@@ -37,6 +37,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.model import BaseModel
+from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.protos.model_pb2 import ModelConfig
 
 
@@ -93,9 +94,9 @@ class GenerativeRecLM(BaseModel):
 
         self._build_prompt_tokens(tokenizer, cfg)
 
-        # Dense-only: the HF backbone owns its embeddings and SID ids flow through
-        # it directly (no EmbeddingGroup). Set explicit (vs RankModel.init_input).
-        self.embedding_group = None
+        # Build the (param-free, raw-passthrough) EmbeddingGroup for the SID
+        # JAGGED_SEQUENCE groups — the HSTU retrieval idiom (see init_input).
+        self.init_input()
 
         # one-shot debug dump of the first spliced batch
         self._smoke_log_once = os.environ.get("TZREC_GENRECLM_DEBUG", "0") == "1"
@@ -121,6 +122,11 @@ class GenerativeRecLM(BaseModel):
         """Parse shared proto knobs into attributes; return the SID atom count."""
         self._input_name: str = common.user_sequence_feature_name
         self._label_name: str = common.label_feature_name
+        # Which JAGGED_SEQUENCE feature_group carries each SID stream; build_input
+        # keys the EmbeddingGroup output by these GROUP names (HSTU idiom),
+        # decoupled from the feature names above.
+        self._history_group: str = common.history_group_name
+        self._label_group: str = common.label_group_name
         self._ignore_index: int = int(common.ignore_index)
         # max history (SID codes) for activation pre-sizing = the user-sequence
         # feature's sequence_length. FG_NONE doesn't truncate, so _sid_token_rows
@@ -308,17 +314,57 @@ class GenerativeRecLM(BaseModel):
         # groups beams per user; the row-wise mask above preserved that order.
         return sids.view(batch_size, -1, self._num_levels)
 
+    def init_input(self) -> None:
+        """Build the EmbeddingGroup for the raw SID JAGGED_SEQUENCE groups.
+
+        Raw (passthrough) features carry no embedding tables, so this
+        EmbeddingGroup holds no params (DMP-neutral); it exists purely to
+        retrieve the raw SID sequences as flat ``(values, lengths)`` — the same
+        path HSTU uses. The HF backbone still owns the token embeddings; SID ids
+        flow through it directly (no embedding lookup here).
+        """
+        self.embedding_group = EmbeddingGroup(self._features, self._feature_groups)
+
+    def build_input(self, batch: Batch) -> Dict[str, List[torch.Tensor]]:
+        """Retrieve per-row SID token sequences via the EmbeddingGroup.
+
+        ``embedding_group(batch)`` returns, per JAGGED_SEQUENCE group, the flat
+        raw values ``"{group}.sequence"`` + ``"{group}.sequence_length"`` (the
+        HSTU idiom). We map SID indices -> extended-vocab token ids and split to
+        rows. The EmbeddingGroup output is keyed by GROUP name
+        (``_history_group`` / ``_label_group``); the returned dict is keyed by
+        FEATURE name (what the family ``predict`` consumes). The label is omitted
+        in inference, where no ground truth is supplied.
+        """
+        g = self.embedding_group(batch)
+        rows: Dict[str, List[torch.Tensor]] = {
+            self._input_name: self._sid_token_rows(
+                g[f"{self._history_group}.sequence"],
+                g[f"{self._history_group}.sequence_length"],
+                max_codes=self._max_seq_length,
+            ),
+        }
+        if not self.is_inference:
+            rows[self._label_name] = self._sid_token_rows(
+                g[f"{self._label_group}.sequence"],
+                g[f"{self._label_group}.sequence_length"],
+                expected_width=self._num_levels,
+            )
+        return rows
+
     def _sid_token_rows(
         self,
-        jt,
+        values: torch.Tensor,
+        lengths: torch.Tensor,
         expected_width: Optional[int] = None,
         max_codes: Optional[int] = None,
     ) -> List[torch.Tensor]:
-        """Read a SID jagged feature -> per-row token-id tensors.
+        """Map flat SID ``(values, lengths)`` -> per-row token-id tensors.
 
-        TER delivers the feature as a JaggedTensor (flat ``values`` + ``lengths``);
-        ``values`` may arrive as float / shape ``(N, 1)``. The whole batch is
-        tokenized once on the backbone device, then split into rows.
+        ``build_input`` supplies a JAGGED_SEQUENCE group's flat
+        ``"{group}.sequence"`` values + ``"{group}.sequence_length"``; ``values``
+        may arrive as float / shape ``(N, 1)``. The whole batch is tokenized once
+        on the backbone device, then split into rows.
 
         ``expected_width``, when set, enforces the sample contract: every row must
         have exactly that many codes (the answer = ``num_levels``).
@@ -328,8 +374,6 @@ class GenerativeRecLM(BaseModel):
         oldest head) so the pre-allocated pool covers every batch. Done on host
         views before the H2D copy, skipped unless a row overflows.
         """
-        values = jt.values()
-        lengths = jt.lengths()
         if values.dim() == 2 and values.size(-1) == 1:
             values = values.squeeze(-1)
         # host-side split bounds, read before the H2D copy below

@@ -213,15 +213,11 @@ class Qwen2RecLM(GenerativeRecLM):
 
     def _predict_train(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Branch 1: teacher-forced forward -> suffix-slice -> CE loss."""
-        # SID indices -> token ids once at the data boundary (_sid_token_rows).
-        u_rows = self._sid_token_rows(
-            batch.sequence_dense_features[self._input_name],
-            max_codes=self._max_seq_length,  # cap to most-recent items (drop oldest)
-        )
-        l_rows = self._sid_token_rows(
-            batch.sequence_dense_features[self._label_name],
-            expected_width=self._num_levels,  # answer = one item = num_levels codes
-        )
+        # Retrieve SID token rows via the EmbeddingGroup (build_input), keyed by
+        # feature name. Train needs both the history and the teacher-forced answer.
+        rows = self.build_input(batch)
+        u_rows = rows[self._input_name]
+        l_rows = rows[self._label_name]
 
         # One-shot pool pre-sizing: pad the FIRST train step to the worst-case
         # length so the allocator reserves its largest segments up front (no
@@ -281,10 +277,8 @@ class Qwen2RecLM(GenerativeRecLM):
         ``_validate_sid_candidates`` (token->SID, malformed beams -> ``-1``).
         Returns ``generated_sids`` of shape ``(B, num_return, num_levels)``.
         """
-        u_rows = self._sid_token_rows(
-            batch.sequence_dense_features[self._input_name],
-            max_codes=self._max_seq_length,  # cap to most-recent items (drop oldest)
-        )
+        # history rows via the EmbeddingGroup (build_input); inference skips label.
+        u_rows = self.build_input(batch)[self._input_name]
         input_ids, attention_mask = self._splice_prompt_ids(u_rows)
         if self._dynamic_beam:
             new_tokens = self._dynamic_beam_search(input_ids, attention_mask)

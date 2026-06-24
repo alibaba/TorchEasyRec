@@ -110,25 +110,67 @@ class GenerativeRecLMTest(unittest.TestCase):
 
     def test_sid_token_rows_split_and_cast(self) -> None:
         m = _stub(base_vocab=100)
-        rows = m._sid_token_rows(_FakeJT([1, 2, 3, 4, 5], [3, 2]))
+        jt = _FakeJT([1, 2, 3, 4, 5], [3, 2])
+        rows = m._sid_token_rows(jt.values(), jt.lengths())
         self.assertEqual([r.tolist() for r in rows], [[100, 101, 102], [103, 104]])
         self.assertTrue(all(r.dtype == torch.int64 for r in rows))
 
     def test_sid_token_rows_squeezes_n1(self) -> None:
         m = _stub(base_vocab=100)
-        rows = m._sid_token_rows(_FakeJT([1, 2, 3], [3], dim2=True))  # (N, 1)
+        jt = _FakeJT([1, 2, 3], [3], dim2=True)  # (N, 1)
+        rows = m._sid_token_rows(jt.values(), jt.lengths())
         self.assertEqual([r.tolist() for r in rows], [[100, 101, 102]])
 
     def test_sid_token_rows_width_ok(self) -> None:
         m = _stub(base_vocab=100, num_levels=3)
-        rows = m._sid_token_rows(_FakeJT([1, 2, 3, 4, 5, 6], [3, 3]), expected_width=3)
+        jt = _FakeJT([1, 2, 3, 4, 5, 6], [3, 3])
+        rows = m._sid_token_rows(jt.values(), jt.lengths(), expected_width=3)
         self.assertEqual([r.tolist() for r in rows], [[100, 101, 102], [103, 104, 105]])
 
     def test_sid_token_rows_width_violation_raises(self) -> None:
         m = _stub(base_vocab=100, num_levels=3)
         with self.assertRaises(ValueError):
             # second row has 2 codes, not 3 -> anomalous sample
-            m._sid_token_rows(_FakeJT([1, 2, 3, 4, 5], [3, 2]), expected_width=3)
+            jt = _FakeJT([1, 2, 3, 4, 5], [3, 2])
+            m._sid_token_rows(jt.values(), jt.lengths(), expected_width=3)
+
+    def test_build_input_keys_by_group_returns_by_feature(self) -> None:
+        # build_input reads the EmbeddingGroup output by GROUP name
+        # ("{group}.sequence" / ".sequence_length") and returns rows keyed by
+        # FEATURE name, tokenizing SID -> token id (sid + base - 1).
+        m = _stub(base_vocab=100, num_levels=3)
+        m._input_name, m._label_name = "user_sequence", "label"
+        m._history_group, m._label_group = "user_seq", "answer"
+        m._max_seq_length = 0
+        m._is_inference = False  # train: the answer is retrieved too
+        out = {
+            "user_seq.sequence": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+            "user_seq.sequence_length": torch.tensor([2, 2]),
+            "answer.sequence": torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            "answer.sequence_length": torch.tensor([3, 3]),
+        }
+        m.embedding_group = lambda b: out
+        rows = m.build_input(object())
+        self.assertEqual(
+            [r.tolist() for r in rows["user_sequence"]], [[100, 101], [102, 103]]
+        )
+        self.assertEqual(
+            [r.tolist() for r in rows["label"]], [[100, 101, 102], [103, 104, 105]]
+        )
+
+    def test_build_input_skips_label_in_inference(self) -> None:
+        m = _stub(base_vocab=100, num_levels=3)
+        m._input_name, m._label_name = "user_sequence", "label"
+        m._history_group, m._label_group = "user_seq", "answer"
+        m._max_seq_length = 0
+        m._is_inference = True  # inference: history only, no ground-truth label
+        m.embedding_group = lambda b: {
+            "user_seq.sequence": torch.tensor([1.0, 2.0, 3.0]),
+            "user_seq.sequence_length": torch.tensor([3]),
+        }
+        rows = m.build_input(object())
+        self.assertEqual([r.tolist() for r in rows["user_sequence"]], [[100, 101, 102]])
+        self.assertNotIn("label", rows)
 
 
 if __name__ == "__main__":

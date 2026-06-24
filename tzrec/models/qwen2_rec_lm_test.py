@@ -163,6 +163,9 @@ class Qwen2RecLMTest(unittest.TestCase):
             return torch.cat([prompt, new], dim=1)
 
         m.lm.generate = fake_generate
+        # build_input (mocked) supplies the tokenized history rows; the batch is
+        # opaque to it. SIDs [1,2,3] tokenize to [100,101,102] at base_vocab=100.
+        m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 101, 102])]}
         sids = m._generate(_gen_batch())["generated_sids"]
         self.assertEqual(tuple(sids.shape), (1, 2, 3))  # (B, num_return, num_levels)
         self.assertEqual(sids[0].tolist(), [[1, 5, 9], [4, 8, 12]])
@@ -199,6 +202,9 @@ class Qwen2RecLMTest(unittest.TestCase):
             return torch.cat([prompt, new], dim=1)
 
         m.lm.generate = fake_generate
+        # build_input (mocked) supplies the tokenized history rows; the batch is
+        # opaque to it. SIDs [1,2,3] tokenize to [100,101,102] at base_vocab=100.
+        m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 101, 102])]}
         sids = m._generate(_gen_batch())["generated_sids"]
         self.assertEqual(tuple(sids.shape), (1, 4, 3))
         # valid candidate kept at its rank; every malformed one -> all -1 (in place)
@@ -228,6 +234,9 @@ class Qwen2RecLMTest(unittest.TestCase):
             return torch.cat([prompt, new], dim=1)
 
         m.lm.generate = fake_generate
+        # build_input (mocked) supplies the tokenized history rows; the batch is
+        # opaque to it. SIDs [1,2,3] tokenize to [100,101,102] at base_vocab=100.
+        m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 101, 102])]}
         sids = m._generate(_gen_batch())["generated_sids"]
         self.assertEqual(tuple(sids.shape), (1, 2, 3))  # rectangular, no crash
         # the missing 3rd atom stays -1 -> out of band -> whole candidate -1
@@ -278,23 +287,20 @@ class Qwen2RecLMTest(unittest.TestCase):
     def test_sid_token_rows_recency_clip(self) -> None:
         m = _stub(num_levels=3, base_vocab=100)  # token = sid + base - 1 = sid + 99
 
-        def _jt(n):  # one row of n codes: values 1..n
-            return types.SimpleNamespace(
-                values=lambda: torch.arange(1, n + 1, dtype=torch.float),
-                lengths=lambda: torch.tensor([n]),
-            )
+        def _vl(n):  # one row of n codes (values 1..n) as flat (values, lengths)
+            return torch.arange(1, n + 1, dtype=torch.float), torch.tensor([n])
 
         # 15 codes (5 items), cap 9 -> keep last 9 (items 3-5 = codes 7..15)
-        rows = m._sid_token_rows(_jt(15), max_codes=9)
+        rows = m._sid_token_rows(*_vl(15), max_codes=9)
         self.assertEqual(rows[0].tolist(), [c + 99 for c in range(7, 16)])
         # item-aligned: cap 10 still keeps 9 (3 whole items), never cuts mid-item
-        rows = m._sid_token_rows(_jt(15), max_codes=10)
+        rows = m._sid_token_rows(*_vl(15), max_codes=10)
         self.assertEqual(rows[0].tolist(), [c + 99 for c in range(7, 16)])
         # within cap -> untouched
-        rows = m._sid_token_rows(_jt(6), max_codes=9)
+        rows = m._sid_token_rows(*_vl(6), max_codes=9)
         self.assertEqual(rows[0].tolist(), [c + 99 for c in range(1, 7)])
         # disabled (0/None) -> no clip
-        rows = m._sid_token_rows(_jt(15), max_codes=0)
+        rows = m._sid_token_rows(*_vl(15), max_codes=0)
         self.assertEqual(rows[0].tolist(), [c + 99 for c in range(1, 16)])
 
     def test_compute_max_total_length(self) -> None:
@@ -319,13 +325,12 @@ class Qwen2RecLMTest(unittest.TestCase):
             seen_lens.append(i.shape[1])
             return {"loss": torch.tensor(0.0)}
 
-        m._sid_token_rows = lambda jt, expected_width=None, max_codes=None: [
-            torch.tensor([100, 101, 102])
-        ]
+        m.build_input = lambda b: {
+            m._input_name: [torch.tensor([100, 101, 102])],
+            m._label_name: [torch.tensor([200, 201, 202])],
+        }
         m._forward_loss = fwd
-        batch = types.SimpleNamespace(
-            sequence_dense_features={"user_sequence": None, "label": None}
-        )
+        batch = object()
         m._predict_train(batch)  # first step: pre-size to worst case
         m._predict_train(batch)  # subsequent step: natural length
         # one-shot: first step left-pads to _max_total_len, latched by
@@ -347,13 +352,12 @@ class Qwen2RecLMTest(unittest.TestCase):
             seen_lens.append(i.shape[1])
             return {"loss": torch.tensor(0.0)}
 
-        m._sid_token_rows = lambda jt, expected_width=None, max_codes=None: [
-            torch.tensor([100, 101, 102])
-        ]
+        m.build_input = lambda b: {
+            m._input_name: [torch.tensor([100, 101, 102])],
+            m._label_name: [torch.tensor([200, 201, 202])],
+        }
         m._forward_loss = fwd
-        batch = types.SimpleNamespace(
-            sequence_dense_features={"user_sequence": None, "label": None}
-        )
+        batch = object()
         m._predict_train(batch)
         # disabled: natural length, never forced to max; flag stays unlatched.
         self.assertLess(seen_lens[0], 50)

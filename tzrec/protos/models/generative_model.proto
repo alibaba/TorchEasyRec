@@ -46,6 +46,14 @@ message GenerativeRecLMConfig {
     // candidates (num_return_sequences is ignored). Faithful parity with ALGR's
     // dynamic_beams schedule; exploits the fixed-length, EOS-free SID answer.
     optional bool dynamic_beam = 9 [default = false];
+
+    // Which feature_group (group_type: JAGGED_SEQUENCE) carries the history /
+    // answer SID stream. The model keys the EmbeddingGroup output by GROUP name
+    // (like HSTU's grouped_features["candidate.sequence"]), decoupled from the
+    // feature names — a group may bundle >1 features. Defaults match the
+    // canonical example config's group names.
+    optional string history_group_name = 10 [default = "user_seq"];
+    optional string label_group_name = 11 [default = "answer"];
 }
 
 // Qwen2 / Qwen2.5 family (Qwen2.5-0.5B, etc.). Registered directly via its
