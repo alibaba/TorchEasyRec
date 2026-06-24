@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 from collections import OrderedDict
+from contextlib import nullcontext
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple
@@ -78,6 +79,7 @@ from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -330,6 +332,7 @@ def _train_and_evaluate(
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
     dataloader_state: Optional[Dict[str, Any]] = None,
+    delta_embedding_dumper: Optional[DeltaEmbeddingDumper] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -426,16 +429,22 @@ def _train_and_evaluate(
     def run_eval(step: int, epoch: int) -> None:
         """Run eval after a checkpoint save, if an eval dataloader is configured."""
         if eval_dataloader is not None:
-            _evaluate(
-                model,
-                eval_dataloader,
-                eval_config,
-                eval_result_filename=eval_result_filename,
-                global_step=step,
-                eval_summary_writer=eval_summary_writer,
-                global_epoch=epoch,
-                check_all_workers_data_status=check_all_workers_data_status,
+            tracking_context = (
+                delta_embedding_dumper.pause_tracking()
+                if delta_embedding_dumper is not None
+                else nullcontext()
             )
+            with tracking_context:
+                _evaluate(
+                    model,
+                    eval_dataloader,
+                    eval_config,
+                    eval_result_filename=eval_result_filename,
+                    global_step=step,
+                    eval_summary_writer=eval_summary_writer,
+                    global_epoch=epoch,
+                    check_all_workers_data_status=check_all_workers_data_status,
+                )
             model.train()
 
     # this rank's last consumed event-time, reused by the epoch / final saves
@@ -466,6 +475,8 @@ def _train_and_evaluate(
                 ckpt_manager.restore(
                     ckpt_path, model, optimizer, train_config.fine_tune_ckpt_param_map
                 )
+            if delta_embedding_dumper is not None:
+                delta_embedding_dumper.clear()
 
         for i_step in step_iter:
             if i_step <= skip_steps:
@@ -493,6 +504,9 @@ def _train_and_evaluate(
                 for lr in lr_scheduler:
                     if not lr.by_epoch:
                         lr.step()
+
+                if delta_embedding_dumper is not None:
+                    delta_embedding_dumper.maybe_dump(i_step)
             except StopIteration:
                 # pass completed: later saves should record positions
                 # within the next pass, on top of the completed-pass count.
@@ -539,6 +553,14 @@ def _train_and_evaluate(
     # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
     # the only checkpoint and persists whatever on_train_end produced.
     _model.on_train_end()
+    if delta_embedding_dumper is not None:
+        # Flush the trailing partial interval before the final checkpoint.
+        # final_dump skips dump-boundary steps already written by maybe_dump,
+        # so it never overwrites their shards with an empty file. Ranks can
+        # reach here at different i_step (independent dataloader exhaustion with
+        # check_all_workers_data_status=False), so final_dump all-reduces the
+        # step across ranks to keep one complete shard set per step dir.
+        delta_embedding_dumper.final_dump(i_step)
 
     _log_train(
         i_step,
@@ -608,6 +630,7 @@ def train_and_evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     acc_utils.allow_tf32(train_config)
+    enable_delta_embedding_dump = train_config.HasField("delta_embedding_dump_config")
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -721,6 +744,15 @@ def train_and_evaluate(
         sharders=sharders,
         plan=plan,
     )
+    delta_embedding_dumper = None
+    if enable_delta_embedding_dump:
+        delta_embedding_dumper = DeltaEmbeddingDumper(
+            model,
+            train_config.delta_embedding_dump_config,
+            pipeline_config.model_dir,
+            device,
+            pipeline_config.feature_configs,
+        )
 
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
         train_config.dense_optimizer
@@ -815,6 +847,7 @@ def train_and_evaluate(
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
         dataloader_state=dataloader_state,
+        delta_embedding_dumper=delta_embedding_dumper,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
