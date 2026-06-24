@@ -15,7 +15,6 @@ import os
 from typing import Any, List, Optional, Tuple, Type, cast
 
 import torch
-from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import (
     enumerators,
@@ -28,6 +27,7 @@ from torchrec.distributed.planner.estimator.types import (
 )
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
+    SharderData,
     ShardingOption,
     Storage,
     Topology,
@@ -37,7 +37,6 @@ from torchrec.distributed.types import (
     CacheParams,
     EmbeddingModuleShardingPlan,
     EnumerableShardingSpec,
-    ModuleSharder,
     ParameterSharding,
     PipelineType,
     ShardingPlan,
@@ -541,7 +540,7 @@ if has_dynamicemb:
         sharding_option,  # pyre-ignore [2]
         topology,  # pyre-ignore [2]
         constraints,  # pyre-ignore [2]
-        sharder,  # pyre-ignore [2]
+        sharder_data,  # pyre-ignore [2]
         *args,  # pyre-ignore [2]
         **kwargs,  # pyre-ignore [2]
     ):
@@ -577,7 +576,7 @@ if has_dynamicemb:
                 sharding_option,
                 topology,
                 constraints,
-                sharder,
+                sharder_data,
                 *args,
                 **kwargs,
             )
@@ -635,7 +634,7 @@ if has_dynamicemb:
         return hdm_value_sizes, ddr_value_sizes
 
     def dynamicemb_calculate_shard_storages(
-        sharder: ModuleSharder[nn.Module],
+        sharder_data: SharderData,
         sharding_type: str,
         tensor: torch.Tensor,
         compute_device: str,
@@ -662,8 +661,8 @@ if has_dynamicemb:
         and optimizer sizes.
 
         Args:
-            sharder (ModuleSharder[nn.Module]): sharder for module that supports
-                sharding.
+            sharder_data (SharderData): precomputed sharder data (unused; kept for
+                signature parity with the upstream storage estimator).
             sharding_type (str): provided ShardingType value.
             tensor (torch.Tensor): tensor to be sharded.
             compute_device (str): compute device to be used.
