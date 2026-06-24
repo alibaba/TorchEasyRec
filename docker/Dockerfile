@@ -41,6 +41,12 @@ RUN case ${DEVICE} in \
                  apt-get install -y cuda-toolkit-12-9 cuda-compat-12-9 && \
                  rm -f /usr/local/cuda && \
                  rm -rf /var/lib/apt/lists/* ;; \
+        "cu130") wget https://tzrec.oss-accelerate.aliyuncs.com/third_party/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+                 dpkg -i cuda-keyring_1.1-1_all.deb && \
+                 apt-get update && \
+                 apt-get install -y cuda-toolkit-13-0 cuda-compat-13-0 && \
+                 rm -f /usr/local/cuda && \
+                 rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
         "cu126") pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cu126/ --no-deps && \
@@ -57,6 +63,16 @@ RUN case ${DEVICE} in \
                  pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
                  sed -i -E '/^Requires-Dist: (cuda-toolkit|nvidia-)/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.12.1+cu129.dist-info/METADATA && \
                  pip install torchmetrics==1.0.3 tensordict && \
+                 pip install torchrec==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
+                 pip cache purge ;; \
+        "cu130") pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cu130/ --no-deps && \
+                 pip install torch==2.12.1 && \
+                 pip install fbgemm-gpu==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu130/repo.html && \
+                 pip install torchmetrics==1.0.3 tensordict && \
+                 pip install torch_tensorrt==2.12.0 -f https://${PIP_MIRROR}/pytorch-wheels/cu130/ --no-deps && \
+                 pip install packaging typing-extensions dllist psutil "tensorrt_cu13==10.16.1.11" && \
+                 rm -f /opt/conda/lib/python${PYTHON_VERSION}/site-packages/tensorrt_libs/libnvinfer_builder_resource_win_*.so.* && \
+                 sed -i -E '/^Requires-Dist: tensorrt/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch_tensorrt-2.12.0+cu130.dist-info/METADATA && \
                  pip install torchrec==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
         * )      pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cpu/ && \
@@ -92,14 +108,14 @@ RUN echo "dash dash/sh boolean false" | debconf-set-selections \
     && DEBIAN_FRONTEND=noninteractive dpkg-reconfigure dash
 
 RUN case ${DEVICE} in \
-        "cu126"|"cu129") apt-get update && \
+        "cu126"|"cu129"|"cu130") apt-get update && \
                  apt-get install -y --allow-downgrades --allow-change-held-packages --no-install-recommends \
                  libnl-3-dev libnl-route-3-dev libnl-3-200 libnl-route-3-200 udev dmidecode ethtool && \
                  apt-get clean && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
-        "cu126"|"cu129") cd /tmp/ && \
+        "cu126"|"cu129"|"cu130") cd /tmp/ && \
                  wget http://pythonrun.oss-cn-zhangjiakou.aliyuncs.com/rdma/nic-libs-mellanox-rdma-5.2-2/nic-lib-rdma-core-installer-ubuntu.tar.gz && \
                  tar xzvf nic-lib-rdma-core-installer-ubuntu.tar.gz && \
                  cd nic-lib-rdma-core-installer-ubuntu && \
