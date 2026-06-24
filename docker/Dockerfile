@@ -43,14 +43,16 @@ RUN case ${DEVICE} in \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
 RUN case ${DEVICE} in \
-        "cu126") pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cu126/ && \
+        "cu126") pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cu126/ --no-deps && \
+                 pip install torch==2.12.1 && \
                  pip install fbgemm-gpu==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu126/repo.html && \
                  pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
                  sed -i -E '/^Requires-Dist: (cuda-toolkit|nvidia-)/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.12.1+cu126.dist-info/METADATA && \
                  pip install torchmetrics==1.0.3 tensordict && \
                  pip install torchrec==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
-        "cu129") pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cu129/ && \
+        "cu129") pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cu129/ --no-deps && \
+                 pip install torch==2.12.1 && \
                  pip install fbgemm-gpu==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu129/repo.html && \
                  pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
                  sed -i -E '/^Requires-Dist: (cuda-toolkit|nvidia-)/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.12.1+cu129.dist-info/METADATA && \
