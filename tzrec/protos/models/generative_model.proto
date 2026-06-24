@@ -63,6 +63,14 @@ message GenerativeRecLMConfig {
     // mixed_precision:"BF16" autocast, NOT the param dtype. One of:
     // float32 | bfloat16 | float16.
     optional string param_dtype = 13 [default = "float32"];
+
+    // Model's history budget (SID codes): the truncation cap enforced model-side
+    // (_sid_token_rows, item-aligned, recency-preserving) AND the activation-pool
+    // pre-size (_compute_max_total_length). A model knob like HSTU's
+    // DlrmHSTU.max_seq_len, distinct from the user_sequence feature's
+    // sequence_length. 0 = fall back to that feature's sequence_length (then off
+    // if it too is unset).
+    optional uint32 max_sequence_length = 14 [default = 0];
 }
 
 // Qwen2 / Qwen2.5 family (Qwen2.5-0.5B, etc.). Registered directly via its

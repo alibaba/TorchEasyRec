@@ -81,7 +81,7 @@ class GenerativeRecLM(BaseModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        cfg = self._model_config  # family message (e.g. Qwen2RecLM)
+        cfg = self._model_config
         common = cfg.common  # GenerativeRecLMConfig — shared by all families
 
         sid_atoms = self._read_common_config(common)
@@ -139,10 +139,14 @@ class GenerativeRecLM(BaseModel):
                 f"{list(self._DTYPE_BY_NAME)}, got {common.param_dtype!r}."
             )
         self._param_dtype: torch.dtype = param_dtype
-        # max history (SID codes) for activation pre-sizing = the user-sequence
-        # feature's sequence_length. FG_NONE doesn't truncate, so _sid_token_rows
-        # enforces this cap (item-aligned) model-side. 0 = off.
-        self._max_seq_length: int = self._input_sequence_length()
+        # Model's history budget (SID codes): the truncation cap (_sid_token_rows,
+        # item-aligned) AND the activation-pool pre-size. HSTU-style model knob
+        # (common.max_sequence_length); 0 -> fall back to the user_sequence
+        # feature's sequence_length (then off if that's also unset). FG_NONE does
+        # not truncate, so this cap is enforced model-side.
+        self._max_seq_length: int = (
+            int(common.max_sequence_length) or self._input_sequence_length()
+        )
         codebook = list(common.codebook)
         if len(codebook) == 0:
             raise ValueError("GenerativeRecLM: codebook must be non-empty.")
@@ -238,10 +242,9 @@ class GenerativeRecLM(BaseModel):
     def _input_sequence_length(self) -> int:
         """The user-sequence feature's ``sequence_length`` (SID codes), or 0.
 
-        FG_NONE does NOT truncate, so this is the cap ``_sid_token_rows`` enforces
-        model-side (item-aligned), and the upper bound the activation pool is
-        pre-sized to (see ``Qwen2RecLM._predict_train``). 0 if the feature has no
-        length cap, which disables pre-allocation.
+        The FALLBACK for ``_max_seq_length`` when ``common.max_sequence_length``
+        is 0; the model knob takes precedence (see ``_read_common_config``). 0 if
+        the feature has no length cap, which disables the cap + pre-allocation.
         """
         for feature in self._features:
             if feature.config.feature_name == self._input_name:
@@ -397,6 +400,11 @@ class GenerativeRecLM(BaseModel):
                     f"{expected_width} codes (len(codebook)); rows {bad} have "
                     f"{[sizes[i] for i in bad]} — anomalous sample(s)."
                 )
+
+        # TODO: The truncation logic should not be placed here, but should be
+        # handled in FG. Since FG currently cannot control the truncation
+        # direction (it keeps the HEAD), this may result in truncating the most
+        # recent SIDs. Check it.
         if max_codes:
             keep = (max_codes // self._num_levels) * self._num_levels
             if keep and any(n > keep for n in sizes):

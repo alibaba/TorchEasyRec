@@ -114,14 +114,50 @@ class GenerativeRecLMTest(unittest.TestCase):
             param_dtype="bfloat16",
             codebook=[4, 4, 4],
             vocab_pad_to_multiple_of=128,
+            max_sequence_length=288,
         )
         m._read_common_config(common)
         self.assertEqual(m._generated_sids_key, "my_sids")  # configurable
         self.assertIs(m._param_dtype, torch.bfloat16)  # name -> torch dtype
+        self.assertEqual(m._max_seq_length, 288)  # model knob used
         # unknown dtype -> a clear error, not a KeyError
         common.param_dtype = "float64"
         with self.assertRaisesRegex(ValueError, "param_dtype must be one of"):
             m._read_common_config(common)
+
+    def test_max_sequence_length_model_knob_and_fallback(self) -> None:
+        # _max_seq_length comes from the model knob (HSTU-style); 0 falls back to
+        # the user_sequence feature's sequence_length.
+        def _common(max_seq):
+            return types.SimpleNamespace(
+                user_sequence_feature_name="user_sequence",
+                label_feature_name="label",
+                history_group_name="user_seq",
+                label_group_name="answer",
+                ignore_index=-100,
+                generated_sids_key="generated_sids",
+                param_dtype="float32",
+                codebook=[4, 4, 4],
+                vocab_pad_to_multiple_of=128,
+                max_sequence_length=max_seq,
+            )
+
+        f_user = types.SimpleNamespace(
+            config=types.SimpleNamespace(feature_name="user_sequence"),
+            sequence_length=256,
+        )
+        # knob 0 -> fall back to the feature's sequence_length
+        m = object.__new__(Qwen2RecLM)
+        nn.Module.__init__(m)
+        m._features = [f_user]
+        m._read_common_config(_common(0))
+        self.assertEqual(m._max_seq_length, 256)
+        # knob set -> overrides the feature
+        m2 = object.__new__(Qwen2RecLM)
+        nn.Module.__init__(m2)
+        m2._features = [f_user]
+        m2._read_common_config(_common(128))
+        self.assertEqual(m2._max_seq_length, 128)
 
     def test_abstract_hooks_raise(self) -> None:
         base = object.__new__(GenerativeRecLM)
