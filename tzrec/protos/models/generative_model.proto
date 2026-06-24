@@ -54,6 +54,15 @@ message GenerativeRecLMConfig {
     // canonical example config's group names.
     optional string history_group_name = 10 [default = "user_seq"];
     optional string label_group_name = 11 [default = "answer"];
+
+    // Predictions key the inference branch emits generated SIDs under (stable
+    // across families; PredictWrapper output_cols should reference it).
+    optional string generated_sids_key = 12 [default = "generated_sids"];
+    // Backbone PARAM dtype = the fp32 MASTER weights. "float32" avoids bf16-ULP
+    // underflow of Adam's small (lr=1e-5) updates; bf16 COMPUTE comes from
+    // mixed_precision:"BF16" autocast, NOT the param dtype. One of:
+    // float32 | bfloat16 | float16.
+    optional string param_dtype = 13 [default = "float32"];
 }
 
 // Qwen2 / Qwen2.5 family (Qwen2.5-0.5B, etc.). Registered directly via its

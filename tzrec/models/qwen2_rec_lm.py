@@ -294,7 +294,7 @@ class Qwen2RecLM(GenerativeRecLM):
             )
             new_tokens = out[:, input_ids.shape[1] :]  # the generated tail
         sids = self._validate_sid_candidates(new_tokens, input_ids.shape[0])
-        return {self.GENERATED_SIDS_KEY: sids}
+        return {self._generated_sids_key: sids}
 
     def _dynamic_beam_search(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor

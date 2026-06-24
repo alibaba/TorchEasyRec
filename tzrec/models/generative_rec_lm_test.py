@@ -89,6 +89,40 @@ class GenerativeRecLMTest(unittest.TestCase):
         common_fields = [f.name for f in GenerativeRecLMConfig.DESCRIPTOR.fields]
         self.assertNotIn("hf_model_id", common_fields)
 
+    def test_configurable_knob_defaults(self) -> None:
+        # generated_sids_key / param_dtype are proto knobs whose defaults are the
+        # previous class-constant values.
+        from tzrec.protos.models.generative_model_pb2 import GenerativeRecLMConfig
+
+        c = GenerativeRecLMConfig()
+        self.assertEqual(c.generated_sids_key, "generated_sids")
+        self.assertEqual(c.param_dtype, "float32")
+        self.assertIs(Qwen2RecLM._DTYPE_BY_NAME["float32"], torch.float32)
+        self.assertIs(Qwen2RecLM._DTYPE_BY_NAME["bfloat16"], torch.bfloat16)
+
+    def test_read_common_config_reads_knobs(self) -> None:
+        m = object.__new__(Qwen2RecLM)
+        nn.Module.__init__(m)
+        m._features = []  # _input_sequence_length -> 0
+        common = types.SimpleNamespace(
+            user_sequence_feature_name="user_sequence",
+            label_feature_name="label",
+            history_group_name="user_seq",
+            label_group_name="answer",
+            ignore_index=-100,
+            generated_sids_key="my_sids",
+            param_dtype="bfloat16",
+            codebook=[4, 4, 4],
+            vocab_pad_to_multiple_of=128,
+        )
+        m._read_common_config(common)
+        self.assertEqual(m._generated_sids_key, "my_sids")  # configurable
+        self.assertIs(m._param_dtype, torch.bfloat16)  # name -> torch dtype
+        # unknown dtype -> a clear error, not a KeyError
+        common.param_dtype = "float64"
+        with self.assertRaisesRegex(ValueError, "param_dtype must be one of"):
+            m._read_common_config(common)
+
     def test_abstract_hooks_raise(self) -> None:
         base = object.__new__(GenerativeRecLM)
         with self.assertRaises(NotImplementedError):

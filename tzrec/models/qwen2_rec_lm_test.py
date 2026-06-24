@@ -38,6 +38,7 @@ def _stub(num_levels=3, base_vocab=100, pad_id=9, device="cpu", per_level=4):
     m._pad_token_id = pad_id
     m._dynamic_beam = False  # default = HF fixed-width beam path
     m._max_seq_length = 0  # no recency clip by default in unit stubs
+    m._generated_sids_key = "generated_sids"  # configurable; default key
     m.lm = types.SimpleNamespace(device=torch.device(device))
     for name, vals in {
         "tpl_system": [10, 11],

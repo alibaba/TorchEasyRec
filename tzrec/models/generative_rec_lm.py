@@ -62,14 +62,20 @@ class GenerativeRecLM(BaseModel):
     name).
     """
 
-    # predictions key the inference branch emits generated SIDs under, stable
-    # across families (PredictWrapper ``output_cols`` should reference it).
+    # Default predictions key the inference branch emits generated SIDs under,
+    # stable across families (PredictWrapper ``output_cols`` should reference it).
+    # Overridable via ``common.generated_sids_key`` -> ``self._generated_sids_key``.
     GENERATED_SIDS_KEY = "generated_sids"
 
-    # Single source of truth for the backbone PARAM dtype: fp32 MASTER weights.
-    # The optimizer needs fp32 to avoid bf16-ULP underflow at small lr; bf16
-    # *compute* comes from mixed_precision:"BF16" autocast, not the param dtype.
-    _PARAM_DTYPE = torch.float32
+    # Backbone PARAM dtype options (the fp32 MASTER weights). fp32 avoids
+    # bf16-ULP underflow of Adam's small (lr=1e-5) updates; bf16 *compute* comes
+    # from mixed_precision:"BF16" autocast, NOT the param dtype. Selected by
+    # ``common.param_dtype`` (default "float32") -> ``self._param_dtype``.
+    _DTYPE_BY_NAME = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
 
     def __init__(
         self,
@@ -128,6 +134,15 @@ class GenerativeRecLM(BaseModel):
         self._history_group: str = common.history_group_name
         self._label_group: str = common.label_group_name
         self._ignore_index: int = int(common.ignore_index)
+        # Inference output key + backbone param dtype (configurable; default
+        # "generated_sids" / "float32" = the fp32-master weights).
+        self._generated_sids_key: str = common.generated_sids_key
+        if common.param_dtype not in self._DTYPE_BY_NAME:
+            raise ValueError(
+                f"{type(self).__name__}: param_dtype must be one of "
+                f"{list(self._DTYPE_BY_NAME)}, got {common.param_dtype!r}."
+            )
+        self._param_dtype: torch.dtype = self._DTYPE_BY_NAME[common.param_dtype]
         # max history (SID codes) for activation pre-sizing = the user-sequence
         # feature's sequence_length. FG_NONE doesn't truncate, so _sid_token_rows
         # enforces this cap (item-aligned) model-side. 0 = off.
@@ -160,9 +175,9 @@ class GenerativeRecLM(BaseModel):
         hf_cfg = AutoConfig.from_pretrained(hf_model_id)
         # fp32 MASTER weights: bf16 params underflow Adam's small (lr=1e-5) updates
         # and freeze. bf16 compute comes from mixed_precision:"BF16"; ckpt stays fp32.
-        lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=self._PARAM_DTYPE)
-        if next(lm.parameters()).dtype != self._PARAM_DTYPE:
-            lm = lm.to(self._PARAM_DTYPE)
+        lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=self._param_dtype)
+        if next(lm.parameters()).dtype != self._param_dtype:
+            lm = lm.to(self._param_dtype)
         return lm
 
     def _build_extended_tokenizer(self, sid_atoms: int) -> tuple[Any, int]:
@@ -217,7 +232,7 @@ class GenerativeRecLM(BaseModel):
         # fp32 master (not "auto", which keeps the stored bf16); must match
         # _build_backbone so cold-start and restore arches agree.
         lm = AutoModelForCausalLM.from_pretrained(
-            self._backbone_id(), torch_dtype=self._PARAM_DTYPE
+            self._backbone_id(), torch_dtype=self._param_dtype
         )
         lm.resize_token_embeddings(
             self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
