@@ -434,20 +434,16 @@ class SidRqvaeTest(unittest.TestCase):
         model.init_loss()
         # The temperatures live on the InfoNCE module that owns the clamp.
         clip = model._loss_modules["sid_clip_loss"]
+        scales = (clip.logit_scale_self, clip.logit_scale_cl, clip.logit_scale)
         with torch.no_grad():
-            clip.logit_scale_self.fill_(100.0)
-            clip.logit_scale_cl.fill_(100.0)
-            clip.logit_scale.fill_(100.0)
+            for p in scales:
+                p.fill_(100.0)
 
         batch = self._clip_batch(B, input_dim, torch.ones(B, 1))
         losses = model.loss(model.predict(batch), batch)
         self.assertTrue(torch.isfinite(losses["sid_clip_loss"]))
         sum(losses.values()).backward()
-        for p in (
-            clip.logit_scale_self,
-            clip.logit_scale_cl,
-            clip.logit_scale,
-        ):
+        for p in scales:
             self.assertIsNotNone(p.grad)
             self.assertTrue(torch.isfinite(p.grad).all())
 

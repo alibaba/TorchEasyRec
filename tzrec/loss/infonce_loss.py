@@ -63,6 +63,11 @@ class MaskedInfoNCELoss(_Loss):
         self.logit_scale = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
 
     @staticmethod
+    def _scaled(logit_scale: torch.Tensor) -> torch.Tensor:
+        # Clamp before exp so a large temperature can't overflow to +Inf -> NaN.
+        return logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp()
+
+    @staticmethod
     def _all_gather_with_grad(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
         """All-gather tensors across workers with gradient support.
 
@@ -133,10 +138,10 @@ class MaskedInfoNCELoss(_Loss):
         embed_b = outputs["embed_b"]
         embed_a_ori = outputs["embed_a_ori"]
         embed_b_ori = outputs["embed_b_ori"]
-        # Clamp before exp so a large temperature can't overflow to +Inf -> NaN.
-        logit_scale = self.logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp()
-        logit_scale_self = self.logit_scale_self.clamp(max=_LOGIT_SCALE_MAX).exp()
-        logit_scale_cl = self.logit_scale_cl.clamp(max=_LOGIT_SCALE_MAX).exp()
+        # The three contrastive temperatures, clamped (<= ln 100) then exp'd.
+        logit_scale = self._scaled(self.logit_scale)
+        logit_scale_self = self._scaled(self.logit_scale_self)
+        logit_scale_cl = self._scaled(self.logit_scale_cl)
 
         local_batch_size = embed_a.size(0)
 
