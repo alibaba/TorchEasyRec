@@ -142,11 +142,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             self._create_model(codebook=[16, 0])
 
     def test_init_raises_on_zero_dim_feature_group(self) -> None:
-        """A feature group with total dim 0 fails fast (derived input_dim < 1).
-
-        input_dim is no longer a config knob — it is derived from the group, so
-        the guard now fires via a 0-dim group rather than an explicit input_dim=0.
-        """
+        """A feature group with total dim 0 fails fast (derived input_dim < 1)."""
         with self.assertRaisesRegex(ValueError, "must be >= 1"):
             self._create_model(input_dim=0)
 

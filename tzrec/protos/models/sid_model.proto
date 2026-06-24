@@ -40,8 +40,6 @@ message ClipConfig {
 
 message SidRqvae {
     // === Network structure ===
-    // (input_dim is not configured here — it is derived from the total
-    //  dimension of the `feature_group` built by the model's EmbeddingGroup.)
     // Quantization latent dimension (encoder output / codebook dim).
     optional uint32 embed_dim = 2 [default = 64];
     // Encoder hidden layer sizes, e.g. [256, 128].
@@ -97,9 +95,6 @@ message SidRqvae {
 }
 
 message SidRqkmeans {
-    // (input_dim is not configured here — K-Means runs directly on the raw
-    //  embeddings of the `feature_group` built by the model's EmbeddingGroup,
-    //  whose total dim is the K-Means dimension.)
     // Per-layer cluster counts, e.g. [256, 256, 256].
     // List length is the number of residual quantization layers. Entries
     // may differ per layer (non-uniform codebooks such as [256, 512, 1024]
