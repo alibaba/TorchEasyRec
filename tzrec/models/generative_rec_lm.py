@@ -132,12 +132,13 @@ class GenerativeRecLM(BaseModel):
         # Inference output key + backbone param dtype (configurable; default
         # "generated_sids" / "float32" = the fp32-master weights).
         self._generated_sids_key: str = common.generated_sids_key
-        if common.param_dtype not in self._DTYPE_BY_NAME:
+        param_dtype = self._DTYPE_BY_NAME.get(common.param_dtype)
+        if param_dtype is None:
             raise ValueError(
                 f"{type(self).__name__}: param_dtype must be one of "
                 f"{list(self._DTYPE_BY_NAME)}, got {common.param_dtype!r}."
             )
-        self._param_dtype: torch.dtype = self._DTYPE_BY_NAME[common.param_dtype]
+        self._param_dtype: torch.dtype = param_dtype
         # max history (SID codes) for activation pre-sizing = the user-sequence
         # feature's sequence_length. FG_NONE doesn't truncate, so _sid_token_rows
         # enforces this cap (item-aligned) model-side. 0 = off.
