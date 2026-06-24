@@ -134,13 +134,10 @@ class SidRqvae(BaseSidModel):
         after ``super().__init__()`` — it needs ``embedding_group`` / ``_input_dim``.
         """
         cfg = self._model_config
+        # Default to no CLIP; the group names stay None unless clip_config is set.
+        self._clip_feature_group = None
+        self._clip_pair_feature_group = None
         self._use_clip = cfg.HasField("clip_config")
-        self._clip_feature_group = (
-            cfg.clip_config.clip_feature_group if self._use_clip else None
-        )
-        self._clip_pair_feature_group = (
-            cfg.clip_config.clip_pair_feature_group if self._use_clip else None
-        )
         has_clip_obj = any(
             lc.WhichOneof("sid_loss") == "sid_clip_loss"
             for lc in self._base_model_config.losses
@@ -153,6 +150,8 @@ class SidRqvae(BaseSidModel):
             )
         if not self._use_clip:
             return
+        self._clip_feature_group = cfg.clip_config.clip_feature_group
+        self._clip_pair_feature_group = cfg.clip_config.clip_pair_feature_group
         for grp in (self._clip_feature_group, self._clip_pair_feature_group):
             if not self.embedding_group.has_group(grp):
                 raise ValueError(
