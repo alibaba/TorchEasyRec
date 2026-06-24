@@ -68,8 +68,9 @@ message GenerativeRecLMConfig {
     // (_sid_token_rows, item-aligned, recency-preserving) AND the activation-pool
     // pre-size (_compute_max_total_length). A model knob like HSTU's
     // DlrmHSTU.max_seq_len, distinct from the user_sequence feature's
-    // sequence_length. 0 = off (no cap, no pre-allocation).
-    optional uint32 max_sequence_length = 14 [default = 0];
+    // sequence_length. REQUIRED (like HSTU's DlrmHSTU.max_seq_len); set it to 0
+    // to explicitly disable the cap + activation-pool pre-allocation.
+    required uint32 max_sequence_length = 14;
 }
 
 // Qwen2 / Qwen2.5 family (Qwen2.5-0.5B, etc.). Registered directly via its
