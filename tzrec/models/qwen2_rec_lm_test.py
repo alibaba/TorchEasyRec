@@ -267,24 +267,6 @@ class Qwen2RecLMTest(unittest.TestCase):
             self.assertEqual(buf.dtype, torch.int64)
         self.assertEqual(m.tpl_eos.tolist(), [99])  # eos cached for supervision
 
-    def test_input_sequence_length_from_feature(self) -> None:
-        m = object.__new__(Qwen2RecLM)
-        m._input_name = "user_sequence"
-        f_user = types.SimpleNamespace(
-            config=types.SimpleNamespace(feature_name="user_sequence"),
-            sequence_length=300,
-        )
-        f_label = types.SimpleNamespace(
-            config=types.SimpleNamespace(feature_name="label"), sequence_length=32
-        )
-        m._features = [f_label, f_user]
-        self.assertEqual(m._input_sequence_length(), 300)  # truncation length
-        m._features = [f_label]  # user-sequence feature absent
-        self.assertEqual(m._input_sequence_length(), 0)
-        f_user.sequence_length = None  # no length cap -> pre-allocation disabled
-        m._features = [f_user]
-        self.assertEqual(m._input_sequence_length(), 0)
-
     def test_sid_token_rows_recency_clip(self) -> None:
         m = _stub(num_levels=3, base_vocab=100)  # token = sid + base - 1 = sid + 99
 

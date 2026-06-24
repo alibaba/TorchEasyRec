@@ -140,13 +140,10 @@ class GenerativeRecLM(BaseModel):
             )
         self._param_dtype: torch.dtype = param_dtype
         # Model's history budget (SID codes): the truncation cap (_sid_token_rows,
-        # item-aligned) AND the activation-pool pre-size. HSTU-style model knob
-        # (common.max_sequence_length); 0 -> fall back to the user_sequence
-        # feature's sequence_length (then off if that's also unset). FG_NONE does
+        # item-aligned, recency-preserving) AND the activation-pool pre-size.
+        # HSTU-style model knob; 0 = off (no cap, no pre-allocation). FG_NONE does
         # not truncate, so this cap is enforced model-side.
-        self._max_seq_length: int = (
-            int(common.max_sequence_length) or self._input_sequence_length()
-        )
+        self._max_seq_length: int = int(common.max_sequence_length)
         codebook = list(common.codebook)
         if len(codebook) == 0:
             raise ValueError("GenerativeRecLM: codebook must be non-empty.")
@@ -238,18 +235,6 @@ class GenerativeRecLM(BaseModel):
             self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
         )
         self.lm = lm
-
-    def _input_sequence_length(self) -> int:
-        """The user-sequence feature's ``sequence_length`` (SID codes), or 0.
-
-        The FALLBACK for ``_max_seq_length`` when ``common.max_sequence_length``
-        is 0; the model knob takes precedence (see ``_read_common_config``). 0 if
-        the feature has no length cap, which disables the cap + pre-allocation.
-        """
-        for feature in self._features:
-            if feature.config.feature_name == self._input_name:
-                return int(getattr(feature, "sequence_length", 0) or 0)
-        return 0
 
     def hf_backbone(self):
         """The HF backbone module (``export_util.write_hf_assets``/``dcp_to_hf``)."""

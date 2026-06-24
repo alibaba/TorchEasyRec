@@ -68,8 +68,7 @@ message GenerativeRecLMConfig {
     // (_sid_token_rows, item-aligned, recency-preserving) AND the activation-pool
     // pre-size (_compute_max_total_length). A model knob like HSTU's
     // DlrmHSTU.max_seq_len, distinct from the user_sequence feature's
-    // sequence_length. 0 = fall back to that feature's sequence_length (then off
-    // if it too is unset).
+    // sequence_length. 0 = off (no cap, no pre-allocation).
     optional uint32 max_sequence_length = 14 [default = 0];
 }
 
