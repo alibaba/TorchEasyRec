@@ -13,11 +13,9 @@
 
 from typing import Any, Callable, Dict, List, Optional
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 import torchmetrics
-from torch import nn
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -30,12 +28,6 @@ from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.utils import div_no_nan
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import ModelConfig
-
-# Cap the CLIP temperatures before ``exp`` (reference CLIP clamps to ln(100)):
-# an unbounded ``logit_scale`` overflows to +Inf -> NaN grad -> corrupt param.
-_LOGIT_SCALE_MAX = float(np.log(100))
-# CLIP temperature init (reference CLIP: log(1 / 0.07)).
-_LOGIT_SCALE_INIT = float(np.log(1 / 0.07))
 
 
 def recon_loss(
@@ -186,10 +178,7 @@ class BaseSidModel(BaseModel):
                 commitment_type=cfg.commitment_type,
             )
         elif loss_type == "sid_clip_loss":
-            # The three learnable contrastive temperatures + the InfoNCE module.
-            self._logit_scale_self = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
-            self._logit_scale_cl = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
-            self._logit_scale = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
+            # The InfoNCE module owns its learnable contrastive temperatures.
             self._loss_modules["sid_clip_loss"] = MaskedInfoNCELoss()
         else:
             raise ValueError(
@@ -234,19 +223,11 @@ class BaseSidModel(BaseModel):
             )
             return {"commitment_loss": loss}
         elif loss_type == "sid_clip_loss":
-
-            def scaled(p: torch.Tensor) -> torch.Tensor:
-                # clamp before exp so a large temperature can't overflow to +Inf.
-                return p.clamp(max=_LOGIT_SCALE_MAX).exp()
-
             feats = {
                 "embed_a": predictions["embed_a"],
                 "embed_b": predictions["embed_b"],
                 "embed_a_ori": predictions["embed_a_ori"],
                 "embed_b_ori": predictions["embed_b_ori"],
-                "logit_scale_self": scaled(self._logit_scale_self),
-                "logit_scale_cl": scaled(self._logit_scale_cl),
-                "logit_scale": scaled(self._logit_scale),
             }
             out = self._loss_modules["sid_clip_loss"](feats, predictions["pair_mask"])
             return {"sid_clip_loss": out["loss"]}

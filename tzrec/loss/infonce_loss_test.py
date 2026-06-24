@@ -12,7 +12,6 @@
 import os
 import unittest
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -34,15 +33,11 @@ class MaskedInfoNCELossTest(unittest.TestCase):
 
     def _features(self, B: int, D: int) -> dict:
         torch.manual_seed(0)
-        scale = torch.tensor(np.log(1 / 0.07)).exp()
         return {
             "embed_a": torch.randn(B, D, requires_grad=True),
             "embed_b": torch.randn(B, D, requires_grad=True),
             "embed_a_ori": torch.randn(B, D),
             "embed_b_ori": torch.randn(B, D),
-            "logit_scale_self": scale,
-            "logit_scale_cl": scale,
-            "logit_scale": scale,
         }
 
     def test_forward_all_clip_finite(self) -> None:
@@ -98,7 +93,6 @@ class MaskedInfoNCELossTest(unittest.TestCase):
         torch.manual_seed(0)
         B, D = 4, 8
         img = torch.randn(B, D)
-        scale = torch.tensor(10.0)
         mask = torch.tensor([True, True, False, False])  # rows 2,3 are recon
 
         def feats(txt: torch.Tensor, txt_ori: torch.Tensor, img_ori: torch.Tensor):
@@ -107,9 +101,6 @@ class MaskedInfoNCELossTest(unittest.TestCase):
                 "embed_b": txt,
                 "embed_a_ori": img_ori,
                 "embed_b_ori": txt_ori,
-                "logit_scale_self": scale,
-                "logit_scale_cl": scale,
-                "logit_scale": scale,
             }
 
         txt, txt_ori, img_ori = (torch.randn(B, D) for _ in range(3))
@@ -125,16 +116,19 @@ class MaskedInfoNCELossTest(unittest.TestCase):
 
     def test_mask_holds_under_large_scale(self) -> None:
         # The column fill is finfo.min (below any real logit) rather than a
-        # hardcoded -1e4, so masking holds even when logit_scale is large and
-        # the *_ori operands are un-normalized (real logits can dwarf 1e4).
-        # Loss/grad must stay finite and acc valid; eval exercises the argmax.
+        # hardcoded -1e4, so masking holds even when the temperature is large and
+        # the *_ori operands are un-normalized (real logits can dwarf 1e4). The
+        # loss's internal clamp caps exp() at <= 100; loss/grad must stay finite.
         loss_fn = MaskedInfoNCELoss()
+        with torch.no_grad():
+            for p in (
+                loss_fn.logit_scale,
+                loss_fn.logit_scale_self,
+                loss_fn.logit_scale_cl,
+            ):
+                p.fill_(3000.0)
         loss_fn.eval()
         feats = self._features(6, 8)
-        big = torch.tensor(3000.0)
-        feats["logit_scale"] = big
-        feats["logit_scale_self"] = big
-        feats["logit_scale_cl"] = big
         feats["embed_a_ori"] = feats["embed_a_ori"] * 50
         feats["embed_b_ori"] = feats["embed_b_ori"] * 50
         mask = torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool)
@@ -200,15 +194,11 @@ def _masked_clip_worker(rank: int, world_size: int, port: int) -> None:
     device = _init(rank, world_size, port)
     torch.manual_seed(1234 + rank)
     B, D = 4, 8
-    scale = torch.tensor(np.log(1 / 0.07)).exp().to(device)
     feats = {
         "embed_a": torch.randn(B, D, device=device, requires_grad=True),
         "embed_b": torch.randn(B, D, device=device, requires_grad=True),
         "embed_a_ori": torch.randn(B, D, device=device),
         "embed_b_ori": torch.randn(B, D, device=device),
-        "logit_scale_self": scale,
-        "logit_scale_cl": scale,
-        "logit_scale": scale,
     }
     mask = torch.ones(B, dtype=torch.bool, device=device)
 

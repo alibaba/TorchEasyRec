@@ -11,13 +11,21 @@
 
 """Masked InfoNCE contrastive loss with distributed all-gather support."""
 
+import math
 from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.distributed.nn as dist_nn
+from torch import nn
 from torch.nn import functional as F
 from torch.nn.modules.loss import _Loss
+
+# CLIP temperature init (reference CLIP: log(1 / 0.07)) and the cap applied
+# before ``exp`` (reference CLIP clamps to ln(100)): an unbounded temperature
+# would overflow to +Inf -> NaN grad -> corrupt param.
+_LOGIT_SCALE_INIT = math.log(1 / 0.07)
+_LOGIT_SCALE_MAX = math.log(100)
 
 
 class MaskedInfoNCELoss(_Loss):
@@ -35,9 +43,9 @@ class MaskedInfoNCELoss(_Loss):
         'embed_b':          reconstructed (decoder) output of view b
         'embed_a_ori':      original embedding of view a
         'embed_b_ori':      original embedding of view b
-        'logit_scale_self': scalar  temperature: recon-a vs recon-b
-        'logit_scale_cl':   scalar  temperature: recon vs same-view original
-        'logit_scale':      scalar  temperature: recon vs counterpart original
+
+    The three contrastive temperatures (self/ori/cl) are learnable parameters
+    owned by this module; ``forward`` clamps (to <= ln(100)) and ``exp``s them.
 
     Output dict keys:
         'loss':  scalar  mean of the three contrastive losses (self/ori/cl)
@@ -48,6 +56,11 @@ class MaskedInfoNCELoss(_Loss):
         self.labels: Optional[torch.Tensor] = None
         self.last_local_batch_size: Optional[int] = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
+        # Learnable contrastive temperatures, one per group (self / ori / cl);
+        # registered here so the InfoNCE module is self-contained.
+        self.logit_scale_self = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
+        self.logit_scale_cl = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
+        self.logit_scale = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
 
     @staticmethod
     def _all_gather_with_grad(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -120,9 +133,10 @@ class MaskedInfoNCELoss(_Loss):
         embed_b = outputs["embed_b"]
         embed_a_ori = outputs["embed_a_ori"]
         embed_b_ori = outputs["embed_b_ori"]
-        logit_scale = outputs["logit_scale"]
-        logit_scale_self = outputs["logit_scale_self"]
-        logit_scale_cl = outputs["logit_scale_cl"]
+        # Clamp before exp so a large temperature can't overflow to +Inf -> NaN.
+        logit_scale = self.logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp()
+        logit_scale_self = self.logit_scale_self.clamp(max=_LOGIT_SCALE_MAX).exp()
+        logit_scale_cl = self.logit_scale_cl.clamp(max=_LOGIT_SCALE_MAX).exp()
 
         local_batch_size = embed_a.size(0)
 
