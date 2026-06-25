@@ -121,13 +121,16 @@ class GenerativeRecLM(BaseModel):
 
     def _read_common_config(self, common: Any) -> int:
         """Parse shared proto knobs into attributes; return the SID atom count."""
-        self._input_name: str = common.user_sequence_feature_name
-        self._label_name: str = common.label_feature_name
         # The history is a JAGGED_SEQUENCE feature_group; build_input keys the
         # EmbeddingGroup output by this GROUP name (HSTU idiom). The answer is NOT
-        # a feature — it's a data_config.label_field read from batch.jagged_labels
-        # by self._label_name (see build_input).
+        # a feature — it's a data_config.label_field read from batch.jagged_labels.
         self._history_group: str = common.history_group_name
+        # SID-column names are derived, not restated: the history feature is the
+        # single member of the history group; the answer is the first
+        # data_config.label_field (like RankModel's labels[0]). _input_name is only
+        # the rows-dict key; _label_name also indexes batch.jagged_labels.
+        self._input_name: str = self._history_feature_name()
+        self._label_name: str = self._labels[0] if self._labels else ""
         self._ignore_index: int = int(common.ignore_index)
         # Inference output key + backbone param dtype (configurable; default
         # "generated_sids" / "float32" = the fp32-master weights).
@@ -156,6 +159,27 @@ class GenerativeRecLM(BaseModel):
         self.register_buffer("_sid_lvl_hi", hi, persistent=False)
         self._vocab_pad_mult = int(common.vocab_pad_to_multiple_of) or 128
         return sum(int(c) for c in codebook)
+
+    def _history_feature_name(self) -> str:
+        """The history feature's name = the single member of the history group.
+
+        The history JAGGED_SEQUENCE group carries one SID stream, so its feature
+        name is ``feature_names[0]``; build_input uses it only as the rows-dict
+        key. Fails loudly on a misconfigured group (vs a silent KeyError later).
+        """
+        for g in self._feature_groups:
+            if g.group_name == self._history_group:
+                if not g.feature_names:
+                    raise ValueError(
+                        f"{type(self).__name__}: history feature_group "
+                        f"{self._history_group!r} has no feature_names."
+                    )
+                return g.feature_names[0]
+        raise ValueError(
+            f"{type(self).__name__}: history_group_name {self._history_group!r} "
+            f"matches no feature_group; declare a JAGGED_SEQUENCE group with that "
+            f"group_name."
+        )
 
     def _build_backbone(self) -> Any:
         """Build the EMPTY extended architecture in fp32 (master) — no download.

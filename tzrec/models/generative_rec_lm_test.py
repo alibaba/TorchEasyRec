@@ -104,9 +104,15 @@ class GenerativeRecLMTest(unittest.TestCase):
         m = object.__new__(Qwen2RecLM)
         nn.Module.__init__(m)
         m._features = []
+        # SID-column names are DERIVED, not configured: history = the history
+        # group's single feature; answer = the first data_config.label_field.
+        m._labels = ["label"]
+        m._feature_groups = [
+            types.SimpleNamespace(
+                group_name="user_seq", feature_names=["user_sequence"]
+            )
+        ]
         common = types.SimpleNamespace(
-            user_sequence_feature_name="user_sequence",
-            label_feature_name="label",
             history_group_name="user_seq",
             ignore_index=-100,
             generated_sids_key="my_sids",
@@ -116,6 +122,8 @@ class GenerativeRecLMTest(unittest.TestCase):
             max_sequence_length=288,
         )
         m._read_common_config(common)
+        self.assertEqual(m._input_name, "user_sequence")  # from history group
+        self.assertEqual(m._label_name, "label")  # from label_fields[0]
         self.assertEqual(m._generated_sids_key, "my_sids")  # configurable
         self.assertIs(m._param_dtype, torch.bfloat16)  # name -> torch dtype
         self.assertEqual(m._max_seq_length, 288)  # model knob used
@@ -124,12 +132,31 @@ class GenerativeRecLMTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "param_dtype must be one of"):
             m._read_common_config(common)
 
+    def test_read_common_config_unknown_history_group_raises(self) -> None:
+        # history_group_name must match a declared feature_group, else fail loudly.
+        m = object.__new__(Qwen2RecLM)
+        nn.Module.__init__(m)
+        m._features = []
+        m._labels = ["label"]
+        m._feature_groups = [
+            types.SimpleNamespace(group_name="other", feature_names=["x"])
+        ]
+        common = types.SimpleNamespace(
+            history_group_name="user_seq",
+            ignore_index=-100,
+            generated_sids_key="generated_sids",
+            param_dtype="float32",
+            codebook=[4, 4, 4],
+            vocab_pad_to_multiple_of=128,
+            max_sequence_length=0,
+        )
+        with self.assertRaisesRegex(ValueError, "matches no feature_group"):
+            m._read_common_config(common)
+
     def test_max_sequence_length_model_knob(self) -> None:
         # _max_seq_length is the model knob; 0 = off (no feature fallback).
         def _common(max_seq):
             return types.SimpleNamespace(
-                user_sequence_feature_name="user_sequence",
-                label_feature_name="label",
                 history_group_name="user_seq",
                 ignore_index=-100,
                 generated_sids_key="generated_sids",
@@ -139,14 +166,22 @@ class GenerativeRecLMTest(unittest.TestCase):
                 max_sequence_length=max_seq,
             )
 
-        m = object.__new__(Qwen2RecLM)
-        nn.Module.__init__(m)
-        m._features = []
+        def _wired():
+            m = object.__new__(Qwen2RecLM)
+            nn.Module.__init__(m)
+            m._features = []
+            m._labels = ["label"]
+            m._feature_groups = [
+                types.SimpleNamespace(
+                    group_name="user_seq", feature_names=["user_sequence"]
+                )
+            ]
+            return m
+
+        m = _wired()
         m._read_common_config(_common(128))
         self.assertEqual(m._max_seq_length, 128)  # model knob used
-        m2 = object.__new__(Qwen2RecLM)
-        nn.Module.__init__(m2)
-        m2._features = []
+        m2 = _wired()
         m2._read_common_config(_common(0))
         self.assertEqual(m2._max_seq_length, 0)  # 0 = off, no fallback
 

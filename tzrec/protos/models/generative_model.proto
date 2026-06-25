@@ -30,11 +30,13 @@ message GenerativeRecLMConfig {
     // Pad the post-extension vocab up to a multiple of this value.
     optional uint32 vocab_pad_to_multiple_of = 3 [default = 128];
 
-    // Names of the SID-list columns. user_sequence is a `sequence_raw_feature`
-    // (an input, in feature_configs / a JAGGED_SEQUENCE group); label is a
-    // `data_config.label_field` (the target) read from batch.jagged_labels.
-    required string user_sequence_feature_name = 4;
-    required string label_feature_name = 5;
+    // SID-column names are NOT restated here — they're derived from the config
+    // that already declares them: the history feature is the single member of the
+    // history_group (its feature_names[0]); the answer is the first
+    // data_config.label_field (read from batch.jagged_labels, like RankModel's
+    // labels[0]).
+    reserved 4;  // was user_sequence_feature_name (-> history_group's feature)
+    reserved 5;  // was label_feature_name (-> data_config.label_fields[0])
 
     // Cross-entropy ignore index — matches PyTorch's F.cross_entropy default.
     optional int32 ignore_index = 6 [default = -100];
@@ -52,8 +54,8 @@ message GenerativeRecLMConfig {
     // Which feature_group (group_type: JAGGED_SEQUENCE) carries the HISTORY SID
     // stream. The model keys the EmbeddingGroup output by GROUP name (like HSTU's
     // grouped_features["candidate.sequence"]), decoupled from the feature names.
-    // (The answer is NOT a feature_group: it's a data_config.label_field read from
-    // batch.jagged_labels — see label_feature_name.)
+    // (The answer is NOT a feature_group: it's the first data_config.label_field,
+    // read from batch.jagged_labels.)
     optional string history_group_name = 10 [default = "user_seq"];
     reserved 11;  // was label_group_name (answer moved to data_config.label_fields)
 
