@@ -26,27 +26,11 @@ RQVAE 的输入是离线预先算好的物品 embedding (例如多模态/文本/
 
 非 CLIP 场景只需 `item_id` + `embedding` 两列。
 
-`is_contrastive` 在语义上是布尔标记, 但**以 0/1 整数存储而非 arrow 原生 `bool`**，以 `> 0.5` 判定是否为对比对。embedding 列为原生数组列, 无需 `separator`。
-
-示例数据由脚本 `data/sid_example/gen_sid_example_data.py` 从 al_sid 的物品 embedding Parquet 抽样生成 (默认抽取小样本以便快速试跑):
-
-```bash
-python data/sid_example/gen_sid_example_data.py
-# 产出:
-#   data/sid_example/merged/part-0.parquet     (带 CLIP, 5 列)
-#   data/sid_example/item_only/part-0.parquet  (非 CLIP, 2 列)
-```
+`is_contrastive` 在语义上是布尔标记, 但**以 0/1 整数存储而非 `bool`**，以 `> 0.5` 判定是否为对比对。embedding 列为原生数组列, 无需 `separator`。
 
 ## 配置说明
 
 ```
-data_config {
-    batch_size: 512
-    dataset_type: ParquetDataset
-    fg_mode: FG_DAG
-    num_workers: 4
-}
-
 feature_configs {
     raw_feature { feature_name: "emb" expression: "item:embedding" value_dim: 512 }
 }
@@ -99,8 +83,7 @@ model_config {
         }
     }
     losses {
-        sid_clip_loss {
-        }
+        sid_clip_loss {}
     }
 }
 ```
@@ -136,44 +119,17 @@ model_config {
 
 ## 示例
 
-### 配置参数
+### 配置文件
 
-见仓库根目录 `sid_rqvae.config`。
+[sid_rqvae.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/sid_rqvae.config)
 
 ### 数据
 
-[al_sid 物品 embedding 抽样] 通过 `data/sid_example/gen_sid_example_data.py` 生成 `data/sid_example/merged/*.parquet` (带 CLIP)。
+CLIP 混合数据：
+[sid_generation_clip_merged_sample_4w.parquet](https://tzrec.oss-accelerate.aliyuncs.com/data/models/sid_generation_clip_merged_sample_4w.parquet)
 
-### 训练
-
-```bash
-ODPS_ENDPOINT=https://service.cn-beijing-vpc.maxcompute.aliyun-inc.com/api \
-    torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-    -m tzrec.train_eval \
-    --pipeline_config_path sid_rqvae.config \
-    --train_input_path "data/sid_example/merged/*.parquet" \
-    --eval_input_path "data/sid_example/merged/*.parquet" \
-    --model_dir experiments/sid_rqvae_clip
-```
-
-`--train_input_path` / `--eval_input_path` 会覆盖配置文件中的同名字段; 也可直接写进配置文件而省略命令行参数。RQVAE 为梯度训练, 可做多卡训练。训练日志会打印 `recon_loss` / `commitment_loss` / `sid_clip_loss` 及每个 eval 的 `mse` / `rel_loss` / `unique_sid_ratio`。
-
-### 生成 SID (预测)
-
-训练得到 checkpoint 后, 用 `tzrec.predict` 为每个物品产出 SID:
-
-```bash
-ODPS_ENDPOINT=https://service.cn-beijing-vpc.maxcompute.aliyun-inc.com/api \
-    torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-    -m tzrec.predict \
-    --pipeline_config_path sid_rqvae.config \
-    --checkpoint_path experiments/sid_rqvae_clip/model.ckpt-399 \
-    --predict_input_path "data/sid_example/merged/*.parquet" \
-    --predict_output_path experiments/sid_rqvae_clip/sid_output \
-    --reserved_columns item_id
-```
+非CLIP Item数据：
+[sid_generation_item_only_sample_4w.parquet](https://tzrec.oss-accelerate.aliyuncs.com/data/models/sid_generation_item_only_sample_4w.parquet)
 
 ### 模型输出
 
