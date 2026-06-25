@@ -139,7 +139,7 @@ model_config {
 
 ### 非对比 (纯重建) 用法
 
-如果不需要对比学习, 去掉 `pair` / `pair_flag` 两个特征组、对应的 `pair_emb` / `is_pair` 特征、`sid_rqvae.contrastive_config` 以及 `contrastive_loss`, 输入改用仅含 `item_id` + `embedding` 的 item-only 样本 (如上方数据链接, 或 `data/sid_example_v2/item_only/*.parquet`) 即可。
+如果不需要对比学习, 去掉 `pair` / `pair_flag` 两个特征组、对应的 `pair_emb` / `is_pair` 特征、`sid_rqvae.contrastive_config` 以及 `contrastive_loss`, 输入改用仅含 `item_id` + `embedding` 的 item-only 样本 (上方数据链接) 即可。
 
 ## 参考论文
 
