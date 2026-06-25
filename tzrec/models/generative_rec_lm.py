@@ -123,11 +123,11 @@ class GenerativeRecLM(BaseModel):
         """Parse shared proto knobs into attributes; return the SID atom count."""
         self._input_name: str = common.user_sequence_feature_name
         self._label_name: str = common.label_feature_name
-        # Which JAGGED_SEQUENCE feature_group carries each SID stream; build_input
-        # keys the EmbeddingGroup output by these GROUP names (HSTU idiom),
-        # decoupled from the feature names above.
+        # The history is a JAGGED_SEQUENCE feature_group; build_input keys the
+        # EmbeddingGroup output by this GROUP name (HSTU idiom). The answer is NOT
+        # a feature — it's a data_config.label_field read from batch.jagged_labels
+        # by self._label_name (see build_input).
         self._history_group: str = common.history_group_name
-        self._label_group: str = common.label_group_name
         self._ignore_index: int = int(common.ignore_index)
         # Inference output key + backbone param dtype (configurable; default
         # "generated_sids" / "float32" = the fp32-master weights).
@@ -237,11 +237,14 @@ class GenerativeRecLM(BaseModel):
         self.lm = lm
 
     def hf_backbone(self):
-        """The HF backbone module (``export_util.write_hf_assets``/``dcp_to_hf``)."""
+        """The HF backbone module. Only use when export."""
         return self.lm
 
     def hf_tokenizer(self):
-        """The extended tokenizer (base vocab + C0..C{sum-1}) to serialize."""
+        """The extended tokenizer (base vocab + C0..C{sum-1}) to serialize.
+
+        Only used at export (export_util.write_hf_assets).
+        """
         return self._hf_tokenizer
 
     def _build_prompt_tokens(self, tokenizer, cfg) -> None:
@@ -325,15 +328,17 @@ class GenerativeRecLM(BaseModel):
         self.embedding_group = EmbeddingGroup(self._features, self._feature_groups)
 
     def build_input(self, batch: Batch) -> Dict[str, List[torch.Tensor]]:
-        """Retrieve per-row SID token sequences via the EmbeddingGroup.
+        """Retrieve per-row SID token sequences.
 
-        ``embedding_group(batch)`` returns, per JAGGED_SEQUENCE group, the flat
-        raw values ``"{group}.sequence"`` + ``"{group}.sequence_length"`` (the
-        HSTU idiom). We map SID indices -> extended-vocab token ids and split to
-        rows. The EmbeddingGroup output is keyed by GROUP name
-        (``_history_group`` / ``_label_group``); the returned dict is keyed by
-        FEATURE name (what the family ``predict`` consumes). The label is omitted
-        in inference, where no ground truth is supplied.
+        HISTORY is a JAGGED_SEQUENCE feature_group: ``embedding_group(batch)``
+        returns its flat raw values ``"{group}.sequence"`` +
+        ``"{group}.sequence_length"`` (the HSTU idiom). The ANSWER is a
+        data_config.label_field: its JaggedTensor comes from
+        ``batch.jagged_labels[self._label_name]`` (so it can be absent at
+        inference, where no ground truth is supplied — unlike a feature_group,
+        which the EmbeddingGroup would require every forward). Both are mapped
+        SID -> extended-vocab token ids and split to rows; the returned dict is
+        keyed by FEATURE name (what the family ``predict`` consumes).
         """
         g = self.embedding_group(batch)
         rows: Dict[str, List[torch.Tensor]] = {
@@ -344,9 +349,10 @@ class GenerativeRecLM(BaseModel):
             ),
         }
         if not self.is_inference:
+            jt = batch.jagged_labels[self._label_name]
             rows[self._label_name] = self._sid_token_rows(
-                g[f"{self._label_group}.sequence"],
-                g[f"{self._label_group}.sequence_length"],
+                jt.values(),
+                jt.lengths(),
                 expected_width=self._num_levels,
             )
         return rows

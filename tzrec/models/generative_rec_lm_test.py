@@ -108,7 +108,6 @@ class GenerativeRecLMTest(unittest.TestCase):
             user_sequence_feature_name="user_sequence",
             label_feature_name="label",
             history_group_name="user_seq",
-            label_group_name="answer",
             ignore_index=-100,
             generated_sids_key="my_sids",
             param_dtype="bfloat16",
@@ -132,7 +131,6 @@ class GenerativeRecLMTest(unittest.TestCase):
                 user_sequence_feature_name="user_sequence",
                 label_feature_name="label",
                 history_group_name="user_seq",
-                label_group_name="answer",
                 ignore_index=-100,
                 generated_sids_key="generated_sids",
                 param_dtype="float32",
@@ -197,23 +195,23 @@ class GenerativeRecLMTest(unittest.TestCase):
             jt = _FakeJT([1, 2, 3, 4, 5], [3, 2])
             m._sid_token_rows(jt.values(), jt.lengths(), expected_width=3)
 
-    def test_build_input_keys_by_group_returns_by_feature(self) -> None:
-        # build_input reads the EmbeddingGroup output by GROUP name
-        # ("{group}.sequence" / ".sequence_length") and returns rows keyed by
-        # FEATURE name, tokenizing SID -> token id (sid + base - 1).
+    def test_build_input_history_group_label_field(self) -> None:
+        # history: EmbeddingGroup output keyed by GROUP name ("{group}.sequence"
+        # / ".sequence_length"). answer: batch.jagged_labels[label_name]. Both
+        # tokenized (sid -> sid + base - 1); returned dict keyed by FEATURE name.
         m = _stub(base_vocab=100, num_levels=3)
         m._input_name, m._label_name = "user_sequence", "label"
-        m._history_group, m._label_group = "user_seq", "answer"
+        m._history_group = "user_seq"
         m._max_seq_length = 0
-        m._is_inference = False  # train: the answer is retrieved too
-        out = {
+        m._is_inference = False  # train: the answer label_field is read too
+        m.embedding_group = lambda b: {
             "user_seq.sequence": torch.tensor([1.0, 2.0, 3.0, 4.0]),
             "user_seq.sequence_length": torch.tensor([2, 2]),
-            "answer.sequence": torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-            "answer.sequence_length": torch.tensor([3, 3]),
         }
-        m.embedding_group = lambda b: out
-        rows = m.build_input(object())
+        batch = types.SimpleNamespace(
+            jagged_labels={"label": _FakeJT([1, 2, 3, 4, 5, 6], [3, 3])}
+        )
+        rows = m.build_input(batch)
         self.assertEqual(
             [r.tolist() for r in rows["user_sequence"]], [[100, 101], [102, 103]]
         )
@@ -224,14 +222,15 @@ class GenerativeRecLMTest(unittest.TestCase):
     def test_build_input_skips_label_in_inference(self) -> None:
         m = _stub(base_vocab=100, num_levels=3)
         m._input_name, m._label_name = "user_sequence", "label"
-        m._history_group, m._label_group = "user_seq", "answer"
+        m._history_group = "user_seq"
         m._max_seq_length = 0
         m._is_inference = True  # inference: history only, no ground-truth label
         m.embedding_group = lambda b: {
             "user_seq.sequence": torch.tensor([1.0, 2.0, 3.0]),
             "user_seq.sequence_length": torch.tensor([3]),
         }
-        rows = m.build_input(object())
+        # jagged_labels intentionally empty — the label is absent at inference
+        rows = m.build_input(types.SimpleNamespace(jagged_labels={}))
         self.assertEqual([r.tolist() for r in rows["user_sequence"]], [[100, 101, 102]])
         self.assertNotIn("label", rows)
 
