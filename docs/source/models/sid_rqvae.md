@@ -10,23 +10,23 @@ RQ-VAE (Residual-Quantized Variational Auto-Encoder) 是一种语义ID (Semantic
 
 注意: RQVAE 通过梯度训练码本, 可多卡训练; 若希望用 FAISS 直接对残差做 K-Means 聚类得到码本 (无编码器/解码器, 单机 CPU), 请参考 [SID RQKMeans](sid_rqkmeans.md)。
 
-RQVAE 还支持 CLIP 风格的双视图对比学习: 除主物品 embedding 外, 再输入一个配对 (paired/clip) embedding 以及一个 0/1 的配对标记, 在对比对样本上额外施加 InfoNCE 对比损失, 使语义相近的两个视图被编码到相近的 SID 空间。本文示例即为带 CLIP 的配置; 关闭 CLIP 的用法见文末。
+RQVAE 还支持双视图对比学习 (contrastive, 思路类似 CLIP 的图文对比): 除主物品 embedding 外, 再输入一个配对 (paired) embedding 以及一个 0/1 的配对标记, 在配对样本上额外施加 InfoNCE 对比损失, 使语义相近的两个视图被编码到相近的 SID 空间。本文示例即为带对比损失的配置; 关闭对比的用法见文末。
 
 ## 数据格式
 
-RQVAE 的输入是离线预先算好的物品 embedding (例如多模态/文本/图像 embedding), 以 `fg_mode: FG_DAG` 直接读取数组列。带 CLIP 的样本单文件包含如下列:
+RQVAE 的输入是离线预先算好的物品 embedding (例如多模态/文本/图像 embedding), 以 `fg_mode: FG_DAG` 直接读取数组列。带对比 (contrastive) 的样本单文件包含如下列:
 
 | 列名 | 类型 | 说明 |
 | --- | --- | --- |
 | `item_id` | string | 物品 ID (透传列, 模型不消费, 预测时可用 `--reserved_columns` 带出) |
 | `embedding` | array\<double\> | 主物品 embedding, 维度需与 `value_dim` 一致 (示例为 512) |
-| `clip_item_id` | string | 配对物品 ID (透传列) |
-| `clip_embedding` | array\<double\> | 配对 (CLIP) embedding, 维度同 `embedding` |
-| `is_contrastive` | int32 (0/1) | 配对标记: `1`=对比对样本, `0`=纯重建样本 (此时 `clip_*` 与主列相同) |
+| `pair_item_id` | string | 配对物品 ID (透传列) |
+| `pair_embedding` | array\<double\> | 配对 embedding, 维度同 `embedding` |
+| `is_pair` | int32 (0/1) | 配对标记: `1`=对比对样本, `0`=纯重建样本 (此时 `pair_*` 与主列相同) |
 
-非 CLIP 场景只需 `item_id` + `embedding` 两列。
+非对比 (纯重建) 场景只需 `item_id` + `embedding` 两列。
 
-`is_contrastive` 在语义上是布尔标记, 但**以 0/1 整数存储而非 `bool`**，以 `> 0.5` 判定是否为对比对。embedding 列为原生数组列, 无需 `separator`。
+`is_pair` 在语义上是布尔标记, 但**以 0/1 整数存储而非 `bool`**，以 `> 0.5` 判定是否为对比对。embedding 列为原生数组列, 无需 `separator`。
 
 ## 配置说明
 
@@ -35,10 +35,10 @@ feature_configs {
     raw_feature { feature_name: "emb" expression: "item:embedding" value_dim: 512 }
 }
 feature_configs {
-    raw_feature { feature_name: "clip_emb" expression: "item:clip_embedding" value_dim: 512 }
+    raw_feature { feature_name: "pair_emb" expression: "item:pair_embedding" value_dim: 512 }
 }
 feature_configs {
-    raw_feature { feature_name: "is_clip_pair" expression: "item:is_contrastive" value_dim: 1 }
+    raw_feature { feature_name: "is_pair" expression: "item:is_pair" value_dim: 1 }
 }
 
 model_config {
@@ -48,13 +48,13 @@ model_config {
         group_type: DEEP
     }
     feature_groups {
-        group_name: "clip_image"
-        feature_names: "clip_emb"
+        group_name: "pair"
+        feature_names: "pair_emb"
         group_type: DEEP
     }
     feature_groups {
-        group_name: "clip_pair"
-        feature_names: "is_clip_pair"
+        group_name: "pair_flag"
+        feature_names: "is_pair"
         group_type: DEEP
     }
     sid_rqvae {
@@ -66,9 +66,9 @@ model_config {
         codebook: 256
         forward_mode: "ste"
         kmeans_init: false
-        clip_config {
-            clip_feature_group: "clip_image"
-            clip_pair_feature_group: "clip_pair"
+        contrastive_config {
+            pair_feature_group: "pair"
+            pair_flag_feature_group: "pair_flag"
         }
     }
     losses {
@@ -83,20 +83,20 @@ model_config {
         }
     }
     losses {
-        sid_clip_loss {}
+        contrastive_loss {}
     }
 }
 ```
 
 - feature_configs: 特征配置, 每个 embedding/标记列对应一个 `raw_feature`
   - emb: 主物品 embedding, `expression` 指向 Parquet 列名 (`item:` 前缀仅为 FG 命名空间), `value_dim` 须等于 embedding 维度 (示例 512)
-  - clip_emb: 配对 (CLIP) embedding, `value_dim` 须与主 embedding 相同
-  - is_clip_pair: 0/1 配对标记, `value_dim: 1`
+  - pair_emb: 配对 embedding, `value_dim` 须与主 embedding 相同
+  - is_pair: 0/1 配对标记, `value_dim: 1`
 - feature_groups: 特征组, 每组喂给模型的 `EmbeddingGroup`; **group_name 需与下方 sid_rqvae 的引用对应**
-  - deep: 主输入组 (默认组名 `deep`), 其拼接后的总维度即编码器输入维度 `input_dim`; 类型 DEEP
-  - clip_image: CLIP 配对 embedding 组 (仅 CLIP 时需要); 类型 DEEP
-  - clip_pair: CLIP 配对标记组 (仅 CLIP 时需要); 类型 DEEP
-- sid_rqvae: RQVAE 模型参数
+  - deep: 主输入组; 模型自动取**第一个声明的 feature group** 作为主输入, 因此主输入组须列在最前; 其拼接后的总维度即编码器输入维度 `input_dim`; 类型 DEEP
+  - pair: 配对 embedding 组 (仅对比时需要), 须与主组同维; 类型 DEEP
+  - pair_flag: 配对标记组 (仅对比时需要); 类型 DEEP
+- sid_rqvae: RQVAE 模型参数 (主输入特征组无需单独配置, 取第一个声明的 feature group)
   - embed_dim: 量化潜在维度, 即编码器输出维度与码本向量维度, 默认 64
   - hidden_dims: 编码器各隐层大小 (解码器按反序镜像), 如 `[256, 256]`; 不配置时默认为 `[input_dim // 2]`
   - codebook: 每层码本大小; **列表长度即残差量化层数 (= SID 的位数)**; 示例为 `[256, 256, 256]` (生产规模常用 `[8192, 8192, 8192]`); 支持非均匀如 `[512, 256, 128]`
@@ -106,14 +106,13 @@ model_config {
   - rotation_trick: 是否使用 rotation-trick 形式的 STE 梯度, 默认 `false`
   - kmeans_init: 是否在首个训练 batch 上用 FAISS 残差 K-Means 初始化码本, 默认 `false`; 需 `batch_size >= max(codebook)`
   - sinkhorn_config: Sinkhorn 均匀分配子配置 (省略时默认启用, `iters=5`, `epsilon=10.0`; 设 `enabled: false` 可关闭)
-  - clip_config: CLIP 双编码器结构 (不配置则关闭 CLIP)
-    - clip_feature_group: 配对 embedding 特征组名, 须与主组同维 (示例 `clip_image`)
-    - clip_pair_feature_group: 配对标记特征组名 (维度 1, `>0.5` 视为对比对; 示例 `clip_pair`)
-  - feature_group: 主输入特征组名, 默认 `"deep"`
+  - contrastive_config: 双视图对比结构 (不配置则关闭对比)
+    - pair_feature_group: 配对 embedding 特征组名, 须与主组同维 (示例 `pair`)
+    - pair_flag_feature_group: 配对标记特征组名 (维度 1, `>0.5` 视为对比对; 示例 `pair_flag`)
 - losses: 损失配置, 每个 `losses {}` 配一个 SID 损失项, 总损失为各项之和
-  - recon_loss: 重建损失 (解码输出 vs 输入 embedding), `recon_type` 可选 `"l2"`/`"l1"`/`"cos"`; CLIP 模式下仅在非配对行 (重建样本) 上计算
+  - recon_loss: 重建损失 (解码输出 vs 输入 embedding), `recon_type` 可选 `"l2"`/`"l1"`/`"cos"`; 对比模式下仅在非配对行 (重建样本) 上计算
   - commitment_loss: VQ commitment 损失; `latent_weight` 为 `[w1, w2]` 两个权重 (默认 `[1.0, 0.5]`, **必须长度为 2**), `commitment_type` 可选 `"l2"`/`"l1"`/`"cos"`
-  - sid_clip_loss: 开启 CLIP 对比 (masked InfoNCE) 损失; **须与 `clip_config` 同时设置**; 仅在配对行上生效
+  - contrastive_loss: 开启双视图对比 (masked InfoNCE) 损失; **须与 `contrastive_config` 同时设置**; 仅在配对行上生效
 
 > 评估指标自动输出 `mse` (重建均方误差)、`rel_loss` (相对 L1)、`unique_sid_ratio` (每个 batch 内不重复 SID 占比, 反映码本利用/多样性)。
 
@@ -125,10 +124,10 @@ model_config {
 
 ### 数据
 
-CLIP 混合数据：
-[sid_generation_clip_merged_sample_4w.parquet](https://tzrec.oss-accelerate.aliyuncs.com/data/models/sid_generation_clip_merged_sample_4w.parquet)
+对比 (contrastive) 混合数据：
+[sid_generation_contrastive_sample_4w.parquet](https://tzrec.oss-accelerate.aliyuncs.com/data/models/sid_generation_contrastive_sample_4w.parquet)
 
-非CLIP Item数据：
+非对比 Item 数据：
 [sid_generation_item_only_sample_4w.parquet](https://tzrec.oss-accelerate.aliyuncs.com/data/models/sid_generation_item_only_sample_4w.parquet)
 
 ### 模型输出
@@ -138,9 +137,9 @@ CLIP 混合数据：
 - codes: `array<int64>`, 即该物品的 SID, 长度等于 `codebook` 层数, 每个元素为对应残差层的码本下标 (取值范围 `[0, codebook_i)`)。例如 `[241, 134, 78]`。
 - item_id: 由 `--reserved_columns` 透传的原始物品 ID。
 
-### 非 CLIP 用法
+### 非对比 (纯重建) 用法
 
-如果不需要对比学习, 去掉 `clip_image` / `clip_pair` 两个特征组、对应的 `clip_emb` / `is_clip_pair` 特征、`sid_rqvae.clip_config` 以及 `sid_clip_loss`, 输入改用仅含 `item_id` + `embedding` 的 `data/sid_example/item_only/*.parquet` 即可。
+如果不需要对比学习, 去掉 `pair` / `pair_flag` 两个特征组、对应的 `pair_emb` / `is_pair` 特征、`sid_rqvae.contrastive_config` 以及 `contrastive_loss`, 输入改用仅含 `item_id` + `embedding` 的 item-only 样本 (如上方数据链接, 或 `data/sid_example_v2/item_only/*.parquet`) 即可。
 
 ## 参考论文
 
