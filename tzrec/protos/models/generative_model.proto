@@ -15,10 +15,12 @@ package tzrec.protos;
 // Architecture-agnostic config shared by ALL generative-rec families (the base
 // reads this for everything except the backbone, which the family owns — see
 // _backbone_id). Sample contract (consumed by `predict()`):
-//   * user_sequence : list<int64>  — raw SID indices in [1, sum(codebook)]
-//   * label         : list<int64>  — raw SID indices in [1, sum(codebook)]
-// Both flow into TER as `sequence_raw_feature` parquet columns; the model maps
-// SID -> token id by integer offset at batch time.
+//   * history : list<int64>  — raw SID indices in [1, sum(codebook)]; the single
+//               JAGGED_SEQUENCE feature_group (a `sequence_raw_feature` column).
+//   * answer  : list<int64>  — raw SID indices; a `data_config.label_field`
+//               (read from batch.jagged_labels), NOT a feature.
+// The model maps SID -> token id by integer offset at batch time. Column names
+// are NOT configured here (see below).
 message GenerativeRecLMConfig {
     // Backbone (`hf_model_id`) is NOT here — it's the family's architecture
     // commitment, so it lives on the family message.
@@ -29,11 +31,13 @@ message GenerativeRecLMConfig {
     // Pad the post-extension vocab up to a multiple of this value.
     optional uint32 vocab_pad_to_multiple_of = 3 [default = 128];
 
-    // SID-column names are NOT restated here — they're derived from the config
-    // that already declares them: the history feature is the single member of the
-    // history_group (its feature_names[0]); the answer is the first
+    // Neither the history feature_group nor the SID-column names are configured
+    // here — they're derived from the config that already declares them: the
+    // history is the single declared feature_group (a JAGGED_SEQUENCE group;
+    // build_input keys the EmbeddingGroup output by its GROUP name, the HSTU
+    // idiom), and its one member is the history feature; the answer is the first
     // data_config.label_field (read from batch.jagged_labels, like RankModel's
-    // labels[0]).
+    // labels[0]). The answer is NOT a feature_group.
 
     // Cross-entropy ignore index — matches PyTorch's F.cross_entropy default.
     optional int32 ignore_index = 6 [default = -100];
@@ -47,13 +51,6 @@ message GenerativeRecLMConfig {
     // candidates (num_return_sequences is ignored). Faithful parity with ALGR's
     // dynamic_beams schedule; exploits the fixed-length, EOS-free SID answer.
     optional bool dynamic_beam = 9 [default = false];
-
-    // Which feature_group (group_type: JAGGED_SEQUENCE) carries the HISTORY SID
-    // stream. The model keys the EmbeddingGroup output by GROUP name (like HSTU's
-    // grouped_features["candidate.sequence"]), decoupled from the feature names.
-    // (The answer is NOT a feature_group: it's the first data_config.label_field,
-    // read from batch.jagged_labels.)
-    optional string history_group_name = 10 [default = "user_seq"];
 
     // Predictions key the inference branch emits generated SIDs under (stable
     // across families; PredictWrapper output_cols should reference it).
