@@ -184,7 +184,7 @@ def tdm_retrieval(
         mode=Mode.PREDICT,
         debug_level=debug_level,
     )
-    infer_iterator = iter(infer_dataloader)
+    infer_iterator = infer_dataloader.get_iterator()  # pyre-ignore[16]
 
     if writer_type is None:
         writer_type = DatasetType.Name(data_config.dataset_type).replace(

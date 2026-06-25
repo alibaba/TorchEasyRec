@@ -79,7 +79,7 @@ message ModelConfig {
         RocketLaunching rocket_launching = 500;
 
         // SID generation models
-        // (600 is reserved for SidRqvae, arriving in the follow-up PR)
+        SidRqvae sid_rqvae = 600;
         SidRqkmeans sid_rqkmeans = 601;
     }
 
