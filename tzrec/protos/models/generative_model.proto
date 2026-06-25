@@ -21,8 +21,7 @@ package tzrec.protos;
 // SID -> token id by integer offset at batch time.
 message GenerativeRecLMConfig {
     // Backbone (`hf_model_id`) is NOT here — it's the family's architecture
-    // commitment, so it lives on the family message. (Old class_name was 1.)
-    reserved 1;
+    // commitment, so it lives on the family message.
 
     // SID vocabulary, one entry per RQ level: len = SID codes per item (answer
     // width), sum = atoms appended as C0..C{sum-1} after the base vocab.
@@ -35,8 +34,6 @@ message GenerativeRecLMConfig {
     // history_group (its feature_names[0]); the answer is the first
     // data_config.label_field (read from batch.jagged_labels, like RankModel's
     // labels[0]).
-    reserved 4;  // was user_sequence_feature_name (-> history_group's feature)
-    reserved 5;  // was label_feature_name (-> data_config.label_fields[0])
 
     // Cross-entropy ignore index — matches PyTorch's F.cross_entropy default.
     optional int32 ignore_index = 6 [default = -100];
@@ -57,7 +54,6 @@ message GenerativeRecLMConfig {
     // (The answer is NOT a feature_group: it's the first data_config.label_field,
     // read from batch.jagged_labels.)
     optional string history_group_name = 10 [default = "user_seq"];
-    reserved 11;  // was label_group_name (answer moved to data_config.label_fields)
 
     // Predictions key the inference branch emits generated SIDs under (stable
     // across families; PredictWrapper output_cols should reference it).
