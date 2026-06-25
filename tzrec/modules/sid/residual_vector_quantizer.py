@@ -264,9 +264,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         sum_projection = (
             x_unsq @ normalized_sum.unsqueeze(2) @ normalized_sum.unsqueeze(1)
         )
-        rescaled_embeddings = (
-            x_unsq @ x_hat.unsqueeze(2) @ quant_hat.unsqueeze(1)
-        )
+        rescaled_embeddings = x_unsq @ x_hat.unsqueeze(2) @ quant_hat.unsqueeze(1)
         return lambda_ * (
             x_unsq - 2 * sum_projection + 2 * rescaled_embeddings
         ).squeeze(1)
