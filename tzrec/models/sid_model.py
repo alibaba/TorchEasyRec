@@ -25,28 +25,8 @@ from tzrec.metrics.relative_l1 import RelativeL1
 from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.modules.utils import div_no_nan
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import ModelConfig
-
-
-def _masked_mean(
-    per_sample: torch.Tensor, mask: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """Mean of a per-row loss over the masked-in rows (all rows if ``mask`` None).
-
-    The mixed recon+contrastive path applies the reconstruction loss to recon rows
-    only; the masked mean divides by the valid-row count (``div_no_nan`` keeps an
-    empty mask at 0). No data-dependent branching → ``torch.compile``-friendly.
-
-    Args:
-        per_sample (Tensor): per-row loss, shape (B,).
-        mask (Tensor, optional): per-row bool; rows to include.
-    """
-    if mask is None:
-        return per_sample.mean()
-    mask = mask.float()
-    return div_no_nan((per_sample * mask).sum(), mask.sum())
 
 
 class BaseSidModel(BaseModel):
@@ -104,7 +84,7 @@ class BaseSidModel(BaseModel):
         self._n_layers = len(self._n_embed_list)
 
         self.init_input()
-        self._feature_group = self._resolve_feature_group()
+        self._feature_group = self.embedding_group.group_names()[0]
         self._input_dim = self.embedding_group.group_total_dim(self._feature_group)
         if self._input_dim < 1:
             raise ValueError(
@@ -119,29 +99,6 @@ class BaseSidModel(BaseModel):
     def build_input(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Build grouped input features: ``{group_name: (B, group_total_dim)}``."""
         return self.embedding_group(batch)
-
-    def _resolve_feature_group(self) -> str:
-        """Resolve the main input feature group name.
-
-        Uses ``feature_group`` when set; otherwise, when exactly one group is
-        declared, that sole group (DLRM-style auto-detect); otherwise fails as
-        ambiguous. The resolved name must exist in the model's feature groups.
-        """
-        groups = self.embedding_group.group_names()
-        if self._model_config.HasField("feature_group"):
-            name = self._model_config.feature_group
-            if name not in groups:
-                raise ValueError(
-                    f"feature_group {name!r} is not in model_config.feature_groups "
-                    f"{groups}"
-                )
-            return name
-        if len(groups) == 1:
-            return groups[0]
-        raise ValueError(
-            "feature_group must be set when multiple feature_groups are declared, "
-            f"got groups {groups}"
-        )
 
     def init_loss(self) -> None:
         """Initialize SID loss modules from ``ModelConfig.losses``.
@@ -203,12 +160,12 @@ class BaseSidModel(BaseModel):
         """Compute one ``sid_loss`` term from ``predictions``."""
         loss_type = loss_cfg.WhichOneof("sid_loss")
         if loss_type == "recon_loss":
-            per_sample = self._loss_modules["recon_loss"](
-                predictions["x_hat"], predictions["recon_target"]
+            loss = self._loss_modules["recon_loss"](
+                predictions["x_hat"],
+                predictions["recon_target"],
+                predictions.get("recon_mask"),
             )
-            return {
-                "recon_loss": _masked_mean(per_sample, predictions.get("recon_mask"))
-            }
+            return {"recon_loss": loss}
         elif loss_type == "commitment_loss":
             loss = self._loss_modules["commitment_loss"](
                 predictions["encoder_out"], predictions["latents"]

@@ -85,15 +85,8 @@ message SidRqvae {
     optional ContrastiveConfig contrastive_config = 16;
 
     // Reconstruction, commitment and (optional) contrastive losses are configured
-    // via ModelConfig.losses (the LossConfig ``sid_loss`` oneof); only the CLIP
-    // feature wiring above lives on this message.
-
-    // Name of the main input FEATURE GROUP (built by the model's EmbeddingGroup
-    // from ModelConfig.feature_groups). May hold one or many content/side-info
-    // features; their concatenated dim is the encoder input_dim. Optional: when
-    // unset and exactly one feature group is declared, that group is used; with
-    // multiple groups it must be set explicitly.
-    optional string feature_group = 40;
+    // via ModelConfig.losses (the LossConfig ``sid_loss`` oneof); only the
+    // contrastive feature wiring above lives on this message.
 }
 
 message SidRqkmeans {
@@ -114,11 +107,4 @@ message SidRqkmeans {
     // what FAISS subsamples to internally (default 256), so no training points
     // are wasted.
     optional uint32 train_sample_size = 6 [default = 0];
-
-    // Name of the main input FEATURE GROUP (built by the model's EmbeddingGroup
-    // from ModelConfig.feature_groups). May hold one or many content/side-info
-    // features; their concatenated dim is the K-Means dimension. Optional: when
-    // unset and exactly one feature group is declared, that group is used; with
-    // multiple groups it must be set explicitly.
-    optional string feature_group = 40;
 }

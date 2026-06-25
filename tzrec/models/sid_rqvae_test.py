@@ -117,8 +117,6 @@ class SidRqvaeTest(unittest.TestCase):
         )
         losses = [_recon_loss_cfg(recon), _commitment_cfg()]
         if use_contrastive:
-            # Multiple feature groups -> the main group must be named explicitly.
-            sid_rqvae_cfg.feature_group = "deep"
             sid_rqvae_cfg.contrastive_config.pair_feature_group = "pair"
             sid_rqvae_cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
             losses.append(_contrastive_cfg())
@@ -302,7 +300,6 @@ class SidRqvaeTest(unittest.TestCase):
             32, use_contrastive=True, pair_emb_dim=16
         )
         cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.feature_group = "deep"
         cfg.contrastive_config.pair_feature_group = "pair"
         cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
         model_config = model_pb2.ModelConfig(
@@ -317,7 +314,6 @@ class SidRqvaeTest(unittest.TestCase):
             32, use_contrastive=True, flag_dim=3
         )
         cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.feature_group = "deep"
         cfg.contrastive_config.pair_feature_group = "pair"
         cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
         model_config = model_pb2.ModelConfig(
@@ -330,7 +326,6 @@ class SidRqvaeTest(unittest.TestCase):
         """A typo'd contrastive group name fails fast at init, not on forward."""
         features, feature_groups = _features_and_groups(32, use_contrastive=True)
         cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.feature_group = "deep"
         cfg.contrastive_config.pair_feature_group = "pair"
         cfg.contrastive_config.pair_flag_feature_group = "pair_flagTYPO"
         model_config = model_pb2.ModelConfig(
@@ -443,8 +438,12 @@ class SidRqvaeTest(unittest.TestCase):
         model.train()
         model.init_loss()
         # The temperatures live on the contrastive module that owns the clamp.
-        clip = model._loss_modules["contrastive_loss"]
-        scales = (clip.logit_scale_self, clip.logit_scale_cl, clip.logit_scale_ori)
+        contrastive = model._loss_modules["contrastive_loss"]
+        scales = (
+            contrastive.logit_scale_self,
+            contrastive.logit_scale_cl,
+            contrastive.logit_scale_ori,
+        )
         with torch.no_grad():
             for p in scales:
                 p.fill_(100.0)
