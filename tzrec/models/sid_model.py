@@ -91,7 +91,6 @@ class BaseSidModel(BaseModel):
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
         cfg = self._model_config
-        # Config fields shared by every SID proto message.
         self._normalize_residuals = cfg.normalize_residuals
 
         if not cfg.codebook:

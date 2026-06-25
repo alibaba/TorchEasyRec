@@ -136,21 +136,19 @@ class SidContrastiveLoss(_Loss):
         Returns:
             Tensor: scalar mean of the three contrastive terms (self/ori/cl).
         """
-        # The three contrastive temperatures, clamped (<= ln 100) then exp'd.
         logit_scale_self = self._scaled(self.logit_scale_self)
         logit_scale_ori = self._scaled(self.logit_scale_ori)
         logit_scale_cl = self._scaled(self.logit_scale_cl)
 
         local_batch_size = embed_a.size(0)
 
-        # Update labels when batch size changes (multi-GPU offset)
+        # Labels carry the cross-rank offset, so refresh them on batch-size change.
         if local_batch_size != self.last_local_batch_size:
             self.labels = local_batch_size * self._rank + torch.arange(
                 local_batch_size, device=embed_a.device
             )
             self.last_local_batch_size = local_batch_size
 
-        # L2 normalize the reconstructed features
         embed_a = F.normalize(embed_a, dim=-1, p=2)
         embed_b = F.normalize(embed_b, dim=-1, p=2)
 
