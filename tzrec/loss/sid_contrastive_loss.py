@@ -12,7 +12,7 @@
 """Masked InfoNCE contrastive loss with distributed all-gather support."""
 
 import math
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
@@ -28,27 +28,20 @@ _LOGIT_SCALE_INIT = math.log(1 / 0.07)
 _LOGIT_SCALE_MAX = math.log(100)
 
 
-class MaskedInfoNCELoss(_Loss):
-    """Masked InfoNCE contrastive loss for mixed (paired + non-paired) batches.
+class SidContrastiveLoss(_Loss):
+    """Masked InfoNCE pair-contrastive loss for mixed (paired + non-paired) batches.
 
-    Modality-agnostic: aligns two reconstructed "views" (``embed_a``/``embed_b``)
-    against each other and against their originals (``embed_a_ori``/
+    Modality-agnostic: aligns two reconstructed "views" (``embed_a`` / ``embed_b``)
+    against each other and against their originals (``embed_a_ori`` /
     ``embed_b_ori``) with three symmetric InfoNCE terms (self/ori/cl). In a mixed
     batch, non-pair rows (``pair_mask=False``) must not contribute and must not
     serve as negatives; row/column masks achieve this without data-dependent
     branching (``torch.compile``-friendly).
 
-    Input dict keys (all embeddings shape (B, dim)):
-        'embed_a':          reconstructed (decoder) output of view a
-        'embed_b':          reconstructed (decoder) output of view b
-        'embed_a_ori':      original embedding of view a
-        'embed_b_ori':      original embedding of view b
-
-    The three contrastive temperatures (self/ori/cl) are learnable parameters
-    owned by this module; ``forward`` clamps (to <= ln(100)) and ``exp``s them.
-
-    Output dict keys:
-        'loss':  scalar  mean of the three contrastive losses (self/ori/cl)
+    ``forward`` takes the four ``(B, dim)`` view embeddings plus the ``(B,)`` pair
+    mask and returns the scalar mean of the three contrastive terms. The three
+    temperatures (self/ori/cl) are learnable parameters owned by this module;
+    ``forward`` clamps (to <= ln(100)) and ``exp``s them.
     """
 
     def __init__(self) -> None:
@@ -57,10 +50,10 @@ class MaskedInfoNCELoss(_Loss):
         self.last_local_batch_size: Optional[int] = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         # Learnable contrastive temperatures, one per group (self / ori / cl);
-        # registered here so the InfoNCE module is self-contained.
+        # registered here so the loss module is self-contained.
         self.logit_scale_self = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
         self.logit_scale_cl = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
-        self.logit_scale = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
+        self.logit_scale_ori = nn.Parameter(torch.ones([]) * _LOGIT_SCALE_INIT)
 
     @staticmethod
     def _scaled(logit_scale: torch.Tensor) -> torch.Tensor:
@@ -125,22 +118,27 @@ class MaskedInfoNCELoss(_Loss):
 
     def forward(
         self,
-        outputs: Dict[str, torch.Tensor],
+        embed_a: torch.Tensor,
+        embed_b: torch.Tensor,
+        embed_a_ori: torch.Tensor,
+        embed_b_ori: torch.Tensor,
         pair_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Forward with the pair mask.
+    ) -> torch.Tensor:
+        """Compute the masked pair-contrastive loss.
 
         Args:
-            outputs: feature dict, see class docstring.
+            embed_a: (B, dim) reconstructed (decoder) output of view a.
+            embed_b: (B, dim) reconstructed (decoder) output of view b.
+            embed_a_ori: (B, dim) original embedding of view a.
+            embed_b_ori: (B, dim) original embedding of view b.
             pair_mask: (B,) bool, True = contrastive-pair sample.
+
+        Returns:
+            Tensor: scalar mean of the three contrastive terms (self/ori/cl).
         """
-        embed_a = outputs["embed_a"]
-        embed_b = outputs["embed_b"]
-        embed_a_ori = outputs["embed_a_ori"]
-        embed_b_ori = outputs["embed_b_ori"]
         # The three contrastive temperatures, clamped (<= ln 100) then exp'd.
-        logit_scale = self._scaled(self.logit_scale)
         logit_scale_self = self._scaled(self.logit_scale_self)
+        logit_scale_ori = self._scaled(self.logit_scale_ori)
         logit_scale_cl = self._scaled(self.logit_scale_cl)
 
         local_batch_size = embed_a.size(0)
@@ -156,54 +154,45 @@ class MaskedInfoNCELoss(_Loss):
         embed_a = F.normalize(embed_a, dim=-1, p=2)
         embed_b = F.normalize(embed_b, dim=-1, p=2)
 
-        # All-gather across GPUs (with gradient support)
-        embed_a_all, embed_b_all = self._all_gather_with_grad([embed_a, embed_b])
-        embed_a_all_ori, embed_b_all_ori = self._all_gather_with_grad(
-            [embed_a_ori, embed_b_ori]
+        # One batched all-gather for all four operands (gradient-preserving).
+        embed_a_all, embed_b_all, embed_a_all_ori, embed_b_all_ori = (
+            self._all_gather_with_grad([embed_a, embed_b, embed_a_ori, embed_b_ori])
         )
 
-        # --- Compute six groups of logits (a/b × self/ori/cl) ---
-        logits_a_self = logit_scale_self * embed_a @ embed_b_all.t()
-        logits_b_self = logit_scale_self * embed_b @ embed_a_all.t()
-
-        logits_a_ori = logit_scale * embed_a @ embed_b_all_ori.t()
-        logits_b_ori = logit_scale * embed_b @ embed_a_all_ori.t()
-
-        logits_a_cl = logit_scale_cl * embed_a @ embed_a_all_ori.t()
-        logits_b_cl = logit_scale_cl * embed_b @ embed_b_all_ori.t()
-
-        # Mask non-pair columns out of the negatives with the dtype's most negative
-        # finite value: below any real logit (masks like -inf), but finite so an
-        # all-non-pair row gives a finite CE/grad instead of 0*NaN.
+        # Column mask: drop non-pair columns from the negatives.
         pair_mask_all = self._gather_bool_mask(pair_mask)
         col_mask = (~pair_mask_all).unsqueeze(0)  # (1, B_global)
-        neg_fill = torch.finfo(logits_a_self.dtype).min
 
-        logits_a_self = logits_a_self.masked_fill(col_mask, neg_fill)
-        logits_b_self = logits_b_self.masked_fill(col_mask, neg_fill)
-        logits_a_ori = logits_a_ori.masked_fill(col_mask, neg_fill)
-        logits_b_ori = logits_b_ori.masked_fill(col_mask, neg_fill)
-        logits_a_cl = logits_a_cl.masked_fill(col_mask, neg_fill)
-        logits_b_cl = logits_b_cl.masked_fill(col_mask, neg_fill)
-
-        # --- Safe labels: non-pair rows fallback to the first pair column ---
+        # Safe labels: non-pair rows fall back to the first pair column.
         labels = self.labels
         fallback = pair_mask.long().argmax()  # first pair sample index
         safe_labels = torch.where(pair_mask, labels, fallback.expand_as(labels))
-
-        # --- Masked CE for three loss groups (shared row mask + valid count) ---
         pair_mask_f = pair_mask.float()
         n_valid = pair_mask_f.sum().clamp(min=1)
-        loss_self = self._masked_cross_entropy(
-            logits_a_self, logits_b_self, safe_labels, pair_mask_f, n_valid
-        )
-        loss_ori = self._masked_cross_entropy(
-            logits_a_ori, logits_b_ori, safe_labels, pair_mask_f, n_valid
-        )
-        loss_cl = self._masked_cross_entropy(
-            logits_a_cl, logits_b_cl, safe_labels, pair_mask_f, n_valid
-        )
 
-        loss = (loss_self + loss_ori + loss_cl) / 3
-
-        return {"loss": loss}
+        # Three symmetric contrastive groups, each (scale, a-target, b-target):
+        #   self: recon-a vs recon-b              (vs the other recon view)
+        #   ori:  recon vs the counterpart original
+        #   cl:   recon vs its own-view original
+        groups = (
+            (logit_scale_self, embed_b_all, embed_a_all),
+            (logit_scale_ori, embed_b_all_ori, embed_a_all_ori),
+            (logit_scale_cl, embed_a_all_ori, embed_b_all_ori),
+        )
+        loss = embed_a.new_zeros(())
+        for scale, a_target, b_target in groups:
+            logits_a = scale * embed_a @ a_target.t()
+            logits_b = scale * embed_b @ b_target.t()
+            # Fill masked columns with the LOGITS dtype's most negative finite
+            # value: below any real logit (masks like -inf) but finite, so an
+            # all-non-pair row yields a finite CE/grad instead of 0*NaN. Derive
+            # it from the logits dtype, not the embeddings': under autocast the
+            # matmul casts to bf16/fp16 and finfo(embed.dtype=fp32).min would
+            # overflow masked_fill on the lower-precision logits.
+            neg_fill = torch.finfo(logits_a.dtype).min
+            logits_a = logits_a.masked_fill(col_mask, neg_fill)
+            logits_b = logits_b.masked_fill(col_mask, neg_fill)
+            loss = loss + self._masked_cross_entropy(
+                logits_a, logits_b, safe_labels, pair_mask_f, n_valid
+            )
+        return loss / 3

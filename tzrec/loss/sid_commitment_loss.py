@@ -9,16 +9,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CommitmentLoss: VQ-VAE commitment loss for residual quantizers."""
+"""SidCommitmentLoss: VQ-VAE commitment loss for residual quantizers."""
 
 from typing import Sequence
 
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch.nn.modules.loss import _Loss
 
 
-class CommitmentLoss(nn.Module):
+class SidCommitmentLoss(_Loss):
     """Commitment loss between the encoder output and the quantized vectors.
 
     Operates on a residual quantizer's per-layer cumulative quantized vectors

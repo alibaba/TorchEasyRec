@@ -16,20 +16,20 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tzrec.loss.infonce_loss import MaskedInfoNCELoss
+from tzrec.loss.sid_contrastive_loss import SidContrastiveLoss
 from tzrec.utils import misc_util
 
 
 class AllGatherWithGradTest(unittest.TestCase):
     def test_single_process_identity(self) -> None:
         a, b = torch.randn(3, 4), torch.randn(3, 4)
-        out = MaskedInfoNCELoss._all_gather_with_grad([a, b])
+        out = SidContrastiveLoss._all_gather_with_grad([a, b])
         self.assertIs(out[0], a)
         self.assertIs(out[1], b)
 
 
-class MaskedInfoNCELossTest(unittest.TestCase):
-    """Single-process tests for the masked CLIP loss."""
+class SidContrastiveLossTest(unittest.TestCase):
+    """Single-process tests for the masked pair-contrastive loss."""
 
     def _features(self, B: int, D: int) -> dict:
         torch.manual_seed(0)
@@ -40,52 +40,51 @@ class MaskedInfoNCELossTest(unittest.TestCase):
             "embed_b_ori": torch.randn(B, D),
         }
 
-    def test_forward_all_clip_finite(self) -> None:
-        loss_fn = MaskedInfoNCELoss()
+    def test_forward_all_pairs_finite(self) -> None:
+        loss_fn = SidContrastiveLoss()
         feats = self._features(6, 8)
         mask = torch.ones(6, dtype=torch.bool)
-        out = loss_fn(feats, mask)
-        self.assertIn("loss", out)
-        self.assertTrue(torch.isfinite(out["loss"]))
-        self.assertGreater(out["loss"].item(), 0.0)
+        loss = loss_fn(**feats, pair_mask=mask)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(loss.item(), 0.0)
 
     def test_all_recon_mask_zero_loss(self) -> None:
-        loss_fn = MaskedInfoNCELoss()
+        loss_fn = SidContrastiveLoss()
         feats = self._features(6, 8)
-        mask = torch.zeros(6, dtype=torch.bool)  # no clip rows
-        out = loss_fn(feats, mask)
-        # No clip rows -> masked average is exactly zero (and finite).
-        self.assertTrue(torch.isfinite(out["loss"]))
-        self.assertAlmostEqual(out["loss"].item(), 0.0, places=6)
+        mask = torch.zeros(6, dtype=torch.bool)  # no pair rows
+        loss = loss_fn(**feats, pair_mask=mask)
+        # No pair rows -> masked average is exactly zero (and finite).
+        self.assertTrue(torch.isfinite(loss))
+        self.assertAlmostEqual(loss.item(), 0.0, places=6)
 
     def test_all_recon_mask_finite_gradient(self) -> None:
         # Regression: with float("-inf") column fill an all-recon batch produced
         # a NaN gradient (0 * NaN) that survived the row mask. The finite fill
-        # must keep the backward finite (and zero, since no clip row contributes).
-        loss_fn = MaskedInfoNCELoss()
+        # must keep the backward finite (and zero, since no pair row contributes).
+        loss_fn = SidContrastiveLoss()
         feats = self._features(6, 8)
         mask = torch.zeros(6, dtype=torch.bool)
-        loss_fn(feats, mask)["loss"].backward()
+        loss_fn(**feats, pair_mask=mask).backward()
         grad = feats["embed_a"].grad
         self.assertIsNotNone(grad)
         self.assertTrue(torch.isfinite(grad).all())
         self.assertAlmostEqual(grad.abs().sum().item(), 0.0, places=6)
 
     def test_backward_flows_to_embeddings(self) -> None:
-        loss_fn = MaskedInfoNCELoss()
+        loss_fn = SidContrastiveLoss()
         feats = self._features(6, 8)
         mask = torch.ones(6, dtype=torch.bool)
-        loss_fn(feats, mask)["loss"].backward()
+        loss_fn(**feats, pair_mask=mask).backward()
         self.assertIsNotNone(feats["embed_a"].grad)
         self.assertTrue(torch.isfinite(feats["embed_a"].grad).all())
 
     def test_recon_columns_excluded_from_negatives(self) -> None:
-        """A recon row's embedding must not affect a clip row's loss.
+        """A recon row's embedding must not affect a pair row's loss.
 
         Recon rows are dropped as queries (row mask) AND their columns are
         masked out of the negatives (col_mask). Perturbing the recon rows of
         EVERY column operand — ``embed_b`` (the self group) and both
-        ``*_ori`` operands (the ori/cl groups) — must leave the clip rows' loss
+        ``*_ori`` operands (the ori/cl groups) — must leave the pair rows' loss
         unchanged; a dropped or inverted ``col_mask`` on any group would fail.
         Distinct ``embed_a_ori`` / ``embed_b_ori`` so the ori/cl masking
         is actually exercised (not hidden by a shared tensor).
@@ -104,25 +103,37 @@ class MaskedInfoNCELossTest(unittest.TestCase):
             }
 
         txt, txt_ori, img_ori = (torch.randn(B, D) for _ in range(3))
-        loss_fn = MaskedInfoNCELoss()
+        loss_fn = SidContrastiveLoss()
         loss_fn.eval()
-        base = loss_fn(feats(txt, txt_ori, img_ori), mask)["loss"]
+        base = loss_fn(**feats(txt, txt_ori, img_ori), pair_mask=mask)
         # Perturb ONLY the recon rows of every column operand that feeds negatives.
         txt2, txt_ori2, img_ori2 = txt.clone(), txt_ori.clone(), img_ori.clone()
         for t in (txt2, txt_ori2, img_ori2):
             t[2:] = torch.randn(2, D)
-        after = loss_fn(feats(txt2, txt_ori2, img_ori2), mask)["loss"]
+        after = loss_fn(**feats(txt2, txt_ori2, img_ori2), pair_mask=mask)
         torch.testing.assert_close(base, after)
+
+    def test_autocast_bf16_does_not_overflow_masked_fill(self) -> None:
+        # Regression: the column fill must come from the LOGITS dtype, not the
+        # (fp32) embeddings. Under autocast the matmul emits bf16, so
+        # finfo(fp32).min would raise "cannot be converted to BFloat16 without
+        # overflow" in masked_fill. A mixed pair/non-pair mask exercises the fill.
+        loss_fn = SidContrastiveLoss()
+        feats = self._features(6, 8)
+        mask = torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            loss = loss_fn(**feats, pair_mask=mask)
+        self.assertTrue(torch.isfinite(loss))
 
     def test_mask_holds_under_large_scale(self) -> None:
         # The column fill is finfo.min (below any real logit) rather than a
         # hardcoded -1e4, so masking holds even when the temperature is large and
         # the *_ori operands are un-normalized (real logits can dwarf 1e4). The
         # loss's internal clamp caps exp() at <= 100; loss/grad must stay finite.
-        loss_fn = MaskedInfoNCELoss()
+        loss_fn = SidContrastiveLoss()
         with torch.no_grad():
             for p in (
-                loss_fn.logit_scale,
+                loss_fn.logit_scale_ori,
                 loss_fn.logit_scale_self,
                 loss_fn.logit_scale_cl,
             ):
@@ -132,17 +143,17 @@ class MaskedInfoNCELossTest(unittest.TestCase):
         feats["embed_a_ori"] = feats["embed_a_ori"] * 50
         feats["embed_b_ori"] = feats["embed_b_ori"] * 50
         mask = torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool)
-        out = loss_fn(feats, mask)
-        self.assertTrue(torch.isfinite(out["loss"]))
+        loss = loss_fn(**feats, pair_mask=mask)
+        self.assertTrue(torch.isfinite(loss))
         loss_fn.train()
         feats["embed_a"].grad = None
-        loss_fn(feats, mask)["loss"].backward()
+        loss_fn(**feats, pair_mask=mask).backward()
         self.assertTrue(torch.isfinite(feats["embed_a"].grad).all())
 
 
-# --- Multi-process tests for the CLIP distributed all-gather path. ---
+# --- Multi-process tests for the contrastive distributed all-gather path. ---
 # Validates ``_all_gather_with_grad`` (built on the differentiable
-# ``torch.distributed.nn.functional.all_gather``) and ``MaskedInfoNCELoss`` across
+# ``torch.distributed.nn.functional.all_gather``) and ``SidContrastiveLoss`` across
 # ranks. Uses NCCL on GPU when >=2 devices are available (the production path the
 # reviewer cared about), else falls back to gloo/CPU, so it runs on a multi-GPU
 # box and in CPU CI alike.
@@ -168,7 +179,7 @@ def _all_gather_worker(rank: int, world_size: int, port: int) -> None:
     device = _init(rank, world_size, port)
     # Each rank holds a distinct, rank-identifying tensor.
     x = torch.full((2, 3), float(rank + 1), device=device, requires_grad=True)
-    gathered = MaskedInfoNCELoss._all_gather_with_grad([x])[0]
+    gathered = SidContrastiveLoss._all_gather_with_grad([x])[0]
 
     # Forward: gathered is (world_size*2, 3); rank r contributes rows
     # [2r : 2r+2] all equal to (r+1).
@@ -190,7 +201,7 @@ def _all_gather_worker(rank: int, world_size: int, port: int) -> None:
     dist.destroy_process_group()
 
 
-def _masked_clip_worker(rank: int, world_size: int, port: int) -> None:
+def _contrastive_worker(rank: int, world_size: int, port: int) -> None:
     device = _init(rank, world_size, port)
     torch.manual_seed(1234 + rank)
     B, D = 4, 8
@@ -202,13 +213,12 @@ def _masked_clip_worker(rank: int, world_size: int, port: int) -> None:
     }
     mask = torch.ones(B, dtype=torch.bool, device=device)
 
-    loss_fn = MaskedInfoNCELoss().to(device)
-    out = loss_fn(feats, mask)
-    clip_loss = out["loss"]
-    assert torch.isfinite(clip_loss).all(), f"rank{rank}: non-finite clip_loss"
-    assert clip_loss.item() > 0.0, f"rank{rank}: clip_loss not positive"
+    loss_fn = SidContrastiveLoss().to(device)
+    loss = loss_fn(**feats, pair_mask=mask)
+    assert torch.isfinite(loss).all(), f"rank{rank}: non-finite loss"
+    assert loss.item() > 0.0, f"rank{rank}: loss not positive"
 
-    clip_loss.backward()
+    loss.backward()
     g = feats["embed_a"].grad
     assert g is not None and torch.isfinite(g).all(), f"rank{rank}: bad grad"
     dist.destroy_process_group()
@@ -228,14 +238,14 @@ def _run(target) -> None:
             raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
 
 
-class InfoNCEDistTest(unittest.TestCase):
-    """2-rank tests for the CLIP distributed collectives."""
+class SidContrastiveDistTest(unittest.TestCase):
+    """2-rank tests for the contrastive distributed collectives."""
 
     def test_all_gather_with_grad(self) -> None:
         _run(_all_gather_worker)
 
-    def test_masked_clip_loss(self) -> None:
-        _run(_masked_clip_worker)
+    def test_masked_contrastive_loss(self) -> None:
+        _run(_contrastive_worker)
 
 
 if __name__ == "__main__":

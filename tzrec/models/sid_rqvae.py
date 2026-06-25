@@ -12,7 +12,7 @@
 """SidRqvae: SID generation model using RQ-VAE (Encoder + VQ + Decoder).
 
 End-to-end differentiable training. The reconstruction, commitment and optional
-CLIP contrastive losses are configured via ``ModelConfig.losses`` (the
+contrastive losses are configured via ``ModelConfig.losses`` (the
 ``LossConfig`` ``sid_loss`` oneof) and computed centrally in
 :meth:`BaseSidModel.loss`; :meth:`predict` only produces the raw tensors those
 losses consume. The encoder/decoder and residual vector quantizer live directly
@@ -46,8 +46,8 @@ class SidRqvae(BaseSidModel):
     (ReLU between hidden layers; the decoder mirrors the encoder.)
 
     Losses are config-driven (``ModelConfig.losses`` / ``sid_loss`` oneof). When a
-    ``sid_clip_loss`` is configured, ``predict`` runs a dual (image/text) path and
-    the masked CLIP contrastive loss is applied to the CLIP-pair rows.
+    ``contrastive_loss`` is configured, ``predict`` runs a dual (paired) path and
+    the masked contrastive loss is applied to the contrastive-pair rows.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.
@@ -68,7 +68,7 @@ class SidRqvae(BaseSidModel):
 
         cfg = self._model_config  # SidRqvae proto message
 
-        self._init_clip()
+        self._init_contrastive()
 
         embed_dim = cfg.embed_dim
         # Fail fast (parity with BaseSidModel's codebook/input_dim checks): a zero
@@ -115,61 +115,64 @@ class SidRqvae(BaseSidModel):
 
         logger.info(
             "SidRqvae init: input_dim=%d, embed_dim=%d, hidden_dims=%s, "
-            "n_layers=%d, n_embed=%s, use_clip=%s",
+            "n_layers=%d, n_embed=%s, use_contrastive=%s",
             self._input_dim,
             embed_dim,
             hidden_dims,
             self._n_layers,
             self._n_embed_list,
-            self._use_clip,
+            self._use_contrastive,
         )
 
-    def _init_clip(self) -> None:
-        """Read and validate the CLIP dual-encoder wiring (``clip_config``).
+    def _init_contrastive(self) -> None:
+        """Read and validate the pair-contrastive wiring (``contrastive_config``).
 
-        Sets ``_use_clip`` and the paired / pair-flag group names, and enforces:
-        ``clip_config`` (structure) and a ``sid_clip_loss`` entry (objective) are
-        set together; the paired group exists and matches ``input_dim`` (it shares
-        the encoder); the pair-flag group is a single dim-1 raw flag. Must run
-        after ``super().__init__()`` — it needs ``embedding_group`` / ``_input_dim``.
+        Sets ``_use_contrastive`` and the paired / pair-flag group names, and
+        enforces: ``contrastive_config`` (structure) and a ``contrastive_loss``
+        entry (objective) are set together; the paired group exists and matches
+        ``input_dim`` (it shares the encoder); the pair-flag group is a single
+        dim-1 raw flag. Must run after ``super().__init__()`` — it needs
+        ``embedding_group`` / ``_input_dim``.
         """
         cfg = self._model_config
-        # Default to no CLIP; the group names stay None unless clip_config is set.
-        self._clip_feature_group = None
-        self._clip_pair_feature_group = None
-        self._use_clip = cfg.HasField("clip_config")
-        has_clip_obj = any(
-            lc.WhichOneof("sid_loss") == "sid_clip_loss"
+        # Default to no contrastive path; the group names stay None unless
+        # contrastive_config is set.
+        self._pair_feature_group = None
+        self._pair_flag_feature_group = None
+        self._use_contrastive = cfg.HasField("contrastive_config")
+        has_contrastive_obj = any(
+            lc.WhichOneof("sid_loss") == "contrastive_loss"
             for lc in self._base_model_config.losses
         )
-        if self._use_clip != has_clip_obj:
+        if self._use_contrastive != has_contrastive_obj:
             raise ValueError(
-                "clip_config (model structure) and a sid_clip_loss entry in "
-                "losses (the objective) must be set together; got "
-                f"clip_config={self._use_clip}, sid_clip_loss={has_clip_obj}"
+                "contrastive_config (model structure) and a contrastive_loss entry "
+                "in losses (the objective) must be set together; got "
+                f"contrastive_config={self._use_contrastive}, "
+                f"contrastive_loss={has_contrastive_obj}"
             )
-        if not self._use_clip:
+        if not self._use_contrastive:
             return
-        self._clip_feature_group = cfg.clip_config.clip_feature_group
-        self._clip_pair_feature_group = cfg.clip_config.clip_pair_feature_group
-        for grp in (self._clip_feature_group, self._clip_pair_feature_group):
+        self._pair_feature_group = cfg.contrastive_config.pair_feature_group
+        self._pair_flag_feature_group = cfg.contrastive_config.pair_flag_feature_group
+        for grp in (self._pair_feature_group, self._pair_flag_feature_group):
             if not self.embedding_group.has_group(grp):
                 raise ValueError(
-                    f"clip group {grp!r} is not in model_config.feature_groups "
-                    f"{self.embedding_group.group_names()}"
+                    f"contrastive group {grp!r} is not in model_config.feature_groups"
+                    f" {self.embedding_group.group_names()}"
                 )
-        clip_dim = self.embedding_group.group_total_dim(self._clip_feature_group)
-        if clip_dim != self._input_dim:
+        pair_dim = self.embedding_group.group_total_dim(self._pair_feature_group)
+        if pair_dim != self._input_dim:
             raise ValueError(
-                f"clip_feature_group {self._clip_feature_group!r} has total "
-                f"dim {clip_dim}, but it is encoded by the same encoder as the "
+                f"pair_feature_group {self._pair_feature_group!r} has total "
+                f"dim {pair_dim}, but it is encoded by the same encoder as the "
                 f"main feature_group (dim {self._input_dim}); the two must match"
             )
-        pair_dim = self.embedding_group.group_total_dim(self._clip_pair_feature_group)
-        if pair_dim != 1:
+        flag_dim = self.embedding_group.group_total_dim(self._pair_flag_feature_group)
+        if flag_dim != 1:
             raise ValueError(
-                f"clip_pair_feature_group {self._clip_pair_feature_group!r} must "
-                f"be a single dim-1 raw flag, got total dim {pair_dim}"
+                f"pair_flag_feature_group {self._pair_flag_feature_group!r} must "
+                f"be a single dim-1 raw flag, got total dim {flag_dim}"
             )
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -198,7 +201,7 @@ class SidRqvae(BaseSidModel):
             # Codes-only path: get_codes does just the residual walk (no decode,
             # no commitment latents), so neither dual-path branch is needed.
             return {"codes": self._quantizer.get_codes(self._encode(embedding))}
-        if self._use_clip:
+        if self._use_contrastive:
             return self._predict_mixed(grouped)
         return self._predict_rqvae(embedding)
 
@@ -229,19 +232,19 @@ class SidRqvae(BaseSidModel):
     def _predict_mixed(
         self, grouped: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Mixed recon + CLIP: dual path over the main + paired feature groups.
+        """Mixed recon + contrastive: dual path over the main + paired groups.
 
         ``encoder_out`` / ``latents`` stack both paths so the commitment loss
-        averages over them; ``recon_mask`` (= non-CLIP rows) restricts the recon
+        averages over them; ``recon_mask`` (= non-pair rows) restricts the recon
         loss to reconstruction-only rows.
 
         Args:
             grouped (dict): the EmbeddingGroup output (group name -> tensor).
         """
         embedding = grouped[self._feature_group]
-        fea2 = grouped[self._clip_feature_group]
-        is_clip_pair_raw = grouped[self._clip_pair_feature_group]
-        clip_mask = is_clip_pair_raw.view(is_clip_pair_raw.shape[0], -1)[:, 0] > 0.5
+        fea2 = grouped[self._pair_feature_group]
+        is_pair_raw = grouped[self._pair_flag_feature_group]
+        pair_mask = is_pair_raw.view(is_pair_raw.shape[0], -1)[:, 0] > 0.5
 
         z_e1, quant1, x_hat1 = self._rqvae_pass(embedding)
         z_e2, quant2, x_hat2 = self._rqvae_pass(fea2)
@@ -250,7 +253,7 @@ class SidRqvae(BaseSidModel):
             "codes": quant1.cluster_ids,
             "x_hat": x_hat1,
             "recon_target": embedding,
-            "recon_mask": ~clip_mask,
+            "recon_mask": ~pair_mask,
             "encoder_out": torch.cat([z_e1, z_e2], dim=0),
             "latents": torch.cat([quant1.latents, quant2.latents], dim=0),
             # generic contrastive operands (view a = main, view b = paired):
@@ -258,5 +261,5 @@ class SidRqvae(BaseSidModel):
             "embed_b": x_hat2,
             "embed_a_ori": embedding,
             "embed_b_ori": fea2,
-            "pair_mask": clip_mask,
+            "pair_mask": pair_mask,
         }

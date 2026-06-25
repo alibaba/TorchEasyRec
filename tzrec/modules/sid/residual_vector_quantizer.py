@@ -336,7 +336,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         cluster_ids, aggregated_quants, cumulative = self._residual_pass(walk_input)
 
         # Expose the per-layer cumulative quantized vectors (grad-carrying on the
-        # codebook side) so the model-side CommitmentLoss can consume them.
+        # codebook side) so the model-side SidCommitmentLoss can consume them.
         latents = torch.stack(cumulative, dim=1)  # (B, n_layers, D)
 
         # Aggregate STE (STE only; Gumbel already carries grad).

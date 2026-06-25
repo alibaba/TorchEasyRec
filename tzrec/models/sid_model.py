@@ -11,16 +11,16 @@
 
 """BaseSidModel: shared base for semantic-ID generation models."""
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 import torchmetrics
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.loss.commitment_loss import CommitmentLoss
-from tzrec.loss.infonce_loss import MaskedInfoNCELoss
+from tzrec.loss.sid_commitment_loss import SidCommitmentLoss
+from tzrec.loss.sid_contrastive_loss import SidContrastiveLoss
+from tzrec.loss.sid_recon_loss import SidReconLoss
 from tzrec.metrics.relative_l1 import RelativeL1
 from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
@@ -30,34 +30,14 @@ from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import ModelConfig
 
 
-def recon_loss(
-    recon_type: str,
-) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Per-row reconstruction-distance fn for the configured ``recon_type``.
-
-    Args:
-        recon_type (str): the distance, ``"l2"`` (mse), ``"l1"`` or ``"cos"``.
-
-    Returns:
-        Callable: ``f(x_hat, x) -> (B,)`` per-row reconstruction distance.
-    """
-    if recon_type == "l2":
-        return lambda x_hat, x: F.mse_loss(x_hat, x, reduction="none").mean(dim=-1)
-    if recon_type == "l1":
-        return lambda x_hat, x: F.l1_loss(x_hat, x, reduction="none").mean(dim=-1)
-    if recon_type == "cos":
-        return lambda x_hat, x: 1 - F.cosine_similarity(x_hat, x, dim=-1)
-    raise ValueError(f"recon_type must be 'l2', 'l1' or 'cos', got {recon_type!r}")
-
-
 def _masked_mean(
     per_sample: torch.Tensor, mask: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """Mean of a per-row loss over the masked-in rows (all rows if ``mask`` None).
 
-    The mixed recon+CLIP path applies the reconstruction loss to recon rows only;
-    the masked mean divides by the valid-row count (``div_no_nan`` keeps an empty
-    mask at 0). No data-dependent branching → ``torch.compile``-friendly.
+    The mixed recon+contrastive path applies the reconstruction loss to recon rows
+    only; the masked mean divides by the valid-row count (``div_no_nan`` keeps an
+    empty mask at 0). No data-dependent branching → ``torch.compile``-friendly.
 
     Args:
         per_sample (Tensor): per-row loss, shape (B,).
@@ -112,7 +92,6 @@ class BaseSidModel(BaseModel):
 
         cfg = self._model_config
         # Config fields shared by every SID proto message.
-        self._feature_group = cfg.feature_group
         self._normalize_residuals = cfg.normalize_residuals
 
         if not cfg.codebook:
@@ -130,11 +109,7 @@ class BaseSidModel(BaseModel):
         # from the main group's total dim (which may concatenate several
         # content + side-info features).
         self.init_input()
-        if not self.embedding_group.has_group(self._feature_group):
-            raise ValueError(
-                f"feature_group {self._feature_group!r} is not in "
-                f"model_config.feature_groups {self.embedding_group.group_names()}"
-            )
+        self._feature_group = self._resolve_feature_group()
         self._input_dim = self.embedding_group.group_total_dim(self._feature_group)
         if self._input_dim < 1:
             raise ValueError(
@@ -150,36 +125,57 @@ class BaseSidModel(BaseModel):
         """Build grouped input features: ``{group_name: (B, group_total_dim)}``."""
         return self.embedding_group(batch)
 
+    def _resolve_feature_group(self) -> str:
+        """Resolve the main input feature group name.
+
+        Uses ``feature_group`` when set; otherwise, when exactly one group is
+        declared, that sole group (DLRM-style auto-detect); otherwise fails as
+        ambiguous. The resolved name must exist in the model's feature groups.
+        """
+        groups = self.embedding_group.group_names()
+        if self._model_config.HasField("feature_group"):
+            name = self._model_config.feature_group
+            if name not in groups:
+                raise ValueError(
+                    f"feature_group {name!r} is not in model_config.feature_groups "
+                    f"{groups}"
+                )
+            return name
+        if len(groups) == 1:
+            return groups[0]
+        raise ValueError(
+            "feature_group must be set when multiple feature_groups are declared, "
+            f"got groups {groups}"
+        )
+
     def init_loss(self) -> None:
         """Initialize SID loss modules from ``ModelConfig.losses``.
 
         Each ``LossConfig`` sets one ``sid_loss`` oneof variant (a reconstruction
-        loss, the commitment loss, or the CLIP loss). Mirrors ``RankModel``: the
-        config drives what is bound here, and :meth:`loss` computes them from
-        ``predictions``. The reconstruction loss binds a per-row distance fn into
-        ``_recon_fn``; commitment/CLIP register modules into ``_loss_modules``.
+        loss, the commitment loss, or the contrastive loss). Mirrors ``RankModel``:
+        the config drives what is registered here, and :meth:`loss` computes them
+        from ``predictions``. All three are registered as ``_loss_modules`` entries.
         """
-        self._recon_fn: Optional[
-            Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-        ] = None
         for loss_cfg in self._base_model_config.losses:
             self._init_sid_loss_impl(loss_cfg)
 
     def _init_sid_loss_impl(self, loss_cfg: LossConfig) -> None:
-        """Bind the loss (a recon fn or a module) for one ``sid_loss`` config."""
+        """Register the loss module for one ``sid_loss`` config."""
         loss_type = loss_cfg.WhichOneof("sid_loss")
         if loss_type == "recon_loss":
-            self._recon_fn = recon_loss(loss_cfg.recon_loss.recon_type)
+            self._loss_modules["recon_loss"] = SidReconLoss(
+                loss_cfg.recon_loss.recon_type
+            )
         elif loss_type == "commitment_loss":
             cfg = loss_cfg.commitment_loss
             latent_weight = list(cfg.latent_weight) if cfg.latent_weight else (1.0, 0.5)
-            self._loss_modules["commitment_loss"] = CommitmentLoss(
+            self._loss_modules["commitment_loss"] = SidCommitmentLoss(
                 latent_weight=latent_weight,
                 commitment_type=cfg.commitment_type,
             )
-        elif loss_type == "sid_clip_loss":
-            # The InfoNCE module owns its learnable contrastive temperatures.
-            self._loss_modules["sid_clip_loss"] = MaskedInfoNCELoss()
+        elif loss_type == "contrastive_loss":
+            # The contrastive module owns its learnable temperatures.
+            self._loss_modules["contrastive_loss"] = SidContrastiveLoss()
         else:
             raise ValueError(
                 f"LossConfig for a SID model must set a sid_loss variant, "
@@ -194,7 +190,8 @@ class BaseSidModel(BaseModel):
         Args:
             predictions (dict): a dict of predicted result (the raw tensors the
                 losses consume — ``x_hat``/``recon_target`` for reconstruction,
-                ``encoder_out``/``latents`` for commitment, and the CLIP embeds).
+                ``encoder_out``/``latents`` for commitment, and the contrastive
+                embeds).
             batch (Batch): input batch data.
 
         Return:
@@ -211,7 +208,7 @@ class BaseSidModel(BaseModel):
         """Compute one ``sid_loss`` term from ``predictions``."""
         loss_type = loss_cfg.WhichOneof("sid_loss")
         if loss_type == "recon_loss":
-            per_sample = self._recon_fn(
+            per_sample = self._loss_modules["recon_loss"](
                 predictions["x_hat"], predictions["recon_target"]
             )
             return {
@@ -222,15 +219,15 @@ class BaseSidModel(BaseModel):
                 predictions["encoder_out"], predictions["latents"]
             )
             return {"commitment_loss": loss}
-        elif loss_type == "sid_clip_loss":
-            feats = {
-                "embed_a": predictions["embed_a"],
-                "embed_b": predictions["embed_b"],
-                "embed_a_ori": predictions["embed_a_ori"],
-                "embed_b_ori": predictions["embed_b_ori"],
-            }
-            out = self._loss_modules["sid_clip_loss"](feats, predictions["pair_mask"])
-            return {"sid_clip_loss": out["loss"]}
+        elif loss_type == "contrastive_loss":
+            loss = self._loss_modules["contrastive_loss"](
+                predictions["embed_a"],
+                predictions["embed_b"],
+                predictions["embed_a_ori"],
+                predictions["embed_b_ori"],
+                predictions["pair_mask"],
+            )
+            return {"contrastive_loss": loss}
         else:
             raise ValueError(f"unsupported sid_loss variant: {loss_type!r}")
 
@@ -266,7 +263,7 @@ class BaseSidModel(BaseModel):
         Subclasses expose both only when meaningful, so a not-yet-fitted model
         omits them and this logs nothing. (Reading the target from
         ``predictions`` avoids a second ``build_input`` pass over ``batch``.)
-        For the mixed CLIP path the reconstruction is scored only on the
+        For the mixed contrastive path the reconstruction is scored only on the
         non-pair rows (``recon_mask``), matching the masked training recon loss
         so the eval mse/rel_loss stay comparable to the optimized objective.
 

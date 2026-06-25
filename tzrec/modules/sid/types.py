@@ -46,7 +46,7 @@ class ResidualQuantizerOutput(NamedTuple):
 
     The per-layer cumulative quantized vectors are exposed as ``latents`` so the
     model-side commitment loss
-    (:class:`~tzrec.loss.commitment_loss.CommitmentLoss`) can consume them.
+    (:class:`~tzrec.loss.sid_commitment_loss.SidCommitmentLoss`) can consume them.
 
     Attributes:
         cluster_ids (Tensor): codebook indices per layer, shape (B, n_layers).

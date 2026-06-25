@@ -24,16 +24,17 @@ from tzrec.utils.state_dict_util import init_parameters
 
 
 def _features_and_groups(
-    input_dim: int, use_clip: bool = False, clip_dim: int = None, pair_dim: int = 1
+    input_dim: int, use_contrastive: bool = False, pair_emb_dim: int = None, flag_dim=1
 ):
     """Real raw features + feature groups for a SID model.
 
     Mirrors how every other model test wires inputs: ``create_features`` builds
     the ``BaseFeature`` objects and ``feature_groups`` (consumed by the model's
-    :class:`EmbeddingGroup`) name the main ``deep`` group — plus, for CLIP, the
-    paired image group and the per-row pair-flag group. ``clip_dim`` (default:
-    match ``input_dim``) sizes the paired group and ``pair_dim`` (default 1)
-    sizes the pair-flag group, so a test can deliberately mismatch either.
+    :class:`EmbeddingGroup`) name the main ``deep`` group — plus, for the
+    contrastive path, the paired group and the per-row pair-flag group.
+    ``pair_emb_dim`` (default: match ``input_dim``) sizes the paired group and
+    ``flag_dim`` (default 1) sizes the pair-flag group, so a test can
+    deliberately mismatch either.
     """
 
     def _raw(name: str, dim: int) -> feature_pb2.FeatureConfig:
@@ -50,12 +51,12 @@ def _features_and_groups(
 
     feature_cfgs = [_raw("item_emb", input_dim)]
     groups = [_deep("deep", "item_emb")]
-    if use_clip:
+    if use_contrastive:
         feature_cfgs += [
-            _raw("image_emb", clip_dim if clip_dim is not None else input_dim),
-            _raw("is_clip_pair", pair_dim),
+            _raw("pair_emb", pair_emb_dim if pair_emb_dim is not None else input_dim),
+            _raw("is_pair", flag_dim),
         ]
-        groups += [_deep("clip_image", "image_emb"), _deep("clip_pair", "is_clip_pair")]
+        groups += [_deep("pair", "pair_emb"), _deep("pair_flag", "is_pair")]
     return create_features(feature_cfgs), groups
 
 
@@ -87,11 +88,11 @@ def _commitment_cfg(
     return lc
 
 
-def _clip_cfg() -> loss_pb2.LossConfig:
+def _contrastive_cfg() -> loss_pb2.LossConfig:
     # The contrastive objective marker (empty); the paired-feature wiring lives
-    # on the model proto (SidRqvae.clip_config), set in _create_model.
+    # on the model proto (SidRqvae.contrastive_config), set in _create_model.
     lc = loss_pb2.LossConfig()
-    lc.sid_clip_loss.SetInParent()
+    lc.contrastive_loss.SetInParent()
     return lc
 
 
@@ -100,7 +101,7 @@ class SidRqvaeTest(unittest.TestCase):
 
     def _create_model(
         self,
-        use_clip=False,
+        use_contrastive=False,
         input_dim=32,
         embed_dim=8,
         n_layers=2,
@@ -115,13 +116,15 @@ class SidRqvaeTest(unittest.TestCase):
             kmeans_init=False,
         )
         losses = [_recon_loss_cfg(recon), _commitment_cfg()]
-        if use_clip:
-            sid_rqvae_cfg.clip_config.clip_feature_group = "clip_image"
-            sid_rqvae_cfg.clip_config.clip_pair_feature_group = "clip_pair"
-            losses.append(_clip_cfg())
+        if use_contrastive:
+            # Multiple feature groups -> the main group must be named explicitly.
+            sid_rqvae_cfg.feature_group = "deep"
+            sid_rqvae_cfg.contrastive_config.pair_feature_group = "pair"
+            sid_rqvae_cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
+            losses.append(_contrastive_cfg())
 
         # Real features + feature_groups: input_dim is derived from the group.
-        features, feature_groups = _features_and_groups(input_dim, use_clip)
+        features, feature_groups = _features_and_groups(input_dim, use_contrastive)
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups, sid_rqvae=sid_rqvae_cfg, losses=losses
         )
@@ -129,15 +132,15 @@ class SidRqvaeTest(unittest.TestCase):
         init_parameters(model, device=torch.device("cpu"))
         return model
 
-    def _clip_batch(self, B, input_dim, is_clip_pair):
+    def _contrastive_batch(self, B, input_dim, is_pair):
         return Batch(
             dense_features={
                 BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
-                    keys=["item_emb", "image_emb", "is_clip_pair"],
+                    keys=["item_emb", "pair_emb", "is_pair"],
                     tensors=[
                         torch.randn(B, input_dim),
                         torch.randn(B, input_dim),
-                        is_clip_pair,
+                        is_pair,
                     ],
                 )
             },
@@ -202,16 +205,16 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertNotIn("x_hat", predictions)
         self.assertNotIn("latents", predictions)
 
-    def test_rqvae_clip_mode(self) -> None:
-        """Test SidRqvae with CLIP mixed mode (mixed recon + clip batch)."""
+    def test_rqvae_contrastive_mode(self) -> None:
+        """Test SidRqvae with the mixed recon + contrastive path."""
         B, input_dim = 8, 32
-        model = self._create_model(input_dim=input_dim, use_clip=True)
+        model = self._create_model(input_dim=input_dim, use_contrastive=True)
         model.train()
         model.init_loss()
 
-        is_clip_pair = torch.zeros(B, 1)
-        is_clip_pair[B // 2 :] = 1.0  # second half clip
-        batch = self._clip_batch(B, input_dim, is_clip_pair)
+        is_pair = torch.zeros(B, 1)
+        is_pair[B // 2 :] = 1.0  # second half are contrastive pairs
+        batch = self._contrastive_batch(B, input_dim, is_pair)
 
         predictions = model.predict(batch)
         self.assertIn("codes", predictions)
@@ -222,7 +225,7 @@ class SidRqvaeTest(unittest.TestCase):
         losses = model.loss(predictions, batch)
         self.assertIn("recon_loss", losses)
         self.assertIn("commitment_loss", losses)
-        self.assertIn("sid_clip_loss", losses)
+        self.assertIn("contrastive_loss", losses)
 
         total_loss = sum(losses.values())
         self.assertTrue(total_loss.requires_grad)
@@ -232,29 +235,29 @@ class SidRqvaeTest(unittest.TestCase):
         )
         self.assertTrue(has_grad)
 
-    def test_rqvae_clip_all_recon(self) -> None:
-        """Mixed mode with all-recon batch: clip term 0, recon term > 0."""
+    def test_rqvae_contrastive_all_recon(self) -> None:
+        """Mixed mode, all-recon batch: contrastive term 0, recon term > 0."""
         B, input_dim = 4, 32
-        model = self._create_model(input_dim=input_dim, use_clip=True)
+        model = self._create_model(input_dim=input_dim, use_contrastive=True)
         model.train()
         model.init_loss()
 
-        batch = self._clip_batch(B, input_dim, torch.zeros(B, 1))
+        batch = self._contrastive_batch(B, input_dim, torch.zeros(B, 1))
         losses = model.loss(model.predict(batch), batch)
-        self.assertEqual(losses["sid_clip_loss"].item(), 0.0)
+        self.assertEqual(losses["contrastive_loss"].item(), 0.0)
         self.assertGreater(losses["recon_loss"].item(), 0.0)
 
-    def test_rqvae_clip_all_clip(self) -> None:
-        """Mixed mode with all-clip batch: recon term 0, clip term > 0."""
+    def test_rqvae_contrastive_all_pair(self) -> None:
+        """Mixed mode, all-pair batch: recon term 0, contrastive term > 0."""
         B, input_dim = 4, 32
-        model = self._create_model(input_dim=input_dim, use_clip=True)
+        model = self._create_model(input_dim=input_dim, use_contrastive=True)
         model.train()
         model.init_loss()
 
-        batch = self._clip_batch(B, input_dim, torch.ones(B, 1))
+        batch = self._contrastive_batch(B, input_dim, torch.ones(B, 1))
         losses = model.loss(model.predict(batch), batch)
         self.assertEqual(losses["recon_loss"].item(), 0.0)
-        self.assertGreater(losses["sid_clip_loss"].item(), 0.0)
+        self.assertGreater(losses["contrastive_loss"].item(), 0.0)
 
     def test_rqvae_backward(self) -> None:
         """Test that backward pass works without errors."""
@@ -288,78 +291,85 @@ class SidRqvaeTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "latent_weight"):
                 model.init_loss()
 
-    def test_clip_feature_group_dim_mismatch_raises(self) -> None:
-        """A CLIP paired group whose dim != the main group fails fast at init.
+    def test_pair_feature_group_dim_mismatch_raises(self) -> None:
+        """A paired group whose dim != the main group fails fast at init.
 
         The paired feature is encoded by the same encoder as the main input, so
         a dim mismatch would otherwise crash with an opaque matmul shape error
         on the first contrastive forward — not at construction.
         """
-        features, feature_groups = _features_and_groups(32, use_clip=True, clip_dim=16)
+        features, feature_groups = _features_and_groups(
+            32, use_contrastive=True, pair_emb_dim=16
+        )
         cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.clip_config.clip_feature_group = "clip_image"
-        cfg.clip_config.clip_pair_feature_group = "clip_pair"
+        cfg.feature_group = "deep"
+        cfg.contrastive_config.pair_feature_group = "pair"
+        cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
         model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_clip_cfg()]
+            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
         )
         with self.assertRaisesRegex(ValueError, "must match"):
             SidRqvae(model_config=model_config, features=features, labels=[])
 
-    def test_clip_pair_group_must_be_dim_1(self) -> None:
+    def test_pair_flag_group_must_be_dim_1(self) -> None:
         """A pair-flag group with dim != 1 fails fast (would mis-route rows)."""
-        features, feature_groups = _features_and_groups(32, use_clip=True, pair_dim=3)
+        features, feature_groups = _features_and_groups(
+            32, use_contrastive=True, flag_dim=3
+        )
         cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.clip_config.clip_feature_group = "clip_image"
-        cfg.clip_config.clip_pair_feature_group = "clip_pair"
+        cfg.feature_group = "deep"
+        cfg.contrastive_config.pair_feature_group = "pair"
+        cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
         model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_clip_cfg()]
+            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
         )
         with self.assertRaisesRegex(ValueError, "dim-1 raw flag"):
             SidRqvae(model_config=model_config, features=features, labels=[])
 
-    def test_clip_group_missing_raises(self) -> None:
-        """A typo'd clip group name fails fast at init, not a forward KeyError."""
-        features, feature_groups = _features_and_groups(32, use_clip=True)
+    def test_contrastive_group_missing_raises(self) -> None:
+        """A typo'd contrastive group name fails fast at init, not on forward."""
+        features, feature_groups = _features_and_groups(32, use_contrastive=True)
         cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.clip_config.clip_feature_group = "clip_image"
-        cfg.clip_config.clip_pair_feature_group = "clip_pairTYPO"
+        cfg.feature_group = "deep"
+        cfg.contrastive_config.pair_feature_group = "pair"
+        cfg.contrastive_config.pair_flag_feature_group = "pair_flagTYPO"
         model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_clip_cfg()]
+            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
         )
         with self.assertRaisesRegex(ValueError, "not in model_config.feature_groups"):
             SidRqvae(model_config=model_config, features=features, labels=[])
 
-    def test_eval_metric_masks_clip_pair_rows(self) -> None:
-        """CLIP eval mse/rel_loss score only the non-pair (recon) rows.
+    def test_eval_metric_masks_contrastive_pair_rows(self) -> None:
+        """Contrastive eval mse/rel_loss score only the non-pair (recon) rows.
 
         Training masks the recon loss to non-pair rows; update_metric must apply
         the same ``recon_mask`` so the eval metric stays comparable (pair rows,
         which the decoder is not trained to reconstruct, must not dilute it).
         """
         B, input_dim = 8, 32
-        model = self._create_model(input_dim=input_dim, use_clip=True)
+        model = self._create_model(input_dim=input_dim, use_contrastive=True)
         model.eval()
         model.init_metric()
 
         # All-pair batch: recon_mask selects zero rows, so mse observes none.
-        all_pair = self._clip_batch(B, input_dim, torch.ones(B, 1))
+        all_pair = self._contrastive_batch(B, input_dim, torch.ones(B, 1))
         model.update_metric(model.predict(all_pair), all_pair)
         self.assertEqual(model._metric_modules["mse"].total.item(), 0.0)
 
         # A recon (non-pair) batch then contributes rows.
-        all_recon = self._clip_batch(B, input_dim, torch.zeros(B, 1))
+        all_recon = self._contrastive_batch(B, input_dim, torch.zeros(B, 1))
         model.update_metric(model.predict(all_recon), all_recon)
         self.assertGreater(model._metric_modules["mse"].total.item(), 0.0)
 
-    def test_clip_mask_uses_flag_not_equality(self) -> None:
-        """The is_clip_pair flag, not bit-exact equality, drives routing.
+    def test_pair_flag_drives_routing_not_equality(self) -> None:
+        """The is_pair flag, not bit-exact equality, drives routing.
 
-        Build a batch where ``image_emb == item_emb`` numerically but
-        ``is_clip_pair=1``: rows must route to the CLIP branch (under the old
+        Build a batch where ``pair_emb == item_emb`` numerically but
+        ``is_pair=1``: rows must route to the contrastive branch (under the old
         bit-exact logic they would have been silently relabeled recon).
         """
         B, input_dim = 4, 32
-        model = self._create_model(input_dim=input_dim, use_clip=True)
+        model = self._create_model(input_dim=input_dim, use_contrastive=True)
         model.train()
         model.init_loss()
 
@@ -367,7 +377,7 @@ class SidRqvaeTest(unittest.TestCase):
         batch = Batch(
             dense_features={
                 BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
-                    keys=["item_emb", "image_emb", "is_clip_pair"],
+                    keys=["item_emb", "pair_emb", "is_pair"],
                     tensors=[item_emb, item_emb.clone(), torch.ones(B, 1)],
                 )
             },
@@ -376,7 +386,7 @@ class SidRqvaeTest(unittest.TestCase):
         )
         losses = model.loss(model.predict(batch), batch)
         self.assertEqual(losses["recon_loss"].item(), 0.0)
-        self.assertGreater(losses["sid_clip_loss"].item(), 0.0)
+        self.assertGreater(losses["contrastive_loss"].item(), 0.0)
 
     @parameterized.expand(
         [
@@ -424,24 +434,24 @@ class SidRqvaeTest(unittest.TestCase):
     def test_logit_scale_clamped_prevents_overflow(self) -> None:
         """A raw logit_scale far above ln(100) must not overflow.
 
-        The clamp caps ``exp()`` so the CLIP loss and the parameter gradient
-        stay finite; without it, ``exp(large)`` -> +Inf -> a NaN gradient that
-        permanently corrupts the parameter.
+        The clamp caps ``exp()`` so the contrastive loss and the parameter
+        gradient stay finite; without it, ``exp(large)`` -> +Inf -> a NaN
+        gradient that permanently corrupts the parameter.
         """
         B, input_dim = 8, 32
-        model = self._create_model(input_dim=input_dim, use_clip=True)
+        model = self._create_model(input_dim=input_dim, use_contrastive=True)
         model.train()
         model.init_loss()
-        # The temperatures live on the InfoNCE module that owns the clamp.
-        clip = model._loss_modules["sid_clip_loss"]
-        scales = (clip.logit_scale_self, clip.logit_scale_cl, clip.logit_scale)
+        # The temperatures live on the contrastive module that owns the clamp.
+        clip = model._loss_modules["contrastive_loss"]
+        scales = (clip.logit_scale_self, clip.logit_scale_cl, clip.logit_scale_ori)
         with torch.no_grad():
             for p in scales:
                 p.fill_(100.0)
 
-        batch = self._clip_batch(B, input_dim, torch.ones(B, 1))
+        batch = self._contrastive_batch(B, input_dim, torch.ones(B, 1))
         losses = model.loss(model.predict(batch), batch)
-        self.assertTrue(torch.isfinite(losses["sid_clip_loss"]))
+        self.assertTrue(torch.isfinite(losses["contrastive_loss"]))
         sum(losses.values()).backward()
         for p in scales:
             self.assertIsNotNone(p.grad)

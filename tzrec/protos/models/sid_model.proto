@@ -26,16 +26,16 @@ message SinkhornConfig {
     optional bool enabled = 3 [default = true];
 }
 
-// CLIP-style dual-encoder wiring for SidRqvae: which paired feature group to
-// encode and which group flags the contrastive-pair rows. This is model
-// structure / input contract (declared on the model), not loss config.
-message ClipConfig {
+// Pair contrastive (dual-encoder) wiring for SidRqvae: which paired feature
+// group to encode and which group flags the contrastive-pair rows. This is
+// model structure / input contract (declared on the model), not loss config.
+message ContrastiveConfig {
     // Name of the second (paired) embedding FEATURE GROUP (built by the same
     // EmbeddingGroup as the main input; same total dim as `feature_group`).
-    required string clip_feature_group = 1;
+    required string pair_feature_group = 1;
     // Name of the per-row pair-flag FEATURE GROUP (a single raw feature,
     // dim 1; >0.5 = contrastive pair).
-    required string clip_pair_feature_group = 2;
+    required string pair_flag_feature_group = 2;
 }
 
 message SidRqvae {
@@ -77,12 +77,12 @@ message SidRqvae {
     // omitted: enabled with iters=5, epsilon=10.0. Include the sub-config
     // to override params; set ``enabled: false`` inside it to disable.
     optional SinkhornConfig sinkhorn_config = 15;
-    // CLIP-style dual-encoder structure: when set, the model encodes a second
-    // (paired) feature group and runs the contrastive path. This declares the
-    // model's input contract + topology; the contrastive OBJECTIVE is enabled
-    // separately by a `sid_clip_loss` entry in ModelConfig.losses (both must be
-    // set together).
-    optional ClipConfig clip_config = 16;
+    // Pair contrastive (dual-encoder) structure: when set, the model encodes a
+    // second (paired) feature group and runs the contrastive path. This declares
+    // the model's input contract + topology; the contrastive OBJECTIVE is enabled
+    // separately by a `contrastive_loss` entry in ModelConfig.losses (both must
+    // be set together).
+    optional ContrastiveConfig contrastive_config = 16;
 
     // Reconstruction, commitment and (optional) contrastive losses are configured
     // via ModelConfig.losses (the LossConfig ``sid_loss`` oneof); only the CLIP
@@ -90,8 +90,10 @@ message SidRqvae {
 
     // Name of the main input FEATURE GROUP (built by the model's EmbeddingGroup
     // from ModelConfig.feature_groups). May hold one or many content/side-info
-    // features; their concatenated dim is the encoder input_dim.
-    optional string feature_group = 40 [default = "deep"];
+    // features; their concatenated dim is the encoder input_dim. Optional: when
+    // unset and exactly one feature group is declared, that group is used; with
+    // multiple groups it must be set explicitly.
+    optional string feature_group = 40;
 }
 
 message SidRqkmeans {
@@ -115,6 +117,8 @@ message SidRqkmeans {
 
     // Name of the main input FEATURE GROUP (built by the model's EmbeddingGroup
     // from ModelConfig.feature_groups). May hold one or many content/side-info
-    // features; their concatenated dim is the K-Means dimension.
-    optional string feature_group = 40 [default = "deep"];
+    // features; their concatenated dim is the K-Means dimension. Optional: when
+    // unset and exactly one feature group is declared, that group is used; with
+    // multiple groups it must be set explicitly.
+    optional string feature_group = 40;
 }

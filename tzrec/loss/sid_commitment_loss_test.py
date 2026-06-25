@@ -14,17 +14,17 @@ import unittest
 import torch
 from parameterized import parameterized
 
-from tzrec.loss.commitment_loss import CommitmentLoss
+from tzrec.loss.sid_commitment_loss import SidCommitmentLoss
 
 
-class CommitmentLossTest(unittest.TestCase):
-    """Tests for the standalone CommitmentLoss module."""
+class SidCommitmentLossTest(unittest.TestCase):
+    """Tests for the standalone SidCommitmentLoss module."""
 
     @parameterized.expand([("l2",), ("l1",), ("cos",)])
     def test_branch_runs_and_backprops(self, commitment_type) -> None:
         """Each commitment_type runs end-to-end; grad reaches both operands."""
         torch.manual_seed(0)
-        loss_fn = CommitmentLoss(
+        loss_fn = SidCommitmentLoss(
             latent_weight=(1.0, 0.5), commitment_type=commitment_type
         )
         B, L, D = 4, 3, 8
@@ -43,20 +43,20 @@ class CommitmentLossTest(unittest.TestCase):
         """latent_weight must be exactly [w1, w2]."""
         for bad in ([1.0], [1.0, 0.5, 0.25]):
             with self.assertRaisesRegex(ValueError, "latent_weight"):
-                CommitmentLoss(latent_weight=bad)
+                SidCommitmentLoss(latent_weight=bad)
 
     def test_invalid_commitment_type_raises(self) -> None:
         """An unknown commitment_type is rejected."""
         with self.assertRaisesRegex(AssertionError, "commitment_type"):
-            CommitmentLoss(commitment_type="bogus")
+            SidCommitmentLoss(commitment_type="bogus")
 
     def test_weights_scale_the_two_directions(self) -> None:
         """w1/w2 weight the encoder-toward-quant / quant-toward-encoder terms."""
         torch.manual_seed(0)
         encoder_out = torch.randn(4, 8)
         latents = torch.randn(4, 3, 8)
-        base = CommitmentLoss(latent_weight=(1.0, 0.5), commitment_type="l2")
-        zero = CommitmentLoss(latent_weight=(0.0, 0.0), commitment_type="l2")
+        base = SidCommitmentLoss(latent_weight=(1.0, 0.5), commitment_type="l2")
+        zero = SidCommitmentLoss(latent_weight=(0.0, 0.0), commitment_type="l2")
         self.assertGreater(base(encoder_out, latents).item(), 0.0)
         self.assertEqual(zero(encoder_out, latents).item(), 0.0)
 
