@@ -93,7 +93,6 @@ class SidRqvae(BaseSidModel):
             MLP(self._input_dim, hidden_units=hidden_dims),
             nn.Linear(hidden_dims[-1], embed_dim),
         )
-        # Decoder mirrors the encoder over the reversed hidden stack.
         self._decoder = nn.Sequential(
             MLP(embed_dim, hidden_units=list(reversed(hidden_dims))),
             nn.Linear(hidden_dims[0], self._input_dim),

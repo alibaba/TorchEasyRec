@@ -79,7 +79,7 @@ def _sinkhorn(
 
     # Step 4: scale back so columns sum to 1 (assignment)
     Q *= B
-    return Q.t()  # (B, K)
+    return Q.t()
 
 
 class VectorQuantizeLayer(QuantizeLayer):
@@ -159,7 +159,7 @@ class VectorQuantizeLayer(QuantizeLayer):
         Returns:
             Tensor: pairwise distances, shape (B, n_embed).
         """
-        codebook = self.embedding.weight  # (n_embed, D)
+        codebook = self.embedding.weight
 
         if self.distance_type == "l2":
             distances = torch.cdist(x, codebook, p=2).pow(2)
@@ -188,7 +188,7 @@ class VectorQuantizeLayer(QuantizeLayer):
         Returns:
             Tensor: codebook indices, shape (B,).
         """
-        distances = self._compute_distances(x)  # (B, n_embed)
+        distances = self._compute_distances(x)
 
         if self.training and self.use_sinkhorn:
             # Sinkhorn requires non-negative cost; z-score then shift.
@@ -224,7 +224,7 @@ class VectorQuantizeLayer(QuantizeLayer):
         # Gumbel: grad-enabled distances feed the encoder; the hard sample drives
         # both emb and ids, so the saved code matches the vector used.
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
-            logits = -self._compute_distances(x)  # (B, n_embed), differentiable
+            logits = -self._compute_distances(x)  # differentiable
             weights = F.gumbel_softmax(
                 logits, tau=self.gumbel_temperature, hard=True, dim=-1
             )

@@ -63,7 +63,7 @@ def faiss_residual_kmeans(
     res_centers: List[torch.Tensor] = []
     for n_clusters in n_clusters_list:
         km = faiss_kmeans_fit(x, D, n_clusters, faiss_kmeans_kwargs)
-        centroids = km.centroids.copy()  # (K, D)
+        centroids = km.centroids.copy()
         res_centers.append(torch.from_numpy(centroids).to(device))
         _, idx = km.index.search(x, 1)
         x -= centroids[idx.ravel()]  # residual, in place
@@ -255,26 +255,24 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         quant_detached = quant.detach()
         x_detached = x.detach()
 
-        quant_norms = torch.linalg.vector_norm(quant_detached, dim=-1).unsqueeze(
-            1
-        )  # (B, 1)
-        x_norms = torch.linalg.vector_norm(x_detached, dim=-1).unsqueeze(1)  # (B, 1)
-        lambda_ = quant_norms / (x_norms + 1e-8)  # (B, 1)
+        quant_norms = torch.linalg.vector_norm(quant_detached, dim=-1).unsqueeze(1)
+        x_norms = torch.linalg.vector_norm(x_detached, dim=-1).unsqueeze(1)
+        lambda_ = quant_norms / (x_norms + 1e-8)
 
-        x_hat = x_detached / (x_norms + 1e-8)  # (B, D)
-        quant_hat = quant_detached / (quant_norms + 1e-8)  # (B, D)
+        x_hat = x_detached / (x_norms + 1e-8)
+        quant_hat = quant_detached / (quant_norms + 1e-8)
 
-        normalized_sum = F.normalize(x_hat + quant_hat, p=2, dim=1)  # (B, D)
+        normalized_sum = F.normalize(x_hat + quant_hat, p=2, dim=1)
 
-        x_unsq = x.unsqueeze(1)  # (B, 1, D)
+        x_unsq = x.unsqueeze(1)
 
         # Eq 4.2: Householder reflection
         sum_projection = (
             x_unsq @ normalized_sum.unsqueeze(2) @ normalized_sum.unsqueeze(1)
-        )  # (B, 1, D)
+        )
         rescaled_embeddings = (
             x_unsq @ x_hat.unsqueeze(2) @ quant_hat.unsqueeze(1)
-        )  # (B, 1, D)
+        )
         return lambda_ * (
             x_unsq - 2 * sum_projection + 2 * rescaled_embeddings
         ).squeeze(1)
@@ -331,13 +329,12 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             self.training and self._forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
         )
 
-        # cumulative[i] = sum after layer i.
         walk_input = input if train_gumbel else input.detach()
         cluster_ids, aggregated_quants, cumulative = self._residual_pass(walk_input)
 
         # Expose the per-layer cumulative quantized vectors (grad-carrying on the
         # codebook side) so the model-side SidCommitmentLoss can consume them.
-        latents = torch.stack(cumulative, dim=1)  # (B, n_layers, D)
+        latents = torch.stack(cumulative, dim=1)
 
         # Aggregate STE (STE only; Gumbel already carries grad).
         quants_trunc = aggregated_quants
