@@ -76,12 +76,9 @@ class Qwen2RecLM(GenerativeRecLM):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         common = self._model_config.common
-        # generation params, consumed only by this family's _generate.
         self._num_beams = int(common.num_beams)
         self._num_return = int(common.num_return_sequences)
-        # opt-in ALGR-style escalating beam (width doubles per SID level).
         self._dynamic_beam = bool(common.dynamic_beam)
-        # worst-case spliced length for the first-step activation-pool pre-sizing.
         self._max_total_len = self._compute_max_total_length()
         self._pool_warmed = False
         # CE suffix width: the supervised tail [answer | asst_suffix | eos] is
@@ -168,8 +165,6 @@ class Qwen2RecLM(GenerativeRecLM):
         assert len(user_seq_rows) == len(label_rows)
         A = self._num_levels
 
-        # input_ids: assembled per row (user history length varies), then
-        # left-padded into a (B, T) batch (real content right-aligned).
         rows_ids = [
             torch.cat(
                 [
@@ -187,11 +182,9 @@ class Qwen2RecLM(GenerativeRecLM):
         ]
         input_ids, attention_mask = self._left_pad(rows_ids, pad_to=pad_to)
 
-        # supervised tail is fixed-width -> same columns every row -> one write.
-        # tail from the end: [answer(A) | asst_suffix(s) | eos(1)].
         B, T = input_ids.shape
         s = self.tpl_asst_suffix.numel()
-        tail = A + s + 1
+        tail = A + s + 1  # [answer(A) | asst_suffix(s) | eos(1)], end-aligned
         labels = torch.full(
             (B, T), self._ignore_index, dtype=torch.long, device=self.device
         )
@@ -213,8 +206,6 @@ class Qwen2RecLM(GenerativeRecLM):
 
     def _predict_train(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Branch 1: teacher-forced forward -> suffix-slice -> CE loss."""
-        # Retrieve SID token rows via the EmbeddingGroup (build_input), keyed by
-        # feature name. Train needs both the history and the teacher-forced answer.
         rows = self.build_input(batch)
         u_rows = rows[self._input_name]
         l_rows = rows[self._label_name]
@@ -277,7 +268,6 @@ class Qwen2RecLM(GenerativeRecLM):
         ``_validate_sid_candidates`` (token->SID, malformed beams -> ``-1``).
         Returns ``generated_sids`` of shape ``(B, num_return, num_levels)``.
         """
-        # history rows via the EmbeddingGroup (build_input); inference skips label.
         u_rows = self.build_input(batch)[self._input_name]
         input_ids, attention_mask = self._splice_prompt_ids(u_rows)
         if self._dynamic_beam:
@@ -292,7 +282,7 @@ class Qwen2RecLM(GenerativeRecLM):
                 do_sample=False,
                 pad_token_id=self._pad_token_id,
             )
-            new_tokens = out[:, input_ids.shape[1] :]  # the generated tail
+            new_tokens = out[:, input_ids.shape[1] :]
         sids = self._validate_sid_candidates(new_tokens, input_ids.shape[0])
         return {self._generated_sids_key: sids}
 

@@ -12,9 +12,9 @@ family is a concrete subclass implementing the ``_build_prompt_tokens`` and
 family by its own oneof entry, whose message-type name resolves directly to
 the same-named class via the BaseModel registry. Shared config lives in
 ``GenerativeRecLMConfig`` (the family message's ``common`` field).
-* Streaming sample format: each row carries two raw-int64 sequence features,
-``user_sequence`` and ``label``, both holding raw SID indices in
-``[1, sum(codebook)]``.
+* Streaming sample format: each row carries the history ``user_sequence`` (a
+raw-int64 sequence feature) and the ``label`` answer (a ``data_config``
+label_field), both holding raw SID indices in ``[1, sum(codebook)]``.
 * The chat template is tokenised ONCE at ``__init__`` and cached as
 non-persistent buffers, so per-batch encoding is integer arithmetic only
 (no HF tokenizer in the hot path).
@@ -95,11 +95,8 @@ class GenerativeRecLM(BaseModel):
 
         self._build_prompt_tokens(tokenizer, cfg)
 
-        # Build the (param-free, raw-passthrough) EmbeddingGroup for the SID
-        # JAGGED_SEQUENCE groups — the HSTU retrieval idiom (see init_input).
         self.init_input()
 
-        # one-shot debug dump of the first spliced batch
         self._smoke_log_once = os.environ.get("TZREC_GENRECLM_DEBUG", "0") == "1"
         self._first_predict = True
 
@@ -121,20 +118,13 @@ class GenerativeRecLM(BaseModel):
 
     def _read_common_config(self, common: Any) -> int:
         """Parse shared proto knobs into attributes; return the SID atom count."""
-        # The history is the single declared feature_group (a JAGGED_SEQUENCE
-        # group); build_input keys the EmbeddingGroup output by its GROUP name
-        # (HSTU idiom). Nothing about it is restated in `common`: the group name
-        # and its one member (the history feature) come straight from the group;
-        # the answer is the first data_config.label_field (like RankModel's
-        # labels[0]). _input_name is only the rows-dict key; _label_name also
-        # indexes batch.jagged_labels. The answer is NOT a feature_group.
+        # History = the single feature_group (its group_name keys the
+        # EmbeddingGroup output); answer = the first data_config.label_field.
         hist = self._history_feature_group()
         self._history_group: str = hist.group_name
         self._input_name: str = hist.feature_names[0]
         self._label_name: str = self._labels[0] if self._labels else ""
         self._ignore_index: int = int(common.ignore_index)
-        # Inference output key + backbone param dtype (configurable; default
-        # "generated_sids" / "float32" = the fp32-master weights).
         self._generated_sids_key: str = common.generated_sids_key
         param_dtype = self._DTYPE_BY_NAME.get(common.param_dtype)
         if param_dtype is None:
@@ -143,18 +133,13 @@ class GenerativeRecLM(BaseModel):
                 f"{list(self._DTYPE_BY_NAME)}, got {common.param_dtype!r}."
             )
         self._param_dtype: torch.dtype = param_dtype
-        # Model's history budget (SID codes): the truncation cap (_sid_token_rows,
-        # item-aligned, recency-preserving) AND the activation-pool pre-size.
-        # HSTU-style model knob; 0 = off (no cap, no pre-allocation). FG_NONE does
-        # not truncate, so this cap is enforced model-side.
         self._max_seq_length: int = int(common.max_sequence_length)
         codebook = list(common.codebook)
         if len(codebook) == 0:
             raise ValueError("GenerativeRecLM: codebook must be non-empty.")
-        # len(codebook) = SID codes per item (answer width); sum = vocab atoms.
         self._num_levels = len(codebook)
-        # Per-level SID validity bands (buffers) for the inference gate
-        # (_validate_sid_candidates). Non-persistent: derived config.
+        # inference-gate validity bands; non-persistent — derived from codebook,
+        # kept off the state_dict (HF safetensors round-trip).
         lo, hi = self._sid_level_bands(codebook)
         self.register_buffer("_sid_lvl_lo", lo, persistent=False)
         self.register_buffer("_sid_lvl_hi", hi, persistent=False)
@@ -331,19 +316,18 @@ class GenerativeRecLM(BaseModel):
         wrong-level atom) set to ``-1`` — which can never match a real item.
         """
         sids = self._detokenize_sids(new_tokens)
-        # pad each candidate to exactly num_levels with the -1 sentinel (an
-        # early-EOS beam returns fewer tokens) so the reshape stays rectangular.
+        # early-EOS beams return < num_levels tokens; pad to num_levels with -1.
         sids = F.pad(sids, (0, self._num_levels - sids.shape[1]), value=-1)
-        # valid only if every position-j atom is in level j's band; any violation
-        # invalidates the WHOLE candidate -> -1.
+        # any single out-of-band atom invalidates the WHOLE candidate (.any over
+        # the levels -> masked_fill blanks the entire row to -1, matching no item).
         invalid = ((sids < self._sid_lvl_lo) | (sids > self._sid_lvl_hi)).any(dim=1)
         sids = sids.masked_fill(invalid.unsqueeze(1), -1)
-        # generate() returns rows batch-major ([b0_beam0, b0_beam1, ...]) so this
-        # groups beams per user; the row-wise mask above preserved that order.
+        # generate() returns rows batch-major ([b0_beam0, b0_beam1, ...]); group
+        # the beams per user.
         return sids.view(batch_size, -1, self._num_levels)
 
     def init_input(self) -> None:
-        """Build the EmbeddingGroup for the raw SID JAGGED_SEQUENCE groups.
+        """Build the EmbeddingGroup for the single raw SID JAGGED_SEQUENCE group.
 
         Raw (passthrough) features carry no embedding tables, so this
         EmbeddingGroup holds no params (DMP-neutral); it exists purely to
@@ -392,10 +376,12 @@ class GenerativeRecLM(BaseModel):
     ) -> List[torch.Tensor]:
         """Map flat SID ``(values, lengths)`` -> per-row token-id tensors.
 
-        ``build_input`` supplies a JAGGED_SEQUENCE group's flat
-        ``"{group}.sequence"`` values + ``"{group}.sequence_length"``; ``values``
-        may arrive as float / shape ``(N, 1)``. The whole batch is tokenized once
-        on the backbone device, then split into rows.
+        ``build_input`` supplies flat SID ``(values, lengths)``: the history from
+        the JAGGED_SEQUENCE group's ``"{group}.sequence"`` /
+        ``"{group}.sequence_length"``, and the answer from
+        ``batch.jagged_labels[label].values()/.lengths()``. ``values`` may arrive
+        as float / shape ``(N, 1)``. The whole batch is tokenized once on the
+        backbone device, then split into rows.
 
         ``expected_width``, when set, enforces the sample contract: every row must
         have exactly that many codes (the answer = ``num_levels``).
@@ -407,7 +393,6 @@ class GenerativeRecLM(BaseModel):
         """
         if values.dim() == 2 and values.size(-1) == 1:
             values = values.squeeze(-1)
-        # host-side split bounds, read before the H2D copy below
         sizes = lengths.long().tolist()
         if expected_width is not None:
             bad = [i for i, n in enumerate(sizes) if n != expected_width]
@@ -425,10 +410,9 @@ class GenerativeRecLM(BaseModel):
         if max_codes:
             keep = (max_codes // self._num_levels) * self._num_levels
             if keep and any(n > keep for n in sizes):
-                rows = torch.split(values, sizes)  # host views, no copy
-                values = torch.cat([r[-keep:] for r in rows])  # keep recent tail
+                rows = torch.split(values, sizes)
+                values = torch.cat([r[-keep:] for r in rows])
                 sizes = [min(n, keep) for n in sizes]
-        # one vectorized SID->token map over the whole batch, on the backbone device
         values = self._tokenize_sids(values.to(self.device).long())
         return list(torch.split(values, sizes))
 
