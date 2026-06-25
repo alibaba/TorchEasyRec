@@ -103,10 +103,6 @@ class BaseSidModel(BaseModel):
             )
         self._n_layers = len(self._n_embed_list)
 
-        # Built in the base __init__ (not the subclass like Rank/Match models)
-        # so _input_dim is ready before the subclass builds its encoder; derived
-        # from the main group's total dim (which may concatenate several
-        # content + side-info features).
         self.init_input()
         self._feature_group = self._resolve_feature_group()
         self._input_dim = self.embedding_group.group_total_dim(self._feature_group)

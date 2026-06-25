@@ -57,7 +57,6 @@ def faiss_residual_kmeans(
     """
     device = samples.device
     _, D = samples.shape
-    # Own a contiguous fp32 numpy copy we mutate in place to form residuals.
     x = samples.detach().cpu().float().numpy().copy()
 
     res_centers: List[torch.Tensor] = []
@@ -66,7 +65,7 @@ def faiss_residual_kmeans(
         centroids = km.centroids.copy()
         res_centers.append(torch.from_numpy(centroids).to(device))
         _, idx = km.index.search(x, 1)
-        x -= centroids[idx.ravel()]  # residual, in place
+        x -= centroids[idx.ravel()]
     return res_centers
 
 
@@ -125,8 +124,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
         self.rotation_trick = rotation_trick
 
-        # ``initted`` is the kmeans_init guard: True means "codebook has
-        # been seeded", so init_embed_() becomes a no-op on later forwards.
         self.register_buffer("initted", torch.tensor([not kmeans_init]))
 
         if forward_mode not in self._FORWARD_MODE_MAP:
@@ -137,12 +134,9 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         mode_enum = self._FORWARD_MODE_MAP[forward_mode]
         self._forward_mode = mode_enum
         is_gumbel = mode_enum == QuantizeForwardMode.GUMBEL_SOFTMAX
-        # Sinkhorn is incompatible with Gumbel; auto-disable (the proto default
-        # is on) instead of crashing.
         if is_gumbel and use_sinkhorn:
             logger.warning("gumbel_softmax: disabling incompatible use_sinkhorn.")
             use_sinkhorn = False
-        # Gumbel skips the aggregate STE, so the rotation trick is unused.
         if is_gumbel and rotation_trick:
             logger.warning("gumbel_softmax: rotation_trick has no effect; ignoring.")
 
@@ -296,11 +290,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             emb (Tensor): the raw codebook vector (STE/eval) or the soft
                 embedding (Gumbel), with grad, shape (B, D).
         """
-        # On the STE residual walk the residual is detached and the layer
-        # returns the raw codebook vector (grad-carrying on the codebook, no
-        # per-layer STE wrap); the encoder STE gradient is applied once on the
-        # aggregate in :meth:`forward`. Gumbel returns the soft embedding that
-        # carries grad directly.
         out = self.layers[layer_idx].quantize(residual)
         return out.ids, out.embeddings
 
@@ -323,7 +312,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
                 latents).
         """
         if self.training:
-            self.init_embed_(input)  # first training forward only
+            self.init_embed_(input)
 
         train_gumbel = (
             self.training and self._forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
@@ -332,11 +321,8 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         walk_input = input if train_gumbel else input.detach()
         cluster_ids, aggregated_quants, cumulative = self._residual_pass(walk_input)
 
-        # Expose the per-layer cumulative quantized vectors (grad-carrying on the
-        # codebook side) so the model-side SidCommitmentLoss can consume them.
         latents = torch.stack(cumulative, dim=1)
 
-        # Aggregate STE (STE only; Gumbel already carries grad).
         quants_trunc = aggregated_quants
         if self.training and not train_gumbel:
             if self.rotation_trick:

@@ -157,11 +157,9 @@ class SidContrastiveLoss(_Loss):
             self._all_gather_with_grad([embed_a, embed_b, embed_a_ori, embed_b_ori])
         )
 
-        # Column mask: drop non-pair columns from the negatives.
         pair_mask_all = self._gather_bool_mask(pair_mask)
         col_mask = (~pair_mask_all).unsqueeze(0)  # (1, B_global)
 
-        # Safe labels: non-pair rows fall back to the first pair column.
         labels = self.labels
         fallback = pair_mask.long().argmax()  # first pair sample index
         safe_labels = torch.where(pair_mask, labels, fallback.expand_as(labels))

@@ -48,36 +48,29 @@ def _sinkhorn(
         Tensor: assignment matrix, shape (B, K).
             Use Q.argmax(dim=-1) externally to get codebook indices.
     """
-    # Step 1: exponential kernel transform  (B, K) -> (K, B)
     Q = torch.exp(-cost * epsilon).t()
 
-    # Global batch size for distributed training
     if dist.is_initialized():
         B = Q.size(1) * dist.get_world_size()
     else:
         B = Q.size(1)
     K = Q.size(0)
 
-    # Step 2: global normalization — make matrix sum to 1
     sum_Q = torch.sum(Q)
     if dist.is_initialized():
         dist.all_reduce(sum_Q)
     Q /= sum_Q + 1e-8
 
-    # Step 3: alternating row-column normalization
     for _ in range(n_iters):
-        # Row normalization: each prototype's total weight = 1/K
         sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
         if dist.is_initialized():
             dist.all_reduce(sum_of_rows)
         Q /= sum_of_rows + 1e-8
         Q /= K
 
-        # Column normalization: each sample's total weight = 1/B
         Q /= torch.sum(Q, dim=0, keepdim=True) + 1e-8
         Q /= B
 
-    # Step 4: scale back so columns sum to 1 (assignment)
     Q *= B
     return Q.t()
 
@@ -121,9 +114,6 @@ class VectorQuantizeLayer(QuantizeLayer):
         gumbel_temperature: float = 1.0,
     ) -> None:
         super().__init__(n_embed=n_embed, embed_dim=embed_dim)
-        # Sinkhorn drives `ids` (balanced assignment), Gumbel drives `emb`
-        # (nearest code); combining them makes the saved id and embedding
-        # diverge, so reject the combo (see the assert message).
         _is_gumbel = forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX
         assert not (use_sinkhorn and _is_gumbel), (
             "use_sinkhorn=True is incompatible with forward_mode=GUMBEL_SOFTMAX: "
@@ -135,7 +125,6 @@ class VectorQuantizeLayer(QuantizeLayer):
         # (large, shifted) cost overflows to +Inf -> NaN assignments.
         if use_sinkhorn and sinkhorn_epsilon <= 0:
             raise ValueError(f"sinkhorn_epsilon must be > 0, got {sinkhorn_epsilon}")
-        # ``n_embed`` / ``embed_dim`` are owned by the QuantizeLayer base.
         self.forward_mode = forward_mode
         self.distance_type = distance_type
         self.use_sinkhorn = use_sinkhorn
@@ -196,7 +185,6 @@ class VectorQuantizeLayer(QuantizeLayer):
             distances = (distances - mean) / std.add(1e-12)
             distances = distances - distances.min()
 
-            # Sinkhorn optimal-transport assignment
             Q = _sinkhorn(
                 distances,
                 n_iters=self.sinkhorn_iters,
@@ -221,10 +209,8 @@ class VectorQuantizeLayer(QuantizeLayer):
         Returns:
             QuantizeOutput: named tuple of (embeddings, ids).
         """
-        # Gumbel: grad-enabled distances feed the encoder; the hard sample drives
-        # both emb and ids, so the saved code matches the vector used.
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
-            logits = -self._compute_distances(x)  # differentiable
+            logits = -self._compute_distances(x)
             weights = F.gumbel_softmax(
                 logits, tau=self.gumbel_temperature, hard=True, dim=-1
             )
@@ -232,13 +218,10 @@ class VectorQuantizeLayer(QuantizeLayer):
             ids = weights.argmax(dim=-1)
             return QuantizeOutput(embeddings=emb, ids=ids)
 
-        # STE / eval: nearest-neighbour assignment under no_grad, one codebook
-        # gather. Return the RAW codebook vector (grad-carrying to the codebook)
-        # so the residual quantizer's cumulative ``latents`` trains the codebook
-        # via the commitment loss. The encoder straight-through gradient is
-        # applied once on the aggregate in ``ResidualVectorQuantizer.forward``; a
-        # per-layer STE wrap here would detach the codebook from ``latents`` and
-        # leave it frozen at init.
+        # Return the RAW codebook vector (no per-layer STE wrap): the aggregate
+        # STE in ResidualVectorQuantizer.forward routes the encoder gradient,
+        # while a wrap here would detach the codebook from ``latents`` and freeze
+        # it at init.
         ids = self._find_nearest_embedding(x)
         return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
 

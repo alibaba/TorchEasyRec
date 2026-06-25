@@ -199,7 +199,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         # breaks that invariant, so clone then.
         x0 = x.clone() if (verbose and self.normalize_residuals) else None
 
-        # CPU-only fit (SidRqkmeans refuses CUDA).
         if verbose:
             logger.info(
                 "[ResidualKMeansQuantizer] fitting %d-layer codebook on CPU "

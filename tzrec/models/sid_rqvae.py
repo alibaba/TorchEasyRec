@@ -81,14 +81,10 @@ class SidRqvae(BaseSidModel):
         if any(h < 1 for h in hidden_dims):
             raise ValueError(f"every hidden_dims entry must be >= 1, got {hidden_dims}")
 
-        # Sinkhorn params from the proto: config_to_kwargs flows the proto
-        # defaults (enabled=True, iters=5, epsilon=10.0) so the model never
-        # restates them; keys map to the quantizer's use_sinkhorn/iters/epsilon.
         sinkhorn_cfg = config_to_kwargs(cfg.sinkhorn_config)
 
-        # Framework MLP (Linear+ReLU per hidden) + a bare trailing Linear: the
-        # latent / reconstruction must be unbounded and MLP always activates its
-        # last layer, so the projection carries no activation.
+        # MLP activates its last layer; the trailing bare Linear keeps the
+        # latent / reconstruction unbounded.
         self._encoder = nn.Sequential(
             MLP(self._input_dim, hidden_units=hidden_dims),
             nn.Linear(hidden_dims[-1], embed_dim),
@@ -134,8 +130,6 @@ class SidRqvae(BaseSidModel):
         ``embedding_group`` / ``_input_dim``.
         """
         cfg = self._model_config
-        # Default to no contrastive path; the group names stay None unless
-        # contrastive_config is set.
         self._pair_feature_group = None
         self._pair_flag_feature_group = None
         self._use_contrastive = cfg.HasField("contrastive_config")
@@ -197,8 +191,6 @@ class SidRqvae(BaseSidModel):
         grouped = self.build_input(batch)
         embedding = grouped[self._feature_group]
         if self._is_inference:
-            # Codes-only path: get_codes does just the residual walk (no decode,
-            # no commitment latents), so neither dual-path branch is needed.
             return {"codes": self._quantizer.get_codes(self._encode(embedding))}
         if self._use_contrastive:
             return self._predict_mixed(grouped)
