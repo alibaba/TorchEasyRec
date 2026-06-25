@@ -151,9 +151,13 @@ class ReservoirSamplerTest(unittest.TestCase):
         )
         # All indices are valid stream positions.
         self.assertTrue((idx >= 0).all() and (idx < total).all())
-        # Phase-2 replacement happened: at least one slot holds a row added
-        # after the reservoir filled (index >= cap).
-        self.assertTrue((idx >= cap).any(), "no Phase-2 replacement occurred")
+        # Phase-2 replacement dominates the final sample: with a correct accept
+        # probability the expected post-fill survivor count is
+        # cap*(total-cap)/total ~= cap, so require well over half. A near-empty
+        # phase-2 count means the accept rate is broken (``.any()`` would only
+        # catch replacement being disabled outright).
+        n_phase2 = (idx >= cap).sum().item()
+        self.assertGreater(n_phase2, cap // 2, f"too few Phase-2 rows: {n_phase2}")
 
     def test_reset(self) -> None:
         """reset() drops the buffer and counters."""
