@@ -88,7 +88,7 @@ model_config {
 ### 训练参数
 
 ```bash
-OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc) \
+OMP_NUM_THREADS=$(nproc) \
     torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=1 --node_rank=0 \
     -m tzrec.train_eval \
@@ -100,7 +100,7 @@ OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc) \
 
 `--nproc-per-node` 必须为 `1`。训练时每个 batch 只把 embedding 写入蓄水池并返回占位 (全 0) 编码; 训练结束时日志会打印 `[SidRqkmeans.on_train_end] fitting FAISS on N samples` 以及逐层聚类信息, 随后做一次 eval 输出 `mse` / `rel_loss` / `unique_sid_ratio`。
 
-**`OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc)` 为必须配置项，否则默认设置为1，影响模型训练推理速度。**
+**`OMP_NUM_THREADS=$(nproc)` 为必须配置项，否则默认设置为1，影响模型训练推理速度。**
 
 ### 模型输出
 
