@@ -122,6 +122,11 @@ def parameterized_name_func(func, num, p) -> str:
     return base_name + name_suffix
 
 
+def is_ci_nightly() -> bool:
+    """Whether this is the nightly full run (``CI_NIGHTLY=true``)."""
+    return os.environ.get("CI_NIGHTLY", "false").lower() == "true"
+
+
 class hypothesis_settings(_settings):
     """Hypothesis settings for TorchEasyRec."""
 
@@ -135,7 +140,7 @@ class hypothesis_settings(_settings):
         derandomize: bool = _not_set,
         **kwargs: Any,
     ) -> None:
-        if os.environ.get("CI_NIGHTLY", "false").lower() == "true":
+        if is_ci_nightly():
             if derandomize == _not_set:
                 derandomize = False
         else:

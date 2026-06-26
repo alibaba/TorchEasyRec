@@ -19,8 +19,7 @@ import glob
 import os
 import unittest
 
-# Tokens whose presence in a skip decorator means the test needs a GPU lane
-# (the resource -- a GPU, or an extra.txt-only wheel -- is absent on the CPU lane).
+# A skip referencing any of these means the test needs a GPU lane.
 _GPU_SKIP_TOKENS = (
     "gpu_unavailable",
     "cutlass_hstu_unavailable",
@@ -47,8 +46,7 @@ def _is_gpu_required(decorators) -> bool:
             continue
         if any(tok in s for tok in _GPU_SKIP_TOKENS):
             return True
-        # skipUnless(cuda.is_available()) / skipIf(not cuda.is_available()) skip on
-        # CPU; skipIf(cuda.is_available()) (the FAISS CPU-only pattern) does NOT.
+        # skipUnless(cuda) / skipIf(not cuda) skip on CPU; skipIf(cuda) does not.
         if "cuda.is_available()" in s and (
             "skipUnless" in s or "not torch.cuda.is_available()" in s
         ):

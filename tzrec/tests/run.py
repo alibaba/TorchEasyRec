@@ -252,8 +252,7 @@ if __name__ == "__main__":
     test_suite_main, test_suite_subproc = _gather_test_cases(args)
 
     if not args.list_tests:
-        # Tests that mkdtemp(dir="./tmp") rely on it existing; create it once
-        # here so coverage is independent of test order and the --scope subset.
+        # Ensure ./tmp exists for tests that mkdtemp into it (scope-independent).
         os.makedirs("./tmp", exist_ok=True)
         runner_result = runner.run(test_suite_main, test_suite_subproc)
         failed, errored = len(runner_result.failures), len(runner_result.errors)

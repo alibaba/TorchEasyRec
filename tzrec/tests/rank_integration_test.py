@@ -28,15 +28,15 @@ from tzrec.utils.test_util import (
     cutlass_hstu_unavailable,
     dfs_are_close,
     gpu_unavailable,
+    is_ci_nightly,
     mark_ci_scope,
     torch_fx_tool_unavailable,
 )
 
-# Quant export covers every dtype only in the nightly full run; per-PR CI
-# runs a representative subset to keep the GPU lane fast.
+# Full dtype matrix only in nightly; per-PR runs a fast subset.
 _QUANT_EMBS = (
     ["FP32", "FP16", "INT8", "INT4", "INT2", "0"]
-    if os.environ.get("CI_NIGHTLY", "false").lower() == "true"
+    if is_ci_nightly()
     else ["FP16", "INT8"]
 )
 
