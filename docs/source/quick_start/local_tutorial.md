@@ -15,10 +15,10 @@ pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nig
 ```bash
 conda create -n tzrec python=3.11
 conda activate tzrec
-pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu129
-pip install fbgemm-gpu==1.6.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu129/repo.html
+pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu129
+pip install fbgemm-gpu==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu129/repo.html
 pip install torchmetrics==1.0.3 tensordict
-pip install torchrec==1.6.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html
+pip install torchrec==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html
 pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
@@ -37,11 +37,13 @@ GPU版本（CUDA 12.9) 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu129
 GPU版本（CUDA 12.6) 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu126
+GPU版本（CUDA 13.0，含 TensorRT) 镜像地址:
+  mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu130
 CPU版本 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cpu
 ```
 
-注意：两个 GPU 镜像中 PyTorch 编译的 SASS 目标不同，请按显卡 CC 选择：
+注意：GPU 镜像中 PyTorch 编译的 SASS 目标及 CUDA 版本不同，请按显卡 CC 与需求选择：
 
 - **CUDA 12.9** 镜像：`sm_75 / 80 / 86 / 90 / 100 / 120`（含
   `compute_120` PTX）。覆盖 Turing (T4)、Ampere (A10/A30/A100、
@@ -50,6 +52,9 @@ CPU版本 镜像地址:
 - **CUDA 12.6** 镜像：`sm_60 / 70 / 75 / 80 / 86 / 90`。覆盖 Pascal
   (P100)、Volta (V100)、Turing (T4)、Ampere (A10/A30/A100、L4/L20)、
   Hopper (H100) 等 CC 6.0–9.0 的卡，不支持 Blackwell。
+- **CUDA 13.0（含 TensorRT）** 镜像：在 CUDA 12.9 软件栈基础上改用 CUDA 13.0
+  工具链，并预装 torch-tensorrt 2.12 / TensorRT 10.16，用于 TRT 导出与推理。
+  注意：dynamicemb / hstu 算子目前仅提供 cu129 版本，cu130 镜像暂不包含。
 
 ## 前置准备
 

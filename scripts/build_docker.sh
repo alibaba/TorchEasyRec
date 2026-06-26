@@ -3,15 +3,15 @@ set -eo pipefail
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 REPO_NAME=tzrec-test
-DOCKER_TAG=1.2
-DOCKER_TAG_SUFFIX=
+DOCKER_TAG=1.3
+DOCKER_TAG_SUFFIX=-u1
 
 rm -rf docker/requirements*
 cp -r requirements*.txt docker/
 cp -r requirements/ docker/requirements
 cd docker
 
-for DEVICE in cpu cu126 cu129
+for DEVICE in cpu cu126 cu129 cu130
 do
     docker build --network host -t ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX} --build-arg DEVICE=${DEVICE} ${PIP_MIRROR:+--build-arg PIP_MIRROR=${PIP_MIRROR}} .
     docker push ${REGISTRY}/${REPO_NAME}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX}

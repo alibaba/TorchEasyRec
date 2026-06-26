@@ -62,10 +62,12 @@ def _backport_pt178147_int_array_dedup() -> None:
     Upstream fix (pytorch/pytorch#178147, merged 2026-05-10): key on
     ``id(writeline.__self__)`` -- the underlying IndentedBuffer, stable for
     the whole compile -- with a fallback to ``id(writeline)`` for free
-    functions. Not present in torch 2.11.0; will be in the next release.
+    functions. Still absent in torch 2.12.1 (its ``codegen_int_array_var``
+    keys on ``id(writeline)``; 2.12.1 was cut before the 2026-05-10 merge);
+    it lands in torch 2.13.0+.
 
     REMOVE THIS PATCH when tzrec's torch pin advances to a release that
-    includes pytorch/pytorch#178147.
+    includes pytorch/pytorch#178147 (torch >= 2.13.0).
     """
     from torch._inductor.codegen import cpp_wrapper_cpu as _cwc
 
