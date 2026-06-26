@@ -783,6 +783,7 @@ class RankIntegrationTest(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_with_fg_fp16_ga_train_eval_export(self):
         self._test_rank_with_fg(
             "tzrec/tests/configs/multi_tower_din_fg_mock_fp16_ga.config",
@@ -790,6 +791,7 @@ class RankIntegrationTest(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_with_fg_bf16_emb_fp16_train_eval_export(self):
         self._test_rank_with_fg(
             "tzrec/tests/configs/multi_tower_din_fg_mock_bf16_emb_fp16.config",
@@ -797,6 +799,7 @@ class RankIntegrationTest(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_zch_with_fg_train_eval_export(self):
         self._test_rank_with_fg(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
@@ -807,6 +810,7 @@ class RankIntegrationTest(unittest.TestCase):
         not torch.cuda.is_available() or torch.cuda.device_count() < 2,
         "needs >= 2 GPUs to exercise different world sizes",
     )
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_zch_finetune_world_size_change(self):
         # First train on 1 GPU, then finetune from that checkpoint on 2 GPUs.
         # Regression test for the assertion in MCH validate_state caused by
@@ -889,12 +893,14 @@ class RankIntegrationTest(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_zch_with_fg_train_eval_export_input_tile(self):
         self._test_rank_with_fg_input_tile(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
         )
 
     @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_with_fg_train_eval_aot_export_input_tile(self):
         self._test_rank_with_fg_aot_input_tile(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
@@ -1023,7 +1029,7 @@ class RankIntegrationTest(unittest.TestCase):
             acc_cfg = json.load(f)
             self.assertEqual(acc_cfg["cand_seq_pk"], "cand_seq")
 
-    @mark_ci_scope("h20")
+    @mark_ci_scope("h20", "gpu")
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_train_eval_export(self):
         # Default path: legacy two-stage export (sparse JIT + dense AOTI).
@@ -1038,7 +1044,7 @@ class RankIntegrationTest(unittest.TestCase):
         with open(os.path.join(self.test_dir, "export/model_acc.json")) as f:
             self.assertEqual(json.load(f).get("ENABLE_AOT"), "1")
 
-    @mark_ci_scope("h20")
+    @mark_ci_scope("h20", "gpu")
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_train_eval_export_unified_aot(self):
         # Unified AOTI export (ENABLE_AOT=2): fused sparse+dense single .pt2.
@@ -1054,7 +1060,7 @@ class RankIntegrationTest(unittest.TestCase):
             acc_cfg = json.load(f)
             self.assertEqual(acc_cfg.get("ENABLE_AOT"), "2")
 
-    @mark_ci_scope("h20")
+    @mark_ci_scope("h20", "gpu")
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_train_eval_export_autotune_with_sample_inputs(self):
         # Exercise the AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS path with a small
@@ -1070,7 +1076,7 @@ class RankIntegrationTest(unittest.TestCase):
             self.assertEqual(acc_cfg.get("AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS"), "1")
             self.assertEqual(acc_cfg.get("MAX_EXPORT_BATCH_SIZE"), "2")
 
-    @mark_ci_scope("h20")
+    @mark_ci_scope("h20", "gpu")
     @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_dlrm_hstu_cutlass_train_eval_export(self):
@@ -1100,7 +1106,7 @@ class RankIntegrationTest(unittest.TestCase):
             )
         self.assertTrue(self.success)
 
-    @mark_ci_scope("h20")
+    @mark_ci_scope("h20", "gpu")
     @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_rank_ultra_hstu_cutlass_train_eval_export(self):
@@ -1135,6 +1141,7 @@ class RankIntegrationTest(unittest.TestCase):
         gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
         "dynamicemb not available.",
     )
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_with_dynamicemb_train_eval(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config",
@@ -1155,6 +1162,7 @@ class RankIntegrationTest(unittest.TestCase):
     @unittest.skipIf(
         gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
     )
+    @mark_ci_scope("gpu")
     def test_multi_tower_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config",
@@ -1164,6 +1172,7 @@ class RankIntegrationTest(unittest.TestCase):
     @unittest.skipIf(
         gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
     )
+    @mark_ci_scope("gpu")
     def test_multi_tower_zch_with_fg_train_eval_export_trt(self):
         self._test_rank_with_fg_trt(
             "tzrec/tests/configs/multi_tower_din_zch_fg_mock_nodice.config",
@@ -1176,6 +1185,7 @@ class RankIntegrationTest(unittest.TestCase):
         "dynamicemb not available (config sets `dynamicemb { }` on features).",
     )
     @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_rtp_train_export(self):
         # set USE_RTP env here for gen correct rtp style train/eval data
         os.environ["USE_RTP"] = "1"
@@ -1207,7 +1217,7 @@ class RankIntegrationTest(unittest.TestCase):
             in weight_json
         )
 
-    @mark_ci_scope("h20")
+    @mark_ci_scope("h20", "gpu")
     @unittest.skipIf(*torch_fx_tool_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_dlrm_hstu_rtp_train_export(self):

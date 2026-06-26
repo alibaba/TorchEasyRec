@@ -42,6 +42,7 @@ from tzrec.utils.test_util import (
     TestGraphType,
     create_test_model,
     gpu_unavailable,
+    mark_ci_scope,
 )
 from tzrec.utils.test_util import (
     hypothesis_settings as settings,
@@ -325,6 +326,7 @@ def _build_batch(device: torch.device, channel_names: List[str]) -> Batch:
     ).to(device)
 
 
+@mark_ci_scope("gpu")
 class UltraHSTUTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = None

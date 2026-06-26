@@ -54,7 +54,7 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_no_zch_features,
 )
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 
 _SHARDED_TABLE_NAME = "table_1"
 _SHARDED_FEATURE_NAME = "feature_1"
@@ -811,6 +811,7 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
         self.world_size = 2
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
+    @mark_ci_scope("gpu")
     def test_row_wise_sharded_dump_writes_global_key_ids(self):
         with (
             tempfile.TemporaryDirectory() as tmp_dir,
@@ -864,6 +865,7 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
         gpu_unavailable[0] or not has_dynamicemb,
         "dynamicemb or GPU not available.",
     )
+    @mark_ci_scope("gpu")
     def test_dynamicemb_multi_gpu_delta_dump_writes_uniform_shards(self):
         world_size = int(os.getenv("TEST_NPROC_PER_NODE", "2"))
         pipeline_config = config_util.load_pipeline_config(

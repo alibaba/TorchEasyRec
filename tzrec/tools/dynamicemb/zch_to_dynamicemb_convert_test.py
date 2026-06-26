@@ -30,7 +30,7 @@ from tzrec.tests import utils
 from tzrec.tools.dynamicemb import zch_to_dynamicemb_convert as conv
 from tzrec.utils import checkpoint_util, misc_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 
 _IINFO_MAX = torch.iinfo(torch.int64).max
 
@@ -585,6 +585,7 @@ class ConvertE2ETests(unittest.TestCase):
         gpu_unavailable[0] or not has_dynamicemb,
         "dynamicemb not available.",
     )
+    @mark_ci_scope("gpu")
     def test_convert_e2e(self):
         # 1. Train a ZCH model briefly to produce a real source checkpoint.
         src_train_dir = os.path.join(self.test_dir, "src_train")

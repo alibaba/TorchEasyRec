@@ -42,7 +42,7 @@ def _inplace_swap(
     return x
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class StuTest(unittest.TestCase):
     # pyre-ignore
     @given(
@@ -529,7 +529,7 @@ class StuTest(unittest.TestCase):
             )
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class STUStackTruncationTest(unittest.TestCase):
     """Cover the mid-stack truncation block in ``STUStack.forward``.
 

@@ -16,7 +16,7 @@ import tempfile
 import unittest
 
 from tzrec.tests import utils
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 
 
 class MatchIntegrationTest(unittest.TestCase):
@@ -230,6 +230,7 @@ class MatchIntegrationTest(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_dssm_with_fg_train_eval_export_aot(self):
         # AOT variant exercises TowerWrapper through the helpers refactored
         # to take feature_groups (_compute_seq_share_groups +
@@ -257,6 +258,7 @@ class MatchIntegrationTest(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_dssm_v2_with_fg_train_eval_export_aot(self):
         # AOT variant exercises TowerWoEGWrapper through the helpers
         # refactored to take feature_groups.
@@ -369,6 +371,7 @@ class MatchIntegrationTest(unittest.TestCase):
         self.assertTrue(self.success)
 
     @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_hstu_with_fg_train_eval(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/hstu_kuairand_1k.config",

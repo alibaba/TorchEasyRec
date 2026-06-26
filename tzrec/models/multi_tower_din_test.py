@@ -32,9 +32,15 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
+from tzrec.utils.test_util import (
+    TestGraphType,
+    create_test_model,
+    gpu_unavailable,
+    mark_ci_scope,
+)
 
 
+@mark_ci_scope("gpu")
 class MultiTowerDINTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = None

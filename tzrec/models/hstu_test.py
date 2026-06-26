@@ -36,6 +36,7 @@ from tzrec.utils.test_util import (
     TestGraphType,
     create_test_model,
     gpu_unavailable,
+    mark_ci_scope,
 )
 from tzrec.utils.test_util import (
     hypothesis_settings as settings,
@@ -220,6 +221,7 @@ def _build_batch(device: torch.device) -> Batch:
     ).to(device)
 
 
+@mark_ci_scope("gpu")
 class HSTUMatchTest(unittest.TestCase):
     @given(
         graph_type=st.sampled_from(

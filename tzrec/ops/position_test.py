@@ -43,7 +43,7 @@ def _retry(max_attempts=3):
     return decorator
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class PositionEmbeddingsTest(unittest.TestCase):
     def teardown_example(self, example):
         gc.collect()
