@@ -35,8 +35,8 @@ jobs:
             -e CI=true \
             -e CI_HYPOTHESIS=true \
             -e TZREC_TEST_TIMEOUT_SCALE=4 \
-            -e TRITON_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/triton \
-            -e TORCHINDUCTOR_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/inductor \
+            -e TRITON_CACHE_DIR=/__w/${{ github.event.repository.name }}/tzrec-ci-cache/triton \
+            -e TORCHINDUCTOR_CACHE_DIR=/__w/${{ github.event.repository.name }}/tzrec-ci-cache/inductor \
             -v "$WORK_ROOT":/__w \
             -v "$EXTERNALS_ROOT":/__e:ro \
             -v "$WORK_ROOT/_temp":/__w/_temp \
@@ -45,7 +45,7 @@ jobs:
             -v "$WORK_ROOT/_temp/_github_home":/github/home \
             -v "$WORK_ROOT/_temp/_github_workflow":/github/workflow \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.1-ppu \
-            bash -c 'mkdir -p /__w/TorchEasyRec/tzrec-ci-cache/triton /__w/TorchEasyRec/tzrec-ci-cache/inductor && cd run_${{ github.run_id }} && bash scripts/ci/ci_test_ppu.sh'
+            bash -c 'mkdir -p /__w/${{ github.event.repository.name }}/tzrec-ci-cache/triton /__w/${{ github.event.repository.name }}/tzrec-ci-cache/inductor && cd run_${{ github.run_id }} && bash scripts/ci/ci_test_ppu.sh'
       - name: StopDockerContainer
         if: always()
         run: |
