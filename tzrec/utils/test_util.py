@@ -11,6 +11,7 @@
 
 import importlib.util
 import os
+import tempfile
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -122,6 +123,19 @@ def parameterized_name_func(func, num, p) -> str:
     return base_name + name_suffix
 
 
+def is_ci_nightly() -> bool:
+    """Whether this is the nightly full run (``CI_NIGHTLY=true``)."""
+    return os.environ.get("CI_NIGHTLY", "false").lower() == "true"
+
+
+def make_test_dir(prefix: str = "tzrec_") -> str:
+    """Create a fresh, world-readable ``./tmp/<prefix>*`` dir; return its path."""
+    os.makedirs("./tmp", exist_ok=True)
+    test_dir = tempfile.mkdtemp(prefix=prefix, dir="./tmp")
+    os.chmod(test_dir, 0o755)
+    return test_dir
+
+
 class hypothesis_settings(_settings):
     """Hypothesis settings for TorchEasyRec."""
 
@@ -135,14 +149,14 @@ class hypothesis_settings(_settings):
         derandomize: bool = _not_set,
         **kwargs: Any,
     ) -> None:
-        if os.environ.get("CI_HYPOTHESIS", "false").lower() == "true":
+        if is_ci_nightly():
+            if derandomize == _not_set:
+                derandomize = False
+        else:
             if max_examples != _not_set:
                 max_examples = max(1, max_examples // 5)
             if derandomize == _not_set:
                 derandomize = True
-        else:
-            if derandomize == _not_set:
-                derandomize = False
         super().__init__(
             parent, max_examples=max_examples, derandomize=derandomize, **kwargs
         )

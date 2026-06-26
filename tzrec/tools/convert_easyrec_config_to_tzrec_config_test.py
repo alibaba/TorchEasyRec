@@ -12,13 +12,13 @@
 import json
 import os
 import shutil
-import tempfile
 import unittest
 
 from google.protobuf import text_format
 
 from tzrec.protos import pipeline_pb2 as tzrec_pipeline_pb2
 from tzrec.tools.convert_easyrec_config_to_tzrec_config import ConvertConfig
+from tzrec.utils.test_util import make_test_dir
 
 FG_JSON = {
     "features": [
@@ -2004,9 +2004,7 @@ class ConvertConfigTest(unittest.TestCase):
     def setUp(self):
         self.maxDiff = None
         self.success = False
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_convert_", dir="./tmp")
+        self.test_dir = make_test_dir(prefix="tzrec_convert_")
         self.fg_path = os.path.join(self.test_dir, "fg.json")
         self.easyrec_path = os.path.join(self.test_dir, "easyrec.config")
         self.tzrec_path = os.path.join(self.test_dir, "tzrec.config")

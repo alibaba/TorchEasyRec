@@ -37,6 +37,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.utils import checkpoint_util, misc_util
+from tzrec.utils.test_util import make_test_dir
 
 
 def _create_test_model(large_table_cnt=2, small_table_cnt=2):
@@ -173,9 +174,7 @@ def _remap_restore_worker(test_dir, rank, world_size, port, remap_file_path):
 
 class CheckpointUtilTest(unittest.TestCase):
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
@@ -408,9 +407,7 @@ class DataloaderCheckpointTest(unittest.TestCase):
     """Tests for dataloader checkpoint utilities."""
 
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
