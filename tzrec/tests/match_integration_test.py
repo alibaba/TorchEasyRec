@@ -275,6 +275,7 @@ class MatchIntegrationTest(unittest.TestCase):
             item_id="item_id",
         )
 
+    @mark_ci_scope("gpu")
     def test_tdm_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/tdm_fg_mock.config",

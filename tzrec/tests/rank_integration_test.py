@@ -32,6 +32,14 @@ from tzrec.utils.test_util import (
     torch_fx_tool_unavailable,
 )
 
+# Quant export covers every dtype only in the nightly full run; per-PR CI
+# runs a representative subset to keep the GPU lane fast.
+_QUANT_EMBS = (
+    ["FP32", "FP16", "INT8", "INT4", "INT2", "0"]
+    if os.environ.get("CI_NIGHTLY")
+    else ["FP16", "INT8"]
+)
+
 
 class RankIntegrationTest(unittest.TestCase):
     def setUp(self):
@@ -76,6 +84,7 @@ class RankIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(self.test_dir, "export/scripted_model.pt"))
         )
 
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_fg_encoded_train_eval_export(self):
         self._test_rank_nofg(
             "tzrec/tests/configs/multi_tower_din_mock.config",
@@ -191,7 +200,7 @@ class RankIntegrationTest(unittest.TestCase):
             user_id="user_id",
             item_id="item_id",
         )
-        for quant_emb in ["FP32", "FP16", "INT8", "INT4", "INT2", "0"]:
+        for quant_emb in _QUANT_EMBS:
             test_dir = os.path.join(self.test_dir, f"quant_{quant_emb.lower()}")
             if self.success:
                 self.success = utils.test_export(
@@ -848,6 +857,7 @@ class RankIntegrationTest(unittest.TestCase):
             else:
                 os.environ["TEST_NPROC_PER_NODE"] = prev_nproc
 
+    @mark_ci_scope("gpu")
     def test_multi_tower_din_with_fg_export_quant(self):
         self._test_rank_with_fg_quant(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
