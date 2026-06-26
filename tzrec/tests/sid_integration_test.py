@@ -25,7 +25,7 @@ import torch
 
 from tzrec.tests import utils
 from tzrec.utils import config_util
-from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import mark_ci_scope
 
 
 class SidIntegrationTest(unittest.TestCase):
@@ -123,7 +123,6 @@ class SidIntegrationTest(unittest.TestCase):
         self.assertGreater(metrics["unique_sid_ratio"], 0.0)
 
     @mark_ci_scope("gpu")
-    @unittest.skipIf(*gpu_unavailable)
     def test_sid_rqvae_train_eval(self):
         """End-to-end SidRqvae train -> checkpoint -> eval (gradient-trained).
 
