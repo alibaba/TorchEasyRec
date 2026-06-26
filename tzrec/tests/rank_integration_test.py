@@ -36,7 +36,7 @@ from tzrec.utils.test_util import (
 # runs a representative subset to keep the GPU lane fast.
 _QUANT_EMBS = (
     ["FP32", "FP16", "INT8", "INT4", "INT2", "0"]
-    if os.environ.get("CI_NIGHTLY")
+    if os.environ.get("CI_NIGHTLY", "false").lower() == "true"
     else ["FP16", "INT8"]
 )
 

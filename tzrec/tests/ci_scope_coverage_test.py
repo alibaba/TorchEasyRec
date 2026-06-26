@@ -8,15 +8,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lint: every GPU-only test must carry a CI scope marker.
+"""Lint: every test that skips on the CPU lane must carry a gpu/h20 marker.
 
-The per-PR GPU lane runs ``run.py --scope gpu`` and the H20 lane runs
-``--scope h20``; the CPU lane runs the full suite but has neither a GPU nor
-the ``requirements/extra.txt`` wheels (dynamicemb / fbgemm_gpu_hstu /
-torch_fx_tool / tensorrt). So any test that *skips on the CPU lane* runs
-**only** on a GPU lane -- and if it carries no ``@mark_ci_scope("gpu")`` /
-``("h20")`` it is filtered out there too and silently runs on **no** per-PR
-lane. This test statically asserts that can't happen.
+Such a test runs only on a scoped GPU lane (``run.py --scope gpu``/``h20``);
+without the marker it is filtered out there too and runs on no per-PR lane.
 """
 
 import ast

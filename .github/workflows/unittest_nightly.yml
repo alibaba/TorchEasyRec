@@ -28,9 +28,7 @@ jobs:
           CI_ALIKAFKA_BROKERS: ${{ secrets.CI_ALIKAFKA_BROKERS }}
           CI_REGION: ${{ secrets.CI_REGION }}
         run: |
-          # schedule-triggered: github.event.repository.name is empty here, so
-          # derive the repo name from $GITHUB_REPOSITORY.
-          CACHE_ROOT="/__w/${GITHUB_REPOSITORY##*/}/tzrec-ci-cache"
+          CACHE_ROOT="/__w/TorchEasyRec/tzrec-ci-cache"
           mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
           cd run_${{ github.run_id }}
           CI_NIGHTLY=true \

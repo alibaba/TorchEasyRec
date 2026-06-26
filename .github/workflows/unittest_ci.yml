@@ -24,10 +24,10 @@ jobs:
       - name: RunUnitTestCI
         id: run_unittest_ci
         run: |
-          CACHE_ROOT="/__w/${{ github.event.repository.name }}/tzrec-ci-cache"
+          CACHE_ROOT="/__w/TorchEasyRec/tzrec-ci-cache"
           mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
           cd run_${{ github.run_id }}
           TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
           TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
-          CUDA_HOME=/usr/local/cuda-12 CI_HYPOTHESIS=true \
+          CUDA_HOME=/usr/local/cuda-12 \
           bash scripts/ci/ci_test.sh --scope gpu
