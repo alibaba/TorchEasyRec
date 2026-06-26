@@ -25,6 +25,7 @@ import torch
 
 from tzrec.tests import utils
 from tzrec.utils import config_util
+from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 
 
 class SidIntegrationTest(unittest.TestCase):
@@ -121,11 +122,8 @@ class SidIntegrationTest(unittest.TestCase):
         self.assertLess(metrics["rel_loss"], 1.0)
         self.assertGreater(metrics["unique_sid_ratio"], 0.0)
 
-    @unittest.skipIf(
-        torch.cuda.is_available(),
-        "the SID integration tests run on the CPU CI job; forcing CPU on a "
-        "CUDA-built (GPU) image is unreliable.",
-    )
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
     def test_sid_rqvae_train_eval(self):
         """End-to-end SidRqvae train -> checkpoint -> eval (gradient-trained).
 
