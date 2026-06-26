@@ -57,7 +57,7 @@ model_config {
   - save_checkpoints_steps / save_checkpoints_epochs: **必须项，设 `0` 关闭周期性保存**; 拟合好的码本只随训练结束时的最终 checkpoint 持久化 (周期性保存可能会忽略checkpoint落盘, 故关闭)
 - feature_configs / feature_groups: 同 RQVAE, 但只需主物品 embedding 一组 (`deep`); 其拼接后的总维度即 K-Means 的向量维度
 - sid_rqkmeans: RQKMeans 模型参数
-  - codebook: 每层聚类中心数; **列表长度即残差层数 (= SID 的位数)**; 示例 `[256, 256, 256]` (生产常用 `[8192, 8192, 8192]`); 支持非均匀如 `[256, 512, 1024]` (每层独立拟合一个 faiss.Kmeans)
+  - codebook: 每层聚类中心数; **列表长度即残差层数 (= SID 的位数)**; 示例 `[256, 256, 256]`，则码本语义空间大小为`256 * 256 * 256 = 16777216`; 支持非均匀如 `[256, 512, 1024]` (每层独立拟合一个 faiss.Kmeans; 可类比层级类目——各层码本大小相当于一级/二级/三级类目的个数); **根据业务规模和实际码表碰撞率可对codebook规模进行调整, SID无冲突率(去重SID使用数/商品数)>70%时效果更佳，亿级规模物品集码本参考可设`[8192, 8192, 8192]`**;
   - normalize_residuals: 每层聚类前是否对残差做 L2 归一化, 默认 `false` (开启后效果更佳)
   - faiss_kmeans_kwargs: 透传给 `faiss.Kmeans(D, K, **kwargs)` 的强类型参数, 未设置的字段回落到 FAISS 自身默认值
     - niter: 每层 K-Means 迭代次数 (FAISS 默认 25)
@@ -71,7 +71,7 @@ model_config {
 
 ## 示例
 
-模型的训练和评估方式同[local_tutorial](../quick_start/local_tutorial.md)，示例数据和配置参数如下：
+模型的训练和评估方式同[local_tutorial](../quick_start/local_tutorial.md)，但 **`--nproc-per-node` 必须为 `1`**，示例数据和配置参数如下：
 
 ### 数据
 
@@ -81,7 +81,7 @@ model_config {
 
 [sid_rq_kmeans.config](https://tzrec.oss-accelerate.aliyuncs.com/config/models/sid_rq_kmeans.config)
 
-### 训练参数
+### 训练预测参数
 
 ```bash
 OMP_NUM_THREADS=$(nproc) \
@@ -90,13 +90,39 @@ OMP_NUM_THREADS=$(nproc) \
     -m tzrec.train_eval \
     --pipeline_config_path sid_rq_kmeans.config \
     --train_input_path "data/sid_example/item_only/*.parquet" \
-    --eval_input_path "data/sid_example/item_only/*.parquet" \
     --model_dir experiments/sid_rqkmeans
 ```
 
 `--nproc-per-node` 必须为 `1`。训练时每个 batch 只把 embedding 写入蓄水池并返回占位 (全 0) 编码; 训练结束时日志会打印 `[SidRqkmeans.on_train_end] fitting FAISS on N samples` 以及逐层聚类信息, 随后做一次 eval 输出 `mse` / `rel_loss` / `unique_sid_ratio`。
 
 **`OMP_NUM_THREADS=$(nproc)` 为必须配置项，否则默认设置为1，影响模型训练推理速度。**
+
+离线生成 SID (预测): 训练得到 checkpoint 后, 用 `tzrec.predict` 为每个物品产出 `codes` (同样 `--nproc-per-node=1`):
+
+```bash
+OMP_NUM_THREADS=$(nproc) \
+    torchrun --master_addr=localhost --master_port=32556 \
+    --nnodes=1 --nproc-per-node=1 --node_rank=0 \
+    -m tzrec.predict \
+    --pipeline_config_path sid_rq_kmeans.config \
+    --checkpoint_path experiments/sid_rqkmeans/model.ckpt-{step} \
+    --predict_input_path "data/sid_example/item_only/*.parquet" \
+    --predict_output_path experiments/sid_rqkmeans/sid_output \
+    --reserved_columns item_id
+```
+
+读取 MaxCompute (ODPS) 表: 把 config 里 `data_config.dataset_type` 改为 `OdpsDataset`, 输入/输出路径换成 ODPS 表 (`odps://{project}/tables/{table}/{partition}`, 多表逗号分隔), 并设置 `ODPS_ENDPOINT`:
+
+```bash
+ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
+OMP_NUM_THREADS=$(nproc) \
+    torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    --nnodes=$WORLD_SIZE --nproc-per-node=1 --node_rank=$RANK \
+    -m tzrec.train_eval \
+    --pipeline_config_path sid_rq_kmeans.config \
+    --train_input_path odps://{project}/tables/{item_emb_table} \
+    --model_dir experiments/sid_rqkmeans
+```
 
 ### 模型输出
 
