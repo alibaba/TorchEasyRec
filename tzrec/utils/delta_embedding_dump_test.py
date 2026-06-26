@@ -54,7 +54,7 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_no_zch_features,
 )
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 _SHARDED_TABLE_NAME = "table_1"
 _SHARDED_FEATURE_NAME = "feature_1"
@@ -854,10 +854,7 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
 
     def setUp(self):
         self.success = False
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_delta_dyn_", dir="./tmp")
-        os.chmod(self.test_dir, 0o755)
+        self.test_dir = make_test_dir(prefix="tzrec_delta_dyn_")
 
     def tearDown(self):
         if self.success and os.path.exists(self.test_dir):

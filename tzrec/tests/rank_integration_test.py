@@ -12,7 +12,6 @@
 import json
 import os
 import shutil
-import tempfile
 import unittest
 
 import torch
@@ -29,6 +28,7 @@ from tzrec.utils.test_util import (
     dfs_are_close,
     gpu_unavailable,
     is_ci_nightly,
+    make_test_dir,
     mark_ci_scope,
     torch_fx_tool_unavailable,
 )
@@ -44,10 +44,7 @@ _QUANT_EMBS = (
 class RankIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
-        os.chmod(self.test_dir, 0o755)
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if self.success:

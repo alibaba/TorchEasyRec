@@ -12,20 +12,16 @@
 import json
 import os
 import shutil
-import tempfile
 import unittest
 
 from tzrec.tests import utils
-from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 
 class MatchIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
-        os.chmod(self.test_dir, 0o755)
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if self.success:

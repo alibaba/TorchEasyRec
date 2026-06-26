@@ -12,7 +12,6 @@
 
 import os
 import shutil
-import tempfile
 import unittest
 from collections import OrderedDict
 
@@ -30,11 +29,11 @@ from tzrec.features import (
 from tzrec.features import feature as feature_lib
 from tzrec.features.feature import FgMode
 from tzrec.protos import feature_pb2
+from tzrec.utils.test_util import make_test_dir
 
 
 class FeatureTest(unittest.TestCase):
     def setUp(self):
-        os.makedirs("./tmp", exist_ok=True)
         self.test_dir = None
 
     def tearDown(self):
@@ -336,7 +335,7 @@ class FeatureTest(unittest.TestCase):
         token_file = "data/test/tokenizer.json"
         vocab_file = "data/test/id_vocab_list_0"
         if with_asset_dir:
-            self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+            self.test_dir = make_test_dir()
             asset_dir = self.test_dir
             token_file = "tokenizer_b2faab7921bbfb593973632993ca4c85.json"
             vocab_file = "id_vocab_list_0_583794bd44eb2c6d83336c71258521e8"
@@ -485,7 +484,7 @@ class FeatureTest(unittest.TestCase):
         asset_dir = None
         token_file = "data/test/tokenizer.json"
         if with_asset_dir:
-            self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+            self.test_dir = make_test_dir()
             asset_dir = self.test_dir
             token_file = "tokenizer_b2faab7921bbfb593973632993ca4c85.json"
         feature_cfgs = self._create_test_feature_cfgs()
@@ -628,7 +627,7 @@ class FeatureTest(unittest.TestCase):
         token_file = "data/test/tokenizer.json"
         vocab_file = "data/test/id_vocab_list_0"
         if with_asset_dir:
-            self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+            self.test_dir = make_test_dir()
             asset_dir = self.test_dir
             token_file = "tokenizer_b2faab7921bbfb593973632993ca4c85.json"
             vocab_file = "id_vocab_list_0_583794bd44eb2c6d83336c71258521e8"

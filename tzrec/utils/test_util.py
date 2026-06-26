@@ -11,6 +11,7 @@
 
 import importlib.util
 import os
+import tempfile
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -125,6 +126,14 @@ def parameterized_name_func(func, num, p) -> str:
 def is_ci_nightly() -> bool:
     """Whether this is the nightly full run (``CI_NIGHTLY=true``)."""
     return os.environ.get("CI_NIGHTLY", "false").lower() == "true"
+
+
+def make_test_dir(prefix: str = "tzrec_") -> str:
+    """Create a fresh, world-readable ``./tmp/<prefix>*`` dir; return its path."""
+    os.makedirs("./tmp", exist_ok=True)
+    test_dir = tempfile.mkdtemp(prefix=prefix, dir="./tmp")
+    os.chmod(test_dir, 0o755)
+    return test_dir
 
 
 class hypothesis_settings(_settings):

@@ -11,7 +11,6 @@
 
 import os
 import shutil
-import tempfile
 import unittest
 from collections import OrderedDict
 from typing import List, Tuple
@@ -42,6 +41,7 @@ from tzrec.utils.test_util import (
     TestGraphType,
     create_test_model,
     gpu_unavailable,
+    make_test_dir,
     mark_ci_scope,
 )
 from tzrec.utils.test_util import (
@@ -329,7 +329,6 @@ def _build_batch(device: torch.device, channel_names: List[str]) -> Batch:
 @mark_ci_scope("gpu")
 class UltraHSTUTest(unittest.TestCase):
     def setUp(self):
-        os.makedirs("./tmp", exist_ok=True)
         self.test_dir = None
 
     def tearDown(self):
@@ -424,7 +423,7 @@ class UltraHSTUTest(unittest.TestCase):
         elif graph_type == TestGraphType.AOT_INDUCTOR:
             data = batch.to_dict()
             data = OrderedDict(sorted(data.items()))
-            self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+            self.test_dir = make_test_dir()
             ultra_hstu.set_is_inference(True)
             ultra_hstu = create_test_model(ultra_hstu, graph_type, data, self.test_dir)
             predictions = ultra_hstu(data)

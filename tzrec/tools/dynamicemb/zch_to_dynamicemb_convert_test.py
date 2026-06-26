@@ -30,7 +30,7 @@ from tzrec.tests import utils
 from tzrec.tools.dynamicemb import zch_to_dynamicemb_convert as conv
 from tzrec.utils import checkpoint_util, misc_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 _IINFO_MAX = torch.iinfo(torch.int64).max
 
@@ -573,10 +573,7 @@ class ConvertE2ETests(unittest.TestCase):
 
     def setUp(self):
         self.success = False
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_zch_to_dyemb_", dir="./tmp")
-        os.chmod(self.test_dir, 0o755)
+        self.test_dir = make_test_dir(prefix="tzrec_zch_to_dyemb_")
 
     def tearDown(self):
         if self.success and os.path.exists(self.test_dir):

@@ -14,7 +14,6 @@ import json
 import math
 import os
 import shutil
-import tempfile
 import unittest
 from unittest import mock
 
@@ -25,16 +24,13 @@ import torch
 
 from tzrec.tests import utils
 from tzrec.utils import config_util
-from tzrec.utils.test_util import mark_ci_scope
+from tzrec.utils.test_util import make_test_dir, mark_ci_scope
 
 
 class SidIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
-        os.chmod(self.test_dir, 0o755)
+        self.test_dir = make_test_dir()
         # SidRqkmeans is single-process; pin nproc=1 (the CI harness defaults
         # to 2, which would trip the world_size>1 guard).
         patcher = mock.patch.dict(os.environ, {"TEST_NPROC_PER_NODE": "1"})
