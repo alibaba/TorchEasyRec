@@ -13,11 +13,18 @@ import copy
 import unittest
 
 import torch
-from hypothesis import Verbosity, given, settings
+from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import (
+    get_test_dtypes,
+    gpu_unavailable,
+    mark_ci_scope,
+)
+from tzrec.utils.test_util import (
+    hypothesis_settings as settings,
+)
 
 
 @mark_ci_scope("h20")

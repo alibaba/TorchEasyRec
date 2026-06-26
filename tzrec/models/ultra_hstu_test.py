@@ -17,7 +17,7 @@ from collections import OrderedDict
 from typing import List, Tuple
 
 import torch
-from hypothesis import Verbosity, assume, given, settings
+from hypothesis import Verbosity, assume, given
 from hypothesis import strategies as st
 from parameterized import parameterized
 from torchrec import JaggedTensor, KeyedJaggedTensor
@@ -38,7 +38,14 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
+from tzrec.utils.test_util import (
+    TestGraphType,
+    create_test_model,
+    gpu_unavailable,
+)
+from tzrec.utils.test_util import (
+    hypothesis_settings as settings,
+)
 
 
 def _hstu_subconfig(channel_name: str, embedding_dim: int) -> module_pb2.HSTU:

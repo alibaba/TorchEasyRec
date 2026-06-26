@@ -14,7 +14,7 @@ import unittest
 from typing import List
 
 import torch
-from hypothesis import Verbosity, given, settings
+from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 from parameterized import parameterized
 
@@ -23,6 +23,9 @@ from tzrec.utils.test_util import (
     gpu_unavailable,
     mark_ci_scope,
     reference_stu_truncation,
+)
+from tzrec.utils.test_util import (
+    hypothesis_settings as settings,
 )
 
 
