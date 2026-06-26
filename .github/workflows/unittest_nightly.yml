@@ -28,5 +28,8 @@ jobs:
           CI_ALIKAFKA_BROKERS: ${{ secrets.CI_ALIKAFKA_BROKERS }}
           CI_REGION: ${{ secrets.CI_REGION }}
         run: |
+          mkdir -p /__w/TorchEasyRec/tzrec-ci-cache/triton /__w/TorchEasyRec/tzrec-ci-cache/inductor
           cd run_${{ github.run_id }}
+          TRITON_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/triton \
+          TORCHINDUCTOR_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/inductor \
           CUDA_HOME=/usr/local/cuda-12 bash scripts/ci/ci_test.sh
