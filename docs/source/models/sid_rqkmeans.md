@@ -28,7 +28,6 @@ train_config {
     num_epochs: 1
     save_checkpoints_steps: 0
     save_checkpoints_epochs: 0
-    log_step_count_steps: 100
 }
 
 feature_configs {
@@ -53,10 +52,9 @@ model_config {
 ```
 
 - train_config: 训练流程配置。RQKMeans 不做梯度训练, 因此优化器与 epoch 数仅为框架训练循环所需的形式配置
-  - sparse_optimizer / dense_optimizer: 必填 (训练循环要构建优化器), 但模型只有一个 dummy 参数、损失恒为 0, 因此其学习率不影响最终码本
-  - num_epochs: 设 `1` 即可; 每个 epoch 只把 embedding 流式写入蓄水池采样 (reservoir), 真正的 FAISS 拟合在训练结束 (`on_train_end`) 时一次性完成, 多跑 epoch 不会迭代/精炼码本
+  - sparse_optimizer / dense_optimizer: 必填 (训练循环要构建优化器), 但模型只有一个 dummy 参数、损失恒为 0, **因此其学习率不影响最终码本**
+  - num_epochs: **设 `1` 即可**; 每个 epoch 只把 embedding 流式写入蓄水池采样 (reservoir), 真正的 FAISS 拟合在训练结束 (`on_train_end`) 时一次性完成, 多跑 epoch 不会迭代/精炼码本
   - save_checkpoints_steps / save_checkpoints_epochs: **必须项，设 `0` 关闭周期性保存**; 拟合好的码本只随训练结束时的最终 checkpoint 持久化 (周期性保存可能会忽略checkpoint落盘, 故关闭)
-  - log_step_count_steps: 训练日志打印间隔 (步)
 - feature_configs / feature_groups: 同 RQVAE, 但只需主物品 embedding 一组 (`deep`); 其拼接后的总维度即 K-Means 的向量维度
 - sid_rqkmeans: RQKMeans 模型参数
   - codebook: 每层聚类中心数; **列表长度即残差层数 (= SID 的位数)**; 示例 `[256, 256, 256]` (生产常用 `[8192, 8192, 8192]`); 支持非均匀如 `[256, 512, 1024]` (每层独立拟合一个 faiss.Kmeans)

@@ -89,7 +89,7 @@ model_config {
 ```
 
 - feature_configs: 特征配置, 每个 embedding/标记列对应一个 `raw_feature`
-  - emb: 主物品 embedding, `expression` 指向 Parquet 列名 (`item:` 前缀仅为 FG 命名空间), `value_dim` 须等于 embedding 维度 (示例 512)
+  - emb: 主物品 embedding, `value_dim` 须等于 embedding 维度 (示例 512)
   - pair_emb: 配对 embedding, `value_dim` 须与主 embedding 相同
   - is_pair: 0/1 配对标记, `value_dim: 1`
 - feature_groups: 特征组, 每组喂给模型的 `EmbeddingGroup`; **group_name 需与下方 sid_rqvae 的引用对应**
