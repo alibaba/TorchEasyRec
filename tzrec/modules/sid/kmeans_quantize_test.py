@@ -16,7 +16,31 @@ import torch
 from tzrec.modules.sid.kmeans_quantize import (
     KMeansQuantizeLayer,
     ReservoirSampler,
+    faiss_kmeans_fit,
 )
+
+
+class FaissKmeansFitTest(unittest.TestCase):
+    """Tests for the shared one-layer FAISS fit primitive."""
+
+    def _require_faiss(self) -> None:
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+
+    def test_fit_returns_trained_kmeans(self) -> None:
+        self._require_faiss()
+        torch.manual_seed(0)
+        # numpy input (the RQ-VAE call path; no faiss torch-utils needed).
+        x = torch.randn(200, 6).numpy()
+        km = faiss_kmeans_fit(x, 6, 8, {"niter": 5, "seed": 1, "verbose": False})
+        self.assertEqual(tuple(km.centroids.shape), (8, 6))
+
+    def test_raises_on_too_few_points(self) -> None:
+        self._require_faiss()
+        with self.assertRaisesRegex(RuntimeError, "need >= 8 points"):
+            faiss_kmeans_fit(torch.randn(4, 6).numpy(), 6, 8)
 
 
 class KMeansQuantizeLayerTest(unittest.TestCase):
@@ -127,9 +151,13 @@ class ReservoirSamplerTest(unittest.TestCase):
         )
         # All indices are valid stream positions.
         self.assertTrue((idx >= 0).all() and (idx < total).all())
-        # Phase-2 replacement happened: at least one slot holds a row added
-        # after the reservoir filled (index >= cap).
-        self.assertTrue((idx >= cap).any(), "no Phase-2 replacement occurred")
+        # Phase-2 replacement dominates the final sample: with a correct accept
+        # probability the expected post-fill survivor count is
+        # cap*(total-cap)/total ~= cap, so require well over half. A near-empty
+        # phase-2 count means the accept rate is broken (``.any()`` would only
+        # catch replacement being disabled outright).
+        n_phase2 = (idx >= cap).sum().item()
+        self.assertGreater(n_phase2, cap // 2, f"too few Phase-2 rows: {n_phase2}")
 
     def test_reset(self) -> None:
         """reset() drops the buffer and counters."""

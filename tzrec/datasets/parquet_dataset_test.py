@@ -29,6 +29,7 @@ from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils import misc_util
 from tzrec.utils.checkpoint_util import EPOCHS_COMPLETED, update_dataloder_state
+from tzrec.utils.test_util import make_test_dir
 
 
 class ParquetDatasetTest(unittest.TestCase):
@@ -370,9 +371,7 @@ class ParquetDatasetTest(unittest.TestCase):
 
 class ParquetReaderTest(unittest.TestCase):
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
@@ -435,9 +434,7 @@ class ParquetReaderTest(unittest.TestCase):
 
 class ParquetWriterTest(unittest.TestCase):
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):

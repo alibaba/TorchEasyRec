@@ -54,7 +54,7 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_no_zch_features,
 )
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 _SHARDED_TABLE_NAME = "table_1"
 _SHARDED_FEATURE_NAME = "feature_1"
@@ -752,6 +752,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    @mark_ci_scope("gpu")
     def test_lookup_dynamic_embeddings_filters_missing_ids(self):
         from dynamicemb.types import CopyMode
 
@@ -780,6 +781,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    @mark_ci_scope("gpu")
     def test_lookup_dynamic_embeddings_flushes_module_once_per_dump(self):
         torch.cuda.set_device(0)
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -811,6 +813,7 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
         self.world_size = 2
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
+    @mark_ci_scope("gpu")
     def test_row_wise_sharded_dump_writes_global_key_ids(self):
         with (
             tempfile.TemporaryDirectory() as tmp_dir,
@@ -851,10 +854,7 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
 
     def setUp(self):
         self.success = False
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_delta_dyn_", dir="./tmp")
-        os.chmod(self.test_dir, 0o755)
+        self.test_dir = make_test_dir(prefix="tzrec_delta_dyn_")
 
     def tearDown(self):
         if self.success and os.path.exists(self.test_dir):
@@ -864,6 +864,7 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
         gpu_unavailable[0] or not has_dynamicemb,
         "dynamicemb or GPU not available.",
     )
+    @mark_ci_scope("gpu")
     def test_dynamicemb_multi_gpu_delta_dump_writes_uniform_shards(self):
         world_size = int(os.getenv("TEST_NPROC_PER_NODE", "2"))
         pipeline_config = config_util.load_pipeline_config(
