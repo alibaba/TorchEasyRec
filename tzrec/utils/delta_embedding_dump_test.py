@@ -752,6 +752,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    @mark_ci_scope("gpu")
     def test_lookup_dynamic_embeddings_filters_missing_ids(self):
         from dynamicemb.types import CopyMode
 
@@ -780,6 +781,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    @mark_ci_scope("gpu")
     def test_lookup_dynamic_embeddings_flushes_module_once_per_dump(self):
         torch.cuda.set_device(0)
         dumper = object.__new__(DeltaEmbeddingDumper)

@@ -310,6 +310,7 @@ class DeriveScoresTests(unittest.TestCase):
 
 
 @unittest.skipUnless(has_dynamicemb, "dynamicemb not available")
+@mark_ci_scope("gpu")
 class ShardWriteTests(unittest.TestCase):
     """Parameterized tests for ``_gather_and_shard_writes`` output files."""
 
