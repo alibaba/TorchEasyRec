@@ -367,6 +367,7 @@ def _build_batch(
 @mark_ci_scope("gpu")
 class DlrmHSTUTest(unittest.TestCase):
     def setUp(self):
+        os.makedirs("./tmp", exist_ok=True)
         self.test_dir = None
 
     def tearDown(self):

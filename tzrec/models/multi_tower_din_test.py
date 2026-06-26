@@ -43,6 +43,7 @@ from tzrec.utils.test_util import (
 @mark_ci_scope("gpu")
 class MultiTowerDINTest(unittest.TestCase):
     def setUp(self):
+        os.makedirs("./tmp", exist_ok=True)
         self.test_dir = None
 
     def tearDown(self):

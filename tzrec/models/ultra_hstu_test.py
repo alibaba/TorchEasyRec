@@ -329,6 +329,7 @@ def _build_batch(device: torch.device, channel_names: List[str]) -> Batch:
 @mark_ci_scope("gpu")
 class UltraHSTUTest(unittest.TestCase):
     def setUp(self):
+        os.makedirs("./tmp", exist_ok=True)
         self.test_dir = None
 
     def tearDown(self):

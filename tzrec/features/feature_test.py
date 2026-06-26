@@ -34,6 +34,7 @@ from tzrec.protos import feature_pb2
 
 class FeatureTest(unittest.TestCase):
     def setUp(self):
+        os.makedirs("./tmp", exist_ok=True)
         self.test_dir = None
 
     def tearDown(self):
