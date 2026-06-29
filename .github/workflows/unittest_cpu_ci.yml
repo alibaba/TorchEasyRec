@@ -32,4 +32,4 @@ jobs:
           CI_REGION: ${{ secrets.CI_REGION }}
         run: |
           cd run_${{ github.run_id }}
-          CI_HYPOTHESIS=true bash scripts/ci/ci_test_cpu.sh
+          bash scripts/ci/ci_test_cpu.sh

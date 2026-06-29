@@ -9,6 +9,36 @@ message LossConfig {
         JRCLoss jrc_loss = 4;
         BinaryFocalLoss binary_focal_loss = 5;
     }
+    // Losses for semantic-ID (SID) generation models (SidRqvae). A SID model
+    // lists one LossConfig per term it trains on (a reconstruction loss, the
+    // commitment loss, and optionally the pair contrastive loss).
+    oneof sid_loss {
+        SidReconLoss recon_loss = 6;
+        SidCommitmentLoss commitment_loss = 7;
+        SidContrastiveLoss contrastive_loss = 8;
+    }
+}
+
+// RQ-VAE reconstruction loss (input vs. decoder output).
+message SidReconLoss {
+    // Distance for the reconstruction term: "l2" (mse), "l1" or "cos".
+    optional string recon_type = 1 [default = "l2"];
+}
+
+// RQ-VAE commitment loss between the encoder output and the per-layer
+// cumulative quantized vectors.
+message SidCommitmentLoss {
+    // Commitment loss weights [w1, w2] (encoder-toward-quant, quant-toward-
+    // encoder). Defaults to [1.0, 0.5] when unset.
+    repeated float latent_weight = 1;
+    // Distance used for the commitment term: "l2", "l1" or "cos".
+    optional string commitment_type = 2 [default = "l2"];
+}
+
+// Enables the pair contrastive (masked InfoNCE) objective for a SID model. The
+// paired-feature wiring lives on the model (SidRqvae.contrastive_config); this
+// just turns the objective on (any loss hyperparameters would go here).
+message SidContrastiveLoss {
 }
 
 message BinaryCrossEntropy {

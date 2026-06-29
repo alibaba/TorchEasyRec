@@ -12,7 +12,6 @@
 import os
 import random
 import shutil
-import tempfile
 import unittest
 
 import pyarrow as pa
@@ -20,16 +19,13 @@ import pyarrow.dataset as ds
 
 from tzrec.tests import utils
 from tzrec.utils import config_util, dynamicemb_util, misc_util
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 
 class CreateDynamicEmbInitCkptTest(unittest.TestCase):
     def setUp(self):
         self.success = False
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
-        os.chmod(self.test_dir, 0o755)
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if self.success:
@@ -40,6 +36,7 @@ class CreateDynamicEmbInitCkptTest(unittest.TestCase):
         gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
         "dynamicemb not available.",
     )
+    @mark_ci_scope("gpu")
     def test_create_dynamicemb_init_ckpt(self):
         pipeline_config = config_util.load_pipeline_config(
             "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config"

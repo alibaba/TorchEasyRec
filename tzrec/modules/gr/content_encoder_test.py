@@ -22,7 +22,7 @@ from tzrec.modules.gr.content_encoder import (
 from tzrec.utils.test_util import TestGraphType, gpu_unavailable, mark_ci_scope
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class ContentEncoderTest(unittest.TestCase):
     @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
     @unittest.skipIf(*gpu_unavailable)

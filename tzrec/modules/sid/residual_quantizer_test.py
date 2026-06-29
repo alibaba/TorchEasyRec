@@ -72,7 +72,7 @@ class _FakeQuantizer(ResidualQuantizer):
             ]
         )
 
-    def _quantize_layer(self, layer_idx, residual, temperature=1.0):
+    def _quantize_layer(self, layer_idx, residual):
         codes = (residual.detach() @ self.books[layer_idx].t()).argmax(dim=-1)
         return codes, self.books[layer_idx][codes]
 

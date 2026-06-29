@@ -29,7 +29,7 @@ from tzrec.utils.test_util import (
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class HSTUComputeTest(unittest.TestCase):
     def teardown_example(self, example):
         gc.collect()
@@ -495,7 +495,7 @@ class HSTUComputeTest(unittest.TestCase):
             )
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class Hstu4WayRematParityTest(unittest.TestCase):
     """Forward + backward parity for ``hstu_compute_uqvk``'s 4 remat combos.
 

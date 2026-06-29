@@ -26,6 +26,7 @@ Welcome to TorchEasyRec's documentation!
    models/rank
    models/multi_target
    models/generative
+   models/sid_model
    models/user_define
    models/feature_group
    models/loss

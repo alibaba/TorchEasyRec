@@ -30,7 +30,7 @@ from tzrec.tests import utils
 from tzrec.tools.dynamicemb import zch_to_dynamicemb_convert as conv
 from tzrec.utils import checkpoint_util, misc_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.test_util import gpu_unavailable
+from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 _IINFO_MAX = torch.iinfo(torch.int64).max
 
@@ -310,6 +310,7 @@ class DeriveScoresTests(unittest.TestCase):
 
 
 @unittest.skipUnless(has_dynamicemb, "dynamicemb not available")
+@mark_ci_scope("gpu")
 class ShardWriteTests(unittest.TestCase):
     """Parameterized tests for ``_gather_and_shard_writes`` output files."""
 
@@ -572,10 +573,7 @@ class ConvertE2ETests(unittest.TestCase):
 
     def setUp(self):
         self.success = False
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_zch_to_dyemb_", dir="./tmp")
-        os.chmod(self.test_dir, 0o755)
+        self.test_dir = make_test_dir(prefix="tzrec_zch_to_dyemb_")
 
     def tearDown(self):
         if self.success and os.path.exists(self.test_dir):
@@ -585,6 +583,7 @@ class ConvertE2ETests(unittest.TestCase):
         gpu_unavailable[0] or not has_dynamicemb,
         "dynamicemb not available.",
     )
+    @mark_ci_scope("gpu")
     def test_convert_e2e(self):
         # 1. Train a ZCH model briefly to produce a real source checkpoint.
         src_train_dir = os.path.join(self.test_dir, "src_train")

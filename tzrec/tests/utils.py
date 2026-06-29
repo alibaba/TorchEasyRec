@@ -476,6 +476,13 @@ class NestedMapInput(MockInput):
         return pa.array(data)
 
 
+def _learnable_label_value(label: npt.NDArray) -> pa.Array:
+    """Bimodal raw value (0 -> ~0.05, 1 -> ~0.95) that separably predicts ``label``."""
+    margin = np.where(label == 1, 0.95, 0.05).astype(np.float32)
+    noise = np.random.uniform(-0.03, 0.03, len(label)).astype(np.float32)
+    return pa.array(margin + noise)
+
+
 def create_mock_data(
     data_dir: str,
     inputs: Dict[str, MockInput],
@@ -485,8 +492,13 @@ def create_mock_data(
     unique_id: str = "",
     join_t: Optional[pa.Table] = None,
     fmt: str = "parquet",
+    learnable_label: Optional[str] = None,
 ) -> Tuple[str, pa.Table]:
-    """Create mock data for testing."""
+    """Create mock data for testing.
+
+    ``learnable_label`` overwrites that raw feature with a bimodal encoding of the
+    label so the model learns a confident signal; None (default) keeps random labels.
+    """
     input_data = {}
     for inp in inputs.values():
         if inp.name == unique_id:
@@ -498,6 +510,12 @@ def create_mock_data(
 
     for label_field in label_fields:
         input_data[label_field] = pa.array(np.random.randint(2, size=(num_rows,)))
+    if learnable_label:
+        assert label_fields and learnable_label in input_data, (
+            f"learnable_label '{learnable_label}' is not a column in the mock data"
+        )
+        label = input_data[label_fields[0]].to_numpy(zero_copy_only=False)
+        input_data[learnable_label] = _learnable_label_value(label)
 
     t = pa.Table.from_arrays(list(input_data.values()), names=list(input_data.keys()))
     max_rows_per_file = int(math.ceil(num_rows / num_parts))
@@ -521,8 +539,13 @@ def create_mock_join_data(
     num_parts: int = 2,
     id_fields: Optional[List[str]] = None,
     fmt: str = "parquet",
+    learnable_label: Optional[str] = None,
 ) -> str:
-    """Create mock data for testing."""
+    """Create mock data for testing.
+
+    Like ``create_mock_data``, ``learnable_label`` encodes the label into that
+    feature; done after the join since the feature lives in the side tables.
+    """
     input_data = {}
     for inp in inputs.values():
         has_null = id_fields is None or inp.name not in id_fields
@@ -534,6 +557,17 @@ def create_mock_join_data(
     t = pa.Table.from_arrays(list(input_data.values()), names=list(input_data.keys()))
     for join_key, join_t in join_tables.items():
         t = t.join(join_t, keys=join_key)
+
+    if learnable_label:
+        assert label_fields and learnable_label in t.column_names, (
+            f"learnable_label '{learnable_label}' is not a column in the mock data"
+        )
+        label = t.column(label_fields[0]).to_numpy(zero_copy_only=False)
+        t = t.set_column(
+            t.column_names.index(learnable_label),
+            learnable_label,
+            _learnable_label_value(label),
+        )
 
     max_rows_per_file = int(math.ceil(num_rows / num_parts))
     ds.write_dataset(
@@ -812,10 +846,14 @@ def load_config_for_test(
     item_id: str = "",
     cate_id: str = "",
     num_rows: Optional[int] = None,
+    learnable_label: Optional[str] = None,
+    num_epochs: Optional[int] = None,
 ) -> EasyRecConfig:
     """Modify pipeline config for integration tests."""
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     pipeline_config.model_dir = os.path.join(test_dir, "train")
+    if num_epochs is not None:
+        pipeline_config.train_config.num_epochs = num_epochs
     if len(pipeline_config.train_input_path) > 0:
         # use prepared data
         return pipeline_config
@@ -838,6 +876,7 @@ def load_config_for_test(
             list(data_config.label_fields),
             num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
+            learnable_label=learnable_label,
         )
         pipeline_config.eval_input_path, _ = create_mock_data(
             os.path.join(test_dir, "eval_data"),
@@ -845,6 +884,7 @@ def load_config_for_test(
             list(data_config.label_fields),
             num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
+            learnable_label=learnable_label,
         )
     else:
         user_inputs, item_inputs = build_mock_input_with_fg(features, user_id, item_id)
@@ -873,6 +913,7 @@ def load_config_for_test(
             num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
             id_fields=[user_id, item_id],
+            learnable_label=learnable_label,
         )
         pipeline_config.eval_input_path = create_mock_join_data(
             os.path.join(test_dir, "eval_data"),
@@ -882,6 +923,7 @@ def load_config_for_test(
             num_rows=num_rows or data_config.batch_size * num_parts * 4,
             num_parts=num_parts,
             id_fields=[user_id, item_id],
+            learnable_label=learnable_label,
         )
 
     sampler_type = None
@@ -993,6 +1035,8 @@ def test_train_eval(
     cate_id: str = "",
     env_str: str = "",
     num_rows: Optional[int] = None,
+    learnable_label: Optional[str] = None,
+    num_epochs: Optional[int] = None,
 ) -> bool:
     """Run train_eval integration test."""
     pipeline_config = load_config_for_test(
@@ -1002,6 +1046,8 @@ def test_train_eval(
         item_id,
         cate_id,
         num_rows=num_rows,
+        learnable_label=learnable_label,
+        num_epochs=num_epochs,
     )
 
     test_config_path = os.path.join(test_dir, "pipeline.config")

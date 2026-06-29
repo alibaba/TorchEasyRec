@@ -100,6 +100,13 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 | [ULTRA-HSTU](docs/source/models/ultra_hstu.md) | HSTU with Semi-Local Attention, Attention Truncation, and Mixture of Transducers |
 | [HSTU-Match](docs/source/models/hstu_match.md) | HSTU-based two-tower retrieval model                                             |
 
+### Semantic ID (SID) Generation
+
+| Model                                              | Description                                                               |
+| -------------------------------------------------- | ------------------------------------------------------------------------- |
+| [SID RQVAE](docs/source/models/sid_rqvae.md)       | RQ-VAE residual-quantized semantic-ID generation for generative retrieval |
+| [SID RQKMeans](docs/source/models/sid_rqkmeans.md) | FAISS residual K-Means semantic-ID generation                             |
+
 ## Documentation
 
 Get started with TorchEasyRec in minutes:

@@ -39,7 +39,7 @@ class QuantizeLayer(nn.Module):
         self.embed_dim = embed_dim
 
     @abstractmethod
-    def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
+    def quantize(self, x: torch.Tensor) -> QuantizeOutput:
         """Assign ``x`` (B, D) to the codebook, returning codes + embeddings."""
         raise NotImplementedError
 

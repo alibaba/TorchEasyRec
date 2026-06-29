@@ -17,13 +17,12 @@ over the full embedding matrix; ``forward`` is read-only (predict + lookup).
 
 from typing import Dict, List, Optional, Tuple, Union
 
-import faiss
 import faiss.contrib.torch_utils  # noqa: F401  (registers torch tensor I/O)
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid.kmeans_quantize import KMeansQuantizeLayer
+from tzrec.modules.sid.kmeans_quantize import KMeansQuantizeLayer, faiss_kmeans_fit
 from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
 from tzrec.utils.logging_util import logger
 
@@ -83,7 +82,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         self,
         layer_idx: int,
         residual: torch.Tensor,
-        temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Nearest-centroid assignment for one layer (delegates to the layer).
 
@@ -93,13 +91,12 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         Args:
             layer_idx (int): quantization layer index.
             residual (Tensor): current residual, shape (B, D).
-            temperature (float): unused (no soft assignment).
 
         Returns:
             codes (Tensor): cluster indices, shape (B,).
             quantized (Tensor): selected centroids, shape (B, D).
         """
-        out = self.layers[layer_idx].quantize(residual, temperature)
+        out = self.layers[layer_idx].quantize(residual)
         return out.ids, out.embeddings
 
     def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -202,10 +199,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         # breaks that invariant, so clone then.
         x0 = x.clone() if (verbose and self.normalize_residuals) else None
 
-        # CPU-only fit (SidRqkmeans refuses CUDA). Drop any stale ``gpu`` kwarg
-        # so a faiss-gpu build can't target an absent GPU.
-        kwargs = dict(self.faiss_kmeans_kwargs)
-        kwargs.pop("gpu", None)
         if verbose:
             logger.info(
                 "[ResidualKMeansQuantizer] fitting %d-layer codebook on CPU "
@@ -224,15 +217,17 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
 
             # Fresh Kmeans per layer so each can use its own K (non-uniform
             # codebooks).
-            kmeans = faiss.Kmeans(
-                self.embed_dim, self.n_embed_list[layer_idx], **kwargs
+            km = faiss_kmeans_fit(
+                x,
+                self.embed_dim,
+                self.n_embed_list[layer_idx],
+                self.faiss_kmeans_kwargs,
             )
-            kmeans.train(x)
-            centroids = torch.as_tensor(kmeans.centroids, dtype=torch.float32)
+            centroids = torch.as_tensor(km.centroids, dtype=torch.float32)
 
             for start in range(0, N, SEARCH_CHUNK):
                 end = min(start + SEARCH_CHUNK, N)
-                _, idx = kmeans.index.search(x[start:end], 1)
+                _, idx = km.index.search(x[start:end], 1)
                 idx = torch.as_tensor(idx).reshape(-1).long()
                 q = centroids[idx]  # (chunk, D)
                 out[start:end] += q

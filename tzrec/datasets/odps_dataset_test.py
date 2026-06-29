@@ -14,14 +14,19 @@ import multiprocessing as mp
 import os
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pyarrow as pa
+import requests
 from odps import ODPS
+from odps.errors import ODPSError
 from parameterized import parameterized
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 
+from tzrec.datasets import odps_dataset
 from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_account
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
@@ -687,6 +692,108 @@ class OdpsWriterTest(unittest.TestCase):
             partition = None
         with t.open_reader(partition=partition) as reader:
             self.assertEqual(reader.count, 1280)
+
+
+class _FailingStorageClient:
+    """Stub storage-api client whose calls raise a connection-reset error."""
+
+    table = SimpleNamespace(full_table_name="test_project.test_table")
+    _quota_name = "test_quota"
+    _rest_endpoint = "http://service.odps.test"
+
+    def _raise(self):
+        raise requests.exceptions.ConnectionError(
+            "Connection aborted.",
+            ConnectionResetError(104, "Connection reset by peer"),
+        )
+
+    def read_rows_arrow(self, read_req):
+        self._raise()
+
+    def get_read_session(self, sess_req):
+        self._raise()
+
+
+class _RetryingStorageClient:
+    """Stub whose read_rows_arrow raises ODPSError `fail_times` times, then succeeds."""
+
+    table = SimpleNamespace(full_table_name="test_project.test_table")
+    _quota_name = "test_quota"
+    _rest_endpoint = "http://service.odps.test"
+
+    def __init__(self, fail_times):
+        self._fail_times = fail_times
+        self.calls = 0
+        self.sentinel = object()
+
+    def read_rows_arrow(self, read_req):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise ODPSError("synthetic ODPS error", request_id="REQ-XYZ")
+        return self.sentinel
+
+
+class OdpsStorageErrorLogTest(unittest.TestCase):
+    def test_read_rows_arrow_logs_session_and_reraises(self):
+        client = _FailingStorageClient()
+        read_req = SimpleNamespace(
+            session_id="sess-read-123",
+            row_index=0,
+            row_count=10,
+            max_batch_rows=100,
+        )
+        with mock.patch.object(odps_dataset, "logger") as m_logger:
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                odps_dataset._read_rows_arrow_with_retry(client, read_req)
+        m_logger.error.assert_called_once()
+        logged = m_logger.error.call_args[0][0]
+        self.assertIn("sess-read-123", logged)
+        self.assertIn("test_project.test_table", logged)
+
+    def test_get_read_session_logs_session_and_reraises(self):
+        client = _FailingStorageClient()
+        sess_req = SimpleNamespace(session_id="sess-scan-456")
+        with mock.patch.object(odps_dataset, "logger") as m_logger:
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                odps_dataset._get_session_record_count(client, sess_req)
+        m_logger.error.assert_called_once()
+        logged = m_logger.error.call_args[0][0]
+        self.assertIn("sess-scan-456", logged)
+
+    def test_read_rows_arrow_retries_odps_error_then_succeeds(self):
+        client = _RetryingStorageClient(fail_times=2)
+        read_req = SimpleNamespace(
+            session_id="sess-retry-1",
+            row_index=0,
+            row_count=10,
+            max_batch_rows=100,
+        )
+        with mock.patch.object(odps_dataset.time, "sleep"):
+            with mock.patch.object(odps_dataset, "logger") as m_logger:
+                reader = odps_dataset._read_rows_arrow_with_retry(client, read_req)
+        self.assertIs(reader, client.sentinel)
+        self.assertEqual(client.calls, 3)  # 2 failures + 1 success
+        self.assertEqual(m_logger.warning.call_count, 2)
+        m_logger.error.assert_not_called()
+
+    def test_read_rows_arrow_odps_error_exhausts_retries_and_raises(self):
+        client = _RetryingStorageClient(fail_times=99)
+        read_req = SimpleNamespace(
+            session_id="sess-retry-2",
+            row_index=5,
+            row_count=10,
+            max_batch_rows=100,
+        )
+        with mock.patch.object(odps_dataset.time, "sleep"):
+            with mock.patch.object(odps_dataset, "logger") as m_logger:
+                with self.assertRaises(ODPSError):
+                    odps_dataset._read_rows_arrow_with_retry(client, read_req)
+        self.assertEqual(client.calls, 4)  # initial + 3 retries
+        self.assertEqual(m_logger.warning.call_count, 3)
+        m_logger.error.assert_called_once()
+        logged = m_logger.error.call_args[0][0]
+        self.assertIn("after 3 retries", logged)
+        self.assertIn("sess-retry-2", logged)
 
 
 if __name__ == "__main__":

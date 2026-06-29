@@ -29,6 +29,18 @@ message GradClipping {
     optional bool enable_global_grad_clip = 4 [default = false];
 }
 
+message DeltaEmbeddingDumpConfig {
+    // MC/ZCH features are not supported; use dynamicemb for delta dump.
+    // dump touched ids and their latest embedding every N training steps. Larger
+    // intervals retain a longer id window in memory; auto compaction reduces
+    // per-batch tensor buildup but unique ids still scale with the interval.
+    optional uint32 dump_interval_steps = 1 [default = 1000];
+    // output directory. default is ${model_dir}/delta_embedding_dump
+    optional string output_dir = 2;
+    // parquet file prefix
+    optional string file_prefix = 3 [default = "delta_embedding"];
+}
+
 message TrainConfig {
     // embedding part optimizer
     required SparseOptimizer sparse_optimizer = 1;
@@ -81,5 +93,9 @@ message TrainConfig {
     // fraction of workers (0,1] that must pass a boundary/target before a
     // timestamp checkpoint fires; default 0.5 (1.0 = all). outlier-robust.
     optional float save_checkpoints_timestamp_quorum = 23 [default = 0.5];
+    // Configuring this field dumps changed sparse embedding rows during CUDA
+    // training. Multi-GPU training writes one parquet shard per rank;
+    // column-wise embedding sharding is not supported.
+    optional DeltaEmbeddingDumpConfig delta_embedding_dump_config = 24;
     // TBD: qcomm config
 }

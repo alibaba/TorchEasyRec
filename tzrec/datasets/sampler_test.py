@@ -15,6 +15,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
+import traceback
 import unittest
 
 import numpy as np
@@ -205,6 +206,54 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual(len(res["int_a"]), 8)
         self.assertEqual(len(res["float_b"]), 8)
         self.assertEqual(len(res["str_c"]), 8)
+
+    def test_server_liveness_watchdog_aborts_on_server_death(self):
+        f = self._create_item_gl_data("int64")
+
+        def _watchdog_worker(res):
+            try:
+                from tzrec.datasets import sampler as sampler_mod
+
+                # poll fast so the watchdog reacts within the test window.
+                sampler_mod._SERVER_LIVENESS_CHECK_INTERVAL_S = 0.3
+                config = sampler_pb2.NegativeSampler(
+                    input_path=f.name,
+                    num_sample=8,
+                    attr_fields=["int_a", "float_b", "str_c"],
+                    item_id_field="item_id",
+                )
+                sampler = NegativeSampler(
+                    config=config,
+                    fields=[
+                        pa.field(name="int_a", type=pa.int64()),
+                        pa.field(name="float_b", type=pa.float64()),
+                        pa.field(name="str_c", type=pa.string()),
+                    ],
+                    batch_size=4,
+                )
+                sampler.init_cluster()
+                sampler.launch_server()
+                res["captured"] = sampler._server_proc is not None
+                if sampler._server_proc is None:
+                    os._exit(2)
+                time.sleep(1.0)
+                # simulate an abnormal death (e.g. OOM kill) of the server.
+                if sampler._server_proc.is_alive():
+                    sampler._server_proc.kill()
+                # the watchdog should os._exit(1) before this returns.
+                time.sleep(5.0)
+            except BaseException:
+                traceback.print_exc()
+                os._exit(2)
+            os._exit(0)
+
+        res = mp.Manager().dict()
+        p = mp.Process(target=_watchdog_worker, args=(res,))
+        p.start()
+        p.join(timeout=60)
+        self.assertTrue(res.get("captured"))
+        # exit 1 == watchdog fired; 0 == it missed the death; 2 == setup error.
+        self.assertEqual(p.exitcode, 1)
 
     def test_negative_sampler_with_null(self):
         f = self._create_item_gl_data_with_null()

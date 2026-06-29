@@ -31,7 +31,7 @@ class _StubQuantizeLayer(QuantizeLayer):
             n_embed, embed_dim
         )
 
-    def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
+    def quantize(self, x: torch.Tensor) -> QuantizeOutput:
         dist = torch.cdist(x, self._codebook)
         ids = dist.argmin(dim=-1)
         return QuantizeOutput(embeddings=self.lookup(ids), ids=ids)

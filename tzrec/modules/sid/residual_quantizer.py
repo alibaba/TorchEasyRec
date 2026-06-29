@@ -98,17 +98,15 @@ class ResidualQuantizer(nn.Module):
         self,
         layer_idx: int,
         residual: torch.Tensor,
-        temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Assign one layer's codes and look up its quantized vector.
 
         Backend primitive behind the residual walk (encode-direction mirror of
-        :meth:`_lookup_code`). ``temperature`` is used only by the VQ backend.
+        :meth:`_lookup_code`).
 
         Args:
             layer_idx (int): quantization layer index.
             residual (Tensor): current residual, shape (B, D).
-            temperature (float): Gumbel-Softmax temperature (VQ only).
 
         Returns:
             codes (Tensor): per-layer cluster ids, shape (B,).
@@ -119,7 +117,6 @@ class ResidualQuantizer(nn.Module):
     def _residual_pass(
         self,
         input: torch.Tensor,
-        temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """Shared residual walk: per-layer assign, subtract, accumulate.
 
@@ -129,7 +126,6 @@ class ResidualQuantizer(nn.Module):
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
-            temperature (float): forwarded to :meth:`_quantize_layer`.
 
         Returns:
             cluster_ids (Tensor): stacked codes, shape (B, n_layers).
@@ -144,7 +140,7 @@ class ResidualQuantizer(nn.Module):
         for i in range(self.n_layers):
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
-            codes, quantized = self._quantize_layer(i, residual, temperature)
+            codes, quantized = self._quantize_layer(i, residual)
             all_codes.append(codes)
             aggregated = aggregated + quantized
             cumulative.append(aggregated)
