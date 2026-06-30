@@ -20,11 +20,18 @@ import warnings
 from unittest.runner import TextTestRunner
 from unittest.signals import registerResult
 
+# Tests that must run in a fresh subprocess: they mutate process-global/fork
+# state that doesn't reset in-process -- launching the graphlearn server in the
+# MAIN process (the liveness watchdog os._exit's the whole process on server
+# death), distributed RANK/WORLD_SIZE env + init_process_group, USE_HASH_NODE_ID
+# + clustering forks, or the protobuf-impl env read at import.
+# sampler_test is NOT here: it launches the server only inside forked worker
+# children, so the watchdog runs in the child and the graphlearn duplicate-launch
+# guard never applies (and that guard is gone now that tzrec owns the launch).
 SUBPROC_TEST_PATTERN = [
     ".dataset_test.",
     ".odps_dataset_test.",
     ".parquet_dataset_test.",
-    ".sampler_test.",
     ".tdm.gen_tree.",
     ".convert_easyrec_config_to_tzrec_config_test.",
 ]
