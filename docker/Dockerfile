@@ -112,11 +112,13 @@ RUN case ${DEVICE} in \
     esac
 RUN case ${DEVICE} in \
         "cu126"|"cu129"|"cu130") cd /tmp/ && \
-                 wget http://pythonrun.oss-cn-zhangjiakou.aliyuncs.com/rdma/nic-libs-mellanox-rdma-5.2-2/nic-lib-rdma-core-installer-ubuntu.tar.gz && \
-                 tar xzvf nic-lib-rdma-core-installer-ubuntu.tar.gz && \
-                 cd nic-lib-rdma-core-installer-ubuntu && \
+                 wget https://hpn-driver.oss-cn-hangzhou.aliyuncs.com/nic-drivers/shuyao/drivers/ubuntu22.04-rdma-core-23.10.tar && \
+                 tar xf ubuntu22.04-rdma-core-23.10.tar && \
+                 cd ubuntu22.04-rdma-core-23.10 && \
+                 apt-get update && \
                  echo Y | /bin/bash install.sh && \
+                 apt-get clean && rm -rf /var/lib/apt/lists/* && \
                  cd .. && \
-                 rm -rf nic-lib-rdma-core-installer-ubuntu && \
-                 rm -f nic-lib-rdma-core-installer-ubuntu.tar.gz ;; \
+                 rm -rf ubuntu22.04-rdma-core-23.10 && \
+                 rm -f ubuntu22.04-rdma-core-23.10.tar ;; \
 esac
