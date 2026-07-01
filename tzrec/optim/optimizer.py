@@ -88,6 +88,8 @@ def apply_split_helper(
     dev_reshape: Optional[tuple[int, ...]] = None,
     uvm_tensors_log: Optional[list[str]] = None,
     uvm_host_mapped: bool = False,
+    make_persistent: bool = False,
+    preallocated_host_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     """Patch for state split helper of FBGEMM SplitTableBatchedEmbeddingBagsCodegen."""
     # Adagrad of tensorflow has param initial_accumulator_value with default value 0.1
@@ -142,39 +144,56 @@ def apply_split_helper(
     else:
         persistent_state_fn(f"{prefix}_dev", dev_buffer)
     if split.host_size > 0:
-        if dtype == torch.uint8:
-            persistent_state_fn(
-                f"{prefix}_host",
+        if preallocated_host_buffer is not None:
+            assert preallocated_host_buffer.numel() == split.host_size, (
+                f"preallocated_host_buffer size mismatch for '{prefix}_host': "
+                f"expected {split.host_size}, got {preallocated_host_buffer.numel()}"
+            )
+            assert preallocated_host_buffer.is_contiguous(), (
+                f"preallocated_host_buffer for '{prefix}_host' must be contiguous"
+            )
+            assert preallocated_host_buffer.dim() == 1, (
+                f"preallocated_host_buffer for '{prefix}_host' must be 1D, got "
+                f"{preallocated_host_buffer.dim()}D with shape "
+                f"{preallocated_host_buffer.shape}"
+            )
+            assert preallocated_host_buffer.dtype == dtype, (
+                f"preallocated_host_buffer dtype mismatch for '{prefix}_host': "
+                f"expected {dtype}, got {preallocated_host_buffer.dtype}"
+            )
+            assert preallocated_host_buffer.device == current_device, (
+                f"preallocated_host_buffer device mismatch for '{prefix}_host': "
+                f"expected {current_device}, got {preallocated_host_buffer.device}"
+            )
+            host_buffer = preallocated_host_buffer
+        else:
+            host_buffer = (
                 torch.zeros(
                     split.host_size,
                     device=current_device,
                     # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]` for
                     #  3rd param but got `Type[Type[torch._dtype]]`.
                     dtype=dtype,
-                ),
+                )
+                if not use_init_value
+                else torch.full(
+                    (split.host_size,),
+                    init_value,
+                    device=current_device,
+                    # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]` for
+                    #  3rd param but got `Type[Type[torch._dtype]]`.
+                    dtype=dtype,
+                )
             )
+        if dtype == torch.uint8:
+            persistent_state_fn(f"{prefix}_host", host_buffer)
+        # For fused TBE on MTIA, always set tensor in persistent states and not
+        # nn.Parameter. This only applies to Split TBE and not QR TBE.
+        elif make_persistent:
+            assert not make_dev_param, "MTIA does not support OptimizerType.NONE."
+            persistent_state_fn(f"{prefix}_host", host_buffer)
         else:
-            set_attr_fn(
-                f"{prefix}_host",
-                nn.Parameter(
-                    torch.zeros(
-                        split.host_size,
-                        device=current_device,
-                        # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]`
-                        #  for 3rd param but got `Type[Type[torch._dtype]]`.
-                        dtype=dtype,
-                    )
-                    if not use_init_value
-                    else torch.full(
-                        (split.host_size,),
-                        init_value,
-                        device=current_device,
-                        # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]`
-                        #  for 3rd param but got `Type[Type[torch._dtype]]`.
-                        dtype=dtype,
-                    )
-                ),
-            )
+            set_attr_fn(f"{prefix}_host", nn.Parameter(host_buffer))
         if uvm_tensors_log is not None:
             uvm_tensors_log.append(f"{prefix}_host")
     else:
