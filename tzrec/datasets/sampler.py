@@ -405,7 +405,7 @@ class BaseSampler(metaclass=_meta_cls):
                 feature = nodes.float_attrs[:, :, float_idx]
                 float_idx += 1
             elif attr_gl_type == "string":
-                feature = nodes.string_attrs[:, :, string_idx].astype(np.string_)
+                feature = nodes.string_attrs[:, :, string_idx].astype(np.bytes_)
                 feature = np.char.decode(feature, "utf-8")
                 string_idx += 1
             else:
@@ -445,7 +445,7 @@ class BaseSampler(metaclass=_meta_cls):
                 feature = nodes.float_attrs[:, float_idx]
                 float_idx += 1
             elif attr_gl_type == "string":
-                feature = nodes.string_attrs[:, string_idx].astype(np.string_)
+                feature = nodes.string_attrs[:, string_idx].astype(np.bytes_)
                 feature = np.char.decode(feature, "utf-8")
                 string_idx += 1
             else:
