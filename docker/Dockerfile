@@ -65,7 +65,6 @@ RUN case ${DEVICE} in \
                  pip install torchmetrics==1.0.3 tensordict && \
                  pip install torch_tensorrt==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cu130/ && \
                  rm -f /opt/conda/lib/python${PYTHON_VERSION}/site-packages/tensorrt_libs/libnvinfer_builder_resource_win_*.so.* && \
-                 sed -i -E '/^Requires-Dist: executorch/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch_tensorrt-2.12.1+cu130.dist-info/METADATA && \
                  pip install torchrec==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
         * )      pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cpu/ && \
