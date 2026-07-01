@@ -91,17 +91,7 @@ def apply_split_helper(
     make_persistent: bool = False,
     preallocated_host_buffer: Optional[torch.Tensor] = None,
 ) -> None:
-    """Patch for state split helper of FBGEMM SplitTableBatchedEmbeddingBagsCodegen.
-
-    Kept in sync with fbgemm_gpu 1.7.0's ``apply_split_helper`` signature and its
-    ``preallocated_host_buffer`` / ``make_persistent`` host-buffer logic (fbgemm
-    1.7.0's internal TBE caller passes both kwargs, so the patched override must
-    accept them). The only tzrec-specific behavior is
-    ``FBGEMM_MOMENTUM1_STATE_INIT_VALUE``: TensorFlow's Adagrad seeds its
-    accumulator to ``initial_accumulator_value`` (default 0.1), so when that env
-    var is set we initialize the ``momentum1`` optimizer-state buffers to it
-    instead of zeros.
-    """
+    """Patch for state split helper of FBGEMM SplitTableBatchedEmbeddingBagsCodegen."""
     # Adagrad of tensorflow has param initial_accumulator_value with default value 0.1
     momentum1_init_value_str = os.environ.get("FBGEMM_MOMENTUM1_STATE_INIT_VALUE", None)
     init_value = 0.0

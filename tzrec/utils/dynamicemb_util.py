@@ -152,9 +152,8 @@ try:
     )
     from dynamicemb.shard.embedding import DynamicEmbeddingCollectionContext
 
-    # torchrec 1.7.0 dropped EmbeddingCollectionContext's None -> [] coercion of its
-    # list-fields; dynamicemb still forwards them as None, crashing the sharded EC
-    # forward with "NoneType is not iterable". Restore the coercion here.
+    # torchrec 1.7.0 no longer coerces EmbeddingCollectionContext's None list-fields
+    # to []; dynamicemb still passes None (breaks sharded EC forward), so re-coerce.
     _orig_demb_ctx_init = DynamicEmbeddingCollectionContext.__init__
 
     def _demb_ctx_init_coerce_none(

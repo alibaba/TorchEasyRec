@@ -54,7 +54,6 @@ CPU版本 镜像地址:
   Hopper (H100) 等 CC 6.0–9.0 的卡，不支持 Blackwell。
 - **CUDA 13.0（含 TensorRT）** 镜像：在 CUDA 12.9 软件栈基础上改用 CUDA 13.0
   工具链，并预装 torch-tensorrt 2.12 / TensorRT 10.16，用于 TRT 导出与推理。
-  注意：dynamicemb / hstu 算子目前仅提供 cu129 版本，cu130 镜像暂不包含。
 
 ## 前置准备
 

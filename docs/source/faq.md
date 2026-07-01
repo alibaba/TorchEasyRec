@@ -298,15 +298,14 @@ File "/opt/conda/lib/python3.11/site-packages/triton/testing.py", line 150, in d
 torch.AcceleratorError: CUDA error: an illegal memory access was encountered
 ```
 
-**原因：** Triton在Hopper GPU（如H20）上存在WGMMA（Warp Group Matrix Multiply-Accumulate）代码生成Bug：RS WGMMA路径中缺少寄存器同步指令，导致`_hstu_attn_bwd`内核在autotuning阶段出现非法内存访问。upstream修复为 triton-lang/triton#9514（`[Hopper] Add dummy mov before RS WGMMA`），但该修复尚未进入 Triton 3.7.x 发布分支（仅在 main 分支），因此 1.3.0 镜像内置的 Triton 3.7.1 仍受影响。
+**原因：** Triton 3.7.1 自带的 ptxas 12.8.93 在 Hopper（如 H20，sm_90）上会误编译 HSTU 的 WGMMA kernel：`_hstu_attn_bwd` 内核在 autotuning 阶段的共享内存访问越界（约 246 KiB，超出 H20 的 228 KiB 上限），触发非法内存访问（compute-sanitizer 下可见 `Invalid __shared__ read`）。该问题由 Triton `release/3.7` 分支的 commit `6c96454f2f` 将内置 ptxas 从 12.9.86 降级到 12.8.93 引入；换用 ptxas 12.9.86 即可修复（与 MMA v3 代码生成、triton-lang/triton#9514 均无关——经 H20 实测单独打入 #9514 仍报越界）。
 
-**解决方法：** 设置环境变量 `DISABLE_MMA_V3=1`，强制 HSTU kernel 走 MMA v2 路径绕开该 Bug（会损失 Hopper 上的 v3 性能）：
+**解决方法：** 1.3.0 镜像已内置修复——将官方 triton 3.7.1 wheel 中的 `backends/nvidia/bin/ptxas` 替换为 12.9.86 后重新打包，默认即生效，无需 `DISABLE_MMA_V3`，也不损失 Hopper v3 性能。如需在其它环境手动安装该修复版 wheel：
 
 ```bash
-export DISABLE_MMA_V3=1
+pip install --force-reinstall --no-deps \
+  https://tzrec.oss-accelerate.aliyuncs.com/third_party/triton/triton-3.7.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
 ```
-
-若需保留 Hopper v3 性能，可使用从含 #9514 补丁的 Triton 3.7.x 源构建的 Triton wheel 替换内置版本。
 
 ______________________________________________________________________
 
