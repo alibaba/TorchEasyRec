@@ -4,13 +4,13 @@ common_io @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/common_io-0.4.
 confluent-kafka
 fbgemm-gpu==1.7.0
 fsspec
-graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn-1.3.7-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
-graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn-1.3.7-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
-graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn-1.3.7-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
+graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn/graphlearn-1.3.8-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
+graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn/graphlearn-1.3.8-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
+graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn/graphlearn-1.3.8-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
 grpcio-tools<1.63.0
-numpy<2
+numpy
 packaging
-pandas<3
+pandas
 psutil
 pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-1.0.5-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
 pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-1.0.5-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
