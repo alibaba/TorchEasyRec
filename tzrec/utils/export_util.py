@@ -437,6 +437,66 @@ def _get_sparse_embedding_leaf_module_names(model: torch.nn.Module) -> List[str]
     return names
 
 
+def _resolve_keyed_tensor_source_module(
+    model: torch.nn.Module, node: Any
+) -> Optional[torch.nn.Module]:
+    """Resolve the module producing a KeyedTensor FX node."""
+    if getattr(node, "op", None) == "call_module":
+        return model.get_submodule(node.target)
+    if getattr(node, "op", None) == "call_function":
+        if node.target == operator.getitem:
+            return _resolve_keyed_tensor_source_module(model, node.args[0])
+        if node.target == KeyedTensor:
+            for attr_name in ("keys", "length_per_key", "values"):
+                attr_node = node.kwargs.get(attr_name)
+                source_module = _resolve_keyed_tensor_source_module(model, attr_node)
+                if source_module is not None:
+                    return source_module
+    if getattr(node, "op", None) == "call_method" and node.target in (
+        "keys",
+        "length_per_key",
+        "values",
+        "tile",
+    ):
+        return _resolve_keyed_tensor_source_module(model, node.args[0])
+    return None
+
+
+def _get_embedding_bag_configs(module: torch.nn.Module) -> Optional[List[Any]]:
+    """Get EmbeddingBag configs from EBC or MC_EBC modules by duck typing."""
+    if hasattr(module, "embedding_bag_configs"):
+        return list(module.embedding_bag_configs())
+    inner = getattr(module, "_embedding_module", None)
+    if inner is not None and hasattr(inner, "embedding_bag_configs"):
+        return list(inner.embedding_bag_configs())
+    return None
+
+
+def _infer_keyed_tensor_attrs_from_module(
+    module: torch.nn.Module,
+) -> Optional[Tuple[List[str], List[int]]]:
+    """Infer KeyedTensor keys/length_per_key from embedding module configs."""
+    configs = _get_embedding_bag_configs(module)
+    if configs is None:
+        return None
+
+    keys = []
+    length_per_key = []
+    for config in configs:
+        embedding_names = getattr(config, "embedding_names", None)
+        if not embedding_names:
+            embedding_names = [config.name]
+        embedding_dim = config.embedding_dim
+        keys.extend(embedding_names)
+        length_per_key.extend([embedding_dim] * len(embedding_names))
+    return keys, length_per_key
+
+
+def _is_fx_node(value: Any) -> bool:
+    """Whether value is an FX node from the traced graph."""
+    return getattr(value, "op", None) is not None and hasattr(value, "target")
+
+
 def _get_rtp_feature_to_embedding_info(
     model: nn.Module,
 ) -> Dict[str, BaseEmbeddingConfig]:
@@ -1667,7 +1727,7 @@ def export_dense_model_cpu(
     **kwargs: Any,
 ) -> None:
     """Export only the dense model on CPU without DMP or GPU usage."""
-    del assets, use_local_cache_dir, kwargs
+    del pipeline_config, assets, use_local_cache_dir, data_input_path, kwargs
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
@@ -1676,17 +1736,8 @@ def export_dense_model_cpu(
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(graph_dir, exist_ok=True)
 
-    data_config = copy.deepcopy(pipeline_config.data_config)
-    features = cast(List[BaseFeature], model.features)
-    data_config.num_workers = 1
-    input_path = data_input_path or pipeline_config.train_input_path
-    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
-    batch = next(iter(dataloader))
-    data = batch.to(device).to_dict(sparse_dtype=torch.int64)
-
     model.set_is_inference(True)
     model.eval()
-    model.to(device)
 
     leaf_modules = _get_sparse_embedding_leaf_module_names(
         model
@@ -1696,58 +1747,45 @@ def export_dense_model_cpu(
     with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
         f.write(str(full_graph))
 
-    logger.info("collecting sparse attrs for CPU dense export...")
-    graph = copy.deepcopy(full_graph)
-    for node in graph.nodes:
-        if node.op == "output":
-            graph.erase_node(node)
-    sparse_outputs = {}
-    sparse_output_attrs = {}
-    for node in list(graph.nodes):
-        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
-            name = node.args[0]
-            if node.kwargs.get("is_dense", False):
-                continue
-            node_kt = node.args[1]
-            with graph.inserting_after(node_kt):
-                kt_values = node_kt.kwargs.get("values")
-                if (
-                    _is_input_tile_user_keyed_tensor(name)
-                    and getattr(kt_values, "op", None) == "call_method"
-                    and kt_values.target == "tile"
-                ):
-                    sparse_outputs[name] = kt_values.args[0]
-                    sparse_output_attrs[name + "__length_per_key"] = node_kt.kwargs[
-                        "length_per_key"
-                    ]
-                    sparse_output_attrs[name + "__keys"] = node_kt.kwargs["keys"]
-                else:
-                    sparse_outputs[name] = graph.call_method("values", args=(node_kt,))
-                    sparse_output_attrs[name + "__length_per_key"] = graph.call_method(
-                        "length_per_key", args=(node_kt,)
-                    )
-                    sparse_output_attrs[name + "__keys"] = graph.call_method(
-                        "keys", args=(node_kt,)
-                    )
-        elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
-            name = node.args[0]
-            node_jt = node.args[1]
-            with graph.inserting_after(node_jt):
-                sparse_outputs[name] = graph.call_method("values", args=(node_jt,))
-                sparse_outputs[name + "__lengths"] = graph.call_method(
-                    "lengths", args=(node_jt,)
-                )
-                sparse_output_attrs[name + "__lengths"] = graph.call_method(
-                    "lengths", args=(node_jt,)
-                )
-    graph.output(tuple([sparse_outputs, sparse_output_attrs]))
-    sparse_gm = torch.fx.GraphModule(model, graph)
-    sparse_gm.graph.eliminate_dead_code()
-    sparse_gm = _prune_unused_param_and_buffer(sparse_gm)
-    with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
-        f.write(str(sparse_gm.graph))
-    with torch.no_grad():
-        sparse_output, sparse_attrs = sparse_gm(data, device=device)
+    logger.info("collecting sparse attrs statically for CPU dense export...")
+    sparse_attrs = {}
+    for node in list(full_graph.nodes):
+        if node.op != "call_function" or node.target != fx_mark_keyed_tensor:
+            continue
+        name = node.args[0]
+        if node.kwargs.get("is_dense", False):
+            continue
+        node_kt = node.args[1]
+        node_kt_kwargs = getattr(node_kt, "kwargs", {})
+        keys = node_kt_kwargs.get("keys")
+        length_per_key = node_kt_kwargs.get("length_per_key")
+        need_infer_attrs = (
+            keys is None
+            or length_per_key is None
+            or _is_fx_node(keys)
+            or _is_fx_node(length_per_key)
+        )
+        if need_infer_attrs:
+            source_module = _resolve_keyed_tensor_source_module(model, node_kt)
+            inferred_attrs = (
+                _infer_keyed_tensor_attrs_from_module(source_module)
+                if source_module is not None
+                else None
+            )
+            if inferred_attrs is not None:
+                keys, length_per_key = inferred_attrs
+        if (
+            keys is None
+            or length_per_key is None
+            or _is_fx_node(keys)
+            or _is_fx_node(length_per_key)
+        ):
+            raise RuntimeError(
+                "CPU dense export cannot statically infer KeyedTensor attrs "
+                f"for feature group [{name}]."
+            )
+        sparse_attrs[name + "__keys"] = keys
+        sparse_attrs[name + "__length_per_key"] = length_per_key
 
     logger.info("exporting dense model on CPU...")
     graph = copy.deepcopy(full_graph)
@@ -1830,8 +1868,6 @@ def export_dense_model_cpu(
         json.dump(dense_graph_config, f, indent=4)
     with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
         f.write(str(gm.graph))
-    data.update(sparse_output)
-    _ = gm(data, device)
 
     dense_model_traced = symbolic_trace(gm)
     with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
