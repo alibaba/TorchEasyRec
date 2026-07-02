@@ -30,8 +30,8 @@ class OnlineDenseExportTest(unittest.TestCase):
             pipeline_config_path = os.path.join(tmp_dir, "pipeline.config")
             open(pipeline_config_path, "w").close()
 
-            def fake_export_distributed_embedding(**kwargs):
-                self.assertTrue(kwargs["dense_only"])
+            def fake_export_dense_model_cpu(**kwargs):
+                self.assertNotIn("dense_only", kwargs)
                 save_dir = kwargs["save_dir"]
                 os.makedirs(save_dir, exist_ok=True)
                 with open(os.path.join(save_dir, "scripted_model.pt"), "w") as f:
@@ -69,8 +69,8 @@ class OnlineDenseExportTest(unittest.TestCase):
                     side_effect=lambda model: model,
                 ),
                 mock.patch(
-                    "tzrec.tools.online_dense_export.export_distributed_embedding",
-                    side_effect=fake_export_distributed_embedding,
+                    "tzrec.tools.online_dense_export.export_dense_model_cpu",
+                    side_effect=fake_export_dense_model_cpu,
                 ),
             ):
                 payload = export_online_dense_model(

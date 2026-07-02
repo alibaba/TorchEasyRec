@@ -75,6 +75,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         self.assertEqual(env["MASTER_PORT"], "45678")
         self.assertEqual(env["USE_DISTRIBUTED_EMBEDDING"], "1")
         self.assertEqual(env["INPUT_TILE"], "3")
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "")
         self.assertEqual(env["PYTHONPATH"], "/repo:/old/path")
 
 

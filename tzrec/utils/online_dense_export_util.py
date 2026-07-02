@@ -80,6 +80,7 @@ def _build_export_subprocess_env(repo_root: str) -> Dict[str, str]:
         {
             "USE_DISTRIBUTED_EMBEDDING": "1",
             "INPUT_TILE": "3",
+            "CUDA_VISIBLE_DEVICES": "",
             "RANK": "0",
             "LOCAL_RANK": "0",
             "WORLD_SIZE": "1",

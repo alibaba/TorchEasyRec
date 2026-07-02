@@ -24,7 +24,7 @@ from tzrec.models.model import ScriptWrapper
 from tzrec.utils import config_util, env_util
 from tzrec.utils.export_util import (
     ensure_input_tile_for_distributed_embedding,
-    export_distributed_embedding,
+    export_dense_model_cpu,
 )
 from tzrec.utils.logging_util import logger
 from tzrec.utils.online_dense_export_util import make_version
@@ -91,12 +91,11 @@ def export_online_dense_model(
     scripted_model = ScriptWrapper(model)
 
     try:
-        export_distributed_embedding(
+        export_dense_model_cpu(
             pipeline_config=pipeline_config,
             model=scripted_model,
             checkpoint_path=checkpoint_path,
             save_dir=tmp_dir,
-            dense_only=True,
         )
 
         required_files = ["scripted_model.pt", "dense_meta.json"]
