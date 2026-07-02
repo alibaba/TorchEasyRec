@@ -166,6 +166,8 @@ def apply_split_helper(
                 f"expected {current_device}, got {preallocated_host_buffer.device}"
             )
             host_buffer = preallocated_host_buffer
+            if use_init_value:
+                host_buffer.fill_(init_value)
         else:
             host_buffer = (
                 torch.zeros(
