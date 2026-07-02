@@ -985,24 +985,20 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(dfs_are_close(df1, df2, 1e-6))
 
     def _test_rank_dlrm_hstu_train_eval_export(self, export_env_str: str):
-        # DISABLE_MMA_V3=1: Triton 3.6 sm_90 WGMMA bug
-        hstu_env = "DISABLE_MMA_V3=1"
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/dlrm_hstu_kuairand_1k.config",
             self.test_dir,
-            env_str=hstu_env,
         )
         if self.success:
             self.success = utils.test_eval(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str=hstu_env,
             )
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str=f"{hstu_env} {export_env_str}",
+                env_str=export_env_str,
                 additional_export_config='{"cand_seq_pk": "cand_seq"}',
             )
         predict_output_path = os.path.join(self.test_dir, "predict_result")
