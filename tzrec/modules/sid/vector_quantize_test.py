@@ -58,6 +58,8 @@ class VectorQuantizeTest(unittest.TestCase):
         self.assertEqual(out.ids.shape, (5,))
         self.assertTrue((out.ids >= 0).all() and (out.ids < 16).all())
         self.assertTrue(torch.isfinite(out.embeddings).all())
+        self.assertIsNone(out.topk_ids)
+        self.assertIsNone(out.topk_scores)
 
     def test_sinkhorn_balances_assignment(self) -> None:
         """Sinkhorn spreads clustered points across codes; argmin collapses them.
@@ -119,6 +121,31 @@ class VectorQuantizeTest(unittest.TestCase):
         out = vq.quantize(x)
         # In eval, emb == embedding(ids) exactly.
         torch.testing.assert_close(out.embeddings, vq.embedding(out.ids))
+
+    def test_eval_forward_returns_topk_neighbors(self) -> None:
+        vq = VectorQuantizeLayer(embed_dim=1, n_embed=4, use_sinkhorn=False)
+        vq.eval()
+        vq.embedding.weight.data.copy_(torch.tensor([[0.0], [1.0], [2.0], [3.0]]))
+
+        out = vq.quantize(torch.tensor([[1.2], [2.8]]), topk=3)
+
+        torch.testing.assert_close(out.ids, torch.tensor([1, 3]))
+        torch.testing.assert_close(out.topk_ids, torch.tensor([[1, 2, 0], [3, 2, 1]]))
+        torch.testing.assert_close(
+            out.topk_scores,
+            torch.tensor([[0.04, 0.64, 1.44], [0.04, 0.64, 3.24]]),
+        )
+
+    def test_training_forward_skips_topk_neighbors(self) -> None:
+        vq = VectorQuantizeLayer(embed_dim=1, n_embed=4, use_sinkhorn=False)
+        vq.train()
+        vq.embedding.weight.data.copy_(torch.tensor([[0.0], [1.0], [2.0], [3.0]]))
+
+        out = vq.quantize(torch.tensor([[1.2], [2.8]]), topk=3)
+
+        torch.testing.assert_close(out.ids, torch.tensor([1, 3]))
+        self.assertIsNone(out.topk_ids)
+        self.assertIsNone(out.topk_scores)
 
     def test_gumbel_train_ids_match_embedding(self) -> None:
         # In gumbel training the saved code must index the codebook vector

@@ -15,7 +15,7 @@ Training is FAISS-only: the codebook is built once via ``train_offline``
 over the full embedding matrix; ``forward`` is read-only (predict + lookup).
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 import faiss.contrib.torch_utils  # noqa: F401  (registers torch tensor I/O)
 import torch
@@ -24,6 +24,7 @@ from torch.nn import functional as F
 
 from tzrec.modules.sid.kmeans_quantize import KMeansQuantizeLayer, faiss_kmeans_fit
 from tzrec.modules.sid.residual_quantizer import ResidualQuantizer
+from tzrec.modules.sid.types import ResidualQuantizerOutput
 from tzrec.utils.logging_util import logger
 
 
@@ -64,8 +65,15 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         n_embed: Union[int, List[int]] = 256,
         normalize_residuals: bool = False,
         faiss_kmeans_kwargs: Optional[Dict] = None,
+        candidate_output_config: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
+        super().__init__(
+            embed_dim,
+            n_layers,
+            n_embed,
+            normalize_residuals,
+            candidate_output_config=candidate_output_config,
+        )
         self.faiss_kmeans_kwargs = dict(faiss_kmeans_kwargs or {})
 
         self.layers = nn.ModuleList(
@@ -78,28 +86,10 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             ]
         )
 
-    def _quantize_layer(
+    def forward(
         self,
-        layer_idx: int,
-        residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Nearest-centroid assignment for one layer (delegates to the layer).
-
-        Uninitialized layers (before ``train_offline``) return zeros, so the
-        residual walk is a no-op and the model stays callable.
-
-        Args:
-            layer_idx (int): quantization layer index.
-            residual (Tensor): current residual, shape (B, D).
-
-        Returns:
-            codes (Tensor): cluster indices, shape (B,).
-            quantized (Tensor): selected centroids, shape (B, D).
-        """
-        out = self.layers[layer_idx].quantize(residual)
-        return out.ids, out.embeddings
-
-    def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        input: torch.Tensor,
+    ) -> ResidualQuantizerOutput:
         """Assign codes per layer and sum the centroids.
 
         Codebook is read-only here; training happens in ``train_offline``.
@@ -110,11 +100,21 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             input (Tensor): input embeddings, shape (B, D).
 
         Returns:
-            codes (Tensor): cluster indices per layer, shape (B, n_layers).
-            quantized (Tensor): sum of quantized embeddings, shape (B, D).
+            ResidualQuantizerOutput: named output with optional candidate tensors.
         """
-        cluster_ids, quantized_sum, _ = self._residual_pass(input)
-        return cluster_ids, quantized_sum
+        cluster_ids, quantized_sum, cumulative, candidate_codes, candidate_scores = (
+            self._residual_pass(
+                input,
+                include_candidates=self._should_output_candidates(),
+            )
+        )
+        return self._residual_output(
+            cluster_ids,
+            quantized_sum,
+            cumulative,
+            candidate_codes,
+            candidate_scores,
+        )
 
     @property
     def is_fitted(self) -> bool:

@@ -254,7 +254,7 @@ class KMeansQuantizeLayer(QuantizeLayer):
             )
 
     @torch.no_grad()
-    def quantize(self, x: torch.Tensor) -> QuantizeOutput:
+    def quantize(self, x: torch.Tensor, topk: int = 1) -> QuantizeOutput:
         """Assign points to the nearest centroid and gather them.
 
         Uses ``torch.cdist`` (L2); argmin is invariant to the monotonic sqrt,
@@ -265,17 +265,31 @@ class KMeansQuantizeLayer(QuantizeLayer):
 
         Args:
             x (Tensor): data points, shape (B, D).
+            topk (int): number of nearest centroids to return.
 
         Returns:
-            QuantizeOutput: ``ids`` (B,) and ``embeddings`` (B, D).
+            QuantizeOutput: selected centroid/id plus top-k nearest ids/scores.
         """
         if not self.is_initialized:
+            # Pre-fit no-op so the model stays callable; codes are dummy zeros and
+            # topk/candidate metadata is omitted (never consumed before the fit).
             ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
             return QuantizeOutput(embeddings=torch.zeros_like(x), ids=ids)
         # Match x to the centroid dtype (as load_centroids_ does): cdist rejects
         # mismatched dtypes, so a non-fp32 input would otherwise raise.
-        ids = torch.cdist(x.to(self.centroids.dtype), self.centroids).argmin(dim=-1)
-        return QuantizeOutput(embeddings=self.centroids[ids], ids=ids)
+        distances = torch.cdist(x.to(self.centroids.dtype), self.centroids).pow(2)
+        if self.training:
+            ids = distances.argmin(dim=-1)
+            return QuantizeOutput(embeddings=self.centroids[ids], ids=ids)
+        topk_scores, topk_ids = self.nearest_neighbors(distances, topk)
+        ids = topk_ids[:, 0]
+        return QuantizeOutput(
+            embeddings=self.centroids[ids],
+            ids=ids,
+            scores=topk_scores[:, 0],
+            topk_ids=topk_ids,
+            topk_scores=topk_scores,
+        )
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the centroid table, shape (n_embed, embed_dim)."""

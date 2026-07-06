@@ -19,6 +19,7 @@ from tzrec.modules.sid.residual_kmeans_quantizer import (
 from tzrec.modules.sid.residual_quantizer import (
     ResidualQuantizer,
 )
+from tzrec.modules.sid.types import ResidualQuantizerOutput
 
 
 class ResidualKMeansQuantizerTest(unittest.TestCase):
@@ -46,9 +47,13 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
     def test_forward_returns_zeros_before_fit(self) -> None:
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=2, n_embed=8)
         self.assertFalse(all(layer.is_initialized for layer in rkq.layers))
-        codes, quantized = rkq(torch.randn(5, 4))
-        self.assertEqual(codes.shape, (5, 2))
-        self.assertEqual(quantized.shape, (5, 4))
+        out = rkq(torch.randn(5, 4))
+        self.assertIsInstance(out, ResidualQuantizerOutput)
+        self.assertEqual(out.cluster_ids.shape, (5, 2))
+        self.assertEqual(out.quantized_embeddings.shape, (5, 4))
+        self.assertEqual(out.latents.shape, (5, 2, 4))
+        self.assertIsNone(out.candidate_codes)
+        self.assertIsNone(out.candidate_scores)
 
     def test_forward_is_fx_traceable(self) -> None:
         """Predict forward must FX-trace.
@@ -64,10 +69,12 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
             layer.load_centroids_(torch.randn(8, 4))
         traced = fx.symbolic_trace(rkq)
         x = torch.randn(5, 4)
-        c_eager, q_eager = rkq(x)
-        c_traced, q_traced = traced(x)
-        torch.testing.assert_close(c_traced, c_eager)
-        torch.testing.assert_close(q_traced, q_eager)
+        eager = rkq(x)
+        traced_out = traced(x)
+        torch.testing.assert_close(traced_out.cluster_ids, eager.cluster_ids)
+        torch.testing.assert_close(
+            traced_out.quantized_embeddings, eager.quantized_embeddings
+        )
 
     def test_train_offline_non_uniform(self) -> None:
         try:
@@ -82,10 +89,12 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         rkq.train_offline(torch.randn(512, 4), verbose=False)
         self.assertTrue(all(layer.is_initialized for layer in rkq.layers))
         # Each layer fit its own K centroids; codes stay in per-layer range.
-        codes, _ = rkq(torch.randn(7, 4))
-        self.assertEqual(codes.shape, (7, 3))
+        out = rkq(torch.randn(7, 4))
+        self.assertEqual(out.cluster_ids.shape, (7, 3))
         for i, k in enumerate(n_embed):
-            self.assertTrue((codes[:, i] >= 0).all() and (codes[:, i] < k).all())
+            self.assertTrue(
+                (out.cluster_ids[:, i] >= 0).all() and (out.cluster_ids[:, i] < k).all()
+            )
 
     def test_train_offline_then_decode(self) -> None:
         try:
@@ -99,10 +108,49 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         rkq.train_offline(torch.randn(256, 4), verbose=False)
         self.assertTrue(all(layer.is_initialized for layer in rkq.layers))
 
-        codes, _ = rkq(torch.randn(5, 4))
-        self.assertTrue((codes >= 0).all() and (codes < 8).all())
-        recon = rkq.decode_codes(codes)  # inherited from the base
+        out = rkq(torch.randn(5, 4))
+        self.assertTrue((out.cluster_ids >= 0).all() and (out.cluster_ids < 8).all())
+        recon = rkq.decode_codes(out.cluster_ids)  # inherited from the base
         self.assertEqual(recon.shape, (5, 4))
+
+    def test_candidate_output_last_layer_knn(self) -> None:
+        """Candidate SIDs keep the greedy prefix and vary only the last layer."""
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+        rkq = ResidualKMeansQuantizer(
+            embed_dim=1,
+            n_layers=2,
+            n_embed=[2, 4],
+            candidate_output_config={
+                "enabled": True,
+                "topk": 3,
+                "strategy": "last_layer_knn",
+            },
+        )
+        rkq.eval()
+        rkq.set_is_inference(True)
+        # Deterministic centroids (set directly; no fit needed).
+        rkq.layers[0].load_centroids_(torch.tensor([[0.0], [10.0]]))
+        rkq.layers[1].load_centroids_(torch.tensor([[0.0], [1.0], [2.0], [3.0]]))
+
+        x = torch.tensor([[2.2], [0.9]])
+        out = rkq(x)
+
+        self.assertEqual(out.candidate_codes.shape, (2, 3, 2))  # (B, topk, n_layers)
+        self.assertEqual(out.candidate_scores.shape, (2, 3))
+        # The first candidate is the greedy SID (nearest == get_codes order).
+        torch.testing.assert_close(out.candidate_codes[:, 0, :], rkq.get_codes(x))
+        # The first-layer greedy prefix is unchanged for every candidate.
+        self.assertTrue(
+            torch.equal(
+                out.candidate_codes[:, :, 0],
+                out.candidate_codes[:, :1, 0].expand(-1, 3),
+            )
+        )
+        # For 2.2, last-layer origin is 2; nearest alternatives are 3 then 1.
+        self.assertEqual(out.candidate_codes[0, :, 1].tolist(), [2, 3, 1])
 
     def test_forward_get_codes_consistent(self) -> None:
         """Forward ids and get_codes both route through the shared walk."""
@@ -116,10 +164,13 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         )
         rkq.train_offline(torch.randn(256, 4), verbose=False)
         x = torch.randn(9, 4)
-        fwd_ids, fwd_quant = rkq(x)
-        torch.testing.assert_close(rkq.get_codes(x), fwd_ids)
+        out = rkq(x)
+        torch.testing.assert_close(rkq.get_codes(x), out.cluster_ids)
         # forward's residual-sum equals the centroid-sum reconstruction.
-        torch.testing.assert_close(fwd_quant, rkq.decode_codes(fwd_ids))
+        torch.testing.assert_close(
+            out.quantized_embeddings,
+            rkq.decode_codes(out.cluster_ids),
+        )
 
 
 if __name__ == "__main__":

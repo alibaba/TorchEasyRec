@@ -12,7 +12,7 @@
 """Data types for SID generation: enums and output tuples shared across quantizers."""
 
 from enum import Enum
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -35,26 +35,36 @@ class QuantizeOutput(NamedTuple):
     Attributes:
         embeddings (Tensor): quantized embeddings, shape (B, D).
         ids (Tensor): codebook indices, shape (B,).
+        scores (Tensor, optional): selected-code distances/scores, shape (B,).
+        topk_ids (Tensor, optional): top-k nearest codebook indices, shape (B, K).
+        topk_scores (Tensor, optional): top-k nearest distances/scores, shape (B, K).
     """
 
     embeddings: torch.Tensor
     ids: torch.Tensor
+    scores: Optional[torch.Tensor] = None
+    topk_ids: Optional[torch.Tensor] = None
+    topk_scores: Optional[torch.Tensor] = None
 
 
 class ResidualQuantizerOutput(NamedTuple):
-    """Output of the residual quantization module (RQ-VAE backend).
+    """Output of a residual quantization module.
 
     The per-layer cumulative quantized vectors are exposed as ``latents`` so the
-    model-side commitment loss
-    (:class:`~tzrec.loss.sid_commitment_loss.SidCommitmentLoss`) can consume them.
+    model-side commitment loss can consume them when needed.
 
     Attributes:
         cluster_ids (Tensor): codebook indices per layer, shape (B, n_layers).
         quantized_embeddings (Tensor): sum of quantized embeddings, shape (B, D).
         latents (Tensor): per-layer cumulative quantized vectors, shape
             (B, n_layers, D) (``latents[:, i]`` is the sum after layer ``i``).
+        candidate_codes (Tensor, optional): candidate code tuples, shape
+            (B, K, n_layers).
+        candidate_scores (Tensor, optional): candidate scores, shape (B, K).
     """
 
     cluster_ids: torch.Tensor
     quantized_embeddings: torch.Tensor
     latents: torch.Tensor
+    candidate_codes: Optional[torch.Tensor] = None
+    candidate_scores: Optional[torch.Tensor] = None

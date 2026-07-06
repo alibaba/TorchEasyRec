@@ -31,10 +31,23 @@ class _StubQuantizeLayer(QuantizeLayer):
             n_embed, embed_dim
         )
 
-    def quantize(self, x: torch.Tensor) -> QuantizeOutput:
+    def quantize(self, x: torch.Tensor, topk: int = 1) -> QuantizeOutput:
         dist = torch.cdist(x, self._codebook)
+        topk_ids = None
+        topk_scores = None
         ids = dist.argmin(dim=-1)
-        return QuantizeOutput(embeddings=self.lookup(ids), ids=ids)
+        scores = None
+        if not self.training:
+            topk_scores, topk_ids = self.nearest_neighbors(dist, topk)
+            ids = topk_ids[:, 0]
+            scores = topk_scores[:, 0]
+        return QuantizeOutput(
+            embeddings=self.lookup(ids),
+            ids=ids,
+            scores=scores,
+            topk_ids=topk_ids,
+            topk_scores=topk_scores,
+        )
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         return self._codebook
@@ -62,6 +75,18 @@ class QuantizeLayerTest(unittest.TestCase):
         out = layer.quantize(x)
         torch.testing.assert_close(out.ids, torch.arange(4))
         torch.testing.assert_close(out.embeddings, x)
+
+    def test_quantize_returns_topk_neighbors(self) -> None:
+        layer = _StubQuantizeLayer(n_embed=4, embed_dim=1)
+        layer.eval()
+        x = torch.tensor([[1.1], [2.9]])
+        out = layer.quantize(x, topk=2)
+        torch.testing.assert_close(out.ids, torch.tensor([1, 3]))
+        torch.testing.assert_close(out.topk_ids, torch.tensor([[1, 2], [3, 2]]))
+        torch.testing.assert_close(
+            out.topk_scores,
+            torch.tensor([[0.1, 0.9], [0.1, 0.9]]),
+        )
 
     def test_abstract_methods_unoverridden_raise(self) -> None:
         # The abstract methods are documented to raise if a subclass forgets

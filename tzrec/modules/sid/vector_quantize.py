@@ -164,7 +164,7 @@ class VectorQuantizeLayer(QuantizeLayer):
         return distances
 
     @torch.no_grad()
-    def _find_nearest_embedding(self, x: torch.Tensor) -> torch.Tensor:
+    def _find_nearest_embedding(self, distances: torch.Tensor) -> torch.Tensor:
         """Find the nearest codebook id for each input vector.
 
         During training with use_sinkhorn=True, applies z-score
@@ -172,13 +172,11 @@ class VectorQuantizeLayer(QuantizeLayer):
         Otherwise falls back to argmin.
 
         Args:
-            x (Tensor): input vectors, shape (B, D).
+            distances (Tensor): pairwise distances, shape (B, n_embed).
 
         Returns:
             Tensor: codebook indices, shape (B,).
         """
-        distances = self._compute_distances(x)
-
         if self.training and self.use_sinkhorn:
             # Sinkhorn requires non-negative cost; z-score then shift.
             std, mean = torch.std_mean(distances, unbiased=False)
@@ -196,7 +194,7 @@ class VectorQuantizeLayer(QuantizeLayer):
 
         return ids
 
-    def quantize(self, x: torch.Tensor) -> QuantizeOutput:
+    def quantize(self, x: torch.Tensor, topk: int = 1) -> QuantizeOutput:
         """Assign ``x`` to the codebook (the :class:`QuantizeLayer` interface).
 
         Commitment loss is computed by the caller; device follows ``x``, so this
@@ -205,12 +203,15 @@ class VectorQuantizeLayer(QuantizeLayer):
 
         Args:
             x (Tensor): input vectors, shape (B, D).
+            topk (int): number of nearest codebook entries to return.
 
         Returns:
-            QuantizeOutput: named tuple of (embeddings, ids).
+            QuantizeOutput: selected embedding/id plus top-k nearest ids/scores.
         """
+        distances = self._compute_distances(x)
+
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
-            logits = -self._compute_distances(x)
+            logits = -distances
             weights = F.gumbel_softmax(
                 logits, tau=self.gumbel_temperature, hard=True, dim=-1
             )
@@ -218,12 +219,25 @@ class VectorQuantizeLayer(QuantizeLayer):
             ids = weights.argmax(dim=-1)
             return QuantizeOutput(embeddings=emb, ids=ids)
 
-        # Return the RAW codebook vector (no per-layer STE wrap): the aggregate
-        # STE in ResidualVectorQuantizer.forward routes the encoder gradient,
-        # while a wrap here would detach the codebook from ``latents`` and freeze
-        # it at init.
-        ids = self._find_nearest_embedding(x)
-        return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
+        if self.training:
+            # Return the RAW codebook vector (no per-layer STE wrap): the aggregate
+            # STE in ResidualVectorQuantizer.forward routes the encoder gradient,
+            # while a wrap here would detach the codebook from ``latents`` and freeze
+            # it at init.
+            ids = self._find_nearest_embedding(distances)
+            return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
+
+        # eval/inference: torch.topk(largest=False) already yields the nearest at
+        # slot 0, so reuse it instead of a separate argmin + gather.
+        topk_scores, topk_ids = self.nearest_neighbors(distances, topk)
+        ids = topk_ids[:, 0]
+        return QuantizeOutput(
+            embeddings=self.embedding(ids),
+            ids=ids,
+            scores=topk_scores[:, 0],
+            topk_ids=topk_ids,
+            topk_scores=topk_scores,
+        )
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the codebook table, shape (n_embed, embed_dim)."""

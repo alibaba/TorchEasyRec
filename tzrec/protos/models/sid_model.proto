@@ -38,6 +38,18 @@ message ContrastiveConfig {
     required string pair_flag_feature_group = 2;
 }
 
+message SidCandidateOutputConfig {
+    reserved 4, 5;
+
+    // Whether predict/inference emits candidate SIDs. Disabled by default.
+    optional bool enabled = 1 [default = false];
+    // Number of candidate SIDs per item; the nearest last-layer codes,
+    // best-first (slot 0 is the greedy SID).
+    optional uint32 topk = 2 [default = 10];
+    // v1 supports only last-layer nearest-neighbor replacement.
+    optional string strategy = 3 [default = "last_layer_knn"];
+}
+
 message SidRqvae {
     // === Network structure ===
     // Quantization latent dimension (encoder output / codebook dim).
@@ -83,6 +95,8 @@ message SidRqvae {
     // separately by a `contrastive_loss` entry in ModelConfig.losses (both must
     // be set together).
     optional ContrastiveConfig contrastive_config = 16;
+    // Optional candidate SID output for offline collision prevention.
+    optional SidCandidateOutputConfig candidate_output_config = 17;
 
     // Reconstruction, commitment and (optional) contrastive losses are configured
     // via ModelConfig.losses (the LossConfig ``sid_loss`` oneof); only the
@@ -107,4 +121,6 @@ message SidRqkmeans {
     // what FAISS subsamples to internally (default 256), so no training points
     // are wasted.
     optional uint32 train_sample_size = 6 [default = 0];
+    // Optional candidate SID output for offline collision prevention.
+    optional SidCandidateOutputConfig candidate_output_config = 7;
 }

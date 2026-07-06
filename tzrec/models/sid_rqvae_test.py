@@ -17,9 +17,11 @@ from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
+from tzrec.models.model import ScriptWrapper
 from tzrec.models.sid_rqvae import SidRqvae
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2
 from tzrec.protos.models import sid_model_pb2
+from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.state_dict_util import init_parameters
 
 
@@ -106,6 +108,7 @@ class SidRqvaeTest(unittest.TestCase):
         embed_dim=8,
         n_layers=2,
         recon="l2",
+        candidate_output=False,
     ):
         """Helper to create a SidRqvae model with config-driven losses."""
         n_embed_list = [16] * n_layers
@@ -120,6 +123,9 @@ class SidRqvaeTest(unittest.TestCase):
             sid_rqvae_cfg.contrastive_config.pair_feature_group = "pair"
             sid_rqvae_cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
             losses.append(_contrastive_cfg())
+        if candidate_output:
+            sid_rqvae_cfg.candidate_output_config.enabled = True
+            sid_rqvae_cfg.candidate_output_config.topk = 3
 
         # Real features + feature_groups: input_dim is derived from the group.
         features, feature_groups = _features_and_groups(input_dim, use_contrastive)
@@ -202,6 +208,82 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertIn("codes", predictions)
         self.assertNotIn("x_hat", predictions)
         self.assertNotIn("latents", predictions)
+        self.assertNotIn("candidate_codes", predictions)
+
+    def test_rqvae_export_trace_keeps_candidate_output(self) -> None:
+        """Export wrapper traces candidate outputs after inference is set."""
+        B, input_dim = 4, 32
+        model = self._create_model(input_dim=input_dim, candidate_output=True)
+        model.eval()
+        model.set_is_inference(True)
+
+        wrapper = ScriptWrapper(model).eval()
+        data = {"item_emb.values": torch.randn(B, input_dim)}
+
+        predictions = wrapper(data)
+        traced = symbolic_trace(wrapper)
+        traced_predictions = traced(data)
+
+        self.assertEqual(
+            set(predictions.keys()),
+            {"codes", "candidate_codes", "candidate_scores"},
+        )
+        self.assertEqual(set(traced_predictions.keys()), set(predictions.keys()))
+        self.assertEqual(traced_predictions["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(traced_predictions["candidate_scores"].shape, (B, 3))
+        torch.testing.assert_close(
+            traced_predictions["candidate_codes"][:, 0, :],
+            traced_predictions["codes"],
+        )
+
+    def test_rqvae_candidate_scores_sorted(self) -> None:
+        """Candidate scores come back sorted best-first, minimum at slot 0."""
+        B, input_dim = 4, 32
+        model = self._create_model(
+            input_dim=input_dim,
+            candidate_output=True,
+        )
+        model.eval()
+        model.set_is_inference(True)
+
+        preds = model.predict(_make_batch(B, input_dim))
+        self.assertEqual(
+            set(preds.keys()), {"codes", "candidate_codes", "candidate_scores"}
+        )
+        self.assertEqual(preds["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(preds["candidate_scores"].shape, (B, 3))
+        scores = preds["candidate_scores"]
+        # Slot 0 is the best-scored (nearest) neighbor: minimum score, sorted.
+        self.assertTrue(bool(torch.all(scores[:, 0] == scores.min(dim=1).values)))
+        self.assertTrue(bool(torch.all(scores[:, :-1] <= scores[:, 1:])))
+
+    def test_candidate_output_topk_zero_raises(self) -> None:
+        """A candidate_output_config with topk=0 fails fast at construction.
+
+        Validation lives in the quantizer's _init_candidate_output_config, which
+        runs during model __init__.
+        """
+        features, feature_groups = _features_and_groups(32)
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.candidate_output_config.enabled = True
+        cfg.candidate_output_config.topk = 0
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg
+        )
+        with self.assertRaisesRegex(ValueError, "topk must be >= 1"):
+            SidRqvae(model_config=model_config, features=features, labels=[])
+
+    def test_candidate_output_topk_exceeds_codebook_raises(self) -> None:
+        """topk above the last-layer codebook size fails fast at construction."""
+        features, feature_groups = _features_and_groups(32)
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.candidate_output_config.enabled = True
+        cfg.candidate_output_config.topk = 17
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg
+        )
+        with self.assertRaisesRegex(ValueError, "codebook size"):
+            SidRqvae(model_config=model_config, features=features, labels=[])
 
     def test_rqvae_contrastive_mode(self) -> None:
         """Test SidRqvae with the mixed recon + contrastive path."""

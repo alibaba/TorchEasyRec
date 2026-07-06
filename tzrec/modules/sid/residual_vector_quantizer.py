@@ -11,7 +11,7 @@
 
 """ResidualVectorQuantizer: multi-layer residual VQ with gradient training."""
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -120,8 +120,15 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         sinkhorn_iters: int = 5,
         sinkhorn_epsilon: float = 10.0,
         gumbel_temperature: float = 1.0,
+        candidate_output_config: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
+        super().__init__(
+            embed_dim,
+            n_layers,
+            n_embed,
+            normalize_residuals,
+            candidate_output_config=candidate_output_config,
+        )
         self.rotation_trick = rotation_trick
 
         self.register_buffer("initted", torch.tensor([not kmeans_init]))
@@ -269,28 +276,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             x_unsq - 2 * sum_projection + 2 * rescaled_embeddings
         ).squeeze(1)
 
-    def _quantize_layer(
-        self,
-        layer_idx: int,
-        residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Quantize one layer's residual via its ``VectorQuantizeLayer`` layer.
-
-        STE: raw codebook vector (STE applied on the aggregate in :meth:`forward`).
-        Gumbel: the soft embedding (carries grad directly).
-
-        Args:
-            layer_idx (int): quantization layer index.
-            residual (Tensor): current residual, shape (B, D).
-
-        Returns:
-            ids (Tensor): per-layer cluster ids, shape (B,).
-            emb (Tensor): the raw codebook vector (STE/eval) or the soft
-                embedding (Gumbel), with grad, shape (B, D).
-        """
-        out = self.layers[layer_idx].quantize(residual)
-        return out.ids, out.embeddings
-
     def forward(
         self,
         input: torch.Tensor,
@@ -307,7 +292,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         Returns:
             ResidualQuantizerOutput: (cluster_ids, quantized_embeddings,
-                latents).
+                latents, optional candidate_codes, optional candidate_scores).
         """
         if self.training:
             self.init_embed_(input)
@@ -317,9 +302,16 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         )
 
         walk_input = input if train_gumbel else input.detach()
-        cluster_ids, aggregated_quants, cumulative = self._residual_pass(walk_input)
-
-        latents = torch.stack(cumulative, dim=1)
+        (
+            cluster_ids,
+            aggregated_quants,
+            cumulative,
+            candidate_codes,
+            candidate_scores,
+        ) = self._residual_pass(
+            walk_input,
+            include_candidates=self._should_output_candidates(),
+        )
 
         quants_trunc = aggregated_quants
         if self.training and not train_gumbel:
@@ -328,10 +320,12 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             else:
                 quants_trunc = input + (quants_trunc - input).detach()
 
-        return ResidualQuantizerOutput(
-            cluster_ids=cluster_ids,
-            quantized_embeddings=quants_trunc,
-            latents=latents,
+        return self._residual_output(
+            cluster_ids,
+            quants_trunc,
+            cumulative,
+            candidate_codes,
+            candidate_scores,
         )
 
     @torch.no_grad()

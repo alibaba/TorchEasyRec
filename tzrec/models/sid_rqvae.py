@@ -106,6 +106,7 @@ class SidRqvae(BaseSidModel):
             use_sinkhorn=sinkhorn_cfg["enabled"],
             sinkhorn_iters=sinkhorn_cfg["iters"],
             sinkhorn_epsilon=sinkhorn_cfg["epsilon"],
+            candidate_output_config=self._candidate_output_kwargs,
         )
 
         logger.info(
@@ -191,7 +192,8 @@ class SidRqvae(BaseSidModel):
         grouped = self.build_input(batch)
         embedding = grouped[self._feature_group]
         if self._is_inference:
-            return {"codes": self._quantizer.get_codes(self._encode(embedding))}
+            quant = self._quantizer(self._encode(embedding))
+            return self._sid_predictions(quant)
         if self._use_contrastive:
             return self._predict_mixed(grouped)
         return self._predict_rqvae(embedding)

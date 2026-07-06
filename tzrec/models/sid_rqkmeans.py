@@ -89,6 +89,7 @@ class SidRqkmeans(BaseSidModel):
             n_embed=self._n_embed_list,
             normalize_residuals=self._normalize_residuals,
             faiss_kmeans_kwargs=self._faiss_kwargs,
+            candidate_output_config=self._candidate_output_kwargs,
         )
 
         # Bounded host reservoir for the end-of-loop fit: cap at
@@ -133,14 +134,11 @@ class SidRqkmeans(BaseSidModel):
                 )
             }
 
-        codes, quantized = self._quantizer(embedding)
-
-        predictions: Dict[str, torch.Tensor] = {
-            "codes": codes,
-        }
+        quantizer_output = self._quantizer(embedding)
+        predictions = self._sid_predictions(quantizer_output)
 
         if self.is_eval and self._quantizer.is_fitted:
-            predictions["x_hat"] = quantized
+            predictions["x_hat"] = quantizer_output.quantized_embeddings
             predictions["recon_target"] = embedding
 
         return predictions
