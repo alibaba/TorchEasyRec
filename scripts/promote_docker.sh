@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 set -e
 
-# Promote tzrec-test:<tag>-{cpu,cu126,cu129} images to tzrec-devel after CI passes.
+# Promote tzrec-test:<tag>-{cpu,cu126,cu129,cu130} images to tzrec-devel after CI passes.
 # Retags the already-pushed test images and pushes them to the devel repo,
-# plus refreshes the <tag> (= cu129) and latest aliases.
+# plus refreshes the <tag> (= cu130) and latest aliases.
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 SRC_REPO=tzrec-test
 DST_REPO=tzrec-devel
-DOCKER_TAG=1.2
-DOCKER_TAG_SUFFIX=
+DOCKER_TAG=1.3
+DOCKER_TAG_SUFFIX=-u3
 
-for DEVICE in cpu cu126 cu129
+for DEVICE in cpu cu126 cu129 cu130
 do
     docker pull ${REGISTRY}/${SRC_REPO}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX}
     docker tag ${REGISTRY}/${SRC_REPO}:${DOCKER_TAG}-${DEVICE}${DOCKER_TAG_SUFFIX} ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}-${DEVICE}
     docker push ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}-${DEVICE}
 done
 
-docker tag ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}-cu129 ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}
-docker tag ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}-cu129 ${REGISTRY}/${DST_REPO}:latest
+docker tag ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}-cu130 ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}
+docker tag ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}-cu130 ${REGISTRY}/${DST_REPO}:latest
 docker push ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}
 docker push ${REGISTRY}/${DST_REPO}:latest
