@@ -53,7 +53,7 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         self.assertIsInstance(out, ResidualQuantizerOutput)
         self.assertEqual(out.cluster_ids.shape, (5, 2))
         self.assertEqual(out.quantized_embeddings.shape, (5, 4))
-        self.assertEqual(out.latents.shape, (5, 2, 4))
+        self.assertIsNone(out.latents)  # K-Means never computes latents
         self.assertIsNone(out.candidate_codes)
         self.assertIsNone(out.candidate_scores)
 

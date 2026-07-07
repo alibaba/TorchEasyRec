@@ -43,9 +43,11 @@ message SidCandidateOutputConfig {
 
     // Whether predict/inference emits candidate SIDs. Disabled by default.
     optional bool enabled = 1 [default = false];
-    // Number of candidate SIDs per item; the nearest last-layer codes,
-    // best-first (slot 0 is the greedy SID).
-    optional uint32 topk = 2 [default = 10];
+    // Number of candidate SIDs per item (the nearest last-layer codes,
+    // best-first; slot 0 is the greedy SID). Must be <= the last-layer codebook
+    // size; defaults to 1 (greedy only) so a minimal opt-in config always
+    // constructs -- set it explicitly for a useful candidate set.
+    optional uint32 topk = 2 [default = 1];
     // v1 supports only last-layer nearest-neighbor replacement.
     optional string strategy = 3 [default = "last_layer_knn"];
 }

@@ -238,16 +238,20 @@ class ResidualQuantizer(BaseModule):
         self,
         walk: ResidualPassOutput,
         quantized_embeddings: torch.Tensor,
+        with_latents: bool,
     ) -> ResidualQuantizerOutput:
         """Pack a residual walk into the public output type.
 
         ``quantized_embeddings`` is supplied separately because the VQ backend
         replaces the raw ``walk.aggregated`` sum with its STE-adjusted version.
+        ``latents`` (the (B, n_layers, D) cumulative stack) is built only when a
+        consumer needs it — the RQ-VAE commitment loss — and skipped otherwise
+        (K-Means and the inference path never read it).
         """
         return ResidualQuantizerOutput(
             cluster_ids=walk.cluster_ids,
             quantized_embeddings=quantized_embeddings,
-            latents=torch.stack(walk.cumulative, dim=1),
+            latents=torch.stack(walk.cumulative, dim=1) if with_latents else None,
             candidate_codes=walk.candidate_codes,
             candidate_scores=walk.candidate_scores,
         )

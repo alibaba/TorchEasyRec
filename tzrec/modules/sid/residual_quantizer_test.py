@@ -94,7 +94,6 @@ class _FakeQuantizer(ResidualQuantizer):
         return QuantizeOutput(
             embeddings=self.books[layer_idx][codes],
             ids=codes,
-            scores=topk_scores[:, 0],
             topk_ids=topk_ids,
             topk_scores=topk_scores,
         )

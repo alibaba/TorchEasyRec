@@ -35,14 +35,12 @@ class QuantizeOutput(NamedTuple):
     Attributes:
         embeddings (Tensor): quantized embeddings, shape (B, D).
         ids (Tensor): codebook indices, shape (B,).
-        scores (Tensor, optional): selected-code distances/scores, shape (B,).
         topk_ids (Tensor, optional): top-k nearest codebook indices, shape (B, K).
         topk_scores (Tensor, optional): top-k nearest distances/scores, shape (B, K).
     """
 
     embeddings: torch.Tensor
     ids: torch.Tensor
-    scores: Optional[torch.Tensor] = None
     topk_ids: Optional[torch.Tensor] = None
     topk_scores: Optional[torch.Tensor] = None
 
@@ -56,8 +54,10 @@ class ResidualQuantizerOutput(NamedTuple):
     Attributes:
         cluster_ids (Tensor): codebook indices per layer, shape (B, n_layers).
         quantized_embeddings (Tensor): sum of quantized embeddings, shape (B, D).
-        latents (Tensor): per-layer cumulative quantized vectors, shape
-            (B, n_layers, D) (``latents[:, i]`` is the sum after layer ``i``).
+        latents (Tensor, optional): per-layer cumulative quantized vectors, shape
+            (B, n_layers, D) (``latents[:, i]`` is the sum after layer ``i``);
+            built only when a consumer needs it (RQ-VAE commitment loss), else
+            None (K-Means and the inference path never read it).
         candidate_codes (Tensor, optional): candidate code tuples, shape
             (B, K, n_layers).
         candidate_scores (Tensor, optional): candidate scores, shape (B, K).
@@ -65,7 +65,7 @@ class ResidualQuantizerOutput(NamedTuple):
 
     cluster_ids: torch.Tensor
     quantized_embeddings: torch.Tensor
-    latents: torch.Tensor
+    latents: Optional[torch.Tensor] = None
     candidate_codes: Optional[torch.Tensor] = None
     candidate_scores: Optional[torch.Tensor] = None
 

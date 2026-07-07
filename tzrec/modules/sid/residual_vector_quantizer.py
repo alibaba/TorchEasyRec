@@ -310,7 +310,9 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             else:
                 quants_trunc = input + (quants_trunc - input).detach()
 
-        return self._residual_output(walk, quants_trunc)
+        return self._residual_output(
+            walk, quants_trunc, with_latents=not self.is_inference
+        )
 
     @torch.no_grad()
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:

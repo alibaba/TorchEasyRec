@@ -106,7 +106,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             ResidualQuantizerOutput: named output with optional candidate tensors.
         """
         walk = self._residual_pass(input)
-        return self._residual_output(walk, walk.aggregated)
+        return self._residual_output(walk, walk.aggregated, with_latents=False)
 
     @property
     def is_fitted(self) -> bool:

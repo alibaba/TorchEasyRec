@@ -71,7 +71,6 @@ class QuantizeLayer(nn.Module):
         return QuantizeOutput(
             embeddings=self.lookup(ids),
             ids=ids,
-            scores=topk_scores[:, 0],
             topk_ids=topk_ids,
             topk_scores=topk_scores,
         )
