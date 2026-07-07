@@ -177,7 +177,9 @@ class SidRqvae(BaseSidModel):
         """Predict the model.
 
         Returns the raw tensors the configured losses consume (computed in
-        :meth:`BaseSidModel.loss`); inference emits codes only.
+        :meth:`BaseSidModel.loss`); inference emits ``codes`` (plus
+        ``candidate_codes``/``candidate_scores`` when candidate output is
+        configured).
 
         Args:
             batch (Batch): input batch data.

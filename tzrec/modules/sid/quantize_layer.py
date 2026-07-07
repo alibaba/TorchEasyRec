@@ -53,7 +53,7 @@ class QuantizeLayer(nn.Module):
         distances: torch.Tensor,
         topk: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return top-k nearest ids and scores from a distance matrix."""
+        """Return ``(scores, ids)`` of the top-k nearest codes, ascending distance."""
         if topk < 1 or topk > self.n_embed:
             raise ValueError(f"topk must be in [1, {self.n_embed}], got {topk}")
         return torch.topk(distances, k=topk, dim=-1, largest=False)

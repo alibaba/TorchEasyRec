@@ -64,9 +64,10 @@ class ResidualQuantizer(BaseModule):
     This base owns the structural invariants (``embed_dim``, ``n_layers``,
     per-layer codebook sizes, residual normalization toggle) and the shared
     residual walk (:meth:`_residual_pass`, :meth:`get_codes`,
-    :meth:`decode_codes`, :meth:`output_dim`). Subclasses build ``self.layers``
-    and implement the per-layer primitives :meth:`_quantize_layer` (encode) and
-    :meth:`_lookup_code` (decode), plus :meth:`forward` and
+    :meth:`decode_codes`, :meth:`output_dim`), plus the concrete encode
+    primitive :meth:`_quantize_layer` (which delegates to each layer's
+    ``quantize``). Subclasses build ``self.layers`` and implement the decode
+    primitive :meth:`_lookup_code`, plus :meth:`forward` and
     :meth:`get_codebook_embeddings`.
 
     Args:
@@ -110,12 +111,15 @@ class ResidualQuantizer(BaseModule):
         candidate_output_config: Optional[Mapping[str, Any]],
     ) -> None:
         """Read optional inference candidate-output settings."""
+        # Always define the fields (last layer, greedy-only) so downstream reads
+        # stay safe even when candidate output is disabled.
         self._candidate_output_enabled = False
+        self._candidate_layer_idx = self.n_layers - 1
+        self._candidate_output_topk = 1
 
         if candidate_output_config is None or not candidate_output_config["enabled"]:
             return
 
-        self._candidate_layer_idx = self.n_layers - 1
         self._candidate_output_topk = int(candidate_output_config["topk"])
 
         n_embed = self.n_embed_list[self._candidate_layer_idx]

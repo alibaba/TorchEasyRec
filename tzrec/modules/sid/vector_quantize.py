@@ -137,9 +137,9 @@ class VectorQuantizeLayer(QuantizeLayer):
     def _compute_distances(self, x: torch.Tensor) -> torch.Tensor:
         """Compute L2/cosine distances between inputs and codebook entries.
 
-        Not ``no_grad``: Gumbel calls this directly for the encoder gradient;
-        the STE/Sinkhorn path calls it inside ``no_grad`` in
-        :meth:`_find_nearest_embedding`.
+        Not ``no_grad`` itself: the Gumbel path calls it directly for the
+        encoder gradient, while the STE/eval paths wrap the call in ``no_grad``
+        in :meth:`quantize` (the assignment that follows is non-differentiable).
 
         Args:
             x (Tensor): input vectors, shape (B, D).
@@ -207,10 +207,10 @@ class VectorQuantizeLayer(QuantizeLayer):
         Returns:
             QuantizeOutput: selected embedding/id plus top-k nearest ids/scores.
         """
-        distances = self._compute_distances(x)
-
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
-            logits = -distances
+            # Differentiable assignment: distances feed the Gumbel logits, so the
+            # graph must stay live here.
+            logits = -self._compute_distances(x)
             weights = F.gumbel_softmax(
                 logits, tau=self.gumbel_temperature, hard=True, dim=-1
             )
@@ -218,9 +218,15 @@ class VectorQuantizeLayer(QuantizeLayer):
             ids = weights.argmax(dim=-1)
             return QuantizeOutput(embeddings=emb, ids=ids)
 
+        # STE / eval: assignment (argmin / Sinkhorn / top-k) is non-differentiable,
+        # so build the distance matrix grad-free. The STE codebook gradient flows
+        # through the embedding lookup below, which stays outside no_grad.
+        with torch.no_grad():
+            distances = self._compute_distances(x)
+
         if self.training:
-            # Return the RAW codebook vector: the aggregate STE in
-            # ResidualVectorQuantizer.forward; a wrap here freezes the codebook at init.
+            # Return the RAW codebook vector: the aggregate STE lives in
+            # ResidualVectorQuantizer.forward; a wrap here freezes the codebook.
             ids = self._find_nearest_embedding(distances)
             return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
 

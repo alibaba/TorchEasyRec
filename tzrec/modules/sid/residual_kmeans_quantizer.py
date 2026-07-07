@@ -17,7 +17,6 @@ over the full embedding matrix; ``forward`` is read-only (predict + lookup).
 
 from typing import Any, Dict, List, Mapping, Optional, Union
 
-import faiss.contrib.torch_utils  # noqa: F401  (registers torch tensor I/O)
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -166,6 +165,10 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 rely on its contents afterward (copy first if it needs them).
             verbose (bool): print per-layer reconstruction loss. Default: True.
         """
+        # Lazy import: forward/predict are faiss-free, so only the offline fit
+        # pulls faiss in (torch_utils lets faiss take torch tensors directly).
+        import faiss.contrib.torch_utils  # noqa: F401
+
         # raise (not assert): these host-tensor guards must survive `python -O`.
         if inputs.is_cuda:
             raise RuntimeError("train_offline is CPU-only; got a CUDA tensor")
