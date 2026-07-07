@@ -166,22 +166,17 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 rely on its contents afterward (copy first if it needs them).
             verbose (bool): print per-layer reconstruction loss. Default: True.
         """
-        # Host-tensor contract, checked here (not deep in faiss). raise (not
-        # assert): these guard data corruption and must survive ``python -O``.
+        # raise (not assert): these host-tensor guards must survive `python -O`.
         if inputs.is_cuda:
             raise RuntimeError("train_offline is CPU-only; got a CUDA tensor")
         if inputs.dim() != 2 or inputs.shape[1] != self.embed_dim:
             raise RuntimeError(
                 f"inputs must be (N, {self.embed_dim}), got {tuple(inputs.shape)}"
             )
-        # The loop below mutates x in place (``x -= q``); the dtype/layout
-        # normalize is a no-op view when already float32 + contiguous, so the
-        # mutation lands in the caller's buffer (intended — see Args: CONSUMED).
+        # The loop mutates x in place into the caller's buffer (see Args: CONSUMED).
         x = inputs.detach().to(dtype=torch.float32).contiguous()
         N = x.shape[0]
-        # Clear message before faiss's own opaque C++ throw for N < K. (The
-        # K <= N < K * min_points_per_centroid case, where faiss only warns and
-        # returns a degenerate codebook, is not guarded here.)
+        # Clear N<K error before faiss's opaque throw (K<=N<K*min_points unguarded).
         max_k = max(self.n_embed_list)
         if N < max_k:
             raise RuntimeError(
@@ -200,15 +195,12 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 self.embed_dim,
             )
 
-        # Chunk index.search to cap peak memory (~1 GB at 500K × 512 × 4B).
         SEARCH_CHUNK = 500_000
 
         for layer_idx in range(self.n_layers):
             if self.normalize_residuals:
                 x = F.normalize(x, dim=-1)
 
-            # Fresh Kmeans per layer so each can use its own K (non-uniform
-            # codebooks).
             km = faiss_kmeans_fit(
                 x,
                 self.embed_dim,

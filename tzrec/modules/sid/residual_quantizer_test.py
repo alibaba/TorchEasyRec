@@ -188,7 +188,7 @@ class ResidualQuantizerCandidateConfigTest(unittest.TestCase):
         self.assertFalse(fq._candidate_output_enabled)
 
     def test_topk_below_one_raises(self) -> None:
-        with self.assertRaisesRegex(ValueError, "topk must be >= 1"):
+        with self.assertRaisesRegex(ValueError, "topk must be in"):
             _FakeQuantizer(
                 embed_dim=3,
                 n_layers=2,
@@ -207,7 +207,7 @@ class ResidualQuantizerCandidateConfigTest(unittest.TestCase):
 
     def test_topk_exceeds_last_layer_codebook_raises(self) -> None:
         # n_embed=4 -> last-layer codebook size is 4; topk=5 is out of range.
-        with self.assertRaisesRegex(ValueError, "must be <= target"):
+        with self.assertRaisesRegex(ValueError, "topk must be in"):
             _FakeQuantizer(
                 embed_dim=3,
                 n_layers=2,

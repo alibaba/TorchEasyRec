@@ -79,7 +79,6 @@ class BaseSidModel(BaseModel):
         if not cfg.codebook:
             raise ValueError("codebook must be set, e.g. [256, 256, 256]")
         self._n_embed_list = list(cfg.codebook)
-        # Fail fast: a zero entry only errors opaquely deep in faiss later.
         if any(k < 1 for k in self._n_embed_list):
             raise ValueError(
                 f"every codebook entry must be >= 1, got {self._n_embed_list}"

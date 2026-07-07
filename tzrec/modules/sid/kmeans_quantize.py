@@ -68,8 +68,7 @@ def faiss_kmeans_fit(
             "`pip install faiss-cpu` or `pip install faiss-gpu`."
         ) from e
 
-    # Copy + drop any `gpu` key: faiss.Kmeans honors it and would move the fit
-    # to GPU, breaking the CPU-only contract (the caller's dict stays untouched).
+    # Drop any `gpu` key: faiss.Kmeans honors it and would move the fit off CPU.
     kwargs = dict(faiss_kmeans_kwargs or {})
     kwargs.pop("gpu", None)
     n = int(x.shape[0])
@@ -98,8 +97,6 @@ class ReservoirSampler:
     def __init__(self, capacity: int, dim: int) -> None:
         self._cap = capacity
         self._dim = dim
-        # Allocated lazily on the first add. _n_filled = used slots;
-        # _n_seen = running count for the accept prob.
         self._buf: Optional[torch.Tensor] = None
         self._n_filled = 0
         self._n_seen = 0
@@ -132,8 +129,6 @@ class ReservoirSampler:
         if self._buf is None:
             self._buf = torch.empty(cap, self._dim, dtype=torch.float32)
 
-        # Phase 1: fill empty slots first. x is on the host, so ``.to`` is a
-        # dtype cast into the buffer, not a device copy.
         if self._n_filled < cap:
             take = min(x.shape[0], cap - self._n_filled)
             self._buf[self._n_filled : self._n_filled + take] = x[:take].to(
@@ -145,15 +140,13 @@ class ReservoirSampler:
             if x.shape[0] == 0:
                 return
 
-        # Phase 2: row j enters with prob cap/(n_seen+j+1), displacing a random
-        # slot. float64 keeps n_seen+j+1 exact past 2**24.
+        # float64 keeps n_seen+j+1 exact past 2**24.
         r = x.shape[0]
         pos = self._n_seen + torch.arange(r)
         accept = torch.rand(r) < (cap / (pos + 1).to(torch.float64))
         idx = accept.nonzero(as_tuple=True)[0]
         if idx.numel() > 0:
             slots = torch.randint(0, cap, (idx.numel(),))
-            # Slot collisions are last-write-wins; O(B/cap) bias, negligible here.
             self._buf[slots] = x[idx].to(torch.float32)
         self._n_seen += r
 
@@ -186,12 +179,9 @@ class KMeansQuantizeLayer(QuantizeLayer):
     def __init__(self, n_embed: int, embed_dim: int) -> None:
         super().__init__(n_embed, embed_dim)
         self.register_buffer("centroids", torch.zeros(n_embed, embed_dim))
-        # Persistent so a post-fit checkpoint round-trips; a mid-fit poison
-        # (True flag + zero centroids) is caught in _load_from_state_dict.
+        # Persistent so post-fit checkpoints round-trip; mid-fit poison caught on load.
         self.register_buffer("_is_initialized", torch.tensor(False))
-        # Plain-Python mirror of the buffer, read on the per-batch forward
-        # path to avoid a .item() GPU->CPU sync. Synced only via
-        # mark_initialized_ and _load_from_state_dict.
+        # Plain-Python mirror of the buffer, avoiding a per-forward .item() GPU sync.
         self._initialized: bool = False
 
     @property
@@ -212,8 +202,7 @@ class KMeansQuantizeLayer(QuantizeLayer):
             centroids (Tensor): externally trained centroids,
                 shape (n_embed, embed_dim).
         """
-        # raise (not assert): under ``python -O`` a dropped assert would let a
-        # (1, D) tensor broadcast-replicate into all K centroid rows silently.
+        # raise (not assert): `python -O` would drop it, letting a bad shape broadcast.
         if centroids.shape != self.centroids.shape:
             raise RuntimeError(
                 f"centroids shape mismatch: expected {tuple(self.centroids.shape)}, "
@@ -244,7 +233,6 @@ class KMeansQuantizeLayer(QuantizeLayer):
             unexpected_keys,
             error_msgs,
         )
-        # Mirror the restored buffer into the cached flag (one load-time sync).
         self._initialized = bool(self._is_initialized.item())
         if self._initialized and self.centroids.abs().sum() == 0:
             error_msgs.append(
@@ -271,18 +259,13 @@ class KMeansQuantizeLayer(QuantizeLayer):
             QuantizeOutput: selected centroid/id plus top-k nearest ids/scores.
         """
         if not self.is_initialized:
-            # Pre-fit no-op so the model stays callable; codes are dummy zeros and
-            # topk/candidate metadata is omitted (never consumed before the fit).
             ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
             return QuantizeOutput(embeddings=torch.zeros_like(x), ids=ids)
-        # Match x to the centroid dtype (as load_centroids_ does): cdist rejects
-        # mismatched dtypes, so a non-fp32 input would otherwise raise.
+        # Match centroid dtype: cdist rejects mismatched dtypes.
         distances = torch.cdist(x.to(self.centroids.dtype), self.centroids)
         if self.training:
-            # argmin is invariant to the monotonic square, so skip the .pow(2).
             ids = distances.argmin(dim=-1)
             return QuantizeOutput(embeddings=self.centroids[ids], ids=ids)
-        # eval/inference: squared-L2 scores; the square doesn't affect selection.
         return self._topk_output(distances.pow(2), topk)
 
     def get_codebook_embeddings(self) -> torch.Tensor:

@@ -200,10 +200,8 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             return
 
         is_ddp = dist.is_initialized() and dist.get_world_size() > 1
-        # The fit runs on rank 0 only, then broadcasts. faiss needs N >= max(K),
-        # so a too-small rank-0 first batch would raise on rank 0 while the other
-        # ranks block forever on the centroid broadcast. Broadcast rank 0's verdict
-        # first so every rank aborts together with a clear error instead.
+        # Fit on rank 0 then broadcast; send the N>=max(K) verdict first so a too-small
+        # rank-0 batch aborts all ranks instead of deadlocking the broadcast.
         max_k = max(self.n_embed_list)
         enough = torch.tensor([1 if data.shape[0] >= max_k else 0], device=data.device)
         if is_ddp:
@@ -215,8 +213,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             )
 
         if (not is_ddp) or dist.get_rank() == 0:
-            # TODO(follow-up): accumulate samples across multiple batches for the
-            # warm-start fit instead of seeding from only the first training batch.
+            # TODO(follow-up): accumulate samples across batches, not just the first.
             centers = faiss_residual_kmeans(
                 data,
                 self.n_embed_list,

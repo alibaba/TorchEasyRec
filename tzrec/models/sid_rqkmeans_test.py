@@ -318,7 +318,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         cfg = sid_model_pb2.SidRqkmeans(codebook=[16, 16])
         cfg.candidate_output_config.enabled = True
         cfg.candidate_output_config.topk = 17
-        with self.assertRaisesRegex(ValueError, "codebook size"):
+        with self.assertRaisesRegex(ValueError, "topk must be in"):
             SidRqkmeans(
                 model_config=model_pb2.ModelConfig(
                     feature_groups=feature_groups, sid_rqkmeans=cfg

@@ -266,7 +266,7 @@ class SidRqvaeTest(unittest.TestCase):
         model_config = model_pb2.ModelConfig(
             feature_groups=feature_groups, sid_rqvae=cfg
         )
-        with self.assertRaisesRegex(ValueError, "codebook size"):
+        with self.assertRaisesRegex(ValueError, "topk must be in"):
             SidRqvae(model_config=model_config, features=features, labels=[])
 
     def test_rqvae_contrastive_mode(self) -> None:

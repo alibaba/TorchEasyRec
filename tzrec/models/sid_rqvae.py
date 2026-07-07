@@ -71,8 +71,6 @@ class SidRqvae(BaseSidModel):
         self._init_contrastive()
 
         embed_dim = cfg.embed_dim
-        # Fail fast (parity with BaseSidModel's codebook/input_dim checks): a zero
-        # dim only errors opaquely deep in nn.Linear/Embedding otherwise.
         if embed_dim < 1:
             raise ValueError(f"embed_dim must be >= 1, got {embed_dim}")
         hidden_dims = (
@@ -83,8 +81,6 @@ class SidRqvae(BaseSidModel):
 
         sinkhorn_cfg = config_to_kwargs(cfg.sinkhorn_config)
 
-        # MLP activates its last layer; the trailing bare Linear keeps the
-        # latent / reconstruction unbounded.
         self._encoder = nn.Sequential(
             MLP(self._input_dim, hidden_units=hidden_dims),
             nn.Linear(hidden_dims[-1], embed_dim),

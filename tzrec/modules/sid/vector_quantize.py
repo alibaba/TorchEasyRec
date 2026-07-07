@@ -121,8 +121,7 @@ class VectorQuantizeLayer(QuantizeLayer):
             "`emb` (nearest code), so the returned id and embedding diverge. "
             "Use STE with Sinkhorn, or Gumbel-Softmax without Sinkhorn."
         )
-        # epsilon sharpens exp(-cost * epsilon); <= 0 flips the kernel and the
-        # (large, shifted) cost overflows to +Inf -> NaN assignments.
+        # epsilon <= 0 flips exp(-cost*epsilon) and overflows to +Inf -> NaN.
         if use_sinkhorn and sinkhorn_epsilon <= 0:
             raise ValueError(f"sinkhorn_epsilon must be > 0, got {sinkhorn_epsilon}")
         self.forward_mode = forward_mode
@@ -220,10 +219,8 @@ class VectorQuantizeLayer(QuantizeLayer):
             return QuantizeOutput(embeddings=emb, ids=ids)
 
         if self.training:
-            # Return the RAW codebook vector (no per-layer STE wrap): the aggregate
-            # STE in ResidualVectorQuantizer.forward routes the encoder gradient,
-            # while a wrap here would detach the codebook from ``latents`` and freeze
-            # it at init.
+            # Return the RAW codebook vector: the aggregate STE in
+            # ResidualVectorQuantizer.forward; a wrap here freezes the codebook at init.
             ids = self._find_nearest_embedding(distances)
             return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
 

@@ -92,11 +92,9 @@ class ResidualQuantizer(BaseModule):
         assert n_layers >= 1, f"n_layers must be >= 1, got {n_layers}"
         self.embed_dim = embed_dim
         self.n_layers = n_layers
-        self._candidate_layer_idx = n_layers - 1
         self.normalize_residuals = normalize_residuals
         self.n_embed_list = normalize_n_embed(n_embed, n_layers)
         self._init_candidate_output_config(candidate_output_config)
-        # Subclasses MUST populate this with one quantization layer each.
         self.layers: nn.ModuleList = nn.ModuleList()
 
     def output_dim(self) -> int:
@@ -117,22 +115,18 @@ class ResidualQuantizer(BaseModule):
         if candidate_output_config is None or not candidate_output_config["enabled"]:
             return
 
+        self._candidate_layer_idx = self.n_layers - 1
         self._candidate_output_topk = int(candidate_output_config["topk"])
 
-        if self._candidate_output_topk < 1:
+        n_embed = self.n_embed_list[self._candidate_layer_idx]
+        if self._candidate_output_topk < 1 or self._candidate_output_topk > n_embed:
             raise ValueError(
-                f"candidate_output_config.topk must be >= 1, "
+                f"candidate_output_config.topk must be in [1, {n_embed}], "
                 f"got {self._candidate_output_topk}"
             )
         if candidate_output_config["strategy"] != "last_layer_knn":
             raise ValueError(
                 "candidate_output_config.strategy supports only 'last_layer_knn' in v1."
-            )
-        if self._candidate_output_topk > self.n_embed_list[self._candidate_layer_idx]:
-            raise ValueError(
-                f"candidate_output_config.topk ({self._candidate_output_topk}) "
-                f"must be <= target "
-                f"layer codebook size ({self.n_embed_list[self._candidate_layer_idx]})."
             )
 
         self._candidate_output_enabled = True
@@ -338,8 +332,7 @@ class ResidualQuantizer(BaseModule):
         Returns:
             Tensor: reconstructed embeddings, shape (B, embed_dim).
         """
-        # Seed from the first lookup so device and dtype follow the codebook
-        # (avoids pinning the sum to fp32 under mixed precision).
+        # Seed from the first lookup so dtype/device follow the codebook (not fp32/AMP).
         quantized_sum = self._lookup_code(0, codes[:, 0])
         for i in range(1, self.n_layers):
             quantized_sum = quantized_sum + self._lookup_code(i, codes[:, i])
