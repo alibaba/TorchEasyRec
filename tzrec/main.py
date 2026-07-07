@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 from collections import OrderedDict
+from contextlib import nullcontext
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple
@@ -78,6 +79,7 @@ from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -181,7 +183,7 @@ def _evaluate(
     )
 
     use_step = eval_config.num_steps and eval_config.num_steps > 0
-    iterator = iter(eval_dataloader)
+    iterator = eval_dataloader.get_iterator()  # pyre-ignore[16]
     step_iter = range(eval_config.num_steps) if use_step else itertools.count(0)
 
     desc_suffix = ""
@@ -332,7 +334,8 @@ def _train_and_evaluate(
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
-    dataloader_state: Optional[Dict[str, int]] = None,
+    dataloader_state: Optional[Dict[str, Any]] = None,
+    delta_embedding_dumper: Optional[DeltaEmbeddingDumper] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -350,7 +353,21 @@ def _train_and_evaluate(
     )
     use_epoch = train_config.num_epochs and train_config.num_epochs > 0
     use_step = train_config.num_steps and train_config.num_steps > 0
-    epoch_iter = range(train_config.num_epochs) if use_epoch else itertools.count(0, 0)
+    epochs_completed = dataloader_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+    if use_epoch and epochs_completed >= train_config.num_epochs:
+        # nothing left to train; return before the model restore (inside the
+        # epoch loop) is skipped and a fresh-weight checkpoint is re-saved.
+        if is_local_rank_zero:
+            logger.warning(
+                f"{epochs_completed} epochs already completed in the restored "
+                "checkpoint, no epochs left to train."
+            )
+        return
+    epoch_iter = (
+        range(epochs_completed, train_config.num_epochs)
+        if use_epoch
+        else itertools.count(0, 0)
+    )
     step_iter = range(train_config.num_steps) if use_step else itertools.count(0)
 
     save_checkpoints_steps, save_checkpoints_epochs = 0, 0
@@ -358,6 +375,16 @@ def _train_and_evaluate(
         save_checkpoints_epochs = train_config.save_checkpoints_epochs
     else:
         save_checkpoints_steps = train_config.save_checkpoints_steps
+
+    # The CheckpointManager owns the save cadence + dedupe + watermark; the loop
+    # only gathers per-worker event-times and runs eval after a save.
+    ckpt_manager.set_save_policy(
+        save_checkpoints_steps,
+        save_checkpoints_epochs,
+        train_config.save_checkpoints_timestamp_interval,
+        list(train_config.save_checkpoints_timestamps),
+        train_config.save_checkpoints_timestamp_quorum,
+    )
 
     plogger = None
     summary_writer = None
@@ -398,10 +425,33 @@ def _train_and_evaluate(
         )
         prof.start()
 
-    last_ckpt_step = -1
     i_step = 0
     i_epoch = 0
     losses = {}
+
+    def run_eval(step: int, epoch: int) -> None:
+        """Run eval after a checkpoint save, if an eval dataloader is configured."""
+        if eval_dataloader is not None:
+            tracking_context = (
+                delta_embedding_dumper.pause_tracking()
+                if delta_embedding_dumper is not None
+                else nullcontext()
+            )
+            with tracking_context:
+                _evaluate(
+                    model,
+                    eval_dataloader,
+                    eval_config,
+                    eval_result_filename=eval_result_filename,
+                    global_step=step,
+                    eval_summary_writer=eval_summary_writer,
+                    global_epoch=epoch,
+                    check_all_workers_data_status=check_all_workers_data_status,
+                )
+            model.train()
+
+    # this rank's last consumed event-time, reused by the epoch / final saves
+    data_timestamp = -1.0
     for i_epoch in epoch_iter:
         pipeline = create_train_pipeline(
             model,
@@ -411,7 +461,7 @@ def _train_and_evaluate(
         if plogger is not None:
             plogger.set_description(f"Training Epoch {i_epoch}")
 
-        train_iterator = iter(train_dataloader)
+        train_iterator = train_dataloader.get_iterator()  # pyre-ignore[16]
 
         # Restore model and optimizer checkpoint
         if i_step == 0 and ckpt_path is not None:
@@ -420,14 +470,16 @@ def _train_and_evaluate(
                     ckpt_path, model, None, train_config.fine_tune_ckpt_param_map
                 )
             else:
-                # because optimizer's state is lazy init, we should do a dummy
-                # step before restore.
+                # optimizer state is lazy, so peek one batch to init it
+                # before restore.
                 peek_batch = next(train_iterator)
                 pipeline.progress(iter([peek_batch]))
                 train_iterator = itertools.chain([peek_batch], train_iterator)
                 ckpt_manager.restore(
                     ckpt_path, model, optimizer, train_config.fine_tune_ckpt_param_map
                 )
+            if delta_embedding_dumper is not None:
+                delta_embedding_dumper.clear()
 
         for i_step in step_iter:
             if i_step <= skip_steps:
@@ -455,46 +507,42 @@ def _train_and_evaluate(
                 for lr in lr_scheduler:
                     if not lr.by_epoch:
                         lr.step()
+
+                if delta_embedding_dumper is not None:
+                    delta_embedding_dumper.maybe_dump(i_step)
             except StopIteration:
+                # pass completed: later saves should record positions
+                # within the next pass, on top of the completed-pass count.
+                epochs_completed += 1
+                dataloader_state.clear()
+                dataloader_state[checkpoint_util.EPOCHS_COMPLETED] = epochs_completed
                 step_iter = itertools.chain([i_step], step_iter)
                 i_step -= 1
                 break
 
-            if save_checkpoints_steps > 0 and i_step > 0:
-                if i_step % save_checkpoints_steps == 0:
-                    last_ckpt_step = i_step
-                    ckpt_manager.save(i_step, model, optimizer, dataloader_state)
-                    if eval_dataloader is not None:
-                        _evaluate(
-                            model,
-                            eval_dataloader,
-                            eval_config,
-                            eval_result_filename=eval_result_filename,
-                            global_step=i_step,
-                            eval_summary_writer=eval_summary_writer,
-                            global_epoch=i_epoch,
-                            check_all_workers_data_status=check_all_workers_data_status,
-                        )
-                        model.train()
+            # Single entry point for step / epoch / event-time saves + dedupe;
+            # maybe_save reconciles this rank's event-time across ranks in lockstep.
+            data_timestamp = batch.data_timestamp
+            if ckpt_manager.maybe_save(
+                i_step,
+                model,
+                optimizer,
+                dataloader_state,
+                data_timestamp=data_timestamp,
+            ):
+                run_eval(i_step, i_epoch)
             if train_config.is_profiling:
                 prof.step()
 
-        if save_checkpoints_epochs > 0 and i_step > 0:
-            if (i_epoch + 1) % save_checkpoints_epochs == 0:
-                last_ckpt_step = i_step
-                ckpt_manager.save(i_step, model, optimizer, dataloader_state)
-                if eval_dataloader is not None:
-                    _evaluate(
-                        model,
-                        eval_dataloader,
-                        eval_config,
-                        eval_result_filename=eval_result_filename,
-                        global_step=i_step,
-                        eval_summary_writer=eval_summary_writer,
-                        global_epoch=i_epoch,
-                        check_all_workers_data_status=check_all_workers_data_status,
-                    )
-                    model.train()
+        if ckpt_manager.maybe_save(
+            i_step,
+            model,
+            optimizer,
+            dataloader_state,
+            epoch=i_epoch,
+            data_timestamp=data_timestamp,
+        ):
+            run_eval(i_step, i_epoch)
 
         if use_step and i_step >= train_config.num_steps - 1:
             break
@@ -502,6 +550,20 @@ def _train_and_evaluate(
         for lr in lr_scheduler:
             if lr.by_epoch:
                 lr.step()
+
+    # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
+    # codebook here). SID models run with periodic checkpointing disabled
+    # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
+    # the only checkpoint and persists whatever on_train_end produced.
+    _model.on_train_end()
+    if delta_embedding_dumper is not None:
+        # Flush the trailing partial interval before the final checkpoint.
+        # final_dump skips dump-boundary steps already written by maybe_dump,
+        # so it never overwrites their shards with an empty file. Ranks can
+        # reach here at different i_step (independent dataloader exhaustion with
+        # check_all_workers_data_status=False), so final_dump all-reduces the
+        # step across ranks to keep one complete shard set per step dir.
+        delta_embedding_dumper.final_dump(i_step)
 
     _log_train(
         i_step,
@@ -516,20 +578,15 @@ def _train_and_evaluate(
         summary_writer.close()
     if train_config.is_profiling:
         prof.stop()
-    if last_ckpt_step != i_step:
-        ckpt_manager.save(i_step, model, optimizer, dataloader_state)
-        if eval_dataloader is not None:
-            _evaluate(
-                model,
-                eval_dataloader,
-                eval_config,
-                eval_result_filename=eval_result_filename,
-                global_step=i_step,
-                eval_summary_writer=eval_summary_writer,
-                global_epoch=i_epoch,
-                check_all_workers_data_status=check_all_workers_data_status,
-            )
-            model.train()
+    if ckpt_manager.maybe_save(
+        i_step,
+        model,
+        optimizer,
+        dataloader_state,
+        data_timestamp=data_timestamp,
+        final=True,
+    ):
+        run_eval(i_step, i_epoch)
     ckpt_manager.close()
 
 
@@ -576,26 +633,11 @@ def train_and_evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     acc_utils.allow_tf32(train_config)
+    enable_delta_embedding_dump = train_config.HasField("delta_embedding_dump_config")
 
     data_config = pipeline_config.data_config
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
-
-    # Build dataloader
-    train_dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.TRAIN
-    )
-    eval_dataloader = None
-    if pipeline_config.eval_input_path:
-        # pyre-ignore [16]
-        gl_cluster = train_dataloader.dataset.get_sampler_cluster()
-        eval_dataloader = create_dataloader(
-            data_config,
-            features,
-            pipeline_config.eval_input_path,
-            mode=Mode.EVAL,
-            gl_cluster=gl_cluster,
-        )
 
     ckpt_manager = checkpoint_util.CheckpointManager(
         pipeline_config.model_dir,
@@ -616,12 +658,14 @@ def train_and_evaluate(
                 "fine_tune_checkpoint"
                 f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
             )
+    restore_from_model_dir = False
     if os.path.exists(pipeline_config.model_dir):
-        # Restore dataloader state if continuing training
+        # Find the latest checkpoint in model_dir when continuing training
         latest_ckpt_path, skip_steps = ckpt_manager.latest_checkpoint()
         if latest_ckpt_path:
             if continue_train:
                 ckpt_path = latest_ckpt_path
+                restore_from_model_dir = True
             else:
                 raise RuntimeError(
                     f"model_dir[{pipeline_config.model_dir}] already exists "
@@ -630,12 +674,33 @@ def train_and_evaluate(
                     "--continue_train)"
                 )
 
-    # Restore dataloader checkpoint state
-    dataloader_state: Optional[Dict[str, int]] = None
+    # Restore dataloader state before create_dataloader starts its workers
+    dataloader_state: Optional[Dict[str, Any]] = None
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
-        if dataloader_state:
-            train_dataloader.dataset.load_state_dict(dataloader_state)
+        if dataloader_state and not restore_from_model_dir:
+            # fine-tune checkpoints do not carry this job's epoch budget
+            dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
+
+    # Build dataloader
+    train_dataloader = create_dataloader(
+        data_config,
+        features,
+        pipeline_config.train_input_path,
+        mode=Mode.TRAIN,
+        checkpoint_state=dataloader_state,
+    )
+    eval_dataloader = None
+    if pipeline_config.eval_input_path:
+        # pyre-ignore [16]
+        gl_cluster = train_dataloader.dataset.get_sampler_cluster()
+        eval_dataloader = create_dataloader(
+            data_config,
+            features,
+            pipeline_config.eval_input_path,
+            mode=Mode.EVAL,
+            gl_cluster=gl_cluster,
+        )
 
     sampler_type = _get_sampler_type(data_config)
 
@@ -682,6 +747,15 @@ def train_and_evaluate(
         sharders=sharders,
         plan=plan,
     )
+    delta_embedding_dumper = None
+    if enable_delta_embedding_dump:
+        delta_embedding_dumper = DeltaEmbeddingDumper(
+            model,
+            train_config.delta_embedding_dump_config,
+            pipeline_config.model_dir,
+            device,
+            pipeline_config.feature_configs,
+        )
 
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
         train_config.dense_optimizer
@@ -776,6 +850,7 @@ def train_and_evaluate(
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
         dataloader_state=dataloader_state,
+        delta_embedding_dumper=delta_embedding_dumper,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
@@ -1138,7 +1213,7 @@ def predict(
         mode=Mode.PREDICT,
         debug_level=debug_level,
     )
-    infer_iterator = iter(infer_dataloader)
+    infer_iterator = infer_dataloader.get_iterator()  # pyre-ignore[16]
 
     if writer_type is None:
         writer_type = DatasetType.Name(data_config.dataset_type).replace(
@@ -1427,7 +1502,7 @@ def predict_checkpoint(
         model.device,
         execute_all_batches=True,
     )
-    iterator = iter(predict_dataloader)
+    iterator = predict_dataloader.get_iterator()  # pyre-ignore[16]
     step_iter = range(predict_steps) if predict_steps else itertools.count(0)
 
     desc_suffix = ""

@@ -1,0 +1,110 @@
+syntax = "proto2";
+package tzrec.protos;
+
+// Strictly-typed subset of faiss.Kmeans(D, K, **kwargs) knobs. Unset fields
+// fall back to faiss's own defaults (so it is safe to leave partially set).
+// ``gpu`` is intentionally omitted — the fit is CPU-only (SidRqkmeans refuses
+// a visible CUDA device).
+message FaissKmeansConfig {
+    optional uint32 niter = 1;
+    optional uint32 nredo = 2;
+    optional uint32 seed = 3;
+    optional uint32 max_points_per_centroid = 4;
+    optional uint32 min_points_per_centroid = 5;
+    optional bool spherical = 6;
+    optional bool verbose = 7;
+}
+
+message SinkhornConfig {
+    // Number of Sinkhorn iterations.
+    optional uint32 iters = 1 [default = 5];
+    // Sinkhorn sharpness parameter (epsilon).
+    optional float epsilon = 2 [default = 10.0];
+    // Whether Sinkhorn uniform assignment is enabled. Default: true.
+    // Set ``enabled: false`` to turn Sinkhorn off while still providing
+    // the sub-config (e.g. to override iters/epsilon for an A/B comparison).
+    optional bool enabled = 3 [default = true];
+}
+
+// Pair contrastive (dual-encoder) wiring for SidRqvae: which paired feature
+// group to encode and which group flags the contrastive-pair rows. This is
+// model structure / input contract (declared on the model), not loss config.
+message ContrastiveConfig {
+    // Name of the second (paired) embedding FEATURE GROUP (built by the same
+    // EmbeddingGroup as the main input; same total dim as `feature_group`).
+    required string pair_feature_group = 1;
+    // Name of the per-row pair-flag FEATURE GROUP (a single raw feature,
+    // dim 1; >0.5 = contrastive pair).
+    required string pair_flag_feature_group = 2;
+}
+
+message SidRqvae {
+    // === Network structure ===
+    // Quantization latent dimension (encoder output / codebook dim).
+    optional uint32 embed_dim = 2 [default = 64];
+    // Encoder hidden layer sizes, e.g. [256, 128].
+    // Defaults to [input_dim // 2] when unset.
+    repeated uint32 hidden_dims = 3;
+    // Per-layer codebook size, e.g. [256, 256, 256].
+    // List length is the number of residual quantization layers;
+    // non-uniform codebooks such as [512, 256, 128] are supported.
+    repeated uint32 codebook = 5;
+
+    // === Quantization strategy ===
+    // VQ forward mode: "ste" or "gumbel_softmax".
+    optional string forward_mode = 6 [default = "ste"];
+    // L2-normalize residuals before each quantization layer.
+    optional bool normalize_residuals = 7 [default = false];
+    // Distance metric: "l2" or "cosine".
+    optional string distance_type = 9 [default = "l2"];
+    // STE rotation trick.
+    optional bool rotation_trick = 12 [default = false];
+    // KMeans codebook initialization on first training forward. Default false.
+    // Best-effort warm-start only: it seeds the codebook from a SINGLE batch
+    // (the encoder is still near-random at step 1), and gradient training +
+    // commitment loss refine it afterward. Requirements/caveats:
+    //   * batch_size >= max(codebook) (FAISS requires N >= K) — so it is
+    //     unusable with large codebooks at typical batch sizes (e.g. an 8192
+    //     codebook needs a >= 8192-row first batch); under DDP a too-small
+    //     rank-0 batch now raises on all ranks instead of hanging.
+    //   * one batch is statistically thin (few points per centroid); for a
+    //     data-rich fit use the SidRqkmeans model (reservoir-sampled) instead.
+    // Opt-in for these reasons.
+    optional bool kmeans_init = 13 [default = false];
+
+    // === Optional sub-module configs ===
+    // Sinkhorn uniform assignment. Default behavior when this block is
+    // omitted: enabled with iters=5, epsilon=10.0. Include the sub-config
+    // to override params; set ``enabled: false`` inside it to disable.
+    optional SinkhornConfig sinkhorn_config = 15;
+    // Pair contrastive (dual-encoder) structure: when set, the model encodes a
+    // second (paired) feature group and runs the contrastive path. This declares
+    // the model's input contract + topology; the contrastive OBJECTIVE is enabled
+    // separately by a `contrastive_loss` entry in ModelConfig.losses (both must
+    // be set together).
+    optional ContrastiveConfig contrastive_config = 16;
+
+    // Reconstruction, commitment and (optional) contrastive losses are configured
+    // via ModelConfig.losses (the LossConfig ``sid_loss`` oneof); only the
+    // contrastive feature wiring above lives on this message.
+}
+
+message SidRqkmeans {
+    // Per-layer cluster counts, e.g. [256, 256, 256].
+    // List length is the number of residual quantization layers. Entries
+    // may differ per layer (non-uniform codebooks such as [256, 512, 1024]
+    // are supported — the FAISS backend fits a separate ``faiss.Kmeans``
+    // per layer).
+    repeated uint32 codebook = 3;
+    // L2-normalize residuals before each layer.
+    optional bool normalize_residuals = 4 [default = false];
+    // Strictly-typed extra kwargs forwarded to faiss.Kmeans(D, K, **kwargs).
+    optional FaissKmeansConfig faiss_kmeans_kwargs = 5;
+    // Target number of embeddings to reservoir-sample for the FAISS fit.
+    // Bounds host memory regardless of corpus
+    // size. 0 (the default) auto-derives it as max(K) * max_points_per_centroid
+    // (the largest per-layer codebook, for non-uniform codebooks) — exactly
+    // what FAISS subsamples to internally (default 256), so no training points
+    // are wasted.
+    optional uint32 train_sample_size = 6 [default = 0];
+}

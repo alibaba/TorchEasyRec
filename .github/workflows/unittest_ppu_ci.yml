@@ -24,7 +24,8 @@ jobs:
         id: run_unittest_ppu_ci
         run: |
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
-          EXTERNALS_ROOT="$(dirname "$WORK_ROOT")/externals"
+          # Resolve symlink: runner self-update makes externals a symlink, which DSW authZ rejects as a mount source.
+          EXTERNALS_ROOT="$(readlink -f "$(dirname "$WORK_ROOT")/externals")"
           docker run --rm --name "ppu-ci-${{ github.run_id }}" \
             --workdir /__w/TorchEasyRec/TorchEasyRec \
             --device=/dev/alixpu_ppu0 --device=/dev/alixpu_ppu1 --device=/dev/alixpu --device=/dev/alixpu_ctl \
@@ -32,9 +33,9 @@ jobs:
             -e HOME=/github/home \
             -e GITHUB_ACTIONS=true \
             -e CI=true \
-            -e CI_HYPOTHESIS=true \
             -e TZREC_TEST_TIMEOUT_SCALE=4 \
-            -e TORCHINDUCTOR_CACHE_DIR=/github/home/.torchinductor \
+            -e TRITON_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/triton \
+            -e TORCHINDUCTOR_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/inductor \
             -v "$WORK_ROOT":/__w \
             -v "$EXTERNALS_ROOT":/__e:ro \
             -v "$WORK_ROOT/_temp":/__w/_temp \
@@ -43,7 +44,7 @@ jobs:
             -v "$WORK_ROOT/_temp/_github_home":/github/home \
             -v "$WORK_ROOT/_temp/_github_workflow":/github/workflow \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.1-ppu \
-            bash -c 'cd run_${{ github.run_id }} && bash scripts/ci/ci_test_ppu.sh'
+            bash -c 'mkdir -p /__w/TorchEasyRec/tzrec-ci-cache/triton /__w/TorchEasyRec/tzrec-ci-cache/inductor && cd run_${{ github.run_id }} && bash scripts/ci/ci_test_ppu.sh'
       - name: StopDockerContainer
         if: always()
         run: |

@@ -38,6 +38,9 @@ CAND_POS_LENGTHS = "cand_pos_lengths"
 # Checkpoint metadata column names injected into RecordBatch
 CKPT_SOURCE_ID = "__ckpt_source_id__"  # string column for checkpoint source identifier
 CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
+# transient event-time column (Unix-epoch seconds, -1 when unavailable); its
+# per-batch max is surfaced on Batch.data_timestamp.
+DATA_TIMESTAMP = "__data_timestamp__"  # float64 column, event-time (seconds)
 
 
 def inject_checkpoint_metadata(
@@ -335,6 +338,8 @@ class Batch(Pipelineable):
     dummy: bool = field(default=False)
     # checkpoint info: {source_key: max_abs_row}
     checkpoint_info: Optional[Dict[str, int]] = field(default=None)
+    # max event-time (Unix-epoch seconds) in this batch, -1.0 when unavailable
+    data_timestamp: float = field(default=-1.0)
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
         """Copy to specified device."""
@@ -375,6 +380,7 @@ class Batch(Pipelineable):
             },
             dummy=self.dummy,
             checkpoint_info=self.checkpoint_info,
+            data_timestamp=self.data_timestamp,
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -453,6 +459,7 @@ class Batch(Pipelineable):
             },
             dummy=self.dummy,
             checkpoint_info=self.checkpoint_info,
+            data_timestamp=self.data_timestamp,
         )
 
     def to_dict(

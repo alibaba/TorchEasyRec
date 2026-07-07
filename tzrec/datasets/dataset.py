@@ -30,6 +30,7 @@ from tzrec.datasets.utils import (
     CAND_POS_LENGTHS,
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
+    DATA_TIMESTAMP,
     HARD_NEG_INDICES,
     Batch,
     RecordBatchTensor,
@@ -289,7 +290,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         return rank * num_workers + worker_id, num_workers * world_size
 
-    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+    def load_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
         """Set checkpoint state for resume.
 
         Args:
@@ -305,6 +306,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         worker_id, num_workers = self.get_worker_info()
         for input_data in self._reader.to_batches(worker_id, num_workers):
             yield self._build_batch(input_data)
+        # pass complete: clear the resume state so later epochs do full passes
+        self._reader.load_state_dict(None)
 
     def _build_batch(self, input_data: Dict[str, pa.Array]) -> Batch:
         """Process input data and build batch.
@@ -332,6 +335,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     grouped[f"{CKPT_ROW_IDX}_max"].to_pylist(),
                 )
             )
+
+        # Pop the event-time column (so it's not parsed as a feature) and surface
+        # its max; the -1.0 sentinel sorts below real times, so max is correct.
+        data_timestamp = -1.0
+        ts_col = input_data.pop(DATA_TIMESTAMP, None)
+        if ts_col is not None and len(ts_col) > 0:
+            max_ts = pc.max(ts_col).as_py()
+            if max_ts is not None:
+                data_timestamp = max_ts
 
         use_sample_mask = self._mode == Mode.TRAIN and (
             self._data_config.negative_sample_mask_prob > 0
@@ -372,6 +384,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
 
         # Set checkpoint info on batch
         batch.checkpoint_info = checkpoint_info
+        batch.data_timestamp = data_timestamp
         return batch
 
     def _apply_negative_sampler(
@@ -527,14 +540,14 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._sample_cost_field = sample_cost_field
         self._batch_cost_size = batch_cost_size
         self._use_sample_cost = False
-        self._checkpoint_state: Optional[Dict[str, int]] = None
+        self._checkpoint_state: Optional[Dict[str, Any]] = None
         if self._batch_cost_size is not None and self._batch_cost_size > 0:
             assert (
                 self._sample_cost_field is not None and len(self._sample_cost_field) > 0
             ), "Should set data_config.sample_cost_field when use batch_cost_size"
             self._use_sample_cost = True
 
-    def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
+    def load_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
         """Set checkpoint state for resume.
 
         Args:
@@ -745,6 +758,7 @@ def create_dataloader(
     mode: Mode = Mode.TRAIN,
     gl_cluster: Optional[Dict[str, Union[int, str]]] = None,
     debug_level: int = 0,
+    checkpoint_state: Optional[Dict[str, Any]] = None,
 ) -> DataLoader:
     """Build dataloader.
 
@@ -757,6 +771,8 @@ def create_dataloader(
         gl_cluster (dict, bool): if set, reuse the graphlearn cluster.
         debug_level (int): dataset debug level, when mode=predict and
             debug_level > 0, will dump fg encoded data to debug_str
+        checkpoint_state (dict, optional): resume state, applied before the
+            eager ``iter()`` forks workers so it reaches them.
 
     Return:
         dataloader (dataloader): a DataLoader.
@@ -772,6 +788,8 @@ def create_dataloader(
         mode=mode,
         debug_level=debug_level,
     )
+    if checkpoint_state:
+        dataset.load_state_dict(dict(checkpoint_state))
 
     kwargs = {}
     if data_config.num_workers < 1:
@@ -823,5 +841,15 @@ def create_dataloader(
     # For PyTorch versions 2.6 and above, we initialize the data iterator before
     # beginning the training process to avoid potential CUDA-related issues following
     # model saving.
-    iter(dataloader)
+    first_iterator = iter(dataloader)
+
+    def get_iterator() -> Iterator[Batch]:
+        # return the eager iterator first (keeps its prefetch), then fresh ones
+        nonlocal first_iterator
+        if first_iterator is not None:
+            it, first_iterator = first_iterator, None
+            return it
+        return iter(dataloader)
+
+    dataloader.get_iterator = get_iterator  # pyre-ignore[16]
     return dataloader

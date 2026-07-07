@@ -14,11 +14,13 @@ import unittest
 from parameterized import parameterized
 
 from tzrec.utils import dynamicemb_util
+from tzrec.utils.test_util import mark_ci_scope
 
 
 @unittest.skipUnless(
     dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
 )
+@mark_ci_scope("gpu")
 class StorageFormulaTest(unittest.TestCase):
     """Mode-aware ``_calculate_dynamicemb_table_storage_specific_size``."""
 

@@ -11,12 +11,11 @@
 
 import os
 import shutil
-import tempfile
 import unittest
 from collections import OrderedDict
 
 import torch
-from hypothesis import Verbosity, assume, given, settings
+from hypothesis import Verbosity, assume, given
 from hypothesis import strategies as st
 from torchrec import JaggedTensor, KeyedJaggedTensor
 
@@ -24,6 +23,7 @@ from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.dlrm_hstu import DlrmHSTU
 from tzrec.models.model import TrainWrapper
+from tzrec.models.rank_model import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.ops import Kernel
 from tzrec.protos import (
     feature_pb2,
@@ -35,7 +35,16 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
+from tzrec.utils.test_util import (
+    TestGraphType,
+    create_test_model,
+    gpu_unavailable,
+    make_test_dir,
+    mark_ci_scope,
+)
+from tzrec.utils.test_util import (
+    hypothesis_settings as settings,
+)
 
 
 def _build_model(
@@ -355,6 +364,7 @@ def _build_batch(
     ).to(device)
 
 
+@mark_ci_scope("gpu")
 class DlrmHSTUTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = None
@@ -425,7 +435,7 @@ class DlrmHSTUTest(unittest.TestCase):
         elif graph_type == TestGraphType.AOT_INDUCTOR:
             data = batch.to_dict()
             data = OrderedDict(sorted(data.items()))
-            self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+            self.test_dir = make_test_dir()
             dlrm_hstu.set_is_inference(True)
             dlrm_hstu = create_test_model(dlrm_hstu, graph_type, data, self.test_dir)
             predictions = dlrm_hstu(data)
@@ -444,6 +454,34 @@ class DlrmHSTUTest(unittest.TestCase):
         self.assertEqual(predictions["probs_is_like"].size(), (6,))
         self.assertEqual(predictions["logits_is_comment"].size(), (6,))
         self.assertEqual(predictions["probs_is_comment"].size(), (6,))
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_dlrm_hstu_predict_num_targets_order(self) -> None:
+        """num_targets split key must stay in input order.
+
+        ``_write_predictions`` regroups predictions per request via
+        ``cumsum(predictions[TARGET_REPEAT_INTERLEAVE_KEY])``. With
+        ``sequence_timestamp_is_ascending=False``, ``predict()`` flips features
+        (reversing request order) and flips predictions back, so the key must
+        also be un-flipped; reading it from the still-flipped
+        ``candidate.sequence_length`` returns [4, 2] for the [2, 4] test batch,
+        misassigning whole-request blocks. ``size()`` (== 6) can't catch it.
+        """
+        device = torch.device("cuda")
+        # candidate (cand_seq) counts in _build_batch, in input order.
+        expected_num_targets = [2, 4]
+        for ascending in (True, False):
+            model = _build_model(
+                device=device, sequence_timestamp_is_ascending=ascending
+            )
+            batch = _build_batch(device=device)
+            with torch.no_grad():
+                predictions = model.predict(batch)
+            self.assertEqual(
+                predictions[TARGET_REPEAT_INTERLEAVE_KEY].cpu().tolist(),
+                expected_num_targets,
+                msg=f"num_targets order wrong for ascending={ascending}",
+            )
 
     @unittest.skipIf(*gpu_unavailable)
     def test_dlrm_hstu_task_weight(self) -> None:

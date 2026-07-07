@@ -20,7 +20,7 @@ from unittest import mock
 import torch
 import torch.distributed as dist
 import torchrec
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torch import nn
 from torchrec import EmbeddingBagCollection
 from torchrec.distributed.model_parallel import (
@@ -37,6 +37,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.utils import checkpoint_util, misc_util
+from tzrec.utils.test_util import make_test_dir
 
 
 def _create_test_model(large_table_cnt=2, small_table_cnt=2):
@@ -173,9 +174,7 @@ def _remap_restore_worker(test_dir, rank, world_size, port, remap_file_path):
 
 class CheckpointUtilTest(unittest.TestCase):
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
@@ -408,9 +407,7 @@ class DataloaderCheckpointTest(unittest.TestCase):
     """Tests for dataloader checkpoint utilities."""
 
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
@@ -480,6 +477,250 @@ class DataloaderCheckpointTest(unittest.TestCase):
         checkpoint_util.update_dataloder_state(checkpoint_state, checkpoint_info)
 
         self.assertEqual(checkpoint_state, {"path:0": 100, "path:500": 200})
+
+    @parameterized.expand(
+        [
+            # no reference yet -> only initialize, never save
+            param(
+                "first_batch",
+                data_ts=1000,
+                last=None,
+                interval=600,
+                targets=[500],
+                expected=False,
+            ),
+            # floor(3600/3600)=1 > floor(3599/3600)=0
+            param(
+                "interval_crossed",
+                data_ts=3600,
+                last=3599,
+                interval=3600,
+                targets=[],
+                expected=True,
+            ),
+            # floor(3500/3600) == floor(3000/3600) == 0
+            param(
+                "interval_not_crossed",
+                data_ts=3500,
+                last=3000,
+                interval=3600,
+                targets=[],
+                expected=False,
+            ),
+            param(
+                "interval_disabled",
+                data_ts=10000,
+                last=0,
+                interval=0,
+                targets=[],
+                expected=False,
+            ),
+            # target boundary is inclusive on the right
+            param(
+                "target_crossed_exact",
+                data_ts=1500,
+                last=1000,
+                interval=0,
+                targets=[1500],
+                expected=True,
+            ),
+            param(
+                "target_crossed_past",
+                data_ts=1600,
+                last=1000,
+                interval=0,
+                targets=[1500],
+                expected=True,
+            ),
+            param(
+                "target_not_reached",
+                data_ts=1400,
+                last=1000,
+                interval=0,
+                targets=[1500],
+                expected=False,
+            ),
+            param(
+                "target_no_refire",
+                data_ts=2000,
+                last=1500,
+                interval=0,
+                targets=[1500],
+                expected=False,
+            ),
+            param(
+                "multiple_targets",
+                data_ts=1600,
+                last=1000,
+                interval=0,
+                targets=[900, 1500, 5000],
+                expected=True,
+            ),
+            # same interval bucket, but a target at 1500 is crossed
+            param(
+                "interval_and_targets",
+                data_ts=1600,
+                last=1000,
+                interval=3600,
+                targets=[1500],
+                expected=True,
+            ),
+        ]
+    )
+    def test_should_save_on_timestamp(
+        self, _name, data_ts, last, interval, targets, expected
+    ):
+        self.assertEqual(
+            checkpoint_util.should_save_on_timestamp(data_ts, last, interval, targets),
+            expected,
+        )
+
+    @parameterized.expand(
+        [
+            param("empty", ts_list=[], quorum=0.5, expected=None),
+            param("single", ts_list=[42.0], quorum=0.5, expected=42.0),
+            param("all_equal", ts_list=[5.0, 5.0, 5.0], quorum=0.5, expected=5.0),
+            # quorum=1.0 -> all workers must be past T -> min
+            param(
+                "full_quorum_is_min",
+                ts_list=[10.0, 20.0, 30.0, 40.0],
+                quorum=1.0,
+                expected=10.0,
+            ),
+            # quorum near 0 -> any one worker -> max
+            param(
+                "tiny_quorum_is_max",
+                ts_list=[10.0, 20.0, 30.0, 40.0],
+                quorum=0.01,
+                expected=40.0,
+            ),
+            # m=4, k=ceil(0.5*4)=2 -> 2nd largest, half are >= it
+            param(
+                "half_even", ts_list=[10.0, 20.0, 30.0, 40.0], quorum=0.5, expected=30.0
+            ),
+            # m=3, k=ceil(1.5)=2 -> median
+            param("half_odd", ts_list=[10.0, 30.0, 20.0], quorum=0.5, expected=20.0),
+            # a single far-future garbage value does not move the median
+            param(
+                "robust_to_outlier",
+                ts_list=[100.0, 101.0, 1e18],
+                quorum=0.5,
+                expected=101.0,
+            ),
+            # -1.0 (worker without a timestamp) sorts low, counts as "not past":
+            # 2 of 3 have a real time, quorum 0.5 met -> 100.0
+            param(
+                "sentinel_quorum_met",
+                ts_list=[100.0, 101.0, -1.0],
+                quorum=0.5,
+                expected=100.0,
+            ),
+            # only 1 of 3 has a real time, quorum 0.5 not met -> negative result
+            param(
+                "sentinel_quorum_unmet",
+                ts_list=[100.0, -1.0, -1.0],
+                quorum=0.5,
+                expected=-1.0,
+            ),
+        ]
+    )
+    def test_quorum_event_time(self, _name, ts_list, quorum, expected):
+        self.assertEqual(checkpoint_util.quorum_event_time(ts_list, quorum), expected)
+
+    def _policy_manager(self, **policy):
+        """A CheckpointManager with save() mocked and a save policy applied."""
+        tmp_dir = tempfile.mkdtemp(dir="./")
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        mgr = checkpoint_util.CheckpointManager(tmp_dir)
+        defaults = dict(
+            save_steps=0,
+            save_epochs=0,
+            ts_interval_s=0,
+            ts_targets=[],
+            ts_quorum=0.5,
+        )
+        defaults.update(policy)
+        mgr.set_save_policy(**defaults)
+        mgr.save = mock.MagicMock(return_value="ckpt")
+        return mgr
+
+    def test_maybe_save_step_interval(self):
+        mgr = self._policy_manager(save_steps=10)
+        self.assertFalse(mgr.maybe_save(5, model=None))
+        self.assertTrue(mgr.maybe_save(10, model=None))
+        self.assertEqual(mgr.save.call_count, 1)
+
+    def test_maybe_save_epoch_interval(self):
+        mgr = self._policy_manager(save_epochs=2)
+        self.assertFalse(mgr.maybe_save(100, model=None, epoch=0))
+        self.assertTrue(mgr.maybe_save(100, model=None, epoch=1))
+
+    def test_maybe_save_dedupe_epoch_after_same_step(self):
+        # regression: an epoch save right after a same-step save must not re-save
+        mgr = self._policy_manager(save_steps=10, save_epochs=1)
+        self.assertTrue(mgr.maybe_save(10, model=None))  # step trigger
+        self.assertFalse(mgr.maybe_save(10, model=None, epoch=0))  # same step -> no-op
+        self.assertEqual(mgr.save.call_count, 1)
+
+    def test_maybe_save_final_dedupe(self):
+        mgr = self._policy_manager(save_steps=10)
+        self.assertTrue(mgr.maybe_save(10, model=None))
+        self.assertFalse(mgr.maybe_save(10, model=None, final=True))  # already saved
+        self.assertTrue(mgr.maybe_save(11, model=None, final=True))  # new step
+
+    def test_maybe_save_timestamp_init_then_fire(self):
+        mgr = self._policy_manager(ts_interval_s=3600)
+        # first observed event-time only initializes the reference, no save
+        self.assertFalse(mgr.maybe_save(1, model=None, data_timestamp=3599.0))
+        # crossing the next Unix-epoch-aligned boundary fires
+        self.assertTrue(mgr.maybe_save(2, model=None, data_timestamp=3600.0))
+
+    def test_maybe_save_timestamp_sentinel(self):
+        # -1.0 (no timestamp this step) never establishes/advances the reference
+        # nor triggers a save; a real time later initializes cleanly
+        mgr = self._policy_manager(ts_interval_s=3600)
+        self.assertFalse(mgr.maybe_save(1, model=None, data_timestamp=-1.0))
+        self.assertIsNone(mgr._last_data_ts)  # not initialized to -1.0
+        self.assertFalse(mgr.maybe_save(2, model=None, data_timestamp=3599.0))
+        self.assertEqual(mgr._last_data_ts, 3599.0)  # real time initializes
+        self.assertTrue(mgr.maybe_save(3, model=None, data_timestamp=3600.0))
+
+    def test_maybe_save_stamps_watermark(self):
+        mgr = self._policy_manager(ts_interval_s=3600)
+        state = {}
+        self.assertFalse(
+            mgr.maybe_save(1, model=None, dataloader_state=state, data_timestamp=3599.0)
+        )
+        self.assertTrue(
+            mgr.maybe_save(2, model=None, dataloader_state=state, data_timestamp=3600.0)
+        )
+        # the watermark is stamped into the saved state, not the caller's dict
+        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, state)
+        saved_state = mgr.save.call_args.args[3]
+        self.assertEqual(saved_state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
+
+    def test_reconcile_event_time_single_process(self):
+        # not distributed: this rank's value passes through (quorum of one); -1.0
+        # (no timestamp) -> None; disabled policy -> None
+        mgr = self._policy_manager(ts_interval_s=3600)
+        self.assertEqual(mgr._reconcile_event_time(1717000000.0), 1717000000.0)
+        self.assertIsNone(mgr._reconcile_event_time(-1.0))
+        mgr_off = self._policy_manager()
+        self.assertIsNone(mgr_off._reconcile_event_time(1717000000.0))
+
+    def test_restore_seeds_watermark(self):
+        mgr = self._policy_manager(ts_interval_s=3600)
+        tmp_dir = tempfile.mkdtemp(dir="./")
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        checkpoint_util.save_dataloader_state(
+            tmp_dir, {"topic:0": 5, checkpoint_util.DATA_TS_WATERMARK: 7200.0}
+        )
+        state = mgr.restore_dataloader_state(tmp_dir)
+        self.assertEqual(state[checkpoint_util.DATA_TS_WATERMARK], 7200.0)
+        # seeded reference: a value in the same bucket does not re-fire
+        self.assertFalse(mgr.maybe_save(1, model=None, data_timestamp=7201.0))
+        # crossing the next boundary fires
+        self.assertTrue(mgr.maybe_save(2, model=None, data_timestamp=10800.0))
 
 
 if __name__ == "__main__":
