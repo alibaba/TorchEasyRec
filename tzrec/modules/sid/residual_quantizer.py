@@ -17,7 +17,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tzrec.modules.sid.types import QuantizeOutput, ResidualQuantizerOutput
+from tzrec.modules.sid.types import (
+    QuantizeOutput,
+    ResidualPassOutput,
+    ResidualQuantizerOutput,
+)
 from tzrec.modules.utils import BaseModule
 
 
@@ -71,6 +75,9 @@ class ResidualQuantizer(BaseModule):
         n_embed (int|List[int]): codebook size per layer. Default: 256.
         normalize_residuals (bool): L2-normalize residuals before each
             layer. Default: False.
+        candidate_output_config (Mapping|None): optional inference-time candidate
+            SID settings (``enabled`` / ``topk`` / ``strategy``); see
+            :meth:`_init_candidate_output_config`. Default: None (disabled).
     """
 
     def __init__(
@@ -134,10 +141,25 @@ class ResidualQuantizer(BaseModule):
     def _should_output_candidates(self) -> bool:
         """Whether forward should emit candidate SID tensors.
 
-        Candidate output is a configured, inference-only behavior: it is gated
-        purely by inference mode plus the enabling config, with no per-call flag.
+        Candidate output is a configured, inference-only behavior: inference mode
+        + the enabling config + a codebook that can actually produce candidates
+        (:meth:`_candidates_available`), with no per-call flag.
         """
-        return self.is_inference and self._candidate_output_enabled
+        return (
+            self.is_inference
+            and self._candidate_output_enabled
+            and self._candidates_available()
+        )
+
+    def _candidates_available(self) -> bool:
+        """Whether the codebook can currently produce candidate SIDs.
+
+        Base default: always. A backend whose codebook may be unfit (e.g.
+        :class:`~tzrec.modules.sid.residual_kmeans_quantizer.ResidualKMeansQuantizer`
+        before ``train_offline``) overrides this so candidate output is skipped —
+        not crashed — until the fit lands.
+        """
+        return True
 
     def _quantize_layer(
         self,
@@ -164,36 +186,25 @@ class ResidualQuantizer(BaseModule):
             )
         return self.layers[layer_idx].quantize(residual, topk=topk)
 
-    def _residual_pass(
-        self,
-        input: torch.Tensor,
-        include_candidates: bool = False,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        List[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
+    def _residual_pass(self, input: torch.Tensor) -> ResidualPassOutput:
         """Shared residual walk: per-layer assign, subtract, accumulate.
 
         The quantized vector is subtracted detached (keeps the residual chain
         gradient-free) and accumulated (keeps gradient when the backend
-        supplies it, e.g. VQ). Candidate generation reuses the last-layer
-        residual input from this same walk when requested.
+        supplies it, e.g. VQ). Whether candidate SIDs are produced is decided
+        internally by :meth:`_should_output_candidates` (inference mode + the
+        enabling config), so callers never pass a flag; the candidate walk
+        reuses the last-layer residual from this same pass.
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
-            include_candidates (bool): whether to return candidate SID tensors.
 
         Returns:
-            cluster_ids (Tensor): stacked codes, shape (B, n_layers).
-            aggregated (Tensor): sum of quantized vectors, shape (B, D).
-            cumulative (List[Tensor]): running sum after each layer
-                (``cumulative[-1] is aggregated``).
-            candidate_codes (Tensor, optional): candidate code tuples.
-            candidate_scores (Tensor, optional): candidate scores.
+            ResidualPassOutput: the walk result (``cluster_ids``, raw
+                ``aggregated`` sum, per-layer ``cumulative`` sums, and optional
+                ``candidate_codes`` / ``candidate_scores``).
         """
+        include_candidates = self._should_output_candidates()
         if include_candidates and self.training:
             raise RuntimeError("candidate SID output requires eval/inference mode.")
         residual = input
@@ -204,49 +215,52 @@ class ResidualQuantizer(BaseModule):
         for i in range(self.n_layers):
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
-            layer_topk = 1
-            if include_candidates and i == self._candidate_layer_idx:
-                # Last layer fetches topk neighbors to vary; others stay greedy.
-                layer_topk = self._candidate_output_topk
+            is_candidate_layer = include_candidates and i == self._candidate_layer_idx
+            # Last layer fetches topk neighbors to vary; others stay greedy.
+            layer_topk = self._candidate_output_topk if is_candidate_layer else 1
             out = self._quantize_layer(i, residual, topk=layer_topk)
-            codes, quantized = out.ids, out.embeddings
-            all_codes.append(codes)
-            aggregated = aggregated + quantized
+            all_codes.append(out.ids)
+            aggregated = aggregated + out.embeddings
             cumulative.append(aggregated)
-            residual = residual - quantized.detach()
-            if include_candidates and i == self._candidate_layer_idx:
+            residual = residual - out.embeddings.detach()
+            if is_candidate_layer:
                 candidate_layer_output = out
         cluster_ids = torch.stack(all_codes, dim=-1)  # (B, n_layers)
-        if include_candidates:
-            assert candidate_layer_output is not None
+
+        candidate_codes: Optional[torch.Tensor] = None
+        candidate_scores: Optional[torch.Tensor] = None
+        # candidate_layer_output is set iff candidates were requested; the
+        # ``_candidates_available`` gate guarantees the codebook is fit, so the
+        # last layer's top-k metadata is present.
+        if candidate_layer_output is not None:
             candidate_codes, candidate_scores = self._build_code_candidates(
                 cluster_ids,
                 candidate_layer_output,
             )
-            return (
-                cluster_ids,
-                aggregated,
-                cumulative,
-                candidate_codes,
-                candidate_scores,
-            )
-        return cluster_ids, aggregated, cumulative, None, None
+        return ResidualPassOutput(
+            cluster_ids=cluster_ids,
+            aggregated=aggregated,
+            cumulative=cumulative,
+            candidate_codes=candidate_codes,
+            candidate_scores=candidate_scores,
+        )
 
     def _residual_output(
         self,
-        cluster_ids: torch.Tensor,
+        walk: ResidualPassOutput,
         quantized_embeddings: torch.Tensor,
-        cumulative: List[torch.Tensor],
-        candidate_codes: Optional[torch.Tensor],
-        candidate_scores: Optional[torch.Tensor],
     ) -> ResidualQuantizerOutput:
-        """Pack residual-walk tensors into the public output type."""
+        """Pack a residual walk into the public output type.
+
+        ``quantized_embeddings`` is supplied separately because the VQ backend
+        replaces the raw ``walk.aggregated`` sum with its STE-adjusted version.
+        """
         return ResidualQuantizerOutput(
-            cluster_ids=cluster_ids,
+            cluster_ids=walk.cluster_ids,
             quantized_embeddings=quantized_embeddings,
-            latents=torch.stack(cumulative, dim=1),
-            candidate_codes=candidate_codes,
-            candidate_scores=candidate_scores,
+            latents=torch.stack(walk.cumulative, dim=1),
+            candidate_codes=walk.candidate_codes,
+            candidate_scores=walk.candidate_scores,
         )
 
     @torch.no_grad()
@@ -261,8 +275,7 @@ class ResidualQuantizer(BaseModule):
         Returns:
             Tensor: cluster ids, shape (B, n_layers).
         """
-        cluster_ids, _, _, _, _ = self._residual_pass(input)
-        return cluster_ids
+        return self._residual_pass(input).cluster_ids
 
     def _build_code_candidates(
         self,

@@ -220,19 +220,21 @@ class ResidualQuantizerCandidateWalkTest(unittest.TestCase):
     """Candidate machinery exercised backend-agnostically via _FakeQuantizer."""
 
     def test_candidate_output_requires_eval_mode(self) -> None:
-        # The training guard lives in _residual_pass (before the is_inference
-        # gate), so drive it directly in .train() mode.
+        # Inconsistent mode: candidate output is requested (is_inference + config
+        # enabled) yet the module is still in .train(); _residual_pass must reject
+        # it via the training guard.
         fq = _FakeQuantizer(
             embed_dim=3,
             n_layers=2,
             n_embed=4,
             candidate_output_config=_candidate_config(topk=2),
         )
+        fq.set_is_inference(True)
         fq.train()
         with self.assertRaisesRegex(
             RuntimeError, "candidate SID output requires eval/inference mode."
         ):
-            fq._residual_pass(torch.randn(3, 3), include_candidates=True)
+            fq._residual_pass(torch.randn(3, 3))
 
     def test_build_candidates(self) -> None:
         # Last-layer codes are the raw top-k neighbors (candidate[:, 0] is the
@@ -245,8 +247,9 @@ class ResidualQuantizerCandidateWalkTest(unittest.TestCase):
             candidate_output_config=_candidate_config(topk=2),
         )
         fq.eval()
+        fq.set_is_inference(True)
         x = torch.randn(5, 3)
-        _, _, _, cand_codes, cand_scores = fq._residual_pass(x, include_candidates=True)
+        _, _, _, cand_codes, cand_scores = fq._residual_pass(x)
         self.assertEqual(cand_codes.shape, (5, 2, 2))  # (B, topk, n_layers)
         self.assertEqual(cand_scores.shape, (5, 2))
         torch.testing.assert_close(cand_codes[:, 0, :], fq.get_codes(x))
@@ -265,8 +268,9 @@ class ResidualQuantizerCandidateWalkTest(unittest.TestCase):
             candidate_output_config=_candidate_config(topk=1),
         )
         fq.eval()
+        fq.set_is_inference(True)
         x = torch.randn(5, 3)
-        _, _, _, cand_codes, cand_scores = fq._residual_pass(x, include_candidates=True)
+        _, _, _, cand_codes, cand_scores = fq._residual_pass(x)
         self.assertEqual(cand_codes.shape, (5, 1, 2))
         self.assertEqual(cand_scores.shape, (5, 1))
         torch.testing.assert_close(cand_codes[:, 0, :], fq.get_codes(x))

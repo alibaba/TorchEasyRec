@@ -12,6 +12,7 @@
 """QuantizeLayer: the per-layer quantizer interface shared by SID backends."""
 
 from abc import abstractmethod
+from typing import Tuple
 
 import torch
 from torch import nn
@@ -51,7 +52,7 @@ class QuantizeLayer(nn.Module):
         self,
         distances: torch.Tensor,
         topk: int = 1,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return top-k nearest ids and scores from a distance matrix."""
         self._check_topk(topk)
         return torch.topk(distances, k=topk, dim=-1, largest=False)
@@ -62,6 +63,24 @@ class QuantizeLayer(nn.Module):
             raise ValueError(f"topk must be >= 1, got {topk}")
         if topk > self.n_embed:
             raise ValueError(f"topk must be <= n_embed ({self.n_embed}), got {topk}")
+
+    def _topk_output(self, distances: torch.Tensor, topk: int) -> QuantizeOutput:
+        """Assemble the eval/inference output (greedy pick + top-k) from distances.
+
+        Shared by both backends' eval paths: slot 0 of the ascending top-k is the
+        nearest (greedy) code, and the full top-k rides along for candidate SIDs.
+        The codebook read goes through :meth:`lookup`, so it stays backend-agnostic
+        (``centroids`` for K-Means, the ``nn.Embedding`` table for VQ).
+        """
+        topk_scores, topk_ids = self.nearest_neighbors(distances, topk)
+        ids = topk_ids[:, 0]
+        return QuantizeOutput(
+            embeddings=self.lookup(ids),
+            ids=ids,
+            scores=topk_scores[:, 0],
+            topk_ids=topk_ids,
+            topk_scores=topk_scores,
+        )
 
     @abstractmethod
     def get_codebook_embeddings(self) -> torch.Tensor:

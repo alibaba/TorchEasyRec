@@ -227,17 +227,8 @@ class VectorQuantizeLayer(QuantizeLayer):
             ids = self._find_nearest_embedding(distances)
             return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
 
-        # eval/inference: torch.topk(largest=False) already yields the nearest at
-        # slot 0, so reuse it instead of a separate argmin + gather.
-        topk_scores, topk_ids = self.nearest_neighbors(distances, topk)
-        ids = topk_ids[:, 0]
-        return QuantizeOutput(
-            embeddings=self.embedding(ids),
-            ids=ids,
-            scores=topk_scores[:, 0],
-            topk_ids=topk_ids,
-            topk_scores=topk_scores,
-        )
+        # eval/inference: slot 0 of the top-k is the nearest (greedy) code.
+        return self._topk_output(distances, topk)
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the codebook table, shape (n_embed, embed_dim)."""

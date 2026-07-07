@@ -12,7 +12,7 @@
 """Data types for SID generation: enums and output tuples shared across quantizers."""
 
 from enum import Enum
-from typing import NamedTuple, Optional
+from typing import List, NamedTuple, Optional
 
 import torch
 
@@ -66,5 +66,29 @@ class ResidualQuantizerOutput(NamedTuple):
     cluster_ids: torch.Tensor
     quantized_embeddings: torch.Tensor
     latents: torch.Tensor
+    candidate_codes: Optional[torch.Tensor] = None
+    candidate_scores: Optional[torch.Tensor] = None
+
+
+class ResidualPassOutput(NamedTuple):
+    """Internal result of :meth:`ResidualQuantizer._residual_pass` (shared walk).
+
+    Distinct from :class:`ResidualQuantizerOutput`: it carries the raw running
+    sums (``cumulative``) and the un-STE'd ``aggregated`` sum, which the public
+    ``forward`` turns into ``latents`` / ``quantized_embeddings``.
+
+    Attributes:
+        cluster_ids (Tensor): stacked codes, shape (B, n_layers).
+        aggregated (Tensor): sum of quantized vectors, shape (B, D).
+        cumulative (List[Tensor]): running sum after each layer
+            (``cumulative[-1]`` is ``aggregated``).
+        candidate_codes (Tensor, optional): candidate code tuples, shape
+            (B, K, n_layers).
+        candidate_scores (Tensor, optional): candidate scores, shape (B, K).
+    """
+
+    cluster_ids: torch.Tensor
+    aggregated: torch.Tensor
+    cumulative: List[torch.Tensor]
     candidate_codes: Optional[torch.Tensor] = None
     candidate_scores: Optional[torch.Tensor] = None

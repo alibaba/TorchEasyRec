@@ -55,6 +55,29 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         self.assertIsNone(out.candidate_codes)
         self.assertIsNone(out.candidate_scores)
 
+    def test_candidate_output_before_fit_degrades_gracefully(self) -> None:
+        # Candidate output enabled + inference mode, but the codebook was never
+        # fit: the pre-fit KMeans layer emits no top-k metadata, so the model
+        # must stay callable (like the greedy path) and emit no candidates
+        # rather than crash in _build_code_candidates.
+        rkq = ResidualKMeansQuantizer(
+            embed_dim=4,
+            n_layers=2,
+            n_embed=8,
+            candidate_output_config={
+                "enabled": True,
+                "topk": 3,
+                "strategy": "last_layer_knn",
+            },
+        )
+        rkq.eval()
+        rkq.set_is_inference(True)
+        self.assertFalse(rkq.is_fitted)
+        out = rkq(torch.randn(5, 4))  # must not raise
+        self.assertEqual(out.cluster_ids.shape, (5, 2))
+        self.assertIsNone(out.candidate_codes)
+        self.assertIsNone(out.candidate_scores)
+
     def test_forward_is_fx_traceable(self) -> None:
         """Predict forward must FX-trace.
 

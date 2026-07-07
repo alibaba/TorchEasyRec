@@ -56,6 +56,9 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
             ``faiss.Kmeans(D, K, **kwargs)`` (e.g. {'niter': 20,
             'verbose': True, 'spherical': False}). A ``gpu`` key is ignored —
             the fit is CPU-only.
+        candidate_output_config (Mapping|None): optional inference-time candidate
+            SID settings (``enabled`` / ``topk`` / ``strategy``); candidates are
+            emitted only once the codebook is fit. Default: None (disabled).
     """
 
     def __init__(
@@ -102,19 +105,8 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         Returns:
             ResidualQuantizerOutput: named output with optional candidate tensors.
         """
-        cluster_ids, quantized_sum, cumulative, candidate_codes, candidate_scores = (
-            self._residual_pass(
-                input,
-                include_candidates=self._should_output_candidates(),
-            )
-        )
-        return self._residual_output(
-            cluster_ids,
-            quantized_sum,
-            cumulative,
-            candidate_codes,
-            candidate_scores,
-        )
+        walk = self._residual_pass(input)
+        return self._residual_output(walk, walk.aggregated)
 
     @property
     def is_fitted(self) -> bool:
@@ -124,6 +116,10 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         zeros), so reconstruction outputs are meaningful only once this is True.
         """
         return all(layer.is_initialized for layer in self.layers)
+
+    def _candidates_available(self) -> bool:
+        """Candidate SIDs need a fit codebook; skip (don't crash) before the fit."""
+        return self.is_fitted
 
     @torch.no_grad()
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:

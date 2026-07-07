@@ -99,6 +99,8 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         sinkhorn_iters (int): Sinkhorn iterations. Default: 5.
         sinkhorn_epsilon (float): Sinkhorn sharpness. Default: 10.0.
         gumbel_temperature (float): Gumbel-Softmax temperature. Default: 1.0.
+        candidate_output_config (Mapping|None): optional inference-time candidate
+            SID settings (``enabled`` / ``topk`` / ``strategy``). Default: None.
     """
 
     _FORWARD_MODE_MAP = {
@@ -302,31 +304,16 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         )
 
         walk_input = input if train_gumbel else input.detach()
-        (
-            cluster_ids,
-            aggregated_quants,
-            cumulative,
-            candidate_codes,
-            candidate_scores,
-        ) = self._residual_pass(
-            walk_input,
-            include_candidates=self._should_output_candidates(),
-        )
+        walk = self._residual_pass(walk_input)
 
-        quants_trunc = aggregated_quants
+        quants_trunc = walk.aggregated
         if self.training and not train_gumbel:
             if self.rotation_trick:
                 quants_trunc = self._apply_rotation_trick(input, quants_trunc)
             else:
                 quants_trunc = input + (quants_trunc - input).detach()
 
-        return self._residual_output(
-            cluster_ids,
-            quants_trunc,
-            cumulative,
-            candidate_codes,
-            candidate_scores,
-        )
+        return self._residual_output(walk, quants_trunc)
 
     @torch.no_grad()
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:

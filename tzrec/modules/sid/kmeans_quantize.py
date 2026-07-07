@@ -277,19 +277,13 @@ class KMeansQuantizeLayer(QuantizeLayer):
             return QuantizeOutput(embeddings=torch.zeros_like(x), ids=ids)
         # Match x to the centroid dtype (as load_centroids_ does): cdist rejects
         # mismatched dtypes, so a non-fp32 input would otherwise raise.
-        distances = torch.cdist(x.to(self.centroids.dtype), self.centroids).pow(2)
+        distances = torch.cdist(x.to(self.centroids.dtype), self.centroids)
         if self.training:
+            # argmin is invariant to the monotonic square, so skip the .pow(2).
             ids = distances.argmin(dim=-1)
             return QuantizeOutput(embeddings=self.centroids[ids], ids=ids)
-        topk_scores, topk_ids = self.nearest_neighbors(distances, topk)
-        ids = topk_ids[:, 0]
-        return QuantizeOutput(
-            embeddings=self.centroids[ids],
-            ids=ids,
-            scores=topk_scores[:, 0],
-            topk_ids=topk_ids,
-            topk_scores=topk_scores,
-        )
+        # eval/inference: squared-L2 scores; the square doesn't affect selection.
+        return self._topk_output(distances.pow(2), topk)
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the centroid table, shape (n_embed, embed_dim)."""
