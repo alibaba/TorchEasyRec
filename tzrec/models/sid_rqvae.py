@@ -210,12 +210,14 @@ class SidRqvae(BaseSidModel):
     def _predict_rqvae(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Standard RQ-VAE: a single reconstruction pass."""
         z_e, quant, x_hat = self._rqvae_pass(embedding)
+        latents = quant.latents
+        assert latents is not None  # RQ-VAE train/eval always builds latents
         return {
             "codes": quant.cluster_ids,
             "x_hat": x_hat,
             "recon_target": embedding,
             "encoder_out": z_e,
-            "latents": quant.latents,
+            "latents": latents,
         }
 
     def _predict_mixed(
@@ -237,6 +239,8 @@ class SidRqvae(BaseSidModel):
 
         z_e1, quant1, x_hat1 = self._rqvae_pass(embedding)
         z_e2, quant2, x_hat2 = self._rqvae_pass(fea2)
+        lat1, lat2 = quant1.latents, quant2.latents
+        assert lat1 is not None and lat2 is not None  # train/eval builds latents
 
         return {
             "codes": quant1.cluster_ids,
@@ -244,7 +248,7 @@ class SidRqvae(BaseSidModel):
             "recon_target": embedding,
             "recon_mask": ~pair_mask,
             "encoder_out": torch.cat([z_e1, z_e2], dim=0),
-            "latents": torch.cat([quant1.latents, quant2.latents], dim=0),
+            "latents": torch.cat([lat1, lat2], dim=0),
             "embed_a": x_hat1,
             "embed_b": x_hat2,
             "embed_a_ori": embedding,
