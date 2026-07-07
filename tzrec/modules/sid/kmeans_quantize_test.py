@@ -18,19 +18,14 @@ from tzrec.modules.sid.kmeans_quantize import (
     ReservoirSampler,
     faiss_kmeans_fit,
 )
+from tzrec.utils.test_util import faiss_unavailable
 
 
+@unittest.skipIf(*faiss_unavailable)
 class FaissKmeansFitTest(unittest.TestCase):
     """Tests for the shared one-layer FAISS fit primitive."""
 
-    def _require_faiss(self) -> None:
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-
     def test_fit_returns_trained_kmeans(self) -> None:
-        self._require_faiss()
         torch.manual_seed(0)
         # numpy input (the RQ-VAE call path; no faiss torch-utils needed).
         x = torch.randn(200, 6).numpy()
@@ -38,7 +33,6 @@ class FaissKmeansFitTest(unittest.TestCase):
         self.assertEqual(tuple(km.centroids.shape), (8, 6))
 
     def test_raises_on_too_few_points(self) -> None:
-        self._require_faiss()
         with self.assertRaisesRegex(RuntimeError, "need >= 8 points"):
             faiss_kmeans_fit(torch.randn(4, 6).numpy(), 6, 8)
 

@@ -12,6 +12,7 @@
 import unittest
 
 import torch
+from parameterized import parameterized
 from torch import nn
 
 from tzrec.modules.sid.residual_quantizer import (
@@ -174,6 +175,18 @@ def _candidate_config(topk=2, strategy="last_layer_knn") -> dict:
     }
 
 
+def _inference_fake(topk: int) -> "_FakeQuantizer":
+    fq = _FakeQuantizer(
+        embed_dim=3,
+        n_layers=2,
+        n_embed=4,
+        candidate_output_config=_candidate_config(topk=topk),
+    )
+    fq.eval()
+    fq.set_is_inference(True)
+    return fq
+
+
 class ResidualQuantizerCandidateConfigTest(unittest.TestCase):
     """Validation done by _init_candidate_output_config at construction."""
 
@@ -187,32 +200,18 @@ class ResidualQuantizerCandidateConfigTest(unittest.TestCase):
         )
         self.assertFalse(fq._candidate_output_enabled)
 
-    def test_topk_below_one_raises(self) -> None:
-        with self.assertRaisesRegex(ValueError, "topk must be in"):
+    @parameterized.expand(
+        [
+            ("topk_below_one", _candidate_config(topk=0), "topk must be in"),
+            ("bad_strategy", _candidate_config(strategy="random"), "last_layer_knn"),
+            # n_embed=4 -> last-layer codebook size is 4; topk=5 is out of range.
+            ("topk_exceeds_codebook", _candidate_config(topk=5), "topk must be in"),
+        ]
+    )
+    def test_invalid_candidate_config_raises(self, _name, config, regex) -> None:
+        with self.assertRaisesRegex(ValueError, regex):
             _FakeQuantizer(
-                embed_dim=3,
-                n_layers=2,
-                n_embed=4,
-                candidate_output_config=_candidate_config(topk=0),
-            )
-
-    def test_unknown_strategy_raises(self) -> None:
-        with self.assertRaisesRegex(ValueError, "last_layer_knn"):
-            _FakeQuantizer(
-                embed_dim=3,
-                n_layers=2,
-                n_embed=4,
-                candidate_output_config=_candidate_config(strategy="random"),
-            )
-
-    def test_topk_exceeds_last_layer_codebook_raises(self) -> None:
-        # n_embed=4 -> last-layer codebook size is 4; topk=5 is out of range.
-        with self.assertRaisesRegex(ValueError, "topk must be in"):
-            _FakeQuantizer(
-                embed_dim=3,
-                n_layers=2,
-                n_embed=4,
-                candidate_output_config=_candidate_config(topk=5),
+                embed_dim=3, n_layers=2, n_embed=4, candidate_output_config=config
             )
 
 
@@ -236,44 +235,22 @@ class ResidualQuantizerCandidateWalkTest(unittest.TestCase):
         ):
             fq._residual_pass(torch.randn(3, 3))
 
-    def test_build_candidates(self) -> None:
-        # Last-layer codes are the raw top-k neighbors (candidate[:, 0] is the
-        # top-scored one, == greedy here).
+    # topk>1: candidate[:, 0] is the top-scored last-layer neighbor (== greedy);
+    # topk==1: the single candidate is the greedy SID.
+    @parameterized.expand([("topk_two", 2), ("topk_one", 1)])
+    def test_build_candidates(self, _name, topk) -> None:
         torch.manual_seed(0)
-        fq = _FakeQuantizer(
-            embed_dim=3,
-            n_layers=2,
-            n_embed=4,
-            candidate_output_config=_candidate_config(topk=2),
-        )
-        fq.eval()
-        fq.set_is_inference(True)
+        fq = _inference_fake(topk)
         x = torch.randn(5, 3)
         _, _, _, cand_codes, cand_scores = fq._residual_pass(x)
-        self.assertEqual(cand_codes.shape, (5, 2, 2))  # (B, topk, n_layers)
-        self.assertEqual(cand_scores.shape, (5, 2))
+        self.assertEqual(cand_codes.shape, (5, topk, 2))  # (B, topk, n_layers)
+        self.assertEqual(cand_scores.shape, (5, topk))
         torch.testing.assert_close(cand_codes[:, 0, :], fq.get_codes(x))
-        # The greedy prefix (all but the last layer) is shared by every candidate.
-        self.assertTrue(
-            torch.equal(cand_codes[:, :, 0], cand_codes[:, :1, 0].expand(-1, 2))
-        )
-
-    def test_build_candidates_topk_one(self) -> None:
-        # topk==1: the single candidate is the greedy SID.
-        torch.manual_seed(0)
-        fq = _FakeQuantizer(
-            embed_dim=3,
-            n_layers=2,
-            n_embed=4,
-            candidate_output_config=_candidate_config(topk=1),
-        )
-        fq.eval()
-        fq.set_is_inference(True)
-        x = torch.randn(5, 3)
-        _, _, _, cand_codes, cand_scores = fq._residual_pass(x)
-        self.assertEqual(cand_codes.shape, (5, 1, 2))
-        self.assertEqual(cand_scores.shape, (5, 1))
-        torch.testing.assert_close(cand_codes[:, 0, :], fq.get_codes(x))
+        if topk > 1:
+            # greedy prefix (all but last layer) shared by every candidate
+            self.assertTrue(
+                torch.equal(cand_codes[:, :, 0], cand_codes[:, :1, 0].expand(-1, topk))
+            )
 
 
 if __name__ == "__main__":

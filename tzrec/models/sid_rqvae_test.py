@@ -101,6 +101,24 @@ def _contrastive_cfg() -> loss_pb2.LossConfig:
 class SidRqvaeTest(unittest.TestCase):
     """Tests for SidRqvae model."""
 
+    def _assert_has_grad(self, model) -> None:
+        self.assertTrue(
+            any(
+                p.grad is not None and p.grad.abs().sum() > 0
+                for p in model.parameters()
+            )
+        )
+
+    def _build_contrastive(self, features, feature_groups, pair_flag_group="pair_flag"):
+        """Construct a SidRqvae with contrastive wiring (raises tests drive this)."""
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.contrastive_config.pair_feature_group = "pair"
+        cfg.contrastive_config.pair_flag_feature_group = pair_flag_group
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
+        )
+        return SidRqvae(model_config=model_config, features=features, labels=[])
+
     def _create_model(
         self,
         use_contrastive=False,
@@ -294,10 +312,7 @@ class SidRqvaeTest(unittest.TestCase):
         total_loss = sum(losses.values())
         self.assertTrue(total_loss.requires_grad)
         total_loss.backward()
-        has_grad = any(
-            p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()
-        )
-        self.assertTrue(has_grad)
+        self._assert_has_grad(model)
 
     def test_rqvae_contrastive_all_recon(self) -> None:
         """Mixed mode, all-recon batch: contrastive term 0, recon term > 0."""
@@ -334,10 +349,7 @@ class SidRqvaeTest(unittest.TestCase):
         losses = model.loss(model.predict(batch), batch)
         sum(losses.values()).backward()
 
-        has_grad = any(
-            p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()
-        )
-        self.assertTrue(has_grad)
+        self._assert_has_grad(model)
 
     def test_commitment_latent_weight_wrong_length_raises(self) -> None:
         """A commitment_loss with a bad latent_weight length fails in init_loss."""
@@ -365,40 +377,24 @@ class SidRqvaeTest(unittest.TestCase):
         features, feature_groups = _features_and_groups(
             32, use_contrastive=True, pair_emb_dim=16
         )
-        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.contrastive_config.pair_feature_group = "pair"
-        cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
-        model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
-        )
         with self.assertRaisesRegex(ValueError, "must match"):
-            SidRqvae(model_config=model_config, features=features, labels=[])
+            self._build_contrastive(features, feature_groups)
 
     def test_pair_flag_group_must_be_dim_1(self) -> None:
         """A pair-flag group with dim != 1 fails fast (would mis-route rows)."""
         features, feature_groups = _features_and_groups(
             32, use_contrastive=True, flag_dim=3
         )
-        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.contrastive_config.pair_feature_group = "pair"
-        cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
-        model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
-        )
         with self.assertRaisesRegex(ValueError, "dim-1 raw flag"):
-            SidRqvae(model_config=model_config, features=features, labels=[])
+            self._build_contrastive(features, feature_groups)
 
     def test_contrastive_group_missing_raises(self) -> None:
         """A typo'd contrastive group name fails fast at init, not on forward."""
         features, feature_groups = _features_and_groups(32, use_contrastive=True)
-        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.contrastive_config.pair_feature_group = "pair"
-        cfg.contrastive_config.pair_flag_feature_group = "pair_flagTYPO"
-        model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
-        )
         with self.assertRaisesRegex(ValueError, "not in model_config.feature_groups"):
-            SidRqvae(model_config=model_config, features=features, labels=[])
+            self._build_contrastive(
+                features, feature_groups, pair_flag_group="pair_flagTYPO"
+            )
 
     def test_eval_metric_masks_contrastive_pair_rows(self) -> None:
         """Contrastive eval mse/rel_loss score only the non-pair (recon) rows.

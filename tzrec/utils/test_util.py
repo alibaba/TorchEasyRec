@@ -52,6 +52,10 @@ torch_fx_tool_unavailable: Tuple[bool, str] = (
     importlib.util.find_spec("torch_fx_tool") is None,
     "torch_fx_tool wheel is not installed (required for RTP export)",
 )
+faiss_unavailable: Tuple[bool, str] = (
+    importlib.util.find_spec("faiss") is None,
+    "faiss is not installed (required for SID residual K-Means)",
+)
 
 
 def get_compare_tolerance(

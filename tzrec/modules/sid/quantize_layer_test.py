@@ -33,21 +33,10 @@ class _StubQuantizeLayer(QuantizeLayer):
 
     def quantize(self, x: torch.Tensor, topk: int = 1) -> QuantizeOutput:
         dist = torch.cdist(x, self._codebook)
-        topk_ids = None
-        topk_scores = None
-        ids = dist.argmin(dim=-1)
-        scores = None
         if not self.training:
-            topk_scores, topk_ids = self.nearest_neighbors(dist, topk)
-            ids = topk_ids[:, 0]
-            scores = topk_scores[:, 0]
-        return QuantizeOutput(
-            embeddings=self.lookup(ids),
-            ids=ids,
-            scores=scores,
-            topk_ids=topk_ids,
-            topk_scores=topk_scores,
-        )
+            return self._topk_output(dist, topk)
+        ids = dist.argmin(dim=-1)
+        return QuantizeOutput(embeddings=self.lookup(ids), ids=ids)
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         return self._codebook
@@ -56,23 +45,23 @@ class _StubQuantizeLayer(QuantizeLayer):
 class QuantizeLayerTest(unittest.TestCase):
     """Tests for the shared QuantizeLayer base class."""
 
+    def setUp(self) -> None:
+        self.layer = _StubQuantizeLayer(n_embed=4, embed_dim=3)
+
     def test_init_stores_codebook_shape(self) -> None:
-        layer = _StubQuantizeLayer(n_embed=4, embed_dim=3)
-        self.assertEqual(layer.n_embed, 4)
-        self.assertEqual(layer.embed_dim, 3)
+        self.assertEqual(self.layer.n_embed, 4)
+        self.assertEqual(self.layer.embed_dim, 3)
 
     def test_lookup_gathers_codebook_rows(self) -> None:
-        layer = _StubQuantizeLayer(n_embed=4, embed_dim=3)
         ids = torch.tensor([0, 2, 3, 1])
-        out = layer.lookup(ids)
-        torch.testing.assert_close(out, layer.get_codebook_embeddings()[ids])
+        out = self.layer.lookup(ids)
+        torch.testing.assert_close(out, self.layer.get_codebook_embeddings()[ids])
         self.assertEqual(out.shape, (4, 3))
 
     def test_quantize_assigns_exact_codebook_rows(self) -> None:
         # Feeding codebook rows back in must recover their own indices.
-        layer = _StubQuantizeLayer(n_embed=4, embed_dim=3)
-        x = layer.get_codebook_embeddings().clone()
-        out = layer.quantize(x)
+        x = self.layer.get_codebook_embeddings().clone()
+        out = self.layer.quantize(x)
         torch.testing.assert_close(out.ids, torch.arange(4))
         torch.testing.assert_close(out.embeddings, x)
 

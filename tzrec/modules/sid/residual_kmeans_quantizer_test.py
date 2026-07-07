@@ -12,6 +12,7 @@
 import unittest
 
 import torch
+from parameterized import parameterized
 
 from tzrec.modules.sid.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
@@ -20,6 +21,7 @@ from tzrec.modules.sid.residual_quantizer import (
     ResidualQuantizer,
 )
 from tzrec.modules.sid.types import ResidualQuantizerOutput
+from tzrec.utils.test_util import faiss_unavailable
 
 
 class ResidualKMeansQuantizerTest(unittest.TestCase):
@@ -32,17 +34,17 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         self.assertEqual(rkq.n_embed_list, [8, 4, 16])
         self.assertEqual([layer.centroids.shape[0] for layer in rkq.layers], [8, 4, 16])
 
-    def test_train_offline_raises_on_too_few_points(self) -> None:
-        """N < largest K fails fast (clear message before faiss's own throw)."""
+    @parameterized.expand(
+        [
+            ("too_few_points", (4, 4), "largest layer K"),
+            ("wrong_dim", (16, 8), "inputs must be"),
+        ]
+    )
+    def test_train_offline_guard_raises(self, _name, shape, regex) -> None:
+        """train_offline validates N-vs-K and input width before faiss runs."""
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=1, n_embed=8)
-        with self.assertRaisesRegex(RuntimeError, "largest layer K"):
-            rkq.train_offline(torch.randn(4, 4), verbose=False)
-
-    def test_train_offline_raises_on_wrong_dim(self) -> None:
-        """An input whose width != embed_dim fails fast."""
-        rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=1, n_embed=8)
-        with self.assertRaisesRegex(RuntimeError, "inputs must be"):
-            rkq.train_offline(torch.randn(16, 8), verbose=False)
+        with self.assertRaisesRegex(RuntimeError, regex):
+            rkq.train_offline(torch.randn(*shape), verbose=False)
 
     def test_forward_returns_zeros_before_fit(self) -> None:
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=2, n_embed=8)
@@ -99,11 +101,8 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
             traced_out.quantized_embeddings, eager.quantized_embeddings
         )
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_train_offline_non_uniform(self) -> None:
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
         torch.manual_seed(0)
         n_embed = [8, 4, 16]
         rkq = ResidualKMeansQuantizer(
@@ -114,17 +113,12 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         # Each layer fit its own K centroids; codes stay in per-layer range.
         out = rkq(torch.randn(7, 4))
         self.assertEqual(out.cluster_ids.shape, (7, 3))
-        for i, k in enumerate(n_embed):
-            self.assertTrue(
-                (out.cluster_ids[:, i] >= 0).all() and (out.cluster_ids[:, i] < k).all()
-            )
+        ub = torch.tensor(n_embed)  # per-layer K, broadcast across columns
+        self.assertTrue(((out.cluster_ids >= 0) & (out.cluster_ids < ub)).all())
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_candidate_output_last_layer_knn(self) -> None:
         """Candidate SIDs keep the greedy prefix and vary only the last layer."""
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
         rkq = ResidualKMeansQuantizer(
             embed_dim=1,
             n_layers=2,
@@ -158,12 +152,9 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         # For 2.2, last-layer origin is 2; nearest alternatives are 3 then 1.
         self.assertEqual(out.candidate_codes[0, :, 1].tolist(), [2, 3, 1])
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_forward_get_codes_consistent(self) -> None:
         """Forward ids and get_codes both route through the shared walk."""
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
         torch.manual_seed(0)
         rkq = ResidualKMeansQuantizer(
             embed_dim=4, n_layers=3, n_embed=8, faiss_kmeans_kwargs={"niter": 5}

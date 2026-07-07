@@ -24,6 +24,7 @@ from tzrec.modules.sid.residual_vector_quantizer import (
 )
 from tzrec.modules.sid.types import ResidualQuantizerOutput
 from tzrec.utils import misc_util
+from tzrec.utils.test_util import faiss_unavailable
 
 
 def _candidate_output_config(topk: int = 3) -> dict:
@@ -32,6 +33,25 @@ def _candidate_output_config(topk: int = 3) -> dict:
         "topk": topk,
         "strategy": "last_layer_knn",
     }
+
+
+def _candidate_rvq() -> ResidualVectorQuantizer:
+    """Eval-mode 2-layer/[2,4] STE RVQ with pinned codebooks (fresh per call)."""
+    rvq = ResidualVectorQuantizer(
+        embed_dim=1,
+        n_layers=2,
+        n_embed=[2, 4],
+        forward_mode="ste",
+        use_sinkhorn=False,
+        kmeans_init=False,
+        candidate_output_config=_candidate_output_config(),
+    )
+    rvq.eval()
+    rvq.layers[0].embedding.weight.data.copy_(torch.tensor([[0.0], [10.0]]))
+    rvq.layers[1].embedding.weight.data.copy_(
+        torch.tensor([[0.0], [1.0], [2.0], [3.0]])
+    )
+    return rvq
 
 
 class GumbelResidualVQTest(unittest.TestCase):
@@ -114,11 +134,8 @@ class GumbelResidualVQTest(unittest.TestCase):
 class FaissResidualKmeansTest(unittest.TestCase):
     """Tests for the FAISS residual K-Means warm-start helper."""
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_faiss_residual_kmeans_per_layer_centers(self) -> None:
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
         torch.manual_seed(0)
         samples = torch.randn(512, 6)
         centers = faiss_residual_kmeans(
@@ -215,21 +232,8 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
 
     def test_candidate_output_last_layer_knn(self) -> None:
         """Candidate SIDs keep the greedy prefix and replace only the last layer."""
-        rvq = ResidualVectorQuantizer(
-            embed_dim=1,
-            n_layers=2,
-            n_embed=[2, 4],
-            forward_mode="ste",
-            use_sinkhorn=False,
-            kmeans_init=False,
-            candidate_output_config=_candidate_output_config(),
-        )
-        rvq.eval()
+        rvq = _candidate_rvq()
         rvq.set_is_inference(True)
-        rvq.layers[0].embedding.weight.data.copy_(torch.tensor([[0.0], [10.0]]))
-        rvq.layers[1].embedding.weight.data.copy_(
-            torch.tensor([[0.0], [1.0], [2.0], [3.0]])
-        )
 
         x = torch.tensor([[2.2], [0.9]])
         out = rvq(x)
@@ -254,23 +258,8 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         class CandidateWrapper(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.rvq = ResidualVectorQuantizer(
-                    embed_dim=1,
-                    n_layers=2,
-                    n_embed=[2, 4],
-                    forward_mode="ste",
-                    use_sinkhorn=False,
-                    kmeans_init=False,
-                    candidate_output_config=_candidate_output_config(),
-                )
-                self.rvq.eval()
+                self.rvq = _candidate_rvq()
                 self.rvq.set_is_inference(True)
-                self.rvq.layers[0].embedding.weight.data.copy_(
-                    torch.tensor([[0.0], [10.0]])
-                )
-                self.rvq.layers[1].embedding.weight.data.copy_(
-                    torch.tensor([[0.0], [1.0], [2.0], [3.0]])
-                )
 
             def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 out = self.rvq(x)
@@ -284,16 +273,7 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
 
     def test_candidate_output_gated_by_is_inference(self) -> None:
         """Forward emits candidates only in inference mode."""
-        rvq = ResidualVectorQuantizer(
-            embed_dim=1,
-            n_layers=2,
-            n_embed=[2, 4],
-            forward_mode="ste",
-            use_sinkhorn=False,
-            kmeans_init=False,
-            candidate_output_config=_candidate_output_config(),
-        )
-        rvq.eval()
+        rvq = _candidate_rvq()
         x = torch.tensor([[2.2], [0.9]])
 
         out = rvq(x)
@@ -305,11 +285,8 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         self.assertEqual(out.candidate_codes.shape, (2, 3, 2))
         self.assertEqual(out.candidate_scores.shape, (2, 3))
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_faiss_kmeans_init_seeds_codebook(self) -> None:
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
         torch.manual_seed(0)
         rvq = ResidualVectorQuantizer(
             embed_dim=8, n_layers=2, n_embed=16, kmeans_init=True
@@ -374,6 +351,7 @@ def _init_embed_worker(rank: int, world_size: int, port: int) -> None:
 class ResidualVectorQuantizerDistTest(unittest.TestCase):
     """2-rank test for the FAISS kmeans-init broadcast."""
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_init_embed_broadcast(self) -> None:
         port = misc_util.get_free_port()
         ctx = mp.get_context("spawn")
