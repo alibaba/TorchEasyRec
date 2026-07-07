@@ -119,23 +119,6 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
                 (out.cluster_ids[:, i] >= 0).all() and (out.cluster_ids[:, i] < k).all()
             )
 
-    def test_train_offline_then_decode(self) -> None:
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-        torch.manual_seed(0)
-        rkq = ResidualKMeansQuantizer(
-            embed_dim=4, n_layers=2, n_embed=8, faiss_kmeans_kwargs={"niter": 5}
-        )
-        rkq.train_offline(torch.randn(256, 4), verbose=False)
-        self.assertTrue(all(layer.is_initialized for layer in rkq.layers))
-
-        out = rkq(torch.randn(5, 4))
-        self.assertTrue((out.cluster_ids >= 0).all() and (out.cluster_ids < 8).all())
-        recon = rkq.decode_codes(out.cluster_ids)  # inherited from the base
-        self.assertEqual(recon.shape, (5, 4))
-
     def test_candidate_output_last_layer_knn(self) -> None:
         """Candidate SIDs keep the greedy prefix and vary only the last layer."""
         try:

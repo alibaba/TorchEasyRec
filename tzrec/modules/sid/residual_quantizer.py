@@ -92,7 +92,6 @@ class ResidualQuantizer(BaseModule):
         assert n_layers >= 1, f"n_layers must be >= 1, got {n_layers}"
         self.embed_dim = embed_dim
         self.n_layers = n_layers
-        # Last layer index; the only layer varied to build candidate SIDs.
         self._candidate_layer_idx = n_layers - 1
         self.normalize_residuals = normalize_residuals
         self.n_embed_list = normalize_n_embed(n_embed, n_layers)
@@ -216,7 +215,6 @@ class ResidualQuantizer(BaseModule):
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
             is_candidate_layer = include_candidates and i == self._candidate_layer_idx
-            # Last layer fetches topk neighbors to vary; others stay greedy.
             layer_topk = self._candidate_output_topk if is_candidate_layer else 1
             out = self._quantize_layer(i, residual, topk=layer_topk)
             all_codes.append(out.ids)
@@ -225,13 +223,10 @@ class ResidualQuantizer(BaseModule):
             residual = residual - out.embeddings.detach()
             if is_candidate_layer:
                 candidate_layer_output = out
-        cluster_ids = torch.stack(all_codes, dim=-1)  # (B, n_layers)
+        cluster_ids = torch.stack(all_codes, dim=-1)
 
         candidate_codes: Optional[torch.Tensor] = None
         candidate_scores: Optional[torch.Tensor] = None
-        # candidate_layer_output is set iff candidates were requested; the
-        # ``_candidates_available`` gate guarantees the codebook is fit, so the
-        # last layer's top-k metadata is present.
         if candidate_layer_output is not None:
             candidate_codes, candidate_scores = self._build_code_candidates(
                 cluster_ids,
@@ -344,8 +339,7 @@ class ResidualQuantizer(BaseModule):
             Tensor: reconstructed embeddings, shape (B, embed_dim).
         """
         # Seed from the first lookup so device and dtype follow the codebook
-        # (avoids pinning the sum to fp32 under mixed precision). n_layers >= 1
-        # is guaranteed by the codebook config.
+        # (avoids pinning the sum to fp32 under mixed precision).
         quantized_sum = self._lookup_code(0, codes[:, 0])
         for i in range(1, self.n_layers):
             quantized_sum = quantized_sum + self._lookup_code(i, codes[:, i])

@@ -106,14 +106,14 @@ class KMeansQuantizeLayerTest(unittest.TestCase):
         self.assertIsNone(out.topk_scores)
 
     def test_quantize_topk_out_of_range_raises(self) -> None:
-        # _check_topk (shared QuantizeLayer guard) rejects topk<1 and topk>n_embed
-        # on the eval quantize path.
+        # nearest_neighbors (shared QuantizeLayer guard) rejects topk<1 and
+        # topk>n_embed on the eval quantize path.
         layer = KMeansQuantizeLayer(n_embed=4, embed_dim=1)
         layer.load_centroids_(torch.tensor([[0.0], [1.0], [2.0], [3.0]]))
         layer.eval()
-        with self.assertRaisesRegex(ValueError, "topk must be >= 1"):
+        with self.assertRaisesRegex(ValueError, r"topk must be in \[1, 4\]"):
             layer.quantize(torch.tensor([[1.0]]), topk=0)
-        with self.assertRaisesRegex(ValueError, r"topk must be <= n_embed"):
+        with self.assertRaisesRegex(ValueError, r"topk must be in \[1, 4\]"):
             layer.quantize(torch.tensor([[1.0]]), topk=5)
 
     def test_load_centroids_shape_mismatch_raises(self) -> None:

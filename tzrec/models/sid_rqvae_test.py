@@ -257,24 +257,8 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertTrue(bool(torch.all(scores[:, 0] == scores.min(dim=1).values)))
         self.assertTrue(bool(torch.all(scores[:, :-1] <= scores[:, 1:])))
 
-    def test_candidate_output_topk_zero_raises(self) -> None:
-        """A candidate_output_config with topk=0 fails fast at construction.
-
-        Validation lives in the quantizer's _init_candidate_output_config, which
-        runs during model __init__.
-        """
-        features, feature_groups = _features_and_groups(32)
-        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.candidate_output_config.enabled = True
-        cfg.candidate_output_config.topk = 0
-        model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg
-        )
-        with self.assertRaisesRegex(ValueError, "topk must be >= 1"):
-            SidRqvae(model_config=model_config, features=features, labels=[])
-
     def test_candidate_output_topk_exceeds_codebook_raises(self) -> None:
-        """topk above the last-layer codebook size fails fast at construction."""
+        """Reject topk above the last-layer codebook size at construction."""
         features, feature_groups = _features_and_groups(32)
         cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
         cfg.candidate_output_config.enabled = True

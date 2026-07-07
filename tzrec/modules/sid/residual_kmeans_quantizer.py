@@ -189,10 +189,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 f"got N={N}"
             )
         out = torch.zeros_like(x)
-        # x0 (original input) feeds the per-layer recon log. Without
-        # normalization ``out + x == x0``, so it's rebuilt on the fly below and
-        # the persistent (N, D) clone is skipped; normalization rescales x and
-        # breaks that invariant, so clone then.
         x0 = x.clone() if (verbose and self.normalize_residuals) else None
 
         if verbose:
@@ -225,18 +221,17 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 end = min(start + SEARCH_CHUNK, N)
                 _, idx = km.index.search(x[start:end], 1)
                 idx = torch.as_tensor(idx).reshape(-1).long()
-                q = centroids[idx]  # (chunk, D)
+                q = centroids[idx]
                 out[start:end] += q
-                x[start:end] -= q  # residual
+                x[start:end] -= q
                 del idx, q
 
             if verbose:
-                # x0 == out + x without normalization (see above).
                 ref = x0 if self.normalize_residuals else out + x
                 logger.info(
                     "[ResidualKMeansQuantizer][offline_faiss][layer %d] %s",
                     layer_idx,
-                    self._calc_loss(ref, out),  # cumulative recon of original input
+                    self._calc_loss(ref, out),
                 )
 
             self.layers[layer_idx].load_centroids_(centroids)

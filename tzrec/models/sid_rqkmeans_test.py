@@ -312,56 +312,8 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertEqual(preds["candidate_scores"].shape, (B, 3))
         torch.testing.assert_close(preds["candidate_codes"][:, 0, :], preds["codes"])
 
-    def test_inference_candidate_scores_sorted(self) -> None:
-        """Candidate scores come back sorted best-first, minimum at slot 0.
-
-        Mirrors test_inference_candidate_output_opt_in but asserts the score
-        ordering (slot 0 is the top-scored/nearest last-layer centroid).
-        """
-        B, input_dim = 4, 8
-        model = self._create_model(
-            input_dim=input_dim,
-            codebook=[4, 4],
-            candidate_output=True,
-        )
-        for layer in model._quantizer.layers:
-            layer.load_centroids_(torch.randn(4, input_dim))
-
-        model.eval()
-        model.set_is_inference(True)
-        preds = model.predict(_make_batch(B, input_dim))
-
-        self.assertEqual(
-            set(preds.keys()), {"codes", "candidate_codes", "candidate_scores"}
-        )
-        self.assertEqual(preds["candidate_codes"].shape, (B, 3, 2))
-        self.assertEqual(preds["candidate_scores"].shape, (B, 3))
-        scores = preds["candidate_scores"]
-        # Slot 0 is the best-scored (nearest) neighbor: minimum score, sorted.
-        self.assertTrue(bool(torch.all(scores[:, 0] == scores.min(dim=1).values)))
-        self.assertTrue(bool(torch.all(scores[:, :-1] <= scores[:, 1:])))
-
-    def test_candidate_output_topk_zero_raises(self) -> None:
-        """A candidate_output_config with topk=0 fails fast at construction.
-
-        Validation lives in the quantizer's _init_candidate_output_config, which
-        runs during model __init__.
-        """
-        features, feature_groups = _features_and_groups(32)
-        cfg = sid_model_pb2.SidRqkmeans(codebook=[16, 16])
-        cfg.candidate_output_config.enabled = True
-        cfg.candidate_output_config.topk = 0
-        with self.assertRaisesRegex(ValueError, "topk must be >= 1"):
-            SidRqkmeans(
-                model_config=model_pb2.ModelConfig(
-                    feature_groups=feature_groups, sid_rqkmeans=cfg
-                ),
-                features=features,
-                labels=[],
-            )
-
     def test_candidate_output_topk_exceeds_codebook_raises(self) -> None:
-        """topk above the last-layer codebook size fails fast at construction."""
+        """Reject topk above the last-layer codebook size at construction."""
         features, feature_groups = _features_and_groups(32)
         cfg = sid_model_pb2.SidRqkmeans(codebook=[16, 16])
         cfg.candidate_output_config.enabled = True

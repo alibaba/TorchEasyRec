@@ -124,7 +124,6 @@ class SidRqkmeans(BaseSidModel):
         """
         embedding = self.build_input(batch)[self._feature_group]
 
-        # Training: reservoir-sample only; codes are dummy until the fit.
         if self.is_train:
             self._reservoir.add(embedding)
             B = embedding.shape[0]

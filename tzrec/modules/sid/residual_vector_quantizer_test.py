@@ -365,9 +365,9 @@ def _init_embed_worker(rank: int, world_size: int, port: int) -> None:
         wmin, wmax = w.clone(), w.clone()
         dist.all_reduce(wmin, op=dist.ReduceOp.MIN)
         dist.all_reduce(wmax, op=dist.ReduceOp.MAX)
-        assert torch.allclose(
-            wmin, wmax
-        ), f"rank{rank}: codebook differs across ranks (init not broadcast)"
+        assert torch.allclose(wmin, wmax), (
+            f"rank{rank}: codebook differs across ranks (init not broadcast)"
+        )
     dist.destroy_process_group()
 
 

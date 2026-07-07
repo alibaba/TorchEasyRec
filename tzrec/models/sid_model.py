@@ -74,8 +74,6 @@ class BaseSidModel(BaseModel):
 
         cfg = self._model_config
         self._normalize_residuals = cfg.normalize_residuals
-        # Shared across both SID protos (SidRqvae field 17, SidRqkmeans field 7);
-        # convert once here so subclasses just hand it to their quantizer.
         self._candidate_output_kwargs = config_to_kwargs(cfg.candidate_output_config)
 
         if not cfg.codebook:
@@ -142,7 +140,6 @@ class BaseSidModel(BaseModel):
                 commitment_type=cfg.commitment_type,
             )
         elif loss_type == "contrastive_loss":
-            # The contrastive module owns its learnable temperatures.
             self._loss_modules["contrastive_loss"] = SidContrastiveLoss()
         else:
             raise ValueError(

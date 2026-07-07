@@ -66,7 +66,7 @@ class SidRqvae(BaseSidModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
-        cfg = self._model_config  # SidRqvae proto message
+        cfg = self._model_config
 
         self._init_contrastive()
 
@@ -249,7 +249,6 @@ class SidRqvae(BaseSidModel):
             "recon_mask": ~pair_mask,
             "encoder_out": torch.cat([z_e1, z_e2], dim=0),
             "latents": torch.cat([quant1.latents, quant2.latents], dim=0),
-            # generic contrastive operands (view a = main, view b = paired):
             "embed_a": x_hat1,
             "embed_b": x_hat2,
             "embed_a_ori": embedding,

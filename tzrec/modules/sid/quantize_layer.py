@@ -54,15 +54,9 @@ class QuantizeLayer(nn.Module):
         topk: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return top-k nearest ids and scores from a distance matrix."""
-        self._check_topk(topk)
+        if topk < 1 or topk > self.n_embed:
+            raise ValueError(f"topk must be in [1, {self.n_embed}], got {topk}")
         return torch.topk(distances, k=topk, dim=-1, largest=False)
-
-    def _check_topk(self, topk: int) -> None:
-        """Validate a top-k request against this codebook."""
-        if topk < 1:
-            raise ValueError(f"topk must be >= 1, got {topk}")
-        if topk > self.n_embed:
-            raise ValueError(f"topk must be <= n_embed ({self.n_embed}), got {topk}")
 
     def _topk_output(self, distances: torch.Tensor, topk: int) -> QuantizeOutput:
         """Assemble the eval/inference output (greedy pick + top-k) from distances.

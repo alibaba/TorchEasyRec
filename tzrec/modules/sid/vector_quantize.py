@@ -227,7 +227,6 @@ class VectorQuantizeLayer(QuantizeLayer):
             ids = self._find_nearest_embedding(distances)
             return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
 
-        # eval/inference: slot 0 of the top-k is the nearest (greedy) code.
         return self._topk_output(distances, topk)
 
     def get_codebook_embeddings(self) -> torch.Tensor:
