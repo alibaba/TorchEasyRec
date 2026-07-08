@@ -102,6 +102,26 @@ def _is_input_tile_user_keyed_tensor(name: str) -> bool:
     return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
 
 
+def _dedup_key_files_by_realpath(key_files: List[str]) -> List[str]:
+    """Keep one dynamicemb key shard path for each physical file.
+
+    Normal training checkpoints do not create INPUT_TILE user-side dynamicemb
+    aliases, but externally staged checkpoints may contain symlinked or aliased
+    table directories. Since export discovers dynamicemb shards by globbing the
+    checkpoint directory, loading the same physical shard twice would duplicate
+    its keys and values in the exported dynamic embedding data.
+    """
+    seen_real: Set[str] = set()
+    deduped_key_files = []
+    for key_file in key_files:
+        real = os.path.realpath(key_file)
+        if real in seen_real:
+            continue
+        seen_real.add(real)
+        deduped_key_files.append(key_file)
+    return deduped_key_files
+
+
 def export_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
@@ -568,25 +588,7 @@ def _get_rtp_embedding_tensor(
         key_files = sorted(
             glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
         )
-        # Deduplicate by real filesystem path. INPUT_TILE=3 export creates
-        # `<...>.ebc_user` symlinks pointing at `<...>.ebc` (see
-        # `_make_dynamicemb_input_tile_user_view` in checkpoint_util.py),
-        # so the glob above returns the same physical file under two
-        # collection paths. Without dedup, each dynamic table's key/value
-        # file would be exported twice, causing online serving to insert the
-        # same keys twice into the dynamic embedding table. With score-based
-        # eviction at the capacity boundary, the second insertion shifts the
-        # eviction set and produces small per-key inference drift vs offline
-        # predict.
-        seen_real: set = set()
-        deduped_key_files = []
-        for f in key_files:
-            real = os.path.realpath(f)
-            if real in seen_real:
-                continue
-            seen_real.add(real)
-            deduped_key_files.append(f)
-        key_files = deduped_key_files
+        key_files = _dedup_key_files_by_realpath(key_files)
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
@@ -1919,25 +1921,7 @@ def _get_sparse_embedding_tensor(
         key_files = sorted(
             glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
         )
-        # Deduplicate by real filesystem path. INPUT_TILE=3 export creates
-        # `<...>.ebc_user` symlinks pointing at `<...>.ebc` (see
-        # `_make_dynamicemb_input_tile_user_view` in checkpoint_util.py),
-        # so the glob above returns the same physical file under two
-        # collection paths. Without dedup, each dynamic table's key/value
-        # file would be exported twice, causing online serving to insert the
-        # same keys twice into the dynamic embedding table. With score-based
-        # eviction at the capacity boundary, the second insertion shifts the
-        # eviction set and produces small per-key inference drift vs offline
-        # predict.
-        seen_real: set = set()
-        deduped_key_files = []
-        for f in key_files:
-            real = os.path.realpath(f)
-            if real in seen_real:
-                continue
-            seen_real.add(real)
-            deduped_key_files.append(f)
-        key_files = deduped_key_files
+        key_files = _dedup_key_files_by_realpath(key_files)
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
