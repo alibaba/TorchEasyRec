@@ -14,16 +14,22 @@ import math
 import os
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
 import pyarrow as pa
-from confluent_kafka import OFFSET_INVALID, Consumer, TopicPartition
+from confluent_kafka import (
+    OFFSET_INVALID,
+    Consumer,
+    KafkaException,
+    TopicPartition,
+)
 
 from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import (
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
+    DATA_TIMESTAMP,
     FIELD_TYPE_TO_PA,
     get_input_fields_proto,
 )
@@ -88,6 +94,72 @@ def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any], Optional[int]]:
     params["bootstrap.servers"] = broker
 
     return topic, params, start_timestamp_ms
+
+
+def _offsets_for_times_batched(
+    consumer: Consumer,
+    ts_partitions: List[TopicPartition],
+    start_timestamp_ms: int,
+    batch_size: int,
+    timeout: float,
+    max_retries: int,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> Dict[Tuple[str, int], int]:
+    """Resolve a start timestamp to offsets in chunks, with retry.
+
+    ``consumer.offsets_for_times`` is split into chunks of ``batch_size``
+    partitions to keep each broker request small, and every chunk is retried
+    up to ``max_retries`` times on ``KafkaException`` (e.g. request timeout).
+    A persistent failure re-raises rather than silently falling back, because
+    this reader is shared with training, where falling back to
+    ``auto.offset.reset`` would replay the whole topic.
+
+    Args:
+        consumer (Consumer): the kafka consumer.
+        ts_partitions (list): partitions to resolve.
+        start_timestamp_ms (int): target timestamp in milliseconds.
+        batch_size (int): number of partitions per ``offsets_for_times`` call.
+        timeout (float): per-call request timeout in seconds.
+        max_retries (int): retries per chunk after the first attempt.
+        sleep_fn (callable): sleep between retries (injectable for testing).
+
+    Returns:
+        dict: map of (topic, partition) to resolved offset, including only
+            partitions the broker resolved to a real (>= 0) offset.
+
+    Raises:
+        KafkaException: if a chunk still fails after exhausting retries.
+    """
+    resolved_map: Dict[Tuple[str, int], int] = {}
+    for i in range(0, len(ts_partitions), batch_size):
+        chunk = ts_partitions[i : i + batch_size]
+        # offsets_for_times reads the target timestamp from the offset field.
+        for tp in chunk:
+            tp.offset = start_timestamp_ms
+        retry_cnt = 0
+        while True:
+            try:
+                resolved = consumer.offsets_for_times(chunk, timeout=timeout)
+            except KafkaException as e:
+                if retry_cnt >= max_retries:
+                    logger.error(
+                        f"offsets_for_times failed after {max_retries} retries "
+                        f"for {len(chunk)} partition(s) (timeout={timeout}s); "
+                        f"tune TZREC_KAFKA_OFFSETS_FOR_TIMES_* env vars"
+                    )
+                    raise
+                retry_cnt += 1
+                logger.warning(
+                    f"offsets_for_times attempt {retry_cnt}/{max_retries} failed "
+                    f"for {len(chunk)} partition(s), retrying: {e}"
+                )
+                sleep_fn(min(2.0 * retry_cnt, 10.0))
+                continue
+            break
+        for r in resolved:
+            if r.offset is not None and r.offset >= 0:
+                resolved_map[(r.topic, r.partition)] = r.offset
+    return resolved_map
 
 
 class KafkaDataset(BaseDataset):
@@ -259,6 +331,14 @@ class KafkaReader(BaseReader):
         """
         topic, config, start_timestamp_ms = _parse_kafka_uri(self._input_path)
         max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
+        # offsets_for_times tunables (chunk size / per-call timeout / retries).
+        offt_batch_size = max(
+            1, int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_BATCH_SIZE", "32"))
+        )
+        offt_timeout = float(
+            os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT", "30.0")
+        )
+        offt_retries = int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES", "2"))
         consumer = Consumer(config)
 
         stop_event = threading.Event()
@@ -282,10 +362,14 @@ class KafkaReader(BaseReader):
                     tp.offset = OFFSET_INVALID
 
             if ts_partitions:
-                for tp in ts_partitions:
-                    tp.offset = start_timestamp_ms
-                resolved = consumer.offsets_for_times(ts_partitions, timeout=30.0)
-                resolved_map = {(r.topic, r.partition): r.offset for r in resolved}
+                resolved_map = _offsets_for_times_batched(
+                    consumer,
+                    ts_partitions,
+                    start_timestamp_ms,
+                    offt_batch_size,
+                    offt_timeout,
+                    offt_retries,
+                )
                 for tp in ts_partitions:
                     res_offset = resolved_map.get((tp.topic, tp.partition))
                     if res_offset is not None and res_offset >= 0:
@@ -376,6 +460,8 @@ class KafkaReader(BaseReader):
                 # Track checkpoint metadata for each message
                 source_ids = []
                 row_indices = []
+                # Track event-time (Unix-epoch seconds) for each message
+                timestamps = []
 
                 for msg in messages:
                     msg_error = msg.error()
@@ -410,6 +496,11 @@ class KafkaReader(BaseReader):
                     source_ids.extend([source_id] * batch_len)
                     # Use offset as the row index (each message has one offset)
                     row_indices.extend([offset] * batch_len)
+                    # msg.timestamp() -> (type, ms), -1 when unavailable; use
+                    # Unix-epoch seconds and keep -1 as the sentinel.
+                    ts_ms = msg.timestamp()[1]
+                    ts_s = ts_ms / 1000.0 if ts_ms >= 0 else -1.0
+                    timestamps.extend([ts_s] * batch_len)
 
                 if not record_batchs:
                     continue
@@ -436,6 +527,10 @@ class KafkaReader(BaseReader):
                 )
                 t = t.append_column(
                     CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64())
+                )
+                # transient event-time column (seconds), read in _build_batch
+                t = t.append_column(
+                    DATA_TIMESTAMP, pa.array(timestamps, type=pa.float64())
                 )
 
                 for batch in t.to_batches():

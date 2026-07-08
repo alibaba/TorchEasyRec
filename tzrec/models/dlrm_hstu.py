@@ -201,6 +201,10 @@ class DlrmHSTU(RankModel):
         with record_function("## preprocess ##"):
             grouped_features = self.build_input(batch)
 
+        # Capture num_targets before the descending-timestamp flip below, so the
+        # output split key stays in the original (un-flipped) request order.
+        num_targets = grouped_features["candidate.sequence_length"]
+
         if not self._model_config.sequence_timestamp_is_ascending:
             # if timestamp of sequence is descending,
             # we should reverse all features
@@ -235,9 +239,7 @@ class DlrmHSTU(RankModel):
                         suffix=f"_{task_name}",
                     )
                 )
-        predictions[TARGET_REPEAT_INTERLEAVE_KEY] = grouped_features[
-            "candidate.sequence_length"
-        ]
+        predictions[TARGET_REPEAT_INTERLEAVE_KEY] = num_targets
 
         return predictions
 

@@ -11,7 +11,6 @@
 
 import os
 import shutil
-import tempfile
 import unittest
 from collections import OrderedDict
 
@@ -32,9 +31,16 @@ from tzrec.protos import (
 )
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model, gpu_unavailable
+from tzrec.utils.test_util import (
+    TestGraphType,
+    create_test_model,
+    gpu_unavailable,
+    make_test_dir,
+    mark_ci_scope,
+)
 
 
+@mark_ci_scope("gpu")
 class MultiTowerDINTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = None
@@ -182,7 +188,7 @@ class MultiTowerDINTest(unittest.TestCase):
         elif graph_type == TestGraphType.AOT_INDUCTOR:
             data = batch.to_dict()
             data = OrderedDict(sorted(data.items()))
-            self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+            self.test_dir = make_test_dir()
             multi_tower_din = create_test_model(
                 multi_tower_din, graph_type, data, self.test_dir
             )

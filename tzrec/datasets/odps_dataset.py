@@ -206,10 +206,30 @@ def _parse_table_path(
     return str_list[2], table_name, table_partitions, schema
 
 
+def _storage_debug_info(client: StorageApiArrowClient, **req_fields: Any) -> str:
+    """Format MaxCompute storage-api context for error logging."""
+    parts = {
+        "table": client.table.full_table_name,
+        "quota": getattr(client, "_quota_name", None),
+        "endpoint": getattr(client, "_rest_endpoint", None),
+        **req_fields,
+    }
+    return ", ".join(f"{k}={v}" for k, v in parts.items())
+
+
 def _read_rows_arrow_with_retry(
     client: StorageApiArrowClient,
     read_req: ReadRowsRequest,
 ) -> ArrowReader:
+    def debug_info() -> str:
+        return _storage_debug_info(
+            client,
+            session_id=read_req.session_id,
+            row_index=read_req.row_index,
+            row_count=read_req.row_count,
+            max_batch_rows=read_req.max_batch_rows,
+        )
+
     max_retry_count = 3
     retry_cnt = 0
     while True:
@@ -217,10 +237,21 @@ def _read_rows_arrow_with_retry(
             reader = client.read_rows_arrow(read_req)
         except ODPSError as e:
             if retry_cnt >= max_retry_count:
+                logger.error(
+                    f"read_rows_arrow failed after {retry_cnt} retries "
+                    f"({debug_info()}): {e!r}"
+                )
                 raise e
             retry_cnt += 1
+            logger.warning(
+                f"read_rows_arrow retry {retry_cnt}/{max_retry_count} "
+                f"({debug_info()}): {e!r}"
+            )
             time.sleep(random.choice([5, 9, 12]))
             continue
+        except Exception as e:
+            logger.error(f"read_rows_arrow failed ({debug_info()}): {e!r}")
+            raise
         break
     return reader
 
@@ -231,7 +262,12 @@ def _get_session_record_count(
 ) -> int:
     """Get record count from a session, waiting until ready."""
     while True:
-        scan_resp = client.get_read_session(sess_req)
+        try:
+            scan_resp = client.get_read_session(sess_req)
+        except Exception as e:
+            debug_info = _storage_debug_info(client, session_id=sess_req.session_id)
+            logger.error(f"get_read_session failed ({debug_info}): {e!r}")
+            raise
         if scan_resp.session_status == SessionStatus.INIT:
             time.sleep(1)
             continue
