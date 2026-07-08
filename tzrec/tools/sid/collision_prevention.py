@@ -446,6 +446,9 @@ class CollisionRunner:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        # Class name of the main-input reader, captured during the raw read; used
+        # to derive the writer type when --writer_type is unset.
+        self._input_reader_cls_name: Optional[str] = None
 
     def run(self) -> AssignmentStats:
         """Read inputs, assign, and write outputs via create_reader/create_writer."""
@@ -501,6 +504,7 @@ class CollisionRunner:
         input_path: str,
         reader_type: Optional[str],
         selected_cols: Optional[List[str]] = None,
+        capture_reader_cls: bool = False,
     ) -> Iterable[Dict[str, pa.Array]]:
         reader = create_reader(
             input_path=input_path,
@@ -509,6 +513,8 @@ class CollisionRunner:
             reader_type=reader_type,
             quota_name=self.args.odps_data_quota_name,
         )
+        if capture_reader_cls:
+            self._input_reader_cls_name = reader.__class__.__name__
         yield from reader.to_batches()
 
     def _load_raw_sid_rows(self) -> List[RawSidRow]:
@@ -523,7 +529,10 @@ class CollisionRunner:
         # decode unused columns (create_reader forwards selected_cols to the reader).
         selected = [self.args.item_id_field, *(code_fields or [code_field])]
         for batch in self._read_batches(
-            self.args.input_path, self.args.reader_type, selected_cols=selected
+            self.args.input_path,
+            self.args.reader_type,
+            selected_cols=selected,
+            capture_reader_cls=True,
         ):
             item_ids = self._array_to_pylist(batch, self.args.item_id_field)
             if code_field:
@@ -640,10 +649,20 @@ class CollisionRunner:
             return pa.array(values, type=pa.int64())
         return pa.array([str(v) for v in values], type=pa.string())
 
+    def _writer_type(self) -> Optional[str]:
+        # Derive the writer from the input reader (hitrate.py idiom) when unset,
+        # so the output backend matches the input's. ODPS output still resolves
+        # to OdpsWriter via create_writer's path detection regardless.
+        if self.args.writer_type:
+            return self.args.writer_type
+        if self._input_reader_cls_name:
+            return self._input_reader_cls_name.replace("Reader", "Writer")
+        return None
+
     def _write_table(self, output_path: str, columns: Dict[str, pa.Array]) -> None:
         writer = create_writer(
             output_path,
-            writer_type=self.args.writer_type,
+            writer_type=self._writer_type(),
             quota_name=self.args.odps_data_quota_name,
             world_size=1,
         )
@@ -738,7 +757,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--writer_type",
         choices=["CsvWriter", "ParquetWriter", "OdpsWriter"],
-        default="ParquetWriter",
+        default=None,
+        help="Output writer; defaults to matching the input reader "
+        "(CsvReader -> CsvWriter, etc.).",
     )
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--item_id_field", default="item_id")

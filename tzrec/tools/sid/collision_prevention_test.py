@@ -191,6 +191,30 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self.assertEqual(result.schema.field("codebook").type, pa.string())
         self.assertLessEqual(max(Counter(result["codebook"].to_pylist()).values()), 2)
 
+    def test_writer_type_defaults_to_matching_the_reader(self) -> None:
+        # --writer_type unset: the writer is derived from the input reader
+        # (CsvReader -> CsvWriter), so CSV in yields CSV out.
+        raw_path = os.path.join(self.test_dir, "raw_derive.csv")
+        out_dir = os.path.join(self.test_dir, "out_derive")
+        csv.write_csv(
+            pa.table({"item_id": ["1", "2", "3"], "codes": ["A", "A", "A"]}),
+            raw_path,
+        )
+        args = build_parser().parse_args(
+            [
+                "--input_path",
+                raw_path,
+                "--output_path",
+                out_dir,
+                "--max_items_per_codebook",
+                "3",
+            ]
+        )
+        run(args)
+        # A CSV part file the CSV reader can parse => CsvWriter was derived.
+        result = csv.read_csv(os.path.join(out_dir, "part-0.csv"))
+        self.assertEqual(result.num_rows, 3)
+
     def test_local_parquet_accepts_list_codes(self) -> None:
         raw_path = os.path.join(self.test_dir, "raw.parquet")
         cand_path = os.path.join(self.test_dir, "cand.parquet")
