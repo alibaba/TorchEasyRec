@@ -848,7 +848,7 @@ def _make_dynamicemb_input_tile_user_view(dynamicemb_path: str, view_path: str) 
     """
     entries = []
     for entry in os.listdir(dynamicemb_path):
-        full_path = os.path.join(dynamicemb_path, entry)
+        full_path = os.path.abspath(os.path.join(dynamicemb_path, entry))
         if not os.path.isdir(full_path):
             continue
         entries.append((entry, full_path))
