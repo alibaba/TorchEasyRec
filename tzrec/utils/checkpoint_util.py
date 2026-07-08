@@ -39,6 +39,7 @@ from torch.distributed.checkpoint.default_planner import (
 )
 from torchrec.modules.mc_modules import MCHManagedCollisionModule
 
+from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
@@ -953,10 +954,9 @@ def restore_model(
             # share dynamic-embedding tables with their non-user counterparts.
             # Build a local symlink view instead of mutating the checkpoint
             # directory, which may be read-only or remote-mounted.
-            input_tile = os.environ.get("INPUT_TILE", "")
             dynamicemb_load_path = dynamicemb_path
             dynamicemb_view = None
-            if input_tile.startswith("3"):
+            if is_input_tile_emb():
                 dynamicemb_view = tempfile.TemporaryDirectory(
                     prefix=f"tzrec_dynamicemb_rank{os.environ.get('RANK', '0')}_"
                 )
