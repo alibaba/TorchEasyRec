@@ -1382,12 +1382,6 @@ def export_distributed_embedding(
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
             f.write(str(full_graph))
 
-    def _seq_len_name(seq_name: str) -> str:
-        return seq_name + "__sequence_length"
-
-    def _seq_feat_name(seq_name: str) -> str:
-        return seq_name + "__sequence"
-
     # Extract Sparse Model
     logger.info("exporting sparse model...")
     graph = copy.deepcopy(full_graph)
@@ -1498,8 +1492,6 @@ def export_distributed_embedding(
 
     # Extract Dense Model
     logger.info("exporting dense model...")
-    additional_fg = []
-
     graph = copy.deepcopy(full_graph)
     output_keys = []
     output_values = []
@@ -1620,7 +1612,6 @@ def export_distributed_embedding(
         if not has_fg_asset:
             logger.info("saving fg json...")
             fg_json = create_fg_json(features, asset_dir=save_dir)
-            fg_json["features"].extend(additional_fg)
             with open(os.path.join(save_dir, "fg.json"), "w") as f:
                 json.dump(fg_json, f, indent=4)
 
