@@ -72,7 +72,9 @@ jobs:
             --repo ${{ github.repository }} \
             --remove-label claude-review
 
-      # Checkout trusted .claude/ files from base branch (not the PR author's code)
+      # Checkout trusted agent files from base branch (not the PR author's code).
+      # Cone-mode sparse checkout of .claude also includes root-level files
+      # such as CLAUDE.md and AGENTS.md.
       - name: Checkout trusted agent files
         uses: actions/checkout@v4
         with:
@@ -93,6 +95,14 @@ jobs:
         run: |
           rm -rf pr-code/.claude
           cp -r trusted-claude/.claude pr-code/.claude
+          # Drop the PR's root instruction files; restore from base when present
+          # (tolerates base branches that don't have them yet).
+          for f in CLAUDE.md AGENTS.md; do
+            rm -f "pr-code/$f"
+            if [ -f "trusted-claude/$f" ]; then
+              cp "trusted-claude/$f" "pr-code/$f"
+            fi
+          done
 
       - name: RunCodeReview
         working-directory: pr-code
