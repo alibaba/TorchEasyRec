@@ -144,35 +144,24 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
     def test_local_csv_outputs_codebooks_as_strings(self) -> None:
         raw_path = os.path.join(self.test_dir, "raw.csv")
-        cand_path = os.path.join(self.test_dir, "cand.csv")
         out_dir = os.path.join(self.test_dir, "out")
         csv.write_csv(
             pa.table(
                 {
                     "item_id": ["1", "2", "3"],
                     "codes": ["A", "A", "A"],
-                }
-            ),
-            raw_path,
-        )
-        csv.write_csv(
-            pa.table(
-                {
-                    "item_id": ["1", "2", "3"],
                     "candidate_codebook": ["C", "C", "C"],
                     "priority": [1, 1, 1],
                     "score": [0.1, 0.1, 0.1],
                 }
             ),
-            cand_path,
+            raw_path,
         )
 
         args = build_parser().parse_args(
             [
                 "--input_path",
                 raw_path,
-                "--candidate_input_path",
-                cand_path,
                 "--output_path",
                 out_dir,
                 "--reader_type",
@@ -217,35 +206,24 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
     def test_local_parquet_accepts_list_codes(self) -> None:
         raw_path = os.path.join(self.test_dir, "raw.parquet")
-        cand_path = os.path.join(self.test_dir, "cand.parquet")
         out_dir = os.path.join(self.test_dir, "out_parquet")
         parquet.write_table(
             pa.table(
                 {
                     "item_id": pa.array([1, 2, 3], type=pa.int64()),
                     "codes": pa.array([[1, 2], [1, 2], [1, 2]]),
-                }
-            ),
-            raw_path,
-        )
-        parquet.write_table(
-            pa.table(
-                {
-                    "item_id": pa.array([1, 2, 3], type=pa.int64()),
                     "candidate_codebook": ["1,3", "1,3", "1,3"],
                     "priority": [1, 1, 1],
                     "score": [0.1, 0.1, 0.1],
                 }
             ),
-            cand_path,
+            raw_path,
         )
 
         args = build_parser().parse_args(
             [
                 "--input_path",
                 raw_path,
-                "--candidate_input_path",
-                cand_path,
                 "--output_path",
                 out_dir,
                 "--writer_type",
@@ -263,7 +241,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
     def test_local_csv_accepts_split_codes_and_compact_candidates(self) -> None:
         raw_path = os.path.join(self.test_dir, "raw_split.csv")
-        cand_path = os.path.join(self.test_dir, "cand_compact.csv")
         out_dir = os.path.join(self.test_dir, "out_split")
         csv.write_csv(
             pa.table(
@@ -271,26 +248,16 @@ class SidCollisionPreventionTest(unittest.TestCase):
                     "item_id": ["1", "2", "3"],
                     "code_0": ["A", "A", "A"],
                     "code_1": ["B", "B", "B"],
-                }
-            ),
-            raw_path,
-        )
-        csv.write_csv(
-            pa.table(
-                {
-                    "item_id": ["1", "2", "3"],
                     "sorted_index": ["A|C", "A|C", "A|C"],
                 }
             ),
-            cand_path,
+            raw_path,
         )
 
         args = build_parser().parse_args(
             [
                 "--input_path",
                 raw_path,
-                "--candidate_input_path",
-                cand_path,
                 "--output_path",
                 out_dir,
                 "--reader_type",

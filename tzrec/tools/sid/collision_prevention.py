@@ -452,8 +452,7 @@ class CollisionRunner:
 
     def run(self) -> AssignmentStats:
         """Read inputs, assign, and write outputs via create_reader/create_writer."""
-        raw_rows = self._load_raw_sid_rows()
-        candidate_rows = self._load_candidate_rows()
+        raw_rows, candidate_rows = self._load_rows()
         rows, stats = SidCollisionAssigner(
             capacity=self.args.max_items_per_codebook,
             max_iters=self.args.max_iters,
@@ -517,122 +516,142 @@ class CollisionRunner:
             self._input_reader_cls_name = reader.__class__.__name__
         yield from reader.to_batches()
 
-    def _load_raw_sid_rows(self) -> List[RawSidRow]:
-        rows: List[RawSidRow] = []
-        seen = set()
+    def _load_rows(self) -> Tuple[List[RawSidRow], List[CandidateSidRow]]:
+        """Read raw SID rows and candidate rows from the single input table.
+
+        The model emits ``codes`` and the candidate SIDs in the same rows, so
+        candidates come from the same table. They are read only for the
+        ``candidate`` strategy (``random`` synthesizes its own) and only when the
+        candidate column is present, so a plain SID table still runs (overflow
+        then follows ``--unassigned_policy``).
+        """
         code_fields = self._code_fields()
         code_field = None if code_fields else self.args.code_field
         if bool(code_field) == bool(code_fields):
             raise ValueError("Set exactly one of --code_field or --code_fields.")
 
-        # Project only the required columns so wide / ODPS source tables don't
-        # decode unused columns (create_reader forwards selected_cols to the reader).
-        selected = [self.args.item_id_field, *(code_fields or [code_field])]
+        candidate_field, is_compact = None, False
+        if self.args.strategy == "candidate":
+            codebook_field = (
+                None
+                if self.args.compact_candidate_field
+                else self.args.candidate_codebook_field
+            )
+            if bool(codebook_field) == bool(self.args.compact_candidate_field):
+                raise ValueError(
+                    "Set exactly one of --candidate_codebook_field or "
+                    "--compact_candidate_field."
+                )
+            is_compact = bool(self.args.compact_candidate_field)
+            candidate_field = self.args.compact_candidate_field or codebook_field
+
+        # Project to the SID columns only when candidate columns aren't also read
+        # from the same table (their optional priority/score can't be projected).
+        selected_cols = (
+            [self.args.item_id_field, *(code_fields or [code_field])]
+            if candidate_field is None
+            else None
+        )
+
+        raw_rows: List[RawSidRow] = []
+        candidate_rows: List[CandidateSidRow] = []
+        seen: set = set()
         for batch in self._read_batches(
             self.args.input_path,
             self.args.reader_type,
-            selected_cols=selected,
+            selected_cols=selected_cols,
             capture_reader_cls=True,
         ):
             item_ids = self._array_to_pylist(batch, self.args.item_id_field)
-            if code_field:
-                codes = self._array_to_pylist(batch, code_field)
-                origin_codes = [
-                    self._cell_to_code(v, self.args.code_delimiter) for v in codes
-                ]
-            else:
-                assert code_fields is not None
-                code_columns = [self._array_to_pylist(batch, f) for f in code_fields]
-                origin_codes = [
-                    self.args.code_delimiter.join(str(col[i]) for col in code_columns)
-                    for i in range(len(item_ids))
-                ]
-
+            origin_codes = self._origin_codes(
+                batch, code_field, code_fields, len(item_ids)
+            )
             for item_id, origin_codebook in zip(item_ids, origin_codes):
                 item_key = str(item_id)
                 if item_key in seen:
-                    raise ValueError(f"duplicate item_id in raw SID input: {item_key}")
+                    raise ValueError(f"duplicate item_id in SID input: {item_key}")
                 seen.add(item_key)
-                rows.append(
+                raw_rows.append(
                     RawSidRow(
                         item_id=item_id,
                         item_key=item_key,
                         origin_codebook=origin_codebook,
                     )
                 )
+            if candidate_field is not None and candidate_field in batch:
+                candidate_rows.extend(self._candidate_rows(batch, item_ids, is_compact))
 
-        if not rows:
-            raise ValueError("raw SID input is empty.")
-        return rows
+        if not raw_rows:
+            raise ValueError("SID input is empty.")
+        return raw_rows, candidate_rows
 
-    def _load_candidate_rows(self) -> List[CandidateSidRow]:
+    def _origin_codes(
+        self,
+        batch: Dict[str, pa.Array],
+        code_field: Optional[str],
+        code_fields: Optional[List[str]],
+        n: int,
+    ) -> List[str]:
+        if code_field:
+            codes = self._array_to_pylist(batch, code_field)
+            return [self._cell_to_code(v, self.args.code_delimiter) for v in codes]
+        assert code_fields is not None
+        columns = [self._array_to_pylist(batch, f) for f in code_fields]
+        return [
+            self.args.code_delimiter.join(str(col[i]) for col in columns)
+            for i in range(n)
+        ]
+
+    def _candidate_rows(
+        self,
+        batch: Dict[str, pa.Array],
+        item_ids: List[Any],
+        is_compact: bool,
+    ) -> List[CandidateSidRow]:
         rows: List[CandidateSidRow] = []
-        if not self.args.candidate_input_path:
-            return rows
-
-        candidate_codebook_field = (
-            None
-            if self.args.compact_candidate_field
-            else self.args.candidate_codebook_field
-        )
-        if bool(candidate_codebook_field) == bool(self.args.compact_candidate_field):
-            raise ValueError(
-                "Set exactly one of --candidate_codebook_field or "
-                "--compact_candidate_field."
+        if is_compact:
+            compact_values = self._array_to_pylist(
+                batch, self.args.compact_candidate_field
             )
-
-        reader_type = self.args.candidate_reader_type or self.args.reader_type
-        item_id_field = self.args.candidate_item_id_field or self.args.item_id_field
-        for batch in self._read_batches(self.args.candidate_input_path, reader_type):
-            item_ids = self._array_to_pylist(batch, item_id_field)
-            priorities = (
-                self._array_to_pylist(batch, self.args.priority_field)
-                if self.args.priority_field and self.args.priority_field in batch
-                else None
-            )
-            scores = (
-                self._array_to_pylist(batch, self.args.score_field)
-                if self.args.score_field and self.args.score_field in batch
-                else None
-            )
-            if candidate_codebook_field:
-                candidates = self._array_to_pylist(batch, candidate_codebook_field)
-                for i, (item_id, candidate) in enumerate(zip(item_ids, candidates)):
+            for item_id, compact_value in zip(item_ids, compact_values):
+                for priority, candidate in enumerate(
+                    self._split_compact_candidates(
+                        compact_value, self.args.candidate_delimiter
+                    ),
+                    start=1,
+                ):
                     rows.append(
                         CandidateSidRow(
                             item_key=str(item_id),
-                            candidate_codebook=self._cell_to_code(
-                                candidate,
-                                self.args.code_delimiter,
-                            ),
-                            priority=int(priorities[i])
-                            if priorities is not None
-                            else 1,
-                            score=float(scores[i]) if scores is not None else 0.0,
+                            candidate_codebook=candidate,
+                            priority=priority,
+                            score=0.0,
                         )
                     )
-            else:
-                compact_values = self._array_to_pylist(
-                    batch,
-                    self.args.compact_candidate_field,
-                )
-                for item_id, compact_value in zip(item_ids, compact_values):
-                    for priority, candidate in enumerate(
-                        self._split_compact_candidates(
-                            compact_value,
-                            self.args.candidate_delimiter,
-                        ),
-                        start=1,
-                    ):
-                        rows.append(
-                            CandidateSidRow(
-                                item_key=str(item_id),
-                                candidate_codebook=candidate,
-                                priority=priority,
-                                score=0.0,
-                            )
-                        )
+            return rows
 
+        priorities = (
+            self._array_to_pylist(batch, self.args.priority_field)
+            if self.args.priority_field and self.args.priority_field in batch
+            else None
+        )
+        scores = (
+            self._array_to_pylist(batch, self.args.score_field)
+            if self.args.score_field and self.args.score_field in batch
+            else None
+        )
+        candidates = self._array_to_pylist(batch, self.args.candidate_codebook_field)
+        for i, (item_id, candidate) in enumerate(zip(item_ids, candidates)):
+            rows.append(
+                CandidateSidRow(
+                    item_key=str(item_id),
+                    candidate_codebook=self._cell_to_code(
+                        candidate, self.args.code_delimiter
+                    ),
+                    priority=int(priorities[i]) if priorities is not None else 1,
+                    score=float(scores[i]) if scores is not None else 0.0,
+                )
+            )
         return rows
 
     def _code_fields(self) -> Optional[List[str]]:
@@ -742,15 +761,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input_path", required=True)
     parser.add_argument("--output_path", required=True)
-    parser.add_argument("--candidate_input_path", default=None)
     parser.add_argument("--diagnostics_output_path", default=None)
     parser.add_argument(
         "--reader_type",
-        choices=["CsvReader", "ParquetReader", "OdpsReader"],
-        default=None,
-    )
-    parser.add_argument(
-        "--candidate_reader_type",
         choices=["CsvReader", "ParquetReader", "OdpsReader"],
         default=None,
     )
@@ -763,7 +776,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--item_id_field", default="item_id")
-    parser.add_argument("--candidate_item_id_field", default=None)
     parser.add_argument("--code_field", default="codes")
     parser.add_argument(
         "--code_fields",
