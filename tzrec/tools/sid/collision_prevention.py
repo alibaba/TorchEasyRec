@@ -500,10 +500,12 @@ class CollisionRunner:
         self,
         input_path: str,
         reader_type: Optional[str],
+        selected_cols: Optional[List[str]] = None,
     ) -> Iterable[Dict[str, pa.Array]]:
         reader = create_reader(
             input_path=input_path,
             batch_size=self.args.batch_size,
+            selected_cols=selected_cols,
             reader_type=reader_type,
             quota_name=self.args.odps_data_quota_name,
         )
@@ -517,7 +519,12 @@ class CollisionRunner:
         if bool(code_field) == bool(code_fields):
             raise ValueError("Set exactly one of --code_field or --code_fields.")
 
-        for batch in self._read_batches(self.args.input_path, self.args.reader_type):
+        # Project only the required columns so wide / ODPS source tables don't
+        # decode unused columns (create_reader forwards selected_cols to the reader).
+        selected = [self.args.item_id_field, *(code_fields or [code_field])]
+        for batch in self._read_batches(
+            self.args.input_path, self.args.reader_type, selected_cols=selected
+        ):
             item_ids = self._array_to_pylist(batch, self.args.item_id_field)
             if code_field:
                 codes = self._array_to_pylist(batch, code_field)
