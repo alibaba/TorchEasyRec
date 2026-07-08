@@ -239,15 +239,14 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self.assertIn("1,2", set(result["origin_codebook"].to_pylist()))
         self.assertLessEqual(max(Counter(result["codebook"].to_pylist()).values()), 2)
 
-    def test_local_csv_accepts_split_codes_and_compact_candidates(self) -> None:
-        raw_path = os.path.join(self.test_dir, "raw_split.csv")
-        out_dir = os.path.join(self.test_dir, "out_split")
+    def test_local_csv_accepts_compact_candidates(self) -> None:
+        raw_path = os.path.join(self.test_dir, "raw_compact.csv")
+        out_dir = os.path.join(self.test_dir, "out_compact")
         csv.write_csv(
             pa.table(
                 {
                     "item_id": ["1", "2", "3"],
-                    "code_0": ["A", "A", "A"],
-                    "code_1": ["B", "B", "B"],
+                    "codes": ["A,B", "A,B", "A,B"],
                     "sorted_index": ["A|C", "A|C", "A|C"],
                 }
             ),
@@ -264,10 +263,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
                 "CsvReader",
                 "--writer_type",
                 "CsvWriter",
-                "--code_field",
-                "",
-                "--code_fields",
-                "code_0,code_1",
                 "--compact_candidate_field",
                 "sorted_index",
                 "--max_items_per_codebook",

@@ -525,11 +525,6 @@ class CollisionRunner:
         candidate column is present, so a plain SID table still runs (overflow
         then follows ``--unassigned_policy``).
         """
-        code_fields = self._code_fields()
-        code_field = None if code_fields else self.args.code_field
-        if bool(code_field) == bool(code_fields):
-            raise ValueError("Set exactly one of --code_field or --code_fields.")
-
         candidate_field, is_compact = None, False
         if self.args.strategy == "candidate":
             codebook_field = (
@@ -548,7 +543,7 @@ class CollisionRunner:
         # Project to the SID columns only when candidate columns aren't also read
         # from the same table (their optional priority/score can't be projected).
         selected_cols = (
-            [self.args.item_id_field, *(code_fields or [code_field])]
+            [self.args.item_id_field, self.args.code_field]
             if candidate_field is None
             else None
         )
@@ -563,10 +558,8 @@ class CollisionRunner:
             capture_reader_cls=True,
         ):
             item_ids = self._array_to_pylist(batch, self.args.item_id_field)
-            origin_codes = self._origin_codes(
-                batch, code_field, code_fields, len(item_ids)
-            )
-            for item_id, origin_codebook in zip(item_ids, origin_codes):
+            code_cells = self._array_to_pylist(batch, self.args.code_field)
+            for item_id, code_cell in zip(item_ids, code_cells):
                 item_key = str(item_id)
                 if item_key in seen:
                     raise ValueError(f"duplicate item_id in SID input: {item_key}")
@@ -575,7 +568,9 @@ class CollisionRunner:
                     RawSidRow(
                         item_id=item_id,
                         item_key=item_key,
-                        origin_codebook=origin_codebook,
+                        origin_codebook=self._cell_to_code(
+                            code_cell, self.args.code_delimiter
+                        ),
                     )
                 )
             if candidate_field is not None and candidate_field in batch:
@@ -584,23 +579,6 @@ class CollisionRunner:
         if not raw_rows:
             raise ValueError("SID input is empty.")
         return raw_rows, candidate_rows
-
-    def _origin_codes(
-        self,
-        batch: Dict[str, pa.Array],
-        code_field: Optional[str],
-        code_fields: Optional[List[str]],
-        n: int,
-    ) -> List[str]:
-        if code_field:
-            codes = self._array_to_pylist(batch, code_field)
-            return [self._cell_to_code(v, self.args.code_delimiter) for v in codes]
-        assert code_fields is not None
-        columns = [self._array_to_pylist(batch, f) for f in code_fields]
-        return [
-            self.args.code_delimiter.join(str(col[i]) for col in columns)
-            for i in range(n)
-        ]
 
     def _candidate_rows(
         self,
@@ -653,13 +631,6 @@ class CollisionRunner:
                 )
             )
         return rows
-
-    def _code_fields(self) -> Optional[List[str]]:
-        if not self.args.code_fields:
-            return None
-        return [
-            field.strip() for field in self.args.code_fields.split(",") if field.strip()
-        ]
 
     @staticmethod
     def _item_id_array(rows: Sequence[AssignedSidRow]) -> pa.Array:
@@ -777,11 +748,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--item_id_field", default="item_id")
     parser.add_argument("--code_field", default="codes")
-    parser.add_argument(
-        "--code_fields",
-        default=None,
-        help="Comma-separated split code fields. Mutually exclusive with code_field.",
-    )
     parser.add_argument("--code_delimiter", default=",")
     parser.add_argument("--candidate_codebook_field", default="candidate_codebook")
     parser.add_argument(
