@@ -58,7 +58,8 @@
 #   codex login --device-auth
 #   codex login status
 #
-#   # Optionally pin the model in ~/.codex/config.toml, e.g. model = "gpt-5-codex"
+#   # The job runs with --ignore-user-config (~/.codex/config.toml is not loaded);
+#   # to pin a model, add `-c model=...` to the codex exec call below.
 #
 #   # Verify headless mode
 #   echo "Say hello" | codex exec - --sandbox read-only
@@ -178,18 +179,21 @@ jobs:
           fetch-depth: 1
           path: pr-code
 
-      # Codex reads .codex/agents/ and AGENTS.md from the workspace: generate both
-      # from trusted base-branch files, dropping whatever the PR author shipped.
+      # Codex reads .codex/agents/, .agents/ and AGENTS.md from the workspace: generate
+      # agents from trusted base-branch files, dropping whatever the PR author shipped.
+      # Commit the swap so `git status/diff` inside the review shows the PR, not our setup.
       - name: Use trusted agent files
         run: |
-          rm -rf pr-code/.claude pr-code/.codex pr-code/AGENTS.md
+          rm -rf pr-code/.claude pr-code/.codex pr-code/.agents pr-code/AGENTS.md
           python3 trusted-claude/scripts/ci/gen_codex_review.py \
             --claude-dir trusted-claude/.claude \
             --out-dir pr-code \
             --repo ${{ github.repository }} \
             --pr-number ${{ github.event.pull_request.number }} \
             --prompt-out "${{ runner.temp }}/codex-prompt.md"
-          cp trusted-claude/CLAUDE.md pr-code/AGENTS.md
+          git -C pr-code add -A
+          git -C pr-code -c user.name=ci -c user.email=ci@localhost \
+            commit -q -m "ci: trusted review setup"
 
       - name: RunCodexReview
         working-directory: pr-code
@@ -208,13 +212,28 @@ jobs:
           echo "bun path: $BUN_PATH ($("$BUN_PATH" --version))"
           codex --version
 
+          # HOME shim hides the runner user's personal ~/.agents skills from codex;
+          # CODEX_HOME stays real so stored OAuth keeps working
+          export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+          export HOME="${RUNNER_TEMP}/codex-home-shim"
+          mkdir -p "$HOME"
+
           # gh needs network: workspace-write + network_access (never danger-full-access)
           # mcp env_vars forwards the named job env vars to the MCP server process
+          # ignore-user-config keeps the runner user's personal config/hooks/MCP out of CI
+          # ignore_default_excludes lets gh see GITHUB_TOKEN/GH_TOKEN (stripped by default)
+          # project_doc_max_bytes=0 blocks AGENTS.md injection (user-global and PR-authored)
           codex exec \
+            --ignore-user-config \
+            --ephemeral \
             --sandbox workspace-write \
             -c sandbox_workspace_write.network_access=true \
+            -c shell_environment_policy.ignore_default_excludes=true \
+            -c project_doc_max_bytes=0 \
+            -c model_reasoning_effort='"medium"' \
             -c mcp_servers.github_inline_comment.command="\"${BUN_PATH}\"" \
             -c 'mcp_servers.github_inline_comment.args=["run","/opt/claude-code-action/src/mcp/github-inline-comment-server.ts"]' \
             -c 'mcp_servers.github_inline_comment.env_vars=["GITHUB_TOKEN","REPO_OWNER","REPO_NAME","PR_NUMBER"]' \
+            -c 'mcp_servers.github_inline_comment.default_tools_approval_mode="approve"' \
             --output-last-message "${RUNNER_TEMP}/codex-review-last.md" \
             - < "${RUNNER_TEMP}/codex-prompt.md"

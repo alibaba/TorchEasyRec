@@ -3,6 +3,9 @@ allowed-tools: Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)
 description: Review a pull request
 ---
 
+Fetch the PR context with `gh pr view` and the changes with `gh pr diff`.
+Review statically — do not run tests or builds.
+
 Perform a comprehensive code review using subagents for key areas:
 
 - code-quality-reviewer
