@@ -58,16 +58,12 @@ class SidRqkmeans(BaseSidModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
-        # CPU-only: v1 restricts the whole model (train + inference) to the
-        # host. Refuse to run when CUDA is visible.
         if torch.cuda.is_available():
             raise RuntimeError(
                 "SidRqkmeans is CPU-only, but a CUDA device is visible. "
                 'Run with CUDA_VISIBLE_DEVICES="-1" (or on a CPU-only host).'
             )
 
-        # Single-process only: the fit runs over one process's local reservoir,
-        # with no cross-rank gather. Fail fast before the (wasted) train pass.
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             raise RuntimeError(
                 "SidRqkmeans supports single-process training only "
@@ -77,8 +73,7 @@ class SidRqkmeans(BaseSidModel):
 
         cfg = self._model_config
 
-        # Typed faiss kwargs: only the explicitly-set fields are forwarded, so
-        # unset ones fall back to faiss's own defaults (no float->int coercion).
+        # Forward only explicitly-set fields so unset ones keep faiss's defaults.
         self._faiss_kwargs = {
             f.name: v for f, v in cfg.faiss_kmeans_kwargs.ListFields()
         }
@@ -89,15 +84,11 @@ class SidRqkmeans(BaseSidModel):
             n_embed=self._n_embed_list,
             normalize_residuals=self._normalize_residuals,
             faiss_kmeans_kwargs=self._faiss_kwargs,
+            candidate_output_config=self._candidate_output_kwargs,
         )
 
-        # Bounded host reservoir for the end-of-loop fit: cap at
-        # ``train_sample_size`` (when >0) else the fit's subsample size, rather
-        # than buffer the whole corpus.
         target = self._model_config.train_sample_size
         cap = target if target > 0 else self._quantizer.default_fit_sample_size()
-        # Fail fast: a cap below the largest codebook would only fail deep in
-        # train_offline, after the whole training pass.
         max_k = max(self._n_embed_list)
         if cap < max_k:
             raise RuntimeError(
@@ -106,7 +97,6 @@ class SidRqkmeans(BaseSidModel):
             )
         self._reservoir = ReservoirSampler(cap, self._input_dim)
 
-        # KMeans has no learnable params; a dummy keeps the optimizer/DDP happy.
         self._dummy_param = nn.Parameter(torch.zeros(1), requires_grad=True)
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -123,7 +113,6 @@ class SidRqkmeans(BaseSidModel):
         """
         embedding = self.build_input(batch)[self._feature_group]
 
-        # Training: reservoir-sample only; codes are dummy until the fit.
         if self.is_train:
             self._reservoir.add(embedding)
             B = embedding.shape[0]
@@ -133,14 +122,11 @@ class SidRqkmeans(BaseSidModel):
                 )
             }
 
-        codes, quantized = self._quantizer(embedding)
-
-        predictions: Dict[str, torch.Tensor] = {
-            "codes": codes,
-        }
+        quantizer_output = self._quantizer(embedding)
+        predictions = self._sid_predictions(quantizer_output)
 
         if self.is_eval and self._quantizer.is_fitted:
-            predictions["x_hat"] = quantized
+            predictions["x_hat"] = quantizer_output.quantized_embeddings
             predictions["recon_target"] = embedding
 
         return predictions
@@ -181,8 +167,7 @@ class SidRqkmeans(BaseSidModel):
         An empty reservoir only happens for a pathologically tiny corpus; the
         fit is then skipped.
         """
-        # train_offline consumes its input; hand it the reservoir buffer
-        # directly (no copy) — nothing reads it after this.
+        # train_offline consumes its input; pass the reservoir buffer directly.
         local = self._reservoir.sample()
         self._reservoir.reset()
 

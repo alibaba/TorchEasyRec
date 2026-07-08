@@ -20,13 +20,12 @@ from parameterized import parameterized
 
 from tzrec.tools.tdm.gen_tree.tree_cluster import TreeCluster
 from tzrec.tools.tdm.gen_tree.tree_search_util import TreeSearch
+from tzrec.utils.test_util import make_test_dir
 
 
 class TreeSearchtest(unittest.TestCase):
     def setUp(self) -> None:
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
         self.tmp_file = tempfile.NamedTemporaryFile(
             dir=self.test_dir, mode="w", delete=False, newline="", suffix=".csv"
         )

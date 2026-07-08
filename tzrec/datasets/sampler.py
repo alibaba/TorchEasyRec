@@ -9,10 +9,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import atexit
 import math
+import multiprocessing as mp
 import os
 import random
 import socket
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -22,7 +25,6 @@ import numpy.typing as npt
 import pyarrow as pa
 import torch
 from graphlearn.python.data.values import Values
-from graphlearn.python.nn.pytorch.data.utils import launch_server
 from torch import distributed as dist
 from torch.utils.data import get_worker_info
 
@@ -32,6 +34,9 @@ from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import get_free_port
+
+# Poll interval (seconds) for the GL sampler-server liveness watchdog.
+_SERVER_LIVENESS_CHECK_INTERVAL_S = 10.0
 
 
 # patch graph-learn string_attrs for utf-8
@@ -124,6 +129,17 @@ def _get_cluster_spec(num_client_per_rank: int = 1) -> Dict[str, Union[int, str]
     num_client = num_client_per_rank
     gl_server_info = _bootstrap(group_size, local_rank, group_rank)
     return {"server": gl_server_info, "client_count": world_size * num_client}
+
+
+def _run_gl_server(
+    graph: gl.Graph,
+    cluster: Dict[str, Union[int, str]],
+    task_index: int,
+) -> None:
+    """Run a graphlearn server until clients disconnect (inlined _server_manager)."""
+    graph.init(cluster=cluster, job_name="server", task_index=task_index)
+    graph.server_get_stats()  # blocks until all clients disconnect
+    graph.close()
 
 
 _SAMPLER_CLASS_MAP = {}
@@ -284,6 +300,10 @@ class BaseSampler(metaclass=_meta_cls):
         self._num_client_per_rank = 1
         self._client_id_bias = 0
 
+        # server liveness watchdog state (armed in launch_server on rank 0).
+        self._server_proc: Optional[mp.Process] = None
+        self._server_watchdog_stop: Optional[threading.Event] = None
+
     def init_cluster(
         self,
         num_client_per_rank: int = 1,
@@ -304,7 +324,44 @@ class BaseSampler(metaclass=_meta_cls):
         assert self._cluster, "should init cluster first."
         gl.set_tracker_mode(0)
         if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-            launch_server(self._g, self._cluster, int(os.environ.get("GROUP_RANK", 0)))
+            # inline the launch so we keep the server handle for the watchdog.
+            proc = mp.Process(
+                target=_run_gl_server,
+                args=(self._g, self._cluster, int(os.environ.get("GROUP_RANK", 0))),
+                daemon=True,
+            )
+            proc.start()
+            self._server_proc = proc
+            self._start_server_liveness_watchdog()
+
+    def _start_server_liveness_watchdog(self) -> None:
+        """Exit the rank loudly if the GL sampler server dies unexpectedly."""
+        proc = self._server_proc
+        if proc is None:
+            return
+        stop = threading.Event()
+        self._server_watchdog_stop = stop
+        # disarm at exit so a normal server teardown isn't flagged as a crash.
+        atexit.register(stop.set)
+
+        def _watch() -> None:
+            while not stop.wait(_SERVER_LIVENESS_CHECK_INTERVAL_S):
+                if proc.is_alive():
+                    continue
+                if stop.is_set() or proc.exitcode == 0:
+                    return  # normal shutdown
+                logger.error(
+                    "graphlearn sampler server process (pid=%s) exited "
+                    "unexpectedly (exitcode=%s)",
+                    proc.pid,
+                    proc.exitcode,
+                )
+                # main thread is stuck in the dataloader; os._exit out.
+                os._exit(1)
+
+        threading.Thread(
+            target=_watch, name="gl-sampler-server-watchdog", daemon=True
+        ).start()
 
     def init(self, client_id: int = -1) -> None:
         """Init sampler client and samplers."""
@@ -324,6 +381,9 @@ class BaseSampler(metaclass=_meta_cls):
         self._g.init(task_index=task_index, job_name="client", cluster=self._cluster)
 
     def __del__(self) -> None:
+        stop = getattr(self, "_server_watchdog_stop", None)
+        if stop is not None:
+            stop.set()
         if self._g is not None:
             self._g.close()
 
@@ -345,7 +405,7 @@ class BaseSampler(metaclass=_meta_cls):
                 feature = nodes.float_attrs[:, :, float_idx]
                 float_idx += 1
             elif attr_gl_type == "string":
-                feature = nodes.string_attrs[:, :, string_idx].astype(np.string_)
+                feature = nodes.string_attrs[:, :, string_idx].astype(np.bytes_)
                 feature = np.char.decode(feature, "utf-8")
                 string_idx += 1
             else:
@@ -385,7 +445,7 @@ class BaseSampler(metaclass=_meta_cls):
                 feature = nodes.float_attrs[:, float_idx]
                 float_idx += 1
             elif attr_gl_type == "string":
-                feature = nodes.string_attrs[:, string_idx].astype(np.string_)
+                feature = nodes.string_attrs[:, string_idx].astype(np.bytes_)
                 feature = np.char.decode(feature, "utf-8")
                 string_idx += 1
             else:

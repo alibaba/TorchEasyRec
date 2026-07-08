@@ -7,8 +7,8 @@ DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`ha
 注：同一个 FeatureGroup 中若存在多个配置了 DynamicEmbedding 的特征，底层 dynamicemb 会自动将这些表融合到同一份存储里（table fusion），共享 cache/admission counter，降低显存占用并减少内存碎片，无需额外配置。
 
 ```bash
-# DEVICE 可选: cu126/cu129 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb==0.1.0+20260519.e0c1fbb.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+# DEVICE 可选: cu126/cu129/cu130 (支持 Python 3.10/3.11/3.12)
+pip install dynamicemb==0.1.0+20260630.5dc46a2.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
 ```
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段

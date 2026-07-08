@@ -46,26 +46,16 @@ def _aoti_compile_cfg() -> Dict[str, Any]:
 
 
 def _backport_pt178147_int_array_dedup() -> None:
-    """Backport pytorch/pytorch#178147 onto torch < the release that includes it.
+    """Backport pytorch/pytorch#178147 onto torch < 2.13.0.
 
-    Upstream ``CppWrapperCpu.codegen_int_array_var`` (cpp_wrapper_cpu.py) keys
-    its int_array dedup cache on ``id(writeline)``. ``writeline`` is
-    ``<IndentedBuffer>.writeline``, a fresh bound-method object materialized on
-    every attribute access; CPython's small-object allocator recycles those
-    addresses, so two distinct destination IndentedBuffers can present the
-    same id() across calls. A false cache hit then returns an int_array name
-    whose declaration was queued at a *later* position in the assembled
-    wrapper.cpp, producing intermittently::
+    ``CppWrapperCpu.codegen_int_array_var`` keys its int_array dedup cache on
+    ``id(writeline)`` -- a fresh bound-method whose address CPython recycles, so
+    two distinct IndentedBuffers can collide; a false cache hit then emits an
+    ``int_array_NN`` reference ahead of its declaration ("was not declared in
+    this scope"). #178147 (torch 2.13.0+) keys on ``id(writeline.__self__)``
+    (the buffer) instead; still absent in 2.12.1.
 
-        error: 'int_array_NN' was not declared in this scope
-
-    Upstream fix (pytorch/pytorch#178147, merged 2026-05-10): key on
-    ``id(writeline.__self__)`` -- the underlying IndentedBuffer, stable for
-    the whole compile -- with a fallback to ``id(writeline)`` for free
-    functions. Not present in torch 2.11.0; will be in the next release.
-
-    REMOVE THIS PATCH when tzrec's torch pin advances to a release that
-    includes pytorch/pytorch#178147.
+    REMOVE THIS PATCH once the torch pin reaches >= 2.13.0.
     """
     from torch._inductor.codegen import cpp_wrapper_cpu as _cwc
 

@@ -298,12 +298,13 @@ File "/opt/conda/lib/python3.11/site-packages/triton/testing.py", line 150, in d
 torch.AcceleratorError: CUDA error: an illegal memory access was encountered
 ```
 
-**原因：** Triton v3.6.0在Hopper GPU（如H20）上存在WGMMA（Warp Group Matrix Multiply-Accumulate）代码生成Bug。在RS WGMMA路径中缺少寄存器同步指令，导致`_hstu_attn_bwd`内核在autotuning阶段出现非法内存访问。
+**原因：** Triton 3.7.1 自带的 ptxas 12.8.93 在 Hopper（如 H20，sm_90）上会误编译 HSTU 的 WGMMA kernel：`_hstu_attn_bwd` 内核在 autotuning 阶段的共享内存访问越界（约 246 KiB，超出 H20 的 228 KiB 上限），触发非法内存访问（compute-sanitizer 下可见 `Invalid __shared__ read`）。该问题由 Triton `release/3.7` 分支的 commit `6c96454f2f` 将内置 ptxas 从 12.9.86 降级到 12.8.93 引入；换用 ptxas 12.9.86 即可修复（与 MMA v3 代码生成、triton-lang/triton#9514 均无关——经 H20 实测单独打入 #9514 仍报越界）。
 
-**解决方法：** 安装修复后的Triton wheel：
+**解决方法：** 1.3.0 镜像已内置修复——将官方 triton 3.7.1 wheel 中的 `backends/nvidia/bin/ptxas` 替换为 12.9.86 后重新打包，默认即生效，无需 `DISABLE_MMA_V3`，也不损失 Hopper v3 性能。如需在其它环境手动安装该修复版 wheel：
 
 ```bash
-pip install --force-reinstall --no-deps "https://tzrec.oss-accelerate.aliyuncs.com/third_party/triton/triton-3.6.0%2B565c08520-cp311-cp311-linux_x86_64.whl"
+pip install --force-reinstall --no-deps \
+  https://tzrec.oss-accelerate.aliyuncs.com/third_party/triton/triton-3.7.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
 ```
 
 ______________________________________________________________________
