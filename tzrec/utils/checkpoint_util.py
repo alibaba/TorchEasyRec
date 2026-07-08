@@ -44,11 +44,8 @@ from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
-# Substring substitutions used to fall back from INPUT_TILE=3 user-side state
-# keys to their non-user training-checkpoint counterparts. Mirrors
-# `tzrec/acc/utils.py:write_mapping_file_for_input_tile`. Applied at load time
-# so callers like `export_distributed_embedding` and `export_rtp_model` do not
-# need to pre-generate a mapping file.
+# INPUT_TILE=3 load-time fallback from user-side keys to non-user checkpoint keys.
+# Mirrors `tzrec/acc/utils.py:write_mapping_file_for_input_tile`.
 _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
     (".ebc_user.embedding_bags.", ".ebc.embedding_bags."),
     (".mc_ebc_user._embedding_module.", ".mc_ebc._embedding_module."),
@@ -142,13 +139,9 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                         "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
                     )
 
-            # INPUT_TILE=3 export adds user-side twin modules (`ebc_user`,
-            # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) whose
-            # state_dict keys do not exist in the training checkpoint
-            # (training never sets INPUT_TILE). Fall back to the non-user
-            # counterpart that does exist. Equivalent to the explicit
-            # `emb_ckpt_mapping.txt` generated in `export_model_normal`,
-            # but works without the call site pre-computing a mapping.
+            # INPUT_TILE=3 export adds user-side twin modules absent from
+            # training checkpoints. Remap to existing non-user keys, matching
+            # export_model_normal's emb_ckpt_mapping.txt fallback.
             if meta_fqn not in self.metadata.state_dict_metadata:
                 for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
                     if new_pat not in meta_fqn:
