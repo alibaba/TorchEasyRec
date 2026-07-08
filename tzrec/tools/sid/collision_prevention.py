@@ -77,77 +77,6 @@ class AssignmentStats:
     max_final_bucket_size: int
 
 
-@dataclass(frozen=True)
-class OdpsTableRef:
-    """Parsed ODPS table URI."""
-
-    project: str
-    table: str
-    partitions: Tuple[str, ...]
-    schema: Optional[str] = None
-
-    @classmethod
-    def parse(cls, path: str) -> "OdpsTableRef":
-        """Parse an ``odps://project/tables/table[/pt=value]`` path."""
-        parts = path.split("/")
-        if len(parts) < 5 or parts[0] != "odps:" or parts[3] != "tables":
-            raise ValueError(
-                f"invalid ODPS path {path!r}; expected "
-                "odps://project/tables/table[/pt=value]"
-            )
-        table = parts[4]
-        schema = None
-        if "." in table:
-            schema, table = table.split(".", 1)
-        return cls(
-            project=parts[2],
-            table=table,
-            partitions=tuple(p for p in parts[5:] if p),
-            schema=schema,
-        )
-
-    @property
-    def table_name(self) -> str:
-        """Fully qualified ODPS table name."""
-        table = f"{self.schema}.{self.table}" if self.schema else self.table
-        return f"{self.project}.{table}"
-
-    @property
-    def partition_predicate(self) -> str:
-        """SQL predicate suffix for this table's partition path."""
-        if not self.partitions:
-            return ""
-        predicates = []
-        for key, value in self._partition_pairs():
-            predicates.append(f"{key}='{value}'")
-        return " AND " + " AND ".join(predicates)
-
-    @property
-    def insert_target(self) -> str:
-        """SQL INSERT target including partition spec."""
-        if not self.partitions:
-            return self.table_name
-        specs = [f"{key}='{value}'" for key, value in self._partition_pairs()]
-        return f"{self.table_name} PARTITION ({','.join(specs)})"
-
-    @property
-    def partition_schema(self) -> str:
-        """CREATE TABLE partition schema suffix."""
-        if not self.partitions:
-            return ""
-        fields = [f"{key} STRING" for key, _ in self._partition_pairs()]
-        return f" PARTITIONED BY ({','.join(fields)})"
-
-    def _partition_pairs(self) -> List[Tuple[str, str]]:
-        pairs = []
-        for part in self.partitions:
-            if "=" not in part:
-                raise ValueError(f"invalid ODPS partition segment: {part!r}")
-            key, value = part.split("=", 1)
-            pairs.append((key, value))
-        return pairs
-
-
 class SidCollisionAssigner:
     """Deterministically assign overflow SID rows to explicit candidates."""
 
@@ -497,14 +426,18 @@ class SidCollisionAssigner:
         return final_counts
 
 
-class LocalCollisionRunner:
-    """CSV/Parquet SID collision-prevention runner."""
+class CollisionRunner:
+    """SID collision-prevention runner over the standard dataset reader/writer.
+
+    The backend (CSV / Parquet / ODPS) is chosen by the reader/writer type, so
+    the same path serves local files and MaxCompute tables.
+    """
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
 
     def run(self) -> AssignmentStats:
-        """Run local CSV/Parquet collision prevention."""
+        """Read inputs, assign, and write outputs via create_reader/create_writer."""
         raw_rows = self._load_raw_sid_rows()
         candidate_rows = self._load_candidate_rows()
         rows, stats = SidCollisionAssigner(
@@ -758,336 +691,6 @@ class LocalCollisionRunner:
         writer.close()
 
 
-class OdpsSqlGenerator:
-    """Generate deterministic MaxCompute SQL for canonical candidate tables."""
-
-    def __init__(self, args: argparse.Namespace) -> None:
-        if not args.candidate_input_path:
-            raise ValueError("--candidate_input_path is required for --backend odps.")
-        if args.code_fields:
-            raise ValueError(
-                "--backend odps currently supports --code_field, not split code_fields."
-            )
-        if args.compact_candidate_field:
-            raise ValueError(
-                "--backend odps expects canonical candidate rows; compact candidates "
-                "are supported in local CSV/Parquet mode."
-            )
-
-        self.args = args
-        self.raw_ref = OdpsTableRef.parse(args.input_path)
-        self.candidate_ref = OdpsTableRef.parse(args.candidate_input_path)
-        self.output_ref = OdpsTableRef.parse(args.output_path)
-        self.prefix = args.temp_prefix or "tmp_sid_collision"
-        self.assigned = f"{self.prefix}_assigned"
-        self.selected = f"{self.prefix}_selected"
-        self.counts = f"{self.prefix}_counts"
-
-    def generate(self) -> List[str]:
-        """Generate the SQL statements for one ODPS collision-prevention run."""
-        sqls = [
-            "SET odps.sql.type.system.odps2=true",
-            self._create_assigned_sql(),
-            self._create_selected_sql(),
-            self._create_counts_sql(),
-            self._create_output_sql(),
-            self._initial_assignment_sql(),
-        ]
-        for i in range(self.args.max_iters):
-            sqls.extend(
-                [
-                    self._refresh_counts_sql(),
-                    self._select_candidates_sql(),
-                    self._insert_selected_sql(),
-                    self._remaining_unassigned_sql(f"iteration {i + 1}"),
-                ]
-            )
-        sqls.append(self._remaining_unassigned_sql("final"))
-        if self.args.unassigned_policy == "keep_original":
-            sqls.extend([self._refresh_counts_sql(), self._keep_original_sql()])
-        sqls.append(self._final_insert_sql())
-        return sqls
-
-    @property
-    def _raw_table(self) -> str:
-        return self.raw_ref.table_name
-
-    @property
-    def _candidate_table(self) -> str:
-        return self.candidate_ref.table_name
-
-    @property
-    def _raw_predicate(self) -> str:
-        return self.raw_ref.partition_predicate
-
-    @property
-    def _candidate_predicate(self) -> str:
-        return self.candidate_ref.partition_predicate
-
-    @property
-    def _score_expr(self) -> str:
-        if self.args.score_field:
-            return f"CAST({self.args.score_field} AS DOUBLE)"
-        return "0.0"
-
-    @property
-    def _priority_expr(self) -> str:
-        if self.args.priority_field:
-            return f"CAST({self.args.priority_field} AS BIGINT)"
-        return "1"
-
-    @property
-    def _score_order(self) -> str:
-        return "score ASC" if self.args.score_order == "lower" else "score DESC"
-
-    def _create_assigned_sql(self) -> str:
-        return (
-            f"CREATE TABLE IF NOT EXISTS {self.assigned} ("
-            "item_id STRING, origin_codebook STRING, codebook STRING, `index` BIGINT"
-            f") LIFECYCLE {self.args.odps_lifecycle}"
-        )
-
-    def _create_selected_sql(self) -> str:
-        return (
-            f"CREATE TABLE IF NOT EXISTS {self.selected} ("
-            "item_id STRING, origin_codebook STRING, codebook STRING, "
-            "priority BIGINT, score DOUBLE"
-            f") LIFECYCLE {self.args.odps_lifecycle}"
-        )
-
-    def _create_counts_sql(self) -> str:
-        return (
-            f"CREATE TABLE IF NOT EXISTS {self.counts} ("
-            "codebook STRING, cnt BIGINT"
-            f") LIFECYCLE {self.args.odps_lifecycle}"
-        )
-
-    def _create_output_sql(self) -> str:
-        return (
-            f"CREATE TABLE IF NOT EXISTS {self.output_ref.table_name} ("
-            "item_id STRING, origin_codebook STRING, codebook STRING, `index` BIGINT"
-            f"){self.output_ref.partition_schema}"
-        )
-
-    def _initial_assignment_sql(self) -> str:
-        return (
-            f"INSERT OVERWRITE TABLE {self.assigned}\n"
-            "SELECT item_id, origin_codebook, origin_codebook AS codebook,\n"
-            "       rn AS `index`\n"
-            "FROM (\n"
-            f"  SELECT CAST({self.args.item_id_field} AS STRING) AS item_id,\n"
-            f"         CAST({self.args.code_field} AS STRING) AS origin_codebook,\n"
-            "         ROW_NUMBER() OVER (\n"
-            f"           PARTITION BY CAST({self.args.code_field} AS STRING)\n"
-            "           ORDER BY ABS(HASH(CONCAT("
-            f"'{self.args.seed}', ':', CAST({self.args.item_id_field} AS STRING))))\n"
-            "         ) AS rn\n"
-            f"  FROM {self._raw_table}\n"
-            f"  WHERE 1=1{self._raw_predicate}\n"
-            ") t\n"
-            f"WHERE rn <= {self.args.max_items_per_codebook}"
-        )
-
-    def _refresh_counts_sql(self) -> str:
-        return (
-            f"INSERT OVERWRITE TABLE {self.counts}\n"
-            "SELECT codebook, COUNT(*) AS cnt\n"
-            f"FROM {self.assigned}\n"
-            "GROUP BY codebook"
-        )
-
-    def _select_candidates_sql(self) -> str:
-        return (
-            f"INSERT OVERWRITE TABLE {self.selected}\n"
-            "SELECT item_id, origin_codebook, codebook, priority, score\n"
-            "FROM (\n"
-            "  SELECT c.item_id, c.origin_codebook, c.codebook, "
-            "c.priority, c.score,\n"
-            "         ROW_NUMBER() OVER (\n"
-            "           PARTITION BY c.codebook\n"
-            f"           ORDER BY c.priority ASC, c.{self._score_order}, "
-            "ABS(HASH(CONCAT("
-            f"'{self.args.seed}', ':', c.item_id, ':', c.codebook)))\n"
-            "         ) AS rn,\n"
-            "         COALESCE(cnt.cnt, 0) AS current_cnt\n"
-            "  FROM (\n"
-            "    SELECT CAST("
-            f"{self.args.candidate_item_id_field or self.args.item_id_field}"
-            " AS STRING) AS item_id,\n"
-            "           CAST("
-            f"{self.args.candidate_origin_codebook_field} AS STRING"
-            ") AS origin_codebook,\n"
-            "           CAST("
-            f"{self.args.candidate_codebook_field}"
-            " AS STRING) AS codebook,\n"
-            f"           {self._priority_expr} AS priority,\n"
-            f"           {self._score_expr} AS score\n"
-            f"    FROM {self._candidate_table}\n"
-            f"    WHERE 1=1{self._candidate_predicate}\n"
-            "  ) c\n"
-            "  INNER JOIN (\n"
-            f"    SELECT CAST({self.args.item_id_field} AS STRING) AS item_id\n"
-            f"    FROM {self._raw_table}\n"
-            f"    WHERE 1=1{self._raw_predicate}\n"
-            "  ) r ON c.item_id = r.item_id\n"
-            f"  LEFT OUTER JOIN {self.assigned} a ON c.item_id = a.item_id\n"
-            f"  LEFT OUTER JOIN {self.counts} cnt ON c.codebook = cnt.codebook\n"
-            "  WHERE a.item_id IS NULL\n"
-            f"    AND COALESCE(cnt.cnt, 0) < {self.args.max_items_per_codebook}\n"
-            ") ranked\n"
-            f"WHERE rn <= {self.args.max_items_per_codebook} - current_cnt"
-        )
-
-    def _insert_selected_sql(self) -> str:
-        # ``codebook_rn`` must rank ONLY the surviving (``item_rn = 1``) rows so
-        # the emitted ``index`` stays dense and contiguous with the rows already
-        # in ``assigned`` (counted by ``current_cnt``). Ranking before the
-        # ``item_rn = 1`` filter leaves a gap whenever a codebook's top-ranked
-        # candidate wins a different codebook (its row here is dropped): that gap
-        # both wastes capacity and is re-issued next iteration as a duplicate
-        # ``(codebook, index)`` pair, since ``current_cnt`` (a COUNT of inserted
-        # rows) then undercounts the real slot high-water mark. Hence the nested
-        # shape: pick each item's best codebook first, THEN densely number the
-        # survivors per codebook.
-        return (
-            f"INSERT INTO TABLE {self.assigned}\n"
-            "SELECT item_id, origin_codebook, codebook,\n"
-            "       current_cnt + codebook_rn AS `index`\n"
-            "FROM (\n"
-            "  SELECT item_id, origin_codebook, codebook, current_cnt,\n"
-            "         ROW_NUMBER() OVER (\n"
-            "           PARTITION BY codebook\n"
-            f"           ORDER BY priority ASC, {self._score_order}, "
-            "ABS(HASH(CONCAT("
-            f"'{self.args.seed}', ':', item_id, ':', codebook)))\n"
-            "         ) AS codebook_rn\n"
-            "  FROM (\n"
-            "    SELECT s.item_id, s.origin_codebook, s.codebook, "
-            "s.priority, s.score,\n"
-            "           ROW_NUMBER() OVER (\n"
-            "             PARTITION BY s.item_id\n"
-            f"             ORDER BY s.priority ASC, s.{self._score_order}, "
-            "ABS(HASH(CONCAT("
-            f"'{self.args.seed}', ':', s.item_id, ':', s.codebook)))\n"
-            "           ) AS item_rn,\n"
-            "           COALESCE(cnt.cnt, 0) AS current_cnt\n"
-            f"    FROM {self.selected} s\n"
-            f"    LEFT OUTER JOIN {self.counts} cnt "
-            "ON s.codebook = cnt.codebook\n"
-            "  ) x\n"
-            "  WHERE item_rn = 1\n"
-            ") y\n"
-            f"WHERE current_cnt + codebook_rn <= {self.args.max_items_per_codebook}"
-        )
-
-    def _remaining_unassigned_sql(self, label: str) -> str:
-        return (
-            f"-- {label}: remaining_unassigned\n"
-            "SELECT COUNT(*) AS remaining_unassigned\n"
-            f"FROM {self._raw_table} r\n"
-            f"LEFT OUTER JOIN {self.assigned} a\n"
-            f"ON CAST(r.{self.args.item_id_field} AS STRING) = a.item_id\n"
-            f"WHERE a.item_id IS NULL{self._raw_predicate}"
-        )
-
-    def _keep_original_sql(self) -> str:
-        return (
-            f"INSERT INTO TABLE {self.assigned}\n"
-            "SELECT u.item_id, u.origin_codebook, "
-            "u.origin_codebook AS codebook,\n"
-            "       COALESCE(cnt.cnt, 0) + u.rn AS `index`\n"
-            "FROM (\n"
-            f"  SELECT CAST(r.{self.args.item_id_field} AS STRING) AS item_id,\n"
-            f"         CAST(r.{self.args.code_field} AS STRING) AS "
-            "origin_codebook,\n"
-            "         ROW_NUMBER() OVER (\n"
-            f"           PARTITION BY CAST(r.{self.args.code_field} AS STRING)\n"
-            "           ORDER BY ABS(HASH(CONCAT("
-            f"'{self.args.seed}', ':', CAST(r.{self.args.item_id_field} AS STRING))))\n"
-            "         ) AS rn\n"
-            f"  FROM {self._raw_table} r\n"
-            f"  LEFT OUTER JOIN {self.assigned} a\n"
-            f"  ON CAST(r.{self.args.item_id_field} AS STRING) = a.item_id\n"
-            f"  WHERE a.item_id IS NULL{self._raw_predicate}\n"
-            ") u\n"
-            f"LEFT OUTER JOIN {self.counts} cnt\n"
-            "ON u.origin_codebook = cnt.codebook"
-        )
-
-    def _final_insert_sql(self) -> str:
-        return (
-            f"INSERT OVERWRITE TABLE {self.output_ref.insert_target}\n"
-            "SELECT item_id, origin_codebook, codebook, `index`\n"
-            f"FROM {self.assigned}"
-        )
-
-
-class OdpsCollisionRunner:
-    """ODPS SID collision-prevention runner."""
-
-    def __init__(self, args: argparse.Namespace) -> None:
-        self.args = args
-
-    def run(self) -> None:
-        """Run MaxCompute SQL collision prevention."""
-        sqls = OdpsSqlGenerator(self.args).generate()
-        if self.args.dry_run_sql:
-            print(";\n\n".join(sqls) + ";")
-            return
-
-        from odps import ODPS
-
-        from tzrec.datasets.odps_dataset import _create_odps_account
-
-        output_ref = OdpsTableRef.parse(self.args.output_path)
-        account, endpoint = _create_odps_account()
-        odps = ODPS(account=account, project=output_ref.project, endpoint=endpoint)
-        for sql in sqls:
-            logger.info("Executing ODPS SQL:\n%s", sql)
-            instance = odps.execute_sql(sql)
-            instance.wait_for_success()
-            if not self._is_remaining_unassigned_sql(sql):
-                continue
-
-            remaining_unassigned = self._read_scalar(instance)
-            logger.info(
-                "ODPS remaining unassigned item count: %s",
-                remaining_unassigned,
-            )
-            if not self._is_final_remaining_unassigned_sql(sql):
-                continue
-            self._handle_final_unassigned(remaining_unassigned)
-
-    @staticmethod
-    def _is_remaining_unassigned_sql(sql: str) -> bool:
-        return " AS remaining_unassigned" in sql
-
-    @staticmethod
-    def _is_final_remaining_unassigned_sql(sql: str) -> bool:
-        return sql.lstrip().startswith("-- final:")
-
-    @staticmethod
-    def _read_scalar(instance: Any) -> int:
-        with instance.open_reader() as reader:
-            for record in reader:
-                return int(record[0])
-        return 0
-
-    def _handle_final_unassigned(self, remaining_unassigned: int) -> None:
-        if remaining_unassigned == 0:
-            return
-        if self.args.unassigned_policy == "error":
-            raise RuntimeError(
-                f"{remaining_unassigned} items could not be assigned within "
-                "capacity in ODPS collision-prevention run."
-            )
-        if self.args.unassigned_policy == "drop":
-            logger.warning(
-                "Dropping %s unassigned items because --unassigned_policy=drop.",
-                remaining_unassigned,
-            )
-
-
 def assign_sid_collisions(
     raw_rows: Sequence[RawSidRow],
     candidate_rows: Sequence[CandidateSidRow],
@@ -1115,19 +718,9 @@ def assign_sid_collisions(
     ).assign(raw_rows, candidate_rows)
 
 
-def run_local(args: argparse.Namespace) -> AssignmentStats:
-    """Run local CSV/Parquet collision prevention."""
-    return LocalCollisionRunner(args).run()
-
-
-def generate_odps_sql(args: argparse.Namespace) -> List[str]:
-    """Generate deterministic MaxCompute SQL for canonical candidate tables."""
-    return OdpsSqlGenerator(args).generate()
-
-
-def run_odps(args: argparse.Namespace) -> None:
-    """Run MaxCompute SQL collision prevention."""
-    OdpsCollisionRunner(args).run()
+def run(args: argparse.Namespace) -> AssignmentStats:
+    """Run collision prevention over the configured reader/writer backend."""
+    return CollisionRunner(args).run()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1135,22 +728,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Prevent SID codebook collisions with explicit candidates."
     )
-    parser.add_argument("--backend", choices=["local", "odps"], default="local")
     parser.add_argument("--input_path", required=True)
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--candidate_input_path", default=None)
     parser.add_argument("--diagnostics_output_path", default=None)
     parser.add_argument(
-        "--reader_type", choices=["CsvReader", "ParquetReader"], default=None
+        "--reader_type",
+        choices=["CsvReader", "ParquetReader", "OdpsReader"],
+        default=None,
     )
     parser.add_argument(
         "--candidate_reader_type",
-        choices=["CsvReader", "ParquetReader"],
+        choices=["CsvReader", "ParquetReader", "OdpsReader"],
         default=None,
     )
     parser.add_argument(
         "--writer_type",
-        choices=["CsvWriter", "ParquetWriter"],
+        choices=["CsvWriter", "ParquetWriter", "OdpsWriter"],
         default="ParquetWriter",
     )
     parser.add_argument("--batch_size", type=int, default=4096)
@@ -1168,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--compact_candidate_field",
         default=None,
-        help="Compact string/list candidate field for local mode.",
+        help="Compact string/list candidate field.",
     )
     parser.add_argument(
         "--candidate_delimiter",
@@ -1192,7 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="candidate",
         help="Reassignment strategy: 'candidate' uses explicit nearest-neighbor "
         "candidate rows; 'random' draws random within-band last-layer codes and "
-        "needs no candidate input (local backend only).",
+        "needs no candidate input.",
     )
     parser.add_argument(
         "--random_last_layer_size",
@@ -1207,24 +801,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Random last-layer codes drawn per overflow item for --strategy random.",
     )
     parser.add_argument("--odps_data_quota_name", default="pay-as-you-go")
-    parser.add_argument("--temp_prefix", default=None)
-    parser.add_argument("--odps_lifecycle", type=int, default=7)
-    parser.add_argument("--dry_run_sql", action="store_true", default=False)
     return parser
 
 
 def main() -> None:
     """Command line entrypoint."""
-    parser = build_parser()
-    args = parser.parse_args()
-    if args.backend == "local":
-        run_local(args)
-    else:
-        if args.strategy == "random":
-            raise NotImplementedError(
-                "strategy='random' is only supported for --backend local."
-            )
-        run_odps(args)
+    args = build_parser().parse_args()
+    run(args)
 
 
 if __name__ == "__main__":

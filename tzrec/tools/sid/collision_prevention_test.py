@@ -11,25 +11,19 @@
 
 import os
 import shutil
-import sys
 import tempfile
-import types
 import unittest
 from collections import Counter, defaultdict
-from unittest import mock
 
 import pyarrow as pa
 from pyarrow import csv, parquet
 
 from tzrec.tools.sid.collision_prevention import (
     CandidateSidRow,
-    OdpsSqlGenerator,
     RawSidRow,
     assign_sid_collisions,
     build_parser,
-    generate_odps_sql,
-    run_local,
-    run_odps,
+    run,
 )
 
 
@@ -189,7 +183,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
                 "2",
             ]
         )
-        stats = run_local(args)
+        stats = run(args)
 
         self.assertEqual(stats.reassigned_count, 1)
         result = csv.read_csv(os.path.join(out_dir, "part-0.csv"))
@@ -236,7 +230,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
                 "2",
             ]
         )
-        stats = run_local(args)
+        stats = run(args)
 
         self.assertEqual(stats.reassigned_count, 1)
         result = parquet.read_table(os.path.join(out_dir, "part-0.parquet"))
@@ -289,7 +283,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
                 "2",
             ]
         )
-        stats = run_local(args)
+        stats = run(args)
 
         self.assertEqual(stats.reassigned_count, 1)
         result = csv.read_csv(os.path.join(out_dir, "part-0.csv"))
@@ -297,155 +291,11 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self.assertIn("A", set(result["codebook"].to_pylist()))
         self.assertLessEqual(max(Counter(result["codebook"].to_pylist()).values()), 2)
 
-    def test_generate_odps_sql_uses_tool_capacity_and_no_random(self) -> None:
-        args = build_parser().parse_args(
-            [
-                "--backend",
-                "odps",
-                "--input_path",
-                "odps://proj/tables/raw_sid/ds=20260630",
-                "--candidate_input_path",
-                "odps://proj/tables/cand_sid/ds=20260630",
-                "--output_path",
-                "odps://proj/tables/final_sid/ds=20260630",
-                "--max_items_per_codebook",
-                "5",
-                "--max_iters",
-                "1",
-                "--dry_run_sql",
-            ]
-        )
-        sql = "\n".join(generate_odps_sql(args))
-        self.assertIn("<= 5", sql)
-        self.assertIn("PARTITION (ds='20260630')", sql)
-        self.assertIn("INNER JOIN", sql)
-        self.assertIn("FROM proj.raw_sid", sql)
-        self.assertIn("-- final: remaining_unassigned", sql)
-        self.assertNotIn("rand()", sql.lower())
-        self.assertNotIn("last_layer_random", sql)
-
-    def test_generate_odps_sql_keep_original_policy(self) -> None:
-        args = build_parser().parse_args(
-            [
-                "--backend",
-                "odps",
-                "--input_path",
-                "odps://proj/tables/raw_sid/ds=20260630",
-                "--candidate_input_path",
-                "odps://proj/tables/cand_sid/ds=20260630",
-                "--output_path",
-                "odps://proj/tables/final_sid/ds=20260630",
-                "--max_items_per_codebook",
-                "5",
-                "--max_iters",
-                "1",
-                "--unassigned_policy",
-                "keep_original",
-            ]
-        )
-        sql = "\n".join(generate_odps_sql(args))
-
-        self.assertIn("-- final: remaining_unassigned", sql)
-        self.assertIn("u.origin_codebook AS codebook", sql)
-        self.assertIn("COALESCE(cnt.cnt, 0) + u.rn AS `index`", sql)
-        self.assertIn("WHERE a.item_id IS NULL AND ds='20260630'", sql)
-
-    def test_run_odps_errors_on_remaining_unassigned(self) -> None:
-        executed_sqls = []
-
-        class FakeReader:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                return False
-
-            def __iter__(self):
-                return iter([(1,)])
-
-        class FakeInstance:
-            def __init__(self, sql):
-                self.sql = sql
-
-            def wait_for_success(self):
-                return None
-
-            def open_reader(self):
-                return FakeReader()
-
-        class FakeODPS:
-            def __init__(self, **kwargs):
-                pass
-
-            def execute_sql(self, sql):
-                executed_sqls.append(sql)
-                return FakeInstance(sql)
-
-        args = build_parser().parse_args(
-            [
-                "--backend",
-                "odps",
-                "--input_path",
-                "odps://proj/tables/raw_sid/ds=20260630",
-                "--candidate_input_path",
-                "odps://proj/tables/cand_sid/ds=20260630",
-                "--output_path",
-                "odps://proj/tables/final_sid/ds=20260630",
-                "--max_items_per_codebook",
-                "5",
-                "--max_iters",
-                "0",
-            ]
-        )
-
-        fake_odps_module = types.SimpleNamespace(ODPS=FakeODPS)
-        with mock.patch.dict(sys.modules, {"odps": fake_odps_module}):
-            with mock.patch(
-                "tzrec.datasets.odps_dataset._create_odps_account",
-                return_value=("account", "endpoint"),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "could not be assigned"):
-                    run_odps(args)
-
-        executed_sql = "\n".join(executed_sqls)
-        self.assertIn("-- final: remaining_unassigned", executed_sql)
-        self.assertNotIn("INSERT OVERWRITE TABLE proj.final_sid", executed_sql)
-
-    def test_odps_insert_selected_ranks_survivors_densely(self) -> None:
-        # Regression guard for the duplicate-(codebook, index) bug: the dense
-        # `codebook_rn` that feeds `index` must be computed AFTER the
-        # `WHERE item_rn = 1` survivor filter, otherwise dropped rows leave index
-        # gaps that reappear next iteration as duplicate slots. In the fixed
-        # nesting the `codebook_rn` window is defined in the outer query (over the
-        # already-filtered survivors) and therefore textually precedes the inner
-        # `item_rn` window; the buggy version co-located them with `item_rn` first.
-        args = build_parser().parse_args(
-            [
-                "--backend",
-                "odps",
-                "--input_path",
-                "odps://proj/tables/raw_sid/ds=20260630",
-                "--candidate_input_path",
-                "odps://proj/tables/cand_sid/ds=20260630",
-                "--output_path",
-                "odps://proj/tables/final_sid/ds=20260630",
-                "--max_items_per_codebook",
-                "5",
-                "--max_iters",
-                "3",
-            ]
-        )
-        sql = OdpsSqlGenerator(args)._insert_selected_sql()
-
-        self.assertIn("current_cnt + codebook_rn AS `index`", sql)
-        self.assertIn("WHERE item_rn = 1", sql)
-        self.assertLess(sql.index("AS codebook_rn"), sql.index("AS item_rn"))
-
     def test_local_reassignment_indices_are_unique_and_dense(self) -> None:
         # After reassignment every (codebook, index) pair must be unique and each
-        # bucket's indices must form a contiguous 1..N run -- the invariant the
-        # ODPS backend must also uphold. (Which two items overflow A is decided by
-        # a seeded hash, so every item carries the same B fallback.)
+        # bucket's indices must form a contiguous 1..N run. (Which two items
+        # overflow A is decided by a seeded hash, so every item carries the same
+        # B fallback.)
         raw_rows = [
             RawSidRow("item_0", "item_0", "A"),
             RawSidRow("item_1", "item_1", "A"),
