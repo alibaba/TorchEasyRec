@@ -237,6 +237,30 @@ def ec_quant_dtype() -> torch.dtype:
         return _quant_str_to_dtype[quant_dtype_str]
 
 
+_DISTRIBUTED_SPARSE_QUANT_FORMAT = "QUint8RowwiseF16"
+
+
+def _normalized_distributed_sparse_quant() -> str:
+    return os.environ.get("QUANT", "").strip().upper()
+
+
+def is_distributed_sparse_quant() -> bool:
+    """Whether distributed sparse artifacts should be rowwise quantized."""
+    quant = _normalized_distributed_sparse_quant()
+    if quant in ("", "0", "NONE"):
+        return False
+    if quant == "INT8":
+        return True
+    raise ValueError("Unsupported QUANT: %s, only INT8 is supported." % quant)
+
+
+def distributed_sparse_quant_format() -> str:
+    """Get distributed sparse artifact quantization format."""
+    if not is_distributed_sparse_quant():
+        return ""
+    return _DISTRIBUTED_SPARSE_QUANT_FORMAT
+
+
 _MIXED_PRECISION_TO_DTYPE: Dict[str, torch.dtype] = {
     "BF16": torch.bfloat16,
     "FP16": torch.float16,
@@ -336,6 +360,8 @@ def export_acc_config(
         acc_config["QUANT_EMB"] = os.environ["QUANT_EMB"]
     if "QUANT_EC_EMB" in os.environ:
         acc_config["QUANT_EC_EMB"] = os.environ["QUANT_EC_EMB"]
+    if "QUANT" in os.environ and is_distributed_sparse_quant():
+        acc_config["QUANT"] = "INT8"
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
     if "AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS" in os.environ:

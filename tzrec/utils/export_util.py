@@ -1313,6 +1313,10 @@ def export_distributed_embedding(
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
+    sparse_quant_format = acc_utils.distributed_sparse_quant_format()
+    if sparse_quant_format:
+        logger.info(f"distributed sparse quant export enabled: {sparse_quant_format}")
+
     feature_to_embedding_bag_info, feature_to_embedding_info = (
         _get_sparse_feature_to_embedding_info(model)
     )
@@ -1647,10 +1651,48 @@ def _merge_sharded_embedding_json(
     for emb_json in emb_json_files:
         for emb_name, info in emb_json.items():
             if emb_name not in merged_json:
-                merged_json[emb_name] = info
+                merged_json[emb_name] = copy.deepcopy(info)
             else:
+                for field in ("dimension", "dtype"):
+                    if merged_json[emb_name].get(field) != info.get(field):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent {field}: "
+                            f"{merged_json[emb_name].get(field)} vs {info.get(field)}"
+                        )
+                if merged_json[emb_name]["shape"][1] != info["shape"][1]:
+                    raise ValueError(
+                        f"embedding {emb_name} has inconsistent shape[1]: "
+                        f"{merged_json[emb_name]['shape'][1]} vs {info['shape'][1]}"
+                    )
+                for field in ("storage_dtype", "row_bytes", "quant"):
+                    if merged_json[emb_name].get(field) != info.get(field):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent {field}: "
+                            f"{merged_json[emb_name].get(field)} vs {info.get(field)}"
+                        )
                 merged_json[emb_name]["memory"] += info["memory"]
                 merged_json[emb_name]["shape"][0] += info["shape"][0]
+                if "storage_shape" in merged_json[emb_name] or "storage_shape" in info:
+                    if (
+                        "storage_shape" not in merged_json[emb_name]
+                        or "storage_shape" not in info
+                    ):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent storage_shape "
+                            "presence across shards"
+                        )
+                    if (
+                        merged_json[emb_name]["storage_shape"][1]
+                        != info["storage_shape"][1]
+                    ):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent storage_shape[1]: "
+                            f"{merged_json[emb_name]['storage_shape'][1]} vs "
+                            f"{info['storage_shape'][1]}"
+                        )
+                    merged_json[emb_name]["storage_shape"][0] += info["storage_shape"][
+                        0
+                    ]
                 if info.get("is_dynamic"):
                     # Dynamic npz entry names are uniform across ranks
                     # (e.g. always "user_id_emb.keys"). Serving iterates all
@@ -1792,6 +1834,121 @@ def _resolve_sparse_export_name(
     )
 
 
+_DISTRIBUTED_SPARSE_QUANT_FORMAT = "QUint8RowwiseF16"
+_DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE = "uint8"
+_DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES = 4
+
+
+def _remove_torch_prefix(src: str) -> str:
+    prefix = "torch."
+    if src.startswith(prefix):
+        return src[len(prefix) :]
+    return src
+
+
+def _value_nbytes(values: Any) -> int:
+    if hasattr(values, "nbytes"):
+        return int(values.nbytes)
+    return int(values.numel() * values.element_size())
+
+
+def _quantize_quint8_rowwise_f16(
+    values: Any, emb_dim: int, emb_name: str
+) -> np.ndarray:
+    """Encode rows as nvembedding QUint8RowwiseF16."""
+    if isinstance(values, torch.Tensor):
+        values = values.detach().cpu().numpy()
+    src = np.ascontiguousarray(values, dtype=np.float32)
+    if src.ndim != 2 or src.shape[1] != emb_dim:
+        raise ValueError(
+            f"Expected a 2D sparse embedding tensor with dim={emb_dim}, "
+            f"got shape={list(src.shape)}"
+        )
+
+    rows = src.shape[0]
+    row_bytes = emb_dim + _DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES
+    if row_bytes % 2 != 0:
+        raise ValueError(
+            "Distributed sparse quant export failed for embedding "
+            f"'{emb_name}': QUANT=INT8 is exported as nvembedding "
+            "QUint8RowwiseF16, whose stored row is "
+            "[uint8 values][float16 scale][float16 offset]. This makes "
+            f"row_bytes = embedding_dim + 4 = {emb_dim} + 4 = {row_bytes}. "
+            "nvembedding GPU lookup requires quantized stored row_bytes to be "
+            "even, but this table has an odd embedding_dim, so row_bytes is "
+            "odd. QUint8RowwiseF16 is affine uint8 rowwise quantization, "
+            "matching FBGEMM's fused rowwise INT8 value encoding with "
+            "per-row scale and offset. To fix this, change the table's "
+            "embedding_dim to an even value and retrain/re-export the model, "
+            "or disable distributed sparse quantization by unsetting QUANT or "
+            "setting QUANT=0/NONE. TorchEasyRec does not auto-pad this export "
+            "because padding would change the nvembedding logical value count "
+            "and serving contract."
+        )
+    out = np.empty((rows, row_bytes), dtype=np.uint8)
+    if rows == 0:
+        return out
+
+    row_min = np.min(src, axis=1, keepdims=True).astype(np.float32)
+    row_max = np.max(src, axis=1, keepdims=True).astype(np.float32)
+    offset_fp16 = row_min.astype(np.float16)
+    offset = offset_fp16.astype(np.float32)
+    value_range = (row_max - offset).astype(np.float32)
+    scale = np.where(value_range != 0, value_range / 255.0, np.float32(1.0))
+    scale = scale.astype(np.float32)
+    scale_fp16 = scale.astype(np.float16)
+    scale = scale_fp16.astype(np.float32)
+    scale = np.where(scale == 0, np.float32(1.0), scale).astype(np.float32)
+    scale_fp16 = scale.astype(np.float16)
+    quantized = np.rint((src - offset) / scale)
+    quantized = np.clip(quantized, 0, 255).astype(np.uint8)
+
+    out[:, :emb_dim] = quantized
+    out[:, emb_dim : emb_dim + 2] = scale_fp16.view(np.uint8).reshape(rows, 2)
+    out[:, emb_dim + 2 : emb_dim + 4] = offset_fp16.view(np.uint8).reshape(rows, 2)
+    return out
+
+
+def _prepare_sparse_export_values(
+    values: Any, emb_dim: int, emb_name: str
+) -> Tuple[Any, Dict[str, Any]]:
+    shape = list(values.shape)
+    if len(shape) != 2 or shape[1] != emb_dim:
+        raise ValueError(
+            f"Expected a 2D sparse embedding tensor with dim={emb_dim}, "
+            f"got shape={shape}"
+        )
+
+    quant_format = acc_utils.distributed_sparse_quant_format()
+    if not quant_format:
+        return values, {
+            "dimension": emb_dim,
+            "dtype": _remove_torch_prefix(str(values.dtype)),
+            "memory": _value_nbytes(values),
+            "shape": shape,
+        }
+
+    if quant_format != _DISTRIBUTED_SPARSE_QUANT_FORMAT:
+        raise ValueError(f"Unsupported distributed sparse quant format: {quant_format}")
+
+    quantized_values = _quantize_quint8_rowwise_f16(values, emb_dim, emb_name)
+    return quantized_values, {
+        "dimension": emb_dim,
+        "dtype": _DISTRIBUTED_SPARSE_QUANT_FORMAT,
+        "storage_dtype": _DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
+        "storage_shape": list(quantized_values.shape),
+        "row_bytes": int(quantized_values.shape[1]),
+        "memory": int(quantized_values.nbytes),
+        "shape": shape,
+        "quant": {
+            "enabled": True,
+            "format": _DISTRIBUTED_SPARSE_QUANT_FORMAT,
+            "scale_offset_dtype": "float16",
+            "output_dtype": "float16",
+        },
+    }
+
+
 def _get_sparse_embedding_tensor(
     model: nn.Module,
     checkpoint_path: str,
@@ -1855,19 +2012,12 @@ def _get_sparse_embedding_tensor(
             else:
                 feat_name_to_pooling[feat_name_impl] = "NONE"
 
-    def _remove_prefix(src: str, prefix: str = "torch.") -> str:
-        if src.startswith(prefix):
-            return src[len(prefix) :]
-        return src
-
     out = {}
     # dynamicemb keys/values are saved into a separate npz, kept in this dict.
     dynamic_out = {}
     # shard_offsets = {}
-    # per-table representative tensor used only for meta (shape/dtype/memory).
-    # dynamicemb tables are stored in `dynamic_out` under composite keys, so we
-    # track a separate mapping keyed by emb_name here.
-    emb_name_to_meta_tensor = {}
+    # per-table export metadata (logical shape/dtype plus optional storage info).
+    emb_name_to_export_meta = {}
     # set of emb_names that are dynamic embedding tables (loaded from
     # checkpoint's `dynamicemb/` directory rather than model state_dict).
     dynamic_emb_names = set()
@@ -1904,14 +2054,20 @@ def _get_sparse_embedding_tensor(
                         local_tensor = values.local_tensor().cpu().numpy()
                         if list(local_tensor.shape)[-1] == emb_dim:
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
-                            out[export_emb_name] = local_tensor
-                            emb_name_to_meta_tensor[export_emb_name] = local_tensor
+                            export_tensor, export_meta = _prepare_sparse_export_values(
+                                local_tensor, emb_dim, export_emb_name
+                            )
+                            out[export_emb_name] = export_tensor
+                            emb_name_to_export_meta[export_emb_name] = export_meta
                             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
             local_tensor = values.detach().cpu().numpy()
-            out[export_emb_name] = local_tensor
-            emb_name_to_meta_tensor[export_emb_name] = local_tensor
+            export_tensor, export_meta = _prepare_sparse_export_values(
+                local_tensor, emb_dim, export_emb_name
+            )
+            out[export_emb_name] = export_tensor
+            emb_name_to_export_meta[export_emb_name] = export_meta
             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
@@ -2024,10 +2180,13 @@ def _get_sparse_embedding_tensor(
             keys = torch.cat(keys_list)
             values_2d = torch.cat(values_list, dim=0)
             scores = torch.cat(scores_list)
+            export_values, export_meta = _prepare_sparse_export_values(
+                values_2d, emb_dim, emb_name
+            )
             dynamic_out[key_name] = keys
-            dynamic_out[value_name] = values_2d
+            dynamic_out[value_name] = export_values
             dynamic_out[score_name] = scores
-            emb_name_to_meta_tensor[emb_name] = values_2d
+            emb_name_to_export_meta[emb_name] = export_meta
             dynamic_emb_names.add(emb_name)
             dynamic_key_names[emb_name].append(key_name)
             dynamic_value_names[emb_name].append(value_name)
@@ -2037,26 +2196,19 @@ def _get_sparse_embedding_tensor(
 
     emb_meta = {}
     for emb_name, feat_name_impl_list in emb_name_to_feat_name_impl.items():
-        if emb_name not in emb_name_to_meta_tensor:
+        if emb_name not in emb_name_to_export_meta:
             # table not present on this rank (e.g. sharded to other ranks)
             continue
-        values = emb_name_to_meta_tensor[emb_name]
-        dimension = list(values.shape)[-1]
-        dtype = _remove_prefix(str(values.dtype))
-        memory: int = int(values.nbytes)
-        shape = list(values.shape)
+        export_meta = emb_name_to_export_meta[emb_name]
         is_dynamic = emb_name in dynamic_emb_names
         t_meta = {
             "feat_name_impl": feat_name_impl_list,
             "dense": False,
             "is_dynamic": is_dynamic,
-            "dimension": dimension,
-            "dtype": dtype,
-            "memory": memory,
-            "shape": shape,
             # "shard_offsets": shard_offsets[name],
             # "pooling": feat_name_to_pooling[name],
         }
+        t_meta.update(export_meta)
         if is_dynamic:
             # Entry names inside sparse_dynamic_embedding-*.npz. The serving
             # processor expects one key/value/score entry triplet and applies it
