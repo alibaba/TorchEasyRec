@@ -118,6 +118,9 @@ class SidCollisionAssigner:
         self.code_delimiter = code_delimiter
         self.random_last_layer_size = random_last_layer_size
         self.random_num_candidates = random_num_candidates
+        self._candidate_sort_keys: Dict[
+            CandidateSidRow, Tuple[int, float, int, str, str]
+        ] = {}
 
     def assign(
         self,
@@ -264,14 +267,22 @@ class SidCollisionAssigner:
         self,
         row: CandidateSidRow,
     ) -> Tuple[int, float, int, str, str]:
+        # Memoized: this key's blake2b tie-breaker is pure but is compared inside
+        # the up-to-max_iters assignment loop, so recomputing it would dominate
+        # the phase. CandidateSidRow is frozen/hashable, so cache on the row.
+        cached = self._candidate_sort_keys.get(row)
+        if cached is not None:
+            return cached
         score = row.score if self.score_order == "lower" else -row.score
-        return (
+        key = (
             row.priority,
             score,
             self._stable_hash(self.seed, row.item_key, row.candidate_codebook),
             row.item_key,
             row.candidate_codebook,
         )
+        self._candidate_sort_keys[row] = key
+        return key
 
     def _dedup_candidates(
         self,
