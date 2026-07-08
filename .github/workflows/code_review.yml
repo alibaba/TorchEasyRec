@@ -184,9 +184,7 @@ jobs:
           fetch-depth: 1
           path: pr-code
 
-      # Codex reads .codex/agents/, .agents/ and AGENTS.md from the workspace: generate
-      # agents from trusted base-branch files, dropping whatever the PR author shipped.
-      # Commit the swap so `git status/diff` inside the review shows the PR, not our setup.
+      # Swap in agents generated from trusted base .claude/; commit so git diff shows only the PR
       - name: Use trusted agent files
         run: |
           rm -rf pr-code/.claude pr-code/.codex pr-code/.agents pr-code/AGENTS.md
@@ -223,11 +221,7 @@ jobs:
           export HOME="${RUNNER_TEMP}/codex-home-shim"
           mkdir -p "$HOME"
 
-          # gh needs network: workspace-write + network_access (never danger-full-access)
-          # mcp env_vars forwards the named job env vars to the MCP server process
-          # ignore-user-config keeps the runner user's personal config/hooks/MCP out of CI
-          # ignore_default_excludes lets gh see GITHUB_TOKEN/GH_TOKEN (stripped by default)
-          # project_doc_max_bytes=0 blocks AGENTS.md injection (user-global and PR-authored)
+          # Network + unstripped TOKEN env for gh; personal config and all AGENTS.md kept out
           codex exec \
             --ignore-user-config \
             --ephemeral \
