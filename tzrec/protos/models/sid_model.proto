@@ -39,8 +39,6 @@ message ContrastiveConfig {
 }
 
 message SidCandidateOutputConfig {
-    reserved 4, 5;
-
     // Whether predict/inference emits candidate SIDs. Disabled by default.
     optional bool enabled = 1 [default = false];
     // Number of candidate SIDs per item (the nearest last-layer codes,

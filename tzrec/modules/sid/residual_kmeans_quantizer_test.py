@@ -116,7 +116,6 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         ub = torch.tensor(n_embed)  # per-layer K, broadcast across columns
         self.assertTrue(((out.cluster_ids >= 0) & (out.cluster_ids < ub)).all())
 
-    @unittest.skipIf(*faiss_unavailable)
     def test_candidate_output_last_layer_knn(self) -> None:
         """Candidate SIDs keep the greedy prefix and vary only the last layer."""
         rkq = ResidualKMeansQuantizer(
