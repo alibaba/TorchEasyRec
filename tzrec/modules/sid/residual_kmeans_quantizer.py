@@ -165,8 +165,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
                 rely on its contents afterward (copy first if it needs them).
             verbose (bool): print per-layer reconstruction loss. Default: True.
         """
-        # Lazy import: forward/predict are faiss-free, so only the offline fit
-        # pulls faiss in (torch_utils lets faiss take torch tensors directly).
         import faiss.contrib.torch_utils  # noqa: F401
 
         # raise (not assert): these host-tensor guards must survive `python -O`.
