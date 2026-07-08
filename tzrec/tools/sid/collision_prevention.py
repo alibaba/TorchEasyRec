@@ -21,7 +21,7 @@ reproducible given ``seed``.
 import argparse
 import hashlib
 import random
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -622,73 +622,48 @@ class CollisionRunner:
             return pa.array(values, type=pa.int64())
         return pa.array([str(v) for v in values], type=pa.string())
 
-    def _write_assignments(self, rows: Sequence[AssignedSidRow]) -> None:
+    def _write_table(self, output_path: str, columns: Dict[str, pa.Array]) -> None:
         writer = create_writer(
-            self.args.output_path,
+            output_path,
             writer_type=self.args.writer_type,
             quota_name=self.args.odps_data_quota_name,
             world_size=1,
         )
-        writer.write(
-            OrderedDict(
-                [
-                    ("item_id", self._item_id_array(rows)),
-                    (
-                        "origin_codebook",
-                        pa.array(
-                            [row.origin_codebook for row in rows],
-                            type=pa.string(),
-                        ),
-                    ),
-                    (
-                        "codebook",
-                        pa.array([row.codebook for row in rows], type=pa.string()),
-                    ),
-                    ("index", pa.array([row.index for row in rows], type=pa.int64())),
-                ]
-            )
-        )
+        writer.write(columns)
         writer.close()
 
+    def _write_assignments(self, rows: Sequence[AssignedSidRow]) -> None:
+        self._write_table(
+            self.args.output_path,
+            {
+                "item_id": self._item_id_array(rows),
+                "origin_codebook": pa.array(
+                    [row.origin_codebook for row in rows], type=pa.string()
+                ),
+                "codebook": pa.array([row.codebook for row in rows], type=pa.string()),
+                "index": pa.array([row.index for row in rows], type=pa.int64()),
+            },
+        )
+
     def _write_diagnostics(self, stats: AssignmentStats) -> None:
-        writer = create_writer(
+        self._write_table(
             self.args.diagnostics_output_path,
-            writer_type=self.args.writer_type,
-            quota_name=self.args.odps_data_quota_name,
-            world_size=1,
+            {
+                "total_items": pa.array([stats.total_items], type=pa.int64()),
+                "raw_collision_buckets": pa.array(
+                    [stats.raw_collision_buckets], type=pa.int64()
+                ),
+                "final_collision_buckets": pa.array(
+                    [stats.final_collision_buckets], type=pa.int64()
+                ),
+                "reassigned_count": pa.array([stats.reassigned_count], type=pa.int64()),
+                "unassigned_count": pa.array([stats.unassigned_count], type=pa.int64()),
+                "iteration_count": pa.array([stats.iteration_count], type=pa.int64()),
+                "max_final_bucket_size": pa.array(
+                    [stats.max_final_bucket_size], type=pa.int64()
+                ),
+            },
         )
-        writer.write(
-            OrderedDict(
-                [
-                    ("total_items", pa.array([stats.total_items], type=pa.int64())),
-                    (
-                        "raw_collision_buckets",
-                        pa.array([stats.raw_collision_buckets], type=pa.int64()),
-                    ),
-                    (
-                        "final_collision_buckets",
-                        pa.array([stats.final_collision_buckets], type=pa.int64()),
-                    ),
-                    (
-                        "reassigned_count",
-                        pa.array([stats.reassigned_count], type=pa.int64()),
-                    ),
-                    (
-                        "unassigned_count",
-                        pa.array([stats.unassigned_count], type=pa.int64()),
-                    ),
-                    (
-                        "iteration_count",
-                        pa.array([stats.iteration_count], type=pa.int64()),
-                    ),
-                    (
-                        "max_final_bucket_size",
-                        pa.array([stats.max_final_bucket_size], type=pa.int64()),
-                    ),
-                ]
-            )
-        )
-        writer.close()
 
 
 def assign_sid_collisions(
@@ -758,7 +733,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--code_delimiter", default=",")
     parser.add_argument("--candidate_codebook_field", default="candidate_codebook")
-    parser.add_argument("--candidate_origin_codebook_field", default="origin_codebook")
     parser.add_argument(
         "--compact_candidate_field",
         default=None,
