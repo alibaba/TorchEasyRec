@@ -66,6 +66,11 @@
 #
 # If auth goes stale, re-run `codex login --device-auth` on the runner.
 # If the runner lacks direct OpenAI egress, set HTTPS_PROXY for the runner service.
+#
+# Trust model: the collaborator-added label gates every run (review before labeling).
+# The sandbox confines writes to the workspace but not reads, and gh needs network,
+# so injected instructions in PR file contents could read+exfiltrate runner files —
+# keep this runner single-purpose and its stored credentials minimal.
 # ---- End Codex Setup ----
 
 name: Code Review

@@ -50,7 +50,7 @@ def gen_agent_toml(agent_md: Path, agents_dir: Path) -> None:
         agent_md (Path): path to a .claude/agents/*.md file.
         agents_dir (Path): output .codex/agents directory.
     """
-    fields, body = split_front_matter(agent_md.read_text())
+    fields, body = split_front_matter(agent_md.read_text(encoding="utf-8"))
     name = fields.get("name", agent_md.stem)
     # json.dumps escaping is valid for TOML basic strings.
     lines = [
@@ -60,7 +60,7 @@ def gen_agent_toml(agent_md: Path, agents_dir: Path) -> None:
         'sandbox_mode = "read-only"',
         f"developer_instructions = {json.dumps(body)}",
     ]
-    (agents_dir / f"{name}.toml").write_text("\n".join(lines) + "\n")
+    (agents_dir / f"{name}.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
@@ -75,15 +75,16 @@ def main() -> None:
 
     claude_dir = Path(args.claude_dir)
     agents_dir = Path(args.out_dir) / ".codex" / "agents"
-    agents_dir.mkdir(parents=True)
+    agents_dir.mkdir(parents=True, exist_ok=True)
     for agent_md in sorted((claude_dir / "agents").glob("*.md")):
         gen_agent_toml(agent_md, agents_dir)
 
     _, prompt_body = split_front_matter(
-        (claude_dir / "commands" / "review-pr.md").read_text()
+        (claude_dir / "commands" / "review-pr.md").read_text(encoding="utf-8")
     )
     Path(args.prompt_out).write_text(
-        f"REPO: {args.repo} PR_NUMBER: {args.pr_number}\n\n{prompt_body}"
+        f"REPO: {args.repo} PR_NUMBER: {args.pr_number}\n\n{prompt_body}",
+        encoding="utf-8",
     )
 
 
