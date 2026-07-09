@@ -1,6 +1,8 @@
 name: Unit Test H20 CI
 
 on:
+  pull_request:
+    types: [opened, reopened, synchronize]
   workflow_dispatch:
 
 concurrency:
