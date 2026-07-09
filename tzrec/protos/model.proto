@@ -99,8 +99,10 @@ message ModelConfig {
     // whether use pareto loss weight
     optional bool use_pareto_loss_weight = 13 [default = false];
 
-    // Training TensorBoard summaries (PCOC / scalars), e.g.:
-    //   summaries_set { pcoc {} }
+    // Training TensorBoard summaries (model_config.summaries_set), e.g.:
+    //   summaries_set { pcoc { pred_name: "probs" label_name: "clk" epsilon: 1e-7 } }
+    //   summaries_set { scalars { name: "id_1_bucket_pred" pred_name: "probs"
+    //       feature_name: "id_1" feature_value: "1005" } }
     repeated ModelSummaries summaries_set = 14;
 
 }
