@@ -10,6 +10,7 @@ import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
 import "tzrec/protos/seq_encoder.proto";
 import "tzrec/protos/module.proto";
+import "tzrec/protos/summary.proto";
 
 enum FeatureGroupType {
     DEEP = 0;
@@ -97,5 +98,9 @@ message ModelConfig {
 
     // whether use pareto loss weight
     optional bool use_pareto_loss_weight = 13 [default = false];
+
+    // Training TensorBoard summaries (PCOC / scalars), e.g.:
+    //   summaries_set { pcoc {} }
+    repeated ModelSummaries summaries_set = 14;
 
 }
