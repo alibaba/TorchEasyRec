@@ -489,64 +489,60 @@ class CollisionRunner:
             )
         return batch[field].to_pylist()
 
-    def _read_batches(
-        self,
-        input_path: str,
-        reader_type: Optional[str],
-        selected_cols: Optional[List[str]] = None,
-        capture_reader_cls: bool = False,
+    def _read(
+        self, selected_cols: Optional[List[str]], capture_reader_cls: bool = False
     ) -> Iterable[Dict[str, pa.Array]]:
         reader = create_reader(
-            input_path=input_path,
+            input_path=self.args.input_path,
             batch_size=self.args.batch_size,
             selected_cols=selected_cols,
-            reader_type=reader_type,
+            reader_type=self.args.reader_type,
             quota_name=self.args.odps_data_quota_name,
         )
         if capture_reader_cls:
             self._input_reader_cls_name = reader.__class__.__name__
         yield from reader.to_batches()
 
+    def _candidate_field(self) -> Tuple[Optional[str], bool]:
+        """Resolve the candidate column and whether it is compact.
+
+        Returns ``(None, False)`` for the ``random`` strategy (it synthesizes its
+        own candidates and reads no candidate column).
+        """
+        if self.args.strategy != "candidate":
+            return None, False
+        codebook_field = (
+            None
+            if self.args.compact_candidate_field
+            else self.args.candidate_codebook_field
+        )
+        if bool(codebook_field) == bool(self.args.compact_candidate_field):
+            raise ValueError(
+                "Set exactly one of --candidate_codebook_field or "
+                "--compact_candidate_field."
+            )
+        return (
+            self.args.compact_candidate_field or codebook_field,
+            bool(self.args.compact_candidate_field),
+        )
+
     def _load_rows(self) -> Tuple[List[RawSidRow], List[CandidateSidRow]]:
         """Read raw SID rows and candidate rows from the single input table.
 
-        The model emits ``codes`` and the candidate SIDs in the same rows, so
-        candidates come from the same table. They are read only for the
-        ``candidate`` strategy (``random`` synthesizes its own) and only when the
-        candidate column is present, so a plain SID table still runs (overflow
-        then follows ``--unassigned_policy``).
+        Two passes: pass 1 reads only the id + code columns (raw rows + per-origin
+        counts); pass 2 reads the candidate columns and builds a CandidateSidRow
+        only for items in over-capacity buckets -- the only ones that can overflow
+        -- so candidate memory scales with the overflow fraction, not the whole
+        table. Candidates are read only for the ``candidate`` strategy and only
+        when the column is present, so a plain SID table still runs.
         """
-        candidate_field, is_compact = None, False
-        if self.args.strategy == "candidate":
-            codebook_field = (
-                None
-                if self.args.compact_candidate_field
-                else self.args.candidate_codebook_field
-            )
-            if bool(codebook_field) == bool(self.args.compact_candidate_field):
-                raise ValueError(
-                    "Set exactly one of --candidate_codebook_field or "
-                    "--compact_candidate_field."
-                )
-            is_compact = bool(self.args.compact_candidate_field)
-            candidate_field = self.args.compact_candidate_field or codebook_field
-
-        # Project to the SID columns only when candidate columns aren't also read
-        # from the same table (their optional priority/score can't be projected).
-        selected_cols = (
-            [self.args.item_id_field, self.args.code_field]
-            if candidate_field is None
-            else None
-        )
+        candidate_field, is_compact = self._candidate_field()
 
         raw_rows: List[RawSidRow] = []
-        candidate_rows: List[CandidateSidRow] = []
+        origin_counts: Dict[str, int] = defaultdict(int)
         seen: set = set()
-        for batch in self._read_batches(
-            self.args.input_path,
-            self.args.reader_type,
-            selected_cols=selected_cols,
-            capture_reader_cls=True,
+        for batch in self._read(
+            [self.args.item_id_field, self.args.code_field], capture_reader_cls=True
         ):
             item_ids = self._array_to_pylist(batch, self.args.item_id_field)
             code_cells = self._array_to_pylist(batch, self.args.code_field)
@@ -555,19 +551,27 @@ class CollisionRunner:
                 if item_key in seen:
                     raise ValueError(f"duplicate item_id in SID input: {item_key}")
                 seen.add(item_key)
-                raw_rows.append(
-                    RawSidRow(
-                        item_id=item_id,
-                        origin_codebook=self._cell_to_code(
-                            code_cell, self.args.code_delimiter
-                        ),
-                    )
-                )
-            if candidate_field is not None and candidate_field in batch:
-                candidate_rows.extend(self._candidate_rows(batch, item_ids, is_compact))
-
+                origin = self._cell_to_code(code_cell, self.args.code_delimiter)
+                raw_rows.append(RawSidRow(item_id=item_id, origin_codebook=origin))
+                origin_counts[origin] += 1
         if not raw_rows:
             raise ValueError("SID input is empty.")
+
+        cap = self.args.max_items_per_codebook
+        overflow = {
+            r.item_key for r in raw_rows if origin_counts[r.origin_codebook] > cap
+        }
+        if candidate_field is None or not overflow:
+            return raw_rows, []
+
+        candidate_rows: List[CandidateSidRow] = []
+        for batch in self._read(None):
+            if candidate_field not in batch:
+                break
+            item_ids = self._array_to_pylist(batch, self.args.item_id_field)
+            candidate_rows.extend(
+                self._candidate_rows(batch, item_ids, is_compact, overflow)
+            )
         return raw_rows, candidate_rows
 
     def _candidate_rows(
@@ -575,6 +579,7 @@ class CollisionRunner:
         batch: Dict[str, pa.Array],
         item_ids: List[Any],
         is_compact: bool,
+        overflow: set,
     ) -> List[CandidateSidRow]:
         rows: List[CandidateSidRow] = []
         if is_compact:
@@ -582,6 +587,9 @@ class CollisionRunner:
                 batch, self.args.compact_candidate_field
             )
             for item_id, compact_value in zip(item_ids, compact_values):
+                item_key = str(item_id)
+                if item_key not in overflow:
+                    continue
                 for priority, candidate in enumerate(
                     self._split_compact_candidates(
                         compact_value, self.args.candidate_delimiter
@@ -590,7 +598,7 @@ class CollisionRunner:
                 ):
                     rows.append(
                         CandidateSidRow(
-                            item_key=str(item_id),
+                            item_key=item_key,
                             candidate_codebook=candidate,
                             priority=priority,
                             score=0.0,
@@ -610,9 +618,12 @@ class CollisionRunner:
         )
         candidates = self._array_to_pylist(batch, self.args.candidate_codebook_field)
         for i, (item_id, candidate) in enumerate(zip(item_ids, candidates)):
+            item_key = str(item_id)
+            if item_key not in overflow:
+                continue
             rows.append(
                 CandidateSidRow(
-                    item_key=str(item_id),
+                    item_key=item_key,
                     candidate_codebook=self._cell_to_code(
                         candidate, self.args.code_delimiter
                     ),
