@@ -66,13 +66,11 @@ class SidRqvae(BaseSidModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
 
-        cfg = self._model_config  # SidRqvae proto message
+        cfg = self._model_config
 
         self._init_contrastive()
 
         embed_dim = cfg.embed_dim
-        # Fail fast (parity with BaseSidModel's codebook/input_dim checks): a zero
-        # dim only errors opaquely deep in nn.Linear/Embedding otherwise.
         if embed_dim < 1:
             raise ValueError(f"embed_dim must be >= 1, got {embed_dim}")
         hidden_dims = (
@@ -83,8 +81,6 @@ class SidRqvae(BaseSidModel):
 
         sinkhorn_cfg = config_to_kwargs(cfg.sinkhorn_config)
 
-        # MLP activates its last layer; the trailing bare Linear keeps the
-        # latent / reconstruction unbounded.
         self._encoder = nn.Sequential(
             MLP(self._input_dim, hidden_units=hidden_dims),
             nn.Linear(hidden_dims[-1], embed_dim),
@@ -106,6 +102,7 @@ class SidRqvae(BaseSidModel):
             use_sinkhorn=sinkhorn_cfg["enabled"],
             sinkhorn_iters=sinkhorn_cfg["iters"],
             sinkhorn_epsilon=sinkhorn_cfg["epsilon"],
+            candidate_output_config=self._candidate_output_kwargs,
         )
 
         logger.info(
@@ -180,7 +177,9 @@ class SidRqvae(BaseSidModel):
         """Predict the model.
 
         Returns the raw tensors the configured losses consume (computed in
-        :meth:`BaseSidModel.loss`); inference emits codes only.
+        :meth:`BaseSidModel.loss`); inference emits ``codes`` (plus
+        ``candidate_codes``/``candidate_scores`` when candidate output is
+        configured).
 
         Args:
             batch (Batch): input batch data.
@@ -191,7 +190,8 @@ class SidRqvae(BaseSidModel):
         grouped = self.build_input(batch)
         embedding = grouped[self._feature_group]
         if self._is_inference:
-            return {"codes": self._quantizer.get_codes(self._encode(embedding))}
+            quant = self._quantizer(self._encode(embedding))
+            return self._sid_predictions(quant)
         if self._use_contrastive:
             return self._predict_mixed(grouped)
         return self._predict_rqvae(embedding)
@@ -212,12 +212,14 @@ class SidRqvae(BaseSidModel):
     def _predict_rqvae(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Standard RQ-VAE: a single reconstruction pass."""
         z_e, quant, x_hat = self._rqvae_pass(embedding)
+        latents = quant.latents
+        assert latents is not None  # RQ-VAE train/eval always builds latents
         return {
             "codes": quant.cluster_ids,
             "x_hat": x_hat,
             "recon_target": embedding,
             "encoder_out": z_e,
-            "latents": quant.latents,
+            "latents": latents,
         }
 
     def _predict_mixed(
@@ -239,6 +241,8 @@ class SidRqvae(BaseSidModel):
 
         z_e1, quant1, x_hat1 = self._rqvae_pass(embedding)
         z_e2, quant2, x_hat2 = self._rqvae_pass(fea2)
+        lat1, lat2 = quant1.latents, quant2.latents
+        assert lat1 is not None and lat2 is not None  # train/eval builds latents
 
         return {
             "codes": quant1.cluster_ids,
@@ -246,8 +250,7 @@ class SidRqvae(BaseSidModel):
             "recon_target": embedding,
             "recon_mask": ~pair_mask,
             "encoder_out": torch.cat([z_e1, z_e2], dim=0),
-            "latents": torch.cat([quant1.latents, quant2.latents], dim=0),
-            # generic contrastive operands (view a = main, view b = paired):
+            "latents": torch.cat([lat1, lat2], dim=0),
             "embed_a": x_hat1,
             "embed_b": x_hat2,
             "embed_a_ori": embedding,

@@ -1,8 +1,6 @@
 name: Unit Test H20 CI
 
 on:
-  pull_request:
-    types: [opened, reopened, synchronize]
   workflow_dispatch:
 
 concurrency:
@@ -31,9 +29,9 @@ jobs:
             -e HOME=/github/home \
             -e GITHUB_ACTIONS=true \
             -e CI=true \
-            -e CUDA_HOME=/usr/local/cuda-12 \
-            -e CI_HYPOTHESIS=true \
-            -e TORCHINDUCTOR_CACHE_DIR=/github/home/.torchinductor \
+            -e CUDA_HOME=/usr/local/cuda-13 \
+            -e TRITON_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/triton \
+            -e TORCHINDUCTOR_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/inductor \
             -v "$WORK_ROOT":/__w \
             -v "$EXTERNALS_ROOT":/__e:ro \
             -v "$WORK_ROOT/_temp":/__w/_temp \
@@ -41,8 +39,8 @@ jobs:
             -v "$WORK_ROOT/_tool":/__w/_tool \
             -v "$WORK_ROOT/_temp/_github_home":/github/home \
             -v "$WORK_ROOT/_temp/_github_workflow":/github/workflow \
-            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.2 \
-            bash -c 'cd run_${{ github.run_id }} && bash scripts/ci/ci_test.sh --scope h20'
+            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.3 \
+            bash -c 'mkdir -p /__w/TorchEasyRec/tzrec-ci-cache/triton /__w/TorchEasyRec/tzrec-ci-cache/inductor && cd run_${{ github.run_id }} && bash scripts/ci/ci_test.sh --scope h20'
       - name: StopDockerContainer
         if: always()
         run: |

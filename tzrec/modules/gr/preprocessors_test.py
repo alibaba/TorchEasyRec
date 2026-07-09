@@ -19,7 +19,7 @@ from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class PreprocessorTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
@@ -250,7 +250,7 @@ class PreprocessorTest(unittest.TestCase):
         )
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class UIHPreprocessorTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     def test_uih_preprocessor_contextual(self) -> None:

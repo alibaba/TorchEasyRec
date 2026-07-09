@@ -95,7 +95,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     },
     "containers": [
         {
-            "image": "dsw-registry-vpc.{region}.cr.aliyuncs.com/pai/torcheasyrec:1.2.0-pytorch2.11.0-gpu-py311-cu129-ubuntu22.04",
+            "image": "dsw-registry-vpc.{region}.cr.aliyuncs.com/pai/torcheasyrec:1.3.0-pytorch2.12.1-gpu-py311-cu129-ubuntu22.04",
             "port": 8000,
             "script": "set -e\npip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com\n\nCUDA_HOME=/usr/local/cuda-12 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \\\nENABLE_AOT=1 QUANT_EC_EMB=INT8 \\\ntorchrun --master_addr=127.0.0.1 --master_port=12345 \\\n    --nnodes=1 --nproc-per-node=1 --node_rank=0 \\\n    -m tzrec.export \\\n    --pipeline_config_path /mnt/data/${MODEL_DIR}/pipeline.config \\\n    --export_dir /mnt/data/${MODEL_DIR}/export/ \\\n    --additional_export_config '{\"cand_seq_pk\": \"cand_seq\"}'"
         }
