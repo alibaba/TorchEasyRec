@@ -199,7 +199,8 @@ jobs:
             --out-dir pr-code \
             --repo ${{ github.repository }} \
             --pr-number ${{ github.event.pull_request.number }} \
-            --prompt-out "${{ runner.temp }}/codex-prompt.md"
+            --prompt-out "${{ runner.temp }}/codex-prompt.md" \
+            --agents-md trusted-claude/AGENTS.md
           git -C pr-code add -A
           git -C pr-code -c user.name=ci -c user.email=ci@localhost \
             commit -q -m "ci: trusted review setup"
@@ -227,7 +228,8 @@ jobs:
           export HOME="${RUNNER_TEMP}/codex-home-shim"
           mkdir -p "$HOME"
 
-          # Network + unstripped TOKEN env for gh; personal config and all AGENTS.md kept out
+          # Network + unstripped TOKEN env for gh; ambient AGENTS.md and personal config
+          # kept out (the trusted guide is embedded in the prompt instead)
           codex exec \
             --ignore-user-config \
             --ephemeral \
