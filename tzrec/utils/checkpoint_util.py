@@ -143,7 +143,10 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             # INPUT_TILE=3 export adds user-side twin modules absent from
             # training checkpoints. Remap to existing non-user keys, matching
             # export_model_normal's emb_ckpt_mapping.txt fallback.
-            if meta_fqn not in self.metadata.state_dict_metadata:
+            if (
+                is_input_tile_emb()
+                and meta_fqn not in self.metadata.state_dict_metadata
+            ):
                 for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
                     if new_pat not in meta_fqn:
                         continue
