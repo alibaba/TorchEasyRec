@@ -39,10 +39,10 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
     def test_assign_sid_collisions_respects_capacity(self) -> None:
         raw_rows = [
-            RawSidRow("item_0", "item_0", "A"),
-            RawSidRow("item_1", "item_1", "A"),
-            RawSidRow("item_2", "item_2", "A"),
-            RawSidRow("item_3", "item_3", "B"),
+            RawSidRow("item_0", "A"),
+            RawSidRow("item_1", "A"),
+            RawSidRow("item_2", "A"),
+            RawSidRow("item_3", "B"),
         ]
         candidate_rows = [
             CandidateSidRow("item_0", "C", 1, 0.1),
@@ -68,9 +68,9 @@ class SidCollisionPreventionTest(unittest.TestCase):
     def test_random_strategy_reassigns_within_band_without_candidates(self) -> None:
         # Three items collide on SID (lv1,lv2,lv3) = (1,2,3); capacity 1.
         raw_rows = [
-            RawSidRow("item_0", "item_0", "1,2,3"),
-            RawSidRow("item_1", "item_1", "1,2,3"),
-            RawSidRow("item_2", "item_2", "1,2,3"),
+            RawSidRow("item_0", "1,2,3"),
+            RawSidRow("item_1", "1,2,3"),
+            RawSidRow("item_2", "1,2,3"),
         ]
 
         assigned, stats = assign_sid_collisions(
@@ -96,7 +96,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self.assertEqual(stats.unassigned_count, 0)
 
     def test_random_strategy_is_deterministic_given_seed(self) -> None:
-        raw_rows = [RawSidRow(f"item_{i}", f"item_{i}", "0,0,0") for i in range(4)]
+        raw_rows = [RawSidRow(f"item_{i}", "0,0,0") for i in range(4)]
         kwargs = dict(capacity=1, strategy="random", random_last_layer_size=64, seed=11)
         first, _ = assign_sid_collisions(raw_rows, [], **kwargs)
         second, _ = assign_sid_collisions(raw_rows, [], **kwargs)
@@ -106,23 +106,23 @@ class SidCollisionPreventionTest(unittest.TestCase):
         )
 
     def test_random_strategy_requires_last_layer_size(self) -> None:
-        raw_rows = [RawSidRow("item_0", "item_0", "1,2,3")]
+        raw_rows = [RawSidRow("item_0", "1,2,3")]
         with self.assertRaisesRegex(ValueError, "random_last_layer_size"):
             assign_sid_collisions(raw_rows, [], capacity=1, strategy="random")
 
     def test_missing_candidates_errors_on_overflow(self) -> None:
         raw_rows = [
-            RawSidRow("item_0", "item_0", "A"),
-            RawSidRow("item_1", "item_1", "A"),
+            RawSidRow("item_0", "A"),
+            RawSidRow("item_1", "A"),
         ]
         with self.assertRaisesRegex(ValueError, "no explicit candidate input"):
             assign_sid_collisions(raw_rows, [], capacity=1)
 
     def test_duplicate_candidates_do_not_consume_capacity_twice(self) -> None:
         raw_rows = [
-            RawSidRow("item_0", "item_0", "A"),
-            RawSidRow("item_1", "item_1", "A"),
-            RawSidRow("item_2", "item_2", "A"),
+            RawSidRow("item_0", "A"),
+            RawSidRow("item_1", "A"),
+            RawSidRow("item_2", "A"),
         ]
         candidate_rows = [
             CandidateSidRow("item_0", "C", 1, 0.1),
@@ -283,10 +283,10 @@ class SidCollisionPreventionTest(unittest.TestCase):
         # overflow A is decided by a seeded hash, so every item carries the same
         # B fallback.)
         raw_rows = [
-            RawSidRow("item_0", "item_0", "A"),
-            RawSidRow("item_1", "item_1", "A"),
-            RawSidRow("item_2", "item_2", "A"),
-            RawSidRow("item_3", "item_3", "A"),
+            RawSidRow("item_0", "A"),
+            RawSidRow("item_1", "A"),
+            RawSidRow("item_2", "A"),
+            RawSidRow("item_3", "A"),
         ]
         candidate_rows = [
             CandidateSidRow("item_0", "B", 1, 0.1),
@@ -317,9 +317,9 @@ class SidCollisionPreventionTest(unittest.TestCase):
         # which fits only one -> one item stays unplaceable and reaches
         # _handle_unassigned's drop branch.
         raw_rows = [
-            RawSidRow("item_0", "item_0", "A"),
-            RawSidRow("item_1", "item_1", "A"),
-            RawSidRow("item_2", "item_2", "A"),
+            RawSidRow("item_0", "A"),
+            RawSidRow("item_1", "A"),
+            RawSidRow("item_2", "A"),
         ]
         candidate_rows = [
             CandidateSidRow("item_0", "B", 1, 0.1),
@@ -342,9 +342,9 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
     def test_local_keep_original_readds_over_capacity(self) -> None:
         raw_rows = [
-            RawSidRow("item_0", "item_0", "A"),
-            RawSidRow("item_1", "item_1", "A"),
-            RawSidRow("item_2", "item_2", "A"),
+            RawSidRow("item_0", "A"),
+            RawSidRow("item_1", "A"),
+            RawSidRow("item_2", "A"),
         ]
         candidate_rows = [
             CandidateSidRow("item_0", "B", 1, 0.1),
@@ -369,9 +369,9 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
     def test_local_error_policy_raises_on_unplaceable(self) -> None:
         raw_rows = [
-            RawSidRow("item_0", "item_0", "A"),
-            RawSidRow("item_1", "item_1", "A"),
-            RawSidRow("item_2", "item_2", "A"),
+            RawSidRow("item_0", "A"),
+            RawSidRow("item_1", "A"),
+            RawSidRow("item_2", "A"),
         ]
         candidate_rows = [
             CandidateSidRow("item_0", "B", 1, 0.1),
@@ -396,8 +396,8 @@ class SidCollisionPreventionTest(unittest.TestCase):
         # candidates so the choice is independent of which item the seeded hash
         # picks to overflow.
         raw_rows = [
-            RawSidRow("item_0", "item_0", "A"),
-            RawSidRow("item_1", "item_1", "A"),
+            RawSidRow("item_0", "A"),
+            RawSidRow("item_1", "A"),
         ]
         candidate_rows = [
             CandidateSidRow("item_0", "B", 1, 0.1),

@@ -20,9 +20,11 @@ reproducible given ``seed``.
 
 import argparse
 import hashlib
+import heapq
 import random
+import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
@@ -34,16 +36,20 @@ from tzrec.datasets.dataset import create_reader, create_writer
 from tzrec.utils.logging_util import logger
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RawSidRow:
     """One raw item -> SID row."""
 
     item_id: Any
-    item_key: str
     origin_codebook: str
 
+    @property
+    def item_key(self) -> str:
+        """Stable dict/sort key for the item (its id as a string)."""
+        return str(self.item_id)
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class CandidateSidRow:
     """One item -> candidate SID row."""
 
@@ -53,18 +59,22 @@ class CandidateSidRow:
     score: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AssignedSidRow:
     """One final item -> SID assignment row."""
 
     item_id: Any
-    item_key: str
     origin_codebook: str
     codebook: str
     index: int
 
+    @property
+    def item_key(self) -> str:
+        """Stable dict/sort key for the item (its id as a string)."""
+        return str(self.item_id)
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class AssignmentStats:
     """Summary statistics for a collision-prevention run."""
 
@@ -128,10 +138,10 @@ class SidCollisionAssigner:
         candidate_rows: Sequence[CandidateSidRow],
     ) -> Tuple[List[AssignedSidRow], AssignmentStats]:
         """Assign overflow SID rows to non-full candidate codebooks."""
-        if len({row.item_key for row in raw_rows}) != len(raw_rows):
+        raw_by_item = {row.item_key: row for row in raw_rows}
+        if len(raw_by_item) != len(raw_rows):
             raise ValueError("raw_rows contains duplicate item_id values.")
 
-        raw_by_item = {row.item_key: row for row in raw_rows}
         by_origin: Dict[str, List[RawSidRow]] = defaultdict(list)
         for row in raw_rows:
             by_origin[row.origin_codebook].append(row)
@@ -142,13 +152,12 @@ class SidCollisionAssigner:
 
         for codebook, rows in by_origin.items():
             for index, row in enumerate(
-                sorted(rows, key=self._assignment_sort_key)[: self.capacity],
+                heapq.nsmallest(self.capacity, rows, key=self._assignment_sort_key),
                 start=1,
             ):
                 assigned.append(
                     AssignedSidRow(
                         item_id=row.item_id,
-                        item_key=row.item_key,
                         origin_codebook=row.origin_codebook,
                         codebook=codebook,
                         index=index,
@@ -167,7 +176,7 @@ class SidCollisionAssigner:
                 "raw SID input has overflow rows, but no explicit candidate input was "
                 "provided."
             )
-        candidates_by_item = self._dedup_candidates(candidate_rows, raw_by_item)
+        candidates_by_item = self._dedup_candidates(candidate_rows, overflow_items)
 
         iteration_count = self._assign_candidates(
             raw_by_item,
@@ -182,23 +191,30 @@ class SidCollisionAssigner:
             assigned_items,
             code_counts,
         )
-        final_counts = self._final_counts(assigned)
+
+        final_counts: Dict[str, int] = defaultdict(int)
+        reassigned = 0
+        for row in assigned:
+            final_counts[row.codebook] += 1
+            if row.origin_codebook != row.codebook:
+                reassigned += 1
         stats = AssignmentStats(
             total_items=len(raw_rows),
-            raw_collision_buckets=self._raw_collision_buckets(raw_rows),
+            raw_collision_buckets=sum(
+                1 for rows in by_origin.values() if len(rows) > self.capacity
+            ),
             final_collision_buckets=sum(
                 1 for count in final_counts.values() if count > self.capacity
             ),
-            reassigned_count=sum(
-                1 for row in assigned if row.origin_codebook != row.codebook
-            ),
+            reassigned_count=reassigned,
             unassigned_count=(
                 len(unassigned) if self.unassigned_policy != "keep_original" else 0
             ),
             iteration_count=iteration_count,
             max_final_bucket_size=max(final_counts.values()) if final_counts else 0,
         )
-        return sorted(assigned, key=lambda r: (r.codebook, r.index, r.item_key)), stats
+        assigned.sort(key=lambda r: (r.codebook, r.index, r.item_key))
+        return assigned, stats
 
     @staticmethod
     def _stable_hash(*parts: Any) -> int:
@@ -207,12 +223,6 @@ class SidCollisionAssigner:
             h.update(str(part).encode("utf-8"))
             h.update(b"\x1f")
         return int.from_bytes(h.digest(), byteorder="big", signed=False)
-
-    def _raw_collision_buckets(self, raw_rows: Sequence[RawSidRow]) -> int:
-        counts: Dict[str, int] = defaultdict(int)
-        for row in raw_rows:
-            counts[row.origin_codebook] += 1
-        return sum(1 for count in counts.values() if count > self.capacity)
 
     def _generate_random_candidates(
         self,
@@ -287,11 +297,13 @@ class SidCollisionAssigner:
     def _dedup_candidates(
         self,
         candidate_rows: Sequence[CandidateSidRow],
-        raw_by_item: Dict[str, RawSidRow],
+        overflow_items: set,
     ) -> Dict[str, List[CandidateSidRow]]:
+        # Only overflow items' candidates can ever be used, so filtering here
+        # keeps the dedup map (and the sort-key memo) to the overflow fraction.
         dedup_candidates: Dict[Tuple[str, str], CandidateSidRow] = {}
         for row in candidate_rows:
-            if row.item_key not in raw_by_item:
+            if row.item_key not in overflow_items:
                 continue
             key = (row.item_key, row.candidate_codebook)
             current = dedup_candidates.get(key)
@@ -339,7 +351,6 @@ class SidCollisionAssigner:
                 assigned.append(
                     AssignedSidRow(
                         item_id=raw.item_id,
-                        item_key=raw.item_key,
                         origin_codebook=raw.origin_codebook,
                         codebook=candidate.candidate_codebook,
                         index=code_counts[candidate.candidate_codebook],
@@ -381,7 +392,7 @@ class SidCollisionAssigner:
             if remaining <= 0:
                 continue
             selected_by_codebook.extend(
-                sorted(rows, key=self._candidate_sort_key)[:remaining]
+                heapq.nsmallest(remaining, rows, key=self._candidate_sort_key)
             )
 
         best_by_item: Dict[str, CandidateSidRow] = {}
@@ -421,20 +432,12 @@ class SidCollisionAssigner:
                 assigned.append(
                     AssignedSidRow(
                         item_id=raw.item_id,
-                        item_key=raw.item_key,
                         origin_codebook=raw.origin_codebook,
                         codebook=raw.origin_codebook,
                         index=code_counts[raw.origin_codebook],
                     )
                 )
         return unassigned
-
-    @staticmethod
-    def _final_counts(rows: Sequence[AssignedSidRow]) -> Dict[str, int]:
-        final_counts: Dict[str, int] = defaultdict(int)
-        for row in rows:
-            final_counts[row.codebook] += 1
-        return final_counts
 
 
 class CollisionRunner:
@@ -472,11 +475,13 @@ class CollisionRunner:
 
     @staticmethod
     def _cell_to_code(value: Any, delimiter: str) -> str:
+        # intern: codebook strings repeat heavily over a small distinct-SID space,
+        # so they are stored once instead of once per cell.
         if value is None:
             raise ValueError("SID code value cannot be null.")
         if isinstance(value, (list, tuple)):
-            return delimiter.join(str(v) for v in value)
-        return str(value)
+            return sys.intern(delimiter.join(str(v) for v in value))
+        return sys.intern(str(value))
 
     @classmethod
     def _split_compact_candidates(cls, value: Any, delimiter: str) -> List[str]:
@@ -487,7 +492,7 @@ class CollisionRunner:
         text = str(value).strip()
         if not text:
             return []
-        return [part.strip() for part in text.split(delimiter) if part.strip()]
+        return [sys.intern(p.strip()) for p in text.split(delimiter) if p.strip()]
 
     @staticmethod
     def _array_to_pylist(batch: Dict[str, pa.Array], field: str) -> List[Any]:
@@ -567,7 +572,6 @@ class CollisionRunner:
                 raw_rows.append(
                     RawSidRow(
                         item_id=item_id,
-                        item_key=item_key,
                         origin_codebook=self._cell_to_code(
                             code_cell, self.args.code_delimiter
                         ),
@@ -673,51 +677,23 @@ class CollisionRunner:
         )
 
     def _write_diagnostics(self, stats: AssignmentStats) -> None:
+        # asdict preserves field-declaration order, so column order is unchanged.
         self._write_table(
             self.args.diagnostics_output_path,
-            {
-                "total_items": pa.array([stats.total_items], type=pa.int64()),
-                "raw_collision_buckets": pa.array(
-                    [stats.raw_collision_buckets], type=pa.int64()
-                ),
-                "final_collision_buckets": pa.array(
-                    [stats.final_collision_buckets], type=pa.int64()
-                ),
-                "reassigned_count": pa.array([stats.reassigned_count], type=pa.int64()),
-                "unassigned_count": pa.array([stats.unassigned_count], type=pa.int64()),
-                "iteration_count": pa.array([stats.iteration_count], type=pa.int64()),
-                "max_final_bucket_size": pa.array(
-                    [stats.max_final_bucket_size], type=pa.int64()
-                ),
-            },
+            {k: pa.array([v], type=pa.int64()) for k, v in asdict(stats).items()},
         )
 
 
 def assign_sid_collisions(
     raw_rows: Sequence[RawSidRow],
     candidate_rows: Sequence[CandidateSidRow],
-    capacity: int,
-    max_iters: int = 50,
-    seed: int = 2026,
-    score_order: str = "lower",
-    unassigned_policy: str = "error",
-    strategy: str = "candidate",
-    code_delimiter: str = ",",
-    random_last_layer_size: Optional[int] = None,
-    random_num_candidates: int = 64,
+    **kwargs: Any,
 ) -> Tuple[List[AssignedSidRow], AssignmentStats]:
-    """Assign overflow SID rows to non-full candidate codebooks."""
-    return SidCollisionAssigner(
-        capacity=capacity,
-        max_iters=max_iters,
-        seed=seed,
-        score_order=score_order,
-        unassigned_policy=unassigned_policy,
-        strategy=strategy,
-        code_delimiter=code_delimiter,
-        random_last_layer_size=random_last_layer_size,
-        random_num_candidates=random_num_candidates,
-    ).assign(raw_rows, candidate_rows)
+    """Assign overflow SID rows to non-full candidate codebooks.
+
+    Thin functional entry point; ``kwargs`` are ``SidCollisionAssigner`` params.
+    """
+    return SidCollisionAssigner(**kwargs).assign(raw_rows, candidate_rows)
 
 
 def run(args: argparse.Namespace) -> AssignmentStats:
