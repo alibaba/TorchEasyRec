@@ -52,13 +52,18 @@ def gen_agent_toml(agent_md: Path, agents_dir: Path) -> None:
     """
     fields, body = split_front_matter(agent_md.read_text(encoding="utf-8"))
     name = fields.get("name", agent_md.stem)
-    # json.dumps escaping is valid for TOML basic strings.
+
+    def toml_str(value: str) -> str:
+        # json.dumps escaping is valid for TOML basic strings; ensure_ascii=False
+        # keeps non-BMP chars raw instead of TOML-invalid surrogate escapes.
+        return json.dumps(value, ensure_ascii=False)
+
     lines = [
-        f"name = {json.dumps(name)}",
-        f"description = {json.dumps(fields.get('description', ''))}",
+        f"name = {toml_str(name)}",
+        f"description = {toml_str(fields.get('description', ''))}",
         # Claude agents are read-only (tools: Glob, Grep, Read).
         'sandbox_mode = "read-only"',
-        f"developer_instructions = {json.dumps(body)}",
+        f"developer_instructions = {toml_str(body)}",
     ]
     (agents_dir / f"{name}.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
