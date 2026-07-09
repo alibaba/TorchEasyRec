@@ -176,21 +176,17 @@ class SidCollisionAssigner:
                 "raw SID input has overflow rows, but no explicit candidate input was "
                 "provided."
             )
-        candidates_by_item = self._dedup_candidates(candidate_rows, overflow_items)
+        sorted_by_codebook = self._dedup_candidates(candidate_rows, overflow_items)
 
+        unassigned = set(overflow_items)
         iteration_count = self._assign_candidates(
             raw_by_item,
-            candidates_by_item,
+            sorted_by_codebook,
             assigned,
-            assigned_items,
             code_counts,
+            unassigned,
         )
-        unassigned = self._handle_unassigned(
-            raw_by_item,
-            assigned,
-            assigned_items,
-            code_counts,
-        )
+        self._handle_unassigned(raw_by_item, assigned, code_counts, unassigned)
 
         final_counts: Dict[str, int] = defaultdict(int)
         reassigned = 0
@@ -312,37 +308,36 @@ class SidCollisionAssigner:
             ) < self._candidate_sort_key(current):
                 dedup_candidates[key] = row
 
-        candidates_by_item: Dict[str, List[CandidateSidRow]] = defaultdict(list)
+        # Group by codebook and sort each list ONCE. The sort key is a total
+        # order, so the loop can scan these lists instead of re-sorting per pass.
+        sorted_by_codebook: Dict[str, List[CandidateSidRow]] = defaultdict(list)
         for row in dedup_candidates.values():
-            candidates_by_item[row.item_key].append(row)
-        return candidates_by_item
+            sorted_by_codebook[row.candidate_codebook].append(row)
+        for rows in sorted_by_codebook.values():
+            rows.sort(key=self._candidate_sort_key)
+        return sorted_by_codebook
 
     def _assign_candidates(
         self,
         raw_by_item: Dict[str, RawSidRow],
-        candidates_by_item: Dict[str, List[CandidateSidRow]],
+        sorted_by_codebook: Dict[str, List[CandidateSidRow]],
         assigned: List[AssignedSidRow],
-        assigned_items: set,
         code_counts: Dict[str, int],
+        unassigned: set,
     ) -> int:
         iteration_count = 0
         for iteration in range(self.max_iters):
-            unassigned = set(raw_by_item) - assigned_items
             if not unassigned:
                 break
-
-            available = self._available_candidates(
-                unassigned,
-                candidates_by_item,
-                code_counts,
+            accepted = self._select_candidates(
+                sorted_by_codebook, unassigned, code_counts
             )
-            if not available:
+            if not accepted:
                 break
 
-            accepted = self._select_candidates(available, code_counts)
             progress = 0
             for candidate in accepted:
-                if candidate.item_key in assigned_items:
+                if candidate.item_key not in unassigned:
                     continue
                 if code_counts[candidate.candidate_codebook] >= self.capacity:
                     continue
@@ -356,7 +351,7 @@ class SidCollisionAssigner:
                         index=code_counts[candidate.candidate_codebook],
                     )
                 )
-                assigned_items.add(candidate.item_key)
+                unassigned.discard(candidate.item_key)
                 progress += 1
 
             iteration_count = iteration + 1
@@ -364,36 +359,28 @@ class SidCollisionAssigner:
                 break
         return iteration_count
 
-    def _available_candidates(
-        self,
-        unassigned: Sequence[str],
-        candidates_by_item: Dict[str, List[CandidateSidRow]],
-        code_counts: Dict[str, int],
-    ) -> List[CandidateSidRow]:
-        available = []
-        for item_key in unassigned:
-            for candidate in candidates_by_item.get(item_key, []):
-                if code_counts[candidate.candidate_codebook] < self.capacity:
-                    available.append(candidate)
-        return available
-
     def _select_candidates(
         self,
-        available: Sequence[CandidateSidRow],
+        sorted_by_codebook: Dict[str, List[CandidateSidRow]],
+        unassigned: set,
         code_counts: Dict[str, int],
     ) -> List[CandidateSidRow]:
+        # Per open codebook, take its `remaining` smallest still-unassigned
+        # candidates from the pre-sorted list; then keep each item's single best
+        # and return sorted -- identical to the old sort-per-pass path (unique
+        # keys make sort-then-filter == filter-then-sort).
         selected_by_codebook: List[CandidateSidRow] = []
-        by_codebook: Dict[str, List[CandidateSidRow]] = defaultdict(list)
-        for candidate in available:
-            by_codebook[candidate.candidate_codebook].append(candidate)
-
-        for codebook, rows in by_codebook.items():
+        for codebook, rows in sorted_by_codebook.items():
             remaining = self.capacity - code_counts[codebook]
             if remaining <= 0:
                 continue
-            selected_by_codebook.extend(
-                heapq.nsmallest(remaining, rows, key=self._candidate_sort_key)
-            )
+            taken = 0
+            for row in rows:
+                if row.item_key in unassigned:
+                    selected_by_codebook.append(row)
+                    taken += 1
+                    if taken == remaining:
+                        break
 
         best_by_item: Dict[str, CandidateSidRow] = {}
         for candidate in selected_by_codebook:
@@ -412,21 +399,21 @@ class SidCollisionAssigner:
         self,
         raw_by_item: Dict[str, RawSidRow],
         assigned: List[AssignedSidRow],
-        assigned_items: set,
         code_counts: Dict[str, int],
-    ) -> List[str]:
-        unassigned = sorted(set(raw_by_item) - assigned_items)
-        if not unassigned:
-            return unassigned
+        unassigned: set,
+    ) -> None:
+        pending = sorted(unassigned)
+        if not pending:
+            return
 
         if self.unassigned_policy == "error":
-            preview = ",".join(unassigned[:10])
+            preview = ",".join(pending[:10])
             raise RuntimeError(
-                f"{len(unassigned)} items could not be assigned within capacity; "
+                f"{len(pending)} items could not be assigned within capacity; "
                 f"first unassigned item_ids: {preview}"
             )
         if self.unassigned_policy == "keep_original":
-            for item_key in unassigned:
+            for item_key in pending:
                 raw = raw_by_item[item_key]
                 code_counts[raw.origin_codebook] += 1
                 assigned.append(
@@ -437,7 +424,6 @@ class SidCollisionAssigner:
                         index=code_counts[raw.origin_codebook],
                     )
                 )
-        return unassigned
 
 
 class CollisionRunner:
