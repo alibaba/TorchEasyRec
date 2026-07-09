@@ -1614,7 +1614,6 @@ def export_distributed_embedding(
             with open(os.path.join(save_dir, "fg.json"), "w") as f:
                 json.dump(fg_json, f, indent=4)
 
-    dist.barrier()
     if is_rank_zero:
         # merge sharded sparse meta files
         emb_json_file_names = glob.glob(
