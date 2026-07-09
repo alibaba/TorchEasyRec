@@ -17,7 +17,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from queue import Queue
 from threading import Thread
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pyarrow as pa
 import torch
@@ -961,7 +961,7 @@ def export(
     export_dir: str,
     checkpoint_path: Optional[str] = None,
     asset_files: Optional[str] = None,
-    additional_export_config: Optional[Dict[str, str]] = None,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     item_input_path: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model.

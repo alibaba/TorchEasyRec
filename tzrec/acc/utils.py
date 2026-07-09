@@ -344,16 +344,16 @@ def write_mapping_file_for_input_tile(
 
 
 def export_acc_config(
-    additional_export_config: Optional[Dict[str, str]] = None,
-) -> Dict[str, str]:
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
+) -> Dict[str, Union[bool, str]]:
     """Export acc config for model online inference.
 
     Args:
         additional_export_config (dict, optional): extra key/value pairs merged
-            into the acc config (overriding env-derived defaults on conflict).
+            into the acc config.
     """
     # use int64 sparse id as input
-    acc_config = {"SPARSE_INT64": "1"}
+    acc_config: Dict[str, Union[bool, str]] = {"SPARSE_INT64": "1"}
     if "INPUT_TILE" in os.environ:
         acc_config["INPUT_TILE"] = os.environ["INPUT_TILE"]
     if "QUANT_EMB" in os.environ:
@@ -376,6 +376,8 @@ def export_acc_config(
         acc_config["ENABLE_AOT"] = "2" if is_unified_aot() else "1"
     if additional_export_config:
         acc_config.update(additional_export_config)
+    if os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1":
+        acc_config["DISTRIBUTED_EMBEDDING"] = True
     return acc_config
 
 

@@ -19,7 +19,7 @@ import shutil
 import tempfile
 from collections import OrderedDict, defaultdict
 from queue import Queue
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 import numpy as np
 import torch
@@ -129,7 +129,7 @@ def export_model(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
-    additional_export_config: Optional[Dict[str, str]] = None,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig.
@@ -202,7 +202,7 @@ def export_model_normal(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
-    additional_export_config: Optional[Dict[str, str]] = None,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
