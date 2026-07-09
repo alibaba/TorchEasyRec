@@ -106,7 +106,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-          sparse-checkout: .claude
+          sparse-checkout: |
+            .claude
+            scripts/ci
           path: trusted-claude
 
       # Checkout PR code for review
@@ -117,17 +119,8 @@ jobs:
           fetch-depth: 1
           path: pr-code
 
-      # rm first: cp -r into an existing dir nests instead of replacing (GHSA-f9x3-9rgg-92p7).
-      # Strip at every depth: nested CLAUDE.md files are auto-loaded too.
       - name: Use trusted agent files
-        run: |
-          find pr-code \( -name .claude -o -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md \) -prune -exec rm -rf {} +
-          cp -r trusted-claude/.claude pr-code/.claude
-          for f in CLAUDE.md AGENTS.md; do
-            if [ -f "trusted-claude/$f" ]; then
-              cp "trusted-claude/$f" "pr-code/$f"
-            fi
-          done
+        run: bash trusted-claude/scripts/ci/use_trusted_agent_files.sh trusted-claude pr-code
 
       - name: RunCodeReview
         working-directory: pr-code
@@ -190,20 +183,18 @@ jobs:
           fetch-depth: 1
           path: pr-code
 
-      # Swap in agents generated from trusted base .claude/; commit so git diff shows only the PR
+      # Same trusted-file setup as the claude job, plus generated codex agents as an overlay
       - name: Use trusted agent files
         run: |
-          rm -rf pr-code/.claude pr-code/.codex pr-code/.agents pr-code/AGENTS.md
           python3 trusted-claude/scripts/ci/gen_codex_review.py \
             --claude-dir trusted-claude/.claude \
-            --out-dir pr-code \
+            --out-dir "${{ runner.temp }}/codex-gen" \
             --repo ${{ github.repository }} \
             --pr-number ${{ github.event.pull_request.number }} \
             --prompt-out "${{ runner.temp }}/codex-prompt.md" \
             --agents-md trusted-claude/AGENTS.md
-          git -C pr-code add -A
-          git -C pr-code -c user.name=ci -c user.email=ci@localhost \
-            commit -q -m "ci: trusted review setup"
+          bash trusted-claude/scripts/ci/use_trusted_agent_files.sh \
+            trusted-claude pr-code "${{ runner.temp }}/codex-gen"
 
       - name: RunCodexReview
         working-directory: pr-code
