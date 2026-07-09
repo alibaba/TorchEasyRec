@@ -22,7 +22,6 @@ import argparse
 import hashlib
 import heapq
 import random
-import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -35,13 +34,18 @@ import tzrec.datasets.parquet_dataset  # noqa: F401
 from tzrec.datasets.dataset import create_reader, create_writer
 from tzrec.utils.logging_util import logger
 
+# A SID bucket key: the tuple of per-layer integer codes. Used only as an opaque
+# hashable, ordered identity (grouped / counted / compared), never for arithmetic.
+# list<int64> on disk for Parquet/ODPS; a delimited string for the CSV fallback.
+Codebook = Tuple[int, ...]
+
 
 @dataclass(frozen=True, slots=True)
 class RawSidRow:
     """One raw item -> SID row."""
 
     item_id: Any
-    origin_codebook: str
+    origin_codebook: Codebook
 
     @property
     def item_key(self) -> str:
@@ -54,7 +58,7 @@ class CandidateSidRow:
     """One item -> candidate SID row."""
 
     item_key: str
-    candidate_codebook: str
+    candidate_codebook: Codebook
     priority: int
     score: float
 
@@ -64,8 +68,8 @@ class AssignedSidRow:
     """One final item -> SID assignment row."""
 
     item_id: Any
-    origin_codebook: str
-    codebook: str
+    origin_codebook: Codebook
+    codebook: Codebook
     index: int
 
     @property
@@ -129,7 +133,7 @@ class SidCollisionAssigner:
         self.random_last_layer_size = random_last_layer_size
         self.random_num_candidates = random_num_candidates
         self._candidate_sort_keys: Dict[
-            CandidateSidRow, Tuple[int, float, int, str, str]
+            CandidateSidRow, Tuple[int, float, int, str, Codebook]
         ] = {}
 
     def assign(
@@ -238,12 +242,8 @@ class SidCollisionAssigner:
         rows: List[CandidateSidRow] = []
         for item_key in overflow_items:
             raw = raw_by_item[item_key]
-            parts = raw.origin_codebook.split(self.code_delimiter)
-            prefix = parts[:-1]
-            try:
-                origin_last: Optional[int] = int(parts[-1])
-            except ValueError:
-                origin_last = None
+            prefix = raw.origin_codebook[:-1]
+            origin_last = raw.origin_codebook[-1] if raw.origin_codebook else None
             rng = random.Random(self._stable_hash(self.seed, item_key))
             drawn: set = set()
             while len(drawn) < num_draws:
@@ -254,9 +254,7 @@ class SidCollisionAssigner:
                 rows.append(
                     CandidateSidRow(
                         item_key=item_key,
-                        candidate_codebook=self.code_delimiter.join(
-                            [*prefix, str(value)]
-                        ),
+                        candidate_codebook=(*prefix, value),
                         priority=1,
                         score=0.0,
                     )
@@ -272,7 +270,7 @@ class SidCollisionAssigner:
     def _candidate_sort_key(
         self,
         row: CandidateSidRow,
-    ) -> Tuple[int, float, int, str, str]:
+    ) -> Tuple[int, float, int, str, Codebook]:
         # Memoized: this key's blake2b tie-breaker is pure but is compared inside
         # the up-to-max_iters assignment loop, so recomputing it would dominate
         # the phase. CandidateSidRow is frozen/hashable, so cache on the row.
@@ -438,6 +436,8 @@ class CollisionRunner:
         # Class name of the main-input reader, captured during the raw read; used
         # to derive the writer type when --writer_type is unset.
         self._input_reader_cls_name: Optional[str] = None
+        # Dedup identical codebook tuples so a repeated SID is one object.
+        self._cb_cache: Dict[Codebook, Codebook] = {}
 
     def run(self) -> AssignmentStats:
         """Read inputs, assign, and write outputs via create_reader/create_writer."""
@@ -459,26 +459,41 @@ class CollisionRunner:
         logger.info("SID collision prevention finished: %s", stats)
         return stats
 
-    @staticmethod
-    def _cell_to_code(value: Any, delimiter: str) -> str:
-        # intern: codebook strings repeat heavily over a small distinct-SID space,
-        # so they are stored once instead of once per cell.
+    def _to_codebook(self, value: Any, delimiter: str) -> Codebook:
+        """Normalize a SID cell to a tuple of int codes (deduped).
+
+        Parquet/ODPS give a list<int64> cell; CSV gives a delimited string.
+        """
         if value is None:
             raise ValueError("SID code value cannot be null.")
         if isinstance(value, (list, tuple)):
-            return sys.intern(delimiter.join(str(v) for v in value))
-        return sys.intern(str(value))
+            codes: Codebook = tuple(int(v) for v in value)
+        else:
+            codes = tuple(int(p) for p in str(value).split(delimiter) if p.strip())
+        return self._cb_cache.setdefault(codes, codes)
 
-    @classmethod
-    def _split_compact_candidates(cls, value: Any, delimiter: str) -> List[str]:
+    def _split_compact(self, value: Any) -> List[Codebook]:
+        """Split a compact candidate cell into candidate codebooks.
+
+        Parquet/ODPS give a list<list<int64>> cell; CSV gives candidate SIDs
+        joined by --candidate_delimiter (e.g. ``"1,3|4,5"``).
+        """
         if value is None:
             return []
         if isinstance(value, (list, tuple)):
-            return [cls._cell_to_code(v, ",") for v in value if v is not None]
+            return [
+                self._to_codebook(inner, self.args.code_delimiter)
+                for inner in value
+                if inner is not None
+            ]
         text = str(value).strip()
         if not text:
             return []
-        return [sys.intern(p.strip()) for p in text.split(delimiter) if p.strip()]
+        return [
+            self._to_codebook(part, self.args.code_delimiter)
+            for part in text.split(self.args.candidate_delimiter)
+            if part.strip()
+        ]
 
     @staticmethod
     def _array_to_pylist(batch: Dict[str, pa.Array], field: str) -> List[Any]:
@@ -551,7 +566,7 @@ class CollisionRunner:
                 if item_key in seen:
                     raise ValueError(f"duplicate item_id in SID input: {item_key}")
                 seen.add(item_key)
-                origin = self._cell_to_code(code_cell, self.args.code_delimiter)
+                origin = self._to_codebook(code_cell, self.args.code_delimiter)
                 raw_rows.append(RawSidRow(item_id=item_id, origin_codebook=origin))
                 origin_counts[origin] += 1
         if not raw_rows:
@@ -591,9 +606,7 @@ class CollisionRunner:
                 if item_key not in overflow:
                     continue
                 for priority, candidate in enumerate(
-                    self._split_compact_candidates(
-                        compact_value, self.args.candidate_delimiter
-                    ),
+                    self._split_compact(compact_value),
                     start=1,
                 ):
                     rows.append(
@@ -624,7 +637,7 @@ class CollisionRunner:
             rows.append(
                 CandidateSidRow(
                     item_key=item_key,
-                    candidate_codebook=self._cell_to_code(
+                    candidate_codebook=self._to_codebook(
                         candidate, self.args.code_delimiter
                     ),
                     priority=int(priorities[i]) if priorities is not None else 1,
@@ -660,15 +673,27 @@ class CollisionRunner:
         writer.write(columns)
         writer.close()
 
+    def _is_csv_output(self) -> bool:
+        return self._writer_type() == "CsvWriter"
+
+    def _codebook_array(self, codebooks: List[Codebook]) -> pa.Array:
+        # list<int64> for Parquet/ODPS; a --code_delimiter-joined string for CSV.
+        if self._is_csv_output():
+            d = self.args.code_delimiter
+            return pa.array(
+                [d.join(str(c) for c in cb) for cb in codebooks], type=pa.string()
+            )
+        return pa.array([list(cb) for cb in codebooks], type=pa.list_(pa.int64()))
+
     def _write_assignments(self, rows: Sequence[AssignedSidRow]) -> None:
         self._write_table(
             self.args.output_path,
             {
                 "item_id": self._item_id_array(rows),
-                "origin_codebook": pa.array(
-                    [row.origin_codebook for row in rows], type=pa.string()
+                "origin_codebook": self._codebook_array(
+                    [row.origin_codebook for row in rows]
                 ),
-                "codebook": pa.array([row.codebook for row in rows], type=pa.string()),
+                "codebook": self._codebook_array([row.codebook for row in rows]),
                 "index": pa.array([row.index for row in rows], type=pa.int64()),
             },
         )
@@ -721,7 +746,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--item_id_field", default="item_id")
     parser.add_argument("--code_field", default="codes")
-    parser.add_argument("--code_delimiter", default=",")
+    parser.add_argument(
+        "--code_delimiter",
+        default=",",
+        help="CSV-only: delimiter splitting/joining int codes in a codebook "
+        "string. Parquet/ODPS use list<int64> columns directly.",
+    )
     parser.add_argument("--candidate_codebook_field", default="candidate_codebook")
     parser.add_argument(
         "--compact_candidate_field",
