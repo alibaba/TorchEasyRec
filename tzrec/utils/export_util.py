@@ -1860,7 +1860,7 @@ def _quantize_quint8_rowwise_f16(
     if row_bytes % 2 != 0:
         raise ValueError(
             "Distributed sparse quant export failed for embedding "
-            f"'{emb_name}': QUANT=INT8 is exported as nvembedding "
+            f"'{emb_name}': DIST_QUANT=INT8 is exported as nvembedding "
             "QUint8RowwiseF16, whose stored row is "
             "[uint8 values][float16 scale][float16 offset]. This makes "
             f"row_bytes = embedding_dim + 4 = {emb_dim} + 4 = {row_bytes}. "
@@ -1870,8 +1870,8 @@ def _quantize_quint8_rowwise_f16(
             "matching FBGEMM's fused rowwise INT8 value encoding with "
             "per-row scale and offset. To fix this, change the table's "
             "embedding_dim to an even value and retrain/re-export the model, "
-            "or disable distributed sparse quantization by unsetting QUANT or "
-            "setting QUANT=0/NONE. TorchEasyRec does not auto-pad this export "
+            "or disable distributed sparse quantization by unsetting DIST_QUANT or "
+            "setting DIST_QUANT=0/NONE. TorchEasyRec does not auto-pad this export "
             "because padding would change the nvembedding logical value count "
             "and serving contract."
         )

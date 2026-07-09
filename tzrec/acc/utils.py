@@ -241,7 +241,7 @@ _DISTRIBUTED_SPARSE_QUANT_FORMAT = "QUint8RowwiseF16"
 
 
 def _normalized_distributed_sparse_quant() -> str:
-    return os.environ.get("QUANT", "").strip().upper()
+    return os.environ.get("DIST_QUANT", "").strip().upper()
 
 
 def is_distributed_sparse_quant() -> bool:
@@ -251,7 +251,7 @@ def is_distributed_sparse_quant() -> bool:
         return False
     if quant == "INT8":
         return True
-    raise ValueError("Unsupported QUANT: %s, only INT8 is supported." % quant)
+    raise ValueError("Unsupported DIST_QUANT: %s, only INT8 is supported." % quant)
 
 
 def distributed_sparse_quant_format() -> str:
@@ -360,8 +360,8 @@ def export_acc_config(
         acc_config["QUANT_EMB"] = os.environ["QUANT_EMB"]
     if "QUANT_EC_EMB" in os.environ:
         acc_config["QUANT_EC_EMB"] = os.environ["QUANT_EC_EMB"]
-    if "QUANT" in os.environ and is_distributed_sparse_quant():
-        acc_config["QUANT"] = "INT8"
+    if "DIST_QUANT" in os.environ and is_distributed_sparse_quant():
+        acc_config["DIST_QUANT"] = "INT8"
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
     if "AOTI_AUTOTUNE_WITH_SAMPLE_INPUTS" in os.environ:

@@ -58,26 +58,37 @@ def _dequant_quint8_rowwise_f16(values: np.ndarray, emb_dim: int) -> np.ndarray:
 
 class ExportUtilTest(unittest.TestCase):
     def test_distributed_sparse_quant_env(self) -> None:
-        old_env = {"QUANT": os.environ.get("QUANT")}
+        old_env = {
+            "DIST_QUANT": os.environ.get("DIST_QUANT"),
+            "QUANT": os.environ.get("QUANT"),
+        }
         try:
+            os.environ["QUANT"] = "INT8"
+            os.environ.pop("DIST_QUANT", None)
+            self.assertFalse(acc_utils.is_distributed_sparse_quant())
+            acc_config = acc_utils.export_acc_config()
+            self.assertNotIn("DIST_QUANT", acc_config)
+            self.assertNotIn("QUANT", acc_config)
+            os.environ.pop("QUANT", None)
+
             for value in (None, "", "0", "NONE", "none"):
                 if value is None:
-                    os.environ.pop("QUANT", None)
+                    os.environ.pop("DIST_QUANT", None)
                 else:
-                    os.environ["QUANT"] = value
+                    os.environ["DIST_QUANT"] = value
                 self.assertFalse(acc_utils.is_distributed_sparse_quant())
                 self.assertEqual(acc_utils.distributed_sparse_quant_format(), "")
-                self.assertNotIn("QUANT", acc_utils.export_acc_config())
+                self.assertNotIn("DIST_QUANT", acc_utils.export_acc_config())
 
-            os.environ["QUANT"] = "INT8"
+            os.environ["DIST_QUANT"] = "INT8"
             self.assertTrue(acc_utils.is_distributed_sparse_quant())
             self.assertEqual(
                 acc_utils.distributed_sparse_quant_format(), "QUint8RowwiseF16"
             )
-            self.assertEqual(acc_utils.export_acc_config()["QUANT"], "INT8")
+            self.assertEqual(acc_utils.export_acc_config()["DIST_QUANT"], "INT8")
 
-            os.environ["QUANT"] = "FP16"
-            with self.assertRaisesRegex(ValueError, "Unsupported QUANT"):
+            os.environ["DIST_QUANT"] = "FP16"
+            with self.assertRaisesRegex(ValueError, "Unsupported DIST_QUANT"):
                 acc_utils.is_distributed_sparse_quant()
         finally:
             _restore_env(old_env)
@@ -161,7 +172,7 @@ class ExportUtilTest(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_")
         old_rank = os.environ.get("RANK")
         old_world_size = os.environ.get("WORLD_SIZE")
-        old_quant = os.environ.get("QUANT")
+        old_quant = os.environ.get("DIST_QUANT")
         try:
             ckpt_dir = os.path.join(tmp, "model.ckpt-1")
             dy_dir = os.path.join(
@@ -201,7 +212,7 @@ class ExportUtilTest(unittest.TestCase):
 
             os.environ["RANK"] = "0"
             os.environ["WORLD_SIZE"] = "1"
-            os.environ.pop("QUANT", None)
+            os.environ.pop("DIST_QUANT", None)
             embedding_bag_info = [
                 SimpleNamespace(
                     name="user_id_emb",
@@ -250,9 +261,9 @@ class ExportUtilTest(unittest.TestCase):
             else:
                 os.environ["WORLD_SIZE"] = old_world_size
             if old_quant is None:
-                os.environ.pop("QUANT", None)
+                os.environ.pop("DIST_QUANT", None)
             else:
-                os.environ["QUANT"] = old_quant
+                os.environ["DIST_QUANT"] = old_quant
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_sparse_dynamic_embedding_quant_export(self) -> None:
@@ -260,7 +271,7 @@ class ExportUtilTest(unittest.TestCase):
         old_env = {
             "RANK": os.environ.get("RANK"),
             "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
-            "QUANT": os.environ.get("QUANT"),
+            "DIST_QUANT": os.environ.get("DIST_QUANT"),
         }
         try:
             ckpt_dir = os.path.join(tmp, "model.ckpt-1")
@@ -285,7 +296,7 @@ class ExportUtilTest(unittest.TestCase):
 
             os.environ["RANK"] = "0"
             os.environ["WORLD_SIZE"] = "1"
-            os.environ["QUANT"] = "INT8"
+            os.environ["DIST_QUANT"] = "INT8"
             embedding_bag_info = [
                 SimpleNamespace(
                     name="user_id_emb",
@@ -350,9 +361,9 @@ class ExportUtilTest(unittest.TestCase):
                 }
 
         tmp = tempfile.mkdtemp(prefix="tzrec_export_sparse_collision_")
-        old_env = {"QUANT": os.environ.get("QUANT")}
+        old_env = {"DIST_QUANT": os.environ.get("DIST_QUANT")}
         try:
-            os.environ.pop("QUANT", None)
+            os.environ.pop("DIST_QUANT", None)
             out, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
                 SparseCollisionModel(),
                 tmp,
@@ -415,10 +426,10 @@ class ExportUtilTest(unittest.TestCase):
                     ),
                 }
 
-        old_env = {"QUANT": os.environ.get("QUANT")}
+        old_env = {"DIST_QUANT": os.environ.get("DIST_QUANT")}
         tmp = tempfile.mkdtemp(prefix="tzrec_export_sparse_quant_")
         try:
-            os.environ["QUANT"] = "INT8"
+            os.environ["DIST_QUANT"] = "INT8"
             out, dynamic_out, emb_meta, _ = _get_sparse_embedding_tensor(
                 SparseCollisionModel(),
                 tmp,
@@ -474,15 +485,15 @@ class ExportUtilTest(unittest.TestCase):
                     "embedding_bags.user_id_emb.weight": torch.ones(2, 3)
                 }
 
-        old_env = {"QUANT": os.environ.get("QUANT")}
+        old_env = {"DIST_QUANT": os.environ.get("DIST_QUANT")}
         tmp = tempfile.mkdtemp(prefix="tzrec_export_sparse_quant_odd_")
         try:
-            os.environ["QUANT"] = "INT8"
+            os.environ["DIST_QUANT"] = "INT8"
             with self.assertRaisesRegex(
                 ValueError,
                 "user_id_emb.*embedding_dim \\+ 4 = 3 \\+ 4 = 7.*"
                 "change the table's embedding_dim to an even value.*"
-                "QUANT=0/NONE",
+                "DIST_QUANT=0/NONE",
             ):
                 _get_sparse_embedding_tensor(
                     OddDimModel(),
