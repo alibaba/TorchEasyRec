@@ -237,7 +237,7 @@ def ec_quant_dtype() -> torch.dtype:
         return _quant_str_to_dtype[quant_dtype_str]
 
 
-_DISTRIBUTED_SPARSE_QUANT_FORMAT = "QUint8RowwiseF16"
+DISTRIBUTED_SPARSE_QUANT_FORMAT = "QUint8RowwiseF16"
 
 
 def _normalized_distributed_sparse_quant() -> str:
@@ -258,7 +258,7 @@ def distributed_sparse_quant_format() -> str:
     """Get distributed sparse artifact quantization format."""
     if not is_distributed_sparse_quant():
         return ""
-    return _DISTRIBUTED_SPARSE_QUANT_FORMAT
+    return DISTRIBUTED_SPARSE_QUANT_FORMAT
 
 
 _MIXED_PRECISION_TO_DTYPE: Dict[str, torch.dtype] = {

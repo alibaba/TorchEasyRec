@@ -1824,7 +1824,6 @@ def _resolve_sparse_export_name(
     )
 
 
-_DISTRIBUTED_SPARSE_QUANT_FORMAT = "QUint8RowwiseF16"
 _DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE = "uint8"
 _DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES = 4
 
@@ -1918,13 +1917,13 @@ def _prepare_sparse_export_values(
             "shape": shape,
         }
 
-    if quant_format != _DISTRIBUTED_SPARSE_QUANT_FORMAT:
+    if quant_format != acc_utils.DISTRIBUTED_SPARSE_QUANT_FORMAT:
         raise ValueError(f"Unsupported distributed sparse quant format: {quant_format}")
 
     quantized_values = _quantize_quint8_rowwise_f16(values, emb_dim, emb_name)
     return quantized_values, {
         "dimension": emb_dim,
-        "dtype": _DISTRIBUTED_SPARSE_QUANT_FORMAT,
+        "dtype": acc_utils.DISTRIBUTED_SPARSE_QUANT_FORMAT,
         "storage_dtype": _DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
         "storage_shape": list(quantized_values.shape),
         "row_bytes": int(quantized_values.shape[1]),
@@ -1932,7 +1931,7 @@ def _prepare_sparse_export_values(
         "shape": shape,
         "quant": {
             "enabled": True,
-            "format": _DISTRIBUTED_SPARSE_QUANT_FORMAT,
+            "format": acc_utils.DISTRIBUTED_SPARSE_QUANT_FORMAT,
             "scale_offset_dtype": "float16",
             "output_dtype": "float16",
         },
