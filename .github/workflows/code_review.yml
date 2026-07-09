@@ -101,11 +101,13 @@ jobs:
             --repo ${{ github.repository }} \
             --remove-label claude-review
 
-      # Checkout trusted agent files from base branch; cone mode also includes root-level files
+      # Checkout trusted agent files; cone mode also includes root-level files.
+      # github.sha = base-branch head the workflow definition came from — never the
+      # PR's frozen base.sha, which can predate trusted assets this workflow calls.
       - name: Checkout trusted agent files
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.sha }}
           sparse-checkout: |
             .claude
             scripts/ci
@@ -165,11 +167,12 @@ jobs:
             --repo ${{ github.repository }} \
             --remove-label codex-review
 
-      # Checkout trusted .claude/ + converter from base branch (not the PR author's code)
+      # Checkout trusted .claude/ + scripts (not the PR author's code); github.sha =
+      # base-branch head the workflow definition came from, never the frozen base.sha
       - name: Checkout trusted agent files
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.sha }}
           sparse-checkout: |
             .claude
             scripts/ci
