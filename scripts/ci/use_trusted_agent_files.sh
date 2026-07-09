@@ -24,6 +24,9 @@ if [ -n "$overlay" ]; then
   cp -r "$overlay/." "$pr/"
 fi
 
+# The swap is a no-op when the PR touches no instruction files; commit only real changes
 git -C "$pr" add -A
-git -C "$pr" -c user.name=ci -c user.email=ci@localhost \
-  commit -q -m "ci: trusted review setup"
+if ! git -C "$pr" diff --cached --quiet; then
+  git -C "$pr" -c user.name=ci -c user.email=ci@localhost \
+    commit -q -m "ci: trusted review setup"
+fi
