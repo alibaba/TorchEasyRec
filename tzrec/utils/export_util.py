@@ -1295,6 +1295,8 @@ def export_distributed_embedding(
     save_dir: str,
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
+    data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export for online serving under distributed embedding mode."""
@@ -1327,9 +1329,8 @@ def export_distributed_embedding(
     data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
-    dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
+    input_path = data_input_path or pipeline_config.train_input_path
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(iter(dataloader))
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 
@@ -1601,7 +1602,13 @@ def export_distributed_embedding(
         )
 
         with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(acc_utils.export_acc_config(), f, indent=4)
+            json.dump(
+                acc_utils.export_acc_config(
+                    additional_export_config=additional_export_config
+                ),
+                f,
+                indent=4,
+            )
 
         has_fg_asset = False
         if assets is not None:

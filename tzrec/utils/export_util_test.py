@@ -11,6 +11,7 @@
 
 
 import copy
+import json
 import os
 import shutil
 import tempfile
@@ -28,6 +29,7 @@ from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingCollection,
     MLPDenseEmbeddingConfig,
 )
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils.export_util import (
     _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
@@ -166,6 +168,125 @@ class ExportUtilTest(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def test_distributed_embedding_export_uses_export_overrides(self) -> None:
+        class FakeBatch:
+            def to(self, device):  # type: ignore[no-untyped-def]
+                return self
+
+            def to_dict(self, sparse_dtype):  # type: ignore[no-untyped-def]
+                return {"x": torch.ones(1)}
+
+        class FakeDataloader:
+            dataset = SimpleNamespace(sampled_batch_size=1)
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return iter([FakeBatch()])
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):  # type: ignore[no-untyped-def]
+                super().__init__()
+                self.features = []
+
+            def set_is_inference(self, is_inference):  # type: ignore[no-untyped-def]
+                self.is_inference = is_inference
+
+            def forward(self, data, device=None):  # type: ignore[no-untyped-def]
+                return {"score": data["x"] + 1}
+
+        class FakeDMP(torch.nn.Module):
+            def __init__(self, module, *args, **kwargs):  # type: ignore[no-untyped-def]
+                super().__init__()
+                self.module = module
+
+            def forward(self, data, device=None):  # type: ignore[no-untyped-def]
+                return self.module(data, device=device)
+
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_dist_overrides_")
+        old_env = {
+            key: os.environ.get(key)
+            for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
+        }
+        try:
+            os.environ["RANK"] = "0"
+            os.environ["LOCAL_RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ["LOCAL_WORLD_SIZE"] = "1"
+            pipeline_config = EasyRecConfig(
+                train_input_path="train_input",
+                eval_input_path="eval_input",
+                model_dir="model_dir",
+            )
+            model_acc = {"SPARSE_INT64": "1", "cand_seq_pk": "cand_seq"}
+            fake_scripted = mock.Mock()
+
+            with (
+                mock.patch(
+                    "tzrec.utils.export_util.init_process_group",
+                    return_value=(torch.device("cpu"), None),
+                ),
+                mock.patch(
+                    "tzrec.utils.export_util._get_sparse_feature_to_embedding_info",
+                    return_value=({}, {}),
+                ),
+                mock.patch(
+                    "tzrec.utils.export_util.create_dataloader",
+                    return_value=FakeDataloader(),
+                ) as create_dataloader_mock,
+                mock.patch(
+                    "tzrec.utils.export_util.create_planner",
+                    return_value=SimpleNamespace(collective_plan=lambda *args: None),
+                ),
+                mock.patch(
+                    "tzrec.utils.export_util.get_default_sharders", return_value=[]
+                ),
+                mock.patch(
+                    "tzrec.utils.export_util.DistributedModelParallel",
+                    side_effect=lambda *args, **kwargs: FakeDMP(kwargs["module"]),
+                ),
+                mock.patch("tzrec.utils.export_util.checkpoint_util.restore_model"),
+                mock.patch("tzrec.utils.export_util.init_parameters"),
+                mock.patch(
+                    "tzrec.utils.export_util._get_sparse_embedding_tensor",
+                    return_value=({}, {}, {}, {}),
+                ),
+                mock.patch("tzrec.utils.export_util.config_util.save_message"),
+                mock.patch(
+                    "tzrec.utils.export_util.create_fg_json",
+                    return_value={"features": []},
+                ),
+                mock.patch(
+                    "tzrec.utils.export_util.symbolic_trace",
+                    return_value=SimpleNamespace(code="def forward(self):\n    pass\n"),
+                ),
+                mock.patch(
+                    "tzrec.utils.export_util.torch.jit.script",
+                    return_value=fake_scripted,
+                ),
+                mock.patch(
+                    "tzrec.utils.export_util.acc_utils.export_acc_config",
+                    return_value=model_acc,
+                ) as export_acc_config_mock,
+            ):
+                export_distributed_embedding(
+                    pipeline_config,
+                    TinyModel(),
+                    "checkpoint_dir",
+                    tmp,
+                    additional_export_config={"cand_seq_pk": "cand_seq"},
+                    data_input_path="override_input",
+                )
+
+            create_dataloader_mock.assert_called_once()
+            self.assertEqual(create_dataloader_mock.call_args.args[2], "override_input")
+            export_acc_config_mock.assert_called_once_with(
+                additional_export_config={"cand_seq_pk": "cand_seq"}
+            )
+            with open(os.path.join(tmp, "model_acc.json")) as f:
+                self.assertEqual(json.load(f), model_acc)
+        finally:
+            _restore_env(old_env)
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
         """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
