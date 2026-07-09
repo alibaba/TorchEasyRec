@@ -191,8 +191,7 @@ jobs:
             --out-dir "${{ runner.temp }}/codex-gen" \
             --repo ${{ github.repository }} \
             --pr-number ${{ github.event.pull_request.number }} \
-            --prompt-out "${{ runner.temp }}/codex-prompt.md" \
-            --agents-md trusted-claude/AGENTS.md
+            --prompt-out "${{ runner.temp }}/codex-prompt.md"
           bash trusted-claude/scripts/ci/use_trusted_agent_files.sh \
             trusted-claude pr-code "${{ runner.temp }}/codex-gen"
 
@@ -226,12 +225,13 @@ jobs:
 
           # Sandbox has no network; only the gh pr view/diff/comment rules allowlist
           # escapes it (claude-job parity). Unstripped TOKEN env so gh can auth.
+          # Every AGENTS.md codex can see is trusted: the workspace one is restored by
+          # use_trusted_agent_files.sh and the per-run CODEX_HOME has none.
           codex exec \
             --ignore-user-config \
             --ephemeral \
             --sandbox workspace-write \
             -c shell_environment_policy.ignore_default_excludes=true \
-            -c project_doc_max_bytes=0 \
             -c model_reasoning_effort='"medium"' \
             -c mcp_servers.github_inline_comment.command="\"${BUN_PATH}\"" \
             -c 'mcp_servers.github_inline_comment.args=["run","/opt/claude-code-action/src/mcp/github-inline-comment-server.ts"]' \

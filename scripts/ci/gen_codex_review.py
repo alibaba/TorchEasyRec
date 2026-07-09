@@ -71,7 +71,6 @@ def main() -> None:
     parser.add_argument("--repo", required=True, help="owner/repo of the PR")
     parser.add_argument("--pr-number", required=True, help="PR number to review")
     parser.add_argument("--prompt-out", required=True, help="review prompt file")
-    parser.add_argument("--agents-md", help="trusted agent guide, embedded if present")
     args = parser.parse_args()
 
     claude_dir = Path(args.claude_dir)
@@ -83,13 +82,8 @@ def main() -> None:
     _, prompt_body = split_front_matter(
         (claude_dir / "commands" / "review-pr.md").read_text(encoding="utf-8")
     )
-    # Codex runs with project docs disabled, so the trusted guide goes in the prompt
-    # (guarded like the claude job's restore: older base branches lack AGENTS.md).
-    guide = ""
-    if args.agents_md and Path(args.agents_md).is_file():
-        guide = Path(args.agents_md).read_text(encoding="utf-8").strip() + "\n\n"
     Path(args.prompt_out).write_text(
-        f"REPO: {args.repo} PR_NUMBER: {args.pr_number}\n\n{guide}{prompt_body}",
+        f"REPO: {args.repo} PR_NUMBER: {args.pr_number}\n\n{prompt_body}",
         encoding="utf-8",
     )
 
