@@ -130,5 +130,5 @@ def fx_mark_seq_len(seq_name: str, x: torch.Tensor) -> None:
 
 @torch.fx.wrap
 def fx_mark_seq_ec_jt(seq_name: str, x: JaggedTensor) -> None:
-    """Mark a sequence embedding collection output."""
+    """Mark a query or sequence embedding collection output."""
     return
