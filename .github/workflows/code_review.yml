@@ -68,9 +68,9 @@
 # If the runner lacks direct OpenAI egress, set HTTPS_PROXY for the runner service.
 #
 # Trust model: the collaborator-added label gates every run (review before labeling).
-# The sandbox confines writes to the workspace but not reads, and gh needs network,
-# so injected instructions in PR file contents could read+exfiltrate runner files —
-# keep this runner single-purpose and its stored credentials minimal.
+# Model commands run in a no-network sandbox; only the gh pr view/diff/comment
+# allowlist (scripts/ci/codex_review.rules) runs outside it — as with the claude
+# job's --allowedTools, a PR comment is the only exfil path for injected content.
 # ---- End Codex Setup ----
 
 name: Code Review
@@ -213,19 +213,23 @@ jobs:
           echo "bun path: $BUN_PATH ($("$BUN_PATH" --version))"
           codex --version
 
-          # HOME shim hides the runner user's personal ~/.agents skills from codex;
-          # CODEX_HOME stays real so stored OAuth keeps working
-          export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+          # Per-run CODEX_HOME carries only stored auth + the trusted exec-policy rules;
+          # HOME shim hides the runner user's personal ~/.agents skills
+          REAL_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+          export CODEX_HOME="${RUNNER_TEMP}/codex-home"
+          rm -rf "$CODEX_HOME" && mkdir -p "$CODEX_HOME/rules"
+          cp "$REAL_CODEX_HOME/auth.json" "$CODEX_HOME/auth.json"
+          cp "$GITHUB_WORKSPACE/trusted-claude/scripts/ci/codex_review.rules" \
+            "$CODEX_HOME/rules/default.rules"
           export HOME="${RUNNER_TEMP}/codex-home-shim"
           mkdir -p "$HOME"
 
-          # Network + unstripped TOKEN env for gh; ambient AGENTS.md and personal config
-          # kept out (the trusted guide is embedded in the prompt instead)
+          # Sandbox has no network; only the gh pr view/diff/comment rules allowlist
+          # escapes it (claude-job parity). Unstripped TOKEN env so gh can auth.
           codex exec \
             --ignore-user-config \
             --ephemeral \
             --sandbox workspace-write \
-            -c sandbox_workspace_write.network_access=true \
             -c shell_environment_policy.ignore_default_excludes=true \
             -c project_doc_max_bytes=0 \
             -c model_reasoning_effort='"medium"' \
@@ -235,3 +239,7 @@ jobs:
             -c 'mcp_servers.github_inline_comment.default_tools_approval_mode="approve"' \
             --output-last-message "${RUNNER_TEMP}/codex-review-last.md" \
             - < "${RUNNER_TEMP}/codex-prompt.md"
+
+          # Persist token refreshes back to the runner's stored auth
+          cmp -s "$CODEX_HOME/auth.json" "$REAL_CODEX_HOME/auth.json" || \
+            cp "$CODEX_HOME/auth.json" "$REAL_CODEX_HOME/auth.json"
