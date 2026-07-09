@@ -240,6 +240,7 @@ def _log_train(
     plogger: Optional[ProgressLogger] = None,
     summary_writer: Optional[SummaryWriter] = None,
     train_metrics: Optional[Dict[str, torch.Tensor]] = None,
+    train_summaries: Optional[Dict[str, torch.Tensor]] = None,
 ) -> None:
     """Logging current training step."""
     if plogger is not None:
@@ -317,6 +318,9 @@ def _log_train(
         if train_metrics:
             for k, v in train_metrics.items():
                 summary_writer.add_scalar(f"metric/{k}", v, step)
+        if train_summaries:
+            for k, v in train_summaries.items():
+                summary_writer.add_scalar(k, v, step)
 
 
 def _train_and_evaluate(
@@ -491,8 +495,10 @@ def _train_and_evaluate(
                     dataloader_state, batch.checkpoint_info
                 )
                 _model.update_train_metric(predictions, batch)
+                _model.update_train_summary(predictions, batch)
                 if i_step % train_config.log_step_count_steps == 0:
                     train_metrics = _model.compute_train_metric()
+                    train_summaries = _model.compute_train_summary()
                     _log_train(
                         i_step,
                         losses,
@@ -502,6 +508,7 @@ def _train_and_evaluate(
                         plogger=plogger,
                         summary_writer=summary_writer,
                         train_metrics=train_metrics,
+                        train_summaries=train_summaries,
                     )
 
                 for lr in lr_scheduler:
