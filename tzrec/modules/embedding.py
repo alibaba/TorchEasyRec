@@ -1258,13 +1258,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 d_jt = ec(sparse_feature)
                 new_d_jt = {}
                 for raw_key, shared_key in feature_keys:
-                    if (
-                        shared_key in self.seq_sparse_keys
-                        or shared_key in self.query_sparse_keys
-                    ):
-                        val = d_jt[raw_key]
-                        fx_mark_seq_ec_jt(f"{shared_key}", val)
-                        new_d_jt[shared_key] = val
+                    val = d_jt[raw_key]
+                    fx_mark_seq_ec_jt(shared_key, val)
+                    new_d_jt[shared_key] = val
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse:
@@ -1281,13 +1277,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 d_jt = ec(sparse_feature_user)
                 new_d_jt = {}
                 for raw_key, shared_key in feature_keys:
-                    if (
-                        shared_key in self.seq_sparse_keys_user
-                        or shared_key in self.query_sparse_keys_user
-                    ):
-                        val = d_jt[raw_key]
-                        fx_mark_seq_ec_jt(f"{shared_key}", val)
-                        new_d_jt[shared_key] = val
+                    val = d_jt[raw_key]
+                    fx_mark_seq_ec_jt(shared_key, val)
+                    new_d_jt[shared_key] = val
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse_user:
