@@ -1381,7 +1381,7 @@ def export_distributed_embedding(
 
     unwrap_model = dmp_model.module
     tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
-    full_graph = tracer.trace(unwrap_model)  # , concrete_args=concrete_args)
+    full_graph = tracer.trace(unwrap_model)
 
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
@@ -1468,7 +1468,7 @@ def export_distributed_embedding(
         os.makedirs(save_dir_sparse)
     local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
     logger.info(f"save sparse tensors to {local_tensor_path}")
-    # np.savez(local_tensor_path, **local_tensor)
+
     # OSS mounted file system may have problem in file seek, so first
     # save to a temp file then move to target path
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
@@ -2011,7 +2011,7 @@ def _get_sparse_embedding_tensor(
     out = {}
     # dynamicemb keys/values are saved into a separate npz, kept in this dict.
     dynamic_out = {}
-    # shard_offsets = {}
+
     # per-table export metadata (logical shape/dtype plus optional storage info).
     emb_name_to_export_meta = {}
     # set of emb_names that are dynamic embedding tables (loaded from
@@ -2030,9 +2030,6 @@ def _get_sparse_embedding_tensor(
             emb_name,
             _sparse_export_role_from_state_key(name),
         )
-        # emb_impl_type = name.split(".")[2]  # 'emb_impls' or 'seq_emb_impls'
-
-        # feat_name_impl_list = emb_name_to_feat_name_impl.get(emb_name, [])
 
         emb_dim = emb_name_to_emb_dim[export_emb_name]
         if isinstance(values, DTensor):
