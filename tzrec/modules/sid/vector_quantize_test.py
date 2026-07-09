@@ -23,6 +23,18 @@ from tzrec.modules.sid.vector_quantize import (
 class VectorQuantizeTest(unittest.TestCase):
     """Tests for a single VectorQuantizeLayer layer."""
 
+    def _vq(self, train: bool = True, **kwargs) -> VectorQuantizeLayer:
+        torch.manual_seed(0)
+        vq = VectorQuantizeLayer(**kwargs)
+        vq.train(train)  # train(False) == eval()
+        return vq
+
+    def _pinned_vq(self, train: bool) -> VectorQuantizeLayer:
+        vq = VectorQuantizeLayer(embed_dim=1, n_embed=4, use_sinkhorn=False)
+        vq.train(train)
+        vq.embedding.weight.data.copy_(torch.tensor([[0.0], [1.0], [2.0], [3.0]]))
+        return vq
+
     def test_l2_compute_distances(self) -> None:
         layer = VectorQuantizeLayer(embed_dim=2, n_embed=2, distance_type="l2")
         # Pin the codebook to (0,0) and (0,1) so distances are exact.
@@ -43,21 +55,21 @@ class VectorQuantizeTest(unittest.TestCase):
         ]
     )
     def test_train_forward(self, _name, mode, distance_type, use_sinkhorn) -> None:
-        torch.manual_seed(0)
-        vq = VectorQuantizeLayer(
+        vq = self._vq(
             embed_dim=8,
             n_embed=16,
             forward_mode=mode,
             distance_type=distance_type,
             use_sinkhorn=use_sinkhorn,
         )
-        vq.train()
         x = torch.randn(5, 8, requires_grad=True)
         out = vq.quantize(x)
         self.assertEqual(out.embeddings.shape, (5, 8))
         self.assertEqual(out.ids.shape, (5,))
         self.assertTrue((out.ids >= 0).all() and (out.ids < 16).all())
         self.assertTrue(torch.isfinite(out.embeddings).all())
+        self.assertIsNone(out.topk_ids)
+        self.assertIsNone(out.topk_scores)
 
     def test_sinkhorn_balances_assignment(self) -> None:
         """Sinkhorn spreads clustered points across codes; argmin collapses them.
@@ -66,11 +78,7 @@ class VectorQuantizeTest(unittest.TestCase):
         one anchor — argmin sends all to that code, while Sinkhorn's uniform
         assignment must use more than one code.
         """
-        torch.manual_seed(0)
-        vq = VectorQuantizeLayer(
-            embed_dim=2, n_embed=4, use_sinkhorn=True, sinkhorn_iters=10
-        )
-        vq.train()
+        vq = self._vq(embed_dim=2, n_embed=4, use_sinkhorn=True, sinkhorn_iters=10)
         with torch.no_grad():
             vq.embedding.weight.copy_(
                 torch.tensor([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]])
@@ -100,9 +108,7 @@ class VectorQuantizeTest(unittest.TestCase):
             )
 
     def test_train_forward_backward_reaches_codebook(self) -> None:
-        torch.manual_seed(0)
-        vq = VectorQuantizeLayer(embed_dim=8, n_embed=16, use_sinkhorn=False)
-        vq.train()
+        vq = self._vq(embed_dim=8, n_embed=16, use_sinkhorn=False)
         x = torch.randn(5, 8, requires_grad=True)
         out = vq.quantize(x)
         out.embeddings.sum().backward()
@@ -112,40 +118,55 @@ class VectorQuantizeTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(vq.embedding.weight.grad).all())
 
     def test_eval_forward_is_plain_lookup(self) -> None:
-        torch.manual_seed(0)
-        vq = VectorQuantizeLayer(embed_dim=4, n_embed=8)
-        vq.eval()
+        vq = self._vq(train=False, embed_dim=4, n_embed=8)
         x = torch.randn(3, 4)
         out = vq.quantize(x)
         # In eval, emb == embedding(ids) exactly.
         torch.testing.assert_close(out.embeddings, vq.embedding(out.ids))
+
+    def test_eval_forward_returns_topk_neighbors(self) -> None:
+        vq = self._pinned_vq(train=False)
+
+        out = vq.quantize(torch.tensor([[1.2], [2.8]]), topk=3)
+
+        torch.testing.assert_close(out.ids, torch.tensor([1, 3]))
+        torch.testing.assert_close(out.topk_ids, torch.tensor([[1, 2, 0], [3, 2, 1]]))
+        torch.testing.assert_close(
+            out.topk_scores,
+            torch.tensor([[0.04, 0.64, 1.44], [0.04, 0.64, 3.24]]),
+        )
+
+    def test_training_forward_skips_topk_neighbors(self) -> None:
+        vq = self._pinned_vq(train=True)
+
+        out = vq.quantize(torch.tensor([[1.2], [2.8]]), topk=3)
+
+        torch.testing.assert_close(out.ids, torch.tensor([1, 3]))
+        self.assertIsNone(out.topk_ids)
+        self.assertIsNone(out.topk_scores)
 
     def test_gumbel_train_ids_match_embedding(self) -> None:
         # In gumbel training the saved code must index the codebook vector
         # actually used (the hard sample), so emb forward == embedding(ids).
         # (Under the old code ids came from argmin and could disagree with the
         # gumbel-sampled embedding.)
-        torch.manual_seed(0)
-        vq = VectorQuantizeLayer(
+        vq = self._vq(
             embed_dim=8,
             n_embed=16,
             forward_mode=QuantizeForwardMode.GUMBEL_SOFTMAX,
             use_sinkhorn=False,
         )
-        vq.train()
         out = vq.quantize(torch.randn(5, 8))
         torch.testing.assert_close(out.embeddings, vq.embedding(out.ids))
 
     def test_gumbel_train_distances_are_differentiable(self) -> None:
         # Gumbel needs the assignment differentiable: grad must reach the input.
-        torch.manual_seed(0)
-        vq = VectorQuantizeLayer(
+        vq = self._vq(
             embed_dim=8,
             n_embed=16,
             forward_mode=QuantizeForwardMode.GUMBEL_SOFTMAX,
             use_sinkhorn=False,
         )
-        vq.train()
         x = torch.randn(5, 8, requires_grad=True)
         vq.quantize(x).embeddings.sum().backward()
         self.assertIsNotNone(x.grad)

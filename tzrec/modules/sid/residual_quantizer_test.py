@@ -12,12 +12,14 @@
 import unittest
 
 import torch
+from parameterized import parameterized
 from torch import nn
 
 from tzrec.modules.sid.residual_quantizer import (
     ResidualQuantizer,
     normalize_n_embed,
 )
+from tzrec.modules.sid.types import QuantizeOutput
 
 
 class NormalizeNEmbedTest(unittest.TestCase):
@@ -63,8 +65,21 @@ class _FakeQuantizer(ResidualQuantizer):
     without pulling in the K-Means or VQ backends.
     """
 
-    def __init__(self, embed_dim, n_layers, n_embed=5, normalize_residuals=False):
-        super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
+    def __init__(
+        self,
+        embed_dim,
+        n_layers,
+        n_embed=5,
+        normalize_residuals=False,
+        candidate_output_config=None,
+    ):
+        super().__init__(
+            embed_dim,
+            n_layers,
+            n_embed,
+            normalize_residuals,
+            candidate_output_config=candidate_output_config,
+        )
         self.books = nn.ParameterList(
             [
                 nn.Parameter(torch.randn(self.n_embed_list[i], embed_dim))
@@ -72,9 +87,16 @@ class _FakeQuantizer(ResidualQuantizer):
             ]
         )
 
-    def _quantize_layer(self, layer_idx, residual):
-        codes = (residual.detach() @ self.books[layer_idx].t()).argmax(dim=-1)
-        return codes, self.books[layer_idx][codes]
+    def _quantize_layer(self, layer_idx, residual, topk=1):
+        scores = residual.detach() @ self.books[layer_idx].t()
+        topk_scores, topk_ids = torch.topk(scores, k=topk, dim=-1)
+        codes = topk_ids[:, 0]
+        return QuantizeOutput(
+            embeddings=self.books[layer_idx][codes],
+            ids=codes,
+            topk_ids=topk_ids,
+            topk_scores=topk_scores,
+        )
 
     def _lookup_code(self, layer_idx, code_idx):
         return self.books[layer_idx][code_idx]
@@ -93,18 +115,20 @@ class ResidualQuantizerWalkTest(unittest.TestCase):
         torch.manual_seed(0)
         fq = _FakeQuantizer(embed_dim=4, n_layers=3, n_embed=5)
         x = torch.randn(6, 4)
-        ids, agg, cum = fq._residual_pass(x)
+        ids, agg, cum, candidate_codes, candidate_scores = fq._residual_pass(x)
         self.assertEqual(ids.shape, (6, 3))
         self.assertEqual(fq.get_codes(x).shape, (6, 3))
         manual = sum(fq._lookup_code(i, ids[:, i]) for i in range(3))
         torch.testing.assert_close(agg, manual)  # aggregated == Σ quantized_i
         self.assertTrue(torch.equal(cum[-1], agg))
+        self.assertIsNone(candidate_codes)
+        self.assertIsNone(candidate_scores)
 
     def test_detach_invariant(self) -> None:
         torch.manual_seed(0)
         fq = _FakeQuantizer(embed_dim=4, n_layers=2, n_embed=5)
         x = torch.randn(5, 4, requires_grad=True)
-        _, agg, _ = fq._residual_pass(x)
+        _, agg, _, _, _ = fq._residual_pass(x)
         # Codebook grad flows, but the residual chain is detached, so the
         # input receives no gradient.
         self.assertTrue(agg.requires_grad)
@@ -123,8 +147,8 @@ class ResidualQuantizerWalkTest(unittest.TestCase):
         fq_on = _FakeQuantizer(
             embed_dim=4, n_layers=2, n_embed=6, normalize_residuals=True
         )
-        ids_off, _, _ = fq_off._residual_pass(x)
-        ids_on, _, _ = fq_on._residual_pass(x)
+        ids_off, _, _, _, _ = fq_off._residual_pass(x)
+        ids_on, _, _, _, _ = fq_on._residual_pass(x)
         self.assertEqual(ids_on.shape, (8, 2))
         self.assertFalse(torch.equal(ids_off, ids_on))
 
@@ -140,6 +164,92 @@ class ResidualQuantizerWalkTest(unittest.TestCase):
         fq16 = _FakeQuantizer(embed_dim=4, n_layers=2, n_embed=5).to(torch.bfloat16)
         recon16 = fq16.decode_codes(torch.randint(0, 5, (3, 2)))
         self.assertEqual(recon16.dtype, torch.bfloat16)
+
+
+def _candidate_config(topk=2, strategy="last_layer_knn") -> dict:
+    return {
+        "enabled": True,
+        "topk": topk,
+        "strategy": strategy,
+    }
+
+
+def _inference_fake(topk: int) -> "_FakeQuantizer":
+    fq = _FakeQuantizer(
+        embed_dim=3,
+        n_layers=2,
+        n_embed=4,
+        candidate_output_config=_candidate_config(topk=topk),
+    )
+    fq.eval()
+    fq.set_is_inference(True)
+    return fq
+
+
+class ResidualQuantizerCandidateConfigTest(unittest.TestCase):
+    """Validation done by _init_candidate_output_config at construction."""
+
+    def test_disabled_config_leaves_candidates_off(self) -> None:
+        # enabled=False must short-circuit before topk/strategy are even read.
+        fq = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=4,
+            candidate_output_config={"enabled": False},
+        )
+        self.assertFalse(fq._candidate_output_enabled)
+
+    @parameterized.expand(
+        [
+            ("topk_below_one", _candidate_config(topk=0), "topk must be in"),
+            ("bad_strategy", _candidate_config(strategy="random"), "last_layer_knn"),
+            # n_embed=4 -> last-layer codebook size is 4; topk=5 is out of range.
+            ("topk_exceeds_codebook", _candidate_config(topk=5), "topk must be in"),
+        ]
+    )
+    def test_invalid_candidate_config_raises(self, _name, config, regex) -> None:
+        with self.assertRaisesRegex(ValueError, regex):
+            _FakeQuantizer(
+                embed_dim=3, n_layers=2, n_embed=4, candidate_output_config=config
+            )
+
+
+class ResidualQuantizerCandidateWalkTest(unittest.TestCase):
+    """Candidate machinery exercised backend-agnostically via _FakeQuantizer."""
+
+    def test_candidate_output_requires_eval_mode(self) -> None:
+        # Inconsistent mode: candidate output is requested (is_inference + config
+        # enabled) yet the module is still in .train(); _residual_pass must reject
+        # it via the training guard.
+        fq = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=4,
+            candidate_output_config=_candidate_config(topk=2),
+        )
+        fq.set_is_inference(True)
+        fq.train()
+        with self.assertRaisesRegex(
+            RuntimeError, "candidate SID output requires eval/inference mode."
+        ):
+            fq._residual_pass(torch.randn(3, 3))
+
+    # topk>1: candidate[:, 0] is the top-scored last-layer neighbor (== greedy);
+    # topk==1: the single candidate is the greedy SID.
+    @parameterized.expand([("topk_two", 2), ("topk_one", 1)])
+    def test_build_candidates(self, _name, topk) -> None:
+        torch.manual_seed(0)
+        fq = _inference_fake(topk)
+        x = torch.randn(5, 3)
+        _, _, _, cand_codes, cand_scores = fq._residual_pass(x)
+        self.assertEqual(cand_codes.shape, (5, topk, 2))  # (B, topk, n_layers)
+        self.assertEqual(cand_scores.shape, (5, topk))
+        torch.testing.assert_close(cand_codes[:, 0, :], fq.get_codes(x))
+        if topk > 1:
+            # greedy prefix (all but last layer) shared by every candidate
+            self.assertTrue(
+                torch.equal(cand_codes[:, :, 0], cand_codes[:, :1, 0].expand(-1, topk))
+            )
 
 
 if __name__ == "__main__":

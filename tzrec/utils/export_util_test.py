@@ -29,6 +29,7 @@ from tzrec.modules.dense_embedding_collection import (
     MLPDenseEmbeddingConfig,
 )
 from tzrec.utils.export_util import (
+    _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
     _get_sparse_embedding_tensor,
     _merge_sharded_embedding_json,
@@ -80,6 +81,32 @@ class ExportUtilTest(unittest.TestCase):
                 acc_utils.is_distributed_sparse_quant()
         finally:
             _restore_env(old_env)
+
+    def test_dedup_key_files_by_realpath_preserves_first_physical_file(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_dedup_key_files_")
+        try:
+            real_dir = os.path.join(tmp, "real")
+            alias_dir = os.path.join(tmp, "alias")
+            other_dir = os.path.join(tmp, "other")
+            os.makedirs(real_dir)
+            os.makedirs(alias_dir)
+            os.makedirs(other_dir)
+
+            key_file = os.path.join(real_dir, "table_emb_keys.rank_0.world_size_1")
+            alias_file = os.path.join(alias_dir, "table_emb_keys.rank_0.world_size_1")
+            other_file = os.path.join(other_dir, "table_emb_keys.rank_0.world_size_1")
+            with open(key_file, "wb") as f:
+                f.write(b"key")
+            os.symlink(key_file, alias_file)
+            with open(other_file, "wb") as f:
+                f.write(b"other")
+
+            self.assertEqual(
+                _dedup_key_files_by_realpath([alias_file, key_file, other_file]),
+                [alias_file, other_file],
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_distributed_embedding_export_forces_rank_zero_single_process(self) -> None:
         """Rank 0 export should be normalized to a single logical GPU."""
