@@ -1471,8 +1471,8 @@ def export_distributed_embedding(
     # OSS mounted file system may have problem in file seek, so first
     # save to a temp file then move to target path
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
-        np.savez(f, **local_tensor)
         temp_path = f.name
+        np.savez(f, **local_tensor)
     shutil.move(temp_path, local_tensor_path)
 
     if dynamic_local_tensor:
