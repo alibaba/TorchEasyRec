@@ -137,7 +137,6 @@ def export_model(
     input path; falls back to `pipeline_config.train_input_path` when None.
     """
     use_rtp = env_util.use_rtp()
-    ensure_input_tile_for_distributed_embedding()
     use_dist_embedding = env_util.use_distributed_embedding()
     if use_rtp:
         impl = export_rtp_model
