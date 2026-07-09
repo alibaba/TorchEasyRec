@@ -11,7 +11,7 @@
 
 """ResidualVectorQuantizer: multi-layer residual VQ with gradient training."""
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -99,6 +99,8 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         sinkhorn_iters (int): Sinkhorn iterations. Default: 5.
         sinkhorn_epsilon (float): Sinkhorn sharpness. Default: 10.0.
         gumbel_temperature (float): Gumbel-Softmax temperature. Default: 1.0.
+        candidate_output_config (Mapping|None): optional inference-time candidate
+            SID settings (``enabled`` / ``topk`` / ``strategy``). Default: None.
     """
 
     _FORWARD_MODE_MAP = {
@@ -120,8 +122,15 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         sinkhorn_iters: int = 5,
         sinkhorn_epsilon: float = 10.0,
         gumbel_temperature: float = 1.0,
+        candidate_output_config: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
+        super().__init__(
+            embed_dim,
+            n_layers,
+            n_embed,
+            normalize_residuals,
+            candidate_output_config=candidate_output_config,
+        )
         self.rotation_trick = rotation_trick
 
         self.register_buffer("initted", torch.tensor([not kmeans_init]))
@@ -191,10 +200,8 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             return
 
         is_ddp = dist.is_initialized() and dist.get_world_size() > 1
-        # The fit runs on rank 0 only, then broadcasts. faiss needs N >= max(K),
-        # so a too-small rank-0 first batch would raise on rank 0 while the other
-        # ranks block forever on the centroid broadcast. Broadcast rank 0's verdict
-        # first so every rank aborts together with a clear error instead.
+        # Fit on rank 0 then broadcast; send the N>=max(K) verdict first so a too-small
+        # rank-0 batch aborts all ranks instead of deadlocking the broadcast.
         max_k = max(self.n_embed_list)
         enough = torch.tensor([1 if data.shape[0] >= max_k else 0], device=data.device)
         if is_ddp:
@@ -206,8 +213,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             )
 
         if (not is_ddp) or dist.get_rank() == 0:
-            # TODO(follow-up): accumulate samples across multiple batches for the
-            # warm-start fit instead of seeding from only the first training batch.
+            # TODO(follow-up): accumulate samples across batches, not just the first.
             centers = faiss_residual_kmeans(
                 data,
                 self.n_embed_list,
@@ -269,28 +275,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             x_unsq - 2 * sum_projection + 2 * rescaled_embeddings
         ).squeeze(1)
 
-    def _quantize_layer(
-        self,
-        layer_idx: int,
-        residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Quantize one layer's residual via its ``VectorQuantizeLayer`` layer.
-
-        STE: raw codebook vector (STE applied on the aggregate in :meth:`forward`).
-        Gumbel: the soft embedding (carries grad directly).
-
-        Args:
-            layer_idx (int): quantization layer index.
-            residual (Tensor): current residual, shape (B, D).
-
-        Returns:
-            ids (Tensor): per-layer cluster ids, shape (B,).
-            emb (Tensor): the raw codebook vector (STE/eval) or the soft
-                embedding (Gumbel), with grad, shape (B, D).
-        """
-        out = self.layers[layer_idx].quantize(residual)
-        return out.ids, out.embeddings
-
     def forward(
         self,
         input: torch.Tensor,
@@ -307,7 +291,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         Returns:
             ResidualQuantizerOutput: (cluster_ids, quantized_embeddings,
-                latents).
+                latents, optional candidate_codes, optional candidate_scores).
         """
         if self.training:
             self.init_embed_(input)
@@ -317,21 +301,17 @@ class ResidualVectorQuantizer(ResidualQuantizer):
         )
 
         walk_input = input if train_gumbel else input.detach()
-        cluster_ids, aggregated_quants, cumulative = self._residual_pass(walk_input)
+        walk = self._residual_pass(walk_input)
 
-        latents = torch.stack(cumulative, dim=1)
-
-        quants_trunc = aggregated_quants
+        quants_trunc = walk.aggregated
         if self.training and not train_gumbel:
             if self.rotation_trick:
                 quants_trunc = self._apply_rotation_trick(input, quants_trunc)
             else:
                 quants_trunc = input + (quants_trunc - input).detach()
 
-        return ResidualQuantizerOutput(
-            cluster_ids=cluster_ids,
-            quantized_embeddings=quants_trunc,
-            latents=latents,
+        return self._residual_output(
+            walk, quants_trunc, with_latents=not self.is_inference
         )
 
     @torch.no_grad()
