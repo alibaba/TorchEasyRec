@@ -225,8 +225,10 @@ jobs:
           cp "$GITHUB_WORKSPACE/trusted-claude/scripts/ci/codex_review.rules" \
             "$CODEX_HOME/rules/default.rules"
 
-          # The MCP server gets its token here (config file, not argv or codex env)
+          # The MCP server gets its token here (config file, not argv or codex env).
+          # model must be explicit: subagent spawn cannot resolve a default child model.
           cat > "$CODEX_HOME/config.toml" << EOF
+          model = "gpt-5.5"
           model_reasoning_effort = "medium"
 
           [mcp_servers.github_inline_comment]
