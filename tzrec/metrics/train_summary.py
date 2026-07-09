@@ -103,6 +103,11 @@ class TrainSummaryModule(nn.Module):
         self._state = _RunningMeanState()
         self._label_state = _RunningMeanState()
 
+    @property
+    def summary_cfg(self) -> ModelSummaries:
+        """Configured summary proto for this module."""
+        return self._summary_cfg
+
     def update(
         self,
         predictions: Dict[str, torch.Tensor],

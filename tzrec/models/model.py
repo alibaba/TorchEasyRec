@@ -99,7 +99,7 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         if len(self._train_summary_modules) == 0:
             return
         for summary_module in self._train_summary_modules:
-            cfg = summary_module._summary_cfg
+            cfg = summary_module.summary_cfg
             summary_type = cfg.WhichOneof("summary")
             if summary_type == "pcoc":
                 label_name = self._get_summary_label_name(
