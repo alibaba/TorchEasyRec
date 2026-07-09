@@ -16,6 +16,7 @@ import operator
 import os
 import re
 import shutil
+import tempfile
 from collections import OrderedDict, defaultdict
 from queue import Queue
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
@@ -1463,8 +1464,6 @@ def export_distributed_embedding(
     local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
     logger.info(f"save sparse tensors to {local_tensor_path}")
     # np.savez(local_tensor_path, **local_tensor)
-    import tempfile
-
     # OSS mounted file system may have problem in file seek, so first
     # save to a temp file then move to target path
     with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
