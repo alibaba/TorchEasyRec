@@ -61,6 +61,14 @@ class _FakeDense:
         self._values = values
 
 
+class _FakeSparse:
+    def __init__(self, padded: torch.Tensor) -> None:
+        self._padded = padded
+
+    def to_padded_dense(self, max_len: int) -> torch.Tensor:
+        return self._padded
+
+
 class _FakeKeyedTensor:
     def __init__(self, tensors: dict) -> None:
         self._tensors = tensors
@@ -69,13 +77,15 @@ class _FakeKeyedTensor:
         return self._tensors
 
 
-def _make_batch(labels, dense=None):
+def _make_batch(labels, dense=None, sparse=None):
     batch = types.SimpleNamespace()
     batch.labels = labels
     batch.dense_features = {}
     batch.sparse_features = {}
     if dense is not None:
         batch.dense_features[BASE_DATA_GROUP] = _FakeKeyedTensor(dense)
+    if sparse is not None:
+        batch.sparse_features[BASE_DATA_GROUP] = _FakeKeyedTensor(sparse)
     return batch
 
 
@@ -113,6 +123,42 @@ class TrainSummaryTest(unittest.TestCase):
         module.update(predictions, batch, "label")
         values = module.compute()
         self.assertAlmostEqual(values["summary/raw_1_val"].item(), 0.9, places=4)
+
+    def test_scalars_sparse_feature_slice(self) -> None:
+        """Sparse id feature slice, aligned with multi_tower_din_mock.config."""
+        cfg = summary_pb2.ModelSummaries()
+        cfg.scalars.name = "id_1_bucket_pred"
+        cfg.scalars.feature_name = "id_1"
+        cfg.scalars.feature_value = "1005"
+        module = TrainSummaryModule(cfg)
+        predictions = {"probs": torch.tensor([0.7, 0.3, 0.5])}
+        batch = _make_batch(
+            {"clk": torch.tensor([1, 0, 1], dtype=torch.float32)},
+            sparse={"id_1": _FakeSparse(torch.tensor([[1005], [1002], [1005]]))},
+        )
+        mask = build_feature_mask(batch, "id_1", "1005")
+        self.assertEqual(mask.tolist(), [True, False, True])
+        module.update(predictions, batch, "clk")
+        values = module.compute()
+        self.assertAlmostEqual(values["summary/id_1_bucket_pred"].item(), 0.6, places=4)
+
+    def test_multi_batch_running_mean(self) -> None:
+        """Accumulate summaries across batches between log steps."""
+        cfg = summary_pb2.ModelSummaries()
+        cfg.pcoc.epsilon = 1e-7
+        module = TrainSummaryModule(cfg)
+        batch1 = _make_batch(
+            {"label": torch.tensor([1, 0], dtype=torch.float32)},
+        )
+        batch2 = _make_batch(
+            {"label": torch.tensor([0, 0], dtype=torch.float32)},
+        )
+        module.update({"probs": torch.tensor([0.8, 0.2])}, batch1, "label")
+        module.update({"probs": torch.tensor([0.4, 0.6])}, batch2, "label")
+        values = module.compute()
+        self.assertAlmostEqual(values["summary/predicted_ctr"].item(), 0.5, places=4)
+        self.assertAlmostEqual(values["summary/observed_ctr"].item(), 0.25, places=4)
+        self.assertAlmostEqual(values["summary/pcoc"].item(), 2.0, places=4)
 
 
 if __name__ == "__main__":
