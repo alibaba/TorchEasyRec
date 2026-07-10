@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -43,6 +44,57 @@ class QuantUtilTest(unittest.TestCase):
             values,
             atol=5e-3,
         )
+
+    def test_distributed_quantize_embeddings_in_chunks(self) -> None:
+        values = np.array([[-2.0, 2.0], [-1.0, 1.0], [0.25, 0.75]], dtype=np.float32)
+
+        unchunked = quant_util.distributed_quantize_embeddings(
+            values,
+            emb_dim=2,
+            emb_name="test_emb",
+            quant_format="QUint8RowwiseF16",
+        )
+        with mock.patch.object(quant_util, "_DISTRIBUTED_SPARSE_QUANT_CHUNK_ROWS", 1):
+            chunked = quant_util.distributed_quantize_embeddings(
+                values,
+                emb_dim=2,
+                emb_name="test_emb",
+                quant_format="QUint8RowwiseF16",
+            )
+
+        np.testing.assert_array_equal(chunked, unchunked)
+
+    def test_distributed_quantize_embeddings_rejects_non_finite_values(
+        self,
+    ) -> None:
+        for value in (np.nan, np.inf, -np.inf):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "test_emb.*finite"):
+                    quant_util.distributed_quantize_embeddings(
+                        np.array([[0.0, value]], dtype=np.float32),
+                        emb_dim=2,
+                        emb_name="test_emb",
+                        quant_format="QUint8RowwiseF16",
+                    )
+
+    def test_distributed_quantize_embeddings_rejects_invalid_fp16_metadata(
+        self,
+    ) -> None:
+        invalid_values = (
+            (np.array([[70000.0, 70001.0]], dtype=np.float32), "offset"),
+            (np.array([[-65504.0, 2.0e7]], dtype=np.float32), "scale"),
+        )
+        for values, metadata_name in invalid_values:
+            with self.subTest(metadata_name=metadata_name):
+                with self.assertRaisesRegex(
+                    ValueError, f"test_emb.*{metadata_name}.*float16"
+                ):
+                    quant_util.distributed_quantize_embeddings(
+                        values,
+                        emb_dim=2,
+                        emb_name="test_emb",
+                        quant_format="QUint8RowwiseF16",
+                    )
 
     def test_distributed_quantize_embeddings_rejects_unsupported_format(
         self,

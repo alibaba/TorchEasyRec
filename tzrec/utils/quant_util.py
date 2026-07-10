@@ -16,6 +16,8 @@ import torch
 
 _DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE = "uint8"
 _DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES = 4
+_DISTRIBUTED_SPARSE_QUANT_CHUNK_ROWS = 64 * 1024
+_DISTRIBUTED_SPARSE_QUANT_CHUNK_BYTES = 64 * 1024 * 1024
 DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS: List[str] = ["QUint8RowwiseF16"]
 
 
@@ -52,27 +54,81 @@ def _quantize_quint8_rowwise_f16(
             "because padding would change the nvembedding logical value count "
             "and serving contract."
         )
-    out = np.empty((rows, row_bytes), dtype=np.uint8)
     if rows == 0:
-        return out
+        return np.empty((0, row_bytes), dtype=np.uint8)
 
-    row_min = np.min(src, axis=1, keepdims=True).astype(np.float32)
-    row_max = np.max(src, axis=1, keepdims=True).astype(np.float32)
-    offset_fp16 = row_min.astype(np.float16)
-    offset = offset_fp16.astype(np.float32)
-    value_range = (row_max - offset).astype(np.float32)
-    scale = np.where(value_range != 0, value_range / 255.0, np.float32(1.0))
-    scale = scale.astype(np.float32)
-    scale_fp16 = scale.astype(np.float16)
-    scale = scale_fp16.astype(np.float32)
-    scale = np.where(scale == 0, np.float32(1.0), scale).astype(np.float32)
-    scale_fp16 = scale.astype(np.float16)
-    quantized = np.rint((src - offset) / scale)
-    quantized = np.clip(quantized, 0, 255).astype(np.uint8)
+    source_row_bytes = max(emb_dim * src.itemsize, 1)
+    chunk_rows = min(
+        _DISTRIBUTED_SPARSE_QUANT_CHUNK_ROWS,
+        max(1, _DISTRIBUTED_SPARSE_QUANT_CHUNK_BYTES // source_row_bytes),
+    )
+    for row_start in range(0, rows, chunk_rows):
+        row_end = min(row_start + chunk_rows, rows)
+        if not np.isfinite(src[row_start:row_end]).all():
+            raise ValueError(
+                "Distributed sparse quant export failed for embedding "
+                f"'{emb_name}': source values must all be finite"
+            )
 
-    out[:, :emb_dim] = quantized
-    out[:, emb_dim : emb_dim + 2] = scale_fp16.view(np.uint8).reshape(rows, 2)
-    out[:, emb_dim + 2 : emb_dim + 4] = offset_fp16.view(np.uint8).reshape(rows, 2)
+    out = np.empty((rows, row_bytes), dtype=np.uint8)
+    fp16_max = float(np.finfo(np.float16).max)
+    fp16_max_value_range = fp16_max * 255.0
+    for row_start in range(0, rows, chunk_rows):
+        row_end = min(row_start + chunk_rows, rows)
+        src_chunk = src[row_start:row_end]
+        chunk_size = row_end - row_start
+        row_min = np.min(src_chunk, axis=1, keepdims=True).astype(np.float32)
+        row_max = np.max(src_chunk, axis=1, keepdims=True).astype(np.float32)
+
+        invalid_offset = np.abs(row_min) > fp16_max
+        if invalid_offset.any():
+            chunk_row = int(np.flatnonzero(invalid_offset)[0])
+            row = row_start + chunk_row
+            raise ValueError(
+                "Distributed sparse quant export failed for embedding "
+                f"'{emb_name}': row {row} offset "
+                f"{float(row_min[chunk_row, 0])} is outside the finite "
+                "float16 range"
+            )
+
+        offset_fp16 = row_min.astype(np.float16)
+        offset = offset_fp16.astype(np.float32)
+        value_range_fp64 = row_max.astype(np.float64) - offset.astype(np.float64)
+        invalid_scale = (
+            ~np.isfinite(value_range_fp64)
+            | (np.abs(value_range_fp64) > fp16_max_value_range)
+        ) & (value_range_fp64 != 0)
+        if invalid_scale.any():
+            chunk_row = int(np.flatnonzero(invalid_scale)[0])
+            row = row_start + chunk_row
+            scale_value = float(value_range_fp64[chunk_row, 0] / 255.0)
+            raise ValueError(
+                "Distributed sparse quant export failed for embedding "
+                f"'{emb_name}': row {row} scale {scale_value} is outside "
+                "the finite float16 range"
+            )
+
+        value_range = (row_max - offset).astype(np.float32)
+        scale = np.where(value_range != 0, value_range / 255.0, np.float32(1.0))
+        scale = scale.astype(np.float32)
+        scale_fp16 = scale.astype(np.float16)
+        scale = scale_fp16.astype(np.float32)
+        scale = np.where(scale == 0, np.float32(1.0), scale).astype(np.float32)
+        scale_fp16 = scale.astype(np.float16)
+
+        quantized = np.array(src_chunk, dtype=np.float32, order="C", copy=True)
+        np.subtract(quantized, offset, out=quantized)
+        np.divide(quantized, scale, out=quantized)
+        np.rint(quantized, out=quantized)
+        np.clip(quantized, 0, 255, out=quantized)
+
+        out[row_start:row_end, :emb_dim] = quantized
+        out[row_start:row_end, emb_dim : emb_dim + 2] = scale_fp16.view(
+            np.uint8
+        ).reshape(chunk_size, 2)
+        out[row_start:row_end, emb_dim + 2 : emb_dim + 4] = offset_fp16.view(
+            np.uint8
+        ).reshape(chunk_size, 2)
     return out
 
 
