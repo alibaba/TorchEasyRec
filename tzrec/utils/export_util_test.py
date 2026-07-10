@@ -63,8 +63,10 @@ class ExportUtilTest(unittest.TestCase):
         old_env = {
             "DIST_QUANT": os.environ.get("DIST_QUANT"),
             "QUANT": os.environ.get("QUANT"),
+            "USE_DISTRIBUTED_EMBEDDING": os.environ.get("USE_DISTRIBUTED_EMBEDDING"),
         }
         try:
+            os.environ.pop("USE_DISTRIBUTED_EMBEDDING", None)
             os.environ["QUANT"] = "INT8"
             os.environ.pop("DIST_QUANT", None)
             self.assertFalse(acc_utils.is_distributed_sparse_quant())
@@ -87,6 +89,9 @@ class ExportUtilTest(unittest.TestCase):
             self.assertEqual(
                 acc_utils.distributed_sparse_quant_format(), "QUint8RowwiseF16"
             )
+            self.assertNotIn("DIST_QUANT", acc_utils.export_acc_config())
+
+            os.environ["USE_DISTRIBUTED_EMBEDDING"] = "1"
             self.assertEqual(acc_utils.export_acc_config()["DIST_QUANT"], "INT8")
 
             os.environ["DIST_QUANT"] = "FP16"

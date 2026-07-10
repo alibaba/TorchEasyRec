@@ -363,7 +363,7 @@ def export_acc_config(
         acc_config["QUANT_EMB"] = os.environ["QUANT_EMB"]
     if "QUANT_EC_EMB" in os.environ:
         acc_config["QUANT_EC_EMB"] = os.environ["QUANT_EC_EMB"]
-    if "DIST_QUANT" in os.environ and is_distributed_sparse_quant():
+    if use_distributed_embedding() and is_distributed_sparse_quant():
         acc_config["DIST_QUANT"] = "INT8"
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
