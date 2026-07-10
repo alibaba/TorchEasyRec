@@ -1,0 +1,22 @@
+# Execpolicy allowlist for the codex-review CI job: only these gh commands run
+# outside the sandbox (with network); everything else stays in the no-network
+# sandbox, so posting a PR comment is the only path out — same as the claude
+# job's --allowedTools Bash(gh pr ...) allowlist.
+prefix_rule(
+    pattern = ["gh", "pr", "view"],
+    decision = "allow",
+    justification = "fetch PR metadata",
+    match = ["gh pr view 20 --repo owner/name --json title"],
+)
+prefix_rule(
+    pattern = ["gh", "pr", "diff"],
+    decision = "allow",
+    justification = "fetch PR diff",
+    match = ["gh pr diff 20 --repo owner/name"],
+)
+prefix_rule(
+    pattern = ["gh", "pr", "comment"],
+    decision = "allow",
+    justification = "post the review summary",
+    match = ["gh pr comment 20 --repo owner/name --body-file -"],
+)
