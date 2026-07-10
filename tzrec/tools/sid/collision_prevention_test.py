@@ -35,10 +35,9 @@ _DEFAULTS = dict(
     candidate_codes_field="candidate_codes",
     candidate_depth=None,
     max_items_per_codebook=2,
-    seed=2026,
     unassigned_policy="error",
     strategy="candidate",
-    random_last_layer_size=None,
+    codebook="8,8",
     random_num_candidates=64,
     rate_only=False,
     odps_data_quota_name="pay-as-you-go",
@@ -152,7 +151,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
             out,
             max_items_per_codebook=2,
             strategy="random",
-            random_last_layer_size=8,
             unassigned_policy="keep_original",
         )
         self.assertEqual(stats.reassigned_count, 3)
@@ -160,12 +158,14 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self.assertTrue(all(cb[0] == 0 for cb in d["codebook"]))
         self.assertLessEqual(max(Counter(map(tuple, d["codebook"])).values()), 2)
 
-    def test_random_requires_last_layer_size(self) -> None:
+    def test_random_requires_last_codebook_ge_2(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, list(range(5)), [[0, 0]] * 5)
         with self.assertRaises(ValueError):
-            self._run(inp, out, max_items_per_codebook=2, strategy="random")
+            self._run(
+                inp, out, max_items_per_codebook=2, strategy="random", codebook="8,1"
+            )
 
     def test_single_layer_sid(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -176,7 +176,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
             out,
             max_items_per_codebook=1,
             strategy="random",
-            random_last_layer_size=16,
+            codebook="16",
             unassigned_policy="keep_original",
         )
         self.assertEqual(stats.reassigned_count, 3)
@@ -206,7 +206,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
                 out,
                 max_items_per_codebook=2,
                 unassigned_policy="keep_original",
-                seed=7,
             )
             d = self._read_parquet(out)
             return {
