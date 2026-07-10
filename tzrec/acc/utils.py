@@ -382,7 +382,7 @@ def export_acc_config(
     if additional_export_config:
         acc_config.update(additional_export_config)
     if use_distributed_embedding():
-        acc_config["DISTRIBUTED_EMBEDDING"] = True
+        acc_config["DISTRIBUTED_EMBEDDING"] = "1"
     return acc_config
 
 

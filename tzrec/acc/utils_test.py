@@ -32,9 +32,9 @@ class AccUtilsTest(unittest.TestCase):
         ):
             acc_config = utils.export_acc_config()
 
-        self.assertIs(acc_config["DISTRIBUTED_EMBEDDING"], True)
+        self.assertEqual(acc_config["DISTRIBUTED_EMBEDDING"], "1")
 
-    def test_export_acc_config_keeps_distributed_embedding_marker_true(self) -> None:
+    def test_export_acc_config_keeps_distributed_embedding_enabled(self) -> None:
         with mock.patch.dict(
             os.environ, {"USE_DISTRIBUTED_EMBEDDING": "1"}, clear=True
         ):
@@ -42,7 +42,7 @@ class AccUtilsTest(unittest.TestCase):
                 additional_export_config={"DISTRIBUTED_EMBEDDING": False}
             )
 
-        self.assertIs(acc_config["DISTRIBUTED_EMBEDDING"], True)
+        self.assertEqual(acc_config["DISTRIBUTED_EMBEDDING"], "1")
 
     def test_export_acc_config_omits_distributed_embedding_by_default(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
