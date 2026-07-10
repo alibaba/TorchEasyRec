@@ -19,6 +19,7 @@ import torch
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
+from tzrec.utils import quant_util
 from tzrec.utils.logging_util import logger
 
 
@@ -242,9 +243,6 @@ def ec_quant_dtype() -> torch.dtype:
         return _quant_str_to_dtype[quant_dtype_str]
 
 
-DISTRIBUTED_SPARSE_QUANT_FORMAT = "QUint8RowwiseF16"
-
-
 def _normalized_distributed_sparse_quant() -> str:
     return os.environ.get("DIST_QUANT", "").strip().upper()
 
@@ -263,7 +261,7 @@ def distributed_sparse_quant_format() -> str:
     """Get distributed sparse artifact quantization format."""
     if not is_distributed_sparse_quant():
         return ""
-    return DISTRIBUTED_SPARSE_QUANT_FORMAT
+    return quant_util.DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0]
 
 
 _MIXED_PRECISION_TO_DTYPE: Dict[str, torch.dtype] = {

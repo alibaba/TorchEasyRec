@@ -64,7 +64,7 @@ from tzrec.features.feature import (
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util, env_util
+from tzrec.utils import checkpoint_util, config_util, env_util, quant_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
@@ -1831,10 +1831,6 @@ def _resolve_sparse_export_name(
     )
 
 
-_DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE = "uint8"
-_DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES = 4
-
-
 def _remove_torch_prefix(src: str) -> str:
     prefix = "torch."
     if src.startswith(prefix):
@@ -1846,63 +1842,6 @@ def _value_nbytes(values: Any) -> int:
     if hasattr(values, "nbytes"):
         return int(values.nbytes)
     return int(values.numel() * values.element_size())
-
-
-def _quantize_quint8_rowwise_f16(
-    values: Any, emb_dim: int, emb_name: str
-) -> np.ndarray:
-    """Encode rows as nvembedding QUint8RowwiseF16."""
-    if isinstance(values, torch.Tensor):
-        values = values.detach().cpu().numpy()
-    src = np.ascontiguousarray(values, dtype=np.float32)
-    if src.ndim != 2 or src.shape[1] != emb_dim:
-        raise ValueError(
-            f"Expected a 2D sparse embedding tensor with dim={emb_dim}, "
-            f"got shape={list(src.shape)}"
-        )
-
-    rows = src.shape[0]
-    row_bytes = emb_dim + _DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES
-    if row_bytes % 2 != 0:
-        raise ValueError(
-            "Distributed sparse quant export failed for embedding "
-            f"'{emb_name}': DIST_QUANT=INT8 is exported as nvembedding "
-            "QUint8RowwiseF16, whose stored row is "
-            "[uint8 values][float16 scale][float16 offset]. This makes "
-            f"row_bytes = embedding_dim + 4 = {emb_dim} + 4 = {row_bytes}. "
-            "nvembedding GPU lookup requires quantized stored row_bytes to be "
-            "even, but this table has an odd embedding_dim, so row_bytes is "
-            "odd. QUint8RowwiseF16 is affine uint8 rowwise quantization, "
-            "matching FBGEMM's fused rowwise INT8 value encoding with "
-            "per-row scale and offset. To fix this, change the table's "
-            "embedding_dim to an even value and retrain/re-export the model, "
-            "or disable distributed sparse quantization by unsetting DIST_QUANT or "
-            "setting DIST_QUANT=0/NONE. TorchEasyRec does not auto-pad this export "
-            "because padding would change the nvembedding logical value count "
-            "and serving contract."
-        )
-    out = np.empty((rows, row_bytes), dtype=np.uint8)
-    if rows == 0:
-        return out
-
-    row_min = np.min(src, axis=1, keepdims=True).astype(np.float32)
-    row_max = np.max(src, axis=1, keepdims=True).astype(np.float32)
-    offset_fp16 = row_min.astype(np.float16)
-    offset = offset_fp16.astype(np.float32)
-    value_range = (row_max - offset).astype(np.float32)
-    scale = np.where(value_range != 0, value_range / 255.0, np.float32(1.0))
-    scale = scale.astype(np.float32)
-    scale_fp16 = scale.astype(np.float16)
-    scale = scale_fp16.astype(np.float32)
-    scale = np.where(scale == 0, np.float32(1.0), scale).astype(np.float32)
-    scale_fp16 = scale.astype(np.float16)
-    quantized = np.rint((src - offset) / scale)
-    quantized = np.clip(quantized, 0, 255).astype(np.uint8)
-
-    out[:, :emb_dim] = quantized
-    out[:, emb_dim : emb_dim + 2] = scale_fp16.view(np.uint8).reshape(rows, 2)
-    out[:, emb_dim + 2 : emb_dim + 4] = offset_fp16.view(np.uint8).reshape(rows, 2)
-    return out
 
 
 def _prepare_sparse_export_values(
@@ -1924,21 +1863,23 @@ def _prepare_sparse_export_values(
             "shape": shape,
         }
 
-    if quant_format != acc_utils.DISTRIBUTED_SPARSE_QUANT_FORMAT:
-        raise ValueError(f"Unsupported distributed sparse quant format: {quant_format}")
-
-    quantized_values = _quantize_quint8_rowwise_f16(values, emb_dim, emb_name)
+    quantized_values = quant_util.distributed_quantize_embeddings(
+        values,
+        emb_dim=emb_dim,
+        emb_name=emb_name,
+        quant_format=quant_format,
+    )
     return quantized_values, {
         "dimension": emb_dim,
-        "dtype": acc_utils.DISTRIBUTED_SPARSE_QUANT_FORMAT,
-        "storage_dtype": _DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
+        "dtype": quant_format,
+        "storage_dtype": quant_util._DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
         "storage_shape": list(quantized_values.shape),
         "row_bytes": int(quantized_values.shape[1]),
         "memory": int(quantized_values.nbytes),
         "shape": shape,
         "quant": {
             "enabled": True,
-            "format": acc_utils.DISTRIBUTED_SPARSE_QUANT_FORMAT,
+            "format": quant_format,
             "scale_offset_dtype": "float16",
             "output_dtype": "float16",
         },
