@@ -17,6 +17,15 @@ from tzrec.acc import utils
 
 
 class AccUtilsTest(unittest.TestCase):
+    def test_use_distributed_embedding(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(utils.use_distributed_embedding())
+
+        with mock.patch.dict(
+            os.environ, {"USE_DISTRIBUTED_EMBEDDING": "1"}, clear=True
+        ):
+            self.assertTrue(utils.use_distributed_embedding())
+
     def test_export_acc_config_records_distributed_embedding(self) -> None:
         with mock.patch.dict(
             os.environ, {"USE_DISTRIBUTED_EMBEDDING": "1"}, clear=True

@@ -22,6 +22,11 @@ from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils.logging_util import logger
 
 
+def use_distributed_embedding() -> bool:
+    """Export model for distributed embedding mode of EAS processor."""
+    return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
+
+
 def is_input_tile() -> bool:
     """Judge is input file or not."""
     input_tile = os.environ.get("INPUT_TILE")
@@ -376,7 +381,7 @@ def export_acc_config(
         acc_config["ENABLE_AOT"] = "2" if is_unified_aot() else "1"
     if additional_export_config:
         acc_config.update(additional_export_config)
-    if os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1":
+    if use_distributed_embedding():
         acc_config["DISTRIBUTED_EMBEDDING"] = True
     return acc_config
 

@@ -82,7 +82,7 @@ from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
 def ensure_input_tile_for_distributed_embedding() -> None:
     """Ensure distributed embedding export uses INPUT_TILE=3."""
-    if not env_util.use_distributed_embedding():
+    if not acc_utils.use_distributed_embedding():
         return
 
     # Distributed embedding export only supports INPUT_TILE=3.
@@ -138,7 +138,7 @@ def export_model(
     input path; falls back to `pipeline_config.train_input_path` when None.
     """
     use_rtp = env_util.use_rtp()
-    use_dist_embedding = env_util.use_distributed_embedding()
+    use_dist_embedding = acc_utils.use_distributed_embedding()
     if use_rtp:
         impl = export_rtp_model
     elif use_dist_embedding:
