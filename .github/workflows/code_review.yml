@@ -58,8 +58,9 @@
 #   codex login --device-auth
 #   codex login status
 #
-#   # The job builds a per-run CODEX_HOME (auth + rules + generated config.toml), so
-#   # personal ~/.codex config never loads; to pin a model, edit the config heredoc.
+#   # REQUIRED: set the review model (the job copies top-level model* keys; no other
+#   # personal config loads)
+#   echo 'model = "gpt-5.5"' >> ~/.codex/config.toml
 #
 #   # Verify headless mode
 #   echo "Say hello" | codex exec - --sandbox read-only
@@ -102,8 +103,7 @@ jobs:
             --remove-label claude-review
 
       # Checkout trusted agent files; cone mode also includes root-level files.
-      # github.sha = base-branch head the workflow definition came from — never the
-      # PR's frozen base.sha, which can predate trusted assets this workflow calls.
+      # github.sha = the workflow's own commit; the PR's base.sha is frozen and can lag
       - name: Checkout trusted agent files
         uses: actions/checkout@v4
         with:
@@ -167,8 +167,8 @@ jobs:
             --repo ${{ github.repository }} \
             --remove-label codex-review
 
-      # Checkout trusted .claude/ + scripts (not the PR author's code); github.sha =
-      # base-branch head the workflow definition came from, never the frozen base.sha
+      # Trusted .claude/ + scripts at github.sha (the workflow's own commit, never the
+      # PR's frozen base.sha)
       - name: Checkout trusted agent files
         uses: actions/checkout@v4
         with:
@@ -215,9 +215,7 @@ jobs:
           echo "bun path: $BUN_PATH ($("$BUN_PATH" --version))"
           codex --version
 
-          # Per-run CODEX_HOME: stored auth, trusted exec-policy rules, and a generated
-          # config.toml; the runner user's personal ~/.codex never loads.
-          # HOME shim hides the runner user's personal ~/.agents skills.
+          # Per-run CODEX_HOME (stored auth + trusted rules + generated config only)
           REAL_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
           export CODEX_HOME="${RUNNER_TEMP}/codex-home"
           rm -rf "$CODEX_HOME" && mkdir -p "$CODEX_HOME/rules"
@@ -225,11 +223,14 @@ jobs:
           cp "$GITHUB_WORKSPACE/trusted-claude/scripts/ci/codex_review.rules" \
             "$CODEX_HOME/rules/default.rules"
 
-          # The MCP server gets its token here (config file, not argv or codex env).
-          # model must be explicit: subagent spawn cannot resolve a default child model.
-          cat > "$CODEX_HOME/config.toml" << EOF
-          model = "gpt-5.5"
-          model_reasoning_effort = "medium"
+          # Copy the runner's top-level model* settings; subagent spawn needs explicit model=
+          awk '/^\[/{exit} /^model[a-z_]* *=/{print}' "$REAL_CODEX_HOME/config.toml" \
+            > "$CODEX_HOME/config.toml"
+          grep -q '^model *=' "$CODEX_HOME/config.toml" || {
+            echo "::error::set model = \"...\" in the runner's ~/.codex/config.toml"; exit 1; }
+
+          # The MCP server gets its token here (config file, not argv or codex env)
+          cat >> "$CODEX_HOME/config.toml" << EOF
 
           [mcp_servers.github_inline_comment]
           command = "${BUN_PATH}"
@@ -244,18 +245,14 @@ jobs:
           EOF
           chmod 600 "$CODEX_HOME/config.toml"
 
+          # HOME shim hides the runner user's personal ~/.agents skills
           export HOME="${RUNNER_TEMP}/codex-home-shim"
           rm -rf "$HOME" && mkdir -p "$HOME"
 
-          # gh authenticates from a stored login in the shim HOME: codex runs with the
-          # token env removed, so model-run commands cannot even read it (tighter than
-          # the claude job, where the allowlisted Bash still sees GITHUB_TOKEN)
+          # Store gh login in the shim HOME; codex runs token-free so model commands can't read it
           echo "$GITHUB_TOKEN" | env -u GITHUB_TOKEN -u GH_TOKEN gh auth login --with-token
 
-          # Sandbox has no network; only the gh pr view/diff/comment rules allowlist
-          # escapes it (claude-job parity).
-          # Every AGENTS.md codex can see is trusted: the workspace one is restored by
-          # use_trusted_agent_files.sh and the per-run CODEX_HOME has none.
+          # No-network sandbox; only the gh pr view/diff/comment rules allowlist escapes it
           env -u GITHUB_TOKEN -u GH_TOKEN codex exec \
             --ephemeral \
             --sandbox workspace-write \
