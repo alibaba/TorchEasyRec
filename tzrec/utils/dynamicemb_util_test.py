@@ -10,11 +10,49 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
 
 from parameterized import parameterized
 
 from tzrec.utils import dynamicemb_util
 from tzrec.utils.test_util import mark_ci_scope
+
+
+@unittest.skipUnless(
+    dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+)
+@mark_ci_scope("gpu")
+class ShardPerfContextPatchTest(unittest.TestCase):
+    """Compatibility tests for the dynamicemb perf-context patch."""
+
+    def test_forwards_version_specific_sharder_argument(self):
+        sharding_option = mock.Mock()
+        sharding_option.dynamicemb_options = None
+        sharding_option.cache_params = object()
+        expected = object()
+        original = mock.Mock(return_value=expected)
+        common_kwargs = {
+            "config": object(),
+            "shard_sizes": object(),
+            "sharding_option": sharding_option,
+            "topology": object(),
+            "constraints": object(),
+        }
+
+        with mock.patch.object(
+            dynamicemb_util, "_orig_build_shard_perf_contexts", original
+        ):
+            for argument_name in ("sharder", "sharder_data"):
+                with self.subTest(argument_name=argument_name):
+                    sharder = object()
+                    result = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
+                        **common_kwargs, **{argument_name: sharder}
+                    )
+
+                    self.assertIs(result, expected)
+                    self.assertEqual(original.call_count, 1)
+                    self.assertIs(original.call_args.kwargs[argument_name], sharder)
+                    original.reset_mock()
 
 
 @unittest.skipUnless(
