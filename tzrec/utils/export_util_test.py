@@ -10,8 +10,14 @@
 # limitations under the License.
 
 
+import os
+import shutil
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
+import numpy as np
 import torch
 from torchrec.distributed.train_pipeline.utils import Tracer
 
@@ -21,12 +27,250 @@ from tzrec.modules.dense_embedding_collection import (
     MLPDenseEmbeddingConfig,
 )
 from tzrec.utils.export_util import (
+    _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
+    _get_sparse_embedding_tensor,
+    _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
+    export_distributed_embedding,
 )
 
 
 class ExportUtilTest(unittest.TestCase):
+    def test_dedup_key_files_by_realpath_preserves_first_physical_file(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_dedup_key_files_")
+        try:
+            real_dir = os.path.join(tmp, "real")
+            alias_dir = os.path.join(tmp, "alias")
+            other_dir = os.path.join(tmp, "other")
+            os.makedirs(real_dir)
+            os.makedirs(alias_dir)
+            os.makedirs(other_dir)
+
+            key_file = os.path.join(real_dir, "table_emb_keys.rank_0.world_size_1")
+            alias_file = os.path.join(alias_dir, "table_emb_keys.rank_0.world_size_1")
+            other_file = os.path.join(other_dir, "table_emb_keys.rank_0.world_size_1")
+            with open(key_file, "wb") as f:
+                f.write(b"key")
+            os.symlink(key_file, alias_file)
+            with open(other_file, "wb") as f:
+                f.write(b"other")
+
+            self.assertEqual(
+                _dedup_key_files_by_realpath([alias_file, key_file, other_file]),
+                [alias_file, other_file],
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_distributed_embedding_export_forces_rank_zero_single_process(self) -> None:
+        """Rank 0 export should be normalized to a single logical GPU."""
+        old_env = {
+            key: os.environ.get(key)
+            for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
+        }
+        try:
+            os.environ["RANK"] = "0"
+            os.environ["LOCAL_RANK"] = "2"
+            os.environ["WORLD_SIZE"] = "4"
+            os.environ["LOCAL_WORLD_SIZE"] = "4"
+
+            self.assertTrue(_prepare_single_rank_distributed_embedding_export())
+            self.assertEqual(os.environ["RANK"], "0")
+            self.assertEqual(os.environ["LOCAL_RANK"], "0")
+            self.assertEqual(os.environ["WORLD_SIZE"], "1")
+            self.assertEqual(os.environ["LOCAL_WORLD_SIZE"], "1")
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_distributed_embedding_export_skips_nonzero_rank_before_pg_init(
+        self,
+    ) -> None:
+        """Non-zero ranks should exit before creating a process group."""
+        old_env = {
+            key: os.environ.get(key)
+            for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
+        }
+        try:
+            os.environ["RANK"] = "1"
+            os.environ["LOCAL_RANK"] = "1"
+            os.environ["WORLD_SIZE"] = "2"
+            os.environ["LOCAL_WORLD_SIZE"] = "2"
+
+            with mock.patch("tzrec.utils.export_util.init_process_group") as init_pg:
+                export_distributed_embedding(None, None, None, "/tmp/unused_export")
+                init_pg.assert_not_called()
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
+        """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_")
+        old_rank = os.environ.get("RANK")
+        old_world_size = os.environ.get("WORLD_SIZE")
+        try:
+            ckpt_dir = os.path.join(tmp, "model.ckpt-1")
+            dy_dir = os.path.join(
+                ckpt_dir,
+                "dynamicemb",
+                "model.model.embedding_group.emb_impls.__BASE__.ebc",
+            )
+            os.makedirs(dy_dir)
+
+            def write_shard(rank: int, keys: np.ndarray, values: np.ndarray) -> None:
+                keys.astype(np.int64).tofile(
+                    os.path.join(
+                        dy_dir, f"user_id_emb_emb_keys.rank_{rank}.world_size_2"
+                    )
+                )
+                values.astype(np.float32).tofile(
+                    os.path.join(
+                        dy_dir, f"user_id_emb_emb_values.rank_{rank}.world_size_2"
+                    )
+                )
+                (keys + 100).astype(np.int64).tofile(
+                    os.path.join(
+                        dy_dir, f"user_id_emb_emb_scores.rank_{rank}.world_size_2"
+                    )
+                )
+
+            write_shard(
+                0,
+                np.array([0, 2]),
+                np.array([[0.0, 0.1], [2.0, 2.1]], dtype=np.float32),
+            )
+            write_shard(
+                1,
+                np.array([1, 3]),
+                np.array([[1.0, 1.1], [3.0, 3.1]], dtype=np.float32),
+            )
+
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            embedding_bag_info = [
+                SimpleNamespace(
+                    name="user_id_emb",
+                    embedding_dim=2,
+                    feature_names=["user_id"],
+                    pooling="SUM",
+                )
+            ]
+
+            _, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                torch.nn.Module(),
+                ckpt_dir,
+                [],
+                embedding_bag_info,
+            )
+
+            torch.testing.assert_close(
+                dynamic_out["user_id_emb.keys"], torch.tensor([0, 2, 1, 3])
+            )
+            torch.testing.assert_close(
+                dynamic_out["user_id_emb.scores"], torch.tensor([100, 102, 101, 103])
+            )
+            torch.testing.assert_close(
+                dynamic_out["user_id_emb.values"],
+                torch.tensor([[0.0, 0.1], [2.0, 2.1], [1.0, 1.1], [3.0, 3.1]]),
+            )
+            self.assertEqual(emb_meta["user_id_emb"]["shape"], [4, 2])
+            self.assertEqual(emb_meta["user_id_emb"]["key_name"], "user_id_emb.keys")
+            self.assertEqual(
+                emb_meta["user_id_emb"]["value_name"], "user_id_emb.values"
+            )
+            self.assertEqual(
+                emb_meta["user_id_emb"]["score_name"], "user_id_emb.scores"
+            )
+            self.assertEqual(
+                feat_meta["user_id__ebc"],
+                {"embedding_name": "user_id_emb", "pooling": "SUM"},
+            )
+        finally:
+            if old_rank is None:
+                os.environ.pop("RANK", None)
+            else:
+                os.environ["RANK"] = old_rank
+            if old_world_size is None:
+                os.environ.pop("WORLD_SIZE", None)
+            else:
+                os.environ["WORLD_SIZE"] = old_world_size
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_sparse_export_disambiguates_ec_ebc_embedding_name_collision(
+        self,
+    ) -> None:
+        """EC and EBC may use the same config name but hold different tensors."""
+
+        class SparseCollisionModel(torch.nn.Module):
+            def state_dict(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                return {
+                    "model.embedding_group.emb_impls.__BASE__.ebc."
+                    "embedding_bags.shared_emb.weight": torch.tensor(
+                        [[1.0, 1.1], [1.2, 1.3]]
+                    ),
+                    "model.embedding_group.seq_emb_impls.__BASE__.ec_dict.2."
+                    "embeddings.shared_emb.weight": torch.tensor(
+                        [[2.0, 2.1], [2.2, 2.3]]
+                    ),
+                }
+
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_sparse_collision_")
+        try:
+            out, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                SparseCollisionModel(),
+                tmp,
+                [
+                    SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["seq_feat"],
+                    )
+                ],
+                [
+                    SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["id_feat"],
+                        pooling="SUM",
+                    )
+                ],
+            )
+
+            self.assertEqual(dynamic_out, {})
+            self.assertNotIn("shared_emb", out)
+            np.testing.assert_array_equal(
+                out["shared_emb__ec"],
+                np.array([[2.0, 2.1], [2.2, 2.3]], dtype=np.float32),
+            )
+            np.testing.assert_array_equal(
+                out["shared_emb__ebc"],
+                np.array([[1.0, 1.1], [1.2, 1.3]], dtype=np.float32),
+            )
+            self.assertEqual(
+                emb_meta["shared_emb__ec"]["feat_name_impl"], ["seq_feat__ec"]
+            )
+            self.assertEqual(
+                emb_meta["shared_emb__ebc"]["feat_name_impl"], ["id_feat__ebc"]
+            )
+            self.assertEqual(
+                feat_meta["seq_feat__ec"],
+                {"embedding_name": "shared_emb__ec", "pooling": "NONE"},
+            )
+            self.assertEqual(
+                feat_meta["id_feat__ebc"],
+                {"embedding_name": "shared_emb__ebc", "pooling": "SUM"},
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_dense_embedding_restore_survives_fx_flatten(self) -> None:
         """AutoDis/MLP params must restore after the RTP FX flatten.
 
