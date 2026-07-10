@@ -12,7 +12,7 @@
 import os
 from collections import OrderedDict, defaultdict
 from functools import partial  # NOQA
-from typing import Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple, Union, cast
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
 from torch import nn
@@ -981,11 +981,6 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         self._group_to_is_jagged = dict()
         self._group_to_sequence_length = OrderedDict()
 
-        seq_sparse_keys: Set[str] = set()
-        seq_sparse_keys_user: Set[str] = set()
-        query_sparse_keys: Set[str] = set()
-        query_sparse_keys_user: Set[str] = set()
-
         feat_to_group_to_emb_name = defaultdict(dict)
         group_name_to_suffix = {
             fg.group_name: fg.embedding_name_suffix for fg in feature_groups
@@ -1074,10 +1069,6 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                                 ] = const
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq_user = True
-                        if feature.is_sequence:
-                            seq_sparse_keys_user.add(shared_name)
-                        else:
-                            query_sparse_keys_user.add(shared_name)
                     else:
                         emb_configs = (
                             dim_to_mc_emb_configs[embedding_dim]
@@ -1104,10 +1095,6 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                                 ] = const
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq = True
-                        if feature.is_sequence:
-                            seq_sparse_keys.add(shared_name)
-                        else:
-                            query_sparse_keys.add(shared_name)
                 else:
                     output_dim = feature.output_dim
                     if feature.is_sequence:
@@ -1144,11 +1131,6 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             self._group_output_dims[f"{group_name}.query"] = query_dims
             self._group_output_dims[f"{group_name}.sequence"] = sequence_dims
             self._group_output_dims[group_name] = output_dims
-
-        self.seq_sparse_keys: FrozenSet[str] = frozenset(seq_sparse_keys)
-        self.seq_sparse_keys_user: FrozenSet[str] = frozenset(seq_sparse_keys_user)
-        self.query_sparse_keys: FrozenSet[str] = frozenset(query_sparse_keys)
-        self.query_sparse_keys_user: FrozenSet[str] = frozenset(query_sparse_keys_user)
 
         self.ec_dict = nn.ModuleDict()
         for k, emb_configs in dim_to_emb_configs.items():
@@ -1258,13 +1240,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 d_jt = ec(sparse_feature)
                 new_d_jt = {}
                 for raw_key, shared_key in feature_keys:
-                    if (
-                        shared_key in self.seq_sparse_keys
-                        or shared_key in self.query_sparse_keys
-                    ):
-                        val = d_jt[raw_key]
-                        fx_mark_seq_ec_jt(f"{shared_key}", val)
-                        new_d_jt[shared_key] = val
+                    val = d_jt[raw_key]
+                    fx_mark_seq_ec_jt(shared_key, val)
+                    new_d_jt[shared_key] = val
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse:
@@ -1281,13 +1259,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 d_jt = ec(sparse_feature_user)
                 new_d_jt = {}
                 for raw_key, shared_key in feature_keys:
-                    if (
-                        shared_key in self.seq_sparse_keys_user
-                        or shared_key in self.query_sparse_keys_user
-                    ):
-                        val = d_jt[raw_key]
-                        fx_mark_seq_ec_jt(f"{shared_key}", val)
-                        new_d_jt[shared_key] = val
+                    val = d_jt[raw_key]
+                    fx_mark_seq_ec_jt(shared_key, val)
+                    new_d_jt[shared_key] = val
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse_user:
