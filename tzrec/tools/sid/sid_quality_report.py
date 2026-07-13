@@ -29,10 +29,10 @@ single-process tool -- launch it with ``python -m`` (no torchrun / process group
 
 Example::
 
-    python -m tzrec.tools.sid.sid_quality_report \\
-        --input_path 'experiments/sid_rqkmeans/predict_output/*.parquet' \\
-        --codes_field codes --codebook 256,256,256 \\
-        --summary_output experiments/sid_rqkmeans/summary \\
+    python -m tzrec.tools.sid.sid_quality_report \
+        --input_path 'experiments/sid_rqkmeans/predict_output/*.parquet' \
+        --codes_field codes --codebook 256,256,256 \
+        --summary_output experiments/sid_rqkmeans/summary \
         --layer_stats_output experiments/sid_rqkmeans/layer_stats
 """
 
