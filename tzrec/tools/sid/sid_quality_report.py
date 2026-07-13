@@ -29,7 +29,7 @@ single-process tool -- launch it with ``python -m`` (no torchrun / process group
 
 Example::
 
-    python -m tzrec.tools.sid_quality_report \\
+    python -m tzrec.tools.sid.sid_quality_report \\
         --input_path 'experiments/sid_rqkmeans/predict_output/*.parquet' \\
         --codes_field codes --codebook 256,256,256 \\
         --summary_output experiments/sid_rqkmeans/summary \\
@@ -39,7 +39,7 @@ Example::
 import argparse
 import math
 from collections import OrderedDict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -101,7 +101,7 @@ def compute_entropy(counts: npt.ArrayLike) -> float:
     return float(torch.special.entr(c / total).sum())
 
 
-def parse_codes(codes: pa.Array) -> List[List[int]]:
+def parse_codes(codes: pa.Array) -> List[List[Optional[int]]]:
     """Parse the ``codes`` column into one integer list per row.
 
     Accepts a native Arrow ``list<int>`` column (as emitted by ``tzrec.predict``
@@ -111,16 +111,23 @@ def parse_codes(codes: pa.Array) -> List[List[int]]:
         codes (pa.Array): the ``codes`` column of one read batch.
 
     Returns:
-        list: one ``list[int]`` (length ``n_layers``) per row.
+        list: one ``list`` per row -- length ``n_layers`` for a well-formed row,
+        ``[]`` for a null/blank/non-integer row, or a list still containing
+        ``None`` for a row with a null element. The caller drops all malformed rows.
     """
     if pa.types.is_list(codes.type) or pa.types.is_large_list(codes.type):
-        # to_pylist() already yields list[int] per row for a list<int> column.
+        # to_pylist(): a null row -> None; a null element -> None inside the list.
         return [[] if r is None else r for r in codes.to_pylist()]
-    values = codes.cast(pa.string()).to_pylist()
-    return [
-        [] if x is None else [int(v) for v in str(x).split(",") if v != ""]
-        for x in values
-    ]
+    out: List[List[Optional[int]]] = []
+    for x in codes.cast(pa.string()).to_pylist():
+        if x is None:
+            out.append([])
+            continue
+        try:
+            out.append([int(v) for v in x.split(",") if v != ""])
+        except ValueError:
+            out.append([])  # a non-integer token -> malformed row (dropped later)
+    return out
 
 
 def update_layer_hist(
@@ -132,8 +139,8 @@ def update_layer_hist(
 
     Args:
         layer_hist (list): current per-layer histograms, or ``None`` to allocate.
-        arr (np.ndarray): ``(batch, n_layers)`` code matrix, already in
-            ``[0, codebook)`` (the caller clamps out-of-range values).
+        arr (np.ndarray): ``(batch, n_layers)`` code matrix, already filtered to
+            ``[0, codebook)`` (the caller drops malformed and out-of-range rows).
         codebook (list): per-layer codebook sizes.
 
     Returns:
@@ -144,6 +151,41 @@ def update_layer_hist(
     for layer, k in enumerate(codebook):
         layer_hist[layer] += np.bincount(arr[:, layer], minlength=k)
     return layer_hist
+
+
+def build_arr(codes: pa.Array, n_layers: int) -> Tuple[np.ndarray, int]:
+    """Parse one batch's codes into a matrix of well-formed rows.
+
+    Keeps only rows with exactly ``n_layers`` non-null integer codes; a null row,
+    a null element, a wrong-width row, or a non-integer token is dropped -- so a
+    few bad rows never discard their whole batch. The fast zero-copy Arrow path is
+    taken only when the entire batch is clean; otherwise it falls back to per-row
+    parsing.
+
+    Args:
+        codes (pa.Array): the ``codes`` column of one read batch.
+        n_layers (int): expected number of codes per row.
+
+    Returns:
+        tuple: the ``(n_valid, n_layers)`` int matrix and the number of dropped rows.
+    """
+    if pa.types.is_list(codes.type) or pa.types.is_large_list(codes.type):
+        widths = np.diff(codes.offsets.to_numpy())
+        flat = codes.flatten()
+        if (
+            codes.null_count == 0
+            and flat.null_count == 0
+            and bool((widths == n_layers).all())
+        ):
+            return flat.to_numpy(zero_copy_only=False).reshape(-1, n_layers), 0
+    rows = parse_codes(codes)
+    valid = [r for r in rows if len(r) == n_layers and None not in r]
+    arr = (
+        np.asarray(valid, dtype=np.int64)
+        if valid
+        else np.empty((0, n_layers), dtype=np.int64)
+    )
+    return arr, len(rows) - len(valid)
 
 
 def _parse_codebook(value: str) -> List[int]:
@@ -245,6 +287,17 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    reader = create_reader(
+        input_path=args.input_path,
+        batch_size=args.batch_size,
+        selected_cols=[args.codes_field],
+        reader_type=args.reader_type,
+        quota_name=args.odps_data_quota_name,
+    )
+    writer_type = args.writer_type or reader.__class__.__name__.replace(
+        "Reader", "Writer"
+    )
+
     codebook: List[int] = args.codebook
     n_layers = len(codebook)
     capacity: int = math.prod(codebook)
@@ -259,79 +312,51 @@ if __name__ == "__main__":
         [math.prod(codebook[layer + 1 :]) for layer in range(n_layers)],
         dtype=np.int64,
     )
-    ubound = np.asarray(codebook, dtype=np.int64) - 1  # per-layer clamp ceiling
+    codebook_arr = np.asarray(codebook, dtype=np.int64)  # per-layer sizes, for range
 
-    reader = create_reader(
-        input_path=args.input_path,
-        batch_size=args.batch_size,
-        selected_cols=[args.codes_field],
-        reader_type=args.reader_type,
-        quota_name=args.odps_data_quota_name,
-    )
-    # create_writer only auto-infers OdpsWriter (from an odps:// path); for local
-    # outputs derive the writer from the reader class, as tzrec.tools.hitrate does.
-    writer_type = args.writer_type or reader.__class__.__name__.replace(
-        "Reader", "Writer"
-    )
-
-    # Whole-dataset accumulators. Each SID tuple is mixed-radix-encoded to one
-    # int64 id, so counting is a single np.unique at the end (no per-row Python
-    # Counter). all_ids holds ~8 bytes/row until that final reduction.
+    # Whole-dataset accumulators. Each well-formed, in-range SID tuple is mixed-
+    # radix-encoded to one int64 id, so counting is a single np.unique at the end
+    # (no per-row Python Counter). all_ids holds ~8 bytes/row until that reduction.
     all_ids: List[np.ndarray] = []
     total = 0
+    n_malformed = 0  # rows dropped: null / wrong-width / non-integer codes
+    n_oob = 0  # rows dropped: a code outside [0, codebook) (wrong --codebook)
     layer_hist: Optional[List[np.ndarray]] = None  # per-layer code-usage histograms
-    warned_width = False
-    warned_range = False
 
     for i, data in enumerate(reader.to_batches()):
         codes = data[args.codes_field]
         if i % 100 == 0:
             logger.info(f"scanned {total} rows...")
 
-        # Turn the codes column into a (batch, n_layers) int matrix. Rows whose
-        # width != n_layers are malformed vs --codebook -> warn once and skip.
-        if pa.types.is_list(codes.type) or pa.types.is_large_list(codes.type):
-            widths = np.diff(codes.offsets.to_numpy())
-            if codes.null_count or not (widths == n_layers).all():
-                if not warned_width:
-                    logger.warning(
-                        f"codes width != {n_layers} (--codebook); skipping rows."
-                    )
-                    warned_width = True
-                continue
-            arr = codes.flatten().to_numpy(zero_copy_only=False).reshape(-1, n_layers)
-        else:
-            rows = parse_codes(codes)
-            if not all(len(r) == n_layers for r in rows):
-                if not warned_width:
-                    logger.warning(
-                        f"codes width != {n_layers} (--codebook); skipping rows."
-                    )
-                    warned_width = True
-                continue
-            arr = np.asarray(rows, dtype=np.int64)
-
+        arr, dropped = build_arr(codes, n_layers)
+        n_malformed += dropped
         if arr.shape[0] == 0:
             continue
 
-        # Codes must be in [0, codebook) for the id bijection + the histograms;
-        # clamp out-of-range values (a wrong --codebook) after warning once.
-        if (arr < 0).any() or (arr >= codebook).any():
-            if not warned_range:
-                logger.warning(
-                    "some codes fall outside [0, codebook); clamped into range "
-                    "(check --codebook)."
-                )
-                warned_range = True
-            arr = np.clip(arr, 0, ubound)
+        # Drop out-of-range rows rather than clamp them: clamping would merge
+        # distinct out-of-range SIDs into fabricated in-range collisions.
+        in_range = ((arr >= 0) & (arr < codebook_arr)).all(axis=1)
+        batch_oob = int(arr.shape[0] - in_range.sum())
+        if batch_oob:
+            arr = arr[in_range]
+            n_oob += batch_oob
+            if arr.shape[0] == 0:
+                continue
 
         total += arr.shape[0]
         all_ids.append(arr @ radix)  # one int64 SID id per row
         layer_hist = update_layer_hist(layer_hist, arr, codebook)
 
+    if n_malformed or n_oob:
+        hint = " (check --codebook)" if n_oob else ""
+        logger.warning(
+            f"skipped {n_malformed} malformed and {n_oob} out-of-range rows; "
+            f"stats cover the remaining {total} rows{hint}."
+        )
     if not all_ids:
-        logger.warning(f"no rows read from {args.input_path}; nothing to report.")
-        raise SystemExit(1)
+        raise ValueError(
+            f"no valid rows read from {args.input_path}; nothing to report."
+        )
 
     # distinct SID ids + their frequencies = the collision/frequency distribution.
     sid_ids, counts = np.unique(np.concatenate(all_ids), return_counts=True)
