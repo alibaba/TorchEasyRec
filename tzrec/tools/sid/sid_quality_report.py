@@ -39,7 +39,7 @@ Example::
 import argparse
 import math
 from collections import OrderedDict
-from typing import List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -48,6 +48,9 @@ import torch
 
 from tzrec.datasets.dataset import create_reader, create_writer
 from tzrec.utils.logging_util import logger
+
+_INT64_MAX = int(np.iinfo(np.int64).max)
+_INT64_MIN = int(np.iinfo(np.int64).min)
 
 
 def compute_gini(counts: npt.ArrayLike) -> float:
@@ -62,8 +65,7 @@ def compute_gini(counts: npt.ArrayLike) -> float:
     c = np.asarray(counts, dtype=np.int64)
     if c.size == 0:
         return 0.0
-    # (distinct count value j, how many SIDs have it n_j), sorted by j.
-    # np.unique intentionally: torch.unique measured slower than numpy on CPU.
+    # np.unique intentionally; torch.unique is slower on CPU.
     values, freqs = np.unique(c, return_counts=True)
     n = int(freqs.sum())
     sum_j_nj = int(np.dot(values, freqs))
@@ -83,10 +85,8 @@ def compute_gini(counts: npt.ArrayLike) -> float:
 def compute_entropy(counts: npt.ArrayLike) -> float:
     """Shannon entropy (natural log / nats) of a frequency distribution.
 
-    Uses torch: for the large summary call (up to tens of millions of unique-SID
-    counts) its multithreaded reduction is ~10x faster than numpy on CPU; the
-    per-layer callers pass tiny arrays where it makes no difference but reuse the
-    same helper. ``entr`` handles zero-probability entries, so no masking needed.
+    Uses torch (``entr`` handles zero-probability entries without masking); its
+    multithreaded reduction is ~10x faster than numpy on the large summary call.
 
     Args:
         counts (array-like): per-SID occurrence counts.
@@ -116,7 +116,6 @@ def parse_codes(codes: pa.Array) -> List[List[Optional[int]]]:
         ``None`` for a row with a null element. The caller drops all malformed rows.
     """
     if pa.types.is_list(codes.type) or pa.types.is_large_list(codes.type):
-        # to_pylist(): a null row -> None; a null element -> None inside the list.
         return [[] if r is None else r for r in codes.to_pylist()]
     out: List[List[Optional[int]]] = []
     for x in codes.cast(pa.string()).to_pylist():
@@ -124,9 +123,12 @@ def parse_codes(codes: pa.Array) -> List[List[Optional[int]]]:
             out.append([])
             continue
         try:
-            out.append([int(v) for v in x.split(",") if v != ""])
+            row = [int(v) for v in x.split(",")]
         except ValueError:
-            out.append([])  # a non-integer token -> malformed row (dropped later)
+            out.append([])
+            continue
+        # int() accepts >int64 tokens that would later crash np.asarray(int64).
+        out.append(row if all(_INT64_MIN <= v <= _INT64_MAX for v in row) else [])
     return out
 
 
@@ -213,6 +215,150 @@ def _parse_codebook(value: str) -> List[int]:
     return sizes
 
 
+def run_report(
+    batches: Iterable[Dict[str, pa.Array]],
+    codes_field: str,
+    codebook: List[int],
+    source: str = "",
+    log_top_sids: Optional[int] = None,
+) -> Tuple[
+    "OrderedDict[str, object]",
+    Optional["OrderedDict[str, list]"],
+    Optional[List[Tuple[str, int]]],
+]:
+    """Scan SID code batches and compute global collision + per-layer stats.
+
+    This is the importable core (argparse / reader / writer wiring stays in
+    ``__main__``), so the numeric branches can be unit-tested in-process.
+
+    Args:
+        batches (iterable): batches of ``{column: pa.Array}`` (e.g. the output of
+            ``reader.to_batches()``); only ``codes_field`` is read.
+        codes_field (str): the codes column name in each batch.
+        codebook (list): per-layer codebook sizes; ``prod(codebook)`` must fit int64.
+        source (str): label recorded in the summary ``source`` column.
+        log_top_sids (int, optional): if set, decode and log the N most-collided SIDs.
+
+    Returns:
+        tuple: ``(summary, layer_stats, top_sids)`` -- the one-row summary
+        ``OrderedDict``; the per-layer ``OrderedDict`` of columns (``None`` if no row
+        contributed); and the decoded top-N ``(sid, count)`` list (``None`` unless
+        ``log_top_sids`` is set).
+
+    Raises:
+        ValueError: if the codebook capacity overflows int64, or no valid rows read.
+    """
+    n_layers = len(codebook)
+    capacity = math.prod(codebook)
+    if capacity > _INT64_MAX:
+        raise ValueError(
+            f"codebook capacity (product = {capacity}) exceeds int64; "
+            "collision analysis is not supported at that scale."
+        )
+    # Mixed-radix id = sum_l code_l * radix_l bijects tuples onto [0, capacity),
+    # so collision counting is a single np.unique over int64 ids.
+    radix = np.array(
+        [math.prod(codebook[layer + 1 :]) for layer in range(n_layers)],
+        dtype=np.int64,
+    )
+    codebook_arr = np.asarray(codebook, dtype=np.int64)
+
+    all_ids: List[np.ndarray] = []
+    total = 0
+    n_malformed = 0
+    n_oob = 0
+    layer_hist: Optional[List[np.ndarray]] = None
+
+    for i, data in enumerate(batches):
+        codes = data[codes_field]
+        if i % 100 == 0:
+            logger.info(f"scanned {total} rows...")
+
+        arr, dropped = build_arr(codes, n_layers)
+        n_malformed += dropped
+        if arr.shape[0] == 0:
+            continue
+
+        # Drop out-of-range rows; clamping would fabricate in-range collisions.
+        in_range = ((arr >= 0) & (arr < codebook_arr)).all(axis=1)
+        batch_oob = int(arr.shape[0] - in_range.sum())
+        if batch_oob:
+            arr = arr[in_range]
+            n_oob += batch_oob
+            if arr.shape[0] == 0:
+                continue
+
+        total += arr.shape[0]
+        all_ids.append(arr @ radix)
+        layer_hist = update_layer_hist(layer_hist, arr, codebook)
+
+    if n_malformed or n_oob:
+        hint = " (check codebook)" if n_oob else ""
+        logger.warning(
+            f"skipped {n_malformed} malformed and {n_oob} out-of-range rows; "
+            f"stats cover the remaining {total} rows{hint}."
+        )
+    if not all_ids:
+        raise ValueError(f"no valid rows read from {source!r}; nothing to report.")
+
+    sid_ids, counts = np.unique(np.concatenate(all_ids), return_counts=True)
+    unique = len(sid_ids)
+    entropy = compute_entropy(counts)
+    max_entropy = math.log(capacity)
+
+    # All-scalar columns so the summary writes natively even to the CSV writer.
+    summary: "OrderedDict[str, object]" = OrderedDict(
+        [
+            ("source", source),
+            ("codebook", ",".join(map(str, codebook))),
+            ("total", total),
+            ("unique_sid", unique),
+            ("no_collision_rate", unique / total),
+            ("uniquely_identified_item_rate", int((counts == 1).sum()) / total),
+            ("max_collision", int(counts.max())),
+            ("gini", compute_gini(counts)),
+            ("entropy", entropy),
+            ("max_entropy", max_entropy),
+            ("entropy_ratio", entropy / max_entropy if max_entropy else float("nan")),
+        ]
+    )
+    logger.info("===== SID collision stats =====")
+    for key, value in summary.items():
+        logger.info(f"{key} = {value}")
+
+    top_sids: Optional[List[Tuple[str, int]]] = None
+    if log_top_sids:
+        order = np.argsort(-counts, kind="stable")[:log_top_sids]
+        # decode: code_l = (id // radix_l) % K_l.
+        top_codes = (sid_ids[order][:, None] // radix) % codebook_arr
+        top_sids = [
+            (",".join(map(str, code)), int(cnt))
+            for code, cnt in zip(top_codes.tolist(), counts[order].tolist())
+        ]
+        logger.info(f"top-{log_top_sids} SIDs by frequency = {top_sids}")
+
+    layer_stats: Optional["OrderedDict[str, list]"] = None
+    if layer_hist is not None:
+        layer_stats = OrderedDict(
+            layer=[], codebook_size=[], coverage=[], dead_codes=[], perplexity=[]
+        )
+        for layer, h in enumerate(layer_hist):
+            nonzero = int(np.count_nonzero(h))
+            coverage = nonzero / len(h)
+            dead_codes = len(h) - nonzero
+            perplexity = math.exp(compute_entropy(h))
+            layer_stats["layer"].append(layer)
+            layer_stats["codebook_size"].append(len(h))
+            layer_stats["coverage"].append(coverage)
+            layer_stats["dead_codes"].append(dead_codes)
+            layer_stats["perplexity"].append(perplexity)
+            logger.info(
+                f"layer {layer}: coverage={coverage:.4f} "
+                f"dead_codes={dead_codes} perplexity={perplexity:.4f}"
+            )
+    return summary, layer_stats, top_sids
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Global SID collision / distribution statistics."
@@ -287,6 +433,14 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # Clean CLI usage error; run_report re-guards for library callers.
+    capacity = math.prod(args.codebook)
+    if capacity > _INT64_MAX:
+        parser.error(
+            f"--codebook capacity (product = {capacity}) exceeds int64; "
+            "collision analysis is not supported at that scale."
+        )
+
     reader = create_reader(
         input_path=args.input_path,
         batch_size=args.batch_size,
@@ -294,106 +448,22 @@ if __name__ == "__main__":
         reader_type=args.reader_type,
         quota_name=args.odps_data_quota_name,
     )
+    if args.codes_field not in reader.schema.names:
+        parser.error(
+            f"--codes_field {args.codes_field!r} not found in input "
+            f"{args.input_path}; check the column name in the predict output."
+        )
     writer_type = args.writer_type or reader.__class__.__name__.replace(
         "Reader", "Writer"
     )
 
-    codebook: List[int] = args.codebook
-    n_layers = len(codebook)
-    capacity: int = math.prod(codebook)
-    if capacity > np.iinfo(np.int64).max:
-        parser.error(
-            f"--codebook capacity (product = {capacity}) exceeds int64; "
-            "collision analysis is not supported at that scale."
-        )
-    # Mixed-radix weights: id = sum_l code_l * radix[l] bijects distinct in-range
-    # SID tuples onto [0, capacity), so counting is one int64 np.unique at the end.
-    radix = np.array(
-        [math.prod(codebook[layer + 1 :]) for layer in range(n_layers)],
-        dtype=np.int64,
+    summary, layer_stats, _ = run_report(
+        reader.to_batches(),
+        args.codes_field,
+        args.codebook,
+        source=args.input_path,
+        log_top_sids=args.log_top_sids,
     )
-    codebook_arr = np.asarray(codebook, dtype=np.int64)  # per-layer sizes, for range
-
-    # Whole-dataset accumulators. Each well-formed, in-range SID tuple is mixed-
-    # radix-encoded to one int64 id, so counting is a single np.unique at the end
-    # (no per-row Python Counter). all_ids holds ~8 bytes/row until that reduction.
-    all_ids: List[np.ndarray] = []
-    total = 0
-    n_malformed = 0  # rows dropped: null / wrong-width / non-integer codes
-    n_oob = 0  # rows dropped: a code outside [0, codebook) (wrong --codebook)
-    layer_hist: Optional[List[np.ndarray]] = None  # per-layer code-usage histograms
-
-    for i, data in enumerate(reader.to_batches()):
-        codes = data[args.codes_field]
-        if i % 100 == 0:
-            logger.info(f"scanned {total} rows...")
-
-        arr, dropped = build_arr(codes, n_layers)
-        n_malformed += dropped
-        if arr.shape[0] == 0:
-            continue
-
-        # Drop out-of-range rows rather than clamp them: clamping would merge
-        # distinct out-of-range SIDs into fabricated in-range collisions.
-        in_range = ((arr >= 0) & (arr < codebook_arr)).all(axis=1)
-        batch_oob = int(arr.shape[0] - in_range.sum())
-        if batch_oob:
-            arr = arr[in_range]
-            n_oob += batch_oob
-            if arr.shape[0] == 0:
-                continue
-
-        total += arr.shape[0]
-        all_ids.append(arr @ radix)  # one int64 SID id per row
-        layer_hist = update_layer_hist(layer_hist, arr, codebook)
-
-    if n_malformed or n_oob:
-        hint = " (check --codebook)" if n_oob else ""
-        logger.warning(
-            f"skipped {n_malformed} malformed and {n_oob} out-of-range rows; "
-            f"stats cover the remaining {total} rows{hint}."
-        )
-    if not all_ids:
-        raise ValueError(
-            f"no valid rows read from {args.input_path}; nothing to report."
-        )
-
-    # distinct SID ids + their frequencies = the collision/frequency distribution.
-    sid_ids, counts = np.unique(np.concatenate(all_ids), return_counts=True)
-    unique = len(sid_ids)
-    entropy = compute_entropy(counts)
-    max_entropy = math.log(capacity)
-
-    # Overall summary: one row of scalar columns (writes natively to any
-    # csv/parquet/odps writer -- no list<> columns to trip up the CSV writer).
-    summary = OrderedDict(
-        [
-            ("source", args.input_path),
-            ("codebook", ",".join(map(str, codebook))),
-            ("total", total),
-            ("unique_sid", unique),
-            ("no_collision_rate", unique / total),
-            ("uniquely_identified_item_rate", int((counts == 1).sum()) / total),
-            ("max_collision", int(counts.max())),
-            ("gini", compute_gini(counts)),
-            ("entropy", entropy),
-            ("max_entropy", max_entropy),
-            ("entropy_ratio", entropy / max_entropy if max_entropy else float("nan")),
-        ]
-    )
-
-    logger.info("===== SID collision stats =====")
-    for key, value in summary.items():
-        logger.info(f"{key} = {value}")
-    if args.log_top_sids:
-        order = np.argsort(-counts, kind="stable")[: args.log_top_sids]
-        # decode ids back to codes: code_l = (id // radix_l) % codebook_l.
-        top_codes = (sid_ids[order][:, None] // radix) % np.asarray(codebook)
-        top_sids = [
-            (",".join(map(str, code)), int(cnt))
-            for code, cnt in zip(top_codes.tolist(), counts[order].tolist())
-        ]
-        logger.info(f"top-{args.log_top_sids} SIDs by frequency = {top_sids}")
 
     if args.summary_output:
         stats_writer = create_writer(
@@ -403,34 +473,12 @@ if __name__ == "__main__":
         stats_writer.close()
         logger.info(f"wrote summary to {args.summary_output}")
 
-    # Per-layer codebook utilization: one row PER LAYER (long format). All scalar
-    # columns, so it too writes natively to csv/parquet/odps.
-    if layer_hist is not None:
-        layer_stats: "OrderedDict[str, list]" = OrderedDict(
-            layer=[], codebook_size=[], coverage=[], dead_codes=[], perplexity=[]
+    if args.layer_stats_output and layer_stats is not None:
+        layer_writer = create_writer(
+            args.layer_stats_output, writer_type, quota_name=args.odps_data_quota_name
         )
-        for layer, h in enumerate(layer_hist):
-            nonzero = int(np.count_nonzero(h))
-            coverage = nonzero / len(h)
-            dead_codes = len(h) - nonzero
-            perplexity = math.exp(compute_entropy(h))
-            layer_stats["layer"].append(layer)
-            layer_stats["codebook_size"].append(len(h))
-            layer_stats["coverage"].append(coverage)
-            layer_stats["dead_codes"].append(dead_codes)
-            layer_stats["perplexity"].append(perplexity)
-            logger.info(
-                f"layer {layer}: coverage={coverage:.4f} "
-                f"dead_codes={dead_codes} perplexity={perplexity:.4f}"
-            )
-        if args.layer_stats_output:
-            layer_writer = create_writer(
-                args.layer_stats_output,
-                writer_type,
-                quota_name=args.odps_data_quota_name,
-            )
-            layer_writer.write(
-                OrderedDict((k, pa.array(v)) for k, v in layer_stats.items())
-            )
-            layer_writer.close()
-            logger.info(f"wrote per-layer stats to {args.layer_stats_output}")
+        layer_writer.write(
+            OrderedDict((k, pa.array(v)) for k, v in layer_stats.items())
+        )
+        layer_writer.close()
+        logger.info(f"wrote per-layer stats to {args.layer_stats_output}")
