@@ -9,27 +9,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Offline SID codebook collision-prevention tool (vectorized).
+"""Offline SID collision prevention with TorchEasyRec-native I/O.
 
-Caps every SID bucket at ``--max_items_per_codebook`` and reassigns overflow
-items to a free code in the SAME band -- keeping every layer but the last and
-varying only the last SID layer, so an item never leaves its ``(prefix)`` band:
+The runner caps each SID bucket, loads fixed-width last-layer candidates only
+for overflow items, delegates collision resolution to the pure NumPy core, and
+writes item-level and grouped SID results through TorchEasyRec readers and
+writers. CSV uses compact SID strings and JSON item-ID arrays because Arrow's
+CSV writer cannot serialize list columns.
 
-- ``--strategy candidate`` walks the item's model-provided candidate SIDs
-  (``candidate_codes``), taking the last code of each, best-first;
-- ``--strategy random`` draws random last-layer codes (excluding the origin),
-  a baseline that ignores semantic proximity.
-
-Items with no free slot fall back per ``--unassigned_policy``. The hot path is
-numpy/Arrow-vectorized so a hundred-million-row map fits in one pass; results
-are deterministic and independent of input row order. I/O goes
-through ``create_reader`` / ``create_writer`` so CSV, Parquet, and ODPS all work;
-outputs are written in chunks to stay under Arrow's 2^31 list-offset limit.
+The random strategy intentionally preserves the legacy deterministic baseline:
+it draws with replacement from the full last-layer space. Placement skips an
+item's origin, so an origin draw or a duplicate draw is not replaced.
 """
 
+from __future__ import annotations
+
 import argparse
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import json
+import os
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -38,589 +37,699 @@ import pyarrow.compute as pc
 # Register the local reader/writer classes used through create_reader/writer.
 import tzrec.datasets.csv_dataset  # noqa: F401
 import tzrec.datasets.parquet_dataset  # noqa: F401
-from tzrec.datasets.dataset import BaseReader, create_reader, create_writer
+from tzrec.datasets.dataset import (
+    BaseReader,
+    BaseWriter,
+    create_reader,
+    create_writer,
+)
+from tzrec.datasets.odps_dataset import _parse_table_path
+from tzrec.tools.sid.collision_resolution import (
+    CodebookItemGrouping,
+    CollisionPlan,
+    CollisionResolutionConfig,
+    CollisionResolutionResult,
+    CollisionResolutionStats,
+    build_original_item_grouping,
+    build_resolved_item_grouping,
+    generate_random_candidate_last_codes,
+    prepare_collision_plan,
+    resolve_sid_collisions,
+)
 from tzrec.utils.logging_util import logger
 
-_MASK64 = (1 << 64) - 1
-
-# Fixed hash seed for the order-independent tie-break. Not a CLI knob: the
-# collision rate is seed-invariant, so runs stay reproducible without one.
-_SEED = 2026
-
-# CSV-fallback delimiters (Parquet/ODPS carry codes as native list<int64>, so
-# these are unused there). Both are non-comma so a codebook cell never collides
-# with CSV's own field separator, and distinct so a compact cell parses cleanly.
-_CODE_SEP = "|"  # separates the int codes within one SID, e.g. "1|2|3"
-_CAND_SEP = ";"  # separates candidate SIDs in a compact cell, e.g. "1|2;3|4"
-
-# Chunk rows per output write: keeps each Arrow array's int32 offsets under 2^31
-# (a single 255M-row string/list column would overflow one array).
+_CODE_SEP = "|"
+_CAND_SEP = ";"
 _WRITE_CHUNK = 20_000_000
+_CSV_GROUP_WRITE_CHUNK = 1_000_000
+_ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
 
 
-@dataclass
-class AssignmentStats:
-    """Summary statistics for a collision-prevention run."""
+def _output_path_identity(
+    path: str,
+) -> Union[str, Tuple[str, str, Optional[str], str, Optional[str]]]:
+    """Return the destination identity used by the repository writer."""
+    if not path.startswith("odps://"):
+        return os.path.realpath(path)
 
-    total_items: int
-    raw_collision_buckets: int
-    final_collision_buckets: int
-    reassigned_count: int
-    unassigned_count: int
-    max_final_bucket_size: int
-
-
-def _splitmix64(x: np.ndarray) -> np.ndarray:
-    """Vectorized order-independent SplitMix64 hash of a uint64 array.
-
-    A pure function of the input values (not their position), mixed with the
-    module ``_SEED``, so it gives a stable tie-break invariant to input row order
-    -- unlike a read-order index -- while staying fully vectorized.
-
-    Args:
-        x (np.ndarray): uint64 values to hash.
-
-    Returns:
-        np.ndarray: uint64 hashes, same shape as ``x``.
-    """
-    with np.errstate(over="ignore"):
-        z = x.astype(np.uint64) + np.uint64((_SEED * 0x9E3779B97F4A7C15) & _MASK64)
-        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
-        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
-        return z ^ (z >> np.uint64(31))
+    project, table_name, partitions, schema = _parse_table_path(path)
+    partition_spec = partitions[0] if partitions and partitions[0] else None
+    return "odps", project, schema, table_name, partition_spec
 
 
-def _order_hash(item_ids: np.ndarray) -> np.ndarray:
-    """Per-item order-independent tie-break hash (uint64), vectorized.
+@dataclass(frozen=True)
+class CollisionPreventionConfig:
+    """Validated configuration for collision-prevention orchestration."""
 
-    Integer ids hash directly; string/object ids are folded to uint64 via
-    ``pandas.util.hash_array`` first. Both then pass through :func:`_splitmix64`.
+    input_path: str
+    output_path: str
+    original_sid_groups_output_path: Optional[str]
+    resolved_sid_groups_output_path: Optional[str]
+    diagnostics_output_path: Optional[str]
+    reader_type: Optional[str]
+    writer_type: Optional[str]
+    batch_size: int
+    item_id_field: str
+    code_field: str
+    candidate_codes_field: str
+    layer_sizes: Tuple[int, ...]
+    max_items_per_codebook: int
+    unassigned_policy: str
+    strategy: str
+    random_num_candidates: int
+    rate_only: bool
+    odps_data_quota_name: str
 
-    Args:
-        item_ids (np.ndarray): item id values.
+    def __post_init__(self) -> None:
+        if self.batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {self.batch_size}.")
+        if self.random_num_candidates < 1:
+            raise ValueError(
+                f"random_num_candidates must be >= 1, got {self.random_num_candidates}."
+            )
+        if self.strategy not in {"candidate", "random"}:
+            raise ValueError(f"unsupported strategy: {self.strategy!r}.")
+        has_original_groups = bool(self.original_sid_groups_output_path)
+        has_resolved_groups = bool(self.resolved_sid_groups_output_path)
+        if has_original_groups != has_resolved_groups:
+            raise ValueError(
+                "original_sid_groups_output_path and "
+                "resolved_sid_groups_output_path must be supplied together."
+            )
+        if not self.rate_only and not has_original_groups:
+            raise ValueError(
+                "both SID group output paths are required unless rate_only is set."
+            )
 
-    Returns:
-        np.ndarray: uint64 per-item hashes.
-    """
-    if np.issubdtype(item_ids.dtype, np.integer):
-        base = item_ids.astype(np.uint64)
-    else:
-        import pandas as pd
+        named_paths = {
+            "output_path": self.output_path,
+            "original_sid_groups_output_path": self.original_sid_groups_output_path,
+            "resolved_sid_groups_output_path": self.resolved_sid_groups_output_path,
+            "diagnostics_output_path": self.diagnostics_output_path,
+        }
+        seen_paths: Dict[
+            Union[str, Tuple[str, str, Optional[str], str, Optional[str]]], str
+        ] = {}
+        for name, path in named_paths.items():
+            if not path:
+                continue
+            path_identity = _output_path_identity(path)
+            previous_name = seen_paths.get(path_identity)
+            if previous_name is not None:
+                raise ValueError(f"{name} must differ from {previous_name}: {path!r}.")
+            seen_paths[path_identity] = name
+        _ = self.resolution_config
 
-        base = pd.util.hash_array(np.asarray(item_ids, dtype=object))
-    return _splitmix64(base)
+    @classmethod
+    def from_namespace(cls, args: argparse.Namespace) -> "CollisionPreventionConfig":
+        """Build a validated configuration from parsed CLI arguments."""
+        layer_sizes = tuple(
+            int(value) for value in args.codebook.split(",") if value.strip()
+        )
+        return cls(
+            input_path=args.input_path,
+            output_path=args.output_path,
+            original_sid_groups_output_path=getattr(
+                args, "original_sid_groups_output_path", None
+            ),
+            resolved_sid_groups_output_path=getattr(
+                args, "resolved_sid_groups_output_path", None
+            ),
+            diagnostics_output_path=args.diagnostics_output_path,
+            reader_type=args.reader_type,
+            writer_type=args.writer_type,
+            batch_size=args.batch_size,
+            item_id_field=args.item_id_field,
+            code_field=args.code_field,
+            candidate_codes_field=args.candidate_codes_field,
+            layer_sizes=layer_sizes,
+            max_items_per_codebook=args.max_items_per_codebook,
+            unassigned_policy=args.unassigned_policy,
+            strategy=args.strategy,
+            random_num_candidates=args.random_num_candidates,
+            rate_only=args.rate_only,
+            odps_data_quota_name=args.odps_data_quota_name,
+        )
+
+    @property
+    def resolution_config(self) -> CollisionResolutionConfig:
+        """Return the pure-core configuration."""
+        return CollisionResolutionConfig(
+            layer_sizes=self.layer_sizes,
+            capacity=self.max_items_per_codebook,
+            fallback_policy=self.unassigned_policy,
+        )
 
 
 class CollisionRunner:
-    """Vectorized SID collision-prevention runner over the dataset reader/writer.
+    """Run SID collision prevention over TorchEasyRec readers and writers."""
 
-    The backend (CSV / Parquet / ODPS) is chosen by the reader/writer type, so
-    the same path serves local files and MaxCompute tables.
-    """
+    def __init__(
+        self,
+        config: Union[CollisionPreventionConfig, argparse.Namespace],
+    ) -> None:
+        self._config = (
+            config
+            if isinstance(config, CollisionPreventionConfig)
+            else CollisionPreventionConfig.from_namespace(config)
+        )
+        self._default_writer_type: Optional[str] = None
+        self._item_id_type: Optional[pa.DataType] = None
 
-    def __init__(self, args: argparse.Namespace) -> None:
-        self._input_path = args.input_path
-        self._output_path = args.output_path
-        self._diagnostics_output_path = args.diagnostics_output_path
-        self._reader_type = args.reader_type
-        self._writer_type = args.writer_type
-        self._batch_size = args.batch_size
-        self._item_id_field = args.item_id_field
-        self._code_field = args.code_field
-        self._candidate_codes_field = args.candidate_codes_field
-        self._candidate_depth = args.candidate_depth
-        self._max_items_per_codebook = args.max_items_per_codebook
-        if self._max_items_per_codebook < 1:
-            raise ValueError(
-                "--max_items_per_codebook must be >= 1, got "
-                f"{self._max_items_per_codebook}."
-            )
-        self._unassigned_policy = args.unassigned_policy
-        self._strategy = args.strategy
-        self._codebook = [int(x) for x in args.codebook.split(",") if x.strip()]
-        if not self._codebook:
-            raise ValueError("--codebook must list at least one per-layer size.")
-        self._random_num_candidates = args.random_num_candidates
-        self._rate_only = args.rate_only
-        self._odps_data_quota_name = args.odps_data_quota_name
-        # The writer type (and its is-CSV flag) can depend on the input reader
-        # class when --writer_type is unset, so they are finalized once at the
-        # first read rather than here; declared now so the attributes always exist.
-        self._writer_type_str: Optional[str] = None
-        self._is_csv: bool = False
-
-    def run(self) -> AssignmentStats:
-        """Read the SID map, assign, and write the reassigned map + stats."""
+    def run(self) -> CollisionResolutionStats:
+        """Read, resolve collisions, and write the resulting SID map."""
         item_ids, codes = self._load_codes()
-        final_codes, index, keep_mask, stats = self._assign(item_ids, codes)
-        if not self._rate_only:
-            self._write(item_ids, codes, final_codes, index, keep_mask, stats)
+        plan = prepare_collision_plan(
+            item_ids,
+            codes,
+            self._config.resolution_config,
+        )
+        candidate_last_codes = self._candidate_last_codes(plan)
+        result = resolve_sid_collisions(
+            plan,
+            candidate_last_codes,
+            collect_grouping=(
+                not self._config.rate_only and plan.overflow_rows.size > 0
+            ),
+        )
+        del candidate_last_codes
+
+        if self._config.rate_only:
+            logger.info("rate_only: skipping map and SID group writes")
+            del plan
         else:
-            logger.info("rate_only: skipping map write")
-        logger.info("SID collision prevention finished: %s", stats)
-        return stats
+            self._write_group_outputs(item_ids, codes, plan, result)
+            del plan
+            self._write_map(item_ids, codes, result)
+        if self._config.diagnostics_output_path:
+            self._write_diagnostics(result.stats)
+
+        logger.info("SID collision prevention finished: %s", result.stats)
+        return result.stats
 
     def _make_reader(self, selected_cols: List[str]) -> BaseReader:
-        """Open the input reader projecting ``selected_cols``."""
+        """Open a repository reader projecting ``selected_cols``."""
         return create_reader(
-            input_path=self._input_path,
-            batch_size=self._batch_size,
+            input_path=self._config.input_path,
+            batch_size=self._config.batch_size,
             selected_cols=selected_cols,
-            reader_type=self._reader_type,
-            quota_name=self._odps_data_quota_name,
+            reader_type=self._config.reader_type,
+            quota_name=self._config.odps_data_quota_name,
         )
 
-    def _read(self) -> Iterable[Dict[str, pa.Array]]:
-        """Stream item-id + code batches, caching the resolved output backend."""
-        reader = self._make_reader([self._item_id_field, self._code_field])
-        # Writer defaults to matching the input reader (hitrate.py idiom) when
-        # --writer_type is unset; ODPS still resolves to OdpsWriter via
-        # create_writer's path detection regardless.
-        reader_cls_name = reader.__class__.__name__
-        self._writer_type_str = self._writer_type or (
-            reader_cls_name.replace("Reader", "Writer")
+    def _read_codes(self) -> Iterable[Dict[str, pa.Array]]:
+        """Stream item IDs and SIDs while resolving the default writer type."""
+        reader = self._make_reader(
+            [self._config.item_id_field, self._config.code_field]
         )
-        self._is_csv = self._writer_type_str == "CsvWriter"
+        reader_name = reader.__class__.__name__
+        self._default_writer_type = self._config.writer_type or reader_name.replace(
+            "Reader", "Writer"
+        )
         yield from reader.to_batches()
 
     @staticmethod
-    def _codes_matrix(arr: pa.Array) -> np.ndarray:
-        """Decode a SID code column into an (N, n_layers) int64 matrix.
+    def _is_list_type(data_type: pa.DataType) -> bool:
+        """Return whether ``data_type`` is an Arrow list representation."""
+        return (
+            pa.types.is_list(data_type)
+            or pa.types.is_large_list(data_type)
+            or pa.types.is_fixed_size_list(data_type)
+        )
 
-        Parquet/ODPS give a ``list<int64>`` cell; CSV gives a ``_CODE_SEP``
-        string; a single-layer numeric CSV column may arrive already as ints.
-        """
-        if pa.types.is_list(arr.type) or pa.types.is_large_list(arr.type):
-            n = len(arr)
+    @classmethod
+    def _codes_matrix(cls, values: pa.Array) -> np.ndarray:
+        """Decode an SID column into an ``(N, n_layers)`` int64 matrix."""
+        if cls._is_list_type(values.type):
+            row_count = len(values)
             flat = (
-                arr.flatten()
+                values.flatten()
                 .to_numpy(zero_copy_only=False)
                 .astype(np.int64, copy=False)
             )
-        elif pa.types.is_integer(arr.type):
-            arr_np = arr.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-            return arr_np.reshape(-1, 1)
+        elif pa.types.is_integer(values.type):
+            array = values.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+            return array.reshape(-1, 1)
         else:
-            parts = pc.split_pattern(arr, _CODE_SEP)
-            n = len(parts)
+            parts = pc.split_pattern(values, _CODE_SEP)
+            row_count = len(parts)
             flat = pc.cast(parts.flatten(), pa.int64()).to_numpy(zero_copy_only=False)
-        if n == 0:
+
+        if row_count == 0:
             return np.empty((0, 0), dtype=np.int64)
-        n_layers = flat.shape[0] // n
-        if flat.shape[0] != n * n_layers:
+        layer_count = flat.shape[0] // row_count
+        if flat.shape[0] != row_count * layer_count:
             raise ValueError("ragged SID codes: all items must share n_layers.")
-        return flat.reshape(n, n_layers)
+        return flat.reshape(row_count, layer_count)
+
+    def _validate_item_ids(self, item_ids: pa.Array) -> None:
+        """Validate one item ID batch and retain its Arrow type.
+
+        Args:
+            item_ids: Item IDs from one input batch.
+
+        Raises:
+            ValueError: If IDs contain nulls or their type changes between batches.
+        """
+        if item_ids.null_count:
+            raise ValueError("item IDs must not contain null values.")
+        if self._item_id_type is None:
+            self._item_id_type = item_ids.type
+        elif self._item_id_type != item_ids.type:
+            raise ValueError(
+                "item ID type changed between batches: "
+                f"{self._item_id_type} vs {item_ids.type}."
+            )
 
     def _load_codes(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Stream the map into an item-id array and an (N, n_layers) code matrix."""
+        """Load item IDs and SIDs into arrays used by the NumPy core."""
         id_chunks: List[np.ndarray] = []
         code_chunks: List[np.ndarray] = []
-        for batch in self._read():
-            id_chunks.append(batch[self._item_id_field].to_numpy(zero_copy_only=False))
-            code_chunks.append(self._codes_matrix(batch[self._code_field]))
+        for batch in self._read_codes():
+            item_ids = batch[self._config.item_id_field]
+            self._validate_item_ids(item_ids)
+            id_chunks.append(item_ids.to_numpy(zero_copy_only=False))
+            code_chunks.append(self._codes_matrix(batch[self._config.code_field]))
+
         if not id_chunks:
             raise ValueError("SID input is empty.")
-        item_ids = np.concatenate(id_chunks)
-        del id_chunks
-        codes = np.concatenate(code_chunks, axis=0)
-        del code_chunks
-        if codes.shape[1] < 1:
+        item_id_array = np.concatenate(id_chunks)
+        code_matrix = np.concatenate(code_chunks, axis=0)
+        if code_matrix.shape[1] < 1:
             raise ValueError("SID codes must have at least one layer.")
-        return item_ids, codes
+        return item_id_array, code_matrix
 
-    def _load_candidate_last(self, overflow_id_arr: np.ndarray) -> Dict[Any, List[int]]:
-        """Map each overflow item id to its ordered candidate last-layer codes.
+    def _candidate_last_codes(self, plan: CollisionPlan) -> np.ndarray:
+        """Provide row-aligned candidate last codes for the overflow plan."""
+        if plan.overflow_rows.size == 0:
+            return np.empty((0, 0), dtype=np.int64)
+        if self._config.strategy == "random":
+            return generate_random_candidate_last_codes(
+                plan.overflow_item_ids,
+                self._config.random_num_candidates,
+                self._config.layer_sizes[-1],
+            )
+        return self._load_candidate_last_codes(plan.overflow_item_ids)
 
-        Reads ``candidate_codes`` (list<list<int64>> for Parquet/ODPS, a
-        ``_CAND_SEP``/``_CODE_SEP`` string for CSV) but keeps only the last code
-        of each candidate SID and only for overflow items, so memory scales with
-        the overflow fraction, not the whole table.
-        """
-        field = self._candidate_codes_field
-        # Sort the overflow ids once; per-batch membership is then a bisect
-        # instead of re-sorting the whole (potentially huge) overflow set.
-        ov = np.sort(overflow_id_arr)
-        cand: Dict[Any, List[int]] = {}
-        for batch in self._make_reader([self._item_id_field, field]).to_batches():
-            if field not in batch:
-                break
-            ids = batch[self._item_id_field].to_numpy(zero_copy_only=False)
-            pos = np.searchsorted(ov, ids)
-            np.clip(pos, 0, len(ov) - 1, out=pos)
-            keep = np.where(ov[pos] == ids)[0]
-            if keep.size == 0:
-                continue
-            col = batch[field]
-            if pa.types.is_list(col.type) or pa.types.is_large_list(col.type):
-                self._collect_candidate_lists(ids, col, keep, cand)
-            else:
-                self._collect_candidate_strings(ids, col, keep, cand)
-        return cand
+    def _candidate_matrix(self, values: pa.Array) -> np.ndarray:
+        """Decode candidate SIDs and retain only their last-layer codes."""
+        if self._is_list_type(values.type):
+            return self._candidate_list_matrix(values)
+        return self._candidate_string_matrix(values)
 
-    def _collect_candidate_lists(
-        self,
-        ids: np.ndarray,
-        col: pa.Array,
-        keep: np.ndarray,
-        cand: Dict[Any, List[int]],
-    ) -> None:
-        """Vectorized last-code extraction from a list<list<int64>> batch."""
-        n = len(col)
-        inner = col.flatten()  # list<int64>, one per candidate SID
-        if len(inner) == 0:
-            return
-        k = len(inner) // n
-        if len(inner) != n * k:
+    def _candidate_list_matrix(self, values: pa.Array) -> np.ndarray:
+        """Decode a nested Arrow candidate column into an ``(N, K)`` matrix."""
+        row_count = len(values)
+        if row_count == 0:
+            return np.empty((0, 0), dtype=np.int64)
+        inner = values.flatten()
+        candidate_count = len(inner) // row_count
+        if len(inner) != row_count * candidate_count:
             raise ValueError("ragged candidate_codes: all items must share topk.")
+        if candidate_count == 0:
+            return np.empty((row_count, 0), dtype=np.int64)
         flat = (
             inner.flatten().to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
         )
-        n_layers = flat.shape[0] // (n * k)
-        last = flat.reshape(n, k, n_layers)[:, :, n_layers - 1]
-        if self._candidate_depth is not None:
-            last = last[:, : self._candidate_depth]
-        last_lists = last.tolist()  # per-item Python lists: cheap to scan in the loop
-        for iid, i in zip(ids[keep].tolist(), keep.tolist()):
-            cand[iid] = last_lists[i]
-
-    def _collect_candidate_strings(
-        self,
-        ids: np.ndarray,
-        col: pa.Array,
-        keep: np.ndarray,
-        cand: Dict[Any, List[int]],
-    ) -> None:
-        """Per-row last-code extraction from a CSV compact-candidate batch."""
-        depth = self._candidate_depth
-        values = col.to_pylist()
-        for iid, i in zip(ids[keep].tolist(), keep.tolist()):
-            text = values[i]
-            if not text:
-                continue
-            last_codes = []
-            for part in str(text).split(_CAND_SEP):
-                part = part.strip()
-                if not part:
-                    continue
-                codes = [int(p) for p in part.split(_CODE_SEP) if p.strip()]
-                if codes:
-                    last_codes.append(codes[-1])
-            cand[iid] = last_codes[:depth] if depth is not None else last_codes
-
-    def _assign(
-        self, item_ids: np.ndarray, codes: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], AssignmentStats]:
-        """Cap buckets and reassign overflow within-band; return the final map."""
-        cap = self._max_items_per_codebook
-        n, n_layers = codes.shape
-        if n_layers != len(self._codebook):
+        tuple_count = row_count * candidate_count
+        layer_count = flat.shape[0] // tuple_count
+        if layer_count < 1 or flat.shape[0] != tuple_count * layer_count:
             raise ValueError(
-                f"codes have {n_layers} layers but --codebook has "
-                f"{len(self._codebook)}."
+                "ragged candidate_codes: every candidate must share n_layers."
             )
-        last = codes[:, n_layers - 1].astype(np.int64, copy=False)
-
-        band_id = self._band_ids(codes)
-        order = _order_hash(item_ids)
-
-        # Rank rows within their (band_id, last) bucket by order-hash: the RATE is
-        # invariant to which cap items are kept, but the choice is deterministic.
-        # One lexsort yields the rank, each bucket's representative row, and size.
-        rank, rep_rows, counts = self._within_bucket_rank(band_id, last, order)
-        overflow_order = np.flatnonzero(rank >= cap)
-        overflow_order = overflow_order[
-            np.lexsort(
-                (order[overflow_order], last[overflow_order], band_id[overflow_order])
-            )
-        ]
-
-        cand = self._candidates(item_ids, overflow_order)
-        last_size = self._codebook[-1]
-
-        sid_key = band_id * last_size + last
-        slot_count: Dict[int, int] = dict(
-            zip(sid_key[rep_rows].tolist(), np.minimum(counts, cap).tolist())
-        )
-
-        final_key = sid_key.copy()
-        final_index = rank + 1
-        reassigned, unassigned = self._place_overflow(
-            overflow_order,
-            item_ids,
-            band_id,
-            last,
-            cand,
-            last_size,
-            cap,
-            slot_count,
-            final_key,
-            final_index,
-        )
-        keep_mask = self._resolve_unassigned(
-            unassigned, sid_key, slot_count, final_index, n
-        )
-
-        final_codes = codes.copy()
-        final_codes[:, n_layers - 1] = final_key % last_size
-
-        stats = self._stats(n, counts, slot_count, cap, reassigned, len(unassigned))
-        return final_codes, final_index, keep_mask, stats
-
-    def _band_ids(self, codes: np.ndarray) -> np.ndarray:
-        """Dense integer id per distinct ``(prefix)`` band (all layers but last).
-
-        Packs the prefix layers into one int64 key using the declared per-layer
-        codebook sizes as radices, then factorizes -- far faster than
-        ``np.unique`` over 2-D void rows at scale, and independent of the values a
-        given batch happens to contain.
-        """
-        n, n_layers = codes.shape
-        if n_layers == 1:
-            return np.zeros(n, dtype=np.int64)
-        key = codes[:, 0].astype(np.int64)  # fresh copy: safe to pack in place below
-        for j in range(1, n_layers - 1):
-            key *= self._codebook[j]
-            key += codes[:, j]
-        inverse = np.unique(key, return_inverse=True)[1]
-        return inverse.astype(np.int64, copy=False).reshape(-1)
+        return flat.reshape(row_count, candidate_count, layer_count)[:, :, -1]
 
     @staticmethod
-    def _within_bucket_rank(
-        band_id: np.ndarray, last: np.ndarray, order: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Rank rows within their ``(band_id, last)`` bucket by order-hash.
+    def _candidate_string_matrix(values: pa.Array) -> np.ndarray:
+        """Decode compact CSV candidate strings into an ``(N, K)`` matrix."""
+        rows: List[List[int]] = []
+        for value in values.to_pylist():
+            last_codes: List[int] = []
+            if value:
+                for candidate in str(value).split(_CAND_SEP):
+                    parts = [
+                        int(part)
+                        for part in candidate.strip().split(_CODE_SEP)
+                        if part.strip()
+                    ]
+                    if parts:
+                        last_codes.append(parts[-1])
+            rows.append(last_codes)
 
-        Returns the per-row 0-based rank, each bucket's representative original
-        row index, and each bucket's size -- all from a single column lexsort, so
-        the grouping is computed once (no packed key, no per-row size scatter).
-        """
-        n = band_id.shape[0]
-        sort_idx = np.lexsort((order, last, band_id))
-        sb = band_id[sort_idx]
-        sl = last[sort_idx]
-        is_first = np.empty(n, dtype=bool)
-        is_first[0] = True
-        is_first[1:] = (sb[1:] != sb[:-1]) | (sl[1:] != sl[:-1])
-        first_sorted = np.flatnonzero(is_first)
-        counts = np.diff(np.append(first_sorted, n))
-        rank = np.empty(n, dtype=np.int64)
-        rank[sort_idx] = np.arange(n) - np.repeat(first_sorted, counts)
-        return rank, sort_idx[first_sorted], counts
+        widths = {len(row) for row in rows}
+        if len(widths) > 1:
+            raise ValueError("ragged candidate_codes: all items must share topk.")
+        width = widths.pop() if widths else 0
+        if width == 0:
+            return np.empty((len(rows), 0), dtype=np.int64)
+        return np.asarray(rows, dtype=np.int64).reshape(len(rows), width)
 
-    def _candidates(
-        self,
-        item_ids: np.ndarray,
-        overflow_order: np.ndarray,
-    ) -> Dict[Any, List[int]]:
-        """Build per-overflow-item last-code candidate lists."""
-        if self._strategy == "random":
-            size = self._codebook[-1]
-            if size < 2:
-                raise ValueError("strategy='random' requires a last codebook >= 2.")
-            num = min(self._random_num_candidates, size - 1)
-            draws = self._random_draws(overflow_order, item_ids, num, size)
-            ov_ids = item_ids[overflow_order].tolist()  # Python-native dict keys
-            return {ov_ids[j]: draws[j].tolist() for j in range(len(ov_ids))}
-        if overflow_order.size == 0:
-            return {}
-        cand = self._load_candidate_last(item_ids[overflow_order])
-        if not cand:
+    def _load_candidate_last_codes(self, overflow_item_ids: np.ndarray) -> np.ndarray:
+        """Load fixed-width candidates aligned to ``overflow_item_ids``."""
+        item_count = overflow_item_ids.shape[0]
+        sorted_to_overflow = np.argsort(overflow_item_ids, kind="stable")
+        sorted_ids = overflow_item_ids[sorted_to_overflow]
+        if item_count > 1 and np.any(sorted_ids[1:] == sorted_ids[:-1]):
+            raise ValueError("overflow item IDs must be unique.")
+
+        candidates: Optional[np.ndarray] = None
+        seen = np.zeros(item_count, dtype=bool)
+        field = self._config.candidate_codes_field
+        reader = self._make_reader([self._config.item_id_field, field])
+        for batch in reader.to_batches():
+            if field not in batch:
+                break
+            batch_ids = batch[self._config.item_id_field].to_numpy(zero_copy_only=False)
+            positions = np.searchsorted(sorted_ids, batch_ids)
+            in_bounds = positions < item_count
+            source_rows = np.flatnonzero(in_bounds)
+            if source_rows.size:
+                source_rows = source_rows[
+                    sorted_ids[positions[source_rows]] == batch_ids[source_rows]
+                ]
+            if source_rows.size == 0:
+                continue
+
+            target_rows = sorted_to_overflow[positions[source_rows]]
+            if np.any(seen[target_rows]):
+                raise ValueError("candidate input contains duplicate item IDs.")
+            selected = pc.take(batch[field], pa.array(source_rows, type=pa.int64()))
+            batch_candidates = self._candidate_matrix(selected)
+            if candidates is None:
+                candidates = np.empty(
+                    (item_count, batch_candidates.shape[1]), dtype=np.int64
+                )
+            elif candidates.shape[1] != batch_candidates.shape[1]:
+                raise ValueError(
+                    "candidate topk changed between batches: "
+                    f"{candidates.shape[1]} vs {batch_candidates.shape[1]}."
+                )
+            candidates[target_rows] = batch_candidates
+            seen[target_rows] = True
+
+        if candidates is None:
             raise ValueError(
                 "map has overflow items but candidate_codes yielded no candidates."
             )
-        return cand
-
-    def _random_draws(
-        self, overflow_order: np.ndarray, item_ids: np.ndarray, num: int, size: int
-    ) -> np.ndarray:
-        """Order-independent random last-layer draws per overflow item, (M, num)."""
-        h = _order_hash(item_ids[overflow_order])
-        k = np.arange(num, dtype=np.uint64)
-        with np.errstate(over="ignore"):
-            mixed = _splitmix64(h[:, None] + k[None, :] * np.uint64(0x9E3779B97F4A7C15))
-        return (mixed % np.uint64(size)).astype(np.int64)
-
-    def _place_overflow(
-        self,
-        overflow_order: np.ndarray,
-        item_ids: np.ndarray,
-        band_id: np.ndarray,
-        last: np.ndarray,
-        cand: Dict[Any, List[int]],
-        last_size: int,
-        cap: int,
-        slot_count: Dict[int, int],
-        final_key: np.ndarray,
-        final_index: np.ndarray,
-    ) -> Tuple[int, List[int]]:
-        """Greedy single pass: place each overflow item in the first free slot.
-
-        Overflow-row inputs are pre-materialized to Python scalars so the loop
-        avoids per-iteration 0-d numpy indexing; placements are scattered back
-        into ``final_key`` / ``final_index`` vectorized at the end.
-        """
-        rows = overflow_order.tolist()
-        bases = (band_id[overflow_order] * last_size).tolist()
-        origin_lasts = last[overflow_order].tolist()
-        ids = item_ids[overflow_order].tolist()
-        placed_rows: List[int] = []
-        placed_key: List[int] = []
-        placed_idx: List[int] = []
-        unassigned: List[int] = []
-        get = slot_count.get
-        for k, base in enumerate(bases):
-            origin_last = origin_lasts[k]
-            for code in cand.get(ids[k], ()):  # ordered best-first
-                if code == origin_last:
-                    continue
-                ck = base + code
-                count = get(ck, 0)
-                if count < cap:
-                    slot_count[ck] = count + 1
-                    placed_rows.append(rows[k])
-                    placed_key.append(ck)
-                    placed_idx.append(count + 1)
-                    break
-            else:
-                unassigned.append(rows[k])
-        if placed_rows:
-            final_key[placed_rows] = placed_key
-            final_index[placed_rows] = placed_idx
-        return len(placed_rows), unassigned
-
-    def _resolve_unassigned(
-        self,
-        unassigned: List[int],
-        sid_key: np.ndarray,
-        slot_count: Dict[int, int],
-        final_index: np.ndarray,
-        n: int,
-    ) -> Optional[np.ndarray]:
-        """Apply --unassigned_policy; return the drop mask (None unless dropping)."""
-        if not unassigned:
-            return None
-        policy = self._unassigned_policy
-        if policy == "error":
-            preview = ",".join(str(i) for i in unassigned[:10])
-            raise RuntimeError(
-                f"{len(unassigned)} items could not be assigned within capacity; "
-                f"first unassigned row indices: {preview}"
+        if not np.all(seen):
+            missing = np.flatnonzero(~seen)
+            preview = ",".join(str(value) for value in missing[:10])
+            raise ValueError(
+                f"candidate_codes missing for {missing.size} overflow items; "
+                f"first overflow positions: {preview}."
             )
-        if policy == "drop":
-            keep_mask = np.ones(n, dtype=bool)
-            keep_mask[unassigned] = False
-            return keep_mask
-        for i in unassigned:  # keep_original
-            key = int(sid_key[i])
-            slot_count[key] = slot_count.get(key, 0) + 1
-            final_index[i] = slot_count[key]
-        return None
+        return candidates
 
-    @staticmethod
-    def _stats(
-        n: int,
-        counts: np.ndarray,
-        slot_count: Dict[int, int],
-        cap: int,
-        reassigned: int,
-        unassigned_count: int,
-    ) -> AssignmentStats:
-        """Summarize raw vs final bucket occupancy.
-
-        Final occupancy is read straight from ``slot_count`` (maintained during
-        placement) instead of re-grouping the final keys.
-        """
-        if slot_count:
-            vals = slot_count.values()
-            final_collision = sum(1 for v in vals if v > cap)
-            max_final = max(vals)
-        else:
-            final_collision = 0
-            max_final = 0
-        return AssignmentStats(
-            total_items=n,
-            raw_collision_buckets=int((counts > cap).sum()),
-            final_collision_buckets=final_collision,
-            reassigned_count=reassigned,
-            unassigned_count=unassigned_count,
-            max_final_bucket_size=max_final,
+    def _make_writer(self, output_path: str) -> BaseWriter:
+        """Create a repository writer for one independently resolved output."""
+        if self._default_writer_type is None:
+            raise RuntimeError("writer type is unavailable before reading input.")
+        return create_writer(
+            output_path,
+            writer_type=self._default_writer_type,
+            quota_name=self._config.odps_data_quota_name,
+            world_size=1,
         )
 
-    @staticmethod
-    def _item_id_array(values: np.ndarray) -> pa.Array:
-        """Encode item ids as int64 when integral, else as strings."""
-        if np.issubdtype(values.dtype, np.integer):
-            return pa.array(values, type=pa.int64())
-        return pa.array(values, type=pa.string())
+    def _item_id_array(self, values: np.ndarray) -> pa.Array:
+        """Encode item IDs with the input Arrow type preserved."""
+        if self._item_id_type is None:
+            raise RuntimeError("item ID type is unavailable before reading input.")
+        return pa.array(values, type=self._item_id_type)
 
-    def _codes_column(self, codes: np.ndarray) -> pa.Array:
-        """Encode an (M, n_layers) matrix as list<int64> (or a CSV string)."""
-        m, n_layers = codes.shape
-        if self._is_csv:
-            cols = [
-                pc.cast(pa.array(codes[:, j]), pa.string()) for j in range(n_layers)
+    @staticmethod
+    def _grouped_item_ids_column(
+        values: pa.Array, offsets: np.ndarray, is_csv: bool
+    ) -> pa.Array:
+        """Encode flat item IDs and offsets as one grouped output column."""
+        arrow_offsets = pa.array(offsets, type=pa.int32())
+        if not is_csv:
+            return pa.ListArray.from_arrays(arrow_offsets, values)
+
+        if pa.types.is_integer(values.type):
+            encoded_values = pc.cast(values, pa.string())
+        else:
+            try:
+                encoded_values = pa.array(
+                    [
+                        json.dumps(
+                            value,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        for value in values.to_pylist()
+                    ],
+                    type=pa.string(),
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "CSV SID group output cannot JSON-encode item ID type "
+                    f"{values.type}."
+                ) from error
+        encoded_lists = pa.ListArray.from_arrays(arrow_offsets, encoded_values)
+        joined_values = pc.binary_join(encoded_lists, ",")
+        return pc.binary_join_element_wise("[", joined_values, "]", "")
+
+    @staticmethod
+    def _codes_column(codes: np.ndarray, is_csv: bool) -> pa.Array:
+        """Encode an SID matrix for the actual output writer."""
+        row_count, layer_count = codes.shape
+        if layer_count < 1:
+            raise ValueError("SID output must contain at least one layer.")
+        if is_csv:
+            columns = [
+                pc.cast(pa.array(codes[:, layer]), pa.string())
+                for layer in range(layer_count)
             ]
-            return pc.binary_join_element_wise(*cols, _CODE_SEP)
+            return pc.binary_join_element_wise(*columns, _CODE_SEP)
+        if row_count > _ARROW_LIST_OFFSET_MAX // layer_count:
+            raise ValueError("SID output exceeds Arrow list offset capacity.")
         values = pa.array(codes.reshape(-1))
-        offsets = pa.array(np.arange(0, (m + 1) * n_layers, n_layers, dtype=np.int32))
+        offsets = pa.array(
+            np.arange(
+                0,
+                (row_count + 1) * layer_count,
+                layer_count,
+                dtype=np.int32,
+            )
+        )
         return pa.ListArray.from_arrays(offsets, values)
 
-    def _write(
+    def _write_map(
         self,
         item_ids: np.ndarray,
         origin_codes: np.ndarray,
-        final_codes: np.ndarray,
-        index: np.ndarray,
-        keep_mask: Optional[np.ndarray],
-        stats: AssignmentStats,
+        result: CollisionResolutionResult,
     ) -> None:
-        """Chunked, vectorized write of the reassigned map (and diagnostics)."""
-        if keep_mask is not None:
-            item_ids = item_ids[keep_mask]
-            origin_codes = origin_codes[keep_mask]
-            final_codes = final_codes[keep_mask]
-            index = index[keep_mask]
-        writer = create_writer(
-            self._output_path,
-            writer_type=self._writer_type_str,
-            quota_name=self._odps_data_quota_name,
-            world_size=1,
+        """Write the resolved map in chunks without a full final-code copy."""
+        writer = self._make_writer(self._config.output_path)
+        is_csv = writer.__class__.__name__ == "CsvWriter"
+        retained_rows = (
+            np.flatnonzero(result.retained_mask)
+            if result.retained_mask is not None
+            else None
         )
-        n = len(item_ids)
-        for s in range(0, n, _WRITE_CHUNK):
-            e = min(s + _WRITE_CHUNK, n)
+        output_count = (
+            retained_rows.shape[0] if retained_rows is not None else item_ids.shape[0]
+        )
+        try:
+            write_chunk = _WRITE_CHUNK
+            if not is_csv:
+                write_chunk = min(
+                    write_chunk,
+                    _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1],
+                )
+                if write_chunk < 1:
+                    raise ValueError("one SID row exceeds Arrow list offset capacity.")
+            for start in range(0, output_count, write_chunk):
+                end = min(start + write_chunk, output_count)
+                selection: Union[slice, np.ndarray]
+                selection = (
+                    retained_rows[start:end]
+                    if retained_rows is not None
+                    else slice(start, end)
+                )
+                origin_chunk = origin_codes[selection]
+                final_chunk = origin_chunk.copy()
+                final_chunk[:, -1] = result.resolved_last_codes[selection]
+                writer.write(
+                    {
+                        "item_id": self._item_id_array(item_ids[selection]),
+                        "origin_codebook": self._codes_column(origin_chunk, is_csv),
+                        "codebook": self._codes_column(final_chunk, is_csv),
+                        "index": pa.array(
+                            result.slot_indices[selection], type=pa.int64()
+                        ),
+                    }
+                )
+        finally:
+            writer.close()
+
+    def _write_group_outputs(
+        self,
+        item_ids: np.ndarray,
+        origin_codes: np.ndarray,
+        plan: CollisionPlan,
+        result: CollisionResolutionResult,
+    ) -> None:
+        """Build and write original and resolved SID item groups sequentially.
+
+        Args:
+            item_ids: Input item IDs in original row order.
+            origin_codes: Original full SID matrix.
+            plan: Original SID aggregation and overflow plan.
+            result: Completed collision-resolution result.
+        """
+        original_path = self._config.original_sid_groups_output_path
+        resolved_path = self._config.resolved_sid_groups_output_path
+        if original_path is None or resolved_path is None:
+            raise RuntimeError("SID group output paths were not validated.")
+
+        original_grouping = build_original_item_grouping(plan)
+        self._write_sid_groups(
+            original_path,
+            item_ids,
+            origin_codes,
+            original_grouping,
+            resolved_last_codes=None,
+        )
+        if plan.overflow_rows.size == 0:
+            self._write_sid_groups(
+                resolved_path,
+                item_ids,
+                origin_codes,
+                original_grouping,
+                resolved_last_codes=result.resolved_last_codes,
+            )
+            del original_grouping
+        else:
+            del original_grouping
+            resolved_grouping = build_resolved_item_grouping(plan, result)
+            self._write_sid_groups(
+                resolved_path,
+                item_ids,
+                origin_codes,
+                resolved_grouping,
+                resolved_last_codes=result.resolved_last_codes,
+            )
+            del resolved_grouping
+
+    def _write_sid_groups(
+        self,
+        output_path: str,
+        item_ids: np.ndarray,
+        origin_codes: np.ndarray,
+        grouping: CodebookItemGrouping,
+        resolved_last_codes: Optional[np.ndarray],
+    ) -> None:
+        """Write codebook-to-item-ID groups in SID and slot order.
+
+        Args:
+            output_path: Destination passed to the selected repository writer.
+            item_ids: Input item IDs in original row order.
+            origin_codes: Original full SID matrix.
+            grouping: Sorted SID groups and their flattened original row order.
+            resolved_last_codes: Final last-layer values, or ``None`` when
+                writing original SIDs.
+
+        Raises:
+            RuntimeError: If grouping dimensions or counts are inconsistent.
+            ValueError: If one group exceeds Arrow list offset capacity.
+        """
+        group_count = grouping.counts.shape[0]
+        if grouping.sid_keys.shape[0] != group_count:
+            raise RuntimeError("SID group keys and counts must have the same length.")
+        if np.any(grouping.counts <= 0):
+            raise RuntimeError("SID group counts must be positive.")
+        if np.any(grouping.counts > _ARROW_LIST_OFFSET_MAX):
+            raise ValueError("one SID group exceeds Arrow list offset capacity.")
+
+        offsets = grouping.offsets
+        if int(offsets[-1]) != grouping.row_order.shape[0]:
+            raise RuntimeError("SID group counts do not match grouped row count.")
+        writer = self._make_writer(output_path)
+        is_csv = writer.__class__.__name__ == "CsvWriter"
+        child_chunk = (
+            min(_WRITE_CHUNK, _CSV_GROUP_WRITE_CHUNK) if is_csv else _WRITE_CHUNK
+        )
+        try:
+            max_codebook_rows = (
+                group_count
+                if is_csv
+                else _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1]
+            )
+            if not is_csv and max_codebook_rows < 1:
+                raise ValueError("one SID row exceeds Arrow list offset capacity.")
+            group_start = 0
+            while group_start < group_count:
+                child_limit = int(offsets[group_start]) + child_chunk
+                group_end = int(np.searchsorted(offsets, child_limit, side="right") - 1)
+                group_end = max(group_end, group_start + 1)
+                group_end = min(group_end, group_start + max_codebook_rows)
+
+                child_start = int(offsets[group_start])
+                child_end = int(offsets[group_end])
+                rows = grouping.row_order[child_start:child_end]
+                local_offsets = (
+                    offsets[group_start : group_end + 1] - child_start
+                ).astype(np.int32, copy=False)
+                representative_rows = grouping.row_order[offsets[group_start:group_end]]
+                code_chunk = origin_codes[representative_rows]
+                if resolved_last_codes is not None:
+                    code_chunk[:, -1] = resolved_last_codes[representative_rows]
+                flat_item_ids = self._item_id_array(item_ids[rows])
+                writer.write(
+                    {
+                        "codebook": self._codes_column(code_chunk, is_csv),
+                        "itemids": self._grouped_item_ids_column(
+                            flat_item_ids, local_offsets, is_csv
+                        ),
+                    }
+                )
+                group_start = group_end
+        finally:
+            writer.close()
+
+    def _write_diagnostics(self, stats: CollisionResolutionStats) -> None:
+        """Write legacy-compatible diagnostic column names."""
+        path = self._config.diagnostics_output_path
+        if path is None:
+            return
+        writer = self._make_writer(path)
+        try:
             writer.write(
                 {
-                    "item_id": self._item_id_array(item_ids[s:e]),
-                    "origin_codebook": self._codes_column(origin_codes[s:e]),
-                    "codebook": self._codes_column(final_codes[s:e]),
-                    "index": pa.array(index[s:e], type=pa.int64()),
+                    name: pa.array([value], type=pa.int64())
+                    for name, value in stats.to_output_dict().items()
                 }
             )
-        writer.close()
-        if self._diagnostics_output_path:
-            self._write_diagnostics(stats)
-
-    def _write_diagnostics(self, stats: AssignmentStats) -> None:
-        """Write the one-row AssignmentStats table to the diagnostics path."""
-        writer = create_writer(
-            self._diagnostics_output_path,
-            writer_type=self._writer_type_str,
-            quota_name=self._odps_data_quota_name,
-            world_size=1,
-        )
-        writer.write(
-            {k: pa.array([v], type=pa.int64()) for k, v in asdict(stats).items()}
-        )
-        writer.close()
+        finally:
+            writer.close()
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
+    """Build the collision-prevention command-line parser."""
     parser = argparse.ArgumentParser(
         description="Prevent SID codebook collisions (vectorized, within-band)."
     )
     parser.add_argument("--input_path", required=True)
     parser.add_argument("--output_path", required=True)
+    parser.add_argument(
+        "--original_sid_groups_output_path",
+        default=None,
+        help=(
+            "Output grouped item IDs keyed by their original SID; required unless "
+            "--rate_only is set."
+        ),
+    )
+    parser.add_argument(
+        "--resolved_sid_groups_output_path",
+        default=None,
+        help=(
+            "Output grouped retained item IDs keyed by their resolved SID; required "
+            "unless --rate_only is set."
+        ),
+    )
     parser.add_argument("--diagnostics_output_path", default=None)
     parser.add_argument(
         "--reader_type",
@@ -631,8 +740,7 @@ if __name__ == "__main__":
         "--writer_type",
         choices=["CsvWriter", "ParquetWriter", "OdpsWriter"],
         default=None,
-        help="Output writer; defaults to matching the input reader "
-        "(CsvReader -> CsvWriter, etc.).",
+        help="Output writer; defaults to matching the input reader.",
     )
     parser.add_argument("--batch_size", type=int, default=100000)
     parser.add_argument("--item_id_field", default="item_id")
@@ -640,16 +748,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--codebook",
         required=True,
-        help="Comma-separated per-layer codebook sizes, e.g. '8192,8192,8192'. "
-        "Declares n_layers and the last-layer code space used for reassignment.",
+        help="Comma-separated per-layer sizes, e.g. '8192,8192,8192'.",
     )
     parser.add_argument("--candidate_codes_field", default="candidate_codes")
-    parser.add_argument(
-        "--candidate_depth",
-        type=int,
-        default=None,
-        help="Cap on candidate last-codes tried per overflow item (default: all).",
-    )
     parser.add_argument("--max_items_per_codebook", type=int, required=True)
     parser.add_argument(
         "--unassigned_policy",
@@ -660,20 +761,28 @@ if __name__ == "__main__":
         "--strategy",
         choices=["candidate", "random"],
         default="candidate",
-        help="Reassignment strategy: 'candidate' uses model candidate_codes; "
-        "'random' draws random within-band last-layer codes (no candidates).",
+        help="Use model candidates or deterministic legacy random draws.",
     )
     parser.add_argument(
         "--random_num_candidates",
         type=int,
         default=64,
-        help="Random last-layer codes drawn per overflow item for --strategy random.",
+        help="Full-space random draws per overflow item for random strategy.",
     )
     parser.add_argument(
         "--rate_only",
         action="store_true",
-        help="Compute + log stats only; skip writing the map (avoids the map-write "
-        "cost when only the collision rate is needed).",
+        help="Compute and log metrics without writing map or SID group outputs.",
     )
     parser.add_argument("--odps_data_quota_name", default="pay-as-you-go")
-    CollisionRunner(parser.parse_args()).run()
+    return parser
+
+
+def main() -> None:
+    """Run collision prevention from command-line arguments."""
+    config = CollisionPreventionConfig.from_namespace(build_parser().parse_args())
+    CollisionRunner(config).run()
+
+
+if __name__ == "__main__":
+    main()
