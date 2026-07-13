@@ -565,11 +565,12 @@ if has_dynamicemb:
         sharding_option,  # pyre-ignore [2]
         topology,  # pyre-ignore [2]
         constraints,  # pyre-ignore [2]
-        sharder_data,  # pyre-ignore [2]
         *args,  # pyre-ignore [2]
         **kwargs,  # pyre-ignore [2]
     ):
         """Inject the empirical x_eff into the perf estimator for both modes.
+
+        TorchRec version-specific sharder arguments are forwarded unchanged.
 
         Temporarily replace ``sharding_option.cache_params`` with a clone
         whose ``load_factor`` is the empirically-fitted x_eff for the
@@ -601,7 +602,6 @@ if has_dynamicemb:
                 sharding_option,
                 topology,
                 constraints,
-                sharder_data,
                 *args,
                 **kwargs,
             )
