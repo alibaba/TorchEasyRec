@@ -70,7 +70,6 @@ class CollisionResolutionTest(unittest.TestCase):
             result.final_occupied_sid_keys, [0, 1, 2, 3, 4, 5]
         )
         np.testing.assert_array_equal(result.final_bucket_counts, [2, 2, 2, 1, 2, 1])
-        self.assertTrue(result.slots_match_final_sid_keys)
         self.assertTrue(result.grouping_collected)
         self.assertIsNone(result.retained_mask)
         self.assertEqual(result.stats.total_items, 10)
@@ -166,11 +165,19 @@ class CollisionResolutionTest(unittest.TestCase):
         config = CollisionResolutionConfig((2, 4), 2, "error")
         codes = np.asarray([[0, 0], [0, 0], [1, 2]], dtype=np.int64)
         plan = prepare_collision_plan(np.asarray([0, 1, 2]), codes, config)
-        result = resolve_sid_collisions(plan, np.empty((0, 3), dtype=np.int64))
+        with (
+            mock.patch.object(collision_resolution.np, "fromiter") as fromiter,
+            mock.patch.object(collision_resolution.np, "argsort") as argsort,
+        ):
+            result = resolve_sid_collisions(plan, np.empty((0, 3), dtype=np.int64))
 
+        fromiter.assert_not_called()
+        argsort.assert_not_called()
         np.testing.assert_array_equal(result.resolved_last_codes, [0, 0, 2])
         np.testing.assert_array_equal(result.slot_indices, [1, 2, 1])
         np.testing.assert_array_equal(result.unresolved_rows, [])
+        np.testing.assert_array_equal(result.final_occupied_sid_keys, [0, 6])
+        np.testing.assert_array_equal(result.final_bucket_counts, [2, 1])
         self.assertEqual(result.stats.raw_collision_buckets, 0)
         self.assertEqual(result.stats.relocated_count, 0)
 
@@ -239,35 +246,21 @@ class CollisionResolutionTest(unittest.TestCase):
         self.assertEqual(result.stats.relocated_count, 1)
         self.assertEqual(result.stats.unresolved_count, 1)
 
-    def test_resolved_grouping_uses_emitted_sid_for_out_of_range_candidate(
-        self,
-    ) -> None:
+    def test_rejects_out_of_range_candidate(self) -> None:
         config = CollisionResolutionConfig((4,), 1, "drop")
         item_ids = np.asarray([0, 1, 2], dtype=np.int64)
         codes = np.asarray([[0], [0], [1]], dtype=np.int64)
         plan = prepare_collision_plan(item_ids, codes, config)
 
-        result = resolve_sid_collisions(plan, np.asarray([[5]], dtype=np.int64))
-
-        np.testing.assert_array_equal(result.resolved_last_codes, [0, 1, 1])
-        np.testing.assert_array_equal(result.slot_indices, [1, 1, 1])
-        self.assertFalse(result.slots_match_final_sid_keys)
-        np.testing.assert_array_equal(result.final_occupied_sid_keys, [0, 1])
-        np.testing.assert_array_equal(result.final_bucket_counts, [1, 2])
-        self.assertEqual(result.stats.final_collision_buckets, 0)
-        self.assertEqual(result.stats.max_final_bucket_size, 1)
-
-        grouping = build_resolved_item_grouping(plan, result)
-        np.testing.assert_array_equal(grouping.sid_keys, [0, 1])
-        np.testing.assert_array_equal(grouping.counts, [1, 2])
-        np.testing.assert_array_equal(grouping.row_order, [0, 1, 2])
+        with self.assertRaisesRegex(ValueError, r"must be in \[0, 4\)"):
+            resolve_sid_collisions(plan, np.asarray([[5]], dtype=np.int64))
 
     def test_resolution_can_skip_grouping_metadata(self) -> None:
         config = CollisionResolutionConfig((4,), 1, "drop")
         item_ids = np.asarray([0, 1, 2], dtype=np.int64)
         codes = np.asarray([[0], [0], [1]], dtype=np.int64)
         plan = prepare_collision_plan(item_ids, codes, config)
-        candidates = np.asarray([[5]], dtype=np.int64)
+        candidates = np.asarray([[2]], dtype=np.int64)
         expected = resolve_sid_collisions(plan, candidates)
 
         with (
@@ -288,7 +281,6 @@ class CollisionResolutionTest(unittest.TestCase):
         np.testing.assert_array_equal(result.unresolved_rows, expected.unresolved_rows)
         np.testing.assert_array_equal(result.final_occupied_sid_keys, [])
         np.testing.assert_array_equal(result.final_bucket_counts, [])
-        self.assertFalse(result.slots_match_final_sid_keys)
         self.assertFalse(result.grouping_collected)
         self.assertEqual(result.stats, expected.stats)
 

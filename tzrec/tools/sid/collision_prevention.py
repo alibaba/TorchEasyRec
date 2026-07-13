@@ -27,7 +27,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from contextlib import closing
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -35,8 +37,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 # Register the local reader/writer classes used through create_reader/writer.
-import tzrec.datasets.csv_dataset  # noqa: F401
 import tzrec.datasets.parquet_dataset  # noqa: F401
+from tzrec.datasets.csv_dataset import CsvWriter
 from tzrec.datasets.dataset import (
     BaseReader,
     BaseWriter,
@@ -60,8 +62,8 @@ from tzrec.utils.logging_util import logger
 
 _CODE_SEP = "|"
 _CAND_SEP = ";"
-_WRITE_CHUNK = 20_000_000
-_CSV_GROUP_WRITE_CHUNK = 1_000_000
+_MAP_WRITE_ROWS = 1_000_000
+_GROUP_WRITE_ITEMS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
 
 
@@ -75,6 +77,28 @@ def _output_path_identity(
     project, table_name, partitions, schema = _parse_table_path(path)
     partition_spec = partitions[0] if partitions and partitions[0] else None
     return "odps", project, schema, table_name, partition_spec
+
+
+class _ItemIdLookup:
+    """Map streamed item IDs to positions in a fixed requested-ID array."""
+
+    def __init__(self, item_ids: np.ndarray) -> None:
+        self._sorted_to_requested = np.argsort(item_ids, kind="stable")
+        self._sorted_ids = item_ids[self._sorted_to_requested]
+        if self._sorted_ids.size > 1 and np.any(
+            self._sorted_ids[1:] == self._sorted_ids[:-1]
+        ):
+            raise ValueError("overflow item IDs must be unique.")
+
+    def match(self, item_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Return matching source rows and requested-ID positions."""
+        positions = np.searchsorted(self._sorted_ids, item_ids)
+        source_rows = np.flatnonzero(positions < self._sorted_ids.shape[0])
+        if source_rows.size:
+            source_rows = source_rows[
+                self._sorted_ids[positions[source_rows]] == item_ids[source_rows]
+            ]
+        return source_rows, self._sorted_to_requested[positions[source_rows]]
 
 
 @dataclass(frozen=True)
@@ -171,7 +195,7 @@ class CollisionPreventionConfig:
             odps_data_quota_name=args.odps_data_quota_name,
         )
 
-    @property
+    @cached_property
     def resolution_config(self) -> CollisionResolutionConfig:
         """Return the pure-core configuration."""
         return CollisionResolutionConfig(
@@ -387,10 +411,7 @@ class CollisionRunner:
     def _load_candidate_last_codes(self, overflow_item_ids: np.ndarray) -> np.ndarray:
         """Load fixed-width candidates aligned to ``overflow_item_ids``."""
         item_count = overflow_item_ids.shape[0]
-        sorted_to_overflow = np.argsort(overflow_item_ids, kind="stable")
-        sorted_ids = overflow_item_ids[sorted_to_overflow]
-        if item_count > 1 and np.any(sorted_ids[1:] == sorted_ids[:-1]):
-            raise ValueError("overflow item IDs must be unique.")
+        item_id_lookup = _ItemIdLookup(overflow_item_ids)
 
         candidates: Optional[np.ndarray] = None
         seen = np.zeros(item_count, dtype=bool)
@@ -400,17 +421,10 @@ class CollisionRunner:
             if field not in batch:
                 break
             batch_ids = batch[self._config.item_id_field].to_numpy(zero_copy_only=False)
-            positions = np.searchsorted(sorted_ids, batch_ids)
-            in_bounds = positions < item_count
-            source_rows = np.flatnonzero(in_bounds)
-            if source_rows.size:
-                source_rows = source_rows[
-                    sorted_ids[positions[source_rows]] == batch_ids[source_rows]
-                ]
+            source_rows, target_rows = item_id_lookup.match(batch_ids)
             if source_rows.size == 0:
                 continue
 
-            target_rows = sorted_to_overflow[positions[source_rows]]
             if np.any(seen[target_rows]):
                 raise ValueError("candidate input contains duplicate item IDs.")
             selected = pc.take(batch[field], pa.array(source_rows, type=pa.int64()))
@@ -497,11 +511,18 @@ class CollisionRunner:
         if layer_count < 1:
             raise ValueError("SID output must contain at least one layer.")
         if is_csv:
-            columns = [
-                pc.cast(pa.array(codes[:, layer]), pa.string())
-                for layer in range(layer_count)
-            ]
-            return pc.binary_join_element_wise(*columns, _CODE_SEP)
+            values = pc.cast(pa.array(codes.reshape(-1)), pa.string())
+            offsets = pa.array(
+                np.arange(
+                    0,
+                    (row_count + 1) * layer_count,
+                    layer_count,
+                    dtype=np.int64,
+                )
+            )
+            return pc.binary_join(
+                pa.LargeListArray.from_arrays(offsets, values), _CODE_SEP
+            )
         if row_count > _ARROW_LIST_OFFSET_MAX // layer_count:
             raise ValueError("SID output exceeds Arrow list offset capacity.")
         values = pa.array(codes.reshape(-1))
@@ -522,18 +543,19 @@ class CollisionRunner:
         result: CollisionResolutionResult,
     ) -> None:
         """Write the resolved map in chunks without a full final-code copy."""
-        writer = self._make_writer(self._config.output_path)
-        is_csv = writer.__class__.__name__ == "CsvWriter"
-        retained_rows = (
-            np.flatnonzero(result.retained_mask)
-            if result.retained_mask is not None
-            else None
-        )
-        output_count = (
-            retained_rows.shape[0] if retained_rows is not None else item_ids.shape[0]
-        )
-        try:
-            write_chunk = _WRITE_CHUNK
+        with closing(self._make_writer(self._config.output_path)) as writer:
+            is_csv = isinstance(writer, CsvWriter)
+            retained_rows = (
+                np.flatnonzero(result.retained_mask)
+                if result.retained_mask is not None
+                else None
+            )
+            output_count = (
+                retained_rows.shape[0]
+                if retained_rows is not None
+                else item_ids.shape[0]
+            )
+            write_chunk = _MAP_WRITE_ROWS
             if not is_csv:
                 write_chunk = min(
                     write_chunk,
@@ -562,8 +584,6 @@ class CollisionRunner:
                         ),
                     }
                 )
-        finally:
-            writer.close()
 
     def _write_group_outputs(
         self,
@@ -593,26 +613,21 @@ class CollisionRunner:
             original_grouping,
             resolved_last_codes=None,
         )
-        if plan.overflow_rows.size == 0:
-            self._write_sid_groups(
-                resolved_path,
-                item_ids,
-                origin_codes,
-                original_grouping,
-                resolved_last_codes=result.resolved_last_codes,
-            )
+        if plan.overflow_rows.size:
             del original_grouping
+            grouping = build_resolved_item_grouping(plan, result)
+            resolved_last_codes = result.resolved_last_codes
         else:
-            del original_grouping
-            resolved_grouping = build_resolved_item_grouping(plan, result)
-            self._write_sid_groups(
-                resolved_path,
-                item_ids,
-                origin_codes,
-                resolved_grouping,
-                resolved_last_codes=result.resolved_last_codes,
-            )
-            del resolved_grouping
+            grouping = original_grouping
+            resolved_last_codes = None
+        self._write_sid_groups(
+            resolved_path,
+            item_ids,
+            origin_codes,
+            grouping,
+            resolved_last_codes=resolved_last_codes,
+        )
+        del grouping
 
     def _write_sid_groups(
         self,
@@ -647,12 +662,8 @@ class CollisionRunner:
         offsets = grouping.offsets
         if int(offsets[-1]) != grouping.row_order.shape[0]:
             raise RuntimeError("SID group counts do not match grouped row count.")
-        writer = self._make_writer(output_path)
-        is_csv = writer.__class__.__name__ == "CsvWriter"
-        child_chunk = (
-            min(_WRITE_CHUNK, _CSV_GROUP_WRITE_CHUNK) if is_csv else _WRITE_CHUNK
-        )
-        try:
+        with closing(self._make_writer(output_path)) as writer:
+            is_csv = isinstance(writer, CsvWriter)
             max_codebook_rows = (
                 group_count
                 if is_csv
@@ -662,7 +673,7 @@ class CollisionRunner:
                 raise ValueError("one SID row exceeds Arrow list offset capacity.")
             group_start = 0
             while group_start < group_count:
-                child_limit = int(offsets[group_start]) + child_chunk
+                child_limit = int(offsets[group_start]) + _GROUP_WRITE_ITEMS
                 group_end = int(np.searchsorted(offsets, child_limit, side="right") - 1)
                 group_end = max(group_end, group_start + 1)
                 group_end = min(group_end, group_start + max_codebook_rows)
@@ -687,24 +698,19 @@ class CollisionRunner:
                     }
                 )
                 group_start = group_end
-        finally:
-            writer.close()
 
     def _write_diagnostics(self, stats: CollisionResolutionStats) -> None:
         """Write legacy-compatible diagnostic column names."""
         path = self._config.diagnostics_output_path
         if path is None:
             return
-        writer = self._make_writer(path)
-        try:
+        with closing(self._make_writer(path)) as writer:
             writer.write(
                 {
                     name: pa.array([value], type=pa.int64())
                     for name, value in stats.to_output_dict().items()
                 }
             )
-        finally:
-            writer.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

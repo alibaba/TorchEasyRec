@@ -19,6 +19,7 @@ from argparse import Namespace
 from collections import Counter
 from unittest import mock
 
+import numpy as np
 import pyarrow as pa
 from pyarrow import csv, parquet
 
@@ -376,6 +377,13 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
     # ---- CSV backend ----
 
+    def test_csv_code_encoder_joins_all_layers(self) -> None:
+        codes = np.asarray([[1, -2, 3], [4, 5, 6]], dtype=np.int64)
+
+        encoded = CollisionRunner._codes_column(codes, is_csv=True)
+
+        self.assertEqual(encoded.to_pylist(), ["1|-2|3", "4|5|6"])
+
     def test_csv_backend_within_band(self) -> None:
         inp = os.path.join(self.test_dir, "in.csv")
         out = os.path.join(self.test_dir, "out")
@@ -633,12 +641,36 @@ class SidCollisionPreventionTest(unittest.TestCase):
             self.assertEqual(_type_pa_to_table(columns["itemids"].type), "ARRAY<INT>")
         self.assertEqual(_type_pa_to_table(pa.list_(pa.string())), "ARRAY<STRING>")
 
+    def test_writer_closes_when_write_fails(self) -> None:
+        class FailingWriter:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def write(self, output_dict) -> None:
+                raise RuntimeError("write failed")
+
+            def close(self) -> None:
+                self.closed = True
+
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, [0], [[0, 0]])
+        writer = FailingWriter()
+
+        with (
+            mock.patch.object(CollisionRunner, "_make_writer", return_value=writer),
+            self.assertRaisesRegex(RuntimeError, "write failed"),
+        ):
+            self._run(inp, out, max_items_per_codebook=1)
+
+        self.assertTrue(writer.closed)
+
     def test_group_writer_chunks_by_item_count_without_splitting_groups(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, list(range(4)), [[0, 0], [0, 0], [0, 0], [0, 1]])
 
-        with mock.patch("tzrec.tools.sid.collision_prevention._WRITE_CHUNK", 2):
+        with mock.patch("tzrec.tools.sid.collision_prevention._GROUP_WRITE_ITEMS", 2):
             self._run(inp, out, max_items_per_codebook=3)
 
         original_path, _ = self._group_paths(out)
@@ -646,6 +678,17 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self.assertEqual(parquet.ParquetFile(output_file).metadata.num_row_groups, 2)
         groups = parquet.read_table(output_file).to_pydict()
         self.assertEqual([len(group) for group in groups["itemids"]], [3, 1])
+
+    def test_map_writer_chunks_by_row_count(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, list(range(5)), [[0, code] for code in range(5)])
+
+        with mock.patch("tzrec.tools.sid.collision_prevention._MAP_WRITE_ROWS", 2):
+            self._run(inp, out, max_items_per_codebook=1)
+
+        output_file = os.path.join(out, "part-0.parquet")
+        self.assertEqual(parquet.ParquetFile(output_file).metadata.num_row_groups, 3)
 
     def test_writers_bound_codebook_list_offsets(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -656,7 +699,8 @@ class SidCollisionPreventionTest(unittest.TestCase):
             mock.patch(
                 "tzrec.tools.sid.collision_prevention._ARROW_LIST_OFFSET_MAX", 4
             ),
-            mock.patch("tzrec.tools.sid.collision_prevention._WRITE_CHUNK", 100),
+            mock.patch("tzrec.tools.sid.collision_prevention._MAP_WRITE_ROWS", 100),
+            mock.patch("tzrec.tools.sid.collision_prevention._GROUP_WRITE_ITEMS", 100),
         ):
             self._run(inp, out, max_items_per_codebook=1)
 
