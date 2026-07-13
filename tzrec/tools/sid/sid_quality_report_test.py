@@ -164,7 +164,7 @@ class SidQualityReportTest(unittest.TestCase):
         self.assertEqual(summary["total"], 8)
         self.assertEqual(summary["unique_sid"], 5)
         self.assertAlmostEqual(summary["no_collision_rate"], 0.625)
-        self.assertAlmostEqual(summary["collision_free_item_rate"], 0.375)
+        self.assertAlmostEqual(summary["uniquely_identified_item_rate"], 0.375)
         self.assertEqual(summary["max_collision"], 3)
         self.assertAlmostEqual(summary["gini"], 0.25)
         self.assertAlmostEqual(summary["entropy"], 1.4941751382893085)

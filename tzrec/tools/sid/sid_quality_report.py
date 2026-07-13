@@ -16,7 +16,7 @@ for a SID model (``codes`` is a ``list<int>`` of length ``n_layers``) and report
 over all items:
 
 - ``no_collision_rate`` = distinct SID tuples / total items (1.0 == collision-free);
-- ``collision_free_item_rate`` = items whose SID is unique / total items;
+- ``uniquely_identified_item_rate`` = items whose SID is unique / total items;
 - ``max_collision`` = size of the most-collided SID bucket;
 - ``gini`` / ``entropy`` / ``max_entropy`` / ``entropy_ratio`` of the
   SID-frequency distribution;
@@ -373,7 +373,7 @@ if __name__ == "__main__":
             ("total", total),
             ("unique_sid", unique),
             ("no_collision_rate", unique / total),
-            ("collision_free_item_rate", int((counts == 1).sum()) / total),
+            ("uniquely_identified_item_rate", int((counts == 1).sum()) / total),
             ("max_collision", int(counts.max())),
             ("gini", compute_gini(counts)),
             ("entropy", entropy),
