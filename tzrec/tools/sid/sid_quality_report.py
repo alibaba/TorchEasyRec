@@ -56,6 +56,11 @@ _INT64_MIN = int(np.iinfo(np.int64).min)
 def compute_gini(counts: npt.ArrayLike) -> float:
     """Gini coefficient of a frequency distribution.
 
+    Measures inequality among *occupied* SID buckets only (``counts`` holds one
+    entry per distinct SID), not codebook utilization: an all-collapsed single
+    bucket and a perfectly even distribution both score 0, told apart instead by
+    ``no_collision_rate`` / ``max_collision``.
+
     Args:
         counts (array-like): per-SID occurrence counts.
 
@@ -170,8 +175,18 @@ def build_arr(codes: pa.Array, n_layers: int) -> Tuple[np.ndarray, int]:
 
     Returns:
         tuple: the ``(n_valid, n_layers)`` int matrix and the number of dropped rows.
+
+    Raises:
+        ValueError: if a list ``codes`` column has a non-integer element type
+            (e.g. ``list<float>``), which would otherwise crash on the fast path or
+            be silently truncated on the fallback.
     """
     if pa.types.is_list(codes.type) or pa.types.is_large_list(codes.type):
+        if not pa.types.is_integer(codes.type.value_type):
+            raise ValueError(
+                f"codes column has non-integer element type "
+                f"{codes.type.value_type}; SID codes must be integers."
+            )
         widths = np.diff(codes.offsets.to_numpy())
         flat = codes.flatten()
         if (
@@ -179,7 +194,8 @@ def build_arr(codes: pa.Array, n_layers: int) -> Tuple[np.ndarray, int]:
             and flat.null_count == 0
             and bool((widths == n_layers).all())
         ):
-            return flat.to_numpy(zero_copy_only=False).reshape(-1, n_layers), 0
+            arr = flat.to_numpy(zero_copy_only=False).reshape(-1, n_layers)
+            return arr.astype(np.int64, copy=False), 0
     rows = parse_codes(codes)
     valid = [r for r in rows if len(r) == n_layers and None not in r]
     arr = (
@@ -215,6 +231,21 @@ def _parse_codebook(value: str) -> List[int]:
     return sizes
 
 
+def _positive_int(value: str) -> int:
+    """Parse a strictly-positive integer CLI argument.
+
+    Args:
+        value (str): the raw argument value.
+
+    Returns:
+        int: the parsed value, guaranteed ``> 0``.
+    """
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive int, got {value!r}")
+    return ivalue
+
+
 def run_report(
     batches: Iterable[Dict[str, pa.Array]],
     codes_field: str,
@@ -246,7 +277,8 @@ def run_report(
         ``log_top_sids`` is set).
 
     Raises:
-        ValueError: if the codebook capacity overflows int64, or no valid rows read.
+        ValueError: if the codebook capacity overflows int64, ``log_top_sids`` is
+            non-positive, or no valid rows are read.
     """
     n_layers = len(codebook)
     capacity = math.prod(codebook)
@@ -255,6 +287,8 @@ def run_report(
             f"codebook capacity (product = {capacity}) exceeds int64; "
             "collision analysis is not supported at that scale."
         )
+    if log_top_sids is not None and log_top_sids <= 0:
+        raise ValueError(f"log_top_sids must be positive, got {log_top_sids}.")
     # Mixed-radix id = sum_l code_l * radix_l bijects tuples onto [0, capacity),
     # so collision counting is a single np.unique over int64 ids.
     radix = np.array(
@@ -400,10 +434,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--log_top_sids",
-        type=int,
+        type=_positive_int,
         default=None,
-        help="if set to N, log the N most-frequent (most-collided) SIDs; "
-        "off by default.",
+        help="if set to a positive N, log the N most-frequent (most-collided) "
+        "SIDs; off by default.",
     )
     parser.add_argument(
         "--batch_size",

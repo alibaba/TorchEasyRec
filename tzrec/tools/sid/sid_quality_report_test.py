@@ -171,6 +171,12 @@ class SidQualityReportTest(unittest.TestCase):
         self.assertEqual(dropped, 1)
         self.assertTrue(np.array_equal(arr, np.array([[1, 2, 3]])))
 
+    def test_build_arr_rejects_non_integer_element_type(self):
+        # a float (or otherwise non-integer) codes column is rejected outright, not
+        # silently truncated on the fallback or crashed on in bincount.
+        with self.assertRaisesRegex(ValueError, "non-integer"):
+            sqr.build_arr(pa.array([[1.0, 2.0, 3.0]], type=pa.list_(pa.float64())), 3)
+
     def test_update_layer_hist(self):
         arr = np.array([[0, 1], [0, 1], [1, 0]], dtype=np.int64)
         hist = sqr.update_layer_hist(None, arr, [2, 2])
@@ -188,6 +194,13 @@ class SidQualityReportTest(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             sqr._parse_codebook("0,16")
 
+    def test_positive_int(self):
+        self.assertEqual(sqr._positive_int("5"), 5)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            sqr._positive_int("0")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            sqr._positive_int("-3")
+
     def test_run_report_asymmetric(self):
         # asymmetric codebook: validates radix ordering, per-layer indexing, decode.
         summary, layer_stats, top_sids = _run(
@@ -196,6 +209,19 @@ class SidQualityReportTest(unittest.TestCase):
         self._assert_asym_summary(summary)
         self._assert_asym_layers(layer_stats)
         self.assertEqual(top_sids, _ASYM_TOP_SIDS)
+
+    def test_run_report_aggregates_across_batches(self):
+        # the tool's defining behavior is GLOBAL: a SID split across two separate
+        # batches must count as one bucket, and layer histograms must accumulate.
+        b1 = {"codes": pa.array([[1, 1, 1], [2, 2, 2]], type=pa.list_(pa.int64()))}
+        b2 = {"codes": pa.array([[1, 1, 1], [3, 3, 3]], type=pa.list_(pa.int64()))}
+        summary, layer_stats, _ = sqr.run_report([b1, b2], "codes", [4, 4, 4])
+        self.assertEqual(summary["total"], 4)
+        self.assertEqual(summary["unique_sid"], 3)
+        self.assertEqual(summary["max_collision"], 2)  # (1,1,1) spans both batches
+        # each layer saw codes {1: x2, 2: x1, 3: x1} -> 3 of 4 used, accumulated.
+        self.assertEqual(layer_stats["coverage"], [0.75, 0.75, 0.75])
+        self.assertEqual(layer_stats["dead_codes"], [1, 1, 1])
 
     def test_run_report_mixed_radix_is_bijective(self):
         # distinct tuples a degenerate radix (plain sum) would merge -- (0,0,1),
@@ -237,6 +263,13 @@ class SidQualityReportTest(unittest.TestCase):
         # pass a valid row so ONLY the capacity guard (not "no valid rows") can raise.
         with self.assertRaisesRegex(ValueError, "exceeds int64"):
             _run([[0, 0]], [3037000500, 3037000500])
+
+    def test_run_report_rejects_nonpositive_top_sids(self):
+        # negative N is truthy and would slice [:-1], dumping almost every SID;
+        # 0 is redundant with None. Both are rejected.
+        for n in (-1, 0):
+            with self.assertRaisesRegex(ValueError, "positive"):
+                _run([[0, 0, 0]], [4, 4, 4], log_top_sids=n)
 
     def test_run_report_no_valid_rows_raises(self):
         # match the message so the explicit guard, not numpy's concat error, is pinned.
