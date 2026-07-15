@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
 from functools import partial
 from unittest import mock
@@ -32,38 +33,50 @@ class InitUtilTest(unittest.TestCase):
         self.assertIs(init_fn.func, nn.init.uniform_)
         self.assertEqual(init_fn.keywords, {"a": -0.01, "b": 0.01})
 
-    def test_trunc_normal_dispatches_on_numel(self):
-        with mock.patch.object(
-            init_util, "_inplace_trunc_normal_", wraps=init_util._inplace_trunc_normal_
-        ) as mock_inplace:
-            with mock.patch.object(init_util, "_INPLACE_NUMEL_THRESHOLD", 1023):
-                init_util.trunc_normal_(torch.empty(1023), std=0.1)
-                mock_inplace.assert_not_called()
+    def test_trunc_normal_default_native(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("USE_INPLACE_TRUNC_NORMAL", None)
+            with mock.patch.object(
+                nn.init, "trunc_normal_", wraps=nn.init.trunc_normal_
+            ) as mock_native:
+                t = torch.empty(1024)
+                init_util.trunc_normal_(t, mean=0.5, std=0.1, a=-1.0, b=1.0)
+                mock_native.assert_called_once_with(
+                    t, 0.5, 0.1, -1.0, 1.0, generator=None
+                )
+
+    def test_trunc_normal_env_inplace(self):
+        with mock.patch.dict(os.environ, {"USE_INPLACE_TRUNC_NORMAL": "1"}):
+            with mock.patch.object(
+                init_util,
+                "_inplace_trunc_normal_",
+                wraps=init_util._inplace_trunc_normal_,
+            ) as mock_inplace:
                 t = torch.empty(1024)
                 init_util.trunc_normal_(t, mean=0.5, std=0.1, a=-1.0, b=1.0)
                 mock_inplace.assert_called_once_with(
                     t, 0.5, 0.1, -1.0, 1.0, generator=None
                 )
 
-    def test_trunc_normal_large_statistics(self):
+    def test_trunc_normal_inplace_statistics(self):
         t = torch.empty(1000, 1000)
-        with mock.patch.object(init_util, "_INPLACE_NUMEL_THRESHOLD", 0):
-            init_util.trunc_normal_(t, mean=0.0, std=0.0125)
-        self.assertAlmostEqual(t.mean().item(), 0.0, delta=1e-4)
+        with mock.patch.dict(os.environ, {"USE_INPLACE_TRUNC_NORMAL": "1"}):
+            init_util.trunc_normal_(t, mean=0.5, std=0.0125)
+        self.assertAlmostEqual(t.mean().item(), 0.5, delta=1e-4)
         self.assertAlmostEqual(t.std().item(), 0.0125, delta=1e-4)
         self.assertGreaterEqual(t.min().item(), -2.0)
         self.assertLessEqual(t.max().item(), 2.0)
 
-    def test_trunc_normal_large_truncates(self):
+    def test_trunc_normal_inplace_truncates(self):
         t = torch.empty(1000, 1000)
-        with mock.patch.object(init_util, "_INPLACE_NUMEL_THRESHOLD", 0):
+        with mock.patch.dict(os.environ, {"USE_INPLACE_TRUNC_NORMAL": "1"}):
             init_util.trunc_normal_(t, mean=0.0, std=1.0, a=-1.0, b=1.0)
         self.assertGreaterEqual(t.min().item(), -1.0)
         self.assertLessEqual(t.max().item(), 1.0)
         self.assertLess(t.std().item(), 0.6)
 
-    def test_trunc_normal_large_reproducible(self):
-        with mock.patch.object(init_util, "_INPLACE_NUMEL_THRESHOLD", 0):
+    def test_trunc_normal_inplace_reproducible(self):
+        with mock.patch.dict(os.environ, {"USE_INPLACE_TRUNC_NORMAL": "1"}):
             t1 = init_util.trunc_normal_(
                 torch.empty(1000),
                 std=0.1,
