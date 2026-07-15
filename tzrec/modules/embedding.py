@@ -11,7 +11,6 @@
 
 import os
 from collections import OrderedDict, defaultdict
-from functools import partial  # NOQA
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
@@ -42,6 +41,7 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
+from tzrec.utils import init_util
 from tzrec.utils.fx_util import (
     fx_int_item,
     fx_mark_keyed_tensor,
@@ -725,7 +725,9 @@ class EmbeddingGroupImpl(nn.Module):
                             wide_embedding_dim or 4
                         )
                         if wide_init_fn:
-                            emb_bag_config.init_fn = eval(f"partial({wide_init_fn})")
+                            emb_bag_config.init_fn = init_util.create_init_fn(
+                                wide_init_fn
+                            )
                     # we may modify ebc name at feat_to_group_to_emb_name, e.g., wide
                     emb_bag_config.name = feat_to_group_to_emb_name[name][group_name]
                     const = feature.parameter_constraints(emb_bag_config)

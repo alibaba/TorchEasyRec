@@ -100,6 +100,7 @@ class IdFeatureTest(unittest.TestCase):
         [
             ["lambda x: probabilistic_threshold_filter(x,0.05)"],
             ["lambda x: (x > 10, 10)"],
+            ["partial(dynamic_threshold_filter, threshold_skew_multiplier=1.0)"],
         ],
         name_func=test_util.parameterized_name_func,
     )
