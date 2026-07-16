@@ -81,11 +81,10 @@ def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
 def clear_triton_caches(autotuner: object) -> None:
     """Drop both the autotuner config cache and the JITFunction kernel cache.
 
-    Required when flipping a Triton cache-invalidating env var (e.g.
-    ``DISABLE_MMA_V3``) mid-process. The Python in-memory ``kernel_cache`` is
-    keyed by ``(specialization, options)`` only -- env vars do not participate
-    -- so without this clear a previously-cached cubin compiled under a
-    different env state would be silently reused.
+    General utility to force a fresh Triton compile mid-process. The Python
+    in-memory ``kernel_cache`` is keyed by ``(specialization, options)`` only,
+    so a change that affects codegen without touching those keys (e.g. a
+    cache-invalidating env var) would otherwise silently reuse a stale cubin.
     """
     cache = getattr(autotuner, "cache", None)
     if cache is not None:

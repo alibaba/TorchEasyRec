@@ -8,9 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
 import gc
-import os
 import random
 import unittest
 from typing import Optional
@@ -22,7 +20,6 @@ from hypothesis import strategies as st
 from tzrec.ops import (
     Kernel,
 )
-from tzrec.ops.utils import clear_triton_caches
 from tzrec.utils.test_util import (
     cutlass_hstu_unavailable,
     generate_sparse_seq_len,
@@ -32,51 +29,6 @@ from tzrec.utils.test_util import (
     mark_ci_scope,
 )
 from tzrec.utils.test_util import hypothesis_settings as settings
-
-_DISABLE_V3_CACHE_SUFFIX = "_disable_v3"
-
-
-@contextlib.contextmanager
-def _force_mma_v2():  # pyre-ignore[3]
-    """Disable Triton MMA v3 (Hopper WGMMA) for the wrapped test body.
-
-    Workaround for a Triton 3.6 sm_90 WGMMA shmem-OOB bug that surfaces in
-    test_attn_triton_long_seqs and test_cache (compute-sanitizer reports
-    invalid __shared__ reads at ~246 KiB, exceeding H20's 228 KiB shmem
-    limit, inside _hstu_attn_bwd_one_block:816 and _hstu_attn_fwd_one_block:337
-    respectively). Forcing v2 routes through the same MMA path A10 uses,
-    which we have direct evidence works on every config x shape combo.
-
-    The TRITON_CACHE_DIR is suffixed with ``_disable_v3`` so the v2 cubins
-    live in their own on-disk cache and persist across CI runs (no per-run
-    recompile). The autotuner config cache and the JITFunction in-memory
-    kernel cache are cleared on entry and exit so subsequent v3 tests in
-    the same process recompile cleanly.
-
-    Remove once upstream Triton fixes the v3 lowering.
-    """
-    from tzrec.ops._triton import triton_hstu_attention as _t
-
-    saved_disable = os.environ.get("DISABLE_MMA_V3")
-    saved_cache_dir = os.environ.get("TRITON_CACHE_DIR")
-    base_cache = saved_cache_dir or os.path.expanduser("~/.triton/cache")
-    try:
-        os.environ["DISABLE_MMA_V3"] = "1"
-        os.environ["TRITON_CACHE_DIR"] = base_cache + _DISABLE_V3_CACHE_SUFFIX
-        clear_triton_caches(_t._hstu_attn_fwd)
-        clear_triton_caches(_t._hstu_attn_bwd)
-        yield
-    finally:
-        if saved_disable is None:
-            os.environ.pop("DISABLE_MMA_V3", None)
-        else:
-            os.environ["DISABLE_MMA_V3"] = saved_disable
-        if saved_cache_dir is None:
-            os.environ.pop("TRITON_CACHE_DIR", None)
-        else:
-            os.environ["TRITON_CACHE_DIR"] = saved_cache_dir
-        clear_triton_caches(_t._hstu_attn_fwd)
-        clear_triton_caches(_t._hstu_attn_bwd)
 
 
 def test_attn(
@@ -370,16 +322,15 @@ class HSTUAttentionTest(unittest.TestCase):
     )
     # pyre-ignore[2]
     def test_attn_triton_long_seqs(self, *args, **kwargs) -> None:
-        with _force_mma_v2():
-            test_attn(
-                *args,
-                **kwargs,
-                test_backward=True,
-                ref_kernel=Kernel.TRITON,
-                real_kernel=Kernel.TRITON,
-                skip_comparisons=True,
-                sparsity=1.0,
-            )
+        test_attn(
+            *args,
+            **kwargs,
+            test_backward=True,
+            ref_kernel=Kernel.TRITON,
+            real_kernel=Kernel.TRITON,
+            skip_comparisons=True,
+            sparsity=1.0,
+        )
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
@@ -447,102 +398,101 @@ class HSTUAttentionTest(unittest.TestCase):
         contextual_seq_len: int,
         enable_tma: bool,
     ) -> None:
-        with _force_mma_v2():
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            from tzrec.ops.hstu_attention import delta_hstu_mha, hstu_mha
-            from tzrec.ops.jagged_tensors import split_2D_jagged
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        from tzrec.ops.hstu_attention import delta_hstu_mha, hstu_mha
+        from tzrec.ops.jagged_tensors import split_2D_jagged
 
-            alpha = 1.0 / (attn_dim**0.5)
-            lengths = torch.randint(
-                max_uih_len + 1, size=(batch_size,), device=torch.device("cuda")
-            )
-            num_targets = torch.randint(
-                1, delta_size + 1, size=(batch_size,), device=torch.device("cuda")
-            )
-            lengths = lengths + delta_size + contextual_seq_len
-            max_seq_len = max_uih_len + delta_size + contextual_seq_len
-            if has_max_attn_len:
-                max_attn_len = random.randint(1, max_uih_len // 5)
-            else:
-                max_attn_len = 0
-            seq_offsets = torch.zeros(
-                (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
-            )
-            seq_offsets[1:] = torch.cumsum(lengths, dim=0)
+        alpha = 1.0 / (attn_dim**0.5)
+        lengths = torch.randint(
+            max_uih_len + 1, size=(batch_size,), device=torch.device("cuda")
+        )
+        num_targets = torch.randint(
+            1, delta_size + 1, size=(batch_size,), device=torch.device("cuda")
+        )
+        lengths = lengths + delta_size + contextual_seq_len
+        max_seq_len = max_uih_len + delta_size + contextual_seq_len
+        if has_max_attn_len:
+            max_attn_len = random.randint(1, max_uih_len // 5)
+        else:
+            max_attn_len = 0
+        seq_offsets = torch.zeros(
+            (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
+        )
+        seq_offsets[1:] = torch.cumsum(lengths, dim=0)
 
-            L = int(seq_offsets[-1].item())
-            q = torch.empty(
-                (L, heads, attn_dim),
-                dtype=dtype,
-                device=torch.device("cuda"),
-            ).uniform_(-0.1, 0.1)
-            _, delta_q = split_2D_jagged(
-                max_seq_len=max_seq_len,
-                values=q.view(-1, heads * attn_dim),
-                max_len_left=None,
-                max_len_right=delta_size,
-                offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
-                    lengths - delta_size
-                ),
-                offsets_right=None,
-                kernel=Kernel.TRITON,
-            )
-            delta_q = delta_q.view(-1, heads, attn_dim)
-            k = torch.empty(
-                (L, heads, attn_dim), dtype=dtype, device=torch.device("cuda")
-            ).uniform_(-0.1, 0.1)
-            v = torch.empty(
-                (L, heads, hidden_dim), dtype=dtype, device=torch.device("cuda")
-            ).uniform_(-0.1, 0.1)
-            prime_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+        L = int(seq_offsets[-1].item())
+        q = torch.empty(
+            (L, heads, attn_dim),
+            dtype=dtype,
+            device=torch.device("cuda"),
+        ).uniform_(-0.1, 0.1)
+        _, delta_q = split_2D_jagged(
+            max_seq_len=max_seq_len,
+            values=q.view(-1, heads * attn_dim),
+            max_len_left=None,
+            max_len_right=delta_size,
+            offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
                 lengths - delta_size
-            )
+            ),
+            offsets_right=None,
+            kernel=Kernel.TRITON,
+        )
+        delta_q = delta_q.view(-1, heads, attn_dim)
+        k = torch.empty(
+            (L, heads, attn_dim), dtype=dtype, device=torch.device("cuda")
+        ).uniform_(-0.1, 0.1)
+        v = torch.empty(
+            (L, heads, hidden_dim), dtype=dtype, device=torch.device("cuda")
+        ).uniform_(-0.1, 0.1)
+        prime_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            lengths - delta_size
+        )
 
-            # ref implementation
-            ref_out = hstu_mha(
-                max_seq_len=max_seq_len,
-                alpha=alpha,
-                q=q,
-                k=k,
-                v=v,
-                seq_offsets=seq_offsets,
-                causal=True,
-                num_targets=num_targets if has_multiple_targets else None,
-                dropout_pr=0.0,
-                max_attn_len=max_attn_len,
-                contextual_seq_len=contextual_seq_len,
-                kernel=Kernel.TRITON,
-                enable_tma=enable_tma,
-            )
-            _, delta_out = split_2D_jagged(
-                max_seq_len=max_seq_len,
-                values=ref_out.view(-1, heads * hidden_dim),
-                max_len_left=None,
-                max_len_right=delta_size,
-                offsets_left=prime_offsets,
-                offsets_right=None,
-                kernel=Kernel.TRITON,
-            )
-            delta_out = delta_out.view(-1, heads, hidden_dim)
+        # ref implementation
+        ref_out = hstu_mha(
+            max_seq_len=max_seq_len,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            causal=True,
+            num_targets=num_targets if has_multiple_targets else None,
+            dropout_pr=0.0,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            kernel=Kernel.TRITON,
+            enable_tma=enable_tma,
+        )
+        _, delta_out = split_2D_jagged(
+            max_seq_len=max_seq_len,
+            values=ref_out.view(-1, heads * hidden_dim),
+            max_len_left=None,
+            max_len_right=delta_size,
+            offsets_left=prime_offsets,
+            offsets_right=None,
+            kernel=Kernel.TRITON,
+        )
+        delta_out = delta_out.view(-1, heads, hidden_dim)
 
-            # real implementation
-            real_delta_out = delta_hstu_mha(
-                max_seq_len=max_seq_len,
-                alpha=alpha,
-                delta_q=delta_q,
-                k=k,
-                v=v,
-                seq_offsets=seq_offsets,
-                num_targets=num_targets if has_multiple_targets else None,
-                max_attn_len=max_attn_len,
-                contextual_seq_len=contextual_seq_len,
-                enable_tma=enable_tma,
-            )
-            torch.testing.assert_close(
-                delta_out,
-                real_delta_out,
-            )
+        # real implementation
+        real_delta_out = delta_hstu_mha(
+            max_seq_len=max_seq_len,
+            alpha=alpha,
+            delta_q=delta_q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            num_targets=num_targets if has_multiple_targets else None,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            enable_tma=enable_tma,
+        )
+        torch.testing.assert_close(
+            delta_out,
+            real_delta_out,
+        )
 
     @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
@@ -570,19 +520,17 @@ class HSTUAttentionTest(unittest.TestCase):
         hidden_dim = kwargs.pop("attn_dim")
         # CUTLASS silently falls back to Triton when max_attn_len>0 combines
         # with target/contextual masking (hstu_attention.py
-        # _warn_cutlass_fallback_local_target); _force_mma_v2 sidesteps the
-        # Triton 3.6 sm_90 WGMMA bwd race (FAQ Q15) on those fallback shapes.
-        # No-op for the pure-CUTLASS path (env var only affects Triton).
-        with _force_mma_v2():
-            test_attn(
-                *args,
-                **kwargs,
-                attn_dim=hidden_dim,
-                hidden_dim=hidden_dim,
-                test_backward=True,
-                ref_kernel=Kernel.PYTORCH,
-                real_kernel=Kernel.CUTLASS,
-            )
+        # _warn_cutlass_fallback_local_target), so this also exercises the
+        # Triton path on those fallback shapes.
+        test_attn(
+            *args,
+            **kwargs,
+            attn_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            test_backward=True,
+            ref_kernel=Kernel.PYTORCH,
+            real_kernel=Kernel.CUTLASS,
+        )
 
     # NOTE: no ``test_delta_attn_cutlass`` — ``delta_hstu_mha`` has no
     # CUTLASS implementation and falls back to Triton internally. The
@@ -626,16 +574,15 @@ class HSTUAttentionTest(unittest.TestCase):
         hidden_dim = kwargs.pop("attn_dim")
         # Same WGMMA-bwd workaround as test_attn_cutlass; harmless on the
         # pure-CUTLASS NFUNC path (no Triton kernel runs).
-        with _force_mma_v2():
-            test_sla_attn(
-                *args,
-                **kwargs,
-                attn_dim=hidden_dim,
-                sla_k1=sla_k1,
-                sla_k2=sla_k2,
-                test_backward=True,
-                real_kernel=Kernel.CUTLASS,
-            )
+        test_sla_attn(
+            *args,
+            **kwargs,
+            attn_dim=hidden_dim,
+            sla_k1=sla_k1,
+            sla_k2=sla_k2,
+            test_backward=True,
+            real_kernel=Kernel.CUTLASS,
+        )
 
     def test_sla_matches_fixed_causal_when_k1_spans_full_window(self) -> None:
         """CPU coverage of ``pytorch_hstu_mha(attn_func=...)``.

@@ -17,9 +17,11 @@ from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
+from tzrec.models.model import ScriptWrapper
 from tzrec.models.sid_rqvae import SidRqvae
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2
 from tzrec.protos.models import sid_model_pb2
+from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.state_dict_util import init_parameters
 
 
@@ -99,6 +101,24 @@ def _contrastive_cfg() -> loss_pb2.LossConfig:
 class SidRqvaeTest(unittest.TestCase):
     """Tests for SidRqvae model."""
 
+    def _assert_has_grad(self, model) -> None:
+        self.assertTrue(
+            any(
+                p.grad is not None and p.grad.abs().sum() > 0
+                for p in model.parameters()
+            )
+        )
+
+    def _build_contrastive(self, features, feature_groups, pair_flag_group="pair_flag"):
+        """Construct a SidRqvae with contrastive wiring (raises tests drive this)."""
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.contrastive_config.pair_feature_group = "pair"
+        cfg.contrastive_config.pair_flag_feature_group = pair_flag_group
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
+        )
+        return SidRqvae(model_config=model_config, features=features, labels=[])
+
     def _create_model(
         self,
         use_contrastive=False,
@@ -106,6 +126,7 @@ class SidRqvaeTest(unittest.TestCase):
         embed_dim=8,
         n_layers=2,
         recon="l2",
+        candidate_output=False,
     ):
         """Helper to create a SidRqvae model with config-driven losses."""
         n_embed_list = [16] * n_layers
@@ -120,6 +141,9 @@ class SidRqvaeTest(unittest.TestCase):
             sid_rqvae_cfg.contrastive_config.pair_feature_group = "pair"
             sid_rqvae_cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
             losses.append(_contrastive_cfg())
+        if candidate_output:
+            sid_rqvae_cfg.candidate_output_config.enabled = True
+            sid_rqvae_cfg.candidate_output_config.topk = 3
 
         # Real features + feature_groups: input_dim is derived from the group.
         features, feature_groups = _features_and_groups(input_dim, use_contrastive)
@@ -202,6 +226,66 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertIn("codes", predictions)
         self.assertNotIn("x_hat", predictions)
         self.assertNotIn("latents", predictions)
+        self.assertNotIn("candidate_codes", predictions)
+
+    def test_rqvae_export_trace_keeps_candidate_output(self) -> None:
+        """Export wrapper traces candidate outputs after inference is set."""
+        B, input_dim = 4, 32
+        model = self._create_model(input_dim=input_dim, candidate_output=True)
+        model.eval()
+        model.set_is_inference(True)
+
+        wrapper = ScriptWrapper(model).eval()
+        data = {"item_emb.values": torch.randn(B, input_dim)}
+
+        predictions = wrapper(data)
+        traced = symbolic_trace(wrapper)
+        traced_predictions = traced(data)
+
+        self.assertEqual(
+            set(predictions.keys()),
+            {"codes", "candidate_codes", "candidate_scores"},
+        )
+        self.assertEqual(set(traced_predictions.keys()), set(predictions.keys()))
+        self.assertEqual(traced_predictions["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(traced_predictions["candidate_scores"].shape, (B, 3))
+        torch.testing.assert_close(
+            traced_predictions["candidate_codes"][:, 0, :],
+            traced_predictions["codes"],
+        )
+
+    def test_rqvae_candidate_scores_sorted(self) -> None:
+        """Candidate scores come back sorted best-first, minimum at slot 0."""
+        B, input_dim = 4, 32
+        model = self._create_model(
+            input_dim=input_dim,
+            candidate_output=True,
+        )
+        model.eval()
+        model.set_is_inference(True)
+
+        preds = model.predict(_make_batch(B, input_dim))
+        self.assertEqual(
+            set(preds.keys()), {"codes", "candidate_codes", "candidate_scores"}
+        )
+        self.assertEqual(preds["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(preds["candidate_scores"].shape, (B, 3))
+        scores = preds["candidate_scores"]
+        # Slot 0 is the best-scored (nearest) neighbor: minimum score, sorted.
+        self.assertTrue(bool(torch.all(scores[:, 0] == scores.min(dim=1).values)))
+        self.assertTrue(bool(torch.all(scores[:, :-1] <= scores[:, 1:])))
+
+    def test_candidate_output_topk_exceeds_codebook_raises(self) -> None:
+        """Reject topk above the last-layer codebook size at construction."""
+        features, feature_groups = _features_and_groups(32)
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.candidate_output_config.enabled = True
+        cfg.candidate_output_config.topk = 17
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg
+        )
+        with self.assertRaisesRegex(ValueError, "topk must be in"):
+            SidRqvae(model_config=model_config, features=features, labels=[])
 
     def test_rqvae_contrastive_mode(self) -> None:
         """Test SidRqvae with the mixed recon + contrastive path."""
@@ -228,10 +312,7 @@ class SidRqvaeTest(unittest.TestCase):
         total_loss = sum(losses.values())
         self.assertTrue(total_loss.requires_grad)
         total_loss.backward()
-        has_grad = any(
-            p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()
-        )
-        self.assertTrue(has_grad)
+        self._assert_has_grad(model)
 
     def test_rqvae_contrastive_all_recon(self) -> None:
         """Mixed mode, all-recon batch: contrastive term 0, recon term > 0."""
@@ -268,10 +349,7 @@ class SidRqvaeTest(unittest.TestCase):
         losses = model.loss(model.predict(batch), batch)
         sum(losses.values()).backward()
 
-        has_grad = any(
-            p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()
-        )
-        self.assertTrue(has_grad)
+        self._assert_has_grad(model)
 
     def test_commitment_latent_weight_wrong_length_raises(self) -> None:
         """A commitment_loss with a bad latent_weight length fails in init_loss."""
@@ -299,40 +377,24 @@ class SidRqvaeTest(unittest.TestCase):
         features, feature_groups = _features_and_groups(
             32, use_contrastive=True, pair_emb_dim=16
         )
-        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.contrastive_config.pair_feature_group = "pair"
-        cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
-        model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
-        )
         with self.assertRaisesRegex(ValueError, "must match"):
-            SidRqvae(model_config=model_config, features=features, labels=[])
+            self._build_contrastive(features, feature_groups)
 
     def test_pair_flag_group_must_be_dim_1(self) -> None:
         """A pair-flag group with dim != 1 fails fast (would mis-route rows)."""
         features, feature_groups = _features_and_groups(
             32, use_contrastive=True, flag_dim=3
         )
-        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.contrastive_config.pair_feature_group = "pair"
-        cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
-        model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
-        )
         with self.assertRaisesRegex(ValueError, "dim-1 raw flag"):
-            SidRqvae(model_config=model_config, features=features, labels=[])
+            self._build_contrastive(features, feature_groups)
 
     def test_contrastive_group_missing_raises(self) -> None:
         """A typo'd contrastive group name fails fast at init, not on forward."""
         features, feature_groups = _features_and_groups(32, use_contrastive=True)
-        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
-        cfg.contrastive_config.pair_feature_group = "pair"
-        cfg.contrastive_config.pair_flag_feature_group = "pair_flagTYPO"
-        model_config = model_pb2.ModelConfig(
-            feature_groups=feature_groups, sid_rqvae=cfg, losses=[_contrastive_cfg()]
-        )
         with self.assertRaisesRegex(ValueError, "not in model_config.feature_groups"):
-            SidRqvae(model_config=model_config, features=features, labels=[])
+            self._build_contrastive(
+                features, feature_groups, pair_flag_group="pair_flagTYPO"
+            )
 
     def test_eval_metric_masks_contrastive_pair_rows(self) -> None:
         """Contrastive eval mse/rel_loss score only the non-pair (recon) rows.

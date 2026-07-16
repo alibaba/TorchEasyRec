@@ -3,6 +3,9 @@ allowed-tools: Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)
 description: Review a pull request
 ---
 
+Fetch the PR context with `gh pr view` and the changes with `gh pr diff`.
+Review statically — do not run tests or builds.
+
 Perform a comprehensive code review using subagents for key areas:
 
 - code-quality-reviewer
@@ -14,7 +17,7 @@ Perform a comprehensive code review using subagents for key areas:
 Instruct each to only provide noteworthy feedback. Once they finish, review
 the feedback and post only the feedback that you also deem noteworthy.
 
-Use `mcp__github_inline_comment__create_inline_comment` for inline comments on specific lines.
+Use the `create_inline_comment` tool of the `github_inline_comment` MCP server for inline comments on specific lines.
 Use top-level comments for general observations or praise.
 Use `gh pr comment` for top-level summary comments.
 Do NOT use `gh api` — it is not available.
