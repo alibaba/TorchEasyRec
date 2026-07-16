@@ -34,8 +34,7 @@ Example::
         --strategy candidate --unassigned_policy keep_original \
         --output_path sid_collision/map \
         --original_sid_groups_output_path sid_collision/original_groups \
-        --resolved_sid_groups_output_path sid_collision/resolved_groups \
-        --diagnostics_output_path sid_collision/diagnostics
+        --resolved_sid_groups_output_path sid_collision/resolved_groups
 """
 
 from __future__ import annotations
@@ -125,7 +124,6 @@ class CollisionPreventionConfig:
     output_path: str
     original_sid_groups_output_path: Optional[str]
     resolved_sid_groups_output_path: Optional[str]
-    diagnostics_output_path: Optional[str]
     reader_type: Optional[str]
     writer_type: Optional[str]
     batch_size: int
@@ -165,7 +163,6 @@ class CollisionPreventionConfig:
             "output_path": self.output_path,
             "original_sid_groups_output_path": self.original_sid_groups_output_path,
             "resolved_sid_groups_output_path": self.resolved_sid_groups_output_path,
-            "diagnostics_output_path": self.diagnostics_output_path,
         }
         seen_paths: Dict[_PathIdentity, str] = {}
         for name, path in named_paths.items():
@@ -193,7 +190,6 @@ class CollisionPreventionConfig:
             resolved_sid_groups_output_path=getattr(
                 args, "resolved_sid_groups_output_path", None
             ),
-            diagnostics_output_path=args.diagnostics_output_path,
             reader_type=args.reader_type,
             writer_type=args.writer_type,
             batch_size=args.batch_size,
@@ -259,8 +255,6 @@ class CollisionRunner:
             self._write_group_outputs(item_ids, codes, plan, result)
             del plan
             self._write_map(item_ids, codes, result)
-        if self._config.diagnostics_output_path:
-            self._write_diagnostics(result.stats)
 
         logger.info("SID collision prevention finished: %s", result.stats)
         return result.stats
@@ -700,19 +694,6 @@ class CollisionRunner:
                 )
                 group_start = group_end
 
-    def _write_diagnostics(self, stats: CollisionResolutionStats) -> None:
-        """Write legacy-compatible diagnostic column names."""
-        path = self._config.diagnostics_output_path
-        if path is None:
-            return
-        with closing(self._make_writer(path)) as writer:
-            writer.write(
-                {
-                    name: pa.array([value], type=pa.int64())
-                    for name, value in stats.to_output_dict().items()
-                }
-            )
-
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the collision-prevention command-line parser."""
@@ -737,7 +718,6 @@ def build_parser() -> argparse.ArgumentParser:
             "unless --rate_only is set."
         ),
     )
-    parser.add_argument("--diagnostics_output_path", default=None)
     parser.add_argument(
         "--reader_type",
         choices=["CsvReader", "ParquetReader", "OdpsReader"],

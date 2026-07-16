@@ -33,7 +33,6 @@ _DEFAULTS = dict(
     output_path=None,
     original_sid_groups_output_path=None,
     resolved_sid_groups_output_path=None,
-    diagnostics_output_path=None,
     reader_type=None,
     writer_type=None,
     batch_size=100000,
@@ -102,8 +101,8 @@ class SidCollisionPreventionTest(unittest.TestCase):
             inp, out, max_items_per_codebook=2, unassigned_policy="keep_original"
         )
         self.assertEqual(stats.total_items, 5)
-        self.assertEqual(stats.reassigned_count, 3)
-        self.assertEqual(stats.unassigned_count, 0)
+        self.assertEqual(stats.relocated_count, 3)
+        self.assertEqual(stats.unresolved_count, 0)
         self.assertEqual(stats.max_final_bucket_size, 2)
         d = self._read_parquet(out)
         # every final SID keeps prefix 0 (stays in band) ...
@@ -128,8 +127,8 @@ class SidCollisionPreventionTest(unittest.TestCase):
         stats = self._run(
             inp, out, max_items_per_codebook=2, unassigned_policy="keep_original"
         )
-        self.assertEqual(stats.reassigned_count, 0)
-        self.assertEqual(stats.unassigned_count, 3)
+        self.assertEqual(stats.relocated_count, 0)
+        self.assertEqual(stats.unresolved_count, 3)
         d = self._read_parquet(out)
         self.assertTrue(all(tuple(cb) == (0, 0) for cb in d["codebook"]))
         _, resolved_path = self._group_paths(out)
@@ -141,27 +140,24 @@ class SidCollisionPreventionTest(unittest.TestCase):
     def test_error_policy_raises_on_overflow(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
-        diagnostics = os.path.join(self.test_dir, "diagnostics")
         _parquet(inp, list(range(5)), [[0, 0]] * 5, [[[0, 0]]] * 5)
         with self.assertRaises(RuntimeError):
             self._run(
                 inp,
                 out,
-                diagnostics_output_path=diagnostics,
                 max_items_per_codebook=2,
             )
         original_path, resolved_path = self._group_paths(out)
         self.assertFalse(os.path.exists(out))
         self.assertFalse(os.path.exists(original_path))
         self.assertFalse(os.path.exists(resolved_path))
-        self.assertFalse(os.path.exists(diagnostics))
 
     def test_drop_policy_excludes_unassigned(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, list(range(5)), [[0, 0]] * 5, [[[0, 0]]] * 5)
         stats = self._run(inp, out, max_items_per_codebook=2, unassigned_policy="drop")
-        self.assertEqual(stats.unassigned_count, 3)
+        self.assertEqual(stats.unresolved_count, 3)
         d = self._read_parquet(out)
         self.assertEqual(len(d["item_id"]), 2)
         original_path, resolved_path = self._group_paths(out)
@@ -184,7 +180,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, [0, 1, 2], [[0, 0], [0, 1], [0, 2]])
         stats = self._run(inp, out, max_items_per_codebook=1)
-        self.assertEqual(stats.reassigned_count, 0)
+        self.assertEqual(stats.relocated_count, 0)
         self.assertEqual(len(self._read_parquet(out)["item_id"]), 3)
 
     def test_candidates_align_across_batches(self) -> None:
@@ -296,7 +292,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
             strategy="random",
             unassigned_policy="keep_original",
         )
-        self.assertEqual(stats.reassigned_count, 3)
+        self.assertEqual(stats.relocated_count, 3)
         d = self._read_parquet(out)
         self.assertTrue(all(cb[0] == 0 for cb in d["codebook"]))
         self.assertLessEqual(max(Counter(map(tuple, d["codebook"])).values()), 2)
@@ -330,7 +326,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
             codebook="16",
             unassigned_policy="keep_original",
         )
-        self.assertEqual(stats.reassigned_count, 3)
+        self.assertEqual(stats.relocated_count, 3)
         d = self._read_parquet(out)
         self.assertEqual(len({tuple(cb) for cb in d["codebook"]}), 4)
 
@@ -405,7 +401,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
             max_items_per_codebook=2,
             unassigned_policy="keep_original",
         )
-        self.assertEqual(stats.reassigned_count, 3)
+        self.assertEqual(stats.relocated_count, 3)
         result = csv.read_csv(os.path.join(out, "part-0.csv"))
         self.assertEqual(result.schema.field("codebook").type, pa.string())
         self.assertTrue(all(s.startswith("0|") for s in result["codebook"].to_pylist()))
@@ -596,7 +592,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "map")
-        diagnostics = os.path.join(self.test_dir, "diagnostics")
         parquet.write_table(
             pa.table(
                 {
@@ -620,14 +615,13 @@ class SidCollisionPreventionTest(unittest.TestCase):
                 inp,
                 out,
                 writer_type="OdpsWriter",
-                diagnostics_output_path=diagnostics,
                 max_items_per_codebook=1,
             )
 
         original_path, resolved_path = self._group_paths(out)
         self.assertEqual(
             [path for path, _ in created_writers],
-            [original_path, resolved_path, out, diagnostics],
+            [original_path, resolved_path, out],
         )
         self.assertTrue(all(writer.closed for _, writer in created_writers))
         for _, writer in created_writers[:2]:
@@ -728,7 +722,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
                 rate_only=True,
             )
         self.assertFalse(resolve.call_args.kwargs["collect_grouping"])
-        self.assertEqual(stats.reassigned_count, 3)
+        self.assertEqual(stats.relocated_count, 3)
         self.assertFalse(os.path.exists(os.path.join(out, "part-0.parquet")))
         original_path, resolved_path = self._group_paths(out)
         self.assertFalse(os.path.exists(original_path))
@@ -750,42 +744,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
         self.assertEqual(stats.total_items, 2)
         self.assertFalse(os.path.exists(out))
-
-    def test_rate_only_still_writes_diagnostics(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        diag = os.path.join(self.test_dir, "diag")
-        _parquet(inp, list(range(5)), [[0, 0]] * 5, [[[0, 1]]] * 5)
-        self._run(
-            inp,
-            out,
-            diagnostics_output_path=diag,
-            max_items_per_codebook=2,
-            unassigned_policy="keep_original",
-            rate_only=True,
-        )
-        result = parquet.read_table(os.path.join(diag, "part-0.parquet")).to_pydict()
-        self.assertEqual(result["total_items"], [5])
-        self.assertFalse(os.path.exists(os.path.join(out, "part-0.parquet")))
-        original_path, resolved_path = self._group_paths(out)
-        self.assertFalse(os.path.exists(original_path))
-        self.assertFalse(os.path.exists(resolved_path))
-
-    def test_diagnostics_output(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        diag = os.path.join(self.test_dir, "diag")
-        _parquet(inp, list(range(5)), [[0, 0]] * 5, [[[0, 1], [0, 2], [0, 3]]] * 5)
-        self._run(
-            inp,
-            out,
-            max_items_per_codebook=2,
-            unassigned_policy="keep_original",
-            diagnostics_output_path=diag,
-        )
-        d = parquet.read_table(os.path.join(diag, "part-0.parquet")).to_pydict()
-        self.assertEqual(d["total_items"][0], 5)
-        self.assertEqual(d["reassigned_count"][0], 3)
 
     def test_empty_input_raises(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")

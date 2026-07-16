@@ -13,7 +13,7 @@
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Dict, Iterable, Optional
+from typing import Iterable, Optional
 
 import numpy as np
 
@@ -115,27 +115,6 @@ class CollisionResolutionStats:
     relocated_count: int
     unresolved_count: int
     max_final_bucket_size: int
-
-    @property
-    def reassigned_count(self) -> int:
-        """Return the legacy name for ``relocated_count``."""
-        return self.relocated_count
-
-    @property
-    def unassigned_count(self) -> int:
-        """Return the legacy name for ``unresolved_count``."""
-        return self.unresolved_count
-
-    def to_output_dict(self) -> Dict[str, int]:
-        """Return diagnostics using the existing output column names."""
-        return {
-            "total_items": self.total_items,
-            "raw_collision_buckets": self.raw_collision_buckets,
-            "final_collision_buckets": self.final_collision_buckets,
-            "reassigned_count": self.relocated_count,
-            "unassigned_count": self.unresolved_count,
-            "max_final_bucket_size": self.max_final_bucket_size,
-        }
 
 
 @dataclass(frozen=True)
@@ -397,7 +376,7 @@ def resolve_sid_collisions(
             where ``M`` equals the number of overflow rows.
         collect_grouping: Whether to collect final SID keys and bucket counts
             for :func:`build_resolved_item_grouping`. Disable this in
-            diagnostics-only runs to avoid the grouping arrays and sorts.
+            rate-only runs to avoid the grouping arrays and sorts.
 
     Returns:
         Resolved last-layer codes, slot indices, retention mask, unresolved row

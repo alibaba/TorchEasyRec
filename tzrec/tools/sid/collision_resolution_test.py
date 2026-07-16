@@ -73,19 +73,6 @@ class CollisionResolutionTest(unittest.TestCase):
         self.assertEqual(result.stats.relocated_count, 3)
         self.assertEqual(result.stats.unresolved_count, 0)
         self.assertEqual(result.stats.max_final_bucket_size, 2)
-        self.assertEqual(result.stats.reassigned_count, 3)
-        self.assertEqual(result.stats.unassigned_count, 0)
-        self.assertEqual(
-            result.stats.to_output_dict(),
-            {
-                "total_items": 10,
-                "raw_collision_buckets": 2,
-                "final_collision_buckets": 0,
-                "reassigned_count": 3,
-                "unassigned_count": 0,
-                "max_final_bucket_size": 2,
-            },
-        )
 
         with mock.patch.object(collision_resolution, "_GROUPING_ROW_CHUNK", 2):
             original_grouping = build_original_item_grouping(plan)
