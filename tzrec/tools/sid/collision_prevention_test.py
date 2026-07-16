@@ -40,7 +40,6 @@ _DEFAULTS = dict(
     code_field="codes",
     candidate_codes_field="candidate_codes",
     max_items_per_codebook=2,
-    unassigned_policy="error",
     strategy="candidate",
     codebook="8,8",
     random_num_candidates=64,
@@ -97,9 +96,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         out = os.path.join(self.test_dir, "out")
         # 5 items in bucket (0,0); candidates vary only the last layer within band 0.
         _parquet(inp, list(range(5)), [[0, 0]] * 5, [[[0, 1], [0, 2], [0, 3]]] * 5)
-        stats = self._run(
-            inp, out, max_items_per_codebook=2, unassigned_policy="keep_original"
-        )
+        stats = self._run(inp, out, max_items_per_codebook=2)
         self.assertEqual(stats.total_items, 5)
         self.assertEqual(stats.relocated_count, 3)
         self.assertEqual(stats.unresolved_count, 0)
@@ -114,7 +111,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, [0, 1, 2], [[0, 0]] * 3, [[[0, 1]]] * 3)
-        self._run(inp, out, max_items_per_codebook=2, unassigned_policy="keep_original")
+        self._run(inp, out, max_items_per_codebook=2)
         schema = parquet.read_table(os.path.join(out, "part-0.parquet")).schema
         self.assertEqual(schema.field("codebook").type, pa.list_(pa.int64()))
         self.assertEqual(schema.field("origin_codebook").type, pa.list_(pa.int64()))
@@ -122,49 +119,17 @@ class SidCollisionPreventionTest(unittest.TestCase):
     def test_keep_original_when_only_origin_candidate(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
-        # candidate == origin last -> skipped -> nothing to place.
+        # candidate == origin last -> skipped -> nothing to place; kept over cap.
         _parquet(inp, list(range(5)), [[0, 0]] * 5, [[[0, 0]]] * 5)
-        stats = self._run(
-            inp, out, max_items_per_codebook=2, unassigned_policy="keep_original"
-        )
+        stats = self._run(inp, out, max_items_per_codebook=2)
         self.assertEqual(stats.relocated_count, 0)
         self.assertEqual(stats.unresolved_count, 3)
         d = self._read_parquet(out)
+        self.assertEqual(len(d["item_id"]), 5)  # every item preserved
         self.assertTrue(all(tuple(cb) == (0, 0) for cb in d["codebook"]))
         _, resolved_path = self._group_paths(out)
         resolved = self._read_parquet(resolved_path)
         self.assertEqual(len(resolved["itemids"][0]), 5)
-        for item_id, index in zip(d["item_id"], d["index"]):
-            self.assertEqual(resolved["itemids"][0][index - 1], item_id)
-
-    def test_error_policy_raises_on_overflow(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, list(range(5)), [[0, 0]] * 5, [[[0, 0]]] * 5)
-        with self.assertRaises(RuntimeError):
-            self._run(
-                inp,
-                out,
-                max_items_per_codebook=2,
-            )
-        original_path, resolved_path = self._group_paths(out)
-        self.assertFalse(os.path.exists(out))
-        self.assertFalse(os.path.exists(original_path))
-        self.assertFalse(os.path.exists(resolved_path))
-
-    def test_drop_policy_excludes_unassigned(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, list(range(5)), [[0, 0]] * 5, [[[0, 0]]] * 5)
-        stats = self._run(inp, out, max_items_per_codebook=2, unassigned_policy="drop")
-        self.assertEqual(stats.unresolved_count, 3)
-        d = self._read_parquet(out)
-        self.assertEqual(len(d["item_id"]), 2)
-        original_path, resolved_path = self._group_paths(out)
-        original = self._read_parquet(original_path)
-        resolved = self._read_parquet(resolved_path)
-        self.assertEqual(len(original["itemids"][0]), 5)
-        self.assertEqual(len(resolved["itemids"][0]), 2)
         for item_id, index in zip(d["item_id"], d["index"]):
             self.assertEqual(resolved["itemids"][0][index - 1], item_id)
 
@@ -290,7 +255,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
             out,
             max_items_per_codebook=2,
             strategy="random",
-            unassigned_policy="keep_original",
         )
         self.assertEqual(stats.relocated_count, 3)
         d = self._read_parquet(out)
@@ -324,7 +288,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
             max_items_per_codebook=1,
             strategy="random",
             codebook="16",
-            unassigned_policy="keep_original",
         )
         self.assertEqual(stats.relocated_count, 3)
         d = self._read_parquet(out)
@@ -352,7 +315,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
                 inp,
                 out,
                 max_items_per_codebook=2,
-                unassigned_policy="keep_original",
             )
             d = self._read_parquet(out)
             original_path, resolved_path = self._group_paths(out)
@@ -399,7 +361,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
             reader_type="CsvReader",
             writer_type="CsvWriter",
             max_items_per_codebook=2,
-            unassigned_policy="keep_original",
         )
         self.assertEqual(stats.relocated_count, 3)
         result = csv.read_csv(os.path.join(out, "part-0.csv"))
@@ -718,7 +679,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
                 inp,
                 out,
                 max_items_per_codebook=2,
-                unassigned_policy="keep_original",
                 rate_only=True,
             )
         self.assertFalse(resolve.call_args.kwargs["collect_grouping"])

@@ -43,7 +43,7 @@ class CollisionResolutionTest(unittest.TestCase):
             ],
             dtype=np.int64,
         )
-        config = CollisionResolutionConfig((2, 4), 2, "error")
+        config = CollisionResolutionConfig((2, 4), 2)
         with mock.patch.object(collision_resolution, "_GROUPING_ROW_CHUNK", 2):
             plan = prepare_collision_plan(item_ids, codes, config)
 
@@ -66,7 +66,6 @@ class CollisionResolutionTest(unittest.TestCase):
         np.testing.assert_array_equal(result.final_bucket_keys, [0, 1, 2, 3, 4, 5])
         np.testing.assert_array_equal(result.final_bucket_counts, [2, 2, 2, 1, 2, 1])
         self.assertTrue(result.grouping_collected)
-        self.assertIsNone(result.retained_mask)
         self.assertEqual(result.stats.total_items, 10)
         self.assertEqual(result.stats.raw_collision_buckets, 2)
         self.assertEqual(result.stats.final_collision_buckets, 0)
@@ -91,38 +90,8 @@ class CollisionResolutionTest(unittest.TestCase):
             resolved_grouping.row_order, [2, 0, 4, 1, 6, 5, 3, 9, 7, 8]
         )
 
-    def test_error_fallback(self) -> None:
-        config = CollisionResolutionConfig((2,), 1, "error")
-        plan = prepare_collision_plan(
-            np.asarray([0, 1]), np.asarray([[0], [0]]), config
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "first unresolved row indices: 1"):
-            resolve_sid_collisions(plan, np.asarray([[0]], dtype=np.int64))
-
-    def test_drop_fallback(self) -> None:
-        config = CollisionResolutionConfig((2,), 1, "drop")
-        plan = prepare_collision_plan(
-            np.asarray([0, 1]), np.asarray([[0], [0]]), config
-        )
-        result = resolve_sid_collisions(plan, np.asarray([[0]], dtype=np.int64))
-
-        np.testing.assert_array_equal(result.resolved_last_codes, [0, 0])
-        np.testing.assert_array_equal(result.slot_indices, [1, 2])
-        np.testing.assert_array_equal(result.retained_mask, [True, False])
-        np.testing.assert_array_equal(result.unresolved_rows, [1])
-        self.assertEqual(result.stats.final_collision_buckets, 0)
-        self.assertEqual(result.stats.unresolved_count, 1)
-        with mock.patch.object(collision_resolution, "_GROUPING_ROW_CHUNK", 1):
-            original_grouping = build_original_item_grouping(plan)
-            resolved_grouping = build_resolved_item_grouping(plan, result)
-        np.testing.assert_array_equal(original_grouping.counts, [2])
-        np.testing.assert_array_equal(original_grouping.row_order, [0, 1])
-        np.testing.assert_array_equal(resolved_grouping.counts, [1])
-        np.testing.assert_array_equal(resolved_grouping.row_order, [0])
-
     def test_keep_original_fallback(self) -> None:
-        config = CollisionResolutionConfig((2,), 1, "keep_original")
+        config = CollisionResolutionConfig((2,), 1)
         plan = prepare_collision_plan(
             np.asarray([0, 1]), np.asarray([[0], [0]]), config
         )
@@ -130,7 +99,6 @@ class CollisionResolutionTest(unittest.TestCase):
 
         np.testing.assert_array_equal(result.resolved_last_codes, [0, 0])
         np.testing.assert_array_equal(result.slot_indices, [1, 2])
-        self.assertIsNone(result.retained_mask)
         np.testing.assert_array_equal(result.unresolved_rows, [1])
         self.assertEqual(result.stats.final_collision_buckets, 1)
         self.assertEqual(result.stats.max_final_bucket_size, 2)
@@ -141,7 +109,7 @@ class CollisionResolutionTest(unittest.TestCase):
         np.testing.assert_array_equal(resolved_grouping.row_order, [0, 1])
 
     def test_no_overflow(self) -> None:
-        config = CollisionResolutionConfig((2, 4), 2, "error")
+        config = CollisionResolutionConfig((2, 4), 2)
         codes = np.asarray([[0, 0], [0, 0], [1, 2]], dtype=np.int64)
         plan = prepare_collision_plan(np.asarray([0, 1, 2]), codes, config)
         with (
@@ -161,7 +129,7 @@ class CollisionResolutionTest(unittest.TestCase):
         self.assertEqual(result.stats.relocated_count, 0)
 
     def test_empty_groupings(self) -> None:
-        config = CollisionResolutionConfig((2, 4), 2, "error")
+        config = CollisionResolutionConfig((2, 4), 2)
         plan = prepare_collision_plan(
             np.empty(0, dtype=np.int64),
             np.empty((0, 2), dtype=np.int64),
@@ -186,7 +154,7 @@ class CollisionResolutionTest(unittest.TestCase):
         np.testing.assert_array_equal(actual, [[1, 2, 0], [2, 0, 2]])
 
     def test_candidate_matrix_must_be_two_dimensional(self) -> None:
-        config = CollisionResolutionConfig((2,), 1, "drop")
+        config = CollisionResolutionConfig((2,), 1)
         plan = prepare_collision_plan(
             np.asarray([0, 1]), np.asarray([[0], [0]]), config
         )
@@ -195,7 +163,7 @@ class CollisionResolutionTest(unittest.TestCase):
             resolve_sid_collisions(plan, np.asarray([1], dtype=np.int64))
 
     def test_candidate_matrix_must_align_with_overflow_rows(self) -> None:
-        config = CollisionResolutionConfig((2,), 1, "drop")
+        config = CollisionResolutionConfig((2,), 1)
         plan = prepare_collision_plan(
             np.asarray([0, 1]), np.asarray([[0], [0]]), config
         )
@@ -204,7 +172,7 @@ class CollisionResolutionTest(unittest.TestCase):
             resolve_sid_collisions(plan, np.empty((0, 1), dtype=np.int64))
 
     def test_fixed_width_candidates_can_contend_for_free_slots(self) -> None:
-        config = CollisionResolutionConfig((6,), 1, "drop")
+        config = CollisionResolutionConfig((6,), 1)
         item_ids = np.asarray([0, 1, 2, 3, 4, 5], dtype=np.int64)
         codes = np.asarray([[0], [0], [1], [3], [4], [4]], dtype=np.int64)
         plan = prepare_collision_plan(item_ids, codes, config)
@@ -225,7 +193,7 @@ class CollisionResolutionTest(unittest.TestCase):
         self.assertEqual(result.stats.unresolved_count, 1)
 
     def test_rejects_out_of_range_candidate(self) -> None:
-        config = CollisionResolutionConfig((4,), 1, "drop")
+        config = CollisionResolutionConfig((4,), 1)
         item_ids = np.asarray([0, 1, 2], dtype=np.int64)
         codes = np.asarray([[0], [0], [1]], dtype=np.int64)
         plan = prepare_collision_plan(item_ids, codes, config)
@@ -234,7 +202,7 @@ class CollisionResolutionTest(unittest.TestCase):
             resolve_sid_collisions(plan, np.asarray([[5]], dtype=np.int64))
 
     def test_resolution_can_skip_grouping_metadata(self) -> None:
-        config = CollisionResolutionConfig((4,), 1, "drop")
+        config = CollisionResolutionConfig((4,), 1)
         item_ids = np.asarray([0, 1, 2], dtype=np.int64)
         codes = np.asarray([[0], [0], [1]], dtype=np.int64)
         plan = prepare_collision_plan(item_ids, codes, config)
@@ -255,7 +223,6 @@ class CollisionResolutionTest(unittest.TestCase):
             result.resolved_last_codes, expected.resolved_last_codes
         )
         np.testing.assert_array_equal(result.slot_indices, expected.slot_indices)
-        np.testing.assert_array_equal(result.retained_mask, expected.retained_mask)
         np.testing.assert_array_equal(result.unresolved_rows, expected.unresolved_rows)
         np.testing.assert_array_equal(result.final_bucket_keys, [])
         np.testing.assert_array_equal(result.final_bucket_counts, [])

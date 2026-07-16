@@ -31,7 +31,7 @@ Example::
     python -m tzrec.tools.sid.collision_prevention \
         --input_path 'sid_predict_output/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
-        --strategy candidate --unassigned_policy keep_original \
+        --strategy candidate \
         --output_path sid_collision/map \
         --original_sid_groups_output_path sid_collision/original_groups \
         --resolved_sid_groups_output_path sid_collision/resolved_groups
@@ -132,7 +132,6 @@ class CollisionPreventionConfig:
     candidate_codes_field: str
     layer_sizes: Tuple[int, ...]
     max_items_per_codebook: int
-    unassigned_policy: str
     strategy: str
     random_num_candidates: int
     rate_only: bool
@@ -198,7 +197,6 @@ class CollisionPreventionConfig:
             candidate_codes_field=args.candidate_codes_field,
             layer_sizes=layer_sizes,
             max_items_per_codebook=args.max_items_per_codebook,
-            unassigned_policy=args.unassigned_policy,
             strategy=args.strategy,
             random_num_candidates=args.random_num_candidates,
             rate_only=args.rate_only,
@@ -211,7 +209,6 @@ class CollisionPreventionConfig:
         return CollisionResolutionConfig(
             layer_sizes=self.layer_sizes,
             capacity=self.max_items_per_codebook,
-            fallback_policy=self.unassigned_policy,
         )
 
 
@@ -547,16 +544,7 @@ class CollisionRunner:
         """Write the resolved map in chunks without a full final-code copy."""
         with closing(self._make_writer(self._config.output_path)) as writer:
             is_csv = isinstance(writer, CsvWriter)
-            retained_rows = (
-                np.flatnonzero(result.retained_mask)
-                if result.retained_mask is not None
-                else None
-            )
-            output_count = (
-                retained_rows.shape[0]
-                if retained_rows is not None
-                else item_ids.shape[0]
-            )
+            output_count = item_ids.shape[0]
             write_chunk = _MAP_WRITE_ROWS
             if not is_csv:
                 write_chunk = min(
@@ -567,12 +555,7 @@ class CollisionRunner:
                     raise ValueError("one SID row exceeds Arrow list offset capacity.")
             for start in range(0, output_count, write_chunk):
                 end = min(start + write_chunk, output_count)
-                selection: Union[slice, np.ndarray]
-                selection = (
-                    retained_rows[start:end]
-                    if retained_rows is not None
-                    else slice(start, end)
-                )
+                selection = slice(start, end)
                 origin_chunk = origin_codes[selection]
                 final_chunk = origin_chunk.copy()
                 final_chunk[:, -1] = result.resolved_last_codes[selection]
@@ -739,11 +722,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--candidate_codes_field", default="candidate_codes")
     parser.add_argument("--max_items_per_codebook", type=int, required=True)
-    parser.add_argument(
-        "--unassigned_policy",
-        choices=["error", "drop", "keep_original"],
-        default="error",
-    )
     parser.add_argument(
         "--strategy",
         choices=["candidate", "random"],

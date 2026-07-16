@@ -13,14 +13,13 @@
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Iterable, Optional
+from typing import Iterable
 
 import numpy as np
 
 _MASK64 = (1 << 64) - 1
 _SEED = 2026
 _SPLITMIX_INCREMENT = 0x9E3779B97F4A7C15
-_FALLBACK_POLICIES = frozenset({"error", "drop", "keep_original"})
 _GROUPING_ROW_CHUNK = 1_000_000
 
 
@@ -28,16 +27,16 @@ _GROUPING_ROW_CHUNK = 1_000_000
 class CollisionResolutionConfig:
     """Configuration for within-band SID collision resolution.
 
+    Unplaceable overflow items always keep their original SID (over capacity),
+    so every input item is preserved in the output.
+
     Args:
         layer_sizes: Cardinality of each SID layer.
         capacity: Maximum number of retained items in one SID bucket.
-        fallback_policy: Action when no candidate has a free slot. Supported
-            values are ``error``, ``drop``, and ``keep_original``.
     """
 
     layer_sizes: tuple[int, ...]
     capacity: int
-    fallback_policy: str
 
     def __post_init__(self) -> None:
         if not self.layer_sizes:
@@ -46,11 +45,6 @@ class CollisionResolutionConfig:
             raise ValueError("all layer_sizes must be positive.")
         if self.capacity < 1:
             raise ValueError(f"capacity must be >= 1, got {self.capacity}.")
-        if self.fallback_policy not in _FALLBACK_POLICIES:
-            raise ValueError(
-                "fallback_policy must be one of error, drop, or keep_original, "
-                f"got {self.fallback_policy!r}."
-            )
 
 
 @dataclass(frozen=True)
@@ -89,7 +83,7 @@ class CollisionPlan:
         overflow_origin_last_codes: Origin last-layer code of each overflow row
             (used to skip a candidate equal to the origin), int64 aligned with
             ``overflow_rows``.
-        config: Collision capacity, SID shape, and fallback configuration.
+        config: Collision capacity and SID shape configuration.
     """
 
     item_count: int
@@ -119,11 +113,10 @@ class CollisionResolutionStats:
 
 @dataclass(frozen=True)
 class CollisionResolutionResult:
-    """Resolved last codes, indexes, row retention, and diagnostics."""
+    """Resolved last codes, slot indexes, and diagnostics."""
 
     resolved_last_codes: np.ndarray
     slot_indices: np.ndarray
-    retained_mask: Optional[np.ndarray]
     unresolved_rows: np.ndarray
     final_bucket_keys: np.ndarray
     final_bucket_counts: np.ndarray
@@ -263,7 +256,7 @@ def prepare_collision_plan(
     Args:
         item_ids: One-dimensional item IDs aligned with ``codes``.
         codes: Integer SID matrix with shape ``(N, number_of_layers)``.
-        config: Collision capacity, shape, and fallback configuration.
+        config: Collision capacity and SID shape configuration.
 
     Returns:
         A compact plan for candidate loading and collision resolution.
@@ -368,7 +361,9 @@ def resolve_sid_collisions(
     """Greedily relocate overflow rows to their first free candidate slot.
 
     Candidate rows must be aligned with ``plan.overflow_rows`` and values must
-    be valid last-layer codebook indices.
+    be valid last-layer codebook indices. An overflow row that finds no free
+    candidate slot keeps its original SID (over capacity), so every input row is
+    preserved in the output.
 
     Args:
         plan: Grouping and overflow plan from :func:`prepare_collision_plan`.
@@ -379,11 +374,10 @@ def resolve_sid_collisions(
             rate-only runs to avoid the grouping arrays and sorts.
 
     Returns:
-        Resolved last-layer codes, slot indices, retention mask, unresolved row
-        indices, and diagnostics.
+        Resolved last-layer codes, slot indices, unresolved row indices, and
+        diagnostics.
 
     Raises:
-        RuntimeError: If a row is unresolved under the ``error`` policy.
         TypeError: If candidate codes do not use an integer dtype.
         ValueError: If candidates are not a row-aligned two-dimensional matrix
             or contain out-of-range last-layer indices.
@@ -427,7 +421,6 @@ def resolve_sid_collisions(
         return CollisionResolutionResult(
             resolved_last_codes=plan.original_last_codes,
             slot_indices=plan.initial_slot_indices,
-            retained_mask=None,
             unresolved_rows=np.empty(0, dtype=np.int64),
             final_bucket_keys=final_bucket_keys,
             final_bucket_counts=final_bucket_counts,
@@ -474,23 +467,13 @@ def resolve_sid_collisions(
         else:
             unresolved_rows.append(row)
 
-    retained_mask = None
-    fallback_policy = plan.config.fallback_policy
-    if unresolved_rows and fallback_policy == "error":
-        preview = ",".join(str(row) for row in unresolved_rows[:10])
-        raise RuntimeError(
-            f"{len(unresolved_rows)} items could not be placed within capacity; "
-            f"first unresolved row indices: {preview}"
-        )
-    if unresolved_rows and fallback_policy == "drop":
-        retained_mask = np.ones(plan.item_count, dtype=bool)
-        retained_mask[unresolved_rows] = False
-    elif unresolved_rows and fallback_policy == "keep_original":
-        for row in unresolved_rows:
-            origin_key = int(plan.bucket_keys[plan.origin_bucket_indices[row]])
-            origin_count = get_slot_count(origin_key, 0) + 1
-            slot_counts[origin_key] = origin_count
-            slot_indices[row] = origin_count
+    # Unplaceable overflow items keep their original SID (over capacity), so
+    # every input item is preserved in the output.
+    for row in unresolved_rows:
+        origin_key = int(plan.bucket_keys[plan.origin_bucket_indices[row]])
+        origin_count = get_slot_count(origin_key, 0) + 1
+        slot_counts[origin_key] = origin_count
+        slot_indices[row] = origin_count
 
     final_bucket_keys = np.empty(0, dtype=np.int64)
     final_bucket_counts = np.empty(0, dtype=np.int64)
@@ -526,7 +509,6 @@ def resolve_sid_collisions(
     return CollisionResolutionResult(
         resolved_last_codes=resolved_last_codes,
         slot_indices=slot_indices,
-        retained_mask=retained_mask,
         unresolved_rows=unresolved_array,
         final_bucket_keys=final_bucket_keys,
         final_bucket_counts=final_bucket_counts,
@@ -550,7 +532,7 @@ def _scatter_item_grouping(
     offsets = grouping.offsets
     if int(offsets[-1]) != row_count:
         raise RuntimeError(
-            "bucket counts do not match retained row count: "
+            "bucket counts do not match grouped row count: "
             f"{int(offsets[-1])} vs {row_count}."
         )
     written_count = 0
@@ -603,7 +585,7 @@ def build_original_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
 def build_resolved_item_grouping(
     plan: CollisionPlan, result: CollisionResolutionResult
 ) -> CodebookItemGrouping:
-    """Group retained rows by emitted SID and final one-based slot index.
+    """Group all rows by emitted SID and final one-based slot index.
 
     The grouping uses a linear scatter from final one-based slot indices.
 
@@ -612,7 +594,7 @@ def build_resolved_item_grouping(
         result: Collision output from :func:`resolve_sid_collisions`.
 
     Returns:
-        Sorted final SID keys, bucket counts, and grouped retained row order.
+        Sorted final SID keys, bucket counts, and grouped row order.
 
     Raises:
         RuntimeError: If grouping metadata was not collected or result bucket
@@ -627,13 +609,7 @@ def build_resolved_item_grouping(
     def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         for start in range(0, plan.item_count, _GROUPING_ROW_CHUNK):
             end = min(start + _GROUPING_ROW_CHUNK, plan.item_count)
-            if result.retained_mask is None:
-                rows = np.arange(start, end, dtype=np.int64)
-            else:
-                rows = np.flatnonzero(result.retained_mask[start:end])
-                rows += start
-            if rows.size == 0:
-                continue
+            rows = np.arange(start, end, dtype=np.int64)
             emitted_sid_keys = plan.bucket_keys[plan.origin_bucket_indices[rows]]
             emitted_sid_keys -= plan.original_last_codes[rows]
             emitted_sid_keys += result.resolved_last_codes[rows]
