@@ -61,24 +61,48 @@ class CollisionPlan:
     plus only the overflow-aligned identity and ordering data needed by
     candidate loading. It deliberately does not retain the full input code
     matrix.
+
+    Args:
+        item_count: Total number of input rows.
+        original_last_codes: Last-layer code of every input row, int64 shape
+            ``(item_count,)`` in original row order.
+        origin_bucket_indices: Per-row position of each input row's origin bucket
+            *within* ``bucket_keys`` / ``bucket_counts`` (a row->bucket
+            index in ``[0, num_buckets)``, not a key value), int64 shape
+            ``(item_count,)`` in original row order.
+        initial_slot_indices: One-based rank of each row within its origin
+            bucket in deterministic (hash) order, int64 shape ``(item_count,)``
+            in original row order.
+        bucket_keys: Flattened SID key ``band_id * last_size + last_code``
+            for every occupied bucket, int64 shape ``(num_buckets,)`` indexed by
+            bucket index (the values in ``origin_bucket_indices``) and ascending.
+        bucket_counts: Item count of every bucket before capacity capping,
+            int64 shape ``(num_buckets,)`` aligned with ``bucket_keys``.
+        overflow_rows: Original row indices ranked at or beyond ``capacity``
+            within their bucket (the rows to relocate), int64 in deterministic
+            processing order.
+        overflow_item_ids: Item IDs of ``overflow_rows``, aligned with it.
+        overflow_bucket_key_prefixes: The prefix part of each overflow row's
+            bucket key (``band_id * last_size``), so
+            ``prefix + candidate_last_code`` is the destination bucket key within
+            the same band; int64 aligned with ``overflow_rows``.
+        overflow_origin_last_codes: Origin last-layer code of each overflow row
+            (used to skip a candidate equal to the origin), int64 aligned with
+            ``overflow_rows``.
+        config: Collision capacity, SID shape, and fallback configuration.
     """
 
     item_count: int
     original_last_codes: np.ndarray
-    origin_bucket_ids: np.ndarray
+    origin_bucket_indices: np.ndarray
     initial_slot_indices: np.ndarray
-    occupied_sid_keys: np.ndarray
-    raw_bucket_counts: np.ndarray
+    bucket_keys: np.ndarray
+    bucket_counts: np.ndarray
     overflow_rows: np.ndarray
     overflow_item_ids: np.ndarray
-    overflow_band_bases: np.ndarray
+    overflow_bucket_key_prefixes: np.ndarray
     overflow_origin_last_codes: np.ndarray
     config: CollisionResolutionConfig
-
-    @property
-    def origin_sid_keys(self) -> np.ndarray:
-        """Return flattened original SID keys aligned with input rows."""
-        return self.occupied_sid_keys[self.origin_bucket_ids]
 
 
 @dataclass(frozen=True)
@@ -122,7 +146,7 @@ class CollisionResolutionResult:
     slot_indices: np.ndarray
     retained_mask: Optional[np.ndarray]
     unresolved_rows: np.ndarray
-    final_occupied_sid_keys: np.ndarray
+    final_bucket_keys: np.ndarray
     final_bucket_counts: np.ndarray
     grouping_collected: bool
     stats: CollisionResolutionStats
@@ -152,11 +176,6 @@ class CodebookItemGrouping:
         offsets[0] = 0
         np.cumsum(self.counts, dtype=np.int64, out=offsets[1:])
         return offsets
-
-    @cached_property
-    def representative_rows(self) -> np.ndarray:
-        """Return the first original row index in every occupied bucket."""
-        return self.row_order[self.offsets[:-1]]
 
 
 def _splitmix64(values: np.ndarray) -> np.ndarray:
@@ -296,31 +315,31 @@ def prepare_collision_plan(
     order_hashes = stable_order_hash(item_ids)
     (
         bucket_ranks,
-        origin_bucket_ids,
+        origin_bucket_indices,
         sorted_rows,
         representative_rows,
-        raw_bucket_counts,
+        bucket_counts,
     ) = _within_bucket_rank(band_ids, original_last_codes, order_hashes)
 
     overflow_rows = sorted_rows[bucket_ranks[sorted_rows] >= config.capacity]
     bucket_ranks += 1
     last_size = config.layer_sizes[-1]
-    occupied_sid_keys = (
+    bucket_keys = (
         band_ids[representative_rows] * last_size
         + original_last_codes[representative_rows]
     )
-    overflow_band_bases = band_ids[overflow_rows] * last_size
+    overflow_bucket_key_prefixes = band_ids[overflow_rows] * last_size
 
     return CollisionPlan(
         item_count=codes.shape[0],
         original_last_codes=original_last_codes,
-        origin_bucket_ids=origin_bucket_ids,
+        origin_bucket_indices=origin_bucket_indices,
         initial_slot_indices=bucket_ranks,
-        occupied_sid_keys=occupied_sid_keys,
-        raw_bucket_counts=raw_bucket_counts,
+        bucket_keys=bucket_keys,
+        bucket_counts=bucket_counts,
         overflow_rows=overflow_rows,
         overflow_item_ids=item_ids[overflow_rows],
-        overflow_band_bases=overflow_band_bases,
+        overflow_bucket_key_prefixes=overflow_bucket_key_prefixes,
         overflow_origin_last_codes=original_last_codes[overflow_rows],
         config=config,
     )
@@ -415,25 +434,23 @@ def resolve_sid_collisions(
         )
 
     if overflow_count == 0:
-        final_occupied_sid_keys = (
-            plan.occupied_sid_keys.copy()
-            if collect_grouping
-            else np.empty(0, dtype=np.int64)
+        final_bucket_keys = (
+            plan.bucket_keys.copy() if collect_grouping else np.empty(0, dtype=np.int64)
         )
         final_bucket_counts = (
-            plan.raw_bucket_counts.copy()
+            plan.bucket_counts.copy()
             if collect_grouping
             else np.empty(0, dtype=np.int64)
         )
         max_final_bucket_size = (
-            int(plan.raw_bucket_counts.max()) if plan.raw_bucket_counts.size else 0
+            int(plan.bucket_counts.max()) if plan.bucket_counts.size else 0
         )
         return CollisionResolutionResult(
             resolved_last_codes=plan.original_last_codes,
             slot_indices=plan.initial_slot_indices,
             retained_mask=None,
             unresolved_rows=np.empty(0, dtype=np.int64),
-            final_occupied_sid_keys=final_occupied_sid_keys,
+            final_bucket_keys=final_bucket_keys,
             final_bucket_counts=final_bucket_counts,
             grouping_collected=collect_grouping,
             stats=CollisionResolutionStats(
@@ -447,27 +464,27 @@ def resolve_sid_collisions(
         )
 
     capacity = plan.config.capacity
-    initial_counts = np.minimum(plan.raw_bucket_counts, capacity)
-    slot_counts = dict(zip(map(int, plan.occupied_sid_keys), map(int, initial_counts)))
+    initial_counts = np.minimum(plan.bucket_counts, capacity)
+    slot_counts = dict(zip(map(int, plan.bucket_keys), map(int, initial_counts)))
     resolved_last_codes = plan.original_last_codes.copy()
     slot_indices = plan.initial_slot_indices.copy()
     relocated_count = 0
     unresolved_rows = []
     get_slot_count = slot_counts.get
 
-    for row_value, band_base_value, origin_value, candidate_row in zip(
+    for row_value, key_prefix_value, origin_value, candidate_row in zip(
         plan.overflow_rows,
-        plan.overflow_band_bases,
+        plan.overflow_bucket_key_prefixes,
         plan.overflow_origin_last_codes,
         candidates,
     ):
         row = int(row_value)
-        band_base = int(band_base_value)
+        key_prefix = int(key_prefix_value)
         origin_last_code = int(origin_value)
         for candidate in candidate_row.tolist():
             if candidate == origin_last_code:
                 continue
-            destination_key = band_base + candidate
+            destination_key = key_prefix + candidate
             destination_count = get_slot_count(destination_key, 0)
             if destination_count < capacity:
                 slot_counts[destination_key] = destination_count + 1
@@ -491,12 +508,12 @@ def resolve_sid_collisions(
         retained_mask[unresolved_rows] = False
     elif unresolved_rows and fallback_policy == "keep_original":
         for row in unresolved_rows:
-            origin_key = int(plan.occupied_sid_keys[plan.origin_bucket_ids[row]])
+            origin_key = int(plan.bucket_keys[plan.origin_bucket_indices[row]])
             origin_count = get_slot_count(origin_key, 0) + 1
             slot_counts[origin_key] = origin_count
             slot_indices[row] = origin_count
 
-    final_occupied_sid_keys = np.empty(0, dtype=np.int64)
+    final_bucket_keys = np.empty(0, dtype=np.int64)
     final_bucket_counts = np.empty(0, dtype=np.int64)
     if collect_grouping:
         occupancy_counts = np.fromiter(
@@ -506,11 +523,11 @@ def resolve_sid_collisions(
         max_final_bucket_size = (
             int(occupancy_counts.max()) if occupancy_counts.size else 0
         )
-        final_occupied_sid_keys = np.fromiter(
+        final_bucket_keys = np.fromiter(
             slot_counts, dtype=np.int64, count=len(slot_counts)
         )
-        occupancy_order = np.argsort(final_occupied_sid_keys, kind="stable")
-        final_occupied_sid_keys = final_occupied_sid_keys[occupancy_order]
+        occupancy_order = np.argsort(final_bucket_keys, kind="stable")
+        final_bucket_keys = final_bucket_keys[occupancy_order]
         final_bucket_counts = occupancy_counts[occupancy_order]
     else:
         final_collision_buckets = 0
@@ -521,7 +538,7 @@ def resolve_sid_collisions(
     unresolved_array = np.asarray(unresolved_rows, dtype=np.int64)
     stats = CollisionResolutionStats(
         total_items=plan.item_count,
-        raw_collision_buckets=int((plan.raw_bucket_counts > capacity).sum()),
+        raw_collision_buckets=int((plan.bucket_counts > capacity).sum()),
         final_collision_buckets=final_collision_buckets,
         relocated_count=relocated_count,
         unresolved_count=len(unresolved_rows),
@@ -532,7 +549,7 @@ def resolve_sid_collisions(
         slot_indices=slot_indices,
         retained_mask=retained_mask,
         unresolved_rows=unresolved_array,
-        final_occupied_sid_keys=final_occupied_sid_keys,
+        final_bucket_keys=final_bucket_keys,
         final_bucket_counts=final_bucket_counts,
         grouping_collected=collect_grouping,
         stats=stats,
@@ -592,13 +609,13 @@ def build_original_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
             end = min(start + _GROUPING_ROW_CHUNK, plan.item_count)
             yield (
                 np.arange(start, end, dtype=np.int64),
-                plan.origin_bucket_ids[start:end],
+                plan.origin_bucket_indices[start:end],
                 plan.initial_slot_indices[start:end],
             )
 
     return _scatter_item_grouping(
-        plan.occupied_sid_keys,
-        plan.raw_bucket_counts,
+        plan.bucket_keys,
+        plan.bucket_counts,
         plan.item_count,
         row_chunks(),
     )
@@ -638,21 +655,19 @@ def build_resolved_item_grouping(
                 rows += start
             if rows.size == 0:
                 continue
-            emitted_sid_keys = plan.occupied_sid_keys[plan.origin_bucket_ids[rows]]
+            emitted_sid_keys = plan.bucket_keys[plan.origin_bucket_indices[rows]]
             emitted_sid_keys -= plan.original_last_codes[rows]
             emitted_sid_keys += result.resolved_last_codes[rows]
-            bucket_ids = np.searchsorted(
-                result.final_occupied_sid_keys, emitted_sid_keys
-            )
-            in_bounds = bucket_ids < result.final_occupied_sid_keys.shape[0]
+            bucket_ids = np.searchsorted(result.final_bucket_keys, emitted_sid_keys)
+            in_bounds = bucket_ids < result.final_bucket_keys.shape[0]
             if not np.all(in_bounds) or not np.all(
-                result.final_occupied_sid_keys[bucket_ids] == emitted_sid_keys
+                result.final_bucket_keys[bucket_ids] == emitted_sid_keys
             ):
                 raise RuntimeError("final bucket keys do not cover every emitted SID.")
             yield rows, bucket_ids, result.slot_indices[rows]
 
     return _scatter_item_grouping(
-        result.final_occupied_sid_keys,
+        result.final_bucket_keys,
         result.final_bucket_counts,
         int(result.final_bucket_counts.sum()),
         row_chunks(),

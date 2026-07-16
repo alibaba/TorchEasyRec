@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Offline SID collision prevention with TorchEasyRec-native I/O.
+r"""Offline SID collision prevention with TorchEasyRec-native I/O.
 
 The runner caps each SID bucket, loads fixed-width last-layer candidates only
 for overflow items, delegates collision resolution to the pure NumPy core, and
@@ -20,6 +20,22 @@ CSV writer cannot serialize list columns.
 The random strategy intentionally preserves the legacy deterministic baseline:
 it draws with replacement from the full last-layer space. Placement skips an
 item's origin, so an origin draw or a duplicate draw is not replaced.
+
+It is a single-process tool -- launch it with ``python -m`` (no torchrun /
+process group). The input is a Semantic-ID table from ``tzrec.predict`` (an
+``item_id`` column, a ``codes`` ``list<int>`` column, and -- for the default
+``--strategy candidate`` -- a ``candidate_codes`` ``list<list<int>>`` column).
+
+Example::
+
+    python -m tzrec.tools.sid.collision_prevention \
+        --input_path 'sid_predict_output/*.parquet' \
+        --codebook 256,256,256 --max_items_per_codebook 5 \
+        --strategy candidate --unassigned_policy keep_original \
+        --output_path sid_collision/map \
+        --original_sid_groups_output_path sid_collision/original_groups \
+        --resolved_sid_groups_output_path sid_collision/resolved_groups \
+        --diagnostics_output_path sid_collision/diagnostics
 """
 
 from __future__ import annotations
@@ -30,7 +46,7 @@ import os
 from contextlib import closing
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -66,10 +82,10 @@ _MAP_WRITE_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
 
+_PathIdentity = Union[str, Tuple[str, str, Optional[str], str, Optional[str]]]
 
-def _output_path_identity(
-    path: str,
-) -> Union[str, Tuple[str, str, Optional[str], str, Optional[str]]]:
+
+def _output_path_identity(path: str) -> _PathIdentity:
     """Return the destination identity used by the repository writer."""
     if not path.startswith("odps://"):
         return os.path.realpath(path)
@@ -151,9 +167,7 @@ class CollisionPreventionConfig:
             "resolved_sid_groups_output_path": self.resolved_sid_groups_output_path,
             "diagnostics_output_path": self.diagnostics_output_path,
         }
-        seen_paths: Dict[
-            Union[str, Tuple[str, str, Optional[str], str, Optional[str]]], str
-        ] = {}
+        seen_paths: Dict[_PathIdentity, str] = {}
         for name, path in named_paths.items():
             if not path:
                 continue
@@ -261,17 +275,6 @@ class CollisionRunner:
             quota_name=self._config.odps_data_quota_name,
         )
 
-    def _read_codes(self) -> Iterable[Dict[str, pa.Array]]:
-        """Stream item IDs and SIDs while resolving the default writer type."""
-        reader = self._make_reader(
-            [self._config.item_id_field, self._config.code_field]
-        )
-        reader_name = reader.__class__.__name__
-        self._default_writer_type = self._config.writer_type or reader_name.replace(
-            "Reader", "Writer"
-        )
-        yield from reader.to_batches()
-
     @staticmethod
     def _is_list_type(data_type: pa.DataType) -> bool:
         """Return whether ``data_type`` is an Arrow list representation."""
@@ -326,10 +329,20 @@ class CollisionRunner:
             )
 
     def _load_codes(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Load item IDs and SIDs into arrays used by the NumPy core."""
+        """Load item IDs and SIDs into arrays used by the NumPy core.
+
+        Also resolves the default writer type from the reader class name before
+        streaming, so downstream writes can default to the input format.
+        """
+        reader = self._make_reader(
+            [self._config.item_id_field, self._config.code_field]
+        )
+        self._default_writer_type = self._config.writer_type or (
+            reader.__class__.__name__.replace("Reader", "Writer")
+        )
         id_chunks: List[np.ndarray] = []
         code_chunks: List[np.ndarray] = []
-        for batch in self._read_codes():
+        for batch in reader.to_batches():
             item_ids = batch[self._config.item_id_field]
             self._validate_item_ids(item_ids)
             id_chunks.append(item_ids.to_numpy(zero_copy_only=False))
@@ -354,12 +367,6 @@ class CollisionRunner:
                 self._config.layer_sizes[-1],
             )
         return self._load_candidate_last_codes(plan.overflow_item_ids)
-
-    def _candidate_matrix(self, values: pa.Array) -> np.ndarray:
-        """Decode candidate SIDs and retain only their last-layer codes."""
-        if self._is_list_type(values.type):
-            return self._candidate_list_matrix(values)
-        return self._candidate_string_matrix(values)
 
     def _candidate_list_matrix(self, values: pa.Array) -> np.ndarray:
         """Decode a nested Arrow candidate column into an ``(N, K)`` matrix."""
@@ -428,7 +435,10 @@ class CollisionRunner:
             if np.any(seen[target_rows]):
                 raise ValueError("candidate input contains duplicate item IDs.")
             selected = pc.take(batch[field], pa.array(source_rows, type=pa.int64()))
-            batch_candidates = self._candidate_matrix(selected)
+            if self._is_list_type(selected.type):
+                batch_candidates = self._candidate_list_matrix(selected)
+            else:
+                batch_candidates = self._candidate_string_matrix(selected)
             if candidates is None:
                 candidates = np.empty(
                     (item_count, batch_candidates.shape[1]), dtype=np.int64
@@ -508,8 +518,6 @@ class CollisionRunner:
     def _codes_column(codes: np.ndarray, is_csv: bool) -> pa.Array:
         """Encode an SID matrix for the actual output writer."""
         row_count, layer_count = codes.shape
-        if layer_count < 1:
-            raise ValueError("SID output must contain at least one layer.")
         if is_csv:
             values = pc.cast(pa.array(codes.reshape(-1)), pa.string())
             offsets = pa.array(
@@ -648,20 +656,13 @@ class CollisionRunner:
                 writing original SIDs.
 
         Raises:
-            RuntimeError: If grouping dimensions or counts are inconsistent.
             ValueError: If one group exceeds Arrow list offset capacity.
         """
         group_count = grouping.counts.shape[0]
-        if grouping.sid_keys.shape[0] != group_count:
-            raise RuntimeError("SID group keys and counts must have the same length.")
-        if np.any(grouping.counts <= 0):
-            raise RuntimeError("SID group counts must be positive.")
         if np.any(grouping.counts > _ARROW_LIST_OFFSET_MAX):
             raise ValueError("one SID group exceeds Arrow list offset capacity.")
 
         offsets = grouping.offsets
-        if int(offsets[-1]) != grouping.row_order.shape[0]:
-            raise RuntimeError("SID group counts do not match grouped row count.")
         with closing(self._make_writer(output_path)) as writer:
             is_csv = isinstance(writer, CsvWriter)
             max_codebook_rows = (

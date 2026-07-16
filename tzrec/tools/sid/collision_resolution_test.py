@@ -50,12 +50,9 @@ class CollisionResolutionTest(unittest.TestCase):
         np.testing.assert_array_equal(plan.overflow_rows, [1, 3, 8])
         np.testing.assert_array_equal(plan.overflow_item_ids, [1, 3, 8])
         np.testing.assert_array_equal(
-            plan.origin_bucket_ids, [0, 0, 0, 0, 1, 2, 2, 3, 3, 3]
+            plan.origin_bucket_indices, [0, 0, 0, 0, 1, 2, 2, 3, 3, 3]
         )
-        np.testing.assert_array_equal(plan.occupied_sid_keys, [0, 1, 2, 4])
-        np.testing.assert_array_equal(
-            plan.origin_sid_keys, [0, 0, 0, 0, 1, 2, 2, 4, 4, 4]
-        )
+        np.testing.assert_array_equal(plan.bucket_keys, [0, 1, 2, 4])
         candidates = np.asarray([[0, 1, 2], [1, 2, 3], [0, 1, 2]], dtype=np.int64)
         result = resolve_sid_collisions(plan, candidates)
 
@@ -66,9 +63,7 @@ class CollisionResolutionTest(unittest.TestCase):
             result.slot_indices, [2, 2, 1, 1, 1, 2, 1, 2, 1, 1]
         )
         np.testing.assert_array_equal(result.unresolved_rows, [])
-        np.testing.assert_array_equal(
-            result.final_occupied_sid_keys, [0, 1, 2, 3, 4, 5]
-        )
+        np.testing.assert_array_equal(result.final_bucket_keys, [0, 1, 2, 3, 4, 5])
         np.testing.assert_array_equal(result.final_bucket_counts, [2, 2, 2, 1, 2, 1])
         self.assertTrue(result.grouping_collected)
         self.assertIsNone(result.retained_mask)
@@ -99,9 +94,6 @@ class CollisionResolutionTest(unittest.TestCase):
         np.testing.assert_array_equal(original_grouping.offsets, [0, 4, 5, 7, 10])
         np.testing.assert_array_equal(
             original_grouping.row_order, [2, 0, 1, 3, 4, 6, 5, 9, 7, 8]
-        )
-        np.testing.assert_array_equal(
-            original_grouping.representative_rows, [2, 4, 6, 9]
         )
 
         with mock.patch.object(collision_resolution, "_GROUPING_ROW_CHUNK", 2):
@@ -176,7 +168,7 @@ class CollisionResolutionTest(unittest.TestCase):
         np.testing.assert_array_equal(result.resolved_last_codes, [0, 0, 2])
         np.testing.assert_array_equal(result.slot_indices, [1, 2, 1])
         np.testing.assert_array_equal(result.unresolved_rows, [])
-        np.testing.assert_array_equal(result.final_occupied_sid_keys, [0, 6])
+        np.testing.assert_array_equal(result.final_bucket_keys, [0, 6])
         np.testing.assert_array_equal(result.final_bucket_counts, [2, 1])
         self.assertEqual(result.stats.raw_collision_buckets, 0)
         self.assertEqual(result.stats.relocated_count, 0)
@@ -198,7 +190,6 @@ class CollisionResolutionTest(unittest.TestCase):
             np.testing.assert_array_equal(grouping.counts, [])
             np.testing.assert_array_equal(grouping.row_order, [])
             np.testing.assert_array_equal(grouping.offsets, [0])
-            np.testing.assert_array_equal(grouping.representative_rows, [])
 
     def test_random_candidate_golden_draws(self) -> None:
         actual = generate_random_candidate_last_codes(
@@ -279,7 +270,7 @@ class CollisionResolutionTest(unittest.TestCase):
         np.testing.assert_array_equal(result.slot_indices, expected.slot_indices)
         np.testing.assert_array_equal(result.retained_mask, expected.retained_mask)
         np.testing.assert_array_equal(result.unresolved_rows, expected.unresolved_rows)
-        np.testing.assert_array_equal(result.final_occupied_sid_keys, [])
+        np.testing.assert_array_equal(result.final_bucket_keys, [])
         np.testing.assert_array_equal(result.final_bucket_counts, [])
         self.assertFalse(result.grouping_collected)
         self.assertEqual(result.stats, expected.stats)
