@@ -28,6 +28,7 @@ from tzrec.utils.feature_store_delta_uploader import (
     FeatureStoreDeltaUploader,
     FeatureStoreUploadError,
     FeatureStoreUploadSettings,
+    _json_digest,
     feature_store_delta_file_prefix,
 )
 
@@ -141,35 +142,34 @@ class _FakeView:
     sk_field = "key_id"
     embedding_field = "embedding"
 
-    def __init__(self, summaries=None, versions=None, close_error=None):
+    def __init__(self, summaries=None, close_error=None, max_workers=4):
         self.calls = []
         self.closed = []
+        self.flush_calls = []
         self._summaries = list(summaries or [])
-        self._versions = ["model_a@export_1"] if versions is None else list(versions)
         self._close_error = close_error
         self._batch_size = 1000
-        self._last_size = 0
+        self._max_workers = max_workers
+        self._pending_sizes = []
 
     def write_features(self, **kwargs):
         self.calls.append(kwargs)
-        self._last_size = len(kwargs["data"])
+        self._pending_sizes.append(len(kwargs["data"]))
 
     def write_flush(self):
+        pending_sizes = self._pending_sizes
+        self._pending_sizes = []
+        self.flush_calls.append(pending_sizes)
         if self._summaries:
             return self._summaries.pop(0)
+        total_records = sum(pending_sizes)
         return {
-            "total_batches": 1,
+            "total_batches": len(pending_sizes),
             "failed_batches": 0,
-            "total_records": self._last_size,
-            "success_records": self._last_size,
+            "total_records": total_records,
+            "success_records": total_records,
             "failed_records": 0,
             "errors": [],
-        }
-
-    def list_versions(self):
-        return {
-            "default_version": "",
-            "versions": [{"version": version} for version in self._versions],
         }
 
     def close(self, wait=True):
@@ -645,9 +645,9 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             self.assertEqual(len(factory.project.create_calls), 1)
             self.assertEqual(created_view.closed, [True])
 
-    def test_start_creates_missing_view_but_requires_preexisting_version(self):
+    def test_start_creates_missing_view_without_version_precheck(self):
         with tempfile.TemporaryDirectory() as output_dir:
-            created_view = _FakeView(versions=[])
+            created_view = _FakeView()
             factory = _FakeClientFactory(None, created_view=created_view)
             uploader = FeatureStoreDeltaUploader(
                 _feature_store_config(),
@@ -658,10 +658,8 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 client_factory=factory,
             )
 
-            with self.assertRaisesRegex(
-                FeatureStoreUploadError, "version does not exist"
-            ):
-                uploader.start()
+            uploader.start()
+            uploader.close()
 
             self.assertEqual(len(factory.project.create_calls), 1)
             self.assertEqual(created_view.closed, [True])
@@ -709,6 +707,40 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 second.start()
             second.close()
 
+    def test_existing_legacy_version_initialization_contract_is_reused(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
+            legacy = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            legacy._contract["version_initialization"] = (
+                "PREPROVISIONED_FOR_DELTA_MERGE"
+            )
+            legacy._contract_hash = _json_digest(legacy._contract)
+            legacy.start()
+            legacy.close()
+
+            restarted = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            self.assertNotEqual(restarted._contract_hash, legacy._contract_hash)
+
+            restarted.start()
+            restarted.close()
+
+            self.assertEqual(restarted._contract_hash, legacy._contract_hash)
+            self.assertEqual(restarted._committed_global_step, 10)
+
     def test_submit_requires_started_uploader(self):
         with tempfile.TemporaryDirectory() as output_dir:
             uploader = FeatureStoreDeltaUploader(
@@ -751,6 +783,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
 
             self.assertEqual(len(view.calls), 2)
             self.assertEqual([len(call["data"]) for call in view.calls], [2, 1])
+            self.assertEqual(view.flush_calls, [[2, 1]])
             self.assertEqual(
                 {call["version"] for call in view.calls}, {"model_a@export_1"}
             )
@@ -779,6 +812,32 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 "fdb-password-secret",
             ):
                 self.assertNotIn(secret, generated_text)
+
+    def test_upload_uses_bounded_sdk_worker_windows(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            _write_single_shard(
+                output_dir,
+                10,
+                [_row(10, 0, key, [1.0, 2.0]) for key in range(1, 6)],
+            )
+            view = _FakeView(max_workers=2)
+            uploader = FeatureStoreDeltaUploader(
+                _feature_store_config(upload_batch_size=1),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(view),
+                clock_ms=lambda: 100,
+            )
+
+            uploader.start()
+            uploader.close()
+
+            self.assertEqual(
+                [call["ts"] for call in view.calls], [100, 101, 102, 103, 104]
+            )
+            self.assertEqual(view.flush_calls, [[1, 1], [1, 1], [1]])
 
     def test_first_positive_dump_step_is_not_filtered_by_an_implicit_base(self):
         with tempfile.TemporaryDirectory() as output_dir:
@@ -913,7 +972,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 [_row(10, 0, 1, [1.0, 2.0])],
                 file_prefix=prefix_a,
             )
-            view = _FakeView(versions=["model_a@run_2"])
+            view = _FakeView()
             factory = _FakeClientFactory(view)
             uploader = FeatureStoreDeltaUploader(
                 version_b,
@@ -1009,16 +1068,24 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
 
     def test_flush_failure_does_not_publish_success_marker(self):
         failed_summary = {
-            "total_batches": 1,
+            "total_batches": 2,
             "failed_batches": 1,
-            "total_records": 0,
-            "success_records": 0,
-            "failed_records": 0,
+            "total_records": 3,
+            "success_records": 2,
+            "failed_records": 1,
             "errors": ["failed future"],
         }
         with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
-            view = _FakeView([failed_summary, failed_summary])
+            _write_single_shard(
+                output_dir,
+                10,
+                [
+                    _row(10, 0, 1, [1.0, 2.0]),
+                    _row(10, 0, 2, [3.0, 4.0]),
+                    _row(10, 0, 3, [5.0, 6.0]),
+                ],
+            )
+            view = _FakeView([failed_summary])
             uploader = FeatureStoreDeltaUploader(
                 _feature_store_config(max_retries=1),
                 output_dir,
@@ -1031,6 +1098,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             uploader.submit(10)
             with self.assertRaises(FeatureStoreUploadError):
                 uploader.close()
+            self.assertEqual(view.flush_calls, [[2, 1], []])
             self.assertFalse(
                 os.path.exists(
                     os.path.join(uploader.state_dir, "step_10._FS_SUCCESS.json")
@@ -1212,10 +1280,10 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             self.assertFalse(os.path.exists(uploader._error_marker_path))
             uploader.close()
 
-    def test_missing_preprovisioned_version_blocks_merge(self):
+    def test_merge_does_not_require_preprovisioned_version(self):
         with tempfile.TemporaryDirectory() as output_dir:
             _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
-            view = _FakeView(versions=[])
+            view = _FakeView()
             uploader = FeatureStoreDeltaUploader(
                 _feature_store_config(max_retries=1),
                 output_dir,
@@ -1224,14 +1292,14 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 {"user_emb": 2},
                 client_factory=_FakeClientFactory(view),
             )
-            with self.assertRaisesRegex(
-                FeatureStoreUploadError, "version does not exist"
-            ):
-                uploader.start()
+            uploader.start()
             uploader.close()
-            self.assertEqual(view.calls, [])
+
+            self.assertEqual(len(view.calls), 1)
+            self.assertEqual(view.calls[0]["version"], "model_a@export_1")
+            self.assertEqual(view.calls[0]["write_mode"], "MERGE")
             self.assertEqual(view.closed, [True])
-            self.assertFalse(
+            self.assertTrue(
                 os.path.exists(
                     os.path.join(uploader.state_dir, "step_10._FS_SUCCESS.json")
                 )
@@ -1313,7 +1381,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             restarted.close()
             self.assertFalse(os.path.exists(snapshot_dir))
 
-    def test_non_draining_close_stops_after_inflight_batch_without_commit(self):
+    def test_non_draining_close_stops_after_inflight_window_without_commit(self):
         with tempfile.TemporaryDirectory() as output_dir:
             _write_single_shard(
                 output_dir,
@@ -1344,7 +1412,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             )
             view.release_flush.set()
             self.assertTrue(view.close_finished.wait(timeout=2))
-            self.assertEqual(len(view.calls), 1)
+            self.assertEqual(len(view.calls), 2)
             self.assertFalse(
                 os.path.exists(
                     os.path.join(uploader.state_dir, "step_10._FS_SUCCESS.json")

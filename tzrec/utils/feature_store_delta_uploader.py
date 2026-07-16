@@ -55,6 +55,10 @@ DELTA_OPERATION_UPSERT = "UPSERT"
 DELTA_DUMP_SCHEMA_VERSION = "2"
 DELTA_DUMP_GENERATION_METADATA_KEY = b"tzrec.delta_embedding.dump_generation"
 
+_FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES = 100
+_VERSION_INITIALIZATION = "AUTO_CREATE_ON_FIRST_DELTA_MERGE"
+_LEGACY_VERSION_INITIALIZATION = "PREPROVISIONED_FOR_DELTA_MERGE"
+
 _POISONED_WRITER_LOCKS: List[BinaryIO] = []
 
 _SCHEMA_VERSION_METADATA_KEY = b"tzrec.delta_embedding.schema_version"
@@ -453,7 +457,7 @@ class FeatureStoreDeltaUploader:
                 self._settings.feature_view_replication_count
             ),
             "version": self._settings.version,
-            "version_initialization": "PREPROVISIONED_FOR_DELTA_MERGE",
+            "version_initialization": _VERSION_INITIALIZATION,
             "feature_view_provisioning": "CHECK_OR_CREATE_DYNAMIC_EMBEDDING",
             "writer_ownership": "SINGLE_WRITER_PER_VERSION_REQUIRED",
             "publish_semantics": "MONOTONIC_TS_RANGE_PER_ATTEMPT_FULL_REPLAY",
@@ -514,8 +518,7 @@ class FeatureStoreDeltaUploader:
                 self._cleanup_committed_snapshots()
                 self._add_discovered_steps_locked()
                 # Validate or provision the remote DynamicEmbedding FeatureView
-                # synchronously. Training must not start while the target is
-                # missing, has the wrong schema, or lacks the configured version.
+                # synchronously. Training must not start with an incompatible target.
                 self._get_view()
                 self._clear_error_marker()
                 self._started = True
@@ -775,11 +778,22 @@ class FeatureStoreDeltaUploader:
                 "FeatureStore upload journal must be initialized under writer lock"
             )
         if os.path.isfile(self._contract_path):
-            if _read_json(self._contract_path) != self._contract:
-                raise ValueError(
-                    "FeatureStore upload contract changed for an existing remote "
-                    "target; provision and configure a new immutable version"
+            stored_contract = _read_json(self._contract_path)
+            if stored_contract != self._contract:
+                legacy_contract = dict(self._contract)
+                legacy_contract["version_initialization"] = (
+                    _LEGACY_VERSION_INITIALIZATION
                 )
+                if stored_contract == legacy_contract:
+                    # Preserve the old hash so existing manifests and success
+                    # markers remain valid after removing the version precheck.
+                    self._contract = stored_contract
+                    self._contract_hash = _json_digest(stored_contract)
+                else:
+                    raise ValueError(
+                        "FeatureStore upload contract changed for an existing remote "
+                        "target; provision and configure a new immutable version"
+                    )
         else:
             _atomic_write_json(self._contract_path, self._contract)
 
@@ -1303,10 +1317,10 @@ class FeatureStoreDeltaUploader:
             attempt = self._start_attempt(global_step, len(records), manifest)
             try:
                 if records:
-                    summary = self._upload_records(records, attempt)
+                    summary = self._upload_records(global_step, records, attempt)
                 else:
-                    # An empty step still validates the FeatureView schema and
-                    # pre-provisioned target version before it can be committed.
+                    # An empty step still validates the FeatureView schema before
+                    # it can be committed.
                     self._get_view()
                     summary = {
                         "total_batches": 0,
@@ -1563,6 +1577,7 @@ class FeatureStoreDeltaUploader:
             "security_token": self._settings.security_token or None,
             "featuredb_username": self._settings.featuredb_username or None,
             "featuredb_password": self._settings.featuredb_password or None,
+            "test_mode": True,
         }
         client = client_factory(**kwargs)
         project = client.get_project(self._settings.project_name)
@@ -1592,16 +1607,9 @@ class FeatureStoreDeltaUploader:
                 "FeatureStore SDK batch_size is smaller than the configured outer "
                 "batch; one publish timestamp could span multiple HTTP requests"
             )
-        version_info = view.list_versions()
-        versions = version_info.get("versions", []) if version_info else []
-        if not any(
-            isinstance(item, dict) and item.get("version") == self._settings.version
-            for item in versions
-        ):
-            raise FeatureStoreUploadError(
-                "configured FeatureStore version does not exist; provision it "
-                "before enabling delta MERGE upload"
-            )
+        sdk_max_workers = getattr(view, "_max_workers", 1)
+        if type(sdk_max_workers) is not int or sdk_max_workers <= 0:
+            raise RuntimeError("FeatureStore SDK max_workers must be a positive int")
         return view
 
     def _reset_view(self, suppress_errors: bool = False) -> None:
@@ -1651,10 +1659,15 @@ class FeatureStoreDeltaUploader:
 
     def _upload_records(
         self,
+        global_step: int,
         records: List[Tuple[str, int, np.ndarray]],
         attempt: Mapping[str, int],
     ) -> Dict[str, int]:
         view = self._get_view()
+        max_in_flight = int(getattr(view, "_max_workers", 1))
+        batch_count = (
+            len(records) + self._settings.upload_batch_size - 1
+        ) // self._settings.upload_batch_size
         aggregate = {
             "total_batches": 0,
             "failed_batches": 0,
@@ -1662,30 +1675,72 @@ class FeatureStoreDeltaUploader:
             "success_records": 0,
             "failed_records": 0,
         }
+        started_at = time.monotonic()
+        next_progress_batch = _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES
+        logger.info(
+            "FeatureStore delta upload started: step=%s attempt=%s version=%s "
+            "records=%s batches=%s max_in_flight=%s ts_range=%s-%s",
+            global_step,
+            attempt["attempt_id"],
+            self._settings.version,
+            len(records),
+            batch_count,
+            max_in_flight,
+            attempt["range_start"],
+            attempt["range_end"],
+        )
         try:
-            for batch_index, offset in enumerate(
-                range(0, len(records), self._settings.upload_batch_size)
-            ):
-                self._raise_if_aborting()
-                chunk = records[offset : offset + self._settings.upload_batch_size]
-                payload = [
-                    {
-                        FEATURE_STORE_PK_FIELD: embedding_name,
-                        FEATURE_STORE_SK_FIELD: key_id,
-                        FEATURE_STORE_VALUE_FIELD: embedding,
-                    }
-                    for embedding_name, key_id, embedding in chunk
-                ]
-                view.write_features(
-                    data=payload,
-                    version=self._settings.version,
-                    write_mode=FEATURE_STORE_WRITE_MODE,
-                    ts=int(attempt["range_start"]) + batch_index,
-                )
+            for window_start in range(0, batch_count, max_in_flight):
+                window_end = min(window_start + max_in_flight, batch_count)
+                window_records = 0
+                for batch_index in range(window_start, window_end):
+                    self._raise_if_aborting()
+                    offset = batch_index * self._settings.upload_batch_size
+                    chunk = records[offset : offset + self._settings.upload_batch_size]
+                    payload = [
+                        {
+                            FEATURE_STORE_PK_FIELD: embedding_name,
+                            FEATURE_STORE_SK_FIELD: key_id,
+                            FEATURE_STORE_VALUE_FIELD: embedding,
+                        }
+                        for embedding_name, key_id, embedding in chunk
+                    ]
+                    view.write_features(
+                        data=payload,
+                        version=self._settings.version,
+                        write_mode=FEATURE_STORE_WRITE_MODE,
+                        ts=int(attempt["range_start"]) + batch_index,
+                    )
+                    window_records += len(chunk)
                 summary = view.write_flush()
-                self._validate_flush_summary(summary, len(chunk))
+                self._validate_flush_summary(
+                    summary,
+                    expected_records=window_records,
+                    expected_batches=window_end - window_start,
+                )
                 for name in aggregate:
                     aggregate[name] += int(summary[name])
+                completed_batches = window_end
+                if (
+                    window_start == 0
+                    or completed_batches >= next_progress_batch
+                    or completed_batches == batch_count
+                ):
+                    logger.info(
+                        "FeatureStore delta upload progress: step=%s attempt=%s "
+                        "batches=%s/%s records=%s/%s elapsed_secs=%.1f",
+                        global_step,
+                        attempt["attempt_id"],
+                        completed_batches,
+                        batch_count,
+                        aggregate["success_records"],
+                        len(records),
+                        time.monotonic() - started_at,
+                    )
+                    while next_progress_batch <= completed_batches:
+                        next_progress_batch += (
+                            _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES
+                        )
                 self._raise_if_aborting()
         except BaseException:
             # A write_features() call can enqueue part of its work before raising.
@@ -1698,7 +1753,9 @@ class FeatureStoreDeltaUploader:
         return aggregate
 
     @staticmethod
-    def _validate_flush_summary(summary: Any, expected_records: int) -> None:
+    def _validate_flush_summary(
+        summary: Any, expected_records: int, expected_batches: int
+    ) -> None:
         required = {
             "total_batches",
             "failed_batches",
@@ -1709,7 +1766,7 @@ class FeatureStoreDeltaUploader:
         if not isinstance(summary, dict) or not required.issubset(summary):
             raise RuntimeError("FeatureStore write_flush returned an invalid summary")
         if (
-            int(summary["total_batches"]) != 1
+            int(summary["total_batches"]) != expected_batches
             or int(summary["failed_batches"]) != 0
             or int(summary["failed_records"]) != 0
             or int(summary["success_records"]) != int(summary["total_records"])
