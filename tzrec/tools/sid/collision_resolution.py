@@ -465,15 +465,12 @@ def resolve_sid_collisions(
                 relocated_count += 1
                 break
         else:
+            # No free candidate slot: keep the original SID (over capacity).
             unresolved_rows.append(row)
-
-    # Unplaceable overflow items keep their original SID (over capacity), so
-    # every input item is preserved in the output.
-    for row in unresolved_rows:
-        origin_key = int(plan.bucket_keys[plan.origin_bucket_indices[row]])
-        origin_count = get_slot_count(origin_key, 0) + 1
-        slot_counts[origin_key] = origin_count
-        slot_indices[row] = origin_count
+            origin_key = int(plan.bucket_keys[plan.origin_bucket_indices[row]])
+            origin_count = get_slot_count(origin_key, 0) + 1
+            slot_counts[origin_key] = origin_count
+            slot_indices[row] = origin_count
 
     final_bucket_keys = np.empty(0, dtype=np.int64)
     final_bucket_counts = np.empty(0, dtype=np.int64)

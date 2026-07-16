@@ -697,7 +697,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--resolved_sid_groups_output_path",
         default=None,
         help=(
-            "Output grouped retained item IDs keyed by their resolved SID; required "
+            "Output grouped item IDs keyed by their resolved SID; required "
             "unless --rate_only is set."
         ),
     )

@@ -90,7 +90,7 @@ class CollisionResolutionTest(unittest.TestCase):
             resolved_grouping.row_order, [2, 0, 4, 1, 6, 5, 3, 9, 7, 8]
         )
 
-    def test_keep_original_fallback(self) -> None:
+    def test_keep_original_over_capacity(self) -> None:
         config = CollisionResolutionConfig((2,), 1)
         plan = prepare_collision_plan(
             np.asarray([0, 1]), np.asarray([[0], [0]]), config
