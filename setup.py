@@ -80,5 +80,6 @@ setup(
         "tests": parse_requirements("requirements/test.txt"),
         "gpu": parse_requirements("requirements/cu129.txt"),
         "cpu": parse_requirements("requirements/cpu.txt"),
+        "feature_store": parse_requirements("requirements/feature_store.txt"),
     },
 )

@@ -44,7 +44,9 @@ from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
 from tzrec.tests import utils as test_utils
 from tzrec.utils import config_util
 from tzrec.utils.delta_embedding_dump import (
+    _CONSUMER,
     _DELTA_DUMP_SCHEMA,
+    _DURABILITY_CONSUMER,
     DeltaEmbeddingDumper,
     _table_shard_info_from_config,
     _TableShardInfo,
@@ -54,6 +56,10 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_no_zch_features,
 )
 from tzrec.utils.dynamicemb_util import has_dynamicemb
+from tzrec.utils.feature_store_delta_uploader import (
+    DELTA_DUMP_GENERATION_METADATA_KEY,
+    FeatureStoreUploadError,
+)
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 _SHARDED_TABLE_NAME = "table_1"
@@ -156,6 +162,11 @@ def _assert_sharded_dump_file(rank: int, output_path: str, dumper) -> None:
     testcase.assertEqual(
         set(table["feature_name"].to_pylist()), {_SHARDED_FEATURE_NAME}
     )
+    testcase.assertEqual(
+        set(table["embedding_name"].to_pylist()), {_SHARDED_TABLE_NAME}
+    )
+    testcase.assertEqual(set(table["embedding_role"].to_pylist()), {"ebc"})
+    testcase.assertEqual(set(table["operation"].to_pylist()), {"UPSERT"})
     testcase.assertEqual(set(table["source"].to_pylist()), {"model_delta_tracker"})
 
     table_weight = dumper._collect_table_weights()[_SHARDED_TABLE_NAME]
@@ -329,9 +340,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         num_rows = dumper._append_table_chunk(
             table_chunks,
             global_step=10,
+            embedding_name="user_emb",
+            embedding_role="ebc",
+            expected_dimension=2,
             feature_name="user_id",
             table_fqn="model.ebc.user_emb",
-            key_ids=torch.tensor([42]),
+            key_ids=torch.tensor([-42]),
             embeddings=torch.tensor([[1.0, 2.0]]),
             source="model_delta_tracker",
         )
@@ -341,8 +355,29 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
         self.assertEqual(table["rank"].to_pylist(), [1])
         self.assertEqual(table["world_size"].to_pylist(), [4])
-        self.assertEqual(table["key_id"].to_pylist(), [42])
+        self.assertEqual(table["embedding_name"].to_pylist(), ["user_emb"])
+        self.assertEqual(table["embedding_role"].to_pylist(), ["ebc"])
+        self.assertEqual(table["key_id"].to_pylist(), [-42])
         self.assertEqual(table["embedding"].to_pylist(), [[1.0, 2.0]])
+        self.assertEqual(table["operation"].to_pylist(), ["UPSERT"])
+
+    def test_dump_rows_reject_processor_invalid_key_sentinel(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        dumper._world_size = 1
+        with self.assertRaisesRegex(ValueError, "invalid-key sentinel"):
+            dumper._append_table_chunk(
+                [],
+                global_step=10,
+                embedding_name="user_emb",
+                embedding_role="ebc",
+                expected_dimension=2,
+                feature_name="user_id",
+                table_fqn="model.ebc.user_emb",
+                key_ids=torch.tensor([-1]),
+                embeddings=torch.tensor([[1.0, 2.0]]),
+                source="model_delta_tracker",
+            )
 
     def test_write_table_chunks_preserves_parquet_schema(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -352,6 +387,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._append_table_chunk(
             table_chunks,
             global_step=5,
+            embedding_name="user_emb",
+            embedding_role="ebc",
+            expected_dimension=2,
             feature_name="user_id",
             table_fqn="model.ebc.user_emb",
             key_ids=torch.tensor([7, 8]),
@@ -378,6 +416,19 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
         self.assertEqual(table.num_rows, 0)
+
+    def test_write_table_chunks_persists_dump_generation_metadata(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        generation = "00112233445566778899aabbccddeeff"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = os.path.join(tmp_dir, "delta.parquet")
+            dumper._write_table_chunks([], output_path, dump_generation=generation)
+            metadata = pq.read_schema(output_path).metadata
+
+        self.assertEqual(
+            metadata[DELTA_DUMP_GENERATION_METADATA_KEY], generation.encode("ascii")
+        )
 
     def test_write_table_chunks_leaves_no_partial_shard_on_error(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -408,12 +459,19 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             self.assertIsNone(dumper.final_dump(100))
             dump_mock.assert_not_called()
 
-            # Trailing partial interval (and step 0) must still be flushed.
-            dumper.final_dump(0)
+            # Step 0 is not publishable. A positive trailing partial interval
+            # must still be flushed.
+            self.assertIsNone(dumper.final_dump(0))
             dumper.final_dump(73)
             self.assertEqual(
                 [call.args[0] for call in dump_mock.call_args_list],
-                [0, 73],
+                [73],
+            )
+            self.assertTrue(
+                all(
+                    call.kwargs == {"check_upload_error": False}
+                    for call in dump_mock.call_args_list
+                )
             )
 
     def test_final_dump_syncs_step_across_ranks_before_flush(self):
@@ -427,7 +485,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         def fake_all_reduce(tensor, op=None):
             self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            tensor.fill_(73)
+            if tensor.numel() == 2:
+                tensor[0] = 73
+                tensor[1] = 0
+            else:
+                tensor[0] = 0
 
         with (
             mock.patch.object(dumper, "dump") as dump_mock,
@@ -436,18 +498,140 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mock.patch("torch.cuda.current_device", return_value=0),
             mock.patch(
                 "torch.tensor",
-                side_effect=lambda *a, **k: torch.zeros(1, dtype=torch.long),
+                side_effect=lambda value, *a, **k: torch.zeros(
+                    len(value), dtype=torch.long
+                ),
             ),
             mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
             dumper.final_dump(50)
-        dump_mock.assert_called_once_with(73)
+        dump_mock.assert_called_once_with(73, check_upload_error=False)
+
+    def test_final_dump_syncs_ranks_before_skipping_step_zero(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval = 50
+        dumper._world_size = 2
+        collective_count = 0
+
+        def fake_all_reduce(tensor, op=None):
+            nonlocal collective_count
+            self.assertIs(op, torch.distributed.ReduceOp.MAX)
+            tensor[0] = 0
+            tensor[1] = 0
+            collective_count += 1
+
+        with (
+            mock.patch.object(dumper, "dump") as dump_mock,
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.cuda.current_device", return_value=0),
+            mock.patch(
+                "torch.tensor",
+                side_effect=lambda value, *a, **k: torch.zeros(
+                    len(value), dtype=torch.long
+                ),
+            ),
+            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
+        ):
+            self.assertIsNone(dumper.final_dump(0))
+
+        self.assertEqual(collective_count, 1)
+        dump_mock.assert_not_called()
+
+    def test_final_dump_reduces_upload_error_before_raising(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval = 50
+        dumper._world_size = 2
+
+        def fake_all_reduce(tensor, op=None):
+            self.assertIs(op, torch.distributed.ReduceOp.MAX)
+            tensor[0] = 73
+            tensor[1] = 1
+
+        with (
+            mock.patch.object(dumper, "_feature_store_upload_error", return_value=None),
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.cuda.current_device", return_value=0),
+            mock.patch(
+                "torch.tensor",
+                side_effect=lambda value, *a, **k: torch.zeros(
+                    len(value), dtype=torch.long
+                ),
+            ),
+            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
+        ):
+            with self.assertRaisesRegex(
+                FeatureStoreUploadError, "another distributed worker"
+            ):
+                dumper.final_dump(50)
+
+    def test_final_dump_reduces_rank_local_dump_failure_before_checkpoint(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval = 50
+        dumper._world_size = 2
+        collective_index = 0
+
+        def fake_all_reduce(tensor, op=None):
+            nonlocal collective_index
+            self.assertIs(op, torch.distributed.ReduceOp.MAX)
+            if collective_index == 0:
+                tensor[0] = 73
+                tensor[1] = 0
+            else:
+                tensor[0] = 1
+            collective_index += 1
+
+        with (
+            mock.patch.object(dumper, "_feature_store_upload_error", return_value=None),
+            mock.patch.object(dumper, "dump", return_value="rank-local.parquet"),
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.cuda.current_device", return_value=0),
+            mock.patch(
+                "torch.tensor",
+                side_effect=lambda value, *a, **k: torch.zeros(
+                    len(value), dtype=torch.long
+                ),
+            ),
+            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "final delta embedding dump"):
+                dumper.final_dump(50)
+        self.assertEqual(collective_index, 2)
+
+    def test_rank_zero_upload_failure_stops_non_uploader_rank(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            marker_path = os.path.join(tmp_dir, "last_error.json")
+            with open(marker_path, "w") as output:
+                output.write("{}")
+            dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._feature_store_enabled = True
+            dumper._feature_store_error_marker_path = marker_path
+            dumper._uploader = None
+
+            with self.assertRaisesRegex(FeatureStoreUploadError, "rank zero"):
+                dumper._check_feature_store_upload_error()
+
+    def test_dump_generation_is_stable_per_step_and_unique_per_run(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._feature_store_enabled = True
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._run_generation = None
+        dumper._initialize_run_generation()
+
+        step_10_generation = dumper._next_dump_generation(10)
+        self.assertEqual(step_10_generation, dumper._next_dump_generation(10))
+        self.assertNotEqual(step_10_generation, dumper._next_dump_generation(11))
 
     def test_maybe_dump_uses_checkpoint_aligned_global_step(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval = 50
         dumper._tracker = mock.MagicMock()
         with mock.patch.object(dumper, "dump") as dump_mock:
+            dumper.maybe_dump(0)
+            dump_mock.assert_not_called()
             dumper.maybe_dump(49)
             dump_mock.assert_not_called()
             dumper.maybe_dump(50)
@@ -459,7 +643,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 [call.args[0] for call in dump_mock.call_args_list],
                 [50, 100],
             )
-        self.assertEqual(dumper._tracker.step.call_count, 4)
+        self.assertEqual(dumper._tracker.step.call_count, 5)
+
+    def test_direct_dump_rejects_step_zero(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        with self.assertRaisesRegex(ValueError, "global_step must be > 0"):
+            dumper.dump(0)
 
     def test_tracker_uses_auto_compact(self):
         tracker = mock.MagicMock()
@@ -482,6 +671,23 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             )
 
         self.assertTrue(tracker_cls.call_args.kwargs["auto_compact"])
+
+    def test_durable_ack_advances_guard_without_recomputing_unique_rows(self):
+        tracker = mock.MagicMock()
+        tracker.per_consumer_batch_idx = {
+            _CONSUMER: 12,
+            _DURABILITY_CONSUMER: 5,
+        }
+        tracker._delete_on_read = True
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._feature_store_enabled = True
+        dumper._tracker = tracker
+
+        dumper._ack_durable_tracker_read()
+
+        self.assertEqual(tracker.per_consumer_batch_idx[_DURABILITY_CONSUMER], 12)
+        tracker.store.delete.assert_called_once_with(up_to_idx=12)
+        tracker.get_unique.assert_not_called()
 
     def test_multi_gpu_output_path_uses_step_underscore_dir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -9,8 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 import re
+import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
@@ -20,26 +23,64 @@ import pyarrow.parquet as pq
 import torch
 from torch import nn
 from torch.distributed._shard.sharded_tensor import ShardedTensor
+from torchrec.distributed.embedding import ShardedEmbeddingCollection
+from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_tracker.model_delta_tracker import (
     ModelDeltaTrackerTrec,
 )
 from torchrec.distributed.model_tracker.types import TrackingMode
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
+from tzrec.utils.feature_store_delta_uploader import (
+    DELTA_DUMP_GENERATION_METADATA_KEY,
+    DELTA_DUMP_SCHEMA_VERSION,
+    DELTA_OPERATION_UPSERT,
+    FeatureStoreDeltaUploader,
+    FeatureStoreUploadError,
+    _durable_makedirs,
+    feature_store_delta_file_prefix,
+    feature_store_upload_error_marker_path,
+    validate_feature_store_config,
+)
 from tzrec.utils.logging_util import logger
+from tzrec.utils.sparse_embedding_contract import (
+    SPARSE_EBC_ROLE,
+    SPARSE_EC_ROLE,
+    SPARSE_EMBEDDING_INVALID_KEY,
+    SPARSE_EMBEDDING_ROLES,
+    SparseEmbeddingIdentity,
+    build_sparse_embedding_name_map,
+    resolve_sparse_embedding_name,
+    sparse_embedding_role_from_state_key,
+)
 
 _CONSUMER = "delta_embedding_dump"
+_DURABILITY_CONSUMER = "delta_embedding_dump_durable_ack"
 _DELTA_DUMP_SCHEMA = pa.schema(
     [
         ("global_step", pa.int64()),
         ("rank", pa.int32()),
         ("world_size", pa.int32()),
+        ("embedding_name", pa.string()),
+        ("embedding_role", pa.string()),
         ("feature_name", pa.string()),
         ("table_fqn", pa.string()),
         ("key_id", pa.int64()),
         ("embedding", pa.list_(pa.float32())),
+        ("operation", pa.string()),
         ("source", pa.string()),
-    ]
+    ],
+    metadata={
+        b"tzrec.delta_embedding.schema_version": DELTA_DUMP_SCHEMA_VERSION.encode(
+            "ascii"
+        ),
+        b"tzrec.delta_embedding.dynamic_key_encoding": (
+            b"UINT64_BIT_PATTERN_IN_SIGNED_INT64"
+        ),
+        b"tzrec.delta_embedding.invalid_key": str(SPARSE_EMBEDDING_INVALID_KEY).encode(
+            "ascii"
+        ),
+    },
 )
 
 
@@ -87,6 +128,8 @@ def validate_delta_embedding_dump_config(
         )
     if config.dump_interval_steps <= 0:
         raise ValueError("delta_embedding_dump_config.dump_interval_steps must be > 0.")
+    if config.HasField("feature_store_config"):
+        validate_feature_store_config(config.feature_store_config)
 
 
 def _has_proto_field(config: Any, field_name: str) -> bool:
@@ -334,16 +377,40 @@ class DeltaEmbeddingDumper:
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
-        self._file_prefix = config.file_prefix or "delta_embedding"
+        file_prefix = config.file_prefix or "delta_embedding"
+        self._file_prefix = file_prefix
         self._rank, self._world_size = _distributed_rank_world_size()
+        self._device = device
         self._tracking_pause_depth = 0
-        os.makedirs(self._output_dir, exist_ok=True)
+        self._feature_store_enabled = config.HasField("feature_store_config")
+        self._run_generation: Optional[str] = None
+        self._feature_store_error_marker_path: Optional[str] = None
+        self._next_feature_store_error_check = 0.0
+        self._feature_store_error_check_interval_secs = 1
+        if self._feature_store_enabled:
+            self._file_prefix = feature_store_delta_file_prefix(
+                config.feature_store_config, self._file_prefix
+            )
+            self._feature_store_error_check_interval_secs = max(
+                int(config.feature_store_config.poll_interval_secs), 1
+            )
+            self._feature_store_error_marker_path = (
+                feature_store_upload_error_marker_path(
+                    config.feature_store_config, self._output_dir
+                )
+            )
+        _durable_makedirs(self._output_dir)
 
         self._table_shard_infos = self._collect_table_shard_infos()
         self._validate_supported_table_sharding(self._table_shard_infos)
+        tracker_consumers = [_CONSUMER]
+        if self._feature_store_enabled:
+            # Keep tracked rows resident until their parquet outbox is durable.
+            # The second consumer advances only after atomic os.replace().
+            tracker_consumers.append(_DURABILITY_CONSUMER)
         self._tracker = ModelDeltaTrackerTrec(
             model,
-            consumers=[_CONSUMER],
+            consumers=tracker_consumers,
             delete_on_read=True,
             auto_compact=True,
             mode=TrackingMode.ID_ONLY,
@@ -356,20 +423,236 @@ class DeltaEmbeddingDumper:
         }
         self._fqn_to_feature_names: Dict[str, List[str]] = {}
         self._fqn_to_feature_names.update(self._tracker.fqn_to_feature_names())
+        self._fqn_to_identity, embedding_dimensions = (
+            self._build_sparse_embedding_contract()
+        )
+        self._uploader: Optional[FeatureStoreDeltaUploader] = None
+        if self._feature_store_enabled and self._rank == 0:
+            self._uploader = FeatureStoreDeltaUploader(
+                config.feature_store_config,
+                output_dir=self._output_dir,
+                file_prefix=file_prefix,
+                world_size=self._world_size,
+                embedding_dimensions=embedding_dimensions,
+            )
 
         logger.info(
             "Delta embedding dump enabled: interval=%s output_dir=%s "
-            "rank=%s/%s tables=%s",
+            "rank=%s/%s tables=%s feature_store_upload=%s",
             self._interval,
             self._output_dir,
             self._rank,
             self._world_size,
             sorted(self._table_to_fqn.keys()),
+            self._feature_store_enabled,
         )
 
     def clear(self) -> None:
         """Clear tracked sparse ids, usually after restore-time dummy steps."""
-        self._tracker.clear(_CONSUMER)
+        self._tracker.clear()
+
+    def start(self) -> None:
+        """Start rank-zero background publication after training initialization."""
+        if self._feature_store_enabled:
+            self._initialize_run_generation()
+        if self._uploader is not None:
+            self._uploader.start()
+
+    def close(self, raise_on_error: bool = True, drain: bool = True) -> None:
+        """Close the rank-zero uploader; abnormal shutdown can skip draining."""
+        if self._uploader is not None:
+            self._uploader.close(raise_on_error=raise_on_error, drain=drain)
+
+    def _feature_store_upload_error(
+        self, force: bool = False
+    ) -> Optional[BaseException]:
+        """Collect a local/shared uploader error without changing rank control flow."""
+        if not getattr(self, "_feature_store_enabled", False):
+            return None
+
+        local_error: Optional[BaseException] = None
+        uploader = getattr(self, "_uploader", None)
+        if uploader is not None:
+            try:
+                uploader.check_error()
+            except BaseException as exc:
+                local_error = exc
+
+        if local_error is not None:
+            return local_error
+        marker_path = getattr(self, "_feature_store_error_marker_path", None)
+        now = time.monotonic()
+        next_check = getattr(self, "_next_feature_store_error_check", 0.0)
+        if not force and now < next_check:
+            return None
+        self._next_feature_store_error_check = now + getattr(
+            self, "_feature_store_error_check_interval_secs", 1
+        )
+        if marker_path and os.path.isfile(marker_path):
+            return FeatureStoreUploadError(
+                "FeatureStore delta upload failed on rank zero; all training "
+                "workers are stopping and parquet outbox files were retained"
+            )
+        return None
+
+    def _check_feature_store_upload_error(self, force: bool = False) -> None:
+        """Surface the rank-zero background failure through the shared outbox."""
+        error = self._feature_store_upload_error(force=force)
+        if error is not None:
+            raise error.with_traceback(error.__traceback__)
+
+    def _initialize_run_generation(self) -> None:
+        """Broadcast one run fence after every rank constructed successfully."""
+        if self._run_generation is not None:
+            return
+        generation = uuid.uuid4().bytes if self._rank == 0 else bytes(16)
+        if self._world_size > 1:
+            if not (
+                torch.distributed.is_available() and torch.distributed.is_initialized()
+            ):
+                raise RuntimeError(
+                    "distributed FeatureStore delta dump requires an initialized "
+                    "process group"
+                )
+            token = torch.tensor(
+                list(generation), dtype=torch.uint8, device=self._device
+            )
+            torch.distributed.broadcast(token, src=0)
+            generation = bytes(token.cpu().tolist())
+        self._run_generation = generation.hex()
+
+    def _next_dump_generation(self, global_step: int) -> Optional[str]:
+        """Derive a stable per-step token from the process-run generation fence."""
+        if not getattr(self, "_feature_store_enabled", False):
+            return None
+        if self._run_generation is None:
+            raise RuntimeError("FeatureStore delta dumper must be started before use")
+        value = f"{self._run_generation}:{global_step}".encode("ascii")
+        return hashlib.sha256(value).hexdigest()[:32]
+
+    def _build_sparse_embedding_contract(
+        self,
+    ) -> Tuple[Dict[str, SparseEmbeddingIdentity], Dict[str, int]]:
+        """Build the same physical-table identity consumed by sparse export."""
+        metadata_by_identity: Dict[Tuple[str, str], Tuple[int, Tuple[str, ...]]] = {}
+        owner_by_identity: Dict[Tuple[str, str], str] = {}
+        roles_by_table: Dict[str, Set[str]] = {}
+        for module_fqn, module in self._tracker.get_tracked_modules().items():
+            if isinstance(module, ShardedEmbeddingCollection):
+                role = SPARSE_EC_ROLE
+            elif isinstance(module, ShardedEmbeddingBagCollection):
+                role = SPARSE_EBC_ROLE
+            else:
+                continue
+            table_name_to_config = getattr(module, "_table_name_to_config", {})
+            for table_name, table_config in table_name_to_config.items():
+                dimension = _int_attr(table_config, "embedding_dim")
+                if dimension <= 0:
+                    dimension = self._table_shard_infos.get(
+                        table_name, _TableShardInfo()
+                    ).global_cols
+                feature_names = tuple(getattr(table_config, "feature_names", ()))
+                identity_key = (role, table_name)
+                previous_owner = owner_by_identity.get(identity_key)
+                if previous_owner is not None and previous_owner != module_fqn:
+                    raise ValueError(
+                        "delta embedding dump cannot distinguish duplicate physical "
+                        f"table identity {identity_key}: {previous_owner!r} vs "
+                        f"{module_fqn!r}"
+                    )
+                owner_by_identity[identity_key] = module_fqn
+                previous = metadata_by_identity.get(identity_key)
+                current = (dimension, feature_names)
+                if previous is not None and previous != current:
+                    raise ValueError(
+                        "inconsistent sparse embedding metadata for "
+                        f"role={role} table={table_name}: {previous} vs {current}"
+                    )
+                metadata_by_identity[identity_key] = current
+                roles_by_table.setdefault(table_name, set()).add(role)
+
+        ambiguous_tables = sorted(
+            table_name for table_name, roles in roles_by_table.items() if len(roles) > 1
+        )
+        if ambiguous_tables:
+            # ModelDeltaTrackerTrec currently stores table_name -> FQN and
+            # overwrites one collection when EC/EBC reuse a raw name. Refuse to
+            # publish incomplete data instead of silently assigning a wrong PK.
+            raise ValueError(
+                "delta embedding dump cannot safely track table names reused by "
+                "both EmbeddingCollection and EmbeddingBagCollection: "
+                f"{ambiguous_tables}. TorchRec tracker needs role-aware identity."
+            )
+
+        name_by_identity = build_sparse_embedding_name_map(metadata_by_identity)
+        identity_by_fqn: Dict[str, SparseEmbeddingIdentity] = {}
+        embedding_dimensions: Dict[str, int] = {}
+        for table_name, fqn in self._table_to_fqn.items():
+            role = sparse_embedding_role_from_state_key(fqn)
+            if role is None:
+                roles = roles_by_table.get(table_name, set())
+                if len(roles) == 1:
+                    role = next(iter(roles))
+            if role is None or (role, table_name) not in metadata_by_identity:
+                raise ValueError(
+                    "cannot resolve sparse embedding collection role for "
+                    f"table={table_name!r}, fqn={fqn!r}"
+                )
+            dimension, feature_names = metadata_by_identity[(role, table_name)]
+            if dimension <= 0:
+                raise ValueError(
+                    f"invalid embedding dimension for table {table_name!r}: {dimension}"
+                )
+            embedding_name = resolve_sparse_embedding_name(
+                name_by_identity, table_name, role
+            )
+            identity = SparseEmbeddingIdentity(
+                role=role,
+                table_name=table_name,
+                embedding_name=embedding_name,
+                dimension=dimension,
+                feature_names=feature_names,
+            )
+            identity_by_fqn[fqn] = identity
+            previous_dimension = embedding_dimensions.get(embedding_name)
+            if previous_dimension is not None and previous_dimension != dimension:
+                raise ValueError(
+                    f"canonical embedding {embedding_name!r} has inconsistent "
+                    f"dimensions: {previous_dimension} vs {dimension}"
+                )
+            embedding_dimensions[embedding_name] = dimension
+        return identity_by_fqn, embedding_dimensions
+
+    def _tracker_cursor_before_read(self) -> Optional[int]:
+        if not getattr(self, "_feature_store_enabled", False):
+            return None
+        return int(self._tracker.per_consumer_batch_idx[_CONSUMER])
+
+    def _rollback_tracker_read(self, cursor: Optional[int]) -> None:
+        if cursor is not None:
+            self._tracker.per_consumer_batch_idx[_CONSUMER] = cursor
+
+    def _ack_durable_tracker_read(self) -> None:
+        if getattr(self, "_feature_store_enabled", False):
+            # Do not call get_unique() for the guard: that would repeat the
+            # expensive GPU cat/unique already performed by the real consumer.
+            # The parquet shard is durable now, so advance the guard cursor to
+            # the exact snapshot consumed above, then best-effort reclaim rows.
+            durable_cursor = int(self._tracker.per_consumer_batch_idx[_CONSUMER])
+            self._tracker.per_consumer_batch_idx[_DURABILITY_CONSUMER] = durable_cursor
+            if getattr(self._tracker, "_delete_on_read", False):
+                try:
+                    self._tracker.store.delete(
+                        up_to_idx=min(self._tracker.per_consumer_batch_idx.values())
+                    )
+                except BaseException as exc:
+                    # Cursor advancement is the durability acknowledgement;
+                    # deletion is only memory reclamation and can be retried by
+                    # a later dump without republishing rows.
+                    logger.warning(
+                        "Failed to reclaim durable delta tracker rows (%s).",
+                        type(exc).__name__,
+                    )
 
     @contextmanager
     def pause_tracking(self) -> Iterator[None]:
@@ -386,6 +669,9 @@ class DeltaEmbeddingDumper:
         Args:
             global_step: Current training step.
         """
+        # This is a throttled local shared-filesystem check, not a distributed
+        # collective, so all ranks can surface an async rank-zero failure quickly.
+        self._check_feature_store_upload_error()
         if global_step > 0 and global_step % self._interval == 0:
             self.dump(global_step)
         self._tracker.step()
@@ -404,6 +690,10 @@ class DeltaEmbeddingDumper:
             Path to the dumped parquet file, or None if skipped.
         """
         global_step = self._sync_final_step(global_step)
+        if global_step <= 0:
+            # Step zero is excluded from the delta publication contract.
+            logger.info("Skipping delta embedding dump at step %s.", global_step)
+            return None
         if global_step > 0 and global_step % self._interval == 0:
             # Boundary steps were already written (with full delta) by
             # ``maybe_dump``. Re-dumping here has no new delta to flush -- every
@@ -413,10 +703,20 @@ class DeltaEmbeddingDumper:
             # consumer window. Re-dumping would also overwrite the already-written
             # boundary shards (with an empty file under multi-GPU), so skip.
             return None
-        return self.dump(global_step)
+        # The error bit was included in the mandatory final collective. Do not
+        # perform another rank-local marker check here: a marker appearing between
+        # ranks could otherwise make only part of the shard set return early.
+        output_path: Optional[str] = None
+        local_error: Optional[BaseException] = None
+        try:
+            output_path = self.dump(global_step, check_upload_error=False)
+        except BaseException as exc:
+            local_error = exc
+        self._raise_if_any_final_dump_failed(local_error)
+        return output_path
 
     def _sync_final_step(self, global_step: int) -> int:
-        """Align the final step across ranks before the trailing flush.
+        """Align the final step and uploader failure state before the trailing flush.
 
         ``maybe_dump`` runs in lockstep so every rank shares ``global_step``,
         but ``final_dump`` is reached with each rank's own last step. With
@@ -426,51 +726,112 @@ class DeltaEmbeddingDumper:
         empty-shard logic prevents. Reduce with MAX so the furthest-progressed
         rank's trailing delta is never swallowed by the boundary-step skip, and
         so every rank takes the same skip/dump decision into the same dir.
+
+        The same collective carries a local/shared uploader-failure bit. No rank
+        raises before all ranks have entered it, preventing an asynchronous marker
+        from stranding another worker inside the final all-reduce.
         """
-        if self._world_size <= 1:
-            return global_step
-        if not (
+        local_error = self._feature_store_upload_error(force=True)
+        any_failed = local_error is not None
+        synced_step = global_step
+        if self._world_size > 1 and (
             torch.distributed.is_available() and torch.distributed.is_initialized()
         ):
-            return global_step
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        step_tensor = torch.tensor(global_step, dtype=torch.long, device=device)
-        torch.distributed.all_reduce(step_tensor, op=torch.distributed.ReduceOp.MAX)
-        return int(step_tensor.item())
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            final_state = torch.tensor(
+                [global_step, int(any_failed)], dtype=torch.long, device=device
+            )
+            torch.distributed.all_reduce(final_state, op=torch.distributed.ReduceOp.MAX)
+            synced_step = int(final_state[0].item())
+            any_failed = bool(final_state[1].item())
 
-    def dump(self, global_step: int) -> Optional[str]:
+        if local_error is not None:
+            raise local_error.with_traceback(local_error.__traceback__)
+        if any_failed:
+            raise FeatureStoreUploadError(
+                "FeatureStore delta upload failed on another distributed worker; "
+                "all workers are stopping and parquet outbox files were retained"
+            )
+        return synced_step
+
+    def _raise_if_any_final_dump_failed(
+        self, local_error: Optional[BaseException]
+    ) -> None:
+        """Make rank-local final shard/submit failures visible before checkpointing."""
+        any_failed = local_error is not None
+        if self._world_size > 1 and (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            failed = torch.tensor([int(any_failed)], dtype=torch.int32, device=device)
+            torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
+            any_failed = bool(failed.item())
+
+        if local_error is not None:
+            raise local_error.with_traceback(local_error.__traceback__)
+        if any_failed:
+            raise RuntimeError(
+                "final delta embedding dump failed on another distributed worker; "
+                "no worker may enter the final checkpoint"
+            )
+
+    def dump(self, global_step: int, check_upload_error: bool = True) -> Optional[str]:
         """Dump currently tracked sparse ids and embeddings to a parquet file.
 
         Args:
             global_step: Current training step.
+            check_upload_error: Whether to perform a rank-local async error check.
+                ``final_dump`` disables it after synchronizing the error bit.
 
         Returns:
             Path to the dumped parquet file, or None if no data to dump.
         """
-        table_weights = self._collect_table_weights()
-        dynamic_modules = self._collect_dynamic_modules()
-        table_chunks: List[pa.Table] = []
-        num_rows = self._append_model_delta_rows(
-            table_chunks,
-            global_step=global_step,
-            table_weights=table_weights,
-            dynamic_modules=dynamic_modules,
-        )
-        if num_rows == 0:
-            if self._world_size == 1:
+        global_step = int(global_step)
+        if global_step <= 0:
+            raise ValueError("delta embedding dump global_step must be > 0")
+        if check_upload_error:
+            self._check_feature_store_upload_error(force=True)
+        uploader = getattr(self, "_uploader", None)
+        dump_generation = self._next_dump_generation(global_step)
+        tracker_cursor = self._tracker_cursor_before_read()
+        try:
+            table_weights = self._collect_table_weights()
+            dynamic_modules = self._collect_dynamic_modules()
+            table_chunks: List[pa.Table] = []
+            num_rows = self._append_model_delta_rows(
+                table_chunks,
+                global_step=global_step,
+                table_weights=table_weights,
+                dynamic_modules=dynamic_modules,
+            )
+            if (
+                num_rows == 0
+                and self._world_size == 1
+                and not getattr(self, "_feature_store_enabled", False)
+            ):
                 logger.info("No delta embedding rows to dump at step %s.", global_step)
                 return None
             output_path = self._output_path(global_step)
-            self._write_table_chunks(table_chunks, output_path)
+            self._write_table_chunks(
+                table_chunks, output_path, dump_generation=dump_generation
+            )
+        except BaseException:
+            # The durability guard still owns the rows, so rewinding this
+            # consumer makes a caller retry observe the same snapshot.
+            self._rollback_tracker_read(tracker_cursor)
+            raise
+
+        self._ack_durable_tracker_read()
+        if uploader is not None:
+            uploader.submit(global_step)
+        if num_rows == 0:
             logger.info(
                 "Dumped empty delta embedding shard to %s at step %s.",
                 output_path,
                 global_step,
             )
-            return output_path
-        output_path = self._output_path(global_step)
-        self._write_table_chunks(table_chunks, output_path)
-        logger.info("Dumped %s delta embedding rows to %s.", num_rows, output_path)
+        else:
+            logger.info("Dumped %s delta embedding rows to %s.", num_rows, output_path)
         return output_path
 
     def _output_path(self, global_step: int) -> str:
@@ -479,7 +840,7 @@ class DeltaEmbeddingDumper:
                 self._output_dir, f"{self._file_prefix}_step_{global_step}.parquet"
             )
         step_dir = os.path.join(self._output_dir, f"step_{global_step}")
-        os.makedirs(step_dir, exist_ok=True)
+        _durable_makedirs(step_dir)
         return os.path.join(
             step_dir,
             (
@@ -535,6 +896,11 @@ class DeltaEmbeddingDumper:
             if table_name is None:
                 logger.warning("Skip delta rows for unknown table fqn: %s", fqn)
                 continue
+            identity = self._fqn_to_identity.get(fqn)
+            if identity is None:
+                raise ValueError(
+                    f"Missing sparse embedding contract for table fqn {fqn!r}"
+                )
             ids = ids.unique(sorted=True)
             embeddings, key_ids = self._lookup_embeddings(
                 table_name,
@@ -547,6 +913,9 @@ class DeltaEmbeddingDumper:
             num_rows += self._append_table_chunk(
                 table_chunks,
                 global_step=global_step,
+                embedding_name=identity.embedding_name,
+                embedding_role=identity.role,
+                expected_dimension=identity.dimension,
                 feature_name=feature_name,
                 table_fqn=fqn,
                 key_ids=key_ids,
@@ -737,6 +1106,9 @@ class DeltaEmbeddingDumper:
         self,
         table_chunks: List[pa.Table],
         global_step: int,
+        embedding_name: str,
+        embedding_role: str,
+        expected_dimension: int,
         feature_name: str,
         table_fqn: str,
         key_ids: torch.Tensor,
@@ -745,6 +1117,12 @@ class DeltaEmbeddingDumper:
     ) -> int:
         key_ids_cpu = key_ids.detach().cpu().to(torch.int64).contiguous()
         embeddings_cpu = embeddings.detach().cpu().to(torch.float32).contiguous()
+        if not embedding_name:
+            raise ValueError("delta embedding dump embedding_name must not be empty")
+        if embedding_role not in SPARSE_EMBEDDING_ROLES:
+            raise ValueError(
+                f"delta embedding dump has invalid embedding_role={embedding_role!r}"
+            )
         if embeddings_cpu.dim() != 2:
             raise ValueError(
                 "delta embedding dump expects a 2-D embedding tensor, "
@@ -758,17 +1136,31 @@ class DeltaEmbeddingDumper:
                 "delta embedding dump key ids and embeddings row count mismatch: "
                 f"key_ids={num_rows}, embeddings={embeddings_cpu.size(0)}."
             )
-
+        if embeddings_cpu.size(1) != expected_dimension:
+            raise ValueError(
+                f"delta embedding dimension mismatch for {embedding_name!r}: "
+                f"expected={expected_dimension}, actual={embeddings_cpu.size(1)}"
+            )
+        if not bool(torch.isfinite(embeddings_cpu).all().item()):
+            raise ValueError(f"delta embedding {embedding_name!r} contains NaN or Inf")
+        if bool((key_ids_cpu == SPARSE_EMBEDDING_INVALID_KEY).any().item()):
+            raise ValueError(
+                "delta embedding key_id=-1 is reserved as the Processor/NvEmbeddings "
+                "invalid-key sentinel"
+            )
         table_chunks.append(
             pa.Table.from_arrays(
                 [
                     pa.repeat(pa.scalar(global_step, pa.int64()), num_rows),
                     pa.repeat(pa.scalar(self._rank, pa.int32()), num_rows),
                     pa.repeat(pa.scalar(self._world_size, pa.int32()), num_rows),
+                    pa.repeat(pa.scalar(embedding_name, pa.string()), num_rows),
+                    pa.repeat(pa.scalar(embedding_role, pa.string()), num_rows),
                     pa.repeat(pa.scalar(feature_name, pa.string()), num_rows),
                     pa.repeat(pa.scalar(table_fqn, pa.string()), num_rows),
                     pa.array(key_ids_cpu.numpy(), type=pa.int64()),
                     self._embedding_array(embeddings_cpu),
+                    pa.repeat(pa.scalar(DELTA_OPERATION_UPSERT, pa.string()), num_rows),
                     pa.repeat(pa.scalar(source, pa.string()), num_rows),
                 ],
                 schema=_DELTA_DUMP_SCHEMA,
@@ -792,7 +1184,10 @@ class DeltaEmbeddingDumper:
         return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), values)
 
     def _write_table_chunks(
-        self, table_chunks: List[pa.Table], output_path: str
+        self,
+        table_chunks: List[pa.Table],
+        output_path: str,
+        dump_generation: Optional[str] = None,
     ) -> None:
         # Write to a sibling temp file and atomically os.replace() it into place
         # only after the writer closes cleanly. A kill or exception mid-write
@@ -800,11 +1195,25 @@ class DeltaEmbeddingDumper:
         # ignores), never a truncated shard at the canonical path.
         tmp_path = f"{output_path}.rank{self._rank}.tmp"
         try:
-            with pq.ParquetWriter(tmp_path, _DELTA_DUMP_SCHEMA) as writer:
+            writer_schema = _DELTA_DUMP_SCHEMA
+            if dump_generation is not None:
+                metadata = dict(writer_schema.metadata or {})
+                metadata[DELTA_DUMP_GENERATION_METADATA_KEY] = dump_generation.encode(
+                    "ascii"
+                )
+                writer_schema = writer_schema.with_metadata(metadata)
+            with pq.ParquetWriter(tmp_path, writer_schema) as writer:
                 chunks = table_chunks or [_DELTA_DUMP_SCHEMA.empty_table()]
                 for table_chunk in chunks:
                     writer.write_table(table_chunk)
+            with open(tmp_path, "rb") as source:
+                os.fsync(source.fileno())
             os.replace(tmp_path, output_path)
+            directory_fd = os.open(os.path.dirname(output_path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         except BaseException:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)

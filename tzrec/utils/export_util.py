@@ -296,7 +296,7 @@ def export_model_normal(
         pipeline_config = copy.copy(pipeline_config)
         pipeline_config.ClearField("feature_configs")
         pipeline_config.feature_configs.extend(feature_configs)
-        config_util.save_message(
+        config_util.save_pipeline_config_artifact(
             pipeline_config, os.path.join(save_dir, "pipeline.config")
         )
         logger.info("saving fg json...")

@@ -9,6 +9,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import tempfile
 import unittest
 
 from tzrec.utils import config_util
@@ -39,6 +41,65 @@ class ConfigUtilTest(unittest.TestCase):
             pipeline_config.feature_configs[4].id_feature.feature_name, "age_level"
         )
         self.assertEqual(pipeline_config.feature_configs[4].id_feature.num_buckets, 3)
+
+    def test_pipeline_artifact_redacts_feature_store_credentials(self):
+        pipeline_config = config_util.load_pipeline_config(
+            "examples/multi_tower_taobao.config"
+        )
+        dump_config = pipeline_config.train_config.delta_embedding_dump_config
+        feature_store_config = dump_config.feature_store_config
+        feature_store_config.region = "cn-test"
+        feature_store_config.endpoint = "feature-store.example"
+        feature_store_config.project_name = "project_a"
+        feature_store_config.feature_entity_name = "embedding_entity"
+        feature_store_config.feature_view_name = "shared_embeddings"
+        feature_store_config.feature_view_ttl_secs = 86400
+        feature_store_config.feature_view_shard_count = 4
+        feature_store_config.feature_view_replication_count = 2
+        feature_store_config.version = "model_a@export_1"
+        feature_store_config.access_key_id = "SECRET_AK_ID"
+        feature_store_config.access_key_secret = "SECRET_AK_VALUE"
+        feature_store_config.security_token = "SECRET_STS"
+        feature_store_config.featuredb_username = "SECRET_FDB_USER"
+        feature_store_config.featuredb_password = "SECRET_FDB_PASSWORD"
+
+        sanitized = config_util.sanitize_pipeline_config_for_artifact(pipeline_config)
+        sanitized_fs = (
+            sanitized.train_config.delta_embedding_dump_config.feature_store_config
+        )
+        self.assertEqual(sanitized_fs.project_name, "project_a")
+        self.assertEqual(sanitized_fs.feature_entity_name, "embedding_entity")
+        self.assertEqual(sanitized_fs.feature_view_name, "shared_embeddings")
+        self.assertEqual(sanitized_fs.feature_view_ttl_secs, 86400)
+        self.assertEqual(sanitized_fs.feature_view_shard_count, 4)
+        self.assertEqual(sanitized_fs.feature_view_replication_count, 2)
+        self.assertEqual(sanitized_fs.version, "model_a@export_1")
+        self.assertTrue(sanitized_fs.IsInitialized())
+        for field_name in (
+            "access_key_id",
+            "access_key_secret",
+            "featuredb_username",
+            "featuredb_password",
+        ):
+            self.assertTrue(sanitized_fs.HasField(field_name))
+            self.assertEqual(getattr(sanitized_fs, field_name), "")
+            self.assertTrue(feature_store_config.HasField(field_name))
+        self.assertFalse(sanitized_fs.HasField("security_token"))
+        self.assertTrue(feature_store_config.HasField("security_token"))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "pipeline.config")
+            config_util.save_pipeline_config_artifact(pipeline_config, path)
+            with open(path) as source:
+                artifact_text = source.read()
+        for secret in (
+            "SECRET_AK_ID",
+            "SECRET_AK_VALUE",
+            "SECRET_STS",
+            "SECRET_FDB_USER",
+            "SECRET_FDB_PASSWORD",
+        ):
+            self.assertNotIn(secret, artifact_text)
 
 
 if __name__ == "__main__":

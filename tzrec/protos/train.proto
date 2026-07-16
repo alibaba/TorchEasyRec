@@ -29,6 +29,59 @@ message GradClipping {
     optional bool enable_global_grad_clip = 4 [default = false];
 }
 
+message FeatureStoreConfig {
+    // FeatureStore control-plane region. An explicitly empty value falls back
+    // to ALIBABA_CLOUD_REGION at runtime.
+    required string region = 1;
+    // Runtime credentials. Explicit values take precedence over the standard
+    // ALIBABA_CLOUD_* environment variables. Persisted model artifacts replace
+    // these required secret values with empty strings.
+    required string access_key_id = 2;
+    required string access_key_secret = 3;
+    // FeatureDB data-plane credential pair. Explicit values take
+    // precedence over FEATUREDB_USERNAME and FEATUREDB_PASSWORD.
+    required string featuredb_username = 4;
+    required string featuredb_password = 5;
+    // Existing FeatureStore project name and target DynamicEmbedding FeatureView
+    // name. The view is validated at startup and created when it does not exist.
+    required string project_name = 6;
+    required string feature_view_name = 7;
+    // Existing FeatureStore entity associated with an automatically created
+    // DynamicEmbedding FeatureView.
+    required string feature_entity_name = 8;
+    // Explicit FeatureDB version for this incremental training run. It must be
+    // provisioned before upload starts; only positive-global-step dumps are
+    // written to this version with MERGE. One project/view/version may have
+    // only one active delta writer.
+    required string version = 9;
+
+
+    // Optional FeatureStore control-plane endpoint override.
+    optional string endpoint = 10;
+    optional string security_token = 11;
+    // Maximum records submitted before each SDK write_flush() completion gate.
+    optional uint32 upload_batch_size = 12 [default = 1000];
+    // Total attempts per process for one step. All retries reuse the version;
+    // each attempt durably reserves a newer monotonic ts range and fully replays
+    // the step so incremental readers cannot miss a partial earlier attempt.
+    optional uint32 max_retries = 13 [default = 3];
+    optional uint32 retry_backoff_secs = 14 [default = 5];
+    // Maximum time rank zero waits for every rank's atomic parquet shard.
+    // With FeatureStore enabled, output_dir must be one stable shared POSIX
+    // filesystem visible to rank zero across restarts and must support atomic
+    // rename, fsync and advisory file locking.
+    optional uint32 shard_wait_timeout_secs = 15 [default = 600];
+    // Maximum time normal training shutdown waits for the uploader to drain.
+    optional uint32 shutdown_timeout_secs = 16 [default = 600];
+    // Apply back-pressure when too many completed dumps await publication.
+    optional uint32 max_pending_steps = 17 [default = 32];
+    optional uint32 poll_interval_secs = 18 [default = 1];
+    // Creation settings used only when feature_view_name does not yet exist.
+    optional uint32 feature_view_ttl_secs = 19 [default = 1296000];
+    optional uint32 feature_view_shard_count = 20 [default = 20];
+    optional uint32 feature_view_replication_count = 21 [default = 1];
+}
+
 message DeltaEmbeddingDumpConfig {
     // MC/ZCH features are not supported; use dynamicemb for delta dump.
     // dump touched ids and their latest embedding every N training steps. Larger
@@ -39,6 +92,8 @@ message DeltaEmbeddingDumpConfig {
     optional string output_dir = 2;
     // parquet file prefix
     optional string file_prefix = 3 [default = "delta_embedding"];
+    // Presence enables durable, rank-zero background upload to FeatureStore.
+    optional FeatureStoreConfig feature_store_config = 4;
 }
 
 message TrainConfig {
