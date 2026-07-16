@@ -84,8 +84,9 @@ message FeatureStoreConfig {
 
 message DeltaEmbeddingDumpConfig {
     // MC/ZCH features are not supported; use dynamicemb for delta dump.
-    // dump touched ids and their latest embedding every N training steps. Larger
-    // intervals retain a longer id window in memory; auto compaction reduces
+    // Dump touched ids and their latest embedding every N training steps. Do not
+    // set this together with dump_interval_minutes.
+    // Larger intervals retain a longer id window in memory; auto compaction reduces
     // per-batch tensor buildup but unique ids still scale with the interval.
     optional uint32 dump_interval_steps = 1 [default = 1000];
     // output directory. default is ${model_dir}/delta_embedding_dump
@@ -94,6 +95,9 @@ message DeltaEmbeddingDumpConfig {
     optional string file_prefix = 3 [default = "delta_embedding"];
     // Presence enables durable, rank-zero background upload to FeatureStore.
     optional FeatureStoreConfig feature_store_config = 4;
+    // Dump after this many elapsed minutes. The timer starts when training starts.
+    // Do not set this together with dump_interval_steps.
+    optional uint32 dump_interval_minutes = 5;
 }
 
 message TrainConfig {

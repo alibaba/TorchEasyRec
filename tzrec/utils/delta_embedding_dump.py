@@ -126,7 +126,17 @@ def validate_delta_embedding_dump_config(
             "delta_embedding_dump_config only supports CUDA training, "
             f"but got device={device}."
         )
-    if config.dump_interval_steps <= 0:
+    if config.HasField("dump_interval_minutes"):
+        if config.HasField("dump_interval_steps"):
+            raise ValueError(
+                "delta_embedding_dump_config must configure only one of "
+                "dump_interval_steps and dump_interval_minutes."
+            )
+        if config.dump_interval_minutes <= 0:
+            raise ValueError(
+                "delta_embedding_dump_config.dump_interval_minutes must be > 0."
+            )
+    elif config.dump_interval_steps <= 0:
         raise ValueError("delta_embedding_dump_config.dump_interval_steps must be > 0.")
     if config.HasField("feature_store_config"):
         validate_feature_store_config(config.feature_store_config)
@@ -373,7 +383,14 @@ class DeltaEmbeddingDumper:
         validate_delta_embedding_dump_no_zch_features(feature_configs)
         self._model = model
         self._config = config
-        self._interval = config.dump_interval_steps
+        self._interval_steps: Optional[int] = None
+        self._interval_secs: Optional[float] = None
+        if config.HasField("dump_interval_minutes"):
+            self._interval_secs = float(config.dump_interval_minutes * 60)
+        else:
+            self._interval_steps = int(config.dump_interval_steps)
+        self._next_dump_time: Optional[float] = None
+        self._last_dump_step: Optional[int] = None
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
@@ -436,10 +453,17 @@ class DeltaEmbeddingDumper:
                 embedding_dimensions=embedding_dimensions,
             )
 
+        interval_name = "minutes" if self._interval_secs is not None else "steps"
+        interval_value = (
+            config.dump_interval_minutes
+            if self._interval_secs is not None
+            else self._interval_steps
+        )
         logger.info(
-            "Delta embedding dump enabled: interval=%s output_dir=%s "
+            "Delta embedding dump enabled: interval_%s=%s output_dir=%s "
             "rank=%s/%s tables=%s feature_store_upload=%s",
-            self._interval,
+            interval_name,
+            interval_value,
             self._output_dir,
             self._rank,
             self._world_size,
@@ -452,11 +476,13 @@ class DeltaEmbeddingDumper:
         self._tracker.clear()
 
     def start(self) -> None:
-        """Start rank-zero background publication after training initialization."""
+        """Start timed cadence and rank-zero publication after initialization."""
         if self._feature_store_enabled:
             self._initialize_run_generation()
         if self._uploader is not None:
             self._uploader.start()
+        if self._interval_secs is not None:
+            self._next_dump_time = time.monotonic() + self._interval_secs
 
     def close(self, raise_on_error: bool = True, drain: bool = True) -> None:
         """Close the rank-zero uploader; abnormal shutdown can skip draining."""
@@ -664,7 +690,7 @@ class DeltaEmbeddingDumper:
             self._tracking_pause_depth -= 1
 
     def maybe_dump(self, global_step: int) -> None:
-        """Dump on the configured global-step interval and advance tracker state.
+        """Dump on the configured step or time interval and advance tracker state.
 
         Args:
             global_step: Current training step.
@@ -672,9 +698,41 @@ class DeltaEmbeddingDumper:
         # This is a throttled local shared-filesystem check, not a distributed
         # collective, so all ranks can surface an async rank-zero failure quickly.
         self._check_feature_store_upload_error()
-        if global_step > 0 and global_step % self._interval == 0:
+        if self._should_dump(global_step):
             self.dump(global_step)
+            self._last_dump_step = global_step
+            if self._interval_secs is not None and self._rank == 0:
+                # Schedule from dump completion to avoid immediate catch-up dumps
+                # when writing the previous interval took longer than expected.
+                self._next_dump_time = time.monotonic() + self._interval_secs
         self._tracker.step()
+
+    def _should_dump(self, global_step: int) -> bool:
+        """Return one rank-consistent dump decision for the current step."""
+        if global_step <= 0:
+            return False
+        if self._interval_steps is not None:
+            return global_step % self._interval_steps == 0
+        if self._next_dump_time is None:
+            raise RuntimeError(
+                "time-based delta embedding dumper must be started before training"
+            )
+
+        should_dump = self._rank == 0 and time.monotonic() >= self._next_dump_time
+        if self._world_size > 1:
+            if not (
+                torch.distributed.is_available() and torch.distributed.is_initialized()
+            ):
+                raise RuntimeError(
+                    "distributed time-based delta embedding dump requires an "
+                    "initialized process group"
+                )
+            decision = torch.tensor(
+                [int(should_dump)], dtype=torch.int32, device=self._device
+            )
+            torch.distributed.broadcast(decision, src=0)
+            should_dump = bool(decision.item())
+        return should_dump
 
     def final_dump(self, global_step: int) -> Optional[str]:
         """Flush the trailing partial interval at the end of training.
@@ -694,7 +752,7 @@ class DeltaEmbeddingDumper:
             # Step zero is excluded from the delta publication contract.
             logger.info("Skipping delta embedding dump at step %s.", global_step)
             return None
-        if global_step > 0 and global_step % self._interval == 0:
+        if self._interval_steps is not None and global_step % self._interval_steps == 0:
             # Boundary steps were already written (with full delta) by
             # ``maybe_dump``. Re-dumping here has no new delta to flush -- every
             # rank's consumer cursor has already advanced past the boundary's
@@ -702,6 +760,10 @@ class DeltaEmbeddingDumper:
             # ``torch.cat(): expected a non-empty list of Tensors`` on the empty
             # consumer window. Re-dumping would also overwrite the already-written
             # boundary shards (with an empty file under multi-GPU), so skip.
+            return None
+        if self._interval_secs is not None and global_step == self._last_dump_step:
+            # A timed dump can land on any step. Avoid replacing that step's full
+            # delta with an empty final shard when training ends immediately after.
             return None
         # The error bit was included in the mandatory final collective. Do not
         # perform another rank-local marker check here: a marker appearing between
