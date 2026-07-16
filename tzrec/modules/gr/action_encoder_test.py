@@ -24,7 +24,7 @@ from tzrec.utils.test_util import (
 )
 
 
-@mark_ci_scope("h20")
+@mark_ci_scope("h20", "gpu")
 class ActionEncoderTest(unittest.TestCase):
     @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])
     @unittest.skipIf(*gpu_unavailable)

@@ -37,6 +37,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.utils import checkpoint_util, misc_util
+from tzrec.utils.test_util import make_test_dir
 
 
 def _create_test_model(large_table_cnt=2, small_table_cnt=2):
@@ -173,9 +174,7 @@ def _remap_restore_worker(test_dir, rank, world_size, port, remap_file_path):
 
 class CheckpointUtilTest(unittest.TestCase):
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
@@ -427,9 +426,7 @@ class DataloaderCheckpointTest(unittest.TestCase):
     """Tests for dataloader checkpoint utilities."""
 
     def setUp(self):
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
@@ -716,7 +713,10 @@ class DataloaderCheckpointTest(unittest.TestCase):
         self.assertTrue(
             mgr.maybe_save(2, model=None, dataloader_state=state, data_timestamp=3600.0)
         )
-        self.assertEqual(state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
+        # the watermark is stamped into the saved state, not the caller's dict
+        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, state)
+        saved_state = mgr.save.call_args.args[3]
+        self.assertEqual(saved_state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
 
     def test_reconcile_event_time_single_process(self):
         # not distributed: this rank's value passes through (quorum of one); -1.0

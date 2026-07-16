@@ -12,6 +12,7 @@
 """QuantizeLayer: the per-layer quantizer interface shared by SID backends."""
 
 from abc import abstractmethod
+from typing import Tuple
 
 import torch
 from torch import nn
@@ -39,13 +40,40 @@ class QuantizeLayer(nn.Module):
         self.embed_dim = embed_dim
 
     @abstractmethod
-    def quantize(self, x: torch.Tensor, temperature: float = 1.0) -> QuantizeOutput:
+    def quantize(self, x: torch.Tensor, topk: int = 1) -> QuantizeOutput:
         """Assign ``x`` (B, D) to the codebook, returning codes + embeddings."""
         raise NotImplementedError
 
     def lookup(self, ids: torch.Tensor) -> torch.Tensor:
         """Gather codebook embeddings for ``ids`` (indexes the codebook)."""
         return self.get_codebook_embeddings()[ids]
+
+    def nearest_neighbors(
+        self,
+        distances: torch.Tensor,
+        topk: int = 1,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(scores, ids)`` of the top-k nearest codes, ascending distance."""
+        if topk < 1 or topk > self.n_embed:
+            raise ValueError(f"topk must be in [1, {self.n_embed}], got {topk}")
+        return torch.topk(distances, k=topk, dim=-1, largest=False)
+
+    def _topk_output(self, distances: torch.Tensor, topk: int) -> QuantizeOutput:
+        """Assemble the eval/inference output (greedy pick + top-k) from distances.
+
+        Shared by both backends' eval paths: slot 0 of the ascending top-k is the
+        nearest (greedy) code, and the full top-k rides along for candidate SIDs.
+        The codebook read goes through :meth:`lookup`, so it stays backend-agnostic
+        (``centroids`` for K-Means, the ``nn.Embedding`` table for VQ).
+        """
+        topk_scores, topk_ids = self.nearest_neighbors(distances, topk)
+        ids = topk_ids[:, 0]
+        return QuantizeOutput(
+            embeddings=self.lookup(ids),
+            ids=ids,
+            topk_ids=topk_ids,
+            topk_scores=topk_scores,
+        )
 
     @abstractmethod
     def get_codebook_embeddings(self) -> torch.Tensor:

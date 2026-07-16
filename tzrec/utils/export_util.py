@@ -16,9 +16,10 @@ import operator
 import os
 import re
 import shutil
+import tempfile
 from collections import OrderedDict, defaultdict
 from queue import Queue
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 import numpy as np
 import torch
@@ -63,7 +64,7 @@ from tzrec.features.feature import (
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util, env_util
+from tzrec.utils import checkpoint_util, config_util, env_util, quant_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
@@ -81,7 +82,7 @@ from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
 def ensure_input_tile_for_distributed_embedding() -> None:
     """Ensure distributed embedding export uses INPUT_TILE=3."""
-    if not env_util.use_distributed_embedding():
+    if not acc_utils.use_distributed_embedding():
         return
 
     # Distributed embedding export only supports INPUT_TILE=3.
@@ -102,13 +103,33 @@ def _is_input_tile_user_keyed_tensor(name: str) -> bool:
     return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
 
 
+def _dedup_key_files_by_realpath(key_files: List[str]) -> List[str]:
+    """Keep one dynamicemb key shard path for each physical file.
+
+    Normal training checkpoints do not create INPUT_TILE user-side dynamicemb
+    aliases, but externally staged checkpoints may contain symlinked or aliased
+    table directories. Since export discovers dynamicemb shards by globbing the
+    checkpoint directory, loading the same physical shard twice would duplicate
+    its keys and values in the exported dynamic embedding data.
+    """
+    seen_real: Set[str] = set()
+    deduped_key_files = []
+    for key_file in key_files:
+        real = os.path.realpath(key_file)
+        if real in seen_real:
+            continue
+        seen_real.add(real)
+        deduped_key_files.append(key_file)
+    return deduped_key_files
+
+
 def export_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
-    additional_export_config: Optional[Dict[str, str]] = None,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig.
@@ -117,8 +138,7 @@ def export_model(
     input path; falls back to `pipeline_config.train_input_path` when None.
     """
     use_rtp = env_util.use_rtp()
-    ensure_input_tile_for_distributed_embedding()
-    use_dist_embedding = env_util.use_distributed_embedding()
+    use_dist_embedding = acc_utils.use_distributed_embedding()
     if use_rtp:
         impl = export_rtp_model
     elif use_dist_embedding:
@@ -182,7 +202,7 @@ def export_model_normal(
     checkpoint_path: Optional[str],
     save_dir: str,
     assets: Optional[List[str]] = None,
-    additional_export_config: Optional[Dict[str, str]] = None,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
@@ -238,7 +258,7 @@ def export_model_normal(
         # for mc modules, fix output_segments_tensor is a meta tensor.
         fix_mch_state(model)
 
-        batch = next(iter(dataloader))
+        batch = next(dataloader.get_iterator())  # pyre-ignore[16]
 
         # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
         # for nbit quantization uses int32 pointer arithmetic which
@@ -640,25 +660,7 @@ def _get_rtp_embedding_tensor(
         key_files = sorted(
             glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
         )
-        # Deduplicate by real filesystem path. INPUT_TILE=3 export creates
-        # `<...>.ebc_user` symlinks pointing at `<...>.ebc` (see
-        # `_make_dynamicemb_input_tile_user_view` in checkpoint_util.py),
-        # so the glob above returns the same physical file under two
-        # collection paths. Without dedup, each dynamic table's key/value
-        # file would be exported twice, causing online serving to insert the
-        # same keys twice into the dynamic embedding table. With score-based
-        # eviction at the capacity boundary, the second insertion shifts the
-        # eviction set and produces small per-key inference drift vs offline
-        # predict.
-        seen_real: set = set()
-        deduped_key_files = []
-        for f in key_files:
-            real = os.path.realpath(f)
-            if real in seen_real:
-                continue
-            seen_real.add(real)
-            deduped_key_files.append(f)
-        key_files = deduped_key_files
+        key_files = _dedup_key_files_by_realpath(key_files)
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
@@ -904,7 +906,7 @@ def export_rtp_model(
     data_config.batch_size = acc_utils.get_max_export_batch_size()
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
-    batch = next(iter(dataloader))
+    batch = next(dataloader.get_iterator())  # pyre-ignore[16]
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 
     # Build Sharded Model
@@ -1365,7 +1367,8 @@ def export_distributed_embedding(
     save_dir: str,
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
-    dense_only: bool = False,
+    additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
+    data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export for online serving under distributed embedding mode."""
@@ -1386,6 +1389,10 @@ def export_distributed_embedding(
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
+    sparse_quant_format = acc_utils.distributed_sparse_quant_format()
+    if sparse_quant_format:
+        logger.info(f"distributed sparse quant export enabled: {sparse_quant_format}")
+
     feature_to_embedding_bag_info, feature_to_embedding_info = (
         _get_sparse_feature_to_embedding_info(model)
     )
@@ -1394,9 +1401,8 @@ def export_distributed_embedding(
     data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
-    dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
+    input_path = data_input_path or pipeline_config.train_input_path
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(iter(dataloader))
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
 
@@ -1447,17 +1453,11 @@ def export_distributed_embedding(
 
     unwrap_model = dmp_model.module
     tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
-    full_graph = tracer.trace(unwrap_model)  # , concrete_args=concrete_args)
+    full_graph = tracer.trace(unwrap_model)
 
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
             f.write(str(full_graph))
-
-    def _seq_len_name(seq_name: str) -> str:
-        return seq_name + "__sequence_length"
-
-    def _seq_feat_name(seq_name: str) -> str:
-        return seq_name + "__sequence"
 
     # Extract Sparse Model
     logger.info("exporting sparse model...")
@@ -1523,57 +1523,50 @@ def export_distributed_embedding(
     sparse_model = sparse_gm
     sparse_model.eval()
     sparse_output, sparse_attrs = sparse_model(data, device=device)
-    if not dense_only:
-        # Save Sparse Parameters
-        logger.info("saving sparse parameters...")
+    # Save Sparse Parameters
+    logger.info("saving sparse parameters...")
 
-        local_tensor, dynamic_local_tensor, emb_meta, feat_meta = (
-            _get_sparse_embedding_tensor(
-                sparse_model,
-                checkpoint_path,
-                feature_to_embedding_info.values(),
-                feature_to_embedding_bag_info.values(),
-            )
+    local_tensor, dynamic_local_tensor, emb_meta, feat_meta = (
+        _get_sparse_embedding_tensor(
+            sparse_model,
+            checkpoint_path,
+            feature_to_embedding_info.values(),
+            feature_to_embedding_bag_info.values(),
         )
-        local_tensor_name = f"sparse_embeddings-{rank:02d}-of-{world_size:02d}"
-        save_dir_sparse = f"{save_dir}/sparse"
-        if not os.path.exists(save_dir_sparse):
-            os.makedirs(save_dir_sparse)
-        local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
-        logger.info(f"save sparse tensors to {local_tensor_path}")
-        # np.savez(local_tensor_path, **local_tensor)
-        import tempfile
+    )
+    local_tensor_name = f"sparse_embeddings-{rank:02d}-of-{world_size:02d}"
+    save_dir_sparse = f"{save_dir}/sparse"
+    if not os.path.exists(save_dir_sparse):
+        os.makedirs(save_dir_sparse)
+    local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
+    logger.info(f"save sparse tensors to {local_tensor_path}")
 
-        # OSS mounted file system may have problem in file seek, so first
-        # save to a temp file then move to target path
+    # OSS mounted file system may have problem in file seek, so first
+    # save to a temp file then move to target path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
+        temp_path = f.name
+        np.savez(f, **local_tensor)
+    shutil.move(temp_path, local_tensor_path)
+
+    if dynamic_local_tensor:
+        dynamic_tensor_name = f"sparse_dynamic_embedding-{rank:02d}-of-{world_size:02d}"
+        dynamic_tensor_path = os.path.join(
+            save_dir_sparse, f"{dynamic_tensor_name}.npz"
+        )
+        logger.info(f"save dynamic sparse tensors to {dynamic_tensor_path}")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
-            np.savez(f, **local_tensor)
+            np.savez(f, **dynamic_local_tensor)
             temp_path = f.name
-        shutil.move(temp_path, local_tensor_path)
+        shutil.move(temp_path, dynamic_tensor_path)
 
-        if dynamic_local_tensor:
-            dynamic_tensor_name = (
-                f"sparse_dynamic_embedding-{rank:02d}-of-{world_size:02d}"
-            )
-            dynamic_tensor_path = os.path.join(
-                save_dir_sparse, f"{dynamic_tensor_name}.npz"
-            )
-            logger.info(f"save dynamic sparse tensors to {dynamic_tensor_path}")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
-                np.savez(f, **dynamic_local_tensor)
-                temp_path = f.name
-            shutil.move(temp_path, dynamic_tensor_path)
-
-        with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
-            json.dump(emb_meta, f, indent=4)
-        if is_rank_zero:
-            with open(os.path.join(save_dir_sparse, "sparse_features.json"), "w") as f:
-                json.dump(feat_meta, f, indent=4)
+    with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
+        json.dump(emb_meta, f, indent=4)
+    if is_rank_zero:
+        with open(os.path.join(save_dir_sparse, "sparse_features.json"), "w") as f:
+            json.dump(feat_meta, f, indent=4)
 
     # Extract Dense Model
     logger.info("exporting dense model...")
-    additional_fg = []
-
     graph = copy.deepcopy(full_graph)
     output_keys = []
     output_values = []
@@ -1671,36 +1664,39 @@ def export_distributed_embedding(
         dense_model_scripted = torch.jit.script(dense_model_traced)
         dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
 
-        if not dense_only:
-            logger.info("saving pipeline.config...")
-            feature_configs = create_feature_configs(features, asset_dir=save_dir)
-            pipeline_config = copy.copy(pipeline_config)
-            pipeline_config.ClearField("feature_configs")
-            pipeline_config.feature_configs.extend(feature_configs)
-            config_util.save_message(
-                pipeline_config, os.path.join(save_dir, "pipeline.config")
+        logger.info("saving pipeline.config...")
+        feature_configs = create_feature_configs(features, asset_dir=save_dir)
+        pipeline_config = copy.copy(pipeline_config)
+        pipeline_config.ClearField("feature_configs")
+        pipeline_config.feature_configs.extend(feature_configs)
+        config_util.save_message(
+            pipeline_config, os.path.join(save_dir, "pipeline.config")
+        )
+
+        with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
+            json.dump(
+                acc_utils.export_acc_config(
+                    additional_export_config=additional_export_config
+                ),
+                f,
+                indent=4,
             )
 
-            with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-                json.dump(acc_utils.export_acc_config(), f, indent=4)
+        has_fg_asset = False
+        if assets is not None:
+            for asset in assets:
+                if asset.endswith("fg.json"):
+                    has_fg_asset = True
+                shutil.copy(asset, save_dir)
 
-            has_fg_asset = False
-            if assets is not None:
-                for asset in assets:
-                    if asset.endswith("fg.json"):
-                        has_fg_asset = True
-                    shutil.copy(asset, save_dir)
+        # Save FG
+        if not has_fg_asset:
+            logger.info("saving fg json...")
+            fg_json = create_fg_json(features, asset_dir=save_dir)
+            with open(os.path.join(save_dir, "fg.json"), "w") as f:
+                json.dump(fg_json, f, indent=4)
 
-            # Save FG
-            if not has_fg_asset:
-                logger.info("saving fg json...")
-                fg_json = create_fg_json(features, asset_dir=save_dir)
-                fg_json["features"].extend(additional_fg)
-                with open(os.path.join(save_dir, "fg.json"), "w") as f:
-                    json.dump(fg_json, f, indent=4)
-
-    dist.barrier()
-    if is_rank_zero and not dense_only:
+    if is_rank_zero:
         # merge sharded sparse meta files
         emb_json_file_names = glob.glob(
             os.path.join(save_dir_sparse, "sparse_embeddings*.json")
@@ -1884,10 +1880,48 @@ def _merge_sharded_embedding_json(
     for emb_json in emb_json_files:
         for emb_name, info in emb_json.items():
             if emb_name not in merged_json:
-                merged_json[emb_name] = info
+                merged_json[emb_name] = copy.deepcopy(info)
             else:
+                for field in ("dimension", "dtype"):
+                    if merged_json[emb_name].get(field) != info.get(field):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent {field}: "
+                            f"{merged_json[emb_name].get(field)} vs {info.get(field)}"
+                        )
+                if merged_json[emb_name]["shape"][1] != info["shape"][1]:
+                    raise ValueError(
+                        f"embedding {emb_name} has inconsistent shape[1]: "
+                        f"{merged_json[emb_name]['shape'][1]} vs {info['shape'][1]}"
+                    )
+                for field in ("storage_dtype", "row_bytes", "quant"):
+                    if merged_json[emb_name].get(field) != info.get(field):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent {field}: "
+                            f"{merged_json[emb_name].get(field)} vs {info.get(field)}"
+                        )
                 merged_json[emb_name]["memory"] += info["memory"]
                 merged_json[emb_name]["shape"][0] += info["shape"][0]
+                if "storage_shape" in merged_json[emb_name] or "storage_shape" in info:
+                    if (
+                        "storage_shape" not in merged_json[emb_name]
+                        or "storage_shape" not in info
+                    ):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent storage_shape "
+                            "presence across shards"
+                        )
+                    if (
+                        merged_json[emb_name]["storage_shape"][1]
+                        != info["storage_shape"][1]
+                    ):
+                        raise ValueError(
+                            f"embedding {emb_name} has inconsistent storage_shape[1]: "
+                            f"{merged_json[emb_name]['storage_shape'][1]} vs "
+                            f"{info['storage_shape'][1]}"
+                        )
+                    merged_json[emb_name]["storage_shape"][0] += info["storage_shape"][
+                        0
+                    ]
                 if info.get("is_dynamic"):
                     # Dynamic npz entry names are uniform across ranks
                     # (e.g. always "user_id_emb.keys"). Serving iterates all
@@ -2029,6 +2063,61 @@ def _resolve_sparse_export_name(
     )
 
 
+def _remove_torch_prefix(src: str) -> str:
+    prefix = "torch."
+    if src.startswith(prefix):
+        return src[len(prefix) :]
+    return src
+
+
+def _value_nbytes(values: Any) -> int:
+    if hasattr(values, "nbytes"):
+        return int(values.nbytes)
+    return int(values.numel() * values.element_size())
+
+
+def _prepare_sparse_export_values(
+    values: Any, emb_dim: int, emb_name: str
+) -> Tuple[Any, Dict[str, Any]]:
+    shape = list(values.shape)
+    if len(shape) != 2 or shape[1] != emb_dim:
+        raise ValueError(
+            f"Expected a 2D sparse embedding tensor with dim={emb_dim}, "
+            f"got shape={shape}"
+        )
+
+    quant_format = acc_utils.distributed_sparse_quant_format()
+    if not quant_format:
+        return values, {
+            "dimension": emb_dim,
+            "dtype": _remove_torch_prefix(str(values.dtype)),
+            "memory": _value_nbytes(values),
+            "shape": shape,
+        }
+
+    quantized_values = quant_util.distributed_quantize_embeddings(
+        values,
+        emb_dim=emb_dim,
+        emb_name=emb_name,
+        quant_format=quant_format,
+    )
+    return quantized_values, {
+        "dimension": emb_dim,
+        "dtype": quant_format,
+        "storage_dtype": quant_util._DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
+        "storage_shape": list(quantized_values.shape),
+        "row_bytes": int(quantized_values.shape[1]),
+        "memory": int(quantized_values.nbytes),
+        "shape": shape,
+        "quant": {
+            "enabled": True,
+            "format": quant_format,
+            "scale_offset_dtype": "float16",
+            "output_dtype": "float16",
+        },
+    }
+
+
 def _get_sparse_embedding_tensor(
     model: nn.Module,
     checkpoint_path: str,
@@ -2092,19 +2181,12 @@ def _get_sparse_embedding_tensor(
             else:
                 feat_name_to_pooling[feat_name_impl] = "NONE"
 
-    def _remove_prefix(src: str, prefix: str = "torch.") -> str:
-        if src.startswith(prefix):
-            return src[len(prefix) :]
-        return src
-
     out = {}
     # dynamicemb keys/values are saved into a separate npz, kept in this dict.
     dynamic_out = {}
-    # shard_offsets = {}
-    # per-table representative tensor used only for meta (shape/dtype/memory).
-    # dynamicemb tables are stored in `dynamic_out` under composite keys, so we
-    # track a separate mapping keyed by emb_name here.
-    emb_name_to_meta_tensor = {}
+
+    # per-table export metadata (logical shape/dtype plus optional storage info).
+    emb_name_to_export_meta = {}
     # set of emb_names that are dynamic embedding tables (loaded from
     # checkpoint's `dynamicemb/` directory rather than model state_dict).
     dynamic_emb_names = set()
@@ -2121,9 +2203,6 @@ def _get_sparse_embedding_tensor(
             emb_name,
             _sparse_export_role_from_state_key(name),
         )
-        # emb_impl_type = name.split(".")[2]  # 'emb_impls' or 'seq_emb_impls'
-
-        # feat_name_impl_list = emb_name_to_feat_name_impl.get(emb_name, [])
 
         emb_dim = emb_name_to_emb_dim[export_emb_name]
         if isinstance(values, DTensor):
@@ -2141,14 +2220,20 @@ def _get_sparse_embedding_tensor(
                         local_tensor = values.local_tensor().cpu().numpy()
                         if list(local_tensor.shape)[-1] == emb_dim:
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
-                            out[export_emb_name] = local_tensor
-                            emb_name_to_meta_tensor[export_emb_name] = local_tensor
+                            export_tensor, export_meta = _prepare_sparse_export_values(
+                                local_tensor, emb_dim, export_emb_name
+                            )
+                            out[export_emb_name] = export_tensor
+                            emb_name_to_export_meta[export_emb_name] = export_meta
                             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
             local_tensor = values.detach().cpu().numpy()
-            out[export_emb_name] = local_tensor
-            emb_name_to_meta_tensor[export_emb_name] = local_tensor
+            export_tensor, export_meta = _prepare_sparse_export_values(
+                local_tensor, emb_dim, export_emb_name
+            )
+            out[export_emb_name] = export_tensor
+            emb_name_to_export_meta[export_emb_name] = export_meta
             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
@@ -2156,25 +2241,7 @@ def _get_sparse_embedding_tensor(
         key_files = sorted(
             glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
         )
-        # Deduplicate by real filesystem path. INPUT_TILE=3 export creates
-        # `<...>.ebc_user` symlinks pointing at `<...>.ebc` (see
-        # `_make_dynamicemb_input_tile_user_view` in checkpoint_util.py),
-        # so the glob above returns the same physical file under two
-        # collection paths. Without dedup, each dynamic table's key/value
-        # file would be exported twice, causing online serving to insert the
-        # same keys twice into the dynamic embedding table. With score-based
-        # eviction at the capacity boundary, the second insertion shifts the
-        # eviction set and produces small per-key inference drift vs offline
-        # predict.
-        seen_real: set = set()
-        deduped_key_files = []
-        for f in key_files:
-            real = os.path.realpath(f)
-            if real in seen_real:
-                continue
-            seen_real.add(real)
-            deduped_key_files.append(f)
-        key_files = deduped_key_files
+        key_files = _dedup_key_files_by_realpath(key_files)
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
@@ -2261,10 +2328,13 @@ def _get_sparse_embedding_tensor(
             keys = torch.cat(keys_list)
             values_2d = torch.cat(values_list, dim=0)
             scores = torch.cat(scores_list)
+            export_values, export_meta = _prepare_sparse_export_values(
+                values_2d, emb_dim, emb_name
+            )
             dynamic_out[key_name] = keys
-            dynamic_out[value_name] = values_2d
+            dynamic_out[value_name] = export_values
             dynamic_out[score_name] = scores
-            emb_name_to_meta_tensor[emb_name] = values_2d
+            emb_name_to_export_meta[emb_name] = export_meta
             dynamic_emb_names.add(emb_name)
             dynamic_key_names[emb_name].append(key_name)
             dynamic_value_names[emb_name].append(value_name)
@@ -2274,26 +2344,19 @@ def _get_sparse_embedding_tensor(
 
     emb_meta = {}
     for emb_name, feat_name_impl_list in emb_name_to_feat_name_impl.items():
-        if emb_name not in emb_name_to_meta_tensor:
+        if emb_name not in emb_name_to_export_meta:
             # table not present on this rank (e.g. sharded to other ranks)
             continue
-        values = emb_name_to_meta_tensor[emb_name]
-        dimension = list(values.shape)[-1]
-        dtype = _remove_prefix(str(values.dtype))
-        memory: int = int(values.nbytes)
-        shape = list(values.shape)
+        export_meta = emb_name_to_export_meta[emb_name]
         is_dynamic = emb_name in dynamic_emb_names
         t_meta = {
             "feat_name_impl": feat_name_impl_list,
             "dense": False,
             "is_dynamic": is_dynamic,
-            "dimension": dimension,
-            "dtype": dtype,
-            "memory": memory,
-            "shape": shape,
             # "shard_offsets": shard_offsets[name],
             # "pooling": feat_name_to_pooling[name],
         }
+        t_meta.update(export_meta)
         if is_dynamic:
             # Entry names inside sparse_dynamic_embedding-*.npz. The serving
             # processor expects one key/value/score entry triplet and applies it

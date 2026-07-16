@@ -405,12 +405,14 @@ class DeltaEmbeddingDumper:
         """
         global_step = self._sync_final_step(global_step)
         if global_step > 0 and global_step % self._interval == 0:
-            if self._world_size > 1:
-                # Lagging ranks may hold un-flushed tail delta; dump into
-                # the preceding non-boundary step dir to keep full shard sets.
-                global_step -= 1
-            else:
-                return None
+            # Boundary steps were already written (with full delta) by
+            # ``maybe_dump``. Re-dumping here has no new delta to flush -- every
+            # rank's consumer cursor has already advanced past the boundary's
+            # delta -- and torchrec's ``get_unique`` raises
+            # ``torch.cat(): expected a non-empty list of Tensors`` on the empty
+            # consumer window. Re-dumping would also overwrite the already-written
+            # boundary shards (with an empty file under multi-GPU), so skip.
+            return None
         return self.dump(global_step)
 
     def _sync_final_step(self, global_step: int) -> int:

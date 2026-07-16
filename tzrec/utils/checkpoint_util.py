@@ -39,16 +39,14 @@ from torch.distributed.checkpoint.default_planner import (
 )
 from torchrec.modules.mc_modules import MCHManagedCollisionModule
 
+from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
-# Substring substitutions used to fall back from INPUT_TILE=3 user-side state
-# keys to their non-user training-checkpoint counterparts. Mirrors
-# `tzrec/acc/utils.py:write_mapping_file_for_input_tile`. Applied at load time
-# so callers like `export_distributed_embedding` and `export_rtp_model` do not
-# need to pre-generate a mapping file.
+# INPUT_TILE=3 load-time fallback from user-side keys to non-user checkpoint keys.
+# Mirrors `tzrec/acc/utils.py:write_mapping_file_for_input_tile`.
 _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
     (".ebc_user.embedding_bags.", ".ebc.embedding_bags."),
     (".mc_ebc_user._embedding_module.", ".mc_ebc._embedding_module."),
@@ -142,14 +140,13 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                         "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
                     )
 
-            # INPUT_TILE=3 export adds user-side twin modules (`ebc_user`,
-            # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) whose
-            # state_dict keys do not exist in the training checkpoint
-            # (training never sets INPUT_TILE). Fall back to the non-user
-            # counterpart that does exist. Equivalent to the explicit
-            # `emb_ckpt_mapping.txt` generated in `export_model_normal`,
-            # but works without the call site pre-computing a mapping.
-            if meta_fqn not in self.metadata.state_dict_metadata:
+            # INPUT_TILE=3 export adds user-side twin modules absent from
+            # training checkpoints. Remap to existing non-user keys, matching
+            # export_model_normal's emb_ckpt_mapping.txt fallback.
+            if (
+                is_input_tile_emb()
+                and meta_fqn not in self.metadata.state_dict_metadata
+            ):
                 for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
                     if new_pat not in meta_fqn:
                         continue
@@ -349,6 +346,7 @@ class CheckpointManager:
         self._ts_group: Optional[dist.ProcessGroup] = None
         # cadence state owned here so dedupe is centralized across all save sites
         self._last_ckpt_step = -1
+        self._last_ckpt_dir: Optional[str] = None
         self._last_data_ts: Optional[float] = None
 
     def save(
@@ -363,6 +361,7 @@ class CheckpointManager:
         save_model(ckpt_dir, model, optimizer)
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
+        self._last_ckpt_dir = ckpt_dir
         self.prune()
         return ckpt_dir
 
@@ -474,6 +473,11 @@ class CheckpointManager:
             True if a checkpoint was saved.
         """
         data_ts = self._reconcile_event_time(data_timestamp)
+        # copy so the watermark isn't leaked back into the train loop's state
+        if dataloader_state is not None:
+            dataloader_state = dict(dataloader_state)
+            if data_ts is not None:
+                dataloader_state[DATA_TS_WATERMARK] = data_ts
 
         want = final
         if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:
@@ -494,15 +498,25 @@ class CheckpointManager:
             ):
                 want = True
 
-        if not want or step == self._last_ckpt_step:
+        if not want:
+            return False
+        if step == self._last_ckpt_step:
+            # a boundary save dedup'd against an already-saved step: refresh
+            # that checkpoint's state so the cleared + bumped bookkeeping is
+            # not lost to the dedupe (lockstep across ranks, so the collective
+            # in save_dataloader_state is safe).
+            if (
+                (final or epoch is not None)
+                and dataloader_state is not None
+                and self._last_ckpt_dir is not None
+            ):
+                save_dataloader_state(self._last_ckpt_dir, dataloader_state)
             return False
 
         self._last_ckpt_step = step
         if data_ts is not None:
-            # advance + persist the watermark on every save so resume is exact
+            # advance the watermark on every save so resume is exact
             self._last_data_ts = data_ts
-            if dataloader_state is not None:
-                dataloader_state[DATA_TS_WATERMARK] = data_ts
         self.save(step, model, optimizer, dataloader_state)
         return True
 
@@ -853,7 +867,7 @@ def _make_dynamicemb_input_tile_user_view(dynamicemb_path: str, view_path: str) 
     """
     entries = []
     for entry in os.listdir(dynamicemb_path):
-        full_path = os.path.join(dynamicemb_path, entry)
+        full_path = os.path.abspath(os.path.join(dynamicemb_path, entry))
         if not os.path.isdir(full_path):
             continue
         entries.append((entry, full_path))
@@ -965,10 +979,9 @@ def restore_model(
             # share dynamic-embedding tables with their non-user counterparts.
             # Build a local symlink view instead of mutating the checkpoint
             # directory, which may be read-only or remote-mounted.
-            input_tile = os.environ.get("INPUT_TILE", "")
             dynamicemb_load_path = dynamicemb_path
             dynamicemb_view = None
-            if input_tile.startswith("3"):
+            if is_input_tile_emb():
                 dynamicemb_view = tempfile.TemporaryDirectory(
                     prefix=f"tzrec_dynamicemb_rank{os.environ.get('RANK', '0')}_"
                 )
@@ -1041,6 +1054,9 @@ DATALOADER_CKPT_FILENAME = "dataloader_state.json"
 # reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
 # no ":" so per-source consumers skip it.
 DATA_TS_WATERMARK = "__data_ts_watermark__"
+# reserved dataloader_state key: number of completed data passes; resume
+# continues the epoch budget from here. no ":" so per-source consumers skip it.
+EPOCHS_COMPLETED = "__epochs_completed__"
 
 
 def save_dataloader_state(

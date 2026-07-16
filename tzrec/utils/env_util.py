@@ -60,3 +60,14 @@ def enable_tma() -> bool:
 def force_load_sharding_plan() -> bool:
     """Force load sharding plan in checkpoint or not."""
     return os.environ.get("FORCE_LOAD_SHARDING_PLAN", "0") == "1"
+
+
+def use_inplace_trunc_normal() -> bool:
+    """Use the in-place inverse-CDF trunc_normal_ initialization or not.
+
+    nn.init.trunc_normal_ in torch>=2.12 materializes several temporaries as
+    large as the tensor itself and can OOM when initializing a very large
+    embedding table at sharding time; enabling this flag initializes with the
+    in-place implementation of torch<=2.11 instead.
+    """
+    return os.environ.get("USE_INPLACE_TRUNC_NORMAL", "0") == "1"

@@ -1,13 +1,16 @@
-# Claude Code Review Workflow
+# AI Code Review Workflow (Claude Code / OpenAI Codex)
 #
-# Triggered by adding the "claude-review" label to a PR.
-# Uses stored OAuth credentials on self-hosted runner (no ANTHROPIC_API_KEY needed).
+# Triggered by adding the "claude-review" or "codex-review" label to a PR.
+# Uses stored OAuth credentials on self-hosted runner (no API keys needed).
 #
 # Usage:
 #   1. Contributor opens PR
-#   2. Collaborator adds "claude-review" label when ready for review
-#   3. Workflow triggers, removes the label, runs Claude review
+#   2. Collaborator adds "claude-review" or "codex-review" label when ready for review
+#   3. Workflow triggers, removes the label, runs the review
 #   4. Want to re-review after changes? Add the label again
+#
+# Review instructions live only in .claude/ (commands/review-pr.md + agents/*.md);
+# the Codex job converts them at runtime via scripts/ci/gen_codex_review.py.
 #
 # ---- Runner One-Time Setup ----
 # SSH into tzrec-codereview-runner as the runner user and run:
@@ -44,6 +47,32 @@
 # If auth fails after a long period, re-run `claude /login` on the runner.
 # Do NOT use --bare flag — it disables OAuth/keychain reads.
 # ---- End Setup ----
+#
+# ---- Codex Runner One-Time Setup ----
+# Shares bun + /opt/claude-code-action from the Claude setup above.
+#
+#   # Install Codex CLI (keep current: subagents + mcp env_vars need a recent version)
+#   npm install -g @openai/codex
+#
+#   # Login with ChatGPT account (device-code flow, no browser needed on runner)
+#   codex login --device-auth
+#   codex login status
+#
+#   # REQUIRED: set the review model (the job copies top-level model* keys; no other
+#   # personal config loads)
+#   echo 'model = "gpt-5.5"' >> ~/.codex/config.toml
+#
+#   # Verify headless mode
+#   echo "Say hello" | codex exec - --sandbox read-only
+#
+# If auth goes stale, re-run `codex login --device-auth` on the runner.
+# If the runner lacks direct OpenAI egress, set HTTPS_PROXY for the runner service.
+#
+# Trust model: the collaborator-added label gates every run (review before labeling).
+# Model commands run in a no-network sandbox; only the gh pr view/diff/comment
+# allowlist (scripts/ci/codex_review.rules) runs outside it — as with the claude
+# job's --allowedTools, a PR comment is the only exfil path for injected content.
+# ---- End Codex Setup ----
 
 name: Code Review
 
@@ -51,8 +80,9 @@ on:
   pull_request_target:
     types: [labeled]
 
+# Group by label so a codex run does not cancel an in-flight claude run
 concurrency:
-  group: codereview-${{ github.event.pull_request.number }}
+  group: codereview-${{ github.event.label.name }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -72,12 +102,15 @@ jobs:
             --repo ${{ github.repository }} \
             --remove-label claude-review
 
-      # Checkout trusted .claude/ files from base branch (not the PR author's code)
+      # Checkout trusted agent files; cone mode also includes root-level files.
+      # github.sha = the workflow's own commit; the PR's base.sha is frozen and can lag
       - name: Checkout trusted agent files
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          sparse-checkout: .claude
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            .claude
+            scripts/ci
           path: trusted-claude
 
       # Checkout PR code for review
@@ -88,11 +121,8 @@ jobs:
           fetch-depth: 1
           path: pr-code
 
-      # rm first: cp -r into an existing dir nests instead of replacing (GHSA-f9x3-9rgg-92p7).
       - name: Use trusted agent files
-        run: |
-          rm -rf pr-code/.claude
-          cp -r trusted-claude/.claude pr-code/.claude
+        run: bash trusted-claude/scripts/ci/use_trusted_agent_files.sh trusted-claude pr-code
 
       - name: RunCodeReview
         working-directory: pr-code
@@ -120,3 +150,115 @@ jobs:
             --mcp-config "$MCP_CONFIG" \
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob,Agent" \
             -- "/review-pr REPO: ${{ github.repository }} PR_NUMBER: ${PR_NUMBER}"
+
+  codex-review:
+    if: github.event.label.name == 'codex-review'
+    runs-on: tzrec-codereview-runner
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Remove label to allow re-triggering later
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --remove-label codex-review
+
+      # Trusted .claude/ + scripts at github.sha (the workflow's own commit, never the
+      # PR's frozen base.sha)
+      - name: Checkout trusted agent files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            .claude
+            scripts/ci
+          path: trusted-claude
+
+      # Checkout PR code for review
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          path: pr-code
+
+      # Same trusted-file setup as the claude job, plus generated codex agents as an overlay
+      - name: Use trusted agent files
+        run: |
+          python3 trusted-claude/scripts/ci/gen_codex_review.py \
+            --claude-dir trusted-claude/.claude \
+            --out-dir "${{ runner.temp }}/codex-gen" \
+            --repo ${{ github.repository }} \
+            --pr-number ${{ github.event.pull_request.number }} \
+            --prompt-out "${{ runner.temp }}/codex-prompt.md"
+          bash trusted-claude/scripts/ci/use_trusted_agent_files.sh \
+            trusted-claude pr-code "${{ runner.temp }}/codex-gen"
+
+      - name: RunCodexReview
+        working-directory: pr-code
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # No OPENAI_API_KEY — uses stored OAuth from `codex login` on the runner
+        run: |
+          set -euo pipefail
+
+          # Resolve full bun path (bun installed to ~/.bun/bin/ — not in subprocess PATH)
+          BUN_PATH="$(which bun 2>/dev/null || echo "$HOME/.bun/bin/bun")"
+          echo "bun path: $BUN_PATH ($("$BUN_PATH" --version))"
+          codex --version
+
+          # Per-run CODEX_HOME (stored auth + trusted rules + generated config only)
+          REAL_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+          export CODEX_HOME="${RUNNER_TEMP}/codex-home"
+          rm -rf "$CODEX_HOME" && mkdir -p "$CODEX_HOME/rules"
+          cp "$REAL_CODEX_HOME/auth.json" "$CODEX_HOME/auth.json"
+          cp "$GITHUB_WORKSPACE/trusted-claude/scripts/ci/codex_review.rules" \
+            "$CODEX_HOME/rules/default.rules"
+
+          # Copy the runner's top-level model* settings; subagent spawn needs explicit model=
+          awk '/^\[/{exit} /^model[a-z_]* *=/{print}' "$REAL_CODEX_HOME/config.toml" \
+            > "$CODEX_HOME/config.toml"
+          grep -q '^model *=' "$CODEX_HOME/config.toml" || {
+            echo "::error::set model = \"...\" in the runner's ~/.codex/config.toml"; exit 1; }
+
+          # The MCP server gets its token here (config file, not argv or codex env)
+          cat >> "$CODEX_HOME/config.toml" << EOF
+
+          [mcp_servers.github_inline_comment]
+          command = "${BUN_PATH}"
+          args = ["run", "/opt/claude-code-action/src/mcp/github-inline-comment-server.ts"]
+          default_tools_approval_mode = "approve"
+
+          [mcp_servers.github_inline_comment.env]
+          GITHUB_TOKEN = "${GITHUB_TOKEN}"
+          REPO_OWNER = "${REPO_OWNER}"
+          REPO_NAME = "${REPO_NAME}"
+          PR_NUMBER = "${PR_NUMBER}"
+          EOF
+          chmod 600 "$CODEX_HOME/config.toml"
+
+          # HOME shim hides the runner user's personal ~/.agents skills
+          export HOME="${RUNNER_TEMP}/codex-home-shim"
+          rm -rf "$HOME" && mkdir -p "$HOME"
+
+          # Store gh login in the shim HOME; codex runs token-free so model commands can't read it
+          echo "$GITHUB_TOKEN" | env -u GITHUB_TOKEN -u GH_TOKEN gh auth login --with-token
+
+          # No-network sandbox; only the gh pr view/diff/comment rules allowlist escapes it
+          env -u GITHUB_TOKEN -u GH_TOKEN codex exec \
+            --ephemeral \
+            --sandbox workspace-write \
+            --output-last-message "${RUNNER_TEMP}/codex-review-last.md" \
+            - < "${RUNNER_TEMP}/codex-prompt.md"
+
+          # Persist token refreshes back to the runner's stored auth
+          cmp -s "$CODEX_HOME/auth.json" "$REAL_CODEX_HOME/auth.json" || \
+            cp "$CODEX_HOME/auth.json" "$REAL_CODEX_HOME/auth.json"

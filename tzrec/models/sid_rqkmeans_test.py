@@ -17,25 +17,48 @@ import torch.distributed as dist
 from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.features.feature import create_features
 from tzrec.models.sid_rqkmeans import SidRqkmeans
-from tzrec.protos import model_pb2
+from tzrec.protos import feature_pb2, model_pb2
 from tzrec.protos.models import sid_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import faiss_unavailable
 
 
-def _batch_from_rows(rows: torch.Tensor) -> Batch:
-    """Wrap explicit ``item_emb`` rows in a minimal Batch."""
-    dense_feature = KeyedTensor.from_tensor_list(keys=["item_emb"], tensors=[rows])
+def _features_and_groups(input_dim: int):
+    """Real ``item_emb`` raw feature + the ``deep`` group it feeds.
+
+    SID models consume the framework's EmbeddingGroup (built from these), and
+    derive the K-Means dimension from the ``deep`` group's total dim — so real
+    features + feature_groups are required, as in every other model test.
+    """
+    feature_cfgs = [
+        feature_pb2.FeatureConfig(
+            raw_feature=feature_pb2.RawFeature(
+                feature_name="item_emb", value_dim=input_dim
+            )
+        )
+    ]
+    groups = [
+        model_pb2.FeatureGroupConfig(
+            group_name="deep",
+            feature_names=["item_emb"],
+            group_type=model_pb2.FeatureGroupType.DEEP,
+        )
+    ]
+    return create_features(feature_cfgs), groups
+
+
+def _make_batch(batch_size: int, input_dim: int) -> Batch:
+    """Create a minimal Batch with random dense embedding features."""
+    dense_feature = KeyedTensor.from_tensor_list(
+        keys=["item_emb"], tensors=[torch.randn(batch_size, input_dim)]
+    )
     return Batch(
         dense_features={BASE_DATA_GROUP: dense_feature},
         sparse_features={},
         labels={},
     )
-
-
-def _make_batch(batch_size: int, input_dim: int, device: str = "cpu") -> Batch:
-    """Create a minimal Batch with random dense embedding features."""
-    return _batch_from_rows(torch.randn(batch_size, input_dim, device=device))
 
 
 class SidRqkmeansOfflineTest(unittest.TestCase):
@@ -57,31 +80,50 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         codebook=None,
         normalize_residuals=False,
         train_sample_size=0,
+        candidate_output=False,
+        candidate_topk=3,
     ):
-        """Build a SidRqkmeans on CPU with params initialized.
-
-        SID models read the item-embedding dense feature directly from the
-        batch and do not consume feature_groups, so none is set.
-        """
+        """Build a SidRqkmeans on CPU with params initialized."""
         n_embed_list = codebook if codebook is not None else [16] * n_layers
         faiss_kwargs = sid_model_pb2.FaissKmeansConfig(
             niter=niter, verbose=False, seed=1234
         )
         cfg = sid_model_pb2.SidRqkmeans(
-            input_dim=input_dim,
             codebook=n_embed_list,
             normalize_residuals=normalize_residuals,
             faiss_kmeans_kwargs=faiss_kwargs,
-            embedding_feature_name="item_emb",
             train_sample_size=train_sample_size,
         )
+        if candidate_output:
+            cfg.candidate_output_config.enabled = True
+            cfg.candidate_output_config.topk = candidate_topk
+        features, feature_groups = _features_and_groups(input_dim)
         model = SidRqkmeans(
-            model_config=model_pb2.ModelConfig(sid_rqkmeans=cfg),
-            features=[],
+            model_config=model_pb2.ModelConfig(
+                feature_groups=feature_groups, sid_rqkmeans=cfg
+            ),
+            features=features,
             labels=[],
         )
         init_parameters(model, device=torch.device("cpu"))
         return model
+
+    def _collect(self, model, B=64, input_dim=32, n_batches=8) -> None:
+        """Train-mode: reservoir-fill over n_batches (no fit)."""
+        model.train()
+        for _ in range(n_batches):
+            model.predict(_make_batch(B, input_dim))
+
+    def _fit(self, model, B=64, input_dim=32, n_batches=8) -> None:
+        """Reservoir-fill then trigger the one-shot FAISS fit."""
+        self._collect(model, B, input_dim, n_batches)
+        model.on_train_end()
+
+    def _assert_codes_valid(self, codes, batch_size, codebook) -> None:
+        """codes.shape == (batch_size, len(codebook)); column i in [0, codebook[i])."""
+        self.assertEqual(codes.shape, (batch_size, len(codebook)))
+        for i, k in enumerate(codebook):
+            self.assertTrue((codes[:, i] >= 0).all() and (codes[:, i] < k).all())
 
     def test_proto_parse(self) -> None:
         """Verify faiss_kmeans_kwargs are parsed correctly."""
@@ -119,9 +161,9 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "codebook entry must be >= 1"):
             self._create_model(codebook=[16, 0])
 
-    def test_init_raises_on_zero_input_dim(self) -> None:
-        """input_dim < 1 fails fast at construction."""
-        with self.assertRaisesRegex(ValueError, "input_dim must be >= 1"):
+    def test_init_raises_on_zero_dim_feature_group(self) -> None:
+        """A feature group with total dim 0 fails fast (derived input_dim < 1)."""
+        with self.assertRaisesRegex(ValueError, "must be >= 1"):
             self._create_model(input_dim=0)
 
     def test_predict_collects_buffer(self) -> None:
@@ -143,23 +185,13 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         for layer in model._quantizer.layers:
             self.assertFalse(layer.is_initialized)
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_on_train_end_runs_faiss(self) -> None:
         """on_train_end triggers FAISS fit and clears buffer."""
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-
         B, input_dim = 64, 32
         model = self._create_model(input_dim=input_dim)
-        model.train()
-
-        # Accumulate enough samples (FAISS K-Means needs at least K points)
-        for _ in range(8):
-            model.predict(_make_batch(B, input_dim))
+        self._collect(model, B, input_dim)
         self.assertGreater(model._reservoir.n_seen, 0)
-
-        # Trigger one-shot FAISS fit.
         model.on_train_end()
 
         # Reservoir should be released after the fit
@@ -173,17 +205,11 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         # After fit, predict on eval should produce valid codes
         model.eval()
         preds = model.predict(_make_batch(B, input_dim))
-        codes = preds["codes"]
-        self.assertEqual(codes.shape, (B, 2))
-        self.assertTrue((codes >= 0).all() and (codes < 16).all())
+        self._assert_codes_valid(preds["codes"], B, [16, 16])
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_non_uniform_codebook_end_to_end(self) -> None:
         """Non-uniform codebook [8, 4, 16]: fit then emit per-layer codes."""
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-
         B, input_dim = 64, 32
         codebook = [8, 4, 16]
         model = self._create_model(input_dim=input_dim, codebook=codebook)
@@ -193,10 +219,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             16 * int(model._faiss_kwargs.get("max_points_per_centroid", 256)),
         )
 
-        model.train()
-        for _ in range(8):
-            model.predict(_make_batch(B, input_dim))
-        model.on_train_end()
+        self._fit(model, B, input_dim)
 
         for k, layer in zip(codebook, model._quantizer.layers):
             self.assertTrue(bool(layer._is_initialized.item()))
@@ -204,10 +227,9 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
 
         model.eval()
         codes = model.predict(_make_batch(B, input_dim))["codes"]
-        self.assertEqual(codes.shape, (B, 3))
-        for i, k in enumerate(codebook):
-            self.assertTrue((codes[:, i] >= 0).all() and (codes[:, i] < k).all())
+        self._assert_codes_valid(codes, B, codebook)
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_normalize_residuals_end_to_end(self) -> None:
         """train_offline with normalize_residuals=True fits + predicts.
 
@@ -215,67 +237,74 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         normalize independent of ``_residual_pass``), which the other tests —
         all built with normalize_residuals=False — never reach.
         """
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-
         B, input_dim = 64, 32
         model = self._create_model(input_dim=input_dim, normalize_residuals=True)
         self.assertTrue(model._quantizer.normalize_residuals)
 
-        model.train()
-        for _ in range(8):
-            model.predict(_make_batch(B, input_dim))
-        model.on_train_end()
+        self._fit(model, B, input_dim)
 
         for layer in model._quantizer.layers:
             self.assertTrue(layer.is_initialized)
 
         model.eval()
         codes = model.predict(_make_batch(B, input_dim))["codes"]
-        self.assertEqual(codes.shape, (B, 2))
-        self.assertTrue((codes >= 0).all() and (codes < 16).all())
+        self._assert_codes_valid(codes, B, [16, 16])
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_eval_and_inference_predict_contract(self) -> None:
-        """Eval (post-fit) exposes codes + x_hat; inference is codes-only."""
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-
+        """Eval (post-fit) exposes codes + x_hat + recon_target; infer codes-only."""
         B, input_dim = 64, 32
         model = self._create_model(input_dim=input_dim)
-        model.train()
-        for _ in range(8):
-            model.predict(_make_batch(B, input_dim))
-        model.on_train_end()
+        self._fit(model, B, input_dim)
 
-        # Eval mode (fitted): the reconstruction is exposed as ``x_hat`` for
-        # update_metric; the input embedding is re-extracted from the batch
-        # there, not threaded through predictions.
+        # Eval mode (fitted): the reconstruction (``x_hat``) and its target
+        # (``recon_target``) are both exposed for update_metric, so it scores
+        # without a second build_input pass over the batch.
         model.eval()
         eval_preds = model.predict(_make_batch(B, input_dim))
-        self.assertEqual(set(eval_preds.keys()), {"codes", "x_hat"})
+        self.assertEqual(set(eval_preds.keys()), {"codes", "x_hat", "recon_target"})
 
         # Inference (serving) mode: codes-only contract.
         model.set_is_inference(True)
         inf_preds = model.predict(_make_batch(B, input_dim))
         self.assertEqual(set(inf_preds.keys()), {"codes"})
 
+    def test_inference_candidate_output_opt_in(self) -> None:
+        """Candidate tensors are emitted only when explicitly configured."""
+        B, input_dim = 4, 8
+        model = self._create_model(
+            input_dim=input_dim,
+            codebook=[4, 4],
+            candidate_output=True,
+        )
+        for layer in model._quantizer.layers:
+            layer.load_centroids_(torch.randn(4, input_dim))
+
+        model.eval()
+        model.set_is_inference(True)
+        preds = model.predict(_make_batch(B, input_dim))
+
+        self.assertEqual(
+            set(preds.keys()), {"codes", "candidate_codes", "candidate_scores"}
+        )
+        self.assertEqual(preds["codes"].shape, (B, 2))
+        self.assertEqual(preds["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(preds["candidate_scores"].shape, (B, 3))
+        torch.testing.assert_close(preds["candidate_codes"][:, 0, :], preds["codes"])
+
+    def test_candidate_output_topk_exceeds_codebook_raises(self) -> None:
+        """Reject topk above the last-layer codebook size at construction."""
+        with self.assertRaisesRegex(ValueError, "topk must be in"):
+            self._create_model(
+                codebook=[16, 16], candidate_output=True, candidate_topk=17
+            )
+
+    @unittest.skipIf(*faiss_unavailable)
     def test_eval_metric_path(self) -> None:
         """init_metric/update_metric report finite mse + rel_loss in eval."""
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-
         B, input_dim = 64, 32
         model = self._create_model(input_dim=input_dim)
-        model.train()
-        for _ in range(8):
-            model.predict(_make_batch(B, input_dim))
-        model.on_train_end()
+        self._fit(model, B, input_dim)
 
         model.init_metric()
         model.eval()
@@ -324,6 +353,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         ):
             self._create_model()
 
+    @unittest.skipIf(*faiss_unavailable)
     def test_post_fit_checkpoint_round_trips(self) -> None:
         """Fit → save state_dict → load into fresh instance → predict.
 
@@ -331,17 +361,9 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         same batch — verifying the centroids round-trip exactly, not merely
         that they came through as non-zero.
         """
-        try:
-            import faiss  # noqa: F401
-        except ImportError:
-            self.skipTest("faiss not installed")
-
         B, input_dim = 64, 32
         src = self._create_model(input_dim=input_dim)
-        src.train()
-        for _ in range(8):
-            src.predict(_make_batch(B, input_dim))
-        src.on_train_end()
+        self._fit(src, B, input_dim)
         sd = src.state_dict()
 
         dst = self._create_model(input_dim=input_dim)
