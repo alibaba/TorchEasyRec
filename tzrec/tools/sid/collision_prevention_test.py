@@ -208,18 +208,8 @@ class SidCollisionPreventionTest(unittest.TestCase):
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         item_ids = list(range(10))
-        codes = [
-            [0, 0],
-            [0, 0],
-            [0, 0],
-            [0, 0],
-            [0, 1],
-            [0, 2],
-            [0, 2],
-            [1, 0],
-            [1, 0],
-            [1, 0],
-        ]
+        # 4 items in bucket (0,0), 1 in (0,1), 2 in (0,2), 3 in (1,0).
+        codes = [[0, 0]] * 4 + [[0, 1]] + [[0, 2]] * 2 + [[1, 0]] * 3
         candidates = [[[0, 0]] for _ in item_ids]
         candidates[1] = [[0, 0], [0, 1], [0, 2]]
         candidates[3] = [[0, 1], [0, 2], [0, 3]]

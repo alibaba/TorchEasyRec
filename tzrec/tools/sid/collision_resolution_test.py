@@ -36,20 +36,9 @@ def _plan(layer_sizes, capacity, item_ids, codes):
 class CollisionResolutionTest(unittest.TestCase):
     def test_golden_candidate_resolution(self) -> None:
         item_ids = np.arange(10, dtype=np.int64)
+        # 4 items in bucket (0,0), 1 in (0,1), 2 in (0,2), 3 in (1,0).
         codes = np.asarray(
-            [
-                [0, 0],
-                [0, 0],
-                [0, 0],
-                [0, 0],
-                [0, 1],
-                [0, 2],
-                [0, 2],
-                [1, 0],
-                [1, 0],
-                [1, 0],
-            ],
-            dtype=np.int64,
+            [[0, 0]] * 4 + [[0, 1]] + [[0, 2]] * 2 + [[1, 0]] * 3, dtype=np.int64
         )
         with mock.patch.object(collision_resolution, "_GROUPING_ROW_CHUNK", 2):
             plan = _plan((2, 4), 2, item_ids, codes)
@@ -165,13 +154,7 @@ class CollisionResolutionTest(unittest.TestCase):
     def test_fixed_width_candidates_can_contend_for_free_slots(self) -> None:
         plan = _plan((6,), 1, [0, 1, 2, 3, 4, 5], [[0], [0], [1], [3], [4], [4]])
         np.testing.assert_array_equal(plan.overflow_origin_last_codes, [0, 4])
-        candidates = np.asarray(
-            [
-                [0, 1, 2, 5],
-                [4, 2, 1, 3],
-            ],
-            dtype=np.int64,
-        )
+        candidates = np.asarray([[0, 1, 2, 5], [4, 2, 1, 3]], dtype=np.int64)
 
         result = resolve_sid_collisions(plan, candidates)
 
