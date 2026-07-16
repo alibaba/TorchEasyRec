@@ -244,13 +244,8 @@ def _within_bucket_rank(
         bucket_ranks[rows] = (
             np.arange(start, end, dtype=np.int64) - first_sorted_rows[sorted_bucket_ids]
         )
-    return (
-        bucket_ranks,
-        bucket_ids,
-        sorted_rows,
-        sorted_rows[first_sorted_rows],
-        bucket_counts,
-    )
+    representatives = sorted_rows[first_sorted_rows]
+    return bucket_ranks, bucket_ids, sorted_rows, representatives, bucket_counts
 
 
 def prepare_collision_plan(
