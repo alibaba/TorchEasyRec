@@ -180,9 +180,13 @@ class CollisionPreventionConfig:
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "CollisionPreventionConfig":
         """Build a validated configuration from parsed CLI arguments."""
-        layer_sizes = tuple(
-            int(value) for value in args.codebook.split(",") if value.strip()
-        )
+        try:
+            layer_sizes = tuple(int(value) for value in args.codebook.split(","))
+        except ValueError as err:
+            raise ValueError(
+                "--codebook must be 'int,int,...' with no empty fields, got "
+                f"{args.codebook!r}."
+            ) from err
         return cls(
             input_path=args.input_path,
             output_path=args.output_path,
@@ -345,6 +349,8 @@ class CollisionRunner:
         if not id_chunks:
             raise ValueError("SID input is empty.")
         item_id_array = np.concatenate(id_chunks)
+        if np.unique(item_id_array).size != item_id_array.size:
+            raise ValueError("input item IDs must be unique.")
         code_matrix = np.concatenate(code_chunks, axis=0)
         if code_matrix.shape[1] < 1:
             raise ValueError("SID codes must have at least one layer.")
@@ -663,7 +669,10 @@ class CollisionRunner:
 def build_parser() -> argparse.ArgumentParser:
     """Build the collision-prevention command-line parser."""
     parser = argparse.ArgumentParser(
-        description="Prevent SID codebook collisions (vectorized, within-band)."
+        description=(
+            "Prevent SID codebook collisions by relocating overflow items "
+            "within a band."
+        )
     )
     parser.add_argument("--input_path", required=True)
     parser.add_argument("--output_path", required=True)

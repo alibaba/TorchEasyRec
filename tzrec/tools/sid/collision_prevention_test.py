@@ -712,6 +712,20 @@ class SidCollisionPreventionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run(inp, out, max_items_per_codebook=2)
 
+    def test_duplicate_item_id_raises(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, [0, 1, 1], [[0, 0], [0, 1], [0, 2]])
+        with self.assertRaisesRegex(ValueError, "item IDs must be unique"):
+            self._run(inp, out, max_items_per_codebook=2)
+
+    def test_empty_codebook_token_raises(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, [0, 1], [[0, 0], [0, 1]])
+        with self.assertRaisesRegex(ValueError, "codebook"):
+            self._run(inp, out, codebook="8,,8")
+
 
 if __name__ == "__main__":
     unittest.main()

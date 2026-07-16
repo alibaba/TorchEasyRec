@@ -11,12 +11,14 @@
 
 """NumPy collision-resolution core for semantic IDs."""
 
+import math
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Iterable
 
 import numpy as np
 
+_INT64_MAX = int(np.iinfo(np.int64).max)
 _MASK64 = (1 << 64) - 1
 _SEED = 2026
 _SPLITMIX_INCREMENT = 0x9E3779B97F4A7C15
@@ -45,6 +47,11 @@ class CollisionResolutionConfig:
             raise ValueError("all layer_sizes must be positive.")
         if self.capacity < 1:
             raise ValueError(f"capacity must be >= 1, got {self.capacity}.")
+        if math.prod(self.layer_sizes) > _INT64_MAX:
+            raise ValueError(
+                f"prod(layer_sizes) exceeds int64 range: {self.layer_sizes}; "
+                "band keys would overflow."
+            )
 
 
 @dataclass(frozen=True)
@@ -281,6 +288,14 @@ def prepare_collision_plan(
             f"codes have {layer_count} layers but layer_sizes has "
             f"{len(config.layer_sizes)}."
         )
+    if codes.size and (
+        codes.min() < 0 or np.any(codes >= np.asarray(config.layer_sizes))
+    ):
+        raise ValueError(
+            "codes contain out-of-range values for layer_sizes "
+            f"{config.layer_sizes}; check that --codebook matches the model that "
+            "produced the SID table."
+        )
 
     original_last_codes = codes[:, -1].astype(np.int64, copy=False)
     band_ids = _band_ids(codes, config.layer_sizes)
@@ -437,7 +452,20 @@ def resolve_sid_collisions(
 
     capacity = plan.config.capacity
     initial_counts = np.minimum(plan.bucket_counts, capacity)
-    slot_counts = dict(zip(map(int, plan.bucket_keys), map(int, initial_counts)))
+    # Relocation only ever reads or writes buckets in a band that holds an
+    # overflow row (destinations stay within the row's band; unplaceable rows
+    # pile onto their own origin), so seed the mutable slot map from just those
+    # bands -- every other bucket keeps its capped initial count untouched. This
+    # bounds the map by overflow-band buckets, not the whole table, which
+    # dominates cost for sparse-collision inputs at scale.
+    overflow_band_ids = plan.overflow_bucket_key_prefixes // last_size
+    in_overflow_band = np.isin(plan.bucket_keys // last_size, overflow_band_ids)
+    slot_counts = dict(
+        zip(
+            plan.bucket_keys[in_overflow_band].tolist(),
+            initial_counts[in_overflow_band].tolist(),
+        )
+    )
     resolved_last_codes = plan.original_last_codes.copy()
     slot_indices = plan.initial_slot_indices.copy()
     relocated_count = 0
@@ -474,26 +502,32 @@ def resolve_sid_collisions(
 
     final_bucket_keys = np.empty(0, dtype=np.int64)
     final_bucket_counts = np.empty(0, dtype=np.int64)
+    untouched_mask = ~in_overflow_band
+    untouched_counts = initial_counts[untouched_mask]
     if collect_grouping:
-        occupancy_counts = np.fromiter(
+        untouched_keys = plan.bucket_keys[untouched_mask]
+        band_keys = np.fromiter(slot_counts, dtype=np.int64, count=len(slot_counts))
+        band_counts = np.fromiter(
             slot_counts.values(), dtype=np.int64, count=len(slot_counts)
         )
-        final_collision_buckets = int((occupancy_counts > capacity).sum())
-        max_final_bucket_size = (
-            int(occupancy_counts.max()) if occupancy_counts.size else 0
-        )
-        final_bucket_keys = np.fromiter(
-            slot_counts, dtype=np.int64, count=len(slot_counts)
-        )
-        occupancy_order = np.argsort(final_bucket_keys, kind="stable")
-        final_bucket_keys = final_bucket_keys[occupancy_order]
-        final_bucket_counts = occupancy_counts[occupancy_order]
+        all_keys = np.concatenate((untouched_keys, band_keys))
+        all_counts = np.concatenate((untouched_counts, band_counts))
+        final_collision_buckets = int((all_counts > capacity).sum())
+        max_final_bucket_size = int(all_counts.max()) if all_counts.size else 0
+        occupancy_order = np.argsort(all_keys, kind="stable")
+        final_bucket_keys = all_keys[occupancy_order]
+        final_bucket_counts = all_counts[occupancy_order]
     else:
+        # Untouched buckets never exceed capacity, so only the mutated bands add
+        # final collisions; the global max still spans both groups. Iterate the
+        # (overflow-band-scoped) map in Python to skip the grouping arrays/sorts.
         final_collision_buckets = 0
-        max_final_bucket_size = 0
+        max_band = 0
         for count in slot_counts.values():
             final_collision_buckets += count > capacity
-            max_final_bucket_size = max(max_final_bucket_size, count)
+            max_band = max(max_band, count)
+        max_untouched = int(untouched_counts.max()) if untouched_counts.size else 0
+        max_final_bucket_size = max(max_untouched, max_band)
     unresolved_array = np.asarray(unresolved_rows, dtype=np.int64)
     stats = CollisionResolutionStats(
         total_items=plan.item_count,
