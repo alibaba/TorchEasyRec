@@ -107,6 +107,50 @@ class SidCollisionPreventionTest(unittest.TestCase):
         # ... and no bucket exceeds the cap.
         self.assertLessEqual(max(Counter(map(tuple, d["codebook"])).values()), 2)
 
+    def test_three_layer_candidate_reassigns_within_band(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        # 3-layer SIDs: band = (code_0, code_1). Three items collide in bucket
+        # (0, 0, 0); candidates keep the (0, 0) band and vary the last layer, so
+        # the flat topk*3 candidate column must be split at stride 3.
+        _parquet(
+            inp,
+            [0, 1, 2],
+            [[0, 0, 0]] * 3,
+            [[[0, 0, 1], [0, 0, 2], [0, 0, 3]]] * 3,
+        )
+        stats = self._run(inp, out, codebook="2,3,4", max_items_per_codebook=2)
+        self.assertEqual(stats.total_items, 3)
+        self.assertEqual(stats.relocated_count, 1)
+        self.assertEqual(stats.unresolved_count, 0)
+        self.assertEqual(stats.max_final_bucket_size, 2)
+        d = self._read_parquet(out)
+        # The relocated item took the first free candidate last code (1); every
+        # SID keeps its (0, 0) band prefix.
+        self.assertEqual(
+            sorted(tuple(cb) for cb in d["codebook"]),
+            [(0, 0, 0), (0, 0, 0), (0, 0, 1)],
+        )
+
+    def test_candidate_last_matrix_splits_at_n_layers(self) -> None:
+        # A flat topk*n_layers candidate column splits into topk groups of
+        # n_layers, keeping each group's LAST code (stride n_layers), not a
+        # contiguous tail. codebook 2,3,4 -> n_layers=3, so the flat run
+        # [0,0,1, 0,0,2, 0,0,3] decodes to last codes [1, 2, 3].
+        runner = CollisionRunner(
+            Namespace(
+                **{
+                    **_DEFAULTS,
+                    "codebook": "2,3,4",
+                    "rate_only": True,
+                    "input_path": "x",
+                    "output_path": "y",
+                }
+            )
+        )
+        flat = pa.array([[0, 0, 1, 0, 0, 2, 0, 0, 3]], type=pa.list_(pa.int64()))
+        self.assertEqual(runner._candidate_last_matrix(flat).tolist(), [[1, 2, 3]])
+
     def test_output_is_list_int64(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")

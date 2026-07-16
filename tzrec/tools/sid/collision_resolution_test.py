@@ -242,6 +242,52 @@ class CollisionResolutionTest(unittest.TestCase):
         rate_only = resolve_sid_collisions(plan, candidates, collect_grouping=False)
         self.assertEqual(rate_only.stats, result.stats)
 
+    def test_three_layer_band_fold_and_relocation(self) -> None:
+        # Band = (code_0, code_1) via a mixed-radix fold with middle radix 3.
+        # Items 0-2 share band (0, 0); item 3 sits at (0, 2) and item 4 at
+        # (1, 0) -- distinct bands (raw 2 vs 3). A too-small middle radix would
+        # fold both to 2 and merge them; dropping the middle layer would merge
+        # item 3 into band (0, 0). Either regression changes the partition below.
+        plan = _plan(
+            (2, 3, 4),
+            2,
+            [0, 1, 2, 3, 4],
+            [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 2, 0], [1, 0, 0]],
+        )
+        # Band (0, 0) holds exactly 3 items (not 4): the middle code kept item 3
+        # in its own bucket (key 4) distinct from items 0-2 (key 0).
+        np.testing.assert_array_equal(plan.bucket_keys, [0, 4, 8])
+        np.testing.assert_array_equal(plan.bucket_counts, [3, 1, 1])
+
+        result = resolve_sid_collisions(plan, np.asarray([[1, 2, 3]], dtype=np.int64))
+
+        # The single overflow item relocates within band (0, 0) -- only its last
+        # code changes -- and the two non-overflow bands stay put.
+        self.assertEqual(result.stats.relocated_count, 1)
+        self.assertEqual(result.stats.unresolved_count, 0)
+        self.assertEqual(int(result.resolved_last_codes.sum()), 1)
+        self.assertEqual(result.resolved_last_codes[3], 0)
+        self.assertEqual(result.resolved_last_codes[4], 0)
+        np.testing.assert_array_equal(result.final_bucket_keys, [0, 1, 4, 8])
+        np.testing.assert_array_equal(result.final_bucket_counts, [2, 1, 1, 1])
+
+    def test_rate_only_matches_grouping_with_unplaceable(self) -> None:
+        # One unplaceable overflow (its only candidate equals the origin) keeps
+        # bucket (0, 0) over capacity, alongside an untouched band (1, 0). The
+        # rate-only branch must report the same collision stats as the grouping
+        # branch -- those numbers are exactly what --rate_only exists to compute.
+        plan = _plan((2, 2), 1, [0, 1, 2], [[0, 0], [0, 0], [1, 0]])
+        candidates = np.asarray([[0]], dtype=np.int64)  # only candidate == origin
+
+        grouped = resolve_sid_collisions(plan, candidates, collect_grouping=True)
+        rate_only = resolve_sid_collisions(plan, candidates, collect_grouping=False)
+
+        self.assertEqual(grouped.stats.unresolved_count, 1)
+        self.assertEqual(grouped.stats.final_collision_buckets, 1)
+        self.assertEqual(grouped.stats.max_final_bucket_size, 2)
+        self.assertEqual(rate_only.stats, grouped.stats)
+        self.assertFalse(rate_only.grouping_collected)
+
 
 if __name__ == "__main__":
     unittest.main()
