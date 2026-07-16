@@ -14,8 +14,10 @@ r"""Offline SID collision prevention with TorchEasyRec-native I/O.
 The runner caps each SID bucket, loads fixed-width last-layer candidates only
 for overflow items, delegates collision resolution to the pure NumPy core, and
 writes item-level and grouped SID results through TorchEasyRec readers and
-writers. CSV uses compact SID strings and JSON item-ID arrays because Arrow's
-CSV writer cannot serialize list columns.
+writers. CSV encodes each SID/candidate column as comma-separated codes and
+item-ID groups as JSON arrays because Arrow's CSV writer cannot serialize list
+columns; ``candidate_codes`` is a flat ``topk * n_layers`` run split by the
+``--codebook`` length.
 
 The random strategy intentionally preserves the legacy deterministic baseline:
 it draws with replacement from the full last-layer space. Placement skips an
@@ -24,7 +26,8 @@ item's origin, so an origin draw or a duplicate draw is not replaced.
 It is a single-process tool -- launch it with ``python -m`` (no torchrun /
 process group). The input is a Semantic-ID table from ``tzrec.predict`` (an
 ``item_id`` column, a ``codes`` ``list<int>`` column, and -- for the default
-``--strategy candidate`` -- a ``candidate_codes`` ``list<list<int>>`` column).
+``--strategy candidate`` -- a flat ``candidate_codes`` ``list<int>`` column
+(``topk * n_layers`` codes per item)).
 
 Example::
 
@@ -75,8 +78,6 @@ from tzrec.tools.sid.collision_resolution import (
 )
 from tzrec.utils.logging_util import logger
 
-_CODE_SEP = "|"
-_CAND_SEP = ";"
 _MAP_WRITE_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
@@ -172,6 +173,8 @@ class CollisionPreventionConfig:
             if previous_name is not None:
                 raise ValueError(f"{name} must differ from {previous_name}: {path!r}.")
             seen_paths[path_identity] = name
+        # Eagerly build the resolution config so its validation (layer_sizes,
+        # capacity) fails fast here rather than lazily inside run().
         _ = self.resolution_config
 
     @classmethod
@@ -289,7 +292,7 @@ class CollisionRunner:
             array = values.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
             return array.reshape(-1, 1)
         else:
-            parts = pc.split_pattern(values, _CODE_SEP)
+            parts = pc.split_pattern(values, ",")
             row_count = len(parts)
             flat = pc.cast(parts.flatten(), pa.int64()).to_numpy(zero_copy_only=False)
 
@@ -359,52 +362,31 @@ class CollisionRunner:
             )
         return self._load_candidate_last_codes(plan.overflow_item_ids)
 
-    def _candidate_list_matrix(self, values: pa.Array) -> np.ndarray:
-        """Decode a nested Arrow candidate column into an ``(N, K)`` matrix."""
-        row_count = len(values)
-        if row_count == 0:
-            return np.empty((0, 0), dtype=np.int64)
-        inner = values.flatten()
-        candidate_count = len(inner) // row_count
-        if len(inner) != row_count * candidate_count:
-            raise ValueError("ragged candidate_codes: all items must share topk.")
-        if candidate_count == 0:
-            return np.empty((row_count, 0), dtype=np.int64)
-        flat = (
-            inner.flatten().to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-        )
-        tuple_count = row_count * candidate_count
-        layer_count = flat.shape[0] // tuple_count
-        if layer_count < 1 or flat.shape[0] != tuple_count * layer_count:
+    def _candidate_last_matrix(self, values: pa.Array) -> np.ndarray:
+        """Decode a flat candidate column into its per-candidate last codes.
+
+        ``values`` is decoded like ``codes`` (list, integer, or comma string) into
+        an ``(N, topk * n_layers)`` matrix, then split into ``topk`` groups of
+        ``n_layers`` (from ``--codebook``), keeping each group's last-layer code.
+
+        Args:
+            values: One batch's flat ``candidate_codes`` column.
+
+        Returns:
+            The last-layer code of every candidate, shape ``(N, topk)``.
+
+        Raises:
+            ValueError: If the per-row width is not a multiple of ``n_layers``.
+        """
+        flat = self._codes_matrix(values)
+        per_row = flat.shape[1]
+        n_layers = len(self._config.layer_sizes)
+        if per_row % n_layers != 0:
             raise ValueError(
-                "ragged candidate_codes: every candidate must share n_layers."
+                f"candidate_codes width {per_row} is not a multiple of n_layers "
+                f"{n_layers}."
             )
-        return flat.reshape(row_count, candidate_count, layer_count)[:, :, -1]
-
-    @staticmethod
-    def _candidate_string_matrix(values: pa.Array) -> np.ndarray:
-        """Decode compact CSV candidate strings into an ``(N, K)`` matrix."""
-        rows: List[List[int]] = []
-        for value in values.to_pylist():
-            last_codes: List[int] = []
-            if value:
-                for candidate in str(value).split(_CAND_SEP):
-                    parts = [
-                        int(part)
-                        for part in candidate.strip().split(_CODE_SEP)
-                        if part.strip()
-                    ]
-                    if parts:
-                        last_codes.append(parts[-1])
-            rows.append(last_codes)
-
-        widths = {len(row) for row in rows}
-        if len(widths) > 1:
-            raise ValueError("ragged candidate_codes: all items must share topk.")
-        width = widths.pop() if widths else 0
-        if width == 0:
-            return np.empty((len(rows), 0), dtype=np.int64)
-        return np.asarray(rows, dtype=np.int64).reshape(len(rows), width)
+        return flat[:, n_layers - 1 :: n_layers]
 
     def _load_candidate_last_codes(self, overflow_item_ids: np.ndarray) -> np.ndarray:
         """Load fixed-width candidates aligned to ``overflow_item_ids``."""
@@ -417,6 +399,11 @@ class CollisionRunner:
         reader = self._make_reader([self._config.item_id_field, field])
         for batch in reader.to_batches():
             if field not in batch:
+                logger.warning(
+                    "candidate_codes field %r not present in input batch; "
+                    "stopping candidate scan.",
+                    field,
+                )
                 break
             batch_ids = batch[self._config.item_id_field].to_numpy(zero_copy_only=False)
             source_rows, target_rows = item_id_lookup.match(batch_ids)
@@ -426,10 +413,7 @@ class CollisionRunner:
             if np.any(seen[target_rows]):
                 raise ValueError("candidate input contains duplicate item IDs.")
             selected = pc.take(batch[field], pa.array(source_rows, type=pa.int64()))
-            if self._is_list_type(selected.type):
-                batch_candidates = self._candidate_list_matrix(selected)
-            else:
-                batch_candidates = self._candidate_string_matrix(selected)
+            batch_candidates = self._candidate_last_matrix(selected)
             if candidates is None:
                 candidates = np.empty(
                     (item_count, batch_candidates.shape[1]), dtype=np.int64
@@ -519,9 +503,7 @@ class CollisionRunner:
                     dtype=np.int64,
                 )
             )
-            return pc.binary_join(
-                pa.LargeListArray.from_arrays(offsets, values), _CODE_SEP
-            )
+            return pc.binary_join(pa.LargeListArray.from_arrays(offsets, values), ",")
         if row_count > _ARROW_LIST_OFFSET_MAX // layer_count:
             raise ValueError("SID output exceeds Arrow list offset capacity.")
         values = pa.array(codes.reshape(-1))

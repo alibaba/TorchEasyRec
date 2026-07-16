@@ -54,9 +54,9 @@ def _parquet(path, item_ids, codes, candidate_codes=None):
         "codes": pa.array(codes, type=pa.list_(pa.int64())),
     }
     if candidate_codes is not None:
-        cols["candidate_codes"] = pa.array(
-            candidate_codes, type=pa.list_(pa.list_(pa.int64()))
-        )
+        # flatten each row's [[c0, ..], ..] (topk x n_layers) to a flat list<int>
+        flat = [[code for cand in row for code in cand] for row in candidate_codes]
+        cols["candidate_codes"] = pa.array(flat, type=pa.list_(pa.int64()))
     parquet.write_table(pa.table(cols), path)
 
 
@@ -340,7 +340,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
         encoded = CollisionRunner._codes_column(codes, is_csv=True)
 
-        self.assertEqual(encoded.to_pylist(), ["1|-2|3", "4|5|6"])
+        self.assertEqual(encoded.to_pylist(), ["1,-2,3", "4,5,6"])
 
     def test_csv_backend_within_band(self) -> None:
         inp = os.path.join(self.test_dir, "in.csv")
@@ -349,8 +349,8 @@ class SidCollisionPreventionTest(unittest.TestCase):
             pa.table(
                 {
                     "item_id": ["0", "1", "2", "3", "4"],
-                    "codes": ["0|0"] * 5,
-                    "candidate_codes": ["0|1;0|2;0|3"] * 5,
+                    "codes": ["0,0"] * 5,
+                    "candidate_codes": ["0,1,0,2,0,3"] * 5,
                 }
             ),
             inp,
@@ -365,7 +365,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self.assertEqual(stats.relocated_count, 3)
         result = csv.read_csv(os.path.join(out, "part-0.csv"))
         self.assertEqual(result.schema.field("codebook").type, pa.string())
-        self.assertTrue(all(s.startswith("0|") for s in result["codebook"].to_pylist()))
+        self.assertTrue(all(s.startswith("0,") for s in result["codebook"].to_pylist()))
 
         original_path, resolved_path = self._group_paths(out)
         for path in (original_path, resolved_path):
@@ -386,7 +386,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
             pa.table(
                 {
                     "item_id": item_ids,
-                    "codes": ["0|0"] * len(item_ids),
+                    "codes": ["0,0"] * len(item_ids),
                 }
             ),
             inp,
@@ -417,7 +417,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         )
         result = csv.read_csv(os.path.join(out, "part-0.csv"))
         self.assertEqual(result.schema.field("codebook").type, pa.string())
-        self.assertTrue(all("|" in sid for sid in result["codebook"].to_pylist()))
+        self.assertTrue(all("," in sid for sid in result["codebook"].to_pylist()))
         original_path, resolved_path = self._group_paths(out)
         for path in (original_path, resolved_path):
             schema = csv.read_csv(os.path.join(path, "part-0.csv")).schema
@@ -431,8 +431,8 @@ class SidCollisionPreventionTest(unittest.TestCase):
             pa.table(
                 {
                     "item_id": ["a", "b", "c"],
-                    "codes": ["0|0"] * 3,
-                    "candidate_codes": ["0|1"] * 3,
+                    "codes": ["0,0"] * 3,
+                    "candidate_codes": ["0,1"] * 3,
                 }
             ),
             inp,
