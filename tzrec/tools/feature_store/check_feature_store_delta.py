@@ -17,12 +17,12 @@ FeatureDB version through ``DynamicEmbeddingFeatureView.get_online_features``.
 
 Example::
 
+    export ALIBABA_CLOUD_ACCESS_KEY_ID=YOUR_ACCESS_KEY_ID
+    export ALIBABA_CLOUD_ACCESS_KEY_SECRET=YOUR_ACCESS_KEY_SECRET
+    export FEATUREDB_USERNAME=YOUR_FEATUREDB_USERNAME
+    export FEATUREDB_PASSWORD=YOUR_FEATUREDB_PASSWORD
     python -m tzrec.tools.feature_store.check_feature_store_delta \
         --pipeline_config path/to/pipeline.config \
-        --ak YOUR_ACCESS_KEY_ID \
-        --sk YOUR_ACCESS_KEY_SECRET \
-        --featuredb_username YOUR_FEATUREDB_USERNAME \
-        --featuredb_password YOUR_FEATUREDB_PASSWORD \
         --output_dir path/to/delta_embedding_dump \
         --sample_count 10
 """
@@ -435,10 +435,6 @@ def run_check(args: argparse.Namespace) -> int:
             "pipeline config delta_embedding_dump_config has no feature_store_config"
         )
     feature_store_config = dump_config.feature_store_config
-    feature_store_config.access_key_id = args.access_key_id
-    feature_store_config.access_key_secret = args.access_key_secret
-    feature_store_config.featuredb_username = args.featuredb_username
-    feature_store_config.featuredb_password = args.featuredb_password
     settings = FeatureStoreUploadSettings.from_proto(feature_store_config)
     output_dir = resolve_output_dir(
         args.pipeline_config,
@@ -522,30 +518,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         )
     )
     parser.add_argument("--pipeline_config", required=True)
-    parser.add_argument(
-        "--access_key_id",
-        "--ak",
-        dest="access_key_id",
-        required=True,
-        help="Alibaba Cloud AccessKey ID.",
-    )
-    parser.add_argument(
-        "--access_key_secret",
-        "--sk",
-        dest="access_key_secret",
-        required=True,
-        help="Alibaba Cloud AccessKey Secret.",
-    )
-    parser.add_argument(
-        "--featuredb_username",
-        required=True,
-        help="FeatureDB username.",
-    )
-    parser.add_argument(
-        "--featuredb_password",
-        required=True,
-        help="FeatureDB password.",
-    )
     parser.add_argument(
         "--output_dir",
         default=None,

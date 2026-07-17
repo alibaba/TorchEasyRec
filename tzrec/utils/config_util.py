@@ -82,24 +82,15 @@ _FEATURE_STORE_ARTIFACT_FIELDS = (
     "poll_interval_secs",
 )
 
-_FEATURE_STORE_ARTIFACT_REQUIRED_SECRETS = (
-    "access_key_id",
-    "access_key_secret",
-    "featuredb_username",
-    "featuredb_password",
-)
-
 
 def sanitize_pipeline_config_for_artifact(
     pipeline_config: pipeline_pb2.EasyRecConfig,
 ) -> pipeline_pb2.EasyRecConfig:
-    """Return an artifact-safe config without FeatureStore credentials.
+    """Return an artifact-safe config without runtime FeatureStore secrets.
 
     The runtime config remains unchanged. FeatureStore public routing and
     version fields are copied through an allowlist, so newly introduced fields
-    do not silently become persistent secrets. Required credential fields are
-    set to explicit empty strings to keep the protobuf initialized while still
-    allowing the runtime environment fallbacks.
+    do not silently become persistent secrets.
     """
     sanitized = pipeline_pb2.EasyRecConfig()
     sanitized.CopyFrom(pipeline_config)
@@ -115,8 +106,6 @@ def sanitize_pipeline_config_for_artifact(
     for field_name in _FEATURE_STORE_ARTIFACT_FIELDS:
         if runtime_config.HasField(field_name):
             setattr(public_config, field_name, getattr(runtime_config, field_name))
-    for field_name in _FEATURE_STORE_ARTIFACT_REQUIRED_SECRETS:
-        setattr(public_config, field_name, "")
     dump_config.ClearField("feature_store_config")
     dump_config.feature_store_config.CopyFrom(public_config)
     return sanitized

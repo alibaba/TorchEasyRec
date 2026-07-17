@@ -89,24 +89,6 @@ class _ShardSetNotReady(RuntimeError):
     """A multi-rank canonical shard set is still being atomically replaced."""
 
 
-def _config_or_env(config: FeatureStoreConfig, field_name: str, env_name: str) -> str:
-    value = getattr(config, field_name, "")
-    return value or os.environ.get(env_name, "")
-
-
-def _validate_pair(
-    first: str,
-    second: str,
-    first_name: str,
-    second_name: str,
-    required: bool,
-) -> None:
-    if bool(first) != bool(second):
-        raise ValueError(f"{first_name} and {second_name} must be configured together")
-    if required and not first:
-        raise ValueError(f"{first_name} and {second_name} are required")
-
-
 @dataclass(frozen=True)
 class FeatureStoreUploadSettings:
     """Validated immutable settings copied from the runtime protobuf."""
@@ -135,30 +117,43 @@ class FeatureStoreUploadSettings:
 
     @classmethod
     def from_proto(cls, config: FeatureStoreConfig) -> "FeatureStoreUploadSettings":
-        """Resolve standard environment fallbacks without logging credentials."""
+        """Resolve environment-backed credentials without logging them."""
         initialization_errors = config.FindInitializationErrors()
         if initialization_errors:
             raise ValueError(
                 "feature_store_config is missing required fields: "
                 + ", ".join(initialization_errors)
             )
-        region = _config_or_env(config, "region", "ALIBABA_CLOUD_REGION")
+        region = config.region or os.environ.get("ALIBABA_CLOUD_REGION", "")
         endpoint = config.endpoint
-        access_key_id = _config_or_env(
-            config, "access_key_id", "ALIBABA_CLOUD_ACCESS_KEY_ID"
+        security_token = config.security_token or os.environ.get(
+            "ALIBABA_CLOUD_SECURITY_TOKEN", ""
         )
-        access_key_secret = _config_or_env(
-            config, "access_key_secret", "ALIBABA_CLOUD_ACCESS_KEY_SECRET"
-        )
-        security_token = _config_or_env(
-            config, "security_token", "ALIBABA_CLOUD_SECURITY_TOKEN"
-        )
-        featuredb_username = _config_or_env(
-            config, "featuredb_username", "FEATUREDB_USERNAME"
-        )
-        featuredb_password = _config_or_env(
-            config, "featuredb_password", "FEATUREDB_PASSWORD"
-        )
+        credential_env_names = {
+            "access_key_id": "ALIBABA_CLOUD_ACCESS_KEY_ID",
+            "access_key_secret": "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+            "featuredb_username": "FEATUREDB_USERNAME",
+            "featuredb_password": "FEATUREDB_PASSWORD",
+        }
+        credentials = {
+            field_name: os.environ.get(env_name, "")
+            for field_name, env_name in credential_env_names.items()
+        }
+        missing_env_names = [
+            credential_env_names[field_name]
+            for field_name, value in credentials.items()
+            if not value
+        ]
+        if missing_env_names:
+            raise ValueError(
+                "feature_store_config requires non-empty environment variables: "
+                + ", ".join(missing_env_names)
+                + "; set them in the training process environment"
+            )
+        access_key_id = credentials["access_key_id"]
+        access_key_secret = credentials["access_key_secret"]
+        featuredb_username = credentials["featuredb_username"]
+        featuredb_password = credentials["featuredb_password"]
 
         if not region:
             raise ValueError(
@@ -171,21 +166,6 @@ class FeatureStoreUploadSettings:
             raise ValueError(
                 "feature_store_config.endpoint must not contain URI userinfo"
             )
-        _validate_pair(
-            access_key_id,
-            access_key_secret,
-            "access_key_id",
-            "access_key_secret",
-            required=True,
-        )
-        _validate_pair(
-            featuredb_username,
-            featuredb_password,
-            "featuredb_username",
-            "featuredb_password",
-            required=True,
-        )
-
         project_name = config.project_name.strip()
         feature_entity_name = config.feature_entity_name.strip()
         feature_view_name = config.feature_view_name.strip()

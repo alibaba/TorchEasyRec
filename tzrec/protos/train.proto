@@ -30,18 +30,13 @@ message GradClipping {
 }
 
 message FeatureStoreConfig {
+    // Runtime credentials are read only from ALIBABA_CLOUD_ACCESS_KEY_ID,
+    // ALIBABA_CLOUD_ACCESS_KEY_SECRET, FEATUREDB_USERNAME and FEATUREDB_PASSWORD.
+    reserved 2 to 5;
+    reserved "access_key_id", "access_key_secret", "featuredb_username", "featuredb_password";
     // FeatureStore control-plane region. An explicitly empty value falls back
     // to ALIBABA_CLOUD_REGION at runtime.
     required string region = 1;
-    // Runtime credentials. Explicit values take precedence over the standard
-    // ALIBABA_CLOUD_* environment variables. Persisted model artifacts replace
-    // these required secret values with empty strings.
-    required string access_key_id = 2;
-    required string access_key_secret = 3;
-    // FeatureDB data-plane credential pair. Explicit values take
-    // precedence over FEATUREDB_USERNAME and FEATUREDB_PASSWORD.
-    required string featuredb_username = 4;
-    required string featuredb_password = 5;
     // Existing FeatureStore project name and target DynamicEmbedding FeatureView
     // name. The view is validated at startup and created when it does not exist.
     required string project_name = 6;

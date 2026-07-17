@@ -42,25 +42,14 @@ class _FakeView:
 
 
 class CheckFeatureStoreDeltaTest(unittest.TestCase):
-    def test_parse_args_requires_command_line_access_key_pair(self):
-        args = parse_args(
-            [
-                "--pipeline_config",
-                "pipeline.config",
-                "--ak",
-                "access-key-id",
-                "--sk",
-                "access-key-secret",
-                "--featuredb_username",
-                "featuredb-user",
-                "--featuredb_password",
-                "featuredb-password",
-            ]
-        )
-        self.assertEqual(args.access_key_id, "access-key-id")
-        self.assertEqual(args.access_key_secret, "access-key-secret")
-        self.assertEqual(args.featuredb_username, "featuredb-user")
-        self.assertEqual(args.featuredb_password, "featuredb-password")
+    def test_parse_args_does_not_accept_credentials(self):
+        args = parse_args(["--pipeline_config", "pipeline.config"])
+
+        self.assertEqual(args.pipeline_config, "pipeline.config")
+        self.assertFalse(hasattr(args, "access_key_id"))
+        self.assertFalse(hasattr(args, "access_key_secret"))
+        self.assertFalse(hasattr(args, "featuredb_username"))
+        self.assertFalse(hasattr(args, "featuredb_password"))
 
     def test_resolve_output_dir_uses_colocated_relocated_outbox(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
