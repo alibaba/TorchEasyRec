@@ -72,8 +72,6 @@ _REQUIRED_PARQUET_FIELDS = {
     "table_fqn": pa.string(),
     "key_id": pa.int64(),
     "embedding": pa.list_(pa.float32()),
-    "operation": pa.string(),
-    "source": pa.string(),
 }
 
 
@@ -1784,8 +1782,6 @@ class FeatureStoreDeltaUploader:
                     raise ValueError("delta shard rank mismatch")
                 if int(row["world_size"]) != self._world_size:
                     raise ValueError("delta shard world_size mismatch")
-                if row["operation"] != DELTA_OPERATION_UPSERT:
-                    raise ValueError("only UPSERT delta operations are supported")
                 if row["embedding_role"] not in SPARSE_EMBEDDING_ROLES:
                     raise ValueError("delta shard has an invalid embedding role")
 

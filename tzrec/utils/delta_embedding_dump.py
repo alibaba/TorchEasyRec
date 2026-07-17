@@ -34,7 +34,6 @@ from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
 from tzrec.utils.feature_store_delta_uploader import (
     DELTA_DUMP_GENERATION_METADATA_KEY,
     DELTA_DUMP_SCHEMA_VERSION,
-    DELTA_OPERATION_UPSERT,
     FeatureStoreDeltaUploader,
     FeatureStoreUploadError,
     _durable_makedirs,
@@ -67,8 +66,6 @@ _DELTA_DUMP_SCHEMA = pa.schema(
         ("table_fqn", pa.string()),
         ("key_id", pa.int64()),
         ("embedding", pa.list_(pa.float32())),
-        ("operation", pa.string()),
-        ("source", pa.string()),
     ],
     metadata={
         b"tzrec.delta_embedding.schema_version": DELTA_DUMP_SCHEMA_VERSION.encode(
@@ -982,7 +979,6 @@ class DeltaEmbeddingDumper:
                 table_fqn=fqn,
                 key_ids=key_ids,
                 embeddings=embeddings,
-                source="model_delta_tracker",
             )
         return num_rows
 
@@ -1175,7 +1171,6 @@ class DeltaEmbeddingDumper:
         table_fqn: str,
         key_ids: torch.Tensor,
         embeddings: torch.Tensor,
-        source: str,
     ) -> int:
         key_ids_cpu = key_ids.detach().cpu().to(torch.int64).contiguous()
         embeddings_cpu = embeddings.detach().cpu().to(torch.float32).contiguous()
@@ -1222,8 +1217,6 @@ class DeltaEmbeddingDumper:
                     pa.repeat(pa.scalar(table_fqn, pa.string()), num_rows),
                     pa.array(key_ids_cpu.numpy(), type=pa.int64()),
                     self._embedding_array(embeddings_cpu),
-                    pa.repeat(pa.scalar(DELTA_OPERATION_UPSERT, pa.string()), num_rows),
-                    pa.repeat(pa.scalar(source, pa.string()), num_rows),
                 ],
                 schema=_DELTA_DUMP_SCHEMA,
             )

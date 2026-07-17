@@ -166,8 +166,6 @@ def _assert_sharded_dump_file(rank: int, output_path: str, dumper) -> None:
         set(table["embedding_name"].to_pylist()), {_SHARDED_TABLE_NAME}
     )
     testcase.assertEqual(set(table["embedding_role"].to_pylist()), {"ebc"})
-    testcase.assertEqual(set(table["operation"].to_pylist()), {"UPSERT"})
-    testcase.assertEqual(set(table["source"].to_pylist()), {"model_delta_tracker"})
 
     table_weight = dumper._collect_table_weights()[_SHARDED_TABLE_NAME]
     expected_key_ids = [
@@ -363,7 +361,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             table_fqn="model.ebc.user_emb",
             key_ids=torch.tensor([-42]),
             embeddings=torch.tensor([[1.0, 2.0]]),
-            source="model_delta_tracker",
         )
         self.assertEqual(num_rows, 1)
         self.assertEqual(len(table_chunks), 1)
@@ -375,7 +372,20 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(table["embedding_role"].to_pylist(), ["ebc"])
         self.assertEqual(table["key_id"].to_pylist(), [-42])
         self.assertEqual(table["embedding"].to_pylist(), [[1.0, 2.0]])
-        self.assertEqual(table["operation"].to_pylist(), ["UPSERT"])
+        self.assertEqual(
+            table.column_names,
+            [
+                "global_step",
+                "rank",
+                "world_size",
+                "embedding_name",
+                "embedding_role",
+                "feature_name",
+                "table_fqn",
+                "key_id",
+                "embedding",
+            ],
+        )
 
     def test_dump_rows_reject_processor_invalid_key_sentinel(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -392,7 +402,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 table_fqn="model.ebc.user_emb",
                 key_ids=torch.tensor([-1]),
                 embeddings=torch.tensor([[1.0, 2.0]]),
-                source="model_delta_tracker",
             )
 
     def test_write_table_chunks_preserves_parquet_schema(self):
@@ -410,7 +419,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             table_fqn="model.ebc.user_emb",
             key_ids=torch.tensor([7, 8]),
             embeddings=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-            source="model_delta_tracker",
         )
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_path = os.path.join(tmp_dir, "delta.parquet")
@@ -1244,9 +1252,6 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
                     continue
                 dumped_real_rows = True
                 self.assertEqual(set(table["world_size"].to_pylist()), {world_size})
-                self.assertEqual(
-                    set(table["source"].to_pylist()), {"model_delta_tracker"}
-                )
                 # dynamic lookup must return a real embedding vector per id.
                 self.assertTrue(
                     all(len(emb) > 0 for emb in table["embedding"].to_pylist())

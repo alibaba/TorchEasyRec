@@ -90,8 +90,6 @@ def _row(
         "table_fqn": f"model.ebc.embedding_bags.{name}.weight",
         "key_id": key_id,
         "embedding": values,
-        "operation": "UPSERT",
-        "source": "model_delta_tracker",
     }
 
 

@@ -43,7 +43,6 @@ import pyarrow.parquet as pq
 
 from tzrec.utils import config_util
 from tzrec.utils.feature_store_delta_uploader import (
-    DELTA_OPERATION_UPSERT,
     FEATURE_STORE_PK_FIELD,
     FEATURE_STORE_SK_FIELD,
     FEATURE_STORE_VALUE_FIELD,
@@ -223,7 +222,7 @@ def sample_local_records(
     sample_count: int,
     embedding_name: Optional[str] = None,
 ) -> List[LocalSample]:
-    """Read a bounded set of unique UPSERT records from canonical parquet shards."""
+    """Read a bounded set of unique records from canonical parquet shards."""
     if sample_count <= 0:
         raise ValueError("sample_count must be > 0")
 
@@ -231,7 +230,6 @@ def sample_local_records(
         FEATURE_STORE_PK_FIELD,
         FEATURE_STORE_SK_FIELD,
         FEATURE_STORE_VALUE_FIELD,
-        "operation",
     ]
     samples: List[LocalSample] = []
     seen: set[Tuple[str, int]] = set()
@@ -246,14 +244,11 @@ def sample_local_records(
             )
         for batch in parquet_file.iter_batches(batch_size=1024, columns=columns):
             values = batch.to_pydict()
-            for name, key_id, vector, operation in zip(
+            for name, key_id, vector in zip(
                 values[FEATURE_STORE_PK_FIELD],
                 values[FEATURE_STORE_SK_FIELD],
                 values[FEATURE_STORE_VALUE_FIELD],
-                values["operation"],
             ):
-                if operation != DELTA_OPERATION_UPSERT:
-                    continue
                 name = str(name)
                 if embedding_name is not None and name != embedding_name:
                     continue
@@ -277,7 +272,7 @@ def sample_local_records(
                     return samples
     if not samples:
         suffix = f" for embedding_name={embedding_name!r}" if embedding_name else ""
-        raise ValueError(f"no sampleable UPSERT delta records were found{suffix}")
+        raise ValueError(f"no sampleable delta records were found{suffix}")
     return samples
 
 
