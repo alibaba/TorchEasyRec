@@ -95,6 +95,33 @@ def _output_path_identity(path: str) -> _PathIdentity:
     return "odps", project, schema, table_name, partition_spec
 
 
+def _input_write_identity(input_path: str) -> _PathIdentity:
+    """Destination identity a writer must avoid for the given input path.
+
+    Writers emit part files into a directory, so the collision unit is a
+    directory: the input's own for a local file/glob, else the path itself.
+    """
+    if input_path.startswith("odps://"):
+        return _output_path_identity(input_path)
+    base = input_path
+    if any(ch in input_path for ch in "*?[") or os.path.isfile(input_path):
+        base = os.path.dirname(input_path) or "."
+    return os.path.realpath(base)
+
+
+def _require_single_process() -> None:
+    """Reject multi-process launches; the tool writes one complete map itself."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    if world_size != 1 or rank != 0:
+        raise RuntimeError(
+            "collision_prevention is single-process; launch it with `python -m` "
+            f"(not torchrun): got WORLD_SIZE={world_size}, RANK={rank}. Under "
+            "multiple ranks every rank reprocesses the full input and emits "
+            "duplicate shards (local) or racing overwrite sessions (ODPS)."
+        )
+
+
 class _ItemIdLookup:
     """Map streamed item IDs to positions in a fixed requested-ID array."""
 
@@ -173,6 +200,17 @@ class CollisionPreventionConfig:
             if previous_name is not None:
                 raise ValueError(f"{name} must differ from {previous_name}: {path!r}.")
             seen_paths[path_identity] = name
+
+        # Writers overwrite in place after the full read, so an output in the
+        # input's location silently destroys the source map.
+        input_identity = _input_write_identity(self.input_path)
+        for name, path in named_paths.items():
+            if path and _output_path_identity(path) == input_identity:
+                raise ValueError(
+                    f"{name} would overwrite --input_path ({self.input_path!r}); "
+                    "write outputs to a location outside the input."
+                )
+
         # Eagerly build the resolution config so its validation (layer_sizes,
         # capacity) fails fast here rather than lazily inside run().
         _ = self.resolution_config
@@ -236,6 +274,7 @@ class CollisionRunner:
 
     def run(self) -> CollisionResolutionStats:
         """Read, resolve collisions, and write the resulting SID map."""
+        _require_single_process()
         item_ids, codes = self._load_codes()
         plan = prepare_collision_plan(
             item_ids,

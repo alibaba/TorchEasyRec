@@ -184,6 +184,24 @@ class SidCollisionPreventionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run(inp, out, max_items_per_codebook=2)
 
+    def test_output_into_input_location_rejected(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        _parquet(inp, list(range(3)), [[0, 0]] * 3, [[[0, 1]]] * 3)
+        # output_path is the directory holding the input file -> would overwrite it
+        with self.assertRaises(ValueError):
+            self._run(inp, self.test_dir)
+
+    def test_multi_process_launch_rejected(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, list(range(3)), [[0, 0]] * 3, [[[0, 1]]] * 3)
+        os.environ["WORLD_SIZE"] = "2"
+        try:
+            with self.assertRaises(RuntimeError):
+                self._run(inp, out)
+        finally:
+            os.environ.pop("WORLD_SIZE", None)
+
     def test_no_overflow_does_not_require_candidates(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
