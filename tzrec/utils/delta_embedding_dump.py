@@ -1049,13 +1049,16 @@ class DeltaEmbeddingDumper:
         )
         emb_dim = dynamic_module._dynamicemb_options[table_id].dim
         founds = founds.to(dtype=torch.bool)
+        embeddings = values[:, :emb_dim].detach()
         if not bool(founds.all().item()):
+            embeddings = embeddings.clone()
+            embeddings[~founds] = 0
             logger.warning(
-                "Skip %s missing dynamic embedding ids for table %s.",
+                "Use zero embeddings for %s missing dynamic embedding ids in table %s.",
                 int((~founds).sum().item()),
                 table_name,
             )
-        return values[founds, :emb_dim].detach(), ids[founds]
+        return embeddings, ids
 
     def _collect_table_shard_infos(self) -> Dict[str, _TableShardInfo]:
         table_shard_infos: Dict[str, _TableShardInfo] = {}

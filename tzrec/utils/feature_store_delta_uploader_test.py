@@ -747,7 +747,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 [
                     _row(10, 0, 1, [1.0, 2.0]),
                     _row(10, 0, 2, [3.0, 4.0]),
-                    _row(10, 0, 3, [5.0, 6.0]),
+                    _row(10, 0, 3, [0.0, 0.0]),
                 ],
             )
             view = _FakeView()
@@ -773,6 +773,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             )
             self.assertEqual({call["write_mode"] for call in view.calls}, {"MERGE"})
             self.assertEqual([call["ts"] for call in view.calls], [123456, 123457])
+            self.assertEqual(view.calls[1]["data"][0]["embedding"].tolist(), [0.0, 0.0])
             self.assertEqual(view.closed, [True])
 
             success_path = os.path.join(uploader.state_dir, "step_10._FS_SUCCESS.json")

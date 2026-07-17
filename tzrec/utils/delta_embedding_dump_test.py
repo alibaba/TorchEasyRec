@@ -90,16 +90,17 @@ class _DeltaDumpEBCModel(nn.Module):
 
 
 class _FakeDynamicTables:
-    def __init__(self) -> None:
+    def __init__(self, founds=None) -> None:
         self.ids = None
         self.table_ids = None
         self.copy_mode = None
+        self._founds = founds if founds is not None else [True, False, True]
 
     def find(self, ids, table_ids, copy_mode):
         self.ids = ids.detach().clone()
         self.table_ids = table_ids.detach().clone()
         self.copy_mode = copy_mode
-        founds = torch.tensor([True, False, True], device=ids.device)
+        founds = torch.tensor(self._founds, device=ids.device)
         values = torch.tensor(
             [
                 [1.0, 2.0, 20.0],
@@ -1083,12 +1084,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             )
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
-    @mark_ci_scope("gpu")
-    def test_lookup_dynamic_embeddings_filters_missing_ids(self):
+    def test_lookup_dynamic_embeddings_zero_fills_missing_ids(self):
         from dynamicemb.types import CopyMode
 
-        torch.cuda.set_device(0)
         dumper = object.__new__(DeltaEmbeddingDumper)
         fake_tables = _FakeDynamicTables()
         dynamic_module = SimpleNamespace(
@@ -1098,18 +1096,46 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             _dynamicemb_options=[SimpleNamespace(dim=2)],
         )
 
-        embeddings, key_ids = dumper._lookup_dynamic_embeddings(
-            dynamic_module, "dyn_table", torch.tensor([101, 102, 103])
-        )
+        cpu_device = torch.device("cpu")
+        with (
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch.object(torch, "device", return_value=cpu_device),
+        ):
+            embeddings, key_ids = dumper._lookup_dynamic_embeddings(
+                dynamic_module, "dyn_table", torch.tensor([101, 102, 103])
+            )
 
         dynamic_module.flush.assert_called_once_with()
         self.assertIs(fake_tables.copy_mode, CopyMode.EMBEDDING)
         torch.testing.assert_close(fake_tables.ids.cpu(), torch.tensor([101, 102, 103]))
         torch.testing.assert_close(fake_tables.table_ids.cpu(), torch.tensor([0, 0, 0]))
-        torch.testing.assert_close(key_ids.cpu(), torch.tensor([101, 103]))
+        torch.testing.assert_close(key_ids.cpu(), torch.tensor([101, 102, 103]))
         torch.testing.assert_close(
-            embeddings.cpu(), torch.tensor([[1.0, 2.0], [5.0, 6.0]])
+            embeddings.cpu(),
+            torch.tensor([[1.0, 2.0], [0.0, 0.0], [5.0, 6.0]]),
         )
+
+    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    def test_lookup_dynamic_embeddings_zero_fills_all_missing_ids(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dynamic_module = SimpleNamespace(
+            table_names=["dyn_table"],
+            tables=_FakeDynamicTables(founds=[False, False, False]),
+            flush=mock.MagicMock(),
+            _dynamicemb_options=[SimpleNamespace(dim=2)],
+        )
+
+        cpu_device = torch.device("cpu")
+        with (
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch.object(torch, "device", return_value=cpu_device),
+        ):
+            embeddings, key_ids = dumper._lookup_dynamic_embeddings(
+                dynamic_module, "dyn_table", torch.tensor([101, 102, 103])
+            )
+
+        torch.testing.assert_close(key_ids.cpu(), torch.tensor([101, 102, 103]))
+        torch.testing.assert_close(embeddings.cpu(), torch.zeros(3, 2))
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
