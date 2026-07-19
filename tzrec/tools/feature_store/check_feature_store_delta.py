@@ -121,7 +121,7 @@ def load_committed_upload(
     settings: FeatureStoreUploadSettings,
     global_step: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Load the local committed watermark and its success marker.
+    """Load the latest local commit or a requested committed step.
 
     Args:
         output_dir: Delta parquet outbox directory.
@@ -129,7 +129,7 @@ def load_committed_upload(
         global_step: Specific committed step to inspect, or None for the latest.
 
     Returns:
-        Tuple of state directory, committed watermark, and success marker.
+        Tuple of state directory, latest commit, and selected success marker.
 
     Raises:
         FileNotFoundError: If no committed marker exists for the configured target.
@@ -160,12 +160,6 @@ def load_committed_upload(
     selected_step = committed_step if global_step is None else int(global_step)
     if selected_step <= 0:
         raise ValueError("global_step must be > 0")
-    if selected_step > committed_step:
-        raise ValueError(
-            f"step {selected_step} is newer than the locally committed "
-            f"FeatureStore watermark {committed_step}"
-        )
-
     success_path = os.path.join(state_dir, f"step_{selected_step}._FS_SUCCESS.json")
     if not os.path.isfile(success_path):
         raise FileNotFoundError(
@@ -477,7 +471,7 @@ def run_check(args: argparse.Namespace) -> int:
         },
         "local_commit": {
             "global_step": global_step,
-            "committed_watermark": int(committed["committed_global_step"]),
+            "latest_committed_step": int(committed["committed_global_step"]),
             "success_records": int(success["success_records"]),
             "total_records": int(success["total_records"]),
             "parquet_paths": [
@@ -522,7 +516,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--global_step",
         type=int,
         default=None,
-        help="Committed step to inspect; defaults to the latest committed watermark.",
+        help="Committed step to inspect; defaults to the latest publication.",
     )
     parser.add_argument(
         "--sample_count",

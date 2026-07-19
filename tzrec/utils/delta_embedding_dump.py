@@ -874,6 +874,8 @@ class DeltaEmbeddingDumper:
             self._write_table_chunks(
                 table_chunks, output_path, dump_generation=dump_generation
             )
+            if uploader is not None:
+                uploader.submit(global_step, dump_generation)
         except BaseException:
             # The durability guard still owns the rows, so rewinding this
             # consumer makes a caller retry observe the same snapshot.
@@ -881,8 +883,6 @@ class DeltaEmbeddingDumper:
             raise
 
         self._ack_durable_tracker_read()
-        if uploader is not None:
-            uploader.submit(global_step)
         if num_rows == 0:
             logger.info(
                 "Dumped empty delta embedding shard to %s at step %s.",

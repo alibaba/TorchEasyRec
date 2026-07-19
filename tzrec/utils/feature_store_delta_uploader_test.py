@@ -29,6 +29,7 @@ from tzrec.utils.feature_store_delta_uploader import (
     FeatureStoreUploadError,
     FeatureStoreUploadSettings,
     _json_digest,
+    _read_json,
     feature_store_delta_file_prefix,
 )
 
@@ -901,7 +902,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             self.assertEqual(factory.calls, [])
             self.assertEqual(view.calls, [])
 
-    def test_step_zero_committed_watermark_is_rejected(self):
+    def test_step_zero_committed_state_is_rejected(self):
         with tempfile.TemporaryDirectory() as output_dir:
             view = _FakeView()
             factory = _FakeClientFactory(view)
@@ -1620,6 +1621,175 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             restarted.start()
             restarted.close()
             self.assertEqual(len(factory.calls), 1)
+
+    def test_restart_republishes_same_step_from_new_dump_generation(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            _write_single_shard(
+                output_dir,
+                10,
+                [_row(10, 0, 1, [1.0, 2.0])],
+                generation="run-a",
+            )
+            first = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+                clock_ms=lambda: 100,
+            )
+            first.start()
+            first.close()
+
+            _write_single_shard(
+                output_dir,
+                10,
+                [_row(10, 0, 1, [7.0, 8.0])],
+                generation="run-b",
+            )
+            replay_view = _FakeView()
+            replayed = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(replay_view),
+                clock_ms=lambda: 100,
+            )
+            replayed.start()
+            replayed.close()
+
+            self.assertEqual(len(replay_view.calls), 1)
+            self.assertEqual(
+                replay_view.calls[0]["data"][0]["embedding"].tolist(), [7.0, 8.0]
+            )
+            manifest = _read_json(replayed._manifest_path(10))
+            success = _read_json(replayed._success_path(10))
+            self.assertEqual(manifest["dump_generation"], "run-b")
+            self.assertEqual(manifest["supersedes_dump_generation"], "run-a")
+            self.assertEqual(manifest["supersedes_publish_ts"], 100)
+            self.assertEqual(success["publish_ts"], 101)
+            self.assertEqual(success["manifest_digest"], _json_digest(manifest))
+
+    def test_restart_recovers_interrupted_same_step_supersession(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            _write_single_shard(
+                output_dir,
+                10,
+                [_row(10, 0, 1, [1.0, 2.0])],
+                generation="run-a",
+            )
+            first = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+                clock_ms=lambda: 100,
+            )
+            first.start()
+            first.close()
+
+            shard = _write_single_shard(
+                output_dir,
+                10,
+                [_row(10, 0, 1, [7.0, 8.0])],
+                generation="run-b",
+            )
+            interrupted = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+                clock_ms=lambda: 100,
+            )
+            with _initialized_journal(interrupted):
+                snapshot_paths = interrupted._snapshot_canonical_shards(10, [shard])
+                self.assertIsNotNone(snapshot_paths)
+                manifest = interrupted._load_or_create_manifest(10, snapshot_paths, 1)
+            self.assertEqual(manifest["dump_generation"], "run-b")
+            self.assertFalse(interrupted._is_committed(10))
+
+            replay_view = _FakeView()
+            replayed = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(replay_view),
+                clock_ms=lambda: 100,
+            )
+            replayed.start()
+            replayed.close()
+
+            self.assertEqual(len(replay_view.calls), 1)
+            self.assertEqual(replay_view.calls[0]["ts"], 101)
+            self.assertTrue(replayed._is_committed(10, "run-b"))
+
+    def test_restart_republishes_new_generation_below_previous_step(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            _write_single_shard(
+                output_dir,
+                20,
+                [_row(20, 0, 1, [1.0, 2.0])],
+                generation="run-a",
+            )
+            first = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+                clock_ms=lambda: 100,
+            )
+            first.start()
+            first.close()
+
+            _write_single_shard(
+                output_dir,
+                15,
+                [_row(15, 0, 1, [7.0, 8.0])],
+                generation="run-b",
+            )
+            replay_view = _FakeView()
+            replayed = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(replay_view),
+                clock_ms=lambda: 100,
+            )
+            replayed.start()
+            replayed.close()
+
+            self.assertEqual(len(replay_view.calls), 1)
+            self.assertEqual(replay_view.calls[0]["ts"], 101)
+            with open(os.path.join(replayed.state_dir, "committed.json")) as source:
+                committed = json.load(source)
+            self.assertEqual(committed["committed_global_step"], 15)
+            self.assertEqual(committed["publish_ts"], 101)
+
+            verified = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+                clock_ms=lambda: 100,
+            )
+            verified.start()
+            verified.close()
+            self.assertEqual(verified._committed_global_step, 15)
 
 
 if __name__ == "__main__":

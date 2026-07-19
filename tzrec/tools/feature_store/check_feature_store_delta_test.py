@@ -97,6 +97,40 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
         self.assertEqual(committed["committed_global_step"], 20)
         self.assertEqual(success["global_step"], 20)
 
+    def test_load_committed_upload_accepts_step_before_latest_replay(self):
+        settings = SimpleNamespace(
+            project_name="project", feature_view_name="view", version="v1"
+        )
+        with tempfile.TemporaryDirectory() as output_dir:
+            state_dir = os.path.join(output_dir, ".feature_store_upload", "target")
+            os.makedirs(state_dir)
+            target = {
+                "project_name": "project",
+                "feature_view_name": "view",
+                "version": "v1",
+            }
+            with open(os.path.join(state_dir, "committed.json"), "w") as output:
+                json.dump({**target, "committed_global_step": 15}, output)
+            with open(
+                os.path.join(state_dir, "step_20._FS_SUCCESS.json"), "w"
+            ) as output:
+                json.dump(
+                    {
+                        **target,
+                        "global_step": 20,
+                        "success_records": 1,
+                        "total_records": 1,
+                    },
+                    output,
+                )
+
+            _, committed, success = load_committed_upload(
+                output_dir, settings, global_step=20
+            )
+
+        self.assertEqual(committed["committed_global_step"], 15)
+        self.assertEqual(success["global_step"], 20)
+
     def test_committed_parquet_paths_and_sampling(self):
         with tempfile.TemporaryDirectory() as output_dir:
             path = os.path.join(output_dir, "delta__fs_target_step_20.parquet")

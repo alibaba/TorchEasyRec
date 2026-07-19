@@ -816,6 +816,33 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         tracker.store.delete.assert_called_once_with(up_to_idx=12)
         tracker.get_unique.assert_not_called()
 
+    def test_dump_does_not_ack_tracker_when_submission_is_rejected(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._feature_store_enabled = True
+        dumper._world_size = 1
+        dumper._tracker = mock.MagicMock()
+        dumper._tracker.per_consumer_batch_idx = {_CONSUMER: 7}
+        dumper._uploader = mock.MagicMock()
+        dumper._uploader.submit.side_effect = RuntimeError("submission rejected")
+
+        with (
+            mock.patch.object(dumper, "_check_feature_store_upload_error"),
+            mock.patch.object(dumper, "_next_dump_generation", return_value="run-b"),
+            mock.patch.object(dumper, "_collect_table_weights", return_value={}),
+            mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
+            mock.patch.object(dumper, "_append_model_delta_rows", return_value=1),
+            mock.patch.object(dumper, "_output_path", return_value="delta.parquet"),
+            mock.patch.object(dumper, "_write_table_chunks"),
+            mock.patch.object(dumper, "_rollback_tracker_read") as rollback,
+            mock.patch.object(dumper, "_ack_durable_tracker_read") as durable_ack,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "submission rejected"):
+                dumper.dump(10)
+
+        dumper._uploader.submit.assert_called_once_with(10, "run-b")
+        rollback.assert_called_once_with(7)
+        durable_ack.assert_not_called()
+
     def test_multi_gpu_output_path_uses_step_underscore_dir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dumper = object.__new__(DeltaEmbeddingDumper)

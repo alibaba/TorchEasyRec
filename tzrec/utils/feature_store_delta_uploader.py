@@ -372,7 +372,8 @@ class FeatureStoreDeltaUploader:
     The training thread only writes/parquet-renames and enqueues a step. This
     object's single worker waits for the exact rank shard set and persists a
     monotonic timestamp range before each full-step MERGE attempt. It never
-    invokes a torch.distributed collective.
+    invokes a torch.distributed collective. Restored training may replay a
+    repeated or lower step; dump generation identifies the new publication.
     """
 
     def __init__(
@@ -522,11 +523,13 @@ class FeatureStoreDeltaUploader:
                 self._settings.version,
             )
 
-    def submit(self, global_step: int) -> None:
+    def submit(self, global_step: int, dump_generation: Optional[str] = None) -> None:
         """Enqueue a durably written rank-zero shard with bounded back-pressure."""
         global_step = int(global_step)
         if global_step <= 0:
             raise ValueError("FeatureStore delta global_step must be > 0")
+        if dump_generation is not None and not dump_generation:
+            raise ValueError("FeatureStore delta dump_generation must not be empty")
         with self._condition:
             self._raise_if_failed_locked()
             if not self._started:
@@ -535,13 +538,8 @@ class FeatureStoreDeltaUploader:
                 )
             if self._closing or self._closed:
                 raise RuntimeError("cannot submit to a closing FeatureStore uploader")
-            if self._is_committed(global_step):
+            if self._is_committed(global_step, dump_generation):
                 return
-            if global_step <= self._committed_global_step:
-                raise FeatureStoreUploadError(
-                    "refusing an uncommitted delta step older than the local "
-                    "FeatureStore committed watermark"
-                )
             while (
                 global_step not in self._pending
                 and len(self._pending) >= self._settings.max_pending_steps
@@ -609,19 +607,50 @@ class FeatureStoreDeltaUploader:
                 manifest_exists = os.path.isfile(self._manifest_path(current_step))
                 snapshot_paths = self._snapshot_paths(current_step)
                 snapshot_dir_exists = os.path.isdir(self._snapshot_dir(current_step))
-                if manifest_exists or snapshot_dir_exists:
-                    if not all(os.path.isfile(path) for path in snapshot_paths):
+                if snapshot_dir_exists and self._is_committed(current_step):
+                    try:
+                        canonical_generation = self._canonical_dump_generation(
+                            current_step
+                        )
+                    except _ShardSetNotReady:
+                        canonical_generation = None
+                        snapshot_paths = None
+                    manifest_generation = _read_json(
+                        self._manifest_path(current_step)
+                    ).get("dump_generation")
+                    if (
+                        canonical_generation is not None
+                        and canonical_generation != manifest_generation
+                    ):
+                        self._reclaim_snapshot(current_step)
+                        snapshot_dir_exists = os.path.isdir(
+                            self._snapshot_dir(current_step)
+                        )
+                        if snapshot_dir_exists:
+                            raise FeatureStoreUploadError(
+                                "cannot replace a committed FeatureStore shard "
+                                "snapshot with a newer dump generation"
+                            )
+                if snapshot_paths is not None:
+                    if snapshot_dir_exists:
+                        if not all(os.path.isfile(path) for path in snapshot_paths):
+                            raise FeatureStoreUploadError(
+                                "an uncommitted FeatureStore upload journal is "
+                                "missing its durable shard snapshot; recovery "
+                                "cannot continue"
+                            )
+                    elif manifest_exists and not self._is_committed(current_step):
                         raise FeatureStoreUploadError(
                             "an uncommitted FeatureStore upload journal is missing "
                             "its durable shard snapshot; recovery cannot continue"
                         )
-                else:
-                    try:
-                        snapshot_paths = self._snapshot_canonical_shards(
-                            current_step, canonical_paths
-                        )
-                    except _ShardSetNotReady:
-                        snapshot_paths = None
+                    else:
+                        try:
+                            snapshot_paths = self._snapshot_canonical_shards(
+                                current_step, canonical_paths
+                            )
+                        except _ShardSetNotReady:
+                            snapshot_paths = None
 
                 if snapshot_paths is None:
                     elapsed = time.monotonic() - pending_since
@@ -834,12 +863,17 @@ class FeatureStoreDeltaUploader:
                     "global_step must be > 0"
                 )
             if self._is_committed(step):
-                continue
-            if step <= self._committed_global_step:
-                raise ValueError(
-                    "found an uncommitted delta step older than the local "
-                    "FeatureStore committed watermark"
+                try:
+                    canonical_generation = self._canonical_dump_generation(step)
+                except _ShardSetNotReady:
+                    canonical_generation = ""
+                if canonical_generation is None:
+                    continue
+                manifest_generation = _read_json(self._manifest_path(step)).get(
+                    "dump_generation"
                 )
+                if canonical_generation == manifest_generation:
+                    continue
             if step not in self._pending:
                 self._pending[step] = time.monotonic()
                 remaining_capacity -= 1
@@ -913,18 +947,52 @@ class FeatureStoreDeltaUploader:
             for rank in range(self._world_size)
         ]
 
+    def _canonical_dump_generation(self, global_step: int) -> Optional[str]:
+        """Read one complete canonical shard set's generation without hashing it."""
+        paths = self._expected_shard_paths(global_step)
+        existing = [os.path.isfile(path) for path in paths]
+        if not any(existing):
+            return None
+        if not all(existing):
+            raise _ShardSetNotReady("canonical delta shard set is incomplete")
+
+        generations = set()
+        for path in paths:
+            metadata = pq.read_schema(path).metadata or {}
+            if metadata.get(
+                _SCHEMA_VERSION_METADATA_KEY
+            ) != DELTA_DUMP_SCHEMA_VERSION.encode("ascii"):
+                raise ValueError(f"unsupported delta dump schema version in {path}")
+            generation = metadata.get(DELTA_DUMP_GENERATION_METADATA_KEY)
+            if not generation:
+                raise ValueError(f"delta dump generation is missing in {path}")
+            try:
+                generations.add(generation.decode("ascii"))
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    f"delta dump generation is not ASCII in {path}"
+                ) from exc
+        if len(generations) != 1:
+            raise _ShardSetNotReady(
+                "delta shards from different dump generations are present"
+            )
+        return next(iter(generations))
+
     def _manifest_path(self, global_step: int) -> str:
         return os.path.join(self._state_dir, f"step_{global_step}.manifest.json")
 
     def _success_path(self, global_step: int) -> str:
         return os.path.join(self._state_dir, f"step_{global_step}._FS_SUCCESS.json")
 
-    def _is_committed(self, global_step: int) -> bool:
+    def _load_success_state(
+        self, global_step: int
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], bool]]:
+        """Validate one success marker and report whether its manifest is active."""
         if global_step <= 0:
             raise ValueError("FeatureStore delta global_step must be > 0")
         path = self._success_path(global_step)
         if not os.path.isfile(path):
-            return False
+            return None
         success = _read_json(path)
         expected = {
             "global_step": global_step,
@@ -941,12 +1009,49 @@ class FeatureStoreDeltaUploader:
         if not os.path.isfile(manifest_path):
             raise ValueError("FeatureStore success marker is missing its manifest")
         manifest = _read_json(manifest_path)
-        if success.get("manifest_digest") != _json_digest(manifest):
-            raise ValueError("FeatureStore success marker manifest digest mismatch")
         shards = success.get("shards")
-        if not isinstance(shards, list) or shards != manifest.get("shards"):
+        if not isinstance(shards, list):
             raise ValueError("FeatureStore success marker has invalid shards")
-        return True
+        success_manifest_digest = success.get("manifest_digest")
+        if not isinstance(success_manifest_digest, str) or not success_manifest_digest:
+            raise ValueError("FeatureStore success marker has invalid manifest_digest")
+        success_dump_generation = self._validate_dump_generation(shards)
+        if success.get("dump_generation", success_dump_generation) != (
+            success_dump_generation
+        ):
+            raise ValueError("FeatureStore success marker has invalid dump_generation")
+        if success_manifest_digest == _json_digest(manifest):
+            if (
+                shards != manifest.get("shards")
+                or manifest.get("dump_generation") != success_dump_generation
+            ):
+                raise ValueError("FeatureStore success marker has invalid shards")
+            return success, manifest, True
+
+        if (
+            manifest.get("supersedes_manifest_digest") != success_manifest_digest
+            or manifest.get("supersedes_publish_ts") != publish_ts
+            or manifest.get("supersedes_dump_generation") != success_dump_generation
+        ):
+            raise ValueError("FeatureStore success marker manifest digest mismatch")
+        if manifest.get("dump_generation") == manifest.get(
+            "supersedes_dump_generation"
+        ):
+            raise ValueError("FeatureStore superseding manifest generation is invalid")
+        return success, manifest, False
+
+    def _is_committed(
+        self, global_step: int, dump_generation: Optional[str] = None
+    ) -> bool:
+        state = self._load_success_state(global_step)
+        if state is None:
+            return False
+        _, manifest, active = state
+        if not active:
+            return False
+        return dump_generation is None or (
+            manifest.get("dump_generation") == dump_generation
+        )
 
     def _reconcile_committed_state(self) -> None:
         """Repair a crash between atomic success and committed-state writes."""
@@ -957,22 +1062,23 @@ class FeatureStoreDeltaUploader:
             if match is None:
                 continue
             step = int(match.group(1))
-            if not self._is_committed(step):
+            state = self._load_success_state(step)
+            if state is None:
                 continue
-            success = _read_json(self._success_path(step))
-            if latest_success is None or step > int(latest_success["global_step"]):
+            success, _, _ = state
+            if latest_success is None or int(success["publish_ts"]) > int(
+                latest_success["publish_ts"]
+            ):
                 latest_success = success
         if latest_success is None:
             return
 
         committed_path = os.path.join(self._state_dir, "committed.json")
-        committed_step = -1
+        committed_publish_ts = 0
         if os.path.isfile(committed_path):
-            committed_step = int(
-                _read_json(committed_path).get("committed_global_step", -1)
-            )
+            committed_publish_ts = int(_read_json(committed_path).get("publish_ts", 0))
         latest_step = int(latest_success["global_step"])
-        if committed_step >= latest_step:
+        if committed_publish_ts >= int(latest_success["publish_ts"]):
             return
         committed = {
             "schema_version": 1,
@@ -982,6 +1088,9 @@ class FeatureStoreDeltaUploader:
             "committed_global_step": latest_step,
             "publish_ts": int(latest_success["publish_ts"]),
             "contract_hash": self._contract_hash,
+            "dump_generation": latest_success.get("dump_generation")
+            or self._validate_dump_generation(latest_success["shards"]),
+            "manifest_digest": latest_success["manifest_digest"],
         }
         _atomic_write_json(committed_path, committed)
 
@@ -995,6 +1104,7 @@ class FeatureStoreDeltaUploader:
                 if not name.endswith(".manifest.json"):
                     continue
                 manifest = _read_json(os.path.join(self._state_dir, name))
+                latest = max(latest, int(manifest.get("supersedes_publish_ts", 0)))
                 for attempt in manifest.get("attempts", []):
                     latest = max(latest, int(attempt.get("range_end", 0)))
         return latest
@@ -1212,28 +1322,68 @@ class FeatureStoreDeltaUploader:
                 "dump_generation": dump_generation,
                 "shards": expected_shards,
             }
-            for name, value in expected.items():
-                if manifest.get(name) != value:
+            mismatch = next(
+                (
+                    name
+                    for name, value in expected.items()
+                    if manifest.get(name) != value
+                ),
+                None,
+            )
+            if mismatch is None:
+                attempts = manifest.get("attempts")
+                if not isinstance(attempts, list):
                     raise ValueError(
-                        f"FeatureStore upload manifest mismatch for {name}"
+                        "FeatureStore upload manifest has invalid attempts"
                     )
-            attempts = manifest.get("attempts")
-            if not isinstance(attempts, list):
-                raise ValueError("FeatureStore upload manifest has invalid attempts")
-            for attempt in attempts:
-                if (
-                    not isinstance(attempt, dict)
-                    or type(attempt.get("range_start")) is not int
-                    or type(attempt.get("range_end")) is not int
-                    or attempt["range_start"] <= 0
-                    or attempt["range_end"] < attempt["range_start"]
-                ):
-                    raise ValueError(
-                        "FeatureStore upload manifest has an invalid ts range"
+                for attempt in attempts:
+                    if (
+                        not isinstance(attempt, dict)
+                        or type(attempt.get("range_start")) is not int
+                        or type(attempt.get("range_end")) is not int
+                        or attempt["range_start"] <= 0
+                        or attempt["range_end"] < attempt["range_start"]
+                    ):
+                        raise ValueError(
+                            "FeatureStore upload manifest has an invalid ts range"
+                        )
+                    self._last_publish_ts = max(
+                        self._last_publish_ts, int(attempt["range_end"])
                     )
-                self._last_publish_ts = max(
-                    self._last_publish_ts, int(attempt["range_end"])
+                return manifest
+
+            if manifest.get(
+                "dump_generation"
+            ) == dump_generation or not self._is_committed(global_step):
+                raise ValueError(
+                    f"FeatureStore upload manifest mismatch for {mismatch}"
                 )
+
+            success_state = self._load_success_state(global_step)
+            if success_state is None or not success_state[2]:
+                raise ValueError(
+                    "FeatureStore committed manifest cannot be superseded safely"
+                )
+            # Keep the old success verifiable across a crash during replacement.
+            success, previous_manifest, _ = success_state
+            manifest = {
+                "schema_version": 3,
+                "global_step": global_step,
+                "world_size": self._world_size,
+                "project_name": self._settings.project_name,
+                "feature_view_name": self._settings.feature_view_name,
+                "version": self._settings.version,
+                "write_mode": FEATURE_STORE_WRITE_MODE,
+                "contract_hash": self._contract_hash,
+                "record_count": record_count,
+                "dump_generation": dump_generation,
+                "shards": expected_shards,
+                "attempts": [],
+                "supersedes_manifest_digest": success["manifest_digest"],
+                "supersedes_publish_ts": int(success["publish_ts"]),
+                "supersedes_dump_generation": previous_manifest["dump_generation"],
+            }
+            _atomic_write_json(path, manifest)
             return manifest
 
         manifest = {
@@ -1860,6 +2010,7 @@ class FeatureStoreDeltaUploader:
             "publish_ts": publish_ts,
             "write_mode": FEATURE_STORE_WRITE_MODE,
             "contract_hash": self._contract_hash,
+            "dump_generation": manifest["dump_generation"],
             "manifest_digest": manifest_digest,
             "shards": manifest["shards"],
             "total_records": int(summary["total_records"]),
@@ -1874,6 +2025,7 @@ class FeatureStoreDeltaUploader:
             "committed_global_step": global_step,
             "publish_ts": publish_ts,
             "contract_hash": self._contract_hash,
+            "dump_generation": manifest["dump_generation"],
             "manifest_digest": manifest_digest,
         }
         _atomic_write_json(os.path.join(self._state_dir, "committed.json"), committed)
