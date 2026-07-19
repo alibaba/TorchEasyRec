@@ -467,11 +467,17 @@ def _train_and_evaluate(
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
+    sync_train_data_exhaustion = check_all_workers_data_status or (
+        delta_embedding_dumper is not None
+        and delta_embedding_dumper.requires_synced_dataloader_exhaustion
+    )
     for i_epoch in epoch_iter:
+        # Timed dumps broadcast their per-step decision, so all ranks must stop
+        # consuming data together before any worker can leave that collective.
         pipeline = create_train_pipeline(
             model,
             optimizer,
-            check_all_workers_data_status=check_all_workers_data_status,
+            check_all_workers_data_status=sync_train_data_exhaustion,
         )
         if plogger is not None:
             plogger.set_description(f"Training Epoch {i_epoch}")

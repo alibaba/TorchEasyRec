@@ -799,6 +799,27 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertIsNone(dumper._interval_steps)
         self.assertEqual(dumper._interval_secs, 120.0)
 
+    def test_multi_rank_minutes_requires_synced_dataloader_exhaustion(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval_secs = 60.0
+        dumper._world_size = 2
+
+        self.assertTrue(dumper.requires_synced_dataloader_exhaustion)
+
+    def test_step_interval_does_not_require_synced_dataloader_exhaustion(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval_secs = None
+        dumper._world_size = 2
+
+        self.assertFalse(dumper.requires_synced_dataloader_exhaustion)
+
+    def test_single_rank_minutes_does_not_require_synced_dataloader_exhaustion(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval_secs = 60.0
+        dumper._world_size = 1
+
+        self.assertFalse(dumper.requires_synced_dataloader_exhaustion)
+
     def test_durable_ack_advances_guard_without_recomputing_unique_rows(self):
         tracker = mock.MagicMock()
         tracker.per_consumer_batch_idx = {

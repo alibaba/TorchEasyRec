@@ -472,6 +472,11 @@ class DeltaEmbeddingDumper:
         """Clear tracked sparse ids, usually after restore-time dummy steps."""
         self._tracker.clear()
 
+    @property
+    def requires_synced_dataloader_exhaustion(self) -> bool:
+        """Return whether input exhaustion must stay aligned across ranks."""
+        return self._interval_secs is not None and self._world_size > 1
+
     def start(self) -> None:
         """Start timed cadence and rank-zero publication after initialization."""
         if self._feature_store_enabled:
