@@ -11,9 +11,11 @@
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pyarrow as pa
@@ -22,6 +24,7 @@ import pyarrow.parquet as pq
 from tzrec.tools.feature_store.check_feature_store_delta import (
     LocalSample,
     committed_parquet_paths,
+    create_feature_store_view,
     load_committed_upload,
     parse_args,
     resolve_output_dir,
@@ -42,6 +45,44 @@ class _FakeView:
 
 
 class CheckFeatureStoreDeltaTest(unittest.TestCase):
+    def test_create_feature_store_view_uses_public_endpoint_when_supported(self):
+        captured_kwargs = {}
+        view = SimpleNamespace(
+            pk_field="embedding_name",
+            sk_field="key_id",
+            embedding_field="embedding",
+        )
+        project = SimpleNamespace(get_dynamic_embedding_feature_view=lambda name: view)
+
+        class FakeFeatureStoreClient:
+            def __init__(self, test_mode=False, **kwargs):
+                captured_kwargs.update(kwargs)
+                captured_kwargs["test_mode"] = test_mode
+
+            def get_project(self, name):
+                return project
+
+        settings = SimpleNamespace(
+            access_key_id="ak-id",
+            access_key_secret="ak-secret",
+            region="cn-test",
+            endpoint="",
+            security_token="",
+            featuredb_username="featuredb-user",
+            featuredb_password="featuredb-password",
+            project_name="project",
+            feature_view_name="view",
+        )
+        feature_store_module = SimpleNamespace(
+            FeatureStoreClient=FakeFeatureStoreClient
+        )
+
+        with mock.patch.dict(sys.modules, {"feature_store_py": feature_store_module}):
+            actual = create_feature_store_view(settings)
+
+        self.assertIs(actual, view)
+        self.assertTrue(captured_kwargs["test_mode"])
+
     def test_parse_args_does_not_accept_credentials(self):
         args = parse_args(["--pipeline_config", "pipeline.config"])
 

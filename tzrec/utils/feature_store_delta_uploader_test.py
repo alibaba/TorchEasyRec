@@ -456,6 +456,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
             self.assertEqual(factory.project.generic_get_calls, ["shared_embeddings"])
             self.assertEqual(factory.project.create_calls, [])
+            self.assertNotIn("test_mode", factory.calls[0])
             self.assertEqual(view.closed, [True])
 
     def test_start_creates_missing_dynamic_embedding_feature_view(self):

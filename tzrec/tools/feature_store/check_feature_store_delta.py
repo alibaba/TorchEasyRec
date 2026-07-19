@@ -384,7 +384,7 @@ def create_feature_store_view(settings: FeatureStoreUploadSettings) -> Any:
     except (TypeError, ValueError):
         parameters = {}
     if "test_mode" in parameters:
-        # Match the uploader's FeatureDB routing when supported by the SDK wheel.
+        # This manual readback tool normally runs outside the production VPC.
         kwargs["test_mode"] = True
 
     client = FeatureStoreClient(**kwargs)

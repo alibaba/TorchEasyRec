@@ -1705,7 +1705,6 @@ class FeatureStoreDeltaUploader:
             "security_token": self._settings.security_token or None,
             "featuredb_username": self._settings.featuredb_username or None,
             "featuredb_password": self._settings.featuredb_password or None,
-            "test_mode": True,
         }
         client = client_factory(**kwargs)
         project = client.get_project(self._settings.project_name)
