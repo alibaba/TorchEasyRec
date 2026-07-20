@@ -504,7 +504,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     def test_original_group_output_is_optional(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
-        _, resolved_path = self._group_paths(out)
+        original_path, resolved_path = self._group_paths(out)
         _parquet(inp, [0, 1, 2], [[0, 0]] * 3, [[[0, 1]]] * 3)
 
         with mock.patch.object(
@@ -519,6 +519,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             )
 
         original_builder.assert_not_called()
+        self.assertFalse(os.path.exists(original_path))
         self.assertTrue(os.path.exists(os.path.join(out, "part-0.parquet")))
         self.assertTrue(os.path.exists(os.path.join(resolved_path, "part-0.parquet")))
 

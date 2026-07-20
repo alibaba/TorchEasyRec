@@ -36,8 +36,10 @@ Example::
         --codebook 256,256,256 --max_items_per_codebook 5 \
         --strategy candidate \
         --output_path sid_collision/map \
-        --original_sid_groups_output_path sid_collision/original_groups \
         --resolved_sid_groups_output_path sid_collision/resolved_groups
+
+To also write the optional original-SID audit grouping, add
+``--original_sid_groups_output_path sid_collision/original_groups``.
 """
 
 from __future__ import annotations
