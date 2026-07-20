@@ -228,6 +228,32 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         self.assertEqual(calls, [2.0])
         ckpt.unprotect_checkpoint.assert_called_once()
 
+    def test_init_rejects_remote_model_dir(self) -> None:
+        """Remote (fsspec-URL) model_dir must fail fast, not silently no-op."""
+        ckpt = mock.Mock()
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with mock.patch.dict(os.environ, env):
+                with self.assertRaisesRegex(RuntimeError, "local model_dir"):
+                    OnlineDenseExportManager(
+                        model_dir="oss://bucket/m",
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        ckpt_manager=ckpt,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "local pipeline_config_path"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path="dfs://bucket/pipeline.config",
+                        ckpt_manager=ckpt,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

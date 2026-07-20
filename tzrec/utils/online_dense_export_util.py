@@ -64,6 +64,13 @@ def _online_dense_export_enabled() -> bool:
     return os.environ.get("ONLINE_DENSE_EXPORT", "0") == "1"
 
 
+def _is_remote_path(path: str) -> bool:
+    """Whether path has an fsspec protocol such as oss:// or dfs://."""
+    from fsspec.core import split_protocol
+
+    return split_protocol(path)[0] is not None
+
+
 def _get_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -107,8 +114,6 @@ class OnlineDenseExportManager:
     ) -> None:
         self._enabled = _online_dense_export_enabled()
         self._rank = int(os.environ.get("RANK", 0))
-        self._model_dir = os.path.abspath(model_dir)
-        self._pipeline_config_path = os.path.abspath(pipeline_config_path)
         self._ckpt_manager = ckpt_manager
         self._cond = Condition()
         self._pending: Optional[Dict[str, Any]] = None
@@ -121,11 +126,27 @@ class OnlineDenseExportManager:
         self._close_timeout = self._export_timeout + 120.0
 
         if not self._enabled:
+            self._model_dir = os.path.abspath(model_dir)
+            self._pipeline_config_path = os.path.abspath(pipeline_config_path)
             return
         if not env_util.use_distributed_embedding():
             raise RuntimeError(
                 "ONLINE_DENSE_EXPORT=1 requires USE_DISTRIBUTED_EMBEDDING=1."
             )
+        # Remote (fsspec-URL) model_dir is unsupported: os.path.abspath mangles
+        # the URL, os.rename/os.replace are not fsspec-patched, and protect
+        # keys would never match prune-side glob results. Fail fast instead of
+        # silently producing zero exports per checkpoint.
+        for label, path in (
+            ("model_dir", model_dir),
+            ("pipeline_config_path", pipeline_config_path),
+        ):
+            if _is_remote_path(path):
+                raise RuntimeError(
+                    f"ONLINE_DENSE_EXPORT requires a local {label}, got remote: {path}"
+                )
+        self._model_dir = os.path.abspath(model_dir)
+        self._pipeline_config_path = os.path.abspath(pipeline_config_path)
         if self._rank == 0:
             self._worker = Thread(
                 target=self._worker_loop,
