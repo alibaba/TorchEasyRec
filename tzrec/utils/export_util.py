@@ -39,6 +39,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollectionInterface,
     EmbeddingCollection,
     EmbeddingCollectionInterface,
+    get_embedding_names_by_table,
 )
 from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
@@ -495,20 +496,22 @@ def _get_embedding_bag_configs(module: torch.nn.Module) -> Optional[List[Any]]:
 def _infer_keyed_tensor_attrs_from_module(
     module: torch.nn.Module,
 ) -> Optional[Tuple[List[str], List[int]]]:
-    """Infer KeyedTensor keys/length_per_key from embedding module configs."""
+    """Infer KeyedTensor keys/length_per_key from embedding module configs.
+
+    Derives attrs exactly as torchrec's ``EmbeddingBagCollection`` does: one
+    key per feature name (shared features get an ``@table`` suffix) with one
+    ``length_per_key`` entry per key, so the reconstructed KeyedTensor matches
+    the module's runtime output and ``regroup_as_dict`` group names.
+    """
     configs = _get_embedding_bag_configs(module)
     if configs is None:
         return None
 
     keys = []
     length_per_key = []
-    for config in configs:
-        embedding_names = getattr(config, "embedding_names", None)
-        if not embedding_names:
-            embedding_names = [config.name]
-        embedding_dim = config.embedding_dim
+    for config, embedding_names in zip(configs, get_embedding_names_by_table(configs)):
         keys.extend(embedding_names)
-        length_per_key.extend([embedding_dim] * len(embedding_names))
+        length_per_key.extend([config.embedding_dim] * len(embedding_names))
     return keys, length_per_key
 
 

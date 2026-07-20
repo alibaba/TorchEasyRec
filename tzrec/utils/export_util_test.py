@@ -22,6 +22,8 @@ from unittest import mock
 import numpy as np
 import torch
 from torchrec.distributed.train_pipeline.utils import Tracer
+from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
 from tzrec.acc import utils as acc_utils
 from tzrec.modules.dense_embedding_collection import (
@@ -34,6 +36,7 @@ from tzrec.utils.export_util import (
     _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
     _get_sparse_embedding_tensor,
+    _infer_keyed_tensor_attrs_from_module,
     _merge_sharded_embedding_json,
     _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
@@ -728,6 +731,49 @@ class ExportUtilTest(unittest.TestCase):
                 torch.isnan(restored[name]).any(), f"{name} was not restored"
             )
             torch.testing.assert_close(restored[name], ref)
+
+    def test_infer_keyed_tensor_attrs_from_module_matches_ebc(self) -> None:
+        """Inferred attrs must equal the EBC's runtime KeyedTensor attrs.
+
+        Covers merged tables (one table serving multiple features) and shared
+        features (one feature across tables, which get ``@table`` suffixed
+        keys), and the MC-EBC duck-typing fallback via ``_embedding_module``.
+        """
+        tables = [
+            EmbeddingBagConfig(
+                name="uid_emb",
+                embedding_dim=8,
+                num_embeddings=100,
+                feature_names=["uid"],
+            ),
+            EmbeddingBagConfig(
+                name="pid_emb",
+                embedding_dim=4,
+                num_embeddings=100,
+                feature_names=["pid", "cid"],
+            ),
+            EmbeddingBagConfig(
+                name="pid_emb_shared",
+                embedding_dim=16,
+                num_embeddings=100,
+                feature_names=["pid"],
+            ),
+        ]
+        ebc = EmbeddingBagCollection(tables=tables, device=torch.device("cpu"))
+
+        attrs = _infer_keyed_tensor_attrs_from_module(ebc)
+        self.assertIsNotNone(attrs)
+        keys, length_per_key = attrs
+        self.assertEqual(keys, ebc._embedding_names)
+        self.assertEqual(length_per_key, ebc._lengths_per_embedding)
+        self.assertEqual(keys, ["uid", "pid@pid_emb", "cid", "pid@pid_emb_shared"])
+        self.assertEqual(length_per_key, [8, 4, 4, 16])
+
+        mc_like = torch.nn.Module()
+        mc_like._embedding_module = ebc
+        self.assertEqual(
+            _infer_keyed_tensor_attrs_from_module(mc_like), (keys, length_per_key)
+        )
 
 
 if __name__ == "__main__":
