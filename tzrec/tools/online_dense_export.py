@@ -51,6 +51,56 @@ def _publish_current(current_path: str, payload: Dict[str, Any]) -> None:
     _atomic_write_json(current_path, payload)
 
 
+def _max_kept_versions() -> int:
+    """Max published dense versions to retain (0 = keep all)."""
+    return int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_VERSIONS", "3"))
+
+
+def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
+    """Best-effort retention: keep the newest K versions, sweep stale tmp artifacts.
+
+    Serving reads current.json (the newest pointer) and needs the previous
+    version for an atomic swap, so K defaults to 3. Stale ``*.tmp.<pid>``
+    dirs and current.json.tmp.<pid> files left by crashed exports are swept
+    so they don't accumulate under the serving-facing tree.
+    """
+    max_versions = _max_kept_versions()
+    for base in (versions_root, export_root):
+        try:
+            entries = os.listdir(base)
+        except FileNotFoundError:
+            continue
+        for name in entries:
+            if ".tmp." not in name and not name.endswith(".tmp"):
+                continue
+            path = os.path.join(base, name)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                logger.info("removed stale dense export tmp: %s", path)
+            except OSError as e:
+                logger.warning("failed to remove stale tmp %s: %s", path, e)
+    if max_versions <= 0:
+        return
+    try:
+        entries = os.listdir(versions_root)
+    except FileNotFoundError:
+        return
+    version_dirs = sorted(
+        os.path.join(versions_root, name)
+        for name in entries
+        if os.path.isdir(os.path.join(versions_root, name))
+    )
+    for path in version_dirs[:-max_versions]:
+        try:
+            shutil.rmtree(path)
+            logger.info("removed old dense export version: %s", path)
+        except OSError as e:
+            logger.warning("failed to remove old version %s: %s", path, e)
+
+
 def export_online_dense_model(
     pipeline_config_path: str,
     checkpoint_path: str,
@@ -123,6 +173,7 @@ def export_online_dense_model(
 
     # Keep the service-facing pointer beside the immutable dense export versions.
     _publish_current(os.path.join(export_root, CURRENT_JSON), current_payload)
+    _prune_old_dense_versions(export_root, versions_root)
     logger.info("published online dense export version %s to %s", version, version_dir)
     return current_payload
 

@@ -111,6 +111,93 @@ class OnlineDenseExportTest(unittest.TestCase):
             )
             self.assertEqual(payload["version"], "20260623174703")
 
+    def test_prune_old_versions_and_stale_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = os.path.join(tmp_dir, "model.ckpt-10")
+            os.makedirs(checkpoint_path)
+            pipeline_config_path = os.path.join(tmp_dir, "pipeline.config")
+            open(pipeline_config_path, "w").close()
+
+            export_root = os.path.join(tmp_dir, "dense_hot_export")
+            versions_root = os.path.join(export_root, "versions")
+            os.makedirs(versions_root)
+            for v in (
+                "20260101000001",
+                "20260101000002",
+                "20260101000003",
+                "20260101000004",
+            ):
+                vd = os.path.join(versions_root, v)
+                os.makedirs(vd)
+                with open(os.path.join(vd, "READY"), "w") as f:
+                    f.write("x")
+            # stale per-PID tmp dir + current.json.tmp left by a crashed export
+            os.makedirs(os.path.join(versions_root, "20260101000001.tmp.9999"))
+            with open(os.path.join(export_root, "current.json.tmp.9999"), "w") as f:
+                f.write("x")
+
+            def fake_export_dense_model_cpu(**kwargs):
+                save_dir = kwargs["save_dir"]
+                os.makedirs(save_dir, exist_ok=True)
+                with open(os.path.join(save_dir, "scripted_model.pt"), "w") as f:
+                    f.write("pt")
+                with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
+                    json.dump({}, f)
+
+            dummy_config = SimpleNamespace(
+                feature_configs=[],
+                data_config=SimpleNamespace(label_fields=[]),
+                model_config=SimpleNamespace(),
+            )
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "USE_DISTRIBUTED_EMBEDDING": "1",
+                        "ONLINE_DENSE_EXPORT_KEEP_VERSIONS": "2",
+                    },
+                    clear=False,
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export.config_util.load_pipeline_config",
+                    return_value=dummy_config,
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export._create_features",
+                    return_value=[],
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export._create_model",
+                    return_value=mock.Mock(),
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export.ScriptWrapper",
+                    side_effect=lambda model: model,
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export.export_dense_model_cpu",
+                    side_effect=fake_export_dense_model_cpu,
+                ),
+            ):
+                export_online_dense_model(
+                    pipeline_config_path=pipeline_config_path,
+                    checkpoint_path=checkpoint_path,
+                    model_dir=tmp_dir,
+                    version="20260623174704",
+                    checkpoint_step=10,
+                    data_timestamp=42.0,
+                )
+
+            remaining = sorted(os.listdir(versions_root))
+            self.assertEqual(remaining, ["20260101000004", "20260623174704"])
+            self.assertFalse(
+                os.path.exists(os.path.join(versions_root, "20260101000001.tmp.9999"))
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(export_root, "current.json.tmp.9999"))
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
