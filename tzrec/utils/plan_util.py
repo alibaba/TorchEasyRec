@@ -60,6 +60,8 @@ from torchrec.distributed.planner.storage_reservations import (
 from torchrec.distributed.planner.types import (
     Enumerator,
     Proposer,
+    SharderData,
+    SharderDataMap,
     ShardingOption,
     Storage,
     Topology,
@@ -657,29 +659,25 @@ class EmbeddingStorageEstimator(ShardEstimator):
     def estimate(
         self,
         sharding_options: List[ShardingOption],
-        sharder_map: Optional[Dict[str, ModuleSharder[nn.Module]]] = None,
+        sharder_data_map: SharderDataMap,
     ) -> None:
         """Estimate the storage cost of each sharding option.
 
         Args:
             sharding_options (List[ShardingOption]): list of sharding options.
-            sharder_map (Optional[Dict[str, ModuleSharder[nn.Module]]]): map from module
-                type to sharder.
+            sharder_data_map (SharderDataMap): map from module type to sharder data.
         """
-        if not sharder_map:
-            assert not sharding_options, "sharder_map not provided for sharding_options"
-            return
-
         for sharding_option in sharding_options:
             sharder_key = sharding_option.module_type_key
-            sharder = sharder_map[sharder_key]
+            sharder_data = sharder_data_map[sharder_key]
 
             caching_ratio = sharding_option.cache_load_factor
             # TODO: remove after deprecating fused_params in sharder
             if caching_ratio is None:
                 caching_ratio = (
-                    sharder.fused_params.get("cache_load_factor")  # pyre-ignore[16]
-                    if hasattr(sharder, "fused_params") and sharder.fused_params
+                    sharder_data.fused_params.get("cache_load_factor")
+                    if hasattr(sharder_data, "fused_params")
+                    and sharder_data.fused_params
                     else None
                 )
             constraints: Optional[ParameterConstraints] = (
@@ -701,8 +699,8 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 else None
             )
             kv_cache_load_factor: float = (
-                sharder.fused_params.get("cache_load_factor", KV_CACHING_RATIO)
-                if sharder.fused_params
+                sharder_data.fused_params.get("cache_load_factor", KV_CACHING_RATIO)
+                if sharder_data.fused_params
                 else KV_CACHING_RATIO
             )
             use_virtual_table: bool = (
@@ -728,8 +726,9 @@ class EmbeddingStorageEstimator(ShardEstimator):
             # TODO: remove after deprecating fused_params in sharder
             if mpp_conf is None:
                 mpp_conf = (
-                    sharder.fused_params.get("multipass_prefetch_config", None)
-                    if hasattr(sharder, "fused_params") and sharder.fused_params
+                    sharder_data.fused_params.get("multipass_prefetch_config", None)
+                    if hasattr(sharder_data, "fused_params")
+                    and sharder_data.fused_params
                     else None
                 )
 
@@ -742,7 +741,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 dynamicemb_options = sharding_option.dynamicemb_options
 
             shard_storages = calculate_shard_storages(
-                sharder=sharder,
+                sharder_data=sharder_data,
                 sharding_type=sharding_option.sharding_type,
                 tensor=sharding_option.tensor,
                 compute_device=self._topology.compute_device,
@@ -771,7 +770,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
 
 
 def calculate_shard_storages(
-    sharder: ModuleSharder[nn.Module],
+    sharder_data: SharderData,
     sharding_type: str,
     tensor: torch.Tensor,
     compute_device: str,
@@ -801,8 +800,7 @@ def calculate_shard_storages(
     and optimizer sizes.
 
     Args:
-        sharder (ModuleSharder[nn.Module]): sharder for module that supports
-            sharding.
+        sharder_data (SharderData): precomputed sharder data for the module.
         sharding_type (str): provided ShardingType value.
         tensor (torch.Tensor): tensor to be sharded.
         compute_device (str): compute device to be used.
@@ -836,7 +834,7 @@ def calculate_shard_storages(
         from tzrec.utils.dynamicemb_util import dynamicemb_calculate_shard_storages
 
         return dynamicemb_calculate_shard_storages(
-            sharder=sharder,
+            sharder_data=sharder_data,
             sharding_type=sharding_type,
             tensor=tensor,
             compute_device=compute_device,
@@ -859,7 +857,7 @@ def calculate_shard_storages(
         )
     else:
         return tzrec_calculate_shard_storages(
-            sharder=sharder,
+            sharder_data=sharder_data,
             sharding_type=sharding_type,
             tensor=tensor,
             compute_device=compute_device,

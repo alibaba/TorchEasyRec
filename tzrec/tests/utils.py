@@ -324,7 +324,10 @@ class SeqMockInput(MockInput):
         data = {}
         for name, arr in zip(t.column_names, t.columns):
             if name in self.side_infos:
-                data[f"{self.name}{self.sequence_underline}{name}"] = arr
+                # pandas>=3 `from_pandas` yields large_string; cast back to string.
+                data[f"{self.name}{self.sequence_underline}{name}"] = arr.cast(
+                    pa.string()
+                )
 
         return data
 

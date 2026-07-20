@@ -14,14 +14,14 @@ import os
 import shutil
 from collections import OrderedDict
 from copy import copy
-from functools import partial  # NOQA
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
 import pyfg
 import torch
-from torch import nn  # NOQA
+from torch import nn
 from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.modules.embedding_configs import (
     BaseEmbeddingConfig,
@@ -35,9 +35,9 @@ from torchrec.modules.mc_modules import (
     LRU_EvictionPolicy,
     ManagedCollisionModule,
     MCHManagedCollisionModule,
-    average_threshold_filter,  # NOQA
-    dynamic_threshold_filter,  # NOQA
-    probabilistic_threshold_filter,  # NOQA
+    average_threshold_filter,
+    dynamic_threshold_filter,
+    probabilistic_threshold_filter,
 )
 from torchrec.types import DataType
 
@@ -60,7 +60,7 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.protos import feature_pb2
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.protos.feature_pb2 import FeatureConfig, SequenceFeature
-from tzrec.utils import config_util, dynamicemb_util, env_util
+from tzrec.utils import config_util, dynamicemb_util, env_util, init_util
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
 
@@ -615,7 +615,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             embedding_name = self.config.embedding_name or f"{self.name}_emb"
             init_fn = None
             if self.config.HasField("init_fn"):
-                init_fn = eval(f"partial({self.config.init_fn})")
+                init_fn = init_util.create_init_fn(self.config.init_fn)
             emb_bag_config = EmbeddingBagConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
@@ -642,7 +642,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             embedding_name = self.config.embedding_name or f"{self.name}_emb"
             init_fn = None
             if self.config.HasField("init_fn"):
-                init_fn = eval(f"partial({self.config.init_fn})")
+                init_fn = init_util.create_init_fn(self.config.init_fn)
             emb_config = EmbeddingConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
@@ -699,7 +699,17 @@ class BaseFeature(object, metaclass=_meta_cls):
                 threshold_filtering_func = None
                 if self.config.zch.HasField("threshold_filtering_func"):
                     threshold_filtering_func = eval(
-                        self.config.zch.threshold_filtering_func
+                        self.config.zch.threshold_filtering_func,
+                        {
+                            "partial": partial,
+                            "nn": nn,
+                            "torch": torch,
+                            "average_threshold_filter": average_threshold_filter,
+                            "dynamic_threshold_filter": dynamic_threshold_filter,
+                            "probabilistic_threshold_filter": (
+                                probabilistic_threshold_filter
+                            ),
+                        },
                     )
                 if evict_type == "lfu":
                     eviction_policy = LFU_EvictionPolicy(

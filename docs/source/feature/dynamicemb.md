@@ -2,14 +2,16 @@
 
 DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`hash_bucket_size`的方式能避免hash冲突，相比设置`vocab_dict`和`vocab_list`的方式能更灵活动态地进行id的准入和驱逐。DynamicEmbedding 常用于user id，item id，combo feature等超大id枚举数的特征配置中。DynamicEmbedding 相比 ZCH 能外接PS，支撑十亿百亿甚至更多的Id枚举数，Id准入和淘汰无需攒Batch，可以更加及时。
 
-注：目前使用DynamicEmbedding还处于实验阶段，配置和接口都可能调整，暂只支持训练和评估，暂不包含在官方提供的镜像环境中，使用前需要额外安装如下whl包
+使用 DynamicEmbedding 前需安装如下whl包
+
+```bash
+# DEVICE 可选: cu126/cu129/cu130 (支持 Python 3.10/3.11/3.12)
+pip install dynamicemb==0.1.0+20260630.5dc46a2.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+```
 
 注：同一个 FeatureGroup 中若存在多个配置了 DynamicEmbedding 的特征，底层 dynamicemb 会自动将这些表融合到同一份存储里（table fusion），共享 cache/admission counter，降低显存占用并减少内存碎片，无需额外配置。
 
-```bash
-# DEVICE 可选: cu126/cu129 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb==0.1.0+20260519.e0c1fbb.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
-```
+注：配置了 DynamicEmbedding 的模型导出时需设置环境变量 `USE_DISTRIBUTED_EMBEDDING=1`，使用分布式 embedding 导出模式，详见[模型导出](../usage/export.md)的环境变量章节。
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
 
