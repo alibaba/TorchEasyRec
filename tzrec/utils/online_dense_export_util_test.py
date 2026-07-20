@@ -14,6 +14,7 @@
 
 import datetime
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -128,6 +129,104 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         # both tasks' checkpoints were unprotected in _run_task's finally
         self.assertEqual(ckpt.unprotect_checkpoint.call_count, 2)
+
+    def test_submit_coalesces_to_latest_pending(self) -> None:
+        """A not-yet-started pending task is superseded and unprotected."""
+        ckpt = mock.Mock()
+        unprotected = []
+        ckpt.unprotect_checkpoint.side_effect = unprotected.append
+        calls = []
+        started = threading.Event()
+        proceed = threading.Event()
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd[cmd.index("--version") + 1])
+            if len(calls) == 1:
+                started.set()
+                proceed.wait(timeout=10)
+
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ckpt1 = os.path.join(tmp_dir, "model.ckpt-1")
+            ckpt2 = os.path.join(tmp_dir, "model.ckpt-2")
+            ckpt3 = os.path.join(tmp_dir, "model.ckpt-3")
+            for path in (ckpt1, ckpt2, ckpt3):
+                os.makedirs(path)
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch(
+                    "tzrec.utils.online_dense_export_util.subprocess.run",
+                    side_effect=fake_run,
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    ckpt_manager=ckpt,
+                )
+                try:
+                    mgr.submit(1, ckpt1, 1.0)
+                    self.assertTrue(started.wait(timeout=10))
+                    mgr.submit(2, ckpt2, 2.0)  # pending, not yet started
+                    mgr.submit(3, ckpt3, 3.0)  # supersedes task 2
+                    proceed.set()  # release task 1
+                finally:
+                    mgr.close()
+        # task 2 was superseded (never run); tasks 1 and 3 were processed
+        self.assertEqual(len(calls), 2)
+        self.assertIn(ckpt2, unprotected)  # unprotected at enqueue
+
+    def test_subprocess_run_uses_timeout_and_survives_timeout_expired(
+        self,
+    ) -> None:
+        """subprocess.run gets the timeout kwarg; TimeoutExpired is handled."""
+        ckpt = mock.Mock()
+        calls = []
+        done = threading.Event()
+
+        def fake_run(cmd, **kwargs):
+            calls.append(kwargs.get("timeout"))
+            done.set()
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "ONLINE_DENSE_EXPORT_TIMEOUT": "2",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
+            os.makedirs(ckpt_path)
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch(
+                    "tzrec.utils.online_dense_export_util.subprocess.run",
+                    side_effect=fake_run,
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    ckpt_manager=ckpt,
+                )
+                try:
+                    mgr.submit(1, ckpt_path, 1.0)
+                    self.assertTrue(done.wait(timeout=10))
+                finally:
+                    mgr.close()
+        self.assertEqual(calls, [2.0])
+        ckpt.unprotect_checkpoint.assert_called_once()
 
 
 if __name__ == "__main__":

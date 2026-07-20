@@ -17,8 +17,7 @@ import os
 import socket
 import subprocess
 import sys
-from queue import Queue
-from threading import Thread
+from threading import Condition, Thread
 from typing import Any, Dict, Optional
 
 from tzrec.utils import checkpoint_util, env_util
@@ -111,9 +110,15 @@ class OnlineDenseExportManager:
         self._model_dir = os.path.abspath(model_dir)
         self._pipeline_config_path = os.path.abspath(pipeline_config_path)
         self._ckpt_manager = ckpt_manager
-        self._queue: "Queue[Optional[Dict[str, Any]]]" = Queue()
+        self._cond = Condition()
+        self._pending: Optional[Dict[str, Any]] = None
+        self._draining = False
         self._worker: Optional[Thread] = None
         self._last_version = ""
+        self._export_timeout = float(
+            os.environ.get("ONLINE_DENSE_EXPORT_TIMEOUT", "3600")
+        )
+        self._close_timeout = self._export_timeout + 120.0
 
         if not self._enabled:
             return
@@ -139,35 +144,58 @@ class OnlineDenseExportManager:
         checkpoint_path: str,
         data_timestamp: float,
     ) -> None:
-        """Queue a dense export task for one saved checkpoint."""
+        """Queue a dense export task for the freshest saved checkpoint."""
         if not self._enabled or self._rank != 0:
             return
         checkpoint_path = os.path.abspath(checkpoint_path)
         version = _make_monotonic_version(self._last_version)
         self._last_version = version
-        self._ckpt_manager.protect_checkpoint(checkpoint_path)
-        self._queue.put(
-            {
+        with self._cond:
+            if self._draining:
+                logger.warning("online dense export draining; skip step %s", step)
+                return
+            # latest-wins: a not-yet-started pending task is superseded and
+            # its checkpoint unprotected immediately so prune can reclaim it.
+            # Online serving only consumes the freshest dense version, so a
+            # backlog cannot pin one protected checkpoint per queued task.
+            superseded = self._pending["checkpoint_path"] if self._pending else None
+            self._pending = {
                 "step": step,
                 "checkpoint_path": checkpoint_path,
                 "data_timestamp": data_timestamp,
                 "version": version,
             }
-        )
+            self._ckpt_manager.protect_checkpoint(checkpoint_path)
+            self._cond.notify()
+        if superseded is not None:
+            self._ckpt_manager.unprotect_checkpoint(superseded)
+            self._ckpt_manager.prune()
 
     def close(self) -> None:
-        """Wait for queued dense export tasks to finish."""
+        """Wait for in-flight and pending dense export tasks to finish."""
         if self._worker is None:
             return
-        self._queue.put(None)
-        self._worker.join()
+        with self._cond:
+            self._draining = True
+            self._cond.notify_all()
+        self._worker.join(timeout=self._close_timeout)
+        if self._worker.is_alive():
+            logger.warning(
+                "online dense export worker did not finish within %ss",
+                self._close_timeout,
+            )
 
     def _worker_loop(self) -> None:
         while True:
-            task = self._queue.get()
-            try:
-                if task is None:
+            with self._cond:
+                while self._pending is None and not self._draining:
+                    self._cond.wait()
+                if self._pending is None:
+                    # draining and nothing left to run
                     return
+                task = self._pending
+                self._pending = None
+            try:
                 self._run_task(task)
             except Exception:
                 # Keep the worker alive across unexpected task failures (e.g.
@@ -176,8 +204,6 @@ class OnlineDenseExportManager:
                 # single transient I/O error would permanently disable exports
                 # and silently void keep_checkpoint_max for all future submits.
                 logger.exception("online dense export task failed; continuing")
-            finally:
-                self._queue.task_done()
 
     def _run_task(self, task: Dict[str, Any]) -> None:
         checkpoint_path = task["checkpoint_path"]
@@ -228,7 +254,16 @@ class OnlineDenseExportManager:
                         cwd=repo_root,
                         stdout=log_file,
                         stderr=subprocess.STDOUT,
+                        timeout=self._export_timeout,
                     )
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "online dense export version %s timed out after %ss, see %s",
+                    task["version"],
+                    self._export_timeout,
+                    log_path,
+                )
+                return
             except subprocess.CalledProcessError as e:
                 logger.error(
                     "online dense export version %s failed with return code %s, see %s",
