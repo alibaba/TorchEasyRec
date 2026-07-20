@@ -17,7 +17,8 @@ import os
 import socket
 import subprocess
 import sys
-from threading import Condition, Thread
+import weakref
+from threading import Condition, Event, Thread
 from typing import Any, Dict, Optional
 
 from tzrec.utils import checkpoint_util, env_util
@@ -117,8 +118,9 @@ class OnlineDenseExportManager:
         self._ckpt_manager = ckpt_manager
         self._cond = Condition()
         self._pending: Optional[Dict[str, Any]] = None
-        self._draining = False
+        self._drain_event = Event()
         self._worker: Optional[Thread] = None
+        self._finalizer: Optional[weakref.finalize] = None
         self._last_version = ""
         self._export_timeout = float(
             os.environ.get("ONLINE_DENSE_EXPORT_TIMEOUT", "3600")
@@ -154,6 +156,14 @@ class OnlineDenseExportManager:
                 daemon=True,
             )
             self._worker.start()
+            self._finalizer = weakref.finalize(
+                self,
+                type(self)._drain_worker,
+                self._worker,
+                self._cond,
+                self._drain_event,
+                self._close_timeout,
+            )
             logger.info(
                 "ONLINE_DENSE_EXPORT enabled; dense versions will be exported under %s",
                 os.path.join(model_dir, "dense_hot_export"),
@@ -172,7 +182,7 @@ class OnlineDenseExportManager:
         version = _make_monotonic_version(self._last_version)
         self._last_version = version
         with self._cond:
-            if self._draining:
+            if self._drain_event.is_set():
                 logger.warning("online dense export draining; skip step %s", step)
                 return
             # latest-wins: a not-yet-started pending task is superseded and
@@ -196,8 +206,10 @@ class OnlineDenseExportManager:
         """Wait for in-flight and pending dense export tasks to finish."""
         if self._worker is None:
             return
+        if self._finalizer is not None:
+            self._finalizer.detach()
+        self._drain_event.set()
         with self._cond:
-            self._draining = True
             self._cond.notify_all()
         self._worker.join(timeout=self._close_timeout)
         if self._worker.is_alive():
@@ -206,10 +218,29 @@ class OnlineDenseExportManager:
                 self._close_timeout,
             )
 
+    @staticmethod
+    def _drain_worker(
+        worker: Thread,
+        cond: Condition,
+        drain_event: Event,
+        close_timeout: float,
+    ) -> None:
+        """Drain the export worker if close() was never called.
+
+        Registered via weakref.finalize so that if training raises before
+        close() (the manager local goes out of scope), the worker is still
+        stopped instead of leaking as a daemon thread with an in-flight
+        subprocess that could publish current.json unattended.
+        """
+        drain_event.set()
+        with cond:
+            cond.notify_all()
+        worker.join(timeout=close_timeout)
+
     def _worker_loop(self) -> None:
         while True:
             with self._cond:
-                while self._pending is None and not self._draining:
+                while self._pending is None and not self._drain_event.is_set():
                     self._cond.wait()
                 if self._pending is None:
                     # draining and nothing left to run

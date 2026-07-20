@@ -228,6 +228,51 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         self.assertEqual(calls, [2.0])
         ckpt.unprotect_checkpoint.assert_called_once()
 
+    def test_finalizer_drains_worker_when_close_not_called(self) -> None:
+        """If training raises before close(), the finalizer still stops the worker.
+
+        A live worker keeps the manager reachable (threading._active), so the
+        finalizer does not fire via GC; it fires via atexit at interpreter exit.
+        Invoke it directly to simulate that path.
+        """
+        ckpt = mock.Mock()
+        done = threading.Event()
+
+        def fake_run(cmd, **kwargs):
+            done.set()
+
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
+            os.makedirs(ckpt_path)
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch(
+                    "tzrec.utils.online_dense_export_util.subprocess.run",
+                    side_effect=fake_run,
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    ckpt_manager=ckpt,
+                )
+                self.assertTrue(mgr._finalizer.alive)
+                mgr.submit(1, ckpt_path, 1.0)
+                self.assertTrue(done.wait(timeout=10))
+                worker = mgr._worker
+                # simulate the atexit finalizer firing (training raised, close skipped)
+                mgr._finalizer()
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(mgr._finalizer.alive)
+
     def test_init_rejects_remote_model_dir(self) -> None:
         """Remote (fsspec-URL) model_dir must fail fast, not silently no-op."""
         ckpt = mock.Mock()
