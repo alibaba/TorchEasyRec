@@ -168,7 +168,6 @@ class CollisionResolver(ABC):
         self,
         plan: CollisionPlan,
         candidate_codes: Optional[np.ndarray] = None,
-        *,
         collect_grouping: bool = True,
     ) -> CollisionResolutionResult:
         """Resolve overflow rows while preserving every input item.
@@ -185,31 +184,17 @@ class CollisionResolver(ABC):
         """
         raise NotImplementedError
 
-    @staticmethod
-    def _resolve_first_fit(
-        plan: CollisionPlan,
-        candidate_last_codes: np.ndarray,
-        *,
-        collect_grouping: bool,
-    ) -> CollisionResolutionResult:
-        """Greedily relocate overflow rows to their first free candidate slot.
-
-        Candidate rows must be aligned with ``plan.overflow_rows`` and values
-        must be valid last-layer codebook indices. An overflow row that finds
-        no free candidate slot keeps its original SID (over capacity), so every
-        input row is preserved in the output.
+    def _validate_candidate_last_codes(
+        self, plan: CollisionPlan, candidate_last_codes: np.ndarray
+    ) -> np.ndarray:
+        """Validate and normalize candidates aligned with overflow rows.
 
         Args:
-            plan: Grouping and overflow plan from
-                :func:`prepare_collision_plan`.
-            candidate_last_codes: Ordered candidate matrix with shape
-                ``(M, K)``, where ``M`` equals the number of overflow rows.
-            collect_grouping: Whether to retain final bucket metadata required
-                by :func:`build_resolved_item_grouping`.
+            plan: Collision plan defining overflow rows and codebook bounds.
+            candidate_last_codes: Ordered candidate matrix to validate.
 
         Returns:
-            Resolved last-layer codes, slot indices, unresolved row indices,
-            and diagnostics.
+            The candidate matrix as a NumPy array.
 
         Raises:
             TypeError: If candidate codes do not use an integer dtype.
@@ -239,38 +224,136 @@ class CollisionResolver(ABC):
                 f"candidate_last_codes must be in [0, {last_size}), got values "
                 "outside that range."
             )
+        return candidates
 
+    def _build_no_overflow_result(
+        self, plan: CollisionPlan, collect_grouping: bool
+    ) -> CollisionResolutionResult:
+        """Build the unchanged result for a plan without overflow rows.
+
+        Args:
+            plan: Collision plan without overflow rows.
+            collect_grouping: Whether to retain final bucket metadata.
+
+        Returns:
+            A collision result that preserves the original assignments.
+        """
+        final_bucket_keys = (
+            plan.bucket_keys.copy() if collect_grouping else np.empty(0, dtype=np.int64)
+        )
+        final_bucket_counts = (
+            plan.bucket_counts.copy()
+            if collect_grouping
+            else np.empty(0, dtype=np.int64)
+        )
+        max_final_bucket_size = (
+            int(plan.bucket_counts.max()) if plan.bucket_counts.size else 0
+        )
+        stats = CollisionResolutionStats(
+            total_items=plan.item_count,
+            raw_collision_buckets=0,
+            final_collision_buckets=0,
+            relocated_count=0,
+            unresolved_count=0,
+            max_final_bucket_size=max_final_bucket_size,
+        )
+        return CollisionResolutionResult(
+            resolved_last_codes=plan.original_last_codes,
+            slot_indices=plan.initial_slot_indices,
+            unresolved_rows=np.empty(0, dtype=np.int64),
+            final_bucket_keys=final_bucket_keys,
+            final_bucket_counts=final_bucket_counts,
+            grouping_collected=collect_grouping,
+            stats=stats,
+        )
+
+    def _summarize_final_buckets(
+        self,
+        plan: CollisionPlan,
+        initial_counts: np.ndarray,
+        in_overflow_band: np.ndarray,
+        slot_counts: dict[int, int],
+        collect_grouping: bool,
+    ) -> tuple[np.ndarray, np.ndarray, int, int]:
+        """Summarize final bucket metadata and collision statistics.
+
+        Args:
+            plan: Collision plan defining original bucket keys and capacity.
+            initial_counts: Original bucket counts capped at capacity.
+            in_overflow_band: Mask selecting buckets affected by relocation.
+            slot_counts: Final counts for buckets in affected bands.
+            collect_grouping: Whether to build sorted final bucket arrays.
+
+        Returns:
+            Final bucket keys, final bucket counts, number of over-capacity
+            buckets, and maximum final bucket size.
+        """
+        capacity = plan.config.capacity
+        final_bucket_keys = np.empty(0, dtype=np.int64)
+        final_bucket_counts = np.empty(0, dtype=np.int64)
+        untouched_mask = ~in_overflow_band
+        untouched_counts = initial_counts[untouched_mask]
+        if collect_grouping:
+            untouched_keys = plan.bucket_keys[untouched_mask]
+            band_keys = np.fromiter(slot_counts, dtype=np.int64, count=len(slot_counts))
+            band_counts = np.fromiter(
+                slot_counts.values(), dtype=np.int64, count=len(slot_counts)
+            )
+            all_keys = np.concatenate((untouched_keys, band_keys))
+            all_counts = np.concatenate((untouched_counts, band_counts))
+            collision_count = int((all_counts > capacity).sum())
+            max_bucket_size = int(all_counts.max()) if all_counts.size else 0
+            occupancy_order = np.argsort(all_keys, kind="stable")
+            final_bucket_keys = all_keys[occupancy_order]
+            final_bucket_counts = all_counts[occupancy_order]
+        else:
+            # Untouched buckets never exceed capacity. Iterate the scoped map
+            # directly to skip the grouping arrays and sort in rate-only runs.
+            collision_count = 0
+            max_band = 0
+            for count in slot_counts.values():
+                collision_count += count > capacity
+                max_band = max(max_band, count)
+            max_untouched = int(untouched_counts.max()) if untouched_counts.size else 0
+            max_bucket_size = max(max_untouched, max_band)
+        return final_bucket_keys, final_bucket_counts, collision_count, max_bucket_size
+
+    def _resolve_first_fit(
+        self,
+        plan: CollisionPlan,
+        candidate_last_codes: np.ndarray,
+        collect_grouping: bool,
+    ) -> CollisionResolutionResult:
+        """Greedily relocate overflow rows to their first free candidate slot.
+
+        Candidate rows must be aligned with ``plan.overflow_rows`` and values
+        must be valid last-layer codebook indices. An overflow row that finds
+        no free candidate slot keeps its original SID (over capacity), so every
+        input row is preserved in the output.
+
+        Args:
+            plan: Grouping and overflow plan from
+                :func:`prepare_collision_plan`.
+            candidate_last_codes: Ordered candidate matrix with shape
+                ``(M, K)``, where ``M`` equals the number of overflow rows.
+            collect_grouping: Whether to retain final bucket metadata required
+                by :func:`build_resolved_item_grouping`.
+
+        Returns:
+            Resolved last-layer codes, slot indices, unresolved row indices,
+            and diagnostics.
+
+        Raises:
+            TypeError: If candidate codes do not use an integer dtype.
+            ValueError: If candidates are not a row-aligned two-dimensional
+                matrix or contain out-of-range last-layer indices.
+        """
+        candidates = self._validate_candidate_last_codes(plan, candidate_last_codes)
+        overflow_count = plan.overflow_rows.shape[0]
         if overflow_count == 0:
-            final_bucket_keys = (
-                plan.bucket_keys.copy()
-                if collect_grouping
-                else np.empty(0, dtype=np.int64)
-            )
-            final_bucket_counts = (
-                plan.bucket_counts.copy()
-                if collect_grouping
-                else np.empty(0, dtype=np.int64)
-            )
-            max_final_bucket_size = (
-                int(plan.bucket_counts.max()) if plan.bucket_counts.size else 0
-            )
-            return CollisionResolutionResult(
-                resolved_last_codes=plan.original_last_codes,
-                slot_indices=plan.initial_slot_indices,
-                unresolved_rows=np.empty(0, dtype=np.int64),
-                final_bucket_keys=final_bucket_keys,
-                final_bucket_counts=final_bucket_counts,
-                grouping_collected=collect_grouping,
-                stats=CollisionResolutionStats(
-                    total_items=plan.item_count,
-                    raw_collision_buckets=0,
-                    final_collision_buckets=0,
-                    relocated_count=0,
-                    unresolved_count=0,
-                    max_final_bucket_size=max_final_bucket_size,
-                ),
-            )
+            return self._build_no_overflow_result(plan, collect_grouping)
 
+        last_size = plan.config.layer_sizes[-1]
         capacity = plan.config.capacity
         initial_counts = np.minimum(plan.bucket_counts, capacity)
         # Relocation only reads or writes buckets in a band with an overflow
@@ -289,15 +372,12 @@ class CollisionResolver(ABC):
         unresolved_rows = []
         get_slot_count = slot_counts.get
 
-        for row_value, key_prefix_value, origin_value, candidate_row in zip(
-            plan.overflow_rows,
-            plan.overflow_bucket_key_prefixes,
-            plan.overflow_origin_last_codes,
+        for row, key_prefix, origin_last_code, candidate_row in zip(
+            plan.overflow_rows.tolist(),
+            plan.overflow_bucket_key_prefixes.tolist(),
+            plan.overflow_origin_last_codes.tolist(),
             candidates,
         ):
-            row = int(row_value)
-            key_prefix = int(key_prefix_value)
-            origin_last_code = int(origin_value)
             for candidate in candidate_row.tolist():
                 if candidate == origin_last_code:
                     continue
@@ -317,33 +397,18 @@ class CollisionResolver(ABC):
                 slot_counts[origin_key] = origin_count
                 slot_indices[row] = origin_count
 
-        final_bucket_keys = np.empty(0, dtype=np.int64)
-        final_bucket_counts = np.empty(0, dtype=np.int64)
-        untouched_mask = ~in_overflow_band
-        untouched_counts = initial_counts[untouched_mask]
-        if collect_grouping:
-            untouched_keys = plan.bucket_keys[untouched_mask]
-            band_keys = np.fromiter(slot_counts, dtype=np.int64, count=len(slot_counts))
-            band_counts = np.fromiter(
-                slot_counts.values(), dtype=np.int64, count=len(slot_counts)
-            )
-            all_keys = np.concatenate((untouched_keys, band_keys))
-            all_counts = np.concatenate((untouched_counts, band_counts))
-            final_collision_buckets = int((all_counts > capacity).sum())
-            max_final_bucket_size = int(all_counts.max()) if all_counts.size else 0
-            occupancy_order = np.argsort(all_keys, kind="stable")
-            final_bucket_keys = all_keys[occupancy_order]
-            final_bucket_counts = all_counts[occupancy_order]
-        else:
-            # Untouched buckets never exceed capacity. Iterate the scoped map
-            # directly to skip the grouping arrays and sort in rate-only runs.
-            final_collision_buckets = 0
-            max_band = 0
-            for count in slot_counts.values():
-                final_collision_buckets += count > capacity
-                max_band = max(max_band, count)
-            max_untouched = int(untouched_counts.max()) if untouched_counts.size else 0
-            max_final_bucket_size = max(max_untouched, max_band)
+        (
+            final_bucket_keys,
+            final_bucket_counts,
+            final_collision_buckets,
+            max_final_bucket_size,
+        ) = self._summarize_final_buckets(
+            plan,
+            initial_counts,
+            in_overflow_band,
+            slot_counts,
+            collect_grouping,
+        )
         unresolved_array = np.asarray(unresolved_rows, dtype=np.int64)
         stats = CollisionResolutionStats(
             total_items=plan.item_count,
@@ -371,7 +436,6 @@ class KnnCollisionResolver(CollisionResolver):
         self,
         plan: CollisionPlan,
         candidate_codes: Optional[np.ndarray] = None,
-        *,
         collect_grouping: bool = True,
     ) -> CollisionResolutionResult:
         """Resolve overflow rows using their ordered KNN candidates.
@@ -450,7 +514,6 @@ class RandomCollisionResolver(CollisionResolver):
         self,
         plan: CollisionPlan,
         candidate_codes: Optional[np.ndarray] = None,
-        *,
         collect_grouping: bool = True,
     ) -> CollisionResolutionResult:
         """Generate deterministic candidates and resolve overflow rows.
@@ -471,14 +534,14 @@ class RandomCollisionResolver(CollisionResolver):
         if candidate_codes is not None:
             raise ValueError("RandomCollisionResolver does not accept candidate_codes.")
         if plan.overflow_rows.size:
-            candidates = self._generate_candidate_last_codes(
+            candidate_codes = self._generate_candidate_last_codes(
                 plan.overflow_item_ids,
                 plan.config.layer_sizes[-1],
             )
         else:
-            candidates = np.empty((0, 0), dtype=np.int64)
+            candidate_codes = np.empty((0, 0), dtype=np.int64)
         return self._resolve_first_fit(
-            plan, candidates, collect_grouping=collect_grouping
+            plan, candidate_codes, collect_grouping=collect_grouping
         )
 
 

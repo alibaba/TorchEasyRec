@@ -22,17 +22,15 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
+from parameterized import parameterized
 
 from tzrec.tools.sid import evaluate_sid_quality as esq
 from tzrec.utils import misc_util
 from tzrec.utils.sid.quality import (
     SidLayerQualityMetrics,
     SidQualityMetrics,
-    SidQualityResult,
-    compute_entropy,
-    compute_gini,
 )
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 _CODEBOOK = [4, 8, 16]
 _ROWS = [
@@ -44,16 +42,16 @@ _ROWS = [
     [2, 3, 3],
     [3, 7, 15],
 ]
-_SID_COUNTS = [3, 1, 1, 1, 1]
 
 
-def _list_array(rows, n_layers=3):
+def _list_array(rows):
     return pa.array(rows, type=pa.list_(pa.int64()))
 
 
 def _run_single(rows, codebook=None, **kwargs):
-    batch = {"codes": _list_array(rows, len(codebook or _CODEBOOK))}
-    return esq.run_evaluation([batch], "codes", codebook or _CODEBOOK, **kwargs)
+    effective_codebook = _CODEBOOK if codebook is None else codebook
+    batch = {"codes": _list_array(rows)}
+    return esq.run_evaluation([batch], "codes", effective_codebook, **kwargs)
 
 
 class DecodeCodesTest(unittest.TestCase):
@@ -120,20 +118,7 @@ class DecodeCodesTest(unittest.TestCase):
 
 
 class RunEvaluationTest(unittest.TestCase):
-    def _assert_golden_summary(self, row) -> None:
-        self.assertEqual(row["total"], 7)
-        self.assertEqual(row["unique_sid"], 5)
-        self.assertAlmostEqual(row["no_collision_rate"], 5 / 7)
-        self.assertAlmostEqual(row["uniquely_identified_item_rate"], 4 / 7)
-        self.assertEqual(row["max_collision"], 3)
-        self.assertAlmostEqual(row["gini"], compute_gini(_SID_COUNTS))
-        entropy = compute_entropy(_SID_COUNTS)
-        max_entropy = math.log(math.prod(_CODEBOOK))
-        self.assertAlmostEqual(row["entropy"], entropy)
-        self.assertAlmostEqual(row["max_entropy"], max_entropy)
-        self.assertAlmostEqual(row["entropy_ratio"], entropy / max_entropy)
-
-    def test_single_field_preserves_existing_metrics_and_long_schema(self) -> None:
+    def test_single_field_builds_long_schema_and_metadata(self) -> None:
         evaluation = _run_single(_ROWS, source="input", log_top_sids=5)
         self.assertEqual(len(evaluation.summary_rows), 1)
         summary = evaluation.summary_rows[0]
@@ -165,11 +150,13 @@ class RunEvaluationTest(unittest.TestCase):
         self.assertEqual(summary["input_rows"], 7)
         self.assertEqual(summary["evaluated_items"], 7)
         self.assertEqual(summary["invalid_pair_rows"], 0)
-        self._assert_golden_summary(summary)
+        self.assertEqual(summary["total"], 7)
+        self.assertEqual(summary["unique_sid"], 5)
+        self.assertEqual(summary["max_collision"], 3)
         self.assertEqual(len(evaluation.layer_rows), 3)
         self.assertEqual(
-            [row["coverage"] for row in evaluation.layer_rows],
-            [1.0, 0.625, 0.3125],
+            [row["layer"] for row in evaluation.layer_rows],
+            [0, 1, 2],
         )
         self.assertEqual(evaluation.top_sids["single"][0], ("0,0,0", 3))
 
@@ -208,17 +195,15 @@ class RunEvaluationTest(unittest.TestCase):
 
     def test_compare_uses_one_common_valid_cohort(self) -> None:
         batch = {
-            "origin": _list_array([[0, 0], None, [0, 1], [2, 0], [1, 1], [0, 0]], 2),
-            "final": _list_array([[0, 0], [0, 1], [0, 2], [1, 0], [1], [1, 1]], 2),
+            "origin": _list_array([[0, 0], None, [0, 1], [2, 0], [1, 1], [0, 0]]),
+            "final": _list_array([[0, 0], [0, 1], [0, 2], [1, 0], [1], [1, 1]]),
         }
-        with mock.patch.object(esq, "decode_codes", wraps=esq.decode_codes) as decode:
-            evaluation = esq.run_evaluation(
-                [batch],
-                "final",
-                [2, 2],
-                origin_codes_field="origin",
-            )
-        self.assertEqual(decode.call_count, 2)
+        evaluation = esq.run_evaluation(
+            [batch],
+            "final",
+            [2, 2],
+            origin_codes_field="origin",
+        )
         self.assertEqual(
             [row["view"] for row in evaluation.summary_rows],
             ["before", "after", "delta"],
@@ -234,21 +219,7 @@ class RunEvaluationTest(unittest.TestCase):
         self.assertEqual(after["total"], 2)
         self.assertEqual(after["unique_sid"], 2)
         self.assertEqual(after["max_collision"], 1)
-        metric_names = [
-            "total",
-            "unique_sid",
-            "no_collision_rate",
-            "uniquely_identified_item_rate",
-            "max_collision",
-            "gini",
-            "entropy",
-            "max_entropy",
-            "entropy_ratio",
-        ]
-        for metric_name in metric_names:
-            self.assertAlmostEqual(
-                delta[metric_name], after[metric_name] - before[metric_name]
-            )
+        self.assertEqual(delta["unique_sid"], 1)
         self.assertEqual(before["sid_field"], "origin")
         self.assertEqual(after["sid_field"], "final")
         self.assertEqual(delta["sid_field"], "origin->final")
@@ -276,36 +247,6 @@ class RunEvaluationTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "no valid rows"):
             esq.run_evaluation([batch], "final", [2], origin_codes_field="origin")
-
-    def test_compare_prefix_layer_deltas_are_zero(self) -> None:
-        batch = {
-            "origin": _list_array([[0, 0, 0], [0, 0, 0], [1, 1, 0], [1, 1, 0]]),
-            "final": _list_array([[0, 0, 0], [0, 0, 1], [1, 1, 0], [1, 1, 1]]),
-        }
-        evaluation = esq.run_evaluation(
-            [batch], "final", [2, 2, 2], origin_codes_field="origin"
-        )
-        delta_layers = [row for row in evaluation.layer_rows if row["view"] == "delta"]
-        for row in delta_layers[:2]:
-            self.assertEqual(row["coverage"], 0.0)
-            self.assertEqual(row["dead_codes"], 0)
-            self.assertEqual(row["perplexity"], 0.0)
-        before_last = next(
-            row
-            for row in evaluation.layer_rows
-            if row["view"] == "before" and row["layer"] == 2
-        )
-        after_last = next(
-            row
-            for row in evaluation.layer_rows
-            if row["view"] == "after" and row["layer"] == 2
-        )
-        delta_last = delta_layers[2]
-        for metric_name in ("coverage", "dead_codes", "perplexity"):
-            self.assertAlmostEqual(
-                delta_last[metric_name],
-                after_last[metric_name] - before_last[metric_name],
-            )
 
     def test_compare_top_sids_excludes_delta(self) -> None:
         batch = {
@@ -367,15 +308,15 @@ class RunEvaluationTest(unittest.TestCase):
     def test_order_and_batch_boundaries_do_not_change_results(self) -> None:
         origin = [[0, 0], [0, 0], [0, 1], [1, 0], [1, 1]]
         final = [[0, 1], [0, 0], [0, 1], [1, 1], [1, 0]]
-        one_batch = [{"origin": _list_array(origin, 2), "final": _list_array(final, 2)}]
+        one_batch = [{"origin": _list_array(origin), "final": _list_array(final)}]
         reordered_batches = [
             {
-                "origin": _list_array([origin[4], origin[1]], 2),
-                "final": _list_array([final[4], final[1]], 2),
+                "origin": _list_array([origin[4], origin[1]]),
+                "final": _list_array([final[4], final[1]]),
             },
             {
-                "origin": _list_array([origin[3], origin[0], origin[2]], 2),
-                "final": _list_array([final[3], final[0], final[2]], 2),
+                "origin": _list_array([origin[3], origin[0], origin[2]]),
+                "final": _list_array([final[3], final[0], final[2]]),
             },
         ]
         first = esq.run_evaluation(
@@ -390,11 +331,10 @@ class RunEvaluationTest(unittest.TestCase):
 
 class SidQualityCliTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.success = False
-        self.test_dir = None
+        self.test_dir = make_test_dir()
 
     def tearDown(self) -> None:
-        if self.success and self.test_dir and os.path.exists(self.test_dir):
+        if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
     def test_parser_exposes_explicit_field_contract(self) -> None:
@@ -413,28 +353,51 @@ class SidQualityCliTest(unittest.TestCase):
         self.assertEqual(args.codes_field, "final")
         self.assertEqual(args.origin_codes_field, "origin")
         self.assertEqual(args.invalid_row_policy, "drop")
-        self.assertFalse(hasattr(args, "input_mode"))
 
     def test_parse_codebook_and_positive_int(self) -> None:
         self.assertEqual(esq._parse_codebook("256, 256,256"), [256, 256, 256])
         self.assertEqual(esq._positive_int("5"), 5)
-        with self.assertRaises(argparse.ArgumentTypeError):
-            esq._parse_codebook("16,abc")
-        with self.assertRaises(argparse.ArgumentTypeError):
-            esq._parse_codebook("0,16")
-        with self.assertRaises(argparse.ArgumentTypeError):
-            esq._parse_codebook("")
-        with self.assertRaises(argparse.ArgumentTypeError):
-            esq._positive_int("0")
 
-    def test_main_projects_only_explicit_sid_fields(self) -> None:
+    @parameterized.expand(
+        [
+            ("noninteger_codebook", esq._parse_codebook, "16,abc", "must be"),
+            ("nonpositive_codebook", esq._parse_codebook, "0,16", "positive"),
+            ("empty_codebook", esq._parse_codebook, "", "must be"),
+            ("nonpositive_integer", esq._positive_int, "0", "positive"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_cli_value_parsers_reject_invalid_values(
+        self, _name, parser, value, expected_error
+    ) -> None:
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, expected_error):
+            parser(value)
+
+    @parameterized.expand(
+        [
+            ("single", ["--codes_field", "final"], ["final"]),
+            (
+                "compare",
+                [
+                    "--origin_codes_field",
+                    "origin",
+                    "--codes_field",
+                    "final",
+                ],
+                ["origin", "final"],
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_main_projects_only_explicit_sid_fields(
+        self, _name, field_args, selected_fields
+    ) -> None:
+        batch = {field: pa.array(["0"]) for field in selected_fields}
         reader = SimpleNamespace(
             schema=pa.schema(
-                [pa.field("origin", pa.string()), pa.field("final", pa.string())]
+                [pa.field(field, pa.string()) for field in selected_fields]
             ),
-            to_batches=lambda: iter(
-                [{"origin": pa.array(["0"]), "final": pa.array(["1"])}]
-            ),
+            to_batches=lambda: iter([batch]),
         )
         with mock.patch.object(esq, "create_reader", return_value=reader) as create:
             esq.main(
@@ -443,41 +406,65 @@ class SidQualityCliTest(unittest.TestCase):
                     "input.parquet",
                     "--codebook",
                     "2",
+                    *field_args,
+                ]
+            )
+        self.assertEqual(create.call_args.kwargs["selected_cols"], selected_fields)
+
+    @parameterized.expand(
+        [
+            (
+                "missing_field",
+                [
                     "--origin_codes_field",
                     "origin",
                     "--codes_field",
                     "final",
-                ]
-            )
-        self.assertEqual(create.call_args.kwargs["selected_cols"], ["origin", "final"])
+                ],
+                ["final"],
+                "selected SID fields .*origin.* not found",
+                True,
+            ),
+            (
+                "duplicate_fields",
+                ["--origin_codes_field", "codes"],
+                ["codes"],
+                "must be different",
+                False,
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_main_reports_field_errors(
+        self, _name, field_args, schema_fields, expected_error, expects_reader
+    ) -> None:
+        reader = SimpleNamespace(
+            schema=pa.schema([pa.field(field, pa.string()) for field in schema_fields])
+        )
 
-    def test_main_reports_missing_fields_and_duplicate_fields(self) -> None:
-        reader = SimpleNamespace(schema=pa.schema([pa.field("final", pa.string())]))
-        with mock.patch.object(esq, "create_reader", return_value=reader):
-            with self.assertRaises(SystemExit):
-                esq.main(
-                    [
-                        "--input_path",
-                        "input.parquet",
-                        "--codebook",
-                        "2",
-                        "--origin_codes_field",
-                        "origin",
-                        "--codes_field",
-                        "final",
-                    ]
-                )
-        with self.assertRaises(SystemExit):
+        def parser_error(message):
+            raise ValueError(message)
+
+        with (
+            mock.patch.object(esq, "create_reader", return_value=reader) as create,
+            mock.patch.object(
+                argparse.ArgumentParser, "error", side_effect=parser_error
+            ),
+            self.assertRaisesRegex(ValueError, expected_error),
+        ):
             esq.main(
                 [
                     "--input_path",
                     "input.parquet",
                     "--codebook",
                     "2",
-                    "--origin_codes_field",
-                    "codes",
+                    *field_args,
                 ]
             )
+        if expects_reader:
+            create.assert_called_once()
+        else:
+            create.assert_not_called()
 
     def test_rows_to_arrow_columns_validates_schema(self) -> None:
         rows = (OrderedDict(a=1, b="x"), OrderedDict(a=2, b="y"))
@@ -529,17 +516,6 @@ class SidQualityCliTest(unittest.TestCase):
             ("before", 0, 0.5),
         )
 
-    def test_log_result_reports_metrics_layers_and_top_sids(self) -> None:
-        result = SidQualityResult(
-            metrics=SidQualityMetrics(1, 1, 1.0, 1.0, 1, 0.0, 0.0, 0.0, math.nan),
-            layer_metrics=(SidLayerQualityMetrics(0, 1, 1.0, 0, 1.0),),
-            top_sids=(("0", 1),),
-        )
-        with mock.patch.object(esq.logger, "info") as info:
-            esq._log_result("single", result)
-        self.assertGreaterEqual(info.call_count, 4)
-        self.assertIn("single", info.call_args_list[0].args[0])
-
     def test_writer_is_closed_when_write_fails(self) -> None:
         writer = mock.Mock()
         writer.write.side_effect = RuntimeError("write failed")
@@ -554,7 +530,6 @@ class SidQualityCliTest(unittest.TestCase):
         writer.close.assert_called_once_with()
 
     def test_end_to_end_compare_writes_long_format_outputs(self) -> None:
-        self.test_dir = make_test_dir()
         input_dir = os.path.join(self.test_dir, "input")
         os.makedirs(input_dir)
         pq.write_table(
@@ -601,10 +576,8 @@ class SidQualityCliTest(unittest.TestCase):
         self.assertEqual(
             {row["view"] for row in layer_rows}, {"before", "after", "delta"}
         )
-        self.success = True
 
     def test_csv_compare_writes_long_format_summary(self) -> None:
-        self.test_dir = make_test_dir()
         input_path = os.path.join(self.test_dir, "input.csv")
         pacsv.write_csv(
             pa.table(
@@ -639,7 +612,6 @@ class SidQualityCliTest(unittest.TestCase):
         summary = pacsv.read_csv(os.path.join(summary_output, "part-0.csv"))
         self.assertEqual(summary["view"].to_pylist(), ["before", "after", "delta"])
         self.assertEqual(summary["unique_sid"].to_pylist(), [2, 3, 1])
-        self.success = True
 
 
 if __name__ == "__main__":

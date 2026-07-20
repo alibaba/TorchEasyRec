@@ -224,12 +224,8 @@ class ResolveSidCollisionsConfig:
         return cls(
             input_path=args.input_path,
             output_path=args.output_path,
-            original_sid_groups_output_path=getattr(
-                args, "original_sid_groups_output_path", None
-            ),
-            resolved_sid_groups_output_path=getattr(
-                args, "resolved_sid_groups_output_path", None
-            ),
+            original_sid_groups_output_path=args.original_sid_groups_output_path,
+            resolved_sid_groups_output_path=args.resolved_sid_groups_output_path,
             reader_type=args.reader_type,
             writer_type=args.writer_type,
             batch_size=args.batch_size,

@@ -15,6 +15,7 @@ from dataclasses import fields
 from unittest import mock
 
 import numpy as np
+from parameterized import parameterized
 
 from tzrec.utils.sid import quality
 from tzrec.utils.sid.quality import (
@@ -24,6 +25,7 @@ from tzrec.utils.sid.quality import (
     compute_gini,
     valid_code_rows,
 )
+from tzrec.utils.test_util import parameterized_name_func
 
 _CODEBOOK = [4, 8, 16]
 _ROWS = np.asarray(
@@ -44,6 +46,12 @@ _LAYER_USAGE = [
     [3, 1, 1, 1, 1],
     [3, 1, 1, 1, 1],
 ]
+
+
+def _quality_result(codebook, rows):
+    accumulator = SidQualityAccumulator(codebook)
+    accumulator.update(np.asarray(rows, dtype=np.int64))
+    return accumulator.finalize()
 
 
 class SidQualityMathTest(unittest.TestCase):
@@ -71,21 +79,42 @@ class SidQualityMathTest(unittest.TestCase):
             valid_code_rows(codes, [2, 3]), [True, True, False, False]
         )
 
-    def test_valid_code_rows_rejects_invalid_inputs(self) -> None:
-        with self.assertRaisesRegex(ValueError, "at least one"):
-            valid_code_rows(np.empty((0, 0), dtype=np.int64), [])
-        with self.assertRaisesRegex(ValueError, "positive"):
-            valid_code_rows(np.empty((0, 2), dtype=np.int64), [2, 0])
-        with self.assertRaisesRegex(ValueError, "integers"):
-            valid_code_rows(np.empty((0, 2), dtype=np.int64), [2.0, 3.0])
-        with self.assertRaisesRegex(ValueError, "shape"):
-            valid_code_rows(np.asarray([1, 2]), [2, 3])
-        with self.assertRaisesRegex(ValueError, "integer dtype"):
-            valid_code_rows(np.asarray([[0.0, 1.0]]), [2, 3])
-        with self.assertRaisesRegex(ValueError, "fit int64"):
-            valid_code_rows(
-                np.asarray([[np.iinfo(np.uint64).max]], dtype=np.uint64), [2]
-            )
+    @parameterized.expand(
+        [
+            ("empty_codebook", np.empty((0, 0), dtype=np.int64), [], "at least one"),
+            (
+                "nonpositive_codebook",
+                np.empty((0, 2), dtype=np.int64),
+                [2, 0],
+                "positive",
+            ),
+            (
+                "noninteger_codebook",
+                np.empty((0, 2), dtype=np.int64),
+                [2.0, 3.0],
+                "integers",
+            ),
+            ("wrong_shape", np.asarray([1, 2]), [2, 3], "shape"),
+            (
+                "noninteger_codes",
+                np.asarray([[0.0, 1.0]]),
+                [2, 3],
+                "integer dtype",
+            ),
+            (
+                "uint64_overflow",
+                np.asarray([[np.iinfo(np.uint64).max]], dtype=np.uint64),
+                [2],
+                "fit int64",
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_valid_code_rows_rejects_invalid_inputs(
+        self, _name, codes, codebook, expected_error
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, expected_error):
+            valid_code_rows(codes, codebook)
 
 
 class SidQualityAccumulatorTest(unittest.TestCase):
@@ -132,24 +161,13 @@ class SidQualityAccumulatorTest(unittest.TestCase):
             ),
         )
 
-    def test_mixed_radix_encoding_is_bijective(self) -> None:
-        rows = np.asarray(
-            [
-                [0, 0, 1],
-                [0, 1, 0],
-                [1, 0, 0],
-                [0, 1, 1],
-                [1, 1, 0],
-                [1, 0, 1],
-                [1, 1, 1],
-                [3, 7, 15],
-            ],
-            dtype=np.int64,
-        )
-        accumulator = SidQualityAccumulator(_CODEBOOK)
+    def test_mixed_radix_encoding_is_bijective_for_full_codebook(self) -> None:
+        codebook = [2, 3, 4]
+        rows = np.indices(codebook, dtype=np.int64).reshape(len(codebook), -1).T
+        accumulator = SidQualityAccumulator(codebook)
         accumulator.update(rows)
         result = accumulator.finalize()
-        self.assertEqual(result.metrics.unique_sid, 8)
+        self.assertEqual(result.metrics.unique_sid, math.prod(codebook))
         self.assertEqual(result.metrics.max_collision, 1)
         self.assertEqual(result.metrics.no_collision_rate, 1.0)
 
@@ -169,24 +187,44 @@ class SidQualityAccumulatorTest(unittest.TestCase):
         in_range.assert_not_called()
         self.assertEqual(accumulator.finalize().metrics.total, 2)
 
-    def test_accumulator_rejects_invalid_configuration(self) -> None:
-        with self.assertRaisesRegex(ValueError, "at least one"):
-            SidQualityAccumulator([])
-        with self.assertRaisesRegex(ValueError, "positive"):
-            SidQualityAccumulator([2, 0])
-        with self.assertRaisesRegex(ValueError, "exceeds int64"):
-            SidQualityAccumulator([3037000500, 3037000500])
-        with self.assertRaisesRegex(ValueError, "top_sids must be positive"):
-            SidQualityAccumulator([2], top_sids=0)
+    @parameterized.expand(
+        [
+            ("empty_codebook", [], None, "at least one"),
+            ("nonpositive_codebook", [2, 0], None, "positive"),
+            (
+                "capacity_overflow",
+                [3037000500, 3037000500],
+                None,
+                "exceeds int64",
+            ),
+            ("nonpositive_top_sids", [2], 0, "top_sids must be positive"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_accumulator_rejects_invalid_configuration(
+        self, _name, codebook, top_sids, expected_error
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, expected_error):
+            SidQualityAccumulator(codebook, top_sids=top_sids)
 
-    def test_accumulator_rejects_invalid_updates(self) -> None:
+    @parameterized.expand(
+        [
+            ("wrong_shape", np.asarray([0, 1], dtype=np.int64), "shape"),
+            (
+                "noninteger_codes",
+                np.asarray([[0.0, 1.0]]),
+                "integer dtype",
+            ),
+            ("out_of_range", np.asarray([[0, 3]], dtype=np.int64), "outside"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_accumulator_rejects_invalid_updates(
+        self, _name, codes, expected_error
+    ) -> None:
         accumulator = SidQualityAccumulator([2, 3])
-        with self.assertRaisesRegex(ValueError, "shape"):
-            accumulator.update(np.asarray([0, 1], dtype=np.int64))
-        with self.assertRaisesRegex(ValueError, "integer dtype"):
-            accumulator.update(np.asarray([[0.0, 1.0]]))
-        with self.assertRaisesRegex(ValueError, "outside"):
-            accumulator.update(np.asarray([[0, 3]], dtype=np.int64))
+        with self.assertRaisesRegex(ValueError, expected_error):
+            accumulator.update(codes)
 
     def test_accumulator_finalization_is_one_shot(self) -> None:
         empty_accumulator = SidQualityAccumulator([2])
@@ -219,12 +257,8 @@ class CompareSidQualityTest(unittest.TestCase):
         after_codes = np.asarray(
             [[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]], dtype=np.int64
         )
-        before_accumulator = SidQualityAccumulator([2, 2, 2])
-        after_accumulator = SidQualityAccumulator([2, 2, 2])
-        before_accumulator.update(before_codes)
-        after_accumulator.update(after_codes)
-        before = before_accumulator.finalize()
-        after = after_accumulator.finalize()
+        before = _quality_result([2, 2, 2], before_codes)
+        after = _quality_result([2, 2, 2], after_codes)
 
         delta = compare_sid_quality(before, after)
         for metric_field in fields(delta.metrics):
@@ -233,45 +267,53 @@ class CompareSidQualityTest(unittest.TestCase):
             delta_value = getattr(delta.metrics, metric_field.name)
             self.assertAlmostEqual(delta_value, after_value - before_value)
         self.assertIsNone(delta.top_sids)
-        for layer_index, layer_delta in enumerate(delta.layer_metrics):
-            self.assertEqual(layer_delta.layer, layer_index)
-            self.assertEqual(layer_delta.codebook_size, 2)
-        self.assertEqual(delta.layer_metrics[0].coverage, 0.0)
-        self.assertEqual(delta.layer_metrics[0].dead_codes, 0)
-        self.assertEqual(delta.layer_metrics[0].perplexity, 0.0)
-        self.assertEqual(delta.layer_metrics[1].coverage, 0.0)
-        self.assertEqual(delta.layer_metrics[1].dead_codes, 0)
-        self.assertEqual(delta.layer_metrics[1].perplexity, 0.0)
+        for before_layer, after_layer, delta_layer in zip(
+            before.layer_metrics, after.layer_metrics, delta.layer_metrics
+        ):
+            self.assertEqual(delta_layer.layer, after_layer.layer)
+            self.assertEqual(delta_layer.codebook_size, after_layer.codebook_size)
+            for metric_name in ("coverage", "dead_codes", "perplexity"):
+                self.assertAlmostEqual(
+                    getattr(delta_layer, metric_name),
+                    getattr(after_layer, metric_name)
+                    - getattr(before_layer, metric_name),
+                )
 
-    def test_compare_rejects_different_cohort_sizes(self) -> None:
-        before_accumulator = SidQualityAccumulator([2])
-        after_accumulator = SidQualityAccumulator([2])
-        before_accumulator.update(np.asarray([[0]], dtype=np.int64))
-        after_accumulator.update(np.asarray([[0], [1]], dtype=np.int64))
-        with self.assertRaisesRegex(ValueError, "same item cohort"):
-            compare_sid_quality(
-                before_accumulator.finalize(), after_accumulator.finalize()
-            )
-
-    def test_compare_rejects_different_codebooks(self) -> None:
-        before_accumulator = SidQualityAccumulator([2])
-        after_accumulator = SidQualityAccumulator([3])
-        before_accumulator.update(np.asarray([[0]], dtype=np.int64))
-        after_accumulator.update(np.asarray([[0]], dtype=np.int64))
-        with self.assertRaisesRegex(ValueError, "different codebooks"):
-            compare_sid_quality(
-                before_accumulator.finalize(), after_accumulator.finalize()
-            )
-
-    def test_compare_rejects_different_layer_counts(self) -> None:
-        before_accumulator = SidQualityAccumulator([2])
-        after_accumulator = SidQualityAccumulator([2, 2])
-        before_accumulator.update(np.asarray([[0]], dtype=np.int64))
-        after_accumulator.update(np.asarray([[0, 0]], dtype=np.int64))
-        with self.assertRaisesRegex(ValueError, "different layer counts"):
-            compare_sid_quality(
-                before_accumulator.finalize(), after_accumulator.finalize()
-            )
+    @parameterized.expand(
+        [
+            (
+                "cohort_size",
+                [2],
+                [[0]],
+                [2],
+                [[0], [1]],
+                "same item cohort",
+            ),
+            ("codebook", [2], [[0]], [3], [[0]], "different codebooks"),
+            (
+                "layer_count",
+                [2],
+                [[0]],
+                [2, 2],
+                [[0, 0]],
+                "different layer counts",
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_compare_rejects_incompatible_results(
+        self,
+        _name,
+        before_codebook,
+        before_rows,
+        after_codebook,
+        after_rows,
+        expected_error,
+    ) -> None:
+        before = _quality_result(before_codebook, before_rows)
+        after = _quality_result(after_codebook, after_rows)
+        with self.assertRaisesRegex(ValueError, expected_error):
+            compare_sid_quality(before, after)
 
 
 if __name__ == "__main__":

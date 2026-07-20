@@ -56,12 +56,15 @@ class DecodedCodes:
     Attributes:
         values: Integer matrix with a placeholder value for malformed rows.
         valid_rows: Mask selecting rows with the expected width and integer values.
-        malformed_rows: Number of rows excluded by ``valid_rows``.
     """
 
     values: np.ndarray
     valid_rows: np.ndarray
-    malformed_rows: int
+
+    @property
+    def malformed_rows(self) -> int:
+        """Number of rows excluded by ``valid_rows``."""
+        return int((~self.valid_rows).sum())
 
 
 @dataclass(frozen=True)
@@ -125,7 +128,6 @@ def decode_codes(codes: pa.Array, n_layers: int) -> DecodedCodes:
                 return DecodedCodes(
                     values=values,
                     valid_rows=np.ones(len(codes), dtype=np.bool_),
-                    malformed_rows=0,
                 )
         rows = codes.to_pylist()
     else:
@@ -154,8 +156,22 @@ def decode_codes(codes: pa.Array, n_layers: int) -> DecodedCodes:
     return DecodedCodes(
         values=values,
         valid_rows=valid_rows,
-        malformed_rows=int((~valid_rows).sum()),
     )
+
+
+def _decode_and_validate(
+    array: pa.Array, codebook: Sequence[int], n_layers: int
+) -> Tuple[DecodedCodes, np.ndarray, int, int]:
+    """Decode a SID field and split validity into structural + range parts.
+
+    Returns the decoded codes, the row mask that is both well-formed and
+    in-range, the malformed-row count, and the out-of-range-row count.
+    """
+    decoded = decode_codes(array, n_layers)
+    in_range = valid_code_rows(decoded.values, codebook)
+    valid = decoded.valid_rows & in_range
+    out_of_range = int((decoded.valid_rows & ~in_range).sum())
+    return decoded, valid, decoded.malformed_rows, out_of_range
 
 
 def run_evaluation(
@@ -210,13 +226,13 @@ def run_evaluation(
     for batch_index, data in enumerate(batches):
         if codes_field not in data:
             raise KeyError(f"codes field {codes_field!r} is missing from a batch.")
-        after_codes = decode_codes(data[codes_field], n_layers)
+        after_codes, after_valid, m_after, oor_after = _decode_and_validate(
+            data[codes_field], codebook, n_layers
+        )
         batch_rows = len(after_codes.values)
         input_rows += batch_rows
-        after_in_range = valid_code_rows(after_codes.values, codebook)
-        after_valid = after_codes.valid_rows & after_in_range
-        malformed_after += after_codes.malformed_rows
-        out_of_range_after += int((after_codes.valid_rows & ~after_in_range).sum())
+        malformed_after += m_after
+        out_of_range_after += oor_after
 
         before_codes: Optional[DecodedCodes] = None
         if origin_codes_field is not None:
@@ -225,18 +241,16 @@ def run_evaluation(
                     f"origin codes field {origin_codes_field!r} is missing from "
                     "a batch."
                 )
-            before_codes = decode_codes(data[origin_codes_field], n_layers)
+            before_codes, before_valid, m_before, oor_before = _decode_and_validate(
+                data[origin_codes_field], codebook, n_layers
+            )
             if len(before_codes.values) != batch_rows:
                 raise ValueError(
                     "origin and final code fields must contain the same number "
                     "of rows in every batch."
                 )
-            before_in_range = valid_code_rows(before_codes.values, codebook)
-            before_valid = before_codes.valid_rows & before_in_range
-            malformed_before += before_codes.malformed_rows
-            out_of_range_before += int(
-                (before_codes.valid_rows & ~before_in_range).sum()
-            )
+            malformed_before += m_before
+            out_of_range_before += oor_before
             valid_rows = before_valid & after_valid
         else:
             valid_rows = after_valid
@@ -260,6 +274,7 @@ def run_evaluation(
         if batch_index % 100 == 0:
             logger.info(f"scanned {input_rows} rows...")
 
+    evaluated_items = input_rows - invalid_rows
     if invalid_rows:
         logger.warning(
             "skipped %d invalid rows (before: %d malformed, %d out-of-range; "
@@ -269,9 +284,8 @@ def run_evaluation(
             out_of_range_before,
             malformed_after,
             out_of_range_after,
-            input_rows - invalid_rows,
+            evaluated_items,
         )
-    evaluated_items = input_rows - invalid_rows
     if evaluated_items == 0:
         raise ValueError(f"no valid rows read from {source!r}; nothing to report.")
 
