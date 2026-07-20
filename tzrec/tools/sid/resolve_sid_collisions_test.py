@@ -13,39 +13,21 @@ import json
 import os
 import random
 import shutil
-import tempfile
 import unittest
-from argparse import Namespace
 from collections import Counter
 from unittest import mock
 
 import numpy as np
 import pyarrow as pa
+from parameterized import parameterized
 from pyarrow import csv, parquet
 
-from tzrec.datasets.odps_dataset import _type_pa_to_table
-from tzrec.tools.sid import collision_prevention
-from tzrec.tools.sid.collision_prevention import CollisionRunner
-
-# Defaults mirror the __main__ argparse; tests override only what they exercise.
-_DEFAULTS = dict(
-    input_path=None,
-    output_path=None,
-    original_sid_groups_output_path=None,
-    resolved_sid_groups_output_path=None,
-    reader_type=None,
-    writer_type=None,
-    batch_size=100000,
-    item_id_field="item_id",
-    code_field="codes",
-    candidate_codes_field="candidate_codes",
-    max_items_per_codebook=2,
-    strategy="candidate",
-    codebook="8,8",
-    random_num_candidates=64,
-    rate_only=False,
-    odps_data_quota_name="pay-as-you-go",
+from tzrec.tools.sid import resolve_sid_collisions
+from tzrec.tools.sid.resolve_sid_collisions import (
+    CollisionResolutionRunner,
+    ResolveSidCollisionsConfig,
 )
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
 def _parquet(path, item_ids, codes, candidate_codes=None):
@@ -60,27 +42,41 @@ def _parquet(path, item_ids, codes, candidate_codes=None):
     parquet.write_table(pa.table(cols), path)
 
 
-class SidCollisionPreventionTest(unittest.TestCase):
+class ResolveSidCollisionsTest(unittest.TestCase):
     def setUp(self) -> None:
-        if not os.path.exists("./tmp"):
-            os.makedirs("./tmp")
-        self.test_dir = tempfile.mkdtemp(prefix="tzrec_", dir="./tmp")
+        self.test_dir = make_test_dir()
 
     def tearDown(self) -> None:
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
-    def _run(self, inp, out, **kw):
-        args = dict(_DEFAULTS)
+    def _runner(self, inp, out, include_original=False, **kw):
         original_groups, resolved_groups = self._group_paths(out)
-        args.update(
+        config = dict(
             input_path=inp,
             output_path=out,
-            original_sid_groups_output_path=original_groups,
+            original_sid_groups_output_path=(
+                original_groups if include_original else None
+            ),
             resolved_sid_groups_output_path=resolved_groups,
+            reader_type=None,
+            writer_type=None,
+            batch_size=100000,
+            item_id_field="item_id",
+            code_field="codes",
+            candidate_codes_field="candidate_codes",
+            layer_sizes=(8, 8),
+            max_items_per_codebook=2,
+            strategy="candidate",
+            random_num_candidates=64,
+            rate_only=False,
+            odps_data_quota_name="pay-as-you-go",
         )
-        args.update(kw)
-        return CollisionRunner(Namespace(**args)).run()
+        config.update(kw)
+        return CollisionResolutionRunner(ResolveSidCollisionsConfig(**config))
+
+    def _run(self, inp, out, **kw):
+        return self._runner(inp, out, **kw).run()
 
     @staticmethod
     def _group_paths(out):
@@ -119,7 +115,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
             [[0, 0, 0]] * 3,
             [[[0, 0, 1], [0, 0, 2], [0, 0, 3]]] * 3,
         )
-        stats = self._run(inp, out, codebook="2,3,4", max_items_per_codebook=2)
+        stats = self._run(inp, out, layer_sizes=(2, 3, 4), max_items_per_codebook=2)
         self.assertEqual(stats.total_items, 3)
         self.assertEqual(stats.relocated_count, 1)
         self.assertEqual(stats.unresolved_count, 0)
@@ -137,28 +133,14 @@ class SidCollisionPreventionTest(unittest.TestCase):
         # n_layers, keeping each group's LAST code (stride n_layers), not a
         # contiguous tail. codebook 2,3,4 -> n_layers=3, so the flat run
         # [0,0,1, 0,0,2, 0,0,3] decodes to last codes [1, 2, 3].
-        runner = CollisionRunner(
-            Namespace(
-                **{
-                    **_DEFAULTS,
-                    "codebook": "2,3,4",
-                    "rate_only": True,
-                    "input_path": "x",
-                    "output_path": "y",
-                }
-            )
+        runner = self._runner(
+            "input",
+            "output",
+            layer_sizes=(2, 3, 4),
+            rate_only=True,
         )
         flat = pa.array([[0, 0, 1, 0, 0, 2, 0, 0, 3]], type=pa.list_(pa.int64()))
         self.assertEqual(runner._candidate_last_matrix(flat).tolist(), [[1, 2, 3]])
-
-    def test_output_is_list_int64(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, [0, 1, 2], [[0, 0]] * 3, [[[0, 1]]] * 3)
-        self._run(inp, out, max_items_per_codebook=2)
-        schema = parquet.read_table(os.path.join(out, "part-0.parquet")).schema
-        self.assertEqual(schema.field("codebook").type, pa.list_(pa.int64()))
-        self.assertEqual(schema.field("origin_codebook").type, pa.list_(pa.int64()))
 
     def test_keep_original_when_only_origin_candidate(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -177,37 +159,59 @@ class SidCollisionPreventionTest(unittest.TestCase):
         for item_id, index in zip(d["item_id"], d["index"]):
             self.assertEqual(resolved["itemids"][0][index - 1], item_id)
 
+    def test_candidate_overflow_reads_codes_then_candidates(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, [0, 1, 2], [[0, 0]] * 3, [[[0, 1]]] * 3)
+
+        with mock.patch.object(
+            resolve_sid_collisions,
+            "create_reader",
+            wraps=resolve_sid_collisions.create_reader,
+        ) as create_reader:
+            self._run(inp, out, max_items_per_codebook=2)
+
+        self.assertEqual(
+            [call.kwargs["selected_cols"] for call in create_reader.call_args_list],
+            [["item_id", "codes"], ["item_id", "candidate_codes"]],
+        )
+
     def test_raises_when_overflow_but_no_candidates(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, list(range(5)), [[0, 0]] * 5)  # no candidate_codes column
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "candidate_codes field .* is missing"):
             self._run(inp, out, max_items_per_codebook=2)
 
     def test_output_into_input_location_rejected(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         _parquet(inp, list(range(3)), [[0, 0]] * 3, [[[0, 1]]] * 3)
         # output_path is the directory holding the input file -> would overwrite it
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "would overwrite --input_path"):
             self._run(inp, self.test_dir)
 
     def test_multi_process_launch_rejected(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, list(range(3)), [[0, 0]] * 3, [[[0, 1]]] * 3)
-        os.environ["WORLD_SIZE"] = "2"
-        try:
-            with self.assertRaises(RuntimeError):
-                self._run(inp, out)
-        finally:
-            os.environ.pop("WORLD_SIZE", None)
+        with (
+            mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}),
+            self.assertRaisesRegex(RuntimeError, "single-process"),
+        ):
+            self._run(inp, out)
 
     def test_no_overflow_does_not_require_candidates(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, [0, 1, 2], [[0, 0], [0, 1], [0, 2]])
-        stats = self._run(inp, out, max_items_per_codebook=1)
+        with mock.patch.object(
+            resolve_sid_collisions,
+            "create_reader",
+            wraps=resolve_sid_collisions.create_reader,
+        ) as create_reader:
+            stats = self._run(inp, out, max_items_per_codebook=1)
         self.assertEqual(stats.relocated_count, 0)
+        self.assertEqual(create_reader.call_count, 1)
         self.assertEqual(len(self._read_parquet(out)["item_id"]), 3)
 
     def test_candidates_align_across_batches(self) -> None:
@@ -234,7 +238,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         candidates[8] = [[1, 0], [1, 1], [1, 2]]
         _parquet(inp, item_ids, codes, candidates)
 
-        self._run(inp, out, max_items_per_codebook=2)
+        self._run(inp, out, include_original=True, max_items_per_codebook=2)
 
         original_path, resolved_path = self._group_paths(out)
         original = parquet.read_table(os.path.join(original_path, "part-0.parquet"))
@@ -278,12 +282,17 @@ class SidCollisionPreventionTest(unittest.TestCase):
             [[7, 10], [7, 2], [12, 1], [7, 2], [12, 1], [7, 10]],
         )
 
+        runner = self._runner(
+            inp,
+            out,
+            include_original=True,
+            layer_sizes=(16, 16),
+            max_items_per_codebook=2,
+        )
         with mock.patch.object(
-            collision_prevention,
-            "resolve_sid_collisions",
-            wraps=collision_prevention.resolve_sid_collisions,
+            runner._resolver, "resolve", wraps=runner._resolver.resolve
         ) as resolve:
-            self._run(inp, out, codebook="16,16", max_items_per_codebook=2)
+            runner.run()
         self.assertFalse(resolve.call_args.kwargs["collect_grouping"])
 
         original_path, resolved_path = self._group_paths(out)
@@ -321,13 +330,34 @@ class SidCollisionPreventionTest(unittest.TestCase):
         for item_id, codebook, index in zip(d["item_id"], d["codebook"], d["index"]):
             self.assertEqual(resolved_items[tuple(codebook)][index - 1], item_id)
 
+    def test_random_overflow_does_not_read_candidate_column(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, [0, 1, 2], [[0, 0]] * 3)
+
+        with mock.patch.object(
+            resolve_sid_collisions,
+            "create_reader",
+            wraps=resolve_sid_collisions.create_reader,
+        ) as create_reader:
+            self._run(inp, out, max_items_per_codebook=2, strategy="random")
+
+        self.assertEqual(create_reader.call_count, 1)
+        self.assertEqual(
+            create_reader.call_args.kwargs["selected_cols"], ["item_id", "codes"]
+        )
+
     def test_random_requires_last_codebook_ge_2(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, list(range(5)), [[0, 0]] * 5)
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "last_size >= 2"):
             self._run(
-                inp, out, max_items_per_codebook=2, strategy="random", codebook="8,1"
+                inp,
+                out,
+                max_items_per_codebook=2,
+                strategy="random",
+                layer_sizes=(8, 1),
             )
 
     def test_single_layer_sid(self) -> None:
@@ -339,7 +369,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
             out,
             max_items_per_codebook=1,
             strategy="random",
-            codebook="16",
+            layer_sizes=(16,),
         )
         self.assertEqual(stats.relocated_count, 3)
         d = self._read_parquet(out)
@@ -366,6 +396,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
             self._run(
                 inp,
                 out,
+                include_original=True,
                 max_items_per_codebook=2,
             )
             d = self._read_parquet(out)
@@ -390,7 +421,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
     def test_csv_code_encoder_joins_all_layers(self) -> None:
         codes = np.asarray([[1, -2, 3], [4, 5, 6]], dtype=np.int64)
 
-        encoded = CollisionRunner._codes_column(codes, is_csv=True)
+        encoded = CollisionResolutionRunner._codes_column(codes, is_csv=True)
 
         self.assertEqual(encoded.to_pylist(), ["1,-2,3", "4,5,6"])
 
@@ -410,6 +441,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         stats = self._run(
             inp,
             out,
+            include_original=True,
             reader_type="CsvReader",
             writer_type="CsvWriter",
             max_items_per_codebook=2,
@@ -447,6 +479,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self._run(
             inp,
             out,
+            include_original=True,
             reader_type="CsvReader",
             writer_type="CsvWriter",
             max_items_per_codebook=len(item_ids),
@@ -464,6 +497,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self._run(
             inp,
             out,
+            include_original=True,
             writer_type="CsvWriter",
             max_items_per_codebook=2,
         )
@@ -492,12 +526,14 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self._run(
             inp,
             out,
+            include_original=True,
             reader_type="CsvReader",
             writer_type="ParquetWriter",
             max_items_per_codebook=2,
         )
         schema = parquet.read_table(os.path.join(out, "part-0.parquet")).schema
         self.assertEqual(schema.field("codebook").type, pa.list_(pa.int64()))
+        self.assertEqual(schema.field("origin_codebook").type, pa.list_(pa.int64()))
         original_path, resolved_path = self._group_paths(out)
         for path in (original_path, resolved_path):
             group_schema = parquet.read_table(
@@ -521,7 +557,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
             ),
             inp,
         )
-        self._run(inp, out, max_items_per_codebook=1)
+        self._run(inp, out, include_original=True, max_items_per_codebook=1)
         schema = parquet.read_table(os.path.join(out, "part-0.parquet")).schema
         self.assertEqual(schema.field("item_id").type, pa.int32())
         original_path, resolved_path = self._group_paths(out)
@@ -531,65 +567,111 @@ class SidCollisionPreventionTest(unittest.TestCase):
             ).schema
             self.assertEqual(group_schema.field("itemids").type, pa.list_(pa.int32()))
 
-    def test_writer_defaults_to_reader(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, [0, 1, 2], [[0, 0]] * 3, [[[0, 1]]] * 3)
-        self._run(inp, out, max_items_per_codebook=3)
-        self.assertTrue(os.path.exists(os.path.join(out, "part-0.parquet")))
-
     # ---- misc ----
 
-    def test_group_output_paths_are_required_for_normal_runs(self) -> None:
-        args = dict(_DEFAULTS)
-        args.update(input_path="input", output_path="map")
-        with self.assertRaisesRegex(ValueError, "both SID group output paths"):
-            CollisionRunner(Namespace(**args))
-
-    def test_group_output_paths_must_be_supplied_together(self) -> None:
-        args = dict(_DEFAULTS)
-        args.update(
-            input_path="input",
-            output_path="map",
-            original_sid_groups_output_path="original",
-        )
-        with self.assertRaisesRegex(ValueError, "must be supplied together"):
-            CollisionRunner(Namespace(**args))
-
-    def test_output_paths_must_be_distinct(self) -> None:
-        args = dict(_DEFAULTS)
-        args.update(
-            input_path="input",
-            output_path="map",
-            original_sid_groups_output_path="map/../map",
-            resolved_sid_groups_output_path="resolved",
-        )
-        with self.assertRaisesRegex(ValueError, "must differ from output_path"):
-            CollisionRunner(Namespace(**args))
-
-    def test_odps_output_paths_reject_trailing_slash_alias(self) -> None:
-        args = dict(_DEFAULTS)
-        args.update(
-            input_path="input",
-            output_path="odps://project/tables/map",
-            original_sid_groups_output_path="odps://project/tables/map/",
-            resolved_sid_groups_output_path="odps://project/tables/resolved",
-        )
-        with self.assertRaisesRegex(ValueError, "must differ from output_path"):
-            CollisionRunner(Namespace(**args))
-
-    def test_odps_output_paths_reject_ignored_partition_alias(self) -> None:
-        args = dict(_DEFAULTS)
-        args.update(
-            input_path="input",
-            output_path="odps://project/tables/schema.map/dt=20260713",
-            original_sid_groups_output_path=(
-                "odps://project/tables/schema.map/dt=20260713&dt=20260712"
+    @parameterized.expand(
+        [
+            (
+                "resolved_groups",
+                {"resolved_sid_groups_output_path": None},
+                "resolved_sid_groups_output_path",
             ),
-            resolved_sid_groups_output_path="odps://project/tables/schema.resolved",
+            ("map", {"output_path": None}, "output_path"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_normal_runs_require_operational_outputs(
+        self, _name, overrides, expected_field
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, expected_field):
+            self._runner("input", "map", **overrides)
+
+    def test_original_group_output_is_optional(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _, resolved_path = self._group_paths(out)
+        _parquet(inp, [0, 1, 2], [[0, 0]] * 3, [[[0, 1]]] * 3)
+
+        with mock.patch.object(
+            resolve_sid_collisions,
+            "build_original_item_grouping",
+            wraps=resolve_sid_collisions.build_original_item_grouping,
+        ) as original_builder:
+            self._run(
+                inp,
+                out,
+                max_items_per_codebook=2,
+            )
+
+        original_builder.assert_not_called()
+        self.assertTrue(os.path.exists(os.path.join(out, "part-0.parquet")))
+        self.assertTrue(os.path.exists(os.path.join(resolved_path, "part-0.parquet")))
+
+    def test_resolved_groups_are_written_without_original_output_or_overflow(
+        self,
+    ) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _, resolved_path = self._group_paths(out)
+        _parquet(inp, [0, 1], [[0, 0], [0, 1]])
+
+        self._run(
+            inp,
+            out,
+            max_items_per_codebook=1,
         )
+
+        resolved = self._read_parquet(resolved_path)
+        self.assertEqual(resolved["codebook"], [[0, 0], [0, 1]])
+        self.assertEqual(resolved["itemids"], [[0], [1]])
+
+    def test_parser_allows_rate_only_without_outputs(self) -> None:
+        args = resolve_sid_collisions.build_parser().parse_args(
+            [
+                "--input_path",
+                "input",
+                "--codebook",
+                "8,8",
+                "--max_items_per_codebook",
+                "2",
+                "--rate_only",
+            ]
+        )
+
+        config = ResolveSidCollisionsConfig.from_namespace(args)
+
+        self.assertIsNone(config.output_path)
+        self.assertIsNone(config.original_sid_groups_output_path)
+        self.assertIsNone(config.resolved_sid_groups_output_path)
+
+    @parameterized.expand(
+        [
+            ("local", "map", "map/../map", "resolved"),
+            (
+                "odps_trailing_slash",
+                "odps://project/tables/map",
+                "odps://project/tables/map/",
+                "odps://project/tables/resolved",
+            ),
+            (
+                "odps_ignored_partition",
+                "odps://project/tables/schema.map/dt=20260713",
+                "odps://project/tables/schema.map/dt=20260713&dt=20260712",
+                "odps://project/tables/schema.resolved",
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_output_path_aliases_are_rejected(
+        self, _name, output_path, original_path, resolved_path
+    ) -> None:
         with self.assertRaisesRegex(ValueError, "must differ from output_path"):
-            CollisionRunner(Namespace(**args))
+            self._runner(
+                "input",
+                output_path,
+                original_sid_groups_output_path=original_path,
+                resolved_sid_groups_output_path=resolved_path,
+            )
 
     def test_odps_group_writes_use_native_array_columns(self) -> None:
         class OdpsWriter:
@@ -622,11 +704,12 @@ class SidCollisionPreventionTest(unittest.TestCase):
             return writer
 
         with mock.patch.object(
-            CollisionRunner, "_make_writer", side_effect=make_writer
+            CollisionResolutionRunner, "_make_writer", side_effect=make_writer
         ):
             self._run(
                 inp,
                 out,
+                include_original=True,
                 writer_type="OdpsWriter",
                 max_items_per_codebook=1,
             )
@@ -642,11 +725,6 @@ class SidCollisionPreventionTest(unittest.TestCase):
             self.assertEqual(list(columns), ["codebook", "itemids"])
             self.assertEqual(columns["codebook"].type, pa.list_(pa.int64()))
             self.assertEqual(columns["itemids"].type, pa.list_(pa.int32()))
-            self.assertEqual(
-                _type_pa_to_table(columns["codebook"].type), "ARRAY<BIGINT>"
-            )
-            self.assertEqual(_type_pa_to_table(columns["itemids"].type), "ARRAY<INT>")
-        self.assertEqual(_type_pa_to_table(pa.list_(pa.string())), "ARRAY<STRING>")
 
     def test_writer_closes_when_write_fails(self) -> None:
         class FailingWriter:
@@ -665,7 +743,9 @@ class SidCollisionPreventionTest(unittest.TestCase):
         writer = FailingWriter()
 
         with (
-            mock.patch.object(CollisionRunner, "_make_writer", return_value=writer),
+            mock.patch.object(
+                CollisionResolutionRunner, "_make_writer", return_value=writer
+            ),
             self.assertRaisesRegex(RuntimeError, "write failed"),
         ):
             self._run(inp, out, max_items_per_codebook=1)
@@ -677,8 +757,8 @@ class SidCollisionPreventionTest(unittest.TestCase):
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, list(range(4)), [[0, 0], [0, 0], [0, 0], [0, 1]])
 
-        with mock.patch("tzrec.tools.sid.collision_prevention._GROUP_WRITE_ITEMS", 2):
-            self._run(inp, out, max_items_per_codebook=3)
+        with mock.patch("tzrec.tools.sid.resolve_sid_collisions._GROUP_WRITE_ITEMS", 2):
+            self._run(inp, out, include_original=True, max_items_per_codebook=3)
 
         original_path, _ = self._group_paths(out)
         output_file = os.path.join(original_path, "part-0.parquet")
@@ -691,7 +771,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, list(range(5)), [[0, code] for code in range(5)])
 
-        with mock.patch("tzrec.tools.sid.collision_prevention._MAP_WRITE_ROWS", 2):
+        with mock.patch("tzrec.tools.sid.resolve_sid_collisions._MAP_WRITE_ROWS", 2):
             self._run(inp, out, max_items_per_codebook=1)
 
         output_file = os.path.join(out, "part-0.parquet")
@@ -704,12 +784,14 @@ class SidCollisionPreventionTest(unittest.TestCase):
 
         with (
             mock.patch(
-                "tzrec.tools.sid.collision_prevention._ARROW_LIST_OFFSET_MAX", 4
+                "tzrec.tools.sid.resolve_sid_collisions._ARROW_LIST_OFFSET_MAX", 4
             ),
-            mock.patch("tzrec.tools.sid.collision_prevention._MAP_WRITE_ROWS", 100),
-            mock.patch("tzrec.tools.sid.collision_prevention._GROUP_WRITE_ITEMS", 100),
+            mock.patch("tzrec.tools.sid.resolve_sid_collisions._MAP_WRITE_ROWS", 100),
+            mock.patch(
+                "tzrec.tools.sid.resolve_sid_collisions._GROUP_WRITE_ITEMS", 100
+            ),
         ):
-            self._run(inp, out, max_items_per_codebook=1)
+            self._run(inp, out, include_original=True, max_items_per_codebook=1)
 
         original_path, resolved_path = self._group_paths(out)
         for path in (out, original_path, resolved_path):
@@ -722,17 +804,16 @@ class SidCollisionPreventionTest(unittest.TestCase):
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, list(range(5)), [[0, 0]] * 5, [[[0, 1], [0, 2], [0, 3]]] * 5)
+        runner = self._runner(
+            inp,
+            out,
+            max_items_per_codebook=2,
+            rate_only=True,
+        )
         with mock.patch.object(
-            collision_prevention,
-            "resolve_sid_collisions",
-            wraps=collision_prevention.resolve_sid_collisions,
+            runner._resolver, "resolve", wraps=runner._resolver.resolve
         ) as resolve:
-            stats = self._run(
-                inp,
-                out,
-                max_items_per_codebook=2,
-                rate_only=True,
-            )
+            stats = runner.run()
         self.assertFalse(resolve.call_args.kwargs["collect_grouping"])
         self.assertEqual(stats.relocated_count, 3)
         self.assertFalse(os.path.exists(os.path.join(out, "part-0.parquet")))
@@ -740,7 +821,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self.assertFalse(os.path.exists(original_path))
         self.assertFalse(os.path.exists(resolved_path))
 
-    def test_rate_only_allows_omitted_group_paths(self) -> None:
+    def test_rate_only_allows_all_output_paths_to_be_omitted(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, [0, 1], [[0, 0], [0, 0]])
@@ -748,6 +829,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         stats = self._run(
             inp,
             out,
+            output_path=None,
             original_sid_groups_output_path=None,
             resolved_sid_groups_output_path=None,
             max_items_per_codebook=2,
@@ -761,7 +843,7 @@ class SidCollisionPreventionTest(unittest.TestCase):
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, [], [])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "SID input is empty"):
             self._run(inp, out, max_items_per_codebook=2)
 
     def test_duplicate_item_id_raises(self) -> None:
@@ -772,11 +854,19 @@ class SidCollisionPreventionTest(unittest.TestCase):
             self._run(inp, out, max_items_per_codebook=2)
 
     def test_empty_codebook_token_raises(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, [0, 1], [[0, 0], [0, 1]])
+        args = resolve_sid_collisions.build_parser().parse_args(
+            [
+                "--input_path",
+                "input",
+                "--codebook",
+                "8,,8",
+                "--max_items_per_codebook",
+                "2",
+                "--rate_only",
+            ]
+        )
         with self.assertRaisesRegex(ValueError, "codebook"):
-            self._run(inp, out, codebook="8,,8")
+            ResolveSidCollisionsConfig.from_namespace(args)
 
 
 if __name__ == "__main__":

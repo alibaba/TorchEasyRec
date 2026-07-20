@@ -9,15 +9,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Offline SID collision prevention with TorchEasyRec-native I/O.
+r"""Offline best-effort SID collision resolution with TorchEasyRec-native I/O.
 
-The runner caps each SID bucket, loads fixed-width last-layer candidates only
-for overflow items, delegates collision resolution to the pure NumPy core, and
-writes item-level and grouped SID results through TorchEasyRec readers and
-writers. CSV encodes each SID/candidate column as comma-separated codes and
-item-ID groups as JSON arrays because Arrow's CSV writer cannot serialize list
-columns; ``candidate_codes`` is a flat ``topk * n_layers`` run split by the
-``--codebook`` length.
+The runner retains the first capacity items in each SID bucket, attempts to
+relocate overflow items using fixed-width last-layer candidates, delegates
+placement to the pure NumPy core, and writes item-level and grouped SID results
+through TorchEasyRec readers and writers. CSV encodes each SID/candidate column
+as comma-separated codes and item-ID groups as JSON arrays because Arrow's CSV
+writer cannot serialize list columns; ``candidate_codes`` is a flat
+``topk * n_layers`` run split by the ``--codebook`` length.
 
 The random strategy intentionally preserves the legacy deterministic baseline:
 it draws with replacement from the full last-layer space. Placement skips an
@@ -31,7 +31,7 @@ process group). The input is a Semantic-ID table from ``tzrec.predict`` (an
 
 Example::
 
-    python -m tzrec.tools.sid.collision_prevention \
+    python -m tzrec.tools.sid.resolve_sid_collisions \
         --input_path 'sid_predict_output/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
         --strategy candidate \
@@ -64,19 +64,20 @@ from tzrec.datasets.dataset import (
     create_writer,
 )
 from tzrec.datasets.odps_dataset import _parse_table_path
-from tzrec.tools.sid.collision_resolution import (
+from tzrec.utils.logging_util import logger
+from tzrec.utils.sid.collision import (
     CodebookItemGrouping,
     CollisionPlan,
     CollisionResolutionConfig,
     CollisionResolutionResult,
     CollisionResolutionStats,
+    CollisionResolver,
+    KnnCollisionResolver,
+    RandomCollisionResolver,
     build_original_item_grouping,
     build_resolved_item_grouping,
-    generate_random_candidate_last_codes,
     prepare_collision_plan,
-    resolve_sid_collisions,
 )
-from tzrec.utils.logging_util import logger
 
 _MAP_WRITE_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
@@ -115,7 +116,7 @@ def _require_single_process() -> None:
     rank = int(os.environ.get("RANK", "0"))
     if world_size != 1 or rank != 0:
         raise RuntimeError(
-            "collision_prevention is single-process; launch it with `python -m` "
+            "resolve_sid_collisions is single-process; launch it with `python -m` "
             f"(not torchrun): got WORLD_SIZE={world_size}, RANK={rank}. Under "
             "multiple ranks every rank reprocesses the full input and emits "
             "duplicate shards (local) or racing overwrite sessions (ODPS)."
@@ -145,11 +146,11 @@ class _ItemIdLookup:
 
 
 @dataclass(frozen=True)
-class CollisionPreventionConfig:
-    """Validated configuration for collision-prevention orchestration."""
+class ResolveSidCollisionsConfig:
+    """Validated configuration for SID collision-resolution orchestration."""
 
     input_path: str
-    output_path: str
+    output_path: Optional[str]
     original_sid_groups_output_path: Optional[str]
     resolved_sid_groups_output_path: Optional[str]
     reader_type: Optional[str]
@@ -174,16 +175,11 @@ class CollisionPreventionConfig:
             )
         if self.strategy not in {"candidate", "random"}:
             raise ValueError(f"unsupported strategy: {self.strategy!r}.")
-        has_original_groups = bool(self.original_sid_groups_output_path)
-        has_resolved_groups = bool(self.resolved_sid_groups_output_path)
-        if has_original_groups != has_resolved_groups:
+        if not self.rate_only and not self.output_path:
+            raise ValueError("output_path is required unless rate_only is set.")
+        if not self.rate_only and not self.resolved_sid_groups_output_path:
             raise ValueError(
-                "original_sid_groups_output_path and "
-                "resolved_sid_groups_output_path must be supplied together."
-            )
-        if not self.rate_only and not has_original_groups:
-            raise ValueError(
-                "both SID group output paths are required unless rate_only is set."
+                "resolved_sid_groups_output_path is required unless rate_only is set."
             )
 
         named_paths = {
@@ -216,7 +212,7 @@ class CollisionPreventionConfig:
         _ = self.resolution_config
 
     @classmethod
-    def from_namespace(cls, args: argparse.Namespace) -> "CollisionPreventionConfig":
+    def from_namespace(cls, args: argparse.Namespace) -> "ResolveSidCollisionsConfig":
         """Build a validated configuration from parsed CLI arguments."""
         try:
             layer_sizes = tuple(int(value) for value in args.codebook.split(","))
@@ -257,18 +253,19 @@ class CollisionPreventionConfig:
         )
 
 
-class CollisionRunner:
-    """Run SID collision prevention over TorchEasyRec readers and writers."""
+class CollisionResolutionRunner:
+    """Run best-effort SID collision resolution over repository I/O."""
 
     def __init__(
         self,
-        config: Union[CollisionPreventionConfig, argparse.Namespace],
+        config: ResolveSidCollisionsConfig,
     ) -> None:
-        self._config = (
-            config
-            if isinstance(config, CollisionPreventionConfig)
-            else CollisionPreventionConfig.from_namespace(config)
-        )
+        self._config = config
+        self._resolver: CollisionResolver
+        if self._config.strategy == "random":
+            self._resolver = RandomCollisionResolver(self._config.random_num_candidates)
+        else:
+            self._resolver = KnnCollisionResolver()
         self._default_writer_type: Optional[str] = None
         self._item_id_type: Optional[pa.DataType] = None
 
@@ -281,13 +278,16 @@ class CollisionRunner:
             codes,
             self._config.resolution_config,
         )
-        candidate_last_codes = self._candidate_last_codes(plan)
-        result = resolve_sid_collisions(
+        collect_grouping = not self._config.rate_only and bool(plan.overflow_rows.size)
+        candidate_last_codes = None
+        if self._config.strategy != "random" and plan.overflow_rows.size:
+            candidate_last_codes = self._load_candidate_last_codes(
+                plan.overflow_item_ids
+            )
+        result = self._resolver.resolve(
             plan,
             candidate_last_codes,
-            collect_grouping=(
-                not self._config.rate_only and plan.overflow_rows.size > 0
-            ),
+            collect_grouping=collect_grouping,
         )
         del candidate_last_codes
 
@@ -299,7 +299,7 @@ class CollisionRunner:
             del plan
             self._write_map(item_ids, codes, result)
 
-        logger.info("SID collision prevention finished: %s", result.stats)
+        logger.info("SID collision resolution finished: %s", result.stats)
         return result.stats
 
     def _make_reader(self, selected_cols: List[str]) -> BaseReader:
@@ -313,18 +313,13 @@ class CollisionRunner:
         )
 
     @staticmethod
-    def _is_list_type(data_type: pa.DataType) -> bool:
-        """Return whether ``data_type`` is an Arrow list representation."""
-        return (
-            pa.types.is_list(data_type)
-            or pa.types.is_large_list(data_type)
-            or pa.types.is_fixed_size_list(data_type)
-        )
-
-    @classmethod
-    def _codes_matrix(cls, values: pa.Array) -> np.ndarray:
+    def _codes_matrix(values: pa.Array) -> np.ndarray:
         """Decode an SID column into an ``(N, n_layers)`` int64 matrix."""
-        if cls._is_list_type(values.type):
+        if (
+            pa.types.is_list(values.type)
+            or pa.types.is_large_list(values.type)
+            or pa.types.is_fixed_size_list(values.type)
+        ):
             row_count = len(values)
             flat = (
                 values.flatten()
@@ -395,18 +390,6 @@ class CollisionRunner:
             raise ValueError("SID codes must have at least one layer.")
         return item_id_array, code_matrix
 
-    def _candidate_last_codes(self, plan: CollisionPlan) -> np.ndarray:
-        """Provide row-aligned candidate last codes for the overflow plan."""
-        if plan.overflow_rows.size == 0:
-            return np.empty((0, 0), dtype=np.int64)
-        if self._config.strategy == "random":
-            return generate_random_candidate_last_codes(
-                plan.overflow_item_ids,
-                self._config.random_num_candidates,
-                self._config.layer_sizes[-1],
-            )
-        return self._load_candidate_last_codes(plan.overflow_item_ids)
-
     def _candidate_last_matrix(self, values: pa.Array) -> np.ndarray:
         """Decode a flat candidate column into its per-candidate last codes.
 
@@ -444,12 +427,9 @@ class CollisionRunner:
         reader = self._make_reader([self._config.item_id_field, field])
         for batch in reader.to_batches():
             if field not in batch:
-                logger.warning(
-                    "candidate_codes field %r not present in input batch; "
-                    "stopping candidate scan.",
-                    field,
+                raise ValueError(
+                    f"candidate_codes field {field!r} is missing from an input batch."
                 )
-                break
             batch_ids = batch[self._config.item_id_field].to_numpy(zero_copy_only=False)
             source_rows, target_rows = item_id_lookup.match(batch_ids)
             if source_rows.size == 0:
@@ -569,7 +549,10 @@ class CollisionRunner:
         result: CollisionResolutionResult,
     ) -> None:
         """Write the resolved map in chunks without a full final-code copy."""
-        with closing(self._make_writer(self._config.output_path)) as writer:
+        output_path = self._config.output_path
+        if output_path is None:
+            raise RuntimeError("map output path was not validated.")
+        with closing(self._make_writer(output_path)) as writer:
             is_csv = isinstance(writer, CsvWriter)
             output_count = item_ids.shape[0]
             write_chunk = _MAP_WRITE_ROWS
@@ -614,23 +597,26 @@ class CollisionRunner:
         """
         original_path = self._config.original_sid_groups_output_path
         resolved_path = self._config.resolved_sid_groups_output_path
-        if original_path is None or resolved_path is None:
-            raise RuntimeError("SID group output paths were not validated.")
+        if resolved_path is None:
+            raise RuntimeError("resolved SID group output path was not validated.")
 
-        original_grouping = build_original_item_grouping(plan)
-        self._write_sid_groups(
-            original_path,
-            item_ids,
-            origin_codes,
-            original_grouping,
-            resolved_last_codes=None,
-        )
+        original_grouping: Optional[CodebookItemGrouping] = None
+        if original_path is not None:
+            original_grouping = build_original_item_grouping(plan)
+            self._write_sid_groups(
+                original_path,
+                item_ids,
+                origin_codes,
+                original_grouping,
+                resolved_last_codes=None,
+            )
+
         if plan.overflow_rows.size:
             del original_grouping
             grouping = build_resolved_item_grouping(plan, result)
             resolved_last_codes = result.resolved_last_codes
         else:
-            grouping = original_grouping
+            grouping = original_grouping or build_original_item_grouping(plan)
             resolved_last_codes = None
         self._write_sid_groups(
             resolved_path,
@@ -639,7 +625,6 @@ class CollisionRunner:
             grouping,
             resolved_last_codes=resolved_last_codes,
         )
-        del grouping
 
     def _write_sid_groups(
         self,
@@ -706,22 +691,23 @@ class CollisionRunner:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the collision-prevention command-line parser."""
+    """Build the SID collision-resolution command-line parser."""
     parser = argparse.ArgumentParser(
         description=(
-            "Prevent SID codebook collisions by relocating overflow items "
-            "within a band."
+            "Resolve SID codebook collisions within each band on a best-effort "
+            "basis; finite candidate sets may leave over-capacity buckets."
         )
     )
     parser.add_argument("--input_path", required=True)
-    parser.add_argument("--output_path", required=True)
+    parser.add_argument(
+        "--output_path",
+        default=None,
+        help="Resolved item map output; required unless --rate_only is set.",
+    )
     parser.add_argument(
         "--original_sid_groups_output_path",
         default=None,
-        help=(
-            "Output grouped item IDs keyed by their original SID; required unless "
-            "--rate_only is set."
-        ),
+        help=("Optional audit output grouping item IDs by their original SID."),
     )
     parser.add_argument(
         "--resolved_sid_groups_output_path",
@@ -774,9 +760,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """Run collision prevention from command-line arguments."""
-    config = CollisionPreventionConfig.from_namespace(build_parser().parse_args())
-    CollisionRunner(config).run()
+    """Run SID collision resolution from command-line arguments."""
+    config = ResolveSidCollisionsConfig.from_namespace(build_parser().parse_args())
+    CollisionResolutionRunner(config).run()
 
 
 if __name__ == "__main__":
