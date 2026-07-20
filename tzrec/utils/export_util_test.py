@@ -21,17 +21,26 @@ from unittest import mock
 
 import numpy as np
 import torch
+from torch import distributed as dist
+from torchrec import KeyedJaggedTensor, KeyedTensor
 from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
 from tzrec.acc import utils as acc_utils
+from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.features.feature import create_features
+from tzrec.models.deepfm import DeepFM
+from tzrec.models.model import ScriptWrapper
 from tzrec.modules.dense_embedding_collection import (
     AutoDisEmbeddingConfig,
     DenseEmbeddingCollection,
     MLPDenseEmbeddingConfig,
 )
+from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
+from tzrec.protos.models import rank_model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.utils import checkpoint_util, misc_util
 from tzrec.utils.export_util import (
     _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
@@ -40,8 +49,11 @@ from tzrec.utils.export_util import (
     _merge_sharded_embedding_json,
     _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
+    export_dense_model_cpu,
     export_distributed_embedding,
 )
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import make_test_dir
 
 
 def _restore_env(old_env):
@@ -774,6 +786,137 @@ class ExportUtilTest(unittest.TestCase):
         self.assertEqual(
             _infer_keyed_tensor_attrs_from_module(mc_like), (keys, length_per_key)
         )
+
+    def test_export_dense_model_cpu_end_to_end(self) -> None:
+        """Warm-up, strict restore, sanity run and scripting on a real model."""
+        test_dir = make_test_dir()
+        try:
+            feature_cfgs = [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_a", embedding_dim=16, num_buckets=100
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_b", embedding_dim=16, num_buckets=1000
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    raw_feature=feature_pb2.RawFeature(feature_name="int_a")
+                ),
+            ]
+            features = create_features(feature_cfgs)
+            model_config = model_pb2.ModelConfig(
+                feature_groups=[
+                    model_pb2.FeatureGroupConfig(
+                        group_name="wide",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.WIDE,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="fm",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="deep",
+                        feature_names=["cat_a", "cat_b", "int_a"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                ],
+                deepfm=rank_model_pb2.DeepFM(
+                    deep=module_pb2.MLP(hidden_units=[8, 4]),
+                    final=module_pb2.MLP(hidden_units=[2]),
+                ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            )
+
+            def _build_wrapped_model() -> ScriptWrapper:
+                model = DeepFM(
+                    model_config=model_config, features=features, labels=["label"]
+                )
+                init_parameters(model, device=torch.device("cpu"))
+                return ScriptWrapper(model)
+
+            batch = Batch(
+                dense_features={
+                    BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                        keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+                    )
+                },
+                sparse_features={
+                    BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                        keys=["cat_a", "cat_b"],
+                        values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
+                        lengths=torch.tensor([1, 2, 1, 3]),
+                    )
+                },
+                labels={},
+            )
+
+            pipeline_config = EasyRecConfig()
+            pipeline_config.train_input_path = "unused-mocked"
+
+            ckpt_dir = os.path.join(test_dir, "model.ckpt-0")
+            export_dir = os.path.join(test_dir, "dense_export")
+            port = misc_util.get_free_port()
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"tcp://127.0.0.1:{port}",
+                world_size=1,
+                rank=0,
+            )
+            try:
+                with (
+                    mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False),
+                    mock.patch(
+                        "tzrec.utils.export_util.create_dataloader",
+                        return_value=iter([batch]),
+                    ),
+                ):
+                    checkpoint_util.save_model(ckpt_dir, _build_wrapped_model())
+                    export_dense_model_cpu(
+                        pipeline_config=pipeline_config,
+                        model=_build_wrapped_model(),
+                        checkpoint_path=ckpt_dir,
+                        save_dir=export_dir,
+                    )
+            finally:
+                dist.destroy_process_group()
+
+            with open(os.path.join(export_dir, "dense_meta.json")) as f:
+                dense_meta = json.load(f)
+            ebc_groups = {k: v for k, v in dense_meta.items() if k != "sequence__ec"}
+            all_emb_names = [n for names in ebc_groups.values() for n in names]
+            self.assertTrue(all_emb_names)
+            for emb_name in all_emb_names:
+                self.assertIn(emb_name.split("@")[0], {"cat_a", "cat_b"})
+            # never bare table names (cat_a_emb / cat_b_emb): the old
+            # table-name inference emitted those instead of feature names
+            self.assertNotIn("cat_a_emb__ebc", all_emb_names)
+            self.assertNotIn("cat_b_emb__ebc", all_emb_names)
+            # cat_a/cat_b are shared by the wide and fm/deep tables, so the
+            # shared-feature @table form must appear
+            self.assertTrue(any("@" in n for n in all_emb_names))
+            self.assertEqual(dense_meta["sequence__ec"], [])
+
+            scripted = torch.jit.load(os.path.join(export_dir, "scripted_model.pt"))
+            serving_data = dict(batch.to_dict())
+            for group_name, names in ebc_groups.items():
+                # wide tables use the 4-dim wide embedding, others 16
+                dims = [4 if "_wide" in n else 16 for n in names]
+                serving_data[group_name] = torch.rand(2, sum(dims))
+            serving_data["batch_size"] = torch.tensor(2)
+            predictions = scripted(serving_data)
+            self.assertEqual(predictions["logits"].size(), (2,))
+            self.assertEqual(predictions["probs"].size(), (2,))
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

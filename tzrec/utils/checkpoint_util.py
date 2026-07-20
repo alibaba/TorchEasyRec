@@ -76,6 +76,9 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             do not include the current rank's boundaries would crash
             ``validate_state()``. Set this when the saved world size is
             not a multiple divisor of the current world size.
+
+    Model states missing from the checkpoint are skipped with a warning and
+    recorded in ``skipped_keys``.
     """
 
     def __init__(
@@ -88,6 +91,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         super().__init__(flatten_state_dict, flatten_sharded_tensors)
         self._ckpt_param_map = dict()
         self._skip_output_segments_tensor = skip_output_segments_tensor
+        self.skipped_keys: List[str] = []
         if ckpt_param_map_path:
             with open(ckpt_param_map_path) as f:
                 for line in f.readlines():
@@ -163,6 +167,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                 md = self.metadata.state_dict_metadata[meta_fqn]
             else:
                 logger.warning(f"Skip restore state [{fqn}]")
+                self.skipped_keys.append(fqn)
                 continue
 
             read_items = []
@@ -900,6 +905,7 @@ def restore_model(
     model: nn.Module,
     optimizer: Optional[optim.Optimizer] = None,
     ckpt_param_map_path: Optional[str] = None,
+    error_on_missing_keys: bool = False,
 ) -> None:
     """Restore model state.
 
@@ -908,6 +914,9 @@ def restore_model(
         model (nn.Module): a EasyRec model.
         optimizer (optim.Optimizer, optional): a optimizer.
         ckpt_param_map_path (str): parameter mapping for checkpoint.
+        error_on_missing_keys (bool): If True, raise RuntimeError when the
+            model has states absent from the checkpoint instead of skipping
+            them with a warning (which would leave them uninitialized).
     """
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
@@ -935,14 +944,21 @@ def restore_model(
         if is_local_rank_zero:
             logger.info(f"Restoring model state from {model_ckpt_path}...")
         state_dict = model.state_dict()
+        planner = PartialLoadPlanner(
+            ckpt_param_map_path=ckpt_param_map_path,
+            skip_output_segments_tensor=needs_mch_redistribution,
+        )
         load(
             state_dict,
             checkpoint_id=model_ckpt_path,
-            planner=PartialLoadPlanner(
-                ckpt_param_map_path=ckpt_param_map_path,
-                skip_output_segments_tensor=needs_mch_redistribution,
-            ),
+            planner=planner,
         )
+        if error_on_missing_keys and planner.skipped_keys:
+            raise RuntimeError(
+                f"checkpoint[{model_ckpt_path}] is missing "
+                f"{len(planner.skipped_keys)} model states: "
+                + ", ".join(sorted(planner.skipped_keys))
+            )
         if needs_mch_redistribution:
             _redistribute_mch_state(model)
         model.load_state_dict(state_dict)

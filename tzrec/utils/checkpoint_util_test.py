@@ -421,6 +421,38 @@ class CheckpointUtilTest(unittest.TestCase):
             if p.exitcode != 0:
                 raise RuntimeError(f"worker-{i} failed.")
 
+    def test_restore_model_error_on_missing_keys(self):
+        class SmallModel(nn.Module):
+            def __init__(self, with_extra=False):
+                super().__init__()
+                self.dense = nn.Linear(4, 2)
+                if with_extra:
+                    self.extra = nn.Linear(2, 2)
+
+        port = misc_util.get_free_port()
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            world_size=1,
+            rank=0,
+        )
+        try:
+            model = SmallModel()
+            checkpoint_util.save_model(self.test_dir, model)
+
+            restored = SmallModel(with_extra=True)
+            extra_weight = restored.extra.weight.detach().clone()
+            checkpoint_util.restore_model(self.test_dir, restored)
+            torch.testing.assert_close(restored.dense.weight, model.dense.weight)
+            self.assertTrue(torch.equal(restored.extra.weight, extra_weight))
+
+            with self.assertRaisesRegex(RuntimeError, "extra.weight"):
+                checkpoint_util.restore_model(
+                    self.test_dir, restored, error_on_missing_keys=True
+                )
+        finally:
+            dist.destroy_process_group()
+
 
 class DataloaderCheckpointTest(unittest.TestCase):
     """Tests for dataloader checkpoint utilities."""

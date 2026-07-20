@@ -29,6 +29,8 @@ from torch import distributed as dist
 from torch import nn
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
+from torch.fx import Interpreter
+from torch.fx.node import Target
 from torchrec import JaggedTensor, KeyedTensor
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.utils import Tracer
@@ -1715,6 +1717,69 @@ def export_distributed_embedding(
             json.dump(merged_emb_json, f, indent=4)
 
 
+class _SparseMarkCapture(Interpreter):
+    """FX interpreter that records fx-marked sparse group outputs."""
+
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        sparse_kts: Dict[str, KeyedTensor],
+        seq_jts: Dict[str, JaggedTensor],
+    ) -> None:
+        super().__init__(module)
+        self._sparse_kts = sparse_kts
+        self._seq_jts = seq_jts
+
+    def call_function(
+        self, target: Target, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    ) -> Any:
+        """Capture mark arguments, then execute the node as usual."""
+        if target is fx_mark_keyed_tensor and not kwargs.get("is_dense", False):
+            self._sparse_kts[args[0]] = args[1]
+        elif target is fx_mark_seq_ec_jt:
+            self._seq_jts[args[0]] = args[1]
+        return super().call_function(target, args, kwargs)
+
+
+def _run_dense_graph_sanity_check(
+    model: torch.nn.Module,
+    full_graph: torch.fx.Graph,
+    gm: torch.fx.GraphModule,
+    data: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> None:
+    """Run the rewritten dense graph once before scripting.
+
+    Executes the pre-surgery graph to capture each sparse group's runtime
+    output, rebuilds a serving-style input dict from those captures, and
+    forwards the rewritten graph on it, so graph surgery or KeyedTensor
+    regroup errors surface at export time instead of at serving time.
+    """
+    sparse_kts: Dict[str, KeyedTensor] = {}
+    seq_jts: Dict[str, JaggedTensor] = {}
+    capture_gm = torch.fx.GraphModule(model, copy.deepcopy(full_graph))
+    with torch.no_grad():
+        _SparseMarkCapture(capture_gm, sparse_kts, seq_jts).run(data, device)
+
+    sanity_data: Dict[str, Any] = dict(data)
+    batch_size = 0
+    for name, kt in sparse_kts.items():
+        values = kt.values().detach()
+        batch_size = values.size(0)
+        if _is_input_tile_user_keyed_tensor(name):
+            # serving feeds pre-tile user values; the graph tiles them.
+            values = values[:1]
+        sanity_data[name] = values
+    for name, jt in seq_jts.items():
+        sanity_data[name] = jt.values().detach()
+        sanity_data[name + "__lengths"] = jt.lengths().detach()
+        batch_size = jt.lengths().size(0)
+    if batch_size:
+        sanity_data["batch_size"] = torch.tensor(batch_size, device=device)
+    with torch.no_grad():
+        gm(sanity_data, device)
+
+
 def export_dense_model_cpu(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
@@ -1725,8 +1790,14 @@ def export_dense_model_cpu(
     data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
-    """Export only the dense model on CPU without DMP or GPU usage."""
-    del pipeline_config, assets, use_local_cache_dir, data_input_path, kwargs
+    """Export only the dense model on CPU without DMP or GPU usage.
+
+    One batch from ``data_input_path`` (or ``pipeline_config.train_input_path``)
+    warms up lazy modules before tracing and sanity-runs the rewritten graph
+    before scripting; restore fails on any checkpoint-missing state so the
+    exported model can never carry uninitialized weights.
+    """
+    del assets, use_local_cache_dir, kwargs
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
@@ -1737,6 +1808,24 @@ def export_dense_model_cpu(
 
     model.set_is_inference(True)
     model.eval()
+
+    input_path = data_input_path or pipeline_config.train_input_path
+    if not input_path:
+        raise ValueError("data input path should be specified.")
+    data_config = copy.deepcopy(pipeline_config.data_config)
+    data_config.num_workers = 1
+    features = cast(List[BaseFeature], model.features)
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
+    batch = next(iter(dataloader))
+    data = batch.to(device).to_dict(sparse_dtype=torch.int64)
+
+    # Materialize lazy modules before FX tracing. Some modules build
+    # submodules from concrete tensor shapes on their first forward; during
+    # FX trace those shapes become Proxy objects and cannot construct
+    # Parameters.
+    logger.info("running pre-trace warm-up for CPU dense export...")
+    with torch.no_grad():
+        model(data, device=device)
 
     leaf_modules = _get_sparse_embedding_leaf_module_names(
         model
@@ -1861,7 +1950,9 @@ def export_dense_model_cpu(
 
     init_parameters(gm, device)
     gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, gm)
+    checkpoint_util.restore_model(checkpoint_path, gm, error_on_missing_keys=True)
+
+    _run_dense_graph_sanity_check(model, full_graph, gm, data, device)
 
     with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
         json.dump(dense_graph_config, f, indent=4)
