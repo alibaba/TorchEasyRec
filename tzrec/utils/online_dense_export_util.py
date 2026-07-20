@@ -169,6 +169,13 @@ class OnlineDenseExportManager:
                 if task is None:
                     return
                 self._run_task(task)
+            except Exception:
+                # Keep the worker alive across unexpected task failures (e.g.
+                # OSError from makedirs/open/socket). _run_task's finally
+                # still unprotects the failing checkpoint; without this guard a
+                # single transient I/O error would permanently disable exports
+                # and silently void keep_checkpoint_max for all future submits.
+                logger.exception("online dense export task failed; continuing")
             finally:
                 self._queue.task_done()
 

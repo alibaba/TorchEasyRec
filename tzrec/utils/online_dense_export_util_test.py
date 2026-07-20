@@ -14,10 +14,13 @@
 
 import datetime
 import os
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
 from tzrec.utils.online_dense_export_util import (
+    OnlineDenseExportManager,
     _build_export_subprocess_env,
     _make_monotonic_version,
     make_version,
@@ -77,6 +80,54 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         self.assertEqual(env["INPUT_TILE"], "3")
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "")
         self.assertEqual(env["PYTHONPATH"], "/repo:/old/path")
+
+    def test_worker_survives_task_failure(self) -> None:
+        """A raising _run_task must not kill the worker or skip later tasks."""
+        ckpt = mock.Mock()
+        calls = []
+        done = threading.Event()
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd[cmd.index("--version") + 1])
+            done.set()
+            if len(calls) == 1:
+                raise OSError("boom")
+
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
+            os.makedirs(ckpt_path)
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch(
+                    "tzrec.utils.online_dense_export_util.subprocess.run",
+                    side_effect=fake_run,
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    ckpt_manager=ckpt,
+                )
+                try:
+                    mgr.submit(1, ckpt_path, 1.0)
+                    self.assertTrue(done.wait(timeout=10))
+                    # worker must still be alive: a second submit is processed
+                    done.clear()
+                    mgr.submit(2, ckpt_path, 2.0)
+                    self.assertTrue(done.wait(timeout=10))
+                finally:
+                    mgr.close()
+        self.assertEqual(len(calls), 2)
+        # both tasks' checkpoints were unprotected in _run_task's finally
+        self.assertEqual(ckpt.unprotect_checkpoint.call_count, 2)
 
 
 if __name__ == "__main__":
