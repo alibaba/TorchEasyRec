@@ -20,7 +20,9 @@ import shutil
 from typing import Any, Dict, Optional
 
 from tzrec.main import _create_features, _create_model
+from tzrec.models.match_model import MatchModel
 from tzrec.models.model import ScriptWrapper
+from tzrec.models.tdm import TDM
 from tzrec.utils import config_util, env_util
 from tzrec.utils.export_util import (
     ensure_input_tile_for_distributed_embedding,
@@ -138,6 +140,14 @@ def export_online_dense_model(
         sampler_type=None,
     )
     model.set_is_inference(True)
+    if isinstance(model, (MatchModel, TDM)):
+        # The full export emits per-tower (MatchModel) or per-module (TDM)
+        # artifacts; a single monolithic dense export cannot mirror that
+        # layout, so a hot swap would load an incompatible artifact.
+        raise RuntimeError(
+            f"ONLINE_DENSE_EXPORT does not support {type(model).__name__} "
+            "models; use the full export (export_model) instead."
+        )
     scripted_model = ScriptWrapper(model)
 
     try:

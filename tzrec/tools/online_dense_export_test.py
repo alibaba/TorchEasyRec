@@ -19,6 +19,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from tzrec.models.match_model import MatchModel
+from tzrec.models.tdm import TDM
 from tzrec.tools.online_dense_export import export_online_dense_model
 
 
@@ -197,6 +199,46 @@ class OnlineDenseExportTest(unittest.TestCase):
             self.assertFalse(
                 os.path.exists(os.path.join(export_root, "current.json.tmp.9999"))
             )
+
+    def test_rejects_match_model_and_tdm(self) -> None:
+        """MatchModel/TDM need per-tower/per-module export; reject them."""
+        for spec in (MatchModel, TDM):
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                checkpoint_path = os.path.join(tmp_dir, "model.ckpt-10")
+                os.makedirs(checkpoint_path)
+                pipeline_config_path = os.path.join(tmp_dir, "pipeline.config")
+                open(pipeline_config_path, "w").close()
+                dummy_config = SimpleNamespace(
+                    feature_configs=[],
+                    data_config=SimpleNamespace(label_fields=[]),
+                    model_config=SimpleNamespace(),
+                )
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"USE_DISTRIBUTED_EMBEDDING": "1"},
+                        clear=False,
+                    ),
+                    mock.patch(
+                        "tzrec.tools.online_dense_export.config_util.load_pipeline_config",
+                        return_value=dummy_config,
+                    ),
+                    mock.patch(
+                        "tzrec.tools.online_dense_export._create_features",
+                        return_value=[],
+                    ),
+                    mock.patch(
+                        "tzrec.tools.online_dense_export._create_model",
+                        return_value=mock.Mock(spec=spec),
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "does not support"):
+                        export_online_dense_model(
+                            pipeline_config_path=pipeline_config_path,
+                            checkpoint_path=checkpoint_path,
+                            model_dir=tmp_dir,
+                            version="20260623174705",
+                        )
 
 
 if __name__ == "__main__":
