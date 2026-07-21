@@ -1824,6 +1824,8 @@ def export_dense_model_cpu(
     # FX trace those shapes become Proxy objects and cannot construct
     # Parameters.
     logger.info("running pre-trace warm-up for CPU dense export...")
+    # Materialize meta params; real weights come from restore_model below.
+    init_parameters(model, device)
     with torch.no_grad():
         model(data, device=device)
 

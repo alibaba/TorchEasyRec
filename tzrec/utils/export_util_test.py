@@ -836,10 +836,13 @@ class ExportUtilTest(unittest.TestCase):
                 ],
             )
 
-            def _build_wrapped_model() -> ScriptWrapper:
-                model = DeepFM(
+            def _build_model() -> DeepFM:
+                return DeepFM(
                     model_config=model_config, features=features, labels=["label"]
                 )
+
+            def _build_wrapped_model() -> ScriptWrapper:
+                model = _build_model()
                 init_parameters(model, device=torch.device("cpu"))
                 return ScriptWrapper(model)
 
@@ -880,9 +883,10 @@ class ExportUtilTest(unittest.TestCase):
                     ),
                 ):
                     checkpoint_util.save_model(ckpt_dir, _build_wrapped_model())
+                    # pass meta embeddings to exercise in-function init_parameters
                     export_dense_model_cpu(
                         pipeline_config=pipeline_config,
-                        model=_build_wrapped_model(),
+                        model=ScriptWrapper(_build_model()),
                         checkpoint_path=ckpt_dir,
                         save_dir=export_dir,
                     )
