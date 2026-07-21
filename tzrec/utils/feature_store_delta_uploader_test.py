@@ -337,6 +337,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "feature_view_ttl_secs",
             "feature_view_shard_count",
             "feature_view_replication_count",
+            "allow_custom_endpoint",
         ]
         fields = list(FeatureStoreConfig.DESCRIPTOR.fields)
 
@@ -355,7 +356,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 for field in fields[len(required_fields) :]
             )
         )
-        self.assertEqual([field.number for field in fields], [1, *list(range(6, 22))])
+        self.assertEqual([field.number for field in fields], [1, *list(range(6, 23))])
         for field_name in required_fields:
             with self.subTest(field_name=field_name):
                 config = _feature_store_config()
@@ -437,6 +438,64 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             FeatureStoreUploadSettings.from_proto(
                 _feature_store_config(feature_view_replication_count=4)
             )
+
+    def test_endpoint_must_be_a_trusted_https_host(self):
+        # Cloud and FeatureDB credentials are sent to this host, so trusted
+        # Alibaba Cloud endpoints are accepted bare or under explicit https.
+        for endpoint in (
+            "featurestore.cn-hangzhou.aliyuncs.com",
+            "https://featurestore.cn-hangzhou.aliyuncs.com",
+            "https://featurestore-vpc.cn-beijing.aliyuncs.com/",
+        ):
+            with self.subTest(endpoint=endpoint):
+                settings = FeatureStoreUploadSettings.from_proto(
+                    _feature_store_config(endpoint=endpoint)
+                )
+                self.assertEqual(settings.endpoint, endpoint)
+                self.assertFalse(settings.allow_custom_endpoint)
+
+        rejected_endpoints = {
+            "http://featurestore.cn-hangzhou.aliyuncs.com": "HTTPS",
+            "ftp://featurestore.cn-hangzhou.aliyuncs.com": "HTTPS",
+            "evil.example.com": "trusted",
+            "https://aliyuncs.com": "trusted",
+            "https://featurestore.cn-hangzhou.aliyuncs.com.evil.com": "trusted",
+            "featurestore.cn-hangzhou.aliyuncs.com:8443": "port",
+            "https://featurestore.cn-hangzhou.aliyuncs.com/v1": "path, query",
+            "https://featurestore.cn-hangzhou.aliyuncs.com?x=1": "path, query",
+            "https://featurestore.cn-hangzhou.aliyuncs.com#frag": "fragment",
+            "https://": "host",
+        }
+        for endpoint, message in rejected_endpoints.items():
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaisesRegex(ValueError, message):
+                    FeatureStoreUploadSettings.from_proto(
+                        _feature_store_config(endpoint=endpoint)
+                    )
+
+    def test_allow_custom_endpoint_opts_into_vetted_hosts(self):
+        settings = FeatureStoreUploadSettings.from_proto(
+            _feature_store_config(
+                endpoint="https://featurestore.internal.example.com:8443",
+                allow_custom_endpoint=True,
+            )
+        )
+        self.assertTrue(settings.allow_custom_endpoint)
+
+        # The opt-in waives the trusted-host/port rules only; the structural
+        # credential-safety checks still apply.
+        for endpoint in (
+            "http://featurestore.internal.example.com",
+            "https://user:secret@featurestore.internal.example.com",
+            "https://featurestore.internal.example.com/v1",
+        ):
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaisesRegex(ValueError, "endpoint"):
+                    FeatureStoreUploadSettings.from_proto(
+                        _feature_store_config(
+                            endpoint=endpoint, allow_custom_endpoint=True
+                        )
+                    )
 
     def test_start_reuses_existing_dynamic_embedding_feature_view(self):
         with tempfile.TemporaryDirectory() as output_dir:

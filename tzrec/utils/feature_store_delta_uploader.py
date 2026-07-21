@@ -118,6 +118,7 @@ class FeatureStoreUploadSettings:
     shutdown_timeout_secs: int
     max_pending_steps: int
     poll_interval_secs: int
+    allow_custom_endpoint: bool
 
     @classmethod
     def from_proto(cls, config: FeatureStoreConfig) -> "FeatureStoreUploadSettings":
@@ -164,12 +165,8 @@ class FeatureStoreUploadSettings:
                 "feature_store_config.region must not be empty "
                 "(it may come from ALIBABA_CLOUD_REGION)"
             )
-        endpoint_url = endpoint if "://" in endpoint else f"//{endpoint}"
-        parsed_endpoint = urlsplit(endpoint_url)
-        if parsed_endpoint.username is not None or parsed_endpoint.password is not None:
-            raise ValueError(
-                "feature_store_config.endpoint must not contain URI userinfo"
-            )
+        allow_custom_endpoint = bool(config.allow_custom_endpoint)
+        _validate_feature_store_endpoint(endpoint, allow_custom_endpoint)
         project_name = config.project_name.strip()
         feature_entity_name = config.feature_entity_name.strip()
         feature_view_name = config.feature_view_name.strip()
@@ -238,12 +235,58 @@ class FeatureStoreUploadSettings:
             shutdown_timeout_secs=positive_values["shutdown_timeout_secs"],
             max_pending_steps=positive_values["max_pending_steps"],
             poll_interval_secs=positive_values["poll_interval_secs"],
+            allow_custom_endpoint=allow_custom_endpoint,
         )
 
 
 def validate_feature_store_config(config: FeatureStoreConfig) -> None:
     """Validate upload configuration and its environment-resolved credentials."""
     FeatureStoreUploadSettings.from_proto(config)
+
+
+def _validate_feature_store_endpoint(
+    endpoint: str, allow_custom_endpoint: bool
+) -> None:
+    """Reject endpoints that could divert cloud or FeatureDB credentials.
+
+    The endpoint receives the access keys, STS token and FeatureDB
+    credentials, so only trusted Alibaba Cloud hosts are accepted unless the
+    operator explicitly opts in to a vetted custom deployment.
+    """
+    if not endpoint:
+        return
+    parsed_endpoint = urlsplit(endpoint if "://" in endpoint else f"//{endpoint}")
+    if parsed_endpoint.scheme and parsed_endpoint.scheme != "https":
+        raise ValueError(
+            "feature_store_config.endpoint must use HTTPS when a scheme is given"
+        )
+    if parsed_endpoint.username is not None or parsed_endpoint.password is not None:
+        raise ValueError("feature_store_config.endpoint must not contain URI userinfo")
+    if (
+        parsed_endpoint.path not in ("", "/")
+        or parsed_endpoint.query
+        or parsed_endpoint.fragment
+    ):
+        raise ValueError(
+            "feature_store_config.endpoint must not contain path, query, or "
+            "fragment components"
+        )
+    hostname = parsed_endpoint.hostname
+    if not hostname:
+        raise ValueError("feature_store_config.endpoint must name a host")
+    if allow_custom_endpoint:
+        return
+    if parsed_endpoint.port is not None:
+        raise ValueError(
+            "feature_store_config.endpoint must not contain a port unless "
+            "allow_custom_endpoint is set"
+        )
+    if not hostname.endswith(".aliyuncs.com"):
+        raise ValueError(
+            "feature_store_config.endpoint must be a trusted *.aliyuncs.com "
+            "FeatureStore endpoint; set allow_custom_endpoint only for a "
+            "vetted private deployment"
+        )
 
 
 def _feature_store_target_hash(settings: FeatureStoreUploadSettings) -> str:

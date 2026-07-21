@@ -51,7 +51,11 @@ message FeatureStoreConfig {
     required string version = 9;
 
 
-    // Optional FeatureStore control-plane endpoint override.
+    // Optional FeatureStore control-plane endpoint override. Cloud and
+    // FeatureDB credentials are sent to this host, so it must be a trusted
+    // *.aliyuncs.com FeatureStore endpoint (an explicit https:// scheme is
+    // required when a scheme is given) without userinfo, port, path, query or
+    // fragment components, unless allow_custom_endpoint is set.
     optional string endpoint = 10;
     optional string security_token = 11;
     // Maximum records submitted before each SDK write_flush() completion gate.
@@ -75,6 +79,11 @@ message FeatureStoreConfig {
     optional uint32 feature_view_ttl_secs = 19 [default = 1296000];
     optional uint32 feature_view_shard_count = 20 [default = 20];
     optional uint32 feature_view_replication_count = 21 [default = 1];
+    // Explicit opt-in allowing endpoint to name a non-*.aliyuncs.com host
+    // (e.g. a vetted private FeatureStore deployment with a custom port).
+    // Credentials are sent to that host; structural endpoint checks (HTTPS
+    // scheme, no userinfo/path/query/fragment) still apply.
+    optional bool allow_custom_endpoint = 22 [default = false];
 }
 
 message DeltaEmbeddingDumpConfig {
