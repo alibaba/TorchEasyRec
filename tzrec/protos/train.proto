@@ -44,10 +44,7 @@ message FeatureStoreConfig {
     // Existing FeatureStore entity associated with an automatically created
     // DynamicEmbedding FeatureView.
     required string feature_entity_name = 8;
-    // Explicit FeatureDB version for this incremental training run. It must be
-    // provisioned before upload starts; only positive-global-step dumps are
-    // written to this version with MERGE. One project/view/version may have
-    // only one active delta writer.
+    // FeatureDB version for this incremental training run.
     required string version = 9;
 
 
