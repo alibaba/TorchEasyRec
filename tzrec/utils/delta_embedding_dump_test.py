@@ -55,6 +55,7 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_config,
     validate_delta_embedding_dump_no_zch_features,
 )
+from tzrec.utils.dist_util import create_train_pipeline
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.feature_store_delta_uploader import (
     DELTA_DUMP_GENERATION_METADATA_KEY,
@@ -214,6 +215,38 @@ def _run_sharded_delta_embedding_dump(rank: int, world_size: int, output_dir: st
         output_path = dumper.dump(50)
         unittest.TestCase().assertIsNotNone(output_path)
         _assert_sharded_dump_file(rank, output_path, dumper)
+        torch.distributed.barrier()
+
+
+def _run_uneven_exhaustion_rejection(rank: int, world_size: int, output_dir: str):
+    # Regression: with rank 0 stopping at step 49 and rank 1 at step 50,
+    # final_dump used to sync both ranks to the boundary 50, both took the
+    # boundary-step skip, and rank 0's trailing tracked rows were silently
+    # lost. Multi-rank dumps now force aligned dataloader exhaustion, so the
+    # uneven stop must fail loudly on every rank instead.
+    with MultiProcessContext(rank=rank, world_size=world_size, backend="nccl") as ctx:
+        model = _build_sharded_delta_dump_model(rank, world_size, ctx)
+        dumper = DeltaEmbeddingDumper(
+            model,
+            DeltaEmbeddingDumpConfig(dump_interval_steps=50, output_dir=output_dir),
+            output_dir,
+            torch.device(f"cuda:{rank}"),
+            [],
+        )
+        testcase = unittest.TestCase()
+        testcase.assertTrue(dumper.requires_synced_dataloader_exhaustion)
+        pipeline = create_train_pipeline(
+            model,
+            check_all_workers_data_status=dumper.requires_synced_dataloader_exhaustion,
+            fail_on_uneven_data=dumper.requires_synced_dataloader_exhaustion,
+        )
+        # Rank 0's 50th fetch returns None while rank 1 still has batch 50; the
+        # pipeline's collective data-status check must raise on both ranks.
+        num_batches = 49 if rank == 0 else 50
+        batches = iter([_sharded_features(rank) for _ in range(num_batches)])
+        with testcase.assertRaisesRegex(RuntimeError, "exhausted unevenly"):
+            for _ in range(num_batches + 1):
+                pipeline._next_batch(batches)
         torch.distributed.barrier()
 
 
@@ -1003,12 +1036,18 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         self.assertTrue(dumper.requires_synced_dataloader_exhaustion)
 
-    def test_step_interval_does_not_require_synced_dataloader_exhaustion(self):
+    def test_multi_rank_step_interval_requires_synced_dataloader_exhaustion(self):
+        # Regression: with ranks finishing at steps 49 and 50, final_dump synced
+        # both to the boundary 50, both took the boundary-step skip, and the
+        # rank that never ran maybe_dump(50) silently dropped its trailing
+        # tracked rows. Every multi-rank cadence must keep exhaustion aligned
+        # so all ranks participate in every boundary dump.
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval_secs = None
+        dumper._interval_steps = 50
         dumper._world_size = 2
 
-        self.assertFalse(dumper.requires_synced_dataloader_exhaustion)
+        self.assertTrue(dumper.requires_synced_dataloader_exhaustion)
 
     def test_single_rank_minutes_does_not_require_synced_dataloader_exhaustion(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -1444,6 +1483,26 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
                         )
                     )
                 )
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
+    @mark_ci_scope("gpu")
+    def test_uneven_exhaustion_is_rejected_for_step_interval_dump(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "NCCL_DEBUG": "WARN",
+                    "FORCED_NCCL_DEBUG": "WARN",
+                    "NCCL_DEBUG_SUBSYS": "",
+                },
+            ),
+        ):
+            self._run_multi_process_test(
+                callable=_run_uneven_exhaustion_rejection,
+                world_size=self.world_size,
+                output_dir=tmp_dir,
+            )
 
 
 class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):

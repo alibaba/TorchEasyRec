@@ -474,8 +474,15 @@ class DeltaEmbeddingDumper:
 
     @property
     def requires_synced_dataloader_exhaustion(self) -> bool:
-        """Return whether input exhaustion must stay aligned across ranks."""
-        return self._interval_secs is not None and self._world_size > 1
+        """Return whether input exhaustion must stay aligned across ranks.
+
+        Multi-rank dumps of either cadence need every rank to reach the same
+        final step. ``final_dump`` skips steps already written on their dump
+        boundary, and a rank that stops before the synced MAX step never ran
+        that boundary's ``maybe_dump``, so an unsynced stop would make it
+        adopt the boundary skip and silently drop its trailing tracked rows.
+        """
+        return self._world_size > 1
 
     def start(self) -> None:
         """Start timed cadence and rank-zero publication after initialization."""
@@ -810,10 +817,12 @@ class DeltaEmbeddingDumper:
             # Boundary steps were already written (with full delta) by
             # ``maybe_dump``. Re-dumping here has no new delta to flush -- every
             # rank's consumer cursor has already advanced past the boundary's
-            # delta -- and torchrec's ``get_unique`` raises
-            # ``torch.cat(): expected a non-empty list of Tensors`` on the empty
-            # consumer window. Re-dumping would also overwrite the already-written
-            # boundary shards (with an empty file under multi-GPU), so skip.
+            # delta (multi-rank dumps force synced exhaustion, so every rank
+            # participated in the boundary dump) -- and torchrec's ``get_unique``
+            # raises ``torch.cat(): expected a non-empty list of Tensors`` on the
+            # empty consumer window. Re-dumping would also overwrite the
+            # already-written boundary shards (with an empty file under
+            # multi-GPU), so skip.
             return None
         if self._interval_secs is not None and global_step == self._last_dump_step:
             # A timed dump can land on any step. Avoid replacing that step's full
@@ -835,13 +844,14 @@ class DeltaEmbeddingDumper:
         """Align the final step and uploader failure state before the trailing flush.
 
         ``maybe_dump`` runs in lockstep so every rank shares ``global_step``,
-        but ``final_dump`` is reached with each rank's own last step. With
-        ``check_all_workers_data_status=False`` ranks can exhaust the dataloader
-        at different steps, so without syncing each would write a lone shard to
-        its own ``step_<N>/`` dir -- exactly the ragged shard set the per-rank
-        empty-shard logic prevents. Reduce with MAX so the furthest-progressed
-        rank's trailing delta is never swallowed by the boundary-step skip, and
-        so every rank takes the same skip/dump decision into the same dir.
+        and the training loop keeps ``final_dump`` aligned too: multi-rank
+        dumps require synced dataloader exhaustion, because a rank stopping at
+        an earlier step would adopt the synced MAX step, hit the boundary-step
+        skip without ever running that boundary's ``maybe_dump``, and silently
+        drop its trailing tracked rows. The MAX all-reduce remains as a
+        defensive guard so every rank still takes the same skip/dump decision
+        into the same ``step_<N>/`` dir -- the ragged shard set the per-rank
+        empty-shard logic prevents.
 
         The same collective carries a local/shared uploader-failure bit. No rank
         raises before all ranks have entered it, preventing an asynchronous marker

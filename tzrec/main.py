@@ -475,8 +475,9 @@ def _train_and_evaluate(
         check_all_workers_data_status or require_equal_train_batches
     )
     for i_epoch in epoch_iter:
-        # Timed dumps synchronize their per-step state, so uneven workers must
-        # fail together instead of silently truncating data or leaving collectives.
+        # Multi-rank dumps synchronize their per-step state, so uneven workers
+        # must fail together instead of silently dropping a lagging rank's
+        # trailing delta rows or leaving collectives.
         pipeline = create_train_pipeline(
             model,
             optimizer,
