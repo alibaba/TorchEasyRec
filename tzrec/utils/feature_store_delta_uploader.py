@@ -33,6 +33,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Set,
     Tuple,
     cast,
 )
@@ -550,6 +551,10 @@ class FeatureStoreDeltaUploader:
         self._view = None
         self._condition = threading.Condition()
         self._pending: Dict[int, float] = {}
+        # Steps already reconciled as committed with a matching generation;
+        # discovery skips their JSON/Parquet re-reads so poll lock hold time
+        # does not grow with the job's committed history.
+        self._reconciled_steps: Set[int] = set()
         self._started = False
         self._closing = False
         self._aborting = False
@@ -648,6 +653,7 @@ class FeatureStoreDeltaUploader:
                 # A later retry must reconcile again after reacquiring the lock;
                 # another process may have advanced the journal in between.
                 self._journal_initialized = False
+                self._reconciled_steps = set()
                 self._reset_view(suppress_errors=True)
                 self._release_writer_lock()
                 raise
@@ -991,6 +997,16 @@ class FeatureStoreDeltaUploader:
                 raise _UploadAborted()
 
     def _add_discovered_steps_locked(self) -> None:
+        """Incrementally enqueue new outbox steps without rescanning history.
+
+        Full reconciliation happens once in ``start()`` with an empty
+        reconciled set. Afterwards, steps already pending or already verified
+        committed with a matching generation are skipped without any JSON or
+        Parquet reads, so the condition lock hold time stays independent of
+        how many steps this job has committed. A committed step whose
+        canonical generation no longer matches its manifest is deliberately
+        never marked reconciled, keeping the replacement alarm alive.
+        """
         remaining_capacity = self._settings.max_pending_steps - len(self._pending)
         if remaining_capacity <= 0:
             return
@@ -1002,17 +1018,21 @@ class FeatureStoreDeltaUploader:
                     "found invalid FeatureStore delta outbox global_step; "
                     "global_step must be > 0"
                 )
+            if step in self._reconciled_steps or step in self._pending:
+                continue
             if self._is_committed(step):
                 try:
                     canonical_generation = self._canonical_dump_generation(step)
                 except _ShardSetNotReady:
                     canonical_generation = ""
                 if canonical_generation is None:
+                    self._reconciled_steps.add(step)
                     continue
                 manifest_generation = _read_json(self._manifest_path(step)).get(
                     "dump_generation"
                 )
                 if canonical_generation == manifest_generation:
+                    self._reconciled_steps.add(step)
                     continue
             if step not in self._pending:
                 self._pending[step] = time.monotonic()
@@ -1022,6 +1042,10 @@ class FeatureStoreDeltaUploader:
         if not os.path.isdir(self._output_dir):
             return []
         steps = set()
+        # Already pending or reconciled steps are known to be real entries;
+        # re-statting their directories/shards on every poll would make the
+        # scan cost grow with the retained outbox history.
+        known_steps = self._reconciled_steps | set(self._pending)
         manifest_pattern = re.compile(r"^step_(\d+)\.manifest\.json$")
         for name in os.listdir(self._state_dir):
             match = manifest_pattern.match(name)
@@ -1031,8 +1055,13 @@ class FeatureStoreDeltaUploader:
             snapshot_pattern = re.compile(r"^step_(\d+)$")
             for name in os.listdir(self._snapshot_root):
                 match = snapshot_pattern.match(name)
-                if match and os.path.isdir(os.path.join(self._snapshot_root, name)):
-                    steps.add(int(match.group(1)))
+                if match is None:
+                    continue
+                step = int(match.group(1))
+                if step in known_steps or os.path.isdir(
+                    os.path.join(self._snapshot_root, name)
+                ):
+                    steps.add(step)
         if self._world_size == 1:
             pattern = re.compile(
                 rf"^{re.escape(self._file_prefix)}_step_(\d+)\.parquet$"
@@ -1045,11 +1074,14 @@ class FeatureStoreDeltaUploader:
             pattern = re.compile(r"^step_(\d+)$")
             for name in os.listdir(self._output_dir):
                 match = pattern.match(name)
-                if match is None or not os.path.isdir(
-                    os.path.join(self._output_dir, name)
-                ):
+                if match is None:
                     continue
                 step = int(match.group(1))
+                if step in known_steps:
+                    steps.add(step)
+                    continue
+                if not os.path.isdir(os.path.join(self._output_dir, name)):
+                    continue
                 # A partial shard set for this exact contract is real pending
                 # work and must time out fail-safe. Empty dirs and shards from
                 # another prefix/world-size contract are ignored.
@@ -2200,6 +2232,9 @@ class FeatureStoreDeltaUploader:
         }
         _atomic_write_json(os.path.join(self._state_dir, "committed.json"), committed)
         self._committed_global_step = global_step
+        # Committed under the condition lock: later polls never re-read this
+        # step's success marker, manifest, or canonical shard schemas again.
+        self._reconciled_steps.add(global_step)
 
         logger.info(
             "FeatureStore delta upload committed: step=%s version=%s records=%s ts=%s",

@@ -1601,6 +1601,157 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             self.assertEqual(len(view.calls), 1)
             self.assertEqual([item["key_id"] for item in view.calls[0]["data"]], [1, 2])
 
+    def test_commit_marks_step_reconciled_for_later_polls(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
+            uploader = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            uploader.start()
+            uploader.submit(10)
+            uploader.close()
+
+            self.assertIn(10, uploader._reconciled_steps)
+            load_calls = 0
+            original_load = uploader._load_success_state
+
+            def counting_load(step):
+                nonlocal load_calls
+                load_calls += 1
+                return original_load(step)
+
+            with mock.patch.object(
+                uploader, "_load_success_state", side_effect=counting_load
+            ):
+                for _ in range(3):
+                    with uploader._condition:
+                        uploader._add_discovered_steps_locked()
+
+            # The committed step was reconciled at commit time, so repeated
+            # polls never re-read its success marker or manifest again.
+            self.assertEqual(load_calls, 0)
+            self.assertEqual(uploader._pending, {})
+
+    def test_inherited_committed_step_is_reconciled_exactly_once(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
+            first = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            first.start()
+            first.submit(10)
+            first.close()
+
+            # A fresh process starts with no reconciled history.
+            uploader = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            load_calls = 0
+            generation_calls = 0
+            original_load = uploader._load_success_state
+            original_generation = uploader._canonical_dump_generation
+
+            def counting_load(step):
+                nonlocal load_calls
+                load_calls += 1
+                return original_load(step)
+
+            def counting_generation(step):
+                nonlocal generation_calls
+                generation_calls += 1
+                return original_generation(step)
+
+            with (
+                mock.patch.object(
+                    uploader, "_load_success_state", side_effect=counting_load
+                ),
+                mock.patch.object(
+                    uploader,
+                    "_canonical_dump_generation",
+                    side_effect=counting_generation,
+                ),
+            ):
+                for _ in range(3):
+                    with uploader._condition:
+                        uploader._add_discovered_steps_locked()
+
+            self.assertEqual(load_calls, 1)
+            self.assertEqual(generation_calls, 1)
+            self.assertIn(10, uploader._reconciled_steps)
+            self.assertEqual(uploader._pending, {})
+
+    def test_committed_step_with_replaced_generation_stays_unreconciled(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
+            first = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            first.start()
+            first.submit(10)
+            first.close()
+
+            # Replace the committed step's canonical shard with a dump from a
+            # newer generation; discovery must keep checking it (the worker's
+            # replacement alarm relies on that) instead of reconciling it away.
+            _write_single_shard(
+                output_dir,
+                10,
+                [_row(10, 0, 1, [7.0, 8.0])],
+                generation="ffffffffffffffffffffffffffffffff",
+            )
+            uploader = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            with uploader._condition:
+                uploader._add_discovered_steps_locked()
+
+            self.assertNotIn(10, uploader._reconciled_steps)
+            self.assertIn(10, uploader._pending)
+
+    def test_discovery_finds_new_outbox_entries_incrementally(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            uploader = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            with uploader._condition:
+                uploader._add_discovered_steps_locked()
+            self.assertEqual(uploader._pending, {})
+
+            _write_single_shard(output_dir, 5, [_row(5, 0, 1, [1.0, 2.0])])
+            with uploader._condition:
+                uploader._add_discovered_steps_locked()
+            self.assertIn(5, uploader._pending)
+
     def test_dimension_and_finite_value_validation(self):
         with tempfile.TemporaryDirectory() as output_dir:
             bad_dimension = _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0])])
