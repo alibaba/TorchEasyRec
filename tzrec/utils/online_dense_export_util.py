@@ -127,6 +127,7 @@ class OnlineDenseExportManager:
         )
         # Covers an in-flight plus one pending task timeout during close() drain.
         self._close_timeout = 2 * self._export_timeout + 120.0
+        self._keep_logs = int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_LOGS", "3"))
 
         if not self._enabled:
             self._model_dir = os.path.abspath(model_dir)
@@ -266,6 +267,7 @@ class OnlineDenseExportManager:
 
     def _run_task(self, task: Dict[str, Any]) -> None:
         checkpoint_path = task["checkpoint_path"]
+        log_dir = os.path.join(self._model_dir, "dense_hot_export", "logs")
         try:
             if not os.path.exists(checkpoint_path):
                 logger.error(
@@ -301,7 +303,6 @@ class OnlineDenseExportManager:
                 task["version"],
                 checkpoint_path,
             )
-            log_dir = os.path.join(self._model_dir, "dense_hot_export", "logs")
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, f"{task['version']}.log")
             try:
@@ -335,3 +336,31 @@ class OnlineDenseExportManager:
         finally:
             self._ckpt_manager.unprotect_checkpoint(checkpoint_path)
             self._ckpt_manager.prune()
+            self._prune_export_logs(log_dir)
+
+    def _prune_export_logs(self, log_dir: str) -> None:
+        """Best-effort: keep the newest K export logs, drop the rest.
+
+        Each export attempt (success, timeout, or failure) writes one
+        ``<version>.log``; version retention never touches this directory, so
+        without this a long-running job accumulates one file/inode per
+        checkpoint including failed exports. Version names are timestamps, so
+        name order is chronological -- keep the newest K and remove the rest.
+
+        Args:
+            log_dir: Directory holding ``<version>.log`` files.
+        """
+        if self._keep_logs <= 0:
+            return
+        try:
+            entries = os.listdir(log_dir)
+        except FileNotFoundError:
+            return
+        logs = sorted(name for name in entries if name.endswith(".log"))
+        for name in logs[: -self._keep_logs]:
+            path = os.path.join(log_dir, name)
+            try:
+                os.remove(path)
+                logger.info("removed old dense export log: %s", path)
+            except OSError as e:
+                logger.warning("failed to remove old log %s: %s", path, e)

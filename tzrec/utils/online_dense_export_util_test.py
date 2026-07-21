@@ -330,6 +330,88 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             self.assertFalse(mgr._worker.is_alive())
             self.assertFalse(mgr._finalizer.alive)
 
+    def test_prune_export_logs_keeps_newest_k(self) -> None:
+        """Retain the newest K export logs; leave non-log files alone."""
+        with tempfile.TemporaryDirectory() as log_dir:
+            for v in (
+                "20260101000001",
+                "20260101000002",
+                "20260101000003",
+                "20260101000004",
+                "20260101000005",
+            ):
+                with open(os.path.join(log_dir, f"{v}.log"), "w") as f:
+                    f.write("x")
+            open(os.path.join(log_dir, "notes.txt"), "w").close()
+            with mock.patch.dict(os.environ, {"ONLINE_DENSE_EXPORT_KEEP_LOGS": "3"}):
+                mgr = OnlineDenseExportManager(
+                    model_dir="/tmp/tzrec_unused_model_dir",
+                    pipeline_config_path="/tmp/tzrec_unused_pipeline.config",
+                    ckpt_manager=mock.Mock(),
+                )
+            mgr._prune_export_logs(log_dir)
+            self.assertEqual(
+                sorted(os.listdir(log_dir)),
+                [
+                    "20260101000003.log",
+                    "20260101000004.log",
+                    "20260101000005.log",
+                    "notes.txt",
+                ],
+            )
+
+    def test_run_task_prunes_old_logs(self) -> None:
+        """_run_task prunes old export logs after each attempt."""
+        ckpt = mock.Mock()
+        done = threading.Event()
+
+        def fake_run(cmd, **kwargs):
+            done.set()
+
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "ONLINE_DENSE_EXPORT_KEEP_LOGS": "2",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_dir = os.path.join(tmp_dir, "dense_hot_export", "logs")
+            os.makedirs(log_dir)
+            for v in (
+                "20260101000001",
+                "20260101000002",
+                "20260101000003",
+            ):
+                open(os.path.join(log_dir, f"{v}.log"), "w").close()
+            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
+            os.makedirs(ckpt_path)
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch(
+                    "tzrec.utils.online_dense_export_util.subprocess.run",
+                    side_effect=fake_run,
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    ckpt_manager=ckpt,
+                )
+                try:
+                    mgr.submit(1, ckpt_path, 1.0)
+                    self.assertTrue(done.wait(timeout=10))
+                finally:
+                    mgr.close()
+            remaining = sorted(f for f in os.listdir(log_dir) if f.endswith(".log"))
+            # the new attempt's log plus the single newest old log survive
+            self.assertEqual(len(remaining), 2)
+            self.assertIn("20260101000003.log", remaining)
+            self.assertNotIn("20260101000001.log", remaining)
+            self.assertNotIn("20260101000002.log", remaining)
+
     def test_init_rejects_remote_model_dir(self) -> None:
         """Remote (fsspec-URL) model_dir must fail fast, not silently no-op."""
         ckpt = mock.Mock()
