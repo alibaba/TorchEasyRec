@@ -53,6 +53,21 @@ def _publish_current(current_path: str, payload: Dict[str, Any]) -> None:
     _atomic_write_json(current_path, payload)
 
 
+def _read_current_version(current_path: str) -> Optional[str]:
+    """Return the version current.json points at, or None if absent/unreadable.
+
+    Best-effort: a missing or corrupt current.json means there is no live
+    pointer to spare, so pruning falls back to pure newest-K retention.
+    """
+    try:
+        with open(current_path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        logger.warning("could not read current version from %s: %s", current_path, e)
+        return None
+    return data.get("version") if isinstance(data, dict) else None
+
+
 def _max_kept_versions() -> int:
     """Max published dense versions to retain (0 = keep all)."""
     return int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_VERSIONS", "3"))
@@ -62,9 +77,13 @@ def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
     """Best-effort retention: keep the newest K versions, sweep stale tmp artifacts.
 
     Serving reads current.json (the newest pointer) and needs the previous
-    version for an atomic swap, so K defaults to 3. Stale ``*.tmp.<pid>``
-    dirs and current.json.tmp.<pid> files left by crashed exports are swept
-    so they don't accumulate under the serving-facing tree.
+    version for an atomic swap, so K defaults to 3. The version current.json
+    points at is always spared even when it sorts outside the newest K: an
+    explicit --version or clock rollback after a restart can publish an older
+    timestamp, and deleting it would leave the serving pointer referencing a
+    missing directory. Stale ``*.tmp.<pid>`` dirs and current.json.tmp.<pid>
+    files left by crashed exports are swept so they don't accumulate under the
+    serving-facing tree.
     """
     max_versions = _max_kept_versions()
     for base in (versions_root, export_root):
@@ -90,12 +109,15 @@ def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
         entries = os.listdir(versions_root)
     except FileNotFoundError:
         return
+    current_version = _read_current_version(os.path.join(export_root, CURRENT_JSON))
     version_dirs = sorted(
         os.path.join(versions_root, name)
         for name in entries
         if os.path.isdir(os.path.join(versions_root, name))
     )
     for path in version_dirs[:-max_versions]:
+        if os.path.basename(path) == current_version:
+            continue
         try:
             shutil.rmtree(path)
             logger.info("removed old dense export version: %s", path)

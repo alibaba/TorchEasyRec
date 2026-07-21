@@ -21,7 +21,11 @@ from unittest import mock
 
 from tzrec.models.match_model import MatchModel
 from tzrec.models.tdm import TDM
-from tzrec.tools.online_dense_export import export_online_dense_model
+from tzrec.tools.online_dense_export import (
+    CURRENT_JSON,
+    _prune_old_dense_versions,
+    export_online_dense_model,
+)
 
 
 class OnlineDenseExportTest(unittest.TestCase):
@@ -198,6 +202,50 @@ class OnlineDenseExportTest(unittest.TestCase):
             )
             self.assertFalse(
                 os.path.exists(os.path.join(export_root, "current.json.tmp.9999"))
+            )
+
+    def test_prune_spare_current_version_when_oldest(self) -> None:
+        """current.json's version is never pruned, even when it sorts oldest."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            export_root = os.path.join(tmp_dir, "dense_hot_export")
+            versions_root = os.path.join(export_root, "versions")
+            os.makedirs(versions_root)
+            for v in (
+                "20260101000001",
+                "20260101000002",
+                "20260101000003",
+                "20260101000004",
+            ):
+                os.makedirs(os.path.join(versions_root, v))
+            # explicit --version (or clock rollback) publishes an OLDER
+            # timestamp than every on-disk version
+            published = "20200101000000"
+            os.makedirs(os.path.join(versions_root, published))
+            with open(os.path.join(export_root, CURRENT_JSON), "w") as f:
+                json.dump({"version": published}, f)
+
+            with mock.patch.dict(
+                os.environ,
+                {"ONLINE_DENSE_EXPORT_KEEP_VERSIONS": "2"},
+                clear=False,
+            ):
+                _prune_old_dense_versions(export_root, versions_root)
+
+            # the published (oldest) version survives despite KEEP=2
+            self.assertTrue(os.path.isdir(os.path.join(versions_root, published)))
+            # the two newest on-disk versions survive
+            self.assertTrue(
+                os.path.isdir(os.path.join(versions_root, "20260101000003"))
+            )
+            self.assertTrue(
+                os.path.isdir(os.path.join(versions_root, "20260101000004"))
+            )
+            # older non-current versions are pruned
+            self.assertFalse(
+                os.path.isdir(os.path.join(versions_root, "20260101000001"))
+            )
+            self.assertFalse(
+                os.path.isdir(os.path.join(versions_root, "20260101000002"))
             )
 
     def test_rejects_match_model_and_tdm(self) -> None:
