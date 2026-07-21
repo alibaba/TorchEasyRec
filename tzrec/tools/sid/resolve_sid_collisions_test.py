@@ -73,6 +73,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             reader_type=None,
             writer_type=None,
             batch_size=100000,
+            progress_interval=1_000_000,
             item_id_field="item_id",
             code_field="codes",
             candidate_codes_field="candidate_codes",
@@ -484,6 +485,67 @@ class ResolveSidCollisionsTest(unittest.TestCase):
 
     # ---- misc ----
 
+    def test_io_large_loops_report_sample_progress(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(
+            inp,
+            list(range(8)),
+            [[0, 0]] * 8,
+            [[[0, 1], [0, 2], [0, 3]]] * 8,
+        )
+        progress_by_description = {}
+
+        def make_progress(description, **_kwargs):
+            progress = mock.Mock()
+            progress_by_description.setdefault(description, []).append(progress)
+            return progress
+
+        with (
+            mock.patch.object(
+                resolve_sid_collisions,
+                "ProgressLogger",
+                side_effect=make_progress,
+            ),
+            mock.patch.object(resolve_sid_collisions, "_MAP_WRITE_ROWS", 2),
+            mock.patch.object(resolve_sid_collisions, "_GROUP_WRITE_ITEMS", 2),
+        ):
+            self._run(
+                inp,
+                out,
+                batch_size=2,
+                progress_interval=3,
+                include_original=True,
+                max_items_per_codebook=2,
+            )
+
+        expected_progress = [
+            mock.call(4, suffix="4 samples processed"),
+            mock.call(8, suffix="8 samples processed"),
+        ]
+        self.assertEqual(
+            progress_by_description["Reading SID input"][0].log.call_args_list,
+            expected_progress,
+        )
+        candidate_calls = progress_by_description["Scanning candidate input"][
+            0
+        ].log.call_args_list
+        self.assertEqual(candidate_calls, expected_progress)
+        for description in (
+            "Writing resolved item map",
+            "Writing resolved SID item groups",
+        ):
+            self.assertEqual(
+                progress_by_description[description][0].log.call_args_list,
+                expected_progress,
+            )
+        self.assertEqual(
+            progress_by_description["Writing original SID item groups"][
+                0
+            ].log.call_args_list,
+            [mock.call(8, suffix="8 samples processed")],
+        )
+
     @parameterized.expand(
         [
             (
@@ -559,6 +621,11 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertIsNone(config.output_path)
         self.assertIsNone(config.original_sid_groups_output_path)
         self.assertIsNone(config.resolved_sid_groups_output_path)
+        self.assertEqual(config.progress_interval, 1_000_000)
+
+    def test_rejects_invalid_progress_interval(self) -> None:
+        with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
+            self._runner("input", "map", progress_interval=0)
 
     @parameterized.expand(
         [

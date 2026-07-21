@@ -66,7 +66,7 @@ from tzrec.datasets.dataset import (
     create_writer,
 )
 from tzrec.datasets.odps_dataset import _parse_table_path
-from tzrec.utils.logging_util import logger
+from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.sid.collision import (
     CodebookItemGrouping,
     CollisionPlan,
@@ -158,6 +158,7 @@ class ResolveSidCollisionsConfig:
     reader_type: Optional[str]
     writer_type: Optional[str]
     batch_size: int
+    progress_interval: int
     item_id_field: str
     code_field: str
     candidate_codes_field: str
@@ -171,6 +172,10 @@ class ResolveSidCollisionsConfig:
     def __post_init__(self) -> None:
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}.")
+        if self.progress_interval < 1:
+            raise ValueError(
+                f"progress_interval must be >= 1, got {self.progress_interval}."
+            )
         if self.random_num_candidates < 1:
             raise ValueError(
                 f"random_num_candidates must be >= 1, got {self.random_num_candidates}."
@@ -231,6 +236,7 @@ class ResolveSidCollisionsConfig:
             reader_type=args.reader_type,
             writer_type=args.writer_type,
             batch_size=args.batch_size,
+            progress_interval=args.progress_interval,
             item_id_field=args.item_id_field,
             code_field=args.code_field,
             candidate_codes_field=args.candidate_codes_field,
@@ -261,9 +267,14 @@ class CollisionResolutionRunner:
         self._config = config
         self._resolver: CollisionResolver
         if self._config.strategy == "random":
-            self._resolver = RandomCollisionResolver(self._config.random_num_candidates)
+            self._resolver = RandomCollisionResolver(
+                self._config.random_num_candidates,
+                progress_interval=self._config.progress_interval,
+            )
         else:
-            self._resolver = KnnCollisionResolver()
+            self._resolver = KnnCollisionResolver(
+                progress_interval=self._config.progress_interval
+            )
         self._default_writer_type: Optional[str] = None
         self._item_id_type: Optional[pa.DataType] = None
 
@@ -309,6 +320,12 @@ class CollisionResolutionRunner:
             reader_type=self._config.reader_type,
             quota_name=self._config.odps_data_quota_name,
         )
+
+    def _progress_interval_reached(
+        self, processed: int, last_progress_count: int
+    ) -> bool:
+        """Return whether enough samples passed since the last progress update."""
+        return processed - last_progress_count >= self._config.progress_interval
 
     @staticmethod
     def _codes_matrix(values: pa.Array) -> np.ndarray:
@@ -370,6 +387,9 @@ class CollisionResolutionRunner:
         self._default_writer_type = self._config.writer_type or (
             reader.__class__.__name__.replace("Reader", "Writer")
         )
+        progress = ProgressLogger("Reading SID input", start_n=0)
+        read_rows = 0
+        last_progress_count = 0
         id_chunks: List[np.ndarray] = []
         code_chunks: List[np.ndarray] = []
         for batch in reader.to_batches():
@@ -377,6 +397,11 @@ class CollisionResolutionRunner:
             self._validate_item_ids(item_ids)
             id_chunks.append(item_ids.to_numpy(zero_copy_only=False))
             code_chunks.append(self._codes_matrix(batch[self._config.code_field]))
+            batch_rows = len(item_ids)
+            read_rows += batch_rows
+            if self._progress_interval_reached(read_rows, last_progress_count):
+                progress.log(read_rows, suffix=f"{read_rows} samples processed")
+                last_progress_count = read_rows
 
         if not id_chunks:
             raise ValueError("SID input is empty.")
@@ -423,12 +448,23 @@ class CollisionResolutionRunner:
         seen = np.zeros(item_count, dtype=bool)
         field = self._config.candidate_codes_field
         reader = self._make_reader([self._config.item_id_field, field])
+        scanned_items = 0
+        last_progress_count = 0
+        progress = ProgressLogger("Scanning candidate input", start_n=0)
         for batch in reader.to_batches():
             if field not in batch:
                 raise ValueError(
                     f"candidate_codes field {field!r} is missing from an input batch."
                 )
             batch_ids = batch[self._config.item_id_field].to_numpy(zero_copy_only=False)
+            batch_items = batch_ids.shape[0]
+            scanned_items += batch_items
+            if self._progress_interval_reached(scanned_items, last_progress_count):
+                progress.log(
+                    scanned_items,
+                    suffix=f"{scanned_items} samples processed",
+                )
+                last_progress_count = scanned_items
             source_rows, target_rows = item_id_lookup.match(batch_ids)
             if source_rows.size == 0:
                 continue
@@ -553,6 +589,8 @@ class CollisionResolutionRunner:
         with closing(self._make_writer(output_path)) as writer:
             is_csv = isinstance(writer, CsvWriter)
             output_count = item_ids.shape[0]
+            progress = ProgressLogger("Writing resolved item map", start_n=0)
+            last_progress_count = 0
             write_chunk = _MAP_WRITE_ROWS
             if not is_csv:
                 write_chunk = min(
@@ -577,6 +615,9 @@ class CollisionResolutionRunner:
                         ),
                     }
                 )
+                if self._progress_interval_reached(end, last_progress_count):
+                    progress.log(end, suffix=f"{end} samples processed")
+                    last_progress_count = end
 
     def _write_group_outputs(
         self,
@@ -607,6 +648,7 @@ class CollisionResolutionRunner:
                 origin_codes,
                 original_grouping,
                 resolved_last_codes=None,
+                progress_description="Writing original SID item groups",
             )
 
         if plan.overflow_rows.size:
@@ -622,6 +664,7 @@ class CollisionResolutionRunner:
             origin_codes,
             grouping,
             resolved_last_codes=resolved_last_codes,
+            progress_description="Writing resolved SID item groups",
         )
 
     def _write_sid_groups(
@@ -631,6 +674,7 @@ class CollisionResolutionRunner:
         origin_codes: np.ndarray,
         grouping: CodebookItemGrouping,
         resolved_last_codes: Optional[np.ndarray],
+        progress_description: str,
     ) -> None:
         """Write codebook-to-item-ID groups in SID and slot order.
 
@@ -641,6 +685,7 @@ class CollisionResolutionRunner:
             grouping: Sorted SID groups and their flattened original row order.
             resolved_last_codes: Final last-layer values, or ``None`` when
                 writing original SIDs.
+            progress_description: Description identifying the group output.
 
         Raises:
             ValueError: If one group exceeds Arrow list offset capacity.
@@ -652,6 +697,8 @@ class CollisionResolutionRunner:
         offsets = grouping.offsets
         with closing(self._make_writer(output_path)) as writer:
             is_csv = isinstance(writer, CsvWriter)
+            progress = ProgressLogger(progress_description, start_n=0)
+            last_progress_count = 0
             max_codebook_rows = (
                 group_count
                 if is_csv
@@ -686,6 +733,12 @@ class CollisionResolutionRunner:
                     }
                 )
                 group_start = group_end
+                if self._progress_interval_reached(child_end, last_progress_count):
+                    progress.log(
+                        child_end,
+                        suffix=f"{child_end} samples processed",
+                    )
+                    last_progress_count = child_end
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -727,6 +780,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output writer; defaults to matching the input reader.",
     )
     parser.add_argument("--batch_size", type=int, default=100000)
+    parser.add_argument(
+        "--progress_interval",
+        type=int,
+        default=1_000_000,
+        help="Number of processed samples between progress checks.",
+    )
     parser.add_argument("--item_id_field", default="item_id")
     parser.add_argument("--code_field", default="codes")
     parser.add_argument(

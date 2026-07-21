@@ -21,6 +21,8 @@ from typing import Iterable, Optional
 
 import numpy as np
 
+from tzrec.utils.logging_util import ProgressLogger
+
 _INT64_MAX = int(np.iinfo(np.int64).max)
 _MASK64 = (1 << 64) - 1
 _SEED = 2026
@@ -161,7 +163,18 @@ class CodebookItemGrouping:
 
 
 class CollisionResolver(ABC):
-    """Interface for best-effort SID collision-resolution strategies."""
+    """Interface for best-effort SID collision-resolution strategies.
+
+    Args:
+        progress_interval: Number of overflow rows between progress checks.
+    """
+
+    def __init__(self, progress_interval: int = 1_000_000) -> None:
+        if progress_interval < 1:
+            raise ValueError(
+                f"progress_interval must be >= 1, got {progress_interval}."
+            )
+        self._progress_interval = progress_interval
 
     @abstractmethod
     def resolve(
@@ -363,6 +376,8 @@ class CollisionResolver(ABC):
         relocated_count = 0
         unresolved_rows = []
         get_slot_count = slot_counts.get
+        progress = ProgressLogger("Resolving collision overflow", start_n=0)
+        processed_count = 0
 
         for row, key_prefix, origin_last_code, candidate_row in zip(
             plan.overflow_rows.tolist(),
@@ -388,6 +403,13 @@ class CollisionResolver(ABC):
                 origin_count = get_slot_count(origin_key, 0) + 1
                 slot_counts[origin_key] = origin_count
                 slot_indices[row] = origin_count
+
+            processed_count += 1
+            if processed_count % self._progress_interval == 0:
+                progress.log(
+                    processed_count,
+                    suffix=f"{processed_count} samples processed",
+                )
 
         (
             final_bucket_keys,
@@ -464,9 +486,15 @@ class RandomCollisionResolver(CollisionResolver):
     Args:
         num_candidates: Positive number of raw candidate draws per overflow
             row, capped at one less than the final-layer cardinality.
+        progress_interval: Number of overflow rows between progress checks.
     """
 
-    def __init__(self, num_candidates: int) -> None:
+    def __init__(
+        self,
+        num_candidates: int,
+        progress_interval: int = 1_000_000,
+    ) -> None:
+        super().__init__(progress_interval)
         if num_candidates < 1:
             raise ValueError(f"num_candidates must be >= 1, got {num_candidates}.")
         self._num_candidates = num_candidates

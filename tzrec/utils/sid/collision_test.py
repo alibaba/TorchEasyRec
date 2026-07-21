@@ -45,6 +45,29 @@ def _assert_same_assignments(test_case, actual, expected):
 
 
 class CollisionTest(unittest.TestCase):
+    def test_resolution_loop_reports_sample_progress(self) -> None:
+        plan = _plan(
+            (5,),
+            1,
+            [0, 1, 2, 3, 4],
+            [[0], [0], [0], [0], [0]],
+        )
+        candidates = np.asarray([[1], [2], [3], [4]], dtype=np.int64)
+        with mock.patch.object(collision, "ProgressLogger") as progress_cls:
+            KnnCollisionResolver(progress_interval=3).resolve(plan, candidates)
+
+        progress_cls.assert_called_once_with("Resolving collision overflow", start_n=0)
+        self.assertEqual(
+            progress_cls.return_value.log.call_args_list,
+            [mock.call(3, suffix="3 samples processed")],
+        )
+
+    def test_resolvers_reject_invalid_progress_interval(self) -> None:
+        with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
+            KnnCollisionResolver(progress_interval=0)
+        with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
+            RandomCollisionResolver(num_candidates=1, progress_interval=0)
+
     def test_golden_candidate_resolution(self) -> None:
         item_ids = np.arange(10, dtype=np.int64)
         # 4 items in bucket (0,0), 1 in (0,1), 2 in (0,2), 3 in (1,0).
