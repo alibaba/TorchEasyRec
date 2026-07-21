@@ -113,13 +113,15 @@ jobs:
             scripts/ci
           path: trusted-claude
 
-      # Checkout PR code for review
+      # Checkout PR code for review. Fork checkout is intentional here: trusted
+      # agent files come from github.sha above and the model runs sandboxed.
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
           path: pr-code
+          allow-unsafe-pr-checkout: true
 
       - name: Use trusted agent files
         run: bash trusted-claude/scripts/ci/use_trusted_agent_files.sh trusted-claude pr-code
@@ -178,13 +180,15 @@ jobs:
             scripts/ci
           path: trusted-claude
 
-      # Checkout PR code for review
+      # Checkout PR code for review. Fork checkout is intentional here: trusted
+      # agent files come from github.sha above and the model runs sandboxed.
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
           path: pr-code
+          allow-unsafe-pr-checkout: true
 
       # Same trusted-file setup as the claude job, plus generated codex agents as an overlay
       - name: Use trusted agent files
