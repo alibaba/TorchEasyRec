@@ -61,8 +61,8 @@ class CollisionResolutionConfig:
 class CollisionPlan:
     """Compact grouping plan consumed by collision resolution.
 
-    The plan stores full-length last-code, dense bucket-ID, and index arrays,
-    plus only the overflow-aligned identity and ordering data needed by
+    The plan stores full-length last codes, dense row-to-bucket and slot index
+    arrays, plus only the overflow-aligned identity and ordering data needed by
     candidate loading. It deliberately does not retain the full input code
     matrix.
 
@@ -77,7 +77,7 @@ class CollisionPlan:
         initial_slot_indices: One-based rank of each row within its origin
             bucket in deterministic (hash) order, int64 shape ``(item_count,)``
             in original row order.
-        bucket_keys: Flattened SID key ``band_id * last_size + last_code``
+        bucket_keys: Flattened SID key ``prefix_key * last_size + last_code``
             for every occupied bucket, int64 shape ``(num_buckets,)`` indexed by
             bucket index (the values in ``origin_bucket_indices``) and ascending.
         bucket_counts: Item count of every bucket before capacity capping,
@@ -87,7 +87,7 @@ class CollisionPlan:
             processing order.
         overflow_item_ids: Item IDs of ``overflow_rows``, aligned with it.
         overflow_bucket_key_prefixes: The prefix part of each overflow row's
-            bucket key (``band_id * last_size``), so
+            bucket key (``prefix_key * last_size``), so
             ``prefix + candidate_last_code`` is the destination bucket key within
             the same band; int64 aligned with ``overflow_rows``.
         overflow_origin_last_codes: Origin last-layer code of each overflow row
@@ -293,29 +293,21 @@ class CollisionResolver(ABC):
         final_bucket_counts = np.empty(0, dtype=np.int64)
         untouched_mask = ~in_overflow_band
         untouched_counts = initial_counts[untouched_mask]
+        band_counts = np.fromiter(
+            slot_counts.values(), dtype=np.int64, count=len(slot_counts)
+        )
+        collision_count = int((band_counts > capacity).sum())
+        max_untouched = int(untouched_counts.max()) if untouched_counts.size else 0
+        max_band = int(band_counts.max()) if band_counts.size else 0
+        max_bucket_size = max(max_untouched, max_band)
         if collect_grouping:
             untouched_keys = plan.bucket_keys[untouched_mask]
             band_keys = np.fromiter(slot_counts, dtype=np.int64, count=len(slot_counts))
-            band_counts = np.fromiter(
-                slot_counts.values(), dtype=np.int64, count=len(slot_counts)
-            )
             all_keys = np.concatenate((untouched_keys, band_keys))
             all_counts = np.concatenate((untouched_counts, band_counts))
-            collision_count = int((all_counts > capacity).sum())
-            max_bucket_size = int(all_counts.max()) if all_counts.size else 0
             occupancy_order = np.argsort(all_keys, kind="stable")
             final_bucket_keys = all_keys[occupancy_order]
             final_bucket_counts = all_counts[occupancy_order]
-        else:
-            # Untouched buckets never exceed capacity. Iterate the scoped map
-            # directly to skip the grouping arrays and sort in rate-only runs.
-            collision_count = 0
-            max_band = 0
-            for count in slot_counts.values():
-                collision_count += count > capacity
-                max_band = max(max_band, count)
-            max_untouched = int(untouched_counts.max()) if untouched_counts.size else 0
-            max_bucket_size = max(max_untouched, max_band)
         return final_bucket_keys, final_bucket_counts, collision_count, max_bucket_size
 
     def _resolve_first_fit(
@@ -584,7 +576,7 @@ def stable_order_hash(item_ids: np.ndarray) -> np.ndarray:
 
 
 def _band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
-    """Return a dense integer ID for each prefix band."""
+    """Return the mixed-radix prefix key for each row."""
     row_count, layer_count = codes.shape
     if layer_count == 1:
         return np.zeros(row_count, dtype=np.int64)
@@ -592,7 +584,7 @@ def _band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
     for layer in range(1, layer_count - 1):
         keys *= layer_sizes[layer]
         keys += codes[:, layer]
-    return np.unique(keys, return_inverse=True)[1].astype(np.int64, copy=False)
+    return keys
 
 
 def _within_bucket_rank(

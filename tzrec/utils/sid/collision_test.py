@@ -363,6 +363,17 @@ class CollisionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "int64"):
             CollisionResolutionConfig((2**32, 2**32), 1)
 
+    def test_band_key_near_int64_limit(self) -> None:
+        layer_size = 3_037_000_499
+        plan = _plan(
+            (layer_size, layer_size),
+            1,
+            [0],
+            [[layer_size - 1, layer_size - 1]],
+        )
+
+        np.testing.assert_array_equal(plan.bucket_keys, [layer_size**2 - 1])
+
     def test_grouping_includes_untouched_bands(self) -> None:
         plan = _plan(
             (3, 4), 2, [0, 1, 2, 3, 4], [[0, 0], [0, 0], [0, 0], [1, 0], [2, 1]]
@@ -384,36 +395,31 @@ class CollisionTest(unittest.TestCase):
         )
         self.assertEqual(rate_only.stats, result.stats)
 
-    def test_three_layer_band_fold_and_relocation(self) -> None:
-        # Band = (code_0, code_1) via a mixed-radix fold with middle radix 3.
-        # Items 0-2 share band (0, 0); item 3 sits at (0, 2) and item 4 at
-        # (1, 0) -- distinct bands (raw 2 vs 3). A too-small middle radix would
-        # fold both to 2 and merge them; dropping the middle layer would merge
-        # item 3 into band (0, 0). Either regression changes the partition below.
+    def test_three_layer_sparse_band_relocation(self) -> None:
         plan = _plan(
             (2, 3, 4),
             2,
             [0, 1, 2, 3, 4],
-            [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 2, 0], [1, 0, 0]],
+            [[0, 2, 0], [0, 2, 0], [0, 2, 0], [0, 0, 0], [1, 0, 0]],
         )
-        # Band (0, 0) holds exactly 3 items (not 4): the middle code kept item 3
-        # in its own bucket (key 4) distinct from items 0-2 (key 0).
-        np.testing.assert_array_equal(plan.bucket_keys, [0, 4, 8])
-        np.testing.assert_array_equal(plan.bucket_counts, [3, 1, 1])
+        np.testing.assert_array_equal(plan.bucket_keys, [0, 8, 12])
+        np.testing.assert_array_equal(plan.bucket_counts, [1, 3, 1])
+        np.testing.assert_array_equal(plan.overflow_bucket_key_prefixes, [8])
 
         result = KnnCollisionResolver().resolve(
             plan, np.asarray([[1, 2, 3]], dtype=np.int64)
         )
 
-        # The single overflow item relocates within band (0, 0) -- only its last
-        # code changes -- and the two non-overflow bands stay put.
         self.assertEqual(result.stats.relocated_count, 1)
         self.assertEqual(result.stats.unresolved_count, 0)
         self.assertEqual(int(result.resolved_last_codes.sum()), 1)
         self.assertEqual(result.resolved_last_codes[3], 0)
         self.assertEqual(result.resolved_last_codes[4], 0)
-        np.testing.assert_array_equal(result.final_bucket_keys, [0, 1, 4, 8])
-        np.testing.assert_array_equal(result.final_bucket_counts, [2, 1, 1, 1])
+        np.testing.assert_array_equal(result.final_bucket_keys, [0, 8, 9, 12])
+        np.testing.assert_array_equal(result.final_bucket_counts, [1, 2, 1, 1])
+        grouping = build_resolved_item_grouping(plan, result)
+        np.testing.assert_array_equal(grouping.sid_keys, result.final_bucket_keys)
+        np.testing.assert_array_equal(grouping.counts, result.final_bucket_counts)
 
     def test_rate_only_matches_grouping_with_unplaceable(self) -> None:
         # One unplaceable overflow (its only candidate equals the origin) keeps
