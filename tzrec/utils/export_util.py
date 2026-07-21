@@ -20,6 +20,7 @@ import tempfile
 from collections import OrderedDict, defaultdict
 from queue import Queue
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import numpy as np
 import torch
@@ -1780,6 +1781,33 @@ def _run_dense_graph_sanity_check(
         gm(sanity_data, device)
 
 
+def _isolate_kafka_export_group(input_path: str) -> str:
+    """Rewrite a kafka URI's group.id to an export-isolated group.
+
+    The dense export reads one warm-up batch from the input. When that input
+    is the live training Kafka topic, subscribing with the training group.id
+    would join the training consumer group and rebalance it on every export.
+    Swap group.id to an isolated export group so the training group is never
+    disturbed; non-kafka inputs are returned unchanged.
+
+    Args:
+        input_path: Original input path, possibly a kafka:// URI.
+
+    Returns:
+        input_path with the kafka group.id replaced by an isolated export
+        group, or the input unchanged for non-kafka URIs.
+    """
+    parsed = urlparse(input_path)
+    if parsed.scheme != "kafka":
+        return input_path
+    params = dict(parse_qsl(parsed.query))
+    gid = params.get("group.id")
+    if not gid:
+        return input_path
+    params["group.id"] = f"{gid}__dense_export"
+    return urlunparse(parsed._replace(query=urlencode(params)))
+
+
 def export_dense_model_cpu(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
@@ -1812,6 +1840,9 @@ def export_dense_model_cpu(
     input_path = data_input_path or pipeline_config.train_input_path
     if not input_path:
         raise ValueError("data input path should be specified.")
+    if data_input_path is None:
+        # isolate the export's Kafka group when falling back to train_input_path
+        input_path = _isolate_kafka_export_group(input_path)
     data_config = copy.deepcopy(pipeline_config.data_config)
     data_config.num_workers = 1
     features = cast(List[BaseFeature], model.features)

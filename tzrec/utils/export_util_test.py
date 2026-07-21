@@ -46,6 +46,7 @@ from tzrec.utils.export_util import (
     _get_dense_embedding_leaf_module_names,
     _get_sparse_embedding_tensor,
     _infer_keyed_tensor_attrs_from_module,
+    _isolate_kafka_export_group,
     _merge_sharded_embedding_json,
     _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
@@ -785,6 +786,27 @@ class ExportUtilTest(unittest.TestCase):
         mc_like._embedding_module = ebc
         self.assertEqual(
             _infer_keyed_tensor_attrs_from_module(mc_like), (keys, length_per_key)
+        )
+
+    def test_isolate_kafka_export_group_swaps_group_id(self) -> None:
+        """Isolate the export Kafka consumer from the live training group."""
+        from tzrec.datasets.kafka_dataset import _parse_kafka_uri
+
+        uri = "kafka://broker:9092/topic?group.id=training&auto.offset.reset=earliest"
+        isolated = _isolate_kafka_export_group(uri)
+        topic, params, _ = _parse_kafka_uri(isolated)
+        self.assertEqual(topic, "topic")
+        self.assertEqual(params["group.id"], "training__dense_export")
+        self.assertEqual(params.get("auto.offset.reset"), "earliest")
+        # non-kafka inputs pass through unchanged
+        self.assertEqual(
+            _isolate_kafka_export_group("hdfs://path/to/file"),
+            "hdfs://path/to/file",
+        )
+        # kafka without group.id is left untouched
+        self.assertEqual(
+            _isolate_kafka_export_group("kafka://broker:9092/topic?foo=bar"),
+            "kafka://broker:9092/topic?foo=bar",
         )
 
     def test_export_dense_model_cpu_end_to_end(self) -> None:
