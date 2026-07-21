@@ -273,6 +273,63 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             self.assertFalse(worker.is_alive())
             self.assertFalse(mgr._finalizer.alive)
 
+    def test_close_timeout_covers_two_task_timeouts(self) -> None:
+        """_close_timeout must cover an in-flight plus a pending task."""
+        with mock.patch.dict(os.environ, {"ONLINE_DENSE_EXPORT_TIMEOUT": "200"}):
+            mgr = OnlineDenseExportManager(
+                model_dir="/tmp/tzrec_unused_model_dir",
+                pipeline_config_path="/tmp/tzrec_unused_pipeline.config",
+                ckpt_manager=mock.Mock(),
+            )
+        self.assertGreaterEqual(mgr._close_timeout, 2 * mgr._export_timeout)
+
+    def test_close_keeps_finalizer_when_worker_outlives_join(self) -> None:
+        """close() detaches the finalizer only after the worker stops."""
+        ckpt = mock.Mock()
+        started = threading.Event()
+        proceed = threading.Event()
+
+        def fake_run(cmd, **kwargs):
+            started.set()
+            proceed.wait(timeout=30)
+
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
+            os.makedirs(ckpt_path)
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch(
+                    "tzrec.utils.online_dense_export_util.subprocess.run",
+                    side_effect=fake_run,
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    ckpt_manager=ckpt,
+                )
+                try:
+                    mgr._close_timeout = 0.05  # force close to time out mid-task
+                    mgr.submit(1, ckpt_path, 1.0)
+                    self.assertTrue(started.wait(timeout=10))
+                    mgr.close()  # worker still in-flight; join times out
+                    self.assertTrue(mgr._worker.is_alive())
+                    # backstop must stay attached so atexit can still drain
+                    self.assertTrue(mgr._finalizer.alive)
+                finally:
+                    proceed.set()
+                    mgr._finalizer()
+            self.assertFalse(mgr._worker.is_alive())
+            self.assertFalse(mgr._finalizer.alive)
+
     def test_init_rejects_remote_model_dir(self) -> None:
         """Remote (fsspec-URL) model_dir must fail fast, not silently no-op."""
         ckpt = mock.Mock()

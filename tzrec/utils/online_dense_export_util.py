@@ -125,7 +125,8 @@ class OnlineDenseExportManager:
         self._export_timeout = float(
             os.environ.get("ONLINE_DENSE_EXPORT_TIMEOUT", "3600")
         )
-        self._close_timeout = self._export_timeout + 120.0
+        # Covers an in-flight plus one pending task timeout during close() drain.
+        self._close_timeout = 2 * self._export_timeout + 120.0
 
         if not self._enabled:
             self._model_dir = os.path.abspath(model_dir)
@@ -203,20 +204,26 @@ class OnlineDenseExportManager:
             self._ckpt_manager.prune()
 
     def close(self) -> None:
-        """Wait for in-flight and pending dense export tasks to finish."""
+        """Wait for in-flight and pending dense export tasks to finish.
+
+        Detach the finalizer only after the worker actually stops, so a worker
+        that outlives the close timeout keeps the atexit drain backstop
+        instead of leaking a live subprocess publisher.
+        """
         if self._worker is None:
             return
-        if self._finalizer is not None:
-            self._finalizer.detach()
         self._drain_event.set()
         with self._cond:
             self._cond.notify_all()
         self._worker.join(timeout=self._close_timeout)
         if self._worker.is_alive():
             logger.warning(
-                "online dense export worker did not finish within %ss",
+                "online dense export worker did not finish within %ss; "
+                "leaving finalizer attached as a drain backstop",
                 self._close_timeout,
             )
+        elif self._finalizer is not None:
+            self._finalizer.detach()
 
     @staticmethod
     def _drain_worker(
