@@ -16,6 +16,7 @@ import unittest
 from collections import Counter
 from unittest import mock
 
+import numpy as np
 import pyarrow as pa
 from parameterized import parameterized
 from pyarrow import csv, parquet
@@ -25,12 +26,21 @@ from tzrec.tools.sid.resolve_sid_collisions import (
     CollisionResolutionRunner,
     ResolveSidCollisionsConfig,
 )
+from tzrec.utils.sid.collision import stable_order_hash
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
-def _parquet(path, item_ids, codes, candidate_codes=None):
+def _parquet(
+    path,
+    item_ids,
+    codes,
+    candidate_codes=None,
+    item_id_type=None,
+):
+    if item_id_type is None:
+        item_id_type = pa.int64()
     cols = {
-        "item_id": pa.array(item_ids, type=pa.int64()),
+        "item_id": pa.array(item_ids, type=item_id_type),
         "codes": pa.array(codes, type=pa.list_(pa.int64())),
     }
     if candidate_codes is not None:
@@ -824,12 +834,91 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SID input is empty"):
             self._run(inp, out, max_items_per_codebook=2)
 
-    def test_duplicate_item_id_raises(self) -> None:
+    @parameterized.expand(
+        [("same_batch", 100000), ("across_batches", 1)],
+        name_func=parameterized_name_func,
+    )
+    def test_candidate_tolerates_duplicate_item_ids(
+        self, _case_name, batch_size
+    ) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
-        _parquet(inp, [0, 1, 1], [[0, 0], [0, 1], [0, 2]])
-        with self.assertRaisesRegex(ValueError, "item IDs must be unique"):
-            self._run(inp, out, max_items_per_codebook=2)
+        distinct_ids = np.asarray(["a", "b"], dtype=object)
+        hash_order = np.argsort(stable_order_hash(distinct_ids))
+        keeper = distinct_ids[hash_order[0]]
+        duplicate = distinct_ids[hash_order[1]]
+        _parquet(
+            inp,
+            [keeper, duplicate, duplicate],
+            [[0, 0]] * 3,
+            [
+                [[0, 1], [0, 2]],
+                [[0, 1], [0, 2]],
+                [[0, 2], [0, 3]],
+            ],
+            item_id_type=pa.string(),
+        )
+
+        stats = self._run(
+            inp,
+            out,
+            batch_size=batch_size,
+            include_original=True,
+            max_items_per_codebook=1,
+        )
+
+        self.assertEqual(stats.total_items, 3)
+        self.assertEqual(stats.relocated_count, 2)
+        result = self._read_parquet(out)
+        self.assertEqual(result["item_id"], [keeper, duplicate, duplicate])
+        self.assertEqual(result["item_id"].count(duplicate), 2)
+        self._assert_map_matches_resolved_groups(out)
+        original_path, _ = self._group_paths(out)
+        original_groups = self._read_parquet(original_path)
+        self.assertCountEqual(
+            [item_id for group in original_groups["itemids"] for item_id in group],
+            [keeper, duplicate, duplicate],
+        )
+
+    def test_item_id_lookup_broadcasts_all_duplicate_targets(self) -> None:
+        lookup = resolve_sid_collisions._ItemIdLookup(
+            np.asarray(["b", "a", "b", "b"], dtype=object)
+        )
+        source_rows, target_rows = lookup.match(
+            np.asarray(["b", "missing", "a"], dtype=object)
+        )
+        np.testing.assert_array_equal(source_rows, [0, 2])
+        np.testing.assert_array_equal(target_rows, [0, 1])
+
+        values = np.asarray([[10, 11], [20, 21], [-1, -1], [-1, -1]])
+        lookup.broadcast_duplicate_targets(values)
+        np.testing.assert_array_equal(
+            values,
+            [[10, 11], [20, 21], [10, 11], [10, 11]],
+        )
+
+    def test_random_tolerates_duplicate_item_ids(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(
+            inp,
+            ["b", "a", "a"],
+            [[0, 0]] * 3,
+            item_id_type=pa.string(),
+        )
+
+        stats = self._run(
+            inp,
+            out,
+            strategy="random",
+            random_num_candidates=8,
+            max_items_per_codebook=1,
+        )
+
+        self.assertEqual(stats.total_items, 3)
+        result = self._read_parquet(out)
+        self.assertEqual(result["item_id"], ["b", "a", "a"])
+        self._assert_map_matches_resolved_groups(out)
 
     def test_empty_codebook_token_raises(self) -> None:
         args = resolve_sid_collisions.build_parser().parse_args(

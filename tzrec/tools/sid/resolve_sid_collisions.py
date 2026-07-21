@@ -11,6 +11,13 @@
 
 r"""Offline best-effort SID collision resolution with TorchEasyRec-native I/O.
 
+Item IDs are expected to be unique in the upstream prediction output. To avoid
+blocking a large job on rare upstream violations, this tool does not perform a
+full-input uniqueness check or remove duplicate rows. Duplicate rows remain
+independent items in collision accounting and outputs. When candidate-strategy
+overflow rows share an item ID, they reuse one candidate list matched for that
+ID. Duplicate data should still be fixed upstream.
+
 The runner retains the first capacity items in each SID bucket, attempts to
 relocate overflow items using fixed-width last-layer candidates, delegates
 placement to the pure NumPy core, and writes item-level and grouped SID results
@@ -131,10 +138,20 @@ class _ItemIdLookup:
     def __init__(self, item_ids: np.ndarray) -> None:
         self._sorted_to_requested = np.argsort(item_ids, kind="stable")
         self._sorted_ids = item_ids[self._sorted_to_requested]
-        if self._sorted_ids.size > 1 and np.any(
-            self._sorted_ids[1:] == self._sorted_ids[:-1]
-        ):
-            raise ValueError("overflow item IDs must be unique.")
+        duplicate_sorted_rows = (
+            np.flatnonzero(self._sorted_ids[1:] == self._sorted_ids[:-1]) + 1
+        )
+        self._duplicate_requested_rows = self._sorted_to_requested[
+            duplicate_sorted_rows
+        ]
+        representative_sorted_rows = np.searchsorted(
+            self._sorted_ids,
+            self._sorted_ids[duplicate_sorted_rows],
+            side="left",
+        )
+        self._representative_requested_rows = self._sorted_to_requested[
+            representative_sorted_rows
+        ]
 
     def match(self, item_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Return matching source rows and requested-ID positions."""
@@ -145,6 +162,12 @@ class _ItemIdLookup:
                 self._sorted_ids[positions[source_rows]] == item_ids[source_rows]
             ]
         return source_rows, self._sorted_to_requested[positions[source_rows]]
+
+    def broadcast_duplicate_targets(self, values: np.ndarray) -> None:
+        """Copy representative values to duplicate requested-ID positions."""
+        values[self._duplicate_requested_rows] = values[
+            self._representative_requested_rows
+        ]
 
 
 @dataclass(frozen=True)
@@ -406,8 +429,6 @@ class CollisionResolutionRunner:
         if not id_chunks:
             raise ValueError("SID input is empty.")
         item_id_array = np.concatenate(id_chunks)
-        if np.unique(item_id_array).size != item_id_array.size:
-            raise ValueError("input item IDs must be unique.")
         code_matrix = np.concatenate(code_chunks, axis=0)
         if code_matrix.shape[1] < 1:
             raise ValueError("SID codes must have at least one layer.")
@@ -469,8 +490,6 @@ class CollisionResolutionRunner:
             if source_rows.size == 0:
                 continue
 
-            if np.any(seen[target_rows]):
-                raise ValueError("candidate input contains duplicate item IDs.")
             selected = pc.take(batch[field], pa.array(source_rows, type=pa.int64()))
             batch_candidates = self._candidate_last_matrix(selected)
             if candidates is None:
@@ -489,6 +508,8 @@ class CollisionResolutionRunner:
             raise ValueError(
                 "map has overflow items but candidate_codes yielded no candidates."
             )
+        item_id_lookup.broadcast_duplicate_targets(candidates)
+        item_id_lookup.broadcast_duplicate_targets(seen)
         if not np.all(seen):
             missing = np.flatnonzero(~seen)
             preview = ",".join(str(value) for value in missing[:10])
