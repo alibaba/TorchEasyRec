@@ -708,22 +708,36 @@ class DeltaEmbeddingDumper:
         if self._should_dump(global_step, upload_error):
             dump_error: Optional[BaseException] = None
             try:
-                if (
-                    getattr(self, "_world_size", 1) > 1
-                    and self._interval_secs is not None
-                ):
+                if self._requires_dump_state_rendezvous():
+                    # The uploader-failure bit was already rendezvoused in
+                    # _should_dump; a rank-local recheck here could diverge.
                     self.dump(global_step, check_upload_error=False)
                 else:
                     self.dump(global_step)
             except BaseException as exc:
                 dump_error = exc
-            self._raise_if_any_timed_dump_failed(dump_error)
+            self._raise_if_any_interval_dump_failed(dump_error)
             self._last_dump_step = global_step
             if self._interval_secs is not None and self._rank == 0:
                 # Schedule from dump completion to avoid immediate catch-up dumps
                 # when writing the previous interval took longer than expected.
                 self._next_dump_time = time.monotonic() + self._interval_secs
         self._tracker.step()
+
+    def _requires_dump_state_rendezvous(self) -> bool:
+        """Return whether maybe_dump must all-reduce its dump and failure state.
+
+        Timed dumps OR-reduce the rank-zero clock decision so every rank dumps
+        together. Distributed FeatureStore dumps of either cadence rendezvous
+        the uploader-failure bit: rank zero observes an async upload failure
+        immediately while peers only see the shared error marker through a
+        throttled poll, so without the collective rank zero could raise alone
+        and strand its peers in the next training collective.
+        """
+        return getattr(self, "_world_size", 1) > 1 and (
+            self._interval_secs is not None
+            or getattr(self, "_feature_store_enabled", False)
+        )
 
     def _should_dump(
         self, global_step: int, local_error: Optional[BaseException] = None
@@ -741,13 +755,13 @@ class DeltaEmbeddingDumper:
             should_dump = self._rank == 0 and time.monotonic() >= self._next_dump_time
 
         any_failed = local_error is not None
-        if getattr(self, "_world_size", 1) > 1 and self._interval_secs is not None:
+        if self._requires_dump_state_rendezvous():
             if not (
                 torch.distributed.is_available() and torch.distributed.is_initialized()
             ):
                 raise RuntimeError(
-                    "distributed time-based delta embedding dump requires an "
-                    "initialized process group"
+                    "distributed delta embedding dump requires an initialized "
+                    "process group"
                 )
             state = torch.tensor(
                 [int(should_dump), int(any_failed)],
@@ -768,18 +782,26 @@ class DeltaEmbeddingDumper:
             )
         return should_dump
 
-    def _raise_if_any_timed_dump_failed(
+    def _raise_if_any_interval_dump_failed(
         self, local_error: Optional[BaseException]
     ) -> None:
-        """Propagate one timed dump failure before the next training step."""
+        """Propagate one interval dump failure before the next training step.
+
+        Boundary and timed dumps run on every rank, but a failure can still be
+        rank-local (a shard write error on one node, or one rank observing the
+        shared uploader-error marker ahead of the others). Reduce the failure
+        bit on every multi-rank cadence so all workers stop together instead
+        of the failing rank raising alone and stranding its peers in the next
+        training collective.
+        """
         any_failed = local_error is not None
-        if getattr(self, "_world_size", 1) > 1 and self._interval_secs is not None:
+        if getattr(self, "_world_size", 1) > 1:
             if not (
                 torch.distributed.is_available() and torch.distributed.is_initialized()
             ):
                 raise RuntimeError(
-                    "distributed time-based delta embedding dump requires an "
-                    "initialized process group"
+                    "distributed delta embedding dump requires an initialized "
+                    "process group"
                 )
             failed = torch.tensor(
                 [int(any_failed)], dtype=torch.int32, device=self._device
@@ -791,7 +813,7 @@ class DeltaEmbeddingDumper:
             raise local_error.with_traceback(local_error.__traceback__)
         if any_failed:
             raise RuntimeError(
-                "timed delta embedding dump failed on another distributed worker; "
+                "delta embedding dump failed on another distributed worker; "
                 "all workers are stopping"
             )
 
@@ -907,7 +929,8 @@ class DeltaEmbeddingDumper:
         Args:
             global_step: Current training step.
             check_upload_error: Whether to perform a rank-local async error check.
-                ``final_dump`` disables it after synchronizing the error bit.
+                ``maybe_dump`` and ``final_dump`` disable it after synchronizing
+                the error bit across ranks.
 
         Returns:
             Path to the dumped parquet file, or None if no data to dump.
