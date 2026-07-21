@@ -740,37 +740,63 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(dumper._last_dump_step, 13)
         self.assertEqual(dumper._tracker.step.call_count, 4)
 
-    def test_time_dump_decision_is_reduced_from_rank_zero(self):
+    def _new_rendezvous_dumper(self) -> DeltaEmbeddingDumper:
         dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._last_dump_step = None
+        dumper._device = torch.device("cpu")
+        dumper._tracker = mock.MagicMock()
+        dumper._pending_rendezvous = None
+        dumper._pending_upload_error = None
+        dumper._timed_dump_in_flight = False
+        return dumper
+
+    def test_time_dump_decision_is_reduced_from_rank_zero(self):
+        # The rank-zero timer vote is launched on one step and consumed on the
+        # next: the pipelined rendezvous lands a timed dump at most one step
+        # after the timer fires without blocking any step on the collective.
+        dumper = self._new_rendezvous_dumper()
         dumper._interval_steps = None
         dumper._interval_secs = 60.0
         dumper._next_dump_time = 160.0
         dumper._rank = 1
         dumper._world_size = 2
-        dumper._device = torch.device("cpu")
+        launched_states = []
 
         def fake_all_reduce(state, op=None):
             self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            self.assertEqual(state.tolist(), [0, 0])
-            state[0] = 1
+            launched_states.append(state.tolist())
+            if state.numel() == 2:
+                state[0] = 1
 
         with (
+            mock.patch.object(
+                dumper, "dump", return_value="delta.parquet"
+            ) as dump_mock,
             mock.patch("torch.distributed.is_available", return_value=True),
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
-            self.assertTrue(dumper._should_dump(10))
+            dumper.maybe_dump(10)
+            dump_mock.assert_not_called()
+            dumper.maybe_dump(11)
+
+        dump_mock.assert_called_once_with(11, check_upload_error=False)
+        self.assertEqual(dumper._last_dump_step, 11)
+        # Both steps launched [0, 0] locally; rank zero's vote arrived through
+        # the MAX reduce. The trailing [0] is the dump-failure rendezvous.
+        self.assertEqual(launched_states, [[0, 0], [0, 0], [0]])
+        self.assertEqual(dumper._tracker.step.call_count, 2)
 
     def test_timed_maybe_dump_reduces_local_upload_error_before_raising(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
+        # Rank zero observes an async uploader failure immediately; the bit is
+        # launched on this step and consumed on the next so every rank raises
+        # together instead of rank zero raising alone.
+        dumper = self._new_rendezvous_dumper()
         dumper._interval_steps = None
         dumper._interval_secs = 60.0
         dumper._next_dump_time = 0.0
-        dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 2
-        dumper._device = torch.device("cpu")
-        dumper._tracker = mock.MagicMock()
         local_error = FeatureStoreUploadError("local upload failed")
         collective_called = False
 
@@ -789,13 +815,14 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
+            dumper.maybe_dump(10)
             with self.assertRaises(FeatureStoreUploadError) as context:
-                dumper.maybe_dump(10)
+                dumper.maybe_dump(11)
 
         self.assertTrue(collective_called)
         self.assertIs(context.exception, local_error)
         dump_mock.assert_not_called()
-        dumper._tracker.step.assert_not_called()
+        self.assertEqual(dumper._tracker.step.call_count, 1)
 
     def test_timed_maybe_dump_surfaces_remote_upload_error_when_marker_is_throttled(
         self,
@@ -804,17 +831,16 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             marker_path = os.path.join(tmp_dir, "last_error.json")
             with open(marker_path, "w") as output:
                 output.write("{}")
-            dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper = self._new_rendezvous_dumper()
             dumper._interval_steps = None
             dumper._interval_secs = 60.0
             dumper._next_dump_time = 0.0
-            dumper._last_dump_step = None
             dumper._rank = 1
             dumper._world_size = 2
-            dumper._device = torch.device("cpu")
-            dumper._tracker = mock.MagicMock()
             dumper._feature_store_enabled = True
             dumper._feature_store_error_marker_path = marker_path
+            # The throttled poll hides the marker locally; only rank zero's
+            # rendezvoused failure bit surfaces the error, one step later.
             dumper._next_feature_store_error_check = 100.0
             dumper._feature_store_error_check_interval_secs = 1
             dumper._uploader = None
@@ -822,7 +848,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             def fake_all_reduce(state, op=None):
                 self.assertIs(op, torch.distributed.ReduceOp.MAX)
                 self.assertEqual(state.tolist(), [0, 0])
-                state[0] = 1
                 state[1] = 1
 
             with (
@@ -835,24 +860,22 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 mock.patch("torch.distributed.is_initialized", return_value=True),
                 mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
             ):
+                dumper.maybe_dump(10)
                 with self.assertRaisesRegex(
                     FeatureStoreUploadError, "another distributed worker"
                 ):
-                    dumper.maybe_dump(10)
+                    dumper.maybe_dump(11)
 
             dump_mock.assert_not_called()
-            dumper._tracker.step.assert_not_called()
+            self.assertEqual(dumper._tracker.step.call_count, 1)
 
     def test_timed_maybe_dump_advances_after_all_workers_succeed(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper = self._new_rendezvous_dumper()
         dumper._interval_steps = None
         dumper._interval_secs = 60.0
         dumper._next_dump_time = 0.0
-        dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 2
-        dumper._device = torch.device("cpu")
-        dumper._tracker = mock.MagicMock()
         collective_states = []
 
         def fake_all_reduce(state, op=None):
@@ -866,41 +889,36 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             ) as dump_mock,
             mock.patch(
                 "tzrec.utils.delta_embedding_dump.time.monotonic",
-                side_effect=[1.0, 2.0],
+                side_effect=[1.0, 2.0, 3.0],
             ),
             mock.patch("torch.distributed.is_available", return_value=True),
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
             dumper.maybe_dump(10)
+            dump_mock.assert_not_called()
+            dumper.maybe_dump(11)
 
-        self.assertEqual(collective_states, [[1, 0], [0]])
-        dump_mock.assert_called_once_with(10, check_upload_error=False)
-        self.assertEqual(dumper._last_dump_step, 10)
+        self.assertEqual(collective_states, [[1, 0], [0, 0], [0]])
+        dump_mock.assert_called_once_with(11, check_upload_error=False)
+        self.assertEqual(dumper._last_dump_step, 11)
         self.assertEqual(dumper._next_dump_time, 62.0)
-        dumper._tracker.step.assert_called_once_with()
+        self.assertFalse(dumper._timed_dump_in_flight)
+        self.assertEqual(dumper._tracker.step.call_count, 2)
 
     def test_timed_maybe_dump_reduces_local_dump_failure_before_raising(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper = self._new_rendezvous_dumper()
         dumper._interval_steps = None
         dumper._interval_secs = 60.0
         dumper._next_dump_time = 0.0
-        dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 2
-        dumper._device = torch.device("cpu")
-        dumper._tracker = mock.MagicMock()
         dump_error = RuntimeError("local dump failed")
-        collective_index = 0
+        collective_states = []
 
         def fake_all_reduce(state, op=None):
-            nonlocal collective_index
             self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            if collective_index == 0:
-                self.assertEqual(state.tolist(), [1, 0])
-            else:
-                self.assertEqual(state.tolist(), [1])
-            collective_index += 1
+            collective_states.append(state.tolist())
 
         with (
             mock.patch.object(dumper, "_feature_store_upload_error", return_value=None),
@@ -909,36 +927,30 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
+            dumper.maybe_dump(10)
             with self.assertRaises(RuntimeError) as context:
-                dumper.maybe_dump(10)
+                dumper.maybe_dump(11)
 
-        self.assertEqual(collective_index, 2)
+        self.assertEqual(collective_states, [[1, 0], [0, 0], [1]])
         self.assertIs(context.exception, dump_error)
-        dump_mock.assert_called_once_with(10, check_upload_error=False)
+        dump_mock.assert_called_once_with(11, check_upload_error=False)
         self.assertIsNone(dumper._last_dump_step)
-        dumper._tracker.step.assert_not_called()
+        self.assertEqual(dumper._tracker.step.call_count, 1)
 
     def test_timed_maybe_dump_surfaces_remote_dump_failure(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper = self._new_rendezvous_dumper()
         dumper._interval_steps = None
         dumper._interval_secs = 60.0
         dumper._next_dump_time = 0.0
-        dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 2
-        dumper._device = torch.device("cpu")
-        dumper._tracker = mock.MagicMock()
-        collective_index = 0
+        collective_states = []
 
         def fake_all_reduce(state, op=None):
-            nonlocal collective_index
             self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            if collective_index == 0:
-                self.assertEqual(state.tolist(), [1, 0])
-            else:
-                self.assertEqual(state.tolist(), [0])
+            collective_states.append(state.tolist())
+            if state.numel() == 1:
                 state[0] = 1
-            collective_index += 1
 
         with (
             mock.patch.object(dumper, "_feature_store_upload_error", return_value=None),
@@ -949,26 +961,63 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
+            dumper.maybe_dump(10)
             with self.assertRaisesRegex(RuntimeError, "another distributed worker"):
-                dumper.maybe_dump(10)
+                dumper.maybe_dump(11)
 
-        self.assertEqual(collective_index, 2)
-        dump_mock.assert_called_once_with(10, check_upload_error=False)
+        self.assertEqual(collective_states, [[1, 0], [0, 0], [0]])
+        dump_mock.assert_called_once_with(11, check_upload_error=False)
         self.assertIsNone(dumper._last_dump_step)
-        dumper._tracker.step.assert_not_called()
+        self.assertEqual(dumper._tracker.step.call_count, 1)
 
-    def test_step_maybe_dump_reduces_local_upload_error_before_raising(self):
-        # Rank zero observes an async uploader failure immediately; without a
-        # step-cadence rendezvous it would raise alone and strand peers that
-        # skipped the throttled marker poll in the next training collective.
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = 50
-        dumper._interval_secs = None
-        dumper._last_dump_step = None
+    def test_timed_dump_vote_does_not_fire_twice_before_completion(self):
+        # Once rank zero's timer vote fires, the next step's vote stays low
+        # until the consumed dump reschedules from its completion time; the
+        # still-elapsed deadline must not launch a second dump.
+        dumper = self._new_rendezvous_dumper()
+        dumper._interval_steps = None
+        dumper._interval_secs = 60.0
+        dumper._next_dump_time = 0.0
         dumper._rank = 0
         dumper._world_size = 2
-        dumper._device = torch.device("cpu")
-        dumper._tracker = mock.MagicMock()
+        collective_states = []
+
+        def fake_all_reduce(state, op=None):
+            self.assertIs(op, torch.distributed.ReduceOp.MAX)
+            collective_states.append(state.tolist())
+
+        with (
+            mock.patch.object(dumper, "_feature_store_upload_error", return_value=None),
+            mock.patch.object(
+                dumper, "dump", return_value="delta.parquet"
+            ) as dump_mock,
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.time.monotonic",
+                side_effect=[100.0, 100.0, 100.0, 100.0],
+            ),
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
+        ):
+            dumper.maybe_dump(10)
+            dumper.maybe_dump(11)
+            dumper.maybe_dump(12)
+
+        dump_mock.assert_called_once_with(11, check_upload_error=False)
+        self.assertEqual(dumper._next_dump_time, 160.0)
+        self.assertFalse(dumper._timed_dump_in_flight)
+        self.assertEqual(collective_states, [[1, 0], [0, 0], [0], [0, 0]])
+        self.assertEqual(dumper._tracker.step.call_count, 3)
+
+    def test_step_maybe_dump_reduces_local_upload_error_before_raising(self):
+        # Rank zero observes an async uploader failure immediately; the
+        # pipelined rendezvous launches the bit on this step and raises on the
+        # next so every rank stops together instead of rank zero raising alone.
+        dumper = self._new_rendezvous_dumper()
+        dumper._interval_steps = 50
+        dumper._interval_secs = None
+        dumper._rank = 0
+        dumper._world_size = 2
         dumper._feature_store_enabled = True
         local_error = FeatureStoreUploadError("local upload failed")
         collective_called = False
@@ -988,13 +1037,14 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
+            dumper.maybe_dump(10)
             with self.assertRaises(FeatureStoreUploadError) as context:
-                dumper.maybe_dump(10)
+                dumper.maybe_dump(11)
 
         self.assertTrue(collective_called)
         self.assertIs(context.exception, local_error)
         dump_mock.assert_not_called()
-        dumper._tracker.step.assert_not_called()
+        self.assertEqual(dumper._tracker.step.call_count, 1)
 
     def test_step_maybe_dump_surfaces_remote_upload_error_when_marker_is_throttled(
         self,
@@ -1003,14 +1053,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             marker_path = os.path.join(tmp_dir, "last_error.json")
             with open(marker_path, "w") as output:
                 output.write("{}")
-            dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper = self._new_rendezvous_dumper()
             dumper._interval_steps = 50
             dumper._interval_secs = None
-            dumper._last_dump_step = None
             dumper._rank = 1
             dumper._world_size = 2
-            dumper._device = torch.device("cpu")
-            dumper._tracker = mock.MagicMock()
             dumper._feature_store_enabled = True
             dumper._feature_store_error_marker_path = marker_path
             # The throttled poll hides the marker on this rank; only the
@@ -1034,23 +1081,23 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 mock.patch("torch.distributed.is_initialized", return_value=True),
                 mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
             ):
+                dumper.maybe_dump(10)
                 with self.assertRaisesRegex(
                     FeatureStoreUploadError, "another distributed worker"
                 ):
-                    dumper.maybe_dump(10)
+                    dumper.maybe_dump(11)
 
             dump_mock.assert_not_called()
-            dumper._tracker.step.assert_not_called()
+            self.assertEqual(dumper._tracker.step.call_count, 1)
 
     def test_step_feature_store_boundary_dump_skips_rank_local_upload_recheck(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
+        # Only the failure bit travels through the pipelined rendezvous; the
+        # boundary decision stays deterministic and on its exact boundary step.
+        dumper = self._new_rendezvous_dumper()
         dumper._interval_steps = 50
         dumper._interval_secs = None
-        dumper._last_dump_step = None
         dumper._rank = 1
         dumper._world_size = 2
-        dumper._device = torch.device("cpu")
-        dumper._tracker = mock.MagicMock()
         dumper._feature_store_enabled = True
         collective_states = []
 
@@ -1067,12 +1114,14 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
+            dumper.maybe_dump(49)
+            dump_mock.assert_not_called()
             dumper.maybe_dump(50)
 
-        self.assertEqual(collective_states, [[1, 0], [0]])
+        self.assertEqual(collective_states, [[0, 0], [0, 0], [0]])
         dump_mock.assert_called_once_with(50, check_upload_error=False)
         self.assertEqual(dumper._last_dump_step, 50)
-        dumper._tracker.step.assert_called_once_with()
+        self.assertEqual(dumper._tracker.step.call_count, 2)
 
     def test_step_boundary_dump_failure_is_reduced_before_raising(self):
         # Even without FeatureStore, a rank-local boundary dump failure (e.g. a

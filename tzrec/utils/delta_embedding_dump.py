@@ -388,6 +388,9 @@ class DeltaEmbeddingDumper:
             self._interval_steps = int(config.dump_interval_steps)
         self._next_dump_time: Optional[float] = None
         self._last_dump_step: Optional[int] = None
+        self._pending_rendezvous: Optional[torch.Tensor] = None
+        self._pending_upload_error: Optional[BaseException] = None
+        self._timed_dump_in_flight = False
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
@@ -704,16 +707,31 @@ class DeltaEmbeddingDumper:
         Args:
             global_step: Current training step.
         """
-        upload_error = self._feature_store_upload_error()
-        if self._should_dump(global_step, upload_error):
+        if self._requires_dump_state_rendezvous():
+            should_dump, any_failed = self._consume_dump_state_rendezvous()
+            if self._interval_steps is not None:
+                # Step-boundary decisions are deterministic across ranks and
+                # stay on their exact boundary step; only the failure bit
+                # travels through the pipelined rendezvous.
+                should_dump = (
+                    global_step > 0 and global_step % self._interval_steps == 0
+                )
+            if any_failed:
+                self._raise_rendezvoused_upload_failure()
+            self._launch_dump_state_rendezvous(global_step)
+            check_upload_error = False
+        else:
+            should_dump = self._local_dump_decision(global_step)
+            check_upload_error = True
+        if should_dump:
             dump_error: Optional[BaseException] = None
             try:
-                if self._requires_dump_state_rendezvous():
-                    # The uploader-failure bit was already rendezvoused in
-                    # _should_dump; a rank-local recheck here could diverge.
-                    self.dump(global_step, check_upload_error=False)
-                else:
+                if check_upload_error:
                     self.dump(global_step)
+                else:
+                    # The failure bit was already rendezvoused; a rank-local
+                    # recheck inside dump() could diverge across ranks.
+                    self.dump(global_step, check_upload_error=False)
             except BaseException as exc:
                 dump_error = exc
             self._raise_if_any_interval_dump_failed(dump_error)
@@ -722,6 +740,7 @@ class DeltaEmbeddingDumper:
                 # Schedule from dump completion to avoid immediate catch-up dumps
                 # when writing the previous interval took longer than expected.
                 self._next_dump_time = time.monotonic() + self._interval_secs
+                self._timed_dump_in_flight = False
         self._tracker.step()
 
     def _requires_dump_state_rendezvous(self) -> bool:
@@ -732,55 +751,101 @@ class DeltaEmbeddingDumper:
         the uploader-failure bit: rank zero observes an async upload failure
         immediately while peers only see the shared error marker through a
         throttled poll, so without the collective rank zero could raise alone
-        and strand its peers in the next training collective.
+        and strand its peers in the next training collective. The rendezvous
+        is pipelined across steps so it never blocks the training hot path.
         """
         return getattr(self, "_world_size", 1) > 1 and (
             self._interval_secs is not None
             or getattr(self, "_feature_store_enabled", False)
         )
 
-    def _should_dump(
-        self, global_step: int, local_error: Optional[BaseException] = None
-    ) -> bool:
-        """Synchronize upload failure state and return one dump decision."""
+    def _local_dump_decision(self, global_step: int) -> bool:
+        """Return the dump decision when no cross-rank rendezvous is needed."""
+        upload_error = self._feature_store_upload_error()
+        if upload_error is not None:
+            raise upload_error.with_traceback(upload_error.__traceback__)
         if global_step <= 0:
-            should_dump = False
-        elif self._interval_steps is not None:
-            should_dump = global_step % self._interval_steps == 0
-        else:
-            if self._next_dump_time is None:
-                raise RuntimeError(
-                    "time-based delta embedding dumper must be started before training"
-                )
-            should_dump = self._rank == 0 and time.monotonic() >= self._next_dump_time
-
-        any_failed = local_error is not None
-        if self._requires_dump_state_rendezvous():
-            if not (
-                torch.distributed.is_available() and torch.distributed.is_initialized()
-            ):
-                raise RuntimeError(
-                    "distributed delta embedding dump requires an initialized "
-                    "process group"
-                )
-            state = torch.tensor(
-                [int(should_dump), int(any_failed)],
-                dtype=torch.int32,
-                device=self._device,
+            return False
+        if self._interval_steps is not None:
+            return global_step % self._interval_steps == 0
+        if self._next_dump_time is None:
+            raise RuntimeError(
+                "time-based delta embedding dumper must be started before training"
             )
-            torch.distributed.all_reduce(state, op=torch.distributed.ReduceOp.MAX)
-            should_dump = bool(state[0].item())
-            any_failed = bool(state[1].item())
+        return self._rank == 0 and time.monotonic() >= self._next_dump_time
 
+    def _launch_dump_state_rendezvous(self, global_step: int) -> None:
+        """Asynchronously all-reduce this step's dump vote and failure bit.
+
+        The reduced tensor is consumed by the next ``maybe_dump`` call. NCCL
+        orders this collective ahead of the next training step's communication
+        on the same process group, so it has already completed by the time
+        the next call reads it back: the hot path pays an asynchronous launch
+        instead of a host-blocking all_reduce plus ``.item()`` pair on every
+        training step, and the decision lands at most one step late.
+        """
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            raise RuntimeError(
+                "distributed delta embedding dump requires an initialized process group"
+            )
+        local_error = self._feature_store_upload_error()
+        if local_error is not None:
+            self._pending_upload_error = local_error
+        state = torch.tensor(
+            [
+                int(self._timed_dump_vote(global_step)),
+                int(self._pending_upload_error is not None),
+            ],
+            dtype=torch.int32,
+            device=self._device,
+        )
+        torch.distributed.all_reduce(state, op=torch.distributed.ReduceOp.MAX)
+        self._pending_rendezvous = state
+
+    def _consume_dump_state_rendezvous(self) -> Tuple[bool, bool]:
+        """Read back the previous step's reduced dump vote and failure bit."""
+        state = self._pending_rendezvous
+        self._pending_rendezvous = None
+        if state is None:
+            return False, False
+        # Launched one training step ago and ordered ahead of this step's
+        # communication, so this read does not block the host.
+        should_dump, any_failed = state.tolist()
+        return bool(should_dump), bool(any_failed)
+
+    def _timed_dump_vote(self, global_step: int) -> bool:
+        """Return rank zero's local vote for whether a timed dump is due.
+
+        A fired vote arms ``_timed_dump_in_flight`` so the following step's
+        vote stays low until the dump executes and reschedules the timer from
+        its completion time; without the guard the still-elapsed deadline
+        would fire on the next launch and dump twice.
+        """
+        if self._interval_secs is None or global_step <= 0:
+            return False
+        if self._next_dump_time is None:
+            raise RuntimeError(
+                "time-based delta embedding dumper must be started before training"
+            )
+        if self._timed_dump_in_flight:
+            return False
+        if self._rank == 0 and time.monotonic() >= self._next_dump_time:
+            self._timed_dump_in_flight = True
+            return True
+        return False
+
+    def _raise_rendezvoused_upload_failure(self) -> None:
+        """Raise the rendezvoused upload failure identically on every rank."""
+        local_error = self._pending_upload_error
         if local_error is not None:
             raise local_error.with_traceback(local_error.__traceback__)
-        if any_failed:
-            raise FeatureStoreUploadError(
-                "FeatureStore delta upload failed on another distributed worker; "
-                "all training workers are stopping and parquet outbox files were "
-                "retained"
-            )
-        return should_dump
+        raise FeatureStoreUploadError(
+            "FeatureStore delta upload failed on another distributed worker; "
+            "all training workers are stopping and parquet outbox files were "
+            "retained"
+        )
 
     def _raise_if_any_interval_dump_failed(
         self, local_error: Optional[BaseException]
