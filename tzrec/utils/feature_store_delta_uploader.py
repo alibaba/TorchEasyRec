@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -28,10 +29,12 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     Optional,
     Tuple,
+    cast,
 )
 from urllib.parse import urlsplit
 
@@ -56,6 +59,8 @@ DELTA_DUMP_SCHEMA_VERSION = "2"
 DELTA_DUMP_GENERATION_METADATA_KEY = b"tzrec.delta_embedding.dump_generation"
 
 _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES = 100
+_RECORD_STORE_DB_FILENAME = "upload_records.sqlite"
+_RECORD_STORE_CACHE_SIZE_KB = 65536
 _VERSION_INITIALIZATION = "AUTO_CREATE_ON_FIRST_DELTA_MERGE"
 _LEGACY_VERSION_INITIALIZATION = "PREPROVISIONED_FOR_DELTA_MERGE"
 
@@ -364,6 +369,137 @@ def _file_sha256(source: BinaryIO) -> str:
         digest.update(chunk)
     source.seek(0)
     return digest.hexdigest()
+
+
+class _RecordStore:
+    """Deduplicated delta records spilled to a throwaway SQLite database.
+
+    One delta dump can contain an arbitrary number of unique keys, so keeping
+    the dedup state and the upload ordering in memory would make rank-zero
+    peak memory scale with a single dump's size. The store keeps both on disk
+    behind a bounded page cache, so memory depends only on the streaming
+    Parquet read batch and one in-flight upload batch. The database is
+    disposable: after a crash the whole step replays from its durable shard
+    snapshot.
+    """
+
+    def __init__(self, db_path: str) -> None:
+        self._db_path = db_path
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        self._connection = sqlite3.connect(db_path)
+        self._connection.execute("PRAGMA journal_mode = OFF")
+        self._connection.execute("PRAGMA synchronous = OFF")
+        self._connection.execute(f"PRAGMA cache_size = -{_RECORD_STORE_CACHE_SIZE_KB}")
+        self._connection.execute(
+            "CREATE TABLE dedup ("
+            "embedding_name TEXT NOT NULL, "
+            "key_id INTEGER NOT NULL, "
+            "embedding BLOB NOT NULL, "
+            "PRIMARY KEY (embedding_name, key_id))"
+        )
+        self._record_count: Optional[int] = None
+
+    def __enter__(self) -> "_RecordStore":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+    @property
+    def record_count(self) -> int:
+        """Return the number of unique deduplicated records."""
+        if self._record_count is None:
+            cursor = self._connection.execute("SELECT COUNT(*) FROM dedup")
+            self._record_count = int(cursor.fetchone()[0])
+        return self._record_count
+
+    def add_batch(
+        self,
+        embedding_names: List[str],
+        key_ids: np.ndarray,
+        flat_embeddings: np.ndarray,
+        offsets: np.ndarray,
+    ) -> None:
+        """Spill one streamed shard batch, deduplicating on (name, key_id)."""
+        rows = [
+            (
+                embedding_names[index],
+                int(key_ids[index]),
+                flat_embeddings[
+                    int(offsets[index]) : int(offsets[index + 1])
+                ].tobytes(),
+            )
+            for index in range(len(embedding_names))
+        ]
+        try:
+            self._connection.executemany("INSERT INTO dedup VALUES (?, ?, ?)", rows)
+        except sqlite3.IntegrityError:
+            # A duplicate can be exact (harmless) or conflicting (corruption);
+            # replay the batch row by row to tell the two apart.
+            for row in rows:
+                try:
+                    self._connection.execute("INSERT INTO dedup VALUES (?, ?, ?)", row)
+                except sqlite3.IntegrityError:
+                    existing = self._connection.execute(
+                        "SELECT embedding FROM dedup "
+                        "WHERE embedding_name = ? AND key_id = ?",
+                        (row[0], row[1]),
+                    ).fetchone()
+                    if existing[0] != row[2]:
+                        raise ValueError(
+                            "conflicting duplicate delta row for "
+                            f"embedding_name={row[0]!r}, key_id={row[1]}"
+                        ) from None
+        self._connection.commit()
+        self._record_count = None
+
+    def iter_upload_batches(
+        self, batch_size: int
+    ) -> Iterator[Tuple[List[Dict[str, Any]], int]]:
+        """Yield (payload, record count) upload batches in a deterministic order."""
+        cursor = self._connection.execute(
+            "SELECT embedding_name, key_id, embedding FROM dedup "
+            "ORDER BY embedding_name, key_id"
+        )
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                return
+            payload = [
+                {
+                    FEATURE_STORE_PK_FIELD: embedding_name,
+                    FEATURE_STORE_SK_FIELD: key_id,
+                    FEATURE_STORE_VALUE_FIELD: np.frombuffer(
+                        embedding, dtype=np.float32
+                    ).copy(),
+                }
+                for embedding_name, key_id, embedding in rows
+            ]
+            yield payload, len(payload)
+
+    def to_records(self) -> List[Tuple[str, int, np.ndarray]]:
+        """Materialize every deduplicated record in upload order."""
+        cursor = self._connection.execute(
+            "SELECT embedding_name, key_id, embedding FROM dedup "
+            "ORDER BY embedding_name, key_id"
+        )
+        return [
+            (
+                embedding_name,
+                int(key_id),
+                np.frombuffer(embedding, dtype=np.float32).copy(),
+            )
+            for embedding_name, key_id, embedding in cursor
+        ]
+
+    def close(self) -> None:
+        """Close the connection and remove the throwaway database file."""
+        try:
+            self._connection.close()
+        finally:
+            if os.path.exists(self._db_path):
+                os.remove(self._db_path)
 
 
 class FeatureStoreDeltaUploader:
@@ -677,16 +813,20 @@ class FeatureStoreDeltaUploader:
                         snapshot_paths, shard_sources
                     )
                     self._validate_dump_generation(shard_descriptions)
-                    records = self._load_records(
-                        current_step, snapshot_paths, shard_sources
+                    record_store = stack.enter_context(
+                        self._build_record_store(
+                            current_step, snapshot_paths, shard_sources
+                        )
                     )
                     manifest = self._load_or_create_manifest(
                         current_step,
                         snapshot_paths,
-                        len(records),
+                        record_store.record_count,
                         shard_descriptions=shard_descriptions,
                     )
-                    summary = self._upload_with_retries(current_step, records, manifest)
+                    summary = self._upload_with_retries(
+                        current_step, record_store, manifest
+                    )
                     # Rehashing can scan large shards. Keep it outside the
                     # condition so close(drain=False) can publish the abort bit
                     # immediately; the small durable commit remains serialized.
@@ -1437,15 +1577,15 @@ class FeatureStoreDeltaUploader:
     def _upload_with_retries(
         self,
         global_step: int,
-        records: List[Tuple[str, int, np.ndarray]],
+        store: _RecordStore,
         manifest: Dict[str, Any],
     ) -> Dict[str, int]:
         for local_attempt in range(1, self._settings.max_retries + 1):
             self._raise_if_aborting()
-            attempt = self._start_attempt(global_step, len(records), manifest)
+            attempt = self._start_attempt(global_step, store.record_count, manifest)
             try:
-                if records:
-                    summary = self._upload_records(global_step, records, attempt)
+                if store.record_count:
+                    summary = self._upload_records(global_step, store, attempt)
                 else:
                     # An empty step still validates the FeatureView schema before
                     # it can be committed.
@@ -1787,13 +1927,14 @@ class FeatureStoreDeltaUploader:
     def _upload_records(
         self,
         global_step: int,
-        records: List[Tuple[str, int, np.ndarray]],
+        store: _RecordStore,
         attempt: Mapping[str, int],
     ) -> Dict[str, int]:
         view = self._get_view()
         max_in_flight = int(getattr(view, "_max_workers", 1))
+        total_records = store.record_count
         batch_count = (
-            len(records) + self._settings.upload_batch_size - 1
+            total_records + self._settings.upload_batch_size - 1
         ) // self._settings.upload_batch_size
         aggregate = {
             "total_batches": 0,
@@ -1810,46 +1951,42 @@ class FeatureStoreDeltaUploader:
             global_step,
             attempt["attempt_id"],
             self._settings.version,
-            len(records),
+            total_records,
             batch_count,
             max_in_flight,
             attempt["range_start"],
             attempt["range_end"],
         )
         try:
-            for window_start in range(0, batch_count, max_in_flight):
-                window_end = min(window_start + max_in_flight, batch_count)
-                window_records = 0
-                for batch_index in range(window_start, window_end):
-                    self._raise_if_aborting()
-                    offset = batch_index * self._settings.upload_batch_size
-                    chunk = records[offset : offset + self._settings.upload_batch_size]
-                    payload = [
-                        {
-                            FEATURE_STORE_PK_FIELD: embedding_name,
-                            FEATURE_STORE_SK_FIELD: key_id,
-                            FEATURE_STORE_VALUE_FIELD: embedding,
-                        }
-                        for embedding_name, key_id, embedding in chunk
-                    ]
-                    view.write_features(
-                        data=payload,
-                        version=self._settings.version,
-                        write_mode=FEATURE_STORE_WRITE_MODE,
-                        ts=int(attempt["range_start"]) + batch_index,
-                    )
-                    window_records += len(chunk)
+            completed_batches = 0
+            window_batches = 0
+            window_records = 0
+            logged_first_window = False
+            for payload, payload_records in store.iter_upload_batches(
+                self._settings.upload_batch_size
+            ):
+                self._raise_if_aborting()
+                view.write_features(
+                    data=payload,
+                    version=self._settings.version,
+                    write_mode=FEATURE_STORE_WRITE_MODE,
+                    ts=int(attempt["range_start"]) + completed_batches,
+                )
+                completed_batches += 1
+                window_batches += 1
+                window_records += payload_records
+                if window_batches < max_in_flight and completed_batches < batch_count:
+                    continue
                 summary = view.write_flush()
                 self._validate_flush_summary(
                     summary,
                     expected_records=window_records,
-                    expected_batches=window_end - window_start,
+                    expected_batches=window_batches,
                 )
                 for name in aggregate:
                     aggregate[name] += int(summary[name])
-                completed_batches = window_end
                 if (
-                    window_start == 0
+                    not logged_first_window
                     or completed_batches >= next_progress_batch
                     or completed_batches == batch_count
                 ):
@@ -1861,13 +1998,16 @@ class FeatureStoreDeltaUploader:
                         completed_batches,
                         batch_count,
                         aggregate["success_records"],
-                        len(records),
+                        total_records,
                         time.monotonic() - started_at,
                     )
+                    logged_first_window = True
                     while next_progress_batch <= completed_batches:
                         next_progress_batch += (
                             _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES
                         )
+                window_batches = 0
+                window_records = 0
                 self._raise_if_aborting()
         except BaseException:
             # A write_features() call can enqueue part of its work before raising.
@@ -1901,79 +2041,110 @@ class FeatureStoreDeltaUploader:
         ):
             raise RuntimeError("FeatureStore write_flush reported incomplete writes")
 
-    def _load_records(
+    def _build_record_store(
         self,
         global_step: int,
         shard_paths: List[str],
         shard_sources: Optional[List[BinaryIO]] = None,
-    ) -> List[Tuple[str, int, np.ndarray]]:
+    ) -> _RecordStore:
+        """Stream the step's shards into a disk-spilled deduplicated store.
+
+        Shards are read batch by batch and validated with vectorized checks,
+        so peak memory stays bounded by one Parquet batch and the store's
+        page cache, independently of one dump's size.
+        """
         if shard_sources is None:
             with ExitStack() as stack:
                 opened_sources = [
                     stack.enter_context(open(path, "rb")) for path in shard_paths
                 ]
-                return self._load_records(global_step, shard_paths, opened_sources)
+                return self._build_record_store(
+                    global_step, shard_paths, opened_sources
+                )
         if len(shard_paths) != len(shard_sources):
             raise ValueError("delta shard paths and sources must have equal length")
 
-        # Exact duplicates are harmless; conflicting duplicates are corruption.
-        # The final sort makes retry/restart batch boundaries deterministic.
-        records: Dict[Tuple[str, int], np.ndarray] = {}
-        for expected_rank, (path, source) in enumerate(zip(shard_paths, shard_sources)):
-            source.seek(0)
-            table = pq.read_table(source)
-            source.seek(0)
-            self._validate_parquet_schema(table.schema, path)
-            for row in table.to_pylist():
-                if int(row["global_step"]) != global_step:
-                    raise ValueError("delta shard global_step mismatch")
-                if int(row["rank"]) != expected_rank:
-                    raise ValueError("delta shard rank mismatch")
-                if int(row["world_size"]) != self._world_size:
-                    raise ValueError("delta shard world_size mismatch")
-                if row["embedding_role"] not in SPARSE_EMBEDDING_ROLES:
-                    raise ValueError("delta shard has an invalid embedding role")
+        store = _RecordStore(os.path.join(self._state_dir, _RECORD_STORE_DB_FILENAME))
+        try:
+            for expected_rank, (path, source) in enumerate(
+                zip(shard_paths, shard_sources)
+            ):
+                source.seek(0)
+                parquet_file = pq.ParquetFile(source)
+                self._validate_parquet_schema(parquet_file.schema_arrow, path)
+                for batch in parquet_file.iter_batches(
+                    batch_size=self._settings.upload_batch_size
+                ):
+                    self._ingest_record_batch(store, global_step, expected_rank, batch)
+                source.seek(0)
+        except BaseException:
+            store.close()
+            raise
+        return store
 
-                embedding_name = row["embedding_name"]
-                if not isinstance(embedding_name, str) or not embedding_name:
-                    raise ValueError("delta shard embedding_name must not be empty")
-                if embedding_name not in self._embedding_dimensions:
-                    raise ValueError(
-                        "delta shard embedding_name is absent from model contract: "
-                        f"{embedding_name!r}"
-                    )
-                key_id = row["key_id"]
-                if isinstance(key_id, bool) or not isinstance(key_id, int):
-                    raise ValueError("delta shard key_id must be a signed int64")
-                if key_id == SPARSE_EMBEDDING_INVALID_KEY:
-                    raise ValueError(
-                        "delta shard key_id=-1 is reserved as the Processor/"
-                        "NvEmbeddings invalid-key sentinel"
-                    )
-                embedding = np.asarray(row["embedding"], dtype=np.float32)
-                expected_dimension = self._embedding_dimensions[embedding_name]
-                if embedding.ndim != 1 or embedding.size != expected_dimension:
-                    raise ValueError(
-                        f"delta embedding dimension mismatch for {embedding_name!r}: "
-                        f"expected={expected_dimension}, actual_shape={embedding.shape}"
-                    )
-                if not np.isfinite(embedding).all():
-                    raise ValueError("delta embedding contains NaN or Inf")
-                record_key = (embedding_name, key_id)
-                previous = records.get(record_key)
-                if previous is not None:
-                    if not np.array_equal(previous, embedding):
-                        raise ValueError(
-                            "conflicting duplicate delta row for "
-                            f"embedding_name={embedding_name!r}, key_id={key_id}"
-                        )
-                    continue
-                records[record_key] = embedding
+    def _ingest_record_batch(
+        self,
+        store: _RecordStore,
+        global_step: int,
+        expected_rank: int,
+        batch: pa.RecordBatch,
+    ) -> None:
+        """Validate one streamed shard batch and spill it into the store."""
+        num_rows = batch.num_rows
+        if num_rows == 0:
+            return
+        # The parquet schema check already enforces every column type, so the
+        # value checks below stay vectorized instead of per-row Python loops.
+        global_steps = batch.column("global_step").to_numpy(zero_copy_only=False)
+        if not bool((global_steps == global_step).all()):
+            raise ValueError("delta shard global_step mismatch")
+        ranks = batch.column("rank").to_numpy(zero_copy_only=False)
+        if not bool((ranks == expected_rank).all()):
+            raise ValueError("delta shard rank mismatch")
+        world_sizes = batch.column("world_size").to_numpy(zero_copy_only=False)
+        if not bool((world_sizes == self._world_size).all()):
+            raise ValueError("delta shard world_size mismatch")
 
-        return [
-            (embedding_name, key_id, records[(embedding_name, key_id)])
-            for embedding_name, key_id in sorted(records)
-        ]
+        batch_roles = set(batch.column("embedding_role").to_pylist())
+        if not batch_roles <= set(SPARSE_EMBEDDING_ROLES):
+            raise ValueError("delta shard has an invalid embedding role")
+        embedding_names = batch.column("embedding_name").to_pylist()
+        for embedding_name in set(embedding_names):
+            if not embedding_name:
+                raise ValueError("delta shard embedding_name must not be empty")
+            if embedding_name not in self._embedding_dimensions:
+                raise ValueError(
+                    "delta shard embedding_name is absent from model contract: "
+                    f"{embedding_name!r}"
+                )
+
+        key_ids = batch.column("key_id").to_numpy(zero_copy_only=False)
+        if bool((key_ids == SPARSE_EMBEDDING_INVALID_KEY).any()):
+            raise ValueError(
+                "delta shard key_id=-1 is reserved as the Processor/"
+                "NvEmbeddings invalid-key sentinel"
+            )
+
+        embedding_column = cast(pa.ListArray, batch.column("embedding"))
+        flat_embeddings = embedding_column.values.to_numpy(zero_copy_only=False)
+        if not bool(np.isfinite(flat_embeddings).all()):
+            raise ValueError("delta embedding contains NaN or Inf")
+        offsets = embedding_column.offsets.to_numpy()
+        lengths = np.diff(offsets)
+        expected_dims = np.array(
+            [self._embedding_dimensions[name] for name in embedding_names],
+            dtype=lengths.dtype,
+        )
+        bad_rows = np.flatnonzero(lengths != expected_dims)
+        if bad_rows.size > 0:
+            row = int(bad_rows[0])
+            raise ValueError(
+                f"delta embedding dimension mismatch for {embedding_names[row]!r}: "
+                f"expected={int(expected_dims[row])}, "
+                f"actual_shape=({int(lengths[row])},)"
+            )
+
+        store.add_batch(embedding_names, key_ids, flat_embeddings, offsets)
 
     @staticmethod
     def _validate_parquet_schema(schema: pa.Schema, path: str) -> None:

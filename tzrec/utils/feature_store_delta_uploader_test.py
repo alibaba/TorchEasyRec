@@ -24,6 +24,7 @@ from google.protobuf.descriptor import FieldDescriptor
 from tzrec.protos.train_pb2 import FeatureStoreConfig
 from tzrec.utils.delta_embedding_dump import _DELTA_DUMP_SCHEMA
 from tzrec.utils.feature_store_delta_uploader import (
+    _RECORD_STORE_DB_FILENAME,
     DELTA_DUMP_GENERATION_METADATA_KEY,
     FeatureStoreDeltaUploader,
     FeatureStoreUploadError,
@@ -1028,7 +1029,13 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 {"user_emb": 2},
                 client_factory=_FakeClientFactory(_FakeView()),
             )
-            records = uploader._load_records(10, [shard])
+            with uploader._build_record_store(10, [shard]) as store:
+                records = store.to_records()
+            self.assertFalse(
+                os.path.exists(
+                    os.path.join(uploader.state_dir, _RECORD_STORE_DB_FILENAME)
+                )
+            )
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0][2].tolist(), [1.0, 2.0])
 
@@ -1051,7 +1058,102 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 client_factory=_FakeClientFactory(_FakeView()),
             )
             with self.assertRaisesRegex(ValueError, "conflicting duplicate"):
-                uploader._load_records(10, [shard])
+                uploader._build_record_store(10, [shard])
+            # The throwaway spill database must not outlive a failed ingest.
+            self.assertFalse(
+                os.path.exists(
+                    os.path.join(uploader.state_dir, _RECORD_STORE_DB_FILENAME)
+                )
+            )
+
+    def test_duplicate_key_across_streamed_batches_is_deduplicated(self):
+        # Shards stream in upload_batch_size=2 record batches; the duplicate
+        # arrives in a later ingest batch than its first occurrence, so dedup
+        # must hold across spilled batches, not just within one.
+        with tempfile.TemporaryDirectory() as output_dir:
+            shard = _write_single_shard(
+                output_dir,
+                10,
+                [
+                    _row(10, 0, 1, [1.0, 2.0]),
+                    _row(10, 0, 2, [3.0, 4.0]),
+                    _row(10, 0, 1, [1.0, 2.0]),
+                    _row(10, 0, 3, [5.0, 6.0]),
+                ],
+            )
+            uploader = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            with uploader._build_record_store(10, [shard]) as store:
+                records = store.to_records()
+
+        self.assertEqual([record[1] for record in records], [1, 2, 3])
+        self.assertEqual(records[0][2].tolist(), [1.0, 2.0])
+
+    def test_conflicting_duplicate_across_streamed_batches_is_rejected(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            shard = _write_single_shard(
+                output_dir,
+                10,
+                [
+                    _row(10, 0, 1, [1.0, 2.0]),
+                    _row(10, 0, 2, [3.0, 4.0]),
+                    _row(10, 0, 1, [7.0, 8.0]),
+                ],
+            )
+            uploader = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            with self.assertRaisesRegex(ValueError, "conflicting duplicate"):
+                uploader._build_record_store(10, [shard])
+
+    def test_record_store_reiteration_is_deterministic_across_attempts(self):
+        # A retried attempt re-streams the whole store; the spill ordering
+        # must be identical every time so replayed ts ranges carry identical
+        # batch boundaries.
+        with tempfile.TemporaryDirectory() as output_dir:
+            shard = _write_single_shard(
+                output_dir,
+                10,
+                [
+                    _row(10, 0, 3, [5.0, 6.0]),
+                    _row(10, 0, 1, [1.0, 2.0]),
+                    _row(10, 0, 2, [3.0, 4.0]),
+                ],
+            )
+            uploader = FeatureStoreDeltaUploader(
+                _feature_store_config(),
+                output_dir,
+                "delta",
+                1,
+                {"user_emb": 2},
+                client_factory=_FakeClientFactory(_FakeView()),
+            )
+            with uploader._build_record_store(10, [shard]) as store:
+                first = list(store.iter_upload_batches(2))
+                second = list(store.iter_upload_batches(2))
+
+        self.assertEqual([count for _, count in first], [2, 1])
+
+        def keys_and_values(batches):
+            return [
+                (item["key_id"], item["embedding"].tolist())
+                for payload, _ in batches
+                for item in payload
+            ]
+
+        self.assertEqual(keys_and_values(first), keys_and_values(second))
+        self.assertEqual([key for key, _ in keys_and_values(first)], [1, 2, 3])
 
     def test_flush_failure_does_not_publish_success_marker(self):
         failed_summary = {
@@ -1417,7 +1519,8 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 {"user_emb": 2},
                 client_factory=_FakeClientFactory(_FakeView()),
             )
-            records = uploader._load_records(10, [shard])
+            with uploader._build_record_store(10, [shard]) as store:
+                records = store.to_records()
         self.assertEqual(records[0][1], -2)
 
     def test_reserved_invalid_key_is_rejected(self):
@@ -1432,7 +1535,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 client_factory=_FakeClientFactory(_FakeView()),
             )
             with self.assertRaisesRegex(ValueError, "invalid-key sentinel"):
-                uploader._load_records(10, [shard])
+                uploader._build_record_store(10, [shard])
 
     def test_empty_step_validates_remote_contract_before_commit(self):
         with tempfile.TemporaryDirectory() as output_dir:
@@ -1510,13 +1613,13 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 client_factory=_FakeClientFactory(_FakeView()),
             )
             with self.assertRaisesRegex(ValueError, "dimension mismatch"):
-                uploader._load_records(10, [bad_dimension])
+                uploader._build_record_store(10, [bad_dimension])
 
             bad_finite = _write_single_shard(
                 output_dir, 11, [_row(11, 0, 1, [1.0, float("nan")])]
             )
             with self.assertRaisesRegex(ValueError, "NaN or Inf"):
-                uploader._load_records(11, [bad_finite])
+                uploader._build_record_store(11, [bad_finite])
 
     def test_persisted_manifest_rejects_changed_shard_content(self):
         with tempfile.TemporaryDirectory() as output_dir:
@@ -1558,7 +1661,8 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 )
                 os.replace(replacement, shard)
 
-                records = uploader._load_records(10, [shard], [source])
+                with uploader._build_record_store(10, [shard], [source]) as store:
+                    records = store.to_records()
                 self.assertEqual(records[0][2].tolist(), [1.0, 2.0])
                 with self.assertRaisesRegex(
                     RuntimeError, "changed after upload snapshot"
