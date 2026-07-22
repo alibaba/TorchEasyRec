@@ -288,6 +288,75 @@ class OnlineDenseExportTest(unittest.TestCase):
                             version="20260623174705",
                         )
 
+    def test_export_online_dense_model_honors_online_dense_export_dir(self) -> None:
+        """ONLINE_DENSE_EXPORT_DIR redirects the publish root away from model_dir."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = os.path.join(tmp_dir, "model.ckpt-10")
+            os.makedirs(checkpoint_path)
+            pipeline_config_path = os.path.join(tmp_dir, "pipeline.config")
+            open(pipeline_config_path, "w").close()
+            override_root = os.path.join(tmp_dir, "serving_root")
+
+            def fake_export_dense_model_cpu(**kwargs):
+                save_dir = kwargs["save_dir"]
+                os.makedirs(save_dir, exist_ok=True)
+                with open(os.path.join(save_dir, "scripted_model.pt"), "w") as f:
+                    f.write("pt")
+                with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
+                    json.dump({}, f)
+
+            dummy_config = SimpleNamespace(
+                feature_configs=[],
+                data_config=SimpleNamespace(label_fields=[]),
+                model_config=SimpleNamespace(),
+            )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "USE_DISTRIBUTED_EMBEDDING": "1",
+                        "ONLINE_DENSE_EXPORT_DIR": override_root,
+                    },
+                    clear=False,
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export.config_util.load_pipeline_config",
+                    return_value=dummy_config,
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export._create_features",
+                    return_value=[],
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export._create_model",
+                    return_value=mock.Mock(),
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export.ScriptWrapper",
+                    side_effect=lambda model: model,
+                ),
+                mock.patch(
+                    "tzrec.tools.online_dense_export.export_dense_model_cpu",
+                    side_effect=fake_export_dense_model_cpu,
+                ),
+            ):
+                export_online_dense_model(
+                    pipeline_config_path=pipeline_config_path,
+                    checkpoint_path=checkpoint_path,
+                    model_dir=tmp_dir,
+                    version="20260623174706",
+                    checkpoint_step=10,
+                    data_timestamp=42.0,
+                )
+
+            version_dir = os.path.join(override_root, "versions", "20260623174706")
+            self.assertTrue(os.path.exists(os.path.join(version_dir, "READY")))
+            self.assertTrue(
+                os.path.exists(os.path.join(version_dir, "scripted_model.pt"))
+            )
+            self.assertTrue(os.path.exists(os.path.join(override_root, "current.json")))
+            self.assertFalse(os.path.exists(os.path.join(tmp_dir, "dense_hot_export")))
+
 
 if __name__ == "__main__":
     unittest.main()

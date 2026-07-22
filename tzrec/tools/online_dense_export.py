@@ -29,9 +29,8 @@ from tzrec.utils.export_util import (
     export_dense_model_cpu,
 )
 from tzrec.utils.logging_util import logger
-from tzrec.utils.online_dense_export_util import make_version
+from tzrec.utils.online_dense_export_util import make_version, resolve_dense_export_root
 
-DENSE_HOT_EXPORT_DIR = "dense_hot_export"
 VERSIONS_DIR = "versions"
 CURRENT_JSON = "current.json"
 
@@ -140,7 +139,7 @@ def export_online_dense_model(
     ensure_input_tile_for_distributed_embedding()
 
     version = version or make_version()
-    export_root = os.path.join(model_dir, DENSE_HOT_EXPORT_DIR)
+    export_root = resolve_dense_export_root(model_dir)
     versions_root = os.path.join(export_root, VERSIONS_DIR)
     version_dir = os.path.join(versions_root, version)
     tmp_dir = f"{version_dir}.tmp.{os.getpid()}"

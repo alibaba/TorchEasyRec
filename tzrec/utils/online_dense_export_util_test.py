@@ -25,6 +25,7 @@ from tzrec.utils.online_dense_export_util import (
     _build_export_subprocess_env,
     _make_monotonic_version,
     make_version,
+    resolve_dense_export_root,
 )
 
 
@@ -42,6 +43,19 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         )
 
         self.assertEqual(version, "20260623174704")
+
+    def test_resolve_dense_export_root_defaults_when_unset(self) -> None:
+        """Without ONLINE_DENSE_EXPORT_DIR, root is <model_dir>/dense_hot_export."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ONLINE_DENSE_EXPORT_DIR", None)
+            self.assertEqual(
+                resolve_dense_export_root("/model"), "/model/dense_hot_export"
+            )
+
+    def test_resolve_dense_export_root_honors_env(self) -> None:
+        """ONLINE_DENSE_EXPORT_DIR overrides the default root."""
+        with mock.patch.dict(os.environ, {"ONLINE_DENSE_EXPORT_DIR": "/serving/dense"}):
+            self.assertEqual(resolve_dense_export_root("/model"), "/serving/dense")
 
     def test_build_export_subprocess_env_removes_torchelastic_env(self) -> None:
         with (
@@ -107,6 +121,14 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             os.makedirs(ckpt_path)
             with (
                 mock.patch.dict(os.environ, env),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
+                            tmp_dir, "dense_hot_export"
+                        )
+                    },
+                ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
                     side_effect=fake_run,
@@ -161,6 +183,14 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 os.makedirs(path)
             with (
                 mock.patch.dict(os.environ, env),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
+                            tmp_dir, "dense_hot_export"
+                        )
+                    },
+                ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
                     side_effect=fake_run,
@@ -210,6 +240,14 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             os.makedirs(ckpt_path)
             with (
                 mock.patch.dict(os.environ, env),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
+                            tmp_dir, "dense_hot_export"
+                        )
+                    },
+                ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
                     side_effect=fake_run,
@@ -254,6 +292,14 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             os.makedirs(ckpt_path)
             with (
                 mock.patch.dict(os.environ, env),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
+                            tmp_dir, "dense_hot_export"
+                        )
+                    },
+                ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
                     side_effect=fake_run,
@@ -306,6 +352,14 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             os.makedirs(ckpt_path)
             with (
                 mock.patch.dict(os.environ, env),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
+                            tmp_dir, "dense_hot_export"
+                        )
+                    },
+                ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
                     side_effect=fake_run,
@@ -390,6 +444,14 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             os.makedirs(ckpt_path)
             with (
                 mock.patch.dict(os.environ, env),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
+                            tmp_dir, "dense_hot_export"
+                        )
+                    },
+                ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
                     side_effect=fake_run,
@@ -412,8 +474,8 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             self.assertNotIn("20260101000001.log", remaining)
             self.assertNotIn("20260101000002.log", remaining)
 
-    def test_init_rejects_remote_model_dir(self) -> None:
-        """Remote (fsspec-URL) model_dir must fail fast, not silently no-op."""
+    def test_init_requires_export_dir_when_enabled(self) -> None:
+        """ONLINE_DENSE_EXPORT=1 without ONLINE_DENSE_EXPORT_DIR must fail fast."""
         ckpt = mock.Mock()
         env = {
             "ONLINE_DENSE_EXPORT": "1",
@@ -424,19 +486,136 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             "LOCAL_WORLD_SIZE": "1",
         }
         with tempfile.TemporaryDirectory() as tmp_dir:
-            with mock.patch.dict(os.environ, env):
-                with self.assertRaisesRegex(RuntimeError, "local model_dir"):
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop("ONLINE_DENSE_EXPORT_DIR", None)
+                # a remote model_dir surfaces the missing-dir error, not a
+                # remote-path error: the dir requirement fires first.
+                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_DIR"):
                     OnlineDenseExportManager(
                         model_dir="oss://bucket/m",
                         pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
                         ckpt_manager=ckpt,
                     )
+                # a local model_dir is not a substitute for the explicit dir
+                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_DIR"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        ckpt_manager=ckpt,
+                    )
+
+    def test_init_rejects_remote_export_root_and_pipeline_config(self) -> None:
+        """With the dir set, remote export_root/pipeline_config fail fast."""
+        ckpt = mock.Mock()
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_dir = os.path.join(tmp_dir, "dhx")
+            with mock.patch.dict(
+                os.environ, {**env, "ONLINE_DENSE_EXPORT_DIR": local_dir}
+            ):
                 with self.assertRaisesRegex(RuntimeError, "local pipeline_config_path"):
                     OnlineDenseExportManager(
                         model_dir=tmp_dir,
                         pipeline_config_path="dfs://bucket/pipeline.config",
                         ckpt_manager=ckpt,
                     )
+                with mock.patch.dict(
+                    os.environ, {"ONLINE_DENSE_EXPORT_DIR": "oss://bucket/export"}
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "local export_root"):
+                        OnlineDenseExportManager(
+                            model_dir=tmp_dir,
+                            pipeline_config_path=os.path.join(
+                                tmp_dir, "pipeline.config"
+                            ),
+                            ckpt_manager=ckpt,
+                        )
+
+    def test_init_allows_remote_model_dir_when_export_root_overridden(self) -> None:
+        """A local ONLINE_DENSE_EXPORT_DIR decouples the publish tree from model_dir."""
+        ckpt = mock.Mock()
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            override = os.path.join(tmp_dir, "serving_root")
+            with mock.patch.dict(
+                os.environ, {**env, "ONLINE_DENSE_EXPORT_DIR": override}
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir="oss://bucket/m",
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    ckpt_manager=ckpt,
+                )
+                try:
+                    self.assertEqual(mgr._export_root, os.path.abspath(override))
+                finally:
+                    mgr.close()
+
+    def test_run_task_uses_overridden_export_root(self) -> None:
+        """ONLINE_DENSE_EXPORT_DIR redirects the log dir and is propagated abspath'd."""
+        ckpt = mock.Mock()
+        captured = {}
+        done = threading.Event()
+
+        def fake_run(cmd, **kwargs):
+            captured["env"] = kwargs.get("env")
+            done.set()
+
+        env = {
+            "ONLINE_DENSE_EXPORT": "1",
+            "USE_DISTRIBUTED_EMBEDDING": "1",
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+            "LOCAL_WORLD_SIZE": "1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            override = os.path.join(tmp_dir, "serving_dense")
+            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
+            os.makedirs(ckpt_path)
+            with (
+                mock.patch.dict(
+                    os.environ, {**env, "ONLINE_DENSE_EXPORT_DIR": override}
+                ),
+                mock.patch(
+                    "tzrec.utils.online_dense_export_util.subprocess.run",
+                    side_effect=fake_run,
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    ckpt_manager=ckpt,
+                )
+                try:
+                    self.assertEqual(mgr._export_root, os.path.abspath(override))
+                    mgr.submit(1, ckpt_path, 1.0)
+                    self.assertTrue(done.wait(timeout=10))
+                finally:
+                    mgr.close()
+            self.assertEqual(
+                captured["env"]["ONLINE_DENSE_EXPORT_DIR"],
+                os.path.abspath(override),
+            )
+            logs_dir = os.path.join(override, "logs")
+            self.assertTrue(os.path.isdir(logs_dir))
+            self.assertEqual(
+                len([f for f in os.listdir(logs_dir) if f.endswith(".log")]), 1
+            )
+            self.assertFalse(os.path.exists(os.path.join(tmp_dir, "dense_hot_export")))
 
 
 if __name__ == "__main__":

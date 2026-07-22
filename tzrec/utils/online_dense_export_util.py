@@ -65,6 +65,23 @@ def _online_dense_export_enabled() -> bool:
     return os.environ.get("ONLINE_DENSE_EXPORT", "0") == "1"
 
 
+def resolve_dense_export_root(model_dir: str) -> str:
+    """Resolve the online dense export publish root.
+
+    Defaults to ``<model_dir>/dense_hot_export``. Setting the
+    ``ONLINE_DENSE_EXPORT_DIR`` environment variable redirects the publish
+    tree -- e.g. onto the serving root the inference processor reads -- so
+    hot dense export is decoupled from the training ``model_dir`` (which may
+    be remote or hold checkpoints). The raw, pre-abspath value is returned so
+    callers can detect fsspec-URL remotes before ``os.path.abspath`` mangles
+    them.
+    """
+    override = os.environ.get("ONLINE_DENSE_EXPORT_DIR")
+    if override:
+        return override
+    return os.path.join(model_dir, "dense_hot_export")
+
+
 def _is_remote_path(path: str) -> bool:
     """Whether path has an fsspec protocol such as oss:// or dfs://."""
     from fsspec.core import split_protocol
@@ -129,28 +146,35 @@ class OnlineDenseExportManager:
         self._close_timeout = 2 * self._export_timeout + 120.0
         self._keep_logs = int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_LOGS", "3"))
 
+        export_root = resolve_dense_export_root(model_dir)
+        self._export_root = os.path.abspath(export_root)
+        self._model_dir = os.path.abspath(model_dir)
+        self._pipeline_config_path = os.path.abspath(pipeline_config_path)
+
         if not self._enabled:
-            self._model_dir = os.path.abspath(model_dir)
-            self._pipeline_config_path = os.path.abspath(pipeline_config_path)
             return
+        if not os.environ.get("ONLINE_DENSE_EXPORT_DIR"):
+            raise RuntimeError(
+                "ONLINE_DENSE_EXPORT=1 requires ONLINE_DENSE_EXPORT_DIR to be set "
+                "to the serving root the inference processor reads from; refusing "
+                "to default the publish tree to the training model_dir."
+            )
         if not env_util.use_distributed_embedding():
             raise RuntimeError(
                 "ONLINE_DENSE_EXPORT=1 requires USE_DISTRIBUTED_EMBEDDING=1."
             )
-        # Remote (fsspec-URL) model_dir is unsupported: os.path.abspath mangles
-        # the URL, os.rename/os.replace are not fsspec-patched, and protect
-        # keys would never match prune-side glob results. Fail fast instead of
-        # silently producing zero exports per checkpoint.
+        # The publish tree (os.rename / current.json / protect-key glob) is
+        # local-FS only; fsspec URLs break all three. Check the actual export
+        # root -- ONLINE_DENSE_EXPORT_DIR override, else <model_dir>/dense_hot_export
+        # -- so a local override decouples the publish tree from a remote model_dir.
         for label, path in (
-            ("model_dir", model_dir),
+            ("export_root", export_root),
             ("pipeline_config_path", pipeline_config_path),
         ):
             if _is_remote_path(path):
                 raise RuntimeError(
                     f"ONLINE_DENSE_EXPORT requires a local {label}, got remote: {path}"
                 )
-        self._model_dir = os.path.abspath(model_dir)
-        self._pipeline_config_path = os.path.abspath(pipeline_config_path)
         if self._rank == 0:
             self._worker = Thread(
                 target=self._worker_loop,
@@ -168,7 +192,7 @@ class OnlineDenseExportManager:
             )
             logger.info(
                 "ONLINE_DENSE_EXPORT enabled; dense versions will be exported under %s",
-                os.path.join(model_dir, "dense_hot_export"),
+                self._export_root,
             )
 
     def submit(
@@ -267,7 +291,7 @@ class OnlineDenseExportManager:
 
     def _run_task(self, task: Dict[str, Any]) -> None:
         checkpoint_path = task["checkpoint_path"]
-        log_dir = os.path.join(self._model_dir, "dense_hot_export", "logs")
+        log_dir = os.path.join(self._export_root, "logs")
         try:
             if not os.path.exists(checkpoint_path):
                 logger.error(
@@ -281,6 +305,10 @@ class OnlineDenseExportManager:
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             )
             env = _build_export_subprocess_env(repo_root)
+            # Pass the resolved (abspath'd) root so the subprocess publishes
+            # under the same tree the manager logs into, independent of the
+            # subprocess cwd or a relative ONLINE_DENSE_EXPORT_DIR.
+            env["ONLINE_DENSE_EXPORT_DIR"] = self._export_root
             cmd = [
                 sys.executable,
                 "-m",
