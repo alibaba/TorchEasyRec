@@ -27,7 +27,7 @@ _INT64_MAX = int(np.iinfo(np.int64).max)
 _MASK64 = (1 << 64) - 1
 _SEED = 2026
 _SPLITMIX_INCREMENT = 0x9E3779B97F4A7C15
-_GROUPING_ROW_CHUNK = 1_000_000
+_ROW_CHUNK_SIZE = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -379,37 +379,39 @@ class CollisionResolver(ABC):
         progress = ProgressLogger("Resolving collision overflow", start_n=0)
         processed_count = 0
 
-        for row, key_prefix, origin_last_code, candidate_row in zip(
-            plan.overflow_rows.tolist(),
-            plan.overflow_bucket_key_prefixes.tolist(),
-            plan.overflow_origin_last_codes.tolist(),
-            candidates,
-        ):
-            for candidate in candidate_row.tolist():
-                if candidate == origin_last_code:
-                    continue
-                destination_key = key_prefix + candidate
-                destination_count = get_slot_count(destination_key, 0)
-                if destination_count < capacity:
-                    slot_counts[destination_key] = destination_count + 1
-                    resolved_last_codes[row] = candidate
-                    slot_indices[row] = destination_count + 1
-                    relocated_count += 1
-                    break
-            else:
-                # No free candidate slot: keep the original SID over capacity.
-                unresolved_rows.append(row)
-                origin_key = key_prefix + origin_last_code
-                origin_count = get_slot_count(origin_key, 0) + 1
-                slot_counts[origin_key] = origin_count
-                slot_indices[row] = origin_count
+        for start in range(0, overflow_count, _ROW_CHUNK_SIZE):
+            end = min(start + _ROW_CHUNK_SIZE, overflow_count)
+            for row, key_prefix, origin_last_code, candidate_row in zip(
+                plan.overflow_rows[start:end].tolist(),
+                plan.overflow_bucket_key_prefixes[start:end].tolist(),
+                plan.overflow_origin_last_codes[start:end].tolist(),
+                candidates[start:end],
+            ):
+                for candidate in candidate_row.tolist():
+                    if candidate == origin_last_code:
+                        continue
+                    destination_key = key_prefix + candidate
+                    destination_count = get_slot_count(destination_key, 0)
+                    if destination_count < capacity:
+                        slot_counts[destination_key] = destination_count + 1
+                        resolved_last_codes[row] = candidate
+                        slot_indices[row] = destination_count + 1
+                        relocated_count += 1
+                        break
+                else:
+                    # No free candidate slot: keep the original SID over capacity.
+                    unresolved_rows.append(row)
+                    origin_key = key_prefix + origin_last_code
+                    origin_count = get_slot_count(origin_key, 0) + 1
+                    slot_counts[origin_key] = origin_count
+                    slot_indices[row] = origin_count
 
-            processed_count += 1
-            if processed_count % self._progress_interval == 0:
-                progress.log(
-                    processed_count,
-                    suffix=f"{processed_count} samples processed",
-                )
+                processed_count += 1
+                if processed_count % self._progress_interval == 0:
+                    progress.log(
+                        processed_count,
+                        suffix=f"{processed_count} samples processed",
+                    )
 
         (
             final_bucket_keys,
@@ -636,8 +638,8 @@ def _within_bucket_rank(
     del sorted_bands, sorted_last_codes, is_first
     bucket_ids = np.empty(row_count, dtype=np.int64)
     bucket_ranks = np.empty(row_count, dtype=np.int64)
-    for start in range(0, row_count, _GROUPING_ROW_CHUNK):
-        end = min(start + _GROUPING_ROW_CHUNK, row_count)
+    for start in range(0, row_count, _ROW_CHUNK_SIZE):
+        end = min(start + _ROW_CHUNK_SIZE, row_count)
         first_bucket = int(np.searchsorted(first_sorted_rows, start, side="right") - 1)
         last_bucket = int(np.searchsorted(first_sorted_rows, end - 1, side="right") - 1)
         local_starts = first_sorted_rows[first_bucket : last_bucket + 1].copy()
@@ -784,8 +786,8 @@ def build_original_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
     """
 
     def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        for start in range(0, plan.item_count, _GROUPING_ROW_CHUNK):
-            end = min(start + _GROUPING_ROW_CHUNK, plan.item_count)
+        for start in range(0, plan.item_count, _ROW_CHUNK_SIZE):
+            end = min(start + _ROW_CHUNK_SIZE, plan.item_count)
             yield (
                 np.arange(start, end, dtype=np.int64),
                 plan.origin_bucket_indices[start:end],
@@ -825,8 +827,8 @@ def build_resolved_item_grouping(
         )
 
     def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        for start in range(0, plan.item_count, _GROUPING_ROW_CHUNK):
-            end = min(start + _GROUPING_ROW_CHUNK, plan.item_count)
+        for start in range(0, plan.item_count, _ROW_CHUNK_SIZE):
+            end = min(start + _ROW_CHUNK_SIZE, plan.item_count)
             rows = np.arange(start, end, dtype=np.int64)
             emitted_sid_keys = plan.bucket_keys[plan.origin_bucket_indices[rows]]
             emitted_sid_keys -= plan.original_last_codes[rows]

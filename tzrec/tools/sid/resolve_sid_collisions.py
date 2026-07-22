@@ -57,7 +57,7 @@ import os
 from contextlib import closing
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -72,8 +72,8 @@ from tzrec.datasets.dataset import (
     create_reader,
     create_writer,
 )
-from tzrec.datasets.odps_dataset import _parse_table_path
 from tzrec.utils.logging_util import ProgressLogger, logger
+from tzrec.utils.path_util import check_path_conflict
 from tzrec.utils.sid.collision import (
     CodebookItemGrouping,
     CollisionPlan,
@@ -91,32 +91,6 @@ from tzrec.utils.sid.collision import (
 _MAP_WRITE_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
-
-_PathIdentity = Union[str, Tuple[str, str, Optional[str], str, Optional[str]]]
-
-
-def _output_path_identity(path: str) -> _PathIdentity:
-    """Return the destination identity used by the repository writer."""
-    if not path.startswith("odps://"):
-        return os.path.realpath(path)
-
-    project, table_name, partitions, schema = _parse_table_path(path)
-    partition_spec = partitions[0] if partitions and partitions[0] else None
-    return "odps", project, schema, table_name, partition_spec
-
-
-def _input_write_identity(input_path: str) -> _PathIdentity:
-    """Destination identity a writer must avoid for the given input path.
-
-    Writers emit part files into a directory, so the collision unit is a
-    directory: the input's own for a local file/glob, else the path itself.
-    """
-    if input_path.startswith("odps://"):
-        return _output_path_identity(input_path)
-    base = input_path
-    if any(ch in input_path for ch in "*?[") or os.path.isfile(input_path):
-        base = os.path.dirname(input_path) or "."
-    return os.path.realpath(base)
 
 
 def _require_single_process() -> None:
@@ -212,30 +186,19 @@ class ResolveSidCollisionsConfig:
                 "resolved_sid_groups_output_path is required unless rate_only is set."
             )
 
-        named_paths = {
-            "output_path": self.output_path,
-            "original_sid_groups_output_path": self.original_sid_groups_output_path,
-            "resolved_sid_groups_output_path": self.resolved_sid_groups_output_path,
-        }
-        seen_paths: Dict[_PathIdentity, str] = {}
-        for name, path in named_paths.items():
-            if not path:
-                continue
-            path_identity = _output_path_identity(path)
-            previous_name = seen_paths.get(path_identity)
-            if previous_name is not None:
-                raise ValueError(f"{name} must differ from {previous_name}: {path!r}.")
-            seen_paths[path_identity] = name
-
-        # Writers overwrite in place after the full read, so an output in the
-        # input's location silently destroys the source map.
-        input_identity = _input_write_identity(self.input_path)
-        for name, path in named_paths.items():
-            if path and _output_path_identity(path) == input_identity:
-                raise ValueError(
-                    f"{name} would overwrite --input_path ({self.input_path!r}); "
-                    "write outputs to a location outside the input."
-                )
+        paths = [self.input_path]
+        paths.extend(
+            path
+            for path in (
+                self.output_path,
+                self.original_sid_groups_output_path,
+                self.resolved_sid_groups_output_path,
+            )
+            if path
+        )
+        has_conflict, conflict_message = check_path_conflict(paths)
+        if has_conflict:
+            raise ValueError(conflict_message)
 
         # Eagerly build the resolution config so its validation (layer_sizes,
         # capacity) fails fast here rather than lazily inside run().
@@ -429,7 +392,9 @@ class CollisionResolutionRunner:
         if not id_chunks:
             raise ValueError("SID input is empty.")
         item_id_array = np.concatenate(id_chunks)
+        del id_chunks
         code_matrix = np.concatenate(code_chunks, axis=0)
+        del code_chunks
         if code_matrix.shape[1] < 1:
             raise ValueError("SID codes must have at least one layer.")
         return item_id_array, code_matrix
@@ -800,7 +765,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output writer; defaults to matching the input reader.",
     )
-    parser.add_argument("--batch_size", type=int, default=100000)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=100000,
+        help=(
+            "Reader I/O batch size; does not limit the in-memory collision working set."
+        ),
+    )
     parser.add_argument(
         "--progress_interval",
         type=int,

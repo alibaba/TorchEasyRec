@@ -36,6 +36,7 @@ import pyarrow as pa
 
 from tzrec.datasets.dataset import create_reader, create_writer
 from tzrec.utils.logging_util import logger
+from tzrec.utils.path_util import check_path_conflict
 from tzrec.utils.sid.quality import (
     SidLayerQualityMetrics,
     SidQualityAccumulator,
@@ -435,6 +436,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"--codebook capacity (product = {capacity}) exceeds int64; "
             "collision analysis is not supported at that scale."
         )
+    paths = [args.input_path]
+    paths.extend(
+        path for path in (args.summary_output, args.layer_stats_output) if path
+    )
+    has_conflict, conflict_message = check_path_conflict(paths)
+    if has_conflict:
+        raise ValueError(conflict_message)
 
     selected_fields = [args.codes_field]
     if args.origin_codes_field is not None:

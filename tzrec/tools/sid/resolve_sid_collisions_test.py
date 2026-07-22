@@ -252,13 +252,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "candidate_codes field .* is missing"):
             self._run(inp, out, max_items_per_codebook=2)
 
-    def test_output_into_input_location_rejected(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        _parquet(inp, list(range(3)), [[0, 0]] * 3, [[[0, 1]]] * 3)
-        # output_path is the directory holding the input file -> would overwrite it
-        with self.assertRaisesRegex(ValueError, "would overwrite --input_path"):
-            self._run(inp, self.test_dir)
-
     def test_multi_process_launch_rejected(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
@@ -636,35 +629,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     def test_rejects_invalid_progress_interval(self) -> None:
         with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
             self._runner("input", "map", progress_interval=0)
-
-    @parameterized.expand(
-        [
-            ("local", "map", "map/../map", "resolved"),
-            (
-                "odps_trailing_slash",
-                "odps://project/tables/map",
-                "odps://project/tables/map/",
-                "odps://project/tables/resolved",
-            ),
-            (
-                "odps_ignored_partition",
-                "odps://project/tables/schema.map/dt=20260713",
-                "odps://project/tables/schema.map/dt=20260713&dt=20260712",
-                "odps://project/tables/schema.resolved",
-            ),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_output_path_aliases_are_rejected(
-        self, _name, output_path, original_path, resolved_path
-    ) -> None:
-        with self.assertRaisesRegex(ValueError, "must differ from output_path"):
-            self._runner(
-                "input",
-                output_path,
-                original_sid_groups_output_path=original_path,
-                resolved_sid_groups_output_path=resolved_path,
-            )
 
     def test_odps_group_writes_use_native_array_columns(self) -> None:
         class OdpsWriter:

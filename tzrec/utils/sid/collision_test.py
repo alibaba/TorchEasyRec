@@ -45,6 +45,36 @@ def _assert_same_assignments(test_case, actual, expected):
 
 
 class CollisionTest(unittest.TestCase):
+    def test_resolution_chunking_preserves_greedy_results(self) -> None:
+        plan = _plan((4,), 1, range(8), [[0]] * 8)
+        candidates = np.tile(np.asarray([1, 2, 3]), (7, 1))
+
+        with mock.patch.object(collision, "_ROW_CHUNK_SIZE", 100):
+            expected = KnnCollisionResolver().resolve(plan, candidates)
+        with mock.patch.object(collision, "_ROW_CHUNK_SIZE", 2):
+            actual = KnnCollisionResolver().resolve(plan, candidates)
+
+        self.assertEqual(plan.overflow_rows.size, 7)
+        self.assertEqual(actual.stats.relocated_count, 3)
+        self.assertEqual(actual.stats.unresolved_count, 4)
+        _assert_same_assignments(self, actual, expected)
+        np.testing.assert_array_equal(
+            actual.final_bucket_keys, expected.final_bucket_keys
+        )
+        np.testing.assert_array_equal(
+            actual.final_bucket_counts, expected.final_bucket_counts
+        )
+        self.assertEqual(actual.grouping_collected, expected.grouping_collected)
+        actual_grouping = build_resolved_item_grouping(plan, actual)
+        expected_grouping = build_resolved_item_grouping(plan, expected)
+        np.testing.assert_array_equal(
+            actual_grouping.sid_keys, expected_grouping.sid_keys
+        )
+        np.testing.assert_array_equal(actual_grouping.counts, expected_grouping.counts)
+        np.testing.assert_array_equal(
+            actual_grouping.row_order, expected_grouping.row_order
+        )
+
     def test_resolution_loop_reports_sample_progress(self) -> None:
         plan = _plan(
             (5,),
@@ -74,7 +104,7 @@ class CollisionTest(unittest.TestCase):
         codes = np.asarray(
             [[0, 0]] * 4 + [[0, 1]] + [[0, 2]] * 2 + [[1, 0]] * 3, dtype=np.int64
         )
-        with mock.patch.object(collision, "_GROUPING_ROW_CHUNK", 2):
+        with mock.patch.object(collision, "_ROW_CHUNK_SIZE", 2):
             plan = _plan((2, 4), 2, item_ids, codes)
             candidates = np.asarray([[0, 1, 2], [1, 2, 3], [0, 1, 2]], dtype=np.int64)
             result = KnnCollisionResolver().resolve(plan, candidates)
