@@ -349,12 +349,18 @@ class OnlineDenseExportTest(unittest.TestCase):
                     data_timestamp=42.0,
                 )
 
-            version_dir = os.path.join(override_root, "versions", "20260623174706")
+            version_dir = os.path.join(
+                override_root, "dense_hot_export", "versions", "20260623174706"
+            )
             self.assertTrue(os.path.exists(os.path.join(version_dir, "READY")))
             self.assertTrue(
                 os.path.exists(os.path.join(version_dir, "scripted_model.pt"))
             )
-            self.assertTrue(os.path.exists(os.path.join(override_root, "current.json")))
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(override_root, "dense_hot_export", "current.json")
+                )
+            )
             self.assertFalse(os.path.exists(os.path.join(tmp_dir, "dense_hot_export")))
 
 

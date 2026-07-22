@@ -53,9 +53,11 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             )
 
     def test_resolve_dense_export_root_honors_env(self) -> None:
-        """ONLINE_DENSE_EXPORT_DIR overrides the default root."""
+        """ONLINE_DENSE_EXPORT_DIR names the serving root; dense_hot_export appended."""
         with mock.patch.dict(os.environ, {"ONLINE_DENSE_EXPORT_DIR": "/serving/dense"}):
-            self.assertEqual(resolve_dense_export_root("/model"), "/serving/dense")
+            self.assertEqual(
+                resolve_dense_export_root("/model"), "/serving/dense/dense_hot_export"
+            )
 
     def test_build_export_subprocess_env_removes_torchelastic_env(self) -> None:
         with (
@@ -123,11 +125,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 mock.patch.dict(os.environ, env),
                 mock.patch.dict(
                     os.environ,
-                    {
-                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
-                            tmp_dir, "dense_hot_export"
-                        )
-                    },
+                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
                 ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
@@ -185,11 +183,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 mock.patch.dict(os.environ, env),
                 mock.patch.dict(
                     os.environ,
-                    {
-                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
-                            tmp_dir, "dense_hot_export"
-                        )
-                    },
+                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
                 ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
@@ -242,11 +236,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 mock.patch.dict(os.environ, env),
                 mock.patch.dict(
                     os.environ,
-                    {
-                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
-                            tmp_dir, "dense_hot_export"
-                        )
-                    },
+                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
                 ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
@@ -294,11 +284,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 mock.patch.dict(os.environ, env),
                 mock.patch.dict(
                     os.environ,
-                    {
-                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
-                            tmp_dir, "dense_hot_export"
-                        )
-                    },
+                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
                 ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
@@ -354,11 +340,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 mock.patch.dict(os.environ, env),
                 mock.patch.dict(
                     os.environ,
-                    {
-                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
-                            tmp_dir, "dense_hot_export"
-                        )
-                    },
+                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
                 ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
@@ -432,7 +414,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             "LOCAL_WORLD_SIZE": "1",
         }
         with tempfile.TemporaryDirectory() as tmp_dir:
-            log_dir = os.path.join(tmp_dir, "dense_hot_export", "logs")
+            log_dir = os.path.join(tmp_dir, "serving_root", "dense_hot_export", "logs")
             os.makedirs(log_dir)
             for v in (
                 "20260101000001",
@@ -446,11 +428,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 mock.patch.dict(os.environ, env),
                 mock.patch.dict(
                     os.environ,
-                    {
-                        "ONLINE_DENSE_EXPORT_DIR": os.path.join(
-                            tmp_dir, "dense_hot_export"
-                        )
-                    },
+                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
                 ),
                 mock.patch(
                     "tzrec.utils.online_dense_export_util.subprocess.run",
@@ -560,7 +538,10 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     ckpt_manager=ckpt,
                 )
                 try:
-                    self.assertEqual(mgr._export_root, os.path.abspath(override))
+                    self.assertEqual(
+                        mgr._export_root,
+                        os.path.abspath(os.path.join(override, "dense_hot_export")),
+                    )
                 finally:
                     mgr.close()
 
@@ -601,7 +582,10 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     ckpt_manager=ckpt,
                 )
                 try:
-                    self.assertEqual(mgr._export_root, os.path.abspath(override))
+                    self.assertEqual(
+                        mgr._export_root,
+                        os.path.abspath(os.path.join(override, "dense_hot_export")),
+                    )
                     mgr.submit(1, ckpt_path, 1.0)
                     self.assertTrue(done.wait(timeout=10))
                 finally:
@@ -610,7 +594,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 captured["env"]["ONLINE_DENSE_EXPORT_DIR"],
                 os.path.abspath(override),
             )
-            logs_dir = os.path.join(override, "logs")
+            logs_dir = os.path.join(override, "dense_hot_export", "logs")
             self.assertTrue(os.path.isdir(logs_dir))
             self.assertEqual(
                 len([f for f in os.listdir(logs_dir) if f.endswith(".log")]), 1

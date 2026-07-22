@@ -68,18 +68,16 @@ def _online_dense_export_enabled() -> bool:
 def resolve_dense_export_root(model_dir: str) -> str:
     """Resolve the online dense export publish root.
 
-    Defaults to ``<model_dir>/dense_hot_export``. Setting the
-    ``ONLINE_DENSE_EXPORT_DIR`` environment variable redirects the publish
-    tree -- e.g. onto the serving root the inference processor reads -- so
-    hot dense export is decoupled from the training ``model_dir`` (which may
-    be remote or hold checkpoints). The raw, pre-abspath value is returned so
-    callers can detect fsspec-URL remotes before ``os.path.abspath`` mangles
-    them.
+    The publish tree always lives at ``<root>/dense_hot_export``, where
+    ``<root>`` is the ``ONLINE_DENSE_EXPORT_DIR`` serving root when set, else
+    the training ``model_dir``. The inference processor reads from the
+    ``dense_hot_export`` leaf, so decoupling the serving root from
+    ``model_dir`` (which may be remote or hold checkpoints) keeps the layout
+    identical in both cases. The raw, pre-abspath value is returned so callers
+    can detect fsspec-URL remotes before ``os.path.abspath`` mangles them.
     """
-    override = os.environ.get("ONLINE_DENSE_EXPORT_DIR")
-    if override:
-        return override
-    return os.path.join(model_dir, "dense_hot_export")
+    root = os.environ.get("ONLINE_DENSE_EXPORT_DIR") or model_dir
+    return os.path.join(root, "dense_hot_export")
 
 
 def _is_remote_path(path: str) -> bool:
@@ -146,14 +144,16 @@ class OnlineDenseExportManager:
         self._close_timeout = 2 * self._export_timeout + 120.0
         self._keep_logs = int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_LOGS", "3"))
 
+        override = os.environ.get("ONLINE_DENSE_EXPORT_DIR")
         export_root = resolve_dense_export_root(model_dir)
         self._export_root = os.path.abspath(export_root)
+        self._serving_root = os.path.abspath(override) if override else None
         self._model_dir = os.path.abspath(model_dir)
         self._pipeline_config_path = os.path.abspath(pipeline_config_path)
 
         if not self._enabled:
             return
-        if not os.environ.get("ONLINE_DENSE_EXPORT_DIR"):
+        if not override:
             raise RuntimeError(
                 "ONLINE_DENSE_EXPORT=1 requires ONLINE_DENSE_EXPORT_DIR to be set "
                 "to the serving root the inference processor reads from; refusing "
@@ -165,8 +165,8 @@ class OnlineDenseExportManager:
             )
         # The publish tree (os.rename / current.json / protect-key glob) is
         # local-FS only; fsspec URLs break all three. Check the actual export
-        # root -- ONLINE_DENSE_EXPORT_DIR override, else <model_dir>/dense_hot_export
-        # -- so a local override decouples the publish tree from a remote model_dir.
+        # root -- <serving_root>/dense_hot_export -- so a local override
+        # decouples the publish tree from a remote model_dir.
         for label, path in (
             ("export_root", export_root),
             ("pipeline_config_path", pipeline_config_path),
@@ -305,10 +305,11 @@ class OnlineDenseExportManager:
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             )
             env = _build_export_subprocess_env(repo_root)
-            # Pass the resolved (abspath'd) root so the subprocess publishes
-            # under the same tree the manager logs into, independent of the
-            # subprocess cwd or a relative ONLINE_DENSE_EXPORT_DIR.
-            env["ONLINE_DENSE_EXPORT_DIR"] = self._export_root
+            # Pass the pre-suffix serving root (abspath'd) so the subprocess
+            # re-resolves it via resolve_dense_export_root to the same
+            # <serving_root>/dense_hot_export tree the manager logs into,
+            # independent of subprocess cwd or a relative ONLINE_DENSE_EXPORT_DIR.
+            env["ONLINE_DENSE_EXPORT_DIR"] = self._serving_root
             cmd = [
                 sys.executable,
                 "-m",
