@@ -613,13 +613,25 @@ class DeltaEmbeddingDumper:
             table_name for table_name, roles in roles_by_table.items() if len(roles) > 1
         )
         if ambiguous_tables:
-            # ModelDeltaTrackerTrec currently stores table_name -> FQN and
-            # overwrites one collection when EC/EBC reuse a raw name. Refuse to
-            # publish incomplete data instead of silently assigning a wrong PK.
-            raise ValueError(
-                "delta embedding dump cannot safely track table names reused by "
-                "both EmbeddingCollection and EmbeddingBagCollection: "
-                f"{ambiguous_tables}. TorchRec tracker needs role-aware identity."
+            # The TorchRec delta tracker keys bookkeeping by raw table name, so
+            # EC/EBC sharing a name collapse to one physical table and a wrong
+            # primary key could be published. Refuse for the shared FeatureStore
+            # (corrupting); the local parquet dump is re-derivable, so it warns
+            # and publishes the surviving table until the tracker is role-aware.
+            if self._feature_store_enabled:
+                raise ValueError(
+                    "delta embedding dump cannot safely upload to FeatureStore "
+                    "while table names are reused by both EmbeddingCollection "
+                    f"and EmbeddingBagCollection: {ambiguous_tables}. The "
+                    "TorchRec tracker would publish a wrong primary key; "
+                    "role-aware tracker identity is required."
+                )
+            logger.warning(
+                "Delta embedding dump cannot distinguish tables reused by both "
+                "EmbeddingCollection and EmbeddingBagCollection (%s); the TorchRec "
+                "tracker collapses them to one physical table, so only that "
+                "table's deltas are published.",
+                ambiguous_tables,
             )
 
         name_by_identity = build_sparse_embedding_name_map(metadata_by_identity)
