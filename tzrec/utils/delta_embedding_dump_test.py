@@ -1600,6 +1600,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             )
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @mark_ci_scope("gpu")
     def test_lookup_dynamic_embeddings_zero_fills_missing_ids(self):
         from dynamicemb.types import CopyMode
 
@@ -1632,6 +1633,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @mark_ci_scope("gpu")
     def test_lookup_dynamic_embeddings_zero_fills_all_missing_ids(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dynamic_module = SimpleNamespace(
