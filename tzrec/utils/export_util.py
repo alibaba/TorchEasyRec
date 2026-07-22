@@ -1848,7 +1848,15 @@ def export_dense_model_cpu(
     features = cast(List[BaseFeature], model.features)
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(iter(dataloader))
-    data = batch.to(device).to_dict(sparse_dtype=torch.int64)
+    batch = batch.to(device)
+    # Warm-up only materializes lazy-module shapes for FX tracing; its lookup
+    # values are discarded (real weights come from restore_model below). Zero
+    # sparse ids so out-of-range values (e.g. a dynamicemb feature's 64-bit FG
+    # hash) pass F.embedding_bag's strict CPU range-check; the dynamicemb
+    # backend that would remap them is GPU/DMP-only.
+    for kjt in batch.sparse_features.values():
+        kjt.values().zero_()
+    data = batch.to_dict(sparse_dtype=torch.int64)
 
     # Materialize lazy modules before FX tracing. Some modules build
     # submodules from concrete tensor shapes on their first forward; during

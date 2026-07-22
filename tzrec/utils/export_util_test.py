@@ -874,10 +874,13 @@ class ExportUtilTest(unittest.TestCase):
                         keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
                     )
                 },
+                # First id is an out-of-range dynamicemb-style 64-bit FG hash
+                # to guard the warm-up zeroing in export_dense_model_cpu:
+                # without it F.embedding_bag's strict CPU range-check raises.
                 sparse_features={
                     BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
                         keys=["cat_a", "cat_b"],
-                        values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
+                        values=torch.tensor([2100765614044343531, 2, 3, 4, 5, 6, 7]),
                         lengths=torch.tensor([1, 2, 1, 3]),
                     )
                 },
