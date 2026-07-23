@@ -383,7 +383,9 @@ def _train_and_evaluate(
         if use_epoch
         else itertools.count(0, 0)
     )
-    step_iter = range(train_config.num_steps) if use_step else itertools.count(0)
+    # one-shot: the data-pass chain below continues from i_step+1, not from 0;
+    # a bare range would reset the counter and collide model.ckpt-{step}.
+    step_iter = iter(range(train_config.num_steps)) if use_step else itertools.count(0)
 
     save_checkpoints_steps, save_checkpoints_epochs = 0, 0
     if train_config.save_checkpoints_epochs > 0:
