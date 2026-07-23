@@ -36,9 +36,7 @@ from tzrec.utils.feature_store_delta_uploader import (
     DELTA_DUMP_SCHEMA_VERSION,
     FeatureStoreDeltaUploader,
     FeatureStoreUploadError,
-    _durable_makedirs,
     feature_store_delta_file_prefix,
-    feature_store_upload_error_marker_path,
     validate_feature_store_config,
 )
 from tzrec.utils.logging_util import logger
@@ -54,7 +52,6 @@ from tzrec.utils.sparse_embedding_contract import (
 )
 
 _CONSUMER = "delta_embedding_dump"
-_DURABILITY_CONSUMER = "delta_embedding_dump_durable_ack"
 _DELTA_DUMP_SCHEMA = pa.schema(
     [
         ("global_step", pa.int64()),
@@ -401,33 +398,17 @@ class DeltaEmbeddingDumper:
         self._tracking_pause_depth = 0
         self._feature_store_enabled = config.HasField("feature_store_config")
         self._run_generation: Optional[str] = None
-        self._feature_store_error_marker_path: Optional[str] = None
-        self._next_feature_store_error_check = 0.0
-        self._feature_store_error_check_interval_secs = 1
         if self._feature_store_enabled:
             self._file_prefix = feature_store_delta_file_prefix(
                 config.feature_store_config, self._file_prefix
             )
-            self._feature_store_error_check_interval_secs = max(
-                int(config.feature_store_config.poll_interval_secs), 1
-            )
-            self._feature_store_error_marker_path = (
-                feature_store_upload_error_marker_path(
-                    config.feature_store_config, self._output_dir
-                )
-            )
-        _durable_makedirs(self._output_dir)
+        os.makedirs(self._output_dir, exist_ok=True)
 
         self._table_shard_infos = self._collect_table_shard_infos()
         self._validate_supported_table_sharding(self._table_shard_infos)
-        tracker_consumers = [_CONSUMER]
-        if self._feature_store_enabled:
-            # Keep tracked rows resident until their parquet outbox is durable.
-            # The second consumer advances only after atomic os.replace().
-            tracker_consumers.append(_DURABILITY_CONSUMER)
         self._tracker = ModelDeltaTrackerTrec(
             model,
-            consumers=tracker_consumers,
+            consumers=[_CONSUMER],
             delete_on_read=True,
             auto_compact=True,
             mode=TrackingMode.ID_ONLY,
@@ -504,33 +485,16 @@ class DeltaEmbeddingDumper:
     def _feature_store_upload_error(
         self, force: bool = False
     ) -> Optional[BaseException]:
-        """Collect a local/shared uploader error without changing rank control flow."""
+        """Collect a local uploader error without changing rank control flow."""
         if not getattr(self, "_feature_store_enabled", False):
             return None
 
-        local_error: Optional[BaseException] = None
         uploader = getattr(self, "_uploader", None)
         if uploader is not None:
             try:
                 uploader.check_error()
             except BaseException as exc:
-                local_error = exc
-
-        if local_error is not None:
-            return local_error
-        marker_path = getattr(self, "_feature_store_error_marker_path", None)
-        now = time.monotonic()
-        next_check = getattr(self, "_next_feature_store_error_check", 0.0)
-        if not force and now < next_check:
-            return None
-        self._next_feature_store_error_check = now + getattr(
-            self, "_feature_store_error_check_interval_secs", 1
-        )
-        if marker_path and os.path.isfile(marker_path):
-            return FeatureStoreUploadError(
-                "FeatureStore delta upload failed on rank zero; all training "
-                "workers are stopping and parquet outbox files were retained"
-            )
+                return exc
         return None
 
     def _check_feature_store_upload_error(self, force: bool = False) -> None:
@@ -681,28 +645,6 @@ class DeltaEmbeddingDumper:
     def _rollback_tracker_read(self, cursor: Optional[int]) -> None:
         if cursor is not None:
             self._tracker.per_consumer_batch_idx[_CONSUMER] = cursor
-
-    def _ack_durable_tracker_read(self) -> None:
-        if getattr(self, "_feature_store_enabled", False):
-            # Do not call get_unique() for the guard: that would repeat the
-            # expensive GPU cat/unique already performed by the real consumer.
-            # The parquet shard is durable now, so advance the guard cursor to
-            # the exact snapshot consumed above, then best-effort reclaim rows.
-            durable_cursor = int(self._tracker.per_consumer_batch_idx[_CONSUMER])
-            self._tracker.per_consumer_batch_idx[_DURABILITY_CONSUMER] = durable_cursor
-            if getattr(self._tracker, "_delete_on_read", False):
-                try:
-                    self._tracker.store.delete(
-                        up_to_idx=min(self._tracker.per_consumer_batch_idx.values())
-                    )
-                except BaseException as exc:
-                    # Cursor advancement is the durability acknowledgement;
-                    # deletion is only memory reclamation and can be retried by
-                    # a later dump without republishing rows.
-                    logger.warning(
-                        "Failed to reclaim durable delta tracker rows (%s).",
-                        type(exc).__name__,
-                    )
 
     @contextmanager
     def pause_tracking(self) -> Iterator[None]:
@@ -1042,14 +984,11 @@ class DeltaEmbeddingDumper:
                 table_chunks, output_path, dump_generation=dump_generation
             )
             if uploader is not None:
-                uploader.submit(global_step, dump_generation)
+                uploader.submit(global_step)
         except BaseException:
-            # The durability guard still owns the rows, so rewinding this
-            # consumer makes a caller retry observe the same snapshot.
             self._rollback_tracker_read(tracker_cursor)
             raise
 
-        self._ack_durable_tracker_read()
         if num_rows == 0:
             logger.info(
                 "Dumped empty delta embedding shard to %s at step %s.",
@@ -1066,7 +1005,7 @@ class DeltaEmbeddingDumper:
                 self._output_dir, f"{self._file_prefix}_step_{global_step}.parquet"
             )
         step_dir = os.path.join(self._output_dir, f"step_{global_step}")
-        _durable_makedirs(step_dir)
+        os.makedirs(step_dir, exist_ok=True)
         return os.path.join(
             step_dir,
             (
@@ -1414,10 +1353,6 @@ class DeltaEmbeddingDumper:
         output_path: str,
         dump_generation: Optional[str] = None,
     ) -> None:
-        # Write to a sibling temp file and atomically os.replace() it into place
-        # only after the writer closes cleanly. A kill or exception mid-write
-        # then leaves at most an orphan .tmp (which the step_*/*.parquet glob
-        # ignores), never a truncated shard at the canonical path.
         tmp_path = f"{output_path}.rank{self._rank}.tmp"
         try:
             writer_schema = _DELTA_DUMP_SCHEMA
@@ -1431,14 +1366,7 @@ class DeltaEmbeddingDumper:
                 chunks = table_chunks or [_DELTA_DUMP_SCHEMA.empty_table()]
                 for table_chunk in chunks:
                     writer.write_table(table_chunk)
-            with open(tmp_path, "rb") as source:
-                os.fsync(source.fileno())
             os.replace(tmp_path, output_path)
-            directory_fd = os.open(os.path.dirname(output_path) or ".", os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
         except BaseException:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)

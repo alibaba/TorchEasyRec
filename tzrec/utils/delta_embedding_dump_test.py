@@ -46,7 +46,6 @@ from tzrec.utils import config_util
 from tzrec.utils.delta_embedding_dump import (
     _CONSUMER,
     _DELTA_DUMP_SCHEMA,
-    _DURABILITY_CONSUMER,
     DeltaEmbeddingDumper,
     _table_shard_info_from_config,
     _TableShardInfo,
@@ -663,19 +662,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 dumper.final_dump(50)
         self.assertEqual(collective_index, 2)
 
-    def test_rank_zero_upload_failure_stops_non_uploader_rank(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            marker_path = os.path.join(tmp_dir, "last_error.json")
-            with open(marker_path, "w") as output:
-                output.write("{}")
-            dumper = object.__new__(DeltaEmbeddingDumper)
-            dumper._feature_store_enabled = True
-            dumper._feature_store_error_marker_path = marker_path
-            dumper._uploader = None
-
-            with self.assertRaisesRegex(FeatureStoreUploadError, "rank zero"):
-                dumper._check_feature_store_upload_error()
-
     def test_dump_generation_is_stable_per_step_and_unique_per_run(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._feature_store_enabled = True
@@ -1288,23 +1274,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         self.assertFalse(dumper.requires_synced_dataloader_exhaustion)
 
-    def test_durable_ack_advances_guard_without_recomputing_unique_rows(self):
-        tracker = mock.MagicMock()
-        tracker.per_consumer_batch_idx = {
-            _CONSUMER: 12,
-            _DURABILITY_CONSUMER: 5,
-        }
-        tracker._delete_on_read = True
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._feature_store_enabled = True
-        dumper._tracker = tracker
-
-        dumper._ack_durable_tracker_read()
-
-        self.assertEqual(tracker.per_consumer_batch_idx[_DURABILITY_CONSUMER], 12)
-        tracker.store.delete.assert_called_once_with(up_to_idx=12)
-        tracker.get_unique.assert_not_called()
-
     def test_dump_does_not_ack_tracker_when_submission_is_rejected(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._feature_store_enabled = True
@@ -1323,14 +1292,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mock.patch.object(dumper, "_output_path", return_value="delta.parquet"),
             mock.patch.object(dumper, "_write_table_chunks"),
             mock.patch.object(dumper, "_rollback_tracker_read") as rollback,
-            mock.patch.object(dumper, "_ack_durable_tracker_read") as durable_ack,
         ):
             with self.assertRaisesRegex(RuntimeError, "submission rejected"):
                 dumper.dump(10)
 
-        dumper._uploader.submit.assert_called_once_with(10, "run-b")
+        dumper._uploader.submit.assert_called_once_with(10)
         rollback.assert_called_once_with(7)
-        durable_ack.assert_not_called()
 
     def test_multi_gpu_output_path_uses_step_underscore_dir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

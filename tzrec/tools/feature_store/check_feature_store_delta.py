@@ -11,8 +11,8 @@
 
 r"""Read back sampled delta embeddings from FeatureStore.
 
-The tool uses the latest locally committed FeatureStore upload by default, samples
-keys from its canonical parquet shard set, and queries the configured explicit
+The tool scans the local delta parquet outbox for the latest (or specified)
+step, samples keys from its shard set, and queries the configured explicit
 FeatureDB version through ``DynamicEmbeddingFeatureView.get_online_features``.
 
 Example::
@@ -35,7 +35,7 @@ import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, DefaultDict, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, DefaultDict, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -96,119 +96,94 @@ def resolve_output_dir(
     return configured_path
 
 
-def _read_json_object(path: str) -> Dict[str, Any]:
-    """Read one JSON object from disk."""
-    with open(path) as source:
-        value = json.load(source)
-    if not isinstance(value, dict):
-        raise ValueError(f"expected a JSON object in {path}")
-    return value
-
-
-def _target_matches(
-    value: Mapping[str, Any], settings: FeatureStoreUploadSettings
-) -> bool:
-    """Return whether a credential-free marker identifies this remote target."""
-    return (
-        value.get("project_name") == settings.project_name
-        and value.get("feature_view_name") == settings.feature_view_name
-        and value.get("version") == settings.version
-    )
-
-
-def load_committed_upload(
+def resolve_upload_step(
     output_dir: str,
-    settings: FeatureStoreUploadSettings,
+    file_prefix: str,
+    world_size: int,
     global_step: Optional[int] = None,
-) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Load the latest local commit or a requested committed step.
+) -> Tuple[int, List[str]]:
+    """Find the latest (or specified) step with complete parquet shards.
 
     Args:
         output_dir: Delta parquet outbox directory.
-        settings: Resolved FeatureStore target settings.
-        global_step: Specific committed step to inspect, or None for the latest.
+        file_prefix: Scoped file prefix for parquet filenames.
+        world_size: Expected number of rank shards per step.
+        global_step: Specific step to inspect, or None for the latest.
 
     Returns:
-        Tuple of state directory, latest commit, and selected success marker.
+        Tuple of (global_step, shard_paths).
 
     Raises:
-        FileNotFoundError: If no committed marker exists for the configured target.
-        ValueError: If markers are ambiguous, inconsistent, or the step is invalid.
+        FileNotFoundError: If no complete shard set is found.
     """
-    state_root = os.path.join(output_dir, ".feature_store_upload")
-    committed_candidates: List[Tuple[str, Dict[str, Any]]] = []
-    for path in sorted(glob.glob(os.path.join(state_root, "*", "committed.json"))):
-        committed = _read_json_object(path)
-        if _target_matches(committed, settings):
-            committed_candidates.append((os.path.dirname(path), committed))
-
-    if not committed_candidates:
-        raise FileNotFoundError(
-            "no committed FeatureStore upload marker was found for "
-            f"project={settings.project_name!r}, "
-            f"view={settings.feature_view_name!r}, version={settings.version!r} "
-            f"under {state_root}"
-        )
-    if len(committed_candidates) > 1:
-        raise ValueError(
-            "multiple local FeatureStore state directories match the configured "
-            f"target under {state_root}; use a target-specific output_dir"
-        )
-
-    state_dir, committed = committed_candidates[0]
-    committed_step = int(committed.get("committed_global_step", -1))
-    selected_step = committed_step if global_step is None else int(global_step)
-    if selected_step <= 0:
-        raise ValueError("global_step must be > 0")
-    success_path = os.path.join(state_dir, f"step_{selected_step}._FS_SUCCESS.json")
-    if not os.path.isfile(success_path):
-        raise FileNotFoundError(
-            f"committed FeatureStore success marker was not found: {success_path}"
-        )
-    success = _read_json_object(success_path)
-    if not _target_matches(success, settings):
-        raise ValueError(f"FeatureStore success marker target mismatch: {success_path}")
-    if int(success.get("global_step", -1)) != selected_step:
-        raise ValueError(f"FeatureStore success marker step mismatch: {success_path}")
-    if int(success.get("success_records", -1)) != int(success.get("total_records", -2)):
-        raise ValueError(
-            f"FeatureStore success marker is not fully successful: {success_path}"
-        )
-    return state_dir, committed, success
-
-
-def committed_parquet_paths(
-    output_dir: str,
-    file_prefix: str,
-    global_step: int,
-    expected_shards: int,
-) -> List[str]:
-    """Resolve the canonical parquet shards for one committed upload step."""
-    single_rank_path = os.path.join(
-        output_dir, f"{file_prefix}_step_{global_step}.parquet"
-    )
-    if os.path.isfile(single_rank_path):
-        paths = [single_rank_path]
-    else:
-        paths = sorted(
-            glob.glob(
-                os.path.join(
-                    output_dir,
-                    f"step_{global_step}",
-                    f"{file_prefix}_step_{global_step}_rank_*_of_*.parquet",
-                )
+    if global_step is not None:
+        if global_step <= 0:
+            raise ValueError("global_step must be > 0")
+        paths = _shard_paths_for_step(output_dir, file_prefix, global_step, world_size)
+        if not paths:
+            raise FileNotFoundError(
+                f"no delta parquet shards found for step {global_step} "
+                f"under {output_dir}"
             )
-        )
-    if not paths:
+        return global_step, paths
+
+    best_step = -1
+    best_paths: List[str] = []
+    if world_size == 1:
+        pattern = os.path.join(output_dir, f"{file_prefix}_step_*.parquet")
+        for path in glob.glob(pattern):
+            basename = os.path.basename(path)
+            step_str = basename.replace(f"{file_prefix}_step_", "").replace(
+                ".parquet", ""
+            )
+            try:
+                step = int(step_str)
+            except ValueError:
+                continue
+            if step > best_step:
+                best_step = step
+                best_paths = [path]
+    else:
+        pattern = os.path.join(output_dir, "step_*")
+        for step_dir in sorted(glob.glob(pattern)):
+            if not os.path.isdir(step_dir):
+                continue
+            dir_name = os.path.basename(step_dir)
+            step_str = dir_name.replace("step_", "")
+            try:
+                step = int(step_str)
+            except ValueError:
+                continue
+            paths = _shard_paths_for_step(output_dir, file_prefix, step, world_size)
+            if paths and step > best_step:
+                best_step = step
+                best_paths = paths
+
+    if best_step <= 0:
         raise FileNotFoundError(
-            f"no canonical delta parquet shards found for committed step {global_step}"
+            f"no complete delta parquet shard set found under {output_dir}"
         )
-    if expected_shards > 0 and len(paths) != expected_shards:
-        raise ValueError(
-            f"committed step {global_step} has {len(paths)} local parquet shards, "
-            f"but its success marker records {expected_shards}"
+    return best_step, best_paths
+
+
+def _shard_paths_for_step(
+    output_dir: str, file_prefix: str, global_step: int, world_size: int
+) -> List[str]:
+    """Resolve expected shard paths for one step, returning them if complete."""
+    if world_size == 1:
+        path = os.path.join(output_dir, f"{file_prefix}_step_{global_step}.parquet")
+        return [path] if os.path.isfile(path) else []
+    step_dir = os.path.join(output_dir, f"step_{global_step}")
+    paths = [
+        os.path.join(
+            step_dir,
+            f"{file_prefix}_step_{global_step}_rank_{rank}_of_{world_size}.parquet",
         )
-    return paths
+        for rank in range(world_size)
+    ]
+    if all(os.path.isfile(path) for path in paths):
+        return paths
+    return []
 
 
 def sample_local_records(
@@ -413,7 +388,7 @@ def create_feature_store_view(settings: FeatureStoreUploadSettings) -> Any:
 
 
 def run_check(args: argparse.Namespace) -> int:
-    """Run one local-marker plus remote-readback verification."""
+    """Run one local-parquet plus remote-readback verification."""
     pipeline_config = config_util.load_pipeline_config(args.pipeline_config)
     train_config = pipeline_config.train_config
     if not train_config.HasField("delta_embedding_dump_config"):
@@ -436,18 +411,11 @@ def run_check(args: argparse.Namespace) -> int:
             f"delta embedding output directory not found: {output_dir}"
         )
 
-    _, committed, success = load_committed_upload(
-        output_dir, settings, args.global_step
-    )
-    global_step = int(success["global_step"])
     base_prefix = dump_config.file_prefix or "delta_embedding"
     scoped_prefix = feature_store_delta_file_prefix(feature_store_config, base_prefix)
-    shard_count = len(success.get("shards", []))
-    parquet_paths = committed_parquet_paths(
-        output_dir,
-        scoped_prefix,
-        global_step,
-        expected_shards=shard_count,
+    world_size = args.world_size
+    global_step, parquet_paths = resolve_upload_step(
+        output_dir, scoped_prefix, world_size, args.global_step
     )
     samples = sample_local_records(
         parquet_paths,
@@ -469,11 +437,8 @@ def run_check(args: argparse.Namespace) -> int:
             "feature_view_name": settings.feature_view_name,
             "version": settings.version,
         },
-        "local_commit": {
+        "parquet_source": {
             "global_step": global_step,
-            "latest_committed_step": int(committed["committed_global_step"]),
-            "success_records": int(success["success_records"]),
-            "total_records": int(success["total_records"]),
             "parquet_paths": [
                 os.path.relpath(path, output_dir) for path in parquet_paths
             ],
@@ -486,8 +451,7 @@ def run_check(args: argparse.Namespace) -> int:
     if summary["present_different"]:
         report["value_match_note"] = (
             "PRESENT_DIFFERENT confirms the key exists but its value differs from "
-            "the sampled committed parquet; a later in-flight step may have updated "
-            "the same key in this version."
+            "the sampled parquet; a later upload may have updated the same key."
         )
     print(json.dumps(report, indent=2, sort_keys=True))
 
@@ -516,7 +480,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--global_step",
         type=int,
         default=None,
-        help="Committed step to inspect; defaults to the latest publication.",
+        help="Step to inspect; defaults to the latest available shard set.",
+    )
+    parser.add_argument(
+        "--world_size",
+        type=int,
+        default=1,
+        help="Number of rank shards per step (default: 1 for single-rank).",
     )
     parser.add_argument(
         "--sample_count",

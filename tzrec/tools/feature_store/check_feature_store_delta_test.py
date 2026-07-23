@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
 import sys
 import tempfile
@@ -23,11 +22,10 @@ import pyarrow.parquet as pq
 
 from tzrec.tools.feature_store.check_feature_store_delta import (
     LocalSample,
-    committed_parquet_paths,
     create_feature_store_view,
-    load_committed_upload,
     parse_args,
     resolve_output_dir,
+    resolve_upload_step,
     sample_local_records,
     verify_samples,
 )
@@ -102,79 +100,82 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
                 colocated,
             )
 
-    def test_load_committed_upload_checks_target_and_success(self):
-        settings = SimpleNamespace(
-            project_name="project", feature_view_name="view", version="v1"
-        )
+    def test_resolve_upload_step_finds_latest_single_rank(self):
         with tempfile.TemporaryDirectory() as output_dir:
-            state_dir = os.path.join(output_dir, ".feature_store_upload", "target")
-            os.makedirs(state_dir)
-            target = {
-                "project_name": "project",
-                "feature_view_name": "view",
-                "version": "v1",
-            }
-            with open(os.path.join(state_dir, "committed.json"), "w") as output:
-                json.dump({**target, "committed_global_step": 20}, output)
-            with open(
-                os.path.join(state_dir, "step_20._FS_SUCCESS.json"), "w"
-            ) as output:
-                json.dump(
-                    {
-                        **target,
-                        "global_step": 20,
-                        "success_records": 3,
-                        "total_records": 3,
-                        "shards": [{}],
-                    },
-                    output,
+            prefix = "delta__fs_target"
+            for step in (10, 20, 5):
+                path = os.path.join(output_dir, f"{prefix}_step_{step}.parquet")
+                pq.write_table(
+                    pa.table(
+                        {
+                            "embedding_name": ["a"],
+                            "key_id": pa.array([1], type=pa.int64()),
+                            "embedding": pa.array([[1.0]], type=pa.list_(pa.float32())),
+                        }
+                    ),
+                    path,
                 )
+            step, paths = resolve_upload_step(output_dir, prefix, world_size=1)
+            self.assertEqual(step, 20)
+            self.assertEqual(len(paths), 1)
+            self.assertIn("step_20", paths[0])
 
-            actual_state_dir, committed, success = load_committed_upload(
-                output_dir, settings
-            )
-
-        self.assertEqual(actual_state_dir, state_dir)
-        self.assertEqual(committed["committed_global_step"], 20)
-        self.assertEqual(success["global_step"], 20)
-
-    def test_load_committed_upload_accepts_step_before_latest_replay(self):
-        settings = SimpleNamespace(
-            project_name="project", feature_view_name="view", version="v1"
-        )
+    def test_resolve_upload_step_finds_latest_multi_rank(self):
         with tempfile.TemporaryDirectory() as output_dir:
-            state_dir = os.path.join(output_dir, ".feature_store_upload", "target")
-            os.makedirs(state_dir)
-            target = {
-                "project_name": "project",
-                "feature_view_name": "view",
-                "version": "v1",
-            }
-            with open(os.path.join(state_dir, "committed.json"), "w") as output:
-                json.dump({**target, "committed_global_step": 15}, output)
-            with open(
-                os.path.join(state_dir, "step_20._FS_SUCCESS.json"), "w"
-            ) as output:
-                json.dump(
+            prefix = "delta__fs_target"
+            for step in (10, 20):
+                step_dir = os.path.join(output_dir, f"step_{step}")
+                os.makedirs(step_dir)
+                for rank in range(2):
+                    path = os.path.join(
+                        step_dir,
+                        f"{prefix}_step_{step}_rank_{rank}_of_2.parquet",
+                    )
+                    pq.write_table(
+                        pa.table(
+                            {
+                                "embedding_name": ["a"],
+                                "key_id": pa.array([rank + 1], type=pa.int64()),
+                                "embedding": pa.array(
+                                    [[1.0]], type=pa.list_(pa.float32())
+                                ),
+                            }
+                        ),
+                        path,
+                    )
+            step, paths = resolve_upload_step(output_dir, prefix, world_size=2)
+            self.assertEqual(step, 20)
+            self.assertEqual(len(paths), 2)
+
+    def test_resolve_upload_step_explicit_step(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            prefix = "delta__fs_target"
+            path = os.path.join(output_dir, f"{prefix}_step_15.parquet")
+            pq.write_table(
+                pa.table(
                     {
-                        **target,
-                        "global_step": 20,
-                        "success_records": 1,
-                        "total_records": 1,
-                    },
-                    output,
-                )
-
-            _, committed, success = load_committed_upload(
-                output_dir, settings, global_step=20
+                        "embedding_name": ["a"],
+                        "key_id": pa.array([1], type=pa.int64()),
+                        "embedding": pa.array([[1.0]], type=pa.list_(pa.float32())),
+                    }
+                ),
+                path,
             )
+            step, paths = resolve_upload_step(
+                output_dir, prefix, world_size=1, global_step=15
+            )
+            self.assertEqual(step, 15)
+            self.assertEqual(paths, [path])
 
-        self.assertEqual(committed["committed_global_step"], 15)
-        self.assertEqual(success["global_step"], 20)
-
-    def test_committed_parquet_paths_and_sampling(self):
+    def test_resolve_upload_step_raises_when_not_found(self):
         with tempfile.TemporaryDirectory() as output_dir:
-            path = os.path.join(output_dir, "delta__fs_target_step_20.parquet")
+            with self.assertRaises(FileNotFoundError):
+                resolve_upload_step(output_dir, "delta__fs_target", world_size=1)
+
+    def test_parquet_paths_and_sampling(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            prefix = "delta__fs_target"
+            path = os.path.join(output_dir, f"{prefix}_step_20.parquet")
             pq.write_table(
                 pa.table(
                     {
@@ -188,11 +189,12 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
                 ),
                 path,
             )
-            paths = committed_parquet_paths(
-                output_dir, "delta__fs_target", 20, expected_shards=1
+            step, paths = resolve_upload_step(
+                output_dir, prefix, world_size=1, global_step=20
             )
             samples = sample_local_records(paths, 2)
 
+        self.assertEqual(step, 20)
         self.assertEqual(paths, [path])
         self.assertEqual(
             [(sample.embedding_name, sample.key_id) for sample in samples],
