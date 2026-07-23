@@ -681,6 +681,121 @@ def _needs_mch_redistribution(model_ckpt_path: str, cur_world_size: int) -> bool
     return saved_world_size != cur_world_size and saved_world_size % cur_world_size != 0
 
 
+_MCH_RAW_IDS_SUFFIX = "._mch_sorted_raw_ids"
+
+
+def _mch_global_zch_size(local_zch_size: int, world_size: int) -> int:
+    """Global ZCH table size under uniform row-wise sharding."""
+    return local_zch_size * world_size
+
+
+def _is_mch_zch_size_compatible(
+    saved_buffer_size: int,
+    cur_local_zch_size: int,
+    saved_world_size: int,
+    cur_world_size: int,
+) -> bool:
+    """Whether checkpoint MCH buffer size matches the current model capacity.
+
+    DCP metadata may record either the global ShardedTensor size or a
+    per-rank local size. Accept any interpretation that yields the same
+    global ZCH capacity as the current model under uniform RW sharding.
+    """
+    cur_global = _mch_global_zch_size(cur_local_zch_size, cur_world_size)
+    if saved_buffer_size == cur_global:
+        return True
+    if saved_world_size == cur_world_size and saved_buffer_size == cur_local_zch_size:
+        return True
+    if saved_buffer_size * saved_world_size == cur_global:
+        return True
+    return False
+
+
+def _find_mch_raw_ids_metadata_key(
+    state_dict_metadata: Dict[str, Any], prefix: str
+) -> Optional[str]:
+    """Locate ``_mch_sorted_raw_ids`` metadata key for an MC module prefix."""
+    exact = f"{prefix}{_MCH_RAW_IDS_SUFFIX}"
+    if exact in state_dict_metadata:
+        return exact
+    suffix = f".{prefix}{_MCH_RAW_IDS_SUFFIX}"
+    for key in state_dict_metadata:
+        if key == exact or key.endswith(suffix) or key.endswith(
+            f"{prefix}{_MCH_RAW_IDS_SUFFIX}"
+        ):
+            return key
+    return None
+
+
+def _check_mch_zch_size_compatible(model: nn.Module, model_ckpt_path: str) -> None:
+    """Fail fast when checkpoint ZCH table size disagrees with the model.
+
+    Changing ``zch.zch_size`` across ``continue_train`` / fine-tune is not
+    supported. ``_output_segments_tensor`` is a fixed-shape (1025,) buffer, so
+    DCP loads the old partition boundaries even when ``zch_size`` changed;
+    ``MCHManagedCollisionModule.validate_state`` then asserts with an opaque
+    message (see https://github.com/alibaba/TorchEasyRec/issues/176).
+    """
+    mc_modules = _find_mch_modules(model)
+    if not mc_modules or not os.path.exists(model_ckpt_path):
+        return
+
+    try:
+        metadata = FileSystemReader(model_ckpt_path).read_metadata()
+    except Exception as e:
+        logger.warning(
+            f"Failed to read checkpoint metadata for ZCH size check "
+            f"from {model_ckpt_path}: {e}"
+        )
+        return
+
+    cur_world_size = dist.get_world_size() if dist.is_initialized() else 1
+    try:
+        saved_world_size = _ckpt_world_size(model_ckpt_path)
+    except Exception as e:
+        logger.warning(
+            f"Failed to detect saved world size from {model_ckpt_path}: {e}"
+        )
+        saved_world_size = cur_world_size
+
+    # pyre-ignore [16]
+    state_dict_metadata = metadata.state_dict_metadata
+    mismatches: List[str] = []
+    for prefix, m in mc_modules.items():
+        key = _find_mch_raw_ids_metadata_key(state_dict_metadata, prefix)
+        if key is None:
+            continue
+        md = state_dict_metadata[key]
+        size = getattr(md, "size", None)
+        if size is None or len(size) < 1:
+            continue
+        saved_buffer_size = int(size[0])
+        cur_local = int(m._zch_size)
+        if _is_mch_zch_size_compatible(
+            saved_buffer_size, cur_local, saved_world_size, cur_world_size
+        ):
+            continue
+        mismatches.append(
+            f"[{prefix}] saved_buffer_size={saved_buffer_size}, "
+            f"current_zch_size={cur_local}, "
+            f"saved_world_size={saved_world_size}, "
+            f"current_world_size={cur_world_size}"
+        )
+
+    if not mismatches:
+        return
+
+    detail = "; ".join(mismatches)
+    raise RuntimeError(
+        "ZCH (MCH) table size mismatch when restoring checkpoint. "
+        "Changing feature zch.zch_size between training and continue_train / "
+        "fine_tune is not supported; keep the original zch_size, or start a "
+        "new train without restoring this checkpoint. "
+        f"Details: {detail}. "
+        "See https://github.com/alibaba/TorchEasyRec/issues/176"
+    )
+
+
 def _strip_dmp_prefix(name: str) -> str:
     """Strip TorchRec DMP wrapper prefix from a module name."""
     for prefix in (
@@ -901,6 +1016,8 @@ def restore_model(
     needs_mch_redistribution = _needs_mch_redistribution(
         model_ckpt_path, cur_world_size
     )
+    if os.path.exists(model_ckpt_path):
+        _check_mch_zch_size_compatible(model, model_ckpt_path)
 
     meta = {}
     if os.path.exists(meta_path):
