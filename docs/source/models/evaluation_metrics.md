@@ -60,6 +60,45 @@ model_config {
   - decay_rate: 默认为0.9，历史指标的衰减率。
   - decay_step: 默认为100，历史指标每训练多少step会进行一次衰减，配置需要可以被train_config.log_step_count_steps整除。
 
+### 训练期 TensorBoard 摘要（summaries_set）
+
+在 `model_config` 中配置 `summaries_set`，可在训练过程中向 TensorBoard 写入 **PCOC** 与 **特征切片 scalars**（与 `train_metrics` 不同，后者用于在线 AUC 等指标）。摘要按 `train_config.log_step_count_steps` 间隔累积并在日志步写入。
+
+```
+model_config {
+    # PCOC -> summary/pcoc, summary/predicted_ctr, summary/observed_ctr
+    summaries_set {
+        pcoc {
+            pred_name: "probs"      # prediction_dict 中的 key；logits 会先 sigmoid
+            label_name: "clk"       # 可选，默认取 data_config 第一个 label
+            epsilon: 1e-7           # observed ctr 接近 0 时的除数稳定项
+        }
+    }
+    # 特征切片 -> summary/<name>
+    summaries_set {
+        scalars {
+            name: "id_1_bucket_pred"
+            pred_name: "probs"
+            feature_name: "id_1"
+            feature_value: "1005"
+        }
+    }
+}
+```
+
+- **pcoc**
+  - `pred_name`: 预测张量名，默认 `probs`
+  - `label_name`: 标签字段名；多任务时需显式指定
+  - `epsilon`: 默认 `1e-7`
+- **scalars**
+  - `name`: TensorBoard tag 后缀，写入 `summary/<name>`
+  - `pred_name`: 默认 `probs`
+  - `feature_name` / `feature_value`: 可选；同时配置时仅统计该特征取值的样本；省略则统计全 batch 均值
+
+> 分布式训练时，各 rank 在本地累积摘要，仅 **rank 0** 写入 TensorBoard，数值反映 rank 0 所见分片数据的统计，而非全局 all-reduce 结果（与当前 `train_metrics` 行为一致）。
+
+需开启 `train_config.use_tensorboard: true`（默认开启）。
+
 ______________________________________________________________________
 
 ## 指标详情

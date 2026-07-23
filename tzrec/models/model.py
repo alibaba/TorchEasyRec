@@ -29,6 +29,7 @@ from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.pe_mtl_loss import ParetoEfficientMultiTaskLoss
+from tzrec.metrics.train_summary import build_train_summary_modules
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
@@ -72,6 +73,49 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             self._sample_weights = sample_weights
 
         self._train_metric_modules = nn.ModuleDict()
+        self._train_summary_modules = nn.ModuleList()
+
+    def init_train_summary(self) -> None:
+        """Initialize training TensorBoard summaries from model_config.summaries_set."""
+        if len(self._base_model_config.summaries_set) > 0:
+            self._train_summary_modules = build_train_summary_modules(
+                list(self._base_model_config.summaries_set)
+            )
+
+    def _get_summary_label_name(self, label_name: Optional[str] = None) -> str:
+        if label_name:
+            return label_name
+        if hasattr(self, "_label_name") and self._label_name:
+            return self._label_name
+        if len(self._labels) > 0:
+            return self._labels[0]
+        raise ValueError(
+            "summaries pcoc requires labels; set pcoc.label_name in summaries_set"
+        )
+
+    def update_train_summary(
+        self, predictions: Dict[str, torch.Tensor], batch: Batch
+    ) -> None:
+        if len(self._train_summary_modules) == 0:
+            return
+        for summary_module in self._train_summary_modules:
+            cfg = summary_module.summary_cfg
+            summary_type = cfg.WhichOneof("summary")
+            if summary_type == "pcoc":
+                label_name = self._get_summary_label_name(
+                    cfg.pcoc.label_name
+                    if cfg.pcoc.HasField("label_name")
+                    else None
+                )
+            else:
+                label_name = self._get_summary_label_name()
+            summary_module.update(predictions, batch, label_name)
+
+    def compute_train_summary(self) -> Dict[str, torch.Tensor]:
+        results: Dict[str, torch.Tensor] = {}
+        for summary_module in self._train_summary_modules:
+            results.update(summary_module.compute())
+        return results
 
     @property
     def features(self) -> List[BaseFeature]:
@@ -254,6 +298,7 @@ class TrainWrapper(BaseModule):
         self.model = module
         self.model.init_loss()
         self.model.init_metric()
+        self.model.init_train_summary()
         self._device = device
         self._device_type = "cpu"
         if device is not None:
