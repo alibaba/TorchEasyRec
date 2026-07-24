@@ -469,22 +469,11 @@ def _train_and_evaluate(
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
-    require_equal_train_batches = (
-        delta_embedding_dumper is not None
-        and delta_embedding_dumper.requires_synced_dataloader_exhaustion
-    )
-    sync_train_data_exhaustion = (
-        check_all_workers_data_status or require_equal_train_batches
-    )
     for i_epoch in epoch_iter:
-        # Multi-rank dumps synchronize their per-step state, so uneven workers
-        # must fail together instead of silently dropping a lagging rank's
-        # trailing delta rows or leaving collectives.
         pipeline = create_train_pipeline(
             model,
             optimizer,
-            check_all_workers_data_status=sync_train_data_exhaustion,
-            fail_on_uneven_data=require_equal_train_batches,
+            check_all_workers_data_status=check_all_workers_data_status,
         )
         if plogger is not None:
             plogger.set_description(f"Training Epoch {i_epoch}")
