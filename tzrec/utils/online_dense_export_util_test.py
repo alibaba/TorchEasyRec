@@ -13,20 +13,86 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 
 import datetime
+import json
 import os
-import subprocess
 import tempfile
 import threading
+import time
 import unittest
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List
 from unittest import mock
 
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.distributed._shard.metadata import ShardMetadata
+from torch.distributed._shard.sharded_tensor import Shard, ShardedTensor
+from torch.distributed._shard.sharded_tensor.metadata import (
+    ShardedTensorMetadata,
+    TensorProperties,
+)
+from torch.distributed._tensor import DTensor, Replicate
+from torch.distributed.device_mesh import init_device_mesh
+
+from tzrec.utils import misc_util
 from tzrec.utils.online_dense_export_util import (
     OnlineDenseExportManager,
-    _build_export_subprocess_env,
+    _atomic_write_json,
     _make_monotonic_version,
+    _read_current_version,
     make_version,
     resolve_dense_export_root,
 )
+
+
+def _base_env(tmp_dir: str, **extra: str) -> Dict[str, str]:
+    env = {
+        "ONLINE_DENSE_EXPORT": "1",
+        "USE_DISTRIBUTED_EMBEDDING": "1",
+        "ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root"),
+        "ONLINE_DENSE_EXPORT_STEPS": "5",
+        "RANK": "0",
+        "LOCAL_RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_WORLD_SIZE": "1",
+    }
+    env.update(extra)
+    return env
+
+
+def _mock_model(state: Dict[str, Any]) -> mock.Mock:
+    model = mock.Mock()
+    model.state_dict.return_value = state
+    return model
+
+
+def _wait_for(cond: Callable[[], bool], timeout: float = 10.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+class _TinyModel(nn.Module):
+    """Stand-in dense graph module with a single loadable parameter."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(2))
+
+
+_BUILD_PATCHES = "tzrec.utils.online_dense_export_util.{}"
+
+
+def _dummy_pipeline_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        feature_configs=[],
+        data_config=SimpleNamespace(label_fields=[]),
+        model_config=SimpleNamespace(),
+    )
 
 
 class OnlineDenseExportUtilTest(unittest.TestCase):
@@ -46,259 +112,400 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
 
     def test_resolve_dense_export_root_defaults_when_unset(self) -> None:
         """Without ONLINE_DENSE_EXPORT_DIR, root is <model_dir>/dense_hot_export."""
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("ONLINE_DENSE_EXPORT_DIR", None)
+        with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 resolve_dense_export_root("/model"), "/model/dense_hot_export"
             )
 
     def test_resolve_dense_export_root_honors_env(self) -> None:
         """ONLINE_DENSE_EXPORT_DIR names the serving root; dense_hot_export appended."""
-        with mock.patch.dict(os.environ, {"ONLINE_DENSE_EXPORT_DIR": "/serving/dense"}):
+        with mock.patch.dict(
+            os.environ, {"ONLINE_DENSE_EXPORT_DIR": "/serving/dense"}, clear=True
+        ):
             self.assertEqual(
                 resolve_dense_export_root("/model"), "/serving/dense/dense_hot_export"
             )
 
-    def test_build_export_subprocess_env_removes_torchelastic_env(self) -> None:
-        with (
-            mock.patch.dict(
-                os.environ,
-                {
-                    "GROUP_RANK": "3",
-                    "LOCAL_RANK": "2",
-                    "MASTER_ADDR": "elastic-master",
-                    "MASTER_PORT": "123",
-                    "PATH": "/usr/bin",
-                    "PYTHONPATH": "/old/path",
-                    "RANK": "2",
-                    "TORCHELASTIC_RUN_ID": "job",
-                    "TORCHELASTIC_USE_AGENT_STORE": "True",
-                    "WORLD_SIZE": "4",
-                },
-                clear=True,
-            ),
-            mock.patch(
-                "tzrec.utils.online_dense_export_util._get_free_port",
-                return_value=45678,
-            ),
-        ):
-            env = _build_export_subprocess_env("/repo")
+    # --- init-time validation ---
 
-        self.assertNotIn("GROUP_RANK", env)
-        self.assertNotIn("TORCHELASTIC_RUN_ID", env)
-        self.assertNotIn("TORCHELASTIC_USE_AGENT_STORE", env)
-        self.assertEqual(env["RANK"], "0")
-        self.assertEqual(env["LOCAL_RANK"], "0")
-        self.assertEqual(env["WORLD_SIZE"], "1")
-        self.assertEqual(env["LOCAL_WORLD_SIZE"], "1")
-        self.assertEqual(env["MASTER_ADDR"], "127.0.0.1")
-        self.assertEqual(env["MASTER_PORT"], "45678")
-        self.assertEqual(env["USE_DISTRIBUTED_EMBEDDING"], "1")
-        self.assertEqual(env["INPUT_TILE"], "3")
-        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "")
-        self.assertEqual(env["PYTHONPATH"], "/repo:/old/path")
+    def test_init_requires_export_dir_when_enabled(self) -> None:
+        """ONLINE_DENSE_EXPORT=1 without ONLINE_DENSE_EXPORT_DIR must fail fast."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(tmp_dir)
+            del env["ONLINE_DENSE_EXPORT_DIR"]
+            with mock.patch.dict(os.environ, env, clear=True):
+                # a remote model_dir surfaces the missing-dir error, not a
+                # remote-path error: the dir requirement fires first.
+                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_DIR"):
+                    OnlineDenseExportManager(
+                        model_dir="oss://bucket/m",
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+                # a local model_dir is not a substitute for the explicit dir
+                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_DIR"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+
+    def test_init_requires_trigger_config_when_enabled(self) -> None:
+        """Without STEPS or INTERVAL the cadence is undefined: fail fast."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(tmp_dir)
+            del env["ONLINE_DENSE_EXPORT_STEPS"]
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_STEPS"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+
+    def test_init_rejects_bad_quorum(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(
+                tmp_dir,
+                **{
+                    "ONLINE_DENSE_EXPORT_STEPS": "0",
+                    "ONLINE_DENSE_EXPORT_INTERVAL": "60",
+                    "ONLINE_DENSE_EXPORT_QUORUM": "1.5",
+                },
+            )
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_QUORUM"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+
+    def test_init_rejects_remote_export_root_and_pipeline_config(self) -> None:
+        """With the dir set, remote export_root/pipeline_config fail fast."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_dir = os.path.join(tmp_dir, "dhx")
+            env = _base_env(tmp_dir, **{"ONLINE_DENSE_EXPORT_DIR": local_dir})
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "local pipeline_config_path"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path="dfs://bucket/pipeline.config",
+                        model=_mock_model({}),
+                    )
+            env = _base_env(tmp_dir, **{"ONLINE_DENSE_EXPORT_DIR": "oss://bucket/x"})
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "local export_root"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+
+    def test_init_allows_remote_model_dir_when_export_root_overridden(self) -> None:
+        """A local ONLINE_DENSE_EXPORT_DIR decouples the publish tree from model_dir."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            override = os.path.join(tmp_dir, "serving_root")
+            env = _base_env(tmp_dir, **{"ONLINE_DENSE_EXPORT_DIR": override})
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir="oss://bucket/m",
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model({}),
+                )
+                try:
+                    self.assertEqual(
+                        mgr._export_root,
+                        os.path.abspath(os.path.join(override, "dense_hot_export")),
+                    )
+                finally:
+                    mgr.close()
+
+    # --- one-time build phase ---
+
+    def test_build_scopes_input_tile_env_and_restores_it(self) -> None:
+        """INPUT_TILE=3 holds only during the twin build, even on failure."""
+        seen: Dict[str, Any] = {}
+
+        def fake_finalize(*args: Any, **kwargs: Any) -> None:
+            seen["input_tile"] = os.environ.get("INPUT_TILE")
+
+        fake_gm = mock.Mock()
+        fake_gm.state_dict.return_value = {}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(tmp_dir)
+            with mock.patch.dict(os.environ, env, clear=True):
+                with (
+                    mock.patch(
+                        _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                        return_value=_dummy_pipeline_config(),
+                    ),
+                    mock.patch("tzrec.main._create_features", return_value=[]),
+                    mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+                    mock.patch(
+                        "tzrec.models.model.ScriptWrapper",
+                        side_effect=lambda m: m,
+                    ),
+                    mock.patch(
+                        _BUILD_PATCHES.format("create_dense_export_warmup_data"),
+                        return_value={},
+                    ),
+                    mock.patch(
+                        _BUILD_PATCHES.format("build_dense_graph_module"),
+                        return_value=(fake_gm, mock.Mock(), {}),
+                    ),
+                    mock.patch(
+                        _BUILD_PATCHES.format("finalize_dense_export"),
+                        side_effect=fake_finalize,
+                    ),
+                ):
+                    mgr = OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+                    mgr.close()
+                self.assertEqual(seen["input_tile"], "3")
+                self.assertNotIn("INPUT_TILE", os.environ)
+
+                # a failing build must also restore the env
+                with (
+                    mock.patch(
+                        _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                        side_effect=RuntimeError("boom"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "boom"):
+                        OnlineDenseExportManager(
+                            model_dir=tmp_dir,
+                            pipeline_config_path=os.path.join(
+                                tmp_dir, "pipeline.config"
+                            ),
+                            model=_mock_model({}),
+                        )
+                self.assertNotIn("INPUT_TILE", os.environ)
+
+    def test_build_maps_user_twin_keys_to_non_user_sources(self) -> None:
+        """INPUT_TILE=3 user-side keys resolve to their non-user training twins."""
+        gm_state = {
+            "model.mlp.weight": None,
+            "model.eg.ebc_user.embedding_bags.t.weight": None,
+        }
+        dmp_state = {
+            "model.mlp.weight": torch.zeros(2),
+            "model.eg.ebc.embedding_bags.t.weight": torch.zeros(2),
+        }
+        fake_gm = mock.Mock()
+        fake_gm.state_dict.return_value = gm_state
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(tmp_dir)
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch(
+                    _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                    return_value=_dummy_pipeline_config(),
+                ),
+                mock.patch("tzrec.main._create_features", return_value=[]),
+                mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+                mock.patch("tzrec.models.model.ScriptWrapper", side_effect=lambda m: m),
+                mock.patch(
+                    _BUILD_PATCHES.format("create_dense_export_warmup_data"),
+                    return_value={},
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("build_dense_graph_module"),
+                    return_value=(fake_gm, mock.Mock(), {}),
+                ),
+                mock.patch(_BUILD_PATCHES.format("finalize_dense_export")),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model(dmp_state),
+                )
+                try:
+                    self.assertEqual(
+                        mgr._state_pairs,
+                        [
+                            (
+                                "model.eg.ebc_user.embedding_bags.t.weight",
+                                "model.eg.ebc.embedding_bags.t.weight",
+                            ),
+                            ("model.mlp.weight", "model.mlp.weight"),
+                        ],
+                    )
+                finally:
+                    mgr.close()
+
+    def test_build_fails_on_ungatherable_state(self) -> None:
+        """A dense-graph key with no training source must abort startup."""
+        fake_gm = mock.Mock()
+        fake_gm.state_dict.return_value = {"model.missing.weight": None}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(tmp_dir)
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch(
+                    _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                    return_value=_dummy_pipeline_config(),
+                ),
+                mock.patch("tzrec.main._create_features", return_value=[]),
+                mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+                mock.patch("tzrec.models.model.ScriptWrapper", side_effect=lambda m: m),
+                mock.patch(
+                    _BUILD_PATCHES.format("create_dense_export_warmup_data"),
+                    return_value={},
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("build_dense_graph_module"),
+                    return_value=(fake_gm, mock.Mock(), {}),
+                ),
+                mock.patch(_BUILD_PATCHES.format("finalize_dense_export")),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "cannot gather 1 dense model states"
+                ):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+
+    def test_build_rejects_unsupported_state_type(self) -> None:
+        fake_gm = mock.Mock()
+        fake_gm.state_dict.return_value = {"model.w": None}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(tmp_dir)
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch(
+                    _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                    return_value=_dummy_pipeline_config(),
+                ),
+                mock.patch("tzrec.main._create_features", return_value=[]),
+                mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+                mock.patch("tzrec.models.model.ScriptWrapper", side_effect=lambda m: m),
+                mock.patch(
+                    _BUILD_PATCHES.format("create_dense_export_warmup_data"),
+                    return_value={},
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("build_dense_graph_module"),
+                    return_value=(fake_gm, mock.Mock(), {}),
+                ),
+                mock.patch(_BUILD_PATCHES.format("finalize_dense_export")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "unsupported state type"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({"model.w": "not-a-tensor"}),
+                    )
+
+    # --- worker / thread semantics (drive _enqueue, patch _run_task) ---
 
     def test_worker_survives_task_failure(self) -> None:
         """A raising _run_task must not kill the worker or skip later tasks."""
-        ckpt = mock.Mock()
-        calls = []
+        calls: List[str] = []
         done = threading.Event()
 
-        def fake_run(cmd, **kwargs):
-            calls.append(cmd[cmd.index("--version") + 1])
+        def fake_run_task(task: Dict[str, Any]) -> None:
+            calls.append(task["version"])
             done.set()
             if len(calls) == 1:
                 raise OSError("boom")
 
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
         with tempfile.TemporaryDirectory() as tmp_dir:
-            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
-            os.makedirs(ckpt_path)
             with (
-                mock.patch.dict(os.environ, env),
-                mock.patch.dict(
-                    os.environ,
-                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
-                ),
-                mock.patch(
-                    "tzrec.utils.online_dense_export_util.subprocess.run",
-                    side_effect=fake_run,
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
                 ),
             ):
                 mgr = OnlineDenseExportManager(
                     model_dir=tmp_dir,
                     pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                    ckpt_manager=ckpt,
+                    model=_mock_model({}),
                 )
                 try:
-                    mgr.submit(1, ckpt_path, 1.0)
-                    self.assertTrue(done.wait(timeout=10))
-                    # worker must still be alive: a second submit is processed
-                    done.clear()
-                    mgr.submit(2, ckpt_path, 2.0)
-                    self.assertTrue(done.wait(timeout=10))
+                    with mock.patch.object(mgr, "_run_task", side_effect=fake_run_task):
+                        mgr._enqueue(1, 1.0, {})
+                        self.assertTrue(done.wait(timeout=10))
+                        # worker must still be alive: a second task is processed
+                        done.clear()
+                        mgr._enqueue(2, 2.0, {})
+                        self.assertTrue(done.wait(timeout=10))
                 finally:
                     mgr.close()
         self.assertEqual(len(calls), 2)
-        # both tasks' checkpoints were unprotected in _run_task's finally
-        self.assertEqual(ckpt.unprotect_checkpoint.call_count, 2)
 
-    def test_submit_coalesces_to_latest_pending(self) -> None:
-        """A not-yet-started pending task is superseded and unprotected."""
-        ckpt = mock.Mock()
-        unprotected = []
-        ckpt.unprotect_checkpoint.side_effect = unprotected.append
-        calls = []
+    def test_enqueue_coalesces_to_latest_pending(self) -> None:
+        """A not-yet-started pending task is superseded by the newest one."""
+        snapshots: List[Dict[str, str]] = []
         started = threading.Event()
         proceed = threading.Event()
 
-        def fake_run(cmd, **kwargs):
-            calls.append(cmd[cmd.index("--version") + 1])
-            if len(calls) == 1:
+        def fake_run_task(task: Dict[str, Any]) -> None:
+            snapshots.append(task["snapshot"])
+            if len(snapshots) == 1:
                 started.set()
                 proceed.wait(timeout=10)
 
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
         with tempfile.TemporaryDirectory() as tmp_dir:
-            ckpt1 = os.path.join(tmp_dir, "model.ckpt-1")
-            ckpt2 = os.path.join(tmp_dir, "model.ckpt-2")
-            ckpt3 = os.path.join(tmp_dir, "model.ckpt-3")
-            for path in (ckpt1, ckpt2, ckpt3):
-                os.makedirs(path)
             with (
-                mock.patch.dict(os.environ, env),
-                mock.patch.dict(
-                    os.environ,
-                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
-                ),
-                mock.patch(
-                    "tzrec.utils.online_dense_export_util.subprocess.run",
-                    side_effect=fake_run,
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
                 ),
             ):
                 mgr = OnlineDenseExportManager(
                     model_dir=tmp_dir,
                     pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                    ckpt_manager=ckpt,
+                    model=_mock_model({}),
                 )
                 try:
-                    mgr.submit(1, ckpt1, 1.0)
-                    self.assertTrue(started.wait(timeout=10))
-                    mgr.submit(2, ckpt2, 2.0)  # pending, not yet started
-                    mgr.submit(3, ckpt3, 3.0)  # supersedes task 2
-                    proceed.set()  # release task 1
+                    # close() must drain inside the patch: after the fake
+                    # releases, the worker still picks up the pending task.
+                    with mock.patch.object(mgr, "_run_task", side_effect=fake_run_task):
+                        mgr._enqueue(1, 1.0, {"m": "a"})
+                        self.assertTrue(started.wait(timeout=10))
+                        mgr._enqueue(2, 2.0, {"m": "b"})  # pending, not yet started
+                        mgr._enqueue(3, 3.0, {"m": "c"})  # supersedes b
+                        proceed.set()
+                        mgr.close()
                 finally:
                     mgr.close()
-        # task 2 was superseded (never run); tasks 1 and 3 were processed
-        self.assertEqual(len(calls), 2)
-        self.assertIn(ckpt2, unprotected)  # unprotected at enqueue
-
-    def test_subprocess_run_uses_timeout_and_survives_timeout_expired(
-        self,
-    ) -> None:
-        """subprocess.run gets the timeout kwarg; TimeoutExpired is handled."""
-        ckpt = mock.Mock()
-        calls = []
-        done = threading.Event()
-
-        def fake_run(cmd, **kwargs):
-            calls.append(kwargs.get("timeout"))
-            done.set()
-            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
-
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "ONLINE_DENSE_EXPORT_TIMEOUT": "2",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
-            os.makedirs(ckpt_path)
-            with (
-                mock.patch.dict(os.environ, env),
-                mock.patch.dict(
-                    os.environ,
-                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
-                ),
-                mock.patch(
-                    "tzrec.utils.online_dense_export_util.subprocess.run",
-                    side_effect=fake_run,
-                ),
-            ):
-                mgr = OnlineDenseExportManager(
-                    model_dir=tmp_dir,
-                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                    ckpt_manager=ckpt,
-                )
-                try:
-                    mgr.submit(1, ckpt_path, 1.0)
-                    self.assertTrue(done.wait(timeout=10))
-                finally:
-                    mgr.close()
-        self.assertEqual(calls, [2.0])
-        ckpt.unprotect_checkpoint.assert_called_once()
+        # b was superseded (never run); a and c were processed
+        self.assertEqual(snapshots, [{"m": "a"}, {"m": "c"}])
 
     def test_finalizer_drains_worker_when_close_not_called(self) -> None:
-        """If training raises before close(), the finalizer still stops the worker.
-
-        A live worker keeps the manager reachable (threading._active), so the
-        finalizer does not fire via GC; it fires via atexit at interpreter exit.
-        Invoke it directly to simulate that path.
-        """
-        ckpt = mock.Mock()
+        """If training raises before close(), the finalizer still stops the worker."""
         done = threading.Event()
 
-        def fake_run(cmd, **kwargs):
+        def fake_run_task(task: Dict[str, Any]) -> None:
             done.set()
 
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
         with tempfile.TemporaryDirectory() as tmp_dir:
-            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
-            os.makedirs(ckpt_path)
             with (
-                mock.patch.dict(os.environ, env),
-                mock.patch.dict(
-                    os.environ,
-                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
-                ),
-                mock.patch(
-                    "tzrec.utils.online_dense_export_util.subprocess.run",
-                    side_effect=fake_run,
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
                 ),
             ):
                 mgr = OnlineDenseExportManager(
                     model_dir=tmp_dir,
                     pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                    ckpt_manager=ckpt,
+                    model=_mock_model({}),
                 )
                 self.assertTrue(mgr._finalizer.alive)
-                mgr.submit(1, ckpt_path, 1.0)
-                self.assertTrue(done.wait(timeout=10))
+                with mock.patch.object(mgr, "_run_task", side_effect=fake_run_task):
+                    mgr._enqueue(1, 1.0, {})
+                    self.assertTrue(done.wait(timeout=10))
                 worker = mgr._worker
                 # simulate the atexit finalizer firing (training raised, close skipped)
                 mgr._finalizer()
@@ -307,299 +514,305 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
 
     def test_close_timeout_covers_two_task_timeouts(self) -> None:
         """_close_timeout must cover an in-flight plus a pending task."""
-        with mock.patch.dict(os.environ, {"ONLINE_DENSE_EXPORT_TIMEOUT": "200"}):
+        with mock.patch.dict(
+            os.environ, {"ONLINE_DENSE_EXPORT_TIMEOUT": "200"}, clear=True
+        ):
             mgr = OnlineDenseExportManager(
                 model_dir="/tmp/tzrec_unused_model_dir",
                 pipeline_config_path="/tmp/tzrec_unused_pipeline.config",
-                ckpt_manager=mock.Mock(),
+                model=_mock_model({}),
             )
         self.assertGreaterEqual(mgr._close_timeout, 2 * mgr._export_timeout)
 
     def test_close_keeps_finalizer_when_worker_outlives_join(self) -> None:
         """close() detaches the finalizer only after the worker stops."""
-        ckpt = mock.Mock()
         started = threading.Event()
         proceed = threading.Event()
 
-        def fake_run(cmd, **kwargs):
+        def fake_run_task(task: Dict[str, Any]) -> None:
             started.set()
             proceed.wait(timeout=30)
 
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
         with tempfile.TemporaryDirectory() as tmp_dir:
-            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
-            os.makedirs(ckpt_path)
             with (
-                mock.patch.dict(os.environ, env),
-                mock.patch.dict(
-                    os.environ,
-                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
-                ),
-                mock.patch(
-                    "tzrec.utils.online_dense_export_util.subprocess.run",
-                    side_effect=fake_run,
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
                 ),
             ):
                 mgr = OnlineDenseExportManager(
                     model_dir=tmp_dir,
                     pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                    ckpt_manager=ckpt,
+                    model=_mock_model({}),
                 )
                 try:
-                    mgr._close_timeout = 0.05  # force close to time out mid-task
-                    mgr.submit(1, ckpt_path, 1.0)
-                    self.assertTrue(started.wait(timeout=10))
-                    mgr.close()  # worker still in-flight; join times out
-                    self.assertTrue(mgr._worker.is_alive())
-                    # backstop must stay attached so atexit can still drain
-                    self.assertTrue(mgr._finalizer.alive)
+                    with mock.patch.object(mgr, "_run_task", side_effect=fake_run_task):
+                        mgr._close_timeout = 0.05  # force close to time out mid-task
+                        mgr._enqueue(1, 1.0, {})
+                        self.assertTrue(started.wait(timeout=10))
+                        mgr.close()  # worker still in-flight; join times out
+                        self.assertTrue(mgr._worker.is_alive())
+                        # backstop must stay attached so atexit can still drain
+                        self.assertTrue(mgr._finalizer.alive)
                 finally:
                     proceed.set()
                     mgr._finalizer()
             self.assertFalse(mgr._worker.is_alive())
             self.assertFalse(mgr._finalizer.alive)
 
-    def test_prune_export_logs_keeps_newest_k(self) -> None:
-        """Retain the newest K export logs; leave non-log files alone."""
-        with tempfile.TemporaryDirectory() as log_dir:
-            for v in (
-                "20260101000001",
-                "20260101000002",
-                "20260101000003",
-                "20260101000004",
-                "20260101000005",
+    # --- trigger decisions ---
+
+    def test_maybe_export_fires_on_step_interval_and_dedupes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
+                ),
             ):
-                with open(os.path.join(log_dir, f"{v}.log"), "w") as f:
-                    f.write("x")
-            open(os.path.join(log_dir, "notes.txt"), "w").close()
-            with mock.patch.dict(os.environ, {"ONLINE_DENSE_EXPORT_KEEP_LOGS": "3"}):
                 mgr = OnlineDenseExportManager(
-                    model_dir="/tmp/tzrec_unused_model_dir",
-                    pipeline_config_path="/tmp/tzrec_unused_pipeline.config",
-                    ckpt_manager=mock.Mock(),
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model({}),
                 )
-            mgr._prune_export_logs(log_dir)
+                try:
+                    model = _mock_model({})
+                    with mock.patch.object(mgr, "_gather_and_submit") as gather:
+                        for step in (0, 1, 4):
+                            mgr.maybe_export(step, -1.0, model)
+                        gather.assert_not_called()
+                        mgr.maybe_export(5, -1.0, model)
+                        gather.assert_called_once_with(5, -1.0, model)
+                        # same step (even forced) is deduped
+                        mgr.maybe_export(5, -1.0, model, final=True)
+                        gather.assert_called_once()
+                        mgr.maybe_export(6, -1.0, model)
+                        gather.assert_called_once()
+                        mgr.maybe_export(10, -1.0, model)
+                        self.assertEqual(gather.call_count, 2)
+                finally:
+                    mgr.close()
+
+    def test_maybe_export_fires_on_event_time_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(
+                tmp_dir,
+                **{
+                    "ONLINE_DENSE_EXPORT_STEPS": "0",
+                    "ONLINE_DENSE_EXPORT_INTERVAL": "60",
+                },
+            )
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model({}),
+                )
+                try:
+                    model = _mock_model({})
+                    with mock.patch.object(mgr, "_gather_and_submit") as gather:
+                        # first event-time seen only sets the reference
+                        mgr.maybe_export(1, 1000.0, model)
+                        gather.assert_not_called()
+                        # 1000/60 -> 16, 1050/60 -> 17: boundary crossed
+                        mgr.maybe_export(2, 1050.0, model)
+                        gather.assert_called_once()
+                        # still bucket 17: no fire
+                        mgr.maybe_export(3, 1070.0, model)
+                        gather.assert_called_once()
+                        # 1120/60 -> 18: fires
+                        mgr.maybe_export(4, 1120.0, model)
+                        self.assertEqual(gather.call_count, 2)
+                finally:
+                    mgr.close()
+
+    def test_maybe_export_final_fires_and_disabled_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model({}),
+                )
+                try:
+                    model = _mock_model({})
+                    with mock.patch.object(mgr, "_gather_and_submit") as gather:
+                        mgr.maybe_export(3, -1.0, model, final=True)
+                        gather.assert_called_once()
+                finally:
+                    mgr.close()
+            with mock.patch.dict(os.environ, {}, clear=True):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model({}),
+                )
+                self.assertFalse(mgr._enabled)
+                # no gather state at all; must be a pure no-op
+                mgr.maybe_export(1, -1.0, _mock_model({}), final=True)
+                mgr.close()
+
+    # --- gather + publish, with the real worker ---
+
+    def _run_one_export(self, tmp_dir: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a manager over a tiny gm, fire one export, return the payload."""
+        box: Dict[str, Any] = {}
+
+        def fake_build(self: OnlineDenseExportManager, model: nn.Module) -> List:
+            gm = _TinyModel()
+            box["gm"] = gm
+            self._gm = gm
+            self._twin_model = mock.Mock()
+            self._full_graph = mock.Mock()
+            self._warmup_data = {}
+            self._dense_graph_config = {}
+            return [("w", "model.w")]
+
+        with (
+            mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+            mock.patch.object(
+                OnlineDenseExportManager, "_build_export_graph", fake_build
+            ),
+            mock.patch(_BUILD_PATCHES.format("finalize_dense_export")),
+        ):
+            mgr = OnlineDenseExportManager(
+                model_dir=tmp_dir,
+                pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                model=_mock_model(state),
+            )
+            try:
+                mgr.maybe_export(5, 42.0, _mock_model(state))
+                current_path = os.path.join(
+                    tmp_dir, "serving_root", "dense_hot_export", "current.json"
+                )
+                self.assertTrue(_wait_for(lambda: os.path.exists(current_path)))
+            finally:
+                mgr.close()
+        with open(current_path) as f:
+            payload = json.load(f)
+        box["payload"] = payload
+        return box
+
+    def test_maybe_export_gathers_plain_tensor_and_publishes(self) -> None:
+        """Replicated tensors need no collective; the version is published."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            box = self._run_one_export(tmp_dir, {"model.w": torch.full((2,), 7.0)})
+            payload = box["payload"]
             self.assertEqual(
-                sorted(os.listdir(log_dir)),
-                [
-                    "20260101000003.log",
-                    "20260101000004.log",
-                    "20260101000005.log",
-                    "notes.txt",
+                set(payload.keys()),
+                {"version", "checkpoint_step", "data_timestamp", "created_at"},
+            )
+            self.assertEqual(payload["checkpoint_step"], 5)
+            self.assertEqual(payload["data_timestamp"], 42.0)
+            self.assertTrue(payload["version"])
+            versions_root = os.path.join(
+                tmp_dir, "serving_root", "dense_hot_export", "versions"
+            )
+            self.assertEqual(os.listdir(versions_root), [payload["version"]])
+            self.assertTrue(
+                os.path.exists(os.path.join(versions_root, payload["version"], "READY"))
+            )
+        torch.testing.assert_close(box["gm"].w, torch.full((2,), 7.0))
+
+    def test_maybe_export_gathers_dtensor(self) -> None:
+        """Sharded-as-DTensor state is all-gathered via full_tensor()."""
+        port = misc_util.get_free_port()
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            world_size=1,
+            rank=0,
+        )
+        try:
+            mesh = init_device_mesh("cpu", (1,))
+            value = DTensor.from_local(torch.full((2,), 9.0), mesh, [Replicate()])
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                box = self._run_one_export(tmp_dir, {"model.w": value})
+        finally:
+            dist.destroy_process_group()
+        torch.testing.assert_close(box["gm"].w, torch.full((2,), 9.0))
+
+    def test_maybe_export_gathers_sharded_tensor(self) -> None:
+        """ShardedTensor local shards are staged at their global offsets."""
+        port = misc_util.get_free_port()
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            world_size=1,
+            rank=0,
+        )
+        try:
+            placement = "rank:0/cpu"
+            meta = ShardedTensorMetadata(
+                shards_metadata=[
+                    ShardMetadata(
+                        shard_offsets=[0], shard_sizes=[1], placement=placement
+                    ),
+                    ShardMetadata(
+                        shard_offsets=[1], shard_sizes=[1], placement=placement
+                    ),
                 ],
+                size=torch.Size([2]),
+                tensor_properties=TensorProperties(dtype=torch.float32),
             )
+            value = ShardedTensor._init_from_local_shards_and_global_metadata(
+                [
+                    Shard(
+                        torch.full((1,), 3.0),
+                        ShardMetadata(
+                            shard_offsets=[0], shard_sizes=[1], placement=placement
+                        ),
+                    ),
+                    Shard(
+                        torch.full((1,), 5.0),
+                        ShardMetadata(
+                            shard_offsets=[1], shard_sizes=[1], placement=placement
+                        ),
+                    ),
+                ],
+                meta,
+            )
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                box = self._run_one_export(tmp_dir, {"model.w": value})
+        finally:
+            dist.destroy_process_group()
+        torch.testing.assert_close(box["gm"].w, torch.tensor([3.0, 5.0]))
 
-    def test_run_task_prunes_old_logs(self) -> None:
-        """_run_task prunes old export logs after each attempt."""
-        ckpt = mock.Mock()
-        done = threading.Event()
+    # --- publish helpers ---
 
-        def fake_run(cmd, **kwargs):
-            done.set()
-
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "ONLINE_DENSE_EXPORT_KEEP_LOGS": "2",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
+    def test_atomic_write_json_creates_dirs_and_replaces(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            log_dir = os.path.join(tmp_dir, "serving_root", "dense_hot_export", "logs")
-            os.makedirs(log_dir)
-            for v in (
-                "20260101000001",
-                "20260101000002",
-                "20260101000003",
-            ):
-                open(os.path.join(log_dir, f"{v}.log"), "w").close()
-            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
-            os.makedirs(ckpt_path)
-            with (
-                mock.patch.dict(os.environ, env),
-                mock.patch.dict(
-                    os.environ,
-                    {"ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root")},
-                ),
-                mock.patch(
-                    "tzrec.utils.online_dense_export_util.subprocess.run",
-                    side_effect=fake_run,
-                ),
-            ):
-                mgr = OnlineDenseExportManager(
-                    model_dir=tmp_dir,
-                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                    ckpt_manager=ckpt,
-                )
-                try:
-                    mgr.submit(1, ckpt_path, 1.0)
-                    self.assertTrue(done.wait(timeout=10))
-                finally:
-                    mgr.close()
-            remaining = sorted(f for f in os.listdir(log_dir) if f.endswith(".log"))
-            # the new attempt's log plus the single newest old log survive
-            self.assertEqual(len(remaining), 2)
-            self.assertIn("20260101000003.log", remaining)
-            self.assertNotIn("20260101000001.log", remaining)
-            self.assertNotIn("20260101000002.log", remaining)
-
-    def test_init_requires_export_dir_when_enabled(self) -> None:
-        """ONLINE_DENSE_EXPORT=1 without ONLINE_DENSE_EXPORT_DIR must fail fast."""
-        ckpt = mock.Mock()
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            with mock.patch.dict(os.environ, env, clear=False):
-                os.environ.pop("ONLINE_DENSE_EXPORT_DIR", None)
-                # a remote model_dir surfaces the missing-dir error, not a
-                # remote-path error: the dir requirement fires first.
-                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_DIR"):
-                    OnlineDenseExportManager(
-                        model_dir="oss://bucket/m",
-                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                        ckpt_manager=ckpt,
-                    )
-                # a local model_dir is not a substitute for the explicit dir
-                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_DIR"):
-                    OnlineDenseExportManager(
-                        model_dir=tmp_dir,
-                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                        ckpt_manager=ckpt,
-                    )
-
-    def test_init_rejects_remote_export_root_and_pipeline_config(self) -> None:
-        """With the dir set, remote export_root/pipeline_config fail fast."""
-        ckpt = mock.Mock()
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            local_dir = os.path.join(tmp_dir, "dhx")
-            with mock.patch.dict(
-                os.environ, {**env, "ONLINE_DENSE_EXPORT_DIR": local_dir}
-            ):
-                with self.assertRaisesRegex(RuntimeError, "local pipeline_config_path"):
-                    OnlineDenseExportManager(
-                        model_dir=tmp_dir,
-                        pipeline_config_path="dfs://bucket/pipeline.config",
-                        ckpt_manager=ckpt,
-                    )
-                with mock.patch.dict(
-                    os.environ, {"ONLINE_DENSE_EXPORT_DIR": "oss://bucket/export"}
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "local export_root"):
-                        OnlineDenseExportManager(
-                            model_dir=tmp_dir,
-                            pipeline_config_path=os.path.join(
-                                tmp_dir, "pipeline.config"
-                            ),
-                            ckpt_manager=ckpt,
-                        )
-
-    def test_init_allows_remote_model_dir_when_export_root_overridden(self) -> None:
-        """A local ONLINE_DENSE_EXPORT_DIR decouples the publish tree from model_dir."""
-        ckpt = mock.Mock()
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            override = os.path.join(tmp_dir, "serving_root")
-            with mock.patch.dict(
-                os.environ, {**env, "ONLINE_DENSE_EXPORT_DIR": override}
-            ):
-                mgr = OnlineDenseExportManager(
-                    model_dir="oss://bucket/m",
-                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                    ckpt_manager=ckpt,
-                )
-                try:
-                    self.assertEqual(
-                        mgr._export_root,
-                        os.path.abspath(os.path.join(override, "dense_hot_export")),
-                    )
-                finally:
-                    mgr.close()
-
-    def test_run_task_uses_overridden_export_root(self) -> None:
-        """ONLINE_DENSE_EXPORT_DIR redirects the log dir and is propagated abspath'd."""
-        ckpt = mock.Mock()
-        captured = {}
-        done = threading.Event()
-
-        def fake_run(cmd, **kwargs):
-            captured["env"] = kwargs.get("env")
-            done.set()
-
-        env = {
-            "ONLINE_DENSE_EXPORT": "1",
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-        }
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            override = os.path.join(tmp_dir, "serving_dense")
-            ckpt_path = os.path.join(tmp_dir, "model.ckpt-1")
-            os.makedirs(ckpt_path)
-            with (
-                mock.patch.dict(
-                    os.environ, {**env, "ONLINE_DENSE_EXPORT_DIR": override}
-                ),
-                mock.patch(
-                    "tzrec.utils.online_dense_export_util.subprocess.run",
-                    side_effect=fake_run,
-                ),
-            ):
-                mgr = OnlineDenseExportManager(
-                    model_dir=tmp_dir,
-                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                    ckpt_manager=ckpt,
-                )
-                try:
-                    self.assertEqual(
-                        mgr._export_root,
-                        os.path.abspath(os.path.join(override, "dense_hot_export")),
-                    )
-                    mgr.submit(1, ckpt_path, 1.0)
-                    self.assertTrue(done.wait(timeout=10))
-                finally:
-                    mgr.close()
+            path = os.path.join(tmp_dir, "nested", "current.json")
+            _atomic_write_json(path, {"a": 1})
+            with open(path) as f:
+                self.assertEqual(json.load(f), {"a": 1})
+            _atomic_write_json(path, {"a": 2})
+            with open(path) as f:
+                self.assertEqual(json.load(f), {"a": 2})
             self.assertEqual(
-                captured["env"]["ONLINE_DENSE_EXPORT_DIR"],
-                os.path.abspath(override),
+                os.listdir(os.path.join(tmp_dir, "nested")), ["current.json"]
             )
-            logs_dir = os.path.join(override, "dense_hot_export", "logs")
-            self.assertTrue(os.path.isdir(logs_dir))
-            self.assertEqual(
-                len([f for f in os.listdir(logs_dir) if f.endswith(".log")]), 1
-            )
-            self.assertFalse(os.path.exists(os.path.join(tmp_dir, "dense_hot_export")))
+
+    def test_read_current_version_best_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing = os.path.join(tmp_dir, "current.json")
+            self.assertIsNone(_read_current_version(missing))
+            with open(missing, "w") as f:
+                f.write("{not json")
+            self.assertIsNone(_read_current_version(missing))
+            with open(missing, "w") as f:
+                json.dump({"version": "20260101000001"}, f)
+            self.assertEqual(_read_current_version(missing), "20260101000001")
 
 
 if __name__ == "__main__":

@@ -54,6 +54,85 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（sparse 部分用 JIT，dense 部分用 AOTI）
   - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]
 
+(online-dense-export)=
+
+## 在线学习 dense 模型热导出
+
+在 `USE_DISTRIBUTED_EMBEDDING=1` 的在线学习场景下，sparse embedding 由分布式 embedding 服务独立更新，训练进程可以在训练过程中按分钟级（或自定义节奏）持续导出 dense 图，供推理 Processor 热切换。该能力**不依赖 checkpoint**：rank 0 在训练启动时一次性构建 serving 侧 dense 图，之后每次触发时全体 rank 从内存中的 DMP 模型收集 dense 权重（仅收集 dense 图实际携带的参数，不涉及 sparse/dynamicemb/MCH 状态），rank 0 在后台线程热替换权重、script 并原子发布新版本，训练主流程不阻塞在导出上。
+
+### 启用方式
+
+训练命令前加上以下环境变量即可（`ONLINE_DENSE_EXPORT_DIR` 与 `ONLINE_DENSE_EXPORT_STEPS` / `ONLINE_DENSE_EXPORT_INTERVAL` 至少一项为必填）：
+
+```bash
+ONLINE_DENSE_EXPORT=1 \
+ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \
+ONLINE_DENSE_EXPORT_INTERVAL=60 \
+torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+    -m tzrec.train_eval \
+    --pipeline_config_path experiments/online_learning/pipeline.config
+```
+
+### 环境变量
+
+- ONLINE_DENSE_EXPORT: 开启训练内在线 dense 导出，默认关闭
+  - **ONLINE_DENSE_EXPORT=1**：启用（要求同时设置 `USE_DISTRIBUTED_EMBEDDING=1`）
+- ONLINE_DENSE_EXPORT_DIR: 在线服务读取的根目录（必填）。导出产物发布在 `<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export` 下，必须为本地路径（发布依赖 `os.rename` 原子换版）；`model_dir` 可以是远端（如 OSS）
+- ONLINE_DENSE_EXPORT_STEPS: 按训练步数间隔触发导出（如 `300` 表示每 300 步导出一次），0 表示关闭
+- ONLINE_DENSE_EXPORT_INTERVAL: 按数据事件时间（`Batch.data_timestamp`，Unix 秒）间隔触发导出（如 `60` 表示每消费过 60 秒事件时间、且跨过整分边界时导出一次），0 表示关闭。事件时间触发会在各 rank 间做 quorum 对齐，与 checkpoint 的时间触发机制一致
+- ONLINE_DENSE_EXPORT_QUORUM: 事件时间触发的 worker 越界比例阈值，取值 (0, 1\]，默认 0.5
+- ONLINE_DENSE_EXPORT_KEEP_VERSIONS: 保留的历史版本数，默认 3（serving 需要当前版本 + 上一版本用于原子切换）。`current.json` 指向的版本永远不被清理
+- ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 的等待上限
+
+`ONLINE_DENSE_EXPORT_STEPS` 与 `ONLINE_DENSE_EXPORT_INTERVAL` 至少要设置一个；训练结束时还会强制导出一次最终状态。导出频率与 checkpoint 频率完全独立，checkpoint 仍按原有配置保存、用于训练恢复。
+
+### 导出产物与切换契约
+
+```
+<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export/
+├── current.json                  # 服务指向的最新版本指针（原子写）
+└── versions/
+    └── <yyyyMMddHHmmss>/         # 一个不可变的版本目录
+        ├── scripted_model.pt     # TorchScript dense 模型
+        ├── dense_meta.json       # placeholder 名 -> serving embedding 名映射
+        ├── graph/                # 图 dump（排查用）
+        └── READY                 # 目录完整的标记文件，先写 READY 再原子换版
+```
+
+`current.json` 内容：
+
+```json
+{
+  "checkpoint_step": 1200,
+  "created_at": "2026-07-24T05:20:00.000000+00:00",
+  "data_timestamp": 1782365432.0,
+  "version": "20260724052000"
+}
+```
+
+- `version`: 版本目录名，单调递增的时间戳。
+- `checkpoint_step` / `data_timestamp`: 导出时训练步数与该 rank 消费到的事件时间，供 serving 侧与 sparse 状态对齐版本一致性。
+- 推理 Processor 应只读取 `current.json` 指向的版本，且只消费最新版本。
+
+### 运行与排障说明
+
+- 仅 rank 0 执行建图与发布；启动时会对整条建图 + script 链路做一次试运行，任何 trace/script 失败会在训练开始前就暴露（fail-fast）。
+- 启动时还会校验 dense 图的每个参数都能在训练模型 state dict 中找到来源（INPUT_TILE=3 的 user 侧孪生模块自动回落到非 user 侧权重），校验失败训练不会启动。
+- 导出在后台线程执行，失败（日志中 `online dense export task failed`）只跳过该版本、不影响训练，也不改变 `current.json` 指向。
+- 两次导出间隔小于单次导出耗时时，排队中的旧任务被最新版本顶替（latest-wins），不产生积压。
+- MatchModel（向量召回）与 TDM 模型的完整导出按 user/item（或按模块）分目录，与单体 dense 热导出的布局不兼容，启用会直接报错，请使用完整的 `tzrec.export`。
+- 手动/离线从某个 checkpoint 导出一个版本（与训练内导出发布到同一目录结构）：
+
+```bash
+USE_DISTRIBUTED_EMBEDDING=1 ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \
+python -m tzrec.tools.online_dense_export \
+    --pipeline_config_path experiments/online_learning/pipeline.config \
+    --checkpoint_path /mnt/data/model/model.ckpt-1200 \
+    --model_dir /mnt/data/model \
+    --checkpoint_step 1200
+```
+
 (export-aot-on-pai)=
 
 ## 在 PAI 上导出 AOT 模型

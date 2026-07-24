@@ -452,15 +452,13 @@ def _train_and_evaluate(
                 )
             model.train()
 
+    # In-process online dense export: rank zero builds the serving graph once
+    # here and hot-swaps gathered weights per trigger; independent of saves.
     online_dense_exporter = OnlineDenseExportManager(
         model_dir,
         pipeline_config_path or os.path.join(model_dir, "pipeline.config"),
-        ckpt_manager,
+        model,
     )
-
-    def after_checkpoint_saved(step: int, data_ts: float) -> None:
-        checkpoint_path = os.path.join(model_dir, f"model.ckpt-{step}")
-        online_dense_exporter.submit(step, checkpoint_path, data_ts)
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
@@ -548,8 +546,10 @@ def _train_and_evaluate(
                     dataloader_state,
                     data_timestamp=data_timestamp,
                 ):
-                    after_checkpoint_saved(i_step, data_timestamp)
                     run_eval(i_step, i_epoch)
+                # Unconditional: the exporter decides its own (checkpoint-
+                # independent) cadence and enters its collective in lockstep.
+                online_dense_exporter.maybe_export(i_step, data_timestamp, model)
                 if train_config.is_profiling:
                     prof.step()
 
@@ -561,8 +561,8 @@ def _train_and_evaluate(
                 epoch=i_epoch,
                 data_timestamp=data_timestamp,
             ):
-                after_checkpoint_saved(i_step, data_timestamp)
                 run_eval(i_step, i_epoch)
+            online_dense_exporter.maybe_export(i_step, data_timestamp, model)
 
             if use_step and i_step >= train_config.num_steps - 1:
                 break
@@ -606,8 +606,8 @@ def _train_and_evaluate(
             data_timestamp=data_timestamp,
             final=True,
         ):
-            after_checkpoint_saved(i_step, data_timestamp)
             run_eval(i_step, i_epoch)
+        online_dense_exporter.maybe_export(i_step, data_timestamp, model, final=True)
     finally:
         online_dense_exporter.close()
         ckpt_manager.close()

@@ -13,33 +13,130 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 
 import datetime
+import json
 import os
-import socket
-import subprocess
-import sys
+import shutil
+import tempfile
+import time
 import weakref
 from threading import Condition, Event, Thread
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.distributed._shard.sharded_tensor import ShardedTensor
+from torch.distributed._tensor import DTensor
 
 from tzrec.acc import utils as acc_utils
-from tzrec.utils import checkpoint_util
+from tzrec.utils import config_util
+from tzrec.utils.checkpoint_util import (
+    quorum_event_time,
+    remap_input_tile_user_key,
+    should_save_on_timestamp,
+)
+from tzrec.utils.export_util import (
+    build_dense_graph_module,
+    create_dense_export_warmup_data,
+    finalize_dense_export,
+)
 from tzrec.utils.logging_util import logger
 
-_DISTRIBUTED_ENV_KEYS = {
-    "GROUP_RANK",
-    "GROUP_WORLD_SIZE",
-    "LOCAL_RANK",
-    "LOCAL_WORLD_SIZE",
-    "MASTER_ADDR",
-    "MASTER_PORT",
-    "RANK",
-    "ROLE_NAME",
-    "ROLE_RANK",
-    "ROLE_WORLD_SIZE",
-    "WORLD_SIZE",
-}
-_DISTRIBUTED_ENV_PREFIXES = ("TORCHELASTIC_",)
+VERSIONS_DIR = "versions"
+CURRENT_JSON = "current.json"
 _VERSION_TIME_FORMAT = "%Y%m%d%H%M%S"
+
+
+def _utc_now() -> str:
+    """Current UTC time as an ISO-8601 string."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    """Write JSON atomically: tmp file in the same dir, then os.replace."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _publish_current(current_path: str, payload: Dict[str, Any]) -> None:
+    """Atomically publish the service-facing current.json pointer."""
+    _atomic_write_json(current_path, payload)
+
+
+def _read_current_version(current_path: str) -> Optional[str]:
+    """Return the version current.json points at, or None if absent/unreadable.
+
+    Best-effort: a missing or corrupt current.json means there is no live
+    pointer to spare, so pruning falls back to pure newest-K retention.
+    """
+    try:
+        with open(current_path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        logger.warning("could not read current version from %s: %s", current_path, e)
+        return None
+    return data.get("version") if isinstance(data, dict) else None
+
+
+def _max_kept_versions() -> int:
+    """Max published dense versions to retain (0 = keep all)."""
+    return int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_VERSIONS", "3"))
+
+
+def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
+    """Best-effort retention: keep the newest K versions, sweep stale tmp artifacts.
+
+    Serving reads current.json (the newest pointer) and needs the previous
+    version for an atomic swap, so K defaults to 3. The version current.json
+    points at is always spared even when it sorts outside the newest K: an
+    explicit --version or clock rollback after a restart can publish an older
+    timestamp, and deleting it would leave the serving pointer referencing a
+    missing directory. Stale ``*.tmp.<pid>`` dirs and current.json.tmp.<pid>
+    files left by crashed exports are swept so they don't accumulate under the
+    serving-facing tree.
+    """
+    max_versions = _max_kept_versions()
+    for base in (versions_root, export_root):
+        try:
+            entries = os.listdir(base)
+        except FileNotFoundError:
+            continue
+        for name in entries:
+            if ".tmp." not in name and not name.endswith(".tmp"):
+                continue
+            path = os.path.join(base, name)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                logger.info("removed stale dense export tmp: %s", path)
+            except OSError as e:
+                logger.warning("failed to remove stale tmp %s: %s", path, e)
+    if max_versions <= 0:
+        return
+    try:
+        entries = os.listdir(versions_root)
+    except FileNotFoundError:
+        return
+    current_version = _read_current_version(os.path.join(export_root, CURRENT_JSON))
+    version_dirs = sorted(
+        os.path.join(versions_root, name)
+        for name in entries
+        if os.path.isdir(os.path.join(versions_root, name))
+    )
+    for path in version_dirs[:-max_versions]:
+        if os.path.basename(path) == current_version:
+            continue
+        try:
+            shutil.rmtree(path)
+            logger.info("removed old dense export version: %s", path)
+        except OSError as e:
+            logger.warning("failed to remove old version %s: %s", path, e)
 
 
 def _format_version(now: datetime.datetime) -> str:
@@ -88,50 +185,32 @@ def _is_remote_path(path: str) -> bool:
     return split_protocol(path)[0] is not None
 
 
-def _get_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _build_export_subprocess_env(repo_root: str) -> Dict[str, str]:
-    env = os.environ.copy()
-    for key in list(env):
-        if key in _DISTRIBUTED_ENV_KEYS or key.startswith(_DISTRIBUTED_ENV_PREFIXES):
-            del env[key]
-    env.update(
-        {
-            "USE_DISTRIBUTED_EMBEDDING": "1",
-            "INPUT_TILE": "3",
-            "CUDA_VISIBLE_DEVICES": "",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "LOCAL_WORLD_SIZE": "1",
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(_get_free_port()),
-        }
-    )
-    env["PYTHONPATH"] = (
-        repo_root
-        if not env.get("PYTHONPATH")
-        else repo_root + os.pathsep + env["PYTHONPATH"]
-    )
-    return env
-
-
 class OnlineDenseExportManager:
-    """Background launcher for online-learning dense model export."""
+    """In-process online-learning dense model export.
+
+    Rank zero builds the serving dense graph once at construction time. On
+    each trigger (independent of checkpoint saving) all ranks gather the DMP
+    model's dense weights in memory -- scoped to exactly the state keys the
+    dense graph carries, so sparse / dynamicemb / MCH state is never
+    materialized -- and rank zero hot-swaps them into the resident graph from
+    a background thread, then publishes a version. No checkpoint write is
+    needed per export.
+
+    Every collective the manager enters (group creation, the per-step
+    event-time reconcile, the startup key-list broadcast, the per-export
+    gather) is called identically on all ranks: the trigger decision is a
+    deterministic function of job-uniform env config, the step counter and
+    the quorum-reconciled event-time, mirroring CheckpointManager.maybe_save.
+    """
 
     def __init__(
         self,
         model_dir: str,
         pipeline_config_path: str,
-        ckpt_manager: checkpoint_util.CheckpointManager,
+        model: nn.Module,
     ) -> None:
         self._enabled = _online_dense_export_enabled()
         self._rank = int(os.environ.get("RANK", 0))
-        self._ckpt_manager = ckpt_manager
         self._cond = Condition()
         self._pending: Optional[Dict[str, Any]] = None
         self._drain_event = Event()
@@ -143,7 +222,24 @@ class OnlineDenseExportManager:
         )
         # Covers an in-flight plus one pending task timeout during close() drain.
         self._close_timeout = 2 * self._export_timeout + 120.0
-        self._keep_logs = int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_LOGS", "3"))
+        # trigger config; identical on all ranks (env is job-uniform), so the
+        # trigger decision needs no consensus beyond the event-time reconcile
+        self._export_steps = int(os.environ.get("ONLINE_DENSE_EXPORT_STEPS", "0"))
+        self._ts_interval = int(os.environ.get("ONLINE_DENSE_EXPORT_INTERVAL", "0"))
+        self._ts_quorum = float(os.environ.get("ONLINE_DENSE_EXPORT_QUORUM", "0.5"))
+        self._last_export_step = -1
+        self._last_data_ts: Optional[float] = None
+        self._group: Optional[dist.ProcessGroup] = None
+        # (gm state key, DMP state_dict source key) pairs, sorted; identical
+        # on all ranks after the startup broadcast. The gather iterates them
+        # in this order on every rank so collectives stay in lockstep.
+        self._state_pairs: List[Tuple[str, str]] = []
+        # rank-zero resident export state, built once at construction
+        self._twin_model: Optional[nn.Module] = None
+        self._gm: Optional[torch.fx.GraphModule] = None
+        self._full_graph: Optional[torch.fx.Graph] = None
+        self._warmup_data: Optional[Dict[str, Any]] = None
+        self._dense_graph_config: Optional[Dict[str, Any]] = None
 
         override = os.environ.get("ONLINE_DENSE_EXPORT_DIR")
         export_root = resolve_dense_export_root(model_dir)
@@ -164,10 +260,19 @@ class OnlineDenseExportManager:
             raise RuntimeError(
                 "ONLINE_DENSE_EXPORT=1 requires USE_DISTRIBUTED_EMBEDDING=1."
             )
-        # The publish tree (os.rename / current.json / protect-key glob) is
-        # local-FS only; fsspec URLs break all three. Check the actual export
-        # root -- <serving_root>/dense_hot_export -- so a local override
-        # decouples the publish tree from a remote model_dir.
+        if self._export_steps <= 0 and self._ts_interval <= 0:
+            raise RuntimeError(
+                "ONLINE_DENSE_EXPORT=1 requires ONLINE_DENSE_EXPORT_STEPS or "
+                "ONLINE_DENSE_EXPORT_INTERVAL to configure the export cadence."
+            )
+        if self._ts_interval > 0 and not (0.0 < self._ts_quorum <= 1.0):
+            raise RuntimeError(
+                f"ONLINE_DENSE_EXPORT_QUORUM must be in (0, 1], got {self._ts_quorum}."
+            )
+        # The publish tree (os.rename / current.json) is local-FS only;
+        # fsspec URLs break both. Check the actual export root --
+        # <serving_root>/dense_hot_export -- so a local override decouples
+        # the publish tree from a remote model_dir.
         for label, path in (
             ("export_root", export_root),
             ("pipeline_config_path", pipeline_config_path),
@@ -176,6 +281,21 @@ class OnlineDenseExportManager:
                 raise RuntimeError(
                     f"ONLINE_DENSE_EXPORT requires a local {label}, got remote: {path}"
                 )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            # collective; ONLINE_DENSE_EXPORT is job-uniform so all ranks enter
+            self._group = dist.new_group(backend="gloo")
+
+        state_pairs: List[Tuple[str, str]] = []
+        if self._rank == 0:
+            state_pairs = self._build_export_graph(model)
+        if self._group is not None:
+            pair_box: List[List[Tuple[str, str]]] = [state_pairs]
+            dist.broadcast_object_list(pair_box, src=0, group=self._group)
+            self._state_pairs = pair_box[0]
+        else:
+            self._state_pairs = state_pairs
+        self._verify_state_pairs(model)
+
         if self._rank == 0:
             self._worker = Thread(
                 target=self._worker_loop,
@@ -196,45 +316,296 @@ class OnlineDenseExportManager:
                 self._export_root,
             )
 
-    def submit(
+    def _build_export_graph(self, model: nn.Module) -> List[Tuple[str, str]]:
+        """Build the resident dense export graph once, before training starts.
+
+        Runs inside a scoped ``INPUT_TILE=3`` env window: the export-side
+        model has user-side twin modules the training process never builds,
+        and INPUT_TILE is read at model construction and batch-parse time.
+        The training model and its dataloader workers are already constructed
+        by the time this runs, so the window cannot affect them.
+
+        Fails fast (before training) on any trace/script error via a dry-run
+        finalize, and on any dense-graph state key with no gatherable source
+        in the live model's state dict.
+
+        Args:
+            model: the live DMP training model, used to resolve and validate
+                the dense graph's state keys against the real state_dict.
+
+        Returns:
+            Sorted (gm_key, dmp_source_key) pairs for the lockstep gather.
+        """
+        # lazy import: tzrec.main imports this module
+        from tzrec.main import _create_features, _create_model
+        from tzrec.models.match_model import MatchModel
+        from tzrec.models.model import ScriptWrapper
+        from tzrec.models.tdm import TDM
+
+        device = torch.device("cpu")
+        prev_input_tile = os.environ.get("INPUT_TILE")
+        os.environ["INPUT_TILE"] = "3"
+        try:
+            pipeline_config = config_util.load_pipeline_config(
+                self._pipeline_config_path
+            )
+            features = _create_features(
+                list(pipeline_config.feature_configs), pipeline_config.data_config
+            )
+            twin_model = _create_model(
+                pipeline_config.model_config,
+                features,
+                list(pipeline_config.data_config.label_fields),
+                sampler_type=None,
+            )
+            if isinstance(twin_model, (MatchModel, TDM)):
+                # The full export emits per-tower (MatchModel) or per-module
+                # (TDM) artifacts; a single monolithic dense export cannot
+                # mirror that layout, so a hot swap would load an
+                # incompatible artifact.
+                raise RuntimeError(
+                    f"ONLINE_DENSE_EXPORT does not support "
+                    f"{type(twin_model).__name__} models; use the full export "
+                    "(export_model) instead."
+                )
+            twin_model = ScriptWrapper(twin_model)
+            warmup_data = create_dense_export_warmup_data(
+                pipeline_config, twin_model, device
+            )
+            gm, full_graph, dense_graph_config = build_dense_graph_module(
+                twin_model, warmup_data, device
+            )
+            # Fail fast on trace/script errors instead of at the first export.
+            with tempfile.TemporaryDirectory(
+                prefix="online_dense_export_dryrun_"
+            ) as dry_run_dir:
+                finalize_dense_export(
+                    twin_model,
+                    full_graph,
+                    gm,
+                    warmup_data,
+                    device,
+                    dry_run_dir,
+                    dense_graph_config,
+                )
+        finally:
+            if prev_input_tile is None:
+                os.environ.pop("INPUT_TILE", None)
+            else:
+                os.environ["INPUT_TILE"] = prev_input_tile
+
+        source_keys = model.state_dict()
+        pairs: List[Tuple[str, str]] = []
+        missing: List[str] = []
+        # gm keys match the DMP state_dict namespace directly (both wrappers
+        # name the model `model`); user-side twin keys added by INPUT_TILE=3
+        # fall back to their non-user sources, as on checkpoint restore.
+        for gm_key in sorted(gm.state_dict().keys()):
+            source = (
+                gm_key
+                if gm_key in source_keys
+                else remap_input_tile_user_key(gm_key, source_keys)
+            )
+            if source not in source_keys:
+                missing.append(gm_key)
+                continue
+            value = source_keys[source]
+            if not isinstance(value, (torch.Tensor, ShardedTensor)):
+                raise RuntimeError(
+                    f"ONLINE_DENSE_EXPORT cannot gather dense state [{gm_key}]: "
+                    f"unsupported state type {type(value).__name__}"
+                )
+            pairs.append((gm_key, source))
+        if missing:
+            raise RuntimeError(
+                "ONLINE_DENSE_EXPORT cannot gather "
+                f"{len(missing)} dense model states from the live model: "
+                + ", ".join(missing)
+            )
+
+        self._twin_model = twin_model
+        self._gm = gm
+        self._full_graph = full_graph
+        self._warmup_data = warmup_data
+        self._dense_graph_config = dense_graph_config
+        return pairs
+
+    def _verify_state_pairs(self, model: nn.Module) -> None:
+        """Fail fast if any gather source key is absent from this rank's model.
+
+        Guards against rank-skewed state_dict structure; the pairs were
+        resolved against rank zero's model (or broadcast from it).
+        """
+        source_keys = set(model.state_dict().keys())
+        missing = [
+            source for _, source in self._state_pairs if source not in source_keys
+        ]
+        if missing:
+            raise RuntimeError(
+                f"ONLINE_DENSE_EXPORT rank {self._rank} model is missing "
+                f"{len(missing)} dense export source states: "
+                + ", ".join(sorted(set(missing)))
+            )
+
+    def _reconcile_event_time(self, data_timestamp: float) -> Optional[float]:
+        """Quorum-reconcile this rank's event-time across workers.
+
+        A collective over the exporter's gloo group; every rank calls it on
+        the same steps (on every maybe_export call when the event-time
+        trigger is configured). Workers without a timestamp contribute the
+        -1.0 sentinel, which sorts low and counts as "not past".
+        """
+        if self._ts_interval <= 0:
+            return None
+        if self._group is not None:
+            worker_ts: List[float] = [0.0] * dist.get_world_size(self._group)
+            dist.all_gather_object(worker_ts, data_timestamp, group=self._group)
+        else:
+            worker_ts = [data_timestamp]
+        data_ts = quorum_event_time(worker_ts, self._ts_quorum)
+        return data_ts if data_ts is not None and data_ts >= 0 else None
+
+    def maybe_export(
         self,
         step: int,
-        checkpoint_path: str,
         data_timestamp: float,
+        model: nn.Module,
+        final: bool = False,
     ) -> None:
-        """Queue a dense export task for the freshest saved checkpoint."""
-        if not self._enabled or self._rank != 0:
+        """Export a dense version now if a configured trigger fires.
+
+        All ranks must call this in lockstep from the train loop (it is
+        invoked unconditionally, not gated on a checkpoint save): the trigger
+        decision is deterministic and identical across ranks, and a firing
+        decision enters the collective weight gather on every rank.
+
+        Args:
+            step: current global step.
+            data_timestamp: this rank's consumed event-time (seconds), -1.0
+                if none; quorum-reconciled across workers for the event-time
+                trigger.
+            model: the live DMP training model to gather weights from.
+            final: force an export (still subject to the per-step dedupe),
+                e.g. at train end.
+        """
+        if not self._enabled:
             return
-        checkpoint_path = os.path.abspath(checkpoint_path)
+        want = final
+        if self._export_steps > 0 and step > 0 and step % self._export_steps == 0:
+            want = True
+        data_ts = self._reconcile_event_time(data_timestamp)
+        if data_ts is not None:
+            if self._last_data_ts is None:
+                # first event-time seen: set the reference, do not export
+                self._last_data_ts = data_ts
+            elif should_save_on_timestamp(
+                data_ts, self._last_data_ts, self._ts_interval, []
+            ):
+                want = True
+        if not want or step == self._last_export_step:
+            return
+        self._last_export_step = step
+        if data_ts is not None:
+            # advance the watermark on every export
+            self._last_data_ts = data_ts
+        self._gather_and_submit(step, data_timestamp, model)
+
+    def _gather_and_submit(
+        self, step: int, data_timestamp: float, model: nn.Module
+    ) -> None:
+        """Gather the dense graph's weights from the DMP model (all ranks).
+
+        Scoped to exactly the state keys the resident dense graph carries
+        (resolved at construction), so sparse / dynamicemb / MCH state is
+        never materialized. Plain tensors are DDP-replicated and need no
+        communication; DTensors are all-gathered on their mesh;
+        ShardedTensors are staged into a full-size CPU tensor and summed over
+        the exporter's gloo group (position-based shards never overlap).
+        Rank zero then enqueues the snapshot on the latest-wins worker queue.
+        """
+        is_rank_zero = self._rank == 0
+        snapshot: Dict[str, torch.Tensor] = {}
+        if self._state_pairs:
+            source_state = model.state_dict()
+            for gm_key, source_key in self._state_pairs:
+                value = source_state[source_key]
+                if isinstance(value, DTensor):
+                    # collective on the DTensor's mesh; all ranks participate
+                    gathered = value.full_tensor()
+                elif isinstance(value, ShardedTensor):
+                    gathered = self._gather_sharded_tensor(value)
+                elif isinstance(value, torch.Tensor):
+                    gathered = value
+                else:
+                    raise RuntimeError(
+                        f"ONLINE_DENSE_EXPORT cannot gather dense state "
+                        f"[{gm_key}]: unsupported state type "
+                        f"{type(value).__name__}"
+                    )
+                if is_rank_zero:
+                    snapshot[gm_key] = gathered.detach().cpu()
+        if not is_rank_zero:
+            return
+        self._enqueue(step, data_timestamp, snapshot)
+
+    def _gather_sharded_tensor(self, value: ShardedTensor) -> torch.Tensor:
+        """Reconstruct a full CPU tensor from position-based ShardedTensor shards.
+
+        Every rank stages its local shards into a zeroed full-size tensor at
+        their global offsets, then the exporter's gloo group sums them: each
+        element is written by exactly one rank, so the sum is the union.
+        """
+        metadata = value.metadata()
+        gathered = torch.zeros(metadata.size, dtype=metadata.tensor_properties.dtype)
+        for shard in value.local_shards():
+            region = gathered
+            for dim, (offset, size) in enumerate(
+                zip(shard.metadata.shard_offsets, shard.metadata.shard_sizes)
+            ):
+                region = region.narrow(dim, offset, size)
+            region.copy_(shard.tensor.detach().cpu())
+        if self._group is not None:
+            dist.all_reduce(gathered, group=self._group)
+        return gathered
+
+    def _enqueue(
+        self, step: int, data_timestamp: float, snapshot: Dict[str, torch.Tensor]
+    ) -> None:
+        """Queue a dense export task; a not-yet-started task is superseded.
+
+        Latest-wins: online serving only consumes the freshest dense version,
+        so a backlog is collapsed to the newest snapshot instead of pinning
+        worker time (and its memory) per queued task.
+        """
         version = _make_monotonic_version(self._last_version)
         self._last_version = version
+        superseded: Optional[str] = None
         with self._cond:
             if self._drain_event.is_set():
                 logger.warning("online dense export draining; skip step %s", step)
                 return
-            # latest-wins: a not-yet-started pending task is superseded and
-            # its checkpoint unprotected immediately so prune can reclaim it.
-            # Online serving only consumes the freshest dense version, so a
-            # backlog cannot pin one protected checkpoint per queued task.
-            superseded = self._pending["checkpoint_path"] if self._pending else None
+            if self._pending is not None:
+                superseded = self._pending["version"]
             self._pending = {
                 "step": step,
-                "checkpoint_path": checkpoint_path,
                 "data_timestamp": data_timestamp,
                 "version": version,
+                "snapshot": snapshot,
             }
-            self._ckpt_manager.protect_checkpoint(checkpoint_path)
             self._cond.notify()
         if superseded is not None:
-            self._ckpt_manager.unprotect_checkpoint(superseded)
-            self._ckpt_manager.prune()
+            logger.info(
+                "online dense export version %s superseded by %s before it started",
+                superseded,
+                version,
+            )
 
     def close(self) -> None:
         """Wait for in-flight and pending dense export tasks to finish.
 
         Detach the finalizer only after the worker actually stops, so a worker
         that outlives the close timeout keeps the atexit drain backstop
-        instead of leaking a live subprocess publisher.
+        instead of leaking a live publisher.
         """
         if self._worker is None:
             return
@@ -263,7 +634,7 @@ class OnlineDenseExportManager:
         Registered via weakref.finalize so that if training raises before
         close() (the manager local goes out of scope), the worker is still
         stopped instead of leaking as a daemon thread with an in-flight
-        subprocess that could publish current.json unattended.
+        publish that could advance current.json unattended.
         """
         drain_event.set()
         with cond:
@@ -284,113 +655,73 @@ class OnlineDenseExportManager:
                 self._run_task(task)
             except Exception:
                 # Keep the worker alive across unexpected task failures (e.g.
-                # OSError from makedirs/open/socket). _run_task's finally
-                # still unprotects the failing checkpoint; without this guard a
-                # single transient I/O error would permanently disable exports
-                # and silently void keep_checkpoint_max for all future submits.
+                # OSError from makedirs/open); without this guard a single
+                # transient I/O error would permanently disable exports.
                 logger.exception("online dense export task failed; continuing")
 
     def _run_task(self, task: Dict[str, Any]) -> None:
-        checkpoint_path = task["checkpoint_path"]
-        log_dir = os.path.join(self._export_root, "logs")
+        """Load the snapshot into the resident graph, script it and publish."""
+        version = task["version"]
+        versions_root = os.path.join(self._export_root, VERSIONS_DIR)
+        version_dir = os.path.join(versions_root, version)
+        tmp_dir = f"{version_dir}.tmp.{os.getpid()}"
+        device = torch.device("cpu")
+        start_time = time.monotonic()
+        logger.info(
+            "start online dense export version %s (step %s)", version, task["step"]
+        )
         try:
-            if not os.path.exists(checkpoint_path):
-                logger.error(
-                    "skip online dense export version %s: checkpoint missing: %s",
-                    task["version"],
-                    checkpoint_path,
-                )
-                return
-
-            repo_root = os.path.dirname(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if os.path.exists(version_dir):
+                raise RuntimeError(f"dense version already exists: {version_dir}")
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            os.makedirs(tmp_dir, exist_ok=True)
+            assert self._gm is not None
+            assert self._twin_model is not None
+            assert self._full_graph is not None
+            assert self._warmup_data is not None
+            assert self._dense_graph_config is not None
+            self._gm.load_state_dict(task["snapshot"])
+            finalize_dense_export(
+                self._twin_model,
+                self._full_graph,
+                self._gm,
+                self._warmup_data,
+                device,
+                tmp_dir,
+                self._dense_graph_config,
             )
-            env = _build_export_subprocess_env(repo_root)
-            # Pass the pre-suffix serving root (abspath'd) so the subprocess
-            # re-resolves it via resolve_dense_export_root to the same
-            # <serving_root>/dense_hot_export tree the manager logs into,
-            # independent of subprocess cwd or a relative ONLINE_DENSE_EXPORT_DIR.
-            env["ONLINE_DENSE_EXPORT_DIR"] = self._serving_root
-            cmd = [
-                sys.executable,
-                "-m",
-                "tzrec.tools.online_dense_export",
-                "--pipeline_config_path",
-                self._pipeline_config_path,
-                "--checkpoint_path",
-                checkpoint_path,
-                "--model_dir",
-                self._model_dir,
-                "--version",
-                task["version"],
-                "--checkpoint_step",
-                str(task["step"]),
-                "--data_timestamp",
-                str(task["data_timestamp"]),
-            ]
-            logger.info(
-                "start online dense export version %s from %s",
-                task["version"],
-                checkpoint_path,
+            ready_path = os.path.join(tmp_dir, "READY")
+            with open(ready_path, "w") as f:
+                f.write(_utc_now())
+                f.write("\n")
+            os.rename(tmp_dir, version_dir)
+        except BaseException:
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            raise
+
+        payload: Dict[str, Any] = {
+            "version": version,
+            "checkpoint_step": task["step"],
+            "data_timestamp": task["data_timestamp"],
+            "created_at": _utc_now(),
+        }
+        # Keep the service-facing pointer beside the immutable dense versions.
+        _publish_current(os.path.join(self._export_root, CURRENT_JSON), payload)
+        _prune_old_dense_versions(self._export_root, versions_root)
+        elapsed = time.monotonic() - start_time
+        if elapsed > self._export_timeout:
+            logger.warning(
+                "online dense export version %s took %.1fs, exceeding "
+                "ONLINE_DENSE_EXPORT_TIMEOUT=%.1fs",
+                version,
+                elapsed,
+                self._export_timeout,
             )
-            os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, f"{task['version']}.log")
-            try:
-                with open(log_path, "w") as log_file:
-                    subprocess.run(
-                        cmd,
-                        check=True,
-                        env=env,
-                        cwd=repo_root,
-                        stdout=log_file,
-                        stderr=subprocess.STDOUT,
-                        timeout=self._export_timeout,
-                    )
-            except subprocess.TimeoutExpired:
-                logger.error(
-                    "online dense export version %s timed out after %ss, see %s",
-                    task["version"],
-                    self._export_timeout,
-                    log_path,
-                )
-                return
-            except subprocess.CalledProcessError as e:
-                logger.error(
-                    "online dense export version %s failed with return code %s, see %s",
-                    task["version"],
-                    e.returncode,
-                    log_path,
-                )
-                return
-            logger.info("online dense export version %s finished", task["version"])
-        finally:
-            self._ckpt_manager.unprotect_checkpoint(checkpoint_path)
-            self._ckpt_manager.prune()
-            self._prune_export_logs(log_dir)
-
-    def _prune_export_logs(self, log_dir: str) -> None:
-        """Best-effort: keep the newest K export logs, drop the rest.
-
-        Each export attempt (success, timeout, or failure) writes one
-        ``<version>.log``; version retention never touches this directory, so
-        without this a long-running job accumulates one file/inode per
-        checkpoint including failed exports. Version names are timestamps, so
-        name order is chronological -- keep the newest K and remove the rest.
-
-        Args:
-            log_dir: Directory holding ``<version>.log`` files.
-        """
-        if self._keep_logs <= 0:
-            return
-        try:
-            entries = os.listdir(log_dir)
-        except FileNotFoundError:
-            return
-        logs = sorted(name for name in entries if name.endswith(".log"))
-        for name in logs[: -self._keep_logs]:
-            path = os.path.join(log_dir, name)
-            try:
-                os.remove(path)
-                logger.info("removed old dense export log: %s", path)
-            except OSError as e:
-                logger.warning("failed to remove old log %s: %s", path, e)
+        logger.info(
+            "published online dense export version %s to %s (%.1fs)",
+            version,
+            version_dir,
+            elapsed,
+        )

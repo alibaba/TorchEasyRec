@@ -453,6 +453,35 @@ class CheckpointUtilTest(unittest.TestCase):
         finally:
             dist.destroy_process_group()
 
+    def test_remap_input_tile_user_key_maps_user_twins(self) -> None:
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key(
+                "model.eg.ebc_user.embedding_bags.t.weight"
+            ),
+            "model.eg.ebc.embedding_bags.t.weight",
+        )
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key("model.eg.mc_ec_dict_user.16.w"),
+            "model.eg.mc_ec_dict.16.w",
+        )
+
+    def test_remap_input_tile_user_key_passthrough(self) -> None:
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key("model.mlp.weight"),
+            "model.mlp.weight",
+        )
+
+    def test_remap_input_tile_user_key_respects_valid_keys(self) -> None:
+        fqn = "model.eg.ebc_user.embedding_bags.t.weight"
+        target = "model.eg.ebc.embedding_bags.t.weight"
+        # a matching pattern whose candidate is invalid leaves the key alone
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key(fqn, {"unrelated"}), fqn
+        )
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key(fqn, {target}), target
+        )
+
 
 class DataloaderCheckpointTest(unittest.TestCase):
     """Tests for dataloader checkpoint utilities."""

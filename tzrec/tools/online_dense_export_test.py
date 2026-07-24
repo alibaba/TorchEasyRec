@@ -103,17 +103,33 @@ class OnlineDenseExportTest(unittest.TestCase):
             with open(current_path) as f:
                 current = json.load(f)
             self.assertEqual(
-                set(current.keys()), {"checkpoint_path", "created_at", "version"}
+                set(current.keys()),
+                {
+                    "checkpoint_path",
+                    "checkpoint_step",
+                    "created_at",
+                    "data_timestamp",
+                    "version",
+                },
             )
             self.assertEqual(current["version"], "20260623174703")
             self.assertEqual(
                 current["checkpoint_path"], os.path.abspath(checkpoint_path)
             )
+            self.assertEqual(current["checkpoint_step"], 10)
+            self.assertEqual(current["data_timestamp"], 42.0)
             self.assertTrue(current["created_at"])
             self.assertFalse(os.path.exists(os.path.join(tmp_dir, "dense_hot_update")))
 
             self.assertEqual(
-                set(payload.keys()), {"checkpoint_path", "created_at", "version"}
+                set(payload.keys()),
+                {
+                    "checkpoint_path",
+                    "checkpoint_step",
+                    "created_at",
+                    "data_timestamp",
+                    "version",
+                },
             )
             self.assertEqual(payload["version"], "20260623174703")
 

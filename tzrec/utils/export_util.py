@@ -1808,35 +1808,33 @@ def _isolate_kafka_export_group(input_path: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(params)))
 
 
-def export_dense_model_cpu(
+def create_dense_export_warmup_data(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
-    checkpoint_path: Optional[str],
-    save_dir: str,
-    assets: Optional[List[str]] = None,
-    use_local_cache_dir: bool = False,
+    device: torch.device,
     data_input_path: Optional[str] = None,
-    **kwargs: Any,
-) -> None:
-    """Export only the dense model on CPU without DMP or GPU usage.
+) -> Dict[str, Any]:
+    """Build one warm-up batch for CPU dense export.
 
     One batch from ``data_input_path`` (or ``pipeline_config.train_input_path``)
-    warms up lazy modules before tracing and sanity-runs the rewritten graph
-    before scripting; restore fails on any checkpoint-missing state so the
-    exported model can never carry uninitialized weights.
+    materializes lazy-module shapes before FX tracing. Its sparse lookup
+    values are zeroed so out-of-range values (e.g. a dynamicemb feature's
+    64-bit FG hash) pass F.embedding_bag's strict CPU range-check -- the
+    dynamicemb backend that would remap them is GPU/DMP-only, and the
+    warm-up's lookup values are discarded anyway (real weights are loaded
+    by the caller before finalizing).
+
+    Args:
+        pipeline_config: pipeline config whose data_config / train_input_path
+            drive the warm-up dataloader.
+        model: model to export; its features feed the dataloader.
+        device: device the batch is moved to.
+        data_input_path: optional warm-up input override; when unset the
+            training input is used with an export-isolated Kafka group.
+
+    Returns:
+        The warm-up batch as a model-input dict.
     """
-    del assets, use_local_cache_dir, kwargs
-    if not checkpoint_path:
-        raise ValueError("checkpoint path should be specified.")
-
-    device = torch.device("cpu")
-    graph_dir = os.path.join(save_dir, "graph")
-    os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(graph_dir, exist_ok=True)
-
-    model.set_is_inference(True)
-    model.eval()
-
     input_path = data_input_path or pipeline_config.train_input_path
     if not input_path:
         raise ValueError("data input path should be specified.")
@@ -1849,21 +1847,44 @@ def export_dense_model_cpu(
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(iter(dataloader))
     batch = batch.to(device)
-    # Warm-up only materializes lazy-module shapes for FX tracing; its lookup
-    # values are discarded (real weights come from restore_model below). Zero
-    # sparse ids so out-of-range values (e.g. a dynamicemb feature's 64-bit FG
-    # hash) pass F.embedding_bag's strict CPU range-check; the dynamicemb
-    # backend that would remap them is GPU/DMP-only.
     for kjt in batch.sparse_features.values():
         kjt.values().zero_()
-    data = batch.to_dict(sparse_dtype=torch.int64)
+    return batch.to_dict(sparse_dtype=torch.int64)
+
+
+def build_dense_graph_module(
+    model: BaseModule,
+    data: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[torch.fx.GraphModule, torch.fx.Graph, Dict[str, Any]]:
+    """Trace the model and rewrite it into the serving-style dense graph.
+
+    Runs a pre-trace warm-up forward to materialize lazy modules, traces the
+    full graph, rewrites the sparse and sequence embedding lookups into
+    serving-fed input placeholders, and prunes the now-unused embedding
+    parameters. The graph module's parameters are freshly initialized on
+    ``device``; the caller loads the real weights before finalizing.
+
+    Args:
+        model: model to export, switched to inference mode in place.
+        data: warm-up batch dict (see create_dense_export_warmup_data).
+        device: device the traced graph module lives on.
+
+    Returns:
+        Tuple of (gm, full_graph, dense_graph_config): the rewritten dense
+        graph module, the pre-surgery graph (kept for the sanity check), and
+        the dense_meta config mapping placeholder names to serving embedding
+        names.
+    """
+    model.set_is_inference(True)
+    model.eval()
 
     # Materialize lazy modules before FX tracing. Some modules build
     # submodules from concrete tensor shapes on their first forward; during
     # FX trace those shapes become Proxy objects and cannot construct
     # Parameters.
     logger.info("running pre-trace warm-up for CPU dense export...")
-    # Materialize meta params; real weights come from restore_model below.
+    # Materialize meta params; real weights are loaded by the caller.
     init_parameters(model, device)
     with torch.no_grad():
         model(data, device=device)
@@ -1873,8 +1894,6 @@ def export_dense_model_cpu(
     ) + _get_dense_embedding_leaf_module_names(model)
     tracer = Tracer(leaf_modules=leaf_modules)
     full_graph = tracer.trace(model)
-    with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
-        f.write(str(full_graph))
 
     logger.info("collecting sparse attrs statically for CPU dense export...")
     sparse_attrs = {}
@@ -1991,10 +2010,42 @@ def export_dense_model_cpu(
 
     init_parameters(gm, device)
     gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, gm, error_on_missing_keys=True)
+    return gm, full_graph, dense_graph_config
+
+
+def finalize_dense_export(
+    model: BaseModule,
+    full_graph: torch.fx.Graph,
+    gm: torch.fx.GraphModule,
+    data: Dict[str, Any],
+    device: torch.device,
+    save_dir: str,
+    dense_graph_config: Dict[str, Any],
+) -> None:
+    """Sanity-check and script a dense graph carrying its final weights.
+
+    Runs the rewritten graph once on serving-style inputs rebuilt from the
+    warm-up batch (so graph surgery or KeyedTensor regroup errors surface at
+    export time instead of at serving time), then writes dense_meta.json,
+    the graph dumps and the scripted model under ``save_dir``.
+
+    Args:
+        model: model the dense graph was traced from.
+        full_graph: pre-surgery graph captured by build_dense_graph_module.
+        gm: rewritten dense graph module with final weights loaded.
+        data: warm-up batch dict.
+        device: device of ``gm``.
+        save_dir: directory the export artifacts are written to.
+        dense_graph_config: dense_meta config from build_dense_graph_module.
+    """
+    graph_dir = os.path.join(save_dir, "graph")
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(graph_dir, exist_ok=True)
 
     _run_dense_graph_sanity_check(model, full_graph, gm, data, device)
 
+    with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
+        f.write(str(full_graph))
     with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
         json.dump(dense_graph_config, f, indent=4)
     with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
@@ -2005,6 +2056,38 @@ def export_dense_model_cpu(
         f.write(dense_model_traced.code)
     dense_model_scripted = torch.jit.script(dense_model_traced)
     dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
+
+
+def export_dense_model_cpu(
+    pipeline_config: EasyRecConfig,
+    model: BaseModule,
+    checkpoint_path: Optional[str],
+    save_dir: str,
+    assets: Optional[List[str]] = None,
+    use_local_cache_dir: bool = False,
+    data_input_path: Optional[str] = None,
+    **kwargs: Any,
+) -> None:
+    """Export only the dense model on CPU without DMP or GPU usage.
+
+    One batch from ``data_input_path`` (or ``pipeline_config.train_input_path``)
+    warms up lazy modules before tracing and sanity-runs the rewritten graph
+    before scripting; restore fails on any checkpoint-missing state so the
+    exported model can never carry uninitialized weights.
+    """
+    del assets, use_local_cache_dir, kwargs
+    if not checkpoint_path:
+        raise ValueError("checkpoint path should be specified.")
+
+    device = torch.device("cpu")
+    data = create_dense_export_warmup_data(
+        pipeline_config, model, device, data_input_path
+    )
+    gm, full_graph, dense_graph_config = build_dense_graph_module(model, data, device)
+    checkpoint_util.restore_model(checkpoint_path, gm, error_on_missing_keys=True)
+    finalize_dense_export(
+        model, full_graph, gm, data, device, save_dir, dense_graph_config
+    )
 
 
 def _merge_sharded_embedding_json(

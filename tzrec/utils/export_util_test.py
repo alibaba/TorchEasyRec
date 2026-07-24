@@ -50,8 +50,11 @@ from tzrec.utils.export_util import (
     _merge_sharded_embedding_json,
     _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
+    build_dense_graph_module,
+    create_dense_export_warmup_data,
     export_dense_model_cpu,
     export_distributed_embedding,
+    finalize_dense_export,
 )
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import make_test_dir
@@ -944,6 +947,172 @@ class ExportUtilTest(unittest.TestCase):
             predictions = scripted(serving_data)
             self.assertEqual(predictions["logits"].size(), (2,))
             self.assertEqual(predictions["probs"].size(), (2,))
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_in_process_dense_export_matches_checkpoint_export(self) -> None:
+        """Build + in-memory weight load + finalize must match the checkpoint path.
+
+        The in-process online export hot-swaps weights gathered from the live
+        model into a resident dense graph instead of restoring a checkpoint;
+        given the same weights, both paths must script identical predictions.
+        """
+        test_dir = make_test_dir()
+        try:
+            feature_cfgs = [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_a", embedding_dim=16, num_buckets=100
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_b", embedding_dim=16, num_buckets=1000
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    raw_feature=feature_pb2.RawFeature(feature_name="int_a")
+                ),
+            ]
+            features = create_features(feature_cfgs)
+            model_config = model_pb2.ModelConfig(
+                feature_groups=[
+                    model_pb2.FeatureGroupConfig(
+                        group_name="wide",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.WIDE,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="fm",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="deep",
+                        feature_names=["cat_a", "cat_b", "int_a"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                ],
+                deepfm=rank_model_pb2.DeepFM(
+                    deep=module_pb2.MLP(hidden_units=[8, 4]),
+                    final=module_pb2.MLP(hidden_units=[2]),
+                ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            )
+
+            def _build_model() -> DeepFM:
+                return DeepFM(
+                    model_config=model_config, features=features, labels=["label"]
+                )
+
+            batch = Batch(
+                dense_features={
+                    BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                        keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+                    )
+                },
+                sparse_features={
+                    BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                        keys=["cat_a", "cat_b"],
+                        values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
+                        lengths=torch.tensor([1, 2, 1, 3]),
+                    )
+                },
+                labels={},
+            )
+
+            pipeline_config = EasyRecConfig()
+            pipeline_config.train_input_path = "unused-mocked"
+
+            device = torch.device("cpu")
+            live_model = ScriptWrapper(_build_model())
+            init_parameters(live_model, device=device)
+
+            ckpt_dir = os.path.join(test_dir, "model.ckpt-0")
+            ckpt_export_dir = os.path.join(test_dir, "dense_export_ckpt")
+            inproc_export_dir = os.path.join(test_dir, "dense_export_inproc")
+            port = misc_util.get_free_port()
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"tcp://127.0.0.1:{port}",
+                world_size=1,
+                rank=0,
+            )
+            try:
+                with (
+                    mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False),
+                    # a fresh single-batch iterator per dataloader creation
+                    mock.patch(
+                        "tzrec.utils.export_util.create_dataloader",
+                        side_effect=lambda *args, **kwargs: iter([batch]),
+                    ),
+                ):
+                    checkpoint_util.save_model(ckpt_dir, live_model)
+                    export_dense_model_cpu(
+                        pipeline_config=pipeline_config,
+                        model=ScriptWrapper(_build_model()),
+                        checkpoint_path=ckpt_dir,
+                        save_dir=ckpt_export_dir,
+                    )
+                    # in-process path: gather the weights from the live
+                    # model's own state_dict (single process => no sharding,
+                    # every source is a plain replicated tensor), load them
+                    # into the resident graph and finalize.
+                    warmup_data = create_dense_export_warmup_data(
+                        pipeline_config, live_model, device
+                    )
+                    gm, full_graph, dense_graph_config = build_dense_graph_module(
+                        live_model, warmup_data, device
+                    )
+                    live_state = live_model.state_dict()
+                    snapshot = {
+                        key: live_state[
+                            key
+                            if key in live_state
+                            else checkpoint_util.remap_input_tile_user_key(
+                                key, live_state
+                            )
+                        ]
+                        .detach()
+                        .cpu()
+                        for key in sorted(gm.state_dict().keys())
+                    }
+                    gm.load_state_dict(snapshot)
+                    finalize_dense_export(
+                        live_model,
+                        full_graph,
+                        gm,
+                        warmup_data,
+                        device,
+                        inproc_export_dir,
+                        dense_graph_config,
+                    )
+            finally:
+                dist.destroy_process_group()
+
+            scripted_ckpt = torch.jit.load(
+                os.path.join(ckpt_export_dir, "scripted_model.pt")
+            )
+            scripted_inproc = torch.jit.load(
+                os.path.join(inproc_export_dir, "scripted_model.pt")
+            )
+            with open(os.path.join(ckpt_export_dir, "dense_meta.json")) as f:
+                dense_meta = json.load(f)
+            ebc_groups = {k: v for k, v in dense_meta.items() if k != "sequence__ec"}
+            serving_data = dict(batch.to_dict())
+            for group_name, names in ebc_groups.items():
+                dims = [4 if "_wide" in n else 16 for n in names]
+                serving_data[group_name] = torch.rand(2, sum(dims))
+            serving_data["batch_size"] = torch.tensor(2)
+            out_ckpt = scripted_ckpt(serving_data)
+            out_inproc = scripted_inproc(serving_data)
+            self.assertEqual(set(out_ckpt.keys()), set(out_inproc.keys()))
+            for key in out_ckpt:
+                torch.testing.assert_close(out_ckpt[key], out_inproc[key])
         finally:
             shutil.rmtree(test_dir, ignore_errors=True)
 

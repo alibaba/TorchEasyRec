@@ -20,7 +20,7 @@ import tempfile
 import threading
 import weakref
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Container, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -59,6 +59,37 @@ _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
     (".ec_dict_user.", ".ec_dict."),
     (".mc_ec_dict_user.", ".mc_ec_dict."),
 )
+
+
+def remap_input_tile_user_key(
+    fqn: str, valid_keys: Optional[Container[str]] = None
+) -> str:
+    """Map an INPUT_TILE=3 user-side state key to its non-user twin key.
+
+    INPUT_TILE=3 export adds user-side twin modules (``ebc_user``,
+    ``mc_ebc_user``, ``ec_dict_user``, ``mc_ec_dict_user``) absent from
+    training state; their weights come from the non-user twins. Applies the
+    first replacement pattern that yields a key accepted by ``valid_keys``
+    (the first matching pattern when unset), so callers fall back through
+    the patterns exactly like a checkpoint load does.
+
+    Args:
+        fqn: state key to remap.
+        valid_keys: when given, only a candidate present here is used.
+
+    Returns:
+        The remapped non-user key, or ``fqn`` unchanged when no pattern
+        matches (or yields a valid candidate).
+    """
+    for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
+        if new_pat not in fqn:
+            continue
+        candidate = fqn.replace(new_pat, old_pat)
+        if valid_keys is None or candidate in valid_keys:
+            return candidate
+    return fqn
+
+
 # queue token meaning "run a prune pass"; ``None`` means "stop the worker".
 _PRUNE_REQUEST = object()
 
@@ -151,17 +182,13 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                 is_input_tile_emb()
                 and meta_fqn not in self.metadata.state_dict_metadata
             ):
-                for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
-                    if new_pat not in meta_fqn:
-                        continue
-                    candidate = meta_fqn.replace(new_pat, old_pat)
-                    if candidate in self.metadata.state_dict_metadata:
-                        logger.info(
-                            f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]"
-                        )
-                        meta_fqn = candidate
-                        fqn_remap_set.add(fqn)
-                        break
+                candidate = remap_input_tile_user_key(
+                    meta_fqn, self.metadata.state_dict_metadata
+                )
+                if candidate != meta_fqn:
+                    logger.info(f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]")
+                    meta_fqn = candidate
+                    fqn_remap_set.add(fqn)
 
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]

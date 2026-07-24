@@ -13,8 +13,6 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 
 import argparse
-import datetime
-import json
 import os
 import shutil
 from typing import Any, Dict, Optional
@@ -30,99 +28,15 @@ from tzrec.utils.export_util import (
     export_dense_model_cpu,
 )
 from tzrec.utils.logging_util import logger
-from tzrec.utils.online_dense_export_util import make_version, resolve_dense_export_root
-
-VERSIONS_DIR = "versions"
-CURRENT_JSON = "current.json"
-
-
-def _utc_now() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-
-def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp.{os.getpid()}"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp_path, path)
-
-
-def _publish_current(current_path: str, payload: Dict[str, Any]) -> None:
-    _atomic_write_json(current_path, payload)
-
-
-def _read_current_version(current_path: str) -> Optional[str]:
-    """Return the version current.json points at, or None if absent/unreadable.
-
-    Best-effort: a missing or corrupt current.json means there is no live
-    pointer to spare, so pruning falls back to pure newest-K retention.
-    """
-    try:
-        with open(current_path) as f:
-            data = json.load(f)
-    except (OSError, ValueError) as e:
-        logger.warning("could not read current version from %s: %s", current_path, e)
-        return None
-    return data.get("version") if isinstance(data, dict) else None
-
-
-def _max_kept_versions() -> int:
-    """Max published dense versions to retain (0 = keep all)."""
-    return int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_VERSIONS", "3"))
-
-
-def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
-    """Best-effort retention: keep the newest K versions, sweep stale tmp artifacts.
-
-    Serving reads current.json (the newest pointer) and needs the previous
-    version for an atomic swap, so K defaults to 3. The version current.json
-    points at is always spared even when it sorts outside the newest K: an
-    explicit --version or clock rollback after a restart can publish an older
-    timestamp, and deleting it would leave the serving pointer referencing a
-    missing directory. Stale ``*.tmp.<pid>`` dirs and current.json.tmp.<pid>
-    files left by crashed exports are swept so they don't accumulate under the
-    serving-facing tree.
-    """
-    max_versions = _max_kept_versions()
-    for base in (versions_root, export_root):
-        try:
-            entries = os.listdir(base)
-        except FileNotFoundError:
-            continue
-        for name in entries:
-            if ".tmp." not in name and not name.endswith(".tmp"):
-                continue
-            path = os.path.join(base, name)
-            try:
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                else:
-                    os.remove(path)
-                logger.info("removed stale dense export tmp: %s", path)
-            except OSError as e:
-                logger.warning("failed to remove stale tmp %s: %s", path, e)
-    if max_versions <= 0:
-        return
-    try:
-        entries = os.listdir(versions_root)
-    except FileNotFoundError:
-        return
-    current_version = _read_current_version(os.path.join(export_root, CURRENT_JSON))
-    version_dirs = sorted(
-        os.path.join(versions_root, name)
-        for name in entries
-        if os.path.isdir(os.path.join(versions_root, name))
-    )
-    for path in version_dirs[:-max_versions]:
-        if os.path.basename(path) == current_version:
-            continue
-        try:
-            shutil.rmtree(path)
-            logger.info("removed old dense export version: %s", path)
-        except OSError as e:
-            logger.warning("failed to remove old version %s: %s", path, e)
+from tzrec.utils.online_dense_export_util import (
+    CURRENT_JSON,
+    VERSIONS_DIR,
+    _prune_old_dense_versions,
+    _publish_current,
+    _utc_now,
+    make_version,
+    resolve_dense_export_root,
+)
 
 
 def export_online_dense_model(
@@ -133,7 +47,25 @@ def export_online_dense_model(
     checkpoint_step: Optional[int] = None,
     data_timestamp: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Export and publish one online-learning dense model version."""
+    """Export and publish one online-learning dense model version.
+
+    Offline / manual companion to the in-process online export
+    (tzrec.utils.online_dense_export_util.OnlineDenseExportManager): builds
+    the dense model from a checkpoint on disk instead of from the live
+    training state, then publishes it to the same serving tree.
+
+    Args:
+        pipeline_config_path: pipeline config the model is rebuilt from.
+        checkpoint_path: checkpoint to restore dense weights from.
+        model_dir: training model dir (fallback publish root when
+            ONLINE_DENSE_EXPORT_DIR is unset).
+        version: explicit version name; a monotonic timestamp when unset.
+        checkpoint_step: checkpoint step recorded in current.json.
+        data_timestamp: consumed event-time recorded in current.json.
+
+    Returns:
+        The current.json payload published for this version.
+    """
     if not acc_utils.use_distributed_embedding():
         raise RuntimeError("ONLINE_DENSE_EXPORT requires USE_DISTRIBUTED_EMBEDDING=1.")
 
@@ -200,6 +132,8 @@ def export_online_dense_model(
     current_payload: Dict[str, Any] = {
         "version": version,
         "checkpoint_path": os.path.abspath(checkpoint_path),
+        "checkpoint_step": checkpoint_step,
+        "data_timestamp": data_timestamp,
         "created_at": _utc_now(),
     }
 
