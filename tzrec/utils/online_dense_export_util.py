@@ -21,7 +21,8 @@ import weakref
 from threading import Condition, Event, Thread
 from typing import Any, Dict, Optional
 
-from tzrec.utils import checkpoint_util, env_util
+from tzrec.acc import utils as acc_utils
+from tzrec.utils import checkpoint_util
 from tzrec.utils.logging_util import logger
 
 _DISTRIBUTED_ENV_KEYS = {
@@ -159,7 +160,7 @@ class OnlineDenseExportManager:
                 "to the serving root the inference processor reads from; refusing "
                 "to default the publish tree to the training model_dir."
             )
-        if not env_util.use_distributed_embedding():
+        if not acc_utils.use_distributed_embedding():
             raise RuntimeError(
                 "ONLINE_DENSE_EXPORT=1 requires USE_DISTRIBUTED_EMBEDDING=1."
             )

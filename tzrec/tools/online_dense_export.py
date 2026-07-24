@@ -19,11 +19,12 @@ import os
 import shutil
 from typing import Any, Dict, Optional
 
+from tzrec.acc import utils as acc_utils
 from tzrec.main import _create_features, _create_model
 from tzrec.models.match_model import MatchModel
 from tzrec.models.model import ScriptWrapper
 from tzrec.models.tdm import TDM
-from tzrec.utils import config_util, env_util
+from tzrec.utils import config_util
 from tzrec.utils.export_util import (
     ensure_input_tile_for_distributed_embedding,
     export_dense_model_cpu,
@@ -133,7 +134,7 @@ def export_online_dense_model(
     data_timestamp: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Export and publish one online-learning dense model version."""
-    if not env_util.use_distributed_embedding():
+    if not acc_utils.use_distributed_embedding():
         raise RuntimeError("ONLINE_DENSE_EXPORT requires USE_DISTRIBUTED_EMBEDDING=1.")
 
     ensure_input_tile_for_distributed_embedding()
