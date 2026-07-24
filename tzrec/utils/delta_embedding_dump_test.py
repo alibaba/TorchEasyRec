@@ -674,7 +674,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             )
         self.assertEqual(dumper._tracker.step.call_count, 5)
 
-    def test_maybe_dump_uses_elapsed_time_and_resets_from_completion(self):
+    def test_maybe_dump_uses_elapsed_time_with_fixed_rate_schedule(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval_steps = None
         dumper._interval_secs = 60.0
@@ -682,10 +682,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 1
-        dumper._device = torch.device("cpu")
+        dumper._feature_store_enabled = False
         dumper._tracker = mock.MagicMock()
         with (
-            mock.patch.object(dumper, "_feature_store_upload_error", return_value=None),
             mock.patch.object(dumper, "dump") as dump_mock,
             mock.patch(
                 "tzrec.utils.delta_embedding_dump.time.monotonic",
@@ -699,161 +698,96 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         self.assertEqual(
             [call.args[0] for call in dump_mock.call_args_list],
-            [11, 13],
+            [11, 12],
         )
-        self.assertEqual(dumper._next_dump_time, 283.0)
-        self.assertEqual(dumper._last_dump_step, 13)
+        # Deadlines advance at a fixed rate from the armed schedule
+        # (160 -> 220 -> 280), not from each dump's completion time.
+        self.assertEqual(dumper._next_dump_time, 280.0)
+        self.assertEqual(dumper._last_dump_step, 12)
         self.assertEqual(dumper._tracker.step.call_count, 4)
 
-    def _new_rendezvous_dumper(self) -> DeltaEmbeddingDumper:
+    def test_timed_dump_decides_locally_without_collectives(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._last_dump_step = None
-        dumper._device = torch.device("cpu")
-        dumper._tracker = mock.MagicMock()
-        dumper._pending_rendezvous = None
-        dumper._feature_store_enabled = False
-        dumper._timed_dump_in_flight = False
-        return dumper
-
-    def test_time_dump_decision_is_reduced_from_rank_zero(self):
-        # The rank-zero timer vote is launched on one step and consumed on the
-        # next: the pipelined rendezvous lands a timed dump at most one step
-        # after the timer fires without blocking any step on the collective.
-        dumper = self._new_rendezvous_dumper()
         dumper._interval_steps = None
         dumper._interval_secs = 60.0
         dumper._next_dump_time = 160.0
+        dumper._last_dump_step = None
         dumper._rank = 1
         dumper._world_size = 2
-        launched_states = []
-
-        def fake_all_reduce(state, op=None):
-            self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            launched_states.append(state.tolist())
-            state[0] = 1
-
+        dumper._feature_store_enabled = False
+        dumper._tracker = mock.MagicMock()
         with (
             mock.patch.object(
                 dumper, "dump", return_value="delta.parquet"
             ) as dump_mock,
-            mock.patch("torch.distributed.is_available", return_value=True),
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
-        ):
-            dumper.maybe_dump(10)
-            dump_mock.assert_not_called()
-            dumper.maybe_dump(11)
-
-        dump_mock.assert_called_once_with(11)
-        self.assertEqual(dumper._last_dump_step, 11)
-        self.assertEqual(launched_states, [[0], [0]])
-        self.assertEqual(dumper._tracker.step.call_count, 2)
-
-    def test_timed_maybe_dump_advances_after_all_workers_succeed(self):
-        dumper = self._new_rendezvous_dumper()
-        dumper._interval_steps = None
-        dumper._interval_secs = 60.0
-        dumper._next_dump_time = 0.0
-        dumper._rank = 0
-        dumper._world_size = 2
-        collective_states = []
-
-        def fake_all_reduce(state, op=None):
-            self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            collective_states.append(state.tolist())
-
-        with (
-            mock.patch.object(dumper, "_feature_store_upload_error", return_value=None),
-            mock.patch.object(
-                dumper, "dump", return_value="delta.parquet"
-            ) as dump_mock,
+            mock.patch("torch.distributed.all_reduce") as all_reduce_mock,
             mock.patch(
                 "tzrec.utils.delta_embedding_dump.time.monotonic",
-                side_effect=[1.0, 2.0, 3.0],
+                side_effect=[159.0, 160.5, 161.0],
             ),
-            mock.patch("torch.distributed.is_available", return_value=True),
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
             dumper.maybe_dump(10)
             dump_mock.assert_not_called()
             dumper.maybe_dump(11)
 
-        self.assertEqual(collective_states, [[1], [0]])
+        all_reduce_mock.assert_not_called()
         dump_mock.assert_called_once_with(11)
         self.assertEqual(dumper._last_dump_step, 11)
-        self.assertEqual(dumper._next_dump_time, 62.0)
-        self.assertFalse(dumper._timed_dump_in_flight)
+        self.assertEqual(dumper._next_dump_time, 220.0)
         self.assertEqual(dumper._tracker.step.call_count, 2)
 
     def test_timed_maybe_dump_propagates_local_dump_failure(self):
-        dumper = self._new_rendezvous_dumper()
+        dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval_steps = None
         dumper._interval_secs = 60.0
         dumper._next_dump_time = 0.0
+        dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 2
+        dumper._feature_store_enabled = False
+        dumper._tracker = mock.MagicMock()
         dump_error = RuntimeError("local dump failed")
-        collective_states = []
-
-        def fake_all_reduce(state, op=None):
-            self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            collective_states.append(state.tolist())
-
         with (
-            mock.patch.object(dumper, "_feature_store_upload_error", return_value=None),
             mock.patch.object(dumper, "dump", side_effect=dump_error) as dump_mock,
-            mock.patch("torch.distributed.is_available", return_value=True),
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.time.monotonic", return_value=1.0
+            ),
         ):
-            dumper.maybe_dump(10)
             with self.assertRaises(RuntimeError) as context:
-                dumper.maybe_dump(11)
+                dumper.maybe_dump(10)
 
-        self.assertEqual(collective_states, [[1], [0]])
         self.assertIs(context.exception, dump_error)
-        dump_mock.assert_called_once_with(11)
+        dump_mock.assert_called_once_with(10)
         self.assertIsNone(dumper._last_dump_step)
-        self.assertEqual(dumper._tracker.step.call_count, 1)
+        self.assertEqual(dumper._tracker.step.call_count, 0)
 
-    def test_timed_dump_vote_does_not_fire_twice_before_completion(self):
-        # Once rank zero's timer vote fires, the next step's vote stays low
-        # until the consumed dump reschedules from its completion time; the
-        # still-elapsed deadline must not launch a second dump.
-        dumper = self._new_rendezvous_dumper()
+    def test_timed_dump_skips_missed_deadlines_without_burst(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval_steps = None
         dumper._interval_secs = 60.0
         dumper._next_dump_time = 0.0
+        dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 2
-        collective_states = []
-
-        def fake_all_reduce(state, op=None):
-            self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            collective_states.append(state.tolist())
-
+        dumper._feature_store_enabled = False
+        dumper._tracker = mock.MagicMock()
         with (
-            mock.patch.object(dumper, "_feature_store_upload_error", return_value=None),
             mock.patch.object(
                 dumper, "dump", return_value="delta.parquet"
             ) as dump_mock,
             mock.patch(
                 "tzrec.utils.delta_embedding_dump.time.monotonic",
-                side_effect=[100.0, 100.0, 100.0],
+                return_value=100.0,
             ),
-            mock.patch("torch.distributed.is_available", return_value=True),
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
             dumper.maybe_dump(10)
             dumper.maybe_dump(11)
             dumper.maybe_dump(12)
 
-        dump_mock.assert_called_once_with(11)
-        self.assertEqual(dumper._next_dump_time, 160.0)
-        self.assertFalse(dumper._timed_dump_in_flight)
-        self.assertEqual(collective_states, [[1], [0], [0]])
+        dump_mock.assert_called_once_with(10)
+        # Deadlines 0 and 60 already elapsed at the dump; skip past them
+        # instead of firing a burst of catch-up dumps.
+        self.assertEqual(dumper._next_dump_time, 120.0)
         self.assertEqual(dumper._tracker.step.call_count, 3)
 
     def test_final_dump_skips_step_already_dumped_by_time_interval(self):

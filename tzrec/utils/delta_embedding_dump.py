@@ -388,14 +388,11 @@ class DeltaEmbeddingDumper:
             self._interval_steps = int(config.dump_interval_steps)
         self._next_dump_time: Optional[float] = None
         self._last_dump_step: Optional[int] = None
-        self._pending_rendezvous: Optional[torch.Tensor] = None
-        self._timed_dump_in_flight = False
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
         self._file_prefix = config.file_prefix or "delta_embedding"
         self._rank, self._world_size = _distributed_rank_world_size()
-        self._device = device
         self._tracking_pause_depth = 0
         self._feature_store_enabled = config.HasField("feature_store_config")
         self._retain_local_dump = self._feature_store_enabled and bool(
@@ -503,9 +500,7 @@ class DeltaEmbeddingDumper:
         if self._uploader is not None:
             self._uploader.close(raise_on_error=raise_on_error, drain=drain)
 
-    def _feature_store_upload_error(
-        self, force: bool = False
-    ) -> Optional[BaseException]:
+    def _feature_store_upload_error(self) -> Optional[BaseException]:
         """Collect this rank's uploader error without changing control flow."""
         if not self._feature_store_enabled:
             return None
@@ -517,9 +512,9 @@ class DeltaEmbeddingDumper:
                 return exc
         return None
 
-    def _check_feature_store_upload_error(self, force: bool = False) -> None:
+    def _check_feature_store_upload_error(self) -> None:
         """Surface this rank's background upload failure to the trainer."""
-        error = self._feature_store_upload_error(force=force)
+        error = self._feature_store_upload_error()
         if error is not None:
             raise error.with_traceback(error.__traceback__)
 
@@ -630,34 +625,30 @@ class DeltaEmbeddingDumper:
         Args:
             global_step: Current training step.
         """
-        self._check_feature_store_upload_error(force=True)
-        if self._requires_dump_state_rendezvous():
-            should_dump = self._consume_dump_state_rendezvous()
-            self._launch_dump_state_rendezvous(global_step)
-        else:
-            should_dump = self._local_dump_decision(global_step)
-        if should_dump:
+        self._check_feature_store_upload_error()
+        if self._local_dump_decision(global_step):
             self.dump(global_step)
             self._last_dump_step = global_step
-            if self._interval_secs is not None and self._rank == 0:
-                self._next_dump_time = time.monotonic() + self._interval_secs
-                self._timed_dump_in_flight = False
+            if self._interval_secs is not None and self._next_dump_time is not None:
+                # Fixed-rate rescheduling keeps every rank's deadline sequence
+                # identical, so timed dumps stay step-aligned across ranks up
+                # to clock skew exactly astride a step boundary; missed
+                # deadlines are skipped instead of fired as a burst.
+                now = time.monotonic()
+                while self._next_dump_time <= now:
+                    self._next_dump_time += self._interval_secs
         self._tracker.step()
 
-    def _requires_dump_state_rendezvous(self) -> bool:
-        """Return whether maybe_dump must all-reduce its dump vote.
-
-        Timed dumps OR-reduce the rank-zero clock decision so every rank dumps
-        together. Step-based dumps are deterministic across ranks and need no
-        collective.
-        """
-        return self._world_size > 1 and self._interval_secs is not None
-
     def _local_dump_decision(self, global_step: int) -> bool:
-        """Return the dump decision when no cross-rank rendezvous is needed."""
-        upload_error = self._feature_store_upload_error()
-        if upload_error is not None:
-            raise upload_error.with_traceback(upload_error.__traceback__)
+        """Return this rank's local dump decision for the current step.
+
+        Timed dumps are decided per rank against its own clock: FeatureStore
+        uploads are per rank and tracker windows are rank-local, so ranks do
+        not need to dump on the same step and no cross-rank rendezvous is
+        required. All ranks arm the same deadline sequence in ``start`` and
+        advance it at a fixed rate, so their decisions can differ by at most
+        the steps their clocks disagree on.
+        """
         if global_step <= 0:
             return False
         if self._interval_steps is not None:
@@ -666,58 +657,7 @@ class DeltaEmbeddingDumper:
             raise RuntimeError(
                 "time-based delta embedding dumper must be started before training"
             )
-        return self._rank == 0 and time.monotonic() >= self._next_dump_time
-
-    def _launch_dump_state_rendezvous(self, global_step: int) -> None:
-        """Asynchronously all-reduce this step's timed dump vote.
-
-        The reduced tensor is consumed by the next ``maybe_dump`` call. NCCL
-        orders this collective ahead of the next training step's communication
-        on the same process group, so it has already completed by the time
-        the next call reads it back.
-        """
-        if not (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
-        ):
-            raise RuntimeError(
-                "distributed delta embedding dump requires an initialized process group"
-            )
-        state = torch.tensor(
-            [int(self._timed_dump_vote(global_step))],
-            dtype=torch.int32,
-            device=self._device,
-        )
-        torch.distributed.all_reduce(state, op=torch.distributed.ReduceOp.MAX)
-        self._pending_rendezvous = state
-
-    def _consume_dump_state_rendezvous(self) -> bool:
-        """Read back the previous step's reduced timed dump vote."""
-        state = self._pending_rendezvous
-        self._pending_rendezvous = None
-        if state is None:
-            return False
-        return bool(state.tolist()[0])
-
-    def _timed_dump_vote(self, global_step: int) -> bool:
-        """Return rank zero's local vote for whether a timed dump is due.
-
-        A fired vote arms ``_timed_dump_in_flight`` so the following step's
-        vote stays low until the dump executes and reschedules the timer from
-        its completion time; without the guard the still-elapsed deadline
-        would fire on the next launch and dump twice.
-        """
-        if self._interval_secs is None or global_step <= 0:
-            return False
-        if self._next_dump_time is None:
-            raise RuntimeError(
-                "time-based delta embedding dumper must be started before training"
-            )
-        if self._timed_dump_in_flight:
-            return False
-        if self._rank == 0 and time.monotonic() >= self._next_dump_time:
-            self._timed_dump_in_flight = True
-            return True
-        return False
+        return time.monotonic() >= self._next_dump_time
 
     def final_dump(self, global_step: int) -> Optional[str]:
         """Flush the trailing partial interval at the end of training.
