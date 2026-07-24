@@ -56,9 +56,6 @@ from tzrec.utils.delta_embedding_dump import (
 )
 from tzrec.utils.dist_util import create_train_pipeline
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.feature_store_delta_uploader import (
-    DELTA_DUMP_GENERATION_METADATA_KEY,
-)
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 _SHARDED_TABLE_NAME = "table_1"
@@ -471,19 +468,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
         self.assertEqual(table.num_rows, 0)
 
-    def test_write_table_chunks_persists_dump_generation_metadata(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._rank = 0
-        generation = "00112233445566778899aabbccddeeff"
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            output_path = os.path.join(tmp_dir, "delta.parquet")
-            dumper._write_table_chunks([], output_path, dump_generation=generation)
-            metadata = pq.read_schema(output_path).metadata
-
-        self.assertEqual(
-            metadata[DELTA_DUMP_GENERATION_METADATA_KEY], generation.encode("ascii")
-        )
-
     def test_write_table_chunks_leaves_no_partial_shard_on_error(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 0
@@ -583,18 +567,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         self.assertEqual(collective_count, 1)
         dump_mock.assert_not_called()
-
-    def test_dump_generation_is_stable_per_step_and_unique_per_run(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._feature_store_enabled = True
-        dumper._rank = 0
-        dumper._world_size = 1
-        dumper._run_generation = None
-        dumper._initialize_run_generation()
-
-        step_10_generation = dumper._next_dump_generation(10)
-        self.assertEqual(step_10_generation, dumper._next_dump_generation(10))
-        self.assertNotEqual(step_10_generation, dumper._next_dump_generation(11))
 
     def test_maybe_dump_uses_checkpoint_aligned_global_step(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -876,26 +848,31 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_dump_does_not_ack_tracker_when_submission_is_rejected(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._feature_store_enabled = True
+        dumper._retain_local_dump = False
         dumper._world_size = 1
         dumper._tracker = mock.MagicMock()
         dumper._tracker.per_consumer_batch_idx = {_CONSUMER: 7}
         dumper._uploader = mock.MagicMock()
         dumper._uploader.submit.side_effect = RuntimeError("submission rejected")
 
+        def _append_one_chunk(table_chunks, **kwargs):
+            table_chunks.append(_DELTA_DUMP_SCHEMA.empty_table())
+            return 1
+
         with (
             mock.patch.object(dumper, "_check_feature_store_upload_error"),
-            mock.patch.object(dumper, "_next_dump_generation", return_value="run-b"),
             mock.patch.object(dumper, "_collect_table_weights", return_value={}),
             mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
-            mock.patch.object(dumper, "_append_model_delta_rows", return_value=1),
-            mock.patch.object(dumper, "_output_path", return_value="delta.parquet"),
-            mock.patch.object(dumper, "_write_table_chunks"),
+            mock.patch.object(
+                dumper, "_append_model_delta_rows", side_effect=_append_one_chunk
+            ),
             mock.patch.object(dumper, "_rollback_tracker_read") as rollback,
         ):
             with self.assertRaisesRegex(RuntimeError, "submission rejected"):
                 dumper.dump(10)
 
-        dumper._uploader.submit.assert_called_once_with(10)
+        dumper._uploader.submit.assert_called_once()
+        self.assertEqual(dumper._uploader.submit.call_args.args[0], 10)
         rollback.assert_called_once_with(7)
 
     def test_multi_gpu_output_path_uses_step_underscore_dir(self):
@@ -925,7 +902,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._world_size = 2
             dumper._feature_store_enabled = False
             dumper._uploader = None
-            dumper._run_generation = None
+            dumper._retain_local_dump = False
             dumper._tracker = mock.MagicMock()
             dumper._tracker.per_consumer_batch_idx = {_CONSUMER: 0}
             with (
@@ -956,7 +933,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._world_size = 1
             dumper._feature_store_enabled = False
             dumper._uploader = None
-            dumper._run_generation = None
+            dumper._retain_local_dump = False
             dumper._tracker = mock.MagicMock()
             dumper._tracker.per_consumer_batch_idx = {_CONSUMER: 0}
             with (

@@ -9,14 +9,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ephemeral rank-zero uploader for delta-embedding parquet shards.
+"""Ephemeral per-rank uploader for in-memory delta-embedding tables.
 
 Best-effort upload for the current live training process only. No cross-restart
 recovery, no durable state, no replay. A process crash means restart from the
 latest checkpoint and pending deltas are discarded.
 """
 
-import hashlib
 import json
 import os
 import threading
@@ -36,7 +35,6 @@ from urllib.parse import urlsplit
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from tzrec.protos.train_pb2 import FeatureStoreConfig
 from tzrec.utils.logging_util import logger
@@ -50,25 +48,8 @@ FEATURE_STORE_SK_FIELD = "key_id"
 FEATURE_STORE_VALUE_FIELD = "embedding"
 FEATURE_STORE_WRITE_MODE = "MERGE"
 FEATURE_STORE_SDK_BATCH_SIZE = 1000
-DELTA_OPERATION_UPSERT = "UPSERT"
-DELTA_DUMP_SCHEMA_VERSION = "2"
-DELTA_DUMP_GENERATION_METADATA_KEY = b"tzrec.delta_embedding.dump_generation"
 
 _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES = 100
-_VERSION_INITIALIZATION = "AUTO_CREATE_ON_FIRST_DELTA_MERGE"
-
-_SCHEMA_VERSION_METADATA_KEY = b"tzrec.delta_embedding.schema_version"
-_REQUIRED_PARQUET_FIELDS = {
-    "global_step": pa.int64(),
-    "rank": pa.int32(),
-    "world_size": pa.int32(),
-    "embedding_name": pa.string(),
-    "embedding_role": pa.string(),
-    "feature_name": pa.string(),
-    "table_fqn": pa.string(),
-    "key_id": pa.int64(),
-    "embedding": pa.list_(pa.float32()),
-}
 
 
 class FeatureStoreUploadError(RuntimeError):
@@ -77,10 +58,6 @@ class FeatureStoreUploadError(RuntimeError):
 
 class _UploadAborted(RuntimeError):
     """Internal control flow for abnormal, non-draining shutdown."""
-
-
-class _ShardSetNotReady(RuntimeError):
-    """A multi-rank canonical shard set is still being atomically replaced."""
 
 
 @dataclass(frozen=True)
@@ -99,7 +76,6 @@ class FeatureStoreUploadSettings:
     upload_batch_size: int
     max_retries: int
     retry_backoff_secs: int
-    shard_wait_timeout_secs: int
     shutdown_timeout_secs: int
     max_pending_steps: int
     poll_interval_secs: int
@@ -145,7 +121,6 @@ class FeatureStoreUploadSettings:
             "feature_view_ttl_secs": int(config.feature_view_ttl_secs),
             "upload_batch_size": int(config.upload_batch_size),
             "max_retries": int(config.max_retries),
-            "shard_wait_timeout_secs": int(config.shard_wait_timeout_secs),
             "shutdown_timeout_secs": int(config.shutdown_timeout_secs),
             "max_pending_steps": int(config.max_pending_steps),
             "poll_interval_secs": int(config.poll_interval_secs),
@@ -183,7 +158,6 @@ class FeatureStoreUploadSettings:
             upload_batch_size=positive_values["upload_batch_size"],
             max_retries=positive_values["max_retries"],
             retry_backoff_secs=int(config.retry_backoff_secs),
-            shard_wait_timeout_secs=positive_values["shard_wait_timeout_secs"],
             shutdown_timeout_secs=positive_values["shutdown_timeout_secs"],
             max_pending_steps=positive_values["max_pending_steps"],
             poll_interval_secs=positive_values["poll_interval_secs"],
@@ -246,70 +220,35 @@ def _validate_feature_store_endpoint(
             )
 
 
-def _json_digest(value: Mapping[str, Any]) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _feature_store_target_hash(settings: FeatureStoreUploadSettings) -> str:
-    target_identity = {
-        "region": settings.region,
-        "endpoint": settings.endpoint,
-        "project_name": settings.project_name,
-        "feature_view_name": settings.feature_view_name,
-        "version": settings.version,
-    }
-    return _json_digest(target_identity)
-
-
-def feature_store_delta_file_prefix(
-    config: FeatureStoreConfig, file_prefix: str
-) -> str:
-    """Scope canonical parquet names to one immutable FeatureStore target."""
-    settings = FeatureStoreUploadSettings.from_proto(config)
-    return _scoped_feature_store_file_prefix(settings, file_prefix)
-
-
-def _scoped_feature_store_file_prefix(
-    settings: FeatureStoreUploadSettings, file_prefix: str
-) -> str:
-    target_hash = _feature_store_target_hash(settings)
-    return f"{file_prefix}__fs_{target_hash[:16]}"
-
-
 class FeatureStoreDeltaUploader:
-    """Ephemeral in-process uploader for delta-embedding parquet shards.
+    """Ephemeral per-rank uploader for in-memory delta-embedding tables.
 
     Best-effort upload for the current live process only. No cross-restart
     recovery, no durable state, no replay. A process crash means restart from
     the latest checkpoint and pending deltas are discarded.
 
-    The training thread writes parquet shards and enqueues a step. This
-    object's single background worker waits for the complete shard set,
-    streams parquet batches directly to the FeatureStore SDK, and cleans up
-    local files on success.
+    Every rank owns one uploader and streams only its local shard rows, so no
+    cross-rank aggregation or deduplication is needed: table-wise and row-wise
+    sharding give each (embedding_name, key_id) a unique owner rank, while
+    data-parallel replicas issue identical idempotent MERGE writes. Publish
+    timestamps are allocated per rank and only need per-rank monotonicity,
+    because a key's owner rank is fixed for the lifetime of the process.
     """
 
     def __init__(
         self,
         config: FeatureStoreConfig,
-        output_dir: str,
-        file_prefix: str,
-        world_size: int,
         embedding_dimensions: Mapping[str, int],
+        rank: int = 0,
+        manage_remote_view: bool = True,
         client_factory: Optional[Callable[..., Any]] = None,
         credentials_client: Optional[Any] = None,
         clock_ms: Optional[Callable[[], int]] = None,
     ) -> None:
         """Initialize the uploader with validated settings and in-memory state."""
         self._settings = FeatureStoreUploadSettings.from_proto(config)
-        self._output_dir = os.path.abspath(output_dir)
-        self._file_prefix = _scoped_feature_store_file_prefix(
-            self._settings, file_prefix
-        )
-        self._world_size = int(world_size)
-        if self._world_size <= 0:
-            raise ValueError("world_size must be > 0")
+        self._rank = int(rank)
+        self._manage_remote_view = bool(manage_remote_view)
         self._embedding_dimensions = {
             str(name): int(dimension)
             for name, dimension in embedding_dimensions.items()
@@ -332,7 +271,7 @@ class FeatureStoreDeltaUploader:
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self._view = None
         self._condition = threading.Condition()
-        self._pending: Dict[int, float] = {}
+        self._pending: Dict[int, pa.Table] = {}
         self._started = False
         self._closing = False
         self._aborting = False
@@ -363,14 +302,15 @@ class FeatureStoreDeltaUploader:
             self._worker.start()
         logger.info(
             "FeatureStore delta uploader started: project=%s feature_view=%s "
-            "version=%s",
+            "version=%s rank=%s",
             self._settings.project_name,
             self._settings.feature_view_name,
             self._settings.version,
+            self._rank,
         )
 
-    def submit(self, global_step: int) -> None:
-        """Enqueue a completed step for background upload with back-pressure."""
+    def submit(self, global_step: int, table: pa.Table) -> None:
+        """Enqueue one step's in-memory delta table with back-pressure."""
         global_step = int(global_step)
         if global_step <= 0:
             raise ValueError("FeatureStore delta global_step must be > 0")
@@ -388,7 +328,7 @@ class FeatureStoreDeltaUploader:
             ):
                 self._condition.wait(self._settings.poll_interval_secs)
                 self._raise_if_failed_locked()
-            self._pending.setdefault(global_step, time.monotonic())
+            self._pending.setdefault(global_step, table)
             self._condition.notify_all()
 
     def check_error(self) -> None:
@@ -441,28 +381,9 @@ class FeatureStoreDeltaUploader:
                         self._condition.wait(self._settings.poll_interval_secs)
                         continue
                     current_step = min(self._pending)
-                    pending_since = self._pending[current_step]
+                    table = self._pending[current_step]
 
-                shard_paths = self._expected_shard_paths(current_step)
-                if not all(os.path.isfile(path) for path in shard_paths):
-                    elapsed = time.monotonic() - pending_since
-                    if elapsed >= self._settings.shard_wait_timeout_secs:
-                        raise TimeoutError(
-                            "timed out waiting for a complete delta shard set "
-                            f"at step {current_step}"
-                        )
-                    with self._condition:
-                        self._condition.wait(self._settings.poll_interval_secs)
-                    continue
-
-                self._validate_shard_generation(shard_paths)
-
-                with self._condition:
-                    if self._aborting:
-                        return
-
-                self._upload_with_retries(current_step, shard_paths)
-                self._cleanup_shard_files(shard_paths)
+                self._upload_with_retries(current_step, table)
 
                 with self._condition:
                     self._pending.pop(current_step, None)
@@ -499,43 +420,11 @@ class FeatureStoreDeltaUploader:
             if self._aborting:
                 raise _UploadAborted()
 
-    def _expected_shard_paths(self, global_step: int) -> List[str]:
-        if self._world_size == 1:
-            return [
-                os.path.join(
-                    self._output_dir,
-                    f"{self._file_prefix}_step_{global_step}.parquet",
-                )
-            ]
-        step_dir = os.path.join(self._output_dir, f"step_{global_step}")
-        return [
-            os.path.join(
-                step_dir,
-                f"{self._file_prefix}_step_{global_step}_rank_{rank}"
-                f"_of_{self._world_size}.parquet",
-            )
-            for rank in range(self._world_size)
-        ]
-
-    def _validate_shard_generation(self, shard_paths: List[str]) -> None:
-        """Verify all shards share the same dump generation."""
-        generations = set()
-        for path in shard_paths:
-            parquet_file = pq.ParquetFile(path)
-            metadata = parquet_file.schema_arrow.metadata or {}
-            generation = metadata.get(DELTA_DUMP_GENERATION_METADATA_KEY)
-            generations.add(generation)
-        if len(generations) > 1:
-            raise _ShardSetNotReady(
-                "delta shard set has inconsistent dump generations; "
-                "a concurrent dump may be replacing files"
-            )
-
-    def _upload_with_retries(self, global_step: int, shard_paths: List[str]) -> None:
+    def _upload_with_retries(self, global_step: int, table: pa.Table) -> None:
         for attempt in range(1, self._settings.max_retries + 1):
             self._raise_if_aborting()
             try:
-                self._stream_upload(global_step, shard_paths)
+                self._stream_upload(global_step, table)
                 return
             except _UploadAborted:
                 raise
@@ -556,19 +445,24 @@ class FeatureStoreDeltaUploader:
         raise AssertionError("unreachable FeatureStore retry state")
 
     def _allocate_timestamp_range(self, batch_count: int) -> Tuple[int, int]:
-        """Allocate a monotonically increasing timestamp range (in-memory only)."""
+        """Allocate a rank-locally monotonic timestamp range (in-memory only).
+
+        Per-rank monotonicity is sufficient for Next-Ts incremental readers:
+        sharding is fixed for the lifetime of the process, so every key is
+        always republished by the same rank with a strictly newer timestamp.
+        """
         reserved = max(batch_count, 1)
         range_start = max(int(self._clock_ms()), self._last_publish_ts + 1, 1)
         range_end = range_start + reserved - 1
         self._last_publish_ts = range_end
         return range_start, range_end
 
-    def _stream_upload(self, global_step: int, shard_paths: List[str]) -> None:
-        """Stream parquet batches directly to the FeatureStore SDK."""
+    def _stream_upload(self, global_step: int, table: pa.Table) -> None:
+        """Stream the in-memory delta table directly to the FeatureStore SDK."""
         view = self._get_view()
         max_in_flight = int(getattr(view, "_max_workers", 1))
 
-        total_batches = self._count_total_batches(shard_paths)
+        total_batches = self._count_total_batches(table)
         ts_range = self._allocate_timestamp_range(total_batches)
         range_start = ts_range[0]
 
@@ -580,9 +474,10 @@ class FeatureStoreDeltaUploader:
         logged_first_window = False
 
         logger.info(
-            "FeatureStore delta upload started: step=%s version=%s "
+            "FeatureStore delta upload started: step=%s rank=%s version=%s "
             "batches=%s ts_range=%s-%s",
             global_step,
+            self._rank,
             self._settings.version,
             total_batches,
             ts_range[0],
@@ -590,59 +485,51 @@ class FeatureStoreDeltaUploader:
         )
 
         try:
-            for expected_rank, shard_path in enumerate(shard_paths):
-                parquet_file = pq.ParquetFile(shard_path)
-                self._validate_parquet_schema(parquet_file.schema_arrow, shard_path)
-                for batch in parquet_file.iter_batches(
-                    batch_size=self._settings.upload_batch_size
-                ):
-                    self._raise_if_aborting()
-                    payload = self._validate_and_build_payload(
-                        batch, global_step, expected_rank
-                    )
-                    if not payload:
-                        continue
-                    view.write_features(
-                        data=payload,
-                        version=self._settings.version,
-                        write_mode=FEATURE_STORE_WRITE_MODE,
-                        ts=range_start + completed_batches,
-                    )
-                    completed_batches += 1
-                    window_batches += 1
-                    window_records += len(payload)
+            for batch in table.to_batches(
+                max_chunksize=self._settings.upload_batch_size
+            ):
+                self._raise_if_aborting()
+                payload = self._validate_and_build_payload(batch)
+                if not payload:
+                    continue
+                view.write_features(
+                    data=payload,
+                    version=self._settings.version,
+                    write_mode=FEATURE_STORE_WRITE_MODE,
+                    ts=range_start + completed_batches,
+                )
+                completed_batches += 1
+                window_batches += 1
+                window_records += len(payload)
 
-                    if (
-                        window_batches < max_in_flight
-                        and completed_batches < total_batches
-                    ):
-                        continue
-                    summary = view.write_flush()
-                    self._validate_flush_summary(
-                        summary,
-                        expected_records=window_records,
-                        expected_batches=window_batches,
+                if window_batches < max_in_flight and completed_batches < total_batches:
+                    continue
+                summary = view.write_flush()
+                self._validate_flush_summary(
+                    summary,
+                    expected_records=window_records,
+                    expected_batches=window_batches,
+                )
+                if (
+                    not logged_first_window
+                    or completed_batches >= next_progress_batch
+                    or completed_batches == total_batches
+                ):
+                    logger.info(
+                        "FeatureStore delta upload progress: step=%s "
+                        "batches=%s/%s elapsed_secs=%.1f",
+                        global_step,
+                        completed_batches,
+                        total_batches,
+                        time.monotonic() - started_at,
                     )
-                    if (
-                        not logged_first_window
-                        or completed_batches >= next_progress_batch
-                        or completed_batches == total_batches
-                    ):
-                        logger.info(
-                            "FeatureStore delta upload progress: step=%s "
-                            "batches=%s/%s elapsed_secs=%.1f",
-                            global_step,
-                            completed_batches,
-                            total_batches,
-                            time.monotonic() - started_at,
+                    logged_first_window = True
+                    while next_progress_batch <= completed_batches:
+                        next_progress_batch += (
+                            _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES
                         )
-                        logged_first_window = True
-                        while next_progress_batch <= completed_batches:
-                            next_progress_batch += (
-                                _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES
-                            )
-                    window_batches = 0
-                    window_records = 0
+                window_batches = 0
+                window_records = 0
 
             if window_batches > 0:
                 summary = view.write_flush()
@@ -665,12 +552,9 @@ class FeatureStoreDeltaUploader:
             time.monotonic() - started_at,
         )
 
-    def _count_total_batches(self, shard_paths: List[str]) -> int:
-        """Count the total number of upload batches across all shards."""
-        total_rows = 0
-        for path in shard_paths:
-            parquet_file = pq.ParquetFile(path)
-            total_rows += int(parquet_file.metadata.num_rows)
+    def _count_total_batches(self, table: pa.Table) -> int:
+        """Count the number of upload batches in one step's delta table."""
+        total_rows = int(table.num_rows)
         if total_rows == 0:
             return 1
         return (
@@ -680,23 +564,11 @@ class FeatureStoreDeltaUploader:
     def _validate_and_build_payload(
         self,
         batch: pa.RecordBatch,
-        global_step: int,
-        expected_rank: int,
     ) -> List[Dict[str, Any]]:
-        """Validate one streamed shard batch and build the SDK payload."""
+        """Validate one delta batch and build the SDK payload."""
         num_rows = batch.num_rows
         if num_rows == 0:
             return []
-        global_steps = batch.column("global_step").to_numpy(zero_copy_only=False)
-        if not bool((global_steps == global_step).all()):
-            raise ValueError("delta shard global_step mismatch")
-        ranks = batch.column("rank").to_numpy(zero_copy_only=False)
-        if not bool((ranks == expected_rank).all()):
-            raise ValueError("delta shard rank mismatch")
-        world_sizes = batch.column("world_size").to_numpy(zero_copy_only=False)
-        if not bool((world_sizes == self._world_size).all()):
-            raise ValueError("delta shard world_size mismatch")
-
         batch_roles = set(batch.column("embedding_role").to_pylist())
         if not batch_roles <= set(SPARSE_EMBEDDING_ROLES):
             raise ValueError("delta shard has an invalid embedding role")
@@ -746,20 +618,6 @@ class FeatureStoreDeltaUploader:
             }
             for i in range(num_rows)
         ]
-
-    def _cleanup_shard_files(self, shard_paths: List[str]) -> None:
-        """Remove uploaded shard files (best-effort)."""
-        for path in shard_paths:
-            try:
-                os.remove(path)
-            except OSError:
-                logger.warning("Failed to remove uploaded shard file: %s", path)
-        if self._world_size > 1 and shard_paths:
-            step_dir = os.path.dirname(shard_paths[0])
-            try:
-                os.rmdir(step_dir)
-            except OSError:
-                pass
 
     @staticmethod
     def _create_credentials_client() -> Any:
@@ -850,7 +708,26 @@ class FeatureStoreDeltaUploader:
                 )
 
     def _get_or_create_view(self, project: Any) -> Any:
-        """Return the configured DynamicEmbedding view, creating it if absent."""
+        """Return the configured DynamicEmbedding view, creating it if absent.
+
+        Only the primary (rank-zero) uploader creates the view and validates
+        control-plane metadata; other ranks open a handle to the view that the
+        primary published before they started.
+        """
+        if not self._manage_remote_view:
+            view = project.get_dynamic_embedding_feature_view(
+                self._settings.feature_view_name
+            )
+            if view is None:
+                view = self._wait_for_dynamic_embedding_view(project)
+            if view is None:
+                raise RuntimeError(
+                    "configured DynamicEmbedding FeatureView was not found; "
+                    "the rank-zero uploader must create it before other ranks "
+                    "start"
+                )
+            self._view = view
+            return view
         provisioned = False
         view = project.get_dynamic_embedding_feature_view(
             self._settings.feature_view_name
@@ -1063,17 +940,3 @@ class FeatureStoreDeltaUploader:
             or int(summary["total_records"]) != expected_records
         ):
             raise RuntimeError("FeatureStore write_flush reported incomplete writes")
-
-    @staticmethod
-    def _validate_parquet_schema(schema: pa.Schema, path: str) -> None:
-        metadata = schema.metadata or {}
-        if metadata.get(
-            _SCHEMA_VERSION_METADATA_KEY
-        ) != DELTA_DUMP_SCHEMA_VERSION.encode("ascii"):
-            raise ValueError(f"unsupported delta dump schema version in {path}")
-        for field_name, field_type in _REQUIRED_PARQUET_FIELDS.items():
-            index = schema.get_field_index(field_name)
-            if index < 0 or schema.field(index).type != field_type:
-                raise ValueError(
-                    f"delta dump schema mismatch for field {field_name!r} in {path}"
-                )

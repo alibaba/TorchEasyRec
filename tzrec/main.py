@@ -892,9 +892,10 @@ def train_and_evaluate(
         )
     except BaseException:
         if delta_embedding_dumper is not None:
-            # Keep the original training error primary. The durable parquet
-            # outbox remains available for restart. Do not wait up to the
-            # normal upload-drain timeout while unwinding a training failure.
+            # Keep the original training error primary. Pending in-memory
+            # deltas are abandoned; the restarted run re-dumps from the latest
+            # checkpoint. Do not wait up to the normal upload-drain timeout
+            # while unwinding a training failure.
             delta_embedding_dumper.close(raise_on_error=False, drain=False)
         raise
     else:
@@ -904,9 +905,9 @@ def train_and_evaluate(
                 delta_embedding_dumper.close()
             except BaseException as exc:
                 delta_embedding_dumper_close_error = exc
-            # Non-zero ranks have no uploader and can reach this rendezvous while
-            # rank zero drains its background queue. Propagate a late drain/SDK
-            # error uniformly instead of letting only rank zero fail at shutdown.
+            # Each rank drains its own background queue at a different pace.
+            # Propagate a late drain/SDK error uniformly instead of letting a
+            # single rank fail alone at shutdown.
             _raise_if_any_worker_failed(
                 delta_embedding_dumper_close_error,
                 device,

@@ -11,32 +11,20 @@
 
 import json
 import os
-import tempfile
 import threading
 import unittest
 from unittest import mock
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 from google.protobuf.descriptor import FieldDescriptor
 
 from tzrec.protos.train_pb2 import FeatureStoreConfig
 from tzrec.utils.delta_embedding_dump import _DELTA_DUMP_SCHEMA
 from tzrec.utils.feature_store_delta_uploader import (
-    DELTA_DUMP_GENERATION_METADATA_KEY,
     FeatureStoreDeltaUploader,
     FeatureStoreUploadError,
     FeatureStoreUploadSettings,
-    feature_store_delta_file_prefix,
 )
-
-_TEST_DUMP_GENERATION = "00112233445566778899aabbccddeeff"
-
-
-def _schema_with_generation(generation: str = _TEST_DUMP_GENERATION) -> pa.Schema:
-    metadata = dict(_DELTA_DUMP_SCHEMA.metadata or {})
-    metadata[DELTA_DUMP_GENERATION_METADATA_KEY] = generation.encode("ascii")
-    return _DELTA_DUMP_SCHEMA.with_metadata(metadata)
 
 
 def _feature_store_config(**overrides) -> FeatureStoreConfig:
@@ -49,7 +37,6 @@ def _feature_store_config(**overrides) -> FeatureStoreConfig:
         upload_batch_size=2,
         max_retries=1,
         retry_backoff_secs=0,
-        shard_wait_timeout_secs=2,
         shutdown_timeout_secs=5,
         max_pending_steps=8,
         poll_interval_secs=1,
@@ -80,42 +67,10 @@ def _row(
     }
 
 
-def _write_single_shard(
-    output_dir: str,
-    step: int,
-    rows,
-    generation: str = _TEST_DUMP_GENERATION,
-    file_prefix=None,
-) -> str:
-    if file_prefix is None:
-        file_prefix = feature_store_delta_file_prefix(_feature_store_config(), "delta")
-    path = os.path.join(output_dir, f"{file_prefix}_step_{step}.parquet")
-    schema = _schema_with_generation(generation)
-    table = pa.Table.from_pylist(rows, schema=schema) if rows else schema.empty_table()
-    pq.write_table(table, path)
-    return path
-
-
-def _write_rank_shard(
-    output_dir: str,
-    step: int,
-    rank: int,
-    world_size: int,
-    rows,
-    generation: str = _TEST_DUMP_GENERATION,
-    file_prefix=None,
-) -> str:
-    if file_prefix is None:
-        file_prefix = feature_store_delta_file_prefix(_feature_store_config(), "delta")
-    step_dir = os.path.join(output_dir, f"step_{step}")
-    os.makedirs(step_dir, exist_ok=True)
-    path = os.path.join(
-        step_dir,
-        f"{file_prefix}_step_{step}_rank_{rank}_of_{world_size}.parquet",
-    )
-    table = pa.Table.from_pylist(rows, schema=_schema_with_generation(generation))
-    pq.write_table(table, path)
-    return path
+def _delta_table(rows) -> pa.Table:
+    if rows:
+        return pa.Table.from_pylist(rows, schema=_DELTA_DUMP_SCHEMA)
+    return _DELTA_DUMP_SCHEMA.empty_table()
 
 
 class _FakeView:
@@ -307,6 +262,10 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self._cred_patch.start()
         self.addCleanup(self._cred_patch.stop)
 
+    def _uploader(self, config=None, **kwargs):
+        kwargs.setdefault("embedding_dimensions", {"user_emb": 2})
+        return FeatureStoreDeltaUploader(config or _feature_store_config(), **kwargs)
+
     def test_proto_groups_required_fields_before_optional_fields(self):
         required_fields = [
             "region",
@@ -320,7 +279,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "upload_batch_size",
             "max_retries",
             "retry_backoff_secs",
-            "shard_wait_timeout_secs",
             "shutdown_timeout_secs",
             "max_pending_steps",
             "poll_interval_secs",
@@ -328,6 +286,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "feature_view_shard_count",
             "feature_view_replication_count",
             "allow_custom_endpoint",
+            "retain_local_dump",
         ]
         fields = list(FeatureStoreConfig.DESCRIPTOR.fields)
 
@@ -460,388 +419,264 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                     )
 
     def test_start_reuses_existing_dynamic_embedding_feature_view(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            view = _FakeView()
-            factory = _FakeClientFactory(view)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
+        view = _FakeView()
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(client_factory=factory)
 
-            uploader.start()
-            uploader.close()
+        uploader.start()
+        uploader.close()
 
-            self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
-            self.assertEqual(factory.project.generic_get_calls, ["shared_embeddings"])
-            self.assertEqual(factory.project.create_calls, [])
-            self.assertNotIn("test_mode", factory.calls[0])
-            self.assertEqual(view.closed, [True])
+        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.generic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.create_calls, [])
+        self.assertNotIn("test_mode", factory.calls[0])
+        self.assertEqual(view.closed, [True])
 
     def test_start_creates_missing_dynamic_embedding_feature_view(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            created_view = _FakeView()
-            factory = _FakeClientFactory(None, created_view=created_view)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
+        created_view = _FakeView()
+        factory = _FakeClientFactory(None, created_view=created_view)
+        uploader = self._uploader(client_factory=factory)
 
-            uploader.start()
-            uploader.close()
+        uploader.start()
+        uploader.close()
 
-            self.assertEqual(
-                factory.project.generic_get_calls,
-                ["shared_embeddings", "shared_embeddings"],
-            )
-            self.assertEqual(
-                factory.project.create_calls,
-                [
-                    {
-                        "name": "shared_embeddings",
-                        "entity": "embedding_entity",
-                        "pk_field_name": "embedding_name",
-                        "sk_field_name": "key_id",
-                        "embedding_field_name": "embedding",
-                        "pk_field_type": "STRING",
-                        "sk_field_type": "INT64",
-                        "ttl": 1296000,
-                        "shard_count": 20,
-                        "replication_count": 1,
-                    }
-                ],
-            )
-            self.assertEqual(created_view.closed, [True])
-
-    def test_start_rejects_same_name_non_dynamic_feature_view(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            generic_view = mock.Mock(type="Batch")
-            factory = _FakeClientFactory(None, generic_view=generic_view)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
-
-            with self.assertRaisesRegex(RuntimeError, "incompatible type"):
-                uploader.start()
-
-            self.assertEqual(factory.project.create_calls, [])
-
-    def test_start_rejects_existing_feature_view_with_wrong_entity(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            view = _FakeView()
-            generic_view = _FakeGenericFeatureView(entity="another_entity")
-            factory = _FakeClientFactory(view, generic_view=generic_view)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
-
-            with self.assertRaisesRegex(RuntimeError, "entity mismatch"):
-                uploader.start()
-
-            self.assertEqual(factory.project.create_calls, [])
-            self.assertEqual(view.closed, [True])
-
-    def test_start_rejects_existing_feature_view_with_wrong_field_contract(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            view = _FakeView()
-            generic_view = _FakeGenericFeatureView()
-            generic_view.fields_dict["embedding"]["Type"] = "ARRAY<DOUBLE>"
-            factory = _FakeClientFactory(view, generic_view=generic_view)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
-
-            with self.assertRaisesRegex(RuntimeError, "field contract mismatch"):
-                uploader.start()
-
-            self.assertEqual(factory.project.create_calls, [])
-            self.assertEqual(view.closed, [True])
-
-    def test_start_rejects_existing_feature_view_with_wrong_provisioning(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            view = _FakeView()
-            generic_view = _FakeGenericFeatureView(
-                provisioning={
-                    "ttl": 60,
+        self.assertEqual(
+            factory.project.generic_get_calls,
+            ["shared_embeddings", "shared_embeddings"],
+        )
+        self.assertEqual(
+            factory.project.create_calls,
+            [
+                {
+                    "name": "shared_embeddings",
+                    "entity": "embedding_entity",
+                    "pk_field_name": "embedding_name",
+                    "sk_field_name": "key_id",
+                    "embedding_field_name": "embedding",
+                    "pk_field_type": "STRING",
+                    "sk_field_type": "INT64",
+                    "ttl": 1296000,
                     "shard_count": 20,
                     "replication_count": 1,
                 }
-            )
-            factory = _FakeClientFactory(view, generic_view=generic_view)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
+            ],
+        )
+        self.assertEqual(created_view.closed, [True])
 
-            with self.assertRaisesRegex(RuntimeError, "provisioning mismatch"):
-                uploader.start()
+    def test_start_rejects_same_name_non_dynamic_feature_view(self):
+        generic_view = mock.Mock(type="Batch")
+        factory = _FakeClientFactory(None, generic_view=generic_view)
+        uploader = self._uploader(client_factory=factory)
 
-            self.assertEqual(factory.project.create_calls, [])
-            self.assertEqual(view.closed, [True])
+        with self.assertRaisesRegex(RuntimeError, "incompatible type"):
+            uploader.start()
+
+        self.assertEqual(factory.project.create_calls, [])
+
+    def test_start_rejects_existing_feature_view_with_wrong_entity(self):
+        view = _FakeView()
+        generic_view = _FakeGenericFeatureView(entity="another_entity")
+        factory = _FakeClientFactory(view, generic_view=generic_view)
+        uploader = self._uploader(client_factory=factory)
+
+        with self.assertRaisesRegex(RuntimeError, "entity mismatch"):
+            uploader.start()
+
+        self.assertEqual(factory.project.create_calls, [])
+        self.assertEqual(view.closed, [True])
+
+    def test_start_rejects_existing_feature_view_with_wrong_field_contract(self):
+        view = _FakeView()
+        generic_view = _FakeGenericFeatureView()
+        generic_view.fields_dict["embedding"]["Type"] = "ARRAY<DOUBLE>"
+        factory = _FakeClientFactory(view, generic_view=generic_view)
+        uploader = self._uploader(client_factory=factory)
+
+        with self.assertRaisesRegex(RuntimeError, "field contract mismatch"):
+            uploader.start()
+
+        self.assertEqual(factory.project.create_calls, [])
+        self.assertEqual(view.closed, [True])
+
+    def test_start_rejects_existing_feature_view_with_wrong_provisioning(self):
+        view = _FakeView()
+        generic_view = _FakeGenericFeatureView(
+            provisioning={
+                "ttl": 60,
+                "shard_count": 20,
+                "replication_count": 1,
+            }
+        )
+        factory = _FakeClientFactory(view, generic_view=generic_view)
+        uploader = self._uploader(client_factory=factory)
+
+        with self.assertRaisesRegex(RuntimeError, "provisioning mismatch"):
+            uploader.start()
+
+        self.assertEqual(factory.project.create_calls, [])
+        self.assertEqual(view.closed, [True])
 
     def test_start_recovers_from_concurrent_feature_view_creation(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            concurrent_view = _FakeView()
-            factory = _FakeClientFactory(
-                None,
-                create_error=RuntimeError("already exists"),
-                view_after_create_error=concurrent_view,
-            )
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
+        concurrent_view = _FakeView()
+        factory = _FakeClientFactory(
+            None,
+            create_error=RuntimeError("already exists"),
+            view_after_create_error=concurrent_view,
+        )
+        uploader = self._uploader(client_factory=factory)
 
-            uploader.start()
-            uploader.close()
+        uploader.start()
+        uploader.close()
 
-            self.assertEqual(len(factory.project.create_calls), 1)
-            self.assertEqual(
-                factory.project.dynamic_get_calls,
-                ["shared_embeddings", "shared_embeddings"],
-            )
-            self.assertEqual(concurrent_view.closed, [True])
+        self.assertEqual(len(factory.project.create_calls), 1)
+        self.assertEqual(
+            factory.project.dynamic_get_calls,
+            ["shared_embeddings", "shared_embeddings"],
+        )
+        self.assertEqual(concurrent_view.closed, [True])
 
     def test_start_closes_new_feature_view_with_incompatible_schema(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            created_view = _FakeView()
-            created_view.pk_field = "wrong_pk"
-            factory = _FakeClientFactory(None, created_view=created_view)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
+        created_view = _FakeView()
+        created_view.pk_field = "wrong_pk"
+        factory = _FakeClientFactory(None, created_view=created_view)
+        uploader = self._uploader(client_factory=factory)
 
-            with self.assertRaisesRegex(RuntimeError, "schema mismatch"):
-                uploader.start()
+        with self.assertRaisesRegex(RuntimeError, "schema mismatch"):
+            uploader.start()
 
-            self.assertEqual(len(factory.project.create_calls), 1)
-            self.assertEqual(created_view.closed, [True])
+        self.assertEqual(len(factory.project.create_calls), 1)
+        self.assertEqual(created_view.closed, [True])
 
     def test_start_creates_missing_view_without_version_precheck(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            created_view = _FakeView()
-            factory = _FakeClientFactory(None, created_view=created_view)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
+        created_view = _FakeView()
+        factory = _FakeClientFactory(None, created_view=created_view)
+        uploader = self._uploader(client_factory=factory)
 
-            uploader.start()
-            uploader.close()
+        uploader.start()
+        uploader.close()
 
-            self.assertEqual(len(factory.project.create_calls), 1)
-            self.assertEqual(created_view.closed, [True])
+        self.assertEqual(len(factory.project.create_calls), 1)
+        self.assertEqual(created_view.closed, [True])
 
     def test_start_reports_missing_entity_when_view_creation_fails(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            factory = _FakeClientFactory(
-                None, create_error=ValueError("Entity not found")
-            )
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
+        factory = _FakeClientFactory(None, create_error=ValueError("Entity not found"))
+        uploader = self._uploader(client_factory=factory)
 
-            with self.assertRaisesRegex(RuntimeError, "feature_entity_name"):
-                uploader.start()
+        with self.assertRaisesRegex(RuntimeError, "feature_entity_name"):
+            uploader.start()
 
-            self.assertEqual(len(factory.project.create_calls), 1)
+        self.assertEqual(len(factory.project.create_calls), 1)
+
+    def test_non_primary_uploader_opens_view_without_create_or_metadata_checks(self):
+        view = _FakeView()
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(
+            rank=1,
+            manage_remote_view=False,
+            client_factory=factory,
+            clock_ms=lambda: 100,
+        )
+
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 1, 7, [1.0, 2.0])]))
+        uploader.close()
+
+        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.generic_get_calls, [])
+        self.assertEqual(factory.project.create_calls, [])
+        self.assertEqual(len(view.calls), 1)
+        self.assertEqual(view.calls[0]["data"][0]["key_id"], 7)
+
+    def test_non_primary_uploader_fails_when_view_is_missing(self):
+        factory = _FakeClientFactory(None)
+        uploader = self._uploader(
+            rank=1,
+            manage_remote_view=False,
+            client_factory=factory,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "rank-zero uploader must create"):
+            uploader.start()
+
+        self.assertEqual(factory.project.create_calls, [])
+        self.assertEqual(factory.project.generic_get_calls, [])
 
     def test_submit_requires_started_uploader(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(_FakeView()),
-            )
-            with self.assertRaisesRegex(RuntimeError, "start.*before submit"):
-                uploader.submit(10)
-            uploader.close()
+        uploader = self._uploader(client_factory=_FakeClientFactory(_FakeView()))
+        with self.assertRaisesRegex(RuntimeError, "start.*before submit"):
+            uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        uploader.close()
 
     def test_complete_step_uploads_merge_with_stable_version_and_ts(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(
-                output_dir,
-                10,
+        view = _FakeView()
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(
+            client_factory=factory,
+            clock_ms=lambda: 123456,
+        )
+        uploader.start()
+        uploader.submit(
+            10,
+            _delta_table(
                 [
                     _row(10, 0, 1, [1.0, 2.0]),
                     _row(10, 0, 2, [3.0, 4.0]),
                     _row(10, 0, 3, [0.0, 0.0]),
-                ],
-            )
-            view = _FakeView()
-            factory = _FakeClientFactory(view)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir=output_dir,
-                file_prefix="delta",
-                world_size=1,
-                embedding_dimensions={"user_emb": 2},
-                client_factory=factory,
-                clock_ms=lambda: 123456,
-            )
-            uploader.start()
-            uploader.submit(10)
-            uploader.close()
+                ]
+            ),
+        )
+        uploader.close()
 
-            self.assertEqual(len(view.calls), 2)
-            self.assertEqual([len(call["data"]) for call in view.calls], [2, 1])
-            self.assertEqual(view.flush_calls, [[2, 1]])
-            self.assertEqual(
-                {call["version"] for call in view.calls}, {"model_a@export_1"}
-            )
-            self.assertEqual({call["write_mode"] for call in view.calls}, {"MERGE"})
-            self.assertEqual([call["ts"] for call in view.calls], [123456, 123457])
-            self.assertEqual(view.calls[1]["data"][0]["embedding"].tolist(), [0.0, 0.0])
-            self.assertEqual(view.closed, [True])
+        self.assertEqual(len(view.calls), 2)
+        self.assertEqual([len(call["data"]) for call in view.calls], [2, 1])
+        self.assertEqual(view.flush_calls, [[2, 1]])
+        self.assertEqual({call["version"] for call in view.calls}, {"model_a@export_1"})
+        self.assertEqual({call["write_mode"] for call in view.calls}, {"MERGE"})
+        self.assertEqual([call["ts"] for call in view.calls], [123456, 123457])
+        self.assertEqual(view.calls[1]["data"][0]["embedding"].tolist(), [0.0, 0.0])
+        self.assertEqual(view.closed, [True])
 
     def test_upload_uses_bounded_sdk_worker_windows(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(
-                output_dir,
-                10,
-                [_row(10, 0, key, [1.0, 2.0]) for key in range(1, 6)],
-            )
-            view = _FakeView(max_workers=2)
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(upload_batch_size=1),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-                clock_ms=lambda: 100,
-            )
+        view = _FakeView(max_workers=2)
+        uploader = self._uploader(
+            _feature_store_config(upload_batch_size=1),
+            client_factory=_FakeClientFactory(view),
+            clock_ms=lambda: 100,
+        )
 
-            uploader.start()
-            uploader.submit(10)
-            uploader.close()
+        uploader.start()
+        uploader.submit(
+            10, _delta_table([_row(10, 0, key, [1.0, 2.0]) for key in range(1, 6)])
+        )
+        uploader.close()
 
-            self.assertEqual(
-                [call["ts"] for call in view.calls], [100, 101, 102, 103, 104]
-            )
-            self.assertEqual(view.flush_calls, [[1, 1], [1, 1], [1]])
+        self.assertEqual([call["ts"] for call in view.calls], [100, 101, 102, 103, 104])
+        self.assertEqual(view.flush_calls, [[1, 1], [1, 1], [1]])
 
     def test_first_positive_dump_step_is_not_filtered(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 1, [_row(1, 0, 1, [1.0, 2.0])])
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-                clock_ms=lambda: 100,
-            )
+        view = _FakeView()
+        uploader = self._uploader(
+            client_factory=_FakeClientFactory(view),
+            clock_ms=lambda: 100,
+        )
 
-            uploader.start()
-            uploader.submit(1)
-            uploader.close()
+        uploader.start()
+        uploader.submit(1, _delta_table([_row(1, 0, 1, [1.0, 2.0])]))
+        uploader.close()
 
-            self.assertEqual(len(view.calls), 1)
-            self.assertEqual(view.calls[0]["ts"], 100)
-            self.assertEqual(view.calls[0]["version"], "model_a@export_1")
+        self.assertEqual(len(view.calls), 1)
+        self.assertEqual(view.calls[0]["ts"], 100)
+        self.assertEqual(view.calls[0]["version"], "model_a@export_1")
 
     def test_submit_rejects_step_zero(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(_FakeView()),
-            )
+        uploader = self._uploader(client_factory=_FakeClientFactory(_FakeView()))
 
-            uploader.start()
-            try:
-                with self.assertRaisesRegex(ValueError, "global_step must be > 0"):
-                    uploader.submit(0)
-            finally:
-                uploader.close()
-
-    def test_target_scoped_prefix_prevents_cross_version_parquet_replay(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            version_a = _feature_store_config(version="model_a@run_1")
-            version_b = _feature_store_config(version="model_a@run_2")
-            prefix_a = feature_store_delta_file_prefix(version_a, "delta")
-            prefix_b = feature_store_delta_file_prefix(version_b, "delta")
-            self.assertNotEqual(prefix_a, prefix_b)
-            self.assertEqual(
-                prefix_a, feature_store_delta_file_prefix(version_a, "delta")
-            )
-
-            _write_single_shard(
-                output_dir,
-                10,
-                [_row(10, 0, 1, [1.0, 2.0])],
-                file_prefix=prefix_a,
-            )
-            view = _FakeView()
-            factory = _FakeClientFactory(view)
-            uploader = FeatureStoreDeltaUploader(
-                version_b,
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-            )
-            self.assertEqual(uploader._file_prefix, prefix_b)
-
-            uploader.start()
+        uploader.start()
+        try:
+            with self.assertRaisesRegex(ValueError, "global_step must be > 0"):
+                uploader.submit(0, _delta_table([]))
+        finally:
             uploader.close()
-
-            self.assertEqual(len(factory.calls), 1)
-            self.assertEqual(view.calls, [])
 
     def test_flush_failure_raises_error(self):
         failed_summary = {
@@ -852,30 +687,25 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "failed_records": 1,
             "errors": ["failed future"],
         }
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(
-                output_dir,
-                10,
+        view = _FakeView([failed_summary])
+        uploader = self._uploader(
+            _feature_store_config(max_retries=1),
+            client_factory=_FakeClientFactory(view),
+        )
+        uploader.start()
+        uploader.submit(
+            10,
+            _delta_table(
                 [
                     _row(10, 0, 1, [1.0, 2.0]),
                     _row(10, 0, 2, [3.0, 4.0]),
                     _row(10, 0, 3, [5.0, 6.0]),
-                ],
-            )
-            view = _FakeView([failed_summary])
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(max_retries=1),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
-            with self.assertRaises(FeatureStoreUploadError):
-                uploader.close()
-            self.assertEqual(view.flush_calls, [[2, 1], []])
+                ]
+            ),
+        )
+        with self.assertRaises(FeatureStoreUploadError):
+            uploader.close()
+        self.assertEqual(view.flush_calls, [[2, 1], []])
 
     def test_retry_uses_fresh_view_and_newer_timestamp_range(self):
         failed_summary = {
@@ -886,234 +716,118 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "failed_records": 1,
             "errors": ["failed future"],
         }
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
-            first_view = _FakeView([failed_summary])
-            second_view = _FakeView()
-            factory = _SequencedClientFactory([first_view, second_view])
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(max_retries=2),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-                clock_ms=lambda: 777,
-            )
-            uploader.start()
-            uploader.submit(10)
-            uploader.close()
+        first_view = _FakeView([failed_summary])
+        second_view = _FakeView()
+        factory = _SequencedClientFactory([first_view, second_view])
+        uploader = self._uploader(
+            _feature_store_config(max_retries=2),
+            client_factory=factory,
+            clock_ms=lambda: 777,
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        uploader.close()
 
-            self.assertEqual(len(factory.calls), 2)
-            self.assertEqual(first_view.closed, [True])
-            self.assertEqual(second_view.closed, [True])
-            all_calls = first_view.calls + second_view.calls
-            self.assertEqual(
-                {call["version"] for call in all_calls}, {"model_a@export_1"}
-            )
-            self.assertEqual([call["ts"] for call in all_calls], [777, 778])
+        self.assertEqual(len(factory.calls), 2)
+        self.assertEqual(first_view.closed, [True])
+        self.assertEqual(second_view.closed, [True])
+        all_calls = first_view.calls + second_view.calls
+        self.assertEqual({call["version"] for call in all_calls}, {"model_a@export_1"})
+        self.assertEqual([call["ts"] for call in all_calls], [777, 778])
 
     def test_merge_does_not_require_preprovisioned_version(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
-            uploader.close()
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        uploader.close()
 
-            self.assertEqual(len(view.calls), 1)
-            self.assertEqual(view.calls[0]["write_mode"], "MERGE")
+        self.assertEqual(len(view.calls), 1)
+        self.assertEqual(view.calls[0]["write_mode"], "MERGE")
 
     def test_non_draining_close_stops_without_commit(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(
-                output_dir,
-                10,
-                [_row(10, 0, key, [1.0, 2.0]) for key in range(1, 10)],
-            )
-            view = _BlockingView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(upload_batch_size=1),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
-            self.assertTrue(view.flush_started.wait(timeout=5))
-            uploader.close(raise_on_error=False, drain=False)
-            view.release_flush.set()
-            self.assertTrue(view.close_finished.wait(timeout=5))
-            self.assertTrue(len(view.calls) < 9)
+        view = _BlockingView()
+        uploader = self._uploader(
+            _feature_store_config(upload_batch_size=1),
+            client_factory=_FakeClientFactory(view),
+        )
+        uploader.start()
+        uploader.submit(
+            10, _delta_table([_row(10, 0, key, [1.0, 2.0]) for key in range(1, 10)])
+        )
+        self.assertTrue(view.flush_started.wait(timeout=5))
+        uploader.close(raise_on_error=False, drain=False)
+        view.release_flush.set()
+        self.assertTrue(view.close_finished.wait(timeout=5))
+        self.assertTrue(len(view.calls) < 9)
 
     def test_signed_int64_key_is_preserved(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            large_key = (1 << 63) - 1
-            _write_single_shard(output_dir, 10, [_row(10, 0, large_key, [1.0, 2.0])])
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
-            uploader.close()
+        large_key = (1 << 63) - 1
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, large_key, [1.0, 2.0])]))
+        uploader.close()
 
-            self.assertEqual(view.calls[0]["data"][0]["key_id"], large_key)
+        self.assertEqual(view.calls[0]["data"][0]["key_id"], large_key)
 
     def test_reserved_invalid_key_is_rejected(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [_row(10, 0, -1, [1.0, 2.0])])
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(max_retries=1),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
-            with self.assertRaises(FeatureStoreUploadError):
-                uploader.close()
-            self.assertEqual(view.calls, [])
-
-    def test_empty_step_validates_remote_contract(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [])
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
+        view = _FakeView()
+        uploader = self._uploader(
+            _feature_store_config(max_retries=1),
+            client_factory=_FakeClientFactory(view),
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, -1, [1.0, 2.0])]))
+        with self.assertRaises(FeatureStoreUploadError):
             uploader.close()
+        self.assertEqual(view.calls, [])
 
-            self.assertEqual(view.calls, [])
+    def test_empty_table_upload_writes_nothing(self):
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        uploader.start()
+        uploader.submit(10, _delta_table([]))
+        uploader.close()
 
-    def test_multi_rank_waits_for_all_shards(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_rank_shard(
-                output_dir, 10, 0, 2, [_row(10, 0, 1, [1.0, 2.0], world_size=2)]
-            )
-            _write_rank_shard(
-                output_dir, 10, 1, 2, [_row(10, 1, 2, [3.0, 4.0], world_size=2)]
-            )
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                2,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-                clock_ms=lambda: 100,
-            )
-            uploader.start()
-            uploader.submit(10)
-            uploader.close()
-
-            self.assertEqual(len(view.calls), 2)
-            self.assertEqual(view.calls[0]["data"][0]["key_id"], 1)
-            self.assertEqual(view.calls[1]["data"][0]["key_id"], 2)
+        self.assertEqual(view.calls, [])
 
     def test_dimension_and_finite_value_validation(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0, 3.0])])
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(max_retries=1),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
-            with self.assertRaises(FeatureStoreUploadError):
-                uploader.close()
-            self.assertEqual(view.calls, [])
-
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [float("nan"), 2.0])])
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(max_retries=1),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
-            with self.assertRaises(FeatureStoreUploadError):
-                uploader.close()
-            self.assertEqual(view.calls, [])
-
-    def test_successful_upload_deletes_shard_files(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            shard_path = _write_single_shard(
-                output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])]
-            )
-            self.assertTrue(os.path.isfile(shard_path))
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
+        view = _FakeView()
+        uploader = self._uploader(
+            _feature_store_config(max_retries=1),
+            client_factory=_FakeClientFactory(view),
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0, 3.0])]))
+        with self.assertRaises(FeatureStoreUploadError):
             uploader.close()
+        self.assertEqual(view.calls, [])
 
-            self.assertFalse(os.path.isfile(shard_path))
+        view = _FakeView()
+        uploader = self._uploader(
+            _feature_store_config(max_retries=1),
+            client_factory=_FakeClientFactory(view),
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [float("nan"), 2.0])]))
+        with self.assertRaises(FeatureStoreUploadError):
+            uploader.close()
+        self.assertEqual(view.calls, [])
 
     def test_in_memory_timestamp_monotonicity_across_steps(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
-            _write_single_shard(output_dir, 20, [_row(20, 0, 2, [3.0, 4.0])])
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-                clock_ms=lambda: 100,
-            )
-            uploader.start()
-            uploader.submit(10)
-            uploader.submit(20)
-            uploader.close()
+        view = _FakeView()
+        uploader = self._uploader(
+            client_factory=_FakeClientFactory(view),
+            clock_ms=lambda: 100,
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        uploader.submit(20, _delta_table([_row(20, 0, 2, [3.0, 4.0])]))
+        uploader.close()
 
-            ts_values = [call["ts"] for call in view.calls]
-            self.assertEqual(ts_values, [100, 101])
+        ts_values = [call["ts"] for call in view.calls]
+        self.assertEqual(ts_values, [100, 101])
 
     def test_in_memory_timestamp_monotonicity_across_retries(self):
         failed_summary = {
@@ -1123,95 +837,64 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "success_records": 0,
             "failed_records": 1,
         }
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [_row(10, 0, 1, [1.0, 2.0])])
-            first_view = _FakeView([failed_summary])
-            second_view = _FakeView()
-            factory = _SequencedClientFactory([first_view, second_view])
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(max_retries=2),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=factory,
-                clock_ms=lambda: 500,
-            )
-            uploader.start()
-            uploader.submit(10)
-            uploader.close()
+        first_view = _FakeView([failed_summary])
+        second_view = _FakeView()
+        factory = _SequencedClientFactory([first_view, second_view])
+        uploader = self._uploader(
+            _feature_store_config(max_retries=2),
+            client_factory=factory,
+            clock_ms=lambda: 500,
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        uploader.close()
 
-            self.assertEqual([call["ts"] for call in first_view.calls], [500])
-            self.assertEqual([call["ts"] for call in second_view.calls], [501])
+        self.assertEqual([call["ts"] for call in first_view.calls], [500])
+        self.assertEqual([call["ts"] for call in second_view.calls], [501])
 
-    def test_shard_wait_timeout_raises(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(shard_wait_timeout_secs=1, poll_interval_secs=1),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
-            with self.assertRaises(FeatureStoreUploadError):
-                uploader.close()
-            self.assertEqual(view.calls, [])
+    def test_data_parallel_ranks_upload_duplicate_keys_independently(self):
+        rank0_view = _FakeView()
+        rank1_view = _FakeView()
+        rank0 = self._uploader(
+            client_factory=_FakeClientFactory(rank0_view),
+            clock_ms=lambda: 100,
+        )
+        rank1 = self._uploader(
+            rank=1,
+            manage_remote_view=False,
+            client_factory=_FakeClientFactory(rank1_view),
+            clock_ms=lambda: 100,
+        )
+        rank0.start()
+        rank1.start()
+        rank0.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0], world_size=2)]))
+        rank1.submit(10, _delta_table([_row(10, 1, 1, [1.0, 2.0], world_size=2)]))
+        rank0.close()
+        rank1.close()
 
-    def test_data_parallel_duplicate_keys_uploaded_without_dedup(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_rank_shard(
-                output_dir,
-                10,
-                0,
-                2,
-                [_row(10, 0, 1, [1.0, 2.0], world_size=2)],
-            )
-            _write_rank_shard(
-                output_dir,
-                10,
-                1,
-                2,
-                [_row(10, 1, 1, [1.0, 2.0], world_size=2)],
-            )
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(),
-                output_dir,
-                "delta",
-                2,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-                clock_ms=lambda: 100,
-            )
-            uploader.start()
-            uploader.submit(10)
-            uploader.close()
-
-            all_keys = [item["key_id"] for call in view.calls for item in call["data"]]
-            self.assertEqual(all_keys, [1, 1])
+        rank0_keys = [
+            item["key_id"] for call in rank0_view.calls for item in call["data"]
+        ]
+        rank1_keys = [
+            item["key_id"] for call in rank1_view.calls for item in call["data"]
+        ]
+        self.assertEqual(rank0_keys, [1])
+        self.assertEqual(rank1_keys, [1])
+        self.assertEqual({call["write_mode"] for call in rank0_view.calls}, {"MERGE"})
+        self.assertEqual({call["write_mode"] for call in rank1_view.calls}, {"MERGE"})
 
     def test_close_error_surfaces_via_check_error(self):
-        with tempfile.TemporaryDirectory() as output_dir:
-            _write_single_shard(output_dir, 10, [_row(10, 0, -1, [1.0, 2.0])])
-            view = _FakeView()
-            uploader = FeatureStoreDeltaUploader(
-                _feature_store_config(max_retries=1),
-                output_dir,
-                "delta",
-                1,
-                {"user_emb": 2},
-                client_factory=_FakeClientFactory(view),
-            )
-            uploader.start()
-            uploader.submit(10)
-            with self.assertRaises(FeatureStoreUploadError):
-                uploader.close()
-            with self.assertRaises(FeatureStoreUploadError):
-                uploader.check_error()
+        view = _FakeView()
+        uploader = self._uploader(
+            _feature_store_config(max_retries=1),
+            client_factory=_FakeClientFactory(view),
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, -1, [1.0, 2.0])]))
+        with self.assertRaises(FeatureStoreUploadError):
+            uploader.close()
+        with self.assertRaises(FeatureStoreUploadError):
+            uploader.check_error()
 
 
 if __name__ == "__main__":

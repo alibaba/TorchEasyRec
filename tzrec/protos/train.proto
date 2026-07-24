@@ -55,30 +55,30 @@ message FeatureStoreConfig {
     optional string endpoint = 6;
     // Maximum records submitted before each SDK write_flush() completion gate.
     optional uint32 upload_batch_size = 7 [default = 1000];
-    // Total attempts per process for one step. All retries reuse the version;
-    // each attempt durably reserves a newer monotonic ts range and fully replays
-    // the step so incremental readers cannot miss a partial earlier attempt.
+    // Total attempts per rank for one step. All retries reuse the version;
+    // each attempt reserves a newer monotonic ts range and fully replays the
+    // rank's delta so incremental readers cannot miss a partial earlier attempt.
     optional uint32 max_retries = 8 [default = 3];
     optional uint32 retry_backoff_secs = 9 [default = 5];
-    // Maximum time rank zero waits for every rank's atomic parquet shard.
-    // With FeatureStore enabled, output_dir must be one stable shared POSIX
-    // filesystem visible to rank zero across restarts and must support atomic
-    // rename, fsync and advisory file locking.
-    optional uint32 shard_wait_timeout_secs = 10 [default = 600];
     // Maximum time normal training shutdown waits for the uploader to drain.
-    optional uint32 shutdown_timeout_secs = 11 [default = 600];
-    // Apply back-pressure when too many completed dumps await publication.
-    optional uint32 max_pending_steps = 12 [default = 32];
-    optional uint32 poll_interval_secs = 13 [default = 1];
+    optional uint32 shutdown_timeout_secs = 10 [default = 600];
+    // Apply back-pressure when too many completed dumps await upload; bounds
+    // the per-rank memory retained by pending in-memory deltas.
+    optional uint32 max_pending_steps = 11 [default = 32];
+    optional uint32 poll_interval_secs = 12 [default = 1];
     // Creation settings used only when feature_view_name does not yet exist.
-    optional uint32 feature_view_ttl_secs = 14 [default = 1296000];
-    optional uint32 feature_view_shard_count = 15 [default = 20];
-    optional uint32 feature_view_replication_count = 16 [default = 1];
+    optional uint32 feature_view_ttl_secs = 13 [default = 1296000];
+    optional uint32 feature_view_shard_count = 14 [default = 20];
+    optional uint32 feature_view_replication_count = 15 [default = 1];
     // Explicit opt-in allowing endpoint to name a non-*.aliyuncs.com host
     // (e.g. a vetted private FeatureStore deployment with a custom port).
     // Credentials are sent to that host; structural endpoint checks (HTTPS
     // scheme, no userinfo/path/query/fragment) still apply.
-    optional bool allow_custom_endpoint = 17 [default = false];
+    optional bool allow_custom_endpoint = 16 [default = false];
+    // Also write the local per-rank delta parquet files while uploading to
+    // FeatureStore (e.g. for the offline readback checker); by default the
+    // delta is handed to the uploader in memory and never touches disk.
+    optional bool retain_local_dump = 17 [default = false];
 }
 
 message DeltaEmbeddingDumpConfig {
@@ -92,7 +92,7 @@ message DeltaEmbeddingDumpConfig {
     optional string output_dir = 2;
     // parquet file prefix
     optional string file_prefix = 3 [default = "delta_embedding"];
-    // Presence enables durable, rank-zero background upload to FeatureStore.
+    // Presence enables best-effort per-rank background upload to FeatureStore.
     optional FeatureStoreConfig feature_store_config = 4;
     // Dump after this many elapsed minutes. The timer starts when training starts.
     // Do not set this together with dump_interval_steps.

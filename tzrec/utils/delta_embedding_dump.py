@@ -9,11 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 import os
 import re
 import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
@@ -32,10 +30,7 @@ from torchrec.distributed.model_tracker.types import TrackingMode
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
 from tzrec.utils.feature_store_delta_uploader import (
-    DELTA_DUMP_GENERATION_METADATA_KEY,
-    DELTA_DUMP_SCHEMA_VERSION,
     FeatureStoreDeltaUploader,
-    feature_store_delta_file_prefix,
     validate_feature_store_config,
 )
 from tzrec.utils.logging_util import logger
@@ -51,6 +46,7 @@ from tzrec.utils.sparse_embedding_contract import (
 )
 
 _CONSUMER = "delta_embedding_dump"
+DELTA_DUMP_SCHEMA_VERSION = "2"
 _DELTA_DUMP_SCHEMA = pa.schema(
     [
         ("global_step", pa.int64()),
@@ -389,17 +385,14 @@ class DeltaEmbeddingDumper:
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
-        file_prefix = config.file_prefix or "delta_embedding"
-        self._file_prefix = file_prefix
+        self._file_prefix = config.file_prefix or "delta_embedding"
         self._rank, self._world_size = _distributed_rank_world_size()
         self._device = device
         self._tracking_pause_depth = 0
         self._feature_store_enabled = config.HasField("feature_store_config")
-        self._run_generation: Optional[str] = None
-        if self._feature_store_enabled:
-            self._file_prefix = feature_store_delta_file_prefix(
-                config.feature_store_config, self._file_prefix
-            )
+        self._retain_local_dump = self._feature_store_enabled and bool(
+            config.feature_store_config.retain_local_dump
+        )
         os.makedirs(self._output_dir, exist_ok=True)
 
         self._table_shard_infos = self._collect_table_shard_infos()
@@ -423,13 +416,12 @@ class DeltaEmbeddingDumper:
             self._build_sparse_embedding_contract()
         )
         self._uploader: Optional[FeatureStoreDeltaUploader] = None
-        if self._feature_store_enabled and self._rank == 0:
+        if self._feature_store_enabled:
             self._uploader = FeatureStoreDeltaUploader(
                 config.feature_store_config,
-                output_dir=self._output_dir,
-                file_prefix=file_prefix,
-                world_size=self._world_size,
                 embedding_dimensions=embedding_dimensions,
+                rank=self._rank,
+                manage_remote_view=self._rank == 0,
             )
 
         interval_name = "minutes" if self._interval_secs is not None else "steps"
@@ -455,23 +447,47 @@ class DeltaEmbeddingDumper:
         self._tracker.clear()
 
     def start(self) -> None:
-        """Start timed cadence and rank-zero publication after initialization."""
-        if self._feature_store_enabled:
-            self._initialize_run_generation()
+        """Start timed cadence and per-rank FeatureStore publication.
+
+        The rank-zero uploader creates and validates the remote view first;
+        the other ranks start their uploaders only after the barrier so they
+        can open the already-published view without control-plane races. A
+        rank-zero startup failure still joins the barrier before raising so
+        every rank keeps issuing the same collective sequence.
+        """
         if self._uploader is not None:
-            self._uploader.start()
+            start_error: Optional[BaseException] = None
+            if self._rank == 0:
+                try:
+                    self._uploader.start()
+                except BaseException as exc:
+                    start_error = exc
+            if self._world_size > 1:
+                if not (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
+                    raise RuntimeError(
+                        "distributed FeatureStore delta dump requires an "
+                        "initialized process group"
+                    )
+                torch.distributed.barrier()
+            if start_error is not None:
+                raise start_error.with_traceback(start_error.__traceback__)
+            if self._rank != 0:
+                self._uploader.start()
         if self._interval_secs is not None:
             self._next_dump_time = time.monotonic() + self._interval_secs
 
     def close(self, raise_on_error: bool = True, drain: bool = True) -> None:
-        """Close the rank-zero uploader; abnormal shutdown can skip draining."""
+        """Close this rank's uploader; abnormal shutdown can skip draining."""
         if self._uploader is not None:
             self._uploader.close(raise_on_error=raise_on_error, drain=drain)
 
     def _feature_store_upload_error(
         self, force: bool = False
     ) -> Optional[BaseException]:
-        """Collect a local uploader error without changing rank control flow."""
+        """Collect this rank's uploader error without changing control flow."""
         if not self._feature_store_enabled:
             return None
 
@@ -483,39 +499,10 @@ class DeltaEmbeddingDumper:
         return None
 
     def _check_feature_store_upload_error(self, force: bool = False) -> None:
-        """Surface the rank-zero background failure through the shared outbox."""
+        """Surface this rank's background upload failure to the trainer."""
         error = self._feature_store_upload_error(force=force)
         if error is not None:
             raise error.with_traceback(error.__traceback__)
-
-    def _initialize_run_generation(self) -> None:
-        """Broadcast one run fence after every rank constructed successfully."""
-        if self._run_generation is not None:
-            return
-        generation = uuid.uuid4().bytes if self._rank == 0 else bytes(16)
-        if self._world_size > 1:
-            if not (
-                torch.distributed.is_available() and torch.distributed.is_initialized()
-            ):
-                raise RuntimeError(
-                    "distributed FeatureStore delta dump requires an initialized "
-                    "process group"
-                )
-            token = torch.tensor(
-                list(generation), dtype=torch.uint8, device=self._device
-            )
-            torch.distributed.broadcast(token, src=0)
-            generation = bytes(token.cpu().tolist())
-        self._run_generation = generation.hex()
-
-    def _next_dump_generation(self, global_step: int) -> Optional[str]:
-        """Derive a stable per-step token from the process-run generation fence."""
-        if not self._feature_store_enabled:
-            return None
-        if self._run_generation is None:
-            raise RuntimeError("FeatureStore delta dumper must be started before use")
-        value = f"{self._run_generation}:{global_step}".encode("ascii")
-        return hashlib.sha256(value).hexdigest()[:32]
 
     def _build_sparse_embedding_contract(
         self,
@@ -799,7 +786,7 @@ class DeltaEmbeddingDumper:
         if global_step <= 0:
             raise ValueError("delta embedding dump global_step must be > 0")
         uploader = self._uploader
-        dump_generation = self._next_dump_generation(global_step)
+        write_local = not self._feature_store_enabled or self._retain_local_dump
         tracker_cursor = self._tracker_cursor_before_read()
         try:
             table_weights = self._collect_table_weights()
@@ -811,27 +798,31 @@ class DeltaEmbeddingDumper:
                 table_weights=table_weights,
                 dynamic_modules=dynamic_modules,
             )
-            if (
-                num_rows == 0
-                and self._world_size == 1
-                and not self._feature_store_enabled
-            ):
-                logger.info("No delta embedding rows to dump at step %s.", global_step)
-                return None
-            output_path = self._output_path(global_step)
-            self._write_table_chunks(
-                table_chunks, output_path, dump_generation=dump_generation
-            )
-            if uploader is not None:
-                uploader.submit(global_step)
+            output_path: Optional[str] = None
+            if write_local and (num_rows > 0 or self._world_size > 1):
+                # Multi-rank shard sets stay complete even for an empty rank so
+                # per-step file consumers never observe a partial set.
+                output_path = self._output_path(global_step)
+                self._write_table_chunks(table_chunks, output_path)
+            if uploader is not None and num_rows > 0:
+                uploader.submit(global_step, pa.concat_tables(table_chunks))
         except BaseException:
             self._rollback_tracker_read(tracker_cursor)
             raise
 
         if num_rows == 0:
+            if output_path is None:
+                logger.info("No delta embedding rows to dump at step %s.", global_step)
+            else:
+                logger.info(
+                    "Dumped empty delta embedding shard to %s at step %s.",
+                    output_path,
+                    global_step,
+                )
+        elif output_path is None:
             logger.info(
-                "Dumped empty delta embedding shard to %s at step %s.",
-                output_path,
+                "Submitted %s delta embedding rows for FeatureStore upload at step %s.",
+                num_rows,
                 global_step,
             )
         else:
@@ -1190,18 +1181,10 @@ class DeltaEmbeddingDumper:
         self,
         table_chunks: List[pa.Table],
         output_path: str,
-        dump_generation: Optional[str] = None,
     ) -> None:
         tmp_path = f"{output_path}.rank{self._rank}.tmp"
         try:
-            writer_schema = _DELTA_DUMP_SCHEMA
-            if dump_generation is not None:
-                metadata = dict(writer_schema.metadata or {})
-                metadata[DELTA_DUMP_GENERATION_METADATA_KEY] = dump_generation.encode(
-                    "ascii"
-                )
-                writer_schema = writer_schema.with_metadata(metadata)
-            with pq.ParquetWriter(tmp_path, writer_schema) as writer:
+            with pq.ParquetWriter(tmp_path, _DELTA_DUMP_SCHEMA) as writer:
                 chunks = table_chunks or [_DELTA_DUMP_SCHEMA.empty_table()]
                 for table_chunk in chunks:
                     writer.write_table(table_chunk)

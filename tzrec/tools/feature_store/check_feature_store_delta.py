@@ -11,9 +11,12 @@
 
 r"""Read back sampled delta embeddings from FeatureStore.
 
-The tool scans the local delta parquet outbox for the latest (or specified)
+The tool scans the local delta parquet output for the latest (or specified)
 step, samples keys from its shard set, and queries the configured explicit
 FeatureDB version through ``DynamicEmbeddingFeatureView.get_online_features``.
+
+Local parquet files are only produced alongside FeatureStore uploads when
+``feature_store_config.retain_local_dump`` is enabled.
 
 Example::
 
@@ -47,7 +50,6 @@ from tzrec.utils.feature_store_delta_uploader import (
     FEATURE_STORE_SK_FIELD,
     FEATURE_STORE_VALUE_FIELD,
     FeatureStoreUploadSettings,
-    feature_store_delta_file_prefix,
 )
 
 
@@ -407,6 +409,11 @@ def run_check(args: argparse.Namespace) -> int:
             "pipeline config delta_embedding_dump_config has no feature_store_config"
         )
     feature_store_config = dump_config.feature_store_config
+    if not feature_store_config.retain_local_dump:
+        raise ValueError(
+            "feature_store_config.retain_local_dump must be enabled so the "
+            "training job keeps local delta parquet files for readback"
+        )
     settings = FeatureStoreUploadSettings.from_proto(feature_store_config)
     output_dir = resolve_output_dir(
         args.pipeline_config,
@@ -419,11 +426,10 @@ def run_check(args: argparse.Namespace) -> int:
             f"delta embedding output directory not found: {output_dir}"
         )
 
-    base_prefix = dump_config.file_prefix or "delta_embedding"
-    scoped_prefix = feature_store_delta_file_prefix(feature_store_config, base_prefix)
+    file_prefix = dump_config.file_prefix or "delta_embedding"
     world_size = args.world_size
     global_step, parquet_paths = resolve_upload_step(
-        output_dir, scoped_prefix, world_size, args.global_step
+        output_dir, file_prefix, world_size, args.global_step
     )
     samples = sample_local_records(
         parquet_paths,
