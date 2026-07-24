@@ -129,6 +129,21 @@ def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
     return sampler_type
 
 
+def _raise_if_any_worker_failed(
+    local_error: Optional[BaseException], device: torch.device, action: str
+) -> None:
+    """Make rank-local initialization failures visible to every worker."""
+    any_failed = local_error is not None
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        failed = torch.tensor([int(any_failed)], dtype=torch.int32, device=device)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        any_failed = bool(failed.item())
+    if local_error is not None:
+        raise local_error.with_traceback(local_error.__traceback__)
+    if any_failed:
+        raise RuntimeError(f"{action} failed on another distributed worker")
+
+
 def _create_model(
     model_config: ModelConfig,
     features: List[BaseFeature],
@@ -750,13 +765,22 @@ def train_and_evaluate(
         plan=plan,
     )
     delta_embedding_dumper = None
+    delta_embedding_dumper_error: Optional[BaseException] = None
     if enable_delta_embedding_dump:
-        delta_embedding_dumper = DeltaEmbeddingDumper(
-            model,
-            train_config.delta_embedding_dump_config,
-            pipeline_config.model_dir,
+        try:
+            delta_embedding_dumper = DeltaEmbeddingDumper(
+                model,
+                train_config.delta_embedding_dump_config,
+                pipeline_config.model_dir,
+                device,
+                pipeline_config.feature_configs,
+            )
+        except BaseException as exc:
+            delta_embedding_dumper_error = exc
+        _raise_if_any_worker_failed(
+            delta_embedding_dumper_error,
             device,
-            pipeline_config.feature_configs,
+            "delta embedding dumper initialization",
         )
 
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
@@ -835,25 +859,60 @@ def train_and_evaluate(
         with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
             f.write(tzrec_version + "\n")
 
-    # when slice batch by sample cost, data on all workers may not be balanced
-    check_all_workers_data_status = data_config.HasField("batch_cost_size")
-    _train_and_evaluate(
-        model,
-        optimizer,
-        train_dataloader,
-        eval_dataloader,
-        [sparse_lr, dense_lr, *part_lrs],
-        pipeline_config.model_dir,
-        train_config=train_config,
-        eval_config=pipeline_config.eval_config,
-        ckpt_manager=ckpt_manager,
-        skip_steps=skip_steps,
-        ckpt_path=ckpt_path,
-        check_all_workers_data_status=check_all_workers_data_status,
-        ignore_restore_optimizer=ignore_restore_optimizer,
-        dataloader_state=dataloader_state,
-        delta_embedding_dumper=delta_embedding_dumper,
-    )
+    try:
+        if delta_embedding_dumper is not None:
+            delta_embedding_dumper_start_error: Optional[BaseException] = None
+            try:
+                delta_embedding_dumper.start()
+            except BaseException as exc:
+                delta_embedding_dumper_start_error = exc
+            _raise_if_any_worker_failed(
+                delta_embedding_dumper_start_error,
+                device,
+                "FeatureStore delta uploader startup",
+            )
+        # when slice batch by sample cost, data on all workers may not be balanced
+        check_all_workers_data_status = data_config.HasField("batch_cost_size")
+        _train_and_evaluate(
+            model,
+            optimizer,
+            train_dataloader,
+            eval_dataloader,
+            [sparse_lr, dense_lr, *part_lrs],
+            pipeline_config.model_dir,
+            train_config=train_config,
+            eval_config=pipeline_config.eval_config,
+            ckpt_manager=ckpt_manager,
+            skip_steps=skip_steps,
+            ckpt_path=ckpt_path,
+            check_all_workers_data_status=check_all_workers_data_status,
+            ignore_restore_optimizer=ignore_restore_optimizer,
+            dataloader_state=dataloader_state,
+            delta_embedding_dumper=delta_embedding_dumper,
+        )
+    except BaseException:
+        if delta_embedding_dumper is not None:
+            # Keep the original training error primary. Pending in-memory
+            # deltas are abandoned; the restarted run re-dumps from the latest
+            # checkpoint. Do not wait up to the normal upload-drain timeout
+            # while unwinding a training failure.
+            delta_embedding_dumper.close(raise_on_error=False, drain=False)
+        raise
+    else:
+        if delta_embedding_dumper is not None:
+            delta_embedding_dumper_close_error: Optional[BaseException] = None
+            try:
+                delta_embedding_dumper.close()
+            except BaseException as exc:
+                delta_embedding_dumper_close_error = exc
+            # Each rank drains its own background queue at a different pace.
+            # Propagate a late drain/SDK error uniformly instead of letting a
+            # single rank fail alone at shutdown.
+            _raise_if_any_worker_failed(
+                delta_embedding_dumper_close_error,
+                device,
+                "FeatureStore delta uploader shutdown",
+            )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
 

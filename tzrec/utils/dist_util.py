@@ -237,6 +237,7 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         check_all_workers_data_status: bool = False,
+        fail_on_uneven_data: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -251,6 +252,7 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
             enqueue_batch_after_forward,
         )
         self._check_all_workers_data_status = check_all_workers_data_status
+        self._fail_on_uneven_data = fail_on_uneven_data
         self._sync_at_progress_entry = (
             device.type == "cuda"
             and dist.is_initialized()
@@ -288,7 +290,15 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
                     0 if batch is None else 1, dtype=torch.float, device=self._device
                 )
                 dist.all_reduce(has_batch, dist.ReduceOp.AVG)
-                if has_batch.item() < 1:
+                available_fraction = has_batch.item()
+                if self._fail_on_uneven_data and 0 < available_fraction < 1:
+                    self._dataloader_exhausted = True
+                    raise RuntimeError(
+                        "training dataloader exhausted unevenly across workers; "
+                        "refusing to drop remainder batches; ensure every worker "
+                        "yields the same number of batches"
+                    )
+                if available_fraction < 1:
                     # We drop remainder batches on all workers,
                     # if one worker does not have a batch
                     self._dataloader_exhausted = True
@@ -336,6 +346,7 @@ def create_train_pipeline(
     model: nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     check_all_workers_data_status: bool = False,
+    fail_on_uneven_data: bool = False,
 ) -> TrainPipeline:
     """Create TrainPipeline.
 
@@ -344,6 +355,8 @@ def create_train_pipeline(
         optimizer (torch.optim.Optimizer): a KeyedOptimizer.
         check_all_workers_data_status (bool): check data on all workers
             is available or not.
+        fail_on_uneven_data (bool): raise instead of dropping remainder batches
+            when workers exhaust their dataloaders at different times.
 
     Return:
         a TrainPipeline.
@@ -373,4 +386,5 @@ def create_train_pipeline(
             model.device,
             execute_all_batches=True,
             check_all_workers_data_status=check_all_workers_data_status,
+            fail_on_uneven_data=fail_on_uneven_data,
         )
