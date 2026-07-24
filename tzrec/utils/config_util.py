@@ -17,7 +17,7 @@ import numpy as np
 from google.protobuf import json_format, text_format
 from google.protobuf.message import Message
 
-from tzrec.protos import data_pb2, pipeline_pb2, train_pb2
+from tzrec.protos import data_pb2, pipeline_pb2
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.utils.logging_util import logger
 
@@ -61,61 +61,6 @@ def save_message(message: Message, filepath: str) -> None:
     pbtxt = text_format.MessageToString(message, as_utf8=True)
     with open(filepath, "w") as f:
         f.write(pbtxt)
-
-
-_FEATURE_STORE_ARTIFACT_FIELDS = (
-    "region",
-    "endpoint",
-    "project_name",
-    "feature_entity_name",
-    "feature_view_name",
-    "feature_view_ttl_secs",
-    "feature_view_shard_count",
-    "feature_view_replication_count",
-    "version",
-    "upload_batch_size",
-    "max_retries",
-    "retry_backoff_secs",
-    "shard_wait_timeout_secs",
-    "shutdown_timeout_secs",
-    "max_pending_steps",
-    "poll_interval_secs",
-)
-
-
-def sanitize_pipeline_config_for_artifact(
-    pipeline_config: pipeline_pb2.EasyRecConfig,
-) -> pipeline_pb2.EasyRecConfig:
-    """Return an artifact-safe config without runtime FeatureStore secrets.
-
-    The runtime config remains unchanged. FeatureStore public routing and
-    version fields are copied through an allowlist, so newly introduced fields
-    do not silently become persistent secrets.
-    """
-    sanitized = pipeline_pb2.EasyRecConfig()
-    sanitized.CopyFrom(pipeline_config)
-    train_config = sanitized.train_config
-    if not train_config.HasField("delta_embedding_dump_config"):
-        return sanitized
-    dump_config = train_config.delta_embedding_dump_config
-    if not dump_config.HasField("feature_store_config"):
-        return sanitized
-
-    runtime_config = dump_config.feature_store_config
-    public_config = train_pb2.FeatureStoreConfig()
-    for field_name in _FEATURE_STORE_ARTIFACT_FIELDS:
-        if runtime_config.HasField(field_name):
-            setattr(public_config, field_name, getattr(runtime_config, field_name))
-    dump_config.ClearField("feature_store_config")
-    dump_config.feature_store_config.CopyFrom(public_config)
-    return sanitized
-
-
-def save_pipeline_config_artifact(
-    pipeline_config: pipeline_pb2.EasyRecConfig, filepath: str
-) -> None:
-    """Persist a pipeline config after removing runtime-only credentials."""
-    save_message(sanitize_pipeline_config_for_artifact(pipeline_config), filepath)
 
 
 def config_to_kwargs(config: Message) -> Dict[str, Any]:

@@ -21,7 +21,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -89,11 +89,6 @@ class FeatureStoreUploadSettings:
 
     region: str
     endpoint: str
-    access_key_id: str = field(repr=False)
-    access_key_secret: str = field(repr=False)
-    security_token: str = field(repr=False)
-    featuredb_username: str = field(repr=False)
-    featuredb_password: str = field(repr=False)
     project_name: str
     feature_entity_name: str
     feature_view_name: str
@@ -112,7 +107,7 @@ class FeatureStoreUploadSettings:
 
     @classmethod
     def from_proto(cls, config: FeatureStoreConfig) -> "FeatureStoreUploadSettings":
-        """Resolve environment-backed credentials without logging them."""
+        """Validate configuration without resolving credentials."""
         initialization_errors = config.FindInitializationErrors()
         if initialization_errors:
             raise ValueError(
@@ -121,34 +116,6 @@ class FeatureStoreUploadSettings:
             )
         region = config.region or os.environ.get("ALIBABA_CLOUD_REGION", "")
         endpoint = config.endpoint
-        security_token = config.security_token or os.environ.get(
-            "ALIBABA_CLOUD_SECURITY_TOKEN", ""
-        )
-        credential_env_names = {
-            "access_key_id": "ALIBABA_CLOUD_ACCESS_KEY_ID",
-            "access_key_secret": "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
-            "featuredb_username": "FEATUREDB_USERNAME",
-            "featuredb_password": "FEATUREDB_PASSWORD",
-        }
-        credentials = {
-            field_name: os.environ.get(env_name, "")
-            for field_name, env_name in credential_env_names.items()
-        }
-        missing_env_names = [
-            credential_env_names[field_name]
-            for field_name, value in credentials.items()
-            if not value
-        ]
-        if missing_env_names:
-            raise ValueError(
-                "feature_store_config requires non-empty environment variables: "
-                + ", ".join(missing_env_names)
-                + "; set them in the training process environment"
-            )
-        access_key_id = credentials["access_key_id"]
-        access_key_secret = credentials["access_key_secret"]
-        featuredb_username = credentials["featuredb_username"]
-        featuredb_password = credentials["featuredb_password"]
 
         if not region:
             raise ValueError(
@@ -206,11 +173,6 @@ class FeatureStoreUploadSettings:
         return cls(
             region=region,
             endpoint=endpoint,
-            access_key_id=access_key_id,
-            access_key_secret=access_key_secret,
-            security_token=security_token,
-            featuredb_username=featuredb_username,
-            featuredb_password=featuredb_password,
             project_name=project_name,
             feature_entity_name=feature_entity_name,
             feature_view_name=feature_view_name,
@@ -230,7 +192,7 @@ class FeatureStoreUploadSettings:
 
 
 def validate_feature_store_config(config: FeatureStoreConfig) -> None:
-    """Validate upload configuration and its environment-resolved credentials."""
+    """Validate upload configuration without resolving credentials."""
     FeatureStoreUploadSettings.from_proto(config)
 
 
@@ -336,6 +298,7 @@ class FeatureStoreDeltaUploader:
         world_size: int,
         embedding_dimensions: Mapping[str, int],
         client_factory: Optional[Callable[..., Any]] = None,
+        credentials_client: Optional[Any] = None,
         clock_ms: Optional[Callable[[], int]] = None,
     ) -> None:
         """Initialize the uploader with validated settings and in-memory state."""
@@ -363,6 +326,9 @@ class FeatureStoreDeltaUploader:
             )
 
         self._client_factory = client_factory
+        self._credentials_client = (
+            credentials_client or self._create_credentials_client()
+        )
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self._view = None
         self._condition = threading.Condition()
@@ -795,6 +761,18 @@ class FeatureStoreDeltaUploader:
             except OSError:
                 pass
 
+    @staticmethod
+    def _create_credentials_client() -> Any:
+        """Create the Alibaba Cloud credential provider (default chain)."""
+        try:
+            from alibabacloud_credentials.client import Client as CredClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "alibabacloud_credentials is required when feature_store_config "
+                "is set; install it via: pip install alibabacloud_credentials"
+            ) from exc
+        return CredClient()
+
     def _get_view(self) -> Any:
         if self._view is not None:
             return self._view
@@ -809,14 +787,15 @@ class FeatureStoreDeltaUploader:
         else:
             client_factory = self._client_factory
 
+        credential = self._credentials_client.get_credential()
         kwargs = {
-            "access_key_id": self._settings.access_key_id,
-            "access_key_secret": self._settings.access_key_secret,
+            "access_key_id": credential.access_key_id,
+            "access_key_secret": credential.access_key_secret,
             "region": self._settings.region or None,
             "endpoint": self._settings.endpoint or None,
-            "security_token": self._settings.security_token or None,
-            "featuredb_username": self._settings.featuredb_username or None,
-            "featuredb_password": self._settings.featuredb_password or None,
+            "security_token": credential.security_token or None,
+            "featuredb_username": os.environ.get("FEATUREDB_USERNAME") or None,
+            "featuredb_password": os.environ.get("FEATUREDB_PASSWORD") or None,
         }
         client = client_factory(**kwargs)
         project = client.get_project(self._settings.project_name)

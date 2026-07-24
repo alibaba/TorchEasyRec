@@ -30,10 +30,11 @@ message GradClipping {
 }
 
 message FeatureStoreConfig {
-    // Runtime credentials are read only from ALIBABA_CLOUD_ACCESS_KEY_ID,
-    // ALIBABA_CLOUD_ACCESS_KEY_SECRET, FEATUREDB_USERNAME and FEATUREDB_PASSWORD.
-    reserved 2 to 5;
-    reserved "access_key_id", "access_key_secret", "featuredb_username", "featuredb_password";
+    // Cloud credentials (AK/SK/STS) are resolved at runtime through the
+    // Alibaba Cloud default credential provider chain (alibabacloud_credentials).
+    // FeatureDB credentials are read from FEATUREDB_USERNAME/FEATUREDB_PASSWORD.
+    reserved 2 to 5, 11;
+    reserved "access_key_id", "access_key_secret", "featuredb_username", "featuredb_password", "security_token";
     // FeatureStore control-plane region. An explicitly empty value falls back
     // to ALIBABA_CLOUD_REGION at runtime.
     required string region = 1;
@@ -54,7 +55,6 @@ message FeatureStoreConfig {
     // required when a scheme is given) without userinfo, port, path, query or
     // fragment components, unless allow_custom_endpoint is set.
     optional string endpoint = 10;
-    optional string security_token = 11;
     // Maximum records submitted before each SDK write_flush() completion gate.
     optional uint32 upload_batch_size = 12 [default = 1000];
     // Total attempts per process for one step. All retries reuse the version;

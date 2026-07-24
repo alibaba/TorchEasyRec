@@ -42,7 +42,6 @@ def _schema_with_generation(generation: str = _TEST_DUMP_GENERATION) -> pa.Schem
 def _feature_store_config(**overrides) -> FeatureStoreConfig:
     config = FeatureStoreConfig(
         region="cn-test",
-        security_token="sts-secret",
         project_name="project_a",
         feature_entity_name="embedding_entity",
         feature_view_name="shared_embeddings",
@@ -257,6 +256,17 @@ class _FakeProject:
         return self._view
 
 
+class _FakeCredential:
+    access_key_id = "fake-ak"
+    access_key_secret = "fake-sk"
+    security_token = "fake-sts"
+
+
+class _FakeCredentialsClient:
+    def get_credential(self):
+        return _FakeCredential()
+
+
 class _FakeClient:
     def __init__(self, project, kwargs):
         self._project = project
@@ -289,18 +299,13 @@ class _SequencedClientFactory:
 
 class FeatureStoreDeltaUploaderTest(unittest.TestCase):
     def setUp(self):
-        self._credential_env = mock.patch.dict(
-            os.environ,
-            {
-                "ALIBABA_CLOUD_ACCESS_KEY_ID": "ak-id-secret",
-                "ALIBABA_CLOUD_ACCESS_KEY_SECRET": "ak-value-secret",
-                "FEATUREDB_USERNAME": "fdb-user-secret",
-                "FEATUREDB_PASSWORD": "fdb-password-secret",
-            },
-            clear=False,
+        self._cred_patch = mock.patch.object(
+            FeatureStoreDeltaUploader,
+            "_create_credentials_client",
+            return_value=_FakeCredentialsClient(),
         )
-        self._credential_env.start()
-        self.addCleanup(self._credential_env.stop)
+        self._cred_patch.start()
+        self.addCleanup(self._cred_patch.stop)
 
     def test_proto_groups_required_fields_before_optional_fields(self):
         required_fields = [
@@ -312,7 +317,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         ]
         optional_fields = [
             "endpoint",
-            "security_token",
             "upload_batch_size",
             "max_retries",
             "retry_backoff_secs",
@@ -324,7 +328,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "feature_view_shard_count",
             "feature_view_replication_count",
             "allow_custom_endpoint",
-            "upload_mode",
         ]
         fields = list(FeatureStoreConfig.DESCRIPTOR.fields)
 
@@ -343,7 +346,10 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 for field in fields[len(required_fields) :]
             )
         )
-        self.assertEqual([field.number for field in fields], [1, *list(range(6, 24))])
+        self.assertEqual(
+            [field.number for field in fields],
+            [1, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
+        )
         for field_name in required_fields:
             with self.subTest(field_name=field_name):
                 config = _feature_store_config()
@@ -376,38 +382,11 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 _feature_store_config(version="default")
             )
 
-    def test_environment_resolution_and_required_credentials(self):
+    def test_region_fallback_and_config_validation(self):
         config = _feature_store_config(region="")
-        config.ClearField("security_token")
-        environment = {
-            "ALIBABA_CLOUD_REGION": "cn-env",
-            "ALIBABA_CLOUD_ACCESS_KEY_ID": "env-ak",
-            "ALIBABA_CLOUD_ACCESS_KEY_SECRET": "env-sk",
-            "ALIBABA_CLOUD_SECURITY_TOKEN": "env-sts",
-            "FEATUREDB_USERNAME": "env-user",
-            "FEATUREDB_PASSWORD": "env-password",
-        }
-        with mock.patch.dict(os.environ, environment, clear=False):
+        with mock.patch.dict(os.environ, {"ALIBABA_CLOUD_REGION": "cn-env"}):
             settings = FeatureStoreUploadSettings.from_proto(config)
         self.assertEqual(settings.region, "cn-env")
-        self.assertEqual(settings.access_key_id, "env-ak")
-        self.assertEqual(settings.access_key_secret, "env-sk")
-        self.assertEqual(settings.security_token, "env-sts")
-        self.assertEqual(settings.featuredb_username, "env-user")
-        self.assertEqual(settings.featuredb_password, "env-password")
-
-        for missing_env_name in (
-            "ALIBABA_CLOUD_ACCESS_KEY_ID",
-            "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
-            "FEATUREDB_USERNAME",
-            "FEATUREDB_PASSWORD",
-        ):
-            with self.subTest(missing_env_name=missing_env_name):
-                incomplete_environment = dict(environment)
-                incomplete_environment.pop(missing_env_name)
-                with mock.patch.dict(os.environ, incomplete_environment, clear=True):
-                    with self.assertRaisesRegex(ValueError, missing_env_name):
-                        FeatureStoreUploadSettings.from_proto(config)
 
         with self.assertRaisesRegex(ValueError, "userinfo"):
             FeatureStoreUploadSettings.from_proto(

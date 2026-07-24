@@ -853,7 +853,7 @@ def train_and_evaluate(
     dist.barrier()
 
     if is_rank_zero:
-        config_util.save_pipeline_config_artifact(
+        config_util.save_message(
             pipeline_config, os.path.join(pipeline_config.model_dir, "pipeline.config")
         )
         with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:

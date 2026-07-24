@@ -60,22 +60,33 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             def get_project(self, name):
                 return project
 
+        class FakeCredClient:
+            def get_credential(self):
+                return SimpleNamespace(
+                    access_key_id="fake-ak",
+                    access_key_secret="fake-sk",
+                    security_token="fake-sts",
+                )
+
         settings = SimpleNamespace(
-            access_key_id="ak-id",
-            access_key_secret="ak-secret",
             region="cn-test",
             endpoint="",
-            security_token="",
-            featuredb_username="featuredb-user",
-            featuredb_password="featuredb-password",
             project_name="project",
             feature_view_name="view",
         )
         feature_store_module = SimpleNamespace(
             FeatureStoreClient=FakeFeatureStoreClient
         )
+        cred_module = SimpleNamespace(Client=FakeCredClient)
 
-        with mock.patch.dict(sys.modules, {"feature_store_py": feature_store_module}):
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "feature_store_py": feature_store_module,
+                "alibabacloud_credentials": SimpleNamespace(client=cred_module),
+                "alibabacloud_credentials.client": cred_module,
+            },
+        ):
             actual = create_feature_store_view(settings)
 
         self.assertIs(actual, view)

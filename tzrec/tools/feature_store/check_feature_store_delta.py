@@ -345,21 +345,29 @@ def create_feature_store_view(settings: FeatureStoreUploadSettings) -> Any:
             "feature_store_py is required; install requirements/feature_store.txt"
         ) from exc
 
+    try:
+        from alibabacloud_credentials.client import Client as CredClient
+    except ImportError as exc:
+        raise RuntimeError(
+            "alibabacloud_credentials is required; "
+            "install it via: pip install alibabacloud_credentials"
+        ) from exc
+
+    credential = CredClient().get_credential()
     kwargs = {
-        "access_key_id": settings.access_key_id,
-        "access_key_secret": settings.access_key_secret,
+        "access_key_id": credential.access_key_id,
+        "access_key_secret": credential.access_key_secret,
         "region": settings.region or None,
         "endpoint": settings.endpoint or None,
-        "security_token": settings.security_token or None,
-        "featuredb_username": settings.featuredb_username or None,
-        "featuredb_password": settings.featuredb_password or None,
+        "security_token": credential.security_token or None,
+        "featuredb_username": os.environ.get("FEATUREDB_USERNAME") or None,
+        "featuredb_password": os.environ.get("FEATUREDB_PASSWORD") or None,
     }
     try:
         parameters = inspect.signature(FeatureStoreClient).parameters
     except (TypeError, ValueError):
         parameters = {}
     if "test_mode" in parameters:
-        # This manual readback tool normally runs outside the production VPC.
         kwargs["test_mode"] = True
 
     client = FeatureStoreClient(**kwargs)
