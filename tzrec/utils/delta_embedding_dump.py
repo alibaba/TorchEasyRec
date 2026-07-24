@@ -538,10 +538,10 @@ class DeltaEmbeddingDumper:
         The TorchRec tracker collapses same-named tables from different
         modules into one entry, so identities are keyed by
         ``(module_fqn, table_name)`` and ``dump`` fans the tracked ids out to
-        every owner, looking values up in each owner's own weights. Canonical
-        embedding names follow the sparse-export contract: a table name reused
-        across EC and EBC gets a role suffix, so both physical tables publish
-        under distinct serving names.
+        every owner this rank hosts, looking values up in each hosted owner's
+        own weights. Canonical embedding names follow the sparse-export
+        contract: a table name reused across EC and EBC gets a role suffix, so
+        both physical tables publish under distinct serving names.
         """
         identity_by_owner: Dict[Tuple[str, str], SparseEmbeddingIdentity] = {}
         owner_roles: Dict[Tuple[str, str], str] = {}
@@ -847,11 +847,17 @@ class DeltaEmbeddingDumper:
                 )
             ids = ids.unique(sorted=True)
             # The tracker merges same-named tables into one id set; fan it out
-            # to every owning module and read each owner's own weights, so an
-            # id that only one owner touched still publishes that owner's true
-            # current row for the others.
+            # to every owning module this rank hosts and read each owner's own
+            # weights, so an id that only one owner touched still publishes
+            # that owner's true current row for the others.
             for module_fqn in owners:
-                identity = self._identity_by_owner[(module_fqn, table_name)]
+                owner_key = (module_fqn, table_name)
+                if owner_key not in dynamic_modules and owner_key not in table_weights:
+                    # This rank hosts no shard for this owner (e.g. a
+                    # table_wise table placed on another rank); the hosting
+                    # rank dumps its rows.
+                    continue
+                identity = self._identity_by_owner[owner_key]
                 embeddings, key_ids = self._lookup_embeddings(
                     module_fqn,
                     table_name,
