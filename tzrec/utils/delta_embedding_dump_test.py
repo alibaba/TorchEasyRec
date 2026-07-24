@@ -56,6 +56,7 @@ from tzrec.utils.delta_embedding_dump import (
 )
 from tzrec.utils.dist_util import create_train_pipeline
 from tzrec.utils.dynamicemb_util import has_dynamicemb
+from tzrec.utils.sparse_embedding_contract import SparseEmbeddingIdentity
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 _SHARDED_TABLE_NAME = "table_1"
@@ -164,7 +165,12 @@ def _assert_sharded_dump_file(rank: int, output_path: str, dumper) -> None:
     )
     testcase.assertEqual(set(table["embedding_role"].to_pylist()), {"ebc"})
 
-    table_weight = dumper._collect_table_weights()[_SHARDED_TABLE_NAME]
+    table_weights = dumper._collect_table_weights()
+    table_weight = next(
+        weight
+        for (_fqn, table_name), weight in table_weights.items()
+        if table_name == _SHARDED_TABLE_NAME
+    )
     expected_key_ids = [
         key_id
         for key_id in _SHARDED_INPUT_IDS
@@ -413,6 +419,83 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 "embedding",
             ],
         )
+
+    def test_shared_table_name_fans_out_to_all_owners(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._fqn_to_table = {"sparse.shared": "shared"}
+        dumper._owners_by_table = {"shared": ["model.ec_dict.2", "model.ebc"]}
+        dumper._identity_by_owner = {
+            ("model.ec_dict.2", "shared"): SparseEmbeddingIdentity(
+                role="ec",
+                table_name="shared",
+                embedding_name="shared__ec",
+                dimension=2,
+                feature_names=("query_feat",),
+            ),
+            ("model.ebc", "shared"): SparseEmbeddingIdentity(
+                role="ebc",
+                table_name="shared",
+                embedding_name="shared__ebc",
+                dimension=2,
+                feature_names=("deep_feat",),
+            ),
+        }
+        dumper._tracker = mock.MagicMock()
+        dumper._tracker.get_unique.return_value = {
+            "sparse.shared": SimpleNamespace(ids=torch.tensor([0, 2]))
+        }
+        ec_weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        ebc_weight = ec_weight + 10.0
+        shard_info = _TableShardInfo(
+            local_rows=4, local_cols=2, global_rows=4, global_cols=2
+        )
+        table_weights = {
+            ("model.ec_dict.2", "shared"): _TableWeight(
+                tensor=ec_weight, shard_info=shard_info
+            ),
+            ("model.ebc", "shared"): _TableWeight(
+                tensor=ebc_weight, shard_info=shard_info
+            ),
+        }
+
+        table_chunks = []
+        num_rows = dumper._append_model_delta_rows(
+            table_chunks,
+            global_step=10,
+            table_weights=table_weights,
+            dynamic_modules={},
+        )
+
+        self.assertEqual(num_rows, 4)
+        table = pa.concat_tables(table_chunks)
+        rows_by_name = {}
+        for row in table.to_pylist():
+            rows_by_name.setdefault(row["embedding_name"], []).append(row)
+        self.assertEqual(set(rows_by_name), {"shared__ec", "shared__ebc"})
+        ec_rows = rows_by_name["shared__ec"]
+        self.assertEqual([row["key_id"] for row in ec_rows], [0, 2])
+        self.assertEqual(
+            [row["embedding"] for row in ec_rows],
+            ec_weight[[0, 2]].tolist(),
+        )
+        self.assertEqual(
+            {row["table_fqn"] for row in ec_rows},
+            {"model.ec_dict.2.embeddings.shared"},
+        )
+        self.assertEqual({row["feature_name"] for row in ec_rows}, {"query_feat"})
+        ebc_rows = rows_by_name["shared__ebc"]
+        self.assertEqual([row["key_id"] for row in ebc_rows], [0, 2])
+        self.assertEqual(
+            [row["embedding"] for row in ebc_rows],
+            ebc_weight[[0, 2]].tolist(),
+        )
+        self.assertEqual(
+            {row["table_fqn"] for row in ebc_rows},
+            {"model.ebc.embedding_bags.shared"},
+        )
+        self.assertEqual({row["feature_name"] for row in ebc_rows}, {"deep_feat"})
 
     def test_dump_rows_reject_processor_invalid_key_sentinel(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -1061,10 +1144,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._world_size = 2
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
         embeddings, key_ids = dumper._lookup_embeddings(
+            "model.ebc",
             "user_emb",
             torch.tensor([0, 2]),
             table_weights={
-                "user_emb": _TableWeight(
+                ("model.ebc", "user_emb"): _TableWeight(
                     tensor=weight,
                     shard_info=_TableShardInfo(
                         row_offset=32,
@@ -1086,10 +1170,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._world_size = 2
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
         embeddings, key_ids = dumper._lookup_embeddings(
+            "model.ebc",
             "user_emb",
             torch.tensor([0, 2, 99, -1]),
             table_weights={
-                "user_emb": _TableWeight(
+                ("model.ebc", "user_emb"): _TableWeight(
                     tensor=weight,
                     shard_info=_TableShardInfo(
                         row_offset=32,
@@ -1111,10 +1196,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._world_size = 2
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
         embeddings, key_ids = dumper._lookup_embeddings(
+            "model.ebc",
             "user_emb",
             torch.tensor([], dtype=torch.long),
             table_weights={
-                "user_emb": _TableWeight(
+                ("model.ebc", "user_emb"): _TableWeight(
                     tensor=weight,
                     shard_info=_TableShardInfo(
                         row_offset=32,
@@ -1136,10 +1222,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._world_size = 2
         with self.assertRaisesRegex(ValueError, "shard metadata"):
             dumper._lookup_embeddings(
+                "model.ebc",
                 "user_emb",
                 torch.tensor([0]),
                 table_weights={
-                    "user_emb": _TableWeight(
+                    ("model.ebc", "user_emb"): _TableWeight(
                         tensor=torch.zeros(4, 2),
                         shard_info=_TableShardInfo(
                             local_rows=4,

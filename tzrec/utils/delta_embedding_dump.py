@@ -42,7 +42,6 @@ from tzrec.utils.sparse_embedding_contract import (
     SparseEmbeddingIdentity,
     build_sparse_embedding_name_map,
     resolve_sparse_embedding_name,
-    sparse_embedding_role_from_state_key,
 )
 
 _CONSUMER = "delta_embedding_dump"
@@ -177,6 +176,12 @@ def _feature_name(feature_names: Iterable[str]) -> str:
     if len(names) == 1:
         return names[0]
     return ",".join(names)
+
+
+def _owner_table_fqn(module_fqn: str, identity: SparseEmbeddingIdentity) -> str:
+    """Build the state-dict style per-table FQN of one owning module."""
+    segment = "embedding_bags" if identity.role == SPARSE_EBC_ROLE else "embeddings"
+    return f"{module_fqn}.{segment}.{identity.table_name}"
 
 
 def _int_attr(value: Any, name: str) -> int:
@@ -319,9 +324,12 @@ def _local_table_weight(
             raise ValueError(
                 "delta embedding dump only supports one local shard per table."
             )
+        # The shard's own metadata is authoritative for offsets: the passed
+        # shard_info is merged by table name and may describe another module's
+        # same-named table.
         info = _merge_shard_info(
-            shard_info or _TableShardInfo(),
             _metadata_shard_info(getattr(shards[0], "metadata", None)),
+            shard_info or _TableShardInfo(),
         )
         info = _table_shard_info_from_tensor(shards[0].tensor, info)
         return _TableWeight(tensor=shards[0].tensor, shard_info=info)
@@ -334,8 +342,8 @@ def _local_table_weight(
                     "delta embedding dump only supports one local shard per table."
                 )
             info = _merge_shard_info(
-                shard_info or _TableShardInfo(),
                 _metadata_shard_info(getattr(shards[0], "metadata", None)),
+                shard_info or _TableShardInfo(),
             )
             info = _table_shard_info_from_tensor(shards[0].tensor, info)
             return _TableWeight(tensor=shards[0].tensor, shard_info=info)
@@ -410,11 +418,22 @@ class DeltaEmbeddingDumper:
         self._fqn_to_table: Dict[str, str] = {
             fqn: table for table, fqn in self._table_to_fqn.items()
         }
-        self._fqn_to_feature_names: Dict[str, List[str]] = {}
-        self._fqn_to_feature_names.update(self._tracker.fqn_to_feature_names())
-        self._fqn_to_identity, embedding_dimensions = (
+        self._identity_by_owner, embedding_dimensions = (
             self._build_sparse_embedding_contract()
         )
+        self._owners_by_table: Dict[str, List[str]] = {}
+        for module_fqn, table_name in self._identity_by_owner:
+            self._owners_by_table.setdefault(table_name, []).append(module_fqn)
+        unowned_tables = sorted(
+            table_name
+            for table_name in self._table_to_fqn
+            if table_name not in self._owners_by_table
+        )
+        if unowned_tables:
+            raise ValueError(
+                "cannot resolve owning sparse embedding collections for tracked "
+                f"tables: {unowned_tables}"
+            )
         self._uploader: Optional[FeatureStoreDeltaUploader] = None
         if self._feature_store_enabled:
             self._uploader = FeatureStoreDeltaUploader(
@@ -506,11 +525,21 @@ class DeltaEmbeddingDumper:
 
     def _build_sparse_embedding_contract(
         self,
-    ) -> Tuple[Dict[str, SparseEmbeddingIdentity], Dict[str, int]]:
-        """Build the same physical-table identity consumed by sparse export."""
-        metadata_by_identity: Dict[Tuple[str, str], Tuple[int, Tuple[str, ...]]] = {}
-        owner_by_identity: Dict[Tuple[str, str], str] = {}
-        roles_by_table: Dict[str, Set[str]] = {}
+    ) -> Tuple[Dict[Tuple[str, str], SparseEmbeddingIdentity], Dict[str, int]]:
+        """Build per-owner physical-table identities aligned with sparse export.
+
+        The TorchRec tracker collapses same-named tables from different
+        modules into one entry, so identities are keyed by
+        ``(module_fqn, table_name)`` and ``dump`` fans the tracked ids out to
+        every owner, looking values up in each owner's own weights. Canonical
+        embedding names follow the sparse-export contract: a table name reused
+        across EC and EBC gets a role suffix, so both physical tables publish
+        under distinct serving names.
+        """
+        identity_by_owner: Dict[Tuple[str, str], SparseEmbeddingIdentity] = {}
+        owner_roles: Dict[Tuple[str, str], str] = {}
+        owner_metadata: Dict[Tuple[str, str], Tuple[int, Tuple[str, ...]]] = {}
+        fqns_by_role_table: Dict[Tuple[str, str], Set[str]] = {}
         for module_fqn, module in self._tracker.get_tracked_modules().items():
             if isinstance(module, ShardedEmbeddingCollection):
                 role = SPARSE_EC_ROLE
@@ -525,81 +554,49 @@ class DeltaEmbeddingDumper:
                     dimension = self._table_shard_infos.get(
                         table_name, _TableShardInfo()
                     ).global_cols
+                if dimension <= 0:
+                    raise ValueError(
+                        f"invalid embedding dimension for table {table_name!r}: "
+                        f"{dimension}"
+                    )
                 feature_names = tuple(getattr(table_config, "feature_names", ()))
-                identity_key = (role, table_name)
-                previous_owner = owner_by_identity.get(identity_key)
-                if previous_owner is not None and previous_owner != module_fqn:
-                    raise ValueError(
-                        "delta embedding dump cannot distinguish duplicate physical "
-                        f"table identity {identity_key}: {previous_owner!r} vs "
-                        f"{module_fqn!r}"
-                    )
-                owner_by_identity[identity_key] = module_fqn
-                previous = metadata_by_identity.get(identity_key)
-                current = (dimension, feature_names)
-                if previous is not None and previous != current:
-                    raise ValueError(
-                        "inconsistent sparse embedding metadata for "
-                        f"role={role} table={table_name}: {previous} vs {current}"
-                    )
-                metadata_by_identity[identity_key] = current
-                roles_by_table.setdefault(table_name, set()).add(role)
+                owner_key = (module_fqn, table_name)
+                owner_roles[owner_key] = role
+                owner_metadata[owner_key] = (dimension, feature_names)
+                fqns_by_role_table.setdefault((role, table_name), set()).add(module_fqn)
 
-        ambiguous_tables = sorted(
-            table_name for table_name, roles in roles_by_table.items() if len(roles) > 1
-        )
-        if ambiguous_tables:
-            # The TorchRec delta tracker keys bookkeeping by raw table name, so
-            # EC/EBC sharing a name collapse to one physical table and a wrong
-            # primary key could be published. Refuse for the shared FeatureStore
-            # (corrupting); the local parquet dump is re-derivable, so it warns
-            # and publishes the surviving table until the tracker is role-aware.
-            if self._feature_store_enabled:
-                raise ValueError(
-                    "delta embedding dump cannot safely upload to FeatureStore "
-                    "while table names are reused by both EmbeddingCollection "
-                    f"and EmbeddingBagCollection: {ambiguous_tables}. The "
-                    "TorchRec tracker would publish a wrong primary key; "
-                    "role-aware tracker identity is required."
-                )
-            logger.warning(
-                "Delta embedding dump cannot distinguish tables reused by both "
-                "EmbeddingCollection and EmbeddingBagCollection (%s); the TorchRec "
-                "tracker collapses them to one physical table, so only that "
-                "table's deltas are published.",
-                ambiguous_tables,
+        if self._feature_store_enabled:
+            # Cross-role reuse gets distinct role-suffixed serving names, but
+            # two same-role physical tables sharing one table name (e.g. one
+            # embedding_name reused across data groups) would collide on one
+            # FeatureStore primary key with diverged weights.
+            duplicated = sorted(
+                f"{role}:{table_name}"
+                for (role, table_name), fqns in fqns_by_role_table.items()
+                if len(fqns) > 1
             )
+            if duplicated:
+                raise ValueError(
+                    "FeatureStore delta upload cannot address multiple physical "
+                    "tables that share one (role, table_name) serving identity: "
+                    f"{duplicated}. Give the tables distinct embedding_names."
+                )
 
-        name_by_identity = build_sparse_embedding_name_map(metadata_by_identity)
-        identity_by_fqn: Dict[str, SparseEmbeddingIdentity] = {}
+        name_by_identity = build_sparse_embedding_name_map(fqns_by_role_table.keys())
         embedding_dimensions: Dict[str, int] = {}
-        for table_name, fqn in self._table_to_fqn.items():
-            role = sparse_embedding_role_from_state_key(fqn)
-            if role is None:
-                roles = roles_by_table.get(table_name, set())
-                if len(roles) == 1:
-                    role = next(iter(roles))
-            if role is None or (role, table_name) not in metadata_by_identity:
-                raise ValueError(
-                    "cannot resolve sparse embedding collection role for "
-                    f"table={table_name!r}, fqn={fqn!r}"
-                )
-            dimension, feature_names = metadata_by_identity[(role, table_name)]
-            if dimension <= 0:
-                raise ValueError(
-                    f"invalid embedding dimension for table {table_name!r}: {dimension}"
-                )
+        for owner_key, role in owner_roles.items():
+            module_fqn, table_name = owner_key
+            dimension, feature_names = owner_metadata[owner_key]
             embedding_name = resolve_sparse_embedding_name(
                 name_by_identity, table_name, role
             )
-            identity = SparseEmbeddingIdentity(
+            identity_by_owner[owner_key] = SparseEmbeddingIdentity(
                 role=role,
                 table_name=table_name,
                 embedding_name=embedding_name,
                 dimension=dimension,
                 feature_names=feature_names,
             )
-            identity_by_fqn[fqn] = identity
             previous_dimension = embedding_dimensions.get(embedding_name)
             if previous_dimension is not None and previous_dimension != dimension:
                 raise ValueError(
@@ -607,7 +604,7 @@ class DeltaEmbeddingDumper:
                     f"dimensions: {previous_dimension} vs {dimension}"
                 )
             embedding_dimensions[embedding_name] = dimension
-        return identity_by_fqn, embedding_dimensions
+        return identity_by_owner, embedding_dimensions
 
     def _tracker_cursor_before_read(self) -> Optional[int]:
         if not self._feature_store_enabled:
@@ -875,8 +872,8 @@ class DeltaEmbeddingDumper:
         self,
         table_chunks: List[pa.Table],
         global_step: int,
-        table_weights: Dict[str, _TableWeight],
-        dynamic_modules: Dict[str, nn.Module],
+        table_weights: Dict[Tuple[str, str], _TableWeight],
+        dynamic_modules: Dict[Tuple[str, str], nn.Module],
     ) -> int:
         num_rows = 0
         # A dynamic module hosting multiple tables is shared across their
@@ -891,49 +888,60 @@ class DeltaEmbeddingDumper:
             if table_name is None:
                 logger.warning("Skip delta rows for unknown table fqn: %s", fqn)
                 continue
-            identity = self._fqn_to_identity.get(fqn)
-            if identity is None:
+            owners = self._owners_by_table.get(table_name)
+            if not owners:
                 raise ValueError(
-                    f"Missing sparse embedding contract for table fqn {fqn!r}"
+                    f"Missing sparse embedding contract for table {table_name!r}"
                 )
             ids = ids.unique(sorted=True)
-            embeddings, key_ids = self._lookup_embeddings(
-                table_name,
-                ids,
-                table_weights=table_weights,
-                dynamic_modules=dynamic_modules,
-                flushed_module_ids=flushed_module_ids,
-            )
-            feature_name = _feature_name(self._fqn_to_feature_names.get(fqn, []))
-            num_rows += self._append_table_chunk(
-                table_chunks,
-                global_step=global_step,
-                embedding_name=identity.embedding_name,
-                embedding_role=identity.role,
-                expected_dimension=identity.dimension,
-                feature_name=feature_name,
-                table_fqn=fqn,
-                key_ids=key_ids,
-                embeddings=embeddings,
-            )
+            # The tracker merges same-named tables into one id set; fan it out
+            # to every owning module and read each owner's own weights, so an
+            # id that only one owner touched still publishes that owner's true
+            # current row for the others.
+            for module_fqn in owners:
+                identity = self._identity_by_owner[(module_fqn, table_name)]
+                embeddings, key_ids = self._lookup_embeddings(
+                    module_fqn,
+                    table_name,
+                    ids,
+                    table_weights=table_weights,
+                    dynamic_modules=dynamic_modules,
+                    flushed_module_ids=flushed_module_ids,
+                )
+                num_rows += self._append_table_chunk(
+                    table_chunks,
+                    global_step=global_step,
+                    embedding_name=identity.embedding_name,
+                    embedding_role=identity.role,
+                    expected_dimension=identity.dimension,
+                    feature_name=_feature_name(identity.feature_names),
+                    table_fqn=_owner_table_fqn(module_fqn, identity),
+                    key_ids=key_ids,
+                    embeddings=embeddings,
+                )
         return num_rows
 
     def _lookup_embeddings(
         self,
+        module_fqn: str,
         table_name: str,
         ids: torch.Tensor,
-        table_weights: Dict[str, _TableWeight],
-        dynamic_modules: Dict[str, nn.Module],
+        table_weights: Dict[Tuple[str, str], _TableWeight],
+        dynamic_modules: Dict[Tuple[str, str], nn.Module],
         flushed_module_ids: Optional[Set[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        dynamic_module = dynamic_modules.get(table_name)
+        owner_key = (module_fqn, table_name)
+        dynamic_module = dynamic_modules.get(owner_key)
         if dynamic_module is not None:
             return self._lookup_dynamic_embeddings(
                 dynamic_module, table_name, ids, flushed_module_ids
             )
-        if table_name not in table_weights:
-            raise KeyError(f"Embedding table {table_name} not found in sharded model.")
-        table_weight = table_weights[table_name]
+        if owner_key not in table_weights:
+            raise KeyError(
+                f"Embedding table {table_name} not found in sharded module "
+                f"{module_fqn}."
+            )
+        table_weight = table_weights[owner_key]
         _validate_table_shard_info(table_name, table_weight.shard_info)
         self._validate_row_shard_metadata(table_name, table_weight.shard_info)
         weight = table_weight.tensor
@@ -1063,10 +1071,10 @@ class DeltaEmbeddingDumper:
                 "TorchRec shard metadata is missing."
             )
 
-    def _collect_table_weights(self) -> Dict[str, _TableWeight]:
-        table_weights: Dict[str, _TableWeight] = {}
+    def _collect_table_weights(self) -> Dict[Tuple[str, str], _TableWeight]:
+        table_weights: Dict[Tuple[str, str], _TableWeight] = {}
         table_shard_infos = self._table_shard_infos
-        for module in self._model.modules():
+        for module_fqn, module in self._tracker.get_tracked_modules().items():
             lookups = getattr(module, "_lookups", None)
             if lookups is None:
                 continue
@@ -1078,25 +1086,22 @@ class DeltaEmbeddingDumper:
                 if named_parameters_by_table is None:
                     continue
                 for table_name, table_value in named_parameters_by_table():
-                    table_weights[table_name] = _local_table_weight(
+                    table_weights[(module_fqn, table_name)] = _local_table_weight(
                         table_value,
                         table_shard_infos.get(table_name),
                     )
         return table_weights
 
-    def _collect_dynamic_modules(self) -> Dict[str, nn.Module]:
+    def _collect_dynamic_modules(self) -> Dict[Tuple[str, str], nn.Module]:
         try:
             from dynamicemb.dump_load import get_dynamic_emb_module
         except ImportError:
             return {}
-        modules: Dict[str, nn.Module] = {}
-        seen = set()
-        for dynamic_module in get_dynamic_emb_module(self._model):
-            if id(dynamic_module) in seen:
-                continue
-            seen.add(id(dynamic_module))
-            for table_name in dynamic_module.table_names:
-                modules[table_name] = dynamic_module
+        modules: Dict[Tuple[str, str], nn.Module] = {}
+        for module_fqn, module in self._tracker.get_tracked_modules().items():
+            for dynamic_module in get_dynamic_emb_module(module):
+                for table_name in dynamic_module.table_names:
+                    modules[(module_fqn, table_name)] = dynamic_module
         return modules
 
     def _append_table_chunk(

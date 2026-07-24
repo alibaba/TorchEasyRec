@@ -94,12 +94,3 @@ def resolve_sparse_embedding_name(
         f"sparse embedding {table_name!r} appears in multiple collection kinds; "
         f"cannot resolve canonical name without role, got role={role!r}"
     )
-
-
-def sparse_embedding_role_from_state_key(state_key: str) -> Optional[str]:
-    """Infer the sparse collection role from a TorchRec state/table FQN."""
-    if ".embedding_bags." in state_key:
-        return SPARSE_EBC_ROLE
-    if ".embeddings." in state_key:
-        return SPARSE_EC_ROLE
-    return None

@@ -14,7 +14,6 @@ import unittest
 from tzrec.utils.sparse_embedding_contract import (
     build_sparse_embedding_name_map,
     resolve_sparse_embedding_name,
-    sparse_embedding_role_from_state_key,
 )
 
 
@@ -45,21 +44,6 @@ class SparseEmbeddingContractTest(unittest.TestCase):
         self.assertEqual(
             resolve_sparse_embedding_name(names, "shared", "ec"), "shared__ec"
         )
-
-    def test_state_key_role(self):
-        self.assertEqual(
-            sparse_embedding_role_from_state_key(
-                "model.ebc.embedding_bags.user_emb.weight"
-            ),
-            "ebc",
-        )
-        self.assertEqual(
-            sparse_embedding_role_from_state_key(
-                "model.ec.embeddings.sequence_emb.weight"
-            ),
-            "ec",
-        )
-        self.assertIsNone(sparse_embedding_role_from_state_key("model.unknown.weight"))
 
 
 if __name__ == "__main__":
