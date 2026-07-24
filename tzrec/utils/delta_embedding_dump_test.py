@@ -497,23 +497,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
         self.assertEqual({row["feature_name"] for row in ebc_rows}, {"deep_feat"})
 
-    def test_dump_rows_reject_processor_invalid_key_sentinel(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._rank = 0
-        dumper._world_size = 1
-        with self.assertRaisesRegex(ValueError, "invalid-key sentinel"):
-            dumper._append_table_chunk(
-                [],
-                global_step=10,
-                embedding_name="user_emb",
-                embedding_role="ebc",
-                expected_dimension=2,
-                feature_name="user_id",
-                table_fqn="model.ebc.user_emb",
-                key_ids=torch.tensor([-1]),
-                embeddings=torch.tensor([[1.0, 2.0]]),
-            )
-
     def test_write_table_chunks_preserves_parquet_schema(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 0

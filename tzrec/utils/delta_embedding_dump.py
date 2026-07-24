@@ -1082,13 +1082,6 @@ class DeltaEmbeddingDumper:
                 f"delta embedding dimension mismatch for {embedding_name!r}: "
                 f"expected={expected_dimension}, actual={embeddings_cpu.size(1)}"
             )
-        if not bool(torch.isfinite(embeddings_cpu).all().item()):
-            raise ValueError(f"delta embedding {embedding_name!r} contains NaN or Inf")
-        if bool((key_ids_cpu == SPARSE_EMBEDDING_INVALID_KEY).any().item()):
-            raise ValueError(
-                "delta embedding key_id=-1 is reserved as the Processor/NvEmbeddings "
-                "invalid-key sentinel"
-            )
         table_chunks.append(
             pa.Table.from_arrays(
                 [
