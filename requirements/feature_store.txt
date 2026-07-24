@@ -1,1 +1,0 @@
-feature_store_py @ https://gecheng-rec.oss-accelerate-overseas.aliyuncs.com/software/feature_store_py-2.2.7-py3-none-any.whl

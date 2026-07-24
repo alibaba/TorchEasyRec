@@ -342,7 +342,7 @@ def create_feature_store_view(settings: FeatureStoreUploadSettings) -> Any:
         from feature_store_py import FeatureStoreClient
     except ImportError as exc:
         raise RuntimeError(
-            "feature_store_py is required; install requirements/feature_store.txt"
+            "feature_store_py is required; install requirements/runtime.txt"
         ) from exc
 
     try:
