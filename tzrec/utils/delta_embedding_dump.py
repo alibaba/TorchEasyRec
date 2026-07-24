@@ -462,6 +462,18 @@ class DeltaEmbeddingDumper:
         """Clear tracked sparse ids, usually after restore-time dummy steps."""
         self._tracker.clear()
 
+    @property
+    def requires_synced_dataloader_exhaustion(self) -> bool:
+        """Return whether input exhaustion must stay aligned across ranks.
+
+        Multi-rank dumps of either cadence need every rank to reach the same
+        final step. ``final_dump`` skips steps already written on their dump
+        boundary, and a rank that stops before the synced MAX step never ran
+        that boundary's ``maybe_dump``, so an unsynced stop would make it
+        adopt the boundary skip and silently drop its trailing tracked rows.
+        """
+        return self._world_size > 1
+
     def start(self) -> None:
         """Start timed cadence and per-rank FeatureStore publication.
 

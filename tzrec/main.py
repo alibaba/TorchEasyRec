@@ -469,11 +469,22 @@ def _train_and_evaluate(
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
+    require_equal_train_batches = (
+        delta_embedding_dumper is not None
+        and delta_embedding_dumper.requires_synced_dataloader_exhaustion
+    )
+    sync_train_data_exhaustion = (
+        check_all_workers_data_status or require_equal_train_batches
+    )
     for i_epoch in epoch_iter:
+        # Multi-rank dumps synchronize their per-step state, so uneven workers
+        # must fail together instead of silently dropping a lagging rank's
+        # trailing delta rows or leaving collectives.
         pipeline = create_train_pipeline(
             model,
             optimizer,
-            check_all_workers_data_status=check_all_workers_data_status,
+            check_all_workers_data_status=sync_train_data_exhaustion,
+            fail_on_uneven_data=require_equal_train_batches,
         )
         if plogger is not None:
             plogger.set_description(f"Training Epoch {i_epoch}")
@@ -575,11 +586,10 @@ def _train_and_evaluate(
     _model.on_train_end()
     if delta_embedding_dumper is not None:
         # Flush the trailing partial interval before the final checkpoint.
-        # final_dump skips dump-boundary steps already written by maybe_dump,
-        # so it never overwrites their shards with an empty file. Ranks can
-        # reach here at different i_step (independent dataloader exhaustion with
-        # check_all_workers_data_status=False), so final_dump all-reduces the
-        # step across ranks to keep one complete shard set per step dir.
+        # final_dump skips dump-boundary steps already written by maybe_dump
+        # (multi-rank dumps force synced exhaustion, so every rank participated
+        # in those dumps); the MAX all-reduce in final_dump keeps one complete
+        # shard set per step dir as a defensive guard.
         delta_embedding_dumper.final_dump(i_step)
 
     _log_train(

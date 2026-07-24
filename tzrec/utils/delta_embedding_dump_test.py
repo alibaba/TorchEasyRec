@@ -227,7 +227,7 @@ def _run_uneven_exhaustion_rejection(rank: int, world_size: int, output_dir: str
     # uneven stop must fail loudly on every rank instead.
     with MultiProcessContext(rank=rank, world_size=world_size, backend="nccl") as ctx:
         model = _build_sharded_delta_dump_model(rank, world_size, ctx)
-        DeltaEmbeddingDumper(
+        dumper = DeltaEmbeddingDumper(
             model,
             DeltaEmbeddingDumpConfig(dump_interval_steps=50, output_dir=output_dir),
             output_dir,
@@ -235,9 +235,11 @@ def _run_uneven_exhaustion_rejection(rank: int, world_size: int, output_dir: str
             [],
         )
         testcase = unittest.TestCase()
+        testcase.assertTrue(dumper.requires_synced_dataloader_exhaustion)
         pipeline = create_train_pipeline(
             model,
-            check_all_workers_data_status=True,
+            check_all_workers_data_status=dumper.requires_synced_dataloader_exhaustion,
+            fail_on_uneven_data=dumper.requires_synced_dataloader_exhaustion,
         )
         # Rank 0's 50th fetch returns None while rank 1 still has batch 50; the
         # pipeline's collective data-status check must raise on both ranks.
@@ -844,6 +846,33 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         self.assertIsNone(dumper._interval_steps)
         self.assertEqual(dumper._interval_secs, 120.0)
+
+    def test_multi_rank_minutes_requires_synced_dataloader_exhaustion(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval_secs = 60.0
+        dumper._world_size = 2
+
+        self.assertTrue(dumper.requires_synced_dataloader_exhaustion)
+
+    def test_multi_rank_step_interval_requires_synced_dataloader_exhaustion(self):
+        # Regression: with ranks finishing at steps 49 and 50, final_dump synced
+        # both to the boundary 50, both took the boundary-step skip, and the
+        # rank that never ran maybe_dump(50) silently dropped its trailing
+        # tracked rows. Every multi-rank cadence must keep exhaustion aligned
+        # so all ranks participate in every boundary dump.
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval_secs = None
+        dumper._interval_steps = 50
+        dumper._world_size = 2
+
+        self.assertTrue(dumper.requires_synced_dataloader_exhaustion)
+
+    def test_single_rank_minutes_does_not_require_synced_dataloader_exhaustion(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval_secs = 60.0
+        dumper._world_size = 1
+
+        self.assertFalse(dumper.requires_synced_dataloader_exhaustion)
 
     def test_dump_does_not_ack_tracker_when_submission_is_rejected(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
