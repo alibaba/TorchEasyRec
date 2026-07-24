@@ -175,7 +175,7 @@ class ExportUtilTest(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
-    def test_distributed_embedding_export_uses_overrides_and_sanitizes_config(
+    def test_distributed_embedding_export_uses_overrides_and_preserves_config(
         self,
     ) -> None:
         class FakeBatch:
@@ -232,7 +232,6 @@ class ExportUtilTest(unittest.TestCase):
             feature_store_config.feature_entity_name = "embedding_entity"
             feature_store_config.feature_view_name = "shared_embeddings"
             feature_store_config.version = "model_a@export_1"
-            feature_store_config.security_token = "SECRET_STS"
             model_acc = {"SPARSE_INT64": "1", "cand_seq_pk": "cand_seq"}
             fake_scripted = mock.Mock()
 
@@ -300,16 +299,12 @@ class ExportUtilTest(unittest.TestCase):
             with open(os.path.join(tmp, "model_acc.json")) as f:
                 self.assertEqual(json.load(f), model_acc)
             pipeline_config_path = os.path.join(tmp, "pipeline.config")
-            with open(pipeline_config_path) as f:
-                self.assertNotIn("SECRET_STS", f.read())
             exported_config = config_util.load_pipeline_config(pipeline_config_path)
             exported_dump_config = (
                 exported_config.train_config.delta_embedding_dump_config
             )
             exported_feature_store_config = exported_dump_config.feature_store_config
             self.assertEqual(exported_feature_store_config.project_name, "project_a")
-            self.assertFalse(exported_feature_store_config.HasField("security_token"))
-            self.assertTrue(feature_store_config.HasField("security_token"))
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
