@@ -348,7 +348,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         )
         self.assertEqual(
             [field.number for field in fields],
-            [1, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
+            list(range(1, 18)),
         )
         for field_name in required_fields:
             with self.subTest(field_name=field_name):
