@@ -77,6 +77,12 @@ from tzrec.utils.fx_util import (
 )
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
+from tzrec.utils.sparse_embedding_contract import (
+    SPARSE_EBC_ROLE,
+    SPARSE_EC_ROLE,
+    build_sparse_embedding_name_map,
+    resolve_sparse_embedding_name,
+)
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 
 
@@ -1744,10 +1750,6 @@ def _get_sparse_feature_to_embedding_info(
     return feature_to_embedding_bag_info, feature_to_embedding_info
 
 
-_SPARSE_EC_ROLE = "ec"
-_SPARSE_EBC_ROLE = "ebc"
-
-
 def _build_sparse_export_name_map(
     embedding_infos: List[BaseEmbeddingConfig],
     embedding_bag_info: List[BaseEmbeddingConfig],
@@ -1759,38 +1761,20 @@ def _build_sparse_export_name_map(
     but those are still distinct checkpoint tensors. Keep the historical name
     unless it appears in multiple sparse collection kinds; then suffix the
     exported table name so serving can address the correct physical table.
+
+    The naming algorithm is shared with delta dump via
+    ``sparse_embedding_contract`` so export and serving stay aligned.
     """
-    roles_by_name = defaultdict(set)
-    for emb_info in embedding_infos:
-        roles_by_name[emb_info.name].add(_SPARSE_EC_ROLE)
-    for emb_info in embedding_bag_info:
-        roles_by_name[emb_info.name].add(_SPARSE_EBC_ROLE)
-
-    used_names = set(roles_by_name.keys())
-    export_name_by_role: Dict[Tuple[str, str], str] = {}
-    for emb_name, roles in roles_by_name.items():
-        if len(roles) == 1:
-            role = next(iter(roles))
-            export_name_by_role[(role, emb_name)] = emb_name
-            continue
-
-        for role in sorted(roles):
-            base_candidate = f"{emb_name}__{role}"
-            candidate = base_candidate
-            suffix = 1
-            while candidate in used_names:
-                candidate = f"{base_candidate}_{suffix}"
-                suffix += 1
-            used_names.add(candidate)
-            export_name_by_role[(role, emb_name)] = candidate
-    return export_name_by_role
+    role_table_pairs = [(SPARSE_EC_ROLE, e.name) for e in embedding_infos]
+    role_table_pairs += [(SPARSE_EBC_ROLE, e.name) for e in embedding_bag_info]
+    return build_sparse_embedding_name_map(role_table_pairs)
 
 
 def _sparse_export_role_from_state_key(state_key: str) -> Optional[str]:
     if ".embedding_bags." in state_key:
-        return _SPARSE_EBC_ROLE
+        return SPARSE_EBC_ROLE
     if ".embeddings." in state_key:
-        return _SPARSE_EC_ROLE
+        return SPARSE_EC_ROLE
     return None
 
 
@@ -1802,33 +1786,10 @@ def _sparse_export_role_from_dynamic_path(path: str) -> Optional[str]:
         or ".mc_ec" in parent
         or ".ec." in parent
     ):
-        return _SPARSE_EC_ROLE
+        return SPARSE_EC_ROLE
     if ".ebc" in parent or ".mc_ebc" in parent:
-        return _SPARSE_EBC_ROLE
+        return SPARSE_EBC_ROLE
     return None
-
-
-def _resolve_sparse_export_name(
-    export_name_by_role: Dict[Tuple[str, str], str],
-    emb_name: str,
-    role: Optional[str],
-) -> str:
-    if role is not None and (role, emb_name) in export_name_by_role:
-        return export_name_by_role[(role, emb_name)]
-
-    candidates = [
-        export_name
-        for (_role, name), export_name in export_name_by_role.items()
-        if name == emb_name
-    ]
-    if len(candidates) == 1:
-        return candidates[0]
-    if not candidates:
-        raise KeyError(f"sparse embedding {emb_name} is not in export metadata")
-    raise ValueError(
-        f"sparse embedding {emb_name} appears in multiple sparse collection "
-        f"kinds; cannot resolve export name without role, got role={role}"
-    )
 
 
 def _remove_torch_prefix(src: str) -> str:
@@ -1917,8 +1878,8 @@ def _get_sparse_embedding_tensor(
     )
 
     for emb_info in embedding_infos:
-        export_emb_name = _resolve_sparse_export_name(
-            export_name_by_role, emb_info.name, _SPARSE_EC_ROLE
+        export_emb_name = resolve_sparse_embedding_name(
+            export_name_by_role, emb_info.name, SPARSE_EC_ROLE
         )
         emb_name_to_emb_dim[export_emb_name] = emb_info.embedding_dim
         emb_name_to_feat_name_impl[export_emb_name] = []
@@ -1933,8 +1894,8 @@ def _get_sparse_embedding_tensor(
             else:
                 feat_name_to_pooling[feat_name_impl] = "NONE"
     for emb_info in embedding_bag_info:
-        export_emb_name = _resolve_sparse_export_name(
-            export_name_by_role, emb_info.name, _SPARSE_EBC_ROLE
+        export_emb_name = resolve_sparse_embedding_name(
+            export_name_by_role, emb_info.name, SPARSE_EBC_ROLE
         )
         emb_name_to_emb_dim[export_emb_name] = emb_info.embedding_dim
         emb_name_to_feat_name_impl[export_emb_name] = []
@@ -1966,7 +1927,7 @@ def _get_sparse_embedding_tensor(
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     for name, values in model.state_dict().items():
         emb_name = name.split(".")[-2]
-        export_emb_name = _resolve_sparse_export_name(
+        export_emb_name = resolve_sparse_embedding_name(
             export_name_by_role,
             emb_name,
             _sparse_export_role_from_state_key(name),
@@ -2020,7 +1981,7 @@ def _get_sparse_embedding_tensor(
             if not match:
                 continue
             emb_name = match.group("emb_name")
-            export_emb_name = _resolve_sparse_export_name(
+            export_emb_name = resolve_sparse_embedding_name(
                 export_name_by_role,
                 emb_name,
                 _sparse_export_role_from_dynamic_path(key_file),
