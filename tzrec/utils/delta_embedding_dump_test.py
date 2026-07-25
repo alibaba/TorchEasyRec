@@ -381,6 +381,24 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "column-wise"):
             _validate_table_shard_info("user_emb", shard_info)
 
+    def test_table_shard_info_from_config_without_local_dims(self):
+        # A non-sharded table config (e.g. EmbeddingBagConfig from
+        # _table_name_to_config) carries no local_rows/local_cols/
+        # local_metadata; the shard info must fall back to global dims only
+        # and leave local dims at zero for the tensor/sharding-plan paths.
+        table_config = EmbeddingBagConfig(
+            num_embeddings=64,
+            embedding_dim=8,
+            name="user_emb",
+            feature_names=[_SHARDED_FEATURE_NAME],
+        )
+        shard_info = _table_shard_info_from_config(table_config)
+        self.assertEqual(shard_info.local_rows, 0)
+        self.assertEqual(shard_info.local_cols, 0)
+        self.assertEqual(shard_info.global_rows, 64)
+        self.assertEqual(shard_info.global_cols, 8)
+        self.assertFalse(shard_info.has_shard_metadata)
+
     def test_dump_rows_include_rank_metadata(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 1
@@ -983,6 +1001,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._tracking_pause_depth = 0
+        dumper._guarded_tracking_modules = set()
         dumper._tracker = SimpleNamespace(
             get_tracked_modules=lambda: {"user_emb": sharded_module}
         )
@@ -1014,8 +1033,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         original_config_module = torch.nn.Module()
         original_config_module._table_name_to_config = {
             "user_emb": SimpleNamespace(
-                local_rows=16,
-                local_cols=8,
                 num_embeddings=64,
                 embedding_dim=8,
             )
@@ -1048,8 +1065,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         sharded_module = torch.nn.Module()
         sharded_module._table_name_to_config = {
             "adgroup_id_emb": SimpleNamespace(
-                local_rows=16,
-                local_cols=8,
                 num_embeddings=64,
                 embedding_dim=8,
             )

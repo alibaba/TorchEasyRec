@@ -131,14 +131,9 @@ def validate_delta_embedding_dump_config(
 
 
 def _has_proto_field(config: Any, field_name: str) -> bool:
-    descriptor = getattr(config, "DESCRIPTOR", None)
-    if descriptor is None or field_name not in descriptor.fields_by_name:
-        return False
-    return config.HasField(field_name)
-
-
-def _feature_config_name(config: Any) -> str:
-    return getattr(config, "feature_name", "")
+    return field_name in config.DESCRIPTOR.fields_by_name and config.HasField(
+        field_name
+    )
 
 
 def _zch_feature_names(feature_configs: Iterable[Any]) -> Set[str]:
@@ -147,10 +142,10 @@ def _zch_feature_names(feature_configs: Iterable[Any]) -> Set[str]:
         feature_type = feature_config.WhichOneof("feature")
         if feature_type is None:
             continue
+        # getattr is the idiomatic way to access a proto oneof field by name.
         config = getattr(feature_config, feature_type)
         if _has_proto_field(config, "zch"):
-            feature_name = _feature_config_name(config) or feature_type
-            zch_feature_names.add(feature_name)
+            zch_feature_names.add(config.feature_name or feature_type)
     return zch_feature_names
 
 
@@ -184,16 +179,11 @@ def _owner_table_fqn(module_fqn: str, identity: SparseEmbeddingIdentity) -> str:
     return f"{module_fqn}.{segment}.{identity.table_name}"
 
 
-def _int_attr(value: Any, name: str) -> int:
-    attr = getattr(value, name, 0)
-    return int(attr) if attr is not None else 0
-
-
 def _metadata_shard_info(metadata: Any) -> _TableShardInfo:
     if metadata is None or not hasattr(metadata, "shard_offsets"):
         return _TableShardInfo()
-    offsets = getattr(metadata, "shard_offsets", [])
-    sizes = getattr(metadata, "shard_sizes", [])
+    offsets = metadata.shard_offsets
+    sizes = metadata.shard_sizes
     return _TableShardInfo(
         row_offset=int(offsets[0]) if len(offsets) > 0 else 0,
         column_offset=int(offsets[1]) if len(offsets) > 1 else 0,
@@ -206,7 +196,7 @@ def _metadata_shard_info(metadata: Any) -> _TableShardInfo:
 def _placement_rank(placement: Any) -> Optional[int]:
     if placement is None:
         return None
-    rank_fn = getattr(placement, "rank", None)
+    rank_fn = placement.rank if hasattr(placement, "rank") else None
     if callable(rank_fn):
         rank = rank_fn()
         if rank is not None:
@@ -220,14 +210,16 @@ def _placement_rank(placement: Any) -> Optional[int]:
 def _table_shard_info_from_parameter_sharding(
     parameter_sharding: Any, rank: int
 ) -> _TableShardInfo:
-    sharding_spec = getattr(parameter_sharding, "sharding_spec", None)
-    shards = getattr(sharding_spec, "shards", None)
+    sharding_spec = parameter_sharding.sharding_spec
+    if not hasattr(sharding_spec, "shards"):
+        return _TableShardInfo()
+    shards = sharding_spec.shards
     if not shards:
         return _TableShardInfo()
 
-    ranks = getattr(parameter_sharding, "ranks", None)
+    ranks = parameter_sharding.ranks
     for idx, shard in enumerate(shards):
-        placement_rank = _placement_rank(getattr(shard, "placement", None))
+        placement_rank = _placement_rank(shard.placement)
         if placement_rank == rank:
             return _metadata_shard_info(shard)
         if ranks is not None and idx < len(ranks) and ranks[idx] == rank:
@@ -256,13 +248,18 @@ def _merge_shard_info(
 
 
 def _table_shard_info_from_config(table_config: Any) -> _TableShardInfo:
-    metadata_info = _metadata_shard_info(getattr(table_config, "local_metadata", None))
+    if not hasattr(table_config, "local_rows"):
+        return _TableShardInfo(
+            global_rows=int(table_config.num_embeddings),
+            global_cols=int(table_config.embedding_dim),
+        )
     config_info = _TableShardInfo(
-        local_rows=_int_attr(table_config, "local_rows"),
-        local_cols=_int_attr(table_config, "local_cols"),
-        global_rows=_int_attr(table_config, "num_embeddings"),
-        global_cols=_int_attr(table_config, "embedding_dim"),
+        local_rows=int(table_config.local_rows),
+        local_cols=int(table_config.local_cols),
+        global_rows=int(table_config.num_embeddings),
+        global_cols=int(table_config.embedding_dim),
     )
+    metadata_info = _metadata_shard_info(table_config.local_metadata)
     return _merge_shard_info(config_info, metadata_info)
 
 
@@ -328,7 +325,7 @@ def _local_table_weight(
         # shard_info is merged by table name and may describe another module's
         # same-named table.
         info = _merge_shard_info(
-            _metadata_shard_info(getattr(shards[0], "metadata", None)),
+            _metadata_shard_info(shards[0].metadata),
             shard_info or _TableShardInfo(),
         )
         info = _table_shard_info_from_tensor(shards[0].tensor, info)
@@ -342,7 +339,7 @@ def _local_table_weight(
                     "delta embedding dump only supports one local shard per table."
                 )
             info = _merge_shard_info(
-                _metadata_shard_info(getattr(shards[0], "metadata", None)),
+                _metadata_shard_info(shards[0].metadata),
                 shard_info or _TableShardInfo(),
             )
             info = _table_shard_info_from_tensor(shards[0].tensor, info)
@@ -394,6 +391,7 @@ class DeltaEmbeddingDumper:
         self._file_prefix = config.file_prefix or "delta_embedding"
         self._rank, self._world_size = _distributed_rank_world_size()
         self._tracking_pause_depth = 0
+        self._guarded_tracking_modules: Set[int] = set()
         self._feature_store_enabled = config.HasField("feature_store_config")
         self._retain_local_dump = self._feature_store_enabled and bool(
             config.feature_store_config.retain_local_dump
@@ -554,9 +552,9 @@ class DeltaEmbeddingDumper:
                 role = SPARSE_EBC_ROLE
             else:
                 continue
-            table_name_to_config = getattr(module, "_table_name_to_config", {})
+            table_name_to_config = module._table_name_to_config
             for table_name, table_config in table_name_to_config.items():
-                dimension = _int_attr(table_config, "embedding_dim")
+                dimension = int(table_config.embedding_dim)
                 if dimension <= 0:
                     dimension = self._table_shard_infos.get(
                         table_name, _TableShardInfo()
@@ -566,7 +564,7 @@ class DeltaEmbeddingDumper:
                         f"invalid embedding dimension for table {table_name!r}: "
                         f"{dimension}"
                     )
-                feature_names = tuple(getattr(table_config, "feature_names", ()))
+                feature_names = tuple(table_config.feature_names)
                 owner_key = (module_fqn, table_name)
                 owner_roles[owner_key] = role
                 owner_metadata[owner_key] = (dimension, feature_names)
@@ -794,23 +792,30 @@ class DeltaEmbeddingDumper:
         )
 
     def _install_tracking_pause_guard(self) -> None:
-        guarded_modules = getattr(self, "_guarded_tracking_modules", set())
+        guarded_modules = self._guarded_tracking_modules
         for module in self._tracker.get_tracked_modules().values():
             if id(module) in guarded_modules:
                 continue
             has_tracker_fn = False
-            post_lookup_fn = getattr(module, "post_lookup_tracker_fn", None)
+            post_lookup_fn = (
+                module.post_lookup_tracker_fn
+                if hasattr(module, "post_lookup_tracker_fn")
+                else None
+            )
             if post_lookup_fn is not None:
                 module.post_lookup_tracker_fn = self._wrap_tracker_fn(post_lookup_fn)
                 has_tracker_fn = True
-            post_odist_fn = getattr(module, "post_odist_tracker_fn", None)
+            post_odist_fn = (
+                module.post_odist_tracker_fn
+                if hasattr(module, "post_odist_tracker_fn")
+                else None
+            )
             if post_odist_fn is not None:
                 module.post_odist_tracker_fn = self._wrap_tracker_fn(post_odist_fn)
                 has_tracker_fn = True
             if not has_tracker_fn:
                 continue
             guarded_modules.add(id(module))
-        self._guarded_tracking_modules = guarded_modules
 
     def _wrap_tracker_fn(self, tracker_fn: Callable[..., Any]) -> Callable[..., Any]:
         def guarded_tracker_fn(*args: Any, **kwargs: Any) -> Any:
@@ -965,25 +970,23 @@ class DeltaEmbeddingDumper:
     def _collect_table_shard_infos(self) -> Dict[str, _TableShardInfo]:
         table_shard_infos: Dict[str, _TableShardInfo] = {}
         for module in self._model.modules():
-            table_name_to_config = getattr(module, "_table_name_to_config", None)
-            if table_name_to_config is not None:
-                for table_name, table_config in table_name_to_config.items():
+            if hasattr(module, "_table_name_to_config"):
+                for table_name, table_config in module._table_name_to_config.items():
                     table_shard_infos[table_name] = _merge_table_shard_info(
                         table_shard_infos.get(table_name),
                         _table_shard_info_from_config(table_config),
                     )
             for table_config in self._grouped_embedding_table_configs(module):
-                table_name = getattr(table_config, "name", "")
+                table_name = table_config.name
                 if not table_name:
                     continue
                 table_shard_infos[table_name] = _merge_table_shard_info(
                     table_shard_infos.get(table_name),
                     _table_shard_info_from_config(table_config),
                 )
-            module_sharding_plan = getattr(module, "module_sharding_plan", None)
-            if module_sharding_plan is None:
+            if not hasattr(module, "module_sharding_plan"):
                 continue
-            for table_name, parameter_sharding in module_sharding_plan.items():
+            for table_name, parameter_sharding in module.module_sharding_plan.items():
                 table_shard_infos[table_name] = _merge_table_shard_info(
                     table_shard_infos.get(table_name),
                     _table_shard_info_from_parameter_sharding(
@@ -993,19 +996,19 @@ class DeltaEmbeddingDumper:
         return table_shard_infos
 
     def _grouped_embedding_table_configs(self, module: nn.Module) -> Iterable[Any]:
+        module_config = module.config if hasattr(module, "config") else None
         grouped_configs = []
-        module_config = getattr(module, "config", None)
         if module_config is not None:
             grouped_configs.append(module_config)
-        private_config = getattr(module, "_config", None)
-        if private_config is not None and private_config is not module_config:
-            grouped_configs.append(private_config)
+        if hasattr(module, "_config"):
+            private_config = module._config
+            if private_config is not module_config:
+                grouped_configs.append(private_config)
 
         for grouped_config in grouped_configs:
-            embedding_tables = getattr(grouped_config, "embedding_tables", None)
-            if embedding_tables is None:
+            if not hasattr(grouped_config, "embedding_tables"):
                 continue
-            yield from embedding_tables
+            yield from grouped_config.embedding_tables
 
     def _validate_supported_table_sharding(
         self, table_shard_infos: Dict[str, _TableShardInfo]
@@ -1033,17 +1036,13 @@ class DeltaEmbeddingDumper:
         table_weights: Dict[Tuple[str, str], _TableWeight] = {}
         table_shard_infos = self._table_shard_infos
         for module_fqn, module in self._tracker.get_tracked_modules().items():
-            lookups = getattr(module, "_lookups", None)
-            if lookups is None:
+            if not hasattr(module, "_lookups"):
                 continue
-            for lookup in lookups:
-                lookup = getattr(lookup, "module", lookup)
-                named_parameters_by_table = getattr(
-                    lookup, "named_parameters_by_table", None
-                )
-                if named_parameters_by_table is None:
+            for lookup in module._lookups:
+                lookup = lookup.module if hasattr(lookup, "module") else lookup
+                if not hasattr(lookup, "named_parameters_by_table"):
                     continue
-                for table_name, table_value in named_parameters_by_table():
+                for table_name, table_value in lookup.named_parameters_by_table():
                     table_weights[(module_fqn, table_name)] = _local_table_weight(
                         table_value,
                         table_shard_infos.get(table_name),
