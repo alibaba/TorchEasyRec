@@ -35,7 +35,7 @@ class SparseEmbeddingIdentity:
 
 
 def build_sparse_embedding_name_map(
-    table_identities: Iterable[Tuple[str, str]],
+    role_table_pairs: Iterable[Tuple[str, str]],
 ) -> Dict[Tuple[str, str], str]:
     """Allocate canonical names for ``(collection role, table name)`` pairs.
 
@@ -45,7 +45,7 @@ def build_sparse_embedding_name_map(
     raw table names are resolved deterministically with a numeric suffix.
     """
     roles_by_name = defaultdict(set)
-    for role, table_name in table_identities:
+    for role, table_name in role_table_pairs:
         if role not in SPARSE_EMBEDDING_ROLES:
             raise ValueError(f"unsupported sparse embedding role: {role!r}")
         if not table_name:
@@ -53,11 +53,11 @@ def build_sparse_embedding_name_map(
         roles_by_name[table_name].add(role)
 
     used_names = set(roles_by_name.keys())
-    name_by_identity: Dict[Tuple[str, str], str] = {}
+    name_by_role_table: Dict[Tuple[str, str], str] = {}
     for table_name, roles in roles_by_name.items():
         if len(roles) == 1:
             role = next(iter(roles))
-            name_by_identity[(role, table_name)] = table_name
+            name_by_role_table[(role, table_name)] = table_name
             continue
 
         for role in sorted(roles):
@@ -68,22 +68,22 @@ def build_sparse_embedding_name_map(
                 candidate = f"{base_candidate}_{suffix}"
                 suffix += 1
             used_names.add(candidate)
-            name_by_identity[(role, table_name)] = candidate
-    return name_by_identity
+            name_by_role_table[(role, table_name)] = candidate
+    return name_by_role_table
 
 
 def resolve_sparse_embedding_name(
-    name_by_identity: Dict[Tuple[str, str], str],
+    name_by_role_table: Dict[Tuple[str, str], str],
     table_name: str,
     role: Optional[str],
 ) -> str:
     """Resolve a table to its canonical name, rejecting ambiguous identities."""
-    if role is not None and (role, table_name) in name_by_identity:
-        return name_by_identity[(role, table_name)]
+    if role is not None and (role, table_name) in name_by_role_table:
+        return name_by_role_table[(role, table_name)]
 
     candidates = [
         embedding_name
-        for (_role, name), embedding_name in name_by_identity.items()
+        for (_role, name), embedding_name in name_by_role_table.items()
         if name == table_name
     ]
     if len(candidates) == 1:

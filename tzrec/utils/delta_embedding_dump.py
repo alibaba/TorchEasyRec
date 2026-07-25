@@ -541,6 +541,7 @@ class DeltaEmbeddingDumper:
         contract: a table name reused across EC and EBC gets a role suffix, so
         both physical tables publish under distinct serving names.
         """
+        # Keyed by (module_fqn, table_name); cf. the role-keyed name map below.
         identity_by_owner: Dict[Tuple[str, str], SparseEmbeddingIdentity] = {}
         owner_roles: Dict[Tuple[str, str], str] = {}
         owner_metadata: Dict[Tuple[str, str], Tuple[int, Tuple[str, ...]]] = {}
@@ -587,13 +588,13 @@ class DeltaEmbeddingDumper:
                     f"{duplicated}. Give the tables distinct embedding_names."
                 )
 
-        name_by_identity = build_sparse_embedding_name_map(fqns_by_role_table.keys())
+        name_by_role_table = build_sparse_embedding_name_map(fqns_by_role_table.keys())
         embedding_dimensions: Dict[str, int] = {}
         for owner_key, role in owner_roles.items():
             module_fqn, table_name = owner_key
             dimension, feature_names = owner_metadata[owner_key]
             embedding_name = resolve_sparse_embedding_name(
-                name_by_identity, table_name, role
+                name_by_role_table, table_name, role
             )
             identity_by_owner[owner_key] = SparseEmbeddingIdentity(
                 role=role,
