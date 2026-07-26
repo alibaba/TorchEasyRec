@@ -20,7 +20,7 @@ import tempfile
 import threading
 import weakref
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Container, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -59,6 +59,37 @@ _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
     (".ec_dict_user.", ".ec_dict."),
     (".mc_ec_dict_user.", ".mc_ec_dict."),
 )
+
+
+def remap_input_tile_user_key(
+    fqn: str, valid_keys: Optional[Container[str]] = None
+) -> str:
+    """Map an INPUT_TILE=3 user-side state key to its non-user twin key.
+
+    INPUT_TILE=3 export adds user-side twin modules (``ebc_user``,
+    ``mc_ebc_user``, ``ec_dict_user``, ``mc_ec_dict_user``) absent from
+    training state; their weights come from the non-user twins. Applies the
+    first replacement pattern that yields a key accepted by ``valid_keys``
+    (the first matching pattern when unset), so callers fall back through
+    the patterns exactly like a checkpoint load does.
+
+    Args:
+        fqn: state key to remap.
+        valid_keys: when given, only a candidate present here is used.
+
+    Returns:
+        The remapped non-user key, or ``fqn`` unchanged when no pattern
+        matches (or yields a valid candidate).
+    """
+    for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
+        if new_pat not in fqn:
+            continue
+        candidate = fqn.replace(new_pat, old_pat)
+        if valid_keys is None or candidate in valid_keys:
+            return candidate
+    return fqn
+
+
 # queue token meaning "run a prune pass"; ``None`` means "stop the worker".
 _PRUNE_REQUEST = object()
 
@@ -76,6 +107,9 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             do not include the current rank's boundaries would crash
             ``validate_state()``. Set this when the saved world size is
             not a multiple divisor of the current world size.
+
+    Model states missing from the checkpoint are skipped with a warning and
+    recorded in ``skipped_keys``.
     """
 
     def __init__(
@@ -88,6 +122,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         super().__init__(flatten_state_dict, flatten_sharded_tensors)
         self._ckpt_param_map = dict()
         self._skip_output_segments_tensor = skip_output_segments_tensor
+        self.skipped_keys: List[str] = []
         if ckpt_param_map_path:
             with open(ckpt_param_map_path) as f:
                 for line in f.readlines():
@@ -147,22 +182,19 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                 is_input_tile_emb()
                 and meta_fqn not in self.metadata.state_dict_metadata
             ):
-                for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
-                    if new_pat not in meta_fqn:
-                        continue
-                    candidate = meta_fqn.replace(new_pat, old_pat)
-                    if candidate in self.metadata.state_dict_metadata:
-                        logger.info(
-                            f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]"
-                        )
-                        meta_fqn = candidate
-                        fqn_remap_set.add(fqn)
-                        break
+                candidate = remap_input_tile_user_key(
+                    meta_fqn, self.metadata.state_dict_metadata
+                )
+                if candidate != meta_fqn:
+                    logger.info(f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]")
+                    meta_fqn = candidate
+                    fqn_remap_set.add(fqn)
 
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]
             else:
                 logger.warning(f"Skip restore state [{fqn}]")
+                self.skipped_keys.append(fqn)
                 continue
 
             read_items = []
@@ -331,6 +363,7 @@ class CheckpointManager:
         self._eval_result_filename = eval_result_filename
         self._prune_queue: "queue.Queue[object]" = queue.Queue()
         self._prune_pending = False
+        self._protected_checkpoints: Set[str] = set()
         self._lock = threading.Lock()
         self._prune_worker: Optional[threading.Thread] = None
         self._finalizer: Optional[weakref.finalize] = None
@@ -363,6 +396,18 @@ class CheckpointManager:
         self._last_ckpt_dir = ckpt_dir
         self.prune()
         return ckpt_dir
+
+    def protect_checkpoint(self, ckpt_path: str) -> None:
+        """Prevent an in-progress consumer from being pruned."""
+        with self._lock:
+            self._protected_checkpoints.add(self._canonical_checkpoint_path(ckpt_path))
+
+    def unprotect_checkpoint(self, ckpt_path: str) -> None:
+        """Allow a previously protected checkpoint to be pruned again."""
+        with self._lock:
+            self._protected_checkpoints.discard(
+                self._canonical_checkpoint_path(ckpt_path)
+            )
 
     def set_save_policy(
         self,
@@ -621,7 +666,10 @@ class CheckpointManager:
         if len(ckpt_metas) <= self._keep_checkpoint_max:
             return
         ckpt_metas.sort(key=_get_checkpoint_step)
-        protected = set(ckpt_metas[-self._keep_checkpoint_max :])
+        protected = {
+            self._canonical_checkpoint_path(path)
+            for path in ckpt_metas[-self._keep_checkpoint_max :]
+        }
         if (
             self._export_config is not None
             and self._export_config.exporter_type == "best"
@@ -630,14 +678,20 @@ class CheckpointManager:
                 self._model_dir, self._export_config, self._eval_result_filename
             )
             if best_ckpt_path is not None:
-                protected.add(best_ckpt_path.rstrip(os.path.sep))
+                protected.add(self._canonical_checkpoint_path(best_ckpt_path))
+        with self._lock:
+            protected.update(self._protected_checkpoints)
         for ckpt_path in ckpt_metas:
-            if ckpt_path not in protected:
+            if self._canonical_checkpoint_path(ckpt_path) not in protected:
                 logger.info(f"Removing old checkpoint {ckpt_path}...")
                 try:
                     shutil.rmtree(ckpt_path)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to remove checkpoint {ckpt_path}: {e}")
+
+    @staticmethod
+    def _canonical_checkpoint_path(ckpt_path: str) -> str:
+        return os.path.abspath(ckpt_path.rstrip(os.path.sep))
 
 
 _DISTCP_RANK_RE = re.compile(r"__(\d+)_\d+\.distcp$")
@@ -878,6 +932,7 @@ def restore_model(
     model: nn.Module,
     optimizer: Optional[optim.Optimizer] = None,
     ckpt_param_map_path: Optional[str] = None,
+    error_on_missing_keys: bool = False,
 ) -> None:
     """Restore model state.
 
@@ -886,6 +941,9 @@ def restore_model(
         model (nn.Module): a EasyRec model.
         optimizer (optim.Optimizer, optional): a optimizer.
         ckpt_param_map_path (str): parameter mapping for checkpoint.
+        error_on_missing_keys (bool): If True, raise RuntimeError when the
+            model has states absent from the checkpoint instead of skipping
+            them with a warning (which would leave them uninitialized).
     """
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
@@ -913,14 +971,21 @@ def restore_model(
         if is_local_rank_zero:
             logger.info(f"Restoring model state from {model_ckpt_path}...")
         state_dict = model.state_dict()
+        planner = PartialLoadPlanner(
+            ckpt_param_map_path=ckpt_param_map_path,
+            skip_output_segments_tensor=needs_mch_redistribution,
+        )
         load(
             state_dict,
             checkpoint_id=model_ckpt_path,
-            planner=PartialLoadPlanner(
-                ckpt_param_map_path=ckpt_param_map_path,
-                skip_output_segments_tensor=needs_mch_redistribution,
-            ),
+            planner=planner,
         )
+        if error_on_missing_keys and planner.skipped_keys:
+            raise RuntimeError(
+                f"checkpoint[{model_ckpt_path}] is missing "
+                f"{len(planner.skipped_keys)} model states: "
+                + ", ".join(sorted(planner.skipped_keys))
+            )
         if needs_mch_redistribution:
             _redistribute_mch_state(model)
         model.load_state_dict(state_dict)

@@ -273,6 +273,25 @@ class CheckpointUtilTest(unittest.TestCase):
             manager.close()
         self.assertEqual(self._remaining_ckpt_steps(), [0, 10, 20, 30])
 
+    def test_checkpoint_manager_prune_keeps_protected_checkpoint(self):
+        for step in [0, 10, 20, 30]:
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
+        protected_ckpt = os.path.join(self.test_dir, "model.ckpt-10")
+        manager = checkpoint_util.CheckpointManager(
+            self.test_dir, keep_checkpoint_max=2
+        )
+        manager.protect_checkpoint(protected_ckpt)
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+            manager.close()
+        self.assertEqual(self._remaining_ckpt_steps(), [10, 20, 30])
+
+        manager.unprotect_checkpoint(protected_ckpt)
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+            manager.close()
+        self.assertEqual(self._remaining_ckpt_steps(), [20, 30])
+
     def test_checkpoint_manager_prune_idempotent(self):
         for step in [0, 10, 20, 30]:
             os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
@@ -401,6 +420,67 @@ class CheckpointUtilTest(unittest.TestCase):
             p.join()
             if p.exitcode != 0:
                 raise RuntimeError(f"worker-{i} failed.")
+
+    def test_restore_model_error_on_missing_keys(self):
+        class SmallModel(nn.Module):
+            def __init__(self, with_extra=False):
+                super().__init__()
+                self.dense = nn.Linear(4, 2)
+                if with_extra:
+                    self.extra = nn.Linear(2, 2)
+
+        port = misc_util.get_free_port()
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            world_size=1,
+            rank=0,
+        )
+        try:
+            model = SmallModel()
+            checkpoint_util.save_model(self.test_dir, model)
+
+            restored = SmallModel(with_extra=True)
+            extra_weight = restored.extra.weight.detach().clone()
+            checkpoint_util.restore_model(self.test_dir, restored)
+            torch.testing.assert_close(restored.dense.weight, model.dense.weight)
+            self.assertTrue(torch.equal(restored.extra.weight, extra_weight))
+
+            with self.assertRaisesRegex(RuntimeError, "extra.weight"):
+                checkpoint_util.restore_model(
+                    self.test_dir, restored, error_on_missing_keys=True
+                )
+        finally:
+            dist.destroy_process_group()
+
+    def test_remap_input_tile_user_key_maps_user_twins(self) -> None:
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key(
+                "model.eg.ebc_user.embedding_bags.t.weight"
+            ),
+            "model.eg.ebc.embedding_bags.t.weight",
+        )
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key("model.eg.mc_ec_dict_user.16.w"),
+            "model.eg.mc_ec_dict.16.w",
+        )
+
+    def test_remap_input_tile_user_key_passthrough(self) -> None:
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key("model.mlp.weight"),
+            "model.mlp.weight",
+        )
+
+    def test_remap_input_tile_user_key_respects_valid_keys(self) -> None:
+        fqn = "model.eg.ebc_user.embedding_bags.t.weight"
+        target = "model.eg.ebc.embedding_bags.t.weight"
+        # a matching pattern whose candidate is invalid leaves the key alone
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key(fqn, {"unrelated"}), fqn
+        )
+        self.assertEqual(
+            checkpoint_util.remap_input_tile_user_key(fqn, {target}), target
+        )
 
 
 class DataloaderCheckpointTest(unittest.TestCase):
