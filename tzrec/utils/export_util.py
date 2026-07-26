@@ -2317,8 +2317,7 @@ def _get_sparse_embedding_tensor(
             continue
         table_fqn = name[: -len(".weight")]
         export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
-        if export_emb_name not in state_values_by_emb or table_fqn == export_emb_name:
-            state_values_by_emb[export_emb_name] = values
+        state_values_by_emb[export_emb_name] = values
 
     for export_emb_name, values in state_values_by_emb.items():
         emb_dim = emb_name_to_emb_dim[export_emb_name]
