@@ -2362,7 +2362,7 @@ def _get_sparse_embedding_tensor(
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
-        key_files_by_emb = defaultdict(dict)
+        key_files_by_emb = defaultdict(list)
         for key_file in key_files:
             path_parts = key_file.split(os.path.sep)
             match = key_pattern.match(path_parts[-1])
@@ -2374,32 +2374,24 @@ def _get_sparse_embedding_tensor(
                 f"{module_fqn}.embedding_bags.{emb_name}",
                 f"{module_fqn}.embeddings.{emb_name}",
             ]
-            matching_tables = (
-                (
-                    checkpoint_util.remap_input_tile_user_key(table_candidate),
-                    table_candidate,
+            export_emb_name = next(
+                table_fqn
+                for table_fqn in map(
+                    checkpoint_util.remap_input_tile_user_key, table_candidates
                 )
-                for table_candidate in table_candidates
-            )
-            export_emb_name, table_candidate = next(
-                table for table in matching_tables if table[0] in emb_name_to_emb_dim
+                if table_fqn in emb_name_to_emb_dim
             )
             ckpt_rank = int(match.group("idx"))
             ckpt_world_size = int(match.group("num_shards"))
-            shard_id = (ckpt_rank, ckpt_world_size)
             key_file_info = (
                 emb_name,
                 ckpt_rank,
                 ckpt_world_size,
                 key_file,
-                table_candidate == export_emb_name,
             )
-            existing_info = key_files_by_emb[export_emb_name].get(shard_id)
-            if existing_info is None or (key_file_info[-1] and not existing_info[-1]):
-                key_files_by_emb[export_emb_name][shard_id] = key_file_info
+            key_files_by_emb[export_emb_name].append(key_file_info)
 
-        for export_emb_name, emb_key_files_by_shard in key_files_by_emb.items():
-            emb_key_files = list(emb_key_files_by_shard.values())
+        for export_emb_name, emb_key_files in key_files_by_emb.items():
             emb_dim = emb_name_to_emb_dim[export_emb_name]
             keys_list = []
             values_list = []
@@ -2415,7 +2407,6 @@ def _get_sparse_embedding_tensor(
                 ckpt_rank,
                 ckpt_world_size,
                 key_file,
-                _,
             ) in sorted(emb_key_files):
                 if ckpt_rank % world_size != rank:
                     continue
