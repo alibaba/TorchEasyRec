@@ -854,6 +854,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(table_weight.shard_info.local_cols, 2)
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @mark_ci_scope("gpu")
     def test_collect_dynamic_modules_uses_owner_fqn_keys(self):
         ebc_module = torch.nn.Module()
         ec_module = torch.nn.Module()
