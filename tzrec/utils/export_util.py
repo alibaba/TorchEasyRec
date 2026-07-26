@@ -2383,24 +2383,23 @@ def _get_sparse_embedding_tensor(
             )
             ckpt_rank = int(match.group("idx"))
             ckpt_world_size = int(match.group("num_shards"))
-            key_file_info = (
-                emb_name,
-                ckpt_rank,
-                ckpt_world_size,
-                key_file,
+            key_files_by_emb[export_emb_name].append(
+                (emb_name, ckpt_rank, ckpt_world_size, key_file)
             )
-            key_files_by_emb[export_emb_name].append(key_file_info)
 
-        for export_emb_name, emb_key_files in key_files_by_emb.items():
-            emb_dim = emb_name_to_emb_dim[export_emb_name]
+        for emb_name, emb_key_files in key_files_by_emb.items():
+            emb_dim = emb_name_to_emb_dim[emb_name]
+            key_name = f"{emb_name}.keys"
+            value_name = f"{emb_name}.values"
+            score_name = f"{emb_name}.scores"
             keys_list = []
             values_list = []
             scores_list = []
             ckpt_world_sizes = {x[2] for x in emb_key_files}
             if len(ckpt_world_sizes) > 1:
                 raise ValueError(
-                    f"dynamic embedding {export_emb_name} has inconsistent "
-                    f"checkpoint world_size values: {sorted(ckpt_world_sizes)}"
+                    f"dynamic embedding {emb_name} has inconsistent checkpoint "
+                    f"world_size values: {sorted(ckpt_world_sizes)}"
                 )
             for ckpt_emb_name, ckpt_rank, ckpt_world_size, key_file in sorted(
                 emb_key_files
@@ -2425,8 +2424,8 @@ def _get_sparse_embedding_tensor(
                 )
                 if not os.path.exists(score_file):
                     raise FileNotFoundError(
-                        f"dynamic embedding {export_emb_name} score file not "
-                        f"found: {score_file}"
+                        f"dynamic embedding {emb_name} score file not found: "
+                        f"{score_file}"
                     )
                 with open(score_file, "rb") as f:
                     scores = torch.tensor(
@@ -2434,15 +2433,15 @@ def _get_sparse_embedding_tensor(
                     )
                 if keys.numel() != scores.numel():
                     raise ValueError(
-                        f"dynamic embedding {export_emb_name} key/score row "
-                        f"mismatch: keys={keys.numel()}, scores={scores.numel()}, "
+                        f"dynamic embedding {emb_name} key/score row mismatch: "
+                        f"keys={keys.numel()}, scores={scores.numel()}, "
                         f"key_file={key_file}, score_file={score_file}"
                     )
                 if values.numel() != keys.numel() * emb_dim:
                     raise ValueError(
-                        f"dynamic embedding {export_emb_name} value row "
-                        f"mismatch: keys={keys.numel()}, "
-                        f"value_elements={values.numel()}, embedding_dim={emb_dim}"
+                        f"dynamic embedding {emb_name} value row mismatch: "
+                        f"keys={keys.numel()}, value_elements={values.numel()}, "
+                        f"embedding_dim={emb_dim}"
                     )
                 keys_list.append(keys)
                 values_list.append(values.view([-1, emb_dim]))
@@ -2453,20 +2452,17 @@ def _get_sparse_embedding_tensor(
             keys = torch.cat(keys_list)
             values_2d = torch.cat(values_list, dim=0)
             scores = torch.cat(scores_list)
-            key_name = f"{export_emb_name}.keys"
-            value_name = f"{export_emb_name}.values"
-            score_name = f"{export_emb_name}.scores"
             export_values, export_meta = _prepare_sparse_export_values(
-                values_2d, emb_dim, export_emb_name
+                values_2d, emb_dim, emb_name
             )
             dynamic_out[key_name] = keys
             dynamic_out[value_name] = export_values
             dynamic_out[score_name] = scores
-            emb_name_to_export_meta[export_emb_name] = export_meta
-            dynamic_emb_names.add(export_emb_name)
-            dynamic_key_names[export_emb_name].append(key_name)
-            dynamic_value_names[export_emb_name].append(value_name)
-            dynamic_score_names[export_emb_name].append(score_name)
+            emb_name_to_export_meta[emb_name] = export_meta
+            dynamic_emb_names.add(emb_name)
+            dynamic_key_names[emb_name].append(key_name)
+            dynamic_value_names[emb_name].append(value_name)
+            dynamic_score_names[emb_name].append(score_name)
 
     # TODO(hongsheng.jhs): support mczch
 
