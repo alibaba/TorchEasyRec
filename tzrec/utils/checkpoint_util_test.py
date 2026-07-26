@@ -187,58 +187,6 @@ def _remap_restore_worker(test_dir, rank, world_size, port, remap_file_path):
 
 
 class CheckpointUtilTest(unittest.TestCase):
-    @parameterized.expand(
-        [
-            (
-                "ebc",
-                "model.group.ebc_user.embedding_bags.table",
-                "model.group.ebc.embedding_bags.table",
-            ),
-            (
-                "mc_ebc",
-                "model.group.mc_ebc_user._embedding_module.embedding_bags.table",
-                "model.group.mc_ebc._embedding_module.embedding_bags.table",
-            ),
-            (
-                "ec_dict",
-                "model.group.ec_dict_user.16.embeddings.table",
-                "model.group.ec_dict.16.embeddings.table",
-            ),
-            (
-                "mc_ec_dict",
-                "model.group.mc_ec_dict_user.16._embedding_module.embeddings.table",
-                "model.group.mc_ec_dict.16._embedding_module.embeddings.table",
-            ),
-            (
-                "weight_suffix",
-                "model.group.ebc_user.embedding_bags.table.weight",
-                "model.group.ebc.embedding_bags.table.weight",
-            ),
-            (
-                "canonical",
-                "model.group.ebc.embedding_bags.table",
-                "model.group.ebc.embedding_bags.table",
-            ),
-            (
-                "alias_table_name",
-                "model.group.ebc.embedding_bags.ebc_user",
-                "model.group.ebc.embedding_bags.ebc_user",
-            ),
-            (
-                "unrelated_owner",
-                "model.group.unrelated_user.embedding_bags.table",
-                "model.group.unrelated_user.embedding_bags.table",
-            ),
-        ]
-    )
-    def test_canonicalize_input_tile_table_fqn(
-        self, _name: str, table_fqn: str, expected: str
-    ) -> None:
-        self.assertEqual(
-            checkpoint_util.canonicalize_input_tile_table_fqn(table_fqn),
-            expected,
-        )
-
     def setUp(self):
         self.test_dir = make_test_dir()
 

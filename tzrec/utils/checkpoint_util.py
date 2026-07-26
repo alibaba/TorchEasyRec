@@ -91,27 +91,6 @@ def remap_input_tile_user_key(
 _PRUNE_REQUEST = object()
 
 
-def canonicalize_input_tile_table_fqn(table_fqn: str) -> str:
-    """Canonicalize an INPUT_TILE user-side sparse table FQN.
-
-    Only owning-module segments before ``embedding_bags`` or ``embeddings`` are
-    canonicalized. Table names and unrelated module segments are preserved.
-
-    Args:
-        table_fqn: State-dict-style sparse table FQN, optionally including a
-            suffix such as ``.weight``.
-
-    Returns:
-        The canonical physical sparse table FQN.
-    """
-    for table_segment in (".embedding_bags.", ".embeddings."):
-        owner_fqn, separator, table_suffix = table_fqn.partition(table_segment)
-        if separator:
-            canonical_prefix = remap_input_tile_user_key(f".{owner_fqn}{separator}")[1:]
-            return canonical_prefix + table_suffix
-    return table_fqn
-
-
 class PartialLoadPlanner(DefaultLoadPlanner):
     """Support restore partial states.
 

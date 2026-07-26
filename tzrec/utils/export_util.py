@@ -2274,7 +2274,7 @@ def _get_sparse_embedding_tensor(
     emb_name_to_feat_name_impl = {}
 
     for table_fqn, emb_info in embedding_infos.items():
-        export_emb_name = checkpoint_util.canonicalize_input_tile_table_fqn(table_fqn)
+        export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
         emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
         feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
         for feat_name in emb_info.feature_names:
@@ -2285,7 +2285,7 @@ def _get_sparse_embedding_tensor(
             feat_name_to_pooling[feat_name_impl] = "NONE"
 
     for table_fqn, emb_info in embedding_bag_info.items():
-        export_emb_name = checkpoint_util.canonicalize_input_tile_table_fqn(table_fqn)
+        export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
         emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
         feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
         for feat_name in emb_info.feature_names:
@@ -2317,7 +2317,7 @@ def _get_sparse_embedding_tensor(
         if not name.endswith(".weight"):
             continue
         table_fqn = name[: -len(".weight")]
-        export_emb_name = checkpoint_util.canonicalize_input_tile_table_fqn(table_fqn)
+        export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
         if export_emb_name not in state_values_by_emb or table_fqn == export_emb_name:
             state_values_by_emb[export_emb_name] = values
 
@@ -2377,7 +2377,7 @@ def _get_sparse_embedding_tensor(
             ]
             matching_tables = (
                 (
-                    checkpoint_util.canonicalize_input_tile_table_fqn(table_candidate),
+                    checkpoint_util.remap_input_tile_user_key(table_candidate),
                     table_candidate,
                 )
                 for table_candidate in table_candidates
