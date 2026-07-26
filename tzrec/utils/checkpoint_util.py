@@ -129,7 +129,10 @@ class PartialLoadPlanner(DefaultLoadPlanner):
 
             # INPUT_TILE=3 export adds user-side twin modules absent from
             # training checkpoints. Remap them before EC compatibility handling.
-            if is_input_tile_emb():
+            if (
+                is_input_tile_emb()
+                and meta_fqn not in self.metadata.state_dict_metadata
+            ):
                 for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
                     if new_pat not in meta_fqn:
                         continue
