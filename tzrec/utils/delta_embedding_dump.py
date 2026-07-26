@@ -609,15 +609,6 @@ class DeltaEmbeddingDumper:
             embedding_dimensions[embedding_name] = dimension
         return identity_by_owner, embedding_dimensions
 
-    def _tracker_cursor_before_read(self) -> Optional[int]:
-        if not self._feature_store_enabled:
-            return None
-        return int(self._tracker.per_consumer_batch_idx[_CONSUMER])
-
-    def _rollback_tracker_read(self, cursor: Optional[int]) -> None:
-        if cursor is not None:
-            self._tracker.per_consumer_batch_idx[_CONSUMER] = cursor
-
     @contextmanager
     def pause_tracking(self) -> Iterator[None]:
         """Temporarily skip delta tracking for non-training forward passes."""
@@ -680,7 +671,6 @@ class DeltaEmbeddingDumper:
         Returns:
             Path to the dumped parquet file, or None if skipped.
         """
-        global_step = self._sync_final_step(global_step)
         if global_step <= 0:
             # Step zero is excluded from the delta publication contract.
             logger.info("Skipping delta embedding dump at step %s.", global_step)
@@ -702,22 +692,6 @@ class DeltaEmbeddingDumper:
             return None
         return self.dump(global_step)
 
-    def _sync_final_step(self, global_step: int) -> int:
-        """Align the final step across ranks before the trailing flush.
-
-        The MAX all-reduce ensures every rank takes the same skip/dump
-        decision into the same ``step_<N>/`` directory.
-        """
-        synced_step = global_step
-        if self._world_size > 1 and (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
-        ):
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-            final_state = torch.tensor([global_step], dtype=torch.long, device=device)
-            torch.distributed.all_reduce(final_state, op=torch.distributed.ReduceOp.MAX)
-            synced_step = int(final_state[0].item())
-        return synced_step
-
     def dump(self, global_step: int) -> Optional[str]:
         """Dump currently tracked sparse ids and embeddings to a parquet file.
 
@@ -732,28 +706,23 @@ class DeltaEmbeddingDumper:
             raise ValueError("delta embedding dump global_step must be > 0")
         uploader = self._uploader
         write_local = not self._feature_store_enabled or self._retain_local_dump
-        tracker_cursor = self._tracker_cursor_before_read()
-        try:
-            table_weights = self._collect_table_weights()
-            dynamic_modules = self._collect_dynamic_modules()
-            table_chunks: List[pa.Table] = []
-            num_rows = self._append_model_delta_rows(
-                table_chunks,
-                global_step=global_step,
-                table_weights=table_weights,
-                dynamic_modules=dynamic_modules,
-            )
-            output_path: Optional[str] = None
-            if write_local and (num_rows > 0 or self._world_size > 1):
-                # Multi-rank shard sets stay complete even for an empty rank so
-                # per-step file consumers never observe a partial set.
-                output_path = self._output_path(global_step)
-                self._write_table_chunks(table_chunks, output_path)
-            if uploader is not None and num_rows > 0:
-                uploader.submit(global_step, pa.concat_tables(table_chunks))
-        except BaseException:
-            self._rollback_tracker_read(tracker_cursor)
-            raise
+        table_weights = self._collect_table_weights()
+        dynamic_modules = self._collect_dynamic_modules()
+        table_chunks: List[pa.Table] = []
+        num_rows = self._append_model_delta_rows(
+            table_chunks,
+            global_step=global_step,
+            table_weights=table_weights,
+            dynamic_modules=dynamic_modules,
+        )
+        output_path: Optional[str] = None
+        if write_local and (num_rows > 0 or self._world_size > 1):
+            # Multi-rank shard sets stay complete even for an empty rank so
+            # per-step file consumers never observe a partial set.
+            output_path = self._output_path(global_step)
+            self._write_table_chunks(table_chunks, output_path)
+        if uploader is not None and num_rows > 0:
+            uploader.submit(global_step, pa.concat_tables(table_chunks))
 
         if num_rows == 0:
             if output_path is None:

@@ -593,66 +593,21 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 [73],
             )
 
-    def test_final_dump_syncs_step_across_ranks_before_flush(self):
-        # A lagging rank reaches final_dump at a boundary step (50) while the
-        # furthest rank stopped at 73. Without syncing, the lagging rank would
-        # skip and write no shard, leaving step_73/ ragged. The MAX all_reduce
-        # lifts every rank to 73 so all take the same dump-into-step_73 path.
+    def test_final_dump_uses_local_step_without_cross_rank_collective(self):
+        # Multi-rank dumps force synced dataloader exhaustion, so every rank
+        # reaches the same final step; final_dump decides on the local step and
+        # issues no cross-rank collective.
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval_steps = 50
         dumper._interval_secs = None
         dumper._world_size = 2
-
-        def fake_all_reduce(tensor, op=None):
-            self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            tensor[0] = 73
-
         with (
             mock.patch.object(dumper, "dump") as dump_mock,
-            mock.patch("torch.distributed.is_available", return_value=True),
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.cuda.current_device", return_value=0),
-            mock.patch(
-                "torch.tensor",
-                side_effect=lambda value, *a, **k: torch.zeros(
-                    len(value), dtype=torch.long
-                ),
-            ),
-            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
+            mock.patch("torch.distributed.all_reduce") as all_reduce_mock,
         ):
-            dumper.final_dump(50)
+            dumper.final_dump(73)
         dump_mock.assert_called_once_with(73)
-
-    def test_final_dump_syncs_ranks_before_skipping_step_zero(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = 50
-        dumper._interval_secs = None
-        dumper._world_size = 2
-        collective_count = 0
-
-        def fake_all_reduce(tensor, op=None):
-            nonlocal collective_count
-            self.assertIs(op, torch.distributed.ReduceOp.MAX)
-            tensor[0] = 0
-            collective_count += 1
-
-        with (
-            mock.patch.object(dumper, "dump") as dump_mock,
-            mock.patch("torch.distributed.is_available", return_value=True),
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.cuda.current_device", return_value=0),
-            mock.patch(
-                "torch.tensor",
-                side_effect=lambda value, *a, **k: torch.zeros(
-                    len(value), dtype=torch.long
-                ),
-            ),
-            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
-        ):
-            self.assertIsNone(dumper.final_dump(0))
-
-        self.assertEqual(collective_count, 1)
-        dump_mock.assert_not_called()
+        all_reduce_mock.assert_not_called()
 
     def test_maybe_dump_uses_checkpoint_aligned_global_step(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -891,36 +846,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._world_size = 1
 
         self.assertFalse(dumper.requires_synced_dataloader_exhaustion)
-
-    def test_dump_does_not_ack_tracker_when_submission_is_rejected(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._feature_store_enabled = True
-        dumper._retain_local_dump = False
-        dumper._world_size = 1
-        dumper._tracker = mock.MagicMock()
-        dumper._tracker.per_consumer_batch_idx = {_CONSUMER: 7}
-        dumper._uploader = mock.MagicMock()
-        dumper._uploader.submit.side_effect = RuntimeError("submission rejected")
-
-        def _append_one_chunk(table_chunks, **kwargs):
-            table_chunks.append(_DELTA_DUMP_SCHEMA.empty_table())
-            return 1
-
-        with (
-            mock.patch.object(dumper, "_check_feature_store_upload_error"),
-            mock.patch.object(dumper, "_collect_table_weights", return_value={}),
-            mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
-            mock.patch.object(
-                dumper, "_append_model_delta_rows", side_effect=_append_one_chunk
-            ),
-            mock.patch.object(dumper, "_rollback_tracker_read") as rollback,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "submission rejected"):
-                dumper.dump(10)
-
-        dumper._uploader.submit.assert_called_once()
-        self.assertEqual(dumper._uploader.submit.call_args.args[0], 10)
-        rollback.assert_called_once_with(7)
 
     def test_multi_gpu_output_path_uses_step_underscore_dir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
