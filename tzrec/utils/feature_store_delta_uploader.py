@@ -19,10 +19,12 @@ latest checkpoint and pending deltas are discarded.
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
+    Deque,
     Dict,
     List,
     Mapping,
@@ -200,7 +202,7 @@ class FeatureStoreDeltaUploader:
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self._view = None
         self._condition = threading.Condition()
-        self._pending: Dict[int, pa.Table] = {}
+        self._pending: Deque[Tuple[int, pa.Table]] = deque()
         self._started = False
         self._closing = False
         self._aborting = False
@@ -251,13 +253,10 @@ class FeatureStoreDeltaUploader:
                 )
             if self._closing or self._closed:
                 raise RuntimeError("cannot submit to a closing FeatureStore uploader")
-            while (
-                global_step not in self._pending
-                and len(self._pending) >= self._settings.max_pending_steps
-            ):
+            while len(self._pending) >= self._settings.max_pending_steps:
                 self._condition.wait(self._settings.poll_interval_secs)
                 self._raise_if_failed_locked()
-            self._pending.setdefault(global_step, table)
+            self._pending.append((global_step, table))
             self._condition.notify_all()
 
     def check_error(self) -> None:
@@ -309,13 +308,12 @@ class FeatureStoreDeltaUploader:
                             return
                         self._condition.wait(self._settings.poll_interval_secs)
                         continue
-                    current_step = min(self._pending)
-                    table = self._pending[current_step]
+                    current_step, table = self._pending[0]
 
                 self._upload_with_retries(current_step, table)
 
                 with self._condition:
-                    self._pending.pop(current_step, None)
+                    self._pending.popleft()
                     self._condition.notify_all()
                 current_step = None
         except _UploadAborted:
@@ -402,7 +400,7 @@ class FeatureStoreDeltaUploader:
         next_progress_batch = _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES
         logged_first_window = False
 
-        logger.info(
+        logger.debug(
             "FeatureStore delta upload started: step=%s rank=%s version=%s "
             "batches=%s ts_range=%s-%s",
             global_step,
@@ -444,7 +442,8 @@ class FeatureStoreDeltaUploader:
                     or completed_batches >= next_progress_batch
                     or completed_batches == total_batches
                 ):
-                    logger.info(
+                    log_progress = logger.info if logged_first_window else logger.debug
+                    log_progress(
                         "FeatureStore delta upload progress: step=%s "
                         "batches=%s/%s elapsed_secs=%.1f",
                         global_step,

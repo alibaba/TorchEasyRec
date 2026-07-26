@@ -755,21 +755,21 @@ class DeltaEmbeddingDumper:
 
         if num_rows == 0:
             if output_path is None:
-                logger.info("No delta embedding rows to dump at step %s.", global_step)
+                logger.debug("No delta embedding rows to dump at step %s.", global_step)
             else:
-                logger.info(
+                logger.debug(
                     "Dumped empty delta embedding shard to %s at step %s.",
                     output_path,
                     global_step,
                 )
         elif output_path is None:
-            logger.info(
+            logger.debug(
                 "Submitted %s delta embedding rows for FeatureStore upload at step %s.",
                 num_rows,
                 global_step,
             )
         else:
-            logger.info("Dumped %s delta embedding rows to %s.", num_rows, output_path)
+            logger.debug("Dumped %s delta embedding rows to %s.", num_rows, output_path)
         return output_path
 
     def _output_path(self, global_step: int) -> str:
