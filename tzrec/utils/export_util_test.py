@@ -22,6 +22,11 @@ from unittest import mock
 import numpy as np
 import torch
 from torchrec.distributed.train_pipeline.utils import Tracer
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
 
 from tzrec.acc import utils as acc_utils
 from tzrec.modules.dense_embedding_collection import (
@@ -34,6 +39,7 @@ from tzrec.utils.export_util import (
     _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
     _get_sparse_embedding_tensor,
+    _get_sparse_table_to_embedding_info,
     _merge_sharded_embedding_json,
     _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
@@ -125,6 +131,60 @@ class ExportUtilTest(unittest.TestCase):
             )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_sparse_table_info_is_keyed_by_owner_fqn(self) -> None:
+        class SparseCollections(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.left = EmbeddingBagCollection(
+                    [
+                        EmbeddingBagConfig(
+                            num_embeddings=4,
+                            embedding_dim=2,
+                            name="shared",
+                            feature_names=["left_feat"],
+                        )
+                    ],
+                    device=torch.device("cpu"),
+                )
+                self.right = EmbeddingBagCollection(
+                    [
+                        EmbeddingBagConfig(
+                            num_embeddings=4,
+                            embedding_dim=2,
+                            name="shared",
+                            feature_names=["right_feat"],
+                        )
+                    ],
+                    device=torch.device("cpu"),
+                )
+                self.sequence = EmbeddingCollection(
+                    [
+                        EmbeddingConfig(
+                            num_embeddings=4,
+                            embedding_dim=2,
+                            name="shared",
+                            feature_names=["sequence_feat"],
+                        )
+                    ],
+                    device=torch.device("cpu"),
+                )
+
+        embedding_bag_info, embedding_info = _get_sparse_table_to_embedding_info(
+            SparseCollections()
+        )
+
+        self.assertEqual(
+            set(embedding_bag_info),
+            {
+                "left.embedding_bags.shared",
+                "right.embedding_bags.shared",
+            },
+        )
+        self.assertEqual(
+            set(embedding_info),
+            {"sequence.embeddings.shared"},
+        )
 
     def test_distributed_embedding_export_forces_rank_zero_single_process(self) -> None:
         """Rank 0 export should be normalized to a single logical GPU."""
@@ -231,7 +291,7 @@ class ExportUtilTest(unittest.TestCase):
                     return_value=(torch.device("cpu"), None),
                 ),
                 mock.patch(
-                    "tzrec.utils.export_util._get_sparse_feature_to_embedding_info",
+                    "tzrec.utils.export_util._get_sparse_table_to_embedding_info",
                     return_value=({}, {}),
                 ),
                 mock.patch(
@@ -339,43 +399,44 @@ class ExportUtilTest(unittest.TestCase):
             os.environ["RANK"] = "0"
             os.environ["WORLD_SIZE"] = "1"
             os.environ.pop("DIST_QUANT", None)
-            embedding_bag_info = [
-                SimpleNamespace(
+            table_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc."
+                "embedding_bags.user_id_emb"
+            )
+            embedding_bag_info = {
+                table_fqn: SimpleNamespace(
                     name="user_id_emb",
                     embedding_dim=2,
                     feature_names=["user_id"],
                     pooling="SUM",
                 )
-            ]
+            }
 
             _, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
                 torch.nn.Module(),
                 ckpt_dir,
-                [],
+                {},
                 embedding_bag_info,
             )
 
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.keys"], torch.tensor([0, 2, 1, 3])
+                dynamic_out[f"{table_fqn}.keys"], torch.tensor([0, 2, 1, 3])
             )
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.scores"], torch.tensor([100, 102, 101, 103])
+                dynamic_out[f"{table_fqn}.scores"],
+                torch.tensor([100, 102, 101, 103]),
             )
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.values"],
+                dynamic_out[f"{table_fqn}.values"],
                 torch.tensor([[0.0, 0.1], [2.0, 2.1], [1.0, 1.1], [3.0, 3.1]]),
             )
-            self.assertEqual(emb_meta["user_id_emb"]["shape"], [4, 2])
-            self.assertEqual(emb_meta["user_id_emb"]["key_name"], "user_id_emb.keys")
-            self.assertEqual(
-                emb_meta["user_id_emb"]["value_name"], "user_id_emb.values"
-            )
-            self.assertEqual(
-                emb_meta["user_id_emb"]["score_name"], "user_id_emb.scores"
-            )
+            self.assertEqual(emb_meta[table_fqn]["shape"], [4, 2])
+            self.assertEqual(emb_meta[table_fqn]["key_name"], f"{table_fqn}.keys")
+            self.assertEqual(emb_meta[table_fqn]["value_name"], f"{table_fqn}.values")
+            self.assertEqual(emb_meta[table_fqn]["score_name"], f"{table_fqn}.scores")
             self.assertEqual(
                 feat_meta["user_id__ebc"],
-                {"embedding_name": "user_id_emb", "pooling": "SUM"},
+                {"embedding_name": table_fqn, "pooling": "SUM"},
             )
         finally:
             if old_rank is None:
@@ -423,47 +484,192 @@ class ExportUtilTest(unittest.TestCase):
             os.environ["RANK"] = "0"
             os.environ["WORLD_SIZE"] = "1"
             os.environ["DIST_QUANT"] = "INT8"
-            embedding_bag_info = [
-                SimpleNamespace(
+            table_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc."
+                "embedding_bags.user_id_emb"
+            )
+            embedding_bag_info = {
+                table_fqn: SimpleNamespace(
                     name="user_id_emb",
                     embedding_dim=2,
                     feature_names=["user_id"],
                     pooling="SUM",
                 )
-            ]
+            }
 
             _, dynamic_out, emb_meta, _ = _get_sparse_embedding_tensor(
                 torch.nn.Module(),
                 ckpt_dir,
-                [],
+                {},
                 embedding_bag_info,
             )
 
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.keys"], torch.tensor([0, 1])
+                dynamic_out[f"{table_fqn}.keys"], torch.tensor([0, 1])
             )
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.scores"], torch.tensor([100, 101])
+                dynamic_out[f"{table_fqn}.scores"], torch.tensor([100, 101])
             )
-            self.assertEqual(dynamic_out["user_id_emb.values"].dtype, np.uint8)
-            self.assertEqual(dynamic_out["user_id_emb.values"].shape, (2, 6))
+            self.assertEqual(dynamic_out[f"{table_fqn}.values"].dtype, np.uint8)
+            self.assertEqual(dynamic_out[f"{table_fqn}.values"].shape, (2, 6))
             np.testing.assert_allclose(
                 _dequant_quint8_rowwise_f16(
-                    dynamic_out["user_id_emb.values"], emb_dim=2
+                    dynamic_out[f"{table_fqn}.values"], emb_dim=2
                 ),
                 values,
                 atol=5e-3,
             )
-            self.assertEqual(emb_meta["user_id_emb"]["dtype"], "QUint8RowwiseF16")
-            self.assertEqual(emb_meta["user_id_emb"]["shape"], [2, 2])
-            self.assertEqual(emb_meta["user_id_emb"]["storage_shape"], [2, 6])
-            self.assertEqual(emb_meta["user_id_emb"]["row_bytes"], 6)
-            self.assertEqual(
-                emb_meta["user_id_emb"]["quant"]["format"], "QUint8RowwiseF16"
+            self.assertEqual(emb_meta[table_fqn]["dtype"], "QUint8RowwiseF16")
+            self.assertEqual(emb_meta[table_fqn]["shape"], [2, 2])
+            self.assertEqual(emb_meta[table_fqn]["storage_shape"], [2, 6])
+            self.assertEqual(emb_meta[table_fqn]["row_bytes"], 6)
+            self.assertEqual(emb_meta[table_fqn]["quant"]["format"], "QUint8RowwiseF16")
+            self.assertEqual(emb_meta[table_fqn]["value_name"], f"{table_fqn}.values")
+        finally:
+            _restore_env(old_env)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_sparse_dynamic_export_disambiguates_owner_fqns(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_fqn_")
+        old_env = {
+            "RANK": os.environ.get("RANK"),
+            "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
+            "DIST_QUANT": os.environ.get("DIST_QUANT"),
+        }
+        try:
+            ckpt_dir = os.path.join(tmp, "model.ckpt-1")
+            ebc_dir = os.path.join(
+                ckpt_dir,
+                "dynamicemb",
+                "model.model.left.ebc",
             )
-            self.assertEqual(
-                emb_meta["user_id_emb"]["value_name"], "user_id_emb.values"
+            ec_dir = os.path.join(
+                ckpt_dir,
+                "dynamicemb",
+                "model.model.right.ec_dict.2",
             )
+            os.makedirs(ebc_dir)
+            os.makedirs(ec_dir)
+            for directory, key, values in (
+                (ebc_dir, 1, np.array([[1.0, 1.1]], dtype=np.float32)),
+                (ec_dir, 2, np.array([[2.0, 2.1]], dtype=np.float32)),
+            ):
+                np.array([key], dtype=np.int64).tofile(
+                    os.path.join(directory, "shared_emb_emb_keys.rank_0.world_size_1")
+                )
+                values.tofile(
+                    os.path.join(directory, "shared_emb_emb_values.rank_0.world_size_1")
+                )
+                np.array([key + 100], dtype=np.int64).tofile(
+                    os.path.join(directory, "shared_emb_emb_scores.rank_0.world_size_1")
+                )
+
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ.pop("DIST_QUANT", None)
+            ebc_fqn = "model.left.ebc.embedding_bags.shared_emb"
+            ec_fqn = "model.right.ec_dict.2.embeddings.shared_emb"
+
+            _, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                torch.nn.Module(),
+                ckpt_dir,
+                {
+                    ec_fqn: SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["sequence_feat"],
+                    )
+                },
+                {
+                    ebc_fqn: SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["pooled_feat"],
+                        pooling="SUM",
+                    )
+                },
+            )
+
+            torch.testing.assert_close(
+                dynamic_out[f"{ebc_fqn}.values"],
+                torch.tensor([[1.0, 1.1]]),
+            )
+            torch.testing.assert_close(
+                dynamic_out[f"{ec_fqn}.values"],
+                torch.tensor([[2.0, 2.1]]),
+            )
+            self.assertEqual(set(emb_meta), {ebc_fqn, ec_fqn})
+            self.assertEqual(feat_meta["pooled_feat__ebc"]["embedding_name"], ebc_fqn)
+            self.assertEqual(feat_meta["sequence_feat__ec"]["embedding_name"], ec_fqn)
+        finally:
+            _restore_env(old_env)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_sparse_dynamic_export_maps_input_tile_table_fqns(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_input_tile_")
+        old_env = {
+            "RANK": os.environ.get("RANK"),
+            "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
+            "DIST_QUANT": os.environ.get("DIST_QUANT"),
+        }
+        try:
+            ckpt_dir = os.path.join(tmp, "model.ckpt-1")
+            dy_dir = os.path.join(
+                ckpt_dir,
+                "dynamicemb",
+                "model.model.embedding_group.emb_impls.__BASE__.ebc",
+            )
+            os.makedirs(dy_dir)
+            np.array([1, 2], dtype=np.int64).tofile(
+                os.path.join(dy_dir, "shared_emb_emb_keys.rank_0.world_size_1")
+            )
+            np.array([[1.0, 1.1], [2.0, 2.1]], dtype=np.float32).tofile(
+                os.path.join(dy_dir, "shared_emb_emb_values.rank_0.world_size_1")
+            )
+            np.array([101, 102], dtype=np.int64).tofile(
+                os.path.join(dy_dir, "shared_emb_emb_scores.rank_0.world_size_1")
+            )
+
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ.pop("DIST_QUANT", None)
+            base_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc.embedding_bags.shared_emb"
+            )
+            user_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc_user."
+                "embedding_bags.shared_emb"
+            )
+
+            _, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                torch.nn.Module(),
+                ckpt_dir,
+                {},
+                {
+                    base_fqn: SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["item_feat"],
+                        pooling="SUM",
+                    ),
+                    user_fqn: SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["user_feat"],
+                        pooling="SUM",
+                    ),
+                },
+            )
+
+            torch.testing.assert_close(
+                dynamic_out[f"{base_fqn}.keys"], torch.tensor([1, 2])
+            )
+            torch.testing.assert_close(
+                dynamic_out[f"{user_fqn}.keys"], torch.tensor([1, 2])
+            )
+            self.assertEqual(set(emb_meta), {base_fqn, user_fqn})
+            self.assertEqual(feat_meta["item_feat__ebc"]["embedding_name"], base_fqn)
+            self.assertEqual(feat_meta["user_feat__ebc"]["embedding_name"], user_fqn)
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
@@ -490,49 +696,52 @@ class ExportUtilTest(unittest.TestCase):
         old_env = {"DIST_QUANT": os.environ.get("DIST_QUANT")}
         try:
             os.environ.pop("DIST_QUANT", None)
+            ebc_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc.embedding_bags.shared_emb"
+            )
+            ec_fqn = (
+                "model.embedding_group.seq_emb_impls.__BASE__.ec_dict.2."
+                "embeddings.shared_emb"
+            )
             out, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
                 SparseCollisionModel(),
                 tmp,
-                [
-                    SimpleNamespace(
+                {
+                    ec_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["seq_feat"],
                     )
-                ],
-                [
-                    SimpleNamespace(
+                },
+                {
+                    ebc_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["id_feat"],
                         pooling="SUM",
                     )
-                ],
+                },
             )
 
             self.assertEqual(dynamic_out, {})
             self.assertNotIn("shared_emb", out)
             np.testing.assert_array_equal(
-                out["shared_emb__ec"],
+                out[ec_fqn],
                 np.array([[2.0, 2.1], [2.2, 2.3]], dtype=np.float32),
             )
             np.testing.assert_array_equal(
-                out["shared_emb__ebc"],
+                out[ebc_fqn],
                 np.array([[1.0, 1.1], [1.2, 1.3]], dtype=np.float32),
             )
-            self.assertEqual(
-                emb_meta["shared_emb__ec"]["feat_name_impl"], ["seq_feat__ec"]
-            )
-            self.assertEqual(
-                emb_meta["shared_emb__ebc"]["feat_name_impl"], ["id_feat__ebc"]
-            )
+            self.assertEqual(emb_meta[ec_fqn]["feat_name_impl"], ["seq_feat__ec"])
+            self.assertEqual(emb_meta[ebc_fqn]["feat_name_impl"], ["id_feat__ebc"])
             self.assertEqual(
                 feat_meta["seq_feat__ec"],
-                {"embedding_name": "shared_emb__ec", "pooling": "NONE"},
+                {"embedding_name": ec_fqn, "pooling": "NONE"},
             )
             self.assertEqual(
                 feat_meta["id_feat__ebc"],
-                {"embedding_name": "shared_emb__ebc", "pooling": "SUM"},
+                {"embedding_name": ebc_fqn, "pooling": "SUM"},
             )
         finally:
             _restore_env(old_env)
@@ -556,49 +765,56 @@ class ExportUtilTest(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="tzrec_export_sparse_quant_")
         try:
             os.environ["DIST_QUANT"] = "INT8"
+            ebc_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc.embedding_bags.shared_emb"
+            )
+            ec_fqn = (
+                "model.embedding_group.seq_emb_impls.__BASE__.ec_dict.2."
+                "embeddings.shared_emb"
+            )
             out, dynamic_out, emb_meta, _ = _get_sparse_embedding_tensor(
                 SparseCollisionModel(),
                 tmp,
-                [
-                    SimpleNamespace(
+                {
+                    ec_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["seq_feat"],
                     )
-                ],
-                [
-                    SimpleNamespace(
+                },
+                {
+                    ebc_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["id_feat"],
                         pooling="SUM",
                     )
-                ],
+                },
             )
 
             self.assertEqual(dynamic_out, {})
-            self.assertEqual(out["shared_emb__ec"].dtype, np.uint8)
-            self.assertEqual(out["shared_emb__ebc"].dtype, np.uint8)
-            self.assertEqual(out["shared_emb__ec"].shape, (2, 6))
-            self.assertEqual(out["shared_emb__ebc"].shape, (2, 6))
+            self.assertEqual(out[ec_fqn].dtype, np.uint8)
+            self.assertEqual(out[ebc_fqn].dtype, np.uint8)
+            self.assertEqual(out[ec_fqn].shape, (2, 6))
+            self.assertEqual(out[ebc_fqn].shape, (2, 6))
             np.testing.assert_allclose(
-                _dequant_quint8_rowwise_f16(out["shared_emb__ec"], emb_dim=2),
+                _dequant_quint8_rowwise_f16(out[ec_fqn], emb_dim=2),
                 np.array([[-3.0, 3.0], [-4.0, 4.0]], dtype=np.float32),
                 atol=5e-3,
             )
             np.testing.assert_allclose(
-                _dequant_quint8_rowwise_f16(out["shared_emb__ebc"], emb_dim=2),
+                _dequant_quint8_rowwise_f16(out[ebc_fqn], emb_dim=2),
                 np.array([[-1.0, 1.0], [-2.0, 2.0]], dtype=np.float32),
                 atol=5e-3,
             )
-            self.assertEqual(emb_meta["shared_emb__ec"]["dtype"], "QUint8RowwiseF16")
-            self.assertEqual(emb_meta["shared_emb__ec"]["shape"], [2, 2])
-            self.assertEqual(emb_meta["shared_emb__ec"]["storage_shape"], [2, 6])
-            self.assertEqual(emb_meta["shared_emb__ec"]["row_bytes"], 6)
-            self.assertEqual(emb_meta["shared_emb__ebc"]["dtype"], "QUint8RowwiseF16")
-            self.assertEqual(emb_meta["shared_emb__ebc"]["shape"], [2, 2])
-            self.assertEqual(emb_meta["shared_emb__ebc"]["storage_shape"], [2, 6])
-            self.assertEqual(emb_meta["shared_emb__ebc"]["row_bytes"], 6)
+            self.assertEqual(emb_meta[ec_fqn]["dtype"], "QUint8RowwiseF16")
+            self.assertEqual(emb_meta[ec_fqn]["shape"], [2, 2])
+            self.assertEqual(emb_meta[ec_fqn]["storage_shape"], [2, 6])
+            self.assertEqual(emb_meta[ec_fqn]["row_bytes"], 6)
+            self.assertEqual(emb_meta[ebc_fqn]["dtype"], "QUint8RowwiseF16")
+            self.assertEqual(emb_meta[ebc_fqn]["shape"], [2, 2])
+            self.assertEqual(emb_meta[ebc_fqn]["storage_shape"], [2, 6])
+            self.assertEqual(emb_meta[ebc_fqn]["row_bytes"], 6)
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
@@ -621,18 +837,22 @@ class ExportUtilTest(unittest.TestCase):
                 "change the table's embedding_dim to an even value.*"
                 "DIST_QUANT=0/NONE",
             ):
+                table_fqn = (
+                    "model.embedding_group.emb_impls.__BASE__.ebc."
+                    "embedding_bags.user_id_emb"
+                )
                 _get_sparse_embedding_tensor(
                     OddDimModel(),
                     tmp,
-                    [],
-                    [
-                        SimpleNamespace(
+                    {},
+                    {
+                        table_fqn: SimpleNamespace(
                             name="user_id_emb",
                             embedding_dim=3,
                             feature_names=["user_id"],
                             pooling="SUM",
                         )
-                    ],
+                    },
                 )
         finally:
             _restore_env(old_env)
