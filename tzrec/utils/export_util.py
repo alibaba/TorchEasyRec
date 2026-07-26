@@ -2294,9 +2294,7 @@ def _get_sparse_embedding_tensor(
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
-            feat_name_to_pooling[feat_name_impl] = str(
-                getattr(emb_info, "pooling", "NONE")
-            ).split(".")[-1]
+            feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[-1]
 
     out = {}
     # dynamicemb keys/values are saved into a separate npz, kept in this dict.
