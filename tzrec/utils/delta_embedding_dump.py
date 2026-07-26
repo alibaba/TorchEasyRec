@@ -492,9 +492,20 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         index_start = max(self.per_consumer_batch_idx.values())
         if index_start < index_end:
             self.store.compact(index_start, index_end)
-        tracker_rows = self.store.get_unique(
-            from_idx=self.per_consumer_batch_idx[consumer]
-        )
+
+        tracker_rows: Dict[str, UniqueRows] = {}
+        from_idx = self.per_consumer_batch_idx[consumer]
+        for fqn, lookups in self.store.per_fqn_lookups.items():
+            compact_ids = [
+                lookup.ids for lookup in lookups if lookup.batch_idx >= from_idx
+            ]
+            if not compact_ids:
+                continue
+            tracker_rows[fqn] = UniqueRows(
+                ids=torch.cat(compact_ids).unique(),
+                states=None,
+            )
+
         self.per_consumer_batch_idx[consumer] = index_end
         if self._delete_on_read:
             self.store.delete(up_to_idx=min(self.per_consumer_batch_idx.values()))

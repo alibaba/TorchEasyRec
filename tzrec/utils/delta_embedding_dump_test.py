@@ -704,11 +704,14 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         tracker.per_consumer_batch_idx = {"delta": -1}
         tracker.curr_batch_idx = 0
         tracker.store = mock.MagicMock()
-        tracker.store.get_unique.return_value = {
-            "model.ebc.embedding_bags.shared": SimpleNamespace(
-                ids=torch.tensor([1, 2]),
-                states=None,
-            )
+        tracker.store.per_fqn_lookups = {
+            "model.ebc.embedding_bags.shared": [
+                SimpleNamespace(
+                    batch_idx=0,
+                    ids=torch.tensor([1, 2]),
+                    states=None,
+                )
+            ]
         }
 
         rows = tracker.get_unique("delta")
@@ -718,16 +721,42 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             torch.tensor([1, 2]),
         )
         tracker.store.compact.assert_called_once_with(-1, 1)
-        tracker.store.get_unique.assert_called_once_with(from_idx=-1)
         tracker.store.delete.assert_called_once_with(up_to_idx=1)
         self.assertEqual(tracker.per_consumer_batch_idx["delta"], 1)
 
         tracker.step()
         tracker.store.reset_mock()
-        tracker.get_unique("delta")
+        rows = tracker.get_unique("delta")
+        self.assertEqual(rows, {})
         tracker.store.compact.assert_called_once_with(1, 2)
-        tracker.store.get_unique.assert_called_once_with(from_idx=1)
         tracker.store.delete.assert_called_once_with(up_to_idx=2)
+        self.assertEqual(tracker.per_consumer_batch_idx["delta"], 2)
+
+    def test_model_delta_tracker_skips_empty_table_in_later_interval(self):
+        tracker = ModelDeltaTracker(
+            torch.nn.Module(),
+            consumers=["delta"],
+            delete_on_read=True,
+        )
+        table_fqn = "model.ebc.embedding_bags.shared"
+        tracker.store.append(
+            batch_idx=0,
+            fqn=table_fqn,
+            ids=torch.tensor([2, 1, 2]),
+            states=None,
+        )
+
+        first_rows = tracker.get_unique("delta")
+        torch.testing.assert_close(
+            first_rows[table_fqn].ids,
+            torch.tensor([1, 2]),
+        )
+        self.assertEqual(tracker.store.per_fqn_lookups[table_fqn], [])
+
+        tracker.step()
+        second_rows = tracker.get_unique("delta")
+
+        self.assertEqual(second_rows, {})
         self.assertEqual(tracker.per_consumer_batch_idx["delta"], 2)
 
     def test_model_delta_tracker_auto_compacts_once_per_batch(self):
