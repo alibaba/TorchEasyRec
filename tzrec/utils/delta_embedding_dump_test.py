@@ -22,10 +22,18 @@ import pyarrow.parquet as pq
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torch import nn
+from torch.distributed._shard.metadata import ShardMetadata
+from torch.distributed._shard.sharding_spec import EnumerableShardingSpec
+from torch.distributed.tensor import DTensor
 from torchrec import KeyedJaggedTensor
 from torchrec.distributed import DistributedModelParallel, ShardingEnv
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embedding_lookup import GroupedPooledEmbeddingsLookup
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+    ShardedEmbeddingTable,
+)
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner import (
     EmbeddingShardingPlanner,
@@ -36,7 +44,7 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import ParameterSharding, ShardingType
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
@@ -46,6 +54,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
+from torchrec.types import DataType
 
 from tzrec.protos import feature_pb2
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
@@ -55,6 +64,7 @@ from tzrec.utils.delta_embedding_dump import (
     _DELTA_DUMP_SCHEMA,
     DeltaEmbeddingDumper,
     ModelDeltaTracker,
+    _local_table_weight,
     _table_shard_info_from_config,
     _TableShardInfo,
     _TableWeight,
@@ -445,14 +455,16 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 )
 
     def test_row_wise_shard_info_uses_row_offset(self):
-        table_config = SimpleNamespace(
+        table_config = ShardedEmbeddingTable(
             local_rows=16,
             local_cols=8,
             num_embeddings=64,
             embedding_dim=8,
-            local_metadata=SimpleNamespace(
+            name="user_emb",
+            local_metadata=ShardMetadata(
                 shard_offsets=[32, 0],
                 shard_sizes=[16, 8],
+                placement="rank:1/cuda:1",
             ),
         )
         shard_info = _table_shard_info_from_config(table_config)
@@ -461,14 +473,16 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(shard_info.global_cols, 8)
 
     def test_column_wise_shard_info_fails_fast(self):
-        table_config = SimpleNamespace(
+        table_config = ShardedEmbeddingTable(
             local_rows=64,
             local_cols=4,
             num_embeddings=64,
             embedding_dim=8,
-            local_metadata=SimpleNamespace(
+            name="user_emb",
+            local_metadata=ShardMetadata(
                 shard_offsets=[0, 4],
                 shard_sizes=[64, 4],
+                placement="rank:0/cuda:0",
             ),
         )
         shard_info = _table_shard_info_from_config(table_config)
@@ -741,19 +755,19 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_collect_table_weights_uses_owner_fqn_keys(self):
         ebc_module = torch.nn.Module()
         ec_module = torch.nn.Module()
+        ebc_lookup = mock.Mock(spec=GroupedPooledEmbeddingsLookup)
+        ebc_lookup.named_parameters_by_table.return_value = [
+            ("shared", torch.tensor([[1.0, 2.0]]))
+        ]
+        ec_lookup = mock.Mock(spec=GroupedPooledEmbeddingsLookup)
+        ec_lookup.named_parameters_by_table.return_value = [
+            ("shared", torch.tensor([[3.0, 4.0]]))
+        ]
         ebc_module._lookups = [
-            SimpleNamespace(
-                named_parameters_by_table=lambda: [
-                    ("shared", torch.tensor([[1.0, 2.0]]))
-                ]
-            )
+            ebc_lookup,
         ]
         ec_module._lookups = [
-            SimpleNamespace(
-                named_parameters_by_table=lambda: [
-                    ("shared", torch.tensor([[3.0, 4.0]]))
-                ]
-            )
+            ec_lookup,
         ]
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._table_shard_infos = {}
@@ -784,6 +798,31 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             table_weights["model.ec.shared"].tensor,
             torch.tensor([[3.0, 4.0]]),
         )
+
+    def test_collect_table_weights_rejects_unsupported_lookup(self):
+        sharded_module = torch.nn.Module()
+        sharded_module._lookups = [torch.nn.Identity()]
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._table_shard_infos = {}
+        dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": sharded_module})
+
+        with self.assertRaisesRegex(TypeError, "Unsupported embedding lookup"):
+            dumper._collect_table_weights()
+
+    def test_local_table_weight_rejects_unsupported_weight(self):
+        with self.assertRaisesRegex(TypeError, "Unsupported embedding table value"):
+            _local_table_weight(object())
+
+    def test_local_table_weight_materializes_dtensor(self):
+        local_tensor = torch.tensor([[1.0, 2.0]])
+        dtensor = mock.Mock(spec=DTensor)
+        dtensor.to_local.return_value = local_tensor
+
+        table_weight = _local_table_weight(dtensor)
+
+        self.assertIs(table_weight.tensor, local_tensor)
+        self.assertEqual(table_weight.shard_info.local_rows, 1)
+        self.assertEqual(table_weight.shard_info.local_cols, 2)
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     def test_collect_dynamic_modules_uses_owner_fqn_keys(self):
@@ -919,36 +958,41 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(odist_fn.call_args_list, [mock.call(), mock.call()])
 
     def test_collect_table_shard_infos_prefers_grouped_embedding_metadata(self):
-        original_config_module = torch.nn.Module()
-        original_config_module._table_name_to_config = {
-            "user_emb": SimpleNamespace(
-                local_rows=16,
-                local_cols=8,
-                num_embeddings=64,
-                embedding_dim=8,
-            )
-        }
-        grouped_config_module = torch.nn.Module()
-        grouped_config_module._config = SimpleNamespace(
+        grouped_config = GroupedEmbeddingConfig(
+            data_type=DataType.FP32,
+            pooling=PoolingType.SUM,
+            is_weighted=False,
+            has_feature_processor=False,
+            compute_kernel=EmbeddingComputeKernel.FUSED,
             embedding_tables=[
-                SimpleNamespace(
+                ShardedEmbeddingTable(
                     name="user_emb",
                     local_rows=16,
                     local_cols=8,
                     num_embeddings=64,
                     embedding_dim=8,
-                    local_metadata=SimpleNamespace(
+                    local_metadata=ShardMetadata(
                         shard_offsets=[32, 0],
                         shard_sizes=[16, 8],
+                        placement="rank:1/cuda:1",
                     ),
                 )
-            ]
+            ],
         )
+        grouped_lookup = mock.Mock(spec=GroupedPooledEmbeddingsLookup)
+        grouped_lookup.grouped_configs = [grouped_config]
+        owner_module = torch.nn.Module()
+        owner_module._table_name_to_config = {
+            "user_emb": EmbeddingBagConfig(
+                name="user_emb",
+                num_embeddings=64,
+                embedding_dim=8,
+                feature_names=["user_id"],
+            )
+        }
+        owner_module.module_sharding_plan = {}
+        owner_module._lookups = [grouped_lookup]
         dumper = object.__new__(DeltaEmbeddingDumper)
-        owner_module = torch.nn.Sequential(
-            original_config_module,
-            grouped_config_module,
-        )
         dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": owner_module})
         with mock.patch(
             "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
@@ -964,24 +1008,26 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_collect_table_shard_infos_falls_back_to_sharding_plan(self):
         sharded_module = torch.nn.Module()
         sharded_module._table_name_to_config = {
-            "adgroup_id_emb": SimpleNamespace(
-                local_rows=16,
-                local_cols=8,
+            "adgroup_id_emb": EmbeddingBagConfig(
+                name="adgroup_id_emb",
                 num_embeddings=64,
                 embedding_dim=8,
+                feature_names=["adgroup_id"],
             )
         }
         sharded_module.module_sharding_plan = {
-            "adgroup_id_emb": SimpleNamespace(
+            "adgroup_id_emb": ParameterSharding(
+                sharding_type=ShardingType.ROW_WISE.value,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
                 ranks=None,
-                sharding_spec=SimpleNamespace(
-                    shards=[
-                        SimpleNamespace(
+                sharding_spec=EnumerableShardingSpec(
+                    [
+                        ShardMetadata(
                             shard_offsets=[0, 0],
                             shard_sizes=[32, 8],
                             placement="rank:0/cuda:0",
                         ),
-                        SimpleNamespace(
+                        ShardMetadata(
                             shard_offsets=[32, 0],
                             shard_sizes=[32, 8],
                             placement="rank:1/cuda:1",
@@ -990,6 +1036,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 ),
             )
         }
+        sharded_module._lookups = []
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 0
         dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": sharded_module})
