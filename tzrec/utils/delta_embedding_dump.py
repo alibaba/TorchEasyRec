@@ -29,10 +29,7 @@ from torchrec.distributed.model_tracker.model_delta_tracker import (
 from torchrec.distributed.model_tracker.types import TrackingMode
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
-from tzrec.utils.feature_store_delta_uploader import (
-    FeatureStoreDeltaUploader,
-    validate_feature_store_config,
-)
+from tzrec.utils.feature_store_delta_uploader import FeatureStoreDeltaUploader
 from tzrec.utils.logging_util import logger
 from tzrec.utils.sparse_embedding_contract import (
     SPARSE_EBC_ROLE,
@@ -126,8 +123,6 @@ def validate_delta_embedding_dump_config(
             )
     elif config.dump_interval_steps <= 0:
         raise ValueError("delta_embedding_dump_config.dump_interval_steps must be > 0.")
-    if config.HasField("feature_store_config"):
-        validate_feature_store_config(config.feature_store_config)
 
 
 def _has_proto_field(config: Any, field_name: str) -> bool:

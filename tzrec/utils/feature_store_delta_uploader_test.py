@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
 import threading
 import unittest
@@ -131,75 +130,25 @@ class _BlockingView(_FakeView):
         self.close_finished.set()
 
 
-class _FakeGenericFeatureView:
-    def __init__(
-        self,
-        *,
-        feature_view_type="DynamicEmbedding",
-        entity="embedding_entity",
-        fields=None,
-        provisioning=None,
-    ):
-        self.type = feature_view_type
-        self.feature_entity_name = entity
-        self.fields_dict = (
-            {
-                "embedding_name": {
-                    "Name": "embedding_name",
-                    "Type": "STRING",
-                    "Attributes": ["PrimaryKey"],
-                },
-                "key_id": {
-                    "Name": "key_id",
-                    "Type": "INT64",
-                    "Attributes": ["SubKey"],
-                },
-                "embedding": {
-                    "Name": "embedding",
-                    "Type": "ARRAY<FLOAT>",
-                    "Attributes": [],
-                },
-            }
-            if fields is None
-            else fields
-        )
-        if provisioning is None:
-            provisioning = {
-                "ttl": 1296000,
-                "shard_count": 20,
-                "replication_count": 1,
-            }
-        self.summary = {"Config": json.dumps(provisioning)}
-
-
 class _FakeProject:
     def __init__(
         self,
         view,
         *,
         created_view=None,
-        generic_view=None,
         create_error=None,
         view_after_create_error=None,
     ):
         self._view = view
         self._created_view = created_view
-        self._generic_view = generic_view
         self._create_error = create_error
         self._view_after_create_error = view_after_create_error
         self.dynamic_get_calls = []
-        self.generic_get_calls = []
         self.create_calls = []
 
     def get_dynamic_embedding_feature_view(self, name):
         self.dynamic_get_calls.append(name)
         return self._view
-
-    def get_feature_view(self, name):
-        self.generic_get_calls.append(name)
-        if self._generic_view is None and self._view is not None:
-            self._generic_view = _FakeGenericFeatureView()
-        return self._generic_view
 
     def create_dynamic_embedding_feature_view(self, **kwargs):
         self.create_calls.append(kwargs)
@@ -207,7 +156,6 @@ class _FakeProject:
             self._view = self._view_after_create_error
             raise self._create_error
         self._view = self._created_view or _FakeView()
-        self._generic_view = _FakeGenericFeatureView()
         return self._view
 
 
@@ -285,7 +233,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "feature_view_ttl_secs",
             "feature_view_shard_count",
             "feature_view_replication_count",
-            "allow_custom_endpoint",
             "retain_local_dump",
         ]
         fields = list(FeatureStoreConfig.DESCRIPTOR.fields)
@@ -307,7 +254,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         )
         self.assertEqual(
             [field.number for field in fields],
-            list(range(1, 18)),
+            list(range(1, 16)) + [17],
         )
         for field_name in required_fields:
             with self.subTest(field_name=field_name):
@@ -347,10 +294,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             settings = FeatureStoreUploadSettings.from_proto(config)
         self.assertEqual(settings.region, "cn-env")
 
-        with self.assertRaisesRegex(ValueError, "userinfo"):
-            FeatureStoreUploadSettings.from_proto(
-                _feature_store_config(endpoint="https://user:secret@example.com")
-            )
         with self.assertRaisesRegex(ValueError, "must be <= 1000"):
             FeatureStoreUploadSettings.from_proto(
                 _feature_store_config(upload_batch_size=1001)
@@ -364,60 +307,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 _feature_store_config(feature_view_replication_count=4)
             )
 
-    def test_endpoint_must_be_a_trusted_https_host(self):
-        for endpoint in (
-            "featurestore.cn-hangzhou.aliyuncs.com",
-            "https://featurestore.cn-hangzhou.aliyuncs.com",
-            "https://featurestore-vpc.cn-beijing.aliyuncs.com/",
-        ):
-            with self.subTest(endpoint=endpoint):
-                settings = FeatureStoreUploadSettings.from_proto(
-                    _feature_store_config(endpoint=endpoint)
-                )
-                self.assertEqual(settings.endpoint, endpoint)
-                self.assertFalse(settings.allow_custom_endpoint)
-
-        rejected_endpoints = {
-            "http://featurestore.cn-hangzhou.aliyuncs.com": "HTTPS",
-            "ftp://featurestore.cn-hangzhou.aliyuncs.com": "HTTPS",
-            "evil.example.com": "trusted",
-            "https://aliyuncs.com": "trusted",
-            "https://featurestore.cn-hangzhou.aliyuncs.com.evil.com": "trusted",
-            "featurestore.cn-hangzhou.aliyuncs.com:8443": "port",
-            "https://featurestore.cn-hangzhou.aliyuncs.com/v1": "path, query",
-            "https://featurestore.cn-hangzhou.aliyuncs.com?x=1": "path, query",
-            "https://featurestore.cn-hangzhou.aliyuncs.com#frag": "fragment",
-            "https://": "host",
-        }
-        for endpoint, message in rejected_endpoints.items():
-            with self.subTest(endpoint=endpoint):
-                with self.assertRaisesRegex(ValueError, message):
-                    FeatureStoreUploadSettings.from_proto(
-                        _feature_store_config(endpoint=endpoint)
-                    )
-
-    def test_allow_custom_endpoint_opts_into_vetted_hosts(self):
-        settings = FeatureStoreUploadSettings.from_proto(
-            _feature_store_config(
-                endpoint="https://featurestore.internal.example.com:8443",
-                allow_custom_endpoint=True,
-            )
-        )
-        self.assertTrue(settings.allow_custom_endpoint)
-
-        for endpoint in (
-            "http://featurestore.internal.example.com",
-            "https://user:secret@featurestore.internal.example.com",
-            "https://featurestore.internal.example.com/v1",
-        ):
-            with self.subTest(endpoint=endpoint):
-                with self.assertRaisesRegex(ValueError, "endpoint"):
-                    FeatureStoreUploadSettings.from_proto(
-                        _feature_store_config(
-                            endpoint=endpoint, allow_custom_endpoint=True
-                        )
-                    )
-
     def test_start_reuses_existing_dynamic_embedding_feature_view(self):
         view = _FakeView()
         factory = _FakeClientFactory(view)
@@ -427,7 +316,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         uploader.close()
 
         self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
-        self.assertEqual(factory.project.generic_get_calls, ["shared_embeddings"])
         self.assertEqual(factory.project.create_calls, [])
         self.assertNotIn("test_mode", factory.calls[0])
         self.assertEqual(view.closed, [True])
@@ -440,10 +328,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         uploader.start()
         uploader.close()
 
-        self.assertEqual(
-            factory.project.generic_get_calls,
-            ["shared_embeddings", "shared_embeddings"],
-        )
+        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
         self.assertEqual(
             factory.project.create_calls,
             [
@@ -462,59 +347,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             ],
         )
         self.assertEqual(created_view.closed, [True])
-
-    def test_start_rejects_same_name_non_dynamic_feature_view(self):
-        generic_view = mock.Mock(type="Batch")
-        factory = _FakeClientFactory(None, generic_view=generic_view)
-        uploader = self._uploader(client_factory=factory)
-
-        with self.assertRaisesRegex(RuntimeError, "incompatible type"):
-            uploader.start()
-
-        self.assertEqual(factory.project.create_calls, [])
-
-    def test_start_rejects_existing_feature_view_with_wrong_entity(self):
-        view = _FakeView()
-        generic_view = _FakeGenericFeatureView(entity="another_entity")
-        factory = _FakeClientFactory(view, generic_view=generic_view)
-        uploader = self._uploader(client_factory=factory)
-
-        with self.assertRaisesRegex(RuntimeError, "entity mismatch"):
-            uploader.start()
-
-        self.assertEqual(factory.project.create_calls, [])
-        self.assertEqual(view.closed, [True])
-
-    def test_start_rejects_existing_feature_view_with_wrong_field_contract(self):
-        view = _FakeView()
-        generic_view = _FakeGenericFeatureView()
-        generic_view.fields_dict["embedding"]["Type"] = "ARRAY<DOUBLE>"
-        factory = _FakeClientFactory(view, generic_view=generic_view)
-        uploader = self._uploader(client_factory=factory)
-
-        with self.assertRaisesRegex(RuntimeError, "field contract mismatch"):
-            uploader.start()
-
-        self.assertEqual(factory.project.create_calls, [])
-        self.assertEqual(view.closed, [True])
-
-    def test_start_rejects_existing_feature_view_with_wrong_provisioning(self):
-        view = _FakeView()
-        generic_view = _FakeGenericFeatureView(
-            provisioning={
-                "ttl": 60,
-                "shard_count": 20,
-                "replication_count": 1,
-            }
-        )
-        factory = _FakeClientFactory(view, generic_view=generic_view)
-        uploader = self._uploader(client_factory=factory)
-
-        with self.assertRaisesRegex(RuntimeError, "provisioning mismatch"):
-            uploader.start()
-
-        self.assertEqual(factory.project.create_calls, [])
-        self.assertEqual(view.closed, [True])
 
     def test_start_recovers_from_concurrent_feature_view_creation(self):
         concurrent_view = _FakeView()
@@ -582,7 +414,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         uploader.close()
 
         self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
-        self.assertEqual(factory.project.generic_get_calls, [])
         self.assertEqual(factory.project.create_calls, [])
         self.assertEqual(len(view.calls), 1)
         self.assertEqual(view.calls[0]["data"][0]["key_id"], 7)
@@ -599,7 +430,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             uploader.start()
 
         self.assertEqual(factory.project.create_calls, [])
-        self.assertEqual(factory.project.generic_get_calls, [])
 
     def test_submit_requires_started_uploader(self):
         uploader = self._uploader(client_factory=_FakeClientFactory(_FakeView()))

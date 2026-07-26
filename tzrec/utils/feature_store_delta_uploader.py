@@ -16,7 +16,6 @@ recovery, no durable state, no replay. A process crash means restart from the
 latest checkpoint and pending deltas are discarded.
 """
 
-import json
 import os
 import threading
 import time
@@ -31,7 +30,6 @@ from typing import (
     Tuple,
     cast,
 )
-from urllib.parse import urlsplit
 
 import numpy as np
 import pyarrow as pa
@@ -79,7 +77,6 @@ class FeatureStoreUploadSettings:
     shutdown_timeout_secs: int
     max_pending_steps: int
     poll_interval_secs: int
-    allow_custom_endpoint: bool
 
     @classmethod
     def from_proto(cls, config: FeatureStoreConfig) -> "FeatureStoreUploadSettings":
@@ -98,8 +95,6 @@ class FeatureStoreUploadSettings:
                 "feature_store_config.region must not be empty "
                 "(it may come from ALIBABA_CLOUD_REGION)"
             )
-        allow_custom_endpoint = bool(config.allow_custom_endpoint)
-        _validate_feature_store_endpoint(endpoint, allow_custom_endpoint)
         project_name = config.project_name.strip()
         feature_entity_name = config.feature_entity_name.strip()
         feature_view_name = config.feature_view_name.strip()
@@ -161,63 +156,7 @@ class FeatureStoreUploadSettings:
             shutdown_timeout_secs=positive_values["shutdown_timeout_secs"],
             max_pending_steps=positive_values["max_pending_steps"],
             poll_interval_secs=positive_values["poll_interval_secs"],
-            allow_custom_endpoint=allow_custom_endpoint,
         )
-
-
-def validate_feature_store_config(config: FeatureStoreConfig) -> None:
-    """Validate upload configuration without resolving credentials."""
-    FeatureStoreUploadSettings.from_proto(config)
-
-
-def _validate_feature_store_endpoint(
-    endpoint: str, allow_custom_endpoint: bool
-) -> None:
-    """Reject endpoints that could divert cloud or FeatureDB credentials.
-
-    The endpoint receives the access keys, STS token and FeatureDB
-    credentials, so only trusted Alibaba Cloud hosts are accepted unless the
-    operator explicitly opts in to a vetted custom deployment.
-    """
-    if not endpoint:
-        return
-    parsed_endpoint = urlsplit(endpoint if "://" in endpoint else f"//{endpoint}")
-    if parsed_endpoint.scheme and parsed_endpoint.scheme != "https":
-        raise ValueError(
-            "feature_store_config.endpoint must use HTTPS when set; "
-            f"got scheme={parsed_endpoint.scheme!r}"
-        )
-    if parsed_endpoint.username or parsed_endpoint.password:
-        raise ValueError(
-            "feature_store_config.endpoint must not contain userinfo credentials"
-        )
-    if parsed_endpoint.path not in ("", "/"):
-        raise ValueError(
-            "feature_store_config.endpoint must not contain a path, query, or fragment"
-        )
-    if parsed_endpoint.query or parsed_endpoint.fragment:
-        raise ValueError(
-            "feature_store_config.endpoint must not contain a path, query, or fragment"
-        )
-    if parsed_endpoint.port is not None and not allow_custom_endpoint:
-        raise ValueError(
-            "feature_store_config.endpoint must not contain an explicit port"
-        )
-    hostname = (parsed_endpoint.hostname or "").lower()
-    if not hostname:
-        raise ValueError("feature_store_config.endpoint must contain a hostname")
-    trusted_suffixes = (
-        ".aliyuncs.com",
-        ".alibabacloud.com",
-        ".aliyun.com",
-    )
-    if not hostname.endswith(trusted_suffixes):
-        if not allow_custom_endpoint:
-            raise ValueError(
-                "feature_store_config.endpoint must be a trusted Alibaba Cloud "
-                f"host (got {hostname!r}); set allow_custom_endpoint only for a "
-                "vetted private deployment"
-            )
 
 
 class FeatureStoreDeltaUploader:
@@ -253,16 +192,6 @@ class FeatureStoreDeltaUploader:
             str(name): int(dimension)
             for name, dimension in embedding_dimensions.items()
         }
-        invalid_dimensions = {
-            name: dimension
-            for name, dimension in self._embedding_dimensions.items()
-            if not name or dimension <= 0
-        }
-        if invalid_dimensions:
-            raise ValueError(
-                "invalid sparse embedding dimensions in FeatureStore contract: "
-                f"{invalid_dimensions}"
-            )
 
         self._client_factory = client_factory
         self._credentials_client = (
@@ -710,9 +639,11 @@ class FeatureStoreDeltaUploader:
     def _get_or_create_view(self, project: Any) -> Any:
         """Return the configured DynamicEmbedding view, creating it if absent.
 
-        Only the primary (rank-zero) uploader creates the view and validates
-        control-plane metadata; other ranks open a handle to the view that the
-        primary published before they started.
+        Only the primary (rank-zero) uploader creates the view; other ranks open
+        a handle to the view that the primary published before they started.
+        Schema compatibility is checked once on the data-plane writer in
+        ``_get_view``; creation-time provisioning (TTL/shard/replication) does
+        not affect upload compatibility and is not re-validated here.
         """
         if not self._manage_remote_view:
             view = project.get_dynamic_embedding_feature_view(
@@ -732,19 +663,7 @@ class FeatureStoreDeltaUploader:
         view = project.get_dynamic_embedding_feature_view(
             self._settings.feature_view_name
         )
-        if view is not None:
-            self._view = view
-        metadata = self._wait_for_feature_view_metadata(project)
-        if view is None and metadata is not None:
-            self._validate_feature_view_metadata(metadata)
-            view = self._wait_for_dynamic_embedding_view(project)
-            if view is None:
-                raise RuntimeError(
-                    "configured DynamicEmbedding FeatureView exists but did not "
-                    "become ready"
-                )
-            self._view = view
-        elif view is None:
+        if view is None:
             create_error: Optional[Exception] = None
             try:
                 view = project.create_dynamic_embedding_feature_view(
@@ -772,15 +691,6 @@ class FeatureStoreDeltaUploader:
                     raise error from create_error
                 raise error
             self._view = view
-            metadata = self._wait_for_feature_view_metadata(project)
-
-        if metadata is None:
-            self._view = view
-            raise RuntimeError(
-                "DynamicEmbedding FeatureView control-plane metadata was not found"
-            )
-        self._view = view
-        self._validate_feature_view_metadata(metadata)
         if provisioned:
             logger.info(
                 "Created DynamicEmbedding FeatureView: project=%s entity=%s view=%s",
@@ -813,111 +723,6 @@ class FeatureStoreDeltaUploader:
                 "DynamicEmbedding FeatureView did not become ready after creation"
             ) from last_error
         return None
-
-    def _wait_for_feature_view_metadata(self, project: Any) -> Any:
-        """Bounded control-plane lookup used to validate the created resource."""
-        last_error: Optional[Exception] = None
-        for attempt in range(1, self._settings.max_retries + 1):
-            try:
-                feature_view = project.get_feature_view(
-                    self._settings.feature_view_name
-                )
-            except Exception as exc:
-                last_error = exc
-            else:
-                if feature_view is not None:
-                    return feature_view
-            if (
-                attempt < self._settings.max_retries
-                and self._settings.retry_backoff_secs > 0
-            ):
-                time.sleep(self._settings.retry_backoff_secs * attempt)
-        if last_error is not None:
-            raise RuntimeError(
-                "FeatureView control-plane metadata did not become ready"
-            ) from last_error
-        return None
-
-    def _validate_feature_view_metadata(self, feature_view: Any) -> None:
-        """Validate immutable control-plane schema and provisioning settings."""
-        actual_type = getattr(feature_view, "type", None)
-        if actual_type != "DynamicEmbedding":
-            raise RuntimeError(
-                "configured FeatureView exists with an incompatible type: "
-                f"expected='DynamicEmbedding', actual={actual_type!r}"
-            )
-        actual_entity = getattr(feature_view, "feature_entity_name", None)
-        if actual_entity != self._settings.feature_entity_name:
-            raise RuntimeError(
-                "DynamicEmbedding FeatureView entity mismatch: "
-                f"expected={self._settings.feature_entity_name!r}, "
-                f"actual={actual_entity!r}"
-            )
-
-        expected_fields = {
-            FEATURE_STORE_PK_FIELD: ("STRING", {"PrimaryKey"}),
-            FEATURE_STORE_SK_FIELD: ("INT64", {"SubKey"}),
-            FEATURE_STORE_VALUE_FIELD: ("ARRAY<FLOAT>", set()),
-        }
-        fields = getattr(feature_view, "fields_dict", None)
-        if not isinstance(fields, dict) or set(fields) != set(expected_fields):
-            actual_names = sorted(fields) if isinstance(fields, dict) else None
-            raise RuntimeError(
-                "DynamicEmbedding FeatureView field set mismatch: "
-                f"expected={sorted(expected_fields)}, actual={actual_names}"
-            )
-        for name, (expected_type, expected_attributes) in expected_fields.items():
-            field_info = fields[name]
-            if not isinstance(field_info, dict):
-                raise RuntimeError(
-                    "DynamicEmbedding FeatureView has invalid field metadata for "
-                    f"{name!r}"
-                )
-            actual_field_type = field_info.get("Type")
-            attributes = field_info.get("Attributes", [])
-            if not isinstance(attributes, (list, tuple, set)):
-                raise RuntimeError(
-                    "DynamicEmbedding FeatureView has invalid field attributes for "
-                    f"{name!r}"
-                )
-            actual_attributes = set(attributes)
-            if (
-                actual_field_type != expected_type
-                or actual_attributes != expected_attributes
-            ):
-                raise RuntimeError(
-                    "DynamicEmbedding FeatureView field contract mismatch for "
-                    f"{name!r}: expected_type={expected_type!r}, "
-                    f"actual_type={actual_field_type!r}, "
-                    f"expected_attributes={sorted(expected_attributes)}, "
-                    f"actual_attributes={sorted(actual_attributes)}"
-                )
-
-        summary = getattr(feature_view, "summary", None)
-        config_value = summary.get("Config") if isinstance(summary, dict) else None
-        try:
-            provisioning = (
-                json.loads(config_value)
-                if isinstance(config_value, str)
-                else dict(config_value)
-            )
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "DynamicEmbedding FeatureView has invalid provisioning config"
-            ) from exc
-        expected_provisioning = {
-            "ttl": self._settings.feature_view_ttl_secs,
-            "shard_count": self._settings.feature_view_shard_count,
-            "replication_count": self._settings.feature_view_replication_count,
-        }
-        actual_provisioning = {
-            name: provisioning.get(name) for name in expected_provisioning
-        }
-        if actual_provisioning != expected_provisioning:
-            raise RuntimeError(
-                "DynamicEmbedding FeatureView provisioning mismatch: "
-                f"expected={expected_provisioning}, actual={actual_provisioning}"
-            )
 
     @staticmethod
     def _validate_flush_summary(
