@@ -56,14 +56,6 @@ _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
     (".ec_dict_user.", ".ec_dict."),
     (".mc_ec_dict_user.", ".mc_ec_dict."),
 )
-_INPUT_TILE_TABLE_OWNER_ALIASES = {
-    "ebc_user": "ebc",
-    "mc_ebc_user": "mc_ebc",
-    "ec_dict_user": "ec_dict",
-    "ec_list_user": "ec_list",
-    "mc_ec_dict_user": "mc_ec_dict",
-    "mc_ec_list_user": "mc_ec_list",
-}
 
 
 def remap_input_tile_user_key(
@@ -112,19 +104,12 @@ def canonicalize_input_tile_table_fqn(table_fqn: str) -> str:
     Returns:
         The canonical physical sparse table FQN.
     """
-    segments = table_fqn.split(".")
-    try:
-        table_segment_idx = next(
-            i
-            for i, segment in enumerate(segments)
-            if segment in {"embedding_bags", "embeddings"}
-        )
-    except StopIteration:
-        return table_fqn
-
-    for i in range(table_segment_idx):
-        segments[i] = _INPUT_TILE_TABLE_OWNER_ALIASES.get(segments[i], segments[i])
-    return ".".join(segments)
+    for table_segment in (".embedding_bags.", ".embeddings."):
+        owner_fqn, separator, table_suffix = table_fqn.partition(table_segment)
+        if separator:
+            canonical_prefix = remap_input_tile_user_key(f".{owner_fqn}{separator}")[1:]
+            return canonical_prefix + table_suffix
+    return table_fqn
 
 
 class PartialLoadPlanner(DefaultLoadPlanner):

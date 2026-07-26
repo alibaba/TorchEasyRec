@@ -563,7 +563,7 @@ class ExportUtilTest(unittest.TestCase):
             ec_dir = os.path.join(
                 ckpt_dir,
                 "dynamicemb",
-                "model.model.right.mc_ec_list.0._embedding_module",
+                "model.model.right.mc_ec_dict.16._embedding_module",
             )
             os.makedirs(ebc_dir)
             os.makedirs(ec_dir)
@@ -586,9 +586,9 @@ class ExportUtilTest(unittest.TestCase):
             os.environ.pop("DIST_QUANT", None)
             ebc_fqn = "model.left.ebc.embedding_bags.shared_emb"
             ebc_user_fqn = "model.left.ebc_user.embedding_bags.shared_emb"
-            ec_fqn = "model.right.mc_ec_list.0._embedding_module.embeddings.shared_emb"
+            ec_fqn = "model.right.mc_ec_dict.16._embedding_module.embeddings.shared_emb"
             ec_user_fqn = (
-                "model.right.mc_ec_list_user.0._embedding_module.embeddings.shared_emb"
+                "model.right.mc_ec_dict_user.16._embedding_module.embeddings.shared_emb"
             )
 
             _, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(

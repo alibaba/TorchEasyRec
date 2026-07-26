@@ -205,19 +205,9 @@ class CheckpointUtilTest(unittest.TestCase):
                 "model.group.ec_dict.16.embeddings.table",
             ),
             (
-                "ec_list",
-                "model.group.ec_list_user.0.embeddings.table",
-                "model.group.ec_list.0.embeddings.table",
-            ),
-            (
                 "mc_ec_dict",
                 "model.group.mc_ec_dict_user.16._embedding_module.embeddings.table",
                 "model.group.mc_ec_dict.16._embedding_module.embeddings.table",
-            ),
-            (
-                "mc_ec_list",
-                "model.group.mc_ec_list_user.0._embedding_module.embeddings.table",
-                "model.group.mc_ec_list.0._embedding_module.embeddings.table",
             ),
             (
                 "weight_suffix",
