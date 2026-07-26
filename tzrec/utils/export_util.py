@@ -2183,80 +2183,6 @@ def _get_sparse_table_to_embedding_info(
     return table_to_embedding_bag_info, table_to_embedding_info
 
 
-def _build_sparse_export_metadata(
-    embedding_infos: Dict[str, BaseEmbeddingConfig],
-    embedding_bag_info: Dict[str, BaseEmbeddingConfig],
-) -> Tuple[Dict[str, int], Dict[str, str], Dict[str, str], Dict[str, List[str]]]:
-    """Build canonical physical-table and feature export metadata."""
-    emb_name_to_emb_dim: Dict[str, int] = {}
-    feat_name_to_pooling: Dict[str, str] = {}
-    feat_name_impl_to_emb_name: Dict[str, str] = {}
-    emb_name_to_feat_name_impl: Dict[str, List[str]] = {}
-    table_signatures: Dict[str, Dict[str, Any]] = {}
-    table_sources: Dict[str, str] = {}
-    invalid_table_segments: List[Tuple[str, str, str]] = []
-    quant_format = acc_utils.distributed_sparse_quant_format() or "NONE"
-
-    table_groups = (
-        ("EC", "embeddings", "__ec", embedding_infos),
-        ("EBC", "embedding_bags", "__ebc", embedding_bag_info),
-    )
-    for table_type, table_segment, feature_suffix, table_infos in table_groups:
-        for table_fqn, emb_info in table_infos.items():
-            if table_segment not in table_fqn.split("."):
-                invalid_table_segments.append((table_type, table_fqn, table_segment))
-            export_emb_name = checkpoint_util.canonicalize_input_tile_table_fqn(
-                table_fqn
-            )
-            pooling = (
-                "NONE"
-                if table_type == "EC"
-                else str(getattr(emb_info, "pooling", "NONE")).split(".")[-1]
-            )
-            signature = {
-                "table_type": table_type,
-                "embedding_dim": emb_info.embedding_dim,
-                "dtype": str(getattr(emb_info, "data_type", "UNKNOWN")).split(".")[-1],
-                "pooling": pooling,
-                "quantization_format": quant_format,
-            }
-            if export_emb_name in table_signatures:
-                previous_signature = table_signatures[export_emb_name]
-                previous_source = table_sources[export_emb_name]
-                for field, value in signature.items():
-                    if previous_signature[field] != value:
-                        raise ValueError(
-                            f"sparse table aliases {previous_source} and {table_fqn} "
-                            f"canonicalize to {export_emb_name} but have incompatible "
-                            f"{field}: {previous_signature[field]} vs {value}"
-                        )
-            else:
-                table_signatures[export_emb_name] = signature
-                table_sources[export_emb_name] = table_fqn
-                emb_name_to_emb_dim[export_emb_name] = emb_info.embedding_dim
-                emb_name_to_feat_name_impl[export_emb_name] = []
-
-            for feat_name in emb_info.feature_names:
-                feat_name_impl = feat_name + feature_suffix
-                if feat_name_impl not in emb_name_to_feat_name_impl[export_emb_name]:
-                    emb_name_to_feat_name_impl[export_emb_name].append(feat_name_impl)
-                feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
-                feat_name_to_pooling[feat_name_impl] = pooling
-
-    if invalid_table_segments:
-        table_type, table_fqn, table_segment = invalid_table_segments[0]
-        raise ValueError(
-            f"{table_type} sparse table FQN {table_fqn} must contain {table_segment}"
-        )
-
-    return (
-        emb_name_to_emb_dim,
-        feat_name_to_pooling,
-        feat_name_impl_to_emb_name,
-        emb_name_to_feat_name_impl,
-    )
-
-
 def _dynamic_sparse_module_fqn(dynamicemb_path: str, key_file: str) -> str:
     """Build a normalized module FQN from a dynamic checkpoint shard path."""
     module_fqn = os.path.relpath(os.path.dirname(key_file), dynamicemb_path).replace(
@@ -2342,12 +2268,34 @@ def _get_sparse_embedding_tensor(
         emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
         feat_meta: feature -> embedding_name / pooling mapping.
     """
-    (
-        emb_name_to_emb_dim,
-        feat_name_to_pooling,
-        feat_name_impl_to_emb_name,
-        emb_name_to_feat_name_impl,
-    ) = _build_sparse_export_metadata(embedding_infos, embedding_bag_info)
+    emb_name_to_emb_dim = {}
+    feat_name_to_pooling = {}
+    feat_name_impl_to_emb_name = {}
+    emb_name_to_feat_name_impl = {}
+
+    for table_fqn, emb_info in embedding_infos.items():
+        export_emb_name = checkpoint_util.canonicalize_input_tile_table_fqn(table_fqn)
+        emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
+        feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
+        for feat_name in emb_info.feature_names:
+            feat_name_impl = feat_name + "__ec"
+            if feat_name_impl not in feat_name_impl_list:
+                feat_name_impl_list.append(feat_name_impl)
+            feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
+            feat_name_to_pooling[feat_name_impl] = "NONE"
+
+    for table_fqn, emb_info in embedding_bag_info.items():
+        export_emb_name = checkpoint_util.canonicalize_input_tile_table_fqn(table_fqn)
+        emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
+        feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
+        for feat_name in emb_info.feature_names:
+            feat_name_impl = feat_name + "__ebc"
+            if feat_name_impl not in feat_name_impl_list:
+                feat_name_impl_list.append(feat_name_impl)
+            feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
+            feat_name_to_pooling[feat_name_impl] = str(
+                getattr(emb_info, "pooling", "NONE")
+            ).split(".")[-1]
 
     out = {}
     # dynamicemb keys/values are saved into a separate npz, kept in this dict.
@@ -2364,35 +2312,16 @@ def _get_sparse_embedding_tensor(
     dynamic_score_names = defaultdict(list)
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    state_values_by_emb = defaultdict(list)
+    state_values_by_emb = {}
     for name, values in model.state_dict().items():
         if not name.endswith(".weight"):
             continue
         table_fqn = name[: -len(".weight")]
         export_emb_name = checkpoint_util.canonicalize_input_tile_table_fqn(table_fqn)
-        if export_emb_name not in emb_name_to_emb_dim:
-            raise KeyError(f"sparse table {export_emb_name} is not in export metadata")
-        state_values_by_emb[export_emb_name].append((table_fqn, values))
+        if export_emb_name not in state_values_by_emb or table_fqn == export_emb_name:
+            state_values_by_emb[export_emb_name] = values
 
-    for export_emb_name, state_values in state_values_by_emb.items():
-        canonical_values = [
-            (table_fqn, values)
-            for table_fqn, values in state_values
-            if table_fqn == export_emb_name
-        ]
-        table_fqn, values = canonical_values[0] if canonical_values else state_values[0]
-        expected_shape = list(values.shape)
-        expected_dtype = values.dtype
-        for alias_fqn, alias_values in state_values:
-            alias_shape = list(alias_values.shape)
-            alias_dtype = alias_values.dtype
-            if alias_shape != expected_shape or alias_dtype != expected_dtype:
-                raise ValueError(
-                    f"sparse table aliases {table_fqn} and {alias_fqn} "
-                    f"canonicalize to {export_emb_name} but have incompatible "
-                    f"tensor shape/dtype: {expected_shape}/{expected_dtype} vs "
-                    f"{alias_shape}/{alias_dtype}"
-                )
+    for export_emb_name, values in state_values_by_emb.items():
         emb_dim = emb_name_to_emb_dim[export_emb_name]
         if isinstance(values, DTensor):
             raise ValueError("DTensors are not considered yet.")
@@ -2430,6 +2359,7 @@ def _get_sparse_embedding_tensor(
         key_files = sorted(
             glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
         )
+        key_files = _dedup_key_files_by_realpath(key_files)
         key_pattern = re.compile(
             r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
         )
@@ -2441,24 +2371,20 @@ def _get_sparse_embedding_tensor(
                 continue
             emb_name = match.group("emb_name")
             module_fqn = _dynamic_sparse_module_fqn(dynamicemb_path, key_file)
-            matching_tables = {}
             table_candidates = [
                 f"{module_fqn}.embedding_bags.{emb_name}",
                 f"{module_fqn}.embeddings.{emb_name}",
             ]
-            for table_candidate in table_candidates:
-                export_emb_name = checkpoint_util.canonicalize_input_tile_table_fqn(
-                    table_candidate
+            matching_tables = (
+                (
+                    checkpoint_util.canonicalize_input_tile_table_fqn(table_candidate),
+                    table_candidate,
                 )
-                if export_emb_name in emb_name_to_emb_dim:
-                    matching_tables[export_emb_name] = table_candidate
-            if len(matching_tables) != 1:
-                raise ValueError(
-                    f"dynamic sparse shard {key_file} must match exactly one "
-                    f"registered physical table, candidates={table_candidates}, "
-                    f"matches={sorted(matching_tables)}"
-                )
-            export_emb_name, table_candidate = next(iter(matching_tables.items()))
+                for table_candidate in table_candidates
+            )
+            export_emb_name, table_candidate = next(
+                table for table in matching_tables if table[0] in emb_name_to_emb_dim
+            )
             ckpt_rank = int(match.group("idx"))
             ckpt_world_size = int(match.group("num_shards"))
             shard_id = (ckpt_rank, ckpt_world_size)

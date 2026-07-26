@@ -64,10 +64,6 @@ _INPUT_TILE_TABLE_OWNER_ALIASES = {
     "mc_ec_dict_user": "mc_ec_dict",
     "mc_ec_list_user": "mc_ec_list",
 }
-_INPUT_TILE_CANONICAL_TO_USER_TABLE_OWNER = {
-    canonical_owner: user_owner
-    for user_owner, canonical_owner in _INPUT_TILE_TABLE_OWNER_ALIASES.items()
-}
 
 
 def remap_input_tile_user_key(
@@ -208,12 +204,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                 is_input_tile_emb()
                 and meta_fqn not in self.metadata.state_dict_metadata
             ):
-                candidate = canonicalize_input_tile_table_fqn(meta_fqn)
-                if (
-                    candidate == meta_fqn
-                    or candidate not in self.metadata.state_dict_metadata
-                ):
-                    candidate = remap_input_tile_user_key(meta_fqn)
+                candidate = remap_input_tile_user_key(meta_fqn)
                 if candidate != meta_fqn:
                     logger.info(f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]")
                     meta_fqn = candidate
@@ -924,6 +915,13 @@ def _redistribute_mch_state(model: nn.Module) -> None:
             m._buffers[name].copy_(new_meta)
 
 
+# Module-name segments that get a `_user` twin when INPUT_TILE=3 export
+# duplicates the embedding group into item/user halves. See
+# tzrec/modules/embedding.py:EmbeddingGroupImpl /
+# SequenceEmbeddingGroupImpl for the construction.
+_INPUT_TILE_USER_SEGMENTS = frozenset({"ebc", "mc_ebc", "ec_dict", "mc_ec_dict"})
+
+
 def _make_dynamicemb_input_tile_user_view(dynamicemb_path: str, view_path: str) -> str:
     """Create a local symlink view for INPUT_TILE=3 dynamicemb loading.
 
@@ -946,11 +944,10 @@ def _make_dynamicemb_input_tile_user_view(dynamicemb_path: str, view_path: str) 
         if any(seg.endswith("_user") for seg in segs):
             continue
         for i, seg in enumerate(segs):
-            user_seg = _INPUT_TILE_CANONICAL_TO_USER_TABLE_OWNER.get(seg)
-            if user_seg is None:
+            if seg not in _INPUT_TILE_USER_SEGMENTS:
                 continue
             user_segs = list(segs)
-            user_segs[i] = user_seg
+            user_segs[i] = f"{seg}_user"
             user_entry = ".".join(user_segs)
             user_path = os.path.join(view_path, user_entry)
             if os.path.lexists(user_path):
