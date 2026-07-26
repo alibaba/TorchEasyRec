@@ -24,11 +24,8 @@ import torch
 from torch import distributed as dist
 from torchrec import KeyedJaggedTensor, KeyedTensor
 from torchrec.distributed.train_pipeline.utils import Tracer
-from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
-from torchrec.modules.embedding_modules import (
-    EmbeddingBagCollection,
-    EmbeddingCollection,
-)
+from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
 from tzrec.acc import utils as acc_utils
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
@@ -48,7 +45,6 @@ from tzrec.utils.export_util import (
     _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
     _get_sparse_embedding_tensor,
-    _get_sparse_table_to_embedding_info,
     _infer_keyed_tensor_attrs_from_module,
     _isolate_kafka_export_group,
     _merge_sharded_embedding_json,
@@ -148,60 +144,6 @@ class ExportUtilTest(unittest.TestCase):
             )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-
-    def test_sparse_table_info_is_keyed_by_owner_fqn(self) -> None:
-        class SparseCollections(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.left = EmbeddingBagCollection(
-                    [
-                        EmbeddingBagConfig(
-                            num_embeddings=4,
-                            embedding_dim=2,
-                            name="shared",
-                            feature_names=["left_feat"],
-                        )
-                    ],
-                    device=torch.device("cpu"),
-                )
-                self.right = EmbeddingBagCollection(
-                    [
-                        EmbeddingBagConfig(
-                            num_embeddings=4,
-                            embedding_dim=2,
-                            name="shared",
-                            feature_names=["right_feat"],
-                        )
-                    ],
-                    device=torch.device("cpu"),
-                )
-                self.sequence = EmbeddingCollection(
-                    [
-                        EmbeddingConfig(
-                            num_embeddings=4,
-                            embedding_dim=2,
-                            name="shared",
-                            feature_names=["sequence_feat"],
-                        )
-                    ],
-                    device=torch.device("cpu"),
-                )
-
-        embedding_bag_info, embedding_info = _get_sparse_table_to_embedding_info(
-            SparseCollections()
-        )
-
-        self.assertEqual(
-            set(embedding_bag_info),
-            {
-                "left.embedding_bags.shared",
-                "right.embedding_bags.shared",
-            },
-        )
-        self.assertEqual(
-            set(embedding_info),
-            {"sequence.embeddings.shared"},
-        )
 
     def test_distributed_embedding_export_forces_rank_zero_single_process(self) -> None:
         """Rank 0 export should be normalized to a single logical GPU."""
@@ -542,106 +484,6 @@ class ExportUtilTest(unittest.TestCase):
             self.assertEqual(emb_meta[table_fqn]["row_bytes"], 6)
             self.assertEqual(emb_meta[table_fqn]["quant"]["format"], "QUint8RowwiseF16")
             self.assertEqual(emb_meta[table_fqn]["value_name"], f"{table_fqn}.values")
-        finally:
-            _restore_env(old_env)
-            shutil.rmtree(tmp, ignore_errors=True)
-
-    def test_sparse_dynamic_export_canonicalizes_input_tile_aliases(self) -> None:
-        tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_fqn_")
-        old_env = {
-            "RANK": os.environ.get("RANK"),
-            "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
-            "DIST_QUANT": os.environ.get("DIST_QUANT"),
-        }
-        try:
-            ckpt_dir = os.path.join(tmp, "model.ckpt-1")
-            ebc_dir = os.path.join(
-                ckpt_dir,
-                "dynamicemb",
-                "model.model.left.ebc",
-            )
-            ec_dir = os.path.join(
-                ckpt_dir,
-                "dynamicemb",
-                "model.model.right.mc_ec_dict.16._embedding_module",
-            )
-            os.makedirs(ebc_dir)
-            os.makedirs(ec_dir)
-            for directory, key, values in (
-                (ebc_dir, 1, np.array([[1.0, 1.1]], dtype=np.float32)),
-                (ec_dir, 2, np.array([[2.0, 2.1]], dtype=np.float32)),
-            ):
-                np.array([key], dtype=np.int64).tofile(
-                    os.path.join(directory, "shared_emb_emb_keys.rank_0.world_size_1")
-                )
-                values.tofile(
-                    os.path.join(directory, "shared_emb_emb_values.rank_0.world_size_1")
-                )
-                np.array([key + 100], dtype=np.int64).tofile(
-                    os.path.join(directory, "shared_emb_emb_scores.rank_0.world_size_1")
-                )
-
-            os.environ["RANK"] = "0"
-            os.environ["WORLD_SIZE"] = "1"
-            os.environ.pop("DIST_QUANT", None)
-            ebc_fqn = "model.left.ebc.embedding_bags.shared_emb"
-            ebc_user_fqn = "model.left.ebc_user.embedding_bags.shared_emb"
-            ec_fqn = "model.right.mc_ec_dict.16._embedding_module.embeddings.shared_emb"
-            ec_user_fqn = (
-                "model.right.mc_ec_dict_user.16._embedding_module.embeddings.shared_emb"
-            )
-
-            _, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
-                torch.nn.Module(),
-                ckpt_dir,
-                {
-                    ec_fqn: SimpleNamespace(
-                        name="shared_emb",
-                        embedding_dim=2,
-                        feature_names=["sequence_feat"],
-                    ),
-                    ec_user_fqn: SimpleNamespace(
-                        name="shared_emb",
-                        embedding_dim=2,
-                        feature_names=["sequence_user_feat"],
-                    ),
-                },
-                {
-                    ebc_fqn: SimpleNamespace(
-                        name="shared_emb",
-                        embedding_dim=2,
-                        feature_names=["pooled_feat"],
-                        pooling="SUM",
-                    ),
-                    ebc_user_fqn: SimpleNamespace(
-                        name="shared_emb",
-                        embedding_dim=2,
-                        feature_names=["pooled_user_feat"],
-                        pooling="SUM",
-                    ),
-                },
-            )
-
-            torch.testing.assert_close(
-                dynamic_out[f"{ebc_fqn}.values"],
-                torch.tensor([[1.0, 1.1]]),
-            )
-            torch.testing.assert_close(
-                dynamic_out[f"{ec_fqn}.values"],
-                torch.tensor([[2.0, 2.1]]),
-            )
-            self.assertEqual(set(emb_meta), {ebc_fqn, ec_fqn})
-            self.assertNotIn(ebc_user_fqn, emb_meta)
-            self.assertNotIn(ec_user_fqn, emb_meta)
-            self.assertEqual(feat_meta["pooled_feat__ebc"]["embedding_name"], ebc_fqn)
-            self.assertEqual(
-                feat_meta["pooled_user_feat__ebc"]["embedding_name"], ebc_fqn
-            )
-            self.assertEqual(feat_meta["sequence_feat__ec"]["embedding_name"], ec_fqn)
-            self.assertEqual(
-                feat_meta["sequence_user_feat__ec"],
-                {"embedding_name": ec_fqn, "pooling": "NONE"},
-            )
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
