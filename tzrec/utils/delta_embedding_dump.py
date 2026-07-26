@@ -424,6 +424,8 @@ class DeltaEmbeddingDumper:
                 "cannot resolve owning sparse embedding collections for tracked "
                 f"tables: {unowned_tables}"
             )
+        self._cached_table_weights: Optional[Dict[Tuple[str, str], _TableWeight]] = None
+        self._cached_dynamic_modules: Optional[Dict[Tuple[str, str], nn.Module]] = None
         self._uploader: Optional[FeatureStoreDeltaUploader] = None
         if self._feature_store_enabled:
             self._uploader = FeatureStoreDeltaUploader(
@@ -1029,6 +1031,14 @@ class DeltaEmbeddingDumper:
             )
 
     def _collect_table_weights(self) -> Dict[Tuple[str, str], _TableWeight]:
+        """Return per-owner local table weights, discovered once and cached.
+
+        The owning modules and their local shard tensors keep a stable identity
+        for the life of the process (training updates the storage in place), so
+        the references discovered on the first dump stay valid for later dumps.
+        """
+        if self._cached_table_weights is not None:
+            return self._cached_table_weights
         table_weights: Dict[Tuple[str, str], _TableWeight] = {}
         table_shard_infos = self._table_shard_infos
         for module_fqn, module in self._tracker.get_tracked_modules().items():
@@ -1043,18 +1053,28 @@ class DeltaEmbeddingDumper:
                         table_value,
                         table_shard_infos.get(table_name),
                     )
+        self._cached_table_weights = table_weights
         return table_weights
 
     def _collect_dynamic_modules(self) -> Dict[Tuple[str, str], nn.Module]:
+        """Return per-owner dynamicemb modules, discovered once and cached.
+
+        Only the module handles are cached; each dump still flushes and reads
+        the current values through them.
+        """
+        if self._cached_dynamic_modules is not None:
+            return self._cached_dynamic_modules
         try:
             from dynamicemb.dump_load import get_dynamic_emb_module
         except ImportError:
-            return {}
+            self._cached_dynamic_modules = {}
+            return self._cached_dynamic_modules
         modules: Dict[Tuple[str, str], nn.Module] = {}
         for module_fqn, module in self._tracker.get_tracked_modules().items():
             for dynamic_module in get_dynamic_emb_module(module):
                 for table_name in dynamic_module.table_names:
                     modules[(module_fqn, table_name)] = dynamic_module
+        self._cached_dynamic_modules = modules
         return modules
 
     def _append_table_chunk(
