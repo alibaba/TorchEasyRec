@@ -119,62 +119,42 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             ):
                 continue
 
-            fqn_remap_set = set()
             meta_fqn = fqn
+
+            fqn_remap_set = set()
             if fqn in self._ckpt_param_map:
                 meta_fqn = self._ckpt_param_map[fqn]
                 fqn_remap_set.add(fqn)
                 logger.info(f"Remap restore state [{fqn}] from [{meta_fqn}]")
 
-            candidates: List[Tuple[str, bool, Optional[str]]] = [
-                (meta_fqn, False, None)
-            ]
-            for ec_new, ec_old in ec_compat_map.items():
-                if ec_new in meta_fqn:
-                    candidates.append(
-                        (meta_fqn.replace(ec_new, ec_old), False, meta_fqn)
-                    )
-
+            # INPUT_TILE=3 export adds user-side twin modules absent from
+            # training checkpoints. Remap them before EC compatibility handling.
             if is_input_tile_emb():
                 for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
                     if new_pat not in meta_fqn:
                         continue
-                    input_tile_fqn = meta_fqn.replace(new_pat, old_pat)
-                    candidates.append((input_tile_fqn, True, None))
-                    for ec_new, ec_old in ec_compat_map.items():
-                        if ec_new in input_tile_fqn:
-                            candidates.append(
-                                (
-                                    input_tile_fqn.replace(ec_new, ec_old),
-                                    True,
-                                    input_tile_fqn,
-                                )
-                            )
+                    meta_fqn = meta_fqn.replace(new_pat, old_pat)
+                    fqn_remap_set.add(fqn)
+                    logger.info(f"Remap INPUT_TILE=3 state [{fqn}] from [{meta_fqn}]")
+                    break
 
-            matched_candidate = next(
-                (
-                    candidate
-                    for candidate in candidates
-                    if candidate[0] in self.metadata.state_dict_metadata
-                ),
-                None,
-            )
-            if matched_candidate is None:
+            if meta_fqn not in self.metadata.state_dict_metadata:
+                for ec_new, ec_old in ec_compat_map.items():
+                    if ec_new in meta_fqn:
+                        new_meta_fqn = meta_fqn
+                        meta_fqn = new_meta_fqn.replace(ec_new, ec_old)
+                        fqn_remap_set.add(fqn)
+                        logger.warning(
+                            f"Remap EmbeddingCollection state [{new_meta_fqn}] from "
+                            "old [{meta_fqn}], will be deprecated when tzrec version "
+                            ">= 1.0.0"
+                        )
+
+            if meta_fqn in self.metadata.state_dict_metadata:
+                md = self.metadata.state_dict_metadata[meta_fqn]
+            else:
                 logger.warning(f"Skip restore state [{fqn}]")
                 continue
-
-            meta_fqn, input_tile_remap, ec_compat_source = matched_candidate
-            if input_tile_remap:
-                logger.info(f"Remap INPUT_TILE=3 state [{fqn}] from [{meta_fqn}]")
-            if ec_compat_source is not None:
-                logger.warning(
-                    f"Remap EmbeddingCollection state [{ec_compat_source}] from old "
-                    f"[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
-                )
-            if meta_fqn != fqn:
-                fqn_remap_set.add(fqn)
-
-            md = self.metadata.state_dict_metadata[meta_fqn]
 
             read_items = []
             if isinstance(obj, DTensor):

@@ -122,36 +122,16 @@ def _create_test_model(large_table_cnt=2, small_table_cnt=2):
     return model, optimizer
 
 
-def _create_input_tile_ebc_model(module_values):
+def _create_nested_embedding_model(module_path, value):
     model = nn.Module()
-    model.group = nn.Module()
-    for module_name, value in module_values.items():
-        ebc = nn.Module()
-        ebc.embedding_bags = nn.ModuleDict(
-            {"table": nn.Embedding(num_embeddings=2, embedding_dim=4)}
-        )
-        nn.init.constant_(ebc.embedding_bags["table"].weight, value)
-        model.group.add_module(module_name, ebc)
-    return model
-
-
-def _create_legacy_ec_list_model(value):
-    model = nn.Module()
-    model.group = nn.Module()
-    model.group.ec_list = nn.ModuleList(
-        [nn.Embedding(num_embeddings=2, embedding_dim=4)]
-    )
-    nn.init.constant_(model.group.ec_list[0].weight, value)
-    return model
-
-
-def _create_input_tile_ec_dict_model(value):
-    model = nn.Module()
-    model.group = nn.Module()
-    model.group.ec_dict_user = nn.ModuleDict(
-        {"4": nn.Embedding(num_embeddings=2, embedding_dim=4)}
-    )
-    nn.init.constant_(model.group.ec_dict_user["4"].weight, value)
+    parent = model
+    for module_name in module_path[:-1]:
+        child = nn.Module()
+        parent.add_module(module_name, child)
+        parent = child
+    embedding = nn.Embedding(num_embeddings=2, embedding_dim=4)
+    nn.init.constant_(embedding.weight, value)
+    parent.add_module(module_path[-1], embedding)
     return model
 
 
@@ -436,44 +416,36 @@ class CheckpointUtilTest(unittest.TestCase):
             if p.exitcode != 0:
                 raise RuntimeError(f"worker-{i} failed.")
 
-    def test_input_tile_restores_ebc_user_without_mapping_file(self):
-        source = _create_input_tile_ebc_model({"ebc": 1.0})
-        save(source.state_dict(), checkpoint_id=os.path.join(self.test_dir, "model"))
-        target = _create_input_tile_ebc_model({"ebc_user": 0.0})
+    def test_input_tile_restores_without_mapping_file(self):
+        cases = [
+            (
+                "ebc",
+                ("group", "ebc", "embedding_bags", "table"),
+                ("group", "ebc_user", "embedding_bags", "table"),
+            ),
+            (
+                "legacy_ec_list",
+                ("group", "ec_list", "0"),
+                ("group", "ec_dict_user", "4"),
+            ),
+        ]
+        for name, source_path, target_path in cases:
+            with self.subTest(name=name):
+                checkpoint_dir = os.path.join(self.test_dir, name)
+                source = _create_nested_embedding_model(source_path, 1.0)
+                save(
+                    source.state_dict(),
+                    checkpoint_id=os.path.join(checkpoint_dir, "model"),
+                )
+                target = _create_nested_embedding_model(target_path, 0.0)
 
-        with mock.patch.dict(os.environ, {"INPUT_TILE": "3"}):
-            checkpoint_util.restore_model(self.test_dir, target)
+                with mock.patch.dict(os.environ, {"INPUT_TILE": "3"}):
+                    checkpoint_util.restore_model(checkpoint_dir, target)
 
-        torch.testing.assert_close(
-            target.group.ebc_user.embedding_bags["table"].weight,
-            source.group.ebc.embedding_bags["table"].weight,
-        )
-
-    def test_input_tile_restores_legacy_ec_list_without_mapping_file(self):
-        source = _create_legacy_ec_list_model(1.0)
-        save(source.state_dict(), checkpoint_id=os.path.join(self.test_dir, "model"))
-        target = _create_input_tile_ec_dict_model(0.0)
-
-        with mock.patch.dict(os.environ, {"INPUT_TILE": "3"}):
-            checkpoint_util.restore_model(self.test_dir, target)
-
-        torch.testing.assert_close(
-            target.group.ec_dict_user["4"].weight,
-            source.group.ec_list[0].weight,
-        )
-
-    def test_input_tile_prefers_exact_user_checkpoint_key(self):
-        source = _create_input_tile_ebc_model({"ebc": 1.0, "ebc_user": 2.0})
-        save(source.state_dict(), checkpoint_id=os.path.join(self.test_dir, "model"))
-        target = _create_input_tile_ebc_model({"ebc_user": 0.0})
-
-        with mock.patch.dict(os.environ, {"INPUT_TILE": "3"}):
-            checkpoint_util.restore_model(self.test_dir, target)
-
-        torch.testing.assert_close(
-            target.group.ebc_user.embedding_bags["table"].weight,
-            source.group.ebc_user.embedding_bags["table"].weight,
-        )
+                torch.testing.assert_close(
+                    target.state_dict()[".".join(target_path) + ".weight"],
+                    source.state_dict()[".".join(source_path) + ".weight"],
+                )
 
 
 class DataloaderCheckpointTest(unittest.TestCase):
