@@ -11,7 +11,6 @@
 
 import os
 import re
-from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
@@ -23,10 +22,11 @@ from torch import nn
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
+from torchrec.distributed.model_tracker.delta_store import DeltaStoreTrec
 from torchrec.distributed.model_tracker.model_delta_tracker import (
-    ModelDeltaTrackerTrec,
+    ModelDeltaTracker as TorchRecModelDeltaTracker,
 )
-from torchrec.distributed.model_tracker.types import TrackingMode
+from torchrec.distributed.model_tracker.types import UniqueRows, UpdateMode
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
@@ -330,12 +330,11 @@ def _embedding_table_fqn(module_fqn: str, module: nn.Module, table_name: str) ->
     return ".".join(filter(None, (module_fqn, table_segment, table_name)))
 
 
-class ModelDeltaTracker(ModelDeltaTrackerTrec):
+class ModelDeltaTracker(TorchRecModelDeltaTracker):
     """Track touched embedding IDs by owner-qualified table FQN.
 
-    TorchRec's tracker maps raw table names to FQNs globally, which collapses
-    same-named tables owned by different sharded modules. This specialization
-    uses the callback's owning module to keep their ID streams independent.
+    This ID-only tracker uses the lookup callback's owning module to keep
+    same-named tables in different sharded modules independent.
 
     Args:
         model: Sharded model whose sparse lookups should be tracked.
@@ -351,48 +350,50 @@ class ModelDeltaTracker(ModelDeltaTrackerTrec):
         delete_on_read: bool = True,
         auto_compact: bool = False,
     ) -> None:
-        self._feature_to_fqn_by_module: Dict[int, Dict[str, str]] = {}
-        super().__init__(
-            model,
-            consumers=consumers,
-            delete_on_read=delete_on_read,
-            auto_compact=auto_compact,
-            mode=TrackingMode.ID_ONLY,
-        )
+        consumer_names = consumers or [self.DEFAULT_CONSUMER]
+        self._delete_on_read = delete_on_read
+        self.per_consumer_batch_idx = {consumer: -1 for consumer in consumer_names}
+        self.curr_batch_idx = 0
+        self.curr_compact_index = 0
+        self.tracked_modules: Dict[str, nn.Module] = {}
+        self.fqn_to_feature_names: Dict[str, List[str]] = {}
+        self._feature_to_fqn_by_module: Dict[nn.Module, Dict[str, str]] = {}
+        self.store = DeltaStoreTrec(UpdateMode.NONE)
 
-    def fqn_to_feature_names(self) -> Dict[str, List[str]]:
-        """Return feature names keyed by owner-qualified table FQN."""
-        if self._fqn_to_feature_map:
-            return self._fqn_to_feature_map
-
-        fqn_to_feature_names: Dict[str, List[str]] = OrderedDict()
-        for named_fqn, module in self._model.named_modules():
+        for named_fqn, module in model.named_modules():
             if not isinstance(
                 module, (ShardedEmbeddingCollection, ShardedEmbeddingBagCollection)
             ):
                 continue
-            split_fqn = named_fqn.split(".")
-            if any(fqn_to_skip in split_fqn for fqn_to_skip in self._fqns_to_skip):
-                continue
 
             module_fqn = getattr(module, "_module_fqn", None)
             if not module_fqn:
-                module_fqn = self._clean_fqn_fn(named_fqn)
+                module_fqn = self._clean_module_fqn(named_fqn)
             self.tracked_modules[module_fqn] = module
 
             feature_to_fqn: Dict[str, str] = {}
             for table_name, config in module._table_name_to_config.items():
                 table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
-                if table_fqn in fqn_to_feature_names:
+                if table_fqn in self.fqn_to_feature_names:
                     raise ValueError(f"Duplicate embedding table FQN: {table_fqn}")
                 feature_names = list(config.feature_names)
-                fqn_to_feature_names[table_fqn] = feature_names
+                self.fqn_to_feature_names[table_fqn] = feature_names
                 for feature_name in feature_names:
                     feature_to_fqn[feature_name] = table_fqn
-            self._feature_to_fqn_by_module[id(module)] = feature_to_fqn
+            self._feature_to_fqn_by_module[module] = feature_to_fqn
 
-        self._fqn_to_feature_map = fqn_to_feature_names
-        return fqn_to_feature_names
+        for module in self.tracked_modules.values():
+            module.register_post_lookup_tracker_fn(self.record_lookup)
+            if auto_compact:
+                module.register_post_odist_tracker_fn(self.trigger_compaction)
+
+    @staticmethod
+    def _clean_module_fqn(fqn: str) -> str:
+        """Strip wrapper prefixes from a sharded module FQN."""
+        for prefix in ("_dmp_wrapped_module.module.", "module."):
+            if fqn.startswith(prefix):
+                return fqn[len(prefix) :]
+        return fqn
 
     def record_lookup(
         self,
@@ -411,7 +412,7 @@ class ModelDeltaTracker(ModelDeltaTrackerTrec):
         """
         if emb_module is None:
             raise ValueError("Embedding module is required for FQN delta tracking.")
-        feature_to_fqn = self._feature_to_fqn_by_module.get(id(emb_module))
+        feature_to_fqn = self._feature_to_fqn_by_module.get(emb_module)
         if feature_to_fqn is None:
             raise ValueError(
                 f"Unrecognized embedding module for FQN delta tracking: {emb_module}"
@@ -428,6 +429,83 @@ class ModelDeltaTracker(ModelDeltaTrackerTrec):
                 ids=torch.cat(ids),
                 states=None,
             )
+
+    def get_unique_ids(self, consumer: Optional[str] = None) -> Dict[str, torch.Tensor]:
+        """Return unique touched IDs keyed by table FQN.
+
+        Args:
+            consumer: Consumer whose unread IDs should be returned.
+
+        Returns:
+            Unique touched IDs keyed by table FQN.
+        """
+        return {
+            fqn: rows.ids for fqn, rows in self.get_unique(consumer=consumer).items()
+        }
+
+    def get_unique(
+        self,
+        consumer: Optional[str] = None,
+        top_percentage: Optional[float] = 1.0,
+        per_table_percentage: Optional[Dict[str, Tuple[float, str]]] = None,
+        sorted_by_indices: Optional[bool] = True,
+    ) -> Dict[str, UniqueRows]:
+        """Return unread unique touched IDs keyed by table FQN.
+
+        Args:
+            consumer: Consumer whose unread IDs should be returned.
+            top_percentage: Unused compatibility argument.
+            per_table_percentage: Unused compatibility argument.
+            sorted_by_indices: Unused compatibility argument.
+
+        Returns:
+            Unique touched rows keyed by table FQN.
+        """
+        consumer = consumer or self.DEFAULT_CONSUMER
+        assert consumer in self.per_consumer_batch_idx, (
+            f"consumer {consumer} not present in {self.per_consumer_batch_idx.values()}"
+        )
+
+        index_end = self.curr_batch_idx + 1
+        index_start = max(self.per_consumer_batch_idx.values())
+        if index_start < index_end:
+            self.store.compact(index_start, index_end)
+        tracker_rows = self.store.get_unique(
+            from_idx=self.per_consumer_batch_idx[consumer]
+        )
+        self.per_consumer_batch_idx[consumer] = index_end
+        if self._delete_on_read:
+            self.store.delete(up_to_idx=min(self.per_consumer_batch_idx.values()))
+        return tracker_rows
+
+    def step(self) -> None:
+        """Advance the current tracking batch."""
+        self.curr_batch_idx += 1
+
+    def trigger_compaction(self) -> None:
+        """Compact newly recorded IDs once per completed batch."""
+        if self.curr_compact_index >= self.curr_batch_idx:
+            return
+        start_idx = max(self.per_consumer_batch_idx.values())
+        end_idx = self.curr_batch_idx
+        if start_idx < end_idx:
+            self.store.compact(start_idx, end_idx)
+            self.curr_compact_index = end_idx
+
+    def clear(self, consumer: Optional[str] = None) -> None:
+        """Clear tracked IDs using TorchRec's consumer semantics.
+
+        Args:
+            consumer: Consumer to clear, or None to clear the whole store.
+        """
+        if consumer is None:
+            self.store.delete()
+            return
+        assert consumer in self.per_consumer_batch_idx, (
+            f"consumer {consumer} not found in {self.per_consumer_batch_idx.values()}"
+        )
+        if len(self.per_consumer_batch_idx) == 1:
+            self.store.delete()
 
 
 class DeltaEmbeddingDumper:
@@ -472,9 +550,6 @@ class DeltaEmbeddingDumper:
         self._table_shard_infos = self._collect_table_shard_infos()
         self._validate_supported_table_sharding(self._table_shard_infos)
         self._install_tracking_pause_guard()
-        self._fqn_to_feature_names: Dict[str, List[str]] = {}
-        self._fqn_to_feature_names.update(self._tracker.fqn_to_feature_names())
-
         logger.info(
             "Delta embedding dump enabled: interval=%s output_dir=%s "
             "rank=%s/%s tables=%s",
@@ -482,7 +557,7 @@ class DeltaEmbeddingDumper:
             self._output_dir,
             self._rank,
             self._world_size,
-            sorted(self._fqn_to_feature_names.keys()),
+            sorted(self._tracker.fqn_to_feature_names),
         )
 
     def clear(self) -> None:
@@ -608,7 +683,7 @@ class DeltaEmbeddingDumper:
 
     def _install_tracking_pause_guard(self) -> None:
         guarded_modules = getattr(self, "_guarded_tracking_modules", set())
-        for module in self._tracker.get_tracked_modules().values():
+        for module in self._tracker.tracked_modules.values():
             if id(module) in guarded_modules:
                 continue
             has_tracker_fn = False
@@ -657,7 +732,9 @@ class DeltaEmbeddingDumper:
                 dynamic_modules=dynamic_modules,
                 flushed_module_ids=flushed_module_ids,
             )
-            feature_name = _feature_name(self._fqn_to_feature_names.get(fqn, []))
+            feature_name = _feature_name(
+                self._tracker.fqn_to_feature_names.get(fqn, [])
+            )
             num_rows += self._append_table_chunk(
                 table_chunks,
                 global_step=global_step,
@@ -747,7 +824,7 @@ class DeltaEmbeddingDumper:
 
     def _collect_table_shard_infos(self) -> Dict[str, _TableShardInfo]:
         table_shard_infos: Dict[str, _TableShardInfo] = {}
-        for module_fqn, module in self._tracker.get_tracked_modules().items():
+        for module_fqn, module in self._tracker.tracked_modules.items():
             for child_module in module.modules():
                 table_name_to_config = getattr(
                     child_module, "_table_name_to_config", None
@@ -823,7 +900,7 @@ class DeltaEmbeddingDumper:
     def _collect_table_weights(self) -> Dict[str, _TableWeight]:
         table_weights: Dict[str, _TableWeight] = {}
         table_shard_infos = self._table_shard_infos
-        for module_fqn, module in self._tracker.get_tracked_modules().items():
+        for module_fqn, module in self._tracker.tracked_modules.items():
             lookups = getattr(module, "_lookups", None)
             if lookups is None:
                 continue
@@ -848,7 +925,7 @@ class DeltaEmbeddingDumper:
         except ImportError:
             return {}
         modules: Dict[str, nn.Module] = {}
-        for module_fqn, module in self._tracker.get_tracked_modules().items():
+        for module_fqn, module in self._tracker.tracked_modules.items():
             for dynamic_module in get_dynamic_emb_module(module):
                 for table_name in dynamic_module.table_names:
                     table_fqn = _embedding_table_fqn(module_fqn, module, table_name)

@@ -316,7 +316,7 @@ def _run_shared_table_fqn_delta_embedding_dump(
         ec_fqn = f"ec.embeddings.{_SHARED_TABLE_NAME}"
         testcase.assertEqual(set(table["table_fqn"].to_pylist()), {ebc_fqn, ec_fqn})
         testcase.assertEqual(
-            set(dumper._tracker.fqn_to_feature_names()),
+            set(dumper._tracker.fqn_to_feature_names),
             {ebc_fqn, ec_fqn},
         )
         table_weights = dumper._collect_table_weights()
@@ -617,8 +617,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def test_tracker_uses_auto_compact(self):
         tracker = mock.MagicMock()
-        tracker.fqn_to_feature_names.return_value = {}
-        tracker.get_tracked_modules.return_value = {}
+        tracker.fqn_to_feature_names = {}
+        tracker.tracked_modules = {}
         with (
             tempfile.TemporaryDirectory() as tmp_dir,
             mock.patch(
@@ -643,8 +643,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         ebc_fqn = "model.ebc.embedding_bags.shared"
         ec_fqn = "model.ec.embeddings.shared"
         tracker._feature_to_fqn_by_module = {
-            id(ebc_module): {"deep_feature": ebc_fqn},
-            id(ec_module): {"sequence_feature": ec_fqn},
+            ebc_module: {"deep_feature": ebc_fqn},
+            ec_module: {"sequence_feature": ec_fqn},
+        }
+        tracker.fqn_to_feature_names = {
+            ebc_fqn: ["deep_feature"],
+            ec_fqn: ["sequence_feature"],
         }
         tracker.curr_batch_idx = 3
         tracker.store = mock.MagicMock()
@@ -672,6 +676,67 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         torch.testing.assert_close(
             ec_call.kwargs["ids"], torch.tensor(_SHARED_EC_INPUT_IDS)
         )
+        self.assertEqual(
+            tracker.fqn_to_feature_names,
+            {
+                ebc_fqn: ["deep_feature"],
+                ec_fqn: ["sequence_feature"],
+            },
+        )
+
+    def test_model_delta_tracker_advances_consumer_cursor_and_deletes_read_ids(self):
+        tracker = object.__new__(ModelDeltaTracker)
+        tracker._delete_on_read = True
+        tracker.per_consumer_batch_idx = {"delta": -1}
+        tracker.curr_batch_idx = 0
+        tracker.store = mock.MagicMock()
+        tracker.store.get_unique.return_value = {
+            "model.ebc.embedding_bags.shared": SimpleNamespace(
+                ids=torch.tensor([1, 2]),
+                states=None,
+            )
+        }
+
+        rows = tracker.get_unique("delta")
+
+        torch.testing.assert_close(
+            rows["model.ebc.embedding_bags.shared"].ids,
+            torch.tensor([1, 2]),
+        )
+        tracker.store.compact.assert_called_once_with(-1, 1)
+        tracker.store.get_unique.assert_called_once_with(from_idx=-1)
+        tracker.store.delete.assert_called_once_with(up_to_idx=1)
+        self.assertEqual(tracker.per_consumer_batch_idx["delta"], 1)
+
+        tracker.step()
+        tracker.store.reset_mock()
+        tracker.get_unique("delta")
+        tracker.store.compact.assert_called_once_with(1, 2)
+        tracker.store.get_unique.assert_called_once_with(from_idx=1)
+        tracker.store.delete.assert_called_once_with(up_to_idx=2)
+        self.assertEqual(tracker.per_consumer_batch_idx["delta"], 2)
+
+    def test_model_delta_tracker_auto_compacts_once_per_batch(self):
+        tracker = object.__new__(ModelDeltaTracker)
+        tracker.per_consumer_batch_idx = {"delta": -1}
+        tracker.curr_batch_idx = 2
+        tracker.curr_compact_index = 0
+        tracker.store = mock.MagicMock()
+
+        tracker.trigger_compaction()
+        tracker.trigger_compaction()
+
+        tracker.store.compact.assert_called_once_with(-1, 2)
+        self.assertEqual(tracker.curr_compact_index, 2)
+
+    def test_model_delta_tracker_clears_single_consumer(self):
+        tracker = object.__new__(ModelDeltaTracker)
+        tracker.per_consumer_batch_idx = {"delta": -1}
+        tracker.store = mock.MagicMock()
+
+        tracker.clear("delta")
+
+        tracker.store.delete.assert_called_once_with()
 
     def test_collect_table_weights_uses_owner_fqn_keys(self):
         ebc_module = torch.nn.Module()
@@ -693,7 +758,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._table_shard_infos = {}
         dumper._tracker = SimpleNamespace(
-            get_tracked_modules=lambda: {
+            tracked_modules={
                 "model.ebc": ebc_module,
                 "model.ec": ec_module,
             }
@@ -728,7 +793,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         ec_dynamic_module = SimpleNamespace(table_names=["shared"])
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._tracker = SimpleNamespace(
-            get_tracked_modules=lambda: {
+            tracked_modules={
                 "model.ebc": ebc_module,
                 "model.ec": ec_module,
             }
@@ -828,9 +893,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._tracking_pause_depth = 0
-        dumper._tracker = SimpleNamespace(
-            get_tracked_modules=lambda: {"user_emb": sharded_module}
-        )
+        dumper._tracker = SimpleNamespace(tracked_modules={"user_emb": sharded_module})
         dumper._install_tracking_pause_guard()
 
         sharded_module.post_lookup_tracker_fn("train")
@@ -886,9 +949,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             original_config_module,
             grouped_config_module,
         )
-        dumper._tracker = SimpleNamespace(
-            get_tracked_modules=lambda: {"model.ebc": owner_module}
-        )
+        dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": owner_module})
         with mock.patch(
             "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
             side_effect=lambda module_fqn, _module, table_name: (
@@ -931,9 +992,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         }
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 0
-        dumper._tracker = SimpleNamespace(
-            get_tracked_modules=lambda: {"model.ebc": sharded_module}
-        )
+        dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": sharded_module})
         table_fqn = "model.ebc.adgroup_id_emb"
         with mock.patch(
             "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
