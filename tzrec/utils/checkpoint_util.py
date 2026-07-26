@@ -59,8 +59,48 @@ _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
     (".ec_dict_user.", ".ec_dict."),
     (".mc_ec_dict_user.", ".mc_ec_dict."),
 )
+_INPUT_TILE_TABLE_OWNER_ALIASES = {
+    "ebc_user": "ebc",
+    "mc_ebc_user": "mc_ebc",
+    "ec_dict_user": "ec_dict",
+    "ec_list_user": "ec_list",
+    "mc_ec_dict_user": "mc_ec_dict",
+    "mc_ec_list_user": "mc_ec_list",
+}
+_INPUT_TILE_CANONICAL_TO_USER_TABLE_OWNER = {
+    canonical_owner: user_owner
+    for user_owner, canonical_owner in _INPUT_TILE_TABLE_OWNER_ALIASES.items()
+}
 # queue token meaning "run a prune pass"; ``None`` means "stop the worker".
 _PRUNE_REQUEST = object()
+
+
+def canonicalize_input_tile_table_fqn(table_fqn: str) -> str:
+    """Canonicalize an INPUT_TILE user-side sparse table FQN.
+
+    Only owning-module segments before ``embedding_bags`` or ``embeddings`` are
+    canonicalized. Table names and unrelated module segments are preserved.
+
+    Args:
+        table_fqn: State-dict-style sparse table FQN, optionally including a
+            suffix such as ``.weight``.
+
+    Returns:
+        The canonical physical sparse table FQN.
+    """
+    segments = table_fqn.split(".")
+    try:
+        table_segment_idx = next(
+            i
+            for i, segment in enumerate(segments)
+            if segment in {"embedding_bags", "embeddings"}
+        )
+    except StopIteration:
+        return table_fqn
+
+    for i in range(table_segment_idx):
+        segments[i] = _INPUT_TILE_TABLE_OWNER_ALIASES.get(segments[i], segments[i])
+    return ".".join(segments)
 
 
 class PartialLoadPlanner(DefaultLoadPlanner):
@@ -147,7 +187,17 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                 is_input_tile_emb()
                 and meta_fqn not in self.metadata.state_dict_metadata
             ):
+                candidate = canonicalize_input_tile_table_fqn(meta_fqn)
+                if (
+                    candidate != meta_fqn
+                    and candidate in self.metadata.state_dict_metadata
+                ):
+                    logger.info(f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]")
+                    meta_fqn = candidate
+                    fqn_remap_set.add(fqn)
                 for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
+                    if meta_fqn in self.metadata.state_dict_metadata:
+                        break
                     if new_pat not in meta_fqn:
                         continue
                     candidate = meta_fqn.replace(new_pat, old_pat)
@@ -829,13 +879,6 @@ def _redistribute_mch_state(model: nn.Module) -> None:
             m._buffers[name].copy_(new_meta)
 
 
-# Module-name segments that get a `_user` twin when INPUT_TILE=3 export
-# duplicates the embedding group into item/user halves. See
-# tzrec/modules/embedding.py:EmbeddingGroupImpl /
-# SequenceEmbeddingGroupImpl for the construction.
-_INPUT_TILE_USER_SEGMENTS = frozenset({"ebc", "mc_ebc", "ec_dict", "mc_ec_dict"})
-
-
 def _make_dynamicemb_input_tile_user_view(dynamicemb_path: str, view_path: str) -> str:
     """Create a local symlink view for INPUT_TILE=3 dynamicemb loading.
 
@@ -858,10 +901,11 @@ def _make_dynamicemb_input_tile_user_view(dynamicemb_path: str, view_path: str) 
         if any(seg.endswith("_user") for seg in segs):
             continue
         for i, seg in enumerate(segs):
-            if seg not in _INPUT_TILE_USER_SEGMENTS:
+            user_seg = _INPUT_TILE_CANONICAL_TO_USER_TABLE_OWNER.get(seg)
+            if user_seg is None:
                 continue
             user_segs = list(segs)
-            user_segs[i] = f"{seg}_user"
+            user_segs[i] = user_seg
             user_entry = ".".join(user_segs)
             user_path = os.path.join(view_path, user_entry)
             if os.path.lexists(user_path):
