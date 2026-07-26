@@ -53,8 +53,6 @@ _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
         ".mc_ebc_user._managed_collision_collection.",
         ".mc_ebc._managed_collision_collection.",
     ),
-    (".ec_list_user.", ".ec_list."),
-    (".mc_ec_list_user.", ".mc_ec_list."),
     (".ec_dict_user.", ".ec_dict."),
     (".mc_ec_dict_user.", ".mc_ec_dict."),
 )
