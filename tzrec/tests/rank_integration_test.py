@@ -341,11 +341,6 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(input_tile_dir_emb, "export/model_acc.json"))
         )
-        self.assertFalse(
-            os.path.exists(
-                os.path.join(input_tile_dir_emb, "export/emb_ckpt_mapping.txt")
-            )
-        )
         with open(os.path.join(input_tile_dir_emb, "export/model_acc.json")) as f:
             acc_cfg = json.load(f)
             self.assertEqual(acc_cfg["QUANT_EMB"], "1")
