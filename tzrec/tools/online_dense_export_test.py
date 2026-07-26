@@ -26,6 +26,7 @@ from tzrec.tools.online_dense_export import (
     _prune_old_dense_versions,
     export_online_dense_model,
 )
+from tzrec.utils.online_dense_export_util import _max_kept_versions
 
 
 class OnlineDenseExportTest(unittest.TestCase):
@@ -177,7 +178,7 @@ class OnlineDenseExportTest(unittest.TestCase):
                     os.environ,
                     {
                         "USE_DISTRIBUTED_EMBEDDING": "1",
-                        "ONLINE_DENSE_EXPORT_KEEP_VERSIONS": "2",
+                        "ONLINE_DENSE_EXPORT_KEEP_VERSIONS": "3",
                     },
                     clear=False,
                 ),
@@ -212,7 +213,10 @@ class OnlineDenseExportTest(unittest.TestCase):
                 )
 
             remaining = sorted(os.listdir(versions_root))
-            self.assertEqual(remaining, ["20260101000004", "20260623174704"])
+            self.assertEqual(
+                remaining,
+                ["20260101000003", "20260101000004", "20260623174704"],
+            )
             self.assertFalse(
                 os.path.exists(os.path.join(versions_root, "20260101000001.tmp.9999"))
             )
@@ -231,6 +235,8 @@ class OnlineDenseExportTest(unittest.TestCase):
                 "20260101000002",
                 "20260101000003",
                 "20260101000004",
+                "20260101000005",
+                "20260101000006",
             ):
                 os.makedirs(os.path.join(versions_root, v))
             # explicit --version (or clock rollback) publishes an OLDER
@@ -242,27 +248,54 @@ class OnlineDenseExportTest(unittest.TestCase):
 
             with mock.patch.dict(
                 os.environ,
-                {"ONLINE_DENSE_EXPORT_KEEP_VERSIONS": "2"},
+                {"ONLINE_DENSE_EXPORT_KEEP_VERSIONS": "3"},
                 clear=False,
             ):
                 _prune_old_dense_versions(export_root, versions_root)
 
-            # the published (oldest) version survives despite KEEP=2
+            # the published (oldest) version survives despite KEEP=3
             self.assertTrue(os.path.isdir(os.path.join(versions_root, published)))
-            # the two newest on-disk versions survive
-            self.assertTrue(
-                os.path.isdir(os.path.join(versions_root, "20260101000003"))
-            )
-            self.assertTrue(
-                os.path.isdir(os.path.join(versions_root, "20260101000004"))
-            )
+            # the three newest on-disk versions survive
+            for v in ("20260101000004", "20260101000005", "20260101000006"):
+                self.assertTrue(os.path.isdir(os.path.join(versions_root, v)))
             # older non-current versions are pruned
-            self.assertFalse(
-                os.path.isdir(os.path.join(versions_root, "20260101000001"))
-            )
-            self.assertFalse(
-                os.path.isdir(os.path.join(versions_root, "20260101000002"))
-            )
+            for v in ("20260101000001", "20260101000002", "20260101000003"):
+                self.assertFalse(os.path.isdir(os.path.join(versions_root, v)))
+
+    def test_prune_keep_all_by_default(self) -> None:
+        """Unset KEEP_VERSIONS defaults to 0 and prunes no dense versions."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            export_root = os.path.join(tmp_dir, "dense_hot_export")
+            versions_root = os.path.join(export_root, "versions")
+            os.makedirs(versions_root)
+            versions = [f"2026010100000{i}" for i in range(1, 7)]
+            for v in versions:
+                os.makedirs(os.path.join(versions_root, v))
+
+            env = os.environ.copy()
+            env.pop("ONLINE_DENSE_EXPORT_KEEP_VERSIONS", None)
+            with mock.patch.dict(os.environ, env, clear=True):
+                _prune_old_dense_versions(export_root, versions_root)
+
+            self.assertEqual(sorted(os.listdir(versions_root)), versions)
+
+    def test_keep_versions_validation(self) -> None:
+        """A positive KEEP_VERSIONS below 3 is rejected; 0 and >=3 pass."""
+        for value in ("-1", "1", "2"):
+            with mock.patch.dict(
+                os.environ,
+                {"ONLINE_DENSE_EXPORT_KEEP_VERSIONS": value},
+                clear=False,
+            ):
+                with self.assertRaises(ValueError):
+                    _max_kept_versions()
+        for value, expected in (("0", 0), ("3", 3), ("10", 10)):
+            with mock.patch.dict(
+                os.environ,
+                {"ONLINE_DENSE_EXPORT_KEEP_VERSIONS": value},
+                clear=False,
+            ):
+                self.assertEqual(_max_kept_versions(), expected)
 
     def test_rejects_match_model_and_tdm(self) -> None:
         """MatchModel/TDM need per-tower/per-module export; reject them."""

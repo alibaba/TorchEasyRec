@@ -82,7 +82,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 - ONLINE_DENSE_EXPORT_STEPS: 按训练步数间隔触发导出（如 `300` 表示每 300 步导出一次），0 表示关闭
 - ONLINE_DENSE_EXPORT_INTERVAL: 按数据事件时间（`Batch.data_timestamp`，Unix 秒）间隔触发导出（如 `60` 表示每消费过 60 秒事件时间、且跨过整分边界时导出一次），0 表示关闭。事件时间触发会在各 rank 间做 quorum 对齐，与 checkpoint 的时间触发机制一致
 - ONLINE_DENSE_EXPORT_QUORUM: 事件时间触发的 worker 越界比例阈值，取值 (0, 1\]，默认 0.5
-- ONLINE_DENSE_EXPORT_KEEP_VERSIONS: 保留的历史版本数，默认 3（serving 需要当前版本 + 上一版本用于原子切换）。`current.json` 指向的版本永远不被清理
+- ONLINE_DENSE_EXPORT_KEEP_VERSIONS: 保留的历史版本数，默认 0（不删除任何已导出的版本）。大于 0 时保留最新 K 个版本，且 K 最小为 3（serving 需要当前版本 + 上一版本用于原子切换）。`current.json` 指向的版本永远不被清理
 - ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 的等待上限
 
 `ONLINE_DENSE_EXPORT_STEPS` 与 `ONLINE_DENSE_EXPORT_INTERVAL` 至少要设置一个；训练结束时还会强制导出一次最终状态。导出频率与 checkpoint 频率完全独立，checkpoint 仍按原有配置保存、用于训练恢复。

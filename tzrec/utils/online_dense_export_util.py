@@ -83,21 +83,33 @@ def _read_current_version(current_path: str) -> Optional[str]:
 
 
 def _max_kept_versions() -> int:
-    """Max published dense versions to retain (0 = keep all)."""
-    return int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_VERSIONS", "3"))
+    """Max published dense versions to retain (0 = keep all).
+
+    Reads ``ONLINE_DENSE_EXPORT_KEEP_VERSIONS`` (default 0, keep every
+    exported version). A positive value retains the newest K versions and
+    must be at least 3: serving reads current.json and needs the previous
+    version for an atomic swap, so a smaller K buys no retention safety.
+    """
+    keep = int(os.environ.get("ONLINE_DENSE_EXPORT_KEEP_VERSIONS", "0"))
+    if keep < 0 or 0 < keep < 3:
+        raise ValueError(
+            "ONLINE_DENSE_EXPORT_KEEP_VERSIONS must be 0 (keep all) or "
+            f">= 3, got {keep}."
+        )
+    return keep
 
 
 def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
     """Best-effort retention: keep the newest K versions, sweep stale tmp artifacts.
 
-    Serving reads current.json (the newest pointer) and needs the previous
-    version for an atomic swap, so K defaults to 3. The version current.json
-    points at is always spared even when it sorts outside the newest K: an
-    explicit --version or clock rollback after a restart can publish an older
-    timestamp, and deleting it would leave the serving pointer referencing a
-    missing directory. Stale ``*.tmp.<pid>`` dirs and current.json.tmp.<pid>
-    files left by crashed exports are swept so they don't accumulate under the
-    serving-facing tree.
+    K comes from ``ONLINE_DENSE_EXPORT_KEEP_VERSIONS`` and defaults to 0
+    (keep every exported version); a positive K retains the newest K versions.
+    The version current.json points at is always spared even when it sorts
+    outside the newest K: an explicit --version or clock rollback after a
+    restart can publish an older timestamp, and deleting it would leave the
+    serving pointer referencing a missing directory. Stale ``*.tmp.<pid>``
+    dirs and current.json.tmp.<pid> files left by crashed exports are swept
+    so they don't accumulate under the serving-facing tree.
     """
     max_versions = _max_kept_versions()
     for base in (versions_root, export_root):
@@ -269,6 +281,10 @@ class OnlineDenseExportManager:
             raise RuntimeError(
                 f"ONLINE_DENSE_EXPORT_QUORUM must be in (0, 1], got {self._ts_quorum}."
             )
+        # fail fast on a misconfigured retention K instead of at prune time,
+        # where the worker's exception guard would swallow it and silently
+        # disable retention.
+        _max_kept_versions()
         # The publish tree (os.rename / current.json) is local-FS only;
         # fsspec URLs break both. Check the actual export root --
         # <serving_root>/dense_hot_export -- so a local override decouples
