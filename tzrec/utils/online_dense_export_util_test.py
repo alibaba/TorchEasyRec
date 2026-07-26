@@ -407,6 +407,83 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                         model=_mock_model({"model.w": "not-a-tensor"}),
                     )
 
+    def test_build_rejects_sharded_tensor(self) -> None:
+        """Dense-graph state backed by a ShardedTensor must abort startup.
+
+        Dense export gathers only replicated or DTensor dense weights; a
+        ShardedTensor in the dense graph means sparse/embedding state leaked
+        in, so construction fails fast instead of trying to gather it.
+        """
+        port = misc_util.get_free_port()
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            world_size=1,
+            rank=0,
+        )
+        try:
+            placement = "rank:0/cpu"
+            meta = ShardedTensorMetadata(
+                shards_metadata=[
+                    ShardMetadata(
+                        shard_offsets=[0], shard_sizes=[1], placement=placement
+                    ),
+                    ShardMetadata(
+                        shard_offsets=[1], shard_sizes=[1], placement=placement
+                    ),
+                ],
+                size=torch.Size([2]),
+                tensor_properties=TensorProperties(dtype=torch.float32),
+            )
+            value = ShardedTensor._init_from_local_shards_and_global_metadata(
+                [
+                    Shard(
+                        torch.full((1,), 3.0),
+                        ShardMetadata(
+                            shard_offsets=[0], shard_sizes=[1], placement=placement
+                        ),
+                    ),
+                    Shard(
+                        torch.full((1,), 5.0),
+                        ShardMetadata(
+                            shard_offsets=[1], shard_sizes=[1], placement=placement
+                        ),
+                    ),
+                ],
+                meta,
+            )
+        finally:
+            dist.destroy_process_group()
+        fake_gm = mock.Mock()
+        fake_gm.state_dict.return_value = {"model.w": None}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(tmp_dir)
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch(
+                    _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                    return_value=_dummy_pipeline_config(),
+                ),
+                mock.patch("tzrec.main._create_features", return_value=[]),
+                mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+                mock.patch("tzrec.models.model.ScriptWrapper", side_effect=lambda m: m),
+                mock.patch(
+                    _BUILD_PATCHES.format("create_dense_export_warmup_data"),
+                    return_value={},
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("build_dense_graph_module"),
+                    return_value=(fake_gm, mock.Mock(), {}),
+                ),
+                mock.patch(_BUILD_PATCHES.format("finalize_dense_export")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "must not carry sharded"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({"model.w": value}),
+                    )
+
     # --- worker / thread semantics (drive _enqueue, patch _run_task) ---
 
     def test_worker_survives_task_failure(self) -> None:
@@ -741,52 +818,6 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         finally:
             dist.destroy_process_group()
         torch.testing.assert_close(box["gm"].w, torch.full((2,), 9.0))
-
-    def test_maybe_export_gathers_sharded_tensor(self) -> None:
-        """ShardedTensor local shards are staged at their global offsets."""
-        port = misc_util.get_free_port()
-        dist.init_process_group(
-            backend="gloo",
-            init_method=f"tcp://127.0.0.1:{port}",
-            world_size=1,
-            rank=0,
-        )
-        try:
-            placement = "rank:0/cpu"
-            meta = ShardedTensorMetadata(
-                shards_metadata=[
-                    ShardMetadata(
-                        shard_offsets=[0], shard_sizes=[1], placement=placement
-                    ),
-                    ShardMetadata(
-                        shard_offsets=[1], shard_sizes=[1], placement=placement
-                    ),
-                ],
-                size=torch.Size([2]),
-                tensor_properties=TensorProperties(dtype=torch.float32),
-            )
-            value = ShardedTensor._init_from_local_shards_and_global_metadata(
-                [
-                    Shard(
-                        torch.full((1,), 3.0),
-                        ShardMetadata(
-                            shard_offsets=[0], shard_sizes=[1], placement=placement
-                        ),
-                    ),
-                    Shard(
-                        torch.full((1,), 5.0),
-                        ShardMetadata(
-                            shard_offsets=[1], shard_sizes=[1], placement=placement
-                        ),
-                    ),
-                ],
-                meta,
-            )
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                box = self._run_one_export(tmp_dir, {"model.w": value})
-        finally:
-            dist.destroy_process_group()
-        torch.testing.assert_close(box["gm"].w, torch.tensor([3.0, 5.0]))
 
     # --- publish helpers ---
 

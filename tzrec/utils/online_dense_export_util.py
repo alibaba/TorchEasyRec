@@ -410,7 +410,12 @@ class OnlineDenseExportManager:
                 missing.append(gm_key)
                 continue
             value = source_keys[source]
-            if not isinstance(value, (torch.Tensor, ShardedTensor)):
+            if isinstance(value, ShardedTensor):
+                raise RuntimeError(
+                    f"ONLINE_DENSE_EXPORT cannot gather dense state [{gm_key}]: "
+                    "dense graph must not carry sharded (sparse/embedding) state"
+                )
+            if not isinstance(value, torch.Tensor):
                 raise RuntimeError(
                     f"ONLINE_DENSE_EXPORT cannot gather dense state [{gm_key}]: "
                     f"unsupported state type {type(value).__name__}"
@@ -518,24 +523,22 @@ class OnlineDenseExportManager:
         Scoped to exactly the state keys the resident dense graph carries
         (resolved at construction), so sparse / dynamicemb / MCH state is
         never materialized. Plain tensors are DDP-replicated and need no
-        communication; DTensors are all-gathered on their mesh;
-        ShardedTensors are staged into a full-size CPU tensor and summed over
-        the exporter's gloo group (position-based shards never overlap).
-        Rank zero then enqueues the snapshot on the latest-wins worker queue.
+        communication; DTensors are all-gathered on their mesh. Rank zero
+        then copies the gathered weights into pinned CPU buffers (a single
+        copy-stream sync) and enqueues the snapshot on the latest-wins
+        worker queue.
         """
         is_rank_zero = self._rank == 0
-        snapshot: Dict[str, torch.Tensor] = {}
+        gathered: Dict[str, torch.Tensor] = {}
         if self._state_pairs:
             source_state = model.state_dict()
             for gm_key, source_key in self._state_pairs:
                 value = source_state[source_key]
                 if isinstance(value, DTensor):
                     # collective on the DTensor's mesh; all ranks participate
-                    gathered = value.full_tensor()
-                elif isinstance(value, ShardedTensor):
-                    gathered = self._gather_sharded_tensor(value)
+                    tensor = value.full_tensor()
                 elif isinstance(value, torch.Tensor):
-                    gathered = value
+                    tensor = value
                 else:
                     raise RuntimeError(
                         f"ONLINE_DENSE_EXPORT cannot gather dense state "
@@ -543,30 +546,43 @@ class OnlineDenseExportManager:
                         f"{type(value).__name__}"
                     )
                 if is_rank_zero:
-                    snapshot[gm_key] = gathered.detach().cpu()
+                    gathered[gm_key] = tensor
         if not is_rank_zero:
             return
-        self._enqueue(step, data_timestamp, snapshot)
+        self._enqueue(step, data_timestamp, self._copy_snapshot_to_cpu(gathered))
 
-    def _gather_sharded_tensor(self, value: ShardedTensor) -> torch.Tensor:
-        """Reconstruct a full CPU tensor from position-based ShardedTensor shards.
+    def _copy_snapshot_to_cpu(
+        self, gathered: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Copy gathered weights to pinned CPU buffers with a single sync.
 
-        Every rank stages its local shards into a zeroed full-size tensor at
-        their global offsets, then the exporter's gloo group sums them: each
-        element is written by exactly one rank, so the sum is the union.
+        A per-tensor ``.cpu()`` synchronizes the training thread for every
+        CUDA weight, adding per-weight step latency on large models. Instead
+        each CUDA tensor is issued a non-blocking copy into a pinned buffer
+        on a dedicated stream, and that stream is synchronized once before
+        the snapshot is handed to the worker. CUDA stream synchronization --
+        not a distributed barrier -- is what lets the worker read completed
+        copies; tensors already on CPU are passed through detached.
         """
-        metadata = value.metadata()
-        gathered = torch.zeros(metadata.size, dtype=metadata.tensor_properties.dtype)
-        for shard in value.local_shards():
-            region = gathered
-            for dim, (offset, size) in enumerate(
-                zip(shard.metadata.shard_offsets, shard.metadata.shard_sizes)
-            ):
-                region = region.narrow(dim, offset, size)
-            region.copy_(shard.tensor.detach().cpu())
-        if self._group is not None:
-            dist.all_reduce(gathered, group=self._group)
-        return gathered
+        if not any(tensor.is_cuda for tensor in gathered.values()):
+            return {key: tensor.detach().cpu() for key, tensor in gathered.items()}
+        copy_stream = torch.cuda.Stream()
+        # The gather ran on the current stream; the copy stream must wait on
+        # it so the non-blocking copies read fully-written source tensors.
+        copy_stream.wait_stream(torch.cuda.current_stream())
+        snapshot: Dict[str, torch.Tensor] = {}
+        with torch.cuda.stream(copy_stream):
+            for key, tensor in gathered.items():
+                if tensor.is_cuda:
+                    buffer = torch.empty(
+                        tensor.shape, dtype=tensor.dtype, pin_memory=True
+                    )
+                    buffer.copy_(tensor.detach(), non_blocking=True)
+                    snapshot[key] = buffer
+                else:
+                    snapshot[key] = tensor.detach().cpu()
+        copy_stream.synchronize()
+        return snapshot
 
     def _enqueue(
         self, step: int, data_timestamp: float, snapshot: Dict[str, torch.Tensor]
