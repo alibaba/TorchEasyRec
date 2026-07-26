@@ -2268,10 +2268,11 @@ def _get_sparse_embedding_tensor(
         emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
         feat_meta: feature -> embedding_name / pooling mapping.
     """
-    emb_name_to_emb_dim = {}
-    feat_name_to_pooling = {}
-    feat_name_impl_to_emb_name = {}
-    emb_name_to_feat_name_impl = {}
+    emb_name_to_emb_dim = dict()
+    feat_name_to_pooling = dict()
+
+    feat_name_impl_to_emb_name = dict()
+    emb_name_to_feat_name_impl = dict()
 
     for table_fqn, emb_info in embedding_infos.items():
         export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
