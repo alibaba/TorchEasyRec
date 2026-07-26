@@ -46,7 +46,6 @@ from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 # INPUT_TILE=3 load-time fallback from user-side keys to non-user checkpoint keys.
-# Mirrors `tzrec/acc/utils.py:write_mapping_file_for_input_tile`.
 _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
     (".ebc_user.embedding_bags.", ".ebc.embedding_bags."),
     (".mc_ebc_user._embedding_module.", ".mc_ebc._embedding_module."),
@@ -54,8 +53,6 @@ _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
         ".mc_ebc_user._managed_collision_collection.",
         ".mc_ebc._managed_collision_collection.",
     ),
-    (".ec_list_user.", ".ec_list."),
-    (".mc_ec_list_user.", ".mc_ec_list."),
     (".ec_dict_user.", ".ec_dict."),
     (".mc_ec_dict_user.", ".mc_ec_dict."),
 )
@@ -165,30 +162,29 @@ class PartialLoadPlanner(DefaultLoadPlanner):
                 fqn_remap_set.add(fqn)
                 logger.info(f"Remap restore state [{fqn}] from [{meta_fqn}]")
 
-            for ec_new, ec_old in ec_compat_map.items():
-                if ec_new in meta_fqn:
-                    new_meta_fqn = meta_fqn
-                    meta_fqn = new_meta_fqn.replace(ec_new, ec_old)
-                    fqn_remap_set.add(fqn)
-                    logger.warning(
-                        f"Remap EmbeddingCollection state [{new_meta_fqn}] from old "
-                        "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
-                    )
-
             # INPUT_TILE=3 export adds user-side twin modules absent from
-            # training checkpoints. Remap to existing non-user keys, matching
-            # export_model_normal's emb_ckpt_mapping.txt fallback.
+            # training checkpoints. Remap them before EC compatibility handling.
             if (
                 is_input_tile_emb()
                 and meta_fqn not in self.metadata.state_dict_metadata
             ):
-                candidate = remap_input_tile_user_key(
-                    meta_fqn, self.metadata.state_dict_metadata
-                )
+                candidate = remap_input_tile_user_key(meta_fqn)
                 if candidate != meta_fqn:
                     logger.info(f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]")
                     meta_fqn = candidate
                     fqn_remap_set.add(fqn)
+
+            if meta_fqn not in self.metadata.state_dict_metadata:
+                for ec_new, ec_old in ec_compat_map.items():
+                    if ec_new in meta_fqn:
+                        new_meta_fqn = meta_fqn
+                        meta_fqn = new_meta_fqn.replace(ec_new, ec_old)
+                        fqn_remap_set.add(fqn)
+                        logger.warning(
+                            f"Remap EmbeddingCollection state [{new_meta_fqn}] from "
+                            "old [{meta_fqn}], will be deprecated when tzrec version "
+                            ">= 1.0.0"
+                        )
 
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]

@@ -237,28 +237,14 @@ def export_model_normal(
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
 
-    ckpt_param_map_path = None
-    if checkpoint_path:
-        if acc_utils.is_input_tile_emb():
-            # generate embedding name mapping file
-            ckpt_param_map_path = os.path.join(save_dir, "emb_ckpt_mapping.txt")
-            if is_rank_zero:
-                if not os.path.exists(save_dir):
-                    os.makedirs(save_dir)
-                acc_utils.write_mapping_file_for_input_tile(
-                    model.state_dict(), ckpt_param_map_path
-                )
-                dist.barrier()
-    else:
+    if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         init_parameters(model, torch.device("cpu"))
-        checkpoint_util.restore_model(
-            checkpoint_path, model, ckpt_param_map_path=ckpt_param_map_path
-        )
+        checkpoint_util.restore_model(checkpoint_path, model)
         # for mc modules, fix output_segments_tensor is a meta tensor.
         fix_mch_state(model)
 
