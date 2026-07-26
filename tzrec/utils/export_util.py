@@ -2402,12 +2402,9 @@ def _get_sparse_embedding_tensor(
                     f"dynamic embedding {export_emb_name} has inconsistent "
                     f"checkpoint world_size values: {sorted(ckpt_world_sizes)}"
                 )
-            for (
-                ckpt_emb_name,
-                ckpt_rank,
-                ckpt_world_size,
-                key_file,
-            ) in sorted(emb_key_files):
+            for ckpt_emb_name, ckpt_rank, ckpt_world_size, key_file in sorted(
+                emb_key_files
+            ):
                 if ckpt_rank % world_size != rank:
                     continue
                 with open(key_file, "rb") as f:
