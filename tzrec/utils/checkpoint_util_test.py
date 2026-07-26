@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torchrec
 from parameterized import param, parameterized
 from torch import nn
+from torch.distributed.checkpoint import save
 from torchrec import EmbeddingBagCollection
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel,
@@ -119,6 +120,39 @@ def _create_test_model(large_table_cnt=2, small_table_cnt=2):
     torch.sum(losses, dim=0).backward()
     optimizer.step()
     return model, optimizer
+
+
+def _create_input_tile_ebc_model(module_values):
+    model = nn.Module()
+    model.group = nn.Module()
+    for module_name, value in module_values.items():
+        ebc = nn.Module()
+        ebc.embedding_bags = nn.ModuleDict(
+            {"table": nn.Embedding(num_embeddings=2, embedding_dim=4)}
+        )
+        nn.init.constant_(ebc.embedding_bags["table"].weight, value)
+        model.group.add_module(module_name, ebc)
+    return model
+
+
+def _create_legacy_ec_list_model(value):
+    model = nn.Module()
+    model.group = nn.Module()
+    model.group.ec_list = nn.ModuleList(
+        [nn.Embedding(num_embeddings=2, embedding_dim=4)]
+    )
+    nn.init.constant_(model.group.ec_list[0].weight, value)
+    return model
+
+
+def _create_input_tile_ec_dict_model(value):
+    model = nn.Module()
+    model.group = nn.Module()
+    model.group.ec_dict_user = nn.ModuleDict(
+        {"4": nn.Embedding(num_embeddings=2, embedding_dim=4)}
+    )
+    nn.init.constant_(model.group.ec_dict_user["4"].weight, value)
+    return model
 
 
 def _save_restore_worker(test_dir, rank, world_size, port):
@@ -401,6 +435,45 @@ class CheckpointUtilTest(unittest.TestCase):
             p.join()
             if p.exitcode != 0:
                 raise RuntimeError(f"worker-{i} failed.")
+
+    def test_input_tile_restores_ebc_user_without_mapping_file(self):
+        source = _create_input_tile_ebc_model({"ebc": 1.0})
+        save(source.state_dict(), checkpoint_id=os.path.join(self.test_dir, "model"))
+        target = _create_input_tile_ebc_model({"ebc_user": 0.0})
+
+        with mock.patch.dict(os.environ, {"INPUT_TILE": "3"}):
+            checkpoint_util.restore_model(self.test_dir, target)
+
+        torch.testing.assert_close(
+            target.group.ebc_user.embedding_bags["table"].weight,
+            source.group.ebc.embedding_bags["table"].weight,
+        )
+
+    def test_input_tile_restores_legacy_ec_list_without_mapping_file(self):
+        source = _create_legacy_ec_list_model(1.0)
+        save(source.state_dict(), checkpoint_id=os.path.join(self.test_dir, "model"))
+        target = _create_input_tile_ec_dict_model(0.0)
+
+        with mock.patch.dict(os.environ, {"INPUT_TILE": "3"}):
+            checkpoint_util.restore_model(self.test_dir, target)
+
+        torch.testing.assert_close(
+            target.group.ec_dict_user["4"].weight,
+            source.group.ec_list[0].weight,
+        )
+
+    def test_input_tile_prefers_exact_user_checkpoint_key(self):
+        source = _create_input_tile_ebc_model({"ebc": 1.0, "ebc_user": 2.0})
+        save(source.state_dict(), checkpoint_id=os.path.join(self.test_dir, "model"))
+        target = _create_input_tile_ebc_model({"ebc_user": 0.0})
+
+        with mock.patch.dict(os.environ, {"INPUT_TILE": "3"}):
+            checkpoint_util.restore_model(self.test_dir, target)
+
+        torch.testing.assert_close(
+            target.group.ebc_user.embedding_bags["table"].weight,
+            source.group.ebc_user.embedding_bags["table"].weight,
+        )
 
 
 class DataloaderCheckpointTest(unittest.TestCase):

@@ -46,7 +46,6 @@ from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 # INPUT_TILE=3 load-time fallback from user-side keys to non-user checkpoint keys.
-# Mirrors `tzrec/acc/utils.py:write_mapping_file_for_input_tile`.
 _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
     (".ebc_user.embedding_bags.", ".ebc.embedding_bags."),
     (".mc_ebc_user._embedding_module.", ".mc_ebc._embedding_module."),
@@ -122,48 +121,62 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             ):
                 continue
 
-            meta_fqn = fqn
-
             fqn_remap_set = set()
+            meta_fqn = fqn
             if fqn in self._ckpt_param_map:
                 meta_fqn = self._ckpt_param_map[fqn]
                 fqn_remap_set.add(fqn)
                 logger.info(f"Remap restore state [{fqn}] from [{meta_fqn}]")
 
+            candidates: List[Tuple[str, bool, Optional[str]]] = [
+                (meta_fqn, False, None)
+            ]
             for ec_new, ec_old in ec_compat_map.items():
                 if ec_new in meta_fqn:
-                    new_meta_fqn = meta_fqn
-                    meta_fqn = new_meta_fqn.replace(ec_new, ec_old)
-                    fqn_remap_set.add(fqn)
-                    logger.warning(
-                        f"Remap EmbeddingCollection state [{new_meta_fqn}] from old "
-                        "[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
+                    candidates.append(
+                        (meta_fqn.replace(ec_new, ec_old), False, meta_fqn)
                     )
 
-            # INPUT_TILE=3 export adds user-side twin modules absent from
-            # training checkpoints. Remap to existing non-user keys, matching
-            # export_model_normal's emb_ckpt_mapping.txt fallback.
-            if (
-                is_input_tile_emb()
-                and meta_fqn not in self.metadata.state_dict_metadata
-            ):
+            if is_input_tile_emb():
                 for new_pat, old_pat in _INPUT_TILE_USER_REPLACEMENTS:
                     if new_pat not in meta_fqn:
                         continue
-                    candidate = meta_fqn.replace(new_pat, old_pat)
-                    if candidate in self.metadata.state_dict_metadata:
-                        logger.info(
-                            f"Remap INPUT_TILE=3 state [{fqn}] from [{candidate}]"
-                        )
-                        meta_fqn = candidate
-                        fqn_remap_set.add(fqn)
-                        break
+                    input_tile_fqn = meta_fqn.replace(new_pat, old_pat)
+                    candidates.append((input_tile_fqn, True, None))
+                    for ec_new, ec_old in ec_compat_map.items():
+                        if ec_new in input_tile_fqn:
+                            candidates.append(
+                                (
+                                    input_tile_fqn.replace(ec_new, ec_old),
+                                    True,
+                                    input_tile_fqn,
+                                )
+                            )
 
-            if meta_fqn in self.metadata.state_dict_metadata:
-                md = self.metadata.state_dict_metadata[meta_fqn]
-            else:
+            matched_candidate = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate[0] in self.metadata.state_dict_metadata
+                ),
+                None,
+            )
+            if matched_candidate is None:
                 logger.warning(f"Skip restore state [{fqn}]")
                 continue
+
+            meta_fqn, input_tile_remap, ec_compat_source = matched_candidate
+            if input_tile_remap:
+                logger.info(f"Remap INPUT_TILE=3 state [{fqn}] from [{meta_fqn}]")
+            if ec_compat_source is not None:
+                logger.warning(
+                    f"Remap EmbeddingCollection state [{ec_compat_source}] from old "
+                    f"[{meta_fqn}], will be deprecated when tzrec version >= 1.0.0"
+                )
+            if meta_fqn != fqn:
+                fqn_remap_set.add(fqn)
+
+            md = self.metadata.state_dict_metadata[meta_fqn]
 
             read_items = []
             if isinstance(obj, DTensor):
