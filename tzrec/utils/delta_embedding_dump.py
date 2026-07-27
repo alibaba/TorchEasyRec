@@ -10,25 +10,56 @@
 # limitations under the License.
 
 import os
-import re
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+from google.protobuf.message import Message
 from torch import nn
+from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import ShardedTensor
-from torchrec.distributed.model_tracker.model_delta_tracker import (
-    ModelDeltaTrackerTrec,
+from torch.distributed._shard.sharding_spec import EnumerableShardingSpec
+from torch.distributed.tensor import DTensor
+from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.embedding import ShardedEmbeddingCollection
+from torchrec.distributed.embedding_lookup import (
+    GroupedEmbeddingsLookup,
+    GroupedPooledEmbeddingsLookup,
 )
-from torchrec.distributed.model_tracker.types import TrackingMode
+from torchrec.distributed.embedding_types import ShardedEmbeddingTable
+from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
+from torchrec.distributed.model_tracker.delta_store import DeltaStoreTrec
+from torchrec.distributed.model_tracker.model_delta_tracker import (
+    ModelDeltaTracker as TorchRecModelDeltaTracker,
+)
+from torchrec.distributed.model_tracker.types import UniqueRows, UpdateMode
+from torchrec.distributed.types import ParameterSharding
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
 from tzrec.utils.logging_util import logger
 
 _CONSUMER = "delta_embedding_dump"
+_ShardedEmbeddingModule = Union[
+    ShardedEmbeddingCollection, ShardedEmbeddingBagCollection
+]
+_EmbeddingLookup = Union[GroupedEmbeddingsLookup, GroupedPooledEmbeddingsLookup]
 _DELTA_DUMP_SCHEMA = pa.schema(
     [
         ("global_step", pa.int64()),
@@ -89,18 +120,13 @@ def validate_delta_embedding_dump_config(
         raise ValueError("delta_embedding_dump_config.dump_interval_steps must be > 0.")
 
 
-def _has_proto_field(config: Any, field_name: str) -> bool:
-    descriptor = getattr(config, "DESCRIPTOR", None)
-    if descriptor is None or field_name not in descriptor.fields_by_name:
+def _has_proto_field(config: Message, field_name: str) -> bool:
+    if field_name not in config.DESCRIPTOR.fields_by_name:
         return False
     return config.HasField(field_name)
 
 
-def _feature_config_name(config: Any) -> str:
-    return getattr(config, "feature_name", "")
-
-
-def _zch_feature_names(feature_configs: Iterable[Any]) -> Set[str]:
+def _zch_feature_names(feature_configs: Iterable[FeatureConfig]) -> Set[str]:
     zch_feature_names: Set[str] = set()
     for feature_config in feature_configs:
         feature_type = feature_config.WhichOneof("feature")
@@ -108,13 +134,13 @@ def _zch_feature_names(feature_configs: Iterable[Any]) -> Set[str]:
             continue
         config = getattr(feature_config, feature_type)
         if _has_proto_field(config, "zch"):
-            feature_name = _feature_config_name(config) or feature_type
+            feature_name = config.feature_name or feature_type
             zch_feature_names.add(feature_name)
     return zch_feature_names
 
 
 def validate_delta_embedding_dump_no_zch_features(
-    feature_configs: Iterable[Any],
+    feature_configs: Iterable[FeatureConfig],
 ) -> None:
     """Validate that delta embedding dump is not used with MC/ZCH features.
 
@@ -137,16 +163,11 @@ def _feature_name(feature_names: Iterable[str]) -> str:
     return ",".join(names)
 
 
-def _int_attr(value: Any, name: str) -> int:
-    attr = getattr(value, name, 0)
-    return int(attr) if attr is not None else 0
-
-
-def _metadata_shard_info(metadata: Any) -> _TableShardInfo:
-    if metadata is None or not hasattr(metadata, "shard_offsets"):
+def _metadata_shard_info(metadata: Optional[ShardMetadata]) -> _TableShardInfo:
+    if metadata is None:
         return _TableShardInfo()
-    offsets = getattr(metadata, "shard_offsets", [])
-    sizes = getattr(metadata, "shard_sizes", [])
+    offsets = metadata.shard_offsets
+    sizes = metadata.shard_sizes
     return _TableShardInfo(
         row_offset=int(offsets[0]) if len(offsets) > 0 else 0,
         column_offset=int(offsets[1]) if len(offsets) > 1 else 0,
@@ -156,38 +177,26 @@ def _metadata_shard_info(metadata: Any) -> _TableShardInfo:
     )
 
 
-def _placement_rank(placement: Any) -> Optional[int]:
-    if placement is None:
-        return None
-    rank_fn = getattr(placement, "rank", None)
-    if callable(rank_fn):
-        rank = rank_fn()
-        if rank is not None:
-            return int(rank)
-    match = re.search(r"rank:(\d+)", str(placement))
-    if match is None:
-        return None
-    return int(match.group(1))
-
-
 def _table_shard_info_from_parameter_sharding(
-    parameter_sharding: Any, rank: int
+    parameter_sharding: ParameterSharding, rank: int
 ) -> _TableShardInfo:
-    sharding_spec = getattr(parameter_sharding, "sharding_spec", None)
-    shards = getattr(sharding_spec, "shards", None)
-    if not shards:
+    sharding_spec = parameter_sharding.sharding_spec
+    if (
+        not isinstance(sharding_spec, EnumerableShardingSpec)
+        or not sharding_spec.shards
+    ):
         return _TableShardInfo()
 
-    ranks = getattr(parameter_sharding, "ranks", None)
-    for idx, shard in enumerate(shards):
-        placement_rank = _placement_rank(getattr(shard, "placement", None))
+    ranks = parameter_sharding.ranks
+    for idx, shard in enumerate(sharding_spec.shards):
+        placement_rank = shard.placement.rank() if shard.placement is not None else None
         if placement_rank == rank:
             return _metadata_shard_info(shard)
         if ranks is not None and idx < len(ranks) and ranks[idx] == rank:
             return _metadata_shard_info(shard)
 
-    if ranks is None and 0 <= rank < len(shards):
-        return _metadata_shard_info(shards[rank])
+    if ranks is None and 0 <= rank < len(sharding_spec.shards):
+        return _metadata_shard_info(sharding_spec.shards[rank])
     return _TableShardInfo()
 
 
@@ -208,13 +217,22 @@ def _merge_shard_info(
     )
 
 
-def _table_shard_info_from_config(table_config: Any) -> _TableShardInfo:
-    metadata_info = _metadata_shard_info(getattr(table_config, "local_metadata", None))
+def _table_shard_info_from_config(
+    table_config: BaseEmbeddingConfig,
+) -> _TableShardInfo:
+    local_rows = 0
+    local_cols = 0
+    local_metadata = None
+    if isinstance(table_config, ShardedEmbeddingTable):
+        local_rows = table_config.local_rows
+        local_cols = table_config.local_cols
+        local_metadata = table_config.local_metadata
+    metadata_info = _metadata_shard_info(local_metadata)
     config_info = _TableShardInfo(
-        local_rows=_int_attr(table_config, "local_rows"),
-        local_cols=_int_attr(table_config, "local_cols"),
-        global_rows=_int_attr(table_config, "num_embeddings"),
-        global_cols=_int_attr(table_config, "embedding_dim"),
+        local_rows=local_rows,
+        local_cols=local_cols,
+        global_rows=table_config.num_embeddings,
+        global_cols=table_config.embedding_dim,
     )
     return _merge_shard_info(config_info, metadata_info)
 
@@ -269,7 +287,8 @@ def _merge_table_shard_info(
 
 
 def _local_table_weight(
-    value: Any, shard_info: Optional[_TableShardInfo] = None
+    value: Union[ShardedTensor, DTensor, torch.Tensor],
+    shard_info: Optional[_TableShardInfo] = None,
 ) -> _TableWeight:
     if isinstance(value, ShardedTensor):
         shards = value.local_shards()
@@ -279,31 +298,247 @@ def _local_table_weight(
             )
         info = _merge_shard_info(
             shard_info or _TableShardInfo(),
-            _metadata_shard_info(getattr(shards[0], "metadata", None)),
+            _metadata_shard_info(shards[0].metadata),
         )
         info = _table_shard_info_from_tensor(shards[0].tensor, info)
         return _TableWeight(tensor=shards[0].tensor, shard_info=info)
-    if hasattr(value, "to_local"):
+    if isinstance(value, DTensor):
         local_value = value.to_local()
-        if hasattr(local_value, "local_shards"):
-            shards = local_value.local_shards()
-            if len(shards) != 1:
-                raise ValueError(
-                    "delta embedding dump only supports one local shard per table."
-                )
-            info = _merge_shard_info(
-                shard_info or _TableShardInfo(),
-                _metadata_shard_info(getattr(shards[0], "metadata", None)),
-            )
-            info = _table_shard_info_from_tensor(shards[0].tensor, info)
-            return _TableWeight(tensor=shards[0].tensor, shard_info=info)
-        if isinstance(local_value, torch.Tensor):
-            info = _table_shard_info_from_tensor(local_value, shard_info)
-            return _TableWeight(tensor=local_value, shard_info=info)
+        info = _table_shard_info_from_tensor(local_value, shard_info)
+        return _TableWeight(tensor=local_value, shard_info=info)
     if isinstance(value, torch.Tensor):
         info = _table_shard_info_from_tensor(value, shard_info)
         return _TableWeight(tensor=value, shard_info=info)
     raise TypeError(f"Unsupported embedding table value type: {type(value)}")
+
+
+def _embedding_lookups(
+    module: _ShardedEmbeddingModule,
+) -> Iterator[_EmbeddingLookup]:
+    """Yield the supported grouped lookups owned by a sharded sparse module."""
+    for lookup in module._lookups:
+        while isinstance(lookup, DistributedDataParallel):
+            lookup = lookup.module
+        if not isinstance(
+            lookup, (GroupedEmbeddingsLookup, GroupedPooledEmbeddingsLookup)
+        ):
+            raise TypeError(
+                f"Unsupported embedding lookup for delta embedding dump: {type(lookup)}"
+            )
+        yield lookup
+
+
+def _embedding_table_fqn(
+    module_fqn: str, module: _ShardedEmbeddingModule, table_name: str
+) -> str:
+    """Build a state-dict-style table FQN for a sharded sparse module.
+
+    Args:
+        module_fqn: FQN of the owning sharded embedding collection.
+        module: Owning sharded embedding collection.
+        table_name: Raw table name within the collection.
+
+    Returns:
+        Owner-qualified table FQN.
+    """
+    if isinstance(module, ShardedEmbeddingBagCollection):
+        table_segment = "embedding_bags"
+    elif isinstance(module, ShardedEmbeddingCollection):
+        table_segment = "embeddings"
+    else:
+        raise TypeError(f"Unsupported tracked embedding module: {type(module)}")
+    return ".".join(filter(None, (module_fqn, table_segment, table_name)))
+
+
+class ModelDeltaTracker(TorchRecModelDeltaTracker):
+    """Track touched embedding IDs by owner-qualified table FQN.
+
+    This ID-only tracker uses the lookup callback's owning module to keep
+    same-named tables in different sharded modules independent.
+
+    Args:
+        model: Sharded model whose sparse lookups should be tracked.
+        consumers: Independent consumers of the tracked ID stream.
+        delete_on_read: Whether to delete IDs after all consumers read them.
+        auto_compact: Whether to compact tracked IDs during communication.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        consumers: Optional[List[str]] = None,
+        delete_on_read: bool = True,
+        auto_compact: bool = False,
+    ) -> None:
+        consumer_names = consumers or [self.DEFAULT_CONSUMER]
+        self._delete_on_read = delete_on_read
+        self.per_consumer_batch_idx = {consumer: -1 for consumer in consumer_names}
+        self.curr_batch_idx = 0
+        self.curr_compact_index = 0
+        self.tracked_modules: Dict[str, _ShardedEmbeddingModule] = {}
+        self.fqn_to_feature_names: Dict[str, List[str]] = {}
+        self._feature_to_fqn_by_module: Dict[
+            _ShardedEmbeddingModule, Dict[str, str]
+        ] = {}
+        self.store = DeltaStoreTrec(UpdateMode.NONE)
+
+        for named_fqn, module in model.named_modules():
+            if not isinstance(
+                module, (ShardedEmbeddingCollection, ShardedEmbeddingBagCollection)
+            ):
+                continue
+
+            module_fqn = module._module_fqn
+            if not module_fqn:
+                module_fqn = self._clean_module_fqn(named_fqn)
+            self.tracked_modules[module_fqn] = module
+
+            feature_to_fqn: Dict[str, str] = {}
+            for table_name, config in module._table_name_to_config.items():
+                table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
+                if table_fqn in self.fqn_to_feature_names:
+                    raise ValueError(f"Duplicate embedding table FQN: {table_fqn}")
+                feature_names = list(config.feature_names)
+                self.fqn_to_feature_names[table_fqn] = feature_names
+                for feature_name in feature_names:
+                    feature_to_fqn[feature_name] = table_fqn
+            self._feature_to_fqn_by_module[module] = feature_to_fqn
+
+        for module in self.tracked_modules.values():
+            module.register_post_lookup_tracker_fn(self.record_lookup)
+            if auto_compact:
+                module.register_post_odist_tracker_fn(self.trigger_compaction)
+
+    @staticmethod
+    def _clean_module_fqn(fqn: str) -> str:
+        """Strip wrapper prefixes from a sharded module FQN."""
+        for prefix in ("_dmp_wrapped_module.module.", "module."):
+            if fqn.startswith(prefix):
+                return fqn[len(prefix) :]
+        return fqn
+
+    def record_lookup(
+        self,
+        kjt: KeyedJaggedTensor,
+        states: torch.Tensor,
+        emb_module: Optional[nn.Module] = None,
+        raw_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Record touched IDs using the owning module's table FQNs.
+
+        Args:
+            kjt: Sparse features used by the lookup.
+            states: Lookup output, unused in ID-only tracking mode.
+            emb_module: Sharded module that performed the lookup.
+            raw_ids: Optional unprocessed IDs, unused by delta embedding dump.
+        """
+        if emb_module is None:
+            raise ValueError("Embedding module is required for FQN delta tracking.")
+        feature_to_fqn = self._feature_to_fqn_by_module.get(emb_module)
+        if feature_to_fqn is None:
+            raise ValueError(
+                f"Unrecognized embedding module for FQN delta tracking: {emb_module}"
+            )
+
+        ids_by_fqn: Dict[str, List[torch.Tensor]] = {}
+        for feature_name in kjt.keys():
+            table_fqn = feature_to_fqn[feature_name]
+            ids_by_fqn.setdefault(table_fqn, []).append(kjt[feature_name].values())
+        for table_fqn, ids in ids_by_fqn.items():
+            self.store.append(
+                batch_idx=self.curr_batch_idx,
+                fqn=table_fqn,
+                ids=torch.cat(ids),
+                states=None,
+            )
+
+    def get_unique_ids(self, consumer: Optional[str] = None) -> Dict[str, torch.Tensor]:
+        """Return unique touched IDs keyed by table FQN.
+
+        Args:
+            consumer: Consumer whose unread IDs should be returned.
+
+        Returns:
+            Unique touched IDs keyed by table FQN.
+        """
+        return {
+            fqn: rows.ids for fqn, rows in self.get_unique(consumer=consumer).items()
+        }
+
+    def get_unique(
+        self,
+        consumer: Optional[str] = None,
+        top_percentage: Optional[float] = 1.0,
+        per_table_percentage: Optional[Dict[str, Tuple[float, str]]] = None,
+        sorted_by_indices: Optional[bool] = True,
+    ) -> Dict[str, UniqueRows]:
+        """Return unread unique touched IDs keyed by table FQN.
+
+        Args:
+            consumer: Consumer whose unread IDs should be returned.
+            top_percentage: Unused compatibility argument.
+            per_table_percentage: Unused compatibility argument.
+            sorted_by_indices: Unused compatibility argument.
+
+        Returns:
+            Unique touched rows keyed by table FQN.
+        """
+        consumer = consumer or self.DEFAULT_CONSUMER
+        assert consumer in self.per_consumer_batch_idx, (
+            f"consumer {consumer} not present in {self.per_consumer_batch_idx.values()}"
+        )
+
+        index_end = self.curr_batch_idx + 1
+        index_start = max(self.per_consumer_batch_idx.values())
+        if index_start < index_end:
+            self.store.compact(index_start, index_end)
+
+        tracker_rows: Dict[str, UniqueRows] = {}
+        from_idx = self.per_consumer_batch_idx[consumer]
+        for fqn, lookups in self.store.per_fqn_lookups.items():
+            compact_ids = [
+                lookup.ids for lookup in lookups if lookup.batch_idx >= from_idx
+            ]
+            if not compact_ids:
+                continue
+            tracker_rows[fqn] = UniqueRows(
+                ids=torch.cat(compact_ids).unique(),
+                states=None,
+            )
+
+        self.per_consumer_batch_idx[consumer] = index_end
+        if self._delete_on_read:
+            self.store.delete(up_to_idx=min(self.per_consumer_batch_idx.values()))
+        return tracker_rows
+
+    def step(self) -> None:
+        """Advance the current tracking batch."""
+        self.curr_batch_idx += 1
+
+    def trigger_compaction(self) -> None:
+        """Compact newly recorded IDs once per completed batch."""
+        if self.curr_compact_index >= self.curr_batch_idx:
+            return
+        start_idx = max(self.per_consumer_batch_idx.values())
+        end_idx = self.curr_batch_idx
+        if start_idx < end_idx:
+            self.store.compact(start_idx, end_idx)
+            self.curr_compact_index = end_idx
+
+    def clear(self, consumer: Optional[str] = None) -> None:
+        """Clear tracked IDs using TorchRec's consumer semantics.
+
+        Args:
+            consumer: Consumer to clear, or None to clear the whole store.
+        """
+        if consumer is None:
+            self.store.delete()
+            return
+        assert consumer in self.per_consumer_batch_idx, (
+            f"consumer {consumer} not found in {self.per_consumer_batch_idx.values()}"
+        )
+        if len(self.per_consumer_batch_idx) == 1:
+            self.store.delete()
 
 
 class DeltaEmbeddingDumper:
@@ -324,7 +559,7 @@ class DeltaEmbeddingDumper:
         config: DeltaEmbeddingDumpConfig,
         model_dir: str,
         device: torch.device,
-        feature_configs: Iterable[Any],
+        feature_configs: Iterable[FeatureConfig],
     ) -> None:
         validate_delta_embedding_dump_config(config, device)
         validate_delta_embedding_dump_no_zch_features(feature_configs)
@@ -339,24 +574,15 @@ class DeltaEmbeddingDumper:
         self._tracking_pause_depth = 0
         os.makedirs(self._output_dir, exist_ok=True)
 
-        self._table_shard_infos = self._collect_table_shard_infos()
-        self._validate_supported_table_sharding(self._table_shard_infos)
-        self._tracker = ModelDeltaTrackerTrec(
+        self._tracker = ModelDeltaTracker(
             model,
             consumers=[_CONSUMER],
             delete_on_read=True,
             auto_compact=True,
-            mode=TrackingMode.ID_ONLY,
         )
+        self._table_shard_infos = self._collect_table_shard_infos()
+        self._validate_supported_table_sharding(self._table_shard_infos)
         self._install_tracking_pause_guard()
-        self._table_to_fqn: Dict[str, str] = {}
-        self._table_to_fqn.update(self._tracker.table_to_fqn)
-        self._fqn_to_table: Dict[str, str] = {
-            fqn: table for table, fqn in self._table_to_fqn.items()
-        }
-        self._fqn_to_feature_names: Dict[str, List[str]] = {}
-        self._fqn_to_feature_names.update(self._tracker.fqn_to_feature_names())
-
         logger.info(
             "Delta embedding dump enabled: interval=%s output_dir=%s "
             "rank=%s/%s tables=%s",
@@ -364,7 +590,7 @@ class DeltaEmbeddingDumper:
             self._output_dir,
             self._rank,
             self._world_size,
-            sorted(self._table_to_fqn.keys()),
+            sorted(self._tracker.fqn_to_feature_names),
         )
 
     def clear(self) -> None:
@@ -489,23 +715,16 @@ class DeltaEmbeddingDumper:
         )
 
     def _install_tracking_pause_guard(self) -> None:
-        guarded_modules = getattr(self, "_guarded_tracking_modules", set())
-        for module in self._tracker.get_tracked_modules().values():
-            if id(module) in guarded_modules:
-                continue
-            has_tracker_fn = False
-            post_lookup_fn = getattr(module, "post_lookup_tracker_fn", None)
-            if post_lookup_fn is not None:
-                module.post_lookup_tracker_fn = self._wrap_tracker_fn(post_lookup_fn)
-                has_tracker_fn = True
-            post_odist_fn = getattr(module, "post_odist_tracker_fn", None)
-            if post_odist_fn is not None:
-                module.post_odist_tracker_fn = self._wrap_tracker_fn(post_odist_fn)
-                has_tracker_fn = True
-            if not has_tracker_fn:
-                continue
-            guarded_modules.add(id(module))
-        self._guarded_tracking_modules = guarded_modules
+        for module in self._tracker.tracked_modules.values():
+            post_lookup_fn = module.post_lookup_tracker_fn
+            post_odist_fn = module.post_odist_tracker_fn
+            if post_lookup_fn is None or post_odist_fn is None:
+                raise RuntimeError(
+                    "Delta embedding tracker callbacks were not registered for "
+                    f"sharded embedding module {module._module_fqn}."
+                )
+            module.post_lookup_tracker_fn = self._wrap_tracker_fn(post_lookup_fn)
+            module.post_odist_tracker_fn = self._wrap_tracker_fn(post_odist_fn)
 
     def _wrap_tracker_fn(self, tracker_fn: Callable[..., Any]) -> Callable[..., Any]:
         def guarded_tracker_fn(*args: Any, **kwargs: Any) -> Any:
@@ -523,27 +742,25 @@ class DeltaEmbeddingDumper:
         dynamic_modules: Dict[str, nn.Module],
     ) -> int:
         num_rows = 0
-        # A dynamic module hosting multiple tables is shared across their
-        # table_name keys; flush() flushes the whole module, so track which
+        # A dynamic module hosting multiple tables is shared across their FQN
+        # keys; flush() flushes the whole module, so track which
         # modules were already flushed this dump and skip the redundant repeats.
         flushed_module_ids: Set[int] = set()
         for fqn, unique_rows in self._tracker.get_unique(_CONSUMER).items():
             ids = unique_rows.ids
             if ids.numel() == 0:
                 continue
-            table_name = self._fqn_to_table.get(fqn)
-            if table_name is None:
-                logger.warning("Skip delta rows for unknown table fqn: %s", fqn)
-                continue
             ids = ids.unique(sorted=True)
             embeddings, key_ids = self._lookup_embeddings(
-                table_name,
+                fqn,
                 ids,
                 table_weights=table_weights,
                 dynamic_modules=dynamic_modules,
                 flushed_module_ids=flushed_module_ids,
             )
-            feature_name = _feature_name(self._fqn_to_feature_names.get(fqn, []))
+            feature_name = _feature_name(
+                self._tracker.fqn_to_feature_names.get(fqn, [])
+            )
             num_rows += self._append_table_chunk(
                 table_chunks,
                 global_step=global_step,
@@ -557,22 +774,22 @@ class DeltaEmbeddingDumper:
 
     def _lookup_embeddings(
         self,
-        table_name: str,
+        fqn: str,
         ids: torch.Tensor,
         table_weights: Dict[str, _TableWeight],
         dynamic_modules: Dict[str, nn.Module],
         flushed_module_ids: Optional[Set[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        dynamic_module = dynamic_modules.get(table_name)
+        dynamic_module = dynamic_modules.get(fqn)
         if dynamic_module is not None:
             return self._lookup_dynamic_embeddings(
-                dynamic_module, table_name, ids, flushed_module_ids
+                dynamic_module, fqn, ids, flushed_module_ids
             )
-        if table_name not in table_weights:
-            raise KeyError(f"Embedding table {table_name} not found in sharded model.")
-        table_weight = table_weights[table_name]
-        _validate_table_shard_info(table_name, table_weight.shard_info)
-        self._validate_row_shard_metadata(table_name, table_weight.shard_info)
+        if fqn not in table_weights:
+            raise KeyError(f"Embedding table {fqn} not found in sharded model.")
+        table_weight = table_weights[fqn]
+        _validate_table_shard_info(fqn, table_weight.shard_info)
+        self._validate_row_shard_metadata(fqn, table_weight.shard_info)
         weight = table_weight.tensor
         ids = ids.to(weight.device, dtype=torch.long)
         if ids.numel() == 0:
@@ -587,7 +804,7 @@ class DeltaEmbeddingDumper:
             logger.warning(
                 "Skip %s ids outside table %s row range [0, %s).",
                 int((~valid_mask).sum().item()),
-                table_name,
+                fqn,
                 weight.size(0),
             )
         local_ids = ids[valid_mask]
@@ -597,7 +814,7 @@ class DeltaEmbeddingDumper:
     def _lookup_dynamic_embeddings(
         self,
         dynamic_module: nn.Module,
-        table_name: str,
+        fqn: str,
         ids: torch.Tensor,
         flushed_module_ids: Optional[Set[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -613,6 +830,7 @@ class DeltaEmbeddingDumper:
             dynamic_module.flush()
             if flushed_module_ids is not None:
                 flushed_module_ids.add(id(dynamic_module))
+        table_name = fqn.rsplit(".", maxsplit=1)[-1]
         table_id = dynamic_module.table_names.index(table_name)
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         ids = ids.to(device=device, dtype=torch.int64)
@@ -626,63 +844,48 @@ class DeltaEmbeddingDumper:
             logger.warning(
                 "Skip %s missing dynamic embedding ids for table %s.",
                 int((~founds).sum().item()),
-                table_name,
+                fqn,
             )
         return values[founds, :emb_dim].detach(), ids[founds]
 
     def _collect_table_shard_infos(self) -> Dict[str, _TableShardInfo]:
         table_shard_infos: Dict[str, _TableShardInfo] = {}
-        for module in self._model.modules():
-            table_name_to_config = getattr(module, "_table_name_to_config", None)
-            if table_name_to_config is not None:
-                for table_name, table_config in table_name_to_config.items():
-                    table_shard_infos[table_name] = _merge_table_shard_info(
-                        table_shard_infos.get(table_name),
-                        _table_shard_info_from_config(table_config),
-                    )
-            for table_config in self._grouped_embedding_table_configs(module):
-                table_name = getattr(table_config, "name", "")
-                if not table_name:
-                    continue
-                table_shard_infos[table_name] = _merge_table_shard_info(
-                    table_shard_infos.get(table_name),
+        for module_fqn, module in self._tracker.tracked_modules.items():
+            for table_name, table_config in module._table_name_to_config.items():
+                table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
+                table_shard_infos[table_fqn] = _merge_table_shard_info(
+                    table_shard_infos.get(table_fqn),
                     _table_shard_info_from_config(table_config),
                 )
-            module_sharding_plan = getattr(module, "module_sharding_plan", None)
-            if module_sharding_plan is None:
-                continue
-            for table_name, parameter_sharding in module_sharding_plan.items():
-                table_shard_infos[table_name] = _merge_table_shard_info(
-                    table_shard_infos.get(table_name),
+            for lookup in _embedding_lookups(module):
+                for grouped_config in lookup.grouped_configs:
+                    for table_config in grouped_config.embedding_tables:
+                        table_name = table_config.name
+                        if not table_name:
+                            continue
+                        table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
+                        table_shard_infos[table_fqn] = _merge_table_shard_info(
+                            table_shard_infos.get(table_fqn),
+                            _table_shard_info_from_config(table_config),
+                        )
+            for table_name, parameter_sharding in module.module_sharding_plan.items():
+                table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
+                table_shard_infos[table_fqn] = _merge_table_shard_info(
+                    table_shard_infos.get(table_fqn),
                     _table_shard_info_from_parameter_sharding(
                         parameter_sharding, self._rank
                     ),
                 )
         return table_shard_infos
 
-    def _grouped_embedding_table_configs(self, module: nn.Module) -> Iterable[Any]:
-        grouped_configs = []
-        module_config = getattr(module, "config", None)
-        if module_config is not None:
-            grouped_configs.append(module_config)
-        private_config = getattr(module, "_config", None)
-        if private_config is not None and private_config is not module_config:
-            grouped_configs.append(private_config)
-
-        for grouped_config in grouped_configs:
-            embedding_tables = getattr(grouped_config, "embedding_tables", None)
-            if embedding_tables is None:
-                continue
-            yield from embedding_tables
-
     def _validate_supported_table_sharding(
         self, table_shard_infos: Dict[str, _TableShardInfo]
     ) -> None:
-        for table_name, shard_info in table_shard_infos.items():
-            _validate_table_shard_info(table_name, shard_info)
+        for table_fqn, shard_info in table_shard_infos.items():
+            _validate_table_shard_info(table_fqn, shard_info)
 
     def _validate_row_shard_metadata(
-        self, table_name: str, shard_info: _TableShardInfo
+        self, table_fqn: str, shard_info: _TableShardInfo
     ) -> None:
         if (
             self._world_size > 1
@@ -693,28 +896,20 @@ class DeltaEmbeddingDumper:
         ):
             raise ValueError(
                 "delta_embedding_dump_config cannot convert local row ids to "
-                f"global key ids for row-wise sharded table {table_name}, because "
+                f"global key ids for row-wise sharded table {table_fqn}, because "
                 "TorchRec shard metadata is missing."
             )
 
     def _collect_table_weights(self) -> Dict[str, _TableWeight]:
         table_weights: Dict[str, _TableWeight] = {}
         table_shard_infos = self._table_shard_infos
-        for module in self._model.modules():
-            lookups = getattr(module, "_lookups", None)
-            if lookups is None:
-                continue
-            for lookup in lookups:
-                lookup = getattr(lookup, "module", lookup)
-                named_parameters_by_table = getattr(
-                    lookup, "named_parameters_by_table", None
-                )
-                if named_parameters_by_table is None:
-                    continue
-                for table_name, table_value in named_parameters_by_table():
-                    table_weights[table_name] = _local_table_weight(
+        for module_fqn, module in self._tracker.tracked_modules.items():
+            for lookup in _embedding_lookups(module):
+                for table_name, table_value in lookup.named_parameters_by_table():
+                    table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
+                    table_weights[table_fqn] = _local_table_weight(
                         table_value,
-                        table_shard_infos.get(table_name),
+                        table_shard_infos.get(table_fqn),
                     )
         return table_weights
 
@@ -724,13 +919,11 @@ class DeltaEmbeddingDumper:
         except ImportError:
             return {}
         modules: Dict[str, nn.Module] = {}
-        seen = set()
-        for dynamic_module in get_dynamic_emb_module(self._model):
-            if id(dynamic_module) in seen:
-                continue
-            seen.add(id(dynamic_module))
-            for table_name in dynamic_module.table_names:
-                modules[table_name] = dynamic_module
+        for module_fqn, module in self._tracker.tracked_modules.items():
+            for dynamic_module in get_dynamic_emb_module(module):
+                for table_name in dynamic_module.table_names:
+                    table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
+                    modules[table_fqn] = dynamic_module
         return modules
 
     def _append_table_chunk(
