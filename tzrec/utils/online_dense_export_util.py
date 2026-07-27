@@ -12,6 +12,35 @@
 # Copyright (c) 2026, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+r"""Utilities for exporting and atomically publishing online dense models.
+
+Serving publish contract:
+
+<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export/
+├── current.json                  # Atomic pointer to the latest version
+└── versions/
+    └── <yyyyMMddHHmmss>/         # Immutable version directory
+        ├── scripted_model.pt     # TorchScript dense model
+        ├── dense_meta.json       # Placeholder -> serving embedding mapping
+        ├── graph/                # Graph dump for debugging
+        └── READY                 # Completion marker written before the switch
+
+current.json:
+{
+  "checkpoint_step": 1200,
+  "created_at": "2026-07-24T05:20:00.000000+00:00",
+  "data_timestamp": 1782365432.0,
+  "version": "20260724052000"
+}
+
+- Build each version under a temporary directory, write ``READY``, then rename
+  it atomically into place.
+- Only after the rename, atomically replace ``current.json`` with ``version``,
+  ``checkpoint_step``, ``data_timestamp``, and ``created_at``.
+- The processor reads only the version named by ``current.json``; step/timestamp
+  align dense and sparse state.
+"""
+
 import datetime
 import json
 import os
