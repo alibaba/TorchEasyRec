@@ -87,34 +87,6 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 
 `ONLINE_DENSE_EXPORT_STEPS` 与 `ONLINE_DENSE_EXPORT_INTERVAL` 至少要设置一个；训练结束时还会强制导出一次最终状态。导出频率与 checkpoint 频率完全独立，checkpoint 仍按原有配置保存、用于训练恢复。
 
-### 导出产物与切换契约
-
-```
-<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export/
-├── current.json                  # 服务指向的最新版本指针（原子写）
-└── versions/
-    └── <yyyyMMddHHmmss>/         # 一个不可变的版本目录
-        ├── scripted_model.pt     # TorchScript dense 模型
-        ├── dense_meta.json       # placeholder 名 -> serving embedding 名映射
-        ├── graph/                # 图 dump（排查用）
-        └── READY                 # 目录完整的标记文件，先写 READY 再原子换版
-```
-
-`current.json` 内容：
-
-```json
-{
-  "checkpoint_step": 1200,
-  "created_at": "2026-07-24T05:20:00.000000+00:00",
-  "data_timestamp": 1782365432.0,
-  "version": "20260724052000"
-}
-```
-
-- `version`: 版本目录名，单调递增的时间戳。
-- `checkpoint_step` / `data_timestamp`: 导出时训练步数与该 rank 消费到的事件时间，供 serving 侧与 sparse 状态对齐版本一致性。
-- 推理 Processor 应只读取 `current.json` 指向的版本，且只消费最新版本。
-
 ### 运行与排障说明
 
 - 仅 rank 0 执行建图与发布；启动时会对整条建图 + script 链路做一次试运行，任何 trace/script 失败会在训练开始前就暴露（fail-fast）。
