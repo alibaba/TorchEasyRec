@@ -14,12 +14,14 @@ the same-named class via the BaseModel registry. Shared config lives in
 ``GenerativeRecLMConfig`` (the family message's ``common`` field).
 * Streaming sample format: each row carries the history ``user_sequence`` (a
 raw-int64 sequence feature) and the ``label`` answer (a ``data_config``
-label_field), both holding raw SID indices in ``[1, sum(codebook)]``.
+label_field), both holding local, 1-based per-level codes in
+``[1, codebook[level]]``. Rows contain whole items in level order.
 * The chat template is tokenised ONCE at ``__init__`` and cached as
 non-persistent buffers, so per-batch encoding is integer arithmetic only
 (no HF tokenizer in the hot path).
-* SID -> token id by integer offset: ``token = sid + base_vocab - 1`` (the SID
-atoms ``C0..C{sum-1}`` are added right after the original vocabulary).
+* Raw code -> token id by integer offsets:
+``token = base_vocab + level_offset[level] + code - 1``. The model derives
+``level_offsets`` from ``codebook``; sample writers must not pre-apply them.
 * Left padding with ``eos_token_id``: real content sits at the END of every
 row so the suffix slice captures only ``[response + end_markers]``.
 """
@@ -138,11 +140,10 @@ class GenerativeRecLM(BaseModel):
         if len(codebook) == 0:
             raise ValueError("GenerativeRecLM: codebook must be non-empty.")
         self._num_levels = len(codebook)
-        # inference-gate validity bands; non-persistent — derived from codebook,
-        # kept off the state_dict (HF safetensors round-trip).
+        # Level layout is derived from codebook and kept out of state_dict.
         lo, hi = self._sid_level_bands(codebook)
-        self.register_buffer("_sid_lvl_lo", lo, persistent=False)
-        self.register_buffer("_sid_lvl_hi", hi, persistent=False)
+        self.register_buffer("_level_offsets", lo - 1, persistent=False)
+        self.register_buffer("_codebook_sizes", hi - lo + 1, persistent=False)
         self._vocab_pad_mult = int(common.vocab_pad_to_multiple_of) or 128
         return sum(int(c) for c in codebook)
 
@@ -274,26 +275,31 @@ class GenerativeRecLM(BaseModel):
         """Device the HF backbone runs on — the single source for model I/O."""
         return self.lm.device
 
-    def _tokenize_sids(self, sids: torch.Tensor) -> torch.Tensor:
-        """Map raw 1-indexed SID values to extended-vocab token ids.
+    def _tokenize_sids(
+        self, codes: torch.Tensor, level_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Map local 1-based per-level codes to extended-vocab token ids.
 
-        Atom ``C{k}`` sits at ``base_vocab + k`` (atoms appended right after the
-        original vocab), so ``token_id = sid + base_vocab - 1``. The integer
-        counterpart of the HF tokenizer used for text; shape-agnostic.
+        ``level_ids`` must broadcast against ``codes`` and identify each code's
+        RQ level. Atom ``C{k}`` sits at ``base_vocab + k``, therefore:
+
+        ``token = code + level_offsets[level] + base_vocab - 1``.
         """
-        return sids + (self._base_vocab - 1)
+        return codes + self._level_offsets[level_ids] + (self._base_vocab - 1)
 
-    def _detokenize_sids(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Inverse of ``_tokenize_sids``: token id -> raw 1-indexed SID."""
-        return tokens - (self._base_vocab - 1)
+    def _detokenize_sids(
+        self, tokens: torch.Tensor, level_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Inverse of ``_tokenize_sids``: token ids to local 1-based codes."""
+        return tokens - (self._base_vocab - 1) - self._level_offsets[level_ids]
 
     @staticmethod
     def _sid_level_bands(codebook: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-level closed SID bands ``(lo, hi)`` as ``(num_levels,)`` long tensors.
+        """Per-level flattened 1-based SID bands as two long tensors.
 
         Level ``j`` occupies a DISJOINT band ``[offset_j + 1, offset_j +
         codebook[j]]`` where ``offset_j = sum(codebook[:j])``. Single source of
-        truth: both ``_read_common_config`` and the tests build bands from this.
+        truth for the derived ``_level_offsets`` and ``_codebook_sizes`` buffers.
         """
         lo, hi, acc = [], [], 0
         for c in codebook:
@@ -305,26 +311,40 @@ class GenerativeRecLM(BaseModel):
             torch.tensor(hi, dtype=torch.long),
         )
 
+    def _sid_token_bands(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the inclusive token-id band for every SID level."""
+        level_ids = torch.arange(self._num_levels, device=self.device)
+        return (
+            self._tokenize_sids(torch.ones_like(level_ids), level_ids),
+            self._tokenize_sids(self._codebook_sizes, level_ids),
+        )
+
     def _validate_sid_candidates(
         self, new_tokens: torch.Tensor, batch_size: int
     ) -> torch.Tensor:
-        """Map a generated token tail back to SIDs and reject malformed candidates.
+        """Decode generated tokens to local 1-based codes and reject bad beams.
 
         ``new_tokens`` is the per-beam tail ``(B*num_return, w)`` (``w`` may be <
         ``num_levels`` when beams stop early). Returns ``(batch_size, num_return,
-        num_levels)`` SIDs with every malformed candidate (early EOS / non-SID /
-        wrong-level atom) set to ``-1`` — which can never match a real item.
+        num_levels)`` local codes. Every malformed candidate (early EOS /
+        non-SID / wrong-level atom) is set to ``-1``, which cannot match a real
+        1-based code.
         """
-        sids = self._detokenize_sids(new_tokens)
+        level_ids = torch.arange(new_tokens.shape[1], device=new_tokens.device)
+        codes = self._detokenize_sids(new_tokens, level_ids)
         # early-EOS beams return < num_levels tokens; pad to num_levels with -1.
-        sids = F.pad(sids, (0, self._num_levels - sids.shape[1]), value=-1)
+        codes = F.pad(
+            codes,
+            (0, self._num_levels - codes.shape[1]),
+            value=-1,
+        )
         # any single out-of-band atom invalidates the WHOLE candidate (.any over
         # the levels -> masked_fill blanks the entire row to -1, matching no item).
-        invalid = ((sids < self._sid_lvl_lo) | (sids > self._sid_lvl_hi)).any(dim=1)
-        sids = sids.masked_fill(invalid.unsqueeze(1), -1)
+        invalid = ((codes < 1) | (codes > self._codebook_sizes)).any(dim=1)
+        codes = codes.masked_fill(invalid.unsqueeze(1), -1)
         # generate() returns rows batch-major ([b0_beam0, b0_beam1, ...]); group
         # the beams per user.
-        return sids.view(batch_size, -1, self._num_levels)
+        return codes.view(batch_size, -1, self._num_levels)
 
     def init_input(self) -> None:
         """Build the EmbeddingGroup for the single raw SID JAGGED_SEQUENCE group.
@@ -383,8 +403,10 @@ class GenerativeRecLM(BaseModel):
         as float / shape ``(N, 1)``. The whole batch is tokenized once on the
         backbone device, then split into rows.
 
-        ``expected_width``, when set, enforces the sample contract: every row must
-        have exactly that many codes (the answer = ``num_levels``).
+        All values are local 1-based codes. Rows must contain whole items so the
+        per-level offsets restart at level 0 for each row. ``expected_width``,
+        when set, additionally requires exactly that many codes (the answer =
+        ``num_levels``).
 
         ``max_codes``, when set, caps each row to its most-recent whole items (the
         last ``floor(max_codes / num_levels) * num_levels`` codes, dropping the
@@ -394,6 +416,13 @@ class GenerativeRecLM(BaseModel):
         if values.dim() == 2 and values.size(-1) == 1:
             values = values.squeeze(-1)
         sizes = lengths.long().tolist()
+        misaligned = [i for i, n in enumerate(sizes) if n % self._num_levels != 0]
+        if misaligned:
+            raise ValueError(
+                f"{type(self).__name__}: SID rows must contain whole "
+                f"{self._num_levels}-level items; rows {misaligned} have lengths "
+                f"{[sizes[i] for i in misaligned]}."
+            )
         if expected_width is not None:
             bad = [i for i, n in enumerate(sizes) if n != expected_width]
             if bad:
@@ -413,8 +442,16 @@ class GenerativeRecLM(BaseModel):
                 rows = torch.split(values, sizes)
                 values = torch.cat([r[-keep:] for r in rows])
                 sizes = [min(n, keep) for n in sizes]
-        values = self._tokenize_sids(values.to(self.device).long())
-        return list(torch.split(values, sizes))
+        codes = values.to(self.device).long()
+        level_ids = torch.arange(codes.numel(), device=self.device) % self._num_levels
+        invalid = (codes < 1) | (codes > self._codebook_sizes[level_ids])
+        if invalid.any().item():
+            raise ValueError(
+                f"{type(self).__name__}: SID codes must be local 1-based values "
+                f"in [1, codebook[level]]."
+            )
+        tokens = self._tokenize_sids(codes, level_ids)
+        return list(torch.split(tokens, sizes))
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Family hook: build inputs, run the HF forward, return ``{"loss": ...}``.

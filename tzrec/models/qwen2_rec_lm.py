@@ -295,13 +295,14 @@ class Qwen2RecLM(GenerativeRecLM):
         score-ordered best-first per row, ready for ``_validate_sid_candidates``.
         See ``escalating_beam_search`` for the schedule.
         """
+        lo_tok, hi_tok = self._sid_token_bands()
         return escalating_beam_search(
             self.lm,
             input_ids,
             attention_mask,
             num_beams=self._num_beams,
-            lo_tok=self._tokenize_sids(self._sid_lvl_lo),
-            hi_tok=self._tokenize_sids(self._sid_lvl_hi),
+            lo_tok=lo_tok,
+            hi_tok=hi_tok,
         )
 
     def _splice_prompt_ids(

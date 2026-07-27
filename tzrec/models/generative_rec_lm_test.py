@@ -35,17 +35,21 @@ class _FakeJT:
         return self._l
 
 
-def _stub(num_levels=3, base_vocab=100, device="cpu"):
+def _stub(codebook=None, base_vocab=100, device="cpu"):
     """A Qwen2RecLM with the base data-prep state wired up, but no HF backbone.
 
     Exercises the architecture-agnostic base methods (inherited by every family)
     without downloading a model.
     """
+    codebook = codebook or [2, 3, 4]
     m = object.__new__(Qwen2RecLM)
     nn.Module.__init__(m)
     m._base_vocab = base_vocab
-    m._num_levels = num_levels
+    m._num_levels = len(codebook)
     m.lm = types.SimpleNamespace(device=torch.device(device))
+    lo, hi = Qwen2RecLM._sid_level_bands(codebook)
+    m.register_buffer("_level_offsets", lo - 1, persistent=False)
+    m.register_buffer("_codebook_sizes", hi - lo + 1, persistent=False)
     return m
 
 
@@ -117,17 +121,22 @@ class GenerativeRecLMTest(unittest.TestCase):
             ignore_index=-100,
             generated_sids_key="my_sids",
             param_dtype="bfloat16",
-            codebook=[4, 4, 4],
+            codebook=[2, 3, 4],
             vocab_pad_to_multiple_of=128,
             max_sequence_length=288,
         )
-        m._read_common_config(common)
+        sid_atoms = m._read_common_config(common)
         self.assertEqual(m._history_group, "user_seq")  # the single group
         self.assertEqual(m._input_name, "user_sequence")  # its one member
         self.assertEqual(m._label_name, "label")  # from label_fields[0]
         self.assertEqual(m._generated_sids_key, "my_sids")  # configurable
         self.assertIs(m._param_dtype, torch.bfloat16)  # name -> torch dtype
         self.assertEqual(m._max_seq_length, 288)  # model knob used
+        self.assertEqual(sid_atoms, 9)
+        self.assertEqual(m._level_offsets.tolist(), [0, 2, 5])
+        self.assertEqual(m._codebook_sizes.tolist(), [2, 3, 4])
+        self.assertNotIn("_level_offsets", m.state_dict())
+        self.assertNotIn("_codebook_sizes", m.state_dict())
         # unknown dtype -> a clear error, not a KeyError
         common.param_dtype = "float64"
         with self.assertRaisesRegex(ValueError, "param_dtype must be one of"):
@@ -193,77 +202,122 @@ class GenerativeRecLMTest(unittest.TestCase):
         self.assertEqual(_stub(device="cpu").device, torch.device("cpu"))
 
     def test_tokenize_sids(self) -> None:
-        m = _stub(base_vocab=100)  # token = sid + base - 1 = sid + 99
-        out = m._tokenize_sids(torch.tensor([1, 2, 3]))
-        self.assertEqual(out.tolist(), [100, 101, 102])
+        m = _stub(base_vocab=100)
+        codes = torch.tensor([[1, 1, 1], [2, 3, 4]])
+        level_ids = torch.arange(3)
+        out = m._tokenize_sids(codes, level_ids)
+        self.assertEqual(out.tolist(), [[100, 102, 105], [101, 104, 108]])
         self.assertEqual(out.dtype, torch.int64)
-        # shape-agnostic: a 2-D batch maps elementwise
-        out2 = m._tokenize_sids(torch.tensor([[1, 2], [3, 4]]))
-        self.assertEqual(out2.tolist(), [[100, 101], [102, 103]])
+        self.assertEqual(
+            m._detokenize_sids(out, level_ids).tolist(),
+            codes.tolist(),
+        )
+
+    def test_sid_token_bands_use_same_level_aware_mapping(self) -> None:
+        m = _stub(base_vocab=100)
+        lo, hi = m._sid_token_bands()
+        self.assertEqual(lo.tolist(), [100, 102, 105])
+        self.assertEqual(hi.tolist(), [101, 104, 108])
 
     def test_sid_token_rows_split_and_cast(self) -> None:
         m = _stub(base_vocab=100)
-        jt = _FakeJT([1, 2, 3, 4, 5], [3, 2])
+        jt = _FakeJT([1, 1, 1, 2, 3, 4, 2, 1, 3], [6, 3])
         rows = m._sid_token_rows(jt.values(), jt.lengths())
-        self.assertEqual([r.tolist() for r in rows], [[100, 101, 102], [103, 104]])
+        self.assertEqual(
+            [r.tolist() for r in rows],
+            [[100, 102, 105, 101, 104, 108], [101, 102, 107]],
+        )
         self.assertTrue(all(r.dtype == torch.int64 for r in rows))
 
     def test_sid_token_rows_squeezes_n1(self) -> None:
         m = _stub(base_vocab=100)
-        jt = _FakeJT([1, 2, 3], [3], dim2=True)  # (N, 1)
+        jt = _FakeJT([1, 1, 1], [3], dim2=True)  # (N, 1)
         rows = m._sid_token_rows(jt.values(), jt.lengths())
-        self.assertEqual([r.tolist() for r in rows], [[100, 101, 102]])
+        self.assertEqual([r.tolist() for r in rows], [[100, 102, 105]])
 
     def test_sid_token_rows_width_ok(self) -> None:
-        m = _stub(base_vocab=100, num_levels=3)
-        jt = _FakeJT([1, 2, 3, 4, 5, 6], [3, 3])
+        m = _stub(base_vocab=100)
+        jt = _FakeJT([1, 1, 1, 2, 3, 4], [3, 3])
         rows = m._sid_token_rows(jt.values(), jt.lengths(), expected_width=3)
-        self.assertEqual([r.tolist() for r in rows], [[100, 101, 102], [103, 104, 105]])
+        self.assertEqual(
+            [r.tolist() for r in rows],
+            [[100, 102, 105], [101, 104, 108]],
+        )
 
     def test_sid_token_rows_width_violation_raises(self) -> None:
-        m = _stub(base_vocab=100, num_levels=3)
+        m = _stub(base_vocab=100)
         with self.assertRaises(ValueError):
-            # second row has 2 codes, not 3 -> anomalous sample
-            jt = _FakeJT([1, 2, 3, 4, 5], [3, 2])
+            # second row has 6 codes, not 3 -> anomalous answer sample
+            jt = _FakeJT([1, 1, 1, 1, 1, 1, 1, 1, 1], [3, 6])
             m._sid_token_rows(jt.values(), jt.lengths(), expected_width=3)
+
+    def test_sid_token_rows_rejects_partial_items(self) -> None:
+        m = _stub(base_vocab=100)
+        with self.assertRaisesRegex(ValueError, "whole 3-level items"):
+            # The total is divisible by 3, but neither row starts a whole item.
+            jt = _FakeJT([1, 1, 1, 1, 1, 1], [2, 4])
+            m._sid_token_rows(jt.values(), jt.lengths())
+
+    def test_sid_token_rows_rejects_out_of_range_codes(self) -> None:
+        m = _stub(base_vocab=100)
+        for values in (
+            [0, 1, 1],
+            [1, 0, 1],
+            [1, 1, 0],
+            [-1, 1, 1],
+            [1, -1, 1],
+            [1, 1, -1],
+            [3, 1, 1],
+            [1, 4, 1],
+            [1, 1, 5],
+            [1, 3, 6],  # legacy global 1-based representation
+        ):
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, "local 1-based"):
+                    jt = _FakeJT(values, [3])
+                    m._sid_token_rows(jt.values(), jt.lengths())
 
     def test_build_input_history_group_label_field(self) -> None:
         # history: EmbeddingGroup output keyed by GROUP name ("{group}.sequence"
         # / ".sequence_length"). answer: batch.jagged_labels[label_name]. Both
-        # tokenized (sid -> sid + base - 1); returned dict keyed by FEATURE name.
-        m = _stub(base_vocab=100, num_levels=3)
+        # level-offset tokenized; returned dict keyed by FEATURE name.
+        m = _stub(base_vocab=100)
         m._input_name, m._label_name = "user_sequence", "label"
         m._history_group = "user_seq"
         m._max_seq_length = 0
         m._is_inference = False  # train: the answer label_field is read too
         m.embedding_group = lambda b: {
-            "user_seq.sequence": torch.tensor([1.0, 2.0, 3.0, 4.0]),
-            "user_seq.sequence_length": torch.tensor([2, 2]),
+            "user_seq.sequence": torch.tensor(
+                [1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 3.0]
+            ),
+            "user_seq.sequence_length": torch.tensor([6, 3]),
         }
         batch = types.SimpleNamespace(
-            jagged_labels={"label": _FakeJT([1, 2, 3, 4, 5, 6], [3, 3])}
+            jagged_labels={"label": _FakeJT([2, 3, 4, 1, 2, 3], [3, 3])}
         )
         rows = m.build_input(batch)
         self.assertEqual(
-            [r.tolist() for r in rows["user_sequence"]], [[100, 101], [102, 103]]
+            [r.tolist() for r in rows["user_sequence"]],
+            [[100, 102, 105, 101, 104, 108], [101, 102, 107]],
         )
         self.assertEqual(
-            [r.tolist() for r in rows["label"]], [[100, 101, 102], [103, 104, 105]]
+            [r.tolist() for r in rows["label"]],
+            [[101, 104, 108], [100, 103, 107]],
         )
 
     def test_build_input_skips_label_in_inference(self) -> None:
-        m = _stub(base_vocab=100, num_levels=3)
+        m = _stub(base_vocab=100)
         m._input_name, m._label_name = "user_sequence", "label"
         m._history_group = "user_seq"
         m._max_seq_length = 0
         m._is_inference = True  # inference: history only, no ground-truth label
         m.embedding_group = lambda b: {
-            "user_seq.sequence": torch.tensor([1.0, 2.0, 3.0]),
+            "user_seq.sequence": torch.tensor([1.0, 1.0, 1.0]),
             "user_seq.sequence_length": torch.tensor([3]),
         }
         # jagged_labels intentionally empty — the label is absent at inference
         rows = m.build_input(types.SimpleNamespace(jagged_labels={}))
-        self.assertEqual([r.tolist() for r in rows["user_sequence"]], [[100, 101, 102]])
+        self.assertEqual([r.tolist() for r in rows["user_sequence"]], [[100, 102, 105]])
         self.assertNotIn("label", rows)
 
 
