@@ -59,12 +59,11 @@ def _row(
         "global_step": step,
         "rank": rank,
         "world_size": world_size,
-        "embedding_name": name,
-        "embedding_role": "ebc",
         "feature_name": "user_id",
-        "table_fqn": f"model.ebc.embedding_bags.{name}.weight",
+        "table_fqn": f"model.ebc.embedding_bags.{name}",
         "key_id": key_id,
         "embedding": values,
+        "source": "model_delta_tracker",
     }
 
 
@@ -214,7 +213,9 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
 
     def _uploader(self, config=None, **kwargs):
         client_factory = kwargs.pop("client_factory", None)
-        kwargs.setdefault("embedding_dimensions", {"user_emb": 2})
+        kwargs.setdefault(
+            "embedding_dimensions", {"model.ebc.embedding_bags.user_emb": 2}
+        )
         uploader = FeatureStoreDeltaUploader(
             config or _feature_store_config(), **kwargs
         )

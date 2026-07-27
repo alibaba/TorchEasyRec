@@ -92,6 +92,7 @@ from tzrec.utils.export_util import (
 )
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.logging_util import ProgressLogger, logger
+from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
 
@@ -336,6 +337,7 @@ def _train_and_evaluate(
     ignore_restore_optimizer: bool = False,
     dataloader_state: Optional[Dict[str, Any]] = None,
     delta_embedding_dumper: Optional[DeltaEmbeddingDumper] = None,
+    pipeline_config_path: Optional[str] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -452,6 +454,14 @@ def _train_and_evaluate(
                 )
             model.train()
 
+    # In-process online dense export: rank zero builds the serving graph once
+    # here and hot-swaps gathered weights per trigger; independent of saves.
+    online_dense_exporter = OnlineDenseExportManager(
+        model_dir,
+        pipeline_config_path or os.path.join(model_dir, "pipeline.config"),
+        model,
+    )
+
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
     require_equal_train_batches = (
@@ -461,144 +471,157 @@ def _train_and_evaluate(
     sync_train_data_exhaustion = (
         check_all_workers_data_status or require_equal_train_batches
     )
-    for i_epoch in epoch_iter:
-        # Multi-rank dumps synchronize their per-step state, so uneven workers
-        # must fail together instead of silently dropping a lagging rank's
-        # trailing delta rows or leaving collectives.
-        pipeline = create_train_pipeline(
-            model,
-            optimizer,
-            check_all_workers_data_status=sync_train_data_exhaustion,
-            fail_on_uneven_data=require_equal_train_batches,
-        )
-        if plogger is not None:
-            plogger.set_description(f"Training Epoch {i_epoch}")
+    try:
+        for i_epoch in epoch_iter:
+            # Multi-rank dumps synchronize their per-step state, so uneven workers
+            # must fail together instead of silently dropping a lagging rank's
+            # trailing delta rows or leaving collectives.
+            pipeline = create_train_pipeline(
+                model,
+                optimizer,
+                check_all_workers_data_status=sync_train_data_exhaustion,
+                fail_on_uneven_data=require_equal_train_batches,
+            )
+            if plogger is not None:
+                plogger.set_description(f"Training Epoch {i_epoch}")
 
-        train_iterator = train_dataloader.get_iterator()  # pyre-ignore[16]
+            train_iterator = train_dataloader.get_iterator()  # pyre-ignore[16]
 
-        # Restore model and optimizer checkpoint
-        if i_step == 0 and ckpt_path is not None:
-            if ignore_restore_optimizer:
-                ckpt_manager.restore(
-                    ckpt_path, model, None, train_config.fine_tune_ckpt_param_map
-                )
-            else:
-                # optimizer state is lazy, so peek one batch to init it
-                # before restore.
-                peek_batch = next(train_iterator)
-                pipeline.progress(iter([peek_batch]))
-                train_iterator = itertools.chain([peek_batch], train_iterator)
-                ckpt_manager.restore(
-                    ckpt_path, model, optimizer, train_config.fine_tune_ckpt_param_map
-                )
-            if delta_embedding_dumper is not None:
-                delta_embedding_dumper.clear()
-
-        for i_step in step_iter:
-            if i_step <= skip_steps:
-                continue
-            try:
-                losses, predictions, batch = pipeline.progress(train_iterator)
-                # Update dataloader checkpoint state
-                checkpoint_util.update_dataloder_state(
-                    dataloader_state, batch.checkpoint_info
-                )
-                _model.update_train_metric(predictions, batch)
-                if i_step % train_config.log_step_count_steps == 0:
-                    train_metrics = _model.compute_train_metric()
-                    _log_train(
-                        i_step,
-                        losses,
-                        params=optimizer.params,  # pyre-ignore
-                        param_groups=optimizer.param_groups,
-                        tb_summaries=tb_summaries,
-                        plogger=plogger,
-                        summary_writer=summary_writer,
-                        train_metrics=train_metrics,
+            # Restore model and optimizer checkpoint
+            if i_step == 0 and ckpt_path is not None:
+                if ignore_restore_optimizer:
+                    ckpt_manager.restore(
+                        ckpt_path, model, None, train_config.fine_tune_ckpt_param_map
                     )
-
-                for lr in lr_scheduler:
-                    if not lr.by_epoch:
-                        lr.step()
-
+                else:
+                    # optimizer state is lazy, so peek one batch to init it
+                    # before restore.
+                    peek_batch = next(train_iterator)
+                    pipeline.progress(iter([peek_batch]))
+                    train_iterator = itertools.chain([peek_batch], train_iterator)
+                    ckpt_manager.restore(
+                        ckpt_path,
+                        model,
+                        optimizer,
+                        train_config.fine_tune_ckpt_param_map,
+                    )
                 if delta_embedding_dumper is not None:
-                    delta_embedding_dumper.maybe_dump(i_step)
-            except StopIteration:
-                # pass completed: later saves should record positions
-                # within the next pass, on top of the completed-pass count.
-                epochs_completed += 1
-                dataloader_state.clear()
-                dataloader_state[checkpoint_util.EPOCHS_COMPLETED] = epochs_completed
-                step_iter = itertools.chain([i_step], step_iter)
-                i_step -= 1
-                break
+                    delta_embedding_dumper.clear()
 
-            # Single entry point for step / epoch / event-time saves + dedupe;
-            # maybe_save reconciles this rank's event-time across ranks in lockstep.
-            data_timestamp = batch.data_timestamp
+            for i_step in step_iter:
+                if i_step <= skip_steps:
+                    continue
+                try:
+                    losses, predictions, batch = pipeline.progress(train_iterator)
+                    # Update dataloader checkpoint state
+                    checkpoint_util.update_dataloder_state(
+                        dataloader_state, batch.checkpoint_info
+                    )
+                    _model.update_train_metric(predictions, batch)
+                    if i_step % train_config.log_step_count_steps == 0:
+                        train_metrics = _model.compute_train_metric()
+                        _log_train(
+                            i_step,
+                            losses,
+                            params=optimizer.params,  # pyre-ignore
+                            param_groups=optimizer.param_groups,
+                            tb_summaries=tb_summaries,
+                            plogger=plogger,
+                            summary_writer=summary_writer,
+                            train_metrics=train_metrics,
+                        )
+
+                    for lr in lr_scheduler:
+                        if not lr.by_epoch:
+                            lr.step()
+
+                    if delta_embedding_dumper is not None:
+                        delta_embedding_dumper.maybe_dump(i_step)
+                except StopIteration:
+                    # pass completed: later saves should record positions
+                    # within the next pass, on top of the completed-pass count.
+                    epochs_completed += 1
+                    dataloader_state.clear()
+                    dataloader_state[checkpoint_util.EPOCHS_COMPLETED] = (
+                        epochs_completed
+                    )
+                    step_iter = itertools.chain([i_step], step_iter)
+                    i_step -= 1
+                    break
+
+                # Single entry point for step / epoch / event-time saves + dedupe;
+                # maybe_save reconciles this rank's event-time across ranks in lockstep.
+                data_timestamp = batch.data_timestamp
+                if ckpt_manager.maybe_save(
+                    i_step,
+                    model,
+                    optimizer,
+                    dataloader_state,
+                    data_timestamp=data_timestamp,
+                ):
+                    run_eval(i_step, i_epoch)
+                # Unconditional: the exporter decides its own (checkpoint-
+                # independent) cadence and enters its collective in lockstep.
+                online_dense_exporter.maybe_export(i_step, data_timestamp, model)
+                if train_config.is_profiling:
+                    prof.step()
+
             if ckpt_manager.maybe_save(
                 i_step,
                 model,
                 optimizer,
                 dataloader_state,
+                epoch=i_epoch,
                 data_timestamp=data_timestamp,
             ):
                 run_eval(i_step, i_epoch)
-            if train_config.is_profiling:
-                prof.step()
+            online_dense_exporter.maybe_export(i_step, data_timestamp, model)
 
+            if use_step and i_step >= train_config.num_steps - 1:
+                break
+
+            for lr in lr_scheduler:
+                if lr.by_epoch:
+                    lr.step()
+
+        # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
+        # codebook here). SID models run with periodic checkpointing disabled
+        # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
+        # the only checkpoint and persists whatever on_train_end produced.
+        _model.on_train_end()
+        if delta_embedding_dumper is not None:
+            # Flush the trailing partial interval before the final checkpoint.
+            # final_dump skips dump-boundary steps already written by maybe_dump
+            # (multi-rank dumps force synced exhaustion, so every rank participated
+            # in those dumps and reaches the same final step).
+            delta_embedding_dumper.final_dump(i_step)
+
+        _log_train(
+            i_step,
+            losses,
+            params=optimizer.params,
+            param_groups=optimizer.param_groups,
+            tb_summaries=tb_summaries,
+            plogger=plogger,
+            summary_writer=summary_writer,
+        )
+        if summary_writer is not None:
+            summary_writer.close()
+        if train_config.is_profiling:
+            prof.stop()
         if ckpt_manager.maybe_save(
             i_step,
             model,
             optimizer,
             dataloader_state,
-            epoch=i_epoch,
             data_timestamp=data_timestamp,
+            final=True,
         ):
             run_eval(i_step, i_epoch)
-
-        if use_step and i_step >= train_config.num_steps - 1:
-            break
-
-        for lr in lr_scheduler:
-            if lr.by_epoch:
-                lr.step()
-
-    # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
-    # codebook here). SID models run with periodic checkpointing disabled
-    # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
-    # the only checkpoint and persists whatever on_train_end produced.
-    _model.on_train_end()
-    if delta_embedding_dumper is not None:
-        # Flush the trailing partial interval before the final checkpoint.
-        # final_dump skips dump-boundary steps already written by maybe_dump
-        # (multi-rank dumps force synced exhaustion, so every rank participated
-        # in those dumps and reaches the same final step).
-        delta_embedding_dumper.final_dump(i_step)
-
-    _log_train(
-        i_step,
-        losses,
-        params=optimizer.params,
-        param_groups=optimizer.param_groups,
-        tb_summaries=tb_summaries,
-        plogger=plogger,
-        summary_writer=summary_writer,
-    )
-    if summary_writer is not None:
-        summary_writer.close()
-    if train_config.is_profiling:
-        prof.stop()
-    if ckpt_manager.maybe_save(
-        i_step,
-        model,
-        optimizer,
-        dataloader_state,
-        data_timestamp=data_timestamp,
-        final=True,
-    ):
-        run_eval(i_step, i_epoch)
-    ckpt_manager.close()
+        online_dense_exporter.maybe_export(i_step, data_timestamp, model, final=True)
+    finally:
+        online_dense_exporter.close()
+        ckpt_manager.close()
 
 
 def train_and_evaluate(
@@ -864,6 +887,7 @@ def train_and_evaluate(
         ignore_restore_optimizer=ignore_restore_optimizer,
         dataloader_state=dataloader_state,
         delta_embedding_dumper=delta_embedding_dumper,
+        pipeline_config_path=os.path.join(pipeline_config.model_dir, "pipeline.config"),
     )
     # Drain background uploads only after training succeeds. A training failure
     # terminates the whole job (torchrun tears down every rank) and pending

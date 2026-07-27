@@ -37,11 +37,9 @@ import numpy as np
 import pyarrow as pa
 
 from tzrec.protos.train_pb2 import FeatureStoreConfig
+from tzrec.utils.checkpoint_util import remap_input_tile_user_key
 from tzrec.utils.logging_util import logger
-from tzrec.utils.sparse_embedding_contract import (
-    SPARSE_EMBEDDING_INVALID_KEY,
-    SPARSE_EMBEDDING_ROLES,
-)
+from tzrec.utils.sparse_embedding_contract import SPARSE_EMBEDDING_INVALID_KEY
 
 FEATURE_STORE_PK_FIELD = "embedding_name"
 FEATURE_STORE_SK_FIELD = "key_id"
@@ -518,17 +516,14 @@ class FeatureStoreDeltaUploader:
         num_rows = batch.num_rows
         if num_rows == 0:
             return []
-        batch_roles = set(batch.column("embedding_role").to_pylist())
-        if not batch_roles <= set(SPARSE_EMBEDDING_ROLES):
-            raise ValueError("delta shard has an invalid embedding role")
-        embedding_names = batch.column("embedding_name").to_pylist()
-        for embedding_name in set(embedding_names):
-            if not embedding_name:
-                raise ValueError("delta shard embedding_name must not be empty")
-            if embedding_name not in self._embedding_dimensions:
+        table_fqns = batch.column("table_fqn").to_pylist()
+        for table_fqn in set(table_fqns):
+            if not table_fqn:
+                raise ValueError("delta shard table_fqn must not be empty")
+            if table_fqn not in self._embedding_dimensions:
                 raise ValueError(
-                    "delta shard embedding_name is absent from model contract: "
-                    f"{embedding_name!r}"
+                    "delta shard table_fqn is absent from model contract: "
+                    f"{table_fqn!r}"
                 )
 
         key_ids = batch.column("key_id").to_numpy(zero_copy_only=False)
@@ -545,21 +540,21 @@ class FeatureStoreDeltaUploader:
         offsets = embedding_column.offsets.to_numpy()
         lengths = np.diff(offsets)
         expected_dims = np.array(
-            [self._embedding_dimensions[name] for name in embedding_names],
+            [self._embedding_dimensions[fqn] for fqn in table_fqns],
             dtype=lengths.dtype,
         )
         bad_rows = np.flatnonzero(lengths != expected_dims)
         if bad_rows.size > 0:
             row = int(bad_rows[0])
             raise ValueError(
-                f"delta embedding dimension mismatch for {embedding_names[row]!r}: "
+                f"delta embedding dimension mismatch for {table_fqns[row]!r}: "
                 f"expected={int(expected_dims[row])}, "
                 f"actual={int(lengths[row])}"
             )
 
         return [
             {
-                FEATURE_STORE_PK_FIELD: embedding_names[i],
+                FEATURE_STORE_PK_FIELD: remap_input_tile_user_key(table_fqns[i]),
                 FEATURE_STORE_SK_FIELD: int(key_ids[i]),
                 FEATURE_STORE_VALUE_FIELD: flat_embeddings[
                     int(offsets[i]) : int(offsets[i + 1])

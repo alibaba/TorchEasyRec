@@ -22,9 +22,18 @@ import pyarrow.parquet as pq
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torch import nn
+from torch.distributed._shard.metadata import ShardMetadata
+from torch.distributed._shard.sharding_spec import EnumerableShardingSpec
+from torch.distributed.tensor import DTensor
 from torchrec import KeyedJaggedTensor
 from torchrec.distributed import DistributedModelParallel, ShardingEnv
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embedding import EmbeddingCollectionSharder
+from torchrec.distributed.embedding_lookup import GroupedPooledEmbeddingsLookup
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+    ShardedEmbeddingTable,
+)
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner import (
     EmbeddingShardingPlanner,
@@ -35,18 +44,27 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-from torchrec.distributed.types import ShardingType
-from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
-from torchrec.modules.embedding_modules import EmbeddingBagCollection
+from torchrec.distributed.types import ParameterSharding, ShardingType
+from torchrec.modules.embedding_configs import (
+    EmbeddingBagConfig,
+    EmbeddingConfig,
+    PoolingType,
+)
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
+from torchrec.types import DataType
 
 from tzrec.protos import feature_pb2
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
 from tzrec.tests import utils as test_utils
 from tzrec.utils import config_util
 from tzrec.utils.delta_embedding_dump import (
-    _CONSUMER,
     _DELTA_DUMP_SCHEMA,
     DeltaEmbeddingDumper,
+    ModelDeltaTracker,
+    _local_table_weight,
     _table_shard_info_from_config,
     _TableShardInfo,
     _TableWeight,
@@ -56,7 +74,6 @@ from tzrec.utils.delta_embedding_dump import (
 )
 from tzrec.utils.dist_util import create_train_pipeline
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.sparse_embedding_contract import SparseEmbeddingIdentity
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 _SHARDED_TABLE_NAME = "table_1"
@@ -64,6 +81,13 @@ _SHARDED_FEATURE_NAME = "feature_1"
 _SHARDED_NUM_EMBEDDINGS = 16
 _SHARDED_EMBEDDING_DIM = 4
 _SHARDED_INPUT_IDS = [0, 2, 8, 9, 15]
+_SHARED_TABLE_NAME = "shared_table"
+_SHARED_EBC_FEATURE_NAME = "deep_feature"
+_SHARED_EC_FEATURE_NAME = "sequence_feature"
+_SHARED_EBC_INPUT_IDS = [1, 2]
+_SHARED_EC_INPUT_IDS = [5, 6]
+_SHARED_EBC_EMBEDDING_DIM = 4
+_SHARED_EC_EMBEDDING_DIM = 8
 
 
 class _DeltaDumpEBCModel(nn.Module):
@@ -86,18 +110,50 @@ class _DeltaDumpEBCModel(nn.Module):
         return self.ebc(features).values()
 
 
+class _SharedTableECAndEBCModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ebc = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name=_SHARED_TABLE_NAME,
+                    num_embeddings=_SHARDED_NUM_EMBEDDINGS,
+                    embedding_dim=_SHARED_EBC_EMBEDDING_DIM,
+                    feature_names=[_SHARED_EBC_FEATURE_NAME],
+                    pooling=PoolingType.SUM,
+                )
+            ],
+            device=torch.device("meta"),
+        )
+        self.ec = EmbeddingCollection(
+            tables=[
+                EmbeddingConfig(
+                    name=_SHARED_TABLE_NAME,
+                    num_embeddings=_SHARDED_NUM_EMBEDDINGS,
+                    embedding_dim=_SHARED_EC_EMBEDDING_DIM,
+                    feature_names=[_SHARED_EC_FEATURE_NAME],
+                )
+            ],
+            device=torch.device("meta"),
+        )
+
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        pooled = self.ebc(features).values().sum()
+        sequence = self.ec(features)[_SHARED_EC_FEATURE_NAME].values().sum()
+        return pooled + sequence
+
+
 class _FakeDynamicTables:
-    def __init__(self, founds=None) -> None:
+    def __init__(self) -> None:
         self.ids = None
         self.table_ids = None
         self.copy_mode = None
-        self._founds = founds if founds is not None else [True, False, True]
 
     def find(self, ids, table_ids, copy_mode):
         self.ids = ids.detach().clone()
         self.table_ids = table_ids.detach().clone()
         self.copy_mode = copy_mode
-        founds = torch.tensor(self._founds, device=ids.device)
+        founds = torch.tensor([True, False, True], device=ids.device)
         values = torch.tensor(
             [
                 [1.0, 2.0, 20.0],
@@ -150,6 +206,20 @@ def _sharded_features(rank: int) -> KeyedJaggedTensor:
     )
 
 
+def _shared_table_features(rank: int) -> KeyedJaggedTensor:
+    device = torch.device(f"cuda:{rank}")
+    values = _SHARED_EBC_INPUT_IDS + _SHARED_EC_INPUT_IDS
+    return KeyedJaggedTensor.from_offsets_sync(
+        keys=[_SHARED_EBC_FEATURE_NAME, _SHARED_EC_FEATURE_NAME],
+        values=torch.tensor(values, device=device, dtype=torch.int64),
+        offsets=torch.tensor(
+            [0, len(_SHARED_EBC_INPUT_IDS), len(values)],
+            device=device,
+            dtype=torch.int64,
+        ),
+    )
+
+
 def _assert_sharded_dump_file(rank: int, output_path: str, dumper) -> None:
     testcase = unittest.TestCase()
     testcase.assertTrue(os.path.exists(output_path))
@@ -160,17 +230,11 @@ def _assert_sharded_dump_file(rank: int, output_path: str, dumper) -> None:
     testcase.assertEqual(
         set(table["feature_name"].to_pylist()), {_SHARDED_FEATURE_NAME}
     )
-    testcase.assertEqual(
-        set(table["embedding_name"].to_pylist()), {_SHARDED_TABLE_NAME}
-    )
-    testcase.assertEqual(set(table["embedding_role"].to_pylist()), {"ebc"})
+    testcase.assertEqual(set(table["source"].to_pylist()), {"model_delta_tracker"})
 
-    table_weights = dumper._collect_table_weights()
-    table_weight = next(
-        weight
-        for (_fqn, table_name), weight in table_weights.items()
-        if table_name == _SHARDED_TABLE_NAME
-    )
+    table_weight = dumper._collect_table_weights()[
+        f"ebc.embedding_bags.{_SHARDED_TABLE_NAME}"
+    ]
     expected_key_ids = [
         key_id
         for key_id in _SHARDED_INPUT_IDS
@@ -217,6 +281,95 @@ def _run_sharded_delta_embedding_dump(rank: int, world_size: int, output_dir: st
         unittest.TestCase().assertIsNotNone(output_path)
         _assert_sharded_dump_file(rank, output_path, dumper)
         torch.distributed.barrier()
+
+
+def _run_shared_table_fqn_delta_embedding_dump(
+    rank: int, world_size: int, output_dir: str
+):
+    with MultiProcessContext(rank=rank, world_size=world_size, backend="nccl") as ctx:
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        model = _SharedTableECAndEBCModel()
+        sharders = [
+            EmbeddingBagCollectionSharder(),
+            EmbeddingCollectionSharder(),
+        ]
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(world_size, "cuda"),
+        )
+        plan = planner.collective_plan(model, sharders, ctx.pg)
+        sharded_model = DistributedModelParallel(
+            module=model,
+            device=device,
+            env=ShardingEnv.from_process_group(ctx.pg),
+            plan=plan,
+            sharders=sharders,
+        )
+        dumper = DeltaEmbeddingDumper(
+            sharded_model,
+            DeltaEmbeddingDumpConfig(
+                dump_interval_steps=1,
+                output_dir=output_dir,
+                file_prefix="delta",
+            ),
+            output_dir,
+            device,
+            [],
+        )
+
+        sharded_model(_shared_table_features(rank)).backward()
+        output_path = dumper.dump(1)
+        testcase = unittest.TestCase()
+        testcase.assertIsNotNone(output_path)
+        table = pq.read_table(output_path)
+
+        ebc_fqn = f"ebc.embedding_bags.{_SHARED_TABLE_NAME}"
+        ec_fqn = f"ec.embeddings.{_SHARED_TABLE_NAME}"
+        testcase.assertEqual(set(table["table_fqn"].to_pylist()), {ebc_fqn, ec_fqn})
+        testcase.assertEqual(
+            set(dumper._tracker.fqn_to_feature_names),
+            {ebc_fqn, ec_fqn},
+        )
+        table_weights = dumper._collect_table_weights()
+        testcase.assertEqual(set(table_weights), {ebc_fqn, ec_fqn})
+        testcase.assertEqual(set(dumper._table_shard_infos), {ebc_fqn, ec_fqn})
+        testcase.assertEqual(
+            dumper._table_shard_infos[ebc_fqn].global_cols,
+            _SHARED_EBC_EMBEDDING_DIM,
+        )
+        testcase.assertEqual(
+            dumper._table_shard_infos[ec_fqn].global_cols,
+            _SHARED_EC_EMBEDDING_DIM,
+        )
+
+        expected_ids = {
+            ebc_fqn: _SHARED_EBC_INPUT_IDS,
+            ec_fqn: _SHARED_EC_INPUT_IDS,
+        }
+        expected_features = {
+            ebc_fqn: _SHARED_EBC_FEATURE_NAME,
+            ec_fqn: _SHARED_EC_FEATURE_NAME,
+        }
+        for table_fqn in (ebc_fqn, ec_fqn):
+            owner_rows = table.filter(pa.compute.equal(table["table_fqn"], table_fqn))
+            key_ids = owner_rows["key_id"].to_pylist()
+            testcase.assertEqual(key_ids, expected_ids[table_fqn])
+            testcase.assertEqual(
+                set(owner_rows["feature_name"].to_pylist()),
+                {expected_features[table_fqn]},
+            )
+            expected_embeddings = (
+                table_weights[table_fqn]
+                .tensor[torch.tensor(key_ids, device=device)]
+                .detach()
+                .cpu()
+                .to(torch.float32)
+                .tolist()
+            )
+            testcase.assertEqual(
+                owner_rows["embedding"].to_pylist(),
+                expected_embeddings,
+            )
 
 
 def _run_uneven_exhaustion_rejection(rank: int, world_size: int, output_dir: str):
@@ -282,13 +435,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dump_interval_minutes"):
             validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
 
-    def test_present_config_rejects_both_intervals(self):
-        config = DeltaEmbeddingDumpConfig(
-            dump_interval_steps=10, dump_interval_minutes=5
-        )
-        with self.assertRaisesRegex(ValueError, "only one"):
-            validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
-
     def test_zch_feature_fails_fast(self):
         feature_configs = [
             feature_pb2.FeatureConfig(
@@ -351,14 +497,16 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 )
 
     def test_row_wise_shard_info_uses_row_offset(self):
-        table_config = SimpleNamespace(
+        table_config = ShardedEmbeddingTable(
             local_rows=16,
             local_cols=8,
             num_embeddings=64,
             embedding_dim=8,
-            local_metadata=SimpleNamespace(
+            name="user_emb",
+            local_metadata=ShardMetadata(
                 shard_offsets=[32, 0],
                 shard_sizes=[16, 8],
+                placement="rank:1/cuda:1",
             ),
         )
         shard_info = _table_shard_info_from_config(table_config)
@@ -367,37 +515,21 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(shard_info.global_cols, 8)
 
     def test_column_wise_shard_info_fails_fast(self):
-        table_config = SimpleNamespace(
+        table_config = ShardedEmbeddingTable(
             local_rows=64,
             local_cols=4,
             num_embeddings=64,
             embedding_dim=8,
-            local_metadata=SimpleNamespace(
+            name="user_emb",
+            local_metadata=ShardMetadata(
                 shard_offsets=[0, 4],
                 shard_sizes=[64, 4],
+                placement="rank:0/cuda:0",
             ),
         )
         shard_info = _table_shard_info_from_config(table_config)
         with self.assertRaisesRegex(ValueError, "column-wise"):
             _validate_table_shard_info("user_emb", shard_info)
-
-    def test_table_shard_info_from_config_without_local_dims(self):
-        # A non-sharded table config (e.g. EmbeddingBagConfig from
-        # _table_name_to_config) carries no local_rows/local_cols/
-        # local_metadata; the shard info must fall back to global dims only
-        # and leave local dims at zero for the tensor/sharding-plan paths.
-        table_config = EmbeddingBagConfig(
-            num_embeddings=64,
-            embedding_dim=8,
-            name="user_emb",
-            feature_names=[_SHARDED_FEATURE_NAME],
-        )
-        shard_info = _table_shard_info_from_config(table_config)
-        self.assertEqual(shard_info.local_rows, 0)
-        self.assertEqual(shard_info.local_cols, 0)
-        self.assertEqual(shard_info.global_rows, 64)
-        self.assertEqual(shard_info.global_cols, 8)
-        self.assertFalse(shard_info.has_shard_metadata)
 
     def test_dump_rows_include_rank_metadata(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -407,13 +539,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         num_rows = dumper._append_table_chunk(
             table_chunks,
             global_step=10,
-            embedding_name="user_emb",
-            embedding_role="ebc",
-            expected_dimension=2,
             feature_name="user_id",
             table_fqn="model.ebc.user_emb",
-            key_ids=torch.tensor([-42]),
+            key_ids=torch.tensor([42]),
             embeddings=torch.tensor([[1.0, 2.0]]),
+            source="model_delta_tracker",
         )
         self.assertEqual(num_rows, 1)
         self.assertEqual(len(table_chunks), 1)
@@ -421,101 +551,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
         self.assertEqual(table["rank"].to_pylist(), [1])
         self.assertEqual(table["world_size"].to_pylist(), [4])
-        self.assertEqual(table["embedding_name"].to_pylist(), ["user_emb"])
-        self.assertEqual(table["embedding_role"].to_pylist(), ["ebc"])
-        self.assertEqual(table["key_id"].to_pylist(), [-42])
+        self.assertEqual(table["key_id"].to_pylist(), [42])
         self.assertEqual(table["embedding"].to_pylist(), [[1.0, 2.0]])
-        self.assertEqual(
-            table.column_names,
-            [
-                "global_step",
-                "rank",
-                "world_size",
-                "embedding_name",
-                "embedding_role",
-                "feature_name",
-                "table_fqn",
-                "key_id",
-                "embedding",
-            ],
-        )
-
-    def test_shared_table_name_fans_out_to_all_owners(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._rank = 0
-        dumper._world_size = 1
-        dumper._fqn_to_table = {"sparse.shared": "shared"}
-        dumper._owners_by_table = {"shared": ["model.ec_dict.2", "model.ebc"]}
-        dumper._identity_by_owner = {
-            ("model.ec_dict.2", "shared"): SparseEmbeddingIdentity(
-                role="ec",
-                table_name="shared",
-                embedding_name="shared__ec",
-                dimension=2,
-                feature_names=("query_feat",),
-            ),
-            ("model.ebc", "shared"): SparseEmbeddingIdentity(
-                role="ebc",
-                table_name="shared",
-                embedding_name="shared__ebc",
-                dimension=2,
-                feature_names=("deep_feat",),
-            ),
-        }
-        dumper._tracker = mock.MagicMock()
-        dumper._tracker.get_unique.return_value = {
-            "sparse.shared": SimpleNamespace(ids=torch.tensor([0, 2]))
-        }
-        ec_weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
-        ebc_weight = ec_weight + 10.0
-        shard_info = _TableShardInfo(
-            local_rows=4, local_cols=2, global_rows=4, global_cols=2
-        )
-        table_weights = {
-            ("model.ec_dict.2", "shared"): _TableWeight(
-                tensor=ec_weight, shard_info=shard_info
-            ),
-            ("model.ebc", "shared"): _TableWeight(
-                tensor=ebc_weight, shard_info=shard_info
-            ),
-        }
-
-        table_chunks = []
-        num_rows = dumper._append_model_delta_rows(
-            table_chunks,
-            global_step=10,
-            table_weights=table_weights,
-            dynamic_modules={},
-        )
-
-        self.assertEqual(num_rows, 4)
-        table = pa.concat_tables(table_chunks)
-        rows_by_name = {}
-        for row in table.to_pylist():
-            rows_by_name.setdefault(row["embedding_name"], []).append(row)
-        self.assertEqual(set(rows_by_name), {"shared__ec", "shared__ebc"})
-        ec_rows = rows_by_name["shared__ec"]
-        self.assertEqual([row["key_id"] for row in ec_rows], [0, 2])
-        self.assertEqual(
-            [row["embedding"] for row in ec_rows],
-            ec_weight[[0, 2]].tolist(),
-        )
-        self.assertEqual(
-            {row["table_fqn"] for row in ec_rows},
-            {"model.ec_dict.2.embeddings.shared"},
-        )
-        self.assertEqual({row["feature_name"] for row in ec_rows}, {"query_feat"})
-        ebc_rows = rows_by_name["shared__ebc"]
-        self.assertEqual([row["key_id"] for row in ebc_rows], [0, 2])
-        self.assertEqual(
-            [row["embedding"] for row in ebc_rows],
-            ebc_weight[[0, 2]].tolist(),
-        )
-        self.assertEqual(
-            {row["table_fqn"] for row in ebc_rows},
-            {"model.ebc.embedding_bags.shared"},
-        )
-        self.assertEqual({row["feature_name"] for row in ebc_rows}, {"deep_feat"})
 
     def test_write_table_chunks_preserves_parquet_schema(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -525,13 +562,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._append_table_chunk(
             table_chunks,
             global_step=5,
-            embedding_name="user_emb",
-            embedding_role="ebc",
-            expected_dimension=2,
             feature_name="user_id",
             table_fqn="model.ebc.user_emb",
             key_ids=torch.tensor([7, 8]),
             embeddings=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            source="model_delta_tracker",
         )
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_path = os.path.join(tmp_dir, "delta.parquet")
@@ -576,6 +611,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval_steps = 50
         dumper._interval_secs = None
+        dumper._last_dump_step = None
         dumper._world_size = 1
         with mock.patch.object(dumper, "dump") as dump_mock:
             # Boundary steps were already written by maybe_dump; skip them so a
@@ -584,8 +620,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             self.assertIsNone(dumper.final_dump(100))
             dump_mock.assert_not_called()
 
-            # Step 0 is not publishable. A positive trailing partial interval
-            # must still be flushed.
+            # Step 0 is not publishable; final_dump returns early. A positive
+            # trailing partial interval must still be flushed.
             self.assertIsNone(dumper.final_dump(0))
             dumper.final_dump(73)
             self.assertEqual(
@@ -593,32 +629,56 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 [73],
             )
 
-    def test_final_dump_uses_local_step_without_cross_rank_collective(self):
-        # Multi-rank dumps force synced dataloader exhaustion, so every rank
-        # reaches the same final step; final_dump decides on the local step and
-        # issues no cross-rank collective.
+    def test_final_dump_syncs_step_across_ranks_before_flush(self):
+        # A lagging rank reaches final_dump at a boundary step (50) while the
+        # furthest rank stopped at 73. Without syncing, the lagging rank would
+        # skip and write no shard, leaving step_73/ ragged. The MAX all_reduce
+        # lifts every rank to 73 so all take the same dump-into-step_73 path.
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval_steps = 50
         dumper._interval_secs = None
+        dumper._last_dump_step = None
         dumper._world_size = 2
+
+        def fake_all_reduce(tensor, op=None):
+            self.assertIs(op, torch.distributed.ReduceOp.MAX)
+            tensor.fill_(73)
+
         with (
             mock.patch.object(dumper, "dump") as dump_mock,
-            mock.patch("torch.distributed.all_reduce") as all_reduce_mock,
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.cuda.current_device", return_value=0),
+            mock.patch(
+                "torch.tensor",
+                side_effect=lambda *a, **k: torch.zeros(1, dtype=torch.long),
+            ),
+            mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
-            dumper.final_dump(73)
+            dumper.final_dump(50)
         dump_mock.assert_called_once_with(73)
-        all_reduce_mock.assert_not_called()
+
+    def test_final_dump_skips_step_already_dumped_by_time_interval(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._interval_steps = None
+        dumper._interval_secs = 60.0
+        dumper._last_dump_step = 73
+        dumper._world_size = 1
+        with mock.patch.object(dumper, "dump") as dump_mock:
+            self.assertIsNone(dumper.final_dump(73))
+        dump_mock.assert_not_called()
 
     def test_maybe_dump_uses_checkpoint_aligned_global_step(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._interval_steps = 50
         dumper._interval_secs = None
+        dumper._last_dump_step = None
+        dumper._rank = 0
         dumper._world_size = 1
         dumper._feature_store_enabled = False
+        dumper._uploader = None
         dumper._tracker = mock.MagicMock()
         with mock.patch.object(dumper, "dump") as dump_mock:
-            dumper.maybe_dump(0)
-            dump_mock.assert_not_called()
             dumper.maybe_dump(49)
             dump_mock.assert_not_called()
             dumper.maybe_dump(50)
@@ -630,7 +690,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 [call.args[0] for call in dump_mock.call_args_list],
                 [50, 100],
             )
-        self.assertEqual(dumper._tracker.step.call_count, 5)
+        self.assertEqual(dumper._tracker.step.call_count, 4)
 
     def test_maybe_dump_uses_elapsed_time_with_fixed_rate_schedule(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -641,6 +701,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._rank = 0
         dumper._world_size = 1
         dumper._feature_store_enabled = False
+        dumper._uploader = None
         dumper._tracker = mock.MagicMock()
         with (
             mock.patch.object(dumper, "dump") as dump_mock,
@@ -673,6 +734,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._rank = 1
         dumper._world_size = 2
         dumper._feature_store_enabled = False
+        dumper._uploader = None
         dumper._tracker = mock.MagicMock()
         with (
             mock.patch.object(
@@ -703,6 +765,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._rank = 0
         dumper._world_size = 2
         dumper._feature_store_enabled = False
+        dumper._uploader = None
         dumper._tracker = mock.MagicMock()
         dump_error = RuntimeError("local dump failed")
         with (
@@ -728,6 +791,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._rank = 0
         dumper._world_size = 2
         dumper._feature_store_enabled = False
+        dumper._uploader = None
         dumper._tracker = mock.MagicMock()
         with (
             mock.patch.object(
@@ -748,16 +812,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(dumper._next_dump_time, 120.0)
         self.assertEqual(dumper._tracker.step.call_count, 3)
 
-    def test_final_dump_skips_step_already_dumped_by_time_interval(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = None
-        dumper._interval_secs = 60.0
-        dumper._last_dump_step = 73
-        dumper._world_size = 1
-        with mock.patch.object(dumper, "dump") as dump_mock:
-            self.assertIsNone(dumper.final_dump(73))
-        dump_mock.assert_not_called()
-
     def test_start_initializes_minutes_interval_from_training_start(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._feature_store_enabled = False
@@ -770,20 +824,14 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper.start()
         self.assertEqual(dumper._next_dump_time, 220.0)
 
-    def test_direct_dump_rejects_step_zero(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        with self.assertRaisesRegex(ValueError, "global_step must be > 0"):
-            dumper.dump(0)
-
     def test_tracker_uses_auto_compact(self):
         tracker = mock.MagicMock()
-        tracker.table_to_fqn = {}
-        tracker.fqn_to_feature_names.return_value = {}
-        tracker.get_tracked_modules.return_value = {}
+        tracker.fqn_to_feature_names = {}
+        tracker.tracked_modules = {}
         with (
             tempfile.TemporaryDirectory() as tmp_dir,
             mock.patch(
-                "tzrec.utils.delta_embedding_dump.ModelDeltaTrackerTrec",
+                "tzrec.utils.delta_embedding_dump.ModelDeltaTracker",
                 return_value=tracker,
             ) as tracker_cls,
         ):
@@ -799,13 +847,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def test_minutes_interval_is_converted_to_seconds(self):
         tracker = mock.MagicMock()
-        tracker.table_to_fqn = {}
-        tracker.fqn_to_feature_names.return_value = {}
-        tracker.get_tracked_modules.return_value = {}
+        tracker.fqn_to_feature_names = {}
+        tracker.tracked_modules = {}
         with (
             tempfile.TemporaryDirectory() as tmp_dir,
             mock.patch(
-                "tzrec.utils.delta_embedding_dump.ModelDeltaTrackerTrec",
+                "tzrec.utils.delta_embedding_dump.ModelDeltaTracker",
                 return_value=tracker,
             ),
         ):
@@ -819,6 +866,249 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         self.assertIsNone(dumper._interval_steps)
         self.assertEqual(dumper._interval_secs, 120.0)
+
+    def test_model_delta_tracker_records_same_table_name_by_owner_fqn(self):
+        tracker = object.__new__(ModelDeltaTracker)
+        ebc_module = torch.nn.Module()
+        ec_module = torch.nn.Module()
+        ebc_fqn = "model.ebc.embedding_bags.shared"
+        ec_fqn = "model.ec.embeddings.shared"
+        tracker._feature_to_fqn_by_module = {
+            ebc_module: {"deep_feature": ebc_fqn},
+            ec_module: {"sequence_feature": ec_fqn},
+        }
+        tracker.fqn_to_feature_names = {
+            ebc_fqn: ["deep_feature"],
+            ec_fqn: ["sequence_feature"],
+        }
+        tracker.curr_batch_idx = 3
+        tracker.store = mock.MagicMock()
+
+        ebc_features = KeyedJaggedTensor.from_offsets_sync(
+            keys=["deep_feature"],
+            values=torch.tensor([1, 2]),
+            offsets=torch.tensor([0, 2]),
+        )
+        ec_features = KeyedJaggedTensor.from_offsets_sync(
+            keys=["sequence_feature"],
+            values=torch.tensor([5, 6]),
+            offsets=torch.tensor([0, 2]),
+        )
+        tracker.record_lookup(ebc_features, torch.empty(0), ebc_module)
+        tracker.record_lookup(ec_features, torch.empty(0), ec_module)
+
+        self.assertEqual(tracker.store.append.call_count, 2)
+        ebc_call, ec_call = tracker.store.append.call_args_list
+        self.assertEqual(ebc_call.kwargs["fqn"], ebc_fqn)
+        torch.testing.assert_close(
+            ebc_call.kwargs["ids"], torch.tensor(_SHARED_EBC_INPUT_IDS)
+        )
+        self.assertEqual(ec_call.kwargs["fqn"], ec_fqn)
+        torch.testing.assert_close(
+            ec_call.kwargs["ids"], torch.tensor(_SHARED_EC_INPUT_IDS)
+        )
+        self.assertEqual(
+            tracker.fqn_to_feature_names,
+            {
+                ebc_fqn: ["deep_feature"],
+                ec_fqn: ["sequence_feature"],
+            },
+        )
+
+    def test_model_delta_tracker_advances_consumer_cursor_and_deletes_read_ids(self):
+        tracker = object.__new__(ModelDeltaTracker)
+        tracker._delete_on_read = True
+        tracker.per_consumer_batch_idx = {"delta": -1}
+        tracker.curr_batch_idx = 0
+        tracker.store = mock.MagicMock()
+        tracker.store.per_fqn_lookups = {
+            "model.ebc.embedding_bags.shared": [
+                SimpleNamespace(
+                    batch_idx=0,
+                    ids=torch.tensor([1, 2]),
+                    states=None,
+                )
+            ]
+        }
+
+        rows = tracker.get_unique("delta")
+
+        torch.testing.assert_close(
+            rows["model.ebc.embedding_bags.shared"].ids,
+            torch.tensor([1, 2]),
+        )
+        tracker.store.compact.assert_called_once_with(-1, 1)
+        tracker.store.delete.assert_called_once_with(up_to_idx=1)
+        self.assertEqual(tracker.per_consumer_batch_idx["delta"], 1)
+
+        tracker.step()
+        tracker.store.reset_mock()
+        rows = tracker.get_unique("delta")
+        self.assertEqual(rows, {})
+        tracker.store.compact.assert_called_once_with(1, 2)
+        tracker.store.delete.assert_called_once_with(up_to_idx=2)
+        self.assertEqual(tracker.per_consumer_batch_idx["delta"], 2)
+
+    def test_model_delta_tracker_skips_empty_table_in_later_interval(self):
+        tracker = ModelDeltaTracker(
+            torch.nn.Module(),
+            consumers=["delta"],
+            delete_on_read=True,
+        )
+        table_fqn = "model.ebc.embedding_bags.shared"
+        tracker.store.append(
+            batch_idx=0,
+            fqn=table_fqn,
+            ids=torch.tensor([2, 1, 2]),
+            states=None,
+        )
+
+        first_rows = tracker.get_unique("delta")
+        torch.testing.assert_close(
+            first_rows[table_fqn].ids,
+            torch.tensor([1, 2]),
+        )
+        self.assertEqual(tracker.store.per_fqn_lookups[table_fqn], [])
+
+        tracker.step()
+        second_rows = tracker.get_unique("delta")
+
+        self.assertEqual(second_rows, {})
+        self.assertEqual(tracker.per_consumer_batch_idx["delta"], 2)
+
+    def test_model_delta_tracker_auto_compacts_once_per_batch(self):
+        tracker = object.__new__(ModelDeltaTracker)
+        tracker.per_consumer_batch_idx = {"delta": -1}
+        tracker.curr_batch_idx = 2
+        tracker.curr_compact_index = 0
+        tracker.store = mock.MagicMock()
+
+        tracker.trigger_compaction()
+        tracker.trigger_compaction()
+
+        tracker.store.compact.assert_called_once_with(-1, 2)
+        self.assertEqual(tracker.curr_compact_index, 2)
+
+    def test_model_delta_tracker_clears_single_consumer(self):
+        tracker = object.__new__(ModelDeltaTracker)
+        tracker.per_consumer_batch_idx = {"delta": -1}
+        tracker.store = mock.MagicMock()
+
+        tracker.clear("delta")
+
+        tracker.store.delete.assert_called_once_with()
+
+    def test_collect_table_weights_uses_owner_fqn_keys(self):
+        ebc_module = torch.nn.Module()
+        ec_module = torch.nn.Module()
+        ebc_lookup = mock.Mock(spec=GroupedPooledEmbeddingsLookup)
+        ebc_lookup.named_parameters_by_table.return_value = [
+            ("shared", torch.tensor([[1.0, 2.0]]))
+        ]
+        ec_lookup = mock.Mock(spec=GroupedPooledEmbeddingsLookup)
+        ec_lookup.named_parameters_by_table.return_value = [
+            ("shared", torch.tensor([[3.0, 4.0]]))
+        ]
+        ebc_module._lookups = [
+            ebc_lookup,
+        ]
+        ec_module._lookups = [
+            ec_lookup,
+        ]
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._table_shard_infos = {}
+        dumper._tracker = SimpleNamespace(
+            tracked_modules={
+                "model.ebc": ebc_module,
+                "model.ec": ec_module,
+            }
+        )
+
+        with mock.patch(
+            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+            side_effect=lambda module_fqn, _module, table_name: (
+                f"{module_fqn}.{table_name}"
+            ),
+        ):
+            table_weights = dumper._collect_table_weights()
+
+        self.assertEqual(
+            set(table_weights),
+            {"model.ebc.shared", "model.ec.shared"},
+        )
+        torch.testing.assert_close(
+            table_weights["model.ebc.shared"].tensor,
+            torch.tensor([[1.0, 2.0]]),
+        )
+        torch.testing.assert_close(
+            table_weights["model.ec.shared"].tensor,
+            torch.tensor([[3.0, 4.0]]),
+        )
+
+    def test_collect_table_weights_rejects_unsupported_lookup(self):
+        sharded_module = torch.nn.Module()
+        sharded_module._lookups = [torch.nn.Identity()]
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._table_shard_infos = {}
+        dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": sharded_module})
+
+        with self.assertRaisesRegex(TypeError, "Unsupported embedding lookup"):
+            dumper._collect_table_weights()
+
+    def test_local_table_weight_rejects_unsupported_weight(self):
+        with self.assertRaisesRegex(TypeError, "Unsupported embedding table value"):
+            _local_table_weight(object())
+
+    def test_local_table_weight_materializes_dtensor(self):
+        local_tensor = torch.tensor([[1.0, 2.0]])
+        dtensor = mock.Mock(spec=DTensor)
+        dtensor.to_local.return_value = local_tensor
+
+        table_weight = _local_table_weight(dtensor)
+
+        self.assertIs(table_weight.tensor, local_tensor)
+        self.assertEqual(table_weight.shard_info.local_rows, 1)
+        self.assertEqual(table_weight.shard_info.local_cols, 2)
+
+    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @mark_ci_scope("gpu")
+    def test_collect_dynamic_modules_uses_owner_fqn_keys(self):
+        ebc_module = torch.nn.Module()
+        ec_module = torch.nn.Module()
+        ebc_dynamic_module = SimpleNamespace(table_names=["shared"])
+        ec_dynamic_module = SimpleNamespace(table_names=["shared"])
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._tracker = SimpleNamespace(
+            tracked_modules={
+                "model.ebc": ebc_module,
+                "model.ec": ec_module,
+            }
+        )
+
+        with (
+            mock.patch(
+                "dynamicemb.dump_load.get_dynamic_emb_module",
+                side_effect=lambda module: (
+                    [ebc_dynamic_module]
+                    if module is ebc_module
+                    else [ec_dynamic_module]
+                ),
+            ),
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+                side_effect=lambda module_fqn, _module, table_name: (
+                    f"{module_fqn}.{table_name}"
+                ),
+            ),
+        ):
+            dynamic_modules = dumper._collect_dynamic_modules()
+
+        self.assertEqual(
+            set(dynamic_modules),
+            {"model.ebc.shared", "model.ec.shared"},
+        )
+        self.assertIs(dynamic_modules["model.ebc.shared"], ebc_dynamic_module)
+        self.assertIs(dynamic_modules["model.ec.shared"], ec_dynamic_module)
 
     def test_multi_rank_minutes_requires_synced_dataloader_exhaustion(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -875,8 +1165,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._feature_store_enabled = False
             dumper._uploader = None
             dumper._retain_local_dump = False
-            dumper._tracker = mock.MagicMock()
-            dumper._tracker.per_consumer_batch_idx = {_CONSUMER: 0}
             with (
                 mock.patch.object(dumper, "_collect_table_weights", return_value={}),
                 mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
@@ -906,8 +1194,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._feature_store_enabled = False
             dumper._uploader = None
             dumper._retain_local_dump = False
-            dumper._tracker = mock.MagicMock()
-            dumper._tracker.per_consumer_batch_idx = {_CONSUMER: 0}
             with (
                 mock.patch.object(dumper, "_collect_table_weights", return_value={}),
                 mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
@@ -926,10 +1212,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._tracking_pause_depth = 0
-        dumper._guarded_tracking_modules = set()
-        dumper._tracker = SimpleNamespace(
-            get_tracked_modules=lambda: {"user_emb": sharded_module}
-        )
+        dumper._tracker = SimpleNamespace(tracked_modules={"user_emb": sharded_module})
         dumper._install_tracking_pause_guard()
 
         sharded_module.post_lookup_tracker_fn("train")
@@ -955,56 +1238,76 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(odist_fn.call_args_list, [mock.call(), mock.call()])
 
     def test_collect_table_shard_infos_prefers_grouped_embedding_metadata(self):
-        original_config_module = torch.nn.Module()
-        original_config_module._table_name_to_config = {
-            "user_emb": SimpleNamespace(
-                num_embeddings=64,
-                embedding_dim=8,
-            )
-        }
-        grouped_config_module = torch.nn.Module()
-        grouped_config_module._config = SimpleNamespace(
+        grouped_config = GroupedEmbeddingConfig(
+            data_type=DataType.FP32,
+            pooling=PoolingType.SUM,
+            is_weighted=False,
+            has_feature_processor=False,
+            compute_kernel=EmbeddingComputeKernel.FUSED,
             embedding_tables=[
-                SimpleNamespace(
+                ShardedEmbeddingTable(
                     name="user_emb",
                     local_rows=16,
                     local_cols=8,
                     num_embeddings=64,
                     embedding_dim=8,
-                    local_metadata=SimpleNamespace(
+                    local_metadata=ShardMetadata(
                         shard_offsets=[32, 0],
                         shard_sizes=[16, 8],
+                        placement="rank:1/cuda:1",
                     ),
                 )
-            ]
+            ],
         )
+        grouped_lookup = mock.Mock(spec=GroupedPooledEmbeddingsLookup)
+        grouped_lookup.grouped_configs = [grouped_config]
+        owner_module = torch.nn.Module()
+        owner_module._table_name_to_config = {
+            "user_emb": EmbeddingBagConfig(
+                name="user_emb",
+                num_embeddings=64,
+                embedding_dim=8,
+                feature_names=["user_id"],
+            )
+        }
+        owner_module.module_sharding_plan = {}
+        owner_module._lookups = [grouped_lookup]
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._model = torch.nn.Sequential(
-            original_config_module, grouped_config_module
-        )
-        shard_infos = dumper._collect_table_shard_infos()
-        self.assertTrue(shard_infos["user_emb"].has_shard_metadata)
-        self.assertEqual(shard_infos["user_emb"].row_offset, 32)
+        dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": owner_module})
+        with mock.patch(
+            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+            side_effect=lambda module_fqn, _module, table_name: (
+                f"{module_fqn}.{table_name}"
+            ),
+        ):
+            shard_infos = dumper._collect_table_shard_infos()
+        table_fqn = "model.ebc.user_emb"
+        self.assertTrue(shard_infos[table_fqn].has_shard_metadata)
+        self.assertEqual(shard_infos[table_fqn].row_offset, 32)
 
     def test_collect_table_shard_infos_falls_back_to_sharding_plan(self):
         sharded_module = torch.nn.Module()
         sharded_module._table_name_to_config = {
-            "adgroup_id_emb": SimpleNamespace(
+            "adgroup_id_emb": EmbeddingBagConfig(
+                name="adgroup_id_emb",
                 num_embeddings=64,
                 embedding_dim=8,
+                feature_names=["adgroup_id"],
             )
         }
         sharded_module.module_sharding_plan = {
-            "adgroup_id_emb": SimpleNamespace(
+            "adgroup_id_emb": ParameterSharding(
+                sharding_type=ShardingType.ROW_WISE.value,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
                 ranks=None,
-                sharding_spec=SimpleNamespace(
-                    shards=[
-                        SimpleNamespace(
+                sharding_spec=EnumerableShardingSpec(
+                    [
+                        ShardMetadata(
                             shard_offsets=[0, 0],
                             shard_sizes=[32, 8],
                             placement="rank:0/cuda:0",
                         ),
-                        SimpleNamespace(
+                        ShardMetadata(
                             shard_offsets=[32, 0],
                             shard_sizes=[32, 8],
                             placement="rank:1/cuda:1",
@@ -1013,28 +1316,42 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 ),
             )
         }
+        sharded_module._lookups = []
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 0
-        dumper._model = sharded_module
-        shard_infos = dumper._collect_table_shard_infos()
-        self.assertTrue(shard_infos["adgroup_id_emb"].has_shard_metadata)
-        self.assertEqual(shard_infos["adgroup_id_emb"].row_offset, 0)
+        dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": sharded_module})
+        table_fqn = "model.ebc.adgroup_id_emb"
+        with mock.patch(
+            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+            side_effect=lambda module_fqn, _module, table_name: (
+                f"{module_fqn}.{table_name}"
+            ),
+        ):
+            shard_infos = dumper._collect_table_shard_infos()
+        self.assertTrue(shard_infos[table_fqn].has_shard_metadata)
+        self.assertEqual(shard_infos[table_fqn].row_offset, 0)
 
         dumper._rank = 1
-        shard_infos = dumper._collect_table_shard_infos()
-        self.assertTrue(shard_infos["adgroup_id_emb"].has_shard_metadata)
-        self.assertEqual(shard_infos["adgroup_id_emb"].row_offset, 32)
+        with mock.patch(
+            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+            side_effect=lambda module_fqn, _module, table_name: (
+                f"{module_fqn}.{table_name}"
+            ),
+        ):
+            shard_infos = dumper._collect_table_shard_infos()
+        self.assertTrue(shard_infos[table_fqn].has_shard_metadata)
+        self.assertEqual(shard_infos[table_fqn].row_offset, 32)
 
     def test_row_wise_lookup_outputs_global_key_ids(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        table_fqn = "model.ebc.embedding_bags.user_emb"
         embeddings, key_ids = dumper._lookup_embeddings(
-            "model.ebc",
-            "user_emb",
+            table_fqn,
             torch.tensor([0, 2]),
             table_weights={
-                ("model.ebc", "user_emb"): _TableWeight(
+                table_fqn: _TableWeight(
                     tensor=weight,
                     shard_info=_TableShardInfo(
                         row_offset=32,
@@ -1055,12 +1372,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        table_fqn = "model.ebc.embedding_bags.user_emb"
         embeddings, key_ids = dumper._lookup_embeddings(
-            "model.ebc",
-            "user_emb",
+            table_fqn,
             torch.tensor([0, 2, 99, -1]),
             table_weights={
-                ("model.ebc", "user_emb"): _TableWeight(
+                table_fqn: _TableWeight(
                     tensor=weight,
                     shard_info=_TableShardInfo(
                         row_offset=32,
@@ -1081,12 +1398,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        table_fqn = "model.ebc.embedding_bags.user_emb"
         embeddings, key_ids = dumper._lookup_embeddings(
-            "model.ebc",
-            "user_emb",
+            table_fqn,
             torch.tensor([], dtype=torch.long),
             table_weights={
-                ("model.ebc", "user_emb"): _TableWeight(
+                table_fqn: _TableWeight(
                     tensor=weight,
                     shard_info=_TableShardInfo(
                         row_offset=32,
@@ -1106,13 +1423,13 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_row_wise_lookup_requires_shard_metadata(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
+        table_fqn = "model.ebc.embedding_bags.user_emb"
         with self.assertRaisesRegex(ValueError, "shard metadata"):
             dumper._lookup_embeddings(
-                "model.ebc",
-                "user_emb",
+                table_fqn,
                 torch.tensor([0]),
                 table_weights={
-                    ("model.ebc", "user_emb"): _TableWeight(
+                    table_fqn: _TableWeight(
                         tensor=torch.zeros(4, 2),
                         shard_info=_TableShardInfo(
                             local_rows=4,
@@ -1126,10 +1443,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             )
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
     @mark_ci_scope("gpu")
-    def test_lookup_dynamic_embeddings_zero_fills_missing_ids(self):
+    def test_lookup_dynamic_embeddings_filters_missing_ids(self):
         from dynamicemb.types import CopyMode
 
+        torch.cuda.set_device(0)
         dumper = object.__new__(DeltaEmbeddingDumper)
         fake_tables = _FakeDynamicTables()
         dynamic_module = SimpleNamespace(
@@ -1139,47 +1458,20 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             _dynamicemb_options=[SimpleNamespace(dim=2)],
         )
 
-        cpu_device = torch.device("cpu")
-        with (
-            mock.patch.object(torch.cuda, "current_device", return_value=0),
-            mock.patch.object(torch, "device", return_value=cpu_device),
-        ):
-            embeddings, key_ids = dumper._lookup_dynamic_embeddings(
-                dynamic_module, "dyn_table", torch.tensor([101, 102, 103])
-            )
+        embeddings, key_ids = dumper._lookup_dynamic_embeddings(
+            dynamic_module,
+            "model.ec.embeddings.dyn_table",
+            torch.tensor([101, 102, 103]),
+        )
 
         dynamic_module.flush.assert_called_once_with()
         self.assertIs(fake_tables.copy_mode, CopyMode.EMBEDDING)
         torch.testing.assert_close(fake_tables.ids.cpu(), torch.tensor([101, 102, 103]))
         torch.testing.assert_close(fake_tables.table_ids.cpu(), torch.tensor([0, 0, 0]))
-        torch.testing.assert_close(key_ids.cpu(), torch.tensor([101, 102, 103]))
+        torch.testing.assert_close(key_ids.cpu(), torch.tensor([101, 103]))
         torch.testing.assert_close(
-            embeddings.cpu(),
-            torch.tensor([[1.0, 2.0], [0.0, 0.0], [5.0, 6.0]]),
+            embeddings.cpu(), torch.tensor([[1.0, 2.0], [5.0, 6.0]])
         )
-
-    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
-    @mark_ci_scope("gpu")
-    def test_lookup_dynamic_embeddings_zero_fills_all_missing_ids(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dynamic_module = SimpleNamespace(
-            table_names=["dyn_table"],
-            tables=_FakeDynamicTables(founds=[False, False, False]),
-            flush=mock.MagicMock(),
-            _dynamicemb_options=[SimpleNamespace(dim=2)],
-        )
-
-        cpu_device = torch.device("cpu")
-        with (
-            mock.patch.object(torch.cuda, "current_device", return_value=0),
-            mock.patch.object(torch, "device", return_value=cpu_device),
-        ):
-            embeddings, key_ids = dumper._lookup_dynamic_embeddings(
-                dynamic_module, "dyn_table", torch.tensor([101, 102, 103])
-            )
-
-        torch.testing.assert_close(key_ids.cpu(), torch.tensor([101, 102, 103]))
-        torch.testing.assert_close(embeddings.cpu(), torch.zeros(3, 2))
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
@@ -1199,7 +1491,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         for table_name in ("dyn_a", "dyn_b"):
             dumper._lookup_dynamic_embeddings(
                 dynamic_module,
-                table_name,
+                f"model.ec.embeddings.{table_name}",
                 torch.tensor([101, 102, 103]),
                 flushed_module_ids,
             )
@@ -1243,6 +1535,16 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
                         )
                     )
                 )
+
+    @unittest.skipIf(torch.cuda.device_count() < 1, "test requires a GPU")
+    @mark_ci_scope("gpu")
+    def test_shared_table_name_tracks_ec_and_ebc_fqns_independently(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self._run_multi_process_test(
+                callable=_run_shared_table_fqn_delta_embedding_dump,
+                world_size=1,
+                output_dir=tmp_dir,
+            )
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
     @mark_ci_scope("gpu")
@@ -1342,6 +1644,9 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
                     continue
                 dumped_real_rows = True
                 self.assertEqual(set(table["world_size"].to_pylist()), {world_size})
+                self.assertEqual(
+                    set(table["source"].to_pylist()), {"model_delta_tracker"}
+                )
                 # dynamic lookup must return a real embedding vector per id.
                 self.assertTrue(
                     all(len(emb) > 0 for emb in table["embedding"].to_pylist())
