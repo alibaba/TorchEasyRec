@@ -42,6 +42,13 @@ from tzrec.utils.export_util import (
 )
 from tzrec.utils.logging_util import logger
 
+# Serving publish contract:
+# - versions/<version>/ is immutable and contains scripted_model.pt,
+#   dense_meta.json, graph/, and READY. Build it under a temporary directory,
+#   write READY, then rename it atomically into place.
+# - Only after the rename, atomically replace current.json with version,
+#   checkpoint_step, data_timestamp, and created_at. The processor reads only
+#   the version it names; step/timestamp align dense and sparse state.
 VERSIONS_DIR = "versions"
 CURRENT_JSON = "current.json"
 _VERSION_TIME_FORMAT = "%Y%m%d%H%M%S"
@@ -693,13 +700,6 @@ class OnlineDenseExportManager:
 
     def _run_task(self, task: Dict[str, Any]) -> None:
         """Load the snapshot into the resident graph, script it and publish."""
-        # Serving publish contract:
-        # - versions/<version>/ is immutable and contains scripted_model.pt,
-        #   dense_meta.json, graph/, and READY. Build it under a temporary
-        #   directory, write READY, then rename it atomically into place.
-        # - Only after the rename, atomically replace current.json with version,
-        #   checkpoint_step, data_timestamp, and created_at. The processor reads
-        #   only the version it names; step/timestamp align dense and sparse state.
         version = task["version"]
         versions_root = os.path.join(self._export_root, VERSIONS_DIR)
         version_dir = os.path.join(versions_root, version)
