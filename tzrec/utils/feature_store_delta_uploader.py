@@ -181,6 +181,7 @@ class FeatureStoreDeltaUploader:
         config: FeatureStoreConfig,
         embedding_dimensions: Mapping[str, int],
         rank: int = 0,
+        world_size: int = 1,
         manage_remote_view: bool = True,
         client_factory: Optional[Callable[..., Any]] = None,
         credentials_client: Optional[Any] = None,
@@ -189,6 +190,7 @@ class FeatureStoreDeltaUploader:
         """Initialize the uploader with validated settings and in-memory state."""
         self._settings = FeatureStoreUploadSettings.from_proto(config)
         self._rank = int(rank)
+        self._world_size = int(world_size)
         self._manage_remote_view = bool(manage_remote_view)
         self._embedding_dimensions = {
             str(name): int(dimension)
@@ -212,13 +214,37 @@ class FeatureStoreDeltaUploader:
         self._last_publish_ts: int = 0
 
     def start(self) -> None:
-        """Start the background upload worker after validating the remote view."""
+        """Start the worker after the rank-zero view rendezvous.
+
+        Rank zero creates and validates the DynamicEmbedding view first; every
+        rank then barriers so non-primary ranks open the already-published view
+        without control-plane races. A rank-zero startup failure still joins the
+        barrier before re-raising so every rank issues the same collective order.
+        """
         with self._condition:
             if self._started:
                 return
             if self._closed:
                 raise RuntimeError("FeatureStoreDeltaUploader is already closed")
             self._raise_if_failed_locked()
+            start_error: Optional[BaseException] = None
+            if self._manage_remote_view:
+                try:
+                    self._get_view()
+                except BaseException as exc:
+                    self._reset_view(suppress_errors=True)
+                    start_error = exc
+            if self._world_size > 1:
+                import torch.distributed as dist
+
+                if not (dist.is_available() and dist.is_initialized()):
+                    raise RuntimeError(
+                        "distributed FeatureStore delta dump requires an "
+                        "initialized process group"
+                    )
+                dist.barrier()
+            if start_error is not None:
+                raise start_error.with_traceback(start_error.__traceback__)
             try:
                 self._get_view()
             except BaseException:

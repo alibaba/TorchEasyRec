@@ -432,6 +432,7 @@ class DeltaEmbeddingDumper:
                 config.feature_store_config,
                 embedding_dimensions=embedding_dimensions,
                 rank=self._rank,
+                world_size=self._world_size,
                 manage_remote_view=self._rank == 0,
             )
 
@@ -472,33 +473,13 @@ class DeltaEmbeddingDumper:
     def start(self) -> None:
         """Start timed cadence and per-rank FeatureStore publication.
 
-        The rank-zero uploader creates and validates the remote view first;
-        the other ranks start their uploaders only after the barrier so they
-        can open the already-published view without control-plane races. A
-        rank-zero startup failure still joins the barrier before raising so
-        every rank keeps issuing the same collective sequence.
+        The rank-zero view rendezvous (create the DynamicEmbedding view,
+        barrier, then non-primary ranks open it) lives in
+        :meth:`FeatureStoreDeltaUploader.start`; this method only delegates and
+        arms the timed cadence.
         """
         if self._uploader is not None:
-            start_error: Optional[BaseException] = None
-            if self._rank == 0:
-                try:
-                    self._uploader.start()
-                except BaseException as exc:
-                    start_error = exc
-            if self._world_size > 1:
-                if not (
-                    torch.distributed.is_available()
-                    and torch.distributed.is_initialized()
-                ):
-                    raise RuntimeError(
-                        "distributed FeatureStore delta dump requires an "
-                        "initialized process group"
-                    )
-                torch.distributed.barrier()
-            if start_error is not None:
-                raise start_error.with_traceback(start_error.__traceback__)
-            if self._rank != 0:
-                self._uploader.start()
+            self._uploader.start()
         if self._interval_secs is not None:
             self._next_dump_time = time.monotonic() + self._interval_secs
 
