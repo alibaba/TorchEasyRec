@@ -183,8 +183,6 @@ class FeatureStoreDeltaUploader:
         rank: int = 0,
         world_size: int = 1,
         manage_remote_view: bool = True,
-        client_factory: Optional[Callable[..., Any]] = None,
-        credentials_client: Optional[Any] = None,
         clock_ms: Optional[Callable[[], int]] = None,
     ) -> None:
         """Initialize the uploader with validated settings and in-memory state."""
@@ -197,10 +195,7 @@ class FeatureStoreDeltaUploader:
             for name, dimension in embedding_dimensions.items()
         }
 
-        self._client_factory = client_factory
-        self._credentials_client = (
-            credentials_client or self._create_credentials_client()
-        )
+        self._credentials_client = self._create_credentials_client()
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self._view = None
         self._condition = threading.Condition()
@@ -585,31 +580,33 @@ class FeatureStoreDeltaUploader:
             ) from exc
         return CredClient()
 
+    def _create_client(self) -> Any:
+        """Construct a FeatureStoreClient with refreshed credentials.
+
+        Single seam for credential resolution and client construction; tests
+        patch this method to inject a fake client.
+        """
+        try:
+            from feature_store_py import FeatureStoreClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "feature_store_py is required when feature_store_config is set"
+            ) from exc
+        credential = self._credentials_client.get_credential()
+        return FeatureStoreClient(
+            access_key_id=credential.access_key_id,
+            access_key_secret=credential.access_key_secret,
+            region=self._settings.region or None,
+            endpoint=self._settings.endpoint or None,
+            security_token=credential.security_token or None,
+            featuredb_username=os.environ.get("FEATUREDB_USERNAME") or None,
+            featuredb_password=os.environ.get("FEATUREDB_PASSWORD") or None,
+        )
+
     def _get_view(self) -> Any:
         if self._view is not None:
             return self._view
-        if self._client_factory is None:
-            try:
-                from feature_store_py import FeatureStoreClient
-            except ImportError as exc:
-                raise RuntimeError(
-                    "feature_store_py is required when feature_store_config is set"
-                ) from exc
-            client_factory = FeatureStoreClient
-        else:
-            client_factory = self._client_factory
-
-        credential = self._credentials_client.get_credential()
-        kwargs = {
-            "access_key_id": credential.access_key_id,
-            "access_key_secret": credential.access_key_secret,
-            "region": self._settings.region or None,
-            "endpoint": self._settings.endpoint or None,
-            "security_token": credential.security_token or None,
-            "featuredb_username": os.environ.get("FEATUREDB_USERNAME") or None,
-            "featuredb_password": os.environ.get("FEATUREDB_PASSWORD") or None,
-        }
-        client = client_factory(**kwargs)
+        client = self._create_client()
         project = client.get_project(self._settings.project_name)
         if project is None:
             raise RuntimeError("configured FeatureStore project was not found")

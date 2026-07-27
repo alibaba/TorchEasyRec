@@ -10,7 +10,9 @@
 # limitations under the License.
 
 import os
+import sys
 import threading
+import types
 import unittest
 from unittest import mock
 
@@ -211,8 +213,17 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self.addCleanup(self._cred_patch.stop)
 
     def _uploader(self, config=None, **kwargs):
+        client_factory = kwargs.pop("client_factory", None)
         kwargs.setdefault("embedding_dimensions", {"user_emb": 2})
-        return FeatureStoreDeltaUploader(config or _feature_store_config(), **kwargs)
+        uploader = FeatureStoreDeltaUploader(
+            config or _feature_store_config(), **kwargs
+        )
+        if client_factory is not None:
+            # The production ctor no longer accepts a client factory; install the
+            # test's fake on the _create_client instance seam so each uploader
+            # keeps its own fake project/view wiring and construction counts.
+            uploader._create_client = lambda *a, **k: client_factory()
+        return uploader
 
     def test_proto_groups_required_fields_before_optional_fields(self):
         required_fields = [
@@ -317,8 +328,35 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
 
         self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
         self.assertEqual(factory.project.create_calls, [])
-        self.assertNotIn("test_mode", factory.calls[0])
         self.assertEqual(view.closed, [True])
+
+    def test_create_client_forwards_only_credential_kwargs(self):
+        """_create_client forwards the fixed credential allowlist, no extras."""
+        recorded = {}
+
+        class _RecordingClient:
+            def __init__(self, **kwargs):
+                recorded.update(kwargs)
+
+        fake_module = types.ModuleType("feature_store_py")
+        fake_module.FeatureStoreClient = _RecordingClient
+        with mock.patch.dict(sys.modules, {"feature_store_py": fake_module}):
+            uploader = self._uploader()
+            client = uploader._create_client()
+        self.assertIsInstance(client, _RecordingClient)
+        self.assertEqual(
+            set(recorded),
+            {
+                "access_key_id",
+                "access_key_secret",
+                "region",
+                "endpoint",
+                "security_token",
+                "featuredb_username",
+                "featuredb_password",
+            },
+        )
+        self.assertNotIn("test_mode", recorded)
 
     def test_start_creates_missing_dynamic_embedding_feature_view(self):
         created_view = _FakeView()
