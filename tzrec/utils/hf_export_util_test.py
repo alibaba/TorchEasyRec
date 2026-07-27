@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import unittest
+from unittest import mock
 
 import torch
 from safetensors.torch import load_file
@@ -83,7 +84,10 @@ def _tiny_lm(tie=True):
 class HfExportUtilTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
-        os.environ.setdefault("RANK", "0")
+        # the asset writers are rank-0-gated; pin it without leaking the value.
+        patcher = mock.patch.dict(os.environ, {"RANK": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)

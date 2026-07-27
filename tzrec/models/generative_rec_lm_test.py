@@ -336,6 +336,43 @@ class GenerativeRecLMTest(unittest.TestCase):
                     jt = _FakeJT(values, [3])
                     m._sid_token_rows(jt.values(), jt.lengths())
 
+    def test_sid_token_rows_recency_clip(self) -> None:
+        m = _stub(base_vocab=100)
+        items = [(1, 1, 1), (2, 3, 4), (1, 2, 3), (2, 1, 4), (1, 3, 2)]
+        toks = [
+            [100, 102, 105],
+            [101, 104, 108],
+            [100, 103, 107],
+            [101, 102, 108],
+            [100, 104, 106],
+        ]
+        values = torch.tensor(items, dtype=torch.float).flatten()
+        lengths = torch.tensor([values.numel()])
+
+        # 15 codes (5 items), cap 9 -> keep the most recent three whole items.
+        rows = m._sid_token_rows(values, lengths, max_codes=9)
+        self.assertEqual(rows[0].tolist(), sum(toks[2:], []))
+        # item-aligned: cap 10 still keeps 9 (3 whole items), never cuts mid-item
+        rows = m._sid_token_rows(values, lengths, max_codes=10)
+        self.assertEqual(rows[0].tolist(), sum(toks[2:], []))
+        # within cap -> untouched
+        rows = m._sid_token_rows(values[:6], torch.tensor([6]), max_codes=9)
+        self.assertEqual(rows[0].tolist(), sum(toks[:2], []))
+        # disabled (0/None) -> no clip
+        rows = m._sid_token_rows(values, lengths, max_codes=0)
+        self.assertEqual(rows[0].tolist(), sum(toks, []))
+
+    def test_validate_sid_candidates_groups_batch_major(self) -> None:
+        m = _stub(base_vocab=100)
+        # decoders emit rows batch-major: [b0_c0, b0_c1, b1_c0, b1_c1]
+        tokens = torch.tensor(
+            [[100, 102, 105], [101, 104, 108], [101, 103, 106], [100, 104, 107]]
+        )
+        sids = m._validate_sid_candidates(tokens, batch_size=2)
+        self.assertEqual(tuple(sids.shape), (2, 2, 3))
+        self.assertEqual(sids[0].tolist(), [[1, 1, 1], [2, 3, 4]])
+        self.assertEqual(sids[1].tolist(), [[2, 2, 2], [1, 3, 3]])
+
     def test_build_input_history_group_label_field(self) -> None:
         m = _stub(base_vocab=100)
         m._input_name, m._label_name = "user_sequence", "label"

@@ -11,12 +11,14 @@
 
 import types
 import unittest
+from unittest import mock
 
 import torch
+from parameterized import parameterized
 from torch import nn
 
-from tzrec.models.generative_rec_lm_test import _FakeJT
 from tzrec.models.qwen2_rec_lm import Qwen2RecLM
+from tzrec.utils.test_util import parameterized_name_func
 
 
 def _stub(codebook=None, base_vocab=100, pad_id=9, device="cpu"):
@@ -51,17 +53,56 @@ def _stub(codebook=None, base_vocab=100, pad_id=9, device="cpu"):
     return m
 
 
-def _gen_batch():
-    """An opaque one-row batch; the ``_generate`` tests mock ``build_input``."""
-    return types.SimpleNamespace(
-        sequence_dense_features={"user_sequence": _FakeJT([1, 2, 3], [3])}
+def _real_lm_stub(codebook=None, base_vocab=20, num_beams=2):
+    """A Qwen2RecLM carrying a real (tiny, random) Qwen2 backbone.
+
+    Needed wherever the real forward runs: the training objective and the
+    end-to-end escalating-beam decode; the other tests mock ``lm.generate``.
+    """
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    codebook = codebook or [2, 3, 4]
+    m = object.__new__(Qwen2RecLM)
+    nn.Module.__init__(m)
+    m._num_levels = len(codebook)
+    m._base_vocab = base_vocab
+    m._num_beams = num_beams
+    cfg = Qwen2Config(
+        vocab_size=base_vocab + sum(codebook),
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
     )
+    torch.manual_seed(0)
+    m.lm = Qwen2ForCausalLM(cfg).eval()
+    offsets, sizes = Qwen2RecLM._sid_level_layout(codebook)
+    m.register_buffer("_level_offsets", offsets, persistent=False)
+    m.register_buffer("_codebook_sizes", sizes, persistent=False)
+    return m
 
 
-def _first_non_neg_index(labels):
-    """First supervised label column, minimized over rows."""
-    tmp = (labels >= 0).cumsum(dim=-1)
-    return int((tmp == 1).float().argmax(dim=-1).min().item())
+def _train_stub(max_total_len):
+    """A ``_predict_train``-ready stub; returns ``(model, spliced T per step)``."""
+    m = _stub()
+    m._is_inference = False  # not inference + nn.Module.training=True -> is_train
+    m._input_name, m._label_name = "user_sequence", "label"
+    m._max_total_len = max_total_len
+    m._pool_warmed = False
+    seen_lens = []
+
+    def fwd(input_ids, labels, attention_mask):
+        seen_lens.append(input_ids.shape[1])
+        return {"loss": torch.tensor(0.0)}
+
+    m.build_input = lambda b: {
+        m._input_name: [torch.tensor([100, 101, 102])],
+        m._label_name: [torch.tensor([200, 201, 202])],
+    }
+    m._forward_loss = fwd
+    return m, seen_lens
 
 
 class Qwen2RecLMTest(unittest.TestCase):
@@ -105,14 +146,14 @@ class Qwen2RecLMTest(unittest.TestCase):
 
     def test_suffix_keep_matches_dynamic_slice(self) -> None:
         # the constant suffix width must cover every supervised column.
-        m = _stub()  # num_levels=3, asst_suffix=[15] (numel 1) -> suffix_keep=6
-        suffix_keep = m._num_levels + m.tpl_asst_suffix.numel() + 2
+        m = _stub()
+        suffix_keep = 6  # num_levels 3 + asst_suffix 1 + trailing eos + HF shift
         _, labels, _ = m._splice_input_ids(
             [torch.tensor([100, 101, 102])], [torch.tensor([200, 201, 202])]
         )
-        self.assertEqual(
-            suffix_keep, labels.shape[1] - _first_non_neg_index(labels) + 1
-        )
+        # first supervised column, minimized over rows
+        first_sup = int(((labels >= 0).cumsum(-1) == 1).float().argmax(-1).min())
+        self.assertEqual(suffix_keep, labels.shape[1] - first_sup + 1)
         self.assertTrue(bool((labels[:, :-suffix_keep] < 0).all()))
 
     def test_splice_prompt_ids(self) -> None:
@@ -131,49 +172,12 @@ class Qwen2RecLMTest(unittest.TestCase):
         m._is_inference = True  # inference
         self.assertEqual(Qwen2RecLM.predict(m, object())["branch"], "generate")
 
-    def test_generate_maps_tokens_to_sids(self) -> None:
-        m = _stub(base_vocab=100)
-        m._input_name = "user_sequence"
-        m._num_beams = m._num_return = 2
-
-        def fake_generate(
-            input_ids,
-            attention_mask,
-            max_new_tokens,
-            num_beams,
-            num_return_sequences,
-            do_sample,
-            pad_token_id,
-        ):
-            prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
-            # offsets [0,2,5]: local [1,1,1]/[2,3,4] -> each level's min/max token
-            new = torch.tensor([[100, 102, 105], [101, 104, 108]])
-            return torch.cat([prompt, new], dim=1)
-
-        m.lm.generate = fake_generate
-        # build_input is mocked, so the batch is opaque to this generation test.
-        m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 102, 105])]}
-        sids = m._generate(_gen_batch())["generated_sids"]
-        self.assertEqual(tuple(sids.shape), (1, 2, 3))  # (B, num_return, num_levels)
-        self.assertEqual(sids[0].tolist(), [[1, 1, 1], [2, 3, 4]])
-
-    def test_generate_rejects_malformed_candidates(self) -> None:
-        # every malformed candidate collapses to the -1 sentinel, in place.
-        m = _stub(base_vocab=100)
-        m._input_name = "user_sequence"
-        m._num_beams = m._num_return = 6
-
-        def fake_generate(
-            input_ids,
-            attention_mask,
-            max_new_tokens,
-            num_beams,
-            num_return_sequences,
-            do_sample,
-            pad_token_id,
-        ):
-            prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
-            new = torch.tensor(
+    # (generated tail -> decoded SIDs). offsets [0,2,5]: local [1,1,1]/[2,3,4]
+    # are each level's min/max token; every malformed row collapses to -1.
+    @parameterized.expand(
+        [
+            [[[100, 102, 105], [101, 104, 108]], [[1, 1, 1], [2, 3, 4]]],
+            [
                 [
                     [100, 102, 105],  # valid -> local [1, 1, 1]
                     [101, 104, 108],  # valid -> local [2, 3, 4]
@@ -181,31 +185,20 @@ class Qwen2RecLMTest(unittest.TestCase):
                     [100, 101, 105],  # pos1 below level-1 band
                     [100, 102, 109],  # pos2 above level-2 band
                     [100, 104, 9],  # pos2 = eos/pad token (sid -90) -> invalid
-                ]
-            )
-            return torch.cat([prompt, new], dim=1)
-
-        m.lm.generate = fake_generate
-        m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 102, 105])]}
-        sids = m._generate(_gen_batch())["generated_sids"]
-        self.assertEqual(tuple(sids.shape), (1, 6, 3))
-        self.assertEqual(
-            sids[0].tolist(),
-            [
-                [1, 1, 1],
-                [2, 3, 4],
-                [-1, -1, -1],
-                [-1, -1, -1],
-                [-1, -1, -1],
-                [-1, -1, -1],
+                ],
+                [[1, 1, 1], [2, 3, 4]] + [[-1, -1, -1]] * 4,
             ],
-        )
-
-    def test_generate_narrow_tail_no_crash(self) -> None:
-        # early EOS -> a tail narrower than num_levels must still reshape cleanly
+            # early EOS: a tail narrower than num_levels still reshapes cleanly,
+            # and the missing 3rd atom stays -1 -> out of band -> candidate -1
+            [[[100, 102], [101, 104]], [[-1, -1, -1], [-1, -1, -1]]],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_generate_maps_tokens_to_sids(self, tail, expected) -> None:
         m = _stub(base_vocab=100)
         m._input_name = "user_sequence"
-        m._num_beams = m._num_return = 2
+        m._num_beams, m._num_return = len(tail) + 1, len(tail)
+        seen = {}
 
         def fake_generate(
             input_ids,
@@ -216,28 +209,67 @@ class Qwen2RecLMTest(unittest.TestCase):
             do_sample,
             pad_token_id,
         ):
+            seen.update(
+                prompt=input_ids[0].tolist(),
+                mask=attention_mask[0].tolist(),
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
+                num_return_sequences=num_return_sequences,
+                do_sample=do_sample,
+                pad_token_id=pad_token_id,
+            )
             prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
-            new = torch.tensor([[100, 102], [101, 104]])  # width 2 < num_levels 3
-            return torch.cat([prompt, new], dim=1)
+            return torch.cat([prompt, torch.tensor(tail)], dim=1)
 
         m.lm.generate = fake_generate
+        # build_input is mocked, so the batch is opaque to this generation test.
         m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 102, 105])]}
-        sids = m._generate(_gen_batch())["generated_sids"]
-        self.assertEqual(tuple(sids.shape), (1, 2, 3))
-        # the missing 3rd atom stays -1 -> out of band -> whole candidate -1
-        self.assertEqual(sids[0].tolist(), [[-1, -1, -1], [-1, -1, -1]])
+        sids = m._generate(object())["generated_sids"]
+        self.assertEqual(seen["prompt"], [10, 11, 12, 100, 102, 105, 13, 14])
+        self.assertEqual(seen["mask"], [1] * 8)
+        self.assertEqual(seen["max_new_tokens"], 3)  # = num_levels
+        self.assertEqual(seen["num_beams"], len(tail) + 1)
+        self.assertEqual(seen["num_return_sequences"], len(tail))
+        self.assertFalse(seen["do_sample"])
+        self.assertEqual(seen["pad_token_id"], 9)
+        # (B, num_return, num_levels)
+        self.assertEqual(tuple(sids.shape), (1, len(tail), 3))
+        self.assertEqual(sids[0].tolist(), expected)
 
-    def test_build_prompt_tokens_registers_buffers(self) -> None:
-        m = object.__new__(Qwen2RecLM)
-        nn.Module.__init__(m)
-        tok = types.SimpleNamespace(
+    def test_generate_routes_to_the_dynamic_beam(self) -> None:
+        m = _stub(base_vocab=100)
+        m._input_name = "user_sequence"
+        m._dynamic_beam = True
+        m._num_beams = m._num_return = 2
+        m.lm.generate = lambda **kw: self.fail("HF generate must not run")
+        seen = {}
+
+        def fake_beam(ids, am):
+            seen.update(ids=ids[0].tolist(), mask=am[0].tolist())
+            return torch.tensor([[100, 102, 105], [101, 104, 108]])
+
+        m._dynamic_beam_search = fake_beam
+        m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 102, 105])]}
+        sids = m._generate(object())["generated_sids"]
+        self.assertEqual(seen["ids"], [10, 11, 12, 100, 102, 105, 13, 14])
+        self.assertEqual(seen["mask"], [1] * 8)
+        self.assertEqual(tuple(sids.shape), (1, 2, 3))
+        self.assertEqual(sids[0].tolist(), [[1, 1, 1], [2, 3, 4]])
+
+    def _prompt_tokenizer(self):
+        # encode -> [len(text)] makes each buffer a fingerprint of its fragment
+        return types.SimpleNamespace(
             eos_token_id=99,
             encode=lambda text, add_special_tokens=False: [len(text)],
         )
+
+    def test_build_prompt_tokens_composes_the_family_template(self) -> None:
+        m = object.__new__(Qwen2RecLM)
+        nn.Module.__init__(m)
         cfg = types.SimpleNamespace(
             system_instruction="", user_prefix_text="", user_suffix_text=""
         )
-        m._build_prompt_tokens(tok, cfg)
+        m._build_prompt_tokens(self._prompt_tokenizer(), cfg)
         for name in [
             "tpl_system",
             "tpl_user_prefix",
@@ -249,66 +281,37 @@ class Qwen2RecLMTest(unittest.TestCase):
             buf = getattr(m, name)
             self.assertIsInstance(buf, torch.Tensor)
             self.assertEqual(buf.dtype, torch.int64)
+        tpl = Qwen2RecLM.CHAT_TEMPLATE
+        self.assertEqual(
+            m.tpl_system.tolist(),
+            [
+                len(
+                    tpl["system_prefix"]
+                    + tpl["default_system_instruction"]
+                    + tpl["system_suffix"]
+                )
+            ],
+        )
+        self.assertEqual(m.tpl_user_prefix.tolist(), [len(tpl["user_prefix"])])
+        self.assertEqual(m.tpl_user_suffix.tolist(), [len(tpl["user_suffix"])])
+        self.assertEqual(m.tpl_asst_prefix.tolist(), [len(tpl["asst_prefix"])])
+        self.assertEqual(m.tpl_asst_suffix.tolist(), [len(tpl["asst_suffix"])])
         self.assertEqual(m.tpl_eos.tolist(), [99])  # eos cached for supervision
 
-    def test_sid_token_rows_recency_clip(self) -> None:
-        m = _stub(base_vocab=100)
-        values = torch.tensor(
-            [
-                1,
-                1,
-                1,
-                2,
-                3,
-                4,
-                1,
-                2,
-                3,
-                2,
-                1,
-                4,
-                1,
-                3,
-                2,
-            ],
-            dtype=torch.float,
+    def test_build_prompt_tokens_honours_proto_text_knobs(self) -> None:
+        m = object.__new__(Qwen2RecLM)
+        nn.Module.__init__(m)
+        cfg = types.SimpleNamespace(
+            system_instruction="SYS", user_prefix_text="UP", user_suffix_text="US"
         )
-
-        def _vl():
-            return values, torch.tensor([values.numel()])
-
-        # 15 codes (5 items), cap 9 -> keep the most recent three whole items.
-        expected_tail = [100, 103, 107, 101, 102, 108, 100, 104, 106]
-        rows = m._sid_token_rows(*_vl(), max_codes=9)
-        self.assertEqual(rows[0].tolist(), expected_tail)
-        # item-aligned: cap 10 still keeps 9 (3 whole items), never cuts mid-item
-        rows = m._sid_token_rows(*_vl(), max_codes=10)
-        self.assertEqual(rows[0].tolist(), expected_tail)
-        # within cap -> untouched
-        rows = m._sid_token_rows(values[:6], torch.tensor([6]), max_codes=9)
-        self.assertEqual(rows[0].tolist(), [100, 102, 105, 101, 104, 108])
-        # disabled (0/None) -> no clip
-        rows = m._sid_token_rows(*_vl(), max_codes=0)
+        m._build_prompt_tokens(self._prompt_tokenizer(), cfg)
+        tpl = Qwen2RecLM.CHAT_TEMPLATE
         self.assertEqual(
-            rows[0].tolist(),
-            [
-                100,
-                102,
-                105,
-                101,
-                104,
-                108,
-                100,
-                103,
-                107,
-                101,
-                102,
-                108,
-                100,
-                104,
-                106,
-            ],
+            m.tpl_system.tolist(),
+            [len(tpl["system_prefix"] + "SYS" + tpl["system_suffix"])],
         )
+        self.assertEqual(m.tpl_user_prefix.tolist(), [len(tpl["user_prefix"] + "UP")])
+        self.assertEqual(m.tpl_user_suffix.tolist(), [len("US" + tpl["user_suffix"])])
 
     def test_compute_max_total_length(self) -> None:
         m = _stub()
@@ -319,48 +322,16 @@ class Qwen2RecLMTest(unittest.TestCase):
         self.assertEqual(m._compute_max_total_length(), 0)
 
     def test_first_step_pads_to_max_then_actual_length(self) -> None:
-        m = _stub()
-        m._is_inference = False  # not inference + nn.Module.training=True -> is_train
-        m._input_name, m._label_name = "user_sequence", "label"
-        m._max_total_len = 50
-        m._pool_warmed = False
-        seen_lens = []
-
-        def fwd(i, lbl, a):
-            seen_lens.append(i.shape[1])
-            return {"loss": torch.tensor(0.0)}
-
-        m.build_input = lambda b: {
-            m._input_name: [torch.tensor([100, 101, 102])],
-            m._label_name: [torch.tensor([200, 201, 202])],
-        }
-        m._forward_loss = fwd
-        batch = object()
-        m._predict_train(batch)  # first step: pre-size to worst case
-        m._predict_train(batch)  # subsequent step: natural length
+        m, seen_lens = _train_stub(max_total_len=50)
+        m._predict_train(object())  # first step: pre-size to worst case
+        m._predict_train(object())  # subsequent step: natural length
         self.assertEqual(seen_lens[0], 50)
         self.assertLess(seen_lens[1], 50)
         self.assertTrue(m._pool_warmed)
 
     def test_no_forced_padding_when_disabled(self) -> None:
-        m = _stub()
-        m._is_inference = False
-        m._input_name, m._label_name = "user_sequence", "label"
-        m._max_total_len = 0  # max_seq_length unset -> pre-allocation off
-        m._pool_warmed = False
-        seen_lens = []
-
-        def fwd(i, lbl, a):
-            seen_lens.append(i.shape[1])
-            return {"loss": torch.tensor(0.0)}
-
-        m.build_input = lambda b: {
-            m._input_name: [torch.tensor([100, 101, 102])],
-            m._label_name: [torch.tensor([200, 201, 202])],
-        }
-        m._forward_loss = fwd
-        batch = object()
-        m._predict_train(batch)
+        m, seen_lens = _train_stub(max_total_len=0)  # pre-allocation off
+        m._predict_train(object())
         self.assertLess(seen_lens[0], 50)
         self.assertFalse(m._pool_warmed)
 
@@ -388,7 +359,7 @@ class Qwen2ForwardLossTest(unittest.TestCase):
             m.register_buffer(
                 name, torch.tensor(vals, dtype=torch.long), persistent=False
             )
-        m._suffix_keep = m._num_levels + m.tpl_asst_suffix.numel() + 2
+        m._suffix_keep = 6  # num_levels 3 + asst_suffix 1 + trailing eos + HF shift
         return m
 
     def _rows(self):
@@ -439,108 +410,55 @@ class Qwen2ForwardLossTest(unittest.TestCase):
         self.assertEqual(list(out), ["loss"])
 
 
-def _real_lm_stub(codebook=None, base_vocab=20, num_beams=2):
-    """A Qwen2RecLM carrying a real (tiny, random) Qwen2 backbone.
-
-    Needed by the dynamic-beam tests, which exercise the real KV-cached forward
-    and cache-reorder path; the other tests mock ``lm.generate``.
-    """
-    from transformers import Qwen2Config, Qwen2ForCausalLM
-
-    codebook = codebook or [2, 3, 4]
-    m = object.__new__(Qwen2RecLM)
-    nn.Module.__init__(m)
-    m._num_levels = len(codebook)
-    m._base_vocab = base_vocab
-    m._num_beams = num_beams
-    cfg = Qwen2Config(
-        vocab_size=base_vocab + sum(codebook),
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=64,
-    )
-    torch.manual_seed(0)
-    m.lm = Qwen2ForCausalLM(cfg).eval()
-    offsets, sizes = Qwen2RecLM._sid_level_layout(codebook)
-    m.register_buffer("_level_offsets", offsets, persistent=False)
-    m.register_buffer("_codebook_sizes", sizes, persistent=False)
-    return m
-
-
 class Qwen2DynamicBeamTest(unittest.TestCase):
-    def test_width_schedule_and_final_count(self) -> None:
-        m = _real_lm_stub(codebook=[8, 7, 6], base_vocab=20, num_beams=2)
-        ids = torch.tensor([[1, 2, 3, 4]])
-        new = m._dynamic_beam_search(ids, torch.ones_like(ids))
-        # base 2: widths [4, 8, 16], with enough combinations at each level.
-        self.assertEqual(tuple(new.shape), (2 * 2**3, 3))
+    """The wrapper around ``escalating_beam_search``; the kernel has its own test."""
 
-    def test_every_candidate_is_in_band(self) -> None:
-        # band masking guarantees well-formed SIDs: validate -> no -1 sentinels.
+    def test_dynamic_beam_search_forwards_the_sid_bands(self) -> None:
+        m = _stub(base_vocab=100)
+        m._num_beams = 5
+        ids = torch.zeros(1, 4, dtype=torch.long)
+        am = torch.ones(1, 4, dtype=torch.long)
+        seen = {}
+
+        def fake_kernel(lm, input_ids, attention_mask, *, num_beams, lo_tok, hi_tok):
+            seen.update(
+                lm=lm,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                num_beams=num_beams,
+                lo=lo_tok.tolist(),
+                hi=hi_tok.tolist(),
+            )
+            return torch.zeros(2, 3, dtype=torch.long)
+
+        with mock.patch(
+            "tzrec.models.qwen2_rec_lm.escalating_beam_search", side_effect=fake_kernel
+        ):
+            out = m._dynamic_beam_search(ids, am)
+        self.assertIs(seen["lm"], m.lm)
+        self.assertIs(seen["input_ids"], ids)
+        self.assertIs(seen["attention_mask"], am)
+        self.assertEqual(seen["num_beams"], 5)
+        self.assertEqual(seen["lo"], [100, 102, 105])
+        self.assertEqual(seen["hi"], [101, 104, 108])
+        self.assertEqual(tuple(out.shape), (2, 3))
+
+    def test_band_masked_beams_decode_without_sentinels(self) -> None:
+        # end-to-end against a real backbone: band masking guarantees that every
+        # returned candidate survives _validate_sid_candidates. widths are
+        # [2, 6, 24] here, i.e. exhaustive over the whole 2*3*4 codebook.
         codebook = [2, 3, 4]
-        m = _real_lm_stub(codebook=codebook, base_vocab=20, num_beams=2)
-        lo, hi = m._sid_token_bands()
-        self.assertEqual(lo.tolist(), [20, 22, 25])
-        self.assertEqual(hi.tolist(), [21, 24, 28])
+        m = _real_lm_stub(codebook=codebook, base_vocab=20, num_beams=3)
         ids = torch.tensor([[5, 6, 7]])
         new = m._dynamic_beam_search(ids, torch.ones_like(ids))
         sids = m._validate_sid_candidates(new, batch_size=1)
-        self.assertEqual(tuple(sids.shape), (1, new.shape[0], 3))
+        self.assertEqual(tuple(sids.shape), (1, 24, 3))
         for level, size in enumerate(codebook):
             self.assertTrue(bool((sids[..., level] >= 1).all()))
             self.assertTrue(bool((sids[..., level] <= size).all()))
-
-    def test_left_padding_two_rows(self) -> None:
-        # ragged batch (row 1 left-padded): both rows yield valid, full beam sets.
-        codebook = [2, 3]
-        m = _real_lm_stub(codebook=codebook, base_vocab=20, num_beams=2)
-        ids = torch.tensor([[5, 6, 7, 8], [0, 0, 9, 10]])
-        am = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]])
-        new = m._dynamic_beam_search(ids, am)
-        # The requested width is 8, but only 2*3=6 distinct pairs exist.
-        self.assertEqual(tuple(new.shape), (2 * 6, 2))
-        sids = m._validate_sid_candidates(new, batch_size=2)
-        self.assertEqual(tuple(sids.shape), (2, 6, 2))
-        for level, size in enumerate(codebook):
-            self.assertTrue(bool((sids[..., level] >= 1).all()))
-            self.assertTrue(bool((sids[..., level] <= size).all()))
-
-    def test_exhaustive_matches_bruteforce_topk(self) -> None:
-        # with no pruning the beam is EXACT: every SID combo, ordered by the
-        # true (full-recompute) cumulative log-prob.
-        codebook, base = [2, 3], 20
-        m = _real_lm_stub(codebook=codebook, base_vocab=base, num_beams=3)
-        # widths [min(6,2)=2, min(12,6)=6] -> exhaustive over all 2*3 SIDs
-        ids = torch.tensor([[5, 6, 7, 8]])
-        am = torch.ones_like(ids)
-        got = [tuple(r) for r in m._dynamic_beam_search(ids, am).tolist()]
-        self.assertEqual(len(got), codebook[0] * codebook[1])
-        lm = m.lm
-        lo0, lo1 = base, base + codebook[0]
-        ref = {}
-        with torch.no_grad():
-            logp0 = torch.log_softmax(
-                lm(ids, attention_mask=am).logits[0, -1].float(), -1
-            )
-            for t0 in range(lo0, lo0 + codebook[0]):
-                s2 = torch.cat([ids, torch.tensor([[t0]])], 1)
-                logp1 = torch.log_softmax(
-                    lm(s2, attention_mask=torch.ones_like(s2)).logits[0, -1].float(), -1
-                )
-                for t1 in range(lo1, lo1 + codebook[1]):
-                    ref[(t0, t1)] = (logp0[t0] + logp1[t1]).item()
-        self.assertEqual(set(got), set(ref))
-        # ordered best-first by the true score (tolerant of float-noise ties)
-        s = [ref[c] for c in got]
-        self.assertTrue(all(s[i] >= s[i + 1] - 1e-4 for i in range(len(s) - 1)))
-        self.assertEqual(got[0], max(ref, key=ref.get))  # top-1 is the global best
-        decoded = m._validate_sid_candidates(torch.tensor(got), batch_size=1)[0]
         self.assertEqual(
-            {tuple(row) for row in decoded.tolist()},
-            {(a, b) for a in range(1, 3) for b in range(1, 4)},
+            {tuple(row) for row in sids[0].tolist()},
+            {(a, b, c) for a in range(1, 3) for b in range(1, 4) for c in range(1, 5)},
         )
 
 
