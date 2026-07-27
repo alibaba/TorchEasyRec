@@ -247,10 +247,12 @@ class SidRqvaeTest(unittest.TestCase):
             {"codes", "candidate_codes", "candidate_scores"},
         )
         self.assertEqual(set(traced_predictions.keys()), set(predictions.keys()))
-        self.assertEqual(traced_predictions["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(
+            traced_predictions["candidate_codes"].shape, (B, 6)
+        )  # (B, topk*n_layers)
         self.assertEqual(traced_predictions["candidate_scores"].shape, (B, 3))
         torch.testing.assert_close(
-            traced_predictions["candidate_codes"][:, 0, :],
+            traced_predictions["candidate_codes"][:, :2],
             traced_predictions["codes"],
         )
 
@@ -268,7 +270,7 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertEqual(
             set(preds.keys()), {"codes", "candidate_codes", "candidate_scores"}
         )
-        self.assertEqual(preds["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(preds["candidate_codes"].shape, (B, 6))  # (B, topk*n_layers)
         self.assertEqual(preds["candidate_scores"].shape, (B, 3))
         scores = preds["candidate_scores"]
         # Slot 0 is the best-scored (nearest) neighbor: minimum score, sorted.

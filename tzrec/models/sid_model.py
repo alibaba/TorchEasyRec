@@ -109,7 +109,7 @@ class BaseSidModel(BaseModel):
         """Build SID prediction tensors from a quantizer output."""
         predictions = {"codes": quant.cluster_ids}
         if quant.candidate_codes is not None and quant.candidate_scores is not None:
-            predictions["candidate_codes"] = quant.candidate_codes
+            predictions["candidate_codes"] = quant.candidate_codes.flatten(1)
             predictions["candidate_scores"] = quant.candidate_scores
         return predictions
 

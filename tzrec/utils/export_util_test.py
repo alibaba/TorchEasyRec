@@ -21,24 +21,43 @@ from unittest import mock
 
 import numpy as np
 import torch
+from torch import distributed as dist
+from torchrec import KeyedJaggedTensor, KeyedTensor
 from torchrec.distributed.train_pipeline.utils import Tracer
+from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
 from tzrec.acc import utils as acc_utils
+from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.features.feature import create_features
+from tzrec.models.deepfm import DeepFM
+from tzrec.models.model import ScriptWrapper
 from tzrec.modules.dense_embedding_collection import (
     AutoDisEmbeddingConfig,
     DenseEmbeddingCollection,
     MLPDenseEmbeddingConfig,
 )
+from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
+from tzrec.protos.models import rank_model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.utils import checkpoint_util, misc_util
 from tzrec.utils.export_util import (
     _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
     _get_sparse_embedding_tensor,
+    _infer_keyed_tensor_attrs_from_module,
+    _isolate_kafka_export_group,
     _merge_sharded_embedding_json,
     _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
+    build_dense_graph_module,
+    create_dense_export_warmup_data,
+    export_dense_model_cpu,
     export_distributed_embedding,
+    finalize_dense_export,
 )
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import make_test_dir
 
 
 def _restore_env(old_env):
@@ -231,7 +250,7 @@ class ExportUtilTest(unittest.TestCase):
                     return_value=(torch.device("cpu"), None),
                 ),
                 mock.patch(
-                    "tzrec.utils.export_util._get_sparse_feature_to_embedding_info",
+                    "tzrec.utils.export_util._get_sparse_table_to_embedding_info",
                     return_value=({}, {}),
                 ),
                 mock.patch(
@@ -339,43 +358,44 @@ class ExportUtilTest(unittest.TestCase):
             os.environ["RANK"] = "0"
             os.environ["WORLD_SIZE"] = "1"
             os.environ.pop("DIST_QUANT", None)
-            embedding_bag_info = [
-                SimpleNamespace(
+            table_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc."
+                "embedding_bags.user_id_emb"
+            )
+            embedding_bag_info = {
+                table_fqn: SimpleNamespace(
                     name="user_id_emb",
                     embedding_dim=2,
                     feature_names=["user_id"],
                     pooling="SUM",
                 )
-            ]
+            }
 
             _, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
                 torch.nn.Module(),
                 ckpt_dir,
-                [],
+                {},
                 embedding_bag_info,
             )
 
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.keys"], torch.tensor([0, 2, 1, 3])
+                dynamic_out[f"{table_fqn}.keys"], torch.tensor([0, 2, 1, 3])
             )
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.scores"], torch.tensor([100, 102, 101, 103])
+                dynamic_out[f"{table_fqn}.scores"],
+                torch.tensor([100, 102, 101, 103]),
             )
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.values"],
+                dynamic_out[f"{table_fqn}.values"],
                 torch.tensor([[0.0, 0.1], [2.0, 2.1], [1.0, 1.1], [3.0, 3.1]]),
             )
-            self.assertEqual(emb_meta["user_id_emb"]["shape"], [4, 2])
-            self.assertEqual(emb_meta["user_id_emb"]["key_name"], "user_id_emb.keys")
-            self.assertEqual(
-                emb_meta["user_id_emb"]["value_name"], "user_id_emb.values"
-            )
-            self.assertEqual(
-                emb_meta["user_id_emb"]["score_name"], "user_id_emb.scores"
-            )
+            self.assertEqual(emb_meta[table_fqn]["shape"], [4, 2])
+            self.assertEqual(emb_meta[table_fqn]["key_name"], f"{table_fqn}.keys")
+            self.assertEqual(emb_meta[table_fqn]["value_name"], f"{table_fqn}.values")
+            self.assertEqual(emb_meta[table_fqn]["score_name"], f"{table_fqn}.scores")
             self.assertEqual(
                 feat_meta["user_id__ebc"],
-                {"embedding_name": "user_id_emb", "pooling": "SUM"},
+                {"embedding_name": table_fqn, "pooling": "SUM"},
             )
         finally:
             if old_rank is None:
@@ -423,47 +443,47 @@ class ExportUtilTest(unittest.TestCase):
             os.environ["RANK"] = "0"
             os.environ["WORLD_SIZE"] = "1"
             os.environ["DIST_QUANT"] = "INT8"
-            embedding_bag_info = [
-                SimpleNamespace(
+            table_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc."
+                "embedding_bags.user_id_emb"
+            )
+            embedding_bag_info = {
+                table_fqn: SimpleNamespace(
                     name="user_id_emb",
                     embedding_dim=2,
                     feature_names=["user_id"],
                     pooling="SUM",
                 )
-            ]
+            }
 
             _, dynamic_out, emb_meta, _ = _get_sparse_embedding_tensor(
                 torch.nn.Module(),
                 ckpt_dir,
-                [],
+                {},
                 embedding_bag_info,
             )
 
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.keys"], torch.tensor([0, 1])
+                dynamic_out[f"{table_fqn}.keys"], torch.tensor([0, 1])
             )
             torch.testing.assert_close(
-                dynamic_out["user_id_emb.scores"], torch.tensor([100, 101])
+                dynamic_out[f"{table_fqn}.scores"], torch.tensor([100, 101])
             )
-            self.assertEqual(dynamic_out["user_id_emb.values"].dtype, np.uint8)
-            self.assertEqual(dynamic_out["user_id_emb.values"].shape, (2, 6))
+            self.assertEqual(dynamic_out[f"{table_fqn}.values"].dtype, np.uint8)
+            self.assertEqual(dynamic_out[f"{table_fqn}.values"].shape, (2, 6))
             np.testing.assert_allclose(
                 _dequant_quint8_rowwise_f16(
-                    dynamic_out["user_id_emb.values"], emb_dim=2
+                    dynamic_out[f"{table_fqn}.values"], emb_dim=2
                 ),
                 values,
                 atol=5e-3,
             )
-            self.assertEqual(emb_meta["user_id_emb"]["dtype"], "QUint8RowwiseF16")
-            self.assertEqual(emb_meta["user_id_emb"]["shape"], [2, 2])
-            self.assertEqual(emb_meta["user_id_emb"]["storage_shape"], [2, 6])
-            self.assertEqual(emb_meta["user_id_emb"]["row_bytes"], 6)
-            self.assertEqual(
-                emb_meta["user_id_emb"]["quant"]["format"], "QUint8RowwiseF16"
-            )
-            self.assertEqual(
-                emb_meta["user_id_emb"]["value_name"], "user_id_emb.values"
-            )
+            self.assertEqual(emb_meta[table_fqn]["dtype"], "QUint8RowwiseF16")
+            self.assertEqual(emb_meta[table_fqn]["shape"], [2, 2])
+            self.assertEqual(emb_meta[table_fqn]["storage_shape"], [2, 6])
+            self.assertEqual(emb_meta[table_fqn]["row_bytes"], 6)
+            self.assertEqual(emb_meta[table_fqn]["quant"]["format"], "QUint8RowwiseF16")
+            self.assertEqual(emb_meta[table_fqn]["value_name"], f"{table_fqn}.values")
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
@@ -476,6 +496,10 @@ class ExportUtilTest(unittest.TestCase):
         class SparseCollisionModel(torch.nn.Module):
             def state_dict(self, *args, **kwargs):  # type: ignore[no-untyped-def]
                 return {
+                    "model.embedding_group.emb_impls.__BASE__.ebc_user."
+                    "embedding_bags.shared_emb.weight": torch.tensor(
+                        [[9.0, 9.1], [9.2, 9.3]]
+                    ),
                     "model.embedding_group.emb_impls.__BASE__.ebc."
                     "embedding_bags.shared_emb.weight": torch.tensor(
                         [[1.0, 1.1], [1.2, 1.3]]
@@ -490,49 +514,71 @@ class ExportUtilTest(unittest.TestCase):
         old_env = {"DIST_QUANT": os.environ.get("DIST_QUANT")}
         try:
             os.environ.pop("DIST_QUANT", None)
+            ebc_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc.embedding_bags.shared_emb"
+            )
+            ebc_user_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc_user."
+                "embedding_bags.shared_emb"
+            )
+            ec_fqn = (
+                "model.embedding_group.seq_emb_impls.__BASE__.ec_dict.2."
+                "embeddings.shared_emb"
+            )
             out, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
                 SparseCollisionModel(),
                 tmp,
-                [
-                    SimpleNamespace(
+                {
+                    ec_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["seq_feat"],
                     )
-                ],
-                [
-                    SimpleNamespace(
+                },
+                {
+                    ebc_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["id_feat"],
                         pooling="SUM",
-                    )
-                ],
+                    ),
+                    ebc_user_fqn: SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["user_feat"],
+                        pooling="SUM",
+                    ),
+                },
             )
 
             self.assertEqual(dynamic_out, {})
             self.assertNotIn("shared_emb", out)
+            self.assertNotIn(ebc_user_fqn, out)
+            self.assertNotIn(ebc_user_fqn, emb_meta)
             np.testing.assert_array_equal(
-                out["shared_emb__ec"],
+                out[ec_fqn],
                 np.array([[2.0, 2.1], [2.2, 2.3]], dtype=np.float32),
             )
             np.testing.assert_array_equal(
-                out["shared_emb__ebc"],
+                out[ebc_fqn],
                 np.array([[1.0, 1.1], [1.2, 1.3]], dtype=np.float32),
             )
+            self.assertEqual(emb_meta[ec_fqn]["feat_name_impl"], ["seq_feat__ec"])
             self.assertEqual(
-                emb_meta["shared_emb__ec"]["feat_name_impl"], ["seq_feat__ec"]
-            )
-            self.assertEqual(
-                emb_meta["shared_emb__ebc"]["feat_name_impl"], ["id_feat__ebc"]
+                emb_meta[ebc_fqn]["feat_name_impl"],
+                ["id_feat__ebc", "user_feat__ebc"],
             )
             self.assertEqual(
                 feat_meta["seq_feat__ec"],
-                {"embedding_name": "shared_emb__ec", "pooling": "NONE"},
+                {"embedding_name": ec_fqn, "pooling": "NONE"},
             )
             self.assertEqual(
                 feat_meta["id_feat__ebc"],
-                {"embedding_name": "shared_emb__ebc", "pooling": "SUM"},
+                {"embedding_name": ebc_fqn, "pooling": "SUM"},
+            )
+            self.assertEqual(
+                feat_meta["user_feat__ebc"],
+                {"embedding_name": ebc_fqn, "pooling": "SUM"},
             )
         finally:
             _restore_env(old_env)
@@ -542,6 +588,10 @@ class ExportUtilTest(unittest.TestCase):
         class SparseCollisionModel(torch.nn.Module):
             def state_dict(self, *args, **kwargs):  # type: ignore[no-untyped-def]
                 return {
+                    "model.embedding_group.emb_impls.__BASE__.ebc_user."
+                    "embedding_bags.shared_emb.weight": torch.tensor(
+                        [[-9.0, 9.0], [-10.0, 10.0]]
+                    ),
                     "model.embedding_group.emb_impls.__BASE__.ebc."
                     "embedding_bags.shared_emb.weight": torch.tensor(
                         [[-1.0, 1.0], [-2.0, 2.0]]
@@ -556,49 +606,68 @@ class ExportUtilTest(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="tzrec_export_sparse_quant_")
         try:
             os.environ["DIST_QUANT"] = "INT8"
+            ebc_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc.embedding_bags.shared_emb"
+            )
+            ebc_user_fqn = (
+                "model.embedding_group.emb_impls.__BASE__.ebc_user."
+                "embedding_bags.shared_emb"
+            )
+            ec_fqn = (
+                "model.embedding_group.seq_emb_impls.__BASE__.ec_dict.2."
+                "embeddings.shared_emb"
+            )
             out, dynamic_out, emb_meta, _ = _get_sparse_embedding_tensor(
                 SparseCollisionModel(),
                 tmp,
-                [
-                    SimpleNamespace(
+                {
+                    ec_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["seq_feat"],
                     )
-                ],
-                [
-                    SimpleNamespace(
+                },
+                {
+                    ebc_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["id_feat"],
                         pooling="SUM",
-                    )
-                ],
+                    ),
+                    ebc_user_fqn: SimpleNamespace(
+                        name="shared_emb",
+                        embedding_dim=2,
+                        feature_names=["user_feat"],
+                        pooling="SUM",
+                    ),
+                },
             )
 
             self.assertEqual(dynamic_out, {})
-            self.assertEqual(out["shared_emb__ec"].dtype, np.uint8)
-            self.assertEqual(out["shared_emb__ebc"].dtype, np.uint8)
-            self.assertEqual(out["shared_emb__ec"].shape, (2, 6))
-            self.assertEqual(out["shared_emb__ebc"].shape, (2, 6))
+            self.assertNotIn(ebc_user_fqn, out)
+            self.assertNotIn(ebc_user_fqn, emb_meta)
+            self.assertEqual(out[ec_fqn].dtype, np.uint8)
+            self.assertEqual(out[ebc_fqn].dtype, np.uint8)
+            self.assertEqual(out[ec_fqn].shape, (2, 6))
+            self.assertEqual(out[ebc_fqn].shape, (2, 6))
             np.testing.assert_allclose(
-                _dequant_quint8_rowwise_f16(out["shared_emb__ec"], emb_dim=2),
+                _dequant_quint8_rowwise_f16(out[ec_fqn], emb_dim=2),
                 np.array([[-3.0, 3.0], [-4.0, 4.0]], dtype=np.float32),
                 atol=5e-3,
             )
             np.testing.assert_allclose(
-                _dequant_quint8_rowwise_f16(out["shared_emb__ebc"], emb_dim=2),
+                _dequant_quint8_rowwise_f16(out[ebc_fqn], emb_dim=2),
                 np.array([[-1.0, 1.0], [-2.0, 2.0]], dtype=np.float32),
                 atol=5e-3,
             )
-            self.assertEqual(emb_meta["shared_emb__ec"]["dtype"], "QUint8RowwiseF16")
-            self.assertEqual(emb_meta["shared_emb__ec"]["shape"], [2, 2])
-            self.assertEqual(emb_meta["shared_emb__ec"]["storage_shape"], [2, 6])
-            self.assertEqual(emb_meta["shared_emb__ec"]["row_bytes"], 6)
-            self.assertEqual(emb_meta["shared_emb__ebc"]["dtype"], "QUint8RowwiseF16")
-            self.assertEqual(emb_meta["shared_emb__ebc"]["shape"], [2, 2])
-            self.assertEqual(emb_meta["shared_emb__ebc"]["storage_shape"], [2, 6])
-            self.assertEqual(emb_meta["shared_emb__ebc"]["row_bytes"], 6)
+            self.assertEqual(emb_meta[ec_fqn]["dtype"], "QUint8RowwiseF16")
+            self.assertEqual(emb_meta[ec_fqn]["shape"], [2, 2])
+            self.assertEqual(emb_meta[ec_fqn]["storage_shape"], [2, 6])
+            self.assertEqual(emb_meta[ec_fqn]["row_bytes"], 6)
+            self.assertEqual(emb_meta[ebc_fqn]["dtype"], "QUint8RowwiseF16")
+            self.assertEqual(emb_meta[ebc_fqn]["shape"], [2, 2])
+            self.assertEqual(emb_meta[ebc_fqn]["storage_shape"], [2, 6])
+            self.assertEqual(emb_meta[ebc_fqn]["row_bytes"], 6)
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
@@ -621,18 +690,22 @@ class ExportUtilTest(unittest.TestCase):
                 "change the table's embedding_dim to an even value.*"
                 "DIST_QUANT=0/NONE",
             ):
+                table_fqn = (
+                    "model.embedding_group.emb_impls.__BASE__.ebc."
+                    "embedding_bags.user_id_emb"
+                )
                 _get_sparse_embedding_tensor(
                     OddDimModel(),
                     tmp,
-                    [],
-                    [
-                        SimpleNamespace(
+                    {},
+                    {
+                        table_fqn: SimpleNamespace(
                             name="user_id_emb",
                             embedding_dim=3,
                             feature_names=["user_id"],
                             pooling="SUM",
                         )
-                    ],
+                    },
                 )
         finally:
             _restore_env(old_env)
@@ -728,6 +801,374 @@ class ExportUtilTest(unittest.TestCase):
                 torch.isnan(restored[name]).any(), f"{name} was not restored"
             )
             torch.testing.assert_close(restored[name], ref)
+
+    def test_infer_keyed_tensor_attrs_from_module_matches_ebc(self) -> None:
+        """Inferred attrs must equal the EBC's runtime KeyedTensor attrs.
+
+        Covers merged tables (one table serving multiple features) and shared
+        features (one feature across tables, which get ``@table`` suffixed
+        keys), and the MC-EBC duck-typing fallback via ``_embedding_module``.
+        """
+        tables = [
+            EmbeddingBagConfig(
+                name="uid_emb",
+                embedding_dim=8,
+                num_embeddings=100,
+                feature_names=["uid"],
+            ),
+            EmbeddingBagConfig(
+                name="pid_emb",
+                embedding_dim=4,
+                num_embeddings=100,
+                feature_names=["pid", "cid"],
+            ),
+            EmbeddingBagConfig(
+                name="pid_emb_shared",
+                embedding_dim=16,
+                num_embeddings=100,
+                feature_names=["pid"],
+            ),
+        ]
+        ebc = EmbeddingBagCollection(tables=tables, device=torch.device("cpu"))
+
+        attrs = _infer_keyed_tensor_attrs_from_module(ebc)
+        self.assertIsNotNone(attrs)
+        keys, length_per_key = attrs
+        self.assertEqual(keys, ebc._embedding_names)
+        self.assertEqual(length_per_key, ebc._lengths_per_embedding)
+        self.assertEqual(keys, ["uid", "pid@pid_emb", "cid", "pid@pid_emb_shared"])
+        self.assertEqual(length_per_key, [8, 4, 4, 16])
+
+        mc_like = torch.nn.Module()
+        mc_like._embedding_module = ebc
+        self.assertEqual(
+            _infer_keyed_tensor_attrs_from_module(mc_like), (keys, length_per_key)
+        )
+
+    def test_isolate_kafka_export_group_swaps_group_id(self) -> None:
+        """Isolate the export Kafka consumer from the live training group."""
+        from tzrec.datasets.kafka_dataset import _parse_kafka_uri
+
+        uri = "kafka://broker:9092/topic?group.id=training&auto.offset.reset=earliest"
+        isolated = _isolate_kafka_export_group(uri)
+        topic, params, _ = _parse_kafka_uri(isolated)
+        self.assertEqual(topic, "topic")
+        self.assertEqual(params["group.id"], "training__dense_export")
+        self.assertEqual(params.get("auto.offset.reset"), "earliest")
+        # non-kafka inputs pass through unchanged
+        self.assertEqual(
+            _isolate_kafka_export_group("hdfs://path/to/file"),
+            "hdfs://path/to/file",
+        )
+        # kafka without group.id is left untouched
+        self.assertEqual(
+            _isolate_kafka_export_group("kafka://broker:9092/topic?foo=bar"),
+            "kafka://broker:9092/topic?foo=bar",
+        )
+
+    def test_export_dense_model_cpu_end_to_end(self) -> None:
+        """Warm-up, strict restore, sanity run and scripting on a real model."""
+        test_dir = make_test_dir()
+        try:
+            feature_cfgs = [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_a", embedding_dim=16, num_buckets=100
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_b", embedding_dim=16, num_buckets=1000
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    raw_feature=feature_pb2.RawFeature(feature_name="int_a")
+                ),
+            ]
+            features = create_features(feature_cfgs)
+            model_config = model_pb2.ModelConfig(
+                feature_groups=[
+                    model_pb2.FeatureGroupConfig(
+                        group_name="wide",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.WIDE,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="fm",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="deep",
+                        feature_names=["cat_a", "cat_b", "int_a"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                ],
+                deepfm=rank_model_pb2.DeepFM(
+                    deep=module_pb2.MLP(hidden_units=[8, 4]),
+                    final=module_pb2.MLP(hidden_units=[2]),
+                ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            )
+
+            def _build_model() -> DeepFM:
+                return DeepFM(
+                    model_config=model_config, features=features, labels=["label"]
+                )
+
+            def _build_wrapped_model() -> ScriptWrapper:
+                model = _build_model()
+                init_parameters(model, device=torch.device("cpu"))
+                return ScriptWrapper(model)
+
+            batch = Batch(
+                dense_features={
+                    BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                        keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+                    )
+                },
+                # First id is an out-of-range dynamicemb-style 64-bit FG hash
+                # to guard the warm-up zeroing in export_dense_model_cpu:
+                # without it F.embedding_bag's strict CPU range-check raises.
+                sparse_features={
+                    BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                        keys=["cat_a", "cat_b"],
+                        values=torch.tensor([2100765614044343531, 2, 3, 4, 5, 6, 7]),
+                        lengths=torch.tensor([1, 2, 1, 3]),
+                    )
+                },
+                labels={},
+            )
+
+            pipeline_config = EasyRecConfig()
+            pipeline_config.train_input_path = "unused-mocked"
+
+            ckpt_dir = os.path.join(test_dir, "model.ckpt-0")
+            export_dir = os.path.join(test_dir, "dense_export")
+            port = misc_util.get_free_port()
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"tcp://127.0.0.1:{port}",
+                world_size=1,
+                rank=0,
+            )
+            try:
+                with (
+                    mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False),
+                    mock.patch(
+                        "tzrec.utils.export_util.create_dataloader",
+                        return_value=iter([batch]),
+                    ),
+                ):
+                    checkpoint_util.save_model(ckpt_dir, _build_wrapped_model())
+                    # pass meta embeddings to exercise in-function init_parameters
+                    export_dense_model_cpu(
+                        pipeline_config=pipeline_config,
+                        model=ScriptWrapper(_build_model()),
+                        checkpoint_path=ckpt_dir,
+                        save_dir=export_dir,
+                    )
+            finally:
+                dist.destroy_process_group()
+
+            with open(os.path.join(export_dir, "dense_meta.json")) as f:
+                dense_meta = json.load(f)
+            ebc_groups = {k: v for k, v in dense_meta.items() if k != "sequence__ec"}
+            all_emb_names = [n for names in ebc_groups.values() for n in names]
+            self.assertTrue(all_emb_names)
+            for emb_name in all_emb_names:
+                self.assertIn(emb_name.split("@")[0], {"cat_a", "cat_b"})
+            # never bare table names (cat_a_emb / cat_b_emb): the old
+            # table-name inference emitted those instead of feature names
+            self.assertNotIn("cat_a_emb__ebc", all_emb_names)
+            self.assertNotIn("cat_b_emb__ebc", all_emb_names)
+            # cat_a/cat_b are shared by the wide and fm/deep tables, so the
+            # shared-feature @table form must appear
+            self.assertTrue(any("@" in n for n in all_emb_names))
+            self.assertEqual(dense_meta["sequence__ec"], [])
+
+            scripted = torch.jit.load(os.path.join(export_dir, "scripted_model.pt"))
+            serving_data = dict(batch.to_dict())
+            for group_name, names in ebc_groups.items():
+                # wide tables use the 4-dim wide embedding, others 16
+                dims = [4 if "_wide" in n else 16 for n in names]
+                serving_data[group_name] = torch.rand(2, sum(dims))
+            serving_data["batch_size"] = torch.tensor(2)
+            predictions = scripted(serving_data)
+            self.assertEqual(predictions["logits"].size(), (2,))
+            self.assertEqual(predictions["probs"].size(), (2,))
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_in_process_dense_export_matches_checkpoint_export(self) -> None:
+        """Build + in-memory weight load + finalize must match the checkpoint path.
+
+        The in-process online export hot-swaps weights gathered from the live
+        model into a resident dense graph instead of restoring a checkpoint;
+        given the same weights, both paths must script identical predictions.
+        """
+        test_dir = make_test_dir()
+        try:
+            feature_cfgs = [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_a", embedding_dim=16, num_buckets=100
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_b", embedding_dim=16, num_buckets=1000
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    raw_feature=feature_pb2.RawFeature(feature_name="int_a")
+                ),
+            ]
+            features = create_features(feature_cfgs)
+            model_config = model_pb2.ModelConfig(
+                feature_groups=[
+                    model_pb2.FeatureGroupConfig(
+                        group_name="wide",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.WIDE,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="fm",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="deep",
+                        feature_names=["cat_a", "cat_b", "int_a"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                ],
+                deepfm=rank_model_pb2.DeepFM(
+                    deep=module_pb2.MLP(hidden_units=[8, 4]),
+                    final=module_pb2.MLP(hidden_units=[2]),
+                ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            )
+
+            def _build_model() -> DeepFM:
+                return DeepFM(
+                    model_config=model_config, features=features, labels=["label"]
+                )
+
+            batch = Batch(
+                dense_features={
+                    BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                        keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+                    )
+                },
+                sparse_features={
+                    BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                        keys=["cat_a", "cat_b"],
+                        values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
+                        lengths=torch.tensor([1, 2, 1, 3]),
+                    )
+                },
+                labels={},
+            )
+
+            pipeline_config = EasyRecConfig()
+            pipeline_config.train_input_path = "unused-mocked"
+
+            device = torch.device("cpu")
+            live_model = ScriptWrapper(_build_model())
+            init_parameters(live_model, device=device)
+
+            ckpt_dir = os.path.join(test_dir, "model.ckpt-0")
+            ckpt_export_dir = os.path.join(test_dir, "dense_export_ckpt")
+            inproc_export_dir = os.path.join(test_dir, "dense_export_inproc")
+            port = misc_util.get_free_port()
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"tcp://127.0.0.1:{port}",
+                world_size=1,
+                rank=0,
+            )
+            try:
+                with (
+                    mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False),
+                    # a fresh single-batch iterator per dataloader creation
+                    mock.patch(
+                        "tzrec.utils.export_util.create_dataloader",
+                        side_effect=lambda *args, **kwargs: iter([batch]),
+                    ),
+                ):
+                    checkpoint_util.save_model(ckpt_dir, live_model)
+                    export_dense_model_cpu(
+                        pipeline_config=pipeline_config,
+                        model=ScriptWrapper(_build_model()),
+                        checkpoint_path=ckpt_dir,
+                        save_dir=ckpt_export_dir,
+                    )
+                    # in-process path: gather the weights from the live
+                    # model's own state_dict (single process => no sharding,
+                    # every source is a plain replicated tensor), load them
+                    # into the resident graph and finalize.
+                    warmup_data = create_dense_export_warmup_data(
+                        pipeline_config, live_model, device
+                    )
+                    gm, full_graph, dense_graph_config = build_dense_graph_module(
+                        live_model, warmup_data, device
+                    )
+                    live_state = live_model.state_dict()
+                    snapshot = {
+                        key: live_state[
+                            key
+                            if key in live_state
+                            else checkpoint_util.remap_input_tile_user_key(
+                                key, live_state
+                            )
+                        ]
+                        .detach()
+                        .cpu()
+                        for key in sorted(gm.state_dict().keys())
+                    }
+                    gm.load_state_dict(snapshot)
+                    finalize_dense_export(
+                        live_model,
+                        full_graph,
+                        gm,
+                        warmup_data,
+                        device,
+                        inproc_export_dir,
+                        dense_graph_config,
+                    )
+            finally:
+                dist.destroy_process_group()
+
+            scripted_ckpt = torch.jit.load(
+                os.path.join(ckpt_export_dir, "scripted_model.pt")
+            )
+            scripted_inproc = torch.jit.load(
+                os.path.join(inproc_export_dir, "scripted_model.pt")
+            )
+            with open(os.path.join(ckpt_export_dir, "dense_meta.json")) as f:
+                dense_meta = json.load(f)
+            ebc_groups = {k: v for k, v in dense_meta.items() if k != "sequence__ec"}
+            serving_data = dict(batch.to_dict())
+            for group_name, names in ebc_groups.items():
+                dims = [4 if "_wide" in n else 16 for n in names]
+                serving_data[group_name] = torch.rand(2, sum(dims))
+            serving_data["batch_size"] = torch.tensor(2)
+            out_ckpt = scripted_ckpt(serving_data)
+            out_inproc = scripted_inproc(serving_data)
+            self.assertEqual(set(out_ckpt.keys()), set(out_inproc.keys()))
+            for key in out_ckpt:
+                torch.testing.assert_close(out_ckpt[key], out_inproc[key])
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

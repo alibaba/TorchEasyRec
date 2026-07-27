@@ -288,9 +288,9 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             set(preds.keys()), {"codes", "candidate_codes", "candidate_scores"}
         )
         self.assertEqual(preds["codes"].shape, (B, 2))
-        self.assertEqual(preds["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(preds["candidate_codes"].shape, (B, 6))  # (B, topk*n_layers)
         self.assertEqual(preds["candidate_scores"].shape, (B, 3))
-        torch.testing.assert_close(preds["candidate_codes"][:, 0, :], preds["codes"])
+        torch.testing.assert_close(preds["candidate_codes"][:, :2], preds["codes"])
 
     def test_candidate_output_topk_exceeds_codebook_raises(self) -> None:
         """Reject topk above the last-layer codebook size at construction."""
