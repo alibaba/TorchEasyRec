@@ -210,8 +210,7 @@ class LinearDecayLR(BaseLR):
         t = min(step_count - self._warmup_size, self._total_size - self._warmup_size)
         decay_scale = 1.0 - t / (self._total_size - self._warmup_size)
         return [
-            self._min_learning_rate
-            + (base_lr - self._min_learning_rate) * decay_scale
+            self._min_learning_rate + (base_lr - self._min_learning_rate) * decay_scale
             for base_lr in self.base_lrs
         ]
 

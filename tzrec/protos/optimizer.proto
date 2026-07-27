@@ -238,7 +238,9 @@ message ManualStepLR {
 
 message LinearDecayLR {
     // total number of steps or epochs to decay from base_lr to
-    // min_learning_rate (mirrors HF Trainer's `lr_scheduler_type: linear`)
+    // min_learning_rate (mirrors HF Trainer's `lr_scheduler_type: linear`).
+    // NOTE: unlike decay_size/T_max in the schedulers above, this horizon is
+    // measured from step 0 and INCLUDES warmup_size. Required (must be > 0).
     optional uint32 total_size = 1;
     // minimum learning rate reached at total_size
     optional float min_learning_rate = 2 [default = 0.0];

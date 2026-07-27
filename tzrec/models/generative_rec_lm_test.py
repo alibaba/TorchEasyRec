@@ -18,10 +18,11 @@ from torch import nn
 from tzrec.models.generative_rec_lm import GenerativeRecLM
 from tzrec.models.model import BaseModel
 from tzrec.models.qwen2_rec_lm import Qwen2RecLM
+from tzrec.protos import model_pb2
 
 
 class _FakeJT:
-    """Minimal stand-in for a TorchRec JaggedTensor (callable values/lengths)."""
+    """Minimal stand-in for a TorchRec JaggedTensor."""
 
     def __init__(self, values, lengths, dim2=False):
         v = torch.tensor(values, dtype=torch.float)  # TER delivers list<int64> as float
@@ -36,37 +37,42 @@ class _FakeJT:
 
 
 def _stub(codebook=None, base_vocab=100, device="cpu"):
-    """A Qwen2RecLM with the base data-prep state wired up, but no HF backbone.
-
-    Exercises the architecture-agnostic base methods (inherited by every family)
-    without downloading a model.
-    """
+    """A Qwen2RecLM with the base data-prep state wired up, but no HF backbone."""
     codebook = codebook or [2, 3, 4]
     m = object.__new__(Qwen2RecLM)
     nn.Module.__init__(m)
     m._base_vocab = base_vocab
     m._num_levels = len(codebook)
     m.lm = types.SimpleNamespace(device=torch.device(device))
-    lo, hi = Qwen2RecLM._sid_level_bands(codebook)
-    m.register_buffer("_level_offsets", lo - 1, persistent=False)
-    m.register_buffer("_codebook_sizes", hi - lo + 1, persistent=False)
+    offsets, sizes = Qwen2RecLM._sid_level_layout(codebook)
+    m.register_buffer("_level_offsets", offsets, persistent=False)
+    m.register_buffer("_codebook_sizes", sizes, persistent=False)
     return m
 
 
 class GenerativeRecLMTest(unittest.TestCase):
     def test_registry_dispatch(self) -> None:
-        # importing qwen2_rec_lm auto-registers the family by class name
         self.assertIs(BaseModel.create_class("Qwen2RecLM"), Qwen2RecLM)
         self.assertTrue(issubclass(Qwen2RecLM, GenerativeRecLM))
 
+    def test_model_config_oneof_resolves_to_the_class(self) -> None:
+        # the path _create_model takes: oneof -> message type name -> class.
+        from tzrec.utils import config_util
+
+        cfg = model_pb2.ModelConfig()
+        cfg.qwen2_rec_lm.common.codebook.extend([2, 3])
+        cfg.qwen2_rec_lm.common.max_sequence_length = 8  # required field
+        self.assertEqual(config_util.which_msg(cfg, "model"), "Qwen2RecLM")
+        self.assertIs(
+            BaseModel.create_class(config_util.which_msg(cfg, "model")), Qwen2RecLM
+        )
+
     def test_resolve_pad_token_id(self) -> None:
         tok = types.SimpleNamespace
-        # pad present -> pad
         self.assertEqual(
             GenerativeRecLM._resolve_pad_token_id(tok(pad_token_id=5, eos_token_id=9)),
             5,
         )
-        # pad absent -> eos fallback
         self.assertEqual(
             GenerativeRecLM._resolve_pad_token_id(
                 tok(pad_token_id=None, eos_token_id=9)
@@ -80,8 +86,6 @@ class GenerativeRecLMTest(unittest.TestCase):
             )
 
     def test_backbone_owned_by_family_proto(self) -> None:
-        # the backbone lives on the family message (its architecture), NOT in
-        # the shared common config; it defaults to the canonical Qwen2.5-0.5B.
         from tzrec.protos.models.generative_model_pb2 import (
             GenerativeRecLMConfig,
         )
@@ -94,8 +98,6 @@ class GenerativeRecLMTest(unittest.TestCase):
         self.assertNotIn("hf_model_id", common_fields)
 
     def test_configurable_knob_defaults(self) -> None:
-        # generated_sids_key / param_dtype are proto knobs whose defaults are the
-        # previous class-constant values.
         from tzrec.protos.models.generative_model_pb2 import GenerativeRecLMConfig
 
         c = GenerativeRecLMConfig()
@@ -108,13 +110,12 @@ class GenerativeRecLMTest(unittest.TestCase):
         m = object.__new__(Qwen2RecLM)
         nn.Module.__init__(m)
         m._features = []
-        # The history group + SID-column names are DERIVED, not configured: the
-        # history is the single feature_group + its one member; the answer is the
-        # first data_config.label_field.
         m._labels = ["label"]
         m._feature_groups = [
             types.SimpleNamespace(
-                group_name="user_seq", feature_names=["user_sequence"]
+                group_name="user_seq",
+                feature_names=["user_sequence"],
+                group_type=model_pb2.JAGGED_SEQUENCE,
             )
         ]
         common = types.SimpleNamespace(
@@ -129,9 +130,9 @@ class GenerativeRecLMTest(unittest.TestCase):
         self.assertEqual(m._history_group, "user_seq")  # the single group
         self.assertEqual(m._input_name, "user_sequence")  # its one member
         self.assertEqual(m._label_name, "label")  # from label_fields[0]
-        self.assertEqual(m._generated_sids_key, "my_sids")  # configurable
-        self.assertIs(m._param_dtype, torch.bfloat16)  # name -> torch dtype
-        self.assertEqual(m._max_seq_length, 288)  # model knob used
+        self.assertEqual(m._generated_sids_key, "my_sids")
+        self.assertIs(m._param_dtype, torch.bfloat16)
+        self.assertEqual(m._max_seq_length, 288)
         self.assertEqual(sid_atoms, 9)
         self.assertEqual(m._level_offsets.tolist(), [0, 2, 5])
         self.assertEqual(m._codebook_sizes.tolist(), [2, 3, 4])
@@ -143,12 +144,11 @@ class GenerativeRecLMTest(unittest.TestCase):
             m._read_common_config(common)
 
     def test_read_common_config_no_feature_group_raises(self) -> None:
-        # the history is the single declared feature_group; none -> fail loudly.
         m = object.__new__(Qwen2RecLM)
         nn.Module.__init__(m)
         m._features = []
         m._labels = ["label"]
-        m._feature_groups = []  # no group declared
+        m._feature_groups = []
         common = types.SimpleNamespace(
             ignore_index=-100,
             generated_sids_key="generated_sids",
@@ -160,8 +160,66 @@ class GenerativeRecLMTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no feature_group declared"):
             m._read_common_config(common)
 
+    def test_read_common_config_rejects_bad_group_and_codebook(self) -> None:
+        def _wired(group_type, feature_names=("user_sequence",)):
+            m = object.__new__(Qwen2RecLM)
+            nn.Module.__init__(m)
+            m._features = []
+            m._labels = ["label"]
+            m._feature_groups = [
+                types.SimpleNamespace(
+                    group_name="user_seq",
+                    feature_names=list(feature_names),
+                    group_type=group_type,
+                )
+            ]
+            return m
+
+        def _common(codebook):
+            return types.SimpleNamespace(
+                ignore_index=-100,
+                generated_sids_key="generated_sids",
+                param_dtype="float32",
+                codebook=codebook,
+                vocab_pad_to_multiple_of=128,
+                max_sequence_length=0,
+            )
+
+        # a SEQUENCE group emits the same key with padded-dense semantics.
+        with self.assertRaisesRegex(ValueError, "must be JAGGED_SEQUENCE"):
+            _wired(model_pb2.SEQUENCE)._read_common_config(_common([2, 3]))
+        with self.assertRaisesRegex(ValueError, "has no feature_names"):
+            _wired(model_pb2.JAGGED_SEQUENCE, ())._read_common_config(_common([2, 3]))
+        with self.assertRaisesRegex(ValueError, "codebook must be non-empty"):
+            _wired(model_pb2.JAGGED_SEQUENCE)._read_common_config(_common([]))
+        with self.assertRaisesRegex(ValueError, "codebook size must be positive"):
+            _wired(model_pb2.JAGGED_SEQUENCE)._read_common_config(_common([2, 0]))
+
+    def test_vocab_pad_zero_disables_padding(self) -> None:
+        m = object.__new__(Qwen2RecLM)
+        nn.Module.__init__(m)
+        m._features = []
+        m._labels = ["label"]
+        m._feature_groups = [
+            types.SimpleNamespace(
+                group_name="user_seq",
+                feature_names=["user_sequence"],
+                group_type=model_pb2.JAGGED_SEQUENCE,
+            )
+        ]
+        m._read_common_config(
+            types.SimpleNamespace(
+                ignore_index=-100,
+                generated_sids_key="generated_sids",
+                param_dtype="float32",
+                codebook=[2, 3],
+                vocab_pad_to_multiple_of=0,
+                max_sequence_length=0,
+            )
+        )
+        self.assertEqual(m._vocab_pad_mult, 0)  # not silently rewritten to 128
+
     def test_max_sequence_length_model_knob(self) -> None:
-        # _max_seq_length is the model knob; 0 = off (no feature fallback).
         def _common(max_seq):
             return types.SimpleNamespace(
                 ignore_index=-100,
@@ -179,14 +237,16 @@ class GenerativeRecLMTest(unittest.TestCase):
             m._labels = ["label"]
             m._feature_groups = [
                 types.SimpleNamespace(
-                    group_name="user_seq", feature_names=["user_sequence"]
+                    group_name="user_seq",
+                    feature_names=["user_sequence"],
+                    group_type=model_pb2.JAGGED_SEQUENCE,
                 )
             ]
             return m
 
         m = _wired()
         m._read_common_config(_common(128))
-        self.assertEqual(m._max_seq_length, 128)  # model knob used
+        self.assertEqual(m._max_seq_length, 128)
         m2 = _wired()
         m2._read_common_config(_common(0))
         self.assertEqual(m2._max_seq_length, 0)  # 0 = off, no fallback
@@ -247,7 +307,6 @@ class GenerativeRecLMTest(unittest.TestCase):
     def test_sid_token_rows_width_violation_raises(self) -> None:
         m = _stub(base_vocab=100)
         with self.assertRaises(ValueError):
-            # second row has 6 codes, not 3 -> anomalous answer sample
             jt = _FakeJT([1, 1, 1, 1, 1, 1, 1, 1, 1], [3, 6])
             m._sid_token_rows(jt.values(), jt.lengths(), expected_width=3)
 
@@ -270,7 +329,7 @@ class GenerativeRecLMTest(unittest.TestCase):
             [3, 1, 1],
             [1, 4, 1],
             [1, 1, 5],
-            [1, 3, 6],  # legacy global 1-based representation
+            [1, 3, 6],  # global cross-level codes, not local per-level
         ):
             with self.subTest(values=values):
                 with self.assertRaisesRegex(ValueError, "local 1-based"):
@@ -278,9 +337,6 @@ class GenerativeRecLMTest(unittest.TestCase):
                     m._sid_token_rows(jt.values(), jt.lengths())
 
     def test_build_input_history_group_label_field(self) -> None:
-        # history: EmbeddingGroup output keyed by GROUP name ("{group}.sequence"
-        # / ".sequence_length"). answer: batch.jagged_labels[label_name]. Both
-        # level-offset tokenized; returned dict keyed by FEATURE name.
         m = _stub(base_vocab=100)
         m._input_name, m._label_name = "user_sequence", "label"
         m._history_group = "user_seq"
@@ -315,7 +371,6 @@ class GenerativeRecLMTest(unittest.TestCase):
             "user_seq.sequence": torch.tensor([1.0, 1.0, 1.0]),
             "user_seq.sequence_length": torch.tensor([3]),
         }
-        # jagged_labels intentionally empty — the label is absent at inference
         rows = m.build_input(types.SimpleNamespace(jagged_labels={}))
         self.assertEqual([r.tolist() for r in rows["user_sequence"]], [[100, 102, 105]])
         self.assertNotIn("label", rows)

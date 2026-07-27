@@ -83,8 +83,7 @@ message ModelConfig {
         SidRqvae sid_rqvae = 600;
         SidRqkmeans sid_rqkmeans = 601;
 
-        // Generative (causal-LM) models — one family message per LLM family.
-        // 700-block keeps clear of the SID family's 600-block.
+        // Generative (causal-LM) models; the 700-block keeps clear of the SID 600s.
         Qwen2RecLM qwen2_rec_lm = 700;
     }
 

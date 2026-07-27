@@ -9,28 +9,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ALGR-style escalating-beam SID decode (torch-only, no tzrec deps).
+"""Escalating-beam SID decode (torch-only, no tzrec deps).
 
-A faithful port of ALGR's ``dynamic_beams`` schedule: the beam width doubles at
-every SID level (``num_beams`` -> ``2*num_beams`` -> ...), keeping
-``num_beams * 2**(j+1)`` candidates after level ``j`` and returning
-``num_beams * 2**num_levels`` per row. The aggressive early pruning (only the
-top ``2*num_beams`` level-0 prefixes survive) is what distinguishes it from a
-fixed-width beam that keeps every level-0 code.
-
-Lives in its own torch-only module so both the production path
-(``Qwen2RecLM._dynamic_beam_search``) and the offline predict harness share one
-tested implementation.
+The beam width doubles at every SID level, so early levels are pruned hard.
 """
 
-from __future__ import annotations
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
 
 
 @torch.no_grad()
 def escalating_beam_search(
-    model,
+    model: "PreTrainedModel",
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     *,
@@ -50,30 +44,35 @@ def escalating_beam_search(
         hi_tok: inclusive upper per-level token-space band edge, ``(num_levels,)``.
 
     Returns:
-        The generated SID token tail ``(B * num_beams * 2**num_levels,
-        num_levels)``, score-ordered best-first per row. The SID answer is
-        exactly ``num_levels`` codes with no in-answer EOS, so every beam emits
-        exactly ``num_levels`` tokens — no finished-beam bookkeeping is needed,
-        and band masking makes every candidate well-formed by construction.
+        The generated SID token tail ``(B * W, num_levels)`` score-ordered
+        best-first per row, where ``W`` is ``num_beams * 2**num_levels`` capped
+        to the number of distinct SIDs the codebook can supply. The answer is
+        fixed-length and EOS-free, so no finished-beam bookkeeping is needed.
     """
     device = input_ids.device
     bsz = input_ids.shape[0]
     num_levels = lo_tok.shape[0]
-    # candidates kept after level j (doubling), capped to what the band + the
-    # surviving prefixes can actually supply (guards tiny codebooks).
-    widths, prev = [], 1
-    for j in range(num_levels):
-        avail = prev * int(hi_tok[j] - lo_tok[j] + 1)
-        widths.append(min(num_beams * (2 ** (j + 1)), avail))
+    # Hoist the band edges to host once to keep the level loop sync-free.
+    bands: List[Tuple[int, int]] = [
+        (int(lo_tok[j]), int(hi_tok[j])) for j in range(num_levels)
+    ]
+    # Cap the doubling at what band x surviving prefixes supply (tiny codebooks).
+    widths: List[int] = []
+    prev = 1
+    for j, (lo, hi) in enumerate(bands):
+        widths.append(min(num_beams * (2 ** (j + 1)), prev * (hi - lo + 1)))
         prev = widths[-1]
 
     def _band_logp(logits: torch.Tensor, j: int) -> torch.Tensor:
-        ids = torch.arange(logits.shape[-1], device=device)
-        keep = (ids >= lo_tok[j]) & (ids <= hi_tok[j])
-        logp = torch.log_softmax(logits.float(), dim=-1)
-        return logp.masked_fill(~keep, float("-inf"))
+        """Full-vocab log-probs, narrowed to level ``j``'s band ``(R, band)``.
 
-    # 1. prompt forward (bsz beams) -> level-0 logits.
+        Slicing after normalizing keeps the exact cross-beam ranking of a
+        full-vocab ``log_softmax`` without materializing one per level.
+        """
+        lo, hi = bands[j]
+        log_z = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+        return logits[:, lo : hi + 1].float() - log_z
+
     pos = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
     h = model.model(
         input_ids=input_ids,
@@ -82,17 +81,15 @@ def escalating_beam_search(
         use_cache=True,
     )
     past = h.past_key_values
-    vocab = model.config.vocab_size
     scores = _band_logp(model.lm_head(h.last_hidden_state[:, -1, :]), 0)
-    beam_scores, tok = scores.topk(widths[0], dim=-1)  # (B, W0)
-    seq = tok.reshape(-1, 1)
+    beam_scores, local = scores.topk(widths[0], dim=-1)  # (B, W0)
+    seq = (local + bands[0][0]).reshape(-1, 1)
     beam_scores = beam_scores.reshape(-1)
     parent = torch.arange(bsz, device=device).repeat_interleave(widths[0])
     past.reorder_cache(parent)
     am = attention_mask.repeat_interleave(widths[0], dim=0)
     cur_w = widths[0]
 
-    # 2. levels 1..n-1: forward the last chosen atom with cache, escalate width.
     for j in range(1, num_levels):
         am = torch.cat([am, am.new_ones(bsz * cur_w, 1)], dim=1)
         step_pos = (am.long().cumsum(-1) - 1)[:, -1:].clamp(min=0)
@@ -105,17 +102,20 @@ def escalating_beam_search(
             use_cache=True,
             cache_position=cache_pos,
         )
+        lo_j, hi_j = bands[j]
+        band = hi_j - lo_j + 1
         scores = _band_logp(model.lm_head(h.last_hidden_state[:, -1, :]), j)
-        scores = scores + beam_scores[:, None]  # (B*cur_w, V) cumulative
-        # global top-widths[j] per row over the (cur_w * V) continuations.
-        beam_scores, idx = scores.view(bsz, cur_w * vocab).topk(widths[j], dim=-1)
-        parent_local = torch.div(idx, vocab, rounding_mode="floor")  # in [0,cur_w)
-        tok = idx % vocab
+        scores = scores + beam_scores[:, None]  # (B*cur_w, band) cumulative
+        beam_scores, idx = scores.view(bsz, cur_w * band).topk(widths[j], dim=-1)
+        parent_local = torch.div(idx, band, rounding_mode="floor")
+        tok = lo_j + idx % band
         row_base = torch.arange(bsz, device=device)[:, None] * cur_w
         parent = (parent_local + row_base).reshape(-1)
-        past.reorder_cache(parent)
-        am = am[parent]
         seq = torch.cat([seq[parent], tok.reshape(-1, 1)], dim=1)
         beam_scores = beam_scores.reshape(-1)
         cur_w = widths[j]
+        if j + 1 < num_levels:
+            # the last level never reads the cache; skip the largest reorder copy.
+            past.reorder_cache(parent)
+            am = am[parent]
     return seq  # (B*cur_w, num_levels)

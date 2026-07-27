@@ -3,71 +3,69 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Generic generative-recommendation language-model base for TorchEasyRec.
 
-* Per-family subclasses: ``GenerativeRecLM`` is the abstract base; each LLM
-family is a concrete subclass implementing the ``_build_prompt_tokens`` and
-``predict`` hooks (e.g. ``Qwen2RecLM``). The pipeline config selects the
-family by its own oneof entry, whose message-type name resolves directly to
-the same-named class via the BaseModel registry. Shared config lives in
-``GenerativeRecLMConfig`` (the family message's ``common`` field).
-* Streaming sample format: each row carries the history ``user_sequence`` (a
-raw-int64 sequence feature) and the ``label`` answer (a ``data_config``
-label_field), both holding local, 1-based per-level codes in
-``[1, codebook[level]]``. Rows contain whole items in level order.
-* The chat template is tokenised ONCE at ``__init__`` and cached as
-non-persistent buffers, so per-batch encoding is integer arithmetic only
-(no HF tokenizer in the hot path).
-* Raw code -> token id by integer offsets:
-``token = base_vocab + level_offset[level] + code - 1``. The model derives
-``level_offsets`` from ``codebook``; sample writers must not pre-apply them.
-* Left padding with ``eos_token_id``: real content sits at the END of every
-row so the suffix slice captures only ``[response + end_markers]``.
+``GenerativeRecLM`` owns the architecture-agnostic plumbing; a concrete family
+subclass (e.g. ``Qwen2RecLM``) implements ``_build_prompt_tokens`` and
+``predict``. Shared config and the sample contract live in
+``GenerativeRecLMConfig`` (see ``protos/models/generative_model.proto``).
 """
 
-from __future__ import annotations
-
-import os
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 import torchmetrics
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.models import generative_model_pb2
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel, PreTrainedTokenizerBase
+
+
+def _hf_auto_classes() -> Tuple[Any, Any, Any]:
+    """Import the HF Auto classes lazily.
+
+    ``transformers`` is an optional, multi-hundred-MB dependency needed only by
+    this model family. Importing it at module scope would make it mandatory for
+    the whole package, because ``load_class.auto_import`` re-raises any import
+    failure under ``tzrec/models/`` out of ``import tzrec``.
+
+    Raises:
+        ImportError: if ``transformers`` is not installed.
+    """
+    try:
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+    except ImportError as e:
+        raise ImportError(
+            "transformers is required for generative-recommendation LMs. "
+            "Install via `pip install transformers==4.51.2`."
+        ) from e
+    return AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 class GenerativeRecLM(BaseModel):
     """Abstract base for HF-backed generative-recommendation LMs.
 
-    The base owns the architecture-agnostic plumbing: model construction, SID
-    vocab extension, the shared sample data-prep (``_sid_token_rows`` /
-    ``_tokenize_sids``), loss, and metrics. Each family subclass implements two
-    architecture-specific hooks:
-
-        _build_prompt_tokens(tokenizer, cfg)  — cache the prompt template
-        predict(batch)                        — build inputs + HF forward
-
-    Family proto contract: every family message embeds ``GenerativeRecLMConfig
-    common = 1`` and supplies a backbone (by default an ``hf_model_id`` field,
-    overridable via ``_backbone_id``).
-
-    ``Qwen2RecLM`` provides the decoder-only chat implementation, reusable by
-    Llama/Mistral/Gemma/Phi-style families; GPT-NeoX/RWKV/Mamba/T5 each need
-    their own. Each family registers directly (oneof message-type name == class
-    name).
+    Owns model construction, SID vocab extension, sample data-prep, loss and
+    metrics; subclasses implement ``_build_prompt_tokens`` and ``predict``. The
+    family's proto message must supply ``common`` (``GenerativeRecLMConfig``)
+    and an ``hf_model_id`` field, both read directly by this base.
     """
 
-    # Backbone PARAM dtype options (the fp32 MASTER weights). fp32 avoids
-    # bf16-ULP underflow of Adam's small (lr=1e-5) updates; bf16 *compute* comes
-    # from mixed_precision:"BF16" autocast, NOT the param dtype. Selected by
-    # ``common.param_dtype`` (default "float32") -> ``self._param_dtype``.
+    # See `common.param_dtype` in the proto for why fp32 is the default.
     _DTYPE_BY_NAME = {
         "float32": torch.float32,
         "bfloat16": torch.bfloat16,
@@ -84,30 +82,20 @@ class GenerativeRecLM(BaseModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         cfg = self._model_config
-        common = cfg.common  # GenerativeRecLMConfig — shared by all families
-
-        sid_atoms = self._read_common_config(common)
+        sid_atoms = self._read_common_config(cfg.common)
 
         self.lm = self._build_backbone()
         tokenizer, base = self._build_extended_tokenizer(sid_atoms)
         self._hf_tokenizer = tokenizer
         self._base_vocab = base
-
         self._pad_token_id = self._resolve_pad_token_id(tokenizer)
 
         self._build_prompt_tokens(tokenizer, cfg)
-
         self.init_input()
 
-        self._smoke_log_once = os.environ.get("TZREC_GENRECLM_DEBUG", "0") == "1"
-        self._first_predict = True
-
     @staticmethod
-    def _resolve_pad_token_id(tokenizer: Any) -> int:
-        """Pad id for the left-padded splice, falling back to eos.
-
-        Fail loudly if a tokenizer has neither (vs an opaque ``int(None)``).
-        """
+    def _resolve_pad_token_id(tokenizer: "PreTrainedTokenizerBase") -> int:
+        """Pad id for the left-padded splice, falling back to eos."""
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
             pad_id = tokenizer.eos_token_id
@@ -118,10 +106,10 @@ class GenerativeRecLM(BaseModel):
             )
         return int(pad_id)
 
-    def _read_common_config(self, common: Any) -> int:
+    def _read_common_config(
+        self, common: generative_model_pb2.GenerativeRecLMConfig
+    ) -> int:
         """Parse shared proto knobs into attributes; return the SID atom count."""
-        # History = the single feature_group (its group_name keys the
-        # EmbeddingGroup output); answer = the first data_config.label_field.
         hist = self._history_feature_group()
         self._history_group: str = hist.group_name
         self._input_name: str = hist.feature_names[0]
@@ -136,25 +124,26 @@ class GenerativeRecLM(BaseModel):
             )
         self._param_dtype: torch.dtype = param_dtype
         self._max_seq_length: int = int(common.max_sequence_length)
-        codebook = list(common.codebook)
-        if len(codebook) == 0:
+        codebook = [int(c) for c in common.codebook]
+        if not codebook:
             raise ValueError("GenerativeRecLM: codebook must be non-empty.")
+        if any(c <= 0 for c in codebook):
+            raise ValueError(
+                f"GenerativeRecLM: every codebook size must be positive, got "
+                f"{codebook}."
+            )
         self._num_levels = len(codebook)
-        # Level layout is derived from codebook and kept out of state_dict.
-        lo, hi = self._sid_level_bands(codebook)
-        self.register_buffer("_level_offsets", lo - 1, persistent=False)
-        self.register_buffer("_codebook_sizes", hi - lo + 1, persistent=False)
-        self._vocab_pad_mult = int(common.vocab_pad_to_multiple_of) or 128
-        return sum(int(c) for c in codebook)
+        offsets, sizes = self._sid_level_layout(codebook)
+        self.register_buffer("_level_offsets", offsets, persistent=False)
+        self.register_buffer("_codebook_sizes", sizes, persistent=False)
+        self._vocab_pad_mult = int(common.vocab_pad_to_multiple_of)
+        return sum(codebook)
 
-    def _history_feature_group(self) -> Any:
+    def _history_feature_group(self) -> model_pb2.FeatureGroupConfig:
         """The history feature_group = the single declared feature_group.
 
-        genrec declares exactly one feature_group — the JAGGED_SEQUENCE group
-        carrying the history SID stream (the answer is a data_config.label_field,
-        not a group). Its ``group_name`` keys the EmbeddingGroup output and its one
-        member is the history feature. Fails loudly on a missing/empty group (vs a
-        silent IndexError/KeyError later).
+        Must be JAGGED_SEQUENCE: a SEQUENCE group would silently deliver
+        padded-dense values instead of the flat raw SID stream.
         """
         if not self._feature_groups:
             raise ValueError(
@@ -167,42 +156,47 @@ class GenerativeRecLM(BaseModel):
                 f"{type(self).__name__}: history feature_group {g.group_name!r} "
                 f"has no feature_names."
             )
+        if g.group_type != model_pb2.JAGGED_SEQUENCE:
+            raise ValueError(
+                f"{type(self).__name__}: history feature_group {g.group_name!r} "
+                f"must be JAGGED_SEQUENCE, got "
+                f"{model_pb2.FeatureGroupType.Name(g.group_type)}."
+            )
         return g
 
-    def _build_backbone(self) -> Any:
-        """Build the EMPTY extended architecture in fp32 (master) — no download.
+    def _build_backbone(self) -> "PreTrainedModel":
+        """Build the EMPTY extended architecture -- no weight download.
 
-        Config reads only define the module shapes the DCP checkpoint expects;
-        the GB-scale pretrained weights load once at cold start via
-        ``init_from_pretrained``, then DCP fills them on every restore/eval.
+        Only the module shapes matter here; the weights arrive from
+        ``init_from_pretrained`` (cold start) or DCP (restore/eval).
         """
-        hf_model_id = self._backbone_id()
+        auto_config, auto_causal_lm, _ = _hf_auto_classes()
+        hf_model_id = self._model_config.hf_model_id
         if not hf_model_id:
-            raise ValueError(
-                f"{type(self).__name__}: empty backbone id (see _backbone_id)."
-            )
-        hf_cfg = AutoConfig.from_pretrained(hf_model_id)
-        # fp32 MASTER weights: bf16 params underflow Adam's small (lr=1e-5) updates
-        # and freeze. bf16 compute comes from mixed_precision:"BF16"; ckpt stays fp32.
-        lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=self._param_dtype)
+            raise ValueError(f"{type(self).__name__}: empty hf_model_id.")
+        hf_cfg = auto_config.from_pretrained(hf_model_id)
+        lm = auto_causal_lm.from_config(hf_cfg, torch_dtype=self._param_dtype)
         if next(lm.parameters()).dtype != self._param_dtype:
             lm = lm.to(self._param_dtype)
         return lm
 
-    def _build_extended_tokenizer(self, sid_atoms: int) -> tuple[Any, int]:
+    def _build_extended_tokenizer(
+        self, sid_atoms: int
+    ) -> Tuple["PreTrainedTokenizerBase", int]:
         """Add the SID atoms ``C0..C{sid_atoms-1}`` and resize ``self.lm``.
 
         Returns ``(tokenizer, base)`` where ``base`` is the tokenizer's next free
-        id BEFORE adding the atoms — use ``len(tokenizer)``, NOT
-        ``config.vocab_size`` (which counts reserved slots). The atoms append
-        directly after the existing vocab, so the splice offset is
-        ``token = base + (sid - 1)``.
+        id BEFORE adding the atoms -- use ``len(tokenizer)``, NOT
+        ``config.vocab_size`` (which counts reserved slots).
         """
-        tokenizer = AutoTokenizer.from_pretrained(self._backbone_id(), use_fast=True)
+        _, _, auto_tokenizer = _hf_auto_classes()
+        tokenizer = auto_tokenizer.from_pretrained(
+            self._model_config.hf_model_id, use_fast=True
+        )
         base = len(tokenizer)
         added = tokenizer.add_tokens([f"C{i}" for i in range(sid_atoms)])
         if added != sid_atoms:
-            # pre-existing Cxxx tokens would silently break the offset arithmetic.
+            # a pre-existing Cxxx token would shift the atoms off `base`.
             raise RuntimeError(
                 f"GenerativeRecLM: tokenizer was expected to grow by "
                 f"{sid_atoms} new atoms, only added {added}. "
@@ -211,59 +205,54 @@ class GenerativeRecLM(BaseModel):
         # stash the resize target so init_from_pretrained re-extends identically.
         self._target_vocab = base + sid_atoms
         self.lm.resize_token_embeddings(
-            self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
+            self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult or None
         )
         c0_id = tokenizer.convert_tokens_to_ids("C0")
         if c0_id != base:
             raise RuntimeError(
-                f"GenerativeRecLM: SID atom layout mismatch — expected "
+                f"GenerativeRecLM: SID atom layout mismatch -- expected "
                 f"C0 at token id {base}, got {c0_id}. "
                 f"Splice arithmetic would produce wrong token ids."
             )
         return tokenizer, base
 
-    def _backbone_id(self) -> str:
-        """Family hook: the HF model id to load for ``self.lm``.
-
-        Defaults to the family message's ``hf_model_id``; override if a family
-        sources its backbone differently.
-        """
-        return self._model_config.hf_model_id
-
     def init_from_pretrained(self) -> None:
         """Load the pretrained HF backbone weights into ``self.lm``.
 
-        The single ``from_pretrained`` call, run once at COLD START (no checkpoint
-        to resume); on resume/eval/export the empty ``__init__`` arch is filled by
-        DCP instead, skipping the download. Re-extends the vocab to ``__init__``'s
-        target so the shapes match.
+        Re-extends the vocab to ``__init__``'s target so the shapes match.
+
+        Every rank runs this, so every rank must apply the identical resize or
+        DDP's parameter-shape check fails. The newly-created SID embedding rows
+        are drawn from the global RNG and therefore differ per rank; DDP's
+        ``_sync_module_states`` broadcast from rank 0 is what makes them agree.
         """
-        # fp32 master (not "auto", which keeps the stored bf16); must match
-        # _build_backbone so cold-start and restore arches agree.
-        lm = AutoModelForCausalLM.from_pretrained(
-            self._backbone_id(), torch_dtype=self._param_dtype
+        _, auto_causal_lm, _ = _hf_auto_classes()
+        # drop the empty arch first: holding both peaks at 2x model host RAM.
+        self.lm = None
+        lm = auto_causal_lm.from_pretrained(
+            self._model_config.hf_model_id,
+            torch_dtype=self._param_dtype,
+            low_cpu_mem_usage=True,
         )
         lm.resize_token_embeddings(
-            self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult
+            self._target_vocab, pad_to_multiple_of=self._vocab_pad_mult or None
         )
         self.lm = lm
 
-    def hf_backbone(self):
-        """The HF backbone module. Only use when export."""
+    def hf_backbone(self) -> "PreTrainedModel":
+        """The HF backbone module, for checkpoint/export asset writing."""
         return self.lm
 
-    def hf_tokenizer(self):
-        """The extended tokenizer (base vocab + C0..C{sum-1}) to serialize.
-
-        Only used at export (export_util.write_hf_assets).
-        """
+    def hf_tokenizer(self) -> "PreTrainedTokenizerBase":
+        """The extended tokenizer (base vocab + C0..C{sum-1}) to serialize."""
         return self._hf_tokenizer
 
-    def _build_prompt_tokens(self, tokenizer, cfg) -> None:
+    def _build_prompt_tokens(
+        self, tokenizer: "PreTrainedTokenizerBase", cfg: Any
+    ) -> None:
         """Family hook: cache the tokenised prompt template as buffers.
 
-        Called from ``__init__`` after vocab extension; consumed by the family's
-        ``predict``. Subclasses MUST implement this.
+        Called from ``__init__`` after vocab extension; consumed by ``predict``.
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement _build_prompt_tokens "
@@ -272,7 +261,7 @@ class GenerativeRecLM(BaseModel):
 
     @property
     def device(self) -> torch.device:
-        """Device the HF backbone runs on — the single source for model I/O."""
+        """Device the HF backbone runs on."""
         return self.lm.device
 
     def _tokenize_sids(
@@ -281,9 +270,7 @@ class GenerativeRecLM(BaseModel):
         """Map local 1-based per-level codes to extended-vocab token ids.
 
         ``level_ids`` must broadcast against ``codes`` and identify each code's
-        RQ level. Atom ``C{k}`` sits at ``base_vocab + k``, therefore:
-
-        ``token = code + level_offsets[level] + base_vocab - 1``.
+        RQ level.
         """
         return codes + self._level_offsets[level_ids] + (self._base_vocab - 1)
 
@@ -294,24 +281,12 @@ class GenerativeRecLM(BaseModel):
         return tokens - (self._base_vocab - 1) - self._level_offsets[level_ids]
 
     @staticmethod
-    def _sid_level_bands(codebook: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-level flattened 1-based SID bands as two long tensors.
+    def _sid_level_layout(codebook: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-level ``(flat_offset, size)``; the levels occupy disjoint bands."""
+        sizes = torch.tensor(codebook, dtype=torch.long)
+        return torch.cumsum(sizes, 0) - sizes, sizes
 
-        Level ``j`` occupies a DISJOINT band ``[offset_j + 1, offset_j +
-        codebook[j]]`` where ``offset_j = sum(codebook[:j])``. Single source of
-        truth for the derived ``_level_offsets`` and ``_codebook_sizes`` buffers.
-        """
-        lo, hi, acc = [], [], 0
-        for c in codebook:
-            lo.append(acc + 1)
-            hi.append(acc + int(c))
-            acc += int(c)
-        return (
-            torch.tensor(lo, dtype=torch.long),
-            torch.tensor(hi, dtype=torch.long),
-        )
-
-    def _sid_token_bands(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sid_token_bands(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the inclusive token-id band for every SID level."""
         level_ids = torch.arange(self._num_levels, device=self.device)
         return (
@@ -324,51 +299,34 @@ class GenerativeRecLM(BaseModel):
     ) -> torch.Tensor:
         """Decode generated tokens to local 1-based codes and reject bad beams.
 
-        ``new_tokens`` is the per-beam tail ``(B*num_return, w)`` (``w`` may be <
-        ``num_levels`` when beams stop early). Returns ``(batch_size, num_return,
+        ``new_tokens`` is the per-beam tail ``(B*C, w)`` (``w`` may be <
+        ``num_levels`` when beams stop early). Returns ``(batch_size, C,
         num_levels)`` local codes. Every malformed candidate (early EOS /
         non-SID / wrong-level atom) is set to ``-1``, which cannot match a real
         1-based code.
         """
         level_ids = torch.arange(new_tokens.shape[1], device=new_tokens.device)
         codes = self._detokenize_sids(new_tokens, level_ids)
-        # early-EOS beams return < num_levels tokens; pad to num_levels with -1.
-        codes = F.pad(
-            codes,
-            (0, self._num_levels - codes.shape[1]),
-            value=-1,
-        )
-        # any single out-of-band atom invalidates the WHOLE candidate (.any over
-        # the levels -> masked_fill blanks the entire row to -1, matching no item).
+        codes = F.pad(codes, (0, self._num_levels - codes.shape[1]), value=-1)
+        # one out-of-band atom invalidates the whole candidate row.
         invalid = ((codes < 1) | (codes > self._codebook_sizes)).any(dim=1)
         codes = codes.masked_fill(invalid.unsqueeze(1), -1)
-        # generate() returns rows batch-major ([b0_beam0, b0_beam1, ...]); group
-        # the beams per user.
+        # decoders return rows batch-major ([b0_c0, b0_c1, ...]); group per user.
         return codes.view(batch_size, -1, self._num_levels)
 
     def init_input(self) -> None:
         """Build the EmbeddingGroup for the single raw SID JAGGED_SEQUENCE group.
 
-        Raw (passthrough) features carry no embedding tables, so this
-        EmbeddingGroup holds no params (DMP-neutral); it exists purely to
-        retrieve the raw SID sequences as flat ``(values, lengths)`` — the same
-        path HSTU uses. The HF backbone still owns the token embeddings; SID ids
-        flow through it directly (no embedding lookup here).
+        Raw passthrough features carry no embedding tables, so this group holds
+        no params (DMP-neutral); it only retrieves the flat ``(values, lengths)``.
         """
         self.embedding_group = EmbeddingGroup(self._features, self._feature_groups)
 
     def build_input(self, batch: Batch) -> Dict[str, List[torch.Tensor]]:
-        """Retrieve per-row SID token sequences.
+        """Retrieve per-row SID token sequences, keyed by feature name.
 
-        HISTORY is a JAGGED_SEQUENCE feature_group: ``embedding_group(batch)``
-        returns its flat raw values ``"{group}.sequence"`` +
-        ``"{group}.sequence_length"`` (the HSTU idiom). The ANSWER is a
-        data_config.label_field: its JaggedTensor comes from
-        ``batch.jagged_labels[self._label_name]`` (so it can be absent at
-        inference, where no ground truth is supplied — unlike a feature_group,
-        which the EmbeddingGroup would require every forward). Both are mapped
-        SID -> extended-vocab token ids and split to rows; the returned dict is
-        keyed by FEATURE name (what the family ``predict`` consumes).
+        The answer is a ``data_config.label_field`` rather than a feature_group
+        so it can be absent at inference, where no ground truth is supplied.
         """
         g = self.embedding_group(batch)
         rows: Dict[str, List[torch.Tensor]] = {
@@ -379,11 +337,14 @@ class GenerativeRecLM(BaseModel):
             ),
         }
         if not self.is_inference:
+            if not self._label_name:
+                raise ValueError(
+                    f"{type(self).__name__}: training needs the answer SIDs; "
+                    f"declare it as the first data_config.label_field."
+                )
             jt = batch.jagged_labels[self._label_name]
             rows[self._label_name] = self._sid_token_rows(
-                jt.values(),
-                jt.lengths(),
-                expected_width=self._num_levels,
+                jt.values(), jt.lengths(), expected_width=self._num_levels
             )
         return rows
 
@@ -396,22 +357,13 @@ class GenerativeRecLM(BaseModel):
     ) -> List[torch.Tensor]:
         """Map flat SID ``(values, lengths)`` -> per-row token-id tensors.
 
-        ``build_input`` supplies flat SID ``(values, lengths)``: the history from
-        the JAGGED_SEQUENCE group's ``"{group}.sequence"`` /
-        ``"{group}.sequence_length"``, and the answer from
-        ``batch.jagged_labels[label].values()/.lengths()``. ``values`` may arrive
-        as float / shape ``(N, 1)``. The whole batch is tokenized once on the
-        backbone device, then split into rows.
+        ``values`` may arrive as float / shape ``(N, 1)``. Rows must contain
+        whole items so the per-level offsets restart at level 0 for each row;
+        ``expected_width``, when set, requires exactly that many codes per row.
 
-        All values are local 1-based codes. Rows must contain whole items so the
-        per-level offsets restart at level 0 for each row. ``expected_width``,
-        when set, additionally requires exactly that many codes (the answer =
-        ``num_levels``).
-
-        ``max_codes``, when set, caps each row to its most-recent whole items (the
-        last ``floor(max_codes / num_levels) * num_levels`` codes, dropping the
-        oldest head) so the pre-allocated pool covers every batch. Done on host
-        views before the H2D copy, skipped unless a row overflows.
+        ``max_codes``, when set, caps each row to its most-recent whole items
+        (the last ``floor(max_codes / num_levels) * num_levels`` codes) so the
+        pre-allocated pool covers every batch.
         """
         if values.dim() == 2 and values.size(-1) == 1:
             values = values.squeeze(-1)
@@ -429,13 +381,10 @@ class GenerativeRecLM(BaseModel):
                 raise ValueError(
                     f"{type(self).__name__}: each SID item must be "
                     f"{expected_width} codes (len(codebook)); rows {bad} have "
-                    f"{[sizes[i] for i in bad]} — anomalous sample(s)."
+                    f"{[sizes[i] for i in bad]} -- anomalous sample(s)."
                 )
 
-        # TODO: The truncation logic should not be placed here, but should be
-        # handled in FG. Since FG currently cannot control the truncation
-        # direction (it keeps the HEAD), this may result in truncating the most
-        # recent SIDs. Check it.
+        # TODO(shuqi): move truncation into FG once FG can keep the TAIL, not the HEAD.
         if max_codes:
             keep = (max_codes // self._num_levels) * self._num_levels
             if keep and any(n > keep for n in sizes):
@@ -453,18 +402,6 @@ class GenerativeRecLM(BaseModel):
         tokens = self._tokenize_sids(codes, level_ids)
         return list(torch.split(tokens, sizes))
 
-    def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Family hook: build inputs, run the HF forward, return ``{"loss": ...}``.
-
-        Architecture-specific — the decoder-only implementation lives in
-        ``Qwen2RecLM``; other families (GPT-NeoX, Mamba, T5, …) need their own.
-        See design §15.4/§16. Subclasses MUST implement this.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} must implement predict "
-            f"(GenerativeRecLM is abstract)."
-        )
-
     def init_loss(self) -> None:
         """No-op: the loss is computed inside ``predict`` (HF loss_function)."""
         return
@@ -477,8 +414,6 @@ class GenerativeRecLM(BaseModel):
         """Surface the CE loss already computed in ``predict``."""
         return {"ce_loss": predictions["loss"]}
 
-    # BaseModel declares only the eval-side metric hooks, but the train loop
-    # calls both eval and train hooks, so both are overridden here.
     def init_metric(self) -> None:
         """Register a mean-CE metric for the eval loop."""
         self._metric_modules["ce_loss"] = torchmetrics.MeanMetric()
@@ -492,15 +427,11 @@ class GenerativeRecLM(BaseModel):
         """Update the mean-CE metric with this batch's loss."""
         self._metric_modules["ce_loss"].update(predictions["loss"].detach())
 
-    def init_train_metric(self) -> None:
-        """No-op: no train-time metric beyond the logged CE loss."""
-        return
-
+    # NOTE: BaseModel declares no such hook, but the train loop calls it.
     def update_train_metric(
         self,
         predictions: Dict[str, torch.Tensor],
         batch: Batch,
-        losses: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
         """No-op: no train-time metric beyond the logged CE loss."""
         return

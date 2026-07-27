@@ -146,7 +146,6 @@ def _create_model(
         labels (list): list of label names.
         sample_weights (list): list of sample weight names.
         sampler_type (str): negative sampler type
-
     Return:
         model: a EasyRec Model.
     """
@@ -739,16 +738,9 @@ def train_and_evaluate(
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
     )
-    # Cold-start gate (training-only). `_create_model` builds the EMPTY extended
-    # architecture (GenerativeRecLM: from_config, no weight download). On a fresh
-    # run (no checkpoint to resume/fine-tune — same `ckpt_path is None` signal the
-    # DCP-restore branch at L420-433 keys off) we load the pretrained HF weights
-    # ONCE here, before TrainWrapper/DMP wrapping and before any DCP restore. On
-    # resume/fine-tune (`ckpt_path` set) we skip it: DCP `load_state_dict` fills
-    # the weights. eval/export never reach this path — they always DCP-restore an
-    # empty model. (See design §1.)
+    # Cold start only; a resumed or fine-tuned run gets its weights from DCP.
     if ckpt_path is None:
-        model.init_from_pretrained()  # no-op unless the model has a pretrained source
+        model.init_from_pretrained()
     model = TrainWrapper(
         model, device=device, mixed_precision=train_config.mixed_precision
     )
@@ -1046,17 +1038,19 @@ def export(
         else:
             checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
-    # Explicit export-format branch (driven by export_config.export_format).
-    # HF: a standalone DCP->HF conversion — NO model build, NO DCP restore, NO
-    # from_pretrained. `dcp_to_hf` reads everything from the self-contained
-    # checkpoint dir (DCP weights + co-located config/tokenizer) and writes a
-    # `from_pretrained`-loadable dir. Done before _create_model so we never
-    # instantiate the model for HF export (design §2).
+    # HF export converts the checkpoint dir directly -- no model build, no DCP restore.
     if pipeline_config.export_config.export_format == export_pb2.ExportFormat.HF:
-        if checkpoint_path is None:
+        if not checkpoint_path:
             raise ValueError("HF export: no checkpoint found to convert.")
+        if not os.path.exists(os.path.join(checkpoint_path, "config.json")):
+            raise ValueError(
+                f"HF export: {checkpoint_path} has no co-located HF assets; it "
+                f"was not written by an HF-backed model."
+            )
+        if assets:
+            logger.warning(f"HF export ignores asset_files: {assets}.")
         if is_rank_zero:
-            from tzrec.utils.export_util import dcp_to_hf
+            from tzrec.utils.hf_export_util import dcp_to_hf
 
             dcp_to_hf(checkpoint_path, export_dir)
         return
