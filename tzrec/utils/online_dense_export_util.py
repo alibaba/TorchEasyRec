@@ -36,8 +36,9 @@ current.json:
 - Build each version under a temporary directory, write ``READY``, then rename
   it atomically into place.
 - Only after the rename, atomically replace ``current.json`` with ``version``,
-  ``checkpoint_step``, ``data_timestamp``, and ``created_at``. The processor
-  reads only the version it names; step/timestamp align dense and sparse state.
+  ``checkpoint_step``, ``data_timestamp``, and ``created_at``.
+- The processor reads only the version named by ``current.json``; step/timestamp
+  align dense and sparse state.
 """
 
 import datetime
