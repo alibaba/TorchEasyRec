@@ -71,6 +71,11 @@ message FeatureStoreConfig {
     // FeatureStore (e.g. for the offline readback checker); by default the
     // delta is handed to the uploader in memory and never touches disk.
     optional bool retain_local_dump = 17 [default = false];
+    // Wire format for delta upload. "ARROW" (default) streams a columnar Arrow
+    // IPC batch through write_features_arrow(), avoiding the JSON path's per-row
+    // dict construction and embedding deep-copy; "JSON" keeps the legacy
+    // write_features() per-row payload. Both paths use MERGE write_mode.
+    optional string upload_format = 18 [default = "ARROW"];
 }
 
 message DeltaEmbeddingDumpConfig {

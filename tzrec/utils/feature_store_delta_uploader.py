@@ -46,6 +46,8 @@ FEATURE_STORE_SK_FIELD = "key_id"
 FEATURE_STORE_VALUE_FIELD = "embedding"
 FEATURE_STORE_WRITE_MODE = "MERGE"
 FEATURE_STORE_SDK_BATCH_SIZE = 1000
+FEATURE_STORE_UPLOAD_FORMAT_DEFAULT = "ARROW"
+FEATURE_STORE_UPLOAD_FORMATS = ("ARROW", "JSON")
 
 # Default FeatureStore entity used when a DynamicEmbedding FeatureView has to be
 # created. The entity is provisioned on demand by the rank-zero uploader, so
@@ -54,6 +56,22 @@ FEATURE_STORE_DEFAULT_ENTITY_NAME = "default_dynemb_entity"
 FEATURE_STORE_DEFAULT_ENTITY_JOIN_ID = "default_dynemb_join_id"
 
 _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES = 100
+
+
+@dataclass(frozen=True)
+class _DeltaBatch:
+    """Decoded view of one delta RecordBatch shared by both upload paths.
+
+    PK values are pre-remapped (INPUT_TILE=3 user-side keys -> non-user twin
+    keys); the raw table_fqn is retained only for contract/dimension checks.
+    """
+
+    num_rows: int
+    remapped_fqns: List[str]
+    key_ids: np.ndarray
+    embedding_column: pa.Array
+    flat_embeddings: np.ndarray
+    offsets: np.ndarray
 
 
 class FeatureStoreUploadError(RuntimeError):
@@ -82,6 +100,7 @@ class FeatureStoreUploadSettings:
     shutdown_timeout_secs: int
     max_pending_steps: int
     poll_interval_secs: int
+    upload_format: str
 
     @classmethod
     def from_proto(cls, config: FeatureStoreConfig) -> "FeatureStoreUploadSettings":
@@ -140,6 +159,16 @@ class FeatureStoreUploadSettings:
                 "exactly one FeatureStore SDK HTTP batch"
             )
 
+        upload_format = (
+            (config.upload_format or FEATURE_STORE_UPLOAD_FORMAT_DEFAULT)
+            .strip()
+            .upper()
+        )
+        if upload_format not in FEATURE_STORE_UPLOAD_FORMATS:
+            raise ValueError(
+                "feature_store_config.upload_format must be one of "
+                f"{FEATURE_STORE_UPLOAD_FORMATS}, got {upload_format!r}"
+            )
         return cls(
             region=region,
             endpoint=endpoint,
@@ -155,6 +184,7 @@ class FeatureStoreUploadSettings:
             shutdown_timeout_secs=positive_values["shutdown_timeout_secs"],
             max_pending_steps=positive_values["max_pending_steps"],
             poll_interval_secs=positive_values["poll_interval_secs"],
+            upload_format=upload_format,
         )
 
 
@@ -407,7 +437,12 @@ class FeatureStoreDeltaUploader:
         view = self._get_view()
         max_in_flight = int(getattr(view, "_max_workers", 1))
 
-        total_batches = self._count_total_batches(table)
+        # Materialize the actual batch list so the ts range covers every batch
+        # the SDK will see. to_batches() splits each physical chunk independently,
+        # so ceil(total_rows / batch_size) undercounts multi-chunk (multi-FQN)
+        # tables and lets consecutive steps' timestamps collide.
+        batches = list(table.to_batches(max_chunksize=self._settings.upload_batch_size))
+        total_batches = len(batches) or 1
         ts_range = self._allocate_timestamp_range(total_batches)
         range_start = ts_range[0]
 
@@ -430,22 +465,16 @@ class FeatureStoreDeltaUploader:
         )
 
         try:
-            for batch in table.to_batches(
-                max_chunksize=self._settings.upload_batch_size
-            ):
+            for batch in batches:
                 self._raise_if_aborting()
-                payload = self._validate_and_build_payload(batch)
-                if not payload:
-                    continue
-                view.write_features(
-                    data=payload,
-                    version=self._settings.version,
-                    write_mode=FEATURE_STORE_WRITE_MODE,
-                    ts=range_start + completed_batches,
+                num_rows = self._submit_one_batch(
+                    view, batch, range_start + completed_batches
                 )
+                if num_rows == 0:
+                    continue
                 completed_batches += 1
                 window_batches += 1
-                window_records += len(payload)
+                window_records += num_rows
 
                 if window_batches < max_in_flight and completed_batches < total_batches:
                     continue
@@ -498,23 +527,64 @@ class FeatureStoreDeltaUploader:
             time.monotonic() - started_at,
         )
 
-    def _count_total_batches(self, table: pa.Table) -> int:
-        """Count the number of upload batches in one step's delta table."""
-        total_rows = int(table.num_rows)
-        if total_rows == 0:
-            return 1
-        return (
-            total_rows + self._settings.upload_batch_size - 1
-        ) // self._settings.upload_batch_size
+    def _submit_one_batch(self, view: Any, batch: pa.RecordBatch, ts: int) -> int:
+        """Validate, build, and submit one batch; return submitted rows (0 skip).
 
-    def _validate_and_build_payload(
-        self,
-        batch: pa.RecordBatch,
-    ) -> List[Dict[str, Any]]:
-        """Validate one delta batch and build the SDK payload."""
+        Dispatches on upload_format: ARROW streams a columnar RecordBatch through
+        write_features_arrow(); JSON falls back to the per-row write_features()
+        payload. Both reuse _validate_delta_batch so invariants are identical.
+        """
+        if self._settings.upload_format == FEATURE_STORE_UPLOAD_FORMAT_DEFAULT:
+            wire_batch, num_rows = self._validate_and_build_arrow_batch(batch)
+            if num_rows == 0:
+                return 0
+            view.write_features_arrow(
+                batch=wire_batch,
+                version=self._settings.version,
+                write_mode=FEATURE_STORE_WRITE_MODE,
+                ts=ts,
+            )
+        else:
+            payload = self._validate_and_build_payload(batch)
+            num_rows = len(payload)
+            if num_rows == 0:
+                return 0
+            view.write_features(
+                data=payload,
+                version=self._settings.version,
+                write_mode=FEATURE_STORE_WRITE_MODE,
+                ts=ts,
+            )
+        return num_rows
+
+    def _validate_delta_batch(self, batch: pa.RecordBatch) -> _DeltaBatch:
+        """Validate one delta batch and decode it for payload construction.
+
+        Enforces the table_fqn / key_id / embedding / dimension invariants shared
+        by the JSON and Arrow upload paths. PK values are pre-remapped here
+        (INPUT_TILE=3 user-side keys -> non-user twin keys); dimension checks key
+        against the raw table_fqn, which is how the model contract is indexed.
+
+        Args:
+            batch: One delta RecordBatch from the in-memory delta table.
+
+        Returns:
+            Decoded _DeltaBatch; num_rows==0 when the batch carries no rows.
+
+        Raises:
+            ValueError: On empty table_fqn, contract mismatch, reserved
+                key_id=-1, NaN/Inf embeddings, or dimension mismatch.
+        """
         num_rows = batch.num_rows
         if num_rows == 0:
-            return []
+            return _DeltaBatch(
+                num_rows=0,
+                remapped_fqns=[],
+                key_ids=np.empty(0, dtype=np.int64),
+                embedding_column=batch.column("embedding"),
+                flat_embeddings=np.empty(0, dtype=np.float32),
+                offsets=np.array([0], dtype=np.int32),
+            )
         table_fqns = batch.column("table_fqn").to_pylist()
         for table_fqn in set(table_fqns):
             if not table_fqn:
@@ -533,10 +603,15 @@ class FeatureStoreDeltaUploader:
             )
 
         embedding_column = cast(pa.ListArray, batch.column("embedding"))
-        flat_embeddings = embedding_column.values.to_numpy(zero_copy_only=False)
-        if not bool(np.isfinite(flat_embeddings).all()):
-            raise ValueError("delta embedding contains NaN or Inf")
         offsets = embedding_column.offsets.to_numpy()
+        flat_embeddings = embedding_column.values.to_numpy(zero_copy_only=False)
+        # A sliced ListArray shares the whole chunk's child buffer, so scanning
+        # flat_embeddings in full would re-scan the chunk on every batch. Bound
+        # the NaN/Inf check to this batch's value range [offsets[0], offsets[-1]).
+        value_start = int(offsets[0])
+        value_end = int(offsets[-1])
+        if not bool(np.isfinite(flat_embeddings[value_start:value_end]).all()):
+            raise ValueError("delta embedding contains NaN or Inf")
         lengths = np.diff(offsets)
         expected_dims = np.array(
             [self._embedding_dimensions[fqn] for fqn in table_fqns],
@@ -551,16 +626,61 @@ class FeatureStoreDeltaUploader:
                 f"actual={int(lengths[row])}"
             )
 
+        remap_cache = {fqn: remap_input_tile_user_key(fqn) for fqn in set(table_fqns)}
+        remapped_fqns = [remap_cache[fqn] for fqn in table_fqns]
+        return _DeltaBatch(
+            num_rows=num_rows,
+            remapped_fqns=remapped_fqns,
+            key_ids=key_ids,
+            embedding_column=embedding_column,
+            flat_embeddings=flat_embeddings,
+            offsets=offsets,
+        )
+
+    def _validate_and_build_payload(
+        self,
+        batch: pa.RecordBatch,
+    ) -> List[Dict[str, Any]]:
+        """Validate one delta batch and build the JSON SDK payload."""
+        delta = self._validate_delta_batch(batch)
+        if delta.num_rows == 0:
+            return []
         return [
             {
-                FEATURE_STORE_PK_FIELD: remap_input_tile_user_key(table_fqns[i]),
-                FEATURE_STORE_SK_FIELD: int(key_ids[i]),
-                FEATURE_STORE_VALUE_FIELD: flat_embeddings[
-                    int(offsets[i]) : int(offsets[i + 1])
+                FEATURE_STORE_PK_FIELD: delta.remapped_fqns[i],
+                FEATURE_STORE_SK_FIELD: int(delta.key_ids[i]),
+                FEATURE_STORE_VALUE_FIELD: delta.flat_embeddings[
+                    int(delta.offsets[i]) : int(delta.offsets[i + 1])
                 ].copy(),
             }
-            for i in range(num_rows)
+            for i in range(delta.num_rows)
         ]
+
+    def _validate_and_build_arrow_batch(
+        self,
+        batch: pa.RecordBatch,
+    ) -> Tuple[Optional[pa.RecordBatch], int]:
+        """Validate one delta batch and build the Arrow IPC wire batch.
+
+        Returns a RecordBatch with the configured PK/SK/embedding field names so
+        the SDK remaps them to its wire (pk/sk/embedding) columns. The embedding
+        column is reused zero-copy; only the string PK column and the int64 SK
+        column are rebuilt, avoiding the JSON path's per-row embedding deep-copy.
+        """
+        delta = self._validate_delta_batch(batch)
+        if delta.num_rows == 0:
+            return None, 0
+        pk_column = pa.array(delta.remapped_fqns, type=pa.string())
+        sk_column = pa.array(delta.key_ids, type=pa.int64())
+        wire_batch = pa.RecordBatch.from_arrays(
+            [pk_column, sk_column, delta.embedding_column],
+            names=[
+                FEATURE_STORE_PK_FIELD,
+                FEATURE_STORE_SK_FIELD,
+                FEATURE_STORE_VALUE_FIELD,
+            ],
+        )
+        return wire_batch, delta.num_rows
 
     @staticmethod
     def _create_credentials_client() -> Any:

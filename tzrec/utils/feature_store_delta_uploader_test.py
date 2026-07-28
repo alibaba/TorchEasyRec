@@ -16,6 +16,7 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
 import pyarrow as pa
 from google.protobuf.descriptor import FieldDescriptor
 
@@ -81,6 +82,7 @@ class _FakeView:
 
     def __init__(self, summaries=None, close_error=None, max_workers=4):
         self.calls = []
+        self.arrow_calls = []
         self.closed = []
         self.flush_calls = []
         self._summaries = list(summaries or [])
@@ -92,6 +94,31 @@ class _FakeView:
     def write_features(self, **kwargs):
         self.calls.append(kwargs)
         self._pending_sizes.append(len(kwargs["data"]))
+
+    def write_features_arrow(self, *, batch, version, write_mode, ts):
+        # Decode the Arrow wire batch into the same {data, version, write_mode,
+        # ts} call shape as write_features, so the existing JSON-path assertions
+        # also exercise the default Arrow path unchanged. The raw batch is kept
+        # on arrow_calls for column-type / column-name assertions.
+        self.arrow_calls.append(
+            {"batch": batch, "version": version, "write_mode": write_mode, "ts": ts}
+        )
+        data = [
+            {
+                self.pk_field: pk,
+                self.sk_field: int(sk),
+                self.embedding_field: np.asarray(emb, dtype=np.float32),
+            }
+            for pk, sk, emb in zip(
+                batch.column(self.pk_field).to_pylist(),
+                batch.column(self.sk_field).to_pylist(),
+                batch.column(self.embedding_field).to_pylist(),
+            )
+        ]
+        self.calls.append(
+            {"data": data, "version": version, "write_mode": write_mode, "ts": ts}
+        )
+        self._pending_sizes.append(len(data))
 
     def write_flush(self):
         pending_sizes = self._pending_sizes
@@ -268,6 +295,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "feature_view_shard_count",
             "feature_view_replication_count",
             "retain_local_dump",
+            "upload_format",
         ]
         fields = list(FeatureStoreConfig.DESCRIPTOR.fields)
 
@@ -288,7 +316,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         )
         self.assertEqual(
             [field.number for field in fields],
-            [1, 2, 3] + list(range(5, 16)) + [17],
+            [1, 2, 3] + list(range(5, 16)) + [17, 18],
         )
         for field_name in required_fields:
             with self.subTest(field_name=field_name):
@@ -761,6 +789,19 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             uploader.close()
         self.assertEqual(view.calls, [])
 
+        # Inf is also rejected (np.isfinite covers both; a regression to
+        # np.isnan would let Inf embeddings through undetected).
+        view = _FakeView()
+        uploader = self._uploader(
+            _feature_store_config(max_retries=1),
+            client_factory=_FakeClientFactory(view),
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [float("inf"), 2.0])]))
+        with self.assertRaises(FeatureStoreUploadError):
+            uploader.close()
+        self.assertEqual(view.calls, [])
+
     def test_in_memory_timestamp_monotonicity_across_steps(self):
         view = _FakeView()
         uploader = self._uploader(
@@ -841,6 +882,195 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             uploader.close()
         with self.assertRaises(FeatureStoreUploadError):
             uploader.check_error()
+
+    def test_default_upload_format_is_arrow(self):
+        # An unset upload_format inherits the proto default ARROW.
+        settings = FeatureStoreUploadSettings.from_proto(_feature_store_config())
+        self.assertEqual(settings.upload_format, "ARROW")
+
+    def test_rejects_unknown_upload_format(self):
+        config = _feature_store_config()
+        config.upload_format = "protobuf"
+        with self.assertRaisesRegex(ValueError, "upload_format must be one of"):
+            FeatureStoreUploadSettings.from_proto(config)
+
+    def test_json_path_routes_through_write_features(self):
+        # Explicit JSON keeps the legacy per-row write_features payload path.
+        view = _FakeView()
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(
+            _feature_store_config(upload_format="JSON"),
+            client_factory=factory,
+            clock_ms=lambda: 123456,
+        )
+        uploader.start()
+        uploader.submit(
+            10,
+            _delta_table(
+                [
+                    _row(10, 0, 1, [1.0, 2.0]),
+                    _row(10, 0, 2, [3.0, 4.0]),
+                    _row(10, 0, 3, [0.0, 0.0]),
+                ]
+            ),
+        )
+        uploader.close()
+
+        self.assertEqual(view.arrow_calls, [])
+        self.assertEqual(len(view.calls), 2)
+        self.assertEqual([len(call["data"]) for call in view.calls], [2, 1])
+        self.assertEqual(view.flush_calls, [[2, 1]])
+        self.assertEqual({call["version"] for call in view.calls}, {"model_a@export_1"})
+        self.assertEqual({call["write_mode"] for call in view.calls}, {"MERGE"})
+        self.assertEqual([call["ts"] for call in view.calls], [123456, 123457])
+        self.assertEqual(view.calls[0]["data"][0]["key_id"], 1)
+        self.assertEqual(
+            view.calls[0]["data"][0]["embedding_name"],
+            "model.ebc.embedding_bags.user_emb",
+        )
+        self.assertTrue(
+            np.array_equal(
+                view.calls[0]["data"][0]["embedding"],
+                np.array([1.0, 2.0], dtype=np.float32),
+            )
+        )
+        # The sliced second batch exercises the offset-indexed embedding slice.
+        self.assertTrue(
+            np.array_equal(
+                view.calls[1]["data"][0]["embedding"],
+                np.array([0.0, 0.0], dtype=np.float32),
+            )
+        )
+        self.assertEqual(view.closed, [True])
+
+    def test_arrow_path_builds_wire_batch_columns(self):
+        # Default ARROW path builds a wire RecordBatch whose configured field
+        # names the SDK remaps to its pk/sk/embedding wire columns.
+        view = _FakeView()
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(
+            _feature_store_config(upload_batch_size=2),
+            client_factory=factory,
+            clock_ms=lambda: 100,
+        )
+        uploader.start()
+        uploader.submit(
+            10,
+            _delta_table(
+                [
+                    _row(10, 0, 1, [1.0, 2.0]),
+                    _row(10, 0, 2, [3.0, 4.0]),
+                    _row(10, 0, 3, [5.0, 6.0]),
+                ]
+            ),
+        )
+        uploader.close()
+
+        self.assertEqual(len(view.arrow_calls), 2)
+        self.assertEqual([c["ts"] for c in view.arrow_calls], [100, 101])
+        self.assertEqual({c["version"] for c in view.arrow_calls}, {"model_a@export_1"})
+        self.assertEqual({c["write_mode"] for c in view.arrow_calls}, {"MERGE"})
+
+        batch0 = view.arrow_calls[0]["batch"]
+        self.assertEqual(batch0.schema.names, ["embedding_name", "key_id", "embedding"])
+        self.assertEqual(batch0.num_rows, 2)
+        # PK is the remapped table_fqn (string); SK stays int64 (the SDK casts to
+        # the string wire type); embedding is list<float32> reused zero-copy.
+        self.assertEqual(batch0.column("embedding_name").type, pa.string())
+        self.assertEqual(batch0.column("key_id").type, pa.int64())
+        self.assertEqual(batch0.column("embedding").type, pa.list_(pa.float32()))
+        self.assertEqual(
+            batch0.column("embedding_name").to_pylist(),
+            ["model.ebc.embedding_bags.user_emb"] * 2,
+        )
+        self.assertEqual(batch0.column("key_id").to_pylist(), [1, 2])
+        self.assertEqual(
+            batch0.column("embedding").to_pylist(),
+            [[1.0, 2.0], [3.0, 4.0]],
+        )
+        self.assertEqual(view.closed, [True])
+
+    def test_multi_chunk_table_keeps_timestamps_monotonic_across_steps(self):
+        # A multi-FQN delta table concatenates one chunk per FQN; to_batches()
+        # splits each chunk independently, so the ts range must cover every
+        # actual batch or a stuck clock reuses a prior step's timestamps and
+        # Next-Ts incremental readers miss updates.
+        view = _FakeView()
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(
+            _feature_store_config(upload_batch_size=1000),
+            client_factory=factory,
+            clock_ms=lambda: 100,
+            embedding_dimensions={
+                "model.ebc.embedding_bags.user_emb": 2,
+                "model.ebc.embedding_bags.item_emb": 2,
+            },
+        )
+        uploader.start()
+        rows_a = [_row(10, 0, k, [1.0, 2.0]) for k in range(5)]
+        rows_b = [_row(10, 0, k, [3.0, 4.0], name="item_emb") for k in range(5)]
+        table = pa.concat_tables([_delta_table(rows_a), _delta_table(rows_b)])
+        uploader.submit(10, table)
+        uploader.submit(20, table)
+        uploader.close()
+
+        ts_values = [call["ts"] for call in view.calls]
+        # Two chunks -> two batches per step; the stuck clock forces step 2 to
+        # start strictly after step 1's last ts (101), i.e. 102.
+        self.assertEqual(ts_values, [100, 101, 102, 103])
+        self.assertEqual([len(call["data"]) for call in view.calls], [5, 5, 5, 5])
+        self.assertEqual(view.closed, [True])
+
+    def test_mixed_fqn_dimensions_validated_per_row(self):
+        # _validate_delta_batch keys the expected dimension per row, so a batch
+        # carrying multiple FQNs with different dimensions must not be
+        # mis-flagged as a dimension mismatch.
+        view = _FakeView()
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(
+            _feature_store_config(upload_batch_size=1000),
+            client_factory=factory,
+            clock_ms=lambda: 100,
+            embedding_dimensions={
+                "model.ebc.embedding_bags.user_emb": 2,
+                "model.ebc.embedding_bags.item_emb": 3,
+            },
+        )
+        uploader.start()
+        uploader.submit(
+            10,
+            _delta_table(
+                [
+                    _row(10, 0, 1, [1.0, 2.0]),
+                    _row(10, 0, 2, [3.0, 4.0, 5.0], name="item_emb"),
+                ]
+            ),
+        )
+        uploader.close()
+
+        self.assertEqual(len(view.calls), 1)
+        self.assertEqual(len(view.calls[0]["data"]), 2)
+        self.assertEqual(
+            view.calls[0]["data"][0]["embedding_name"],
+            "model.ebc.embedding_bags.user_emb",
+        )
+        self.assertEqual(
+            view.calls[0]["data"][1]["embedding_name"],
+            "model.ebc.embedding_bags.item_emb",
+        )
+        self.assertTrue(
+            np.array_equal(
+                view.calls[0]["data"][0]["embedding"],
+                np.array([1.0, 2.0], dtype=np.float32),
+            )
+        )
+        self.assertTrue(
+            np.array_equal(
+                view.calls[0]["data"][1]["embedding"],
+                np.array([3.0, 4.0, 5.0], dtype=np.float32),
+            )
+        )
+        self.assertEqual(view.closed, [True])
 
 
 if __name__ == "__main__":
