@@ -561,10 +561,7 @@ class OnlineDenseExportManager:
         if data_ts is not None:
             # advance the watermark on every export
             self._last_data_ts = data_ts
-        if dense_ema is None:
-            self._gather_and_submit(step, data_timestamp, model)
-        else:
-            self._gather_and_submit(step, data_timestamp, model, dense_ema)
+        self._gather_and_submit(step, data_timestamp, model, dense_ema)
 
     def _gather_and_submit(
         self,

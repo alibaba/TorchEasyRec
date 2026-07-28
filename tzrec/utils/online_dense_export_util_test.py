@@ -660,7 +660,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                             mgr.maybe_export(step, -1.0, model)
                         gather.assert_not_called()
                         mgr.maybe_export(5, -1.0, model)
-                        gather.assert_called_once_with(5, -1.0, model)
+                        gather.assert_called_once_with(5, -1.0, model, None)
                         # same step (even forced) is deduped
                         mgr.maybe_export(5, -1.0, model, final=True)
                         gather.assert_called_once()
