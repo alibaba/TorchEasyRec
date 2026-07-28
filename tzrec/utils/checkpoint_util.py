@@ -90,7 +90,6 @@ def remap_input_tile_user_key(
 
 # queue token meaning "run a prune pass"; ``None`` means "stop the worker".
 _PRUNE_REQUEST = object()
-DENSE_EMA_CKPT_DIR = "dense_ema"
 
 
 class PartialLoadPlanner(DefaultLoadPlanner):
@@ -972,7 +971,7 @@ def restore_model(
     meta_path = os.path.join(checkpoint_dir, "meta")
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
-    dense_ema_ckpt_path = os.path.join(checkpoint_dir, DENSE_EMA_CKPT_DIR)
+    dense_ema_ckpt_path = os.path.join(checkpoint_dir, "dense_ema")
 
     cur_world_size = dist.get_world_size() if dist.is_initialized() else 1
     needs_mch_redistribution = _needs_mch_redistribution(
@@ -1132,7 +1131,7 @@ def save_model(
     if dense_ema is not None:
         save(
             dense_ema.state_dict(),
-            checkpoint_id=os.path.join(checkpoint_dir, DENSE_EMA_CKPT_DIR),
+            checkpoint_id=os.path.join(checkpoint_dir, "dense_ema"),
         )
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbDump
