@@ -17,11 +17,18 @@ subclass (e.g. ``Qwen2RecLM``) implements ``_build_prompt_tokens`` and
 ``GenerativeRecLMConfig`` (see ``protos/models/generative_model.proto``).
 """
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 import torchmetrics
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -30,30 +37,6 @@ from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import generative_model_pb2
-
-if TYPE_CHECKING:
-    from transformers import PreTrainedModel, PreTrainedTokenizerBase
-
-
-def _hf_auto_classes() -> Tuple[Any, Any, Any]:
-    """Import the HF Auto classes lazily.
-
-    ``transformers`` is an optional, multi-hundred-MB dependency needed only by
-    this model family. Importing it at module scope would make it mandatory for
-    the whole package, because ``load_class.auto_import`` re-raises any import
-    failure under ``tzrec/models/`` out of ``import tzrec``.
-
-    Raises:
-        ImportError: if ``transformers`` is not installed.
-    """
-    try:
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-    except ImportError as e:
-        raise ImportError(
-            "transformers is required for generative-recommendation LMs. "
-            "Install via `pip install transformers==4.51.2`."
-        ) from e
-    return AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 class GenerativeRecLM(BaseModel):
@@ -94,7 +77,7 @@ class GenerativeRecLM(BaseModel):
         self.init_input()
 
     @staticmethod
-    def _resolve_pad_token_id(tokenizer: "PreTrainedTokenizerBase") -> int:
+    def _resolve_pad_token_id(tokenizer: PreTrainedTokenizerBase) -> int:
         """Pad id for the left-padded splice, falling back to eos."""
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
@@ -164,33 +147,31 @@ class GenerativeRecLM(BaseModel):
             )
         return g
 
-    def _build_backbone(self) -> "PreTrainedModel":
+    def _build_backbone(self) -> PreTrainedModel:
         """Build the EMPTY extended architecture -- no weight download.
 
         Only the module shapes matter here; the weights arrive from
         ``init_from_pretrained`` (cold start) or DCP (restore/eval).
         """
-        auto_config, auto_causal_lm, _ = _hf_auto_classes()
         hf_model_id = self._model_config.hf_model_id
         if not hf_model_id:
             raise ValueError(f"{type(self).__name__}: empty hf_model_id.")
-        hf_cfg = auto_config.from_pretrained(hf_model_id)
-        lm = auto_causal_lm.from_config(hf_cfg, torch_dtype=self._param_dtype)
+        hf_cfg = AutoConfig.from_pretrained(hf_model_id)
+        lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=self._param_dtype)
         if next(lm.parameters()).dtype != self._param_dtype:
             lm = lm.to(self._param_dtype)
         return lm
 
     def _build_extended_tokenizer(
         self, sid_atoms: int
-    ) -> Tuple["PreTrainedTokenizerBase", int]:
+    ) -> Tuple[PreTrainedTokenizerBase, int]:
         """Add the SID atoms ``C0..C{sid_atoms-1}`` and resize ``self.lm``.
 
         Returns ``(tokenizer, base)`` where ``base`` is the tokenizer's next free
         id BEFORE adding the atoms -- use ``len(tokenizer)``, NOT
         ``config.vocab_size`` (which counts reserved slots).
         """
-        _, _, auto_tokenizer = _hf_auto_classes()
-        tokenizer = auto_tokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             self._model_config.hf_model_id, use_fast=True
         )
         base = len(tokenizer)
@@ -226,10 +207,9 @@ class GenerativeRecLM(BaseModel):
         are drawn from the global RNG and therefore differ per rank; DDP's
         ``_sync_module_states`` broadcast from rank 0 is what makes them agree.
         """
-        _, auto_causal_lm, _ = _hf_auto_classes()
         # drop the empty arch first: holding both peaks at 2x model host RAM.
         self.lm = None
-        lm = auto_causal_lm.from_pretrained(
+        lm = AutoModelForCausalLM.from_pretrained(
             self._model_config.hf_model_id,
             torch_dtype=self._param_dtype,
             low_cpu_mem_usage=True,
@@ -239,16 +219,16 @@ class GenerativeRecLM(BaseModel):
         )
         self.lm = lm
 
-    def hf_backbone(self) -> "PreTrainedModel":
+    def hf_backbone(self) -> PreTrainedModel:
         """The HF backbone module, for checkpoint/export asset writing."""
         return self.lm
 
-    def hf_tokenizer(self) -> "PreTrainedTokenizerBase":
+    def hf_tokenizer(self) -> PreTrainedTokenizerBase:
         """The extended tokenizer (base vocab + C0..C{sum-1}) to serialize."""
         return self._hf_tokenizer
 
     def _build_prompt_tokens(
-        self, tokenizer: "PreTrainedTokenizerBase", cfg: Any
+        self, tokenizer: PreTrainedTokenizerBase, cfg: Any
     ) -> None:
         """Family hook: cache the tokenised prompt template as buffers.
 

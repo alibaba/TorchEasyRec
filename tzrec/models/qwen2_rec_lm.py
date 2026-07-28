@@ -15,10 +15,11 @@ Owns the decoder-only-chat implementation: the ChatML prompt template, the
 causal-LM splice, and the ``.model``/``.lm_head`` forward.
 """
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
+from transformers import PreTrainedTokenizerBase
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -26,10 +27,6 @@ from tzrec.models.generative_rec_lm import GenerativeRecLM
 from tzrec.modules.escalating_beam import escalating_beam_search
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import generative_model_pb2
-
-if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
-
 
 QWEN2_TEMPLATE = {
     "system_prefix": "<|im_start|>system\n",
@@ -92,7 +89,7 @@ class Qwen2RecLM(GenerativeRecLM):
 
     def _build_prompt_tokens(
         self,
-        tokenizer: "PreTrainedTokenizerBase",
+        tokenizer: PreTrainedTokenizerBase,
         cfg: generative_model_pb2.Qwen2RecLM,
     ) -> None:
         """Tokenise the family chat template once; cache as buffers.

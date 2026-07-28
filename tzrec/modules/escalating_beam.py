@@ -9,22 +9,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Escalating-beam SID decode (torch-only, no tzrec deps).
+"""Escalating-beam SID decode (no tzrec deps).
 
 The beam width doubles at every SID level, so early levels are pruned hard.
 """
 
-from typing import TYPE_CHECKING, List, Tuple
+from typing import List, Tuple
 
 import torch
-
-if TYPE_CHECKING:
-    from transformers import PreTrainedModel
+from transformers import PreTrainedModel
 
 
 @torch.no_grad()
 def escalating_beam_search(
-    model: "PreTrainedModel",
+    model: PreTrainedModel,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     *,
