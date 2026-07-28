@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
 import os
 import shutil
 import unittest
@@ -40,6 +39,7 @@ from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
+    cleanup_cuda_memory,
     create_test_model,
     gpu_unavailable,
     make_test_dir,
@@ -330,10 +330,7 @@ def _build_batch(device: torch.device, channel_names: List[str]) -> Batch:
 @mark_ci_scope("gpu")
 class UltraHSTUTest(unittest.TestCase):
     def teardown_example(self, example):
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.memory_summary()
+        cleanup_cuda_memory()
 
     def setUp(self):
         self.test_dir = None

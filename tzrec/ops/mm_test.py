@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
 import unittest
 from typing import Optional
 
@@ -18,17 +17,19 @@ from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import get_test_dtypes, gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import (
+    cleanup_cuda_memory,
+    get_test_dtypes,
+    gpu_unavailable,
+    mark_ci_scope,
+)
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
 @mark_ci_scope("h20", "gpu")
 class MMlTest(unittest.TestCase):
     def teardown_example(self, example):
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.memory_summary()  # prevent oom
+        cleanup_cuda_memory()
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
