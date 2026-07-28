@@ -366,7 +366,6 @@ class ExportUtilTest(unittest.TestCase):
             feature_store_config = dump_config.feature_store_config
             feature_store_config.region = "cn-test"
             feature_store_config.project_name = "project_a"
-            feature_store_config.feature_entity_name = "embedding_entity"
             feature_store_config.feature_view_name = "shared_embeddings"
             feature_store_config.version = "model_a@export_1"
             model_acc = {"SPARSE_INT64": "1", "cand_seq_pk": "cand_seq"}

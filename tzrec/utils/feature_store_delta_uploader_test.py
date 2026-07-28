@@ -22,6 +22,8 @@ from google.protobuf.descriptor import FieldDescriptor
 from tzrec.protos.train_pb2 import FeatureStoreConfig
 from tzrec.utils.delta_embedding_dump import _DELTA_DUMP_SCHEMA
 from tzrec.utils.feature_store_delta_uploader import (
+    FEATURE_STORE_DEFAULT_ENTITY_JOIN_ID,
+    FEATURE_STORE_DEFAULT_ENTITY_NAME,
     FeatureStoreDeltaUploader,
     FeatureStoreUploadError,
     FeatureStoreUploadSettings,
@@ -32,7 +34,6 @@ def _feature_store_config(**overrides) -> FeatureStoreConfig:
     config = FeatureStoreConfig(
         region="cn-test",
         project_name="project_a",
-        feature_entity_name="embedding_entity",
         feature_view_name="shared_embeddings",
         version="model_a@export_1",
         upload_batch_size=2,
@@ -131,6 +132,11 @@ class _BlockingView(_FakeView):
         self.close_finished.set()
 
 
+class _FakeEntity:
+    def __init__(self, name):
+        self.feature_entity_name = name
+
+
 class _FakeProject:
     def __init__(
         self,
@@ -139,13 +145,19 @@ class _FakeProject:
         created_view=None,
         create_error=None,
         view_after_create_error=None,
+        entity="existing_entity",
+        entity_create_error=None,
     ):
         self._view = view
         self._created_view = created_view
         self._create_error = create_error
         self._view_after_create_error = view_after_create_error
+        self._entity = entity
+        self._entity_create_error = entity_create_error
         self.dynamic_get_calls = []
         self.create_calls = []
+        self.entity_get_calls = []
+        self.entity_create_calls = []
 
     def get_dynamic_embedding_feature_view(self, name):
         self.dynamic_get_calls.append(name)
@@ -158,6 +170,17 @@ class _FakeProject:
             raise self._create_error
         self._view = self._created_view or _FakeView()
         return self._view
+
+    def get_entity(self, name):
+        self.entity_get_calls.append(name)
+        return self._entity
+
+    def create_entity(self, name, join_id, parent_feature_entity_name=None):
+        self.entity_create_calls.append((name, join_id))
+        if self._entity_create_error is not None:
+            raise self._entity_create_error
+        self._entity = _FakeEntity(name)
+        return self._entity
 
 
 class _FakeCredential:
@@ -231,7 +254,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "region",
             "project_name",
             "feature_view_name",
-            "feature_entity_name",
             "version",
         ]
         optional_fields = [
@@ -266,7 +288,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         )
         self.assertEqual(
             [field.number for field in fields],
-            list(range(1, 16)) + [17],
+            [1, 2, 3] + list(range(5, 16)) + [17],
         )
         for field_name in required_fields:
             with self.subTest(field_name=field_name):
@@ -276,15 +298,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 self.assertIn(field_name, config.FindInitializationErrors())
                 with self.assertRaisesRegex(ValueError, field_name):
                     FeatureStoreUploadSettings.from_proto(config)
-
-    def test_feature_entity_is_required_for_view_creation(self):
-        config = _feature_store_config()
-        config.ClearField("feature_entity_name")
-
-        self.assertFalse(config.IsInitialized())
-        self.assertIn("feature_entity_name", config.FindInitializationErrors())
-        with self.assertRaisesRegex(ValueError, "feature_entity_name"):
-            FeatureStoreUploadSettings.from_proto(config)
 
     def test_version_is_required_and_must_be_explicit(self):
         config = _feature_store_config()
@@ -373,7 +386,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             [
                 {
                     "name": "shared_embeddings",
-                    "entity": "embedding_entity",
+                    "entity": FEATURE_STORE_DEFAULT_ENTITY_NAME,
                     "pk_field_name": "embedding_name",
                     "sk_field_name": "key_id",
                     "embedding_field_name": "embedding",
@@ -385,6 +398,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 }
             ],
         )
+        self.assertEqual(factory.project.entity_create_calls, [])
         self.assertEqual(created_view.closed, [True])
 
     def test_start_recovers_from_concurrent_feature_view_creation(self):
@@ -429,14 +443,77 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self.assertEqual(len(factory.project.create_calls), 1)
         self.assertEqual(created_view.closed, [True])
 
-    def test_start_reports_missing_entity_when_view_creation_fails(self):
-        factory = _FakeClientFactory(None, create_error=ValueError("Entity not found"))
+    def test_start_raises_when_view_creation_fails_and_view_never_appears(self):
+        factory = _FakeClientFactory(None, create_error=ValueError("boom"))
         uploader = self._uploader(client_factory=factory)
 
-        with self.assertRaisesRegex(RuntimeError, "feature_entity_name"):
+        with self.assertRaisesRegex(
+            RuntimeError, "failed to create configured DynamicEmbedding FeatureView"
+        ):
             uploader.start()
 
         self.assertEqual(len(factory.project.create_calls), 1)
+        self.assertEqual(factory.project.entity_create_calls, [])
+
+    def test_start_creates_default_entity_when_it_does_not_exist(self):
+        created_view = _FakeView()
+        factory = _FakeClientFactory(None, created_view=created_view, entity=None)
+        uploader = self._uploader(client_factory=factory)
+
+        uploader.start()
+        uploader.close()
+
+        self.assertEqual(
+            factory.project.entity_get_calls, [FEATURE_STORE_DEFAULT_ENTITY_NAME]
+        )
+        self.assertEqual(
+            factory.project.entity_create_calls,
+            [
+                (
+                    FEATURE_STORE_DEFAULT_ENTITY_NAME,
+                    FEATURE_STORE_DEFAULT_ENTITY_JOIN_ID,
+                )
+            ],
+        )
+        self.assertEqual(
+            factory.project.create_calls[0]["entity"],
+            FEATURE_STORE_DEFAULT_ENTITY_NAME,
+        )
+        self.assertEqual(created_view.closed, [True])
+
+    def test_start_recovers_from_concurrent_default_entity_creation(self):
+        created_view = _FakeView()
+        factory = _FakeClientFactory(
+            None,
+            created_view=created_view,
+            entity=None,
+            entity_create_error=RuntimeError("entity already exists"),
+        )
+        # A concurrent creator wins the race: the first get_entity sees no entity,
+        # create_entity then fails, and the entity is visible on the retry.
+        entity_results = [None, _FakeEntity(FEATURE_STORE_DEFAULT_ENTITY_NAME)]
+
+        def get_entity(name):
+            factory.project.entity_get_calls.append(name)
+            return entity_results.pop(0)
+
+        factory.project.get_entity = get_entity
+        uploader = self._uploader(client_factory=factory)
+
+        uploader.start()
+        uploader.close()
+
+        self.assertEqual(
+            factory.project.entity_create_calls,
+            [
+                (
+                    FEATURE_STORE_DEFAULT_ENTITY_NAME,
+                    FEATURE_STORE_DEFAULT_ENTITY_JOIN_ID,
+                )
+            ],
+        )
+        self.assertEqual(len(factory.project.create_calls), 1)
+        self.assertEqual(created_view.closed, [True])
 
     def test_non_primary_uploader_opens_view_without_create_or_metadata_checks(self):
         view = _FakeView()

@@ -47,6 +47,12 @@ FEATURE_STORE_VALUE_FIELD = "embedding"
 FEATURE_STORE_WRITE_MODE = "MERGE"
 FEATURE_STORE_SDK_BATCH_SIZE = 1000
 
+# Default FeatureStore entity used when a DynamicEmbedding FeatureView has to be
+# created. The entity is provisioned on demand by the rank-zero uploader, so
+# users never configure it; the join_id only needs to be a stable non-empty key.
+FEATURE_STORE_DEFAULT_ENTITY_NAME = "default_dynemb_entity"
+FEATURE_STORE_DEFAULT_ENTITY_JOIN_ID = "default_dynemb_join_id"
+
 _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES = 100
 
 
@@ -65,7 +71,6 @@ class FeatureStoreUploadSettings:
     region: str
     endpoint: str
     project_name: str
-    feature_entity_name: str
     feature_view_name: str
     feature_view_ttl_secs: int
     feature_view_shard_count: int
@@ -96,15 +101,10 @@ class FeatureStoreUploadSettings:
                 "(it may come from ALIBABA_CLOUD_REGION)"
             )
         project_name = config.project_name.strip()
-        feature_entity_name = config.feature_entity_name.strip()
         feature_view_name = config.feature_view_name.strip()
         version = config.version.strip()
         if not project_name:
             raise ValueError("feature_store_config.project_name must not be empty")
-        if not feature_entity_name:
-            raise ValueError(
-                "feature_store_config.feature_entity_name must not be empty"
-            )
         if not feature_view_name:
             raise ValueError("feature_store_config.feature_view_name must not be empty")
         if not version or version == "default":
@@ -144,7 +144,6 @@ class FeatureStoreUploadSettings:
             region=region,
             endpoint=endpoint,
             project_name=project_name,
-            feature_entity_name=feature_entity_name,
             feature_view_name=feature_view_name,
             feature_view_ttl_secs=positive_values["feature_view_ttl_secs"],
             feature_view_shard_count=feature_view_shard_count,
@@ -683,9 +682,10 @@ class FeatureStoreDeltaUploader:
         if view is None:
             create_error: Optional[Exception] = None
             try:
+                entity_name = self._get_or_create_entity(project)
                 view = project.create_dynamic_embedding_feature_view(
                     name=self._settings.feature_view_name,
-                    entity=self._settings.feature_entity_name,
+                    entity=entity_name,
                     pk_field_name=FEATURE_STORE_PK_FIELD,
                     sk_field_name=FEATURE_STORE_SK_FIELD,
                     embedding_field_name=FEATURE_STORE_VALUE_FIELD,
@@ -701,8 +701,7 @@ class FeatureStoreDeltaUploader:
                 view = self._wait_for_dynamic_embedding_view(project)
             if view is None:
                 error = RuntimeError(
-                    "failed to create configured DynamicEmbedding FeatureView; "
-                    "verify that feature_entity_name already exists"
+                    "failed to create configured DynamicEmbedding FeatureView"
                 )
                 if create_error is not None:
                     raise error from create_error
@@ -712,10 +711,37 @@ class FeatureStoreDeltaUploader:
             logger.info(
                 "Created DynamicEmbedding FeatureView: project=%s entity=%s view=%s",
                 self._settings.project_name,
-                self._settings.feature_entity_name,
+                FEATURE_STORE_DEFAULT_ENTITY_NAME,
                 self._settings.feature_view_name,
             )
         return view
+
+    def _get_or_create_entity(self, project: Any) -> str:
+        """Return the default DynamicEmbedding entity name, creating it if absent.
+
+        Only the rank-zero uploader runs this, immediately before it creates the
+        view, so there is no cross-rank race; a concurrent external creator is
+        handled by re-getting the entity if the create call fails.
+        """
+        if project.get_entity(FEATURE_STORE_DEFAULT_ENTITY_NAME) is not None:
+            return FEATURE_STORE_DEFAULT_ENTITY_NAME
+        try:
+            project.create_entity(
+                FEATURE_STORE_DEFAULT_ENTITY_NAME,
+                FEATURE_STORE_DEFAULT_ENTITY_JOIN_ID,
+            )
+        except Exception as exc:
+            if project.get_entity(FEATURE_STORE_DEFAULT_ENTITY_NAME) is None:
+                raise RuntimeError(
+                    "failed to create default DynamicEmbedding entity "
+                    f"{FEATURE_STORE_DEFAULT_ENTITY_NAME!r}"
+                ) from exc
+        logger.info(
+            "Created FeatureStore entity: project=%s entity=%s",
+            self._settings.project_name,
+            FEATURE_STORE_DEFAULT_ENTITY_NAME,
+        )
+        return FEATURE_STORE_DEFAULT_ENTITY_NAME
 
     def _wait_for_dynamic_embedding_view(self, project: Any) -> Any:
         """Bounded re-get after a concurrent or partially completed create."""
