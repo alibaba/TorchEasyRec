@@ -38,14 +38,14 @@ class DenseEMATest(unittest.TestCase):
 
         self.assertEqual(dense_ema.n_averaged.item(), 2)
         torch.testing.assert_close(
-            dense_ema.named_averaged_parameters()["parameter"],
+            dense_ema.state_dict()["parameter"],
             torch.tensor([3.0]),
         )
         with dense_ema.average_parameters():
             torch.testing.assert_close(parameter, torch.tensor([3.0]))
         torch.testing.assert_close(parameter, torch.tensor([4.0]))
         torch.testing.assert_close(
-            dense_ema.named_averaged_parameters()["parameter"],
+            dense_ema.state_dict()["parameter"],
             torch.tensor([3.0]),
         )
 
@@ -72,11 +72,9 @@ class DenseEMATest(unittest.TestCase):
         dense_ema.reset()
 
         self.assertEqual(dense_ema.n_averaged.item(), 0)
+        torch.testing.assert_close(dense_ema.state_dict()["first"], torch.tensor([3.0]))
         torch.testing.assert_close(
-            dense_ema.named_averaged_parameters()["first"], torch.tensor([3.0])
-        )
-        torch.testing.assert_close(
-            dense_ema.named_averaged_parameters()["second"], torch.tensor([4.0])
+            dense_ema.state_dict()["second"], torch.tensor([4.0])
         )
 
     def test_invalid_decay(self) -> None:
@@ -100,7 +98,7 @@ class DenseEMATest(unittest.TestCase):
 
         torch.testing.assert_close(parameter, torch.tensor([4.0]))
         torch.testing.assert_close(
-            dense_ema.named_averaged_parameters()["parameter"],
+            dense_ema.state_dict()["parameter"],
             torch.tensor([3.0]),
         )
 

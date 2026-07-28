@@ -584,9 +584,7 @@ class OnlineDenseExportManager:
         gathered: Dict[str, torch.Tensor] = {}
         if self._state_pairs:
             source_state = model.state_dict()
-            ema_state = (
-                dense_ema.named_averaged_parameters() if dense_ema is not None else {}
-            )
+            ema_state = dense_ema.state_dict() if dense_ema is not None else {}
             for gm_key, source_key in self._state_pairs:
                 value = ema_state.get(source_key, source_state[source_key])
                 if isinstance(value, DTensor):

@@ -54,19 +54,15 @@ class DenseEMA:
         """Update EMA parameters from the current dense parameters."""
         self._averaged_model.update_parameters(self._source)
 
-    def named_averaged_parameters(self) -> "OrderedDict[str, torch.Tensor]":
-        """Return EMA parameters keyed by their original model FQN."""
-        return OrderedDict(
+    def state_dict(self) -> "OrderedDict[str, torch.Tensor]":
+        """Return the distributed-checkpoint state for this EMA."""
+        state = OrderedDict(
             zip(
                 self._names,
                 self._averaged_model.module.parameters(),
                 strict=True,
             )
         )
-
-    def state_dict(self) -> "OrderedDict[str, torch.Tensor]":
-        """Return the distributed-checkpoint state for this EMA."""
-        state = self.named_averaged_parameters()
         state[DENSE_EMA_N_AVERAGED] = self.n_averaged
         return state
 

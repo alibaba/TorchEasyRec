@@ -585,7 +585,7 @@ class CheckpointUtilTest(unittest.TestCase):
                 torch.full_like(resumed_model.dense.weight, 4.0),
             )
             torch.testing.assert_close(
-                resumed_ema.named_averaged_parameters()["dense.weight"],
+                resumed_ema.state_dict()["dense.weight"],
                 torch.full_like(resumed_model.dense.weight, 3.0),
             )
             self.assertEqual(resumed_ema.n_averaged.item(), 2)
@@ -614,11 +614,11 @@ class CheckpointUtilTest(unittest.TestCase):
             )
         self.assertEqual(dense_ema.n_averaged.item(), 0)
         torch.testing.assert_close(
-            dense_ema.named_averaged_parameters()["weight"],
+            dense_ema.state_dict()["weight"],
             torch.full_like(model.weight, 3.0),
         )
         torch.testing.assert_close(
-            dense_ema.named_averaged_parameters()["bias"],
+            dense_ema.state_dict()["bias"],
             torch.full_like(model.bias, 4.0),
         )
 
@@ -655,11 +655,11 @@ class CheckpointUtilTest(unittest.TestCase):
 
         self.assertEqual(resumed_ema.n_averaged.item(), 1)
         torch.testing.assert_close(
-            resumed_ema.named_averaged_parameters()["weight"],
+            resumed_ema.state_dict()["weight"],
             torch.full_like(resumed_model.weight, 2.0),
         )
         torch.testing.assert_close(
-            resumed_ema.named_averaged_parameters()["bias"],
+            resumed_ema.state_dict()["bias"],
             torch.full_like(resumed_model.bias, 5.0),
         )
 
