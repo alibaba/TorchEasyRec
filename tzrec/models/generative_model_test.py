@@ -13,12 +13,15 @@ import types
 import unittest
 
 import torch
+from google.protobuf import text_format
 from torch import nn
 
-from tzrec.models.generative_rec_lm import GenerativeRecLM
+from tzrec.features.feature import create_features
+from tzrec.models.generative_model import BaseGenerativeModel
+from tzrec.models.generative_qwen import GenerativeQwen
 from tzrec.models.model import BaseModel
-from tzrec.models.qwen2_rec_lm import Qwen2RecLM
-from tzrec.protos import model_pb2
+from tzrec.protos import feature_pb2, model_pb2
+from tzrec.protos.models import generative_model_pb2
 
 
 class _FakeJT:
@@ -36,15 +39,50 @@ class _FakeJT:
         return self._l
 
 
-def _sid_feature(name="user_sequence", codebook=(2, 3, 4)):
-    """Minimal stand-in for SidFeature: the model only asks for the space."""
-    return types.SimpleNamespace(name=name, codebook=list(codebook))
+def _sid_feature(name="user_sequence", codebook=(2, 3, 4), prefix_text=""):
+    """A real SidFeature -- the model dispatches on the type, not on duck-typing."""
+    fc = feature_pb2.FeatureConfig()
+    text_format.Merge(
+        f'sequence_sid_feature {{ feature_name: "{name}" expression: "user:{name}" '
+        + " ".join(f"codebook: {c}" for c in codebook)
+        + f' prefix_text: "{prefix_text}" }}',
+        fc,
+    )
+    return create_features([fc])[0]
+
+
+def _common(**overrides):
+    """A fake ``GenerativeModelConfig`` -- only the fields the base actually reads."""
+    fields = {
+        "ignore_index": -100,
+        "generated_sids_key": "generated_sids",
+        "param_dtype": generative_model_pb2.FP32,
+        "vocab_pad_to_multiple_of": 128,
+        "max_sequence_length": 0,
+    }
+    return types.SimpleNamespace(**{**fields, **overrides})
+
+
+def _wired(features=None, group_type=model_pb2.JAGGED_SEQUENCE, members=None):
+    """Pre-``__init__`` state: the features/labels/groups the config-time code reads."""
+    m = object.__new__(GenerativeQwen)
+    nn.Module.__init__(m)
+    m._features = [_sid_feature()] if features is None else features
+    m._labels = ["label"]
+    m._feature_groups = [
+        types.SimpleNamespace(
+            group_name="user_seq",
+            feature_names=["user_sequence"] if members is None else list(members),
+            group_type=group_type,
+        )
+    ]
+    return m
 
 
 def _stub(codebook=None, base_vocab=100, device="cpu"):
-    """A Qwen2RecLM with the base data-prep state wired up, but no HF backbone."""
+    """A GenerativeQwen with the base data-prep state wired up, but no HF backbone."""
     codebook = codebook or [2, 3, 4]
-    m = object.__new__(Qwen2RecLM)
+    m = object.__new__(GenerativeQwen)
     nn.Module.__init__(m)
     m._base_vocab = base_vocab
     m._num_levels = len(codebook)
@@ -57,81 +95,76 @@ def _stub(codebook=None, base_vocab=100, device="cpu"):
     return m
 
 
-class GenerativeRecLMTest(unittest.TestCase):
+class BaseGenerativeModelTest(unittest.TestCase):
     def test_registry_dispatch(self) -> None:
-        self.assertIs(BaseModel.create_class("Qwen2RecLM"), Qwen2RecLM)
-        self.assertTrue(issubclass(Qwen2RecLM, GenerativeRecLM))
+        self.assertIs(BaseModel.create_class("GenerativeQwen"), GenerativeQwen)
+        self.assertTrue(issubclass(GenerativeQwen, BaseGenerativeModel))
 
     def test_model_config_oneof_resolves_to_the_class(self) -> None:
         # the path _create_model takes: oneof -> message type name -> class.
         from tzrec.utils import config_util
 
         cfg = model_pb2.ModelConfig()
-        cfg.qwen2_rec_lm.common.max_sequence_length = 8  # required field
-        self.assertEqual(config_util.which_msg(cfg, "model"), "Qwen2RecLM")
+        cfg.generative_qwen.common.max_sequence_length = 8  # required field
+        self.assertEqual(config_util.which_msg(cfg, "model"), "GenerativeQwen")
         self.assertIs(
-            BaseModel.create_class(config_util.which_msg(cfg, "model")), Qwen2RecLM
+            BaseModel.create_class(config_util.which_msg(cfg, "model")), GenerativeQwen
         )
 
     def test_resolve_pad_token_id(self) -> None:
         tok = types.SimpleNamespace
         self.assertEqual(
-            GenerativeRecLM._resolve_pad_token_id(tok(pad_token_id=5, eos_token_id=9)),
+            BaseGenerativeModel._resolve_pad_token_id(
+                tok(pad_token_id=5, eos_token_id=9)
+            ),
             5,
         )
         self.assertEqual(
-            GenerativeRecLM._resolve_pad_token_id(
+            BaseGenerativeModel._resolve_pad_token_id(
                 tok(pad_token_id=None, eos_token_id=9)
             ),
             9,
         )
         # neither -> a clear error, not an opaque int(None) TypeError
         with self.assertRaisesRegex(ValueError, "neither pad_token_id nor"):
-            GenerativeRecLM._resolve_pad_token_id(
+            BaseGenerativeModel._resolve_pad_token_id(
                 tok(pad_token_id=None, eos_token_id=None)
             )
 
     def test_backbone_owned_by_family_proto(self) -> None:
         from tzrec.protos.models.generative_model_pb2 import (
-            GenerativeRecLMConfig,
+            GenerativeModelConfig,
         )
         from tzrec.protos.models.generative_model_pb2 import (
-            Qwen2RecLM as Qwen2RecLMProto,
+            GenerativeQwen as GenerativeQwenProto,
         )
 
-        self.assertEqual(Qwen2RecLMProto().hf_model_id, "Qwen/Qwen2.5-0.5B")
-        common_fields = [f.name for f in GenerativeRecLMConfig.DESCRIPTOR.fields]
+        self.assertEqual(GenerativeQwenProto().hf_model_id, "Qwen/Qwen2.5-0.5B")
+        common_fields = [f.name for f in GenerativeModelConfig.DESCRIPTOR.fields]
         self.assertNotIn("hf_model_id", common_fields)
 
     def test_configurable_knob_defaults(self) -> None:
-        from tzrec.protos.models.generative_model_pb2 import GenerativeRecLMConfig
+        from tzrec.protos.models.generative_model_pb2 import GenerativeModelConfig
 
-        c = GenerativeRecLMConfig()
+        c = GenerativeModelConfig()
         self.assertEqual(c.generated_sids_key, "generated_sids")
-        self.assertEqual(c.param_dtype, "float32")
-        self.assertIs(Qwen2RecLM._DTYPE_BY_NAME["float32"], torch.float32)
-        self.assertIs(Qwen2RecLM._DTYPE_BY_NAME["bfloat16"], torch.bfloat16)
+        self.assertEqual(c.param_dtype, generative_model_pb2.FP32)
+        self.assertIs(
+            GenerativeQwen._PARAM_DTYPE[generative_model_pb2.FP32], torch.float32
+        )
+        self.assertIs(
+            GenerativeQwen._PARAM_DTYPE[generative_model_pb2.BF16], torch.bfloat16
+        )
 
     def test_read_common_config_reads_knobs(self) -> None:
-        m = object.__new__(Qwen2RecLM)
-        nn.Module.__init__(m)
-        m._features = [_sid_feature(codebook=(2, 3, 4))]
-        m._labels = ["label"]
-        m._feature_groups = [
-            types.SimpleNamespace(
-                group_name="user_seq",
-                feature_names=["user_sequence"],
-                group_type=model_pb2.JAGGED_SEQUENCE,
+        m = _wired()
+        sid_atoms = m._read_common_config(
+            _common(
+                max_sequence_length=288,
+                generated_sids_key="my_sids",
+                param_dtype=generative_model_pb2.BF16,
             )
-        ]
-        common = types.SimpleNamespace(
-            ignore_index=-100,
-            generated_sids_key="my_sids",
-            param_dtype="bfloat16",
-            vocab_pad_to_multiple_of=128,
-            max_sequence_length=288,
         )
-        sid_atoms = m._read_common_config(common)
         self.assertEqual(m._label_name, "label")  # from label_fields[0]
         self.assertEqual(m._generated_sids_key, "my_sids")
         self.assertIs(m._param_dtype, torch.bfloat16)
@@ -141,64 +174,58 @@ class GenerativeRecLMTest(unittest.TestCase):
         self.assertEqual(m._codebook_sizes.tolist(), [2, 3, 4])
         self.assertNotIn("_level_offsets", m.state_dict())
         self.assertNotIn("_codebook_sizes", m.state_dict())
-        # unknown dtype -> a clear error, not a KeyError
-        common.param_dtype = "float64"
-        with self.assertRaisesRegex(ValueError, "param_dtype must be one of"):
-            m._read_common_config(common)
+        # the enum is closed: protobuf itself rejects an unlisted value
+        cfg = generative_model_pb2.GenerativeModelConfig()
+        with self.assertRaises(ValueError):
+            cfg.param_dtype = 99
 
-    def test_read_common_config_no_feature_group_raises(self) -> None:
-        m = object.__new__(Qwen2RecLM)
-        nn.Module.__init__(m)
-        m._features = [_sid_feature(codebook=(2, 3, 4))]
-        m._labels = ["label"]
+    def test_read_common_config_tolerates_no_feature_group(self) -> None:
+        # group validation is prompt-driven, so it lives in _resolve_prompt_slots
+        m = _wired()
         m._feature_groups = []
-        common = types.SimpleNamespace(
-            ignore_index=-100,
-            generated_sids_key="generated_sids",
-            param_dtype="float32",
-            codebook=[4, 4, 4],
-            vocab_pad_to_multiple_of=128,
-            max_sequence_length=0,
-        )
-        # group validation moved to _resolve_prompt_slots (prompt-driven)
-        m._read_common_config(common)
+        m._read_common_config(_common())
         self.assertEqual(m._num_levels, 3)
 
-    def test_read_common_config_rejects_bad_group_and_codebook(self) -> None:
-        def _wired(group_type, feature_names=("user_sequence",)):
-            m = object.__new__(Qwen2RecLM)
-            nn.Module.__init__(m)
-            m._features = [_sid_feature(codebook=(2, 3, 4))]
-            m._labels = ["label"]
-            m._feature_groups = [
-                types.SimpleNamespace(
-                    group_name="user_seq",
-                    feature_names=list(feature_names),
-                    group_type=group_type,
-                )
-            ]
-            return m
+    def test_max_sequence_length_below_one_item_raises(self) -> None:
+        # a budget under num_levels floors to zero whole items, which would
+        # silently leave the history uncapped instead of capping it.
+        for cap in (1, 2):
+            with self.subTest(cap=cap):
+                with self.assertRaisesRegex(ValueError, "cannot hold one 3-level"):
+                    _wired()._read_common_config(_common(max_sequence_length=cap))
+        # 0 disables the budget; num_levels is the smallest meaningful cap
+        for cap in (0, 3):
+            with self.subTest(cap=cap):
+                m = _wired()
+                m._read_common_config(_common(max_sequence_length=cap))
+                self.assertEqual(m._max_seq_length, cap)
 
-        def _common(codebook):
-            return types.SimpleNamespace(
-                ignore_index=-100,
-                generated_sids_key="generated_sids",
-                param_dtype="float32",
-                vocab_pad_to_multiple_of=128,
-                max_sequence_length=0,
+    def test_one_feature_claimed_by_two_groups_raises(self) -> None:
+        # keyed by feature, so a second claim would otherwise just overwrite
+        m = _wired()
+        m._feature_groups.append(
+            types.SimpleNamespace(
+                group_name="user_seq_dup",
+                feature_names=["user_sequence"],
+                group_type=model_pb2.JAGGED_SEQUENCE,
             )
+        )
+        with self.assertRaisesRegex(ValueError, "claimed by both"):
+            m._slot_group_names()
 
+    def test_slot_group_and_shared_codebook_validation(self) -> None:
         # a SEQUENCE group emits the same key with padded-dense semantics.
         with self.assertRaisesRegex(ValueError, "must be JAGGED_SEQUENCE"):
-            _wired(model_pb2.SEQUENCE)._slot_group_names()
+            _wired(group_type=model_pb2.SEQUENCE)._slot_group_names()
         with self.assertRaisesRegex(ValueError, "exactly one feature"):
-            _wired(model_pb2.JAGGED_SEQUENCE, ())._slot_group_names()
+            _wired(members=())._slot_group_names()
         # a codebook the SID features disagree on is the model's business
-        m = _wired(model_pb2.JAGGED_SEQUENCE)
-        m._features = [
-            _sid_feature("user_sequence", (2, 3)),
-            _sid_feature("other_seq", (4, 4)),
-        ]
+        m = _wired(
+            features=[
+                _sid_feature("user_sequence", (2, 3)),
+                _sid_feature("other_seq", (4, 4)),
+            ]
+        )
         with self.assertRaisesRegex(ValueError, "must share one"):
             m._shared_sid_space()
         m._features = []
@@ -206,62 +233,69 @@ class GenerativeRecLMTest(unittest.TestCase):
             m._shared_sid_space()
 
     def test_vocab_pad_zero_disables_padding(self) -> None:
-        m = object.__new__(Qwen2RecLM)
-        nn.Module.__init__(m)
-        m._features = [_sid_feature(codebook=(2, 3, 4))]
-        m._labels = ["label"]
-        m._feature_groups = [
-            types.SimpleNamespace(
-                group_name="user_seq",
-                feature_names=["user_sequence"],
-                group_type=model_pb2.JAGGED_SEQUENCE,
-            )
-        ]
-        m._read_common_config(
-            types.SimpleNamespace(
-                ignore_index=-100,
-                generated_sids_key="generated_sids",
-                param_dtype="float32",
-                codebook=[2, 3],
-                vocab_pad_to_multiple_of=0,
-                max_sequence_length=0,
-            )
-        )
+        m = _wired()
+        m._read_common_config(_common(vocab_pad_to_multiple_of=0))
         self.assertEqual(m._vocab_pad_mult, 0)  # not silently rewritten to 128
 
     def test_max_sequence_length_model_knob(self) -> None:
-        def _common(max_seq):
-            return types.SimpleNamespace(
-                ignore_index=-100,
-                generated_sids_key="generated_sids",
-                param_dtype="float32",
-                vocab_pad_to_multiple_of=128,
-                max_sequence_length=max_seq,
-            )
-
-        def _wired():
-            m = object.__new__(Qwen2RecLM)
-            nn.Module.__init__(m)
-            m._features = [_sid_feature(codebook=(2, 3, 4))]
-            m._labels = ["label"]
-            m._feature_groups = [
-                types.SimpleNamespace(
-                    group_name="user_seq",
-                    feature_names=["user_sequence"],
-                    group_type=model_pb2.JAGGED_SEQUENCE,
-                )
-            ]
-            return m
-
         m = _wired()
-        m._read_common_config(_common(128))
+        m._read_common_config(_common(max_sequence_length=128))
         self.assertEqual(m._max_seq_length, 128)
         m2 = _wired()
-        m2._read_common_config(_common(0))
+        m2._read_common_config(_common(max_sequence_length=0))
         self.assertEqual(m2._max_seq_length, 0)  # 0 = off, no fallback
 
+    def test_resolve_prompt_slots_splits_and_records(self) -> None:
+        m = _wired()
+        gaps, features = m._resolve_prompt_slots("A{{user_sequence}}B")
+        self.assertEqual(gaps, ["A", "B"])  # N slots -> N+1 gaps
+        self.assertEqual([f.name for f in features], ["user_sequence"])
+        # recorded here, not in the family hook -- build_input reads them
+        self.assertEqual(m._slot_names, ["user_sequence"])
+        self.assertEqual(m._slot_groups, ["user_seq"])
+
+    def test_resolve_prompt_slots_rejects_a_mismatched_template(self) -> None:
+        from tzrec.features.feature import create_features
+
+        other = _wired(
+            features=[
+                _sid_feature("user_sequence"),
+                _sid_feature("other_seq"),
+            ]
+        )
+        other._feature_groups.append(
+            types.SimpleNamespace(
+                group_name="other_seq_group",
+                feature_names=["other_seq"],
+                group_type=model_pb2.JAGGED_SEQUENCE,
+            )
+        )
+        raw = feature_pb2.FeatureConfig()
+        text_format.Merge(
+            'id_feature { feature_name: "user_sequence" expression: "user:x" '
+            "num_buckets: 8 embedding_dim: 4 }",
+            raw,
+        )
+        not_a_sid = _wired(features=create_features([raw]))
+
+        for model, template, msg in (
+            (_wired(), "no slot at all", "at least one"),
+            (_wired(), "{{nope}} x", "names no feature_group"),
+            (other, "{{user_sequence}}", "never referenced"),
+            (not_a_sid, "{{user_sequence}}", "only a SidFeature"),
+        ):
+            with self.subTest(template=template):
+                with self.assertRaisesRegex(ValueError, msg):
+                    model._resolve_prompt_slots(template)
+
+        # a group whose feature_config vanished: reachable only out of sync
+        orphan = _wired()
+        orphan._features = []
+        with self.assertRaisesRegex(ValueError, "no feature_config"):
+            orphan._resolve_prompt_slots("{{user_sequence}}")
+
     def test_abstract_hooks_raise(self) -> None:
-        base = object.__new__(GenerativeRecLM)
+        base = object.__new__(BaseGenerativeModel)
         with self.assertRaises(NotImplementedError):
             base._build_prompt_tokens(None, None)
         with self.assertRaises(NotImplementedError):
@@ -290,7 +324,7 @@ class GenerativeRecLMTest(unittest.TestCase):
         self.assertEqual(hi.tolist(), [101, 104, 108])
 
     def test_sid_token_rows_shifts_and_splits(self) -> None:
-        # values arrive FLAT from SidFeature._parse; the model adds base_vocab-1
+        # values arrive FLAT from SidFeature._parse; the model adds base_vocab
         m = _stub(base_vocab=100)
         jt = _FakeJT([0, 2, 5, 1, 4, 8, 0, 3, 6], [6, 3])
         rows = m._sid_token_rows(jt.values(), jt.lengths())
@@ -345,8 +379,6 @@ class GenerativeRecLMTest(unittest.TestCase):
         m._label_name = "label"
         m._slot_names = ["user_sequence"]
         m._slot_groups = ["user_seq"]
-        m._slot_names = ["user_sequence"]
-        m._slot_groups = ["user_seq"]
         m._max_seq_length = 0
         m._is_inference = False  # train: the answer label_field is read too
         m.embedding_group = lambda b: {
@@ -372,8 +404,6 @@ class GenerativeRecLMTest(unittest.TestCase):
     def test_build_input_skips_label_in_inference(self) -> None:
         m = _stub(base_vocab=100)
         m._label_name = "label"
-        m._slot_names = ["user_sequence"]
-        m._slot_groups = ["user_seq"]
         m._slot_names = ["user_sequence"]
         m._slot_groups = ["user_seq"]
         m._max_seq_length = 0

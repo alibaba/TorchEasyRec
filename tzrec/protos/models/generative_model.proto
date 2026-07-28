@@ -3,27 +3,34 @@ package tzrec.protos;
 
 // Generative (causal-LM) recommendation models.
 //
-// Shared, architecture-agnostic config lives in `GenerativeRecLMConfig`, embedded
+// Shared, architecture-agnostic config lives in `GenerativeModelConfig`, embedded
 // as `common` in every family message; family-specific knobs (the backbone, the
 // chat template) live on the family message itself.
+
+// Storage dtype of the backbone's master weights.
+enum ParamDtype {
+    FP32 = 0;
+    BF16 = 1;
+    FP16 = 2;
+}
 
 // Architecture-agnostic config shared by all generative-rec families.
 // Sample contract:
 //   * history : list<int64> -- local 0-based per-level codes in
 //               [0, codebook[level]), laid out as whole items in level order;
-//               the single JAGGED_SEQUENCE feature_group (its one member).
+//               a JAGGED_SEQUENCE feature_group holding it alone.
 //   * answer  : list<int64> -- one item's local 0-based codes; the FIRST
 //               `data_config.label_field`, NOT a feature.
 // SidFeature folds in level_offsets at parse time and the model adds
 // base_vocab, so token_id = base_vocab + level_offsets[level] + code. Sample
 // writers must not pre-apply level_offsets.
-message GenerativeRecLMConfig {
-    // NOTE: the SID vocabulary (`codebook`) is declared on the SidFeature that
-    // carries the codes, not here -- the model asks the feature for it.
+message GenerativeModelConfig {
+    // 2 held codebook, now on SidFeature.
+    reserved 2;
+
     // Pad the post-extension vocab up to a multiple of this value; 0 disables
     // padding.
     optional uint32 vocab_pad_to_multiple_of = 3 [default = 128];
-
 
     // Cross-entropy ignore index -- matches PyTorch's F.cross_entropy default.
     optional int32 ignore_index = 6 [default = -100];
@@ -32,19 +39,18 @@ message GenerativeRecLMConfig {
     // num_beams.
     optional uint32 num_beams = 7 [default = 50];
     optional uint32 num_return_sequences = 8 [default = 50];
-    // When set, decode with the escalating beam: the width doubles at every SID
-    // level, returning up to num_beams * 2**num_levels candidates (capped by the
+    // When set, the beam width doubles at every SID level instead of staying
+    // fixed, returning up to num_beams * 2**num_levels candidates (capped by the
     // codebook). num_return_sequences is ignored.
     optional bool dynamic_beam = 9 [default = false];
 
     // Prediction key the generated SIDs are emitted under; reference it from
     // PredictWrapper output_cols.
     optional string generated_sids_key = 12 [default = "generated_sids"];
-    // Backbone PARAM dtype = the fp32 MASTER weights. "float32" avoids bf16-ULP
+    // Backbone PARAM dtype = the MASTER weights. FP32 avoids bf16-ULP
     // underflow of Adam's small (lr=1e-5) updates; bf16 COMPUTE comes from
-    // mixed_precision:"BF16" autocast, NOT the param dtype. One of:
-    // float32 | bfloat16 | float16.
-    optional string param_dtype = 13 [default = "float32"];
+    // mixed_precision:"BF16" autocast, NOT the param dtype.
+    optional ParamDtype param_dtype = 13 [default = FP32];
 
     // Model's history budget in SID codes: the item-aligned, recency-preserving
     // truncation cap AND the activation-pool pre-size. Distinct from the history
@@ -52,16 +58,19 @@ message GenerativeRecLMConfig {
     required uint32 max_sequence_length = 14;
 }
 
-// Qwen2 / Qwen2.5 family (Qwen2.5-0.5B, etc.).
-message Qwen2RecLM {
-    optional GenerativeRecLMConfig common = 1;
+// Qwen family (Qwen2.5-0.5B, Qwen3-0.6B, etc.) -- one ChatML frame for all.
+message GenerativeQwen {
+    // 11, 12 held user_prefix_text/user_suffix_text, now on SidFeature.
+    reserved 11, 12;
 
-    // Qwen2 backbone: HF hub id or local path; must be a Qwen2 model.
+    optional GenerativeModelConfig common = 1;
+
+    // Qwen backbone: HF hub id or local path.
     optional string hf_model_id = 2 [default = "Qwen/Qwen2.5-0.5B"];
 
     // ----- Prompt -----
-    // Prompt body for the user turn, carrying exactly one {{feature_name}}
-    // placeholder that names the SID feature whose codes are spliced in:
+    // Prompt body for the user turn, carrying one {{feature_name}} placeholder
+    // per SID feature whose codes are spliced in:
     //   "... Each behavior is represented by three words. {{user_sequence}}
     //    Please predict the semantic encoding of the next behavior."
     // That feature's own prefix_text/suffix_text wrap the codes inside the slot.

@@ -9,9 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Escalating-beam SID decode (no tzrec deps).
+"""Dynamic-width beam SID decode (no tzrec deps).
 
-The beam width doubles at every SID level, so early levels are pruned hard.
+Backs ``dynamic_beam`` in ``GenerativeModelConfig``: unlike a fixed-width beam,
+the width doubles at every SID level, so early levels are pruned hard.
 """
 
 from typing import List, Tuple
@@ -21,7 +22,7 @@ from transformers import PreTrainedModel
 
 
 @torch.no_grad()
-def escalating_beam_search(
+def dynamic_beam_search(
     model: PreTrainedModel,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -30,10 +31,10 @@ def escalating_beam_search(
     lo_tok: torch.Tensor,
     hi_tok: torch.Tensor,
 ) -> torch.Tensor:
-    """Decode SID answers with the escalating beam.
+    """Decode SID answers with a per-level escalating beam width.
 
     Args:
-        model: an HF causal LM exposing ``.model`` / ``.lm_head`` (Qwen2 layout).
+        model: an HF causal LM exposing ``.model`` / ``.lm_head`` (Qwen layout).
         input_ids: left-padded prompt ids ``(B, P)``.
         attention_mask: prompt mask ``(B, P)``.
         num_beams: base beam width; doubles per level.
@@ -83,14 +84,16 @@ def escalating_beam_search(
     beam_scores, local = scores.topk(widths[0], dim=-1)  # (B, W0)
     seq = (local + bands[0][0]).reshape(-1, 1)
     beam_scores = beam_scores.reshape(-1)
-    parent = torch.arange(bsz, device=device).repeat_interleave(widths[0])
-    past.reorder_cache(parent)
+    rows = torch.arange(bsz, device=device)
+    past.reorder_cache(rows.repeat_interleave(widths[0]))
     am = attention_mask.repeat_interleave(widths[0], dim=0)
     cur_w = widths[0]
 
     for j in range(1, num_levels):
         am = torch.cat([am, am.new_ones(bsz * cur_w, 1)], dim=1)
-        step_pos = (am.long().cumsum(-1) - 1)[:, -1:].clamp(min=0)
+        # the row always ends on the token just appended, so its position is
+        # simply how many real tokens precede it.
+        step_pos = am.long().sum(-1, keepdim=True) - 1
         cache_pos = torch.tensor([past.get_seq_length()], device=device)
         h = model.model(
             input_ids=seq[:, -1:],
@@ -105,10 +108,8 @@ def escalating_beam_search(
         scores = _band_logp(model.lm_head(h.last_hidden_state[:, -1, :]), j)
         scores = scores + beam_scores[:, None]  # (B*cur_w, band) cumulative
         beam_scores, idx = scores.view(bsz, cur_w * band).topk(widths[j], dim=-1)
-        parent_local = torch.div(idx, band, rounding_mode="floor")
         tok = lo_j + idx % band
-        row_base = torch.arange(bsz, device=device)[:, None] * cur_w
-        parent = (parent_local + row_base).reshape(-1)
+        parent = (idx // band + rows[:, None] * cur_w).reshape(-1)
         seq = torch.cat([seq[parent], tok.reshape(-1, 1)], dim=1)
         beam_scores = beam_scores.reshape(-1)
         cur_w = widths[j]

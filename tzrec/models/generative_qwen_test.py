@@ -17,18 +17,20 @@ import torch
 from parameterized import parameterized
 from torch import nn
 
-from tzrec.models.qwen2_rec_lm import Qwen2RecLM
+from tzrec.models.generative_qwen import GenerativeQwen
+from tzrec.modules.dynamic_beam import dynamic_beam_search
+from tzrec.tests.genrec_test_util import create_tiny_causal_lm
 from tzrec.utils.test_util import parameterized_name_func
 
 
 def _stub(codebook=None, base_vocab=100, pad_id=9, device="cpu"):
-    """A Qwen2RecLM with the splice-relevant state wired up, no HF backbone.
+    """A GenerativeQwen with the splice-relevant state wired up, no HF backbone.
 
     The non-uniform default codebook makes incorrect ``level * uniform_size``
     offset arithmetic visible: sizes=[2,3,4], offsets=[0,2,5].
     """
     codebook = codebook or [2, 3, 4]
-    m = object.__new__(Qwen2RecLM)
+    m = object.__new__(GenerativeQwen)
     nn.Module.__init__(m)
     m._ignore_index = -100
     m._num_levels = len(codebook)
@@ -36,7 +38,6 @@ def _stub(codebook=None, base_vocab=100, pad_id=9, device="cpu"):
     m._pad_token_id = pad_id
     m._dynamic_beam = False
     m._max_seq_length = 0
-    m._num_slots = 1
     m._slot_names = ["user_sequence"]
     m._generated_sids_key = "generated_sids"
     m.lm = types.SimpleNamespace(device=torch.device(device))
@@ -56,30 +57,18 @@ def _stub(codebook=None, base_vocab=100, pad_id=9, device="cpu"):
 
 
 def _real_lm_stub(codebook=None, base_vocab=20, num_beams=2):
-    """A Qwen2RecLM carrying a real (tiny, random) Qwen2 backbone.
+    """A GenerativeQwen carrying a real (tiny, random) Qwen2 backbone.
 
     Needed wherever the real forward runs: the training objective and the
-    end-to-end escalating-beam decode; the other tests mock ``lm.generate``.
+    end-to-end dynamic-beam decode; the other tests mock ``lm.generate``.
     """
-    from transformers import Qwen2Config, Qwen2ForCausalLM
-
     codebook = codebook or [2, 3, 4]
-    m = object.__new__(Qwen2RecLM)
+    m = object.__new__(GenerativeQwen)
     nn.Module.__init__(m)
     m._num_levels = len(codebook)
     m._base_vocab = base_vocab
     m._num_beams = num_beams
-    cfg = Qwen2Config(
-        vocab_size=base_vocab + sum(codebook),
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=64,
-    )
-    torch.manual_seed(0)
-    m.lm = Qwen2ForCausalLM(cfg).eval()
+    m.lm = create_tiny_causal_lm(base_vocab + sum(codebook))
     sizes = torch.tensor(codebook, dtype=torch.long)
     m.register_buffer("_codebook_sizes", sizes, persistent=False)
     m.register_buffer(
@@ -90,13 +79,19 @@ def _real_lm_stub(codebook=None, base_vocab=20, num_beams=2):
 
 def _wire_slots(m, prefix_text="", suffix_text=""):
     """Minimal _features/_feature_groups so the base slot resolver can run."""
-    from tzrec.protos import model_pb2
+    from google.protobuf import text_format
 
-    m._features = [
-        types.SimpleNamespace(
-            name="user_sequence", prefix_text=prefix_text, suffix_text=suffix_text
-        )
-    ]
+    from tzrec.features.feature import create_features
+    from tzrec.protos import feature_pb2, model_pb2
+
+    fc = feature_pb2.FeatureConfig()
+    text_format.Merge(
+        'sequence_sid_feature { feature_name: "user_sequence" '
+        'expression: "user:user_sequence" codebook: 2 codebook: 3 codebook: 4 '
+        f'prefix_text: "{prefix_text}" suffix_text: "{suffix_text}" }}',
+        fc,
+    )
+    m._features = create_features([fc])
     m._feature_groups = [
         types.SimpleNamespace(
             group_name="sids",
@@ -110,8 +105,8 @@ def _train_stub(max_total_len):
     """A ``_predict_train``-ready stub; returns ``(model, spliced T per step)``."""
     m = _stub()
     m._is_inference = False  # not inference + nn.Module.training=True -> is_train
-    m._input_name, m._label_name = "user_sequence", "label"
-    m._slot_names, m._num_slots = ["user_sequence"], 1
+    m._label_name = "label"
+    m._slot_names = ["user_sequence"]
     m._max_total_len = max_total_len
     m._pool_warmed = False
     seen_lens = []
@@ -121,14 +116,14 @@ def _train_stub(max_total_len):
         return {"loss": torch.tensor(0.0)}
 
     m.build_input = lambda b: {
-        m._input_name: [torch.tensor([100, 101, 102])],
+        "user_sequence": [torch.tensor([100, 101, 102])],
         m._label_name: [torch.tensor([200, 201, 202])],
     }
     m._forward_loss = fwd
     return m, seen_lens
 
 
-class Qwen2RecLMTest(unittest.TestCase):
+class GenerativeQwenTest(unittest.TestCase):
     def test_splice_layout_and_labels(self) -> None:
         m = _stub()
         u = [torch.tensor([100, 101, 102])]
@@ -167,36 +162,18 @@ class Qwen2RecLMTest(unittest.TestCase):
         self.assertEqual(int(mask[0, -1]), 1)
         self.assertEqual(mask[0].tolist(), [1] * ids.shape[1])
 
-    def test_suffix_keep_matches_dynamic_slice(self) -> None:
-        # the constant suffix width must cover every supervised column.
-        m = _stub()
-        suffix_keep = 6  # num_levels 3 + asst_suffix 1 + trailing eos + HF shift
-        _, labels, _ = m._splice_input_ids(
-            [[torch.tensor([100, 101, 102])]], [torch.tensor([200, 201, 202])]
-        )
-        # first supervised column, minimized over rows
-        first_sup = int(((labels >= 0).cumsum(-1) == 1).float().argmax(-1).min())
-        self.assertEqual(suffix_keep, labels.shape[1] - first_sup + 1)
-        self.assertTrue(bool((labels[:, :-suffix_keep] < 0).all()))
-
-    def test_splice_prompt_ids(self) -> None:
-        m = _stub()
-        ids, mask = m._splice_prompt_ids([[torch.tensor([100, 101, 102])]])
-        # [head | history | tail], no answer
-        self.assertEqual(ids[0].tolist(), [10, 11, 12, 100, 101, 102, 13, 14])
-        self.assertEqual(mask[0].tolist(), [1] * 8)
-
     def test_predict_routes_on_inference_flag(self) -> None:
         m = _stub()
         m._predict_train = lambda b: {"branch": "train"}
         m._generate = lambda b: {"branch": "generate"}
         m._is_inference = False  # train / eval
-        self.assertEqual(Qwen2RecLM.predict(m, object())["branch"], "train")
+        self.assertEqual(GenerativeQwen.predict(m, object())["branch"], "train")
         m._is_inference = True  # inference
-        self.assertEqual(Qwen2RecLM.predict(m, object())["branch"], "generate")
+        self.assertEqual(GenerativeQwen.predict(m, object())["branch"], "generate")
 
-    # (generated tail -> decoded SIDs). offsets [0,2,5]: local [1,1,1]/[2,3,4]
-    # are each level's min/max token; every malformed row collapses to -1.
+    # (generated tail -> decoded SIDs). sizes [2,3,4] -> offsets [0,2,5], so
+    # [100,102,105] / [101,104,108] are each level's min/max token and local
+    # codes [0,0,0] / [1,2,3]; every malformed row collapses to -1.
     @parameterized.expand(
         [
             [[[100, 102, 105], [101, 104, 108]], [[0, 0, 0], [1, 2, 3]]],
@@ -219,8 +196,7 @@ class Qwen2RecLMTest(unittest.TestCase):
     )
     def test_generate_maps_tokens_to_sids(self, tail, expected) -> None:
         m = _stub(base_vocab=100)
-        m._input_name = "user_sequence"
-        m._slot_names, m._num_slots = ["user_sequence"], 1
+        m._slot_names = ["user_sequence"]
         m._num_beams, m._num_return = len(tail) + 1, len(tail)
         seen = {}
 
@@ -262,22 +238,35 @@ class Qwen2RecLMTest(unittest.TestCase):
 
     def test_generate_routes_to_the_dynamic_beam(self) -> None:
         m = _stub(base_vocab=100)
-        m._input_name = "user_sequence"
-        m._slot_names, m._num_slots = ["user_sequence"], 1
+        m._slot_names = ["user_sequence"]
         m._dynamic_beam = True
-        m._num_beams = m._num_return = 2
+        m._num_beams, m._num_return = 5, 2
         m.lm.generate = lambda **kw: self.fail("HF generate must not run")
         seen = {}
 
-        def fake_beam(ids, am):
-            seen.update(ids=ids[0].tolist(), mask=am[0].tolist())
+        def fake_kernel(lm, input_ids, attention_mask, *, num_beams, lo_tok, hi_tok):
+            seen.update(
+                lm=lm,
+                ids=input_ids[0].tolist(),
+                mask=attention_mask[0].tolist(),
+                num_beams=num_beams,
+                lo=lo_tok.tolist(),
+                hi=hi_tok.tolist(),
+            )
             return torch.tensor([[100, 102, 105], [101, 104, 108]])
 
-        m._dynamic_beam_search = fake_beam
         m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 102, 105])]}
-        sids = m._generate(object())["generated_sids"]
+        with mock.patch(
+            "tzrec.models.generative_qwen.dynamic_beam_search", side_effect=fake_kernel
+        ):
+            sids = m._generate(object())["generated_sids"]
+        self.assertIs(seen["lm"], m.lm)
         self.assertEqual(seen["ids"], [10, 11, 12, 100, 102, 105, 13, 14])
         self.assertEqual(seen["mask"], [1] * 8)
+        self.assertEqual(seen["num_beams"], 5)  # num_return_sequences is ignored
+        # per-level bands, base_vocab-shifted: sizes [2,3,4] -> offsets [0,2,5]
+        self.assertEqual(seen["lo"], [100, 102, 105])
+        self.assertEqual(seen["hi"], [101, 104, 108])
         self.assertEqual(tuple(sids.shape), (1, 2, 3))
         self.assertEqual(sids[0].tolist(), [[0, 0, 0], [1, 2, 3]])
 
@@ -289,7 +278,7 @@ class Qwen2RecLMTest(unittest.TestCase):
         )
 
     def test_build_prompt_tokens_splits_the_template_around_the_slot(self) -> None:
-        m = object.__new__(Qwen2RecLM)
+        m = object.__new__(GenerativeQwen)
         nn.Module.__init__(m)
         _wire_slots(m, prefix_text="PRE", suffix_text="SUF")
         cfg = types.SimpleNamespace(prompt_template="A{{user_sequence}}B")
@@ -298,7 +287,7 @@ class Qwen2RecLMTest(unittest.TestCase):
             buf = getattr(m, name)
             self.assertIsInstance(buf, torch.Tensor)
             self.assertEqual(buf.dtype, torch.int64)
-        tpl = Qwen2RecLM.CHAT_TEMPLATE
+        tpl = GenerativeQwen.CHAT_TEMPLATE
         # head = user_prefix + before + feature.prefix_text
         self.assertEqual(m.tpl_gap_0.tolist(), [len(tpl["user_prefix"] + "A" + "PRE")])
         # tail = feature.suffix_text + after + user_suffix + asst_prefix
@@ -307,20 +296,6 @@ class Qwen2RecLMTest(unittest.TestCase):
             [len("SUF" + "B" + tpl["user_suffix"] + tpl["asst_prefix"])],
         )
         self.assertEqual(m.tpl_eos.tolist(), [99])  # eos cached for supervision
-
-    def test_build_prompt_tokens_rejects_a_bad_placeholder_count(self) -> None:
-        m = object.__new__(Qwen2RecLM)
-        nn.Module.__init__(m)
-        _wire_slots(m)
-        cases = [
-            ("no placeholder", "at least one"),
-            ("{{nope}} x", "names no feature_group"),
-        ]
-        for template, msg in cases:
-            with self.subTest(template=template):
-                cfg = types.SimpleNamespace(prompt_template=template)
-                with self.assertRaisesRegex(ValueError, msg):
-                    m._build_prompt_tokens(self._prompt_tokenizer(), cfg)
 
     def test_compute_max_total_length(self) -> None:
         m = _stub()
@@ -350,8 +325,8 @@ class Qwen2RecLMTest(unittest.TestCase):
             m._splice_input_ids([[torch.tensor([100])]], [])
 
 
-class Qwen2ForwardLossTest(unittest.TestCase):
-    """The training objective, run for real against a tiny Qwen2 backbone."""
+class GenerativeQwenLossTest(unittest.TestCase):
+    """The training objective, run for real against a tiny Qwen backbone."""
 
     def _model(self, ignore_index=-100):
         m = _real_lm_stub(codebook=[2, 3, 4], base_vocab=20, num_beams=2)
@@ -366,8 +341,7 @@ class Qwen2ForwardLossTest(unittest.TestCase):
             m.register_buffer(
                 name, torch.tensor(vals, dtype=torch.long), persistent=False
             )
-        m._num_slots = 1
-        m._slot_names = ["user_sequence"]
+            m._slot_names = ["user_sequence"]
         m._suffix_keep = 6  # num_levels 3 + asst_suffix 1 + trailing eos + HF shift
         return m
 
@@ -419,47 +393,30 @@ class Qwen2ForwardLossTest(unittest.TestCase):
         self.assertEqual(list(out), ["loss"])
 
 
-class Qwen2DynamicBeamTest(unittest.TestCase):
-    """The wrapper around ``escalating_beam_search``; the kernel has its own test."""
+class GenerativeQwenBeamTest(unittest.TestCase):
+    """The kernel/model seam, which neither side can assert alone.
 
-    def test_dynamic_beam_search_forwards_the_sid_bands(self) -> None:
-        m = _stub(base_vocab=100)
-        m._num_beams = 5
-        ids = torch.zeros(1, 4, dtype=torch.long)
-        am = torch.ones(1, 4, dtype=torch.long)
-        seen = {}
-
-        def fake_kernel(lm, input_ids, attention_mask, *, num_beams, lo_tok, hi_tok):
-            seen.update(
-                lm=lm,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                num_beams=num_beams,
-                lo=lo_tok.tolist(),
-                hi=hi_tok.tolist(),
-            )
-            return torch.zeros(2, 3, dtype=torch.long)
-
-        with mock.patch(
-            "tzrec.models.qwen2_rec_lm.escalating_beam_search", side_effect=fake_kernel
-        ):
-            out = m._dynamic_beam_search(ids, am)
-        self.assertIs(seen["lm"], m.lm)
-        self.assertIs(seen["input_ids"], ids)
-        self.assertIs(seen["attention_mask"], am)
-        self.assertEqual(seen["num_beams"], 5)
-        self.assertEqual(seen["lo"], [100, 102, 105])
-        self.assertEqual(seen["hi"], [101, 104, 108])
-        self.assertEqual(tuple(out.shape), (2, 3))
+    ``dynamic_beam_test`` owns the schedule and the band masking, but only the
+    model knows the bands and owns ``_validate_sid_candidates``, so this is where
+    "the kernel's output is exactly what the validator accepts" can be checked.
+    """
 
     def test_band_masked_beams_decode_without_sentinels(self) -> None:
-        # end-to-end against a real backbone: band masking guarantees that every
-        # returned candidate survives _validate_sid_candidates. widths are
-        # [2, 6, 24] here, i.e. exhaustive over the whole 2*3*4 codebook.
+        # real backbone: band masking guarantees that every returned candidate
+        # survives _validate_sid_candidates. widths are [2, 6, 24] here, i.e.
+        # exhaustive over the whole 2*3*4 codebook.
         codebook = [2, 3, 4]
         m = _real_lm_stub(codebook=codebook, base_vocab=20, num_beams=3)
         ids = torch.tensor([[5, 6, 7]])
-        new = m._dynamic_beam_search(ids, torch.ones_like(ids))
+        lo_tok, hi_tok = m._sid_token_bands()
+        new = dynamic_beam_search(
+            m.lm,
+            ids,
+            torch.ones_like(ids),
+            num_beams=m._num_beams,
+            lo_tok=lo_tok,
+            hi_tok=hi_tok,
+        )
         sids = m._validate_sid_candidates(new, batch_size=1)
         self.assertEqual(tuple(sids.shape), (1, 24, 3))
         for level, size in enumerate(codebook):

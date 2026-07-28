@@ -19,6 +19,7 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
+from tzrec.tests.genrec_test_util import create_tiny_causal_lm
 from tzrec.utils.checkpoint_util import save_model
 from tzrec.utils.hf_export_util import (
     _HF_EXPORT_META_FILENAME,
@@ -27,6 +28,11 @@ from tzrec.utils.hf_export_util import (
     write_hf_assets,
 )
 from tzrec.utils.test_util import make_test_dir
+
+
+def _tied_lm():
+    """The tied-head backbone every case here needs; dcp_to_hf must drop the tie."""
+    return create_tiny_causal_lm(64, tie_word_embeddings=True)
 
 
 class _FakeTokenizer:
@@ -39,7 +45,7 @@ class _FakeTokenizer:
 
 
 class _GenRec(nn.Module):
-    """Stand-in for GenerativeRecLM: an HF backbone plus unrelated params."""
+    """Stand-in for BaseGenerativeModel: an HF backbone plus unrelated params."""
 
     def __init__(self, lm):
         super().__init__()
@@ -65,22 +71,6 @@ class _DmpLike(nn.Module):
         self.module = module
 
 
-def _tiny_lm(tie=True):
-    from transformers import AutoModelForCausalLM, Qwen2Config
-
-    cfg = Qwen2Config(
-        vocab_size=64,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        tie_word_embeddings=tie,
-        max_position_embeddings=128,
-    )
-    return AutoModelForCausalLM.from_config(cfg, torch_dtype=torch.float32)
-
-
 class HfExportUtilTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
@@ -93,7 +83,7 @@ class HfExportUtilTest(unittest.TestCase):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_unwrap_walks_dmp_and_train_wrapper(self) -> None:
-        inner = _GenRec(_tiny_lm())
+        inner = _GenRec(_tied_lm())
         self.assertIs(_unwrap_hf_model(inner), inner)
         self.assertIs(_unwrap_hf_model(_TrainWrapper(inner)), inner)
         self.assertIs(_unwrap_hf_model(_DmpLike(_TrainWrapper(inner))), inner)
@@ -113,7 +103,7 @@ class HfExportUtilTest(unittest.TestCase):
         return ckpt_dir
 
     def test_write_hf_assets_records_state_dict_prefix(self) -> None:
-        lm = _tiny_lm()
+        lm = _tied_lm()
         wrapped = _TrainWrapper(_GenRec(lm))
         ckpt_dir = self._save_ckpt(wrapped)
         for name in ("config.json", "tokenizer.json", _HF_EXPORT_META_FILENAME):
@@ -128,7 +118,7 @@ class HfExportUtilTest(unittest.TestCase):
     def test_dcp_to_hf_round_trip_drops_tied_head(self) -> None:
         from transformers import AutoModelForCausalLM
 
-        lm = _tiny_lm(tie=True)
+        lm = _tied_lm()
         ckpt_dir = self._save_ckpt(_DmpLike(_TrainWrapper(_GenRec(lm))))
         out_dir = os.path.join(self.test_dir, "hf_out")
         dcp_to_hf(ckpt_dir, out_dir)
@@ -144,7 +134,7 @@ class HfExportUtilTest(unittest.TestCase):
             self.assertTrue(torch.equal(back.state_dict()[k], v), k)
 
     def test_dcp_to_hf_self_heals_a_stale_prefix(self) -> None:
-        lm = _tiny_lm()
+        lm = _tied_lm()
         ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(lm)))
         meta_path = os.path.join(ckpt_dir, _HF_EXPORT_META_FILENAME)
         with open(meta_path, "w") as f:
@@ -157,7 +147,7 @@ class HfExportUtilTest(unittest.TestCase):
         )
 
     def test_dcp_to_hf_refuses_a_mismatched_architecture(self) -> None:
-        ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(_tiny_lm())))
+        ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(_tied_lm())))
         # widen the recorded architecture so the checkpoint can no longer fill it
         cfg_path = os.path.join(ckpt_dir, "config.json")
         with open(cfg_path) as f:

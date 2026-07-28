@@ -9,12 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generic generative-recommendation language-model base for TorchEasyRec.
+"""Architecture-agnostic base for HF-backed generative-recommendation LMs.
 
-``GenerativeRecLM`` owns the architecture-agnostic plumbing; a concrete family
-subclass (e.g. ``Qwen2RecLM``) implements ``_build_prompt_tokens`` and
-``predict``. Shared config and the sample contract live in
-``GenerativeRecLMConfig`` (see ``protos/models/generative_model.proto``).
+A family subclass (e.g. ``GenerativeQwen``) supplies ``_build_prompt_tokens`` and
+``predict``; ``GenerativeModelConfig`` holds the shared config and the sample
+contract.
 """
 
 import re
@@ -33,6 +32,7 @@ from transformers import (
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.features.sid_feature import SidFeature
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.protos import model_pb2
@@ -40,20 +40,19 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import generative_model_pb2
 
 
-class GenerativeRecLM(BaseModel):
-    """Abstract base for HF-backed generative-recommendation LMs.
+class BaseGenerativeModel(BaseModel):
+    """Model construction, SID vocab extension, data-prep, loss and metrics.
 
-    Owns model construction, SID vocab extension, sample data-prep, loss and
-    metrics; subclasses implement ``_build_prompt_tokens`` and ``predict``. The
-    family's proto message must supply ``common`` (``GenerativeRecLMConfig``)
-    and an ``hf_model_id`` field, both read directly by this base.
+    The family's proto message must carry ``common`` (a
+    ``GenerativeModelConfig``) and ``hf_model_id``; this base reads both.
     """
 
-    # See `common.param_dtype` in the proto for why fp32 is the default.
-    _DTYPE_BY_NAME = {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
+    # See `common.param_dtype` in the proto for why FP32 is the default.
+    # The enum is closed, so protobuf rejects anything not listed here.
+    _PARAM_DTYPE: Dict[int, torch.dtype] = {
+        generative_model_pb2.FP32: torch.float32,
+        generative_model_pb2.BF16: torch.bfloat16,
+        generative_model_pb2.FP16: torch.float16,
     }
 
     def __init__(
@@ -85,28 +84,31 @@ class GenerativeRecLM(BaseModel):
             pad_id = tokenizer.eos_token_id
         if pad_id is None:
             raise ValueError(
-                "GenerativeRecLM: tokenizer has neither pad_token_id nor "
+                "BaseGenerativeModel: tokenizer has neither pad_token_id nor "
                 "eos_token_id; cannot choose a pad id for the left-padded splice."
             )
         return int(pad_id)
 
     def _read_common_config(
-        self, common: generative_model_pb2.GenerativeRecLMConfig
+        self, common: generative_model_pb2.GenerativeModelConfig
     ) -> int:
         """Parse shared proto knobs into attributes; return the SID atom count."""
         self._label_name: str = self._labels[0] if self._labels else ""
         self._ignore_index: int = int(common.ignore_index)
         self._generated_sids_key: str = common.generated_sids_key
-        param_dtype = self._DTYPE_BY_NAME.get(common.param_dtype)
-        if param_dtype is None:
-            raise ValueError(
-                f"{type(self).__name__}: param_dtype must be one of "
-                f"{list(self._DTYPE_BY_NAME)}, got {common.param_dtype!r}."
-            )
-        self._param_dtype: torch.dtype = param_dtype
+        self._param_dtype: torch.dtype = self._PARAM_DTYPE[common.param_dtype]
         self._max_seq_length: int = int(common.max_sequence_length)
         codebook = self._shared_sid_space()
         self._num_levels = len(codebook)
+        # the budget truncates to WHOLE items, so anything under one item's width
+        # would floor to zero and silently leave the history uncapped.
+        if 0 < self._max_seq_length < self._num_levels:
+            raise ValueError(
+                f"{type(self).__name__}: max_sequence_length "
+                f"({self._max_seq_length}) cannot hold one {self._num_levels}"
+                f"-level item; use 0 to disable the budget or a multiple of "
+                f"{self._num_levels}."
+            )
         sizes = torch.tensor(codebook, dtype=torch.long)
         self.register_buffer("_codebook_sizes", sizes, persistent=False)
         # only the decode path still needs per-level offsets: SidFeature folds
@@ -121,16 +123,14 @@ class GenerativeRecLM(BaseModel):
     def _shared_sid_space(self) -> List[int]:
         """The one codebook every SID feature declares.
 
-        SID features share a single space: the model has one extended vocabulary
-        and one answer width, so adding a feature must not resize ``lm_head``.
-        Requiring the declarations to agree makes that invariant explicit and
-        turns a typo into an error instead of a silent reshape.
+        One extended vocabulary and one answer width, so adding a feature must
+        never resize ``lm_head``; disagreement is a typo, not a reshape.
         """
-        spaces = {}
-        for feature in self._features:
-            codebook = getattr(feature, "codebook", None)
-            if codebook is not None:
-                spaces[feature.name] = tuple(codebook)
+        spaces = {
+            f.name: tuple(f.codebook)
+            for f in self._features
+            if isinstance(f, SidFeature)
+        }
         if not spaces:
             raise ValueError(
                 f"{type(self).__name__}: no SID feature declares a codebook; "
@@ -146,10 +146,11 @@ class GenerativeRecLM(BaseModel):
     def _slot_group_names(self) -> Dict[str, str]:
         """{feature_name: group_name} for every declared feature_group.
 
-        Each group must be JAGGED_SEQUENCE and hold exactly ONE feature: the
-        EmbeddingGroup column-interleaves the members of a group into a single
-        ``{group}.sequence``, so two features in one group could not be spliced
-        into separate prompt slots.
+        One JAGGED_SEQUENCE feature per group: EmbeddingGroup interleaves a
+        group's members into one ``{group}.sequence``, which no longer splits
+        back into separate prompt slots. The map is keyed by feature, so a
+        feature claimed by two groups is rejected rather than silently
+        resolving to whichever group came last.
         """
         by_feature: Dict[str, str] = {}
         for group in self._feature_groups:
@@ -165,21 +166,26 @@ class GenerativeRecLM(BaseModel):
                     f"must hold exactly one feature (its members are interleaved "
                     f"into one sequence), got {list(group.feature_names)}."
                 )
-            by_feature[group.feature_names[0]] = group.group_name
+            name = group.feature_names[0]
+            if name in by_feature:
+                raise ValueError(
+                    f"{type(self).__name__}: feature {name!r} is claimed by both "
+                    f"feature_group {by_feature[name]!r} and "
+                    f"{group.group_name!r}; only one can fill its prompt slot."
+                )
+            by_feature[name] = group.group_name
         return by_feature
 
     def _resolve_prompt_slots(
         self, template: str
-    ) -> Tuple[List[str], List[BaseFeature], List[str]]:
-        """Split a prompt template into its static gaps and its slot features.
+    ) -> Tuple[List[str], List["SidFeature"]]:
+        """Split a ``{{feature_name}}`` template into N+1 gaps and N features.
 
-        ``template`` carries ``{{feature_name}}`` slots; returns ``N+1`` static
-        gap strings, the ``N`` features they are interleaved with in template
-        order, and those features' feature_group names. Every slot must name a
-        declared feature, every declared feature_group must be referenced by a
-        slot, and every slot feature must expose the prompt-text interface
-        (``prefix_text`` / ``suffix_text``) -- so a misspelt or unused feature
-        fails here rather than silently vanishing from the prompt.
+        Slots and declared feature_groups must correspond exactly, and each slot
+        must name a ``SidFeature``, so a misspelt or unused feature fails here
+        instead of vanishing from the prompt. ``_slot_names`` / ``_slot_groups``
+        are recorded here, not in the family hook, because ``build_input`` reads
+        them and would otherwise fail far from the cause.
         """
         parts = re.split(r"\{\{(\w+)\}\}", template)
         gaps, names = parts[0::2], parts[1::2]
@@ -203,13 +209,10 @@ class GenerativeRecLM(BaseModel):
                     f"{type(self).__name__}: prompt_template slot {{{{{name}}}}} "
                     f"has no feature_config."
                 )
-            if not hasattr(feature, "prefix_text") or not hasattr(
-                feature, "suffix_text"
-            ):
+            if not isinstance(feature, SidFeature):
                 raise ValueError(
-                    f"{type(self).__name__}: feature {name!r} is a "
-                    f"{type(feature).__name__}, which does not expose the prompt "
-                    f"text interface (prefix_text/suffix_text); use a SidFeature."
+                    f"{type(self).__name__}: prompt slot {{{{{name}}}}} names a "
+                    f"{type(feature).__name__}; only a SidFeature can fill a slot."
                 )
             features.append(feature)
         unused = sorted(set(group_of) - set(names))
@@ -218,22 +221,23 @@ class GenerativeRecLM(BaseModel):
                 f"{type(self).__name__}: feature_group(s) {unused} are declared "
                 f"but never referenced by a prompt_template slot."
             )
-        return gaps, features, [group_of[n] for n in names]
+        self._slot_names = names
+        self._slot_groups = [group_of[n] for n in names]
+        return gaps, features
 
     def _build_backbone(self) -> PreTrainedModel:
-        """Build the EMPTY extended architecture -- no weight download.
+        """Build the EMPTY architecture -- shapes only, no weight download.
 
-        Only the module shapes matter here; the weights arrive from
-        ``init_from_pretrained`` (cold start) or DCP (restore/eval).
+        Weights arrive from ``init_from_pretrained`` (cold start) or DCP.
         """
         hf_model_id = self._model_config.hf_model_id
         if not hf_model_id:
             raise ValueError(f"{type(self).__name__}: empty hf_model_id.")
         hf_cfg = AutoConfig.from_pretrained(hf_model_id)
         lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=self._param_dtype)
-        if next(lm.parameters()).dtype != self._param_dtype:
-            lm = lm.to(self._param_dtype)
-        return lm
+        # a no-op when from_config already honoured torch_dtype, which not every
+        # architecture does.
+        return lm.to(self._param_dtype)
 
     def _build_extended_tokenizer(
         self, sid_atoms: int
@@ -252,7 +256,7 @@ class GenerativeRecLM(BaseModel):
         if added != sid_atoms:
             # a pre-existing Cxxx token would shift the atoms off `base`.
             raise RuntimeError(
-                f"GenerativeRecLM: tokenizer was expected to grow by "
+                f"BaseGenerativeModel: tokenizer was expected to grow by "
                 f"{sid_atoms} new atoms, only added {added}. "
                 f"Aborting to avoid silent SID-token mismatch."
             )
@@ -264,21 +268,18 @@ class GenerativeRecLM(BaseModel):
         c0_id = tokenizer.convert_tokens_to_ids("C0")
         if c0_id != base:
             raise RuntimeError(
-                f"GenerativeRecLM: SID atom layout mismatch -- expected "
+                f"BaseGenerativeModel: SID atom layout mismatch -- expected "
                 f"C0 at token id {base}, got {c0_id}. "
                 f"Splice arithmetic would produce wrong token ids."
             )
         return tokenizer, base
 
     def init_from_pretrained(self) -> None:
-        """Load the pretrained HF backbone weights into ``self.lm``.
+        """Load the pretrained HF weights and re-extend to ``__init__``'s vocab.
 
-        Re-extends the vocab to ``__init__``'s target so the shapes match.
-
-        Every rank runs this, so every rank must apply the identical resize or
-        DDP's parameter-shape check fails. The newly-created SID embedding rows
-        are drawn from the global RNG and therefore differ per rank; DDP's
-        ``_sync_module_states`` broadcast from rank 0 is what makes them agree.
+        Every rank resizes identically or DDP's shape check fails. The new SID
+        rows come from the global RNG and so differ per rank; DDP's
+        ``_sync_module_states`` broadcast from rank 0 is what reconciles them.
         """
         # drop the empty arch first: holding both peaks at 2x model host RAM.
         self.lm = None
@@ -309,7 +310,7 @@ class GenerativeRecLM(BaseModel):
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement _build_prompt_tokens "
-            f"(GenerativeRecLM is abstract)."
+            f"(BaseGenerativeModel is abstract)."
         )
 
     @property
@@ -320,9 +321,8 @@ class GenerativeRecLM(BaseModel):
     def _tokenize_sids(self, flat: torch.Tensor) -> torch.Tensor:
         """Map flat SID indices to extended-vocab token ids.
 
-        ``SidFeature`` has already folded the per-level offsets in, and codes are
-        0-based, so the flat index IS the atom index: the model only owns the
-        shift into its own vocabulary.
+        ``SidFeature`` folded the offsets in and codes are 0-based, so the flat
+        index IS the atom index; the model only owns the vocabulary shift.
         """
         return flat + self._base_vocab
 
@@ -342,28 +342,25 @@ class GenerativeRecLM(BaseModel):
     def _validate_sid_candidates(
         self, new_tokens: torch.Tensor, batch_size: int
     ) -> torch.Tensor:
-        """Decode generated tokens to local 0-based codes and reject bad beams.
+        """Decode the per-beam tail ``(B*C, w)`` to ``(B, C, num_levels)`` codes.
 
-        ``new_tokens`` is the per-beam tail ``(B*C, w)`` (``w`` may be <
-        ``num_levels`` when beams stop early). Returns ``(batch_size, C,
-        num_levels)`` local codes. Every malformed candidate (early EOS /
-        non-SID / wrong-level atom) is set to ``-1``, which cannot match a real
-        0-based code.
+        ``w`` may be < ``num_levels`` when beams stop early. Any malformed
+        candidate (early EOS, non-SID or wrong-level atom) becomes all ``-1``,
+        which no real 0-based code can match.
         """
         level_ids = torch.arange(new_tokens.shape[1], device=new_tokens.device)
         codes = self._detokenize_sids(new_tokens, level_ids)
         codes = F.pad(codes, (0, self._num_levels - codes.shape[1]), value=-1)
-        # one out-of-band atom invalidates the whole candidate row.
         invalid = ((codes < 0) | (codes >= self._codebook_sizes)).any(dim=1)
         codes = codes.masked_fill(invalid.unsqueeze(1), -1)
         # decoders return rows batch-major ([b0_c0, b0_c1, ...]); group per user.
         return codes.view(batch_size, -1, self._num_levels)
 
     def init_input(self) -> None:
-        """Build the EmbeddingGroup for the single raw SID JAGGED_SEQUENCE group.
+        """Build the EmbeddingGroup over the raw SID JAGGED_SEQUENCE groups.
 
-        Raw passthrough features carry no embedding tables, so this group holds
-        no params (DMP-neutral); it only retrieves the flat ``(values, lengths)``.
+        Passthrough features own no tables, so this holds no params (DMP-neutral)
+        and only retrieves the flat ``(values, lengths)``.
         """
         self.embedding_group = EmbeddingGroup(self._features, self._feature_groups)
 
@@ -400,16 +397,11 @@ class GenerativeRecLM(BaseModel):
     ) -> List[torch.Tensor]:
         """Map a feature's flat SID stream to per-row token-id tensors.
 
-        ``SidFeature._parse`` has already validated the codes and folded in the
-        per-level offsets, so this only applies the model-owned budget and the
-        shift into the extended vocabulary.
-
-        ``max_codes``, when set, caps each row to its most-recent whole items
-        (the last ``floor(max_codes / num_levels) * num_levels`` codes, dropping
-        the oldest head). Skipped unless a row overflows.
+        ``SidFeature._parse`` already validated and offset the codes, so only the
+        vocabulary shift and the model-owned budget are left. ``max_codes`` caps
+        each row to its most-recent WHOLE items, dropping the oldest head.
         """
-        if values.dim() == 2 and values.size(-1) == 1:
-            values = values.squeeze(-1)
+        values = values.reshape(-1)  # value_dim 1 arrives as (N,) or (N, 1)
         sizes = lengths.long().tolist()
         # TODO(shuqi): move truncation into FG once FG can keep the TAIL, not the HEAD.
         if max_codes:
@@ -424,14 +416,12 @@ class GenerativeRecLM(BaseModel):
     def _answer_token_rows(
         self, values: torch.Tensor, lengths: torch.Tensor
     ) -> List[torch.Tensor]:
-        """Map the answer label to token ids.
+        """Map the answer label to token ids; every row is ``num_levels`` codes.
 
-        The answer is a ``data_config.label_field``, not a feature, so nothing
-        has offset it: this is the one place the model still owns the per-level
-        fold-in. Every row must be exactly ``num_levels`` codes.
+        The answer is a label_field, not a feature, so nothing has offset it --
+        the one place the model still owns the per-level fold-in.
         """
-        if values.dim() == 2 and values.size(-1) == 1:
-            values = values.squeeze(-1)
+        values = values.reshape(-1)  # value_dim 1 arrives as (N,) or (N, 1)
         sizes = lengths.long().tolist()
         bad = [i for i, n in enumerate(sizes) if n != self._num_levels]
         if bad:
@@ -443,7 +433,7 @@ class GenerativeRecLM(BaseModel):
         codes = values.to(self.device).long()
         level_ids = torch.arange(codes.numel(), device=self.device) % self._num_levels
         invalid = (codes < 0) | (codes >= self._codebook_sizes[level_ids])
-        if invalid.any().item():
+        if invalid.any():
             raise ValueError(
                 f"{type(self).__name__}: answer SID codes must be local 0-based "
                 f"values in [0, codebook[level])."

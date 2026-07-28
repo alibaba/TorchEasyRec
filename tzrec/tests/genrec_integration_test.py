@@ -20,11 +20,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tzrec.tests import utils
+from tzrec.tests.genrec_test_util import create_tiny_causal_lm
 from tzrec.utils import config_util
 from tzrec.utils.test_util import make_test_dir
 
-_MOCK_CONFIG = "tzrec/tests/configs/qwen2_rec_lm_mock.config"
-# must match the mock config's `common.codebook`
+_MOCK_CONFIG = "tzrec/tests/configs/generative_qwen_mock.config"
+# must match the mock config's sequence_sid_feature.codebook
 _CODEBOOK = [4, 4, 4]
 
 
@@ -37,7 +38,7 @@ def _write_backbone(save_dir: str, vocab_size: int = 256) -> str:
     and which has room to append the ``C*`` atoms, so word-level is enough.
     """
     from tokenizers import Tokenizer, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast, Qwen2Config, Qwen2ForCausalLM
+    from transformers import PreTrainedTokenizerFast
 
     eos = "<|endoftext|>"
     vocab = {t: i for i, t in enumerate([eos, "<|im_start|>", "<|im_end|>"])}
@@ -52,17 +53,9 @@ def _write_backbone(save_dir: str, vocab_size: int = 256) -> str:
         pad_token=eos,
         additional_special_tokens=["<|im_start|>", "<|im_end|>"],
     ).save_pretrained(save_dir)
-    config = Qwen2Config(
-        vocab_size=len(vocab),
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=512,
-        tie_word_embeddings=True,
-    )
-    Qwen2ForCausalLM(config).save_pretrained(save_dir)
+    create_tiny_causal_lm(
+        len(vocab), tie_word_embeddings=True, max_position_embeddings=512
+    ).save_pretrained(save_dir)
     return save_dir
 
 
@@ -122,7 +115,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         config = config_util.load_pipeline_config(_MOCK_CONFIG)
         config.train_input_path = data_glob
         config.eval_input_path = data_glob
-        config.model_config.qwen2_rec_lm.hf_model_id = backbone
+        config.model_config.generative_qwen.hf_model_id = backbone
         config_path = os.path.join(self.test_dir, "genrec.config")
         config_util.save_message(config, config_path)
         return config_path
@@ -143,7 +136,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         model = _create_model(
             config.model_config, features, list(config.data_config.label_fields)
         )
-        self.assertEqual(type(model).__name__, "Qwen2RecLM")
+        self.assertEqual(type(model).__name__, "GenerativeQwen")
         self.assertEqual(model._slot_groups, ["sids"])
         self.assertEqual(model._slot_names, ["user_sequence"])
         self.assertEqual(model._label_name, "label")
@@ -158,12 +151,24 @@ class GenRecIntegrationTest(unittest.TestCase):
             config.data_config, features, config.train_input_path, mode=Mode.TRAIN
         )
         model.train()
-        predictions = model.predict(next(dataloader.get_iterator()))
+        batch = next(dataloader.get_iterator())
+        predictions = model.predict(batch)
         self.assertEqual(list(predictions), ["loss"])
         self.assertTrue(bool(predictions["loss"].isfinite()))
+
+        # _suffix_keep bounds the logits _forward_loss upcasts. HF shifts logits
+        # by one, so the window must open one column BEFORE the first supervised
+        # label or that label is never scored. The unit tests hardcode the width;
+        # only a real __init__ proves the formula computes it.
+        rows = model.build_input(batch)
+        _, labels, _ = model._splice_input_ids(
+            model._slot_rows(rows), rows[model._label_name]
+        )
+        first_sup = int((labels >= 0).nonzero()[:, 1].min())
+        self.assertEqual(model._suffix_keep, labels.shape[1] - first_sup + 1)
         self.success = True
 
-    def test_qwen2_rec_lm_train_eval(self) -> None:
+    def test_generative_qwen_train_eval(self) -> None:
         """End-to-end train -> checkpoint, with HF assets co-located."""
         config_path = self._prepare_config()
         self.success = utils.test_train_eval(config_path, self.test_dir)

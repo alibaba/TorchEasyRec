@@ -9,12 +9,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen2/Qwen2.5 family subclass of ``GenerativeRecLM``.
+"""Qwen family subclass of ``BaseGenerativeModel``.
 
 Owns the decoder-only-chat implementation: the ChatML prompt template, the
 causal-LM splice, and the ``.model``/``.lm_head`` forward.
 """
 
+from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -23,14 +24,18 @@ from transformers import PreTrainedTokenizerBase
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.generative_rec_lm import GenerativeRecLM
-from tzrec.modules.escalating_beam import escalating_beam_search
+from tzrec.models.generative_model import BaseGenerativeModel
+from tzrec.modules.dynamic_beam import dynamic_beam_search
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import generative_model_pb2
 
 
-class Qwen2RecLM(GenerativeRecLM):
-    """Qwen2 / Qwen2.5 generative-recommendation LM."""
+class GenerativeQwen(BaseGenerativeModel):
+    """Generative-recommendation LM on a Qwen backbone (Qwen2.5, Qwen3, ...).
+
+    The whole family shares the ChatML frame this class splices, so the version
+    only enters through ``hf_model_id``.
+    """
 
     # ChatML frame. Family-specific; a subclass overrides it wholesale.
     CHAT_TEMPLATE = {
@@ -65,50 +70,49 @@ class Qwen2RecLM(GenerativeRecLM):
         self._suffix_keep = self._num_levels + self.tpl_asst_suffix.numel() + 2
 
     def _compute_max_total_length(self) -> int:
-        """Full spliced length at the max history (0 if pre-allocation is off).
-
-        The ``T`` the activation pool is pre-sized to.
-        """
+        """The ``T`` the activation pool pre-sizes to; 0 when disabled."""
         if self._max_seq_length <= 0:
             return 0
         frame = (
-            sum(
-                getattr(self, f"tpl_gap_{i}").numel()
-                for i in range(self._num_slots + 1)
-            )
+            sum(g.numel() for g in self._gaps)
             + self.tpl_asst_suffix.numel()
             + self.tpl_eos.numel()
         )
-        return int(frame + self._max_seq_length * self._num_slots + self._num_levels)
+        return int(
+            frame + self._max_seq_length * len(self._slot_names) + self._num_levels
+        )
+
+    @property
+    def _gaps(self) -> List[torch.Tensor]:
+        """The N+1 static prompt fragments around the N slots, template order.
+
+        Re-read every time: ``.to(device)`` rebinds the buffer, so a cached list
+        would keep handing back pre-move tensors.
+        """
+        return [getattr(self, f"tpl_gap_{i}") for i in range(len(self._slot_names) + 1)]
 
     def _build_prompt_tokens(
         self,
         tokenizer: PreTrainedTokenizerBase,
-        cfg: generative_model_pb2.Qwen2RecLM,
+        cfg: generative_model_pb2.GenerativeQwen,
     ) -> None:
         """Tokenise the static prompt once, as the N+1 gaps around the N slots.
 
-        The base resolves ``{{feature_name}}`` slots; this hook only frames them
-        with ChatML and folds each slot feature's ``prefix_text`` / ``suffix_text``
-        into the adjacent gap, so every gap is ONE contiguous string tokenized in
-        one call. That keeps the encoding bit-identical to tokenizing the fully
-        rendered prompt -- splitting the token ids instead would let a BPE merge
-        span a seam. Splicing values between gaps is exact because the ``C*``
-        atoms are added-vocab tokens, which HF fast tokenizers pre-split on.
-
-        Buffers are non-persistent: they move with ``model.to(...)`` but stay off
-        the state_dict so HF safetensors round-tripping isn't polluted.
+        Each feature's ``prefix_text`` / ``suffix_text`` is folded into the
+        adjacent gap so every gap is ONE string tokenized in one call, keeping
+        the encoding bit-identical to the fully rendered prompt -- splitting
+        token ids instead would let a BPE merge span a seam. Splicing values
+        between gaps is exact only because the ``C*`` atoms are added-vocab
+        tokens, which HF fast tokenizers pre-split on. Buffers are
+        non-persistent: they follow ``.to()`` but stay out of the state_dict.
         """
         tpl = type(self).CHAT_TEMPLATE
-        gaps, features, groups = self._resolve_prompt_slots(cfg.prompt_template)
-        self._slot_names = [f.name for f in features]
-        self._slot_groups = groups
-        self._num_slots = len(features)
+        gaps, features = self._resolve_prompt_slots(cfg.prompt_template)
         for i, gap in enumerate(gaps):
             head = tpl["user_prefix"] if i == 0 else features[i - 1].suffix_text
             tail = (
                 features[i].prefix_text
-                if i < self._num_slots
+                if i < len(features)
                 else tpl["user_suffix"] + tpl["asst_prefix"]
             )
             # explicit <|im_start|> markers frame the prompt; no auto BOS/EOS.
@@ -138,16 +142,13 @@ class Qwen2RecLM(GenerativeRecLM):
 
         Shared by the teacher-forced splice and the answer-less inference prompt.
         """
-        gaps = [getattr(self, f"tpl_gap_{i}") for i in range(self._num_slots + 1)]
-        rows = []
-        for b in range(len(slot_rows[0])):
-            parts: List[torch.Tensor] = []
-            for i in range(self._num_slots):
-                parts.append(gaps[i])
-                parts.append(slot_rows[i][b])
-            parts.append(gaps[self._num_slots])
-            rows.append(torch.cat(parts))
-        return rows
+        gaps = self._gaps
+        # zip transposes per-slot row lists into one tuple of slots per row, and
+        # pairs each slot with the gap that precedes it (the last gap has none).
+        return [
+            torch.cat([*chain.from_iterable(zip(gaps, slots)), gaps[-1]])
+            for slots in zip(*slot_rows)
+        ]
 
     def _slot_rows(
         self, rows: Dict[str, List[torch.Tensor]]
@@ -163,15 +164,12 @@ class Qwen2RecLM(GenerativeRecLM):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build ``(input_ids, labels, attention_mask)``, each ``(B, T_max)``.
 
-        Rows already hold on-device token ids (see ``_sid_token_rows``).
-
-        Every answer is exactly ``self._num_levels`` SID codes, so the tail
-        ``[answer | asst_suffix | eos]`` has a FIXED width and lands in the same
-        columns for every row after left-padding -> ``labels`` is one vectorized
-        write. Only the answer and the trailing eos are supervised: a decode
-        emits exactly ``num_levels`` tokens and never has to produce
-        ``asst_suffix``. ``pad_to`` left-extends every row for pool pre-sizing,
-        keeping the supervised tail end-aligned.
+        Every answer is exactly ``num_levels`` codes, so the tail
+        ``[answer | asst_suffix | eos]`` has a FIXED width and, after left
+        padding, lands in the same columns for every row -- ``labels`` is one
+        vectorized write. Only the answer and trailing eos are supervised; a
+        decode emits ``num_levels`` tokens and never produces ``asst_suffix``.
+        ``pad_to`` left-extends for pool pre-sizing, keeping the tail aligned.
         """
         if len(slot_rows[0]) != len(label_rows):
             raise ValueError(
@@ -238,16 +236,23 @@ class Qwen2RecLM(GenerativeRecLM):
         return {"loss": loss}
 
     def _generate(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Beam-search the SID answer (no ground truth supplied).
+        """Beam-search the SID answer, no ground truth supplied.
 
-        Returns ``generated_sids`` of shape ``(B, C, num_levels)``, where ``C``
-        is ``num_return_sequences`` on the HF path and the escalating beam's
-        final width when ``dynamic_beam`` is set.
+        ``generated_sids`` is ``(B, C, num_levels)``; ``C`` is
+        ``num_return_sequences``, or the dynamic beam's final width.
         """
         slot_rows = self._slot_rows(self.build_input(batch))
-        input_ids, attention_mask = self._splice_prompt_ids(slot_rows)
+        input_ids, attention_mask = self._left_pad(self._prompt_rows(slot_rows))
         if self._dynamic_beam:
-            new_tokens = self._dynamic_beam_search(input_ids, attention_mask)
+            lo_tok, hi_tok = self._sid_token_bands()
+            new_tokens = dynamic_beam_search(
+                self.lm,
+                input_ids,
+                attention_mask,
+                num_beams=self._num_beams,
+                lo_tok=lo_tok,
+                hi_tok=hi_tok,
+            )
         else:
             out = self.lm.generate(
                 input_ids=input_ids,
@@ -262,34 +267,14 @@ class Qwen2RecLM(GenerativeRecLM):
         sids = self._validate_sid_candidates(new_tokens, input_ids.shape[0])
         return {self._generated_sids_key: sids}
 
-    def _dynamic_beam_search(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """Escalating-beam decode; see ``escalating_beam_search`` for the schedule."""
-        lo_tok, hi_tok = self._sid_token_bands()
-        return escalating_beam_search(
-            self.lm,
-            input_ids,
-            attention_mask,
-            num_beams=self._num_beams,
-            lo_tok=lo_tok,
-            hi_tok=hi_tok,
-        )
-
-    def _splice_prompt_ids(
-        self, slot_rows: List[List[torch.Tensor]]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Assemble the answer-less prompt and left-pad into ``(B, T_max)``."""
-        return self._left_pad(self._prompt_rows(slot_rows))
-
     def _left_pad(
         self, rows: List[torch.Tensor], pad_to: int = 0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Left-pad token rows into ``(input_ids, attention_mask)``, ``(B, T_max)``.
 
-        ``attention_mask`` is built from ``ones_like(row)`` (not ``!= pad``) so a
-        real trailing eos is never masked when ``pad_token_id == eos``. ``pad_to``
-        extends on the LEFT, keeping the end-aligned supervised tail in place.
+        The mask comes from ``ones_like(row)``, not ``!= pad``, so a real
+        trailing eos survives ``pad_token_id == eos``. ``pad_to`` extends LEFT,
+        keeping the end-aligned supervised tail in place.
         """
         input_ids = pad_sequence(
             rows,

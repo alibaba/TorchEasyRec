@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HuggingFace export for HF-backed models (``GenerativeRecLM`` family).
+"""HuggingFace export for HF-backed models (``BaseGenerativeModel`` family).
 
 Kept out of ``export_util`` (TorchScript/TRT/AOTI) so ``checkpoint_util`` can
 call ``write_hf_assets`` without a circular import.
@@ -45,8 +45,7 @@ _HF_EXPORT_META_FILENAME = "hf_export_meta.json"
 def _unwrap_hf_model(wrapped_model: nn.Module) -> Optional[nn.Module]:
     """Walk DMP/TrainWrapper layers down to the model exposing ``hf_backbone``.
 
-    Returns ``None`` if no backbone is found in the chain -- not an HF-backed
-    model, so callers no-op.
+    ``None`` when the chain has none: not HF-backed, so callers no-op.
     """
     m = wrapped_model
     while not hasattr(m, "hf_backbone"):
@@ -62,10 +61,9 @@ def _unwrap_hf_model(wrapped_model: nn.Module) -> Optional[nn.Module]:
 def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
     """Co-locate the HF config + tokenizer (NO weights) in a checkpoint dir.
 
-    Records the backbone's FQN prefix, read off ``wrapped_model``'s live module
-    graph, into ``hf_export_meta.json`` so ``dcp_to_hf`` can strip it without
-    hard-coding a wrapper convention. Rank 0 only -- the dense backbone is
-    data-parallel-replicated.
+    The backbone's FQN prefix, read off the live module graph, goes into
+    ``hf_export_meta.json`` so ``dcp_to_hf`` can strip it without hard-coding a
+    wrapper convention. Rank 0 only; the dense backbone is replicated.
     """
     if int(os.environ.get("RANK", 0)) != 0:
         return
@@ -94,9 +92,9 @@ def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
 def dcp_to_hf(ckpt_dir: str, out_dir: str) -> None:
     """Convert a self-contained checkpoint dir to a ``from_pretrained`` HF dir.
 
-    Reads everything from ``ckpt_dir`` -- no live model is built and no weights
-    are downloaded. Keys that do not map 1:1 onto the architecture in the
-    co-located ``config.json`` raise rather than write a partial model.
+    Everything comes from ``ckpt_dir``: no live model, no download. Keys that do
+    not map 1:1 onto the co-located ``config.json`` raise instead of writing a
+    partial model.
     """
     from torch.distributed.checkpoint.state_dict_loader import (
         _load_state_dict_from_keys,
@@ -156,14 +154,15 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str) -> None:
             )
         mapped = _derive_by_suffix(raw_state)
 
-    if mapped is None or set(mapped.keys()) != target_keys:
-        got = set(mapped.keys()) if mapped is not None else set()
-        missing = sorted(target_keys - got)
-        extra = sorted(got - target_keys)
+    # both strategies return either an exact match or None, so there is nothing
+    # partial to report -- show both key spaces instead.
+    if mapped is None:
         raise RuntimeError(
             "dcp_to_hf: cannot map the DCP state dict onto the backbone "
-            f"architecture (recorded prefix={prefix!r}). missing={missing[:10]} "
-            f"extra={extra[:10]}. Refusing to write a partially-loaded HF model."
+            f"architecture (recorded prefix={prefix!r}). Wanted "
+            f"{len(target_keys)} keys like {sorted(target_keys)[:3]}; the "
+            f"checkpoint holds {len(raw_state)} like {sorted(raw_state)[:3]}. "
+            "Refusing to write a partially-loaded HF model."
         )
 
     # Tied heads are dropped after validation; from_pretrained re-ties them.

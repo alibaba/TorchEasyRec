@@ -16,33 +16,25 @@ import unittest
 from typing import Any, Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from parameterized import parameterized
 
-from tzrec.modules import escalating_beam
-from tzrec.modules.escalating_beam import escalating_beam_search
+from tzrec.modules import dynamic_beam
+from tzrec.modules.dynamic_beam import dynamic_beam_search
+from tzrec.tests.genrec_test_util import create_tiny_causal_lm
 from tzrec.utils.test_util import parameterized_name_func
 
 
-def _tiny_lm(vocab_size, seed=0):
-    from transformers import Qwen2Config, Qwen2ForCausalLM
-
-    cfg = Qwen2Config(
-        vocab_size=vocab_size,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=64,
+def _decode(lm, ids, pairs, num_beams=2, attention_mask=None):
+    """Run the kernel over ``pairs`` of inclusive per-level (lo, hi) band edges."""
+    return dynamic_beam_search(
+        lm,
+        ids,
+        torch.ones_like(ids) if attention_mask is None else attention_mask,
+        num_beams=num_beams,
+        lo_tok=torch.tensor([p[0] for p in pairs]),
+        hi_tok=torch.tensor([p[1] for p in pairs]),
     )
-    torch.manual_seed(seed)
-    return Qwen2ForCausalLM(cfg).eval()
-
-
-def _bands(pairs):
-    lo = torch.tensor([p[0] for p in pairs], dtype=torch.long)
-    hi = torch.tensor([p[1] for p in pairs], dtype=torch.long)
-    return lo, hi
 
 
 class _RowSpy:
@@ -77,10 +69,10 @@ def _bruteforce_scores(lm, input_ids, attention_mask, pairs):
     return ref
 
 
-class EscalatingBeamSearchTest(unittest.TestCase):
+class DynamicBeamSearchTest(unittest.TestCase):
     def test_module_declares_no_tzrec_imports(self) -> None:
         # the "torch-only, no tzrec deps" docstring is what makes it liftable.
-        tree = ast.parse(pathlib.Path(escalating_beam.__file__).read_text())
+        tree = ast.parse(pathlib.Path(dynamic_beam.__file__).read_text())
         mods = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -104,12 +96,9 @@ class EscalatingBeamSearchTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_width_schedule(self, num_beams, pairs, expected_widths) -> None:
-        spy = _RowSpy(_tiny_lm(vocab_size=48))
-        lo, hi = _bands(pairs)
+        spy = _RowSpy(create_tiny_causal_lm(vocab_size=48))
         ids = torch.tensor([[5, 6, 7, 8]])
-        out = escalating_beam_search(
-            spy, ids, torch.ones_like(ids), num_beams=num_beams, lo_tok=lo, hi_tok=hi
-        )
+        out = _decode(spy, ids, pairs, num_beams=num_beams)
         # calls: [prompt (1 row)] + one per level>0, each carrying widths[j-1] rows
         widths = spy.rows[1:] + [out.shape[0]]
         self.assertEqual(spy.rows[0], 1)
@@ -117,20 +106,12 @@ class EscalatingBeamSearchTest(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (expected_widths[-1], len(pairs)))
 
     def test_tokens_stay_inside_arbitrary_bands(self) -> None:
-        # bands the Qwen2RecLM caller can never produce: descending, disjoint,
+        # bands the GenerativeQwen caller can never produce: descending, disjoint,
         # unequal width -- the kernel's contract is per-level (lo, hi), not a
         # contiguous codebook layout.
         pairs = [(5, 6), (20, 24), (11, 13)]
-        lo, hi = _bands(pairs)
         ids = torch.tensor([[1, 2, 3, 4]])
-        out = escalating_beam_search(
-            _tiny_lm(vocab_size=30),
-            ids,
-            torch.ones_like(ids),
-            num_beams=2,
-            lo_tok=lo,
-            hi_tok=hi,
-        )
+        out = _decode(create_tiny_causal_lm(vocab_size=30), ids, pairs)
         self.assertEqual(tuple(out.shape), (min(2 * 2**3, 2 * 5 * 3), 3))
         for level, (lo_j, hi_j) in enumerate(pairs):
             col = out[:, level]
@@ -144,51 +125,38 @@ class EscalatingBeamSearchTest(unittest.TestCase):
     )
     def test_left_padding_matches_unpadded(self, seed, n_pad) -> None:
         pairs = [(20, 21), (22, 24), (25, 28)]
-        lo, hi = _bands(pairs)
-        lm = _tiny_lm(vocab_size=30, seed=seed)
+        lm = create_tiny_causal_lm(vocab_size=30, seed=seed)
         short = torch.tensor([[5, 6, 7]])
-        pad = torch.cat([torch.zeros(1, n_pad, dtype=torch.long), short], dim=1)
-        am_pad = torch.cat(
-            [torch.zeros(1, n_pad, dtype=torch.long), torch.ones_like(short)], dim=1
-        )
-        plain = escalating_beam_search(
-            lm, short, torch.ones_like(short), num_beams=2, lo_tok=lo, hi_tok=hi
-        )
-        padded = escalating_beam_search(
-            lm, pad, am_pad, num_beams=2, lo_tok=lo, hi_tok=hi
+        plain = _decode(lm, short, pairs)
+        padded = _decode(
+            lm,
+            F.pad(short, (n_pad, 0)),
+            pairs,
+            attention_mask=F.pad(torch.ones_like(short), (n_pad, 0)),
         )
         self.assertTrue(torch.equal(plain, padded))
 
     def test_ragged_batch_rows_match_solo_runs(self) -> None:
         # every row of a ragged batch must decode exactly as if run alone.
         pairs = [(20, 21), (22, 24), (25, 28)]
-        lo, hi = _bands(pairs)
-        lm = _tiny_lm(vocab_size=30)
-        row0, row1 = torch.tensor([[5, 6, 7, 8]]), torch.tensor([[9, 10, 11]])
+        lm = create_tiny_causal_lm(vocab_size=30)
         ids = torch.tensor([[5, 6, 7, 8], [0, 9, 10, 11]])
         am = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]])
-        out = escalating_beam_search(lm, ids, am, num_beams=2, lo_tok=lo, hi_tok=hi)
+        out = _decode(lm, ids, pairs, attention_mask=am)
         width = out.shape[0] // 2
-        for i, solo_ids in enumerate([row0, row1]):
-            solo = escalating_beam_search(
-                lm,
-                solo_ids,
-                torch.ones_like(solo_ids),
-                num_beams=2,
-                lo_tok=lo,
-                hi_tok=hi,
-            )
+        solos = [torch.tensor([[5, 6, 7, 8]]), torch.tensor([[9, 10, 11]])]
+        for i, solo_ids in enumerate(solos):
+            solo = _decode(lm, solo_ids, pairs)
             self.assertTrue(torch.equal(out[i * width : (i + 1) * width], solo))
 
     def test_exhaustive_matches_bruteforce_topk(self) -> None:
         # widths [2, 6, 12] over 2*3*2 = 12 combinations -> no pruning at any
         # level, so the beam must reproduce the exact full-recompute ranking.
         pairs = [(20, 21), (22, 24), (25, 26)]
-        lo, hi = _bands(pairs)
-        lm = _tiny_lm(vocab_size=30)
+        lm = create_tiny_causal_lm(vocab_size=30)
         ids = torch.tensor([[5, 6, 7, 8]])
         am = torch.ones_like(ids)
-        out = escalating_beam_search(lm, ids, am, num_beams=6, lo_tok=lo, hi_tok=hi)
+        out = _decode(lm, ids, pairs, num_beams=6)
         got = [tuple(r) for r in out.tolist()]
         ref = _bruteforce_scores(lm, ids, am, pairs)
         self.assertEqual(set(got), set(ref))

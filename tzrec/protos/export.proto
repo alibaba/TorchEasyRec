@@ -3,7 +3,7 @@ package tzrec.protos;
 
 // serialization format produced by `tzrec.export`.
 // TORCHSCRIPT: native scripted_model.pt (+ TRT/AOTI), the default.
-// HF: a HuggingFace `from_pretrained`-loadable dir (GenerativeRecLM family).
+// HF: a HuggingFace `from_pretrained`-loadable dir (BaseGenerativeModel family).
 enum ExportFormat {
     TORCHSCRIPT = 0;
     HF = 1;
