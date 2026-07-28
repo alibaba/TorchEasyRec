@@ -20,9 +20,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tzrec.tests import utils
-from tzrec.tests.genrec_test_util import create_tiny_causal_lm
 from tzrec.utils import config_util
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
 _MOCK_CONFIG = "tzrec/tests/configs/generative_qwen_mock.config"
 # must match the mock config's sequence_sid_feature.codebook

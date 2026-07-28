@@ -25,9 +25,6 @@ enum ParamDtype {
 // base_vocab, so token_id = base_vocab + level_offsets[level] + code. Sample
 // writers must not pre-apply level_offsets.
 message GenerativeModelConfig {
-    // 2 held codebook, now on SidFeature.
-    reserved 2;
-
     // Pad the post-extension vocab up to a multiple of this value; 0 disables
     // padding.
     optional uint32 vocab_pad_to_multiple_of = 3 [default = 128];
@@ -35,14 +32,18 @@ message GenerativeModelConfig {
     // Cross-entropy ignore index -- matches PyTorch's F.cross_entropy default.
     optional int32 ignore_index = 6 [default = -100];
 
-    // Beam search (inference only). num_return_sequences must not exceed
-    // num_beams.
-    optional uint32 num_beams = 7 [default = 50];
+    // Beam search (inference only). Decoding is always restricted to the SID
+    // bands, so every returned candidate is a well-formed SID.
+    //
+    // Beam width per SID level, one entry per level -- the whole schedule,
+    // stated outright rather than derived from a base and a flag:
+    //   [50, 50, 50]    fixed width, returns 50 candidates
+    //   [100, 200, 400] doubling, returns 400 (the ALGR-style escalating beam)
+    // Each entry is capped to what its band and the surviving prefixes can
+    // supply. Empty defaults to a flat width of 50 at every level.
+    repeated uint32 beam_widths = 7;
+    // Candidates kept per row, best-first; must not exceed the final width.
     optional uint32 num_return_sequences = 8 [default = 50];
-    // When set, the beam width doubles at every SID level instead of staying
-    // fixed, returning up to num_beams * 2**num_levels candidates (capped by the
-    // codebook). num_return_sequences is ignored.
-    optional bool dynamic_beam = 9 [default = false];
 
     // Prediction key the generated SIDs are emitted under; reference it from
     // PredictWrapper output_cols.
@@ -60,9 +61,6 @@ message GenerativeModelConfig {
 
 // Qwen family (Qwen2.5-0.5B, Qwen3-0.6B, etc.) -- one ChatML frame for all.
 message GenerativeQwen {
-    // 11, 12 held user_prefix_text/user_suffix_text, now on SidFeature.
-    reserved 11, 12;
-
     optional GenerativeModelConfig common = 1;
 
     // Qwen backbone: HF hub id or local path.

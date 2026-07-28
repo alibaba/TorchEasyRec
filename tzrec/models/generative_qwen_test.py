@@ -19,8 +19,7 @@ from torch import nn
 
 from tzrec.models.generative_qwen import GenerativeQwen
 from tzrec.modules.dynamic_beam import dynamic_beam_search
-from tzrec.tests.genrec_test_util import create_tiny_causal_lm
-from tzrec.utils.test_util import parameterized_name_func
+from tzrec.utils.test_util import create_tiny_causal_lm, parameterized_name_func
 
 
 def _stub(codebook=None, base_vocab=100, pad_id=9, device="cpu"):
@@ -36,7 +35,8 @@ def _stub(codebook=None, base_vocab=100, pad_id=9, device="cpu"):
     m._num_levels = len(codebook)
     m._base_vocab = base_vocab
     m._pad_token_id = pad_id
-    m._dynamic_beam = False
+    m._num_return = 2
+    m._beam_widths = [2] * m._num_levels
     m._max_seq_length = 0
     m._slot_names = ["user_sequence"]
     m._generated_sids_key = "generated_sids"
@@ -56,18 +56,18 @@ def _stub(codebook=None, base_vocab=100, pad_id=9, device="cpu"):
     return m
 
 
-def _real_lm_stub(codebook=None, base_vocab=20, num_beams=2):
+def _real_lm_stub(codebook=None, base_vocab=20, beam_width=2):
     """A GenerativeQwen carrying a real (tiny, random) Qwen2 backbone.
 
     Needed wherever the real forward runs: the training objective and the
-    end-to-end dynamic-beam decode; the other tests mock ``lm.generate``.
+    end-to-end band-restricted decode; the other tests mock the kernel.
     """
     codebook = codebook or [2, 3, 4]
     m = object.__new__(GenerativeQwen)
     nn.Module.__init__(m)
     m._num_levels = len(codebook)
     m._base_vocab = base_vocab
-    m._num_beams = num_beams
+    m._beam_widths = [beam_width] * m._num_levels
     m.lm = create_tiny_causal_lm(base_vocab + sum(codebook))
     sizes = torch.tensor(codebook, dtype=torch.long)
     m.register_buffer("_codebook_sizes", sizes, persistent=False)
@@ -197,59 +197,68 @@ class GenerativeQwenTest(unittest.TestCase):
     def test_generate_maps_tokens_to_sids(self, tail, expected) -> None:
         m = _stub(base_vocab=100)
         m._slot_names = ["user_sequence"]
-        m._num_beams, m._num_return = len(tail) + 1, len(tail)
-        seen = {}
-
-        def fake_generate(
-            input_ids,
-            attention_mask,
-            max_new_tokens,
-            num_beams,
-            num_return_sequences,
-            do_sample,
-            pad_token_id,
-        ):
-            seen.update(
-                prompt=input_ids[0].tolist(),
-                mask=attention_mask[0].tolist(),
-                max_new_tokens=max_new_tokens,
-                num_beams=num_beams,
-                num_return_sequences=num_return_sequences,
-                do_sample=do_sample,
-                pad_token_id=pad_token_id,
-            )
-            prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
-            return torch.cat([prompt, torch.tensor(tail)], dim=1)
-
-        m.lm.generate = fake_generate
-        # build_input is mocked, so the batch is opaque to this generation test.
+        m._num_return = len(tail)
+        m._beam_widths = [len(tail)] * m._num_levels
+        # build_input is mocked, so the batch is opaque to this decoding test.
         m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 102, 105])]}
-        sids = m._generate(object())["generated_sids"]
-        self.assertEqual(seen["prompt"], [10, 11, 12, 100, 102, 105, 13, 14])
-        self.assertEqual(seen["mask"], [1] * 8)
-        self.assertEqual(seen["max_new_tokens"], 3)  # = num_levels
-        self.assertEqual(seen["num_beams"], len(tail) + 1)
-        self.assertEqual(seen["num_return_sequences"], len(tail))
-        self.assertFalse(seen["do_sample"])
-        self.assertEqual(seen["pad_token_id"], 9)
+        with mock.patch(
+            "tzrec.models.generative_qwen.dynamic_beam_search",
+            return_value=torch.tensor(tail),
+        ):
+            sids = m._generate(object())["generated_sids"]
         # (B, num_return, num_levels)
         self.assertEqual(tuple(sids.shape), (1, len(tail), 3))
         self.assertEqual(sids[0].tolist(), expected)
 
-    def test_generate_routes_to_the_dynamic_beam(self) -> None:
+    def test_generate_trims_to_num_return_keeping_the_best(self) -> None:
+        # the kernel returns score-ordered best-first, so the trim is a prefix
         m = _stub(base_vocab=100)
         m._slot_names = ["user_sequence"]
-        m._dynamic_beam = True
-        m._num_beams, m._num_return = 5, 2
-        m.lm.generate = lambda **kw: self.fail("HF generate must not run")
+        m._beam_widths = [4] * m._num_levels
+        m._num_return = 2
+        m.build_input = lambda b: {"user_sequence": [torch.tensor([100, 102, 105])]}
+        four = torch.tensor(
+            [[100, 102, 105], [101, 104, 108], [100, 103, 106], [101, 102, 107]]
+        )
+        with mock.patch(
+            "tzrec.models.generative_qwen.dynamic_beam_search", return_value=four
+        ):
+            sids = m._generate(object())["generated_sids"]
+        self.assertEqual(tuple(sids.shape), (1, 2, 3))
+        self.assertEqual(sids[0].tolist(), [[0, 0, 0], [1, 2, 3]])
+
+    def test_beam_config_defaults_and_validation(self) -> None:
+        def read(widths, num_return, levels=3):
+            m = object.__new__(GenerativeQwen)
+            m._num_levels = levels
+            m._read_beam_config(
+                types.SimpleNamespace(
+                    beam_widths=widths, num_return_sequences=num_return
+                )
+            )
+            return m
+
+        # empty -> flat DEFAULT_BEAM_WIDTH per level; anything else verbatim
+        self.assertEqual(read([], 50)._beam_widths, [50, 50, 50])
+        self.assertEqual(read([100, 200, 400], 400)._beam_widths, [100, 200, 400])
+        with self.assertRaisesRegex(ValueError, "one width per level"):
+            read([50, 50], 50)
+        with self.assertRaisesRegex(ValueError, "must not exceed the final"):
+            read([50, 50, 50], 80)
+
+    def test_generate_hands_the_kernel_prompt_bands_and_schedule(self) -> None:
+        m = _stub(base_vocab=100)
+        m._slot_names = ["user_sequence"]
+        m._beam_widths = [5 * 2 ** (j + 1) for j in range(m._num_levels)]
+        m._num_return = m._beam_widths[-1]
         seen = {}
 
-        def fake_kernel(lm, input_ids, attention_mask, *, num_beams, lo_tok, hi_tok):
+        def fake_kernel(lm, input_ids, attention_mask, *, beam_widths, lo_tok, hi_tok):
             seen.update(
                 lm=lm,
                 ids=input_ids[0].tolist(),
                 mask=attention_mask[0].tolist(),
-                num_beams=num_beams,
+                widths=list(beam_widths),
                 lo=lo_tok.tolist(),
                 hi=hi_tok.tolist(),
             )
@@ -263,7 +272,8 @@ class GenerativeQwenTest(unittest.TestCase):
         self.assertIs(seen["lm"], m.lm)
         self.assertEqual(seen["ids"], [10, 11, 12, 100, 102, 105, 13, 14])
         self.assertEqual(seen["mask"], [1] * 8)
-        self.assertEqual(seen["num_beams"], 5)  # num_return_sequences is ignored
+        # the schedule reaches the kernel verbatim
+        self.assertEqual(seen["widths"], [10, 20, 40])
         # per-level bands, base_vocab-shifted: sizes [2,3,4] -> offsets [0,2,5]
         self.assertEqual(seen["lo"], [100, 102, 105])
         self.assertEqual(seen["hi"], [101, 104, 108])
@@ -329,7 +339,7 @@ class GenerativeQwenLossTest(unittest.TestCase):
     """The training objective, run for real against a tiny Qwen backbone."""
 
     def _model(self, ignore_index=-100):
-        m = _real_lm_stub(codebook=[2, 3, 4], base_vocab=20, num_beams=2)
+        m = _real_lm_stub(codebook=[2, 3, 4], base_vocab=20, beam_width=2)
         m._ignore_index = ignore_index
         m._pad_token_id = 0
         for name, vals in {
@@ -396,9 +406,9 @@ class GenerativeQwenLossTest(unittest.TestCase):
 class GenerativeQwenBeamTest(unittest.TestCase):
     """The kernel/model seam, which neither side can assert alone.
 
-    ``dynamic_beam_test`` owns the schedule and the band masking, but only the
-    model knows the bands and owns ``_validate_sid_candidates``, so this is where
-    "the kernel's output is exactly what the validator accepts" can be checked.
+    ``dynamic_beam_test`` owns the band masking and the per-level capping, but
+    only the model knows the bands and owns ``_validate_sid_candidates``, so this
+    is where "the kernel's output is exactly what the validator accepts" lands.
     """
 
     def test_band_masked_beams_decode_without_sentinels(self) -> None:
@@ -406,14 +416,14 @@ class GenerativeQwenBeamTest(unittest.TestCase):
         # survives _validate_sid_candidates. widths are [2, 6, 24] here, i.e.
         # exhaustive over the whole 2*3*4 codebook.
         codebook = [2, 3, 4]
-        m = _real_lm_stub(codebook=codebook, base_vocab=20, num_beams=3)
+        m = _real_lm_stub(codebook=codebook, base_vocab=20, beam_width=3)
         ids = torch.tensor([[5, 6, 7]])
         lo_tok, hi_tok = m._sid_token_bands()
         new = dynamic_beam_search(
             m.lm,
             ids,
             torch.ones_like(ids),
-            num_beams=m._num_beams,
+            beam_widths=[3 * 2 ** (j + 1) for j in range(len(codebook))],
             lo_tok=lo_tok,
             hi_tok=hi_tok,
         )

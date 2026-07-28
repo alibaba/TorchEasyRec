@@ -19,7 +19,6 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
-from tzrec.tests.genrec_test_util import create_tiny_causal_lm
 from tzrec.utils.checkpoint_util import save_model
 from tzrec.utils.hf_export_util import (
     _HF_EXPORT_META_FILENAME,
@@ -27,7 +26,7 @@ from tzrec.utils.hf_export_util import (
     dcp_to_hf,
     write_hf_assets,
 )
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
 
 def _tied_lm():

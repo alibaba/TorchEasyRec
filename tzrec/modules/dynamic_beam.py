@@ -11,8 +11,9 @@
 
 """Dynamic-width beam SID decode (no tzrec deps).
 
-Backs ``dynamic_beam`` in ``GenerativeModelConfig``: unlike a fixed-width beam,
-the width doubles at every SID level, so early levels are pruned hard.
+Backs ``dynamic_beam`` in ``GenerativeModelConfig``: the beam width varies per
+SID level instead of staying fixed. The caller owns the schedule -- this module
+only enforces what each level can actually supply.
 """
 
 from typing import List, Tuple
@@ -27,39 +28,48 @@ def dynamic_beam_search(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     *,
-    num_beams: int,
+    beam_widths: List[int],
     lo_tok: torch.Tensor,
     hi_tok: torch.Tensor,
 ) -> torch.Tensor:
-    """Decode SID answers with a per-level escalating beam width.
+    """Decode SID answers with a caller-supplied per-level beam width.
 
     Args:
         model: an HF causal LM exposing ``.model`` / ``.lm_head`` (Qwen layout).
         input_ids: left-padded prompt ids ``(B, P)``.
         attention_mask: prompt mask ``(B, P)``.
-        num_beams: base beam width; doubles per level.
-        lo_tok: inclusive lower per-level token-space band edge, ``(num_levels,)``
-            (``num_levels`` is inferred from its length).
+        beam_widths: requested width for each SID level, one entry per level.
+            Any schedule is accepted -- doubling, flat, hand-tuned -- and each
+            entry is capped to what its band and the surviving prefixes supply.
+        lo_tok: inclusive lower per-level token-space band edge, ``(num_levels,)``.
         hi_tok: inclusive upper per-level token-space band edge, ``(num_levels,)``.
 
     Returns:
         The generated SID token tail ``(B * W, num_levels)`` score-ordered
-        best-first per row, where ``W`` is ``num_beams * 2**num_levels`` capped
-        to the number of distinct SIDs the codebook can supply. The answer is
+        best-first per row, where ``W`` is the last capped width. The answer is
         fixed-length and EOS-free, so no finished-beam bookkeeping is needed.
     """
     device = input_ids.device
     bsz = input_ids.shape[0]
     num_levels = lo_tok.shape[0]
+    if len(beam_widths) != num_levels:
+        raise ValueError(
+            f"dynamic_beam_search: beam_widths has {len(beam_widths)} entries "
+            f"but the bands describe {num_levels} SID levels."
+        )
+    if any(w < 1 for w in beam_widths):
+        raise ValueError(
+            f"dynamic_beam_search: beam_widths must be >= 1, got {list(beam_widths)}."
+        )
     # Hoist the band edges to host once to keep the level loop sync-free.
     bands: List[Tuple[int, int]] = [
         (int(lo_tok[j]), int(hi_tok[j])) for j in range(num_levels)
     ]
-    # Cap the doubling at what band x surviving prefixes supply (tiny codebooks).
+    # A level can only carry band x surviving prefixes, however much was asked.
     widths: List[int] = []
     prev = 1
-    for j, (lo, hi) in enumerate(bands):
-        widths.append(min(num_beams * (2 ** (j + 1)), prev * (hi - lo + 1)))
+    for w, (lo, hi) in zip(beam_widths, bands):
+        widths.append(min(w, prev * (hi - lo + 1)))
         prev = widths[-1]
 
     def _band_logp(logits: torch.Tensor, j: int) -> torch.Tensor:

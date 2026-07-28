@@ -37,6 +37,9 @@ class GenerativeQwen(BaseGenerativeModel):
     only enters through ``hf_model_id``.
     """
 
+    # Flat width used when beam_widths is left empty; mirrors the proto comment.
+    DEFAULT_BEAM_WIDTH = 50
+
     # ChatML frame. Family-specific; a subclass overrides it wholesale.
     CHAT_TEMPLATE = {
         "user_prefix": "<|im_start|>user\n",
@@ -55,19 +58,35 @@ class GenerativeQwen(BaseGenerativeModel):
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         common = self._model_config.common
-        self._num_beams = int(common.num_beams)
-        self._num_return = int(common.num_return_sequences)
-        self._dynamic_beam = bool(common.dynamic_beam)
-        if not self._dynamic_beam and self._num_return > self._num_beams:
-            raise ValueError(
-                f"{type(self).__name__}: num_return_sequences "
-                f"({self._num_return}) must not exceed num_beams "
-                f"({self._num_beams})."
-            )
+        self._read_beam_config(common)
         self._max_total_len = self._compute_max_total_length()
         self._pool_warmed = False
         # +2 = trailing eos + HF's shift-by-one; constant width avoids a per-step sync.
         self._suffix_keep = self._num_levels + self.tpl_asst_suffix.numel() + 2
+
+    def _read_beam_config(
+        self, common: generative_model_pb2.GenerativeModelConfig
+    ) -> None:
+        """Parse the decode knobs; the width schedule must match the codebook.
+
+        An empty ``beam_widths`` is a flat ``DEFAULT_BEAM_WIDTH`` at every level.
+        """
+        self._num_return = int(common.num_return_sequences)
+        self._beam_widths: List[int] = (
+            list(common.beam_widths) or [self.DEFAULT_BEAM_WIDTH] * self._num_levels
+        )
+        if len(self._beam_widths) != self._num_levels:
+            raise ValueError(
+                f"{type(self).__name__}: beam_widths has "
+                f"{len(self._beam_widths)} entries but the codebook has "
+                f"{self._num_levels} levels; give one width per level."
+            )
+        if self._num_return > self._beam_widths[-1]:
+            raise ValueError(
+                f"{type(self).__name__}: num_return_sequences "
+                f"({self._num_return}) must not exceed the final beam width "
+                f"({self._beam_widths[-1]})."
+            )
 
     def _compute_max_total_length(self) -> int:
         """The ``T`` the activation pool pre-sizes to; 0 when disabled."""
@@ -238,34 +257,24 @@ class GenerativeQwen(BaseGenerativeModel):
     def _generate(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Beam-search the SID answer, no ground truth supplied.
 
-        ``generated_sids`` is ``(B, C, num_levels)``; ``C`` is
-        ``num_return_sequences``, or the dynamic beam's final width.
+        ``generated_sids`` is ``(B, C, num_levels)``, best-first per row, where
+        ``C`` is ``num_return_sequences`` (flat schedule) or the dynamic beam's
+        final width. Candidates come back score-ordered, so trimming to
+        ``num_return`` keeps the best ones.
         """
         slot_rows = self._slot_rows(self.build_input(batch))
         input_ids, attention_mask = self._left_pad(self._prompt_rows(slot_rows))
-        if self._dynamic_beam:
-            lo_tok, hi_tok = self._sid_token_bands()
-            new_tokens = dynamic_beam_search(
-                self.lm,
-                input_ids,
-                attention_mask,
-                num_beams=self._num_beams,
-                lo_tok=lo_tok,
-                hi_tok=hi_tok,
-            )
-        else:
-            out = self.lm.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=self._num_levels,
-                num_beams=self._num_beams,
-                num_return_sequences=self._num_return,
-                do_sample=False,
-                pad_token_id=self._pad_token_id,
-            )
-            new_tokens = out[:, input_ids.shape[1] :]
+        lo_tok, hi_tok = self._sid_token_bands()
+        new_tokens = dynamic_beam_search(
+            self.lm,
+            input_ids,
+            attention_mask,
+            beam_widths=self._beam_widths,
+            lo_tok=lo_tok,
+            hi_tok=hi_tok,
+        )
         sids = self._validate_sid_candidates(new_tokens, input_ids.shape[0])
-        return {self._generated_sids_key: sids}
+        return {self._generated_sids_key: sids[:, : self._num_return]}
 
     def _left_pad(
         self, rows: List[torch.Tensor], pad_to: int = 0
