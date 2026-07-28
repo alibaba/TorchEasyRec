@@ -70,6 +70,7 @@ from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
+from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
@@ -338,6 +339,7 @@ def _train_and_evaluate(
     dataloader_state: Optional[Dict[str, Any]] = None,
     delta_embedding_dumper: Optional[DeltaEmbeddingDumper] = None,
     pipeline_config_path: Optional[str] = None,
+    dense_ema: Optional[DenseEMA] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -441,7 +443,12 @@ def _train_and_evaluate(
                 if delta_embedding_dumper is not None
                 else nullcontext()
             )
-            with tracking_context:
+            ema_context = (
+                dense_ema.average_parameters()
+                if dense_ema is not None
+                else nullcontext()
+            )
+            with tracking_context, ema_context:
                 _evaluate(
                     model,
                     eval_dataloader,
@@ -480,7 +487,11 @@ def _train_and_evaluate(
             if i_step == 0 and ckpt_path is not None:
                 if ignore_restore_optimizer:
                     ckpt_manager.restore(
-                        ckpt_path, model, None, train_config.fine_tune_ckpt_param_map
+                        ckpt_path,
+                        model,
+                        None,
+                        train_config.fine_tune_ckpt_param_map,
+                        dense_ema=dense_ema,
                     )
                 else:
                     # optimizer state is lazy, so peek one batch to init it
@@ -493,6 +504,7 @@ def _train_and_evaluate(
                         model,
                         optimizer,
                         train_config.fine_tune_ckpt_param_map,
+                        dense_ema=dense_ema,
                     )
                 if delta_embedding_dumper is not None:
                     delta_embedding_dumper.clear()
@@ -546,12 +558,15 @@ def _train_and_evaluate(
                     model,
                     optimizer,
                     dataloader_state,
+                    dense_ema,
                     data_timestamp=data_timestamp,
                 ):
                     run_eval(i_step, i_epoch)
                 # Unconditional: the exporter decides its own (checkpoint-
                 # independent) cadence and enters its collective in lockstep.
-                online_dense_exporter.maybe_export(i_step, data_timestamp, model)
+                online_dense_exporter.maybe_export(
+                    i_step, data_timestamp, model, dense_ema=dense_ema
+                )
                 if train_config.is_profiling:
                     prof.step()
 
@@ -560,11 +575,14 @@ def _train_and_evaluate(
                 model,
                 optimizer,
                 dataloader_state,
+                dense_ema,
                 epoch=i_epoch,
                 data_timestamp=data_timestamp,
             ):
                 run_eval(i_step, i_epoch)
-            online_dense_exporter.maybe_export(i_step, data_timestamp, model)
+            online_dense_exporter.maybe_export(
+                i_step, data_timestamp, model, dense_ema=dense_ema
+            )
 
             if use_step and i_step >= train_config.num_steps - 1:
                 break
@@ -605,11 +623,18 @@ def _train_and_evaluate(
             model,
             optimizer,
             dataloader_state,
+            dense_ema,
             data_timestamp=data_timestamp,
             final=True,
         ):
             run_eval(i_step, i_epoch)
-        online_dense_exporter.maybe_export(i_step, data_timestamp, model, final=True)
+        online_dense_exporter.maybe_export(
+            i_step,
+            data_timestamp,
+            model,
+            final=True,
+            dense_ema=dense_ema,
+        )
     finally:
         online_dense_exporter.close()
         ckpt_manager.close()
@@ -788,12 +813,19 @@ def train_and_evaluate(
     part_optim_cls, part_optim_kwargs, part_optim_regex_patterns = (
         optimizer_builder.create_part_optimizer(train_config.dense_optimizer)
     )
+    dense_params = dict(in_backward_optimizer_filter(model.named_parameters()))
     remaining_params, part_optim_params = (
         optimizer_builder.group_param_by_regex_pattern(
-            dict(in_backward_optimizer_filter(model.named_parameters())),
+            dense_params,
             part_optim_regex_patterns,
         )
     )
+    dense_ema = None
+    if train_config.dense_optimizer.HasField("ema"):
+        dense_ema = DenseEMA(
+            dense_params,
+            train_config.dense_optimizer.ema.decay,
+        )
     dense_optimizer = KeyedOptimizerWrapper(
         remaining_params,
         lambda params: dense_optim_cls(params, **dense_optim_kwargs),
@@ -831,6 +863,8 @@ def train_and_evaluate(
                 norm_type=gc_config.norm_type,
                 enable_global_grad_clip=gc_config.enable_global_grad_clip,
             )
+    if dense_ema is not None:
+        combined_optimizer = EMAOptimizer(combined_optimizer, dense_ema)
     optimizer = TZRecOptimizer(
         combined_optimizer,
         grad_scaler=grad_scaler,
@@ -877,6 +911,7 @@ def train_and_evaluate(
         dataloader_state=dataloader_state,
         delta_embedding_dumper=delta_embedding_dumper,
         pipeline_config_path=os.path.join(pipeline_config.model_dir, "pipeline.config"),
+        dense_ema=dense_ema,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
@@ -957,7 +992,11 @@ def evaluate(
     )
 
     if checkpoint_path:
-        ckpt_manager.restore(checkpoint_path, model)
+        ckpt_manager.restore(
+            checkpoint_path,
+            model,
+            use_dense_ema=train_config.dense_optimizer.HasField("ema"),
+        )
     else:
         raise ValueError("Eval checkpoint path should be specified.")
 
@@ -1506,7 +1545,11 @@ def predict_checkpoint(
     model.eval()
 
     if checkpoint_path:
-        ckpt_manager.restore(checkpoint_path, model)
+        ckpt_manager.restore(
+            checkpoint_path,
+            model,
+            use_dense_ema=train_config.dense_optimizer.HasField("ema"),
+        )
     else:
         raise ValueError("Predict checkpoint path should be specified.")
 

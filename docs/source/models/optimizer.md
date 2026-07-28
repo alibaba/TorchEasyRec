@@ -21,6 +21,9 @@ train_config {
         }
         constant_learning_rate {
         }
+        ema {
+            decay: 0.999
+        }
         part_optimizers {
             adamw_optimizer {
                 lr: 0.01
@@ -52,6 +55,14 @@ train_config {
   - optimizer: 优化器类型，具体见dense optimize的[配置文档](../reference.md)
 
   - learning_rate: dense_optimizer的学习率计划器,具体见dense_optimizer中的learning_rate的[配置文档](../reference.md)
+
+  - ema:
+
+    对全部稠密参数（包括`part_optimizers`管理的参数）计算指数移动平均。配置该字段后启用，`decay`取值范围为`[0, 1]`，默认为`0.999`。EMA在每次实际参数更新后执行；梯度累计的中间步以及GradScaler跳过的异常更新不会计入。
+
+    训练checkpoint仍以原始参数作为主模型，保证optimizer状态能够精确续训，并额外保存稠密EMA状态。训练内评估、独立评估、checkpoint推理、普通模型导出和在线稠密模型导出默认使用EMA参数。旧checkpoint没有EMA状态时会输出告警并回退到原始参数；从旧checkpoint续训时，EMA会在下一次实际参数更新时重新初始化。
+
+    EMA仅平均稠密parameters，BatchNorm等buffers继续使用实时值，不对稀疏Embedding做平均。启用后会在训练设备上额外占用约一份稠密参数大小的显存。
 
   - part_optimizers:
 

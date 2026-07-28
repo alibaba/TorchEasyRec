@@ -244,7 +244,11 @@ def export_model_normal(
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         init_parameters(model, torch.device("cpu"))
-        checkpoint_util.restore_model(checkpoint_path, model)
+        checkpoint_util.restore_model(
+            checkpoint_path,
+            model,
+            use_dense_ema=pipeline_config.train_config.dense_optimizer.HasField("ema"),
+        )
         # for mc modules, fix output_segments_tensor is a meta tensor.
         fix_mch_state(model)
 
@@ -1145,7 +1149,11 @@ def export_rtp_model(
     gm = _prune_unused_param_and_buffer(gm)
     init_parameters(gm, device)
     gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, gm)
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        gm,
+        use_dense_ema=pipeline_config.train_config.dense_optimizer.HasField("ema"),
+    )
 
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
@@ -1637,7 +1645,11 @@ def export_distributed_embedding(
 
     init_parameters(gm, device)
     gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, gm)
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        gm,
+        use_dense_ema=pipeline_config.train_config.dense_optimizer.HasField("ema"),
+    )
 
     if is_rank_zero:
         with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
@@ -2070,7 +2082,12 @@ def export_dense_model_cpu(
         pipeline_config, model, device, data_input_path
     )
     gm, full_graph, dense_graph_config = build_dense_graph_module(model, data, device)
-    checkpoint_util.restore_model(checkpoint_path, gm, error_on_missing_keys=True)
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        gm,
+        error_on_missing_keys=True,
+        use_dense_ema=pipeline_config.train_config.dense_optimizer.HasField("ema"),
+    )
     finalize_dense_export(
         model, full_graph, gm, data, device, save_dir, dense_graph_config
     )
