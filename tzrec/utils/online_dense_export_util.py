@@ -281,6 +281,9 @@ class OnlineDenseExportManager:
         self._full_graph: Optional[torch.fx.Graph] = None
         self._warmup_data: Optional[Dict[str, Any]] = None
         self._dense_graph_config: Optional[Dict[str, Any]] = None
+        # FX-traced gm, traced once at construction and reused by every export
+        # so the worker never fx-traces concurrent with training forwards.
+        self._dense_model_traced: Optional[torch.fx.GraphModule] = None
 
         override = os.environ.get("ONLINE_DENSE_EXPORT_DIR")
         export_root = resolve_dense_export_root(model_dir)
@@ -421,10 +424,13 @@ class OnlineDenseExportManager:
                 twin_model, warmup_data, device
             )
             # Fail fast on trace/script errors instead of at the first export.
+            # Tracing happens here on the main thread and the traced module is
+            # reused by every export; fx-tracing on the worker would patch
+            # nn.Module.__call__ process-wide and race training forwards.
             with tempfile.TemporaryDirectory(
                 prefix="online_dense_export_dryrun_"
             ) as dry_run_dir:
-                finalize_dense_export(
+                dense_model_traced = finalize_dense_export(
                     twin_model,
                     full_graph,
                     gm,
@@ -478,6 +484,7 @@ class OnlineDenseExportManager:
         self._full_graph = full_graph
         self._warmup_data = warmup_data
         self._dense_graph_config = dense_graph_config
+        self._dense_model_traced = dense_model_traced
         return pairs
 
     def _verify_state_pairs(self, model: nn.Module) -> None:
@@ -742,6 +749,9 @@ class OnlineDenseExportManager:
             assert self._full_graph is not None
             assert self._warmup_data is not None
             assert self._dense_graph_config is not None
+            assert self._dense_model_traced is not None
+            # load_state_dict copies in place and the traced module shares these
+            # parameters, so it carries the reloaded weights without re-tracing.
             self._gm.load_state_dict(task["snapshot"])
             finalize_dense_export(
                 self._twin_model,
@@ -751,6 +761,7 @@ class OnlineDenseExportManager:
                 device,
                 tmp_dir,
                 self._dense_graph_config,
+                dense_model_traced=self._dense_model_traced,
             )
             ready_path = os.path.join(tmp_dir, "READY")
             with open(ready_path, "w") as f:

@@ -753,6 +753,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             self._full_graph = mock.Mock()
             self._warmup_data = {}
             self._dense_graph_config = {}
+            self._dense_model_traced = mock.Mock()
             return [("w", "model.w")]
 
         with (
