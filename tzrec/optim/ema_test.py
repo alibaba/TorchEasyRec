@@ -27,6 +27,14 @@ class DenseEMATest(unittest.TestCase):
         self.assertTrue(dense_optimizer.HasField("ema"))
         self.assertAlmostEqual(dense_optimizer.ema.decay, 0.999)
 
+    def test_counter_stays_on_cpu(self) -> None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        parameter = torch.nn.Parameter(torch.ones(1, device=device))
+        dense_ema = DenseEMA({"parameter": parameter}, decay=0.5)
+
+        self.assertEqual(dense_ema.n_averaged.device.type, "cpu")
+        self.assertEqual(dense_ema.state_dict()["parameter"].device, parameter.device)
+
     def test_update_and_average_parameters(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([1.0]))
         dense_ema = DenseEMA({"parameter": parameter}, decay=0.5)

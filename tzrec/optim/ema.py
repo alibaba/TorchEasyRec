@@ -36,10 +36,8 @@ class DenseEMA:
     ) -> None:
         self._names = list(named_parameters.keys())
         self._source = nn.ParameterList(named_parameters.values())
-        device = self._source[0].device if len(self._source) > 0 else None
         self._averaged_model = AveragedModel(
             self._source,
-            device=device,
             multi_avg_fn=get_ema_multi_avg_fn(decay),
             use_buffers=False,
         )
