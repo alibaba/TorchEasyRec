@@ -36,20 +36,22 @@ def _stub(codebook=None, base_vocab=100, pad_id=9, device="cpu"):
     m._pad_token_id = pad_id
     m._dynamic_beam = False
     m._max_seq_length = 0
+    m._num_slots = 1
+    m._slot_names = ["user_sequence"]
     m._generated_sids_key = "generated_sids"
     m.lm = types.SimpleNamespace(device=torch.device(device))
     for name, vals in {
-        "tpl_system": [10, 11],
-        "tpl_user_prefix": [12],
-        "tpl_user_suffix": [13],
-        "tpl_asst_prefix": [14],
+        "tpl_gap_0": [10, 11, 12],
+        "tpl_gap_1": [13, 14],
         "tpl_asst_suffix": [15],
         "tpl_eos": [9],
     }.items():
         m.register_buffer(name, torch.tensor(vals, dtype=torch.long), persistent=False)
-    offsets, sizes = Qwen2RecLM._sid_level_layout(codebook)
-    m.register_buffer("_level_offsets", offsets, persistent=False)
+    sizes = torch.tensor(codebook, dtype=torch.long)
     m.register_buffer("_codebook_sizes", sizes, persistent=False)
+    m.register_buffer(
+        "_level_offsets", torch.cumsum(sizes, 0) - sizes, persistent=False
+    )
     return m
 
 
@@ -78,10 +80,30 @@ def _real_lm_stub(codebook=None, base_vocab=20, num_beams=2):
     )
     torch.manual_seed(0)
     m.lm = Qwen2ForCausalLM(cfg).eval()
-    offsets, sizes = Qwen2RecLM._sid_level_layout(codebook)
-    m.register_buffer("_level_offsets", offsets, persistent=False)
+    sizes = torch.tensor(codebook, dtype=torch.long)
     m.register_buffer("_codebook_sizes", sizes, persistent=False)
+    m.register_buffer(
+        "_level_offsets", torch.cumsum(sizes, 0) - sizes, persistent=False
+    )
     return m
+
+
+def _wire_slots(m, prefix_text="", suffix_text=""):
+    """Minimal _features/_feature_groups so the base slot resolver can run."""
+    from tzrec.protos import model_pb2
+
+    m._features = [
+        types.SimpleNamespace(
+            name="user_sequence", prefix_text=prefix_text, suffix_text=suffix_text
+        )
+    ]
+    m._feature_groups = [
+        types.SimpleNamespace(
+            group_name="sids",
+            feature_names=["user_sequence"],
+            group_type=model_pb2.JAGGED_SEQUENCE,
+        )
+    ]
 
 
 def _train_stub(max_total_len):
@@ -89,6 +111,7 @@ def _train_stub(max_total_len):
     m = _stub()
     m._is_inference = False  # not inference + nn.Module.training=True -> is_train
     m._input_name, m._label_name = "user_sequence", "label"
+    m._slot_names, m._num_slots = ["user_sequence"], 1
     m._max_total_len = max_total_len
     m._pool_warmed = False
     seen_lens = []
@@ -110,8 +133,8 @@ class Qwen2RecLMTest(unittest.TestCase):
         m = _stub()
         u = [torch.tensor([100, 101, 102])]
         a = [torch.tensor([200, 201, 202])]  # 3 codes = num_levels
-        ids, labels, mask = m._splice_input_ids(u, a)
-        # sys|user_prefix|history|user_suffix|asst_prefix|answer|asst_suffix|eos
+        ids, labels, mask = m._splice_input_ids([u], a)
+        # head | history | tail | answer | asst_suffix | eos
         self.assertEqual(
             ids[0].tolist(), [10, 11, 12, 100, 101, 102, 13, 14, 200, 201, 202, 15, 9]
         )
@@ -126,7 +149,7 @@ class Qwen2RecLMTest(unittest.TestCase):
         m = _stub()
         u = [torch.tensor([100, 101, 102, 103]), torch.tensor([100])]
         a = [torch.tensor([200, 201, 202]), torch.tensor([207, 208, 209])]
-        ids, labels, mask = m._splice_input_ids(u, a)
+        ids, labels, mask = m._splice_input_ids([u], a)
         T = ids.shape[1]
         n1 = 2 + 1 + 1 + 1 + 1 + 3 + 1 + 1  # shorter row's real length
         self.assertEqual(ids[1, : T - n1].tolist(), [m._pad_token_id] * (T - n1))
@@ -138,7 +161,7 @@ class Qwen2RecLMTest(unittest.TestCase):
     def test_mask_keeps_trailing_eos_when_pad_equals_eos(self) -> None:
         m = _stub(pad_id=9)  # tpl_eos == 9 too
         ids, _, mask = m._splice_input_ids(
-            [torch.tensor([100])], [torch.tensor([200, 201, 202])]
+            [[torch.tensor([100])]], [torch.tensor([200, 201, 202])]
         )
         self.assertEqual(int(ids[0, -1]), 9)
         self.assertEqual(int(mask[0, -1]), 1)
@@ -149,7 +172,7 @@ class Qwen2RecLMTest(unittest.TestCase):
         m = _stub()
         suffix_keep = 6  # num_levels 3 + asst_suffix 1 + trailing eos + HF shift
         _, labels, _ = m._splice_input_ids(
-            [torch.tensor([100, 101, 102])], [torch.tensor([200, 201, 202])]
+            [[torch.tensor([100, 101, 102])]], [torch.tensor([200, 201, 202])]
         )
         # first supervised column, minimized over rows
         first_sup = int(((labels >= 0).cumsum(-1) == 1).float().argmax(-1).min())
@@ -158,8 +181,8 @@ class Qwen2RecLMTest(unittest.TestCase):
 
     def test_splice_prompt_ids(self) -> None:
         m = _stub()
-        ids, mask = m._splice_prompt_ids([torch.tensor([100, 101, 102])])
-        # [system | user_prefix | history | user_suffix | asst_prefix], no answer
+        ids, mask = m._splice_prompt_ids([[torch.tensor([100, 101, 102])]])
+        # [head | history | tail], no answer
         self.assertEqual(ids[0].tolist(), [10, 11, 12, 100, 101, 102, 13, 14])
         self.assertEqual(mask[0].tolist(), [1] * 8)
 
@@ -176,17 +199,17 @@ class Qwen2RecLMTest(unittest.TestCase):
     # are each level's min/max token; every malformed row collapses to -1.
     @parameterized.expand(
         [
-            [[[100, 102, 105], [101, 104, 108]], [[1, 1, 1], [2, 3, 4]]],
+            [[[100, 102, 105], [101, 104, 108]], [[0, 0, 0], [1, 2, 3]]],
             [
                 [
-                    [100, 102, 105],  # valid -> local [1, 1, 1]
-                    [101, 104, 108],  # valid -> local [2, 3, 4]
+                    [100, 102, 105],  # valid -> local [0, 0, 0]
+                    [101, 104, 108],  # valid -> local [1, 2, 3]
                     [102, 102, 105],  # pos0 above level-0 band
                     [100, 101, 105],  # pos1 below level-1 band
                     [100, 102, 109],  # pos2 above level-2 band
                     [100, 104, 9],  # pos2 = eos/pad token (sid -90) -> invalid
                 ],
-                [[1, 1, 1], [2, 3, 4]] + [[-1, -1, -1]] * 4,
+                [[0, 0, 0], [1, 2, 3]] + [[-1, -1, -1]] * 4,
             ],
             # early EOS: a tail narrower than num_levels still reshapes cleanly,
             # and the missing 3rd atom stays -1 -> out of band -> candidate -1
@@ -197,6 +220,7 @@ class Qwen2RecLMTest(unittest.TestCase):
     def test_generate_maps_tokens_to_sids(self, tail, expected) -> None:
         m = _stub(base_vocab=100)
         m._input_name = "user_sequence"
+        m._slot_names, m._num_slots = ["user_sequence"], 1
         m._num_beams, m._num_return = len(tail) + 1, len(tail)
         seen = {}
 
@@ -239,6 +263,7 @@ class Qwen2RecLMTest(unittest.TestCase):
     def test_generate_routes_to_the_dynamic_beam(self) -> None:
         m = _stub(base_vocab=100)
         m._input_name = "user_sequence"
+        m._slot_names, m._num_slots = ["user_sequence"], 1
         m._dynamic_beam = True
         m._num_beams = m._num_return = 2
         m.lm.generate = lambda **kw: self.fail("HF generate must not run")
@@ -254,7 +279,7 @@ class Qwen2RecLMTest(unittest.TestCase):
         self.assertEqual(seen["ids"], [10, 11, 12, 100, 102, 105, 13, 14])
         self.assertEqual(seen["mask"], [1] * 8)
         self.assertEqual(tuple(sids.shape), (1, 2, 3))
-        self.assertEqual(sids[0].tolist(), [[1, 1, 1], [2, 3, 4]])
+        self.assertEqual(sids[0].tolist(), [[0, 0, 0], [1, 2, 3]])
 
     def _prompt_tokenizer(self):
         # encode -> [len(text)] makes each buffer a fingerprint of its fragment
@@ -263,59 +288,43 @@ class Qwen2RecLMTest(unittest.TestCase):
             encode=lambda text, add_special_tokens=False: [len(text)],
         )
 
-    def test_build_prompt_tokens_composes_the_family_template(self) -> None:
+    def test_build_prompt_tokens_splits_the_template_around_the_slot(self) -> None:
         m = object.__new__(Qwen2RecLM)
         nn.Module.__init__(m)
-        cfg = types.SimpleNamespace(
-            system_instruction="", user_prefix_text="", user_suffix_text=""
-        )
+        _wire_slots(m, prefix_text="PRE", suffix_text="SUF")
+        cfg = types.SimpleNamespace(prompt_template="A{{user_sequence}}B")
         m._build_prompt_tokens(self._prompt_tokenizer(), cfg)
-        for name in [
-            "tpl_system",
-            "tpl_user_prefix",
-            "tpl_user_suffix",
-            "tpl_asst_prefix",
-            "tpl_asst_suffix",
-            "tpl_eos",
-        ]:
+        for name in ["tpl_gap_0", "tpl_gap_1", "tpl_asst_suffix", "tpl_eos"]:
             buf = getattr(m, name)
             self.assertIsInstance(buf, torch.Tensor)
             self.assertEqual(buf.dtype, torch.int64)
         tpl = Qwen2RecLM.CHAT_TEMPLATE
+        # head = user_prefix + before + feature.prefix_text
+        self.assertEqual(m.tpl_gap_0.tolist(), [len(tpl["user_prefix"] + "A" + "PRE")])
+        # tail = feature.suffix_text + after + user_suffix + asst_prefix
         self.assertEqual(
-            m.tpl_system.tolist(),
-            [
-                len(
-                    tpl["system_prefix"]
-                    + tpl["default_system_instruction"]
-                    + tpl["system_suffix"]
-                )
-            ],
+            m.tpl_gap_1.tolist(),
+            [len("SUF" + "B" + tpl["user_suffix"] + tpl["asst_prefix"])],
         )
-        self.assertEqual(m.tpl_user_prefix.tolist(), [len(tpl["user_prefix"])])
-        self.assertEqual(m.tpl_user_suffix.tolist(), [len(tpl["user_suffix"])])
-        self.assertEqual(m.tpl_asst_prefix.tolist(), [len(tpl["asst_prefix"])])
-        self.assertEqual(m.tpl_asst_suffix.tolist(), [len(tpl["asst_suffix"])])
         self.assertEqual(m.tpl_eos.tolist(), [99])  # eos cached for supervision
 
-    def test_build_prompt_tokens_honours_proto_text_knobs(self) -> None:
+    def test_build_prompt_tokens_rejects_a_bad_placeholder_count(self) -> None:
         m = object.__new__(Qwen2RecLM)
         nn.Module.__init__(m)
-        cfg = types.SimpleNamespace(
-            system_instruction="SYS", user_prefix_text="UP", user_suffix_text="US"
-        )
-        m._build_prompt_tokens(self._prompt_tokenizer(), cfg)
-        tpl = Qwen2RecLM.CHAT_TEMPLATE
-        self.assertEqual(
-            m.tpl_system.tolist(),
-            [len(tpl["system_prefix"] + "SYS" + tpl["system_suffix"])],
-        )
-        self.assertEqual(m.tpl_user_prefix.tolist(), [len(tpl["user_prefix"] + "UP")])
-        self.assertEqual(m.tpl_user_suffix.tolist(), [len("US" + tpl["user_suffix"])])
+        _wire_slots(m)
+        cases = [
+            ("no placeholder", "at least one"),
+            ("{{nope}} x", "names no feature_group"),
+        ]
+        for template, msg in cases:
+            with self.subTest(template=template):
+                cfg = types.SimpleNamespace(prompt_template=template)
+                with self.assertRaisesRegex(ValueError, msg):
+                    m._build_prompt_tokens(self._prompt_tokenizer(), cfg)
 
     def test_compute_max_total_length(self) -> None:
         m = _stub()
-        # frame = 2 system + 1 each user_pfx/sfx, asst_pfx/sfx, eos = 7
+        # frame = 3 head + 2 tail + 1 asst_suffix + 1 eos = 7
         m._max_seq_length = 300
         self.assertEqual(m._compute_max_total_length(), 7 + 300 + 3)
         m._max_seq_length = 0  # pre-allocation disabled
@@ -338,7 +347,7 @@ class Qwen2RecLMTest(unittest.TestCase):
     def test_splice_row_count_mismatch_raises(self) -> None:
         m = _stub()
         with self.assertRaisesRegex(ValueError, "row count mismatch"):
-            m._splice_input_ids([torch.tensor([100])], [])
+            m._splice_input_ids([[torch.tensor([100])]], [])
 
 
 class Qwen2ForwardLossTest(unittest.TestCase):
@@ -349,16 +358,16 @@ class Qwen2ForwardLossTest(unittest.TestCase):
         m._ignore_index = ignore_index
         m._pad_token_id = 0
         for name, vals in {
-            "tpl_system": [1, 2],
-            "tpl_user_prefix": [3],
-            "tpl_user_suffix": [4],
-            "tpl_asst_prefix": [5],
+            "tpl_gap_0": [1, 2, 3],
+            "tpl_gap_1": [4, 5],
             "tpl_asst_suffix": [6],
             "tpl_eos": [7],
         }.items():
             m.register_buffer(
                 name, torch.tensor(vals, dtype=torch.long), persistent=False
             )
+        m._num_slots = 1
+        m._slot_names = ["user_sequence"]
         m._suffix_keep = 6  # num_levels 3 + asst_suffix 1 + trailing eos + HF shift
         return m
 
@@ -366,7 +375,7 @@ class Qwen2ForwardLossTest(unittest.TestCase):
         # ragged histories so left padding is exercised
         u = [torch.tensor([20, 22, 25]), torch.tensor([21, 23, 26, 20, 24, 27])]
         a = [torch.tensor([20, 22, 25]), torch.tensor([21, 24, 28])]
-        return u, a
+        return [u], a
 
     def test_suffix_slice_matches_full_sequence_loss(self) -> None:
         # the fixed-width suffix slice must give the same CE as full-T logits
@@ -454,11 +463,11 @@ class Qwen2DynamicBeamTest(unittest.TestCase):
         sids = m._validate_sid_candidates(new, batch_size=1)
         self.assertEqual(tuple(sids.shape), (1, 24, 3))
         for level, size in enumerate(codebook):
-            self.assertTrue(bool((sids[..., level] >= 1).all()))
-            self.assertTrue(bool((sids[..., level] <= size).all()))
+            self.assertTrue(bool((sids[..., level] >= 0).all()))
+            self.assertTrue(bool((sids[..., level] < size).all()))
         self.assertEqual(
             {tuple(row) for row in sids[0].tolist()},
-            {(a, b, c) for a in range(1, 3) for b in range(1, 4) for c in range(1, 5)},
+            {(a, b, c) for a in range(2) for b in range(3) for c in range(4)},
         )
 
 

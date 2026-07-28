@@ -69,13 +69,13 @@ def _write_backbone(save_dir: str, vocab_size: int = 256) -> str:
 def _write_samples(save_dir: str, num_rows: int, seed: int = 0) -> str:
     """Write the two-column sample contract: history + answer, both list<int64>.
 
-    Codes are local 1-based per-level values in ``[1, codebook[level]]`` and
-    every row holds whole items in level order.
+    Codes are local 0-based per-level values in ``[0, codebook[level])``, as the
+    SID-generation models emit them; every row holds whole items in level order.
     """
     rnd = random.Random(seed)
 
     def _item():
-        return [rnd.randint(1, size) for size in _CODEBOOK]
+        return [rnd.randrange(size) for size in _CODEBOOK]
 
     schema = pa.schema(
         [
@@ -144,8 +144,8 @@ class GenRecIntegrationTest(unittest.TestCase):
             config.model_config, features, list(config.data_config.label_fields)
         )
         self.assertEqual(type(model).__name__, "Qwen2RecLM")
-        self.assertEqual(model._history_group, "sids")
-        self.assertEqual(model._input_name, "user_sequence")
+        self.assertEqual(model._slot_groups, ["sids"])
+        self.assertEqual(model._slot_names, ["user_sequence"])
         self.assertEqual(model._label_name, "label")
         self.assertEqual(model._num_levels, len(_CODEBOOK))
         # base vocab + sum(codebook) atoms, padded to vocab_pad_to_multiple_of

@@ -28,23 +28,17 @@ from tzrec.modules.escalating_beam import escalating_beam_search
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import generative_model_pb2
 
-QWEN2_TEMPLATE = {
-    "system_prefix": "<|im_start|>system\n",
-    "system_suffix": "<|im_end|>\n",
-    "user_prefix": "<|im_start|>user\n",
-    "user_suffix": "<|im_end|>\n",
-    "asst_prefix": "<|im_start|>assistant\n",
-    "asst_suffix": "<|im_end|>\n",
-    "default_system_instruction": (
-        "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-    ),
-}
-
 
 class Qwen2RecLM(GenerativeRecLM):
     """Qwen2 / Qwen2.5 generative-recommendation LM."""
 
-    CHAT_TEMPLATE = QWEN2_TEMPLATE
+    # ChatML frame. Family-specific; a subclass overrides it wholesale.
+    CHAT_TEMPLATE = {
+        "user_prefix": "<|im_start|>user\n",
+        "user_suffix": "<|im_end|>\n",
+        "asst_prefix": "<|im_start|>assistant\n",
+        "asst_suffix": "<|im_end|>\n",
+    }
 
     def __init__(
         self,
@@ -78,43 +72,60 @@ class Qwen2RecLM(GenerativeRecLM):
         if self._max_seq_length <= 0:
             return 0
         frame = (
-            self.tpl_system.numel()
-            + self.tpl_user_prefix.numel()
-            + self.tpl_user_suffix.numel()
-            + self.tpl_asst_prefix.numel()
+            sum(
+                getattr(self, f"tpl_gap_{i}").numel()
+                for i in range(self._num_slots + 1)
+            )
             + self.tpl_asst_suffix.numel()
             + self.tpl_eos.numel()
         )
-        return int(frame + self._max_seq_length + self._num_levels)
+        return int(frame + self._max_seq_length * self._num_slots + self._num_levels)
 
     def _build_prompt_tokens(
         self,
         tokenizer: PreTrainedTokenizerBase,
         cfg: generative_model_pb2.Qwen2RecLM,
     ) -> None:
-        """Tokenise the family chat template once; cache as buffers.
+        """Tokenise the static prompt once, as the N+1 gaps around the N slots.
 
-        Composes the proto's optional ``system_instruction`` /
-        ``user_prefix_text`` / ``user_suffix_text`` with the family's static
-        fragments. Buffers are non-persistent: they move with ``model.to(...)``
-        but stay off the state_dict so HF safetensors round-tripping isn't
-        polluted.
+        The base resolves ``{{feature_name}}`` slots; this hook only frames them
+        with ChatML and folds each slot feature's ``prefix_text`` / ``suffix_text``
+        into the adjacent gap, so every gap is ONE contiguous string tokenized in
+        one call. That keeps the encoding bit-identical to tokenizing the fully
+        rendered prompt -- splitting the token ids instead would let a BPE merge
+        span a seam. Splicing values between gaps is exact because the ``C*``
+        atoms are added-vocab tokens, which HF fast tokenizers pre-split on.
+
+        Buffers are non-persistent: they move with ``model.to(...)`` but stay off
+        the state_dict so HF safetensors round-tripping isn't polluted.
         """
         tpl = type(self).CHAT_TEMPLATE
-        sys_text = cfg.system_instruction or tpl["default_system_instruction"]
-        frags = {
-            "system": tpl["system_prefix"] + sys_text + tpl["system_suffix"],
-            "user_prefix": tpl["user_prefix"] + (cfg.user_prefix_text or ""),
-            "user_suffix": (cfg.user_suffix_text or "") + tpl["user_suffix"],
-            "asst_prefix": tpl["asst_prefix"],
-            "asst_suffix": tpl["asst_suffix"],
-        }
-        for slot_name, frag_str in frags.items():
+        gaps, features, groups = self._resolve_prompt_slots(cfg.prompt_template)
+        self._slot_names = [f.name for f in features]
+        self._slot_groups = groups
+        self._num_slots = len(features)
+        for i, gap in enumerate(gaps):
+            head = tpl["user_prefix"] if i == 0 else features[i - 1].suffix_text
+            tail = (
+                features[i].prefix_text
+                if i < self._num_slots
+                else tpl["user_suffix"] + tpl["asst_prefix"]
+            )
             # explicit <|im_start|> markers frame the prompt; no auto BOS/EOS.
             ids = torch.tensor(
-                tokenizer.encode(frag_str, add_special_tokens=False), dtype=torch.long
+                tokenizer.encode(head + gap + tail, add_special_tokens=False),
+                dtype=torch.long,
             )
-            self.register_buffer(f"tpl_{slot_name}", ids, persistent=False)
+            self.register_buffer(f"tpl_gap_{i}", ids, persistent=False)
+        # closes the assistant turn after the answer; not part of any gap.
+        self.register_buffer(
+            "tpl_asst_suffix",
+            torch.tensor(
+                tokenizer.encode(tpl["asst_suffix"], add_special_tokens=False),
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
         # the trailing eos is a SUPERVISED token; cache it for the splice.
         self.register_buffer(
             "tpl_eos",
@@ -122,27 +133,31 @@ class Qwen2RecLM(GenerativeRecLM):
             persistent=False,
         )
 
-    def _prompt_rows(self, user_seq_rows: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Per-row ``[system | user_prefix | history | user_suffix | asst_prefix]``.
+    def _prompt_rows(self, slot_rows: List[List[torch.Tensor]]) -> List[torch.Tensor]:
+        """Per-row ``[gap_0 | slot_0 | gap_1 | ... | slot_N-1 | gap_N]``.
 
         Shared by the teacher-forced splice and the answer-less inference prompt.
         """
-        return [
-            torch.cat(
-                [
-                    self.tpl_system,
-                    self.tpl_user_prefix,
-                    row,
-                    self.tpl_user_suffix,
-                    self.tpl_asst_prefix,
-                ]
-            )
-            for row in user_seq_rows
-        ]
+        gaps = [getattr(self, f"tpl_gap_{i}") for i in range(self._num_slots + 1)]
+        rows = []
+        for b in range(len(slot_rows[0])):
+            parts: List[torch.Tensor] = []
+            for i in range(self._num_slots):
+                parts.append(gaps[i])
+                parts.append(slot_rows[i][b])
+            parts.append(gaps[self._num_slots])
+            rows.append(torch.cat(parts))
+        return rows
+
+    def _slot_rows(
+        self, rows: Dict[str, List[torch.Tensor]]
+    ) -> List[List[torch.Tensor]]:
+        """Per-slot token rows, in template order."""
+        return [rows[name] for name in self._slot_names]
 
     def _splice_input_ids(
         self,
-        user_seq_rows: List[torch.Tensor],
+        slot_rows: List[List[torch.Tensor]],
         label_rows: List[torch.Tensor],
         pad_to: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -158,14 +173,14 @@ class Qwen2RecLM(GenerativeRecLM):
         ``asst_suffix``. ``pad_to`` left-extends every row for pool pre-sizing,
         keeping the supervised tail end-aligned.
         """
-        if len(user_seq_rows) != len(label_rows):
+        if len(slot_rows[0]) != len(label_rows):
             raise ValueError(
                 f"{type(self).__name__}: history/answer row count mismatch "
-                f"({len(user_seq_rows)} vs {len(label_rows)})."
+                f"({len(slot_rows[0])} vs {len(label_rows)})."
             )
         rows_ids = [
             torch.cat([prompt, label_rows[i], self.tpl_asst_suffix, self.tpl_eos])
-            for i, prompt in enumerate(self._prompt_rows(user_seq_rows))
+            for i, prompt in enumerate(self._prompt_rows(slot_rows))
         ]
         input_ids, attention_mask = self._left_pad(rows_ids, pad_to=pad_to)
 
@@ -196,7 +211,7 @@ class Qwen2RecLM(GenerativeRecLM):
             self._pool_warmed = True
 
         input_ids, labels, attention_mask = self._splice_input_ids(
-            rows[self._input_name], rows[self._label_name], pad_to=pad_to
+            self._slot_rows(rows), rows[self._label_name], pad_to=pad_to
         )
         return self._forward_loss(input_ids, labels, attention_mask)
 
@@ -229,8 +244,8 @@ class Qwen2RecLM(GenerativeRecLM):
         is ``num_return_sequences`` on the HF path and the escalating beam's
         final width when ``dynamic_beam`` is set.
         """
-        u_rows = self.build_input(batch)[self._input_name]
-        input_ids, attention_mask = self._splice_prompt_ids(u_rows)
+        slot_rows = self._slot_rows(self.build_input(batch))
+        input_ids, attention_mask = self._splice_prompt_ids(slot_rows)
         if self._dynamic_beam:
             new_tokens = self._dynamic_beam_search(input_ids, attention_mask)
         else:
@@ -262,10 +277,10 @@ class Qwen2RecLM(GenerativeRecLM):
         )
 
     def _splice_prompt_ids(
-        self, user_seq_rows: List[torch.Tensor]
+        self, slot_rows: List[List[torch.Tensor]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Assemble the answer-less prompt and left-pad into ``(B, T_max)``."""
-        return self._left_pad(self._prompt_rows(user_seq_rows))
+        return self._left_pad(self._prompt_rows(slot_rows))
 
     def _left_pad(
         self, rows: List[torch.Tensor], pad_to: int = 0

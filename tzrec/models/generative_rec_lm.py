@@ -17,6 +17,7 @@ subclass (e.g. ``Qwen2RecLM``) implements ``_build_prompt_tokens`` and
 ``GenerativeRecLMConfig`` (see ``protos/models/generative_model.proto``).
 """
 
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -93,9 +94,6 @@ class GenerativeRecLM(BaseModel):
         self, common: generative_model_pb2.GenerativeRecLMConfig
     ) -> int:
         """Parse shared proto knobs into attributes; return the SID atom count."""
-        hist = self._history_feature_group()
-        self._history_group: str = hist.group_name
-        self._input_name: str = hist.feature_names[0]
         self._label_name: str = self._labels[0] if self._labels else ""
         self._ignore_index: int = int(common.ignore_index)
         self._generated_sids_key: str = common.generated_sids_key
@@ -107,45 +105,120 @@ class GenerativeRecLM(BaseModel):
             )
         self._param_dtype: torch.dtype = param_dtype
         self._max_seq_length: int = int(common.max_sequence_length)
-        codebook = [int(c) for c in common.codebook]
-        if not codebook:
-            raise ValueError("GenerativeRecLM: codebook must be non-empty.")
-        if any(c <= 0 for c in codebook):
-            raise ValueError(
-                f"GenerativeRecLM: every codebook size must be positive, got "
-                f"{codebook}."
-            )
+        codebook = self._shared_sid_space()
         self._num_levels = len(codebook)
-        offsets, sizes = self._sid_level_layout(codebook)
-        self.register_buffer("_level_offsets", offsets, persistent=False)
+        sizes = torch.tensor(codebook, dtype=torch.long)
         self.register_buffer("_codebook_sizes", sizes, persistent=False)
+        # only the decode path still needs per-level offsets: SidFeature folds
+        # them into the input stream, but generated tokens must be split back
+        # into per-level codes and no feature is involved in generation.
+        self.register_buffer(
+            "_level_offsets", torch.cumsum(sizes, 0) - sizes, persistent=False
+        )
         self._vocab_pad_mult = int(common.vocab_pad_to_multiple_of)
         return sum(codebook)
 
-    def _history_feature_group(self) -> model_pb2.FeatureGroupConfig:
-        """The history feature_group = the single declared feature_group.
+    def _shared_sid_space(self) -> List[int]:
+        """The one codebook every SID feature declares.
 
-        Must be JAGGED_SEQUENCE: a SEQUENCE group would silently deliver
-        padded-dense values instead of the flat raw SID stream.
+        SID features share a single space: the model has one extended vocabulary
+        and one answer width, so adding a feature must not resize ``lm_head``.
+        Requiring the declarations to agree makes that invariant explicit and
+        turns a typo into an error instead of a silent reshape.
         """
-        if not self._feature_groups:
+        spaces = {}
+        for feature in self._features:
+            codebook = getattr(feature, "codebook", None)
+            if codebook is not None:
+                spaces[feature.name] = tuple(codebook)
+        if not spaces:
             raise ValueError(
-                f"{type(self).__name__}: no feature_group declared; genrec needs "
-                f"one JAGGED_SEQUENCE group carrying the history SID stream."
+                f"{type(self).__name__}: no SID feature declares a codebook; "
+                f"genrec needs at least one sequence_sid_feature."
             )
-        g = self._feature_groups[0]
-        if not g.feature_names:
+        if len(set(spaces.values())) != 1:
             raise ValueError(
-                f"{type(self).__name__}: history feature_group {g.group_name!r} "
-                f"has no feature_names."
+                f"{type(self).__name__}: all SID features must share one "
+                f"codebook, got {dict(sorted(spaces.items()))}."
             )
-        if g.group_type != model_pb2.JAGGED_SEQUENCE:
+        return list(next(iter(spaces.values())))
+
+    def _slot_group_names(self) -> Dict[str, str]:
+        """{feature_name: group_name} for every declared feature_group.
+
+        Each group must be JAGGED_SEQUENCE and hold exactly ONE feature: the
+        EmbeddingGroup column-interleaves the members of a group into a single
+        ``{group}.sequence``, so two features in one group could not be spliced
+        into separate prompt slots.
+        """
+        by_feature: Dict[str, str] = {}
+        for group in self._feature_groups:
+            if group.group_type != model_pb2.JAGGED_SEQUENCE:
+                raise ValueError(
+                    f"{type(self).__name__}: feature_group {group.group_name!r} "
+                    f"must be JAGGED_SEQUENCE, got "
+                    f"{model_pb2.FeatureGroupType.Name(group.group_type)}."
+                )
+            if len(group.feature_names) != 1:
+                raise ValueError(
+                    f"{type(self).__name__}: feature_group {group.group_name!r} "
+                    f"must hold exactly one feature (its members are interleaved "
+                    f"into one sequence), got {list(group.feature_names)}."
+                )
+            by_feature[group.feature_names[0]] = group.group_name
+        return by_feature
+
+    def _resolve_prompt_slots(
+        self, template: str
+    ) -> Tuple[List[str], List[BaseFeature], List[str]]:
+        """Split a prompt template into its static gaps and its slot features.
+
+        ``template`` carries ``{{feature_name}}`` slots; returns ``N+1`` static
+        gap strings, the ``N`` features they are interleaved with in template
+        order, and those features' feature_group names. Every slot must name a
+        declared feature, every declared feature_group must be referenced by a
+        slot, and every slot feature must expose the prompt-text interface
+        (``prefix_text`` / ``suffix_text``) -- so a misspelt or unused feature
+        fails here rather than silently vanishing from the prompt.
+        """
+        parts = re.split(r"\{\{(\w+)\}\}", template)
+        gaps, names = parts[0::2], parts[1::2]
+        if not names:
             raise ValueError(
-                f"{type(self).__name__}: history feature_group {g.group_name!r} "
-                f"must be JAGGED_SEQUENCE, got "
-                f"{model_pb2.FeatureGroupType.Name(g.group_type)}."
+                f"{type(self).__name__}: prompt_template needs at least one "
+                f"{{{{feature_name}}}} slot naming a declared feature."
             )
-        return g
+        group_of = self._slot_group_names()
+        by_name = {f.name: f for f in self._features}
+        features = []
+        for name in names:
+            if name not in group_of:
+                raise ValueError(
+                    f"{type(self).__name__}: prompt_template slot {{{{{name}}}}} "
+                    f"names no feature_group; declared: {sorted(group_of)}."
+                )
+            feature = by_name.get(name)
+            if feature is None:
+                raise ValueError(
+                    f"{type(self).__name__}: prompt_template slot {{{{{name}}}}} "
+                    f"has no feature_config."
+                )
+            if not hasattr(feature, "prefix_text") or not hasattr(
+                feature, "suffix_text"
+            ):
+                raise ValueError(
+                    f"{type(self).__name__}: feature {name!r} is a "
+                    f"{type(feature).__name__}, which does not expose the prompt "
+                    f"text interface (prefix_text/suffix_text); use a SidFeature."
+                )
+            features.append(feature)
+        unused = sorted(set(group_of) - set(names))
+        if unused:
+            raise ValueError(
+                f"{type(self).__name__}: feature_group(s) {unused} are declared "
+                f"but never referenced by a prompt_template slot."
+            )
+        return gaps, features, [group_of[n] for n in names]
 
     def _build_backbone(self) -> PreTrainedModel:
         """Build the EMPTY extended architecture -- no weight download.
@@ -244,52 +317,44 @@ class GenerativeRecLM(BaseModel):
         """Device the HF backbone runs on."""
         return self.lm.device
 
-    def _tokenize_sids(
-        self, codes: torch.Tensor, level_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Map local 1-based per-level codes to extended-vocab token ids.
+    def _tokenize_sids(self, flat: torch.Tensor) -> torch.Tensor:
+        """Map flat SID indices to extended-vocab token ids.
 
-        ``level_ids`` must broadcast against ``codes`` and identify each code's
-        RQ level.
+        ``SidFeature`` has already folded the per-level offsets in, and codes are
+        0-based, so the flat index IS the atom index: the model only owns the
+        shift into its own vocabulary.
         """
-        return codes + self._level_offsets[level_ids] + (self._base_vocab - 1)
+        return flat + self._base_vocab
 
     def _detokenize_sids(
         self, tokens: torch.Tensor, level_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Inverse of ``_tokenize_sids``: token ids to local 1-based codes."""
-        return tokens - (self._base_vocab - 1) - self._level_offsets[level_ids]
-
-    @staticmethod
-    def _sid_level_layout(codebook: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Per-level ``(flat_offset, size)``; the levels occupy disjoint bands."""
-        sizes = torch.tensor(codebook, dtype=torch.long)
-        return torch.cumsum(sizes, 0) - sizes, sizes
+        """Inverse of ``_tokenize_sids``: token ids to local 0-based codes."""
+        return tokens - self._base_vocab - self._level_offsets[level_ids]
 
     def _sid_token_bands(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the inclusive token-id band for every SID level."""
-        level_ids = torch.arange(self._num_levels, device=self.device)
         return (
-            self._tokenize_sids(torch.ones_like(level_ids), level_ids),
-            self._tokenize_sids(self._codebook_sizes, level_ids),
+            self._tokenize_sids(self._level_offsets),
+            self._tokenize_sids(self._level_offsets + self._codebook_sizes - 1),
         )
 
     def _validate_sid_candidates(
         self, new_tokens: torch.Tensor, batch_size: int
     ) -> torch.Tensor:
-        """Decode generated tokens to local 1-based codes and reject bad beams.
+        """Decode generated tokens to local 0-based codes and reject bad beams.
 
         ``new_tokens`` is the per-beam tail ``(B*C, w)`` (``w`` may be <
         ``num_levels`` when beams stop early). Returns ``(batch_size, C,
         num_levels)`` local codes. Every malformed candidate (early EOS /
         non-SID / wrong-level atom) is set to ``-1``, which cannot match a real
-        1-based code.
+        0-based code.
         """
         level_ids = torch.arange(new_tokens.shape[1], device=new_tokens.device)
         codes = self._detokenize_sids(new_tokens, level_ids)
         codes = F.pad(codes, (0, self._num_levels - codes.shape[1]), value=-1)
         # one out-of-band atom invalidates the whole candidate row.
-        invalid = ((codes < 1) | (codes > self._codebook_sizes)).any(dim=1)
+        invalid = ((codes < 0) | (codes >= self._codebook_sizes)).any(dim=1)
         codes = codes.masked_fill(invalid.unsqueeze(1), -1)
         # decoders return rows batch-major ([b0_c0, b0_c1, ...]); group per user.
         return codes.view(batch_size, -1, self._num_levels)
@@ -310,11 +375,12 @@ class GenerativeRecLM(BaseModel):
         """
         g = self.embedding_group(batch)
         rows: Dict[str, List[torch.Tensor]] = {
-            self._input_name: self._sid_token_rows(
-                g[f"{self._history_group}.sequence"],
-                g[f"{self._history_group}.sequence_length"],
+            name: self._sid_token_rows(
+                g[f"{group}.sequence"],
+                g[f"{group}.sequence_length"],
                 max_codes=self._max_seq_length,
-            ),
+            )
+            for name, group in zip(self._slot_names, self._slot_groups)
         }
         if not self.is_inference:
             if not self._label_name:
@@ -323,47 +389,28 @@ class GenerativeRecLM(BaseModel):
                     f"declare it as the first data_config.label_field."
                 )
             jt = batch.jagged_labels[self._label_name]
-            rows[self._label_name] = self._sid_token_rows(
-                jt.values(), jt.lengths(), expected_width=self._num_levels
-            )
+            rows[self._label_name] = self._answer_token_rows(jt.values(), jt.lengths())
         return rows
 
     def _sid_token_rows(
         self,
         values: torch.Tensor,
         lengths: torch.Tensor,
-        expected_width: Optional[int] = None,
         max_codes: Optional[int] = None,
     ) -> List[torch.Tensor]:
-        """Map flat SID ``(values, lengths)`` -> per-row token-id tensors.
+        """Map a feature's flat SID stream to per-row token-id tensors.
 
-        ``values`` may arrive as float / shape ``(N, 1)``. Rows must contain
-        whole items so the per-level offsets restart at level 0 for each row;
-        ``expected_width``, when set, requires exactly that many codes per row.
+        ``SidFeature._parse`` has already validated the codes and folded in the
+        per-level offsets, so this only applies the model-owned budget and the
+        shift into the extended vocabulary.
 
         ``max_codes``, when set, caps each row to its most-recent whole items
-        (the last ``floor(max_codes / num_levels) * num_levels`` codes) so the
-        pre-allocated pool covers every batch.
+        (the last ``floor(max_codes / num_levels) * num_levels`` codes, dropping
+        the oldest head). Skipped unless a row overflows.
         """
         if values.dim() == 2 and values.size(-1) == 1:
             values = values.squeeze(-1)
         sizes = lengths.long().tolist()
-        misaligned = [i for i, n in enumerate(sizes) if n % self._num_levels != 0]
-        if misaligned:
-            raise ValueError(
-                f"{type(self).__name__}: SID rows must contain whole "
-                f"{self._num_levels}-level items; rows {misaligned} have lengths "
-                f"{[sizes[i] for i in misaligned]}."
-            )
-        if expected_width is not None:
-            bad = [i for i, n in enumerate(sizes) if n != expected_width]
-            if bad:
-                raise ValueError(
-                    f"{type(self).__name__}: each SID item must be "
-                    f"{expected_width} codes (len(codebook)); rows {bad} have "
-                    f"{[sizes[i] for i in bad]} -- anomalous sample(s)."
-                )
-
         # TODO(shuqi): move truncation into FG once FG can keep the TAIL, not the HEAD.
         if max_codes:
             keep = (max_codes // self._num_levels) * self._num_levels
@@ -371,15 +418,37 @@ class GenerativeRecLM(BaseModel):
                 rows = torch.split(values, sizes)
                 values = torch.cat([r[-keep:] for r in rows])
                 sizes = [min(n, keep) for n in sizes]
+        tokens = self._tokenize_sids(values.to(self.device).long())
+        return list(torch.split(tokens, sizes))
+
+    def _answer_token_rows(
+        self, values: torch.Tensor, lengths: torch.Tensor
+    ) -> List[torch.Tensor]:
+        """Map the answer label to token ids.
+
+        The answer is a ``data_config.label_field``, not a feature, so nothing
+        has offset it: this is the one place the model still owns the per-level
+        fold-in. Every row must be exactly ``num_levels`` codes.
+        """
+        if values.dim() == 2 and values.size(-1) == 1:
+            values = values.squeeze(-1)
+        sizes = lengths.long().tolist()
+        bad = [i for i, n in enumerate(sizes) if n != self._num_levels]
+        if bad:
+            raise ValueError(
+                f"{type(self).__name__}: each answer must be "
+                f"{self._num_levels} codes (len(codebook)); rows {bad} have "
+                f"{[sizes[i] for i in bad]} -- anomalous sample(s)."
+            )
         codes = values.to(self.device).long()
         level_ids = torch.arange(codes.numel(), device=self.device) % self._num_levels
-        invalid = (codes < 1) | (codes > self._codebook_sizes[level_ids])
+        invalid = (codes < 0) | (codes >= self._codebook_sizes[level_ids])
         if invalid.any().item():
             raise ValueError(
-                f"{type(self).__name__}: SID codes must be local 1-based values "
-                f"in [1, codebook[level]]."
+                f"{type(self).__name__}: answer SID codes must be local 0-based "
+                f"values in [0, codebook[level])."
             )
-        tokens = self._tokenize_sids(codes, level_ids)
+        tokens = self._tokenize_sids(codes + self._level_offsets[level_ids])
         return list(torch.split(tokens, sizes))
 
     def init_loss(self) -> None:
