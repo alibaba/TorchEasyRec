@@ -30,6 +30,24 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import generative_model_pb2
 
 
+@torch.fx.wrap
+def _fx_wrapped_generate(model: "GenerativeQwen", batch: Batch) -> torch.Tensor:
+    """One opaque FX leaf spanning the whole decode.
+
+    TorchRec's predict pipeline FX-traces the model to find shardable modules.
+    The decode cannot be traced -- it turns a jagged batch into per-row python
+    lists, interleaves them, then runs a beam whose widths depend on the data --
+    so without this leaf ``tzrec.predict`` dies inside ``_rewrite_model`` with
+    "Proxy object cannot be iterated". Wrapping the WHOLE decode is what makes
+    it work: a leaf returns a single Proxy, so wrapping any inner helper only
+    moves the failure to its caller. The trace then finds nothing to shard,
+    which is correct -- a SID feature carries no embedding table.
+
+    At run time this is an ordinary call; only tracing sees a leaf.
+    """
+    return model._generate(batch)
+
+
 class GenerativeQwen(BaseGenerativeModel):
     """Generative-recommendation LM on a Qwen backbone (Qwen2.5, Qwen3, ...).
 
@@ -214,7 +232,7 @@ class GenerativeQwen(BaseGenerativeModel):
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Dispatch on the TER inference flag (``set_is_inference`` in main.py)."""
         if self.is_inference:
-            return self._generate(batch)
+            return {self._generated_sids_key: _fx_wrapped_generate(self, batch)}
         return self._predict_train(batch)
 
     def _predict_train(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -254,13 +272,12 @@ class GenerativeQwen(BaseGenerativeModel):
         )
         return {"loss": loss}
 
-    def _generate(self, batch: Batch) -> Dict[str, torch.Tensor]:
+    def _generate(self, batch: Batch) -> torch.Tensor:
         """Beam-search the SID answer, no ground truth supplied.
 
-        ``generated_sids`` is ``(B, C, num_levels)``, best-first per row, where
-        ``C`` is ``num_return_sequences`` (flat schedule) or the dynamic beam's
-        final width. Candidates come back score-ordered, so trimming to
-        ``num_return`` keeps the best ones.
+        Returns ``(B, C, num_levels)`` best-first per row, where ``C`` is
+        ``num_return_sequences``. Candidates come back score-ordered, so
+        trimming to ``num_return`` keeps the best ones.
         """
         slot_rows = self._slot_rows(self.build_input(batch))
         input_ids, attention_mask = self._left_pad(self._prompt_rows(slot_rows))
@@ -274,7 +291,7 @@ class GenerativeQwen(BaseGenerativeModel):
             hi_tok=hi_tok,
         )
         sids = self._validate_sid_candidates(new_tokens, input_ids.shape[0])
-        return {self._generated_sids_key: sids[:, : self._num_return]}
+        return sids[:, : self._num_return]
 
     def _left_pad(
         self, rows: List[torch.Tensor], pad_to: int = 0

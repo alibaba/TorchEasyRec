@@ -165,11 +165,44 @@ class GenerativeQwenTest(unittest.TestCase):
     def test_predict_routes_on_inference_flag(self) -> None:
         m = _stub()
         m._predict_train = lambda b: {"branch": "train"}
-        m._generate = lambda b: {"branch": "generate"}
         m._is_inference = False  # train / eval
         self.assertEqual(GenerativeQwen.predict(m, object())["branch"], "train")
         m._is_inference = True  # inference
-        self.assertEqual(GenerativeQwen.predict(m, object())["branch"], "generate")
+        sentinel = torch.zeros(1, 2, 3)
+        with mock.patch(
+            "tzrec.models.generative_qwen._fx_wrapped_generate", return_value=sentinel
+        ):
+            out = GenerativeQwen.predict(m, object())
+        self.assertIs(out["generated_sids"], sentinel)
+
+    def test_predict_survives_fx_tracing(self) -> None:
+        """TorchRec's predict pipeline FX-traces the model before running it.
+
+        The decode is un-traceable by construction (per-row python lists,
+        data-dependent beam widths), so it sits behind one ``torch.fx.wrap``
+        leaf. Without it ``tzrec.predict`` dies inside TorchRec's
+        ``_rewrite_model`` with "Proxy object cannot be iterated" -- a failure no
+        unit test saw because train and eval take the un-traced
+        ``TrainPipelineBase`` path (this model has no ShardedModule).
+        """
+        m = _stub(base_vocab=100)
+        m._is_inference = True
+
+        class _Wrapper(nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, batch):
+                return self.inner.predict(batch)
+
+        gm = torch.fx.symbolic_trace(_Wrapper(m))
+        leaves = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and "generate" in str(n.target)
+        ]
+        self.assertEqual(len(leaves), 1, f"expected one opaque decode node: {gm.graph}")
 
     # (generated tail -> decoded SIDs). sizes [2,3,4] -> offsets [0,2,5], so
     # [100,102,105] / [101,104,108] are each level's min/max token and local
@@ -205,7 +238,7 @@ class GenerativeQwenTest(unittest.TestCase):
             "tzrec.models.generative_qwen.dynamic_beam_search",
             return_value=torch.tensor(tail),
         ):
-            sids = m._generate(object())["generated_sids"]
+            sids = m._generate(object())
         # (B, num_return, num_levels)
         self.assertEqual(tuple(sids.shape), (1, len(tail), 3))
         self.assertEqual(sids[0].tolist(), expected)
@@ -223,7 +256,7 @@ class GenerativeQwenTest(unittest.TestCase):
         with mock.patch(
             "tzrec.models.generative_qwen.dynamic_beam_search", return_value=four
         ):
-            sids = m._generate(object())["generated_sids"]
+            sids = m._generate(object())
         self.assertEqual(tuple(sids.shape), (1, 2, 3))
         self.assertEqual(sids[0].tolist(), [[0, 0, 0], [1, 2, 3]])
 
@@ -268,7 +301,7 @@ class GenerativeQwenTest(unittest.TestCase):
         with mock.patch(
             "tzrec.models.generative_qwen.dynamic_beam_search", side_effect=fake_kernel
         ):
-            sids = m._generate(object())["generated_sids"]
+            sids = m._generate(object())
         self.assertIs(seen["lm"], m.lm)
         self.assertEqual(seen["ids"], [10, 11, 12, 100, 102, 105, 13, 14])
         self.assertEqual(seen["mask"], [1] * 8)
