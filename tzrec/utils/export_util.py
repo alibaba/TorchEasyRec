@@ -247,7 +247,10 @@ def export_model_normal(
         checkpoint_util.restore_model(
             checkpoint_path,
             model,
-            use_dense_ema=pipeline_config.train_config.dense_optimizer.HasField("ema"),
+            use_dense_ema=config_util.use_dense_ema(
+                pipeline_config.export_config,
+                pipeline_config.train_config,
+            ),
         )
         # for mc modules, fix output_segments_tensor is a meta tensor.
         fix_mch_state(model)
@@ -1152,7 +1155,10 @@ def export_rtp_model(
     checkpoint_util.restore_model(
         checkpoint_path,
         gm,
-        use_dense_ema=pipeline_config.train_config.dense_optimizer.HasField("ema"),
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
     )
 
     if is_rank_zero:
@@ -1648,7 +1654,10 @@ def export_distributed_embedding(
     checkpoint_util.restore_model(
         checkpoint_path,
         gm,
-        use_dense_ema=pipeline_config.train_config.dense_optimizer.HasField("ema"),
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
     )
 
     if is_rank_zero:
@@ -2086,7 +2095,10 @@ def export_dense_model_cpu(
         checkpoint_path,
         gm,
         error_on_missing_keys=True,
-        use_dense_ema=pipeline_config.train_config.dense_optimizer.HasField("ema"),
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
     )
     finalize_dense_export(
         model, full_graph, gm, data, device, save_dir, dense_graph_config

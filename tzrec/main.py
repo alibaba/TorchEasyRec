@@ -75,6 +75,7 @@ from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
+from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
@@ -340,6 +341,7 @@ def _train_and_evaluate(
     delta_embedding_dumper: Optional[DeltaEmbeddingDumper] = None,
     pipeline_config_path: Optional[str] = None,
     dense_ema: Optional[DenseEMA] = None,
+    export_config: Optional[ExportConfig] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -434,6 +436,15 @@ def _train_and_evaluate(
     i_step = 0
     i_epoch = 0
     losses = {}
+    eval_dense_ema = (
+        dense_ema if config_util.use_dense_ema(eval_config, train_config) else None
+    )
+    export_dense_ema = (
+        dense_ema
+        if export_config is None
+        or config_util.use_dense_ema(export_config, train_config)
+        else None
+    )
 
     def run_eval(step: int, epoch: int) -> None:
         """Run eval after a checkpoint save, if an eval dataloader is configured."""
@@ -444,8 +455,8 @@ def _train_and_evaluate(
                 else nullcontext()
             )
             ema_context = (
-                dense_ema.average_parameters()
-                if dense_ema is not None
+                eval_dense_ema.average_parameters()
+                if eval_dense_ema is not None
                 else nullcontext()
             )
             with tracking_context, ema_context:
@@ -565,7 +576,7 @@ def _train_and_evaluate(
                 # Unconditional: the exporter decides its own (checkpoint-
                 # independent) cadence and enters its collective in lockstep.
                 online_dense_exporter.maybe_export(
-                    i_step, data_timestamp, model, dense_ema=dense_ema
+                    i_step, data_timestamp, model, dense_ema=export_dense_ema
                 )
                 if train_config.is_profiling:
                     prof.step()
@@ -581,7 +592,7 @@ def _train_and_evaluate(
             ):
                 run_eval(i_step, i_epoch)
             online_dense_exporter.maybe_export(
-                i_step, data_timestamp, model, dense_ema=dense_ema
+                i_step, data_timestamp, model, dense_ema=export_dense_ema
             )
 
             if use_step and i_step >= train_config.num_steps - 1:
@@ -633,7 +644,7 @@ def _train_and_evaluate(
             data_timestamp,
             model,
             final=True,
-            dense_ema=dense_ema,
+            dense_ema=export_dense_ema,
         )
     finally:
         online_dense_exporter.close()
@@ -912,6 +923,7 @@ def train_and_evaluate(
         delta_embedding_dumper=delta_embedding_dumper,
         pipeline_config_path=os.path.join(pipeline_config.model_dir, "pipeline.config"),
         dense_ema=dense_ema,
+        export_config=pipeline_config.export_config,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
@@ -995,7 +1007,10 @@ def evaluate(
         ckpt_manager.restore(
             checkpoint_path,
             model,
-            use_dense_ema=train_config.dense_optimizer.HasField("ema"),
+            use_dense_ema=config_util.use_dense_ema(
+                pipeline_config.eval_config,
+                train_config,
+            ),
         )
     else:
         raise ValueError("Eval checkpoint path should be specified.")
@@ -1548,7 +1563,10 @@ def predict_checkpoint(
         ckpt_manager.restore(
             checkpoint_path,
             model,
-            use_dense_ema=train_config.dense_optimizer.HasField("ema"),
+            use_dense_ema=config_util.use_dense_ema(
+                pipeline_config.export_config,
+                train_config,
+            ),
         )
     else:
         raise ValueError("Predict checkpoint path should be specified.")

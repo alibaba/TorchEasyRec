@@ -11,13 +11,13 @@
 
 import os
 import re
-from typing import Any, Dict, List, Type
+from typing import Any, Dict, List, Type, Union
 
 import numpy as np
 from google.protobuf import json_format, text_format
 from google.protobuf.message import Message
 
-from tzrec.protos import data_pb2, pipeline_pb2
+from tzrec.protos import data_pb2, eval_pb2, export_pb2, pipeline_pb2, train_pb2
 from tzrec.protos.data_pb2 import FgMode
 from tzrec.utils.logging_util import logger
 
@@ -73,6 +73,21 @@ def config_to_kwargs(config: Message) -> Dict[str, Any]:
 def which_msg(config: Message, oneof_group: str) -> str:
     """Returns the name of the message that is set inside a oneof group."""
     return getattr(config, config.WhichOneof(oneof_group)).__class__.__name__
+
+
+def use_dense_ema(
+    config: Union[eval_pb2.EvalConfig, export_pb2.ExportConfig],
+    train_config: train_pb2.TrainConfig,
+) -> bool:
+    """Resolve whether evaluation or export should use Dense EMA parameters.
+
+    Args:
+        config: EvalConfig or ExportConfig containing the optional override.
+        train_config: Training configuration providing the default.
+    """
+    if config.HasField("use_dense_ema"):
+        return bool(config.use_dense_ema)
+    return train_config.dense_optimizer.HasField("ema")
 
 
 def _get_compatible_fg_mode(data_config: data_pb2.DataConfig) -> FgMode:

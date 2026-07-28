@@ -11,10 +11,46 @@
 
 import unittest
 
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util
 
 
 class ConfigUtilTest(unittest.TestCase):
+    def test_use_dense_ema(self):
+        for config_field in ("eval_config", "export_config"):
+            with self.subTest(config_field=config_field):
+                pipeline_config = EasyRecConfig()
+                config = getattr(pipeline_config, config_field)
+
+                self.assertFalse(
+                    config_util.use_dense_ema(
+                        config,
+                        pipeline_config.train_config,
+                    )
+                )
+                pipeline_config.train_config.dense_optimizer.ema.SetInParent()
+                self.assertTrue(
+                    config_util.use_dense_ema(
+                        config,
+                        pipeline_config.train_config,
+                    )
+                )
+
+                config.use_dense_ema = False
+                self.assertFalse(
+                    config_util.use_dense_ema(
+                        config,
+                        pipeline_config.train_config,
+                    )
+                )
+                config.use_dense_ema = True
+                self.assertTrue(
+                    config_util.use_dense_ema(
+                        config,
+                        pipeline_config.train_config,
+                    )
+                )
+
     def test_edit_config(self):
         pipeline_config = config_util.load_pipeline_config(
             "examples/multi_tower_taobao.config"

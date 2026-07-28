@@ -22,6 +22,9 @@ import torch
 
 from tzrec.main import _train_and_evaluate
 from tzrec.optim.ema import DenseEMA
+from tzrec.protos.eval_pb2 import EvalConfig
+from tzrec.protos.export_pb2 import ExportConfig
+from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 
 
 class MainTest(unittest.TestCase):
@@ -58,8 +61,9 @@ class MainTest(unittest.TestCase):
             tensorboard_summaries=[],
             is_profiling=False,
             log_step_count_steps=1,
+            dense_optimizer=DenseOptimizer(),
         )
-        eval_config = SimpleNamespace()
+        eval_config = EvalConfig()
 
         with tempfile.TemporaryDirectory() as model_dir:
             with (
@@ -120,6 +124,7 @@ class MainTest(unittest.TestCase):
             tensorboard_summaries=[],
             is_profiling=False,
             log_step_count_steps=10,
+            dense_optimizer=DenseOptimizer(ema=EMAConfig()),
         )
 
         def assert_ema(*args, **kwargs):
@@ -139,13 +144,16 @@ class MainTest(unittest.TestCase):
                 lr_scheduler=[],
                 model_dir="unused",
                 train_config=train_config,
-                eval_config=SimpleNamespace(),
+                eval_config=EvalConfig(),
                 ckpt_manager=ckpt_manager,
                 dense_ema=dense_ema,
+                export_config=ExportConfig(use_dense_ema=False),
             )
 
         torch.testing.assert_close(parameter, torch.tensor([4.0]))
         self.assertTrue(model.module.model.on_train_end.called)
+        for call in exporter.maybe_export.call_args_list:
+            self.assertIsNone(call.kwargs["dense_ema"])
 
 
 class TrainStepCounterMultiPassTest(unittest.TestCase):
