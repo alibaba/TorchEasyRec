@@ -1062,12 +1062,6 @@ def restore_model(
                 checkpoint_id=dense_ema_ckpt_path,
                 planner=planner,
             )
-            restored_count = len(state_dict) - len(planner.skipped_keys)
-            if restored_count == 0 and is_local_rank_zero:
-                logger.warning(
-                    f"No Dense EMA parameters from [{dense_ema_ckpt_path}] "
-                    "matched the restored model."
-                )
         elif is_local_rank_zero:
             logger.warning(
                 f"Dense EMA checkpoint [{dense_ema_ckpt_path}] not found; "
