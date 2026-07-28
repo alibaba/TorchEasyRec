@@ -62,25 +62,21 @@ class DenseEMATest(unittest.TestCase):
                 raise RuntimeError("evaluation failed")
         torch.testing.assert_close(parameter, torch.tensor([4.0]))
 
-    def test_reset_and_initialize_missing(self) -> None:
+    def test_reset(self) -> None:
         first = torch.nn.Parameter(torch.tensor([1.0]))
         second = torch.nn.Parameter(torch.tensor([2.0]))
         dense_ema = DenseEMA({"first": first, "second": second}, decay=0.5)
         dense_ema.update()
         first.data.fill_(3.0)
         second.data.fill_(4.0)
-        dense_ema.initialize_missing(["second"])
-
-        torch.testing.assert_close(
-            dense_ema.named_averaged_parameters()["first"], torch.tensor([1.0])
-        )
-        torch.testing.assert_close(
-            dense_ema.named_averaged_parameters()["second"], torch.tensor([4.0])
-        )
         dense_ema.reset()
+
         self.assertEqual(dense_ema.n_averaged.item(), 0)
         torch.testing.assert_close(
             dense_ema.named_averaged_parameters()["first"], torch.tensor([3.0])
+        )
+        torch.testing.assert_close(
+            dense_ema.named_averaged_parameters()["second"], torch.tensor([4.0])
         )
 
     def test_invalid_decay(self) -> None:

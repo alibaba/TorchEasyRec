@@ -601,6 +601,9 @@ class CheckpointUtilTest(unittest.TestCase):
         )
         dense_ema.update()
         self.assertEqual(dense_ema.n_averaged.item(), 1)
+        with torch.no_grad():
+            model.weight.fill_(3.0)
+            model.bias.fill_(4.0)
 
         with mock.patch.object(checkpoint_util, "has_dynamicemb", False):
             checkpoint_util.save_model(self.test_dir, model)
@@ -610,6 +613,55 @@ class CheckpointUtilTest(unittest.TestCase):
                 dense_ema=dense_ema,
             )
         self.assertEqual(dense_ema.n_averaged.item(), 0)
+        torch.testing.assert_close(
+            dense_ema.named_averaged_parameters()["weight"],
+            torch.full_like(model.weight, 3.0),
+        )
+        torch.testing.assert_close(
+            dense_ema.named_averaged_parameters()["bias"],
+            torch.full_like(model.bias, 4.0),
+        )
+
+    def test_dense_ema_partial_checkpoint_keeps_restored_model_parameters(self):
+        model = nn.Linear(2, 1)
+        with torch.no_grad():
+            model.weight.fill_(2.0)
+            model.bias.fill_(3.0)
+        dense_ema = DenseEMA({"weight": model.weight}, decay=0.5)
+        dense_ema.update()
+        with torch.no_grad():
+            model.weight.fill_(4.0)
+            model.bias.fill_(5.0)
+
+        with mock.patch.object(checkpoint_util, "has_dynamicemb", False):
+            checkpoint_util.save_model(
+                self.test_dir,
+                model,
+                dense_ema=dense_ema,
+            )
+            resumed_model = nn.Linear(2, 1)
+            resumed_ema = DenseEMA(
+                {
+                    "weight": resumed_model.weight,
+                    "bias": resumed_model.bias,
+                },
+                decay=0.5,
+            )
+            checkpoint_util.restore_model(
+                self.test_dir,
+                resumed_model,
+                dense_ema=resumed_ema,
+            )
+
+        self.assertEqual(resumed_ema.n_averaged.item(), 1)
+        torch.testing.assert_close(
+            resumed_ema.named_averaged_parameters()["weight"],
+            torch.full_like(resumed_model.weight, 2.0),
+        )
+        torch.testing.assert_close(
+            resumed_ema.named_averaged_parameters()["bias"],
+            torch.full_like(resumed_model.bias, 5.0),
+        )
 
     def test_remap_input_tile_user_key_maps_user_twins(self) -> None:
         self.assertEqual(

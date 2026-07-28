@@ -41,7 +41,7 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 
 from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
-from tzrec.optim.ema import DENSE_EMA_N_AVERAGED, DenseEMA
+from tzrec.optim.ema import DenseEMA
 from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
@@ -1031,6 +1031,7 @@ def restore_model(
                 logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
 
     if dense_ema is not None:
+        dense_ema.reset()
         if os.path.exists(dense_ema_ckpt_path):
             state_dict = dense_ema.state_dict()
             planner = PartialLoadPlanner(
@@ -1042,16 +1043,12 @@ def restore_model(
                 checkpoint_id=dense_ema_ckpt_path,
                 planner=planner,
             )
-            dense_ema.initialize_missing(
-                name for name in planner.skipped_keys if name != DENSE_EMA_N_AVERAGED
-            )
         else:
             if is_local_rank_zero:
                 logger.warning(
                     f"Dense EMA checkpoint [{dense_ema_ckpt_path}] not found; "
                     "EMA will restart from the next optimizer step."
                 )
-            dense_ema.reset()
 
     if use_dense_ema:
         if os.path.exists(dense_ema_ckpt_path):

@@ -11,7 +11,7 @@
 
 from collections import OrderedDict
 from contextlib import contextmanager
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
 import torch
 from torch import nn
@@ -74,21 +74,12 @@ class DenseEMA:
     def reset(self) -> None:
         """Reset EMA so the next update copies the current parameters."""
         self.n_averaged.zero_()
-        self.initialize_missing(self._names)
-
-    @torch.no_grad()
-    def initialize_missing(self, names: Iterable[str]) -> None:
-        """Initialize selected EMA parameters from their current values.
-
-        Args:
-            names: Original parameter FQNs whose EMA state was not restored.
-        """
-        name_to_index = {name: i for i, name in enumerate(self._names)}
-        averaged = list(self._averaged_model.module.parameters())
-        for name in names:
-            index = name_to_index.get(name)
-            if index is not None:
-                averaged[index].copy_(self._source[index])
+        for source, average in zip(
+            self._source,
+            self._averaged_model.module.parameters(),
+            strict=True,
+        ):
+            average.copy_(source)
 
     @contextmanager
     def average_parameters(self) -> Iterator[None]:
