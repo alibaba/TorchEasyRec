@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import os
 import shutil
 import unittest
@@ -366,6 +367,12 @@ def _build_batch(
 
 @mark_ci_scope("gpu")
 class DlrmHSTUTest(unittest.TestCase):
+    def teardown_example(self, example):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.memory_summary()
+
     def setUp(self):
         self.test_dir = None
 
