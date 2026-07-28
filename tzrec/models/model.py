@@ -420,7 +420,7 @@ class CudaAutocastWrapper(nn.Module):
     proper dtype casts. CUTLASS HSTU attention requires bf16/fp16 inputs.
 
     When ``device`` is set, it is passed as a second positional argument
-    to ``inner.forward(x, device)`` -- this binds the device for models
+    to ``inner.forward(x, device)`` — this binds the device for models
     like ``ScriptWrapper`` whose forward takes ``(data, device)``.
 
     ``_mixed_dtype_id: Final[int]`` encodes the dtype so that

@@ -1032,7 +1032,9 @@ message SidFeature {
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
 
-    // max sequence length, only take effect when use it as sequence
+    // NOT a truncation cap here -- fg (which a SID feature forbids) and an
+    // fx export marker are its only readers, so setting it is rejected.
+    // Use model_config.common.max_sequence_length for the history budget.
     optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];

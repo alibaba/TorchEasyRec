@@ -89,7 +89,12 @@ class SidFeatureTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 base = 'feature_name: "s" expression: "user:s" ' + bad
                 with self.assertRaisesRegex(ValueError, msg):
-                    _ = _feature(base).codebook
+                    _feature(base)
+
+    def test_rejects_sequence_length(self) -> None:
+        # it caps nothing here, so accepting it would read as a working budget
+        with self.assertRaisesRegex(ValueError, "max_sequence_length instead"):
+            _feature(f"{_BASE} sequence_length: 64")
 
     def test_no_embedding_table(self) -> None:
         f = _feature(_BASE)
