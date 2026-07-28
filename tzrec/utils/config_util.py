@@ -11,7 +11,7 @@
 
 import os
 import re
-from typing import Any, Dict, List, Type, Union
+from typing import Any, Dict, List, Optional, Type, Union
 
 import numpy as np
 from google.protobuf import json_format, text_format
@@ -76,16 +76,17 @@ def which_msg(config: Message, oneof_group: str) -> str:
 
 
 def use_dense_ema(
-    config: Union[eval_pb2.EvalConfig, export_pb2.ExportConfig],
+    config: Optional[Union[eval_pb2.EvalConfig, export_pb2.ExportConfig]],
     train_config: train_pb2.TrainConfig,
 ) -> bool:
     """Resolve whether evaluation or export should use Dense EMA parameters.
 
     Args:
-        config: EvalConfig or ExportConfig containing the optional override.
+        config: EvalConfig or ExportConfig containing the optional override,
+            or None to use the training default.
         train_config: Training configuration providing the default.
     """
-    if config.HasField("use_dense_ema"):
+    if config is not None and config.HasField("use_dense_ema"):
         return bool(config.use_dense_ema)
     return train_config.dense_optimizer.HasField("ema")
 

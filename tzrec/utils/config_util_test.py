@@ -17,6 +17,21 @@ from tzrec.utils import config_util
 
 class ConfigUtilTest(unittest.TestCase):
     def test_use_dense_ema(self):
+        pipeline_config = EasyRecConfig()
+        self.assertFalse(
+            config_util.use_dense_ema(
+                None,
+                pipeline_config.train_config,
+            )
+        )
+        pipeline_config.train_config.dense_optimizer.ema.SetInParent()
+        self.assertTrue(
+            config_util.use_dense_ema(
+                None,
+                pipeline_config.train_config,
+            )
+        )
+
         for config_field in ("eval_config", "export_config"):
             with self.subTest(config_field=config_field):
                 pipeline_config = EasyRecConfig()

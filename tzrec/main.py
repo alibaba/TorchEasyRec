@@ -440,10 +440,7 @@ def _train_and_evaluate(
         dense_ema if config_util.use_dense_ema(eval_config, train_config) else None
     )
     export_dense_ema = (
-        dense_ema
-        if export_config is None
-        or config_util.use_dense_ema(export_config, train_config)
-        else None
+        dense_ema if config_util.use_dense_ema(export_config, train_config) else None
     )
 
     def run_eval(step: int, epoch: int) -> None:
