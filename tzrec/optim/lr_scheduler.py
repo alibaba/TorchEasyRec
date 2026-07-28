@@ -162,13 +162,15 @@ class ManualStepLR(BaseLR):
 class LinearDecayLR(BaseLR):
     """Linear Decay LearningRate Scheduler.
 
-    Decays the learning rate linearly from base_lr to min_learning_rate
-    over total_size steps or epochs, with optional linear warmup. Mirrors
-    HuggingFace Trainer's ``lr_scheduler_type: linear``.
+    Decays the learning rate linearly from base_lr to min_learning_rate,
+    with optional linear warmup. Mirrors HuggingFace Trainer's
+    ``lr_scheduler_type: linear``.
 
     Args:
         optimizer (Optimizer): an instance of Optimizer.
-        total_size (int): total number of steps or epochs for the decay.
+        num_training_steps (int): length of the whole run in steps or epochs,
+            INCLUDING warmup_size (unlike decay_size/T_max, which measure only
+            the post-warmup horizon).
         min_learning_rate (float): minimum learning rate.
         warmup_learning_rate (float): warmup start learning rate.
         warmup_size (int): warmup steps or epochs.
@@ -178,20 +180,22 @@ class LinearDecayLR(BaseLR):
     def __init__(
         self,
         optimizer: Optimizer,
-        total_size: int,
+        num_training_steps: int,
         min_learning_rate: float = 0.0,
         warmup_learning_rate: float = 0.0,
         warmup_size: int = 0,
         by_epoch: bool = False,
     ) -> None:
-        if total_size <= 0:
-            raise ValueError(f"total_size must be positive, got {total_size}")
-        if warmup_size >= total_size:
+        if num_training_steps <= 0:
+            raise ValueError(
+                f"num_training_steps must be positive, got {num_training_steps}"
+            )
+        if warmup_size >= num_training_steps:
             raise ValueError(
                 f"warmup_size ({warmup_size}) must be smaller than "
-                f"total_size ({total_size})"
+                f"num_training_steps ({num_training_steps})"
             )
-        self._total_size = total_size
+        self._num_training_steps = num_training_steps
         self._min_learning_rate = min_learning_rate
         self._warmup_learning_rate = warmup_learning_rate
         self._warmup_size = warmup_size
@@ -207,8 +211,9 @@ class LinearDecayLR(BaseLR):
                 + self._warmup_learning_rate
                 for base_lr in self.base_lrs
             ]
-        t = min(step_count - self._warmup_size, self._total_size - self._warmup_size)
-        decay_scale = 1.0 - t / (self._total_size - self._warmup_size)
+        decay_steps = self._num_training_steps - self._warmup_size
+        t = min(step_count - self._warmup_size, decay_steps)
+        decay_scale = 1.0 - t / decay_steps
         return [
             self._min_learning_rate + (base_lr - self._min_learning_rate) * decay_scale
             for base_lr in self.base_lrs
