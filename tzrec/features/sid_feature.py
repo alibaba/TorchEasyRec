@@ -15,7 +15,7 @@ import numpy as np
 import pyarrow as pa
 
 from tzrec.datasets.utils import ParsedData
-from tzrec.features.feature import BaseFeature, FgMode
+from tzrec.features.feature import BaseFeature
 from tzrec.protos.feature_pb2 import FeatureConfig
 
 
@@ -23,8 +23,9 @@ class SidFeature(BaseFeature):
     """Semantic-ID sequence feature.
 
     A flat stream of 0-based per-level SID codes -- whole items in level order --
-    plus the prompt text wrapping them. Generated offline, so only
-    ``fg_mode = FG_NONE`` works; there is no pyfg counterpart.
+    plus the prompt text wrapping them. Codes are produced offline by a
+    SID-generation model; under fg this feature is a passthrough (see
+    ``_fg_json``), so it never forces the pipeline's ``fg_mode``.
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
@@ -37,26 +38,21 @@ class SidFeature(BaseFeature):
     ) -> None:
         # BaseFeature.__del__ dereferences _fg_op, so seed it before any raise.
         self._fg_op = None
-        # checked before super(), which calls init_fg() for FG_NORMAL and would
-        # surface the missing pyfg handler instead of this explanation.
-        fg_mode = kwargs.get("fg_mode", FgMode.FG_NONE)
-        if fg_mode != FgMode.FG_NONE:
-            raise ValueError(
-                f"{self.__class__.__name__}"
-                f"[{feature_config.sequence_sid_feature.feature_name}] supports "
-                f"data_config.fg_mode = FG_NONE only (SID codes are generated "
-                f"offline by a SID model), got {fg_mode}."
-            )
         super().__init__(feature_config, **kwargs)
-        # only fg (which this feature forbids) and an fx export marker read it,
-        # so it would cap nothing; the model owns the real, item-aligned budget.
-        if self.config.HasField("sequence_length"):
-            raise ValueError(
-                f"{self.__class__.__name__}[{self.config.feature_name}]: "
-                f"sequence_length does not truncate a SID feature; set "
-                f"model_config.common.max_sequence_length instead."
-            )
         self._codebook = self._read_codebook()
+        # fg truncates by VALUE count and keeps the head, so a cap that is not a
+        # whole number of items would hand the model partial items. The model's
+        # own max_sequence_length is item-aligned and keeps the recent tail.
+        if self.config.HasField("sequence_length"):
+            if self.config.sequence_length % len(self._codebook):
+                raise ValueError(
+                    f"{self.__class__.__name__}[{self.config.feature_name}]: "
+                    f"sequence_length ({self.config.sequence_length}) must be a "
+                    f"multiple of the {len(self._codebook)}-level codebook, or "
+                    f"fg would cut an item in half. Prefer "
+                    f"model_config.common.max_sequence_length, which is "
+                    f"item-aligned and keeps the most RECENT items."
+                )
         self._level_sizes = np.asarray(self._codebook)
         self._level_offsets = np.cumsum(self._level_sizes) - self._level_sizes
 
@@ -167,8 +163,27 @@ class SidFeature(BaseFeature):
         return parsed
 
     def _fg_json(self) -> List[Dict[str, Any]]:
-        """Get fg json config impl."""
-        raise RuntimeError(
-            f"{self.__class__.__name__}[{self.config.feature_name}] has no fg "
-            f"representation; SID codes are generated offline (fg_mode=FG_NONE)."
-        )
+        """Get fg json config impl.
+
+        A PASSTHROUGH: fg only splits the incoming sequence into per-position
+        values, and ``_parse`` folds in the level offsets afterwards either way.
+        There is no fg feature_type that can add ``level_offsets[i % num_levels]``
+        (fg expressions are not position-aware within a sequence), so the
+        arithmetic stays in ``_parse`` and fg is used purely to reach the codes.
+
+        This exists so a SID feature does not force the whole pipeline to
+        ``FG_NONE`` -- ``fg_mode`` is a data_config-level switch, so blocking it
+        here would block every other feature in the config too.
+        """
+        # emit the SCALAR form: BaseFeature.fg_json prepends "sequence_" and
+        # injects sequence_delim / sequence_length for is_sequence features.
+        fg_cfg: Dict[str, Any] = {
+            "feature_type": "raw_feature",
+            "feature_name": self.config.feature_name,
+            "expression": self.config.expression,
+            "default_value": self.config.default_value,
+            "value_type": "float",
+        }
+        if self.config.HasField("stub_type"):
+            fg_cfg["stub_type"] = self.config.stub_type
+        return [fg_cfg]

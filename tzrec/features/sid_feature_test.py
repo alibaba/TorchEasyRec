@@ -59,11 +59,41 @@ class SidFeatureTest(unittest.TestCase):
         [[FgMode.FG_NORMAL], [FgMode.FG_DAG], [FgMode.FG_BUCKETIZE]],
         name_func=parameterized_name_func,
     )
-    def test_rejects_every_fg_mode_but_none(self, fg_mode) -> None:
-        # SID codes come from an offline generation model; there is no pyfg
-        # counterpart, so anything but FG_NONE must fail loudly, not mis-parse.
-        with self.assertRaisesRegex(ValueError, "FG_NONE only"):
-            _feature(_BASE, fg_mode=fg_mode)
+    def test_builds_under_every_fg_mode(self, fg_mode) -> None:
+        # fg_mode is a data_config-level switch, so refusing it here would block
+        # every OTHER feature in the config from using fg.
+        self.assertEqual(type(_feature(_BASE, fg_mode=fg_mode)).__name__, "SidFeature")
+
+    def test_fg_passthrough_matches_the_fg_none_parse(self) -> None:
+        """Fg only reaches the codes; _parse folds the offsets either way."""
+        rows = [[1, 2, 3, 0, 1, 2], [3, 0, 1]]
+        want = [1, 6, 11, 0, 5, 10, 3, 4, 9]  # code + offsets [0,4,8]
+        none = _feature(_BASE).parse({"user_sequence": pa.array(rows)})
+        # under fg the same sequence arrives delimited, as ODPS/CSV deliver it
+        fg = _feature(_BASE, fg_mode=FgMode.FG_NORMAL).parse(
+            {"user_sequence": pa.array([";".join(map(str, r)) for r in rows])}
+        )
+        self.assertEqual(none.values.flatten().astype(int).tolist(), want)
+        self.assertEqual(fg.values.flatten().astype(int).tolist(), want)
+        self.assertEqual(none.seq_lengths.tolist(), fg.seq_lengths.tolist())
+
+    def test_fg_json_is_a_passthrough_raw_feature(self) -> None:
+        cfg = _feature(_BASE).fg_json()
+        self.assertEqual(len(cfg), 1)
+        # the base wrapper prepends "sequence_"; no bucketizer, no normalizer
+        self.assertEqual(cfg[0]["feature_type"], "sequence_raw_feature")
+        self.assertEqual(cfg[0]["expression"], "user:user_sequence")
+        for k in ("boundaries", "normalizer", "vocab_file", "hash_bucket_size"):
+            self.assertNotIn(k, cfg[0])
+
+    def test_rejects_a_sequence_length_that_splits_an_item(self) -> None:
+        # fg truncates by VALUE count, so a non-multiple would hand the model
+        # a partial item; _parse would then reject the whole batch.
+        with self.assertRaisesRegex(ValueError, "multiple of the 3-level"):
+            _feature(f"{_BASE} sequence_length: 10")
+        self.assertEqual(
+            _feature(f"{_BASE} sequence_length: 9").config.sequence_length, 9
+        )
 
     def test_parse_folds_in_the_level_offsets(self) -> None:
         # offsets [0, 4, 8]: level j's 0-based code k becomes flat index k + off[j],
@@ -91,22 +121,12 @@ class SidFeatureTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, msg):
                     _feature(base)
 
-    def test_rejects_sequence_length(self) -> None:
-        # it caps nothing here, so accepting it would read as a working budget
-        with self.assertRaisesRegex(ValueError, "max_sequence_length instead"):
-            _feature(f"{_BASE} sequence_length: 64")
-
     def test_no_embedding_table(self) -> None:
         f = _feature(_BASE)
         self.assertFalse(f.has_embedding)
         self.assertIsNone(f.emb_config)
         with self.assertRaisesRegex(RuntimeError, "no .*embedding table"):
             _ = f.num_embeddings
-
-    def test_no_fg_representation(self) -> None:
-        f = _feature(_BASE)
-        with self.assertRaisesRegex(RuntimeError, "no fg representation"):
-            f.fg_json()
 
 
 if __name__ == "__main__":
