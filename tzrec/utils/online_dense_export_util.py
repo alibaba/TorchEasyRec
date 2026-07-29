@@ -58,6 +58,7 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
 
 from tzrec.acc import utils as acc_utils
+from tzrec.optim.ema import DenseEMA
 from tzrec.utils import config_util
 from tzrec.utils.checkpoint_util import (
     quorum_event_time,
@@ -521,6 +522,7 @@ class OnlineDenseExportManager:
         data_timestamp: float,
         model: nn.Module,
         final: bool = False,
+        dense_ema: Optional[DenseEMA] = None,
     ) -> None:
         """Export a dense version now if a configured trigger fires.
 
@@ -537,6 +539,7 @@ class OnlineDenseExportManager:
             model: the live DMP training model to gather weights from.
             final: force an export (still subject to the per-step dedupe),
                 e.g. at train end.
+            dense_ema: Dense EMA state to use for exported parameters.
         """
         if not self._enabled:
             return
@@ -558,10 +561,14 @@ class OnlineDenseExportManager:
         if data_ts is not None:
             # advance the watermark on every export
             self._last_data_ts = data_ts
-        self._gather_and_submit(step, data_timestamp, model)
+        self._gather_and_submit(step, data_timestamp, model, dense_ema)
 
     def _gather_and_submit(
-        self, step: int, data_timestamp: float, model: nn.Module
+        self,
+        step: int,
+        data_timestamp: float,
+        model: nn.Module,
+        dense_ema: Optional[DenseEMA] = None,
     ) -> None:
         """Gather the dense graph's weights from the DMP model (all ranks).
 
@@ -577,8 +584,9 @@ class OnlineDenseExportManager:
         gathered: Dict[str, torch.Tensor] = {}
         if self._state_pairs:
             source_state = model.state_dict()
+            ema_state = dense_ema.state_dict() if dense_ema is not None else {}
             for gm_key, source_key in self._state_pairs:
-                value = source_state[source_key]
+                value = ema_state.get(source_key, source_state[source_key])
                 if isinstance(value, DTensor):
                     # collective on the DTensor's mesh; all ranks participate
                     tensor = value.full_tensor()

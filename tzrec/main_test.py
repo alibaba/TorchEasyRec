@@ -18,7 +18,13 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from tzrec.main import _train_and_evaluate
+from tzrec.optim.ema import DenseEMA
+from tzrec.protos.eval_pb2 import EvalConfig
+from tzrec.protos.export_pb2 import ExportConfig
+from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 
 
 class MainTest(unittest.TestCase):
@@ -55,8 +61,9 @@ class MainTest(unittest.TestCase):
             tensorboard_summaries=[],
             is_profiling=False,
             log_step_count_steps=1,
+            dense_optimizer=DenseOptimizer(),
         )
-        eval_config = SimpleNamespace()
+        eval_config = EvalConfig()
 
         with tempfile.TemporaryDirectory() as model_dir:
             with (
@@ -80,6 +87,73 @@ class MainTest(unittest.TestCase):
                     )
         self.assertTrue(exporter.close.called)
         self.assertTrue(ckpt_manager.close.called)
+
+    def test_train_eval_uses_ema_and_restores_training_parameters(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor([2.0]))
+        dense_ema = DenseEMA({"parameter": parameter}, decay=0.5)
+        dense_ema.update()
+        parameter.data.fill_(4.0)
+
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()])
+        eval_dataloader = mock.Mock()
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=-1.0)
+        pipeline = mock.Mock()
+        pipeline.progress.return_value = (
+            {"loss": torch.tensor(1.0)},
+            {},
+            batch,
+        )
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.side_effect = [True, False, False]
+        exporter = mock.Mock()
+        train_config = SimpleNamespace(
+            num_steps=1,
+            num_epochs=0,
+            save_checkpoints_steps=1,
+            save_checkpoints_epochs=0,
+            save_checkpoints_timestamp_interval=0,
+            save_checkpoints_timestamps=[],
+            save_checkpoints_timestamp_quorum=0,
+            use_tensorboard=False,
+            tensorboard_summaries=[],
+            is_profiling=False,
+            log_step_count_steps=10,
+            dense_optimizer=DenseOptimizer(ema=EMAConfig()),
+        )
+
+        def assert_ema(*args, **kwargs):
+            torch.testing.assert_close(parameter, torch.tensor([2.0]))
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main._evaluate", side_effect=assert_ema),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            _train_and_evaluate(
+                model=model,
+                optimizer=optimizer,
+                train_dataloader=train_dataloader,
+                eval_dataloader=eval_dataloader,
+                lr_scheduler=[],
+                model_dir="unused",
+                train_config=train_config,
+                eval_config=EvalConfig(),
+                ckpt_manager=ckpt_manager,
+                dense_ema=dense_ema,
+                export_config=ExportConfig(use_dense_ema=False),
+            )
+
+        torch.testing.assert_close(parameter, torch.tensor([4.0]))
+        self.assertTrue(model.module.model.on_train_end.called)
+        for call in exporter.maybe_export.call_args_list:
+            self.assertIsNone(call.kwargs["dense_ema"])
 
 
 class TrainStepCounterMultiPassTest(unittest.TestCase):

@@ -35,6 +35,7 @@ from torch.distributed._shard.sharded_tensor.metadata import (
 from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed.device_mesh import init_device_mesh
 
+from tzrec.optim.ema import DenseEMA
 from tzrec.utils import misc_util
 from tzrec.utils.online_dense_export_util import (
     OnlineDenseExportManager,
@@ -659,7 +660,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                             mgr.maybe_export(step, -1.0, model)
                         gather.assert_not_called()
                         mgr.maybe_export(5, -1.0, model)
-                        gather.assert_called_once_with(5, -1.0, model)
+                        gather.assert_called_once_with(5, -1.0, model, None)
                         # same step (even forced) is deduped
                         mgr.maybe_export(5, -1.0, model, final=True)
                         gather.assert_called_once()
@@ -800,6 +801,32 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 os.path.exists(os.path.join(versions_root, payload["version"], "READY"))
             )
         torch.testing.assert_close(box["gm"].w, torch.full((2,), 7.0))
+
+    def test_gather_uses_ema_parameters_and_live_buffers(self) -> None:
+        manager = OnlineDenseExportManager.__new__(OnlineDenseExportManager)
+        manager._rank = 0
+        manager._state_pairs = [
+            ("w", "model.w"),
+            ("running", "model.running"),
+        ]
+        parameter = nn.Parameter(torch.full((2,), 2.0))
+        dense_ema = DenseEMA({"model.w": parameter}, decay=0.5)
+        dense_ema.update()
+        parameter.data.fill_(4.0)
+        dense_ema.update()
+        model = _mock_model(
+            {
+                "model.w": parameter,
+                "model.running": torch.full((2,), 7.0),
+            }
+        )
+
+        with mock.patch.object(manager, "_enqueue") as enqueue:
+            manager._gather_and_submit(5, 42.0, model, dense_ema)
+
+        snapshot = enqueue.call_args.args[2]
+        torch.testing.assert_close(snapshot["w"], torch.full((2,), 3.0))
+        torch.testing.assert_close(snapshot["running"], torch.full((2,), 7.0))
 
     def test_maybe_export_gathers_dtensor(self) -> None:
         """Sharded-as-DTensor state is all-gathered via full_tensor()."""

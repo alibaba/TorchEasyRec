@@ -14,6 +14,7 @@ export_config {
   - best 导出最好的模型
 - best_exporter_metric: 当exporter_type为best的时候，确定最优导出模型的metric，注意该metric要在对应任务的metrics设置了才行。对于多任务模型则需要设置 {metric_name}\_{tower_name}。
 - metric_larger_is_better: 确定最优导出模型的metric是越大越好，还是越小越好，默认是越大越好
+- use_dense_ema: 是否使用稠密EMA参数导出模型。未配置时默认跟随`train_config.dense_optimizer.ema`是否启用；可显式配置为`true`或`false`覆盖默认行为，在线Dense导出同样使用该配置
 
 ## 导出命令
 
