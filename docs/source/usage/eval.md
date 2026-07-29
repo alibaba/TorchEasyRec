@@ -31,3 +31,4 @@ eval_config {
 
 - num_steps: 评估的步数，默认为评估eval_input_path中指定的所有数据
 - log_step_count_steps: 评估打印log和summary的步数间隔（如果打印时间间隔小于1s，会跳过打印）
+- use_dense_ema: 是否使用稠密EMA参数进行评估。未配置时默认跟随`train_config.dense_optimizer.ema`是否启用；可显式配置为`true`或`false`覆盖默认行为

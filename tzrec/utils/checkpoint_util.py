@@ -41,6 +41,7 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 
 from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
+from tzrec.optim.ema import DenseEMA
 from tzrec.protos import export_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
@@ -104,6 +105,7 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             do not include the current rank's boundaries would crash
             ``validate_state()``. Set this when the saved world size is
             not a multiple divisor of the current world size.
+        warn_on_missing_keys (bool): Log states absent from the checkpoint.
 
     Model states missing from the checkpoint are skipped with a warning and
     recorded in ``skipped_keys``.
@@ -115,10 +117,12 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         flatten_sharded_tensors: bool = True,
         ckpt_param_map_path: Optional[str] = None,
         skip_output_segments_tensor: bool = False,
+        warn_on_missing_keys: bool = True,
     ) -> None:
         super().__init__(flatten_state_dict, flatten_sharded_tensors)
         self._ckpt_param_map = dict()
         self._skip_output_segments_tensor = skip_output_segments_tensor
+        self._warn_on_missing_keys = warn_on_missing_keys
         self.skipped_keys: List[str] = []
         if ckpt_param_map_path:
             with open(ckpt_param_map_path) as f:
@@ -189,7 +193,8 @@ class PartialLoadPlanner(DefaultLoadPlanner):
             if meta_fqn in self.metadata.state_dict_metadata:
                 md = self.metadata.state_dict_metadata[meta_fqn]
             else:
-                logger.warning(f"Skip restore state [{fqn}]")
+                if self._warn_on_missing_keys:
+                    logger.warning(f"Skip restore state [{fqn}]")
                 self.skipped_keys.append(fqn)
                 continue
 
@@ -383,6 +388,7 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
         dataloader_state: Optional[Dict[str, Any]] = None,
+        dense_ema: Optional[DenseEMA] = None,
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune.
 
@@ -393,7 +399,7 @@ class CheckpointManager:
         default format permanently unexportable to HF.
         """
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
-        save_model(ckpt_dir, model, optimizer)
+        save_model(ckpt_dir, model, optimizer, dense_ema)
         # Local import avoids a circular import (hf_export_util imports us).
         from tzrec.utils.hf_export_util import write_hf_assets
 
@@ -491,6 +497,7 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
         dataloader_state: Optional[Dict[str, Any]] = None,
+        dense_ema: Optional[DenseEMA] = None,
         *,
         epoch: Optional[int] = None,
         data_timestamp: float = -1.0,
@@ -510,6 +517,7 @@ class CheckpointManager:
             optimizer: optimizer to save, if any.
             dataloader_state: dataloader resume state; the event-time watermark is
                 stamped into it on save.
+            dense_ema: Dense EMA state to save, if enabled.
             epoch: current epoch; enables the epoch trigger when not None.
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none;
                 reconciled across workers (quorum) for the event-time trigger.
@@ -563,7 +571,7 @@ class CheckpointManager:
         if data_ts is not None:
             # advance the watermark on every save so resume is exact
             self._last_data_ts = data_ts
-        self.save(step, model, optimizer, dataloader_state)
+        self.save(step, model, optimizer, dataloader_state, dense_ema)
         return True
 
     def prune(self) -> None:
@@ -617,9 +625,18 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
         ckpt_param_map_path: Optional[str] = None,
+        dense_ema: Optional[DenseEMA] = None,
+        use_dense_ema: bool = False,
     ) -> None:
         """Restore model/optimizer state from a checkpoint dir."""
-        restore_model(ckpt_path, model, optimizer, ckpt_param_map_path)
+        restore_model(
+            ckpt_path,
+            model,
+            optimizer,
+            ckpt_param_map_path,
+            dense_ema=dense_ema,
+            use_dense_ema=use_dense_ema,
+        )
 
     def restore_dataloader_state(self, ckpt_path: str) -> Optional[Dict[str, Any]]:
         """Restore dataloader state saved alongside a checkpoint.
@@ -947,6 +964,8 @@ def restore_model(
     optimizer: Optional[optim.Optimizer] = None,
     ckpt_param_map_path: Optional[str] = None,
     error_on_missing_keys: bool = False,
+    dense_ema: Optional[DenseEMA] = None,
+    use_dense_ema: bool = False,
 ) -> None:
     """Restore model state.
 
@@ -958,6 +977,8 @@ def restore_model(
         error_on_missing_keys (bool): If True, raise RuntimeError when the
             model has states absent from the checkpoint instead of skipping
             them with a warning (which would leave them uninitialized).
+        dense_ema: Dense EMA state to restore for continued training.
+        use_dense_ema: Overlay Dense EMA parameters onto the restored model.
     """
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
@@ -968,6 +989,7 @@ def restore_model(
     meta_path = os.path.join(checkpoint_dir, "meta")
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
+    dense_ema_ckpt_path = os.path.join(checkpoint_dir, "dense_ema")
 
     cur_world_size = dist.get_world_size() if dist.is_initialized() else 1
     needs_mch_redistribution = _needs_mch_redistribution(
@@ -1025,6 +1047,44 @@ def restore_model(
             if is_local_rank_zero:
                 logger.warning(f"optim_ckpt_path[{optim_ckpt_path}] not exists.")
 
+    if dense_ema is not None:
+        dense_ema.reset()
+        if os.path.exists(dense_ema_ckpt_path):
+            state_dict = dense_ema.state_dict()
+            planner = PartialLoadPlanner(
+                ckpt_param_map_path=ckpt_param_map_path,
+                warn_on_missing_keys=False,
+            )
+            load(
+                state_dict,
+                checkpoint_id=dense_ema_ckpt_path,
+                planner=planner,
+            )
+        else:
+            if is_local_rank_zero:
+                logger.warning(
+                    f"Dense EMA checkpoint [{dense_ema_ckpt_path}] not found; "
+                    "EMA will restart from the next optimizer step."
+                )
+
+    if use_dense_ema:
+        if os.path.exists(dense_ema_ckpt_path):
+            state_dict = dict(model.named_parameters())
+            planner = PartialLoadPlanner(
+                ckpt_param_map_path=ckpt_param_map_path,
+                warn_on_missing_keys=False,
+            )
+            load(
+                state_dict,
+                checkpoint_id=dense_ema_ckpt_path,
+                planner=planner,
+            )
+        elif is_local_rank_zero:
+            logger.warning(
+                f"Dense EMA checkpoint [{dense_ema_ckpt_path}] not found; "
+                "using original model parameters."
+            )
+
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbLoad
 
@@ -1065,7 +1125,10 @@ def restore_model(
 
 
 def save_model(
-    checkpoint_dir: str, model: nn.Module, optimizer: Optional[optim.Optimizer] = None
+    checkpoint_dir: str,
+    model: nn.Module,
+    optimizer: Optional[optim.Optimizer] = None,
+    dense_ema: Optional[DenseEMA] = None,
 ) -> None:
     """Save model state.
 
@@ -1073,6 +1136,7 @@ def save_model(
         checkpoint_dir (str): easyrec model checkpoint dir.
         model (nn.Module): a EasyRec model.
         optimizer (optim.Optimizer, optional): a optimizer.
+        dense_ema: Dense EMA state to save.
     """
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"Saving checkpoint to {checkpoint_dir}...")
@@ -1081,6 +1145,11 @@ def save_model(
         save(
             optimizer.state_dict(),
             checkpoint_id=os.path.join(checkpoint_dir, "optimizer"),
+        )
+    if dense_ema is not None:
+        save(
+            dense_ema.state_dict(),
+            checkpoint_id=os.path.join(checkpoint_dir, "dense_ema"),
         )
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbDump

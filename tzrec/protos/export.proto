@@ -29,7 +29,9 @@ message ExportConfig {
     optional bool cudnn_allow_tf32 = 5 [default = true];
     // whether to use torch.backends.cuda.matmul.allow_tf32
     optional bool cuda_matmul_allow_tf32 = 6 [default = false];
+    // Whether export uses dense EMA parameters.
+    optional bool use_dense_ema = 7;
     // serialization format produced by `tzrec.export`; selects the export
     // branch in main.export (TORCHSCRIPT native graph vs HF backbone dir).
-    optional ExportFormat export_format = 7 [default = TORCHSCRIPT];
+    optional ExportFormat export_format = 8 [default = TORCHSCRIPT];
 }

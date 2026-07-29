@@ -21,6 +21,9 @@ train_config {
         }
         constant_learning_rate {
         }
+        ema {
+            decay: 0.999
+        }
         part_optimizers {
             adamw_optimizer {
                 lr: 0.01
@@ -52,6 +55,10 @@ train_config {
   - optimizer: 优化器类型，具体见dense optimize的[配置文档](../reference.md)
 
   - learning_rate: dense_optimizer的学习率计划器,具体见dense_optimizer中的learning_rate的[配置文档](../reference.md)
+
+  - ema:
+
+    对全部稠密参数（包括`part_optimizers`管理的参数）计算指数移动平均。配置该字段后启用，`decay`取值范围为`[0, 1]`，默认为`0.999`。EMA在每次实际参数更新后执行。
 
   - part_optimizers:
 

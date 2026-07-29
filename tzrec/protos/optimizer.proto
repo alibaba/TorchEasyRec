@@ -24,6 +24,11 @@ message SparseOptimizer {
     }
 }
 
+message EMAConfig {
+    // Exponential moving average decay in [0, 1].
+    optional float decay = 1 [default = 0.999];
+}
+
 message DenseOptimizer {
     oneof optimizer {
         SGDOptimizer sgd_optimizer = 1;
@@ -42,6 +47,7 @@ message DenseOptimizer {
         LinearDecayLR linear_decay_learning_rate = 106;
     }
     repeated PartOptimizer part_optimizers = 201;
+    optional EMAConfig ema = 202;
 }
 
 message PartOptimizer {
