@@ -993,9 +993,9 @@ message SequenceFeature {
 // model reads it as a JAGGED_SEQUENCE group, so the scalar form would never
 // produce the "{group}.sequence" keys it needs.
 //
-// FG note: SID codes are produced offline by a SID-generation model, so this
-// feature is only supported with data_config.fg_mode = FG_NONE. There is no
-// pyfg counterpart.
+// Under fg this is a PASSTHROUGH: no fg feature_type can add
+// level_offsets[i % levels], so fg only reaches the codes and the feature folds
+// the offsets in at parse time.
 message SidFeature {
     // feature name; also the {{name}} placeholder in prompt_template.
     required string feature_name = 1;

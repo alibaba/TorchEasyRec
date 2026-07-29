@@ -114,10 +114,13 @@ class SidFeatureTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "whole 3-level items"):
             f.parse({"user_sequence": pa.array([[0, 1]])})
 
-    def test_rejects_a_bad_codebook(self) -> None:
+    def test_rejects_a_bad_config(self) -> None:
         for bad, msg in (
             ("", "codebook is required"),
             ("codebook: 4 codebook: 0", "positive"),
+            # _parse reshapes by level and splits by seq_lengths, so a wider
+            # value would land the offsets on the wrong components.
+            ("codebook: 4 value_dim: 2", "value_dim must be 1"),
         ):
             with self.subTest(bad=bad):
                 base = 'feature_name: "s" expression: "user:s" ' + bad

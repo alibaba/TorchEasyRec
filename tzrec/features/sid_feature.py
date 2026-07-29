@@ -37,6 +37,12 @@ class SidFeature(BaseFeature):
         # BaseFeature.__del__ dereferences _fg_op, so seed it before any raise.
         self._fg_op = None
         super().__init__(feature_config, **kwargs)
+        if self.config.value_dim != 1:
+            raise ValueError(
+                f"{self.__class__.__name__}[{self.config.feature_name}]: "
+                f"value_dim must be 1 -- the SID stream is flat, one code per "
+                f"sequence position -- got {self.config.value_dim}."
+            )
         self._codebook = self._read_codebook()
         # fg truncates by VALUE count and keeps the head, so a cap that is not a
         # whole number of items would hand the model partial items. The model's
