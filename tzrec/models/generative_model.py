@@ -43,8 +43,8 @@ from tzrec.protos.models import generative_model_pb2
 class BaseGenerativeModel(BaseModel):
     """Model construction, SID vocab extension, data-prep, loss and metrics."""
 
-    # Flat width used when beam_widths is empty; a family may override it.
-    DEFAULT_BEAM_WIDTH = 50
+    # flat width used when beam_widths is empty; a family may override it
+    _default_beam_width = 50
 
     _PARAM_DTYPE: Dict[int, torch.dtype] = {
         generative_model_pb2.FP32: torch.float32,
@@ -120,7 +120,7 @@ class BaseGenerativeModel(BaseModel):
         """Parse the decode knobs; the width schedule must match the codebook."""
         self._num_return = int(common.num_return_sequences)
         self._beam_widths: List[int] = (
-            list(common.beam_widths) or [self.DEFAULT_BEAM_WIDTH] * self._num_levels
+            list(common.beam_widths) or [self._default_beam_width] * self._num_levels
         )
         if len(self._beam_widths) != self._num_levels:
             raise ValueError(

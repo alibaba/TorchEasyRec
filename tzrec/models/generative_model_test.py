@@ -309,7 +309,7 @@ class BaseGenerativeModelTest(unittest.TestCase):
             )
             return m
 
-        # empty -> flat DEFAULT_BEAM_WIDTH per level; anything else verbatim
+        # empty -> flat _default_beam_width per level; anything else verbatim
         self.assertEqual(read([], 50)._beam_widths, [50, 50, 50])
         self.assertEqual(read([100, 200, 400], 400)._beam_widths, [100, 200, 400])
         with self.assertRaisesRegex(ValueError, "one width per level"):
