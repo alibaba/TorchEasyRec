@@ -1007,8 +1007,6 @@ message SidFeature {
     optional string pooling = 10 [default = "sum"];
     // fg default value
     optional string default_value = 11 [default = "0"];
-    // fg multi-value separator
-    optional string separator = 12 [default = "\x1d"];
     // mask value in training progress
     optional bool use_mask = 14;
 
@@ -1024,8 +1022,6 @@ message SidFeature {
     optional string fg_encoded_default_value = 30;
     // only used as fg dag intermediate result or not
     optional bool stub_type = 34 [default = false];
-    // embedding param constraints
-    optional ParameterConstraints embedding_constraints = 50;
 
     // fg-side cap; must be a multiple of len(codebook). Prefer
     // model_config.common.max_sequence_length, which keeps the recent items.

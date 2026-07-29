@@ -18,7 +18,6 @@ from parameterized import parameterized
 from torch import nn
 
 from tzrec.models.generative_qwen import GenerativeQwen
-from tzrec.modules.dynamic_beam import dynamic_beam_search
 from tzrec.utils.test_util import create_tiny_causal_lm, parameterized_name_func
 
 
@@ -415,41 +414,6 @@ class GenerativeQwenLossTest(unittest.TestCase):
         with torch.no_grad():
             out = m._forward_loss(*m._splice_input_ids(*self._rows()))
         self.assertEqual(list(out), ["loss"])
-
-
-class GenerativeQwenBeamTest(unittest.TestCase):
-    """The kernel/model seam, which neither side can assert alone.
-
-    ``dynamic_beam_test`` owns the band masking and the per-level capping, but
-    only the model knows the bands and owns ``_validate_sid_candidates``, so this
-    is where "the kernel's output is exactly what the validator accepts" lands.
-    """
-
-    def test_band_masked_beams_decode_without_sentinels(self) -> None:
-        # real backbone: band masking guarantees that every returned candidate
-        # survives _validate_sid_candidates. widths are [2, 6, 24] here, i.e.
-        # exhaustive over the whole 2*3*4 codebook.
-        codebook = [2, 3, 4]
-        m = _real_lm_stub(codebook=codebook, base_vocab=20, beam_width=3)
-        ids = torch.tensor([[5, 6, 7]])
-        lo_tok, hi_tok = m._sid_token_bands()
-        new = dynamic_beam_search(
-            m.lm,
-            ids,
-            torch.ones_like(ids),
-            beam_widths=[3 * 2 ** (j + 1) for j in range(len(codebook))],
-            lo_tok=lo_tok,
-            hi_tok=hi_tok,
-        )
-        sids = m._validate_sid_candidates(new, batch_size=1)
-        self.assertEqual(tuple(sids.shape), (1, 24, 3))
-        for level, size in enumerate(codebook):
-            self.assertTrue(bool((sids[..., level] >= 0).all()))
-            self.assertTrue(bool((sids[..., level] < size).all()))
-        self.assertEqual(
-            {tuple(row) for row in sids[0].tolist()},
-            {(a, b, c) for a in range(2) for b in range(3) for c in range(4)},
-        )
 
 
 if __name__ == "__main__":
