@@ -69,6 +69,7 @@ def _wired(features=None, group_type=model_pb2.JAGGED_SEQUENCE, members=None):
     """Pre-``__init__`` state: the features/labels/groups the config-time code reads."""
     m = object.__new__(BaseGenerativeModel)
     nn.Module.__init__(m)
+    m._default_beam_width = 50  # __init__ is bypassed here
     m._features = [_sid_feature()] if features is None else features
     m._labels = ["label"]
     m._feature_groups = [
@@ -302,6 +303,7 @@ class BaseGenerativeModelTest(unittest.TestCase):
         def read(widths, num_return, levels=3):
             m = object.__new__(BaseGenerativeModel)
             m._num_levels = levels
+            m._default_beam_width = 50  # __init__ is bypassed here
             m._read_beam_config(
                 types.SimpleNamespace(
                     beam_widths=widths, num_return_sequences=num_return

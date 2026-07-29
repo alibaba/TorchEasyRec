@@ -43,9 +43,6 @@ from tzrec.protos.models import generative_model_pb2
 class BaseGenerativeModel(BaseModel):
     """Model construction, SID vocab extension, data-prep, loss and metrics."""
 
-    # flat width used when beam_widths is empty; a family may override it
-    _default_beam_width = 50
-
     _PARAM_DTYPE: Dict[int, torch.dtype] = {
         generative_model_pb2.FP32: torch.float32,
         generative_model_pb2.BF16: torch.bfloat16,
@@ -61,6 +58,8 @@ class BaseGenerativeModel(BaseModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
+        # flat width used when beam_widths is empty; set before the parse below
+        self._default_beam_width = 50
         cfg = self._model_config
         sid_atoms = self._read_common_config(cfg.common)
 
