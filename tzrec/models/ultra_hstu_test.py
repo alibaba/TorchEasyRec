@@ -329,14 +329,21 @@ def _build_batch(device: torch.device, channel_names: List[str]) -> Batch:
 @mark_ci_scope("gpu")
 class UltraHSTUTest(unittest.TestCase):
     def teardown_example(self, example):
-        cleanup_cuda_memory()
+        try:
+            cleanup_cuda_memory()
+        finally:
+            self._cleanup_test_dir()
 
     def setUp(self):
         self.test_dir = None
 
     def tearDown(self):
+        self._cleanup_test_dir()
+
+    def _cleanup_test_dir(self):
         if self.test_dir is not None and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
+        self.test_dir = None
 
     @unittest.skipIf(*gpu_unavailable)
     @given(
@@ -372,7 +379,7 @@ class UltraHSTUTest(unittest.TestCase):
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=15,
+        max_examples=20,
         deadline=None,
     )
     def test_ultra_hstu(
