@@ -34,31 +34,19 @@ from tzrec.protos.models import generative_model_pb2
 def _fx_wrapped_generate(model: "GenerativeQwen", batch: Batch) -> torch.Tensor:
     """One opaque FX leaf spanning the whole decode.
 
-    TorchRec's predict pipeline FX-traces the model to find shardable modules.
-    The decode cannot be traced -- it turns a jagged batch into per-row python
-    lists, interleaves them, then runs a beam whose widths depend on the data --
-    so without this leaf ``tzrec.predict`` dies inside ``_rewrite_model`` with
-    "Proxy object cannot be iterated". Wrapping the WHOLE decode is what makes
-    it work: a leaf returns a single Proxy, so wrapping any inner helper only
-    moves the failure to its caller. The trace then finds nothing to shard,
-    which is correct -- a SID feature carries no embedding table.
-
-    At run time this is an ordinary call; only tracing sees a leaf.
+    TorchRec's predict pipeline FX-traces the model; the decode is untraceable
+    (per-row python lists, data-dependent beam widths). Wrapping the WHOLE
+    decode is required -- a leaf returns one Proxy, so wrapping an inner helper
+    just moves the failure to its caller. At run time this is a normal call.
     """
     return model._generate(batch)
 
 
 class GenerativeQwen(BaseGenerativeModel):
-    """Generative-recommendation LM on a Qwen backbone (Qwen2.5, Qwen3, ...).
+    """Generative-recommendation LM on a Qwen backbone (Qwen2.5, Qwen3, ...)."""
 
-    The whole family shares the ChatML frame this class splices, so the version
-    only enters through ``hf_model_id``.
-    """
-
-    # Flat width used when beam_widths is left empty; mirrors the proto comment.
     DEFAULT_BEAM_WIDTH = 50
 
-    # ChatML frame. Family-specific; a subclass overrides it wholesale.
     CHAT_TEMPLATE = {
         "user_prefix": "<|im_start|>user\n",
         "user_suffix": "<|im_end|>\n",
@@ -85,10 +73,7 @@ class GenerativeQwen(BaseGenerativeModel):
     def _read_beam_config(
         self, common: generative_model_pb2.GenerativeModelConfig
     ) -> None:
-        """Parse the decode knobs; the width schedule must match the codebook.
-
-        An empty ``beam_widths`` is a flat ``DEFAULT_BEAM_WIDTH`` at every level.
-        """
+        """Parse the decode knobs; the width schedule must match the codebook."""
         self._num_return = int(common.num_return_sequences)
         self._beam_widths: List[int] = (
             list(common.beam_widths) or [self.DEFAULT_BEAM_WIDTH] * self._num_levels
@@ -123,8 +108,7 @@ class GenerativeQwen(BaseGenerativeModel):
     def _gaps(self) -> List[torch.Tensor]:
         """The N+1 static prompt fragments around the N slots, template order.
 
-        Re-read every time: ``.to(device)`` rebinds the buffer, so a cached list
-        would keep handing back pre-move tensors.
+        Re-read every time: ``.to()`` rebinds the buffer, so a cache goes stale.
         """
         return [getattr(self, f"tpl_gap_{i}") for i in range(len(self._slot_names) + 1)]
 
@@ -135,13 +119,11 @@ class GenerativeQwen(BaseGenerativeModel):
     ) -> None:
         """Tokenise the static prompt once, as the N+1 gaps around the N slots.
 
-        Each feature's ``prefix_text`` / ``suffix_text`` is folded into the
-        adjacent gap so every gap is ONE string tokenized in one call, keeping
-        the encoding bit-identical to the fully rendered prompt -- splitting
-        token ids instead would let a BPE merge span a seam. Splicing values
-        between gaps is exact only because the ``C*`` atoms are added-vocab
-        tokens, which HF fast tokenizers pre-split on. Buffers are
-        non-persistent: they follow ``.to()`` but stay out of the state_dict.
+        Every gap is ONE string encoded in one call, so a BPE merge cannot span
+        a seam. Splicing values between gaps is exact only because the ``C*``
+        atoms are added-vocab tokens, which fast tokenizers pre-split on.
+        Buffers are non-persistent: they follow ``.to()`` but stay off the
+        state_dict.
         """
         tpl = type(self).CHAT_TEMPLATE
         gaps, features = self._resolve_prompt_slots(cfg.prompt_template)
@@ -152,13 +134,12 @@ class GenerativeQwen(BaseGenerativeModel):
                 if i < len(features)
                 else tpl["user_suffix"] + tpl["asst_prefix"]
             )
-            # explicit <|im_start|> markers frame the prompt; no auto BOS/EOS.
+            # the template carries its own markers; no auto BOS/EOS.
             ids = torch.tensor(
                 tokenizer.encode(head + gap + tail, add_special_tokens=False),
                 dtype=torch.long,
             )
             self.register_buffer(f"tpl_gap_{i}", ids, persistent=False)
-        # closes the assistant turn after the answer; not part of any gap.
         self.register_buffer(
             "tpl_asst_suffix",
             torch.tensor(
@@ -167,7 +148,7 @@ class GenerativeQwen(BaseGenerativeModel):
             ),
             persistent=False,
         )
-        # the trailing eos is a SUPERVISED token; cache it for the splice.
+        # the trailing eos is SUPERVISED.
         self.register_buffer(
             "tpl_eos",
             torch.tensor([int(tokenizer.eos_token_id)], dtype=torch.long),
@@ -175,13 +156,9 @@ class GenerativeQwen(BaseGenerativeModel):
         )
 
     def _prompt_rows(self, slot_rows: List[List[torch.Tensor]]) -> List[torch.Tensor]:
-        """Per-row ``[gap_0 | slot_0 | gap_1 | ... | slot_N-1 | gap_N]``.
-
-        Shared by the teacher-forced splice and the answer-less inference prompt.
-        """
+        """Per-row ``[gap_0 | slot_0 | gap_1 | ... | slot_N-1 | gap_N]``."""
         gaps = self._gaps
-        # zip transposes per-slot row lists into one tuple of slots per row, and
-        # pairs each slot with the gap that precedes it (the last gap has none).
+        # zip pairs each slot with the gap before it; gaps[-1] closes the row.
         return [
             torch.cat([*chain.from_iterable(zip(gaps, slots)), gaps[-1]])
             for slots in zip(*slot_rows)
@@ -201,12 +178,10 @@ class GenerativeQwen(BaseGenerativeModel):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build ``(input_ids, labels, attention_mask)``, each ``(B, T_max)``.
 
-        Every answer is exactly ``num_levels`` codes, so the tail
-        ``[answer | asst_suffix | eos]`` has a FIXED width and, after left
-        padding, lands in the same columns for every row -- ``labels`` is one
-        vectorized write. Only the answer and trailing eos are supervised; a
-        decode emits ``num_levels`` tokens and never produces ``asst_suffix``.
-        ``pad_to`` left-extends for pool pre-sizing, keeping the tail aligned.
+        The tail ``[answer | asst_suffix | eos]`` has a FIXED width, so after
+        left padding it lands in the same columns for every row and ``labels``
+        is one vectorized write. Only the answer and trailing eos are
+        supervised. ``pad_to`` left-extends for pool pre-sizing.
         """
         if len(slot_rows[0]) != len(label_rows):
             raise ValueError(
@@ -258,9 +233,9 @@ class GenerativeQwen(BaseGenerativeModel):
     ) -> Dict[str, torch.Tensor]:
         """Teacher-forced forward over spliced ids -> suffix-slice -> CE loss."""
         outputs = self.lm.model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden = outputs.last_hidden_state  # (B, T, D)
+        hidden = outputs.last_hidden_state
 
-        # Bound the logits to the supervised suffix; a full (B, T, V) upcast OOMs.
+        # a full (B, T, V) upcast OOMs.
         suffix = slice(-self._suffix_keep, None)
         logits = self.lm.lm_head(hidden[:, suffix, :])
 
@@ -273,12 +248,7 @@ class GenerativeQwen(BaseGenerativeModel):
         return {"loss": loss}
 
     def _generate(self, batch: Batch) -> torch.Tensor:
-        """Beam-search the SID answer, no ground truth supplied.
-
-        Returns ``(B, C, num_levels)`` best-first per row, where ``C`` is
-        ``num_return_sequences``. Candidates come back score-ordered, so
-        trimming to ``num_return`` keeps the best ones.
-        """
+        """Beam-search the SID answer; returns ``(B, C, num_levels)`` best-first."""
         slot_rows = self._slot_rows(self.build_input(batch))
         input_ids, attention_mask = self._left_pad(self._prompt_rows(slot_rows))
         lo_tok, hi_tok = self._sid_token_bands()
@@ -298,9 +268,8 @@ class GenerativeQwen(BaseGenerativeModel):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Left-pad token rows into ``(input_ids, attention_mask)``, ``(B, T_max)``.
 
-        The mask comes from ``ones_like(row)``, not ``!= pad``, so a real
-        trailing eos survives ``pad_token_id == eos``. ``pad_to`` extends LEFT,
-        keeping the end-aligned supervised tail in place.
+        The mask comes from ``ones_like``, not ``!= pad``, so a real trailing
+        eos survives ``pad_token_id == eos``.
         """
         input_ids = pad_sequence(
             rows,

@@ -41,14 +41,8 @@ from tzrec.protos.models import generative_model_pb2
 
 
 class BaseGenerativeModel(BaseModel):
-    """Model construction, SID vocab extension, data-prep, loss and metrics.
+    """Model construction, SID vocab extension, data-prep, loss and metrics."""
 
-    The family's proto message must carry ``common`` (a
-    ``GenerativeModelConfig``) and ``hf_model_id``; this base reads both.
-    """
-
-    # See `common.param_dtype` in the proto for why FP32 is the default.
-    # The enum is closed, so protobuf rejects anything not listed here.
     _PARAM_DTYPE: Dict[int, torch.dtype] = {
         generative_model_pb2.FP32: torch.float32,
         generative_model_pb2.BF16: torch.bfloat16,
@@ -100,8 +94,6 @@ class BaseGenerativeModel(BaseModel):
         self._max_seq_length: int = int(common.max_sequence_length)
         codebook = self._shared_sid_space()
         self._num_levels = len(codebook)
-        # the budget truncates to WHOLE items, so anything under one item's width
-        # would floor to zero and silently leave the history uncapped.
         if 0 < self._max_seq_length < self._num_levels:
             raise ValueError(
                 f"{type(self).__name__}: max_sequence_length "
@@ -111,9 +103,7 @@ class BaseGenerativeModel(BaseModel):
             )
         sizes = torch.tensor(codebook, dtype=torch.long)
         self.register_buffer("_codebook_sizes", sizes, persistent=False)
-        # only the decode path still needs per-level offsets: SidFeature folds
-        # them into the input stream, but generated tokens must be split back
-        # into per-level codes and no feature is involved in generation.
+        # only the decode path needs these; SidFeature folds them into inputs.
         self.register_buffer(
             "_level_offsets", torch.cumsum(sizes, 0) - sizes, persistent=False
         )
@@ -121,11 +111,7 @@ class BaseGenerativeModel(BaseModel):
         return sum(codebook)
 
     def _shared_sid_space(self) -> List[int]:
-        """The one codebook every SID feature declares.
-
-        One extended vocabulary and one answer width, so adding a feature must
-        never resize ``lm_head``; disagreement is a typo, not a reshape.
-        """
+        """The one codebook every SID feature declares."""
         spaces = {
             f.name: tuple(f.codebook)
             for f in self._features
@@ -147,10 +133,7 @@ class BaseGenerativeModel(BaseModel):
         """{feature_name: group_name} for every declared feature_group.
 
         One JAGGED_SEQUENCE feature per group: EmbeddingGroup interleaves a
-        group's members into one ``{group}.sequence``, which no longer splits
-        back into separate prompt slots. The map is keyed by feature, so a
-        feature claimed by two groups is rejected rather than silently
-        resolving to whichever group came last.
+        group's members into one sequence that cannot be split back apart.
         """
         by_feature: Dict[str, str] = {}
         for group in self._feature_groups:
@@ -181,11 +164,8 @@ class BaseGenerativeModel(BaseModel):
     ) -> Tuple[List[str], List["SidFeature"]]:
         """Split a ``{{feature_name}}`` template into N+1 gaps and N features.
 
-        Slots and declared feature_groups must correspond exactly, and each slot
-        must name a ``SidFeature``, so a misspelt or unused feature fails here
-        instead of vanishing from the prompt. ``_slot_names`` / ``_slot_groups``
-        are recorded here, not in the family hook, because ``build_input`` reads
-        them and would otherwise fail far from the cause.
+        Records ``_slot_names`` / ``_slot_groups`` here rather than in the family
+        hook, because ``build_input`` reads them.
         """
         parts = re.split(r"\{\{(\w+)\}\}", template)
         gaps, names = parts[0::2], parts[1::2]
@@ -226,17 +206,13 @@ class BaseGenerativeModel(BaseModel):
         return gaps, features
 
     def _build_backbone(self) -> PreTrainedModel:
-        """Build the EMPTY architecture -- shapes only, no weight download.
-
-        Weights arrive from ``init_from_pretrained`` (cold start) or DCP.
-        """
+        """Build the EMPTY architecture; weights arrive later from HF or DCP."""
         hf_model_id = self._model_config.hf_model_id
         if not hf_model_id:
             raise ValueError(f"{type(self).__name__}: empty hf_model_id.")
         hf_cfg = AutoConfig.from_pretrained(hf_model_id)
         lm = AutoModelForCausalLM.from_config(hf_cfg, torch_dtype=self._param_dtype)
-        # a no-op when from_config already honoured torch_dtype, which not every
-        # architecture does.
+        # no-op when from_config already honoured torch_dtype; not all do.
         return lm.to(self._param_dtype)
 
     def _build_extended_tokenizer(
@@ -254,7 +230,6 @@ class BaseGenerativeModel(BaseModel):
         base = len(tokenizer)
         added = tokenizer.add_tokens([f"C{i}" for i in range(sid_atoms)])
         if added != sid_atoms:
-            # a pre-existing Cxxx token would shift the atoms off `base`.
             raise RuntimeError(
                 f"BaseGenerativeModel: tokenizer was expected to grow by "
                 f"{sid_atoms} new atoms, only added {added}. "
@@ -277,9 +252,8 @@ class BaseGenerativeModel(BaseModel):
     def init_from_pretrained(self) -> None:
         """Load the pretrained HF weights and re-extend to ``__init__``'s vocab.
 
-        Every rank resizes identically or DDP's shape check fails. The new SID
-        rows come from the global RNG and so differ per rank; DDP's
-        ``_sync_module_states`` broadcast from rank 0 is what reconciles them.
+        The new SID rows differ per rank; DDP's ``_sync_module_states``
+        broadcast from rank 0 reconciles them.
         """
         # drop the empty arch first: holding both peaks at 2x model host RAM.
         self.lm = None
@@ -319,11 +293,7 @@ class BaseGenerativeModel(BaseModel):
         return self.lm.device
 
     def _tokenize_sids(self, flat: torch.Tensor) -> torch.Tensor:
-        """Map flat SID indices to extended-vocab token ids.
-
-        ``SidFeature`` folded the offsets in and codes are 0-based, so the flat
-        index IS the atom index; the model only owns the vocabulary shift.
-        """
+        """Map flat SID indices to extended-vocab token ids."""
         return flat + self._base_vocab
 
     def _detokenize_sids(
@@ -344,31 +314,24 @@ class BaseGenerativeModel(BaseModel):
     ) -> torch.Tensor:
         """Decode the per-beam tail ``(B*C, w)`` to ``(B, C, num_levels)`` codes.
 
-        ``w`` may be < ``num_levels`` when beams stop early. Any malformed
-        candidate (early EOS, non-SID or wrong-level atom) becomes all ``-1``,
-        which no real 0-based code can match.
+        Any malformed candidate becomes all ``-1``, which no real code matches.
         """
         level_ids = torch.arange(new_tokens.shape[1], device=new_tokens.device)
         codes = self._detokenize_sids(new_tokens, level_ids)
         codes = F.pad(codes, (0, self._num_levels - codes.shape[1]), value=-1)
         invalid = ((codes < 0) | (codes >= self._codebook_sizes)).any(dim=1)
         codes = codes.masked_fill(invalid.unsqueeze(1), -1)
-        # decoders return rows batch-major ([b0_c0, b0_c1, ...]); group per user.
+        # decoders return rows batch-major; group per user.
         return codes.view(batch_size, -1, self._num_levels)
 
     def init_input(self) -> None:
-        """Build the EmbeddingGroup over the raw SID JAGGED_SEQUENCE groups.
-
-        Passthrough features own no tables, so this holds no params (DMP-neutral)
-        and only retrieves the flat ``(values, lengths)``.
-        """
+        """Build the EmbeddingGroup; passthrough features hold no params."""
         self.embedding_group = EmbeddingGroup(self._features, self._feature_groups)
 
     def build_input(self, batch: Batch) -> Dict[str, List[torch.Tensor]]:
         """Retrieve per-row SID token sequences, keyed by feature name.
 
-        The answer is a ``data_config.label_field`` rather than a feature_group
-        so it can be absent at inference, where no ground truth is supplied.
+        The answer is a label_field so it can be absent at inference.
         """
         g = self.embedding_group(batch)
         rows: Dict[str, List[torch.Tensor]] = {
@@ -397,9 +360,7 @@ class BaseGenerativeModel(BaseModel):
     ) -> List[torch.Tensor]:
         """Map a feature's flat SID stream to per-row token-id tensors.
 
-        ``SidFeature._parse`` already validated and offset the codes, so only the
-        vocabulary shift and the model-owned budget are left. ``max_codes`` caps
-        each row to its most-recent WHOLE items, dropping the oldest head.
+        ``max_codes`` caps each row to its most-recent WHOLE items.
         """
         values = values.reshape(-1)  # value_dim 1 arrives as (N,) or (N, 1)
         sizes = lengths.long().tolist()
@@ -418,8 +379,7 @@ class BaseGenerativeModel(BaseModel):
     ) -> List[torch.Tensor]:
         """Map the answer label to token ids; every row is ``num_levels`` codes.
 
-        The answer is a label_field, not a feature, so nothing has offset it --
-        the one place the model still owns the per-level fold-in.
+        A label_field is not offset by SidFeature, so the fold-in happens here.
         """
         values = values.reshape(-1)  # value_dim 1 arrives as (N,) or (N, 1)
         sizes = lengths.long().tolist()

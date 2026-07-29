@@ -23,9 +23,7 @@ class SidFeature(BaseFeature):
     """Semantic-ID sequence feature.
 
     A flat stream of 0-based per-level SID codes -- whole items in level order --
-    plus the prompt text wrapping them. Codes are produced offline by a
-    SID-generation model; under fg this feature is a passthrough (see
-    ``_fg_json``), so it never forces the pipeline's ``fg_mode``.
+    plus the prompt text wrapping them. Under fg it is a passthrough.
 
     Args:
         feature_config (FeatureConfig): a instance of feature config.
@@ -57,11 +55,7 @@ class SidFeature(BaseFeature):
         self._level_offsets = np.cumsum(self._level_sizes) - self._level_sizes
 
     def _read_codebook(self) -> List[int]:
-        """Validate the declared codebook once and normalize it to a list.
-
-        Every derived quantity reads it on the parse hot path, so the repeated
-        scalar container is checked and converted here, not per access.
-        """
+        """Validate the declared codebook once and normalize it to a list."""
         codebook = [int(c) for c in self.config.codebook]
         if not codebook:
             raise ValueError(
@@ -133,10 +127,9 @@ class SidFeature(BaseFeature):
     def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
         """Parse the SID stream into flat indices in the shared space.
 
-        Codes are 0-based, so the flat index IS the atom index and the model only
-        adds ``base_vocab``. Offsets are folded in here, in the dataloader
-        workers, not on the forward path -- and validating here keeps a malformed
-        row off the collective path, where one rank raising hangs its peers.
+        Offsets are folded in here, in the dataloader workers: validating on the
+        forward path would let one rank raise and hang its peers on the
+        collective.
         """
         parsed = super()._parse(input_data)
         num_levels = len(self._codebook)
@@ -148,16 +141,14 @@ class SidFeature(BaseFeature):
                 f"{bad.tolist()[:10]} have lengths "
                 f"{parsed.seq_lengths[bad].tolist()[:10]}."
             )
-        # rows are whole items, so (-1, num_levels) lines every column up with
-        # its level and the per-level bounds/offsets broadcast down it.
+        # rows are whole items, so each column is one level.
         codes = parsed.values.reshape(-1, num_levels)
         if ((codes < 0) | (codes >= self._level_sizes)).any():
             raise ValueError(
                 f"{self.__class__.__name__}[{self.config.feature_name}]: SID "
                 f"codes must be local 0-based values in [0, codebook[level])."
             )
-        # keep the value dtype: float32 + int64 offsets would promote to float64
-        # and double the bytes crossing worker IPC and the H2D copy.
+        # keep the dtype: int64 offsets would promote float32 to float64.
         offsets = self._level_offsets.astype(codes.dtype, copy=False)
         parsed.values = (codes + offsets).reshape(parsed.values.shape)
         return parsed
@@ -165,18 +156,12 @@ class SidFeature(BaseFeature):
     def _fg_json(self) -> List[Dict[str, Any]]:
         """Get fg json config impl.
 
-        A PASSTHROUGH: fg only splits the incoming sequence into per-position
-        values, and ``_parse`` folds in the level offsets afterwards either way.
-        There is no fg feature_type that can add ``level_offsets[i % num_levels]``
-        (fg expressions are not position-aware within a sequence), so the
-        arithmetic stays in ``_parse`` and fg is used purely to reach the codes.
-
-        This exists so a SID feature does not force the whole pipeline to
-        ``FG_NONE`` -- ``fg_mode`` is a data_config-level switch, so blocking it
-        here would block every other feature in the config too.
+        A PASSTHROUGH: no fg feature_type can add ``level_offsets[i % levels]``,
+        so fg only reaches the codes and ``_parse`` does the arithmetic. It
+        exists because ``fg_mode`` is a data_config-level switch -- refusing it
+        here would block every other feature in the config.
         """
-        # emit the SCALAR form: BaseFeature.fg_json prepends "sequence_" and
-        # injects sequence_delim / sequence_length for is_sequence features.
+        # SCALAR form: fg_json prepends "sequence_" and injects the seq keys.
         fg_cfg: Dict[str, Any] = {
             "feature_type": "raw_feature",
             "feature_name": self.config.feature_name,

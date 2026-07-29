@@ -9,11 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dynamic-width beam SID decode (no tzrec deps).
+"""Band-restricted beam SID decode (no tzrec deps).
 
-Backs ``dynamic_beam`` in ``GenerativeModelConfig``: the beam width varies per
-SID level instead of staying fixed. The caller owns the schedule -- this module
-only enforces what each level can actually supply.
+The caller owns the width schedule; this module only enforces what each level
+can supply.
 """
 
 from typing import List, Tuple
@@ -38,16 +37,14 @@ def dynamic_beam_search(
         model: an HF causal LM exposing ``.model`` / ``.lm_head`` (Qwen layout).
         input_ids: left-padded prompt ids ``(B, P)``.
         attention_mask: prompt mask ``(B, P)``.
-        beam_widths: requested width for each SID level, one entry per level.
-            Any schedule is accepted -- doubling, flat, hand-tuned -- and each
-            entry is capped to what its band and the surviving prefixes supply.
-        lo_tok: inclusive lower per-level token-space band edge, ``(num_levels,)``.
-        hi_tok: inclusive upper per-level token-space band edge, ``(num_levels,)``.
+        beam_widths: requested width per SID level; each is capped to what its
+            band and the surviving prefixes supply.
+        lo_tok: inclusive lower per-level token band edge, ``(num_levels,)``.
+        hi_tok: inclusive upper per-level token band edge, ``(num_levels,)``.
 
     Returns:
-        The generated SID token tail ``(B * W, num_levels)`` score-ordered
-        best-first per row, where ``W`` is the last capped width. The answer is
-        fixed-length and EOS-free, so no finished-beam bookkeeping is needed.
+        The SID token tail ``(B * W, num_levels)``, score-ordered best-first.
+        The answer is fixed-length and EOS-free, so no beam bookkeeping.
     """
     device = input_ids.device
     bsz = input_ids.shape[0]
@@ -65,7 +62,6 @@ def dynamic_beam_search(
     bands: List[Tuple[int, int]] = [
         (int(lo_tok[j]), int(hi_tok[j])) for j in range(num_levels)
     ]
-    # A level can only carry band x surviving prefixes, however much was asked.
     widths: List[int] = []
     prev = 1
     for w, (lo, hi) in zip(beam_widths, bands):
@@ -75,8 +71,8 @@ def dynamic_beam_search(
     def _band_logp(logits: torch.Tensor, j: int) -> torch.Tensor:
         """Full-vocab log-probs, narrowed to level ``j``'s band ``(R, band)``.
 
-        Slicing after normalizing keeps the exact cross-beam ranking of a
-        full-vocab ``log_softmax`` without materializing one per level.
+        Normalize then slice: same ranking as a full-vocab log_softmax, 21x less
+        memory at production vocab.
         """
         lo, hi = bands[j]
         log_z = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
@@ -101,8 +97,7 @@ def dynamic_beam_search(
 
     for j in range(1, num_levels):
         am = torch.cat([am, am.new_ones(bsz * cur_w, 1)], dim=1)
-        # the row always ends on the token just appended, so its position is
-        # simply how many real tokens precede it.
+        # the row ends on the new token, so its position is the count before it.
         step_pos = am.long().sum(-1, keepdim=True) - 1
         cache_pos = torch.tensor([past.get_seq_length()], device=device)
         h = model.model(
