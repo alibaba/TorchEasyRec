@@ -473,14 +473,10 @@ def _train_and_evaluate(
     )
     try:
         for i_epoch in epoch_iter:
-            # Multi-rank dumps synchronize their per-step state, so uneven workers
-            # must fail together instead of silently dropping a lagging rank's
-            # trailing delta rows or leaving collectives.
             pipeline = create_train_pipeline(
                 model,
                 optimizer,
                 check_all_workers_data_status=sync_train_data_exhaustion,
-                fail_on_uneven_data=require_equal_train_batches,
             )
             if plogger is not None:
                 plogger.set_description(f"Training Epoch {i_epoch}")

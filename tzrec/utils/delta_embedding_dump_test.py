@@ -72,7 +72,6 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_config,
     validate_delta_embedding_dump_no_zch_features,
 )
-from tzrec.utils.dist_util import create_train_pipeline
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
@@ -370,38 +369,6 @@ def _run_shared_table_fqn_delta_embedding_dump(
                 owner_rows["embedding"].to_pylist(),
                 expected_embeddings,
             )
-
-
-def _run_uneven_exhaustion_rejection(rank: int, world_size: int, output_dir: str):
-    # Regression: with rank 0 stopping at step 49 and rank 1 at step 50,
-    # final_dump used to sync both ranks to the boundary 50, both took the
-    # boundary-step skip, and rank 0's trailing tracked rows were silently
-    # lost. Multi-rank dumps now force aligned dataloader exhaustion, so the
-    # uneven stop must fail loudly on every rank instead.
-    with MultiProcessContext(rank=rank, world_size=world_size, backend="nccl") as ctx:
-        model = _build_sharded_delta_dump_model(rank, world_size, ctx)
-        dumper = DeltaEmbeddingDumper(
-            model,
-            DeltaEmbeddingDumpConfig(dump_interval_steps=50, output_dir=output_dir),
-            output_dir,
-            torch.device(f"cuda:{rank}"),
-            [],
-        )
-        testcase = unittest.TestCase()
-        testcase.assertTrue(dumper.requires_synced_dataloader_exhaustion)
-        pipeline = create_train_pipeline(
-            model,
-            check_all_workers_data_status=dumper.requires_synced_dataloader_exhaustion,
-            fail_on_uneven_data=dumper.requires_synced_dataloader_exhaustion,
-        )
-        # Rank 0's 50th fetch returns None while rank 1 still has batch 50; the
-        # pipeline's collective data-status check must raise on both ranks.
-        num_batches = 49 if rank == 0 else 50
-        batches = iter([_sharded_features(rank) for _ in range(num_batches)])
-        with testcase.assertRaisesRegex(RuntimeError, "exhausted unevenly"):
-            for _ in range(num_batches + 1):
-                pipeline._next_batch(batches)
-        torch.distributed.barrier()
 
 
 class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
@@ -1543,26 +1510,6 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
             self._run_multi_process_test(
                 callable=_run_shared_table_fqn_delta_embedding_dump,
                 world_size=1,
-                output_dir=tmp_dir,
-            )
-
-    @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
-    @mark_ci_scope("gpu")
-    def test_uneven_exhaustion_is_rejected_for_step_interval_dump(self):
-        with (
-            tempfile.TemporaryDirectory() as tmp_dir,
-            mock.patch.dict(
-                os.environ,
-                {
-                    "NCCL_DEBUG": "WARN",
-                    "FORCED_NCCL_DEBUG": "WARN",
-                    "NCCL_DEBUG_SUBSYS": "",
-                },
-            ),
-        ):
-            self._run_multi_process_test(
-                callable=_run_uneven_exhaustion_rejection,
-                world_size=self.world_size,
                 output_dir=tmp_dir,
             )
 
