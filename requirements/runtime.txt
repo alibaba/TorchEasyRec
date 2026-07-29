@@ -22,4 +22,4 @@ tensorboard
 torch==2.12.1
 torchmetrics==1.0.3
 torchrec==1.7.0
-transformers==4.51.2  # generative-rec LM backbone (HF); pin <5.0 — 5.x flips from_pretrained dtype default to "auto"(bf16)
+transformers @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/transformers/transformers-4.51.2-py3-none-any.whl  # generative-rec LM backbone (HF); pinned to 4.51.2 -- 5.x flips from_pretrained dtype default to "auto"(bf16)
