@@ -46,9 +46,17 @@ def _unwrap_hf_model(wrapped_model: nn.Module) -> Optional[nn.Module]:
     """Walk DMP/TrainWrapper layers down to the model exposing ``hf_backbone``.
 
     ``None`` when the chain has none: not HF-backed, so callers no-op.
+
+    ``seen`` bounds the walk. Every checkpoint save of every model reaches here,
+    so a ``.model`` / ``.module`` cycle would hang inside ``save()`` -- the worst
+    place for it, since peers would block on the collective that follows.
     """
     m = wrapped_model
+    seen = set()
     while not hasattr(m, "hf_backbone"):
+        if id(m) in seen:
+            return None
+        seen.add(id(m))
         if hasattr(m, "module"):  # DMP / DDP-style wrapper
             m = m.module
         elif hasattr(m, "model"):  # Train/Predict/Script wrapper

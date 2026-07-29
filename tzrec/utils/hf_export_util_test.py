@@ -12,6 +12,7 @@
 import json
 import os
 import shutil
+import threading
 import unittest
 from unittest import mock
 
@@ -89,6 +90,25 @@ class HfExportUtilTest(unittest.TestCase):
 
     def test_unwrap_returns_none_for_non_hf_model(self) -> None:
         self.assertIsNone(_unwrap_hf_model(_TrainWrapper(nn.Linear(4, 4))))
+
+    def test_unwrap_terminates_on_a_wrapper_cycle(self) -> None:
+        """A .model/.module cycle must return None, not spin.
+
+        Every checkpoint save of every model walks this, so an unbounded loop
+        here would hang save() and strand the peers waiting on the collective
+        that follows. Run on a thread so a regression fails the test instead of
+        hanging the suite.
+        """
+        a, b = nn.Linear(4, 4), nn.Linear(4, 4)
+        object.__setattr__(a, "model", b)
+        object.__setattr__(b, "model", a)
+        out = []
+        t = threading.Thread(target=lambda: out.append(_unwrap_hf_model(a)))
+        t.daemon = True
+        t.start()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive(), "_unwrap_hf_model did not terminate")
+        self.assertEqual(out, [None])
 
     def test_write_hf_assets_noop_for_non_hf_model(self) -> None:
         save_dir = os.path.join(self.test_dir, "plain")
