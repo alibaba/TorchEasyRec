@@ -100,7 +100,7 @@ class GenerativeQwen(BaseGenerativeModel):
         Buffers are non-persistent: they follow ``.to()`` but stay off the
         state_dict.
         """
-        tpl = type(self).CHAT_TEMPLATE
+        tpl = self.CHAT_TEMPLATE
         gaps, features = self._resolve_prompt_slots(cfg.prompt_template)
         for i, gap in enumerate(gaps):
             head = tpl["user_prefix"] if i == 0 else features[i - 1].suffix_text

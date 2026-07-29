@@ -67,7 +67,7 @@ def _common(**overrides):
 
 def _wired(features=None, group_type=model_pb2.JAGGED_SEQUENCE, members=None):
     """Pre-``__init__`` state: the features/labels/groups the config-time code reads."""
-    m = object.__new__(GenerativeQwen)
+    m = object.__new__(BaseGenerativeModel)
     nn.Module.__init__(m)
     m._features = [_sid_feature()] if features is None else features
     m._labels = ["label"]
@@ -82,9 +82,9 @@ def _wired(features=None, group_type=model_pb2.JAGGED_SEQUENCE, members=None):
 
 
 def _stub(codebook=None, base_vocab=100, device="cpu"):
-    """A GenerativeQwen with the base data-prep state wired up, but no HF backbone."""
+    """Base model with the data-prep state wired up, but no HF backbone."""
     codebook = codebook or [2, 3, 4]
-    m = object.__new__(GenerativeQwen)
+    m = object.__new__(BaseGenerativeModel)
     nn.Module.__init__(m)
     m._base_vocab = base_vocab
     m._num_levels = len(codebook)
@@ -152,10 +152,12 @@ class BaseGenerativeModelTest(unittest.TestCase):
         self.assertEqual(c.generated_sids_key, "generated_sids")
         self.assertEqual(c.param_dtype, generative_model_pb2.FP32)
         self.assertIs(
-            GenerativeQwen._PARAM_DTYPE[generative_model_pb2.FP32], torch.float32
+            BaseGenerativeModel._PARAM_DTYPE[generative_model_pb2.FP32],
+            torch.float32,
         )
         self.assertIs(
-            GenerativeQwen._PARAM_DTYPE[generative_model_pb2.BF16], torch.bfloat16
+            BaseGenerativeModel._PARAM_DTYPE[generative_model_pb2.BF16],
+            torch.bfloat16,
         )
 
     def test_read_common_config_reads_knobs(self) -> None:
@@ -298,7 +300,7 @@ class BaseGenerativeModelTest(unittest.TestCase):
 
     def test_beam_config_defaults_and_validation(self) -> None:
         def read(widths, num_return, levels=3):
-            m = object.__new__(GenerativeQwen)
+            m = object.__new__(BaseGenerativeModel)
             m._num_levels = levels
             m._read_beam_config(
                 types.SimpleNamespace(
