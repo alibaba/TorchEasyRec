@@ -260,25 +260,6 @@ class GenerativeQwenTest(unittest.TestCase):
         self.assertEqual(tuple(sids.shape), (1, 2, 3))
         self.assertEqual(sids[0].tolist(), [[0, 0, 0], [1, 2, 3]])
 
-    def test_beam_config_defaults_and_validation(self) -> None:
-        def read(widths, num_return, levels=3):
-            m = object.__new__(GenerativeQwen)
-            m._num_levels = levels
-            m._read_beam_config(
-                types.SimpleNamespace(
-                    beam_widths=widths, num_return_sequences=num_return
-                )
-            )
-            return m
-
-        # empty -> flat DEFAULT_BEAM_WIDTH per level; anything else verbatim
-        self.assertEqual(read([], 50)._beam_widths, [50, 50, 50])
-        self.assertEqual(read([100, 200, 400], 400)._beam_widths, [100, 200, 400])
-        with self.assertRaisesRegex(ValueError, "one width per level"):
-            read([50, 50], 50)
-        with self.assertRaisesRegex(ValueError, "must not exceed the final"):
-            read([50, 50, 50], 80)
-
     def test_generate_hands_the_kernel_prompt_bands_and_schedule(self) -> None:
         m = _stub(base_vocab=100)
         m._slot_names = ["user_sequence"]

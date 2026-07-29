@@ -59,6 +59,8 @@ def _common(**overrides):
         "param_dtype": generative_model_pb2.FP32,
         "vocab_pad_to_multiple_of": 128,
         "max_sequence_length": 0,
+        "beam_widths": [],
+        "num_return_sequences": 50,
     }
     return types.SimpleNamespace(**{**fields, **overrides})
 
@@ -293,6 +295,25 @@ class BaseGenerativeModelTest(unittest.TestCase):
         orphan._features = []
         with self.assertRaisesRegex(ValueError, "no feature_config"):
             orphan._resolve_prompt_slots("{{user_sequence}}")
+
+    def test_beam_config_defaults_and_validation(self) -> None:
+        def read(widths, num_return, levels=3):
+            m = object.__new__(GenerativeQwen)
+            m._num_levels = levels
+            m._read_beam_config(
+                types.SimpleNamespace(
+                    beam_widths=widths, num_return_sequences=num_return
+                )
+            )
+            return m
+
+        # empty -> flat DEFAULT_BEAM_WIDTH per level; anything else verbatim
+        self.assertEqual(read([], 50)._beam_widths, [50, 50, 50])
+        self.assertEqual(read([100, 200, 400], 400)._beam_widths, [100, 200, 400])
+        with self.assertRaisesRegex(ValueError, "one width per level"):
+            read([50, 50], 50)
+        with self.assertRaisesRegex(ValueError, "must not exceed the final"):
+            read([50, 50, 50], 80)
 
     def test_abstract_hooks_raise(self) -> None:
         base = object.__new__(BaseGenerativeModel)

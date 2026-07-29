@@ -45,8 +45,6 @@ def _fx_wrapped_generate(model: "GenerativeQwen", batch: Batch) -> torch.Tensor:
 class GenerativeQwen(BaseGenerativeModel):
     """Generative-recommendation LM on a Qwen backbone (Qwen2.5, Qwen3, ...)."""
 
-    DEFAULT_BEAM_WIDTH = 50
-
     CHAT_TEMPLATE = {
         "user_prefix": "<|im_start|>user\n",
         "user_suffix": "<|im_end|>\n",
@@ -63,33 +61,10 @@ class GenerativeQwen(BaseGenerativeModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        common = self._model_config.common
-        self._read_beam_config(common)
         self._max_total_len = self._compute_max_total_length()
         self._pool_warmed = False
         # +2 = trailing eos + HF's shift-by-one; constant width avoids a per-step sync.
         self._suffix_keep = self._num_levels + self.tpl_asst_suffix.numel() + 2
-
-    def _read_beam_config(
-        self, common: generative_model_pb2.GenerativeModelConfig
-    ) -> None:
-        """Parse the decode knobs; the width schedule must match the codebook."""
-        self._num_return = int(common.num_return_sequences)
-        self._beam_widths: List[int] = (
-            list(common.beam_widths) or [self.DEFAULT_BEAM_WIDTH] * self._num_levels
-        )
-        if len(self._beam_widths) != self._num_levels:
-            raise ValueError(
-                f"{type(self).__name__}: beam_widths has "
-                f"{len(self._beam_widths)} entries but the codebook has "
-                f"{self._num_levels} levels; give one width per level."
-            )
-        if self._num_return > self._beam_widths[-1]:
-            raise ValueError(
-                f"{type(self).__name__}: num_return_sequences "
-                f"({self._num_return}) must not exceed the final beam width "
-                f"({self._beam_widths[-1]})."
-            )
 
     def _compute_max_total_length(self) -> int:
         """The ``T`` the activation pool pre-sizes to; 0 when disabled."""

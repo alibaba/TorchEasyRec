@@ -26,7 +26,6 @@ def dynamic_beam_search(
     model: PreTrainedModel,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    *,
     beam_widths: List[int],
     lo_tok: torch.Tensor,
     hi_tok: torch.Tensor,
@@ -47,7 +46,7 @@ def dynamic_beam_search(
         The answer is fixed-length and EOS-free, so no beam bookkeeping.
     """
     device = input_ids.device
-    bsz = input_ids.shape[0]
+    batch_size = input_ids.shape[0]
     num_levels = lo_tok.shape[0]
     if len(beam_widths) != num_levels:
         raise ValueError(
@@ -60,66 +59,70 @@ def dynamic_beam_search(
         )
     # Hoist the band edges to host once to keep the level loop sync-free.
     bands: List[Tuple[int, int]] = [
-        (int(lo_tok[j]), int(hi_tok[j])) for j in range(num_levels)
+        (int(lo_tok[level]), int(hi_tok[level])) for level in range(num_levels)
     ]
-    widths: List[int] = []
-    prev = 1
-    for w, (lo, hi) in zip(beam_widths, bands):
-        widths.append(min(w, prev * (hi - lo + 1)))
-        prev = widths[-1]
+    capped_widths: List[int] = []
+    prev_width = 1
+    for requested, (band_lo, band_hi) in zip(beam_widths, bands):
+        capped_widths.append(min(requested, prev_width * (band_hi - band_lo + 1)))
+        prev_width = capped_widths[-1]
 
-    def _band_logp(logits: torch.Tensor, j: int) -> torch.Tensor:
-        """Full-vocab log-probs, narrowed to level ``j``'s band ``(R, band)``.
+    def _band_logp(logits: torch.Tensor, level: int) -> torch.Tensor:
+        """Full-vocab log-probs, narrowed to ``level``'s band ``(rows, band)``.
 
         Normalize then slice: same ranking as a full-vocab log_softmax, 21x less
         memory at production vocab.
         """
-        lo, hi = bands[j]
+        band_lo, band_hi = bands[level]
         log_z = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
-        return logits[:, lo : hi + 1].float() - log_z
+        return logits[:, band_lo : band_hi + 1].float() - log_z
 
-    pos = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
-    h = model.model(
+    position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
+    outputs = model.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        position_ids=pos,
+        position_ids=position_ids,
         use_cache=True,
     )
-    past = h.past_key_values
-    scores = _band_logp(model.lm_head(h.last_hidden_state[:, -1, :]), 0)
-    beam_scores, local = scores.topk(widths[0], dim=-1)  # (B, W0)
-    seq = (local + bands[0][0]).reshape(-1, 1)
+    cache = outputs.past_key_values
+    scores = _band_logp(model.lm_head(outputs.last_hidden_state[:, -1, :]), 0)
+    beam_scores, in_band = scores.topk(capped_widths[0], dim=-1)
+    seq = (in_band + bands[0][0]).reshape(-1, 1)
     beam_scores = beam_scores.reshape(-1)
-    rows = torch.arange(bsz, device=device)
-    past.reorder_cache(rows.repeat_interleave(widths[0]))
-    am = attention_mask.repeat_interleave(widths[0], dim=0)
-    cur_w = widths[0]
+    row_starts = torch.arange(batch_size, device=device)
+    cache.reorder_cache(row_starts.repeat_interleave(capped_widths[0]))
+    beam_mask = attention_mask.repeat_interleave(capped_widths[0], dim=0)
+    width = capped_widths[0]
 
-    for j in range(1, num_levels):
-        am = torch.cat([am, am.new_ones(bsz * cur_w, 1)], dim=1)
-        # the row ends on the new token, so its position is the count before it.
-        step_pos = am.long().sum(-1, keepdim=True) - 1
-        cache_pos = torch.tensor([past.get_seq_length()], device=device)
-        h = model.model(
-            input_ids=seq[:, -1:],
-            attention_mask=am,
-            position_ids=step_pos,
-            past_key_values=past,
-            use_cache=True,
-            cache_position=cache_pos,
+    for level in range(1, num_levels):
+        beam_mask = torch.cat(
+            [beam_mask, beam_mask.new_ones(batch_size * width, 1)], dim=1
         )
-        lo_j, hi_j = bands[j]
-        band = hi_j - lo_j + 1
-        scores = _band_logp(model.lm_head(h.last_hidden_state[:, -1, :]), j)
-        scores = scores + beam_scores[:, None]  # (B*cur_w, band) cumulative
-        beam_scores, idx = scores.view(bsz, cur_w * band).topk(widths[j], dim=-1)
-        tok = lo_j + idx % band
-        parent = (idx // band + rows[:, None] * cur_w).reshape(-1)
-        seq = torch.cat([seq[parent], tok.reshape(-1, 1)], dim=1)
+        # the row ends on the new token, so its position is the count before it.
+        step_position = beam_mask.long().sum(-1, keepdim=True) - 1
+        cache_position = torch.tensor([cache.get_seq_length()], device=device)
+        outputs = model.model(
+            input_ids=seq[:, -1:],
+            attention_mask=beam_mask,
+            position_ids=step_position,
+            past_key_values=cache,
+            use_cache=True,
+            cache_position=cache_position,
+        )
+        band_lo, band_hi = bands[level]
+        band_size = band_hi - band_lo + 1
+        scores = _band_logp(model.lm_head(outputs.last_hidden_state[:, -1, :]), level)
+        scores = scores + beam_scores[:, None]
+        beam_scores, flat_idx = scores.view(batch_size, width * band_size).topk(
+            capped_widths[level], dim=-1
+        )
+        next_token = band_lo + flat_idx % band_size
+        parent = (flat_idx // band_size + row_starts[:, None] * width).reshape(-1)
+        seq = torch.cat([seq[parent], next_token.reshape(-1, 1)], dim=1)
         beam_scores = beam_scores.reshape(-1)
-        cur_w = widths[j]
-        if j + 1 < num_levels:
+        width = capped_widths[level]
+        if level + 1 < num_levels:
             # the last level never reads the cache; skip the largest reorder copy.
-            past.reorder_cache(parent)
-            am = am[parent]
-    return seq  # (B*cur_w, num_levels)
+            cache.reorder_cache(parent)
+            beam_mask = beam_mask[parent]
+    return seq

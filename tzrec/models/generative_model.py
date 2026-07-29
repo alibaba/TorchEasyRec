@@ -43,6 +43,9 @@ from tzrec.protos.models import generative_model_pb2
 class BaseGenerativeModel(BaseModel):
     """Model construction, SID vocab extension, data-prep, loss and metrics."""
 
+    # Flat width used when beam_widths is empty; a family may override it.
+    DEFAULT_BEAM_WIDTH = 50
+
     _PARAM_DTYPE: Dict[int, torch.dtype] = {
         generative_model_pb2.FP32: torch.float32,
         generative_model_pb2.BF16: torch.bfloat16,
@@ -108,7 +111,29 @@ class BaseGenerativeModel(BaseModel):
             "_level_offsets", torch.cumsum(sizes, 0) - sizes, persistent=False
         )
         self._vocab_pad_mult = int(common.vocab_pad_to_multiple_of)
+        self._read_beam_config(common)
         return sum(codebook)
+
+    def _read_beam_config(
+        self, common: generative_model_pb2.GenerativeModelConfig
+    ) -> None:
+        """Parse the decode knobs; the width schedule must match the codebook."""
+        self._num_return = int(common.num_return_sequences)
+        self._beam_widths: List[int] = (
+            list(common.beam_widths) or [self.DEFAULT_BEAM_WIDTH] * self._num_levels
+        )
+        if len(self._beam_widths) != self._num_levels:
+            raise ValueError(
+                f"{type(self).__name__}: beam_widths has "
+                f"{len(self._beam_widths)} entries but the codebook has "
+                f"{self._num_levels} levels; give one width per level."
+            )
+        if self._num_return > self._beam_widths[-1]:
+            raise ValueError(
+                f"{type(self).__name__}: num_return_sequences "
+                f"({self._num_return}) must not exceed the final beam width "
+                f"({self._beam_widths[-1]})."
+            )
 
     def _shared_sid_space(self) -> List[int]:
         """The one codebook every SID feature declares."""

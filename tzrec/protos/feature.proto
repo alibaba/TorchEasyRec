@@ -997,13 +997,13 @@ message SequenceFeature {
 // feature is only supported with data_config.fg_mode = FG_NONE. There is no
 // pyfg counterpart.
 message SidFeature {
-    // feature name; also the {{name}} placeholder in the model prompt_template.
+    // feature name; also the {{name}} placeholder in prompt_template.
     required string feature_name = 1;
     // feature input, e.g. user:user_sequence
     required string expression = 2;
-    // codes per position; SID streams are flat, so this stays 1.
+    // SID streams are flat, so this stays 1.
     optional uint32 value_dim = 6 [default = 1];
-    // embedding pooling type, unused (SIDs carry no embedding table).
+    // unused; SIDs carry no embedding table.
     optional string pooling = 10 [default = "sum"];
     // fg default value
     optional string default_value = 11 [default = "0"];
@@ -1012,17 +1012,12 @@ message SidFeature {
     // mask value in training progress
     optional bool use_mask = 14;
 
-    // Text emitted immediately BEFORE this feature's SID tokens in the prompt,
-    // e.g. "Current user's historical behaviors are as follows:". Empty by
-    // default. Applies only where the model splices this feature.
+    // text emitted immediately BEFORE this feature's SID tokens
     optional string prefix_text = 20 [default = ""];
-    // Text emitted immediately AFTER this feature's SID tokens.
+    // text emitted immediately AFTER this feature's SID tokens
     optional string suffix_text = 21 [default = ""];
-    // SID vocabulary, one entry per RQ level: each code is 0-based in
-    // [0, codebook[level]), matching what the SID-generation models emit.
-    // len() = codes per item; sum() = atoms the model appends as C0..C{sum-1}.
-    // All SID features in a model share ONE space, so every SidFeature must
-    // declare the SAME codebook -- adding a feature must not grow the vocabulary.
+    // per-level SID vocabulary; codes are 0-based in [0, codebook[level]).
+    // All SID features in a model must declare the SAME codebook.
     repeated uint32 codebook = 23;
 
     // default value when fg_mode = FG_NONE
@@ -1032,9 +1027,8 @@ message SidFeature {
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
 
-    // NOT a truncation cap here -- fg (which a SID feature forbids) and an
-    // fx export marker are its only readers, so setting it is rejected.
-    // Use model_config.common.max_sequence_length for the history budget.
+    // fg-side cap; must be a multiple of len(codebook). Prefer
+    // model_config.common.max_sequence_length, which keeps the recent items.
     optional uint32 sequence_length = 101;
     // sequence delimiter, only take effect when use it as sequence
     optional string sequence_delim = 102 [default = ";"];

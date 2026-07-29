@@ -1,9 +1,6 @@
 syntax = "proto2";
 package tzrec.protos;
 
-// serialization format produced by `tzrec.export`.
-// TORCHSCRIPT: native scripted_model.pt (+ TRT/AOTI), the default.
-// HF: a HuggingFace `from_pretrained`-loadable dir (BaseGenerativeModel family).
 enum ExportFormat {
     TORCHSCRIPT = 0;
     HF = 1;
@@ -31,7 +28,5 @@ message ExportConfig {
     optional bool cuda_matmul_allow_tf32 = 6 [default = false];
     // Whether export uses dense EMA parameters.
     optional bool use_dense_ema = 7;
-    // serialization format produced by `tzrec.export`; selects the export
-    // branch in main.export (TORCHSCRIPT native graph vs HF backbone dir).
     optional ExportFormat export_format = 8 [default = TORCHSCRIPT];
 }
