@@ -1091,6 +1091,14 @@ def export(
 
     # HF export converts the checkpoint dir directly -- no model build, no DCP restore.
     if pipeline_config.export_config.export_format == export_pb2.ExportFormat.HF:
+        if config_util.use_dense_ema(
+            pipeline_config.export_config, pipeline_config.train_config
+        ):
+            raise ValueError(
+                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
+                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
+                "false to export the raw weights."
+            )
         if not checkpoint_path:
             raise ValueError("HF export: no checkpoint found to convert.")
         if not os.path.exists(os.path.join(checkpoint_path, "config.json")):

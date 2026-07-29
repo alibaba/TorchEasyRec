@@ -19,12 +19,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from google.protobuf import text_format
 
-from tzrec.main import _train_and_evaluate
+from tzrec.main import _train_and_evaluate, export
 from tzrec.optim.ema import DenseEMA
 from tzrec.protos.eval_pb2 import EvalConfig
-from tzrec.protos.export_pb2 import ExportConfig
+from tzrec.protos.export_pb2 import ExportConfig, ExportFormat
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 
 
 class MainTest(unittest.TestCase):
@@ -154,6 +156,23 @@ class MainTest(unittest.TestCase):
         self.assertTrue(model.module.model.on_train_end.called)
         for call in exporter.maybe_export.call_args_list:
             self.assertIsNone(call.kwargs["dense_ema"])
+
+    def test_hf_export_rejects_dense_ema(self) -> None:
+        # dcp_to_hf reads <ckpt>/model unconditionally, so it would silently
+        # ship raw weights where TorchScript export ships the EMA ones.
+        with tempfile.TemporaryDirectory() as test_dir:
+            config = EasyRecConfig()
+            config.train_input_path = "unused"
+            config.eval_input_path = "unused"
+            config.model_dir = os.path.join(test_dir, "train")
+            os.makedirs(config.model_dir)
+            config.train_config.dense_optimizer.ema.CopyFrom(EMAConfig())
+            config.export_config.export_format = ExportFormat.HF
+            config_path = os.path.join(test_dir, "pipeline.config")
+            with open(config_path, "w") as f:
+                f.write(text_format.MessageToString(config))
+            with self.assertRaisesRegex(ValueError, "Dense EMA"):
+                export(config_path, os.path.join(test_dir, "export"))
 
 
 class TrainStepCounterMultiPassTest(unittest.TestCase):
