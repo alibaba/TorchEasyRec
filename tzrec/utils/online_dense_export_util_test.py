@@ -820,6 +820,72 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             dist.destroy_process_group()
         torch.testing.assert_close(box["gm"].w, torch.full((2,), 9.0))
 
+    def test_worker_reuses_construction_time_traced_module(self) -> None:
+        """The worker scripts the construction-time traced module, not a re-trace.
+
+        The manager traces once during the construction-time dry run and must
+        forward that exact traced module to every worker export. A regression
+        that re-traces on the worker would re-open the fx-trace race this fix
+        targets, yet still pass an output-equivalence check (re-tracing is
+        weight-correct in a single-threaded test), so assert object identity.
+        """
+        sentinel = mock.Mock(name="traced_sentinel")
+        seen: List[Dict[str, Any]] = []
+
+        def fake_finalize(*args: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs)
+            # construction dry run returns the cached traced module; the worker
+            # call (with dense_model_traced=) must forward it verbatim.
+            return sentinel
+
+        fake_gm = mock.Mock()
+        fake_gm.state_dict.return_value = {}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch(
+                    _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                    return_value=_dummy_pipeline_config(),
+                ),
+                mock.patch("tzrec.main._create_features", return_value=[]),
+                mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+                mock.patch("tzrec.models.model.ScriptWrapper", side_effect=lambda m: m),
+                mock.patch(
+                    _BUILD_PATCHES.format("create_dense_export_warmup_data"),
+                    return_value={},
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("build_dense_graph_module"),
+                    return_value=(fake_gm, mock.Mock(), {}),
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("finalize_dense_export"),
+                    side_effect=fake_finalize,
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model({}),
+                )
+                try:
+                    # the real build stored the construction-time finalize
+                    # return as the cached traced module
+                    self.assertIs(mgr._dense_model_traced, sentinel)
+                    mgr.maybe_export(5, 42.0, _mock_model({}))
+                    current_path = os.path.join(
+                        tmp_dir, "serving_root", "dense_hot_export", "current.json"
+                    )
+                    self.assertTrue(_wait_for(lambda: os.path.exists(current_path)))
+                finally:
+                    mgr.close()
+            # one construction call (no cached module) then one worker call
+            # forwarding the construction-time sentinel verbatim
+            self.assertEqual(len(seen), 2)
+            self.assertNotIn("dense_model_traced", seen[0])
+            self.assertIn("dense_model_traced", seen[1])
+            self.assertIs(seen[1]["dense_model_traced"], sentinel)
+
     # --- publish helpers ---
 
     def test_atomic_write_json_creates_dirs_and_replaces(self) -> None:

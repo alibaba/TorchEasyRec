@@ -1170,44 +1170,52 @@ class ExportUtilTest(unittest.TestCase):
 
             # The online export traces once (captured above) and reuses the
             # traced module across versions instead of re-tracing on the worker.
-            # Reusing it at the same weights must script identical predictions.
-            reuse_dir = os.path.join(test_dir, "dense_export_reuse")
-            finalize_dense_export(
-                live_model,
-                full_graph,
-                gm,
-                warmup_data,
-                device,
-                reuse_dir,
-                dense_graph_config,
-                dense_model_traced=dense_model_traced,
-            )
-            out_reuse = torch.jit.load(os.path.join(reuse_dir, "scripted_model.pt"))(
-                serving_data
-            )
-            for key in out_inproc:
-                torch.testing.assert_close(out_reuse[key], out_inproc[key])
+            # Reusing it must not call symbolic_trace at all: a regression that
+            # re-traces on the reuse path would re-open the worker-thread race
+            # this PR fixes while still passing a mere output-equivalence check,
+            # so patch symbolic_trace to raise under the reuse calls.
+            with mock.patch(
+                "tzrec.utils.export_util.symbolic_trace",
+                side_effect=AssertionError("reuse path must not call symbolic_trace"),
+            ):
+                reuse_dir = os.path.join(test_dir, "dense_export_reuse")
+                finalize_dense_export(
+                    live_model,
+                    full_graph,
+                    gm,
+                    warmup_data,
+                    device,
+                    reuse_dir,
+                    dense_graph_config,
+                    dense_model_traced=dense_model_traced,
+                )
+                out_reuse = torch.jit.load(
+                    os.path.join(reuse_dir, "scripted_model.pt")
+                )(serving_data)
+                for key in out_inproc:
+                    torch.testing.assert_close(out_reuse[key], out_inproc[key])
 
-            # A weight reload into gm (whose parameters the traced module
-            # shares) must be reflected by the reused traced module without
-            # re-tracing, matching a fresh internal-trace finalize on the same
-            # reloaded weights.
-            reloaded = {
-                key: value + 1.0 if value.is_floating_point() else value
-                for key, value in gm.state_dict().items()
-            }
-            gm.load_state_dict(reloaded)
-            reload_reuse_dir = os.path.join(test_dir, "dense_export_reload_reuse")
-            finalize_dense_export(
-                live_model,
-                full_graph,
-                gm,
-                warmup_data,
-                device,
-                reload_reuse_dir,
-                dense_graph_config,
-                dense_model_traced=dense_model_traced,
-            )
+                # A weight reload into gm (whose parameters the traced module
+                # shares) must be reflected by the reused traced module without
+                # re-tracing, matching a fresh internal-trace finalize on the
+                # same reloaded weights.
+                reloaded = {
+                    key: value + 1.0 if value.is_floating_point() else value
+                    for key, value in gm.state_dict().items()
+                }
+                gm.load_state_dict(reloaded)
+                reload_reuse_dir = os.path.join(test_dir, "dense_export_reload_reuse")
+                finalize_dense_export(
+                    live_model,
+                    full_graph,
+                    gm,
+                    warmup_data,
+                    device,
+                    reload_reuse_dir,
+                    dense_graph_config,
+                    dense_model_traced=dense_model_traced,
+                )
+            # The fresh internal-trace path (no cached module) still traces.
             reload_fresh_dir = os.path.join(test_dir, "dense_export_reload_fresh")
             finalize_dense_export(
                 live_model,
