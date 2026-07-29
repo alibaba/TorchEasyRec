@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import importlib.util
 import os
 import tempfile
@@ -130,6 +131,14 @@ def parameterized_name_func(func, num, p) -> str:
 def is_ci_nightly() -> bool:
     """Whether this is the nightly full run (``CI_NIGHTLY=true``)."""
     return os.environ.get("CI_NIGHTLY", "false").lower() == "true"
+
+
+def cleanup_cuda_memory() -> None:
+    """Release large CUDA cache reservations left by a test example."""
+    gc.collect()
+    if torch.cuda.is_available() and torch.cuda.memory_reserved() > 2**30:
+        torch.cuda.empty_cache()
+        torch.cuda.memory_summary()
 
 
 def make_test_dir(prefix: str = "tzrec_") -> str:

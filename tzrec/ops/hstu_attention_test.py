@@ -21,6 +21,7 @@ from tzrec.ops import (
     Kernel,
 )
 from tzrec.utils.test_util import (
+    cleanup_cuda_memory,
     cutlass_hstu_unavailable,
     generate_sparse_seq_len,
     get_test_dtypes,
@@ -263,10 +264,7 @@ def test_delta_attn(
 @mark_ci_scope("h20", "gpu")
 class HSTUAttentionTest(unittest.TestCase):
     def teardown_example(self, example):
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.memory_summary()  # prevent oom
+        cleanup_cuda_memory()
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
