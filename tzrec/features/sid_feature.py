@@ -60,7 +60,7 @@ class SidFeature(BaseFeature):
         if not codebook:
             raise ValueError(
                 f"{self.__class__.__name__}[{self.config.feature_name}]: codebook "
-                f"must be non-empty."
+                f"is required; give one vocabulary size per SID level."
             )
         if any(c <= 0 for c in codebook):
             raise ValueError(

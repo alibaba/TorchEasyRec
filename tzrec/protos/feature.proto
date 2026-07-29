@@ -1014,8 +1014,8 @@ message SidFeature {
     optional string prefix_text = 20 [default = ""];
     // text emitted immediately AFTER this feature's SID tokens
     optional string suffix_text = 21 [default = ""];
-    // per-level SID vocabulary; codes are 0-based in [0, codebook[level]).
-    // All SID features in a model must declare the SAME codebook.
+    // REQUIRED, per-level SID vocabulary; codes are 0-based in
+    // [0, codebook[level]). All SID features must declare the SAME codebook.
     repeated uint32 codebook = 23;
 
     // default value when fg_mode = FG_NONE

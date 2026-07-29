@@ -59,7 +59,7 @@ def _common(**overrides):
         "param_dtype": generative_model_pb2.FP32,
         "vocab_pad_to_multiple_of": 128,
         "max_sequence_length": 0,
-        "beam_widths": [],
+        "beam_widths": [50, 50, 50],
         "num_return_sequences": 50,
     }
     return types.SimpleNamespace(**{**fields, **overrides})
@@ -69,7 +69,6 @@ def _wired(features=None, group_type=model_pb2.JAGGED_SEQUENCE, members=None):
     """Pre-``__init__`` state: the features/labels/groups the config-time code reads."""
     m = object.__new__(BaseGenerativeModel)
     nn.Module.__init__(m)
-    m._default_beam_width = 50  # __init__ is bypassed here
     m._features = [_sid_feature()] if features is None else features
     m._labels = ["label"]
     m._feature_groups = [
@@ -303,7 +302,6 @@ class BaseGenerativeModelTest(unittest.TestCase):
         def read(widths, num_return, levels=3):
             m = object.__new__(BaseGenerativeModel)
             m._num_levels = levels
-            m._default_beam_width = 50  # __init__ is bypassed here
             m._read_beam_config(
                 types.SimpleNamespace(
                     beam_widths=widths, num_return_sequences=num_return
@@ -311,9 +309,10 @@ class BaseGenerativeModelTest(unittest.TestCase):
             )
             return m
 
-        # empty -> flat _default_beam_width per level; anything else verbatim
-        self.assertEqual(read([], 50)._beam_widths, [50, 50, 50])
+        # the schedule is taken verbatim; there is no default to fall back on
         self.assertEqual(read([100, 200, 400], 400)._beam_widths, [100, 200, 400])
+        with self.assertRaisesRegex(ValueError, "beam_widths is required"):
+            read([], 50)
         with self.assertRaisesRegex(ValueError, "one width per level"):
             read([50, 50], 50)
         with self.assertRaisesRegex(ValueError, "must not exceed the final"):

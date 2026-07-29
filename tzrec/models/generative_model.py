@@ -58,8 +58,6 @@ class BaseGenerativeModel(BaseModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        # flat width used when beam_widths is empty; set before the parse below
-        self._default_beam_width = 50
         cfg = self._model_config
         sid_atoms = self._read_common_config(cfg.common)
 
@@ -118,9 +116,12 @@ class BaseGenerativeModel(BaseModel):
     ) -> None:
         """Parse the decode knobs; the width schedule must match the codebook."""
         self._num_return = int(common.num_return_sequences)
-        self._beam_widths: List[int] = (
-            list(common.beam_widths) or [self._default_beam_width] * self._num_levels
-        )
+        self._beam_widths: List[int] = list(common.beam_widths)
+        if not self._beam_widths:
+            raise ValueError(
+                f"{type(self).__name__}: beam_widths is required; give one "
+                f"width per SID level, e.g. [50, 50, 50] or [100, 200, 400]."
+            )
         if len(self._beam_widths) != self._num_levels:
             raise ValueError(
                 f"{type(self).__name__}: beam_widths has "

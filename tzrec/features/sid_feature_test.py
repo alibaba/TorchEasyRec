@@ -115,7 +115,10 @@ class SidFeatureTest(unittest.TestCase):
             f.parse({"user_sequence": pa.array([[0, 1]])})
 
     def test_rejects_a_bad_codebook(self) -> None:
-        for bad, msg in (("", "non-empty"), ("codebook: 4 codebook: 0", "positive")):
+        for bad, msg in (
+            ("", "codebook is required"),
+            ("codebook: 4 codebook: 0", "positive"),
+        ):
             with self.subTest(bad=bad):
                 base = 'feature_name: "s" expression: "user:s" ' + bad
                 with self.assertRaisesRegex(ValueError, msg):

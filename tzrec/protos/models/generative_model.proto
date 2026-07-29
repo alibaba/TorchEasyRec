@@ -19,12 +19,11 @@ message GenerativeModelConfig {
 
     optional int32 ignore_index = 6 [default = -100];
 
-    // Beam width per SID level, one entry per level; [100, 200, 400] is the
-    // escalating beam. Each entry is capped to what its band can supply.
-    // Empty defaults to a flat width of 50.
+    // REQUIRED. Beam width per SID level, one entry per level; [100, 200, 400]
+    // is the escalating beam. Each entry is capped to what its band can supply.
     repeated uint32 beam_widths = 7;
     // Must not exceed the final beam width.
-    optional uint32 num_return_sequences = 8 [default = 50];
+    required uint32 num_return_sequences = 8;
 
     optional string generated_sids_key = 12 [default = "generated_sids"];
     // MASTER weights. FP32 avoids bf16-ULP underflow of Adam's small updates;
