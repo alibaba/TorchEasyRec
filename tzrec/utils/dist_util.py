@@ -288,7 +288,8 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
                     0 if batch is None else 1, dtype=torch.float, device=self._device
                 )
                 dist.all_reduce(has_batch, dist.ReduceOp.AVG)
-                if has_batch.item() < 1:
+                available_fraction = has_batch.item()
+                if available_fraction < 1:
                     # We drop remainder batches on all workers,
                     # if one worker does not have a batch
                     self._dataloader_exhausted = True

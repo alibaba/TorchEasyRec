@@ -606,11 +606,9 @@ def _train_and_evaluate(
         _model.on_train_end()
         if delta_embedding_dumper is not None:
             # Flush the trailing partial interval before the final checkpoint.
-            # final_dump skips dump-boundary steps already written by maybe_dump,
-            # so it never overwrites their shards with an empty file. Ranks can
-            # reach here at different i_step (independent dataloader exhaustion with
-            # check_all_workers_data_status=False), so final_dump all-reduces the
-            # step across ranks to keep one complete shard set per step dir.
+            # final_dump skips dump-boundary steps already written by maybe_dump
+            # (all ranks run the same step count, so every rank participated in
+            # those dumps and reaches the same final step).
             delta_embedding_dumper.final_dump(i_step)
 
         _log_train(
@@ -900,6 +898,8 @@ def train_and_evaluate(
         with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
             f.write(tzrec_version + "\n")
 
+    if delta_embedding_dumper is not None:
+        delta_embedding_dumper.start()
     # when slice batch by sample cost, data on all workers may not be balanced
     check_all_workers_data_status = data_config.HasField("batch_cost_size")
     _train_and_evaluate(
@@ -922,6 +922,12 @@ def train_and_evaluate(
         dense_ema=dense_ema,
         export_config=pipeline_config.export_config,
     )
+    # Drain background uploads only after training succeeds. A training failure
+    # terminates the whole job (torchrun tears down every rank) and pending
+    # in-memory deltas are intentionally abandoned: the restarted run re-dumps
+    # from the latest checkpoint, so there is nothing to roll back or undo.
+    if delta_embedding_dumper is not None:
+        delta_embedding_dumper.close()
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
 
