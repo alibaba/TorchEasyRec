@@ -1,0 +1,48 @@
+syntax = "proto2";
+package tzrec.protos;
+
+// Generative (causal-LM) recommendation models.
+
+enum ParamDtype {
+    FP32 = 0;
+    BF16 = 1;
+    FP16 = 2;
+}
+
+// Sample contract: history is a JAGGED_SEQUENCE feature_group holding one
+// SidFeature; the answer is the FIRST data_config.label_field, not a feature.
+// Both are local 0-based per-level codes -- writers must not pre-apply
+// level_offsets, SidFeature folds them in at parse time.
+message GenerativeModelConfig {
+    // 0 disables padding.
+    optional uint32 vocab_pad_to_multiple_of = 3 [default = 128];
+
+    optional int32 ignore_index = 6 [default = -100];
+
+    // REQUIRED. Beam width per SID level, one entry per level; [100, 200, 400]
+    // is the escalating beam. Each entry is capped to what its band can supply.
+    repeated uint32 beam_widths = 7;
+    // Must not exceed the final beam width.
+    required uint32 num_return_sequences = 8;
+
+    optional string generated_sids_key = 12 [default = "generated_sids"];
+    // MASTER weights. FP32 avoids bf16-ULP underflow of Adam's small updates;
+    // bf16 COMPUTE comes from mixed_precision, not from this.
+    optional ParamDtype param_dtype = 13 [default = FP32];
+
+    // History budget in SID codes: item-aligned truncation keeping the most
+    // recent items, and the activation-pool pre-size. 0 disables both.
+    required uint32 max_sequence_length = 14;
+}
+
+// Qwen family (Qwen2.5, Qwen3, ...) -- one ChatML frame for all.
+message GenerativeQwen {
+    optional GenerativeModelConfig common = 1;
+
+    // HF hub id or local path.
+    optional string hf_model_id = 2 [default = "Qwen/Qwen2.5-0.5B"];
+
+    // User-turn body carrying one {{feature_name}} placeholder per SID feature.
+    // The ChatML frame and the supervised tail are family constants.
+    optional string prompt_template = 10;
+}

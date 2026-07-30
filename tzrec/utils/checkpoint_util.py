@@ -390,9 +390,27 @@ class CheckpointManager:
         dataloader_state: Optional[Dict[str, Any]] = None,
         dense_ema: Optional[DenseEMA] = None,
     ) -> str:
-        """Save a checkpoint at the given step, then request an async prune."""
+        """Save a checkpoint at the given step, then request an async prune.
+
+        For HF-backed models, co-locates the HF config + tokenizer (no weights)
+        in this checkpoint dir so each ``model.ckpt-N/`` is self-contained and
+        convertible to HF. Deliberately not gated on ``export_format``: that is
+        an export-time knob, and gating it would make a run trained with the
+        default format permanently unexportable to HF.
+        """
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer, dense_ema)
+        # Local import avoids a circular import (hf_export_util imports us).
+        from tzrec.utils.hf_export_util import write_hf_assets
+
+        # a raise here skips save_dataloader_state's all_gather and hangs other ranks.
+        try:
+            write_hf_assets(model, ckpt_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"write_hf_assets failed for {ckpt_dir}: {e} -- checkpoint "
+                f"weights are saved; skipping HF assets."
+            )
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
         self._last_ckpt_dir = ckpt_dir

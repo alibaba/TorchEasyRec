@@ -73,6 +73,7 @@ from tzrec.optim import optimizer_builder
 from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
+from tzrec.protos import export_pb2
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.export_pb2 import ExportConfig
@@ -768,6 +769,9 @@ def train_and_evaluate(
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
     )
+    # Cold start only; a resumed or fine-tuned run gets its weights from DCP.
+    if ckpt_path is None:
+        model.init_from_pretrained()
     model = TrainWrapper(
         model, device=device, mixed_precision=train_config.mixed_precision
     )
@@ -1079,6 +1083,43 @@ def export(
     if asset_files:
         assets = asset_files.split(",")
 
+    ckpt_manager = checkpoint_util.CheckpointManager(
+        pipeline_config.model_dir, export_config=pipeline_config.export_config
+    )
+    if not checkpoint_path:
+        if (
+            pipeline_config.HasField("export_config")
+            and pipeline_config.export_config.exporter_type == "best"
+        ):
+            checkpoint_path, _ = ckpt_manager.best_checkpoint()
+        else:
+            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
+
+    # HF export converts the checkpoint dir directly -- no model build, no DCP restore.
+    if pipeline_config.export_config.export_format == export_pb2.ExportFormat.HF:
+        if config_util.use_dense_ema(
+            pipeline_config.export_config, pipeline_config.train_config
+        ):
+            raise ValueError(
+                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
+                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
+                "false to export the raw weights."
+            )
+        if not checkpoint_path:
+            raise ValueError("HF export: no checkpoint found to convert.")
+        if not os.path.exists(os.path.join(checkpoint_path, "config.json")):
+            raise ValueError(
+                f"HF export: {checkpoint_path} has no co-located HF assets; it "
+                f"was not written by an HF-backed model."
+            )
+        if assets:
+            logger.warning(f"HF export ignores asset_files: {assets}.")
+        if is_rank_zero:
+            from tzrec.utils.hf_export_util import dcp_to_hf
+
+            dcp_to_hf(checkpoint_path, export_dir)
+        return
+
     data_config = pipeline_config.data_config
 
     # Build feature
@@ -1097,18 +1138,6 @@ def export(
     # is snapshot from the scalar view.
     model.set_is_inference(True)
     model = InferWrapper(model)
-
-    if not checkpoint_path:
-        ckpt_manager = checkpoint_util.CheckpointManager(
-            pipeline_config.model_dir, export_config=pipeline_config.export_config
-        )
-        if (
-            pipeline_config.HasField("export_config")
-            and pipeline_config.export_config.exporter_type == "best"
-        ):
-            checkpoint_path, _ = ckpt_manager.best_checkpoint()
-        else:
-            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():

@@ -83,6 +83,44 @@ class LRSchedulerTest(unittest.TestCase):
             lr.step()
             self.assertAlmostEqual(opt.param_groups[0]["lr"], lr_gt)
 
+    def test_linear_decay_lr(self) -> None:
+        params = [torch.tensor([1.0, 2.0])]
+        opt = torch.optim.Adam(params, lr=0.01)
+        lr = lr_scheduler.LinearDecayLR(opt, num_training_steps=4)
+        lr_gts = [0.0075, 0.005, 0.0025, 0.0, 0.0]
+        for lr_gt in lr_gts:
+            lr.step()
+            self.assertAlmostEqual(opt.param_groups[0]["lr"], lr_gt)
+
+    def test_linear_decay_lr_with_min_lr(self) -> None:
+        params = [torch.tensor([1.0, 2.0])]
+        opt = torch.optim.Adam(params, lr=0.01)
+        lr = lr_scheduler.LinearDecayLR(
+            opt, num_training_steps=4, min_learning_rate=0.002
+        )
+        lr_gts = [0.008, 0.006, 0.004, 0.002, 0.002]
+        for lr_gt in lr_gts:
+            lr.step()
+            self.assertAlmostEqual(opt.param_groups[0]["lr"], lr_gt)
+
+    def test_linear_decay_lr_with_warmup(self) -> None:
+        params = [torch.tensor([1.0, 2.0])]
+        opt = torch.optim.Adam(params, lr=0.01)
+        lr = lr_scheduler.LinearDecayLR(
+            opt, num_training_steps=6, warmup_size=2, warmup_learning_rate=0.002
+        )
+        self.assertFalse(lr.by_epoch)
+        # warmup step 0->1: scale=0.5, lr=0.002+(0.01-0.002)*0.5=0.006
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.006)
+        # warmup step 1->2: scale=1.0, lr=0.01
+        lr.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.01)
+        # decay over remaining 4 steps: 0.0075, 0.005, 0.0025, 0.0
+        for lr_gt in [0.0075, 0.005, 0.0025, 0.0, 0.0]:
+            lr.step()
+            self.assertAlmostEqual(opt.param_groups[0]["lr"], lr_gt)
+
     def test_cosine_annealing_lr(self) -> None:
         params = [torch.tensor([1.0, 2.0])]
         opt = torch.optim.Adam(params, lr=0.01)

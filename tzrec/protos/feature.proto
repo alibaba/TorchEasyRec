@@ -986,6 +986,50 @@ message SequenceFeature {
     repeated SeqFeatureConfig features = 5;
 }
 
+// Semantic-ID (SID) sequence feature for generative-recommendation LMs.
+//
+// Carries a flat stream of per-level SID codes (whole items, level order) plus
+// the prompt text that wraps them. Only usable as `sequence_sid_feature`: the
+// model reads it as a JAGGED_SEQUENCE group, so the scalar form would never
+// produce the "{group}.sequence" keys it needs.
+//
+// Under fg this is a PASSTHROUGH: no fg feature_type can add
+// level_offsets[i % levels], so fg only reaches the codes and the feature folds
+// the offsets in at parse time.
+message SidFeature {
+    // feature name; also the {{name}} placeholder in prompt_template.
+    required string feature_name = 1;
+    // feature input, e.g. user:user_sequence
+    required string expression = 2;
+    // SID streams are flat, so this stays 1.
+    optional uint32 value_dim = 6 [default = 1];
+    // unused; SIDs carry no embedding table.
+    optional string pooling = 10 [default = "sum"];
+    // fg default value
+    optional string default_value = 11 [default = "0"];
+    // mask value in training progress
+    optional bool use_mask = 14;
+
+    // text emitted immediately BEFORE this feature's SID tokens
+    optional string prefix_text = 20 [default = ""];
+    // text emitted immediately AFTER this feature's SID tokens
+    optional string suffix_text = 21 [default = ""];
+    // REQUIRED, per-level SID vocabulary; codes are 0-based in
+    // [0, codebook[level]). All SID features must declare the SAME codebook.
+    repeated uint32 codebook = 23;
+
+    // default value when fg_mode = FG_NONE
+    optional string fg_encoded_default_value = 30;
+    // only used as fg dag intermediate result or not
+    optional bool stub_type = 34 [default = false];
+
+    // fg-side cap; must be a multiple of len(codebook). Prefer
+    // model_config.common.max_sequence_length, which keeps the recent items.
+    optional uint32 sequence_length = 101;
+    // sequence delimiter, only take effect when use it as sequence
+    optional string sequence_delim = 102 [default = ";"];
+}
+
 message FeatureConfig {
     oneof feature {
         IdFeature id_feature = 1;
@@ -1014,6 +1058,7 @@ message FeatureConfig {
         KvDotProduct sequence_kv_dot_product = 111;
         BoolMaskFeature sequence_bool_mask_feature = 112;
         CombineFeature sequence_combine_feature = 113;
+        SidFeature sequence_sid_feature = 114;
     }
 }
 
