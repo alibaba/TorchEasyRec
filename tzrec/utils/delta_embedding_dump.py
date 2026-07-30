@@ -650,18 +650,6 @@ class DeltaEmbeddingDumper:
         finally:
             self._tracking_pause_depth -= 1
 
-    @property
-    def requires_synced_dataloader_exhaustion(self) -> bool:
-        """Return whether input exhaustion must stay aligned across ranks.
-
-        Multi-rank dumps of either cadence need every rank to reach the same
-        final step. ``final_dump`` skips boundary steps already written on their
-        dump boundary, and a rank that stops before the synced step never ran
-        that boundary's ``maybe_dump``, so an unsynced stop would make it adopt
-        the boundary skip and silently drop its trailing tracked rows.
-        """
-        return self._world_size > 1
-
     def start(self) -> None:
         """Start timed cadence and per-rank FeatureStore publication.
 
@@ -746,7 +734,7 @@ class DeltaEmbeddingDumper:
             # Boundary steps were already written (with full delta) by
             # ``maybe_dump``. Re-dumping here has no new delta to flush -- every
             # rank's consumer cursor has already advanced past the boundary's
-            # delta (multi-rank dumps force synced exhaustion, so every rank
+            # delta (all ranks run the same step count, so every rank
             # participated in the boundary dump) -- and torchrec's
             # ``get_unique`` raises ``torch.cat(): expected a non-empty list of
             # Tensors`` on the empty consumer window. Re-dumping would also

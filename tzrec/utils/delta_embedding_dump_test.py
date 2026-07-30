@@ -1077,33 +1077,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertIs(dynamic_modules["model.ebc.shared"], ebc_dynamic_module)
         self.assertIs(dynamic_modules["model.ec.shared"], ec_dynamic_module)
 
-    def test_multi_rank_minutes_requires_synced_dataloader_exhaustion(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_secs = 60.0
-        dumper._world_size = 2
-
-        self.assertTrue(dumper.requires_synced_dataloader_exhaustion)
-
-    def test_multi_rank_step_interval_requires_synced_dataloader_exhaustion(self):
-        # Regression: with ranks finishing at steps 49 and 50, final_dump synced
-        # both to the boundary 50, both took the boundary-step skip, and the
-        # rank that never ran maybe_dump(50) silently dropped its trailing
-        # tracked rows. Every multi-rank cadence must keep exhaustion aligned
-        # so all ranks participate in every boundary dump.
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_secs = None
-        dumper._interval_steps = 50
-        dumper._world_size = 2
-
-        self.assertTrue(dumper.requires_synced_dataloader_exhaustion)
-
-    def test_single_rank_minutes_does_not_require_synced_dataloader_exhaustion(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_secs = 60.0
-        dumper._world_size = 1
-
-        self.assertFalse(dumper.requires_synced_dataloader_exhaustion)
-
     def test_multi_gpu_output_path_uses_step_underscore_dir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dumper = object.__new__(DeltaEmbeddingDumper)

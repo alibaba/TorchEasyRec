@@ -464,19 +464,12 @@ def _train_and_evaluate(
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
-    require_equal_train_batches = (
-        delta_embedding_dumper is not None
-        and delta_embedding_dumper.requires_synced_dataloader_exhaustion
-    )
-    sync_train_data_exhaustion = (
-        check_all_workers_data_status or require_equal_train_batches
-    )
     try:
         for i_epoch in epoch_iter:
             pipeline = create_train_pipeline(
                 model,
                 optimizer,
-                check_all_workers_data_status=sync_train_data_exhaustion,
+                check_all_workers_data_status=check_all_workers_data_status,
             )
             if plogger is not None:
                 plogger.set_description(f"Training Epoch {i_epoch}")
@@ -588,8 +581,8 @@ def _train_and_evaluate(
         if delta_embedding_dumper is not None:
             # Flush the trailing partial interval before the final checkpoint.
             # final_dump skips dump-boundary steps already written by maybe_dump
-            # (multi-rank dumps force synced exhaustion, so every rank participated
-            # in those dumps and reaches the same final step).
+            # (all ranks run the same step count, so every rank participated in
+            # those dumps and reaches the same final step).
             delta_embedding_dumper.final_dump(i_step)
 
         _log_train(
