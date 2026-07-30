@@ -29,6 +29,8 @@ from tzrec.tools.sid.resolve_sid_collisions import (
 from tzrec.utils.sid.collision import stable_order_hash
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
+_PART_FILE = "part-0.parquet"
+
 
 def _parquet(
     path,
@@ -61,6 +63,72 @@ def _csv(path, item_ids, codes, candidate_codes=None):
             for row in candidate_codes
         ]
     csv.write_csv(pa.table(cols), path)
+
+
+def _write_part(path, table):
+    """Write one ``part-0.parquet`` shard, the shape every writer emits."""
+    os.makedirs(path, exist_ok=True)
+    parquet.write_table(table, os.path.join(path, _PART_FILE))
+
+
+def _map_parquet(path, rows):
+    """Write a map artifact from (item_id, origin_codebook, codebook, index)."""
+    _write_part(
+        path,
+        pa.table(
+            {
+                "item_id": pa.array([r[0] for r in rows], type=pa.int64()),
+                "origin_codebook": pa.array(
+                    [r[1] for r in rows], type=pa.list_(pa.int64())
+                ),
+                "codebook": pa.array([r[2] for r in rows], type=pa.list_(pa.int64())),
+                "index": pa.array([r[3] for r in rows], type=pa.int64()),
+            }
+        ),
+    )
+
+
+def _groups_parquet(path, rows):
+    """Write a groups artifact from (codebook, item_ids) in SID-key order."""
+    _write_part(
+        path,
+        pa.table(
+            {
+                "codebook": pa.array([r[0] for r in rows], type=pa.list_(pa.int64())),
+                "itemids": pa.array([r[1] for r in rows], type=pa.list_(pa.int64())),
+            }
+        ),
+    )
+
+
+def _map_csv(path, rows):
+    """Write a map artifact in the CSV encoding this tool emits."""
+    os.makedirs(path, exist_ok=True)
+    csv.write_csv(
+        pa.table(
+            {
+                "item_id": [r[0] for r in rows],
+                "origin_codebook": [",".join(map(str, r[1])) for r in rows],
+                "codebook": [",".join(map(str, r[2])) for r in rows],
+                "index": [r[3] for r in rows],
+            }
+        ),
+        os.path.join(path, "part-0.csv"),
+    )
+
+
+def _groups_csv(path, rows):
+    """Write a groups artifact in the CSV encoding this tool emits."""
+    os.makedirs(path, exist_ok=True)
+    csv.write_csv(
+        pa.table(
+            {
+                "codebook": [",".join(map(str, r[0])) for r in rows],
+                "itemids": ["[" + ",".join(map(str, r[1])) + "]" for r in rows],
+            }
+        ),
+        os.path.join(path, "part-0.csv"),
+    )
 
 
 class ResolveSidCollisionsTest(unittest.TestCase):
@@ -105,7 +173,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         return f"{out}_original_groups", f"{out}_resolved_groups"
 
     def _read_parquet(self, out_dir):
-        return parquet.read_table(os.path.join(out_dir, "part-0.parquet")).to_pydict()
+        return parquet.read_table(os.path.join(out_dir, _PART_FILE)).to_pydict()
 
     def _assert_map_matches_resolved_groups(self, out):
         item_map = self._read_parquet(out)
@@ -123,6 +191,47 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             item_map["item_id"], item_map["codebook"], item_map["index"]
         ):
             self.assertEqual(resolved_items[tuple(codebook)][index - 1], item_id)
+
+    def _map_rows(self, out):
+        """Return {item_id: (origin_codebook, codebook, index)} for a map."""
+        item_map = self._read_parquet(out)
+        return {
+            item_id: (tuple(origin), tuple(codebook), index)
+            for item_id, origin, codebook, index in zip(
+                item_map["item_id"],
+                item_map["origin_codebook"],
+                item_map["codebook"],
+                item_map["index"],
+            )
+        }
+
+    def _append_paths(self, previous_out):
+        """Return the two state reader paths for the previous generation."""
+        _, previous_groups = self._group_paths(previous_out)
+        return {
+            "existing_sid_map_path": os.path.join(previous_out, "*.parquet"),
+            "existing_sid_groups_path": os.path.join(previous_groups, "*.parquet"),
+        }
+
+    def _append(self, inp, out, previous_out, **kw):
+        return self._run(inp, out, **self._append_paths(previous_out), **kw)
+
+    def _prepare_single(self, item_id):
+        path = os.path.join(self.test_dir, f"single_{item_id}.parquet")
+        _parquet(path, [item_id], [[0, 0]], [[[0, 2]]])
+        return path
+
+    def _assert_dense_indices(self, out):
+        """Every bucket's index multiset must be exactly 1..count."""
+        by_bucket = {}
+        for _item, (_origin, codebook, index) in self._map_rows(out).items():
+            by_bucket.setdefault(codebook, []).append(index)
+        for codebook, indices in by_bucket.items():
+            self.assertEqual(
+                sorted(indices),
+                list(range(1, len(indices) + 1)),
+                f"non-dense index set for {codebook}",
+            )
 
     # ---- candidate strategy ----
 
@@ -898,6 +1007,277 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "codebook"):
             ResolveSidCollisionsConfig.from_namespace(args)
+
+    # ---- append mode ----
+
+    def _seed_generation(self, name="v1", item_ids=None, codes=None):
+        """Run a full resolve to produce the state a later append consumes."""
+        inp = os.path.join(self.test_dir, f"{name}_in.parquet")
+        out = os.path.join(self.test_dir, name)
+        item_ids = list(range(5)) if item_ids is None else item_ids
+        codes = [[0, 0], [0, 0], [0, 1], [1, 0], [1, 1]] if codes is None else codes
+        _parquet(inp, item_ids, codes, [[[0, 2], [0, 3]]] * len(item_ids))
+        self._run(inp, out)
+        return out
+
+    def test_append_never_moves_a_published_item(self) -> None:
+        base = self._seed_generation()
+        published = self._map_rows(base)
+
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        # Rows 10 and 11 land in the already-full bucket (0, 0).
+        _parquet(inp, [10, 11, 12], [[0, 0], [0, 0], [1, 1]], [[[0, 2], [0, 3]]] * 3)
+        stats = self._append(inp, out, base)
+
+        self.assertEqual(stats.total_items, 3)
+        merged = self._map_rows(out)
+        self.assertEqual(len(merged), 8)
+        for item_id, row in published.items():
+            self.assertEqual(merged[item_id], row, f"item {item_id} moved")
+        self._assert_dense_indices(out)
+        self._assert_map_matches_resolved_groups(out)
+
+    def test_append_continues_slot_numbering(self) -> None:
+        base = self._seed_generation(item_ids=[0], codes=[[0, 0]])
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        _parquet(inp, [10], [[0, 0]], [[[0, 0]]])
+        self._append(inp, out, base)
+
+        merged = self._map_rows(out)
+        self.assertEqual(merged[0][2], 1)
+        # Capacity is 2, so the new row is retained and continues at slot 2.
+        self.assertEqual(merged[10], ((0, 0), (0, 0), 2))
+
+    def test_append_emits_delta_outputs(self) -> None:
+        base = self._seed_generation()
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        delta_map = os.path.join(self.test_dir, "delta_map")
+        delta_groups = os.path.join(self.test_dir, "delta_groups")
+        _parquet(inp, [10, 11], [[0, 0], [3, 3]], [[[0, 2], [0, 3]]] * 2)
+        self._append(
+            inp,
+            out,
+            base,
+            delta_map_output_path=delta_map,
+            delta_sid_groups_output_path=delta_groups,
+        )
+
+        self.assertCountEqual(self._read_parquet(delta_map)["item_id"], [10, 11])
+        merged_groups = self._read_parquet(self._group_paths(out)[1])
+        full = {
+            tuple(codebook): item_group
+            for codebook, item_group in zip(
+                merged_groups["codebook"], merged_groups["itemids"]
+            )
+        }
+        delta = self._read_parquet(delta_groups)
+        # Delta rows carry the whole post-append bucket, byte-identical to the
+        # corpus output, so a consumer can upsert them idempotently.
+        for codebook, item_group in zip(delta["codebook"], delta["itemids"]):
+            self.assertEqual(item_group, full[tuple(codebook)])
+        touched = {item for group in delta["itemids"] for item in group}
+        self.assertTrue({10, 11}.issubset(touched))
+
+    def test_append_creates_buckets_before_between_and_after(self) -> None:
+        # New SIDs sort before, between and after every published bucket, which
+        # exercises all three branches of the groups merge.
+        base = self._seed_generation(item_ids=[0], codes=[[4, 4]])
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        _parquet(inp, [10, 11, 12], [[0, 0], [4, 5], [7, 7]], [[[0, 0]]] * 3)
+        with mock.patch.object(resolve_sid_collisions, "_STATE_READ_ROWS", 1):
+            self._append(inp, out, base, batch_size=1)
+
+        groups = self._read_parquet(self._group_paths(out)[1])
+        self.assertEqual(groups["codebook"], [[0, 0], [4, 4], [4, 5], [7, 7]])
+        self.assertEqual(groups["itemids"], [[10], [0], [11], [12]])
+        self._assert_map_matches_resolved_groups(out)
+
+    def test_append_merges_across_reader_batches(self) -> None:
+        base = self._seed_generation(
+            item_ids=list(range(6)),
+            codes=[[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5]],
+        )
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        _parquet(inp, [10, 11, 12], [[0, 0], [3, 3], [6, 6]], [[[0, 0]]] * 3)
+        with mock.patch.object(resolve_sid_collisions, "_STATE_READ_ROWS", 1):
+            self._append(inp, out, base, batch_size=1)
+
+        self._assert_dense_indices(out)
+        self._assert_map_matches_resolved_groups(out)
+        self.assertEqual(len(self._map_rows(out)), 9)
+
+    def test_append_chain_stays_consistent(self) -> None:
+        previous = self._seed_generation()
+        for generation in range(2, 5):
+            inp = os.path.join(self.test_dir, f"v{generation}_in.parquet")
+            out = os.path.join(self.test_dir, f"v{generation}")
+            base = 100 * generation
+            _parquet(
+                inp,
+                [base, base + 1],
+                [[0, 0], [generation, generation]],
+                [[[0, 2], [0, 3]]] * 2,
+            )
+            published = self._map_rows(previous)
+            self._append(inp, out, previous)
+            merged = self._map_rows(out)
+            for item_id, row in published.items():
+                self.assertEqual(merged[item_id], row)
+            self._assert_dense_indices(out)
+            self._assert_map_matches_resolved_groups(out)
+            previous = out
+
+    def test_append_reads_csv_state_and_converts_format(self) -> None:
+        # CSV state exercises the JSON branch of the grouped item-ID decoder,
+        # and a parquet new-items input drives _align_codes_column's re-encode.
+        state_map = os.path.join(self.test_dir, "csv_map")
+        state_groups = os.path.join(self.test_dir, "csv_groups")
+        _map_csv(state_map, [(0, [0, 0], [0, 0], 1), (1, [1, 1], [1, 1], 1)])
+        _groups_csv(state_groups, [([0, 0], [0]), ([1, 1], [1])])
+
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        _parquet(inp, [10, 11], [[0, 0], [2, 2]], [[[0, 2]]] * 2)
+        with self.assertLogs(level="WARNING") as logs:
+            self._run(
+                inp,
+                out,
+                existing_sid_map_path=os.path.join(state_map, "*.csv"),
+                existing_sid_groups_path=os.path.join(state_groups, "*.csv"),
+            )
+        self.assertTrue(
+            any("rewritten in the other format" in line for line in logs.output)
+        )
+
+        merged = self._map_rows(out)
+        self.assertEqual(len(merged), 4)
+        self.assertEqual(merged[0], ((0, 0), (0, 0), 1))
+        self.assertEqual(merged[10], ((0, 0), (0, 0), 2))
+        self._assert_dense_indices(out)
+        self._assert_map_matches_resolved_groups(out)
+
+    def test_append_rejects_already_published_item_id(self) -> None:
+        base = self._seed_generation()
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        _parquet(inp, [0, 99], [[0, 0], [2, 2]], [[[0, 2]]] * 2)
+        with self.assertRaisesRegex(ValueError, "already published"):
+            self._append(inp, out, base)
+
+    def test_append_rejects_mismatched_generation_pair(self) -> None:
+        first = self._seed_generation("v1")
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        _parquet(inp, [10], [[0, 0]], [[[0, 2]]])
+        self._append(inp, out, first)
+        # Pair generation 1's map with generation 2's groups.
+        with self.assertRaisesRegex(ValueError, "same generation"):
+            self._run(
+                self._prepare_single(20),
+                os.path.join(self.test_dir, "v3"),
+                existing_sid_map_path=os.path.join(first, "*.parquet"),
+                existing_sid_groups_path=os.path.join(
+                    self._group_paths(out)[1], "*.parquet"
+                ),
+            )
+
+    def test_append_rejects_map_with_index_holes(self) -> None:
+        # Two items share bucket (0, 0) but hold indices 1 and 3: a deleted item
+        # left a hole, so appending would reuse slot 2.
+        state_map = os.path.join(self.test_dir, "holed_map")
+        state_groups = os.path.join(self.test_dir, "holed_groups")
+        _map_parquet(state_map, [(0, [0, 0], [0, 0], 1), (1, [0, 0], [0, 0], 3)])
+        _groups_parquet(state_groups, [([0, 0], [0, 1])])
+        with self.assertRaisesRegex(ValueError, "holes"):
+            self._run(
+                self._prepare_single(10),
+                os.path.join(self.test_dir, "out"),
+                max_items_per_codebook=4,
+                existing_sid_map_path=os.path.join(state_map, "*.parquet"),
+                existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
+            )
+
+    def test_append_rejects_map_with_duplicate_indices(self) -> None:
+        # max(index) == count hides it; only the index sum catches this one.
+        state_map = os.path.join(self.test_dir, "dup_map")
+        state_groups = os.path.join(self.test_dir, "dup_groups")
+        _map_parquet(
+            state_map,
+            [
+                (0, [0, 0], [0, 0], 1),
+                (1, [0, 0], [0, 0], 1),
+                (2, [0, 0], [0, 0], 3),
+            ],
+        )
+        _groups_parquet(state_groups, [([0, 0], [0, 1, 2])])
+        with self.assertRaisesRegex(ValueError, "not dense"):
+            self._run(
+                self._prepare_single(10),
+                os.path.join(self.test_dir, "out"),
+                max_items_per_codebook=4,
+                existing_sid_map_path=os.path.join(state_map, "*.parquet"),
+                existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
+            )
+
+    def test_append_rejects_unsorted_existing_groups(self) -> None:
+        state_map = os.path.join(self.test_dir, "unsorted_map")
+        state_groups = os.path.join(self.test_dir, "unsorted_groups")
+        _map_parquet(state_map, [(0, [1, 1], [1, 1], 1), (1, [0, 0], [0, 0], 1)])
+        _groups_parquet(state_groups, [([1, 1], [0]), ([0, 0], [1])])
+        with self.assertRaisesRegex(ValueError, "ascending"):
+            self._run(
+                self._prepare_single(10),
+                os.path.join(self.test_dir, "out"),
+                existing_sid_map_path=os.path.join(state_map, "*.parquet"),
+                existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
+            )
+
+    def test_append_rate_only_needs_no_map(self) -> None:
+        base = self._seed_generation()
+        stats = self._run(
+            self._prepare_single(10),
+            os.path.join(self.test_dir, "unused"),
+            rate_only=True,
+            output_path=None,
+            resolved_sid_groups_output_path=None,
+            existing_sid_groups_path=os.path.join(
+                self._group_paths(base)[1], "*.parquet"
+            ),
+        )
+        self.assertEqual(stats.total_items, 1)
+
+    @parameterized.expand(
+        [
+            ({"existing_sid_map_path": "state/*.parquet"},),
+            ({"delta_map_output_path": "delta"},),
+            ({"delta_sid_groups_output_path": "delta"},),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_append_only_flags_are_ignored_outside_append_mode(self, overrides) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, [0, 1], [[0, 0], [1, 1]], [[[0, 2]]] * 2)
+        self._run(inp, out, **overrides)
+
+        self.assertCountEqual(self._read_parquet(out)["item_id"], [0, 1])
+        self._assert_map_matches_resolved_groups(out)
+        delta = overrides.get("delta_map_output_path")
+        if delta is not None:
+            self.assertFalse(os.path.exists(delta))
+
+    def test_append_requires_map_unless_rate_only(self) -> None:
+        with self.assertRaisesRegex(ValueError, "existing_sid_map_path is required"):
+            self._runner(
+                os.path.join(self.test_dir, "in.parquet"),
+                os.path.join(self.test_dir, "out"),
+                existing_sid_groups_path="groups/*.parquet",
+            )
 
 
 if __name__ == "__main__":

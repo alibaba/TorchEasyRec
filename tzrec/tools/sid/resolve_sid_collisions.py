@@ -42,11 +42,53 @@ Example::
         --input_path 'sid_predict_output/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
         --strategy candidate \
-        --output_path sid_collision/map \
-        --resolved_sid_groups_output_path sid_collision/resolved_groups
+        --output_path sid_collision/map_v1 \
+        --resolved_sid_groups_output_path sid_collision/groups_v1
 
 To also write the optional original-SID audit grouping, add
 ``--original_sid_groups_output_path sid_collision/original_groups``.
+
+Append mode
+-----------
+
+Supplying ``--existing_sid_groups_path`` switches the tool to appending new
+items onto an already-published corpus: ``--input_path`` then holds only the
+new items, and **no published SID is ever moved**. Published items are never
+rows in the plan, so they cannot be re-ranked; they are read only to be copied
+into the merged outputs. A new item continues its bucket's slot numbering from
+the published occupancy instead of restarting at one::
+
+    python -m tzrec.tools.sid.resolve_sid_collisions \
+        --input_path 'sid_predict_new_20260731/*.parquet' \
+        --existing_sid_map_path    'sid_collision/map_v1/*.parquet' \
+        --existing_sid_groups_path 'sid_collision/groups_v1/*.parquet' \
+        --codebook 256,256,256 --max_items_per_codebook 5 \
+        --strategy candidate \
+        --output_path sid_collision/map_v2 \
+        --resolved_sid_groups_output_path sid_collision/groups_v2 \
+        --delta_map_output_path sid_collision/delta_20260731
+
+Both outputs stay corpus-complete, so generation *n*'s outputs are exactly
+generation *n+1*'s ``--existing_*`` inputs and a full resolve bootstraps the
+chain with no special case. ``--original_sid_groups_output_path`` is the
+exception: it is an audit output keyed by the *predicted* SID, and in append
+mode it covers only this run's items, because published items' original SIDs
+live in the map's ``origin_codebook`` rather than in the groups artifact.
+
+Writers truncate, so every generation needs a fresh output directory.
+``--delta_map_output_path`` emits the new item rows alone and
+``--delta_sid_groups_output_path`` the buckets this run changed, each with its
+complete post-append item list so a serving index can upsert it idempotently.
+
+State paths follow the same rules as ``--input_path``: the reader backend
+comes from the path (``map_v1/*.parquet``, ``odps://…``) or from
+``--reader_type``. Before placing anything, the run
+verifies that no new item ID is already published, and that the two state
+artifacts agree bucket for bucket on count, largest index and index sum -- the
+map stores ``index`` as a value, so unlike the groups artifact it can hold
+holes or duplicates, and appending onto those would reuse a published slot.
+Appends need candidate output more often than a full resolve does, because a
+bucket's free space is ``capacity`` minus its published occupancy.
 """
 
 from __future__ import annotations
@@ -54,10 +96,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from functools import cached_property
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -82,15 +124,34 @@ from tzrec.utils.sid.collision import (
     CollisionResolutionStats,
     CollisionResolver,
     KnnCollisionResolver,
+    PriorOccupancy,
     RandomCollisionResolver,
+    bands_of_bucket_keys,
     build_original_item_grouping,
     build_resolved_item_grouping,
+    concat_ranges,
+    in_sorted_bands,
+    lookup_sorted,
     prepare_collision_plan,
+    sid_band_ids,
+    sid_bucket_keys,
 )
 
 _MAP_WRITE_ROWS = 1_000_000
+# State artifacts are corpus-sized; read them in larger batches than the
+# new-items input so per-batch fixed costs are not multiplied by the corpus.
+_STATE_READ_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
+
+
+def _is_list_column(values: pa.Array) -> bool:
+    """Whether an Arrow column is one of the native list types."""
+    return (
+        pa.types.is_list(values.type)
+        or pa.types.is_large_list(values.type)
+        or pa.types.is_fixed_size_list(values.type)
+    )
 
 
 def _require_single_process() -> None:
@@ -165,6 +226,11 @@ class ResolveSidCollisionsConfig:
     random_num_candidates: int
     rate_only: bool
     odps_data_quota_name: str
+    # Append mode. Defaulted so a full-resolve caller need not mention them.
+    existing_sid_map_path: Optional[str] = None
+    existing_sid_groups_path: Optional[str] = None
+    delta_map_output_path: Optional[str] = None
+    delta_sid_groups_output_path: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -185,17 +251,27 @@ class ResolveSidCollisionsConfig:
             raise ValueError(
                 "resolved_sid_groups_output_path is required unless rate_only is set."
             )
-
-        paths = [self.input_path]
-        paths.extend(
-            path
-            for path in (
-                self.output_path,
-                self.original_sid_groups_output_path,
-                self.resolved_sid_groups_output_path,
+        if self.is_append and not self.rate_only and not self.existing_sid_map_path:
+            raise ValueError(
+                "existing_sid_map_path is required in append mode unless rate_only "
+                "is set; without it the merged map would hold only the new items."
             )
-            if path
-        )
+
+        # Append-only paths are simply unused outside append mode, so they are
+        # left out of the conflict check rather than rejected.
+        candidates = [self.output_path, self.resolved_sid_groups_output_path]
+        candidates.append(self.original_sid_groups_output_path)
+        if self.is_append:
+            candidates.extend(
+                (
+                    self.existing_sid_map_path,
+                    self.existing_sid_groups_path,
+                    self.delta_map_output_path,
+                    self.delta_sid_groups_output_path,
+                )
+            )
+        paths = [self.input_path]
+        paths.extend(path for path in candidates if path)
         has_conflict, conflict_message = check_path_conflict(paths)
         if has_conflict:
             raise ValueError(conflict_message)
@@ -203,6 +279,15 @@ class ResolveSidCollisionsConfig:
         # Eagerly build the resolution config so its validation (layer_sizes,
         # capacity) fails fast here rather than lazily inside run().
         _ = self.resolution_config
+
+    @property
+    def is_append(self) -> bool:
+        """Whether this run appends onto an already-published corpus.
+
+        The previous round's resolved groups is the occupancy authority and is
+        required by every append, so its presence selects the mode.
+        """
+        return self.existing_sid_groups_path is not None
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "ResolveSidCollisionsConfig":
@@ -219,6 +304,10 @@ class ResolveSidCollisionsConfig:
             output_path=args.output_path,
             original_sid_groups_output_path=args.original_sid_groups_output_path,
             resolved_sid_groups_output_path=args.resolved_sid_groups_output_path,
+            existing_sid_map_path=args.existing_sid_map_path,
+            existing_sid_groups_path=args.existing_sid_groups_path,
+            delta_map_output_path=args.delta_map_output_path,
+            delta_sid_groups_output_path=args.delta_sid_groups_output_path,
             reader_type=args.reader_type,
             writer_type=args.writer_type,
             batch_size=args.batch_size,
@@ -268,10 +357,9 @@ class CollisionResolutionRunner:
         """Read, resolve collisions, and write the resulting SID map."""
         _require_single_process()
         item_ids, codes = self._load_codes()
+        prior = self._load_prior_state(item_ids, codes)
         plan = prepare_collision_plan(
-            item_ids,
-            codes,
-            self._config.resolution_config,
+            item_ids, codes, self._config.resolution_config, prior=prior
         )
         collect_grouping = not self._config.rate_only and bool(plan.overflow_rows.size)
         candidate_last_codes = None
@@ -297,15 +385,77 @@ class CollisionResolutionRunner:
         logger.info("SID collision resolution finished: %s", result.stats)
         return result.stats
 
-    def _make_reader(self, selected_cols: List[str]) -> BaseReader:
-        """Open a repository reader projecting ``selected_cols``."""
+    def _make_reader(
+        self,
+        selected_cols: List[str],
+        input_path: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ) -> BaseReader:
+        """Open a repository reader projecting ``selected_cols``.
+
+        Args:
+            selected_cols: Columns to project.
+            input_path: Path to read; defaults to the new-items input.
+            batch_size: Rows per batch; defaults to the configured size.
+
+        Returns:
+            A reader over the requested path.
+        """
         return create_reader(
-            input_path=self._config.input_path,
-            batch_size=self._config.batch_size,
+            input_path=input_path or self._config.input_path,
+            batch_size=batch_size or self._config.batch_size,
             selected_cols=selected_cols,
             reader_type=self._config.reader_type,
             quota_name=self._config.odps_data_quota_name,
         )
+
+    def _iter_state_batches(
+        self,
+        path: str,
+        fields: List[str],
+        description: str,
+        on_open: Optional[Callable[[BaseReader], None]] = None,
+    ) -> Iterator[Dict[str, pa.Array]]:
+        """Stream one state artifact, checking columns and logging progress.
+
+        State artifacts are corpus-sized, so they are read with their own batch
+        size rather than the one tuned for the much smaller new-items input --
+        every per-batch fixed cost is otherwise multiplied by the corpus.
+
+        Args:
+            path: State artifact to read.
+            fields: Columns to project and require.
+            description: Progress logger description.
+            on_open: Optional callback invoked once with the opened reader.
+
+        Yields:
+            Each record batch of the artifact.
+
+        Raises:
+            ValueError: If a required column is missing from the artifact.
+        """
+        reader = self._make_reader(
+            fields,
+            input_path=path,
+            batch_size=max(self._config.batch_size, _STATE_READ_ROWS),
+        )
+        missing = [name for name in fields if name not in reader.schema.names]
+        if missing:
+            raise ValueError(
+                f"columns {missing} are missing from {path!r}; point the flag at "
+                "an output directory written by this tool."
+            )
+        if on_open is not None:
+            on_open(reader)
+        progress = ProgressLogger(description, start_n=0)
+        scanned = 0
+        last_progress_count = 0
+        for batch in reader.to_batches():
+            yield batch
+            scanned += len(batch[fields[0]])
+            if self._progress_interval_reached(scanned, last_progress_count):
+                progress.log(scanned, suffix=f"{scanned} samples processed")
+                last_progress_count = scanned
 
     def _progress_interval_reached(
         self, processed: int, last_progress_count: int
@@ -316,11 +466,7 @@ class CollisionResolutionRunner:
     @staticmethod
     def _codes_matrix(values: pa.Array) -> np.ndarray:
         """Decode an SID column into an ``(N, n_layers)`` int64 matrix."""
-        if (
-            pa.types.is_list(values.type)
-            or pa.types.is_large_list(values.type)
-            or pa.types.is_fixed_size_list(values.type)
-        ):
+        if _is_list_column(values):
             row_count = len(values)
             flat = (
                 values.flatten()
@@ -484,6 +630,359 @@ class CollisionResolutionRunner:
             )
         return candidates
 
+    def _load_prior_state(
+        self, item_ids: np.ndarray, codes: np.ndarray
+    ) -> PriorOccupancy:
+        """Load and verify published state, or return empty for a full resolve.
+
+        Args:
+            item_ids: Item IDs of the new batch.
+            codes: SID matrix of the new batch.
+
+        Returns:
+            Occupancy restricted to the bands this run can touch.
+
+        Raises:
+            ValueError: If the SID width disagrees with ``--codebook``.
+        """
+        if not self._config.is_append:
+            logger.info("full-resolve mode: no existing SID state supplied")
+            return PriorOccupancy.empty()
+
+        layer_sizes = self._config.layer_sizes
+        if codes.shape[1] != len(layer_sizes):
+            # prepare_collision_plan raises the same way, but only after these
+            # two corpus-sized passes would already have run.
+            raise ValueError(
+                f"codes have {codes.shape[1]} layers but --codebook has "
+                f"{len(layer_sizes)}."
+            )
+        groups_path = self._config.existing_sid_groups_path
+        assert groups_path is not None  # is_append means it is set
+        prior = self._load_prior_occupancy(
+            groups_path, sid_band_ids(codes, layer_sizes), item_ids
+        )
+        self._cross_check_existing_map(prior)
+        logger.info(
+            "append mode: %d new items onto %d published items in %d touched "
+            "buckets (groups=%s, map=%s)",
+            item_ids.shape[0],
+            prior.total_items,
+            prior.bucket_keys.shape[0],
+            self._config.existing_sid_groups_path,
+            self._config.existing_sid_map_path,
+        )
+        return prior
+
+    def _decode_grouped_item_ids(self, values: pa.Array) -> Tuple[np.ndarray, pa.Array]:
+        """Decode a grouped item-ID column into per-group counts and values.
+
+        Inverse of :meth:`_grouped_item_ids_column`. Native list columns expose
+        both halves directly and stay zero-copy; the CSV form is a JSON array
+        string, which has to be parsed -- a plain comma count would be wrong for
+        string IDs that themselves contain commas -- so both halves come out of
+        one parse rather than two.
+
+        Args:
+            values: One batch of the grouped item-ID column.
+
+        Returns:
+            An int64 count per group, and the flattened child values.
+        """
+        if _is_list_column(values):
+            lengths = (
+                pc.list_value_length(values)
+                .to_numpy(zero_copy_only=False)
+                .astype(np.int64, copy=False)
+            )
+            return lengths, values.flatten()
+        groups = [json.loads(text) for text in values.to_pylist()]
+        lengths = np.fromiter(
+            (len(group) for group in groups), dtype=np.int64, count=len(groups)
+        )
+        flat = [item_id for group in groups for item_id in group]
+        return lengths, pa.array(flat, type=self._item_id_type)
+
+    def _align_codes_column(self, values: pa.Array, is_csv: bool) -> pa.Array:
+        """Return an SID column in the encoding the destination writer needs.
+
+        Passes the Arrow column straight through when the source encoding
+        already matches the writer, and re-encodes through the NumPy form
+        otherwise, so a mixed-format append still produces one valid artifact.
+
+        Args:
+            values: SID column read from an existing artifact.
+            is_csv: Whether the destination writer is a CSV writer.
+
+        Returns:
+            A column matching what :meth:`_codes_column` would emit.
+        """
+        source_is_text = pa.types.is_string(values.type) or pa.types.is_large_string(
+            values.type
+        )
+        matches_writer = source_is_text if is_csv else _is_list_column(values)
+        if matches_writer:
+            return values
+        return self._codes_column(self._codes_matrix(values), is_csv)
+
+    def _warn_on_state_format_conversion(self, reader: BaseReader) -> None:
+        """Warn when the merged artifacts will change format.
+
+        The writer follows the new-items input, so a CSV prediction against
+        Parquet state silently rewrites the whole corpus in the other format.
+        That is legal -- each output is self-contained -- but it is never what
+        an operator intends, so make it visible.
+
+        Args:
+            reader: Reader opened over an existing state artifact.
+        """
+        state_writer_type = reader.__class__.__name__.replace("Reader", "Writer")
+        if (
+            self._default_writer_type is not None
+            and state_writer_type != self._default_writer_type
+        ):
+            logger.warning(
+                "existing SID state reads as %s but the output writer is %s; the "
+                "whole corpus will be rewritten in the other format. Set "
+                "--writer_type %s to keep it unchanged.",
+                reader.__class__.__name__,
+                self._default_writer_type,
+                state_writer_type,
+            )
+
+    def _check_state_item_id_type(self, values: pa.Array, source: str) -> None:
+        """Reject an existing artifact whose item ID type differs from the input.
+
+        Args:
+            values: Item ID column read from a state artifact.
+            source: Human-readable artifact name for the error message.
+
+        Raises:
+            ValueError: If the type differs from the new-items input.
+        """
+        if len(values) == 0 or self._item_id_type is None:
+            return
+        if values.type != self._item_id_type:
+            raise ValueError(
+                f"{source} item ID type {values.type} differs from the new-items "
+                f"input type {self._item_id_type}; the merged map cannot mix "
+                "them. Re-export the state or the prediction with one type."
+            )
+
+    def _load_prior_occupancy(
+        self, path: str, band_ids: np.ndarray, item_ids: np.ndarray
+    ) -> PriorOccupancy:
+        """Read published occupancy from the previous round's resolved groups.
+
+        This is pass 1. Only buckets in a band the new batch touches are kept:
+        relocation never leaves a row's own band, so no other bucket can be
+        read or written by this run. The same scan probes for item IDs that are
+        already published, which is the only place that can be detected.
+
+        Args:
+            path: Previous round's resolved SID groups.
+            band_ids: Band identifier of every new item.
+            item_ids: Item IDs of the new batch.
+
+        Returns:
+            Occupancy restricted to the new batch's bands.
+
+        Raises:
+            ValueError: If the groups stream is not ascending by SID key, or if
+                any new item ID is already published.
+        """
+        layer_sizes = self._config.layer_sizes
+        wanted_bands = np.unique(band_ids)
+        new_item_ids = self._item_id_array(item_ids)
+
+        key_chunks: List[np.ndarray] = []
+        count_chunks: List[np.ndarray] = []
+        overlapping: List[object] = []
+        overlap_count = 0
+        previous_max_key = -1
+        for batch in self._iter_state_batches(
+            path,
+            ["codebook", "itemids"],
+            "Reading published SID groups",
+            on_open=self._warn_on_state_format_conversion,
+        ):
+            keys = sid_bucket_keys(self._codes_matrix(batch["codebook"]), layer_sizes)
+            if keys.size:
+                if int(keys[0]) <= previous_max_key or np.any(keys[1:] <= keys[:-1]):
+                    raise ValueError(
+                        "existing SID groups must be ascending by SID key with one "
+                        "row per bucket; the merge would otherwise emit duplicate "
+                        "buckets."
+                    )
+                previous_max_key = int(keys[-1])
+
+            lengths, flat_ids = self._decode_grouped_item_ids(batch["itemids"])
+            if len(flat_ids):
+                self._check_state_item_id_type(flat_ids, "existing SID groups")
+                # Hash-based set membership: keeps published IDs inside Arrow
+                # rather than materializing
+                # them as Python objects for a comparison-based search.
+                published = pc.is_in(flat_ids, value_set=new_item_ids)
+                batch_overlap = int(pc.sum(published).as_py() or 0)
+                overlap_count += batch_overlap
+                if batch_overlap and len(overlapping) < 10:
+                    overlapping.extend(
+                        flat_ids.filter(published).slice(0, 10).to_pylist()
+                    )
+
+            keep = in_sorted_bands(keys, wanted_bands, layer_sizes[-1])
+            if np.any(keep):
+                key_chunks.append(keys[keep])
+                count_chunks.append(lengths[keep])
+
+        if overlap_count:
+            preview = ",".join(str(value) for value in overlapping[:10])
+            raise ValueError(
+                f"{overlap_count} new item IDs are already published; an item "
+                "cannot hold two SIDs. Remove them from the append batch. First "
+                f"offending IDs: {preview}."
+            )
+        if not key_chunks:
+            return PriorOccupancy.empty()
+        return PriorOccupancy(np.concatenate(key_chunks), np.concatenate(count_chunks))
+
+    def _cross_check_existing_map(self, prior: PriorOccupancy) -> None:
+        """Verify the existing map agrees with the published groups.
+
+        This is pass 2. The two state artifacts encode the same occupancy in
+        different shapes, so comparing them catches a mismatched generation
+        pair, a mis-pointed directory and a truncated artifact. It is also the
+        only verification of the map's own ``index`` space: density is
+        structural in the groups artifact (list position is the slot) but not
+        in the map, where ``index`` is a stored value.
+
+        Args:
+            prior: Band-restricted occupancy from :meth:`_load_prior_occupancy`.
+
+        Raises:
+            ValueError: If any of the four checks fails.
+        """
+        path = self._config.existing_sid_map_path
+        if path is None or prior.is_empty:
+            return
+        layer_sizes = self._config.layer_sizes
+        domain = prior.bucket_keys
+        bands = np.unique(bands_of_bucket_keys(domain, layer_sizes[-1]))
+        unknown_keys: List[int] = []
+        # Buffer the rows that land in a compared bucket and reduce once at the
+        # end: a per-batch reduction would allocate a domain-sized accumulator
+        # for every batch, which dwarfs the handful of rows each one contributes.
+        position_chunks: List[np.ndarray] = []
+        index_chunks: List[np.ndarray] = []
+
+        for batch in self._iter_state_batches(
+            path,
+            ["codebook", "index"],
+            "Cross-checking published SID map",
+        ):
+            keys = sid_bucket_keys(self._codes_matrix(batch["codebook"]), layer_sizes)
+            # Only buckets in the new batch's bands are compared; nothing else
+            # can affect this run.
+            rows = np.flatnonzero(in_sorted_bands(keys, bands, layer_sizes[-1]))
+            if rows.size == 0:
+                continue
+            keys = keys[rows]
+            indices = (
+                batch["index"]
+                .take(pa.array(rows, type=pa.int64()))
+                .to_numpy(zero_copy_only=False)
+                .astype(np.int64, copy=False)
+            )
+            positions, known = lookup_sorted(domain, keys)
+            if not np.all(known) and len(unknown_keys) < 10:
+                unknown_keys.extend(keys[~known][:10].tolist())
+            if np.any(known):
+                position_chunks.append(positions[known])
+                index_chunks.append(indices[known])
+
+        counts = np.zeros(domain.shape[0], dtype=np.int64)
+        max_index = np.zeros(domain.shape[0], dtype=np.int64)
+        sum_index = np.zeros(domain.shape[0], dtype=np.int64)
+        if position_chunks:
+            positions = np.concatenate(position_chunks)
+            indices = np.concatenate(index_chunks)
+            counts = np.bincount(positions, minlength=domain.shape[0])
+            sum_index = np.bincount(
+                positions, weights=indices, minlength=domain.shape[0]
+            ).astype(np.int64, copy=False)
+            # Segment maximum via one stable sort plus reduceat; np.maximum.at
+            # is unbuffered and far slower at corpus scale.
+            order = np.argsort(positions, kind="stable")
+            sorted_positions = positions[order]
+            starts = np.flatnonzero(
+                np.concatenate(([True], sorted_positions[1:] != sorted_positions[:-1]))
+            )
+            max_index[sorted_positions[starts]] = np.maximum.reduceat(
+                indices[order], starts
+            )
+
+        self._report_cross_check(prior, counts, max_index, sum_index, unknown_keys)
+
+    @staticmethod
+    def _report_cross_check(
+        prior: PriorOccupancy,
+        counts: np.ndarray,
+        max_index: np.ndarray,
+        sum_index: np.ndarray,
+        unknown_keys: List[int],
+    ) -> None:
+        """Raise on the first failing map/groups consistency check.
+
+        Args:
+            prior: Occupancy derived from the groups artifact.
+            counts: Map rows per bucket.
+            max_index: Largest ``index`` per bucket.
+            sum_index: Sum of ``index`` per bucket.
+            unknown_keys: Map bucket keys absent from the groups artifact.
+
+        Raises:
+            ValueError: If any check fails.
+        """
+        hint = (
+            "the two --existing_* artifacts must come from the same generation "
+            "of this tool"
+        )
+        if unknown_keys:
+            preview = ",".join(str(value) for value in unknown_keys[:10])
+            raise ValueError(
+                f"existing map holds SID buckets absent from the existing groups; "
+                f"{hint}. First offending bucket keys: {preview}."
+            )
+        mismatched = np.flatnonzero(counts != prior.bucket_counts)
+        if mismatched.size:
+            first = int(mismatched[0])
+            raise ValueError(
+                f"existing map and groups disagree on {mismatched.size} buckets; "
+                f"{hint}. Bucket key {int(prior.bucket_keys[first])} has "
+                f"{int(counts[first])} map rows but {int(prior.bucket_counts[first])} "
+                "grouped item IDs."
+            )
+        holed = np.flatnonzero(max_index != counts)
+        if holed.size:
+            first = int(holed[0])
+            raise ValueError(
+                f"existing map index space has holes in {holed.size} buckets. "
+                f"Bucket key {int(prior.bucket_keys[first])} holds "
+                f"{int(counts[first])} items but its largest index is "
+                f"{int(max_index[first])}; appending would reuse a published slot. "
+                "Item deletion is not supported -- tombstone instead."
+            )
+        expected_sum = counts * (counts + 1) // 2
+        duplicated = np.flatnonzero(sum_index != expected_sum)
+        if duplicated.size:
+            first = int(duplicated[0])
+            raise ValueError(
+                f"existing map index space is not dense in {duplicated.size} "
+                f"buckets. Bucket key {int(prior.bucket_keys[first])} has index sum "
+                f"{int(sum_index[first])}, expected {int(expected_sum[first])} for "
+                f"{int(counts[first])} items."
+            )
+
     def _make_writer(self, output_path: str) -> BaseWriter:
         """Create a repository writer for one independently resolved output."""
         if self._default_writer_type is None:
@@ -562,48 +1061,144 @@ class CollisionResolutionRunner:
         )
         return pa.ListArray.from_arrays(offsets, values)
 
+    def _map_write_chunk_rows(self, is_csv: bool, layer_count: int) -> int:
+        """Return the largest map row count one write can encode.
+
+        Args:
+            is_csv: Whether the destination writer is a CSV writer.
+            layer_count: Number of SID layers per row.
+
+        Returns:
+            The chunk size in rows.
+
+        Raises:
+            ValueError: If a single row exceeds Arrow list offset capacity.
+        """
+        return _max_code_rows(is_csv, layer_count, _MAP_WRITE_ROWS)
+
+    def _write_new_map_rows(
+        self,
+        writer: BaseWriter,
+        is_csv: bool,
+        item_ids: np.ndarray,
+        origin_codes: np.ndarray,
+        result: CollisionResolutionResult,
+        progress: ProgressLogger,
+        written: int,
+    ) -> None:
+        """Write this run's own item rows in chunks, without a full code copy.
+
+        Args:
+            writer: Destination writer.
+            is_csv: Whether ``writer`` is a CSV writer.
+            item_ids: Item IDs in original row order.
+            origin_codes: Original full SID matrix.
+            result: Completed collision-resolution result.
+            progress: Shared progress logger.
+            written: Rows already written to ``writer``.
+        """
+        output_count = item_ids.shape[0]
+        last_progress_count = written
+        write_chunk = self._map_write_chunk_rows(is_csv, origin_codes.shape[1])
+        for start in range(0, output_count, write_chunk):
+            end = min(start + write_chunk, output_count)
+            selection = slice(start, end)
+            origin_chunk = origin_codes[selection]
+            final_chunk = origin_chunk.copy()
+            final_chunk[:, -1] = result.resolved_last_codes[selection]
+            writer.write(
+                {
+                    "item_id": self._item_id_array(item_ids[selection]),
+                    "origin_codebook": self._codes_column(origin_chunk, is_csv),
+                    "codebook": self._codes_column(final_chunk, is_csv),
+                    "index": pa.array(result.slot_indices[selection], type=pa.int64()),
+                }
+            )
+            written += end - start
+            if self._progress_interval_reached(written, last_progress_count):
+                progress.log(written, suffix=f"{written} samples processed")
+                last_progress_count = written
+
+    def _stream_existing_map_rows(self, writer: BaseWriter, is_csv: bool) -> int:
+        """Copy every published map row into the merged output unchanged.
+
+        Existing rows keep their item ID, both codebooks and their slot index
+        verbatim; that copy is the guarantee that no published SID moves.
+
+        Args:
+            writer: Destination writer.
+            is_csv: Whether ``writer`` is a CSV writer.
+
+        Returns:
+            The number of rows copied, or zero outside append mode, where the
+            published-state flags are ignored rather than rejected.
+        """
+        path = self._config.existing_sid_map_path
+        if path is None or not self._config.is_append:
+            return 0
+        fields = [
+            "item_id",
+            "origin_codebook",
+            "codebook",
+            "index",
+        ]
+        written = 0
+        for batch in self._iter_state_batches(
+            path, fields, "Copying published item map"
+        ):
+            item_id_column = batch["item_id"]
+            self._check_state_item_id_type(item_id_column, "existing SID map")
+            writer.write(
+                {
+                    "item_id": item_id_column,
+                    "origin_codebook": self._align_codes_column(
+                        batch["origin_codebook"], is_csv
+                    ),
+                    "codebook": self._align_codes_column(batch["codebook"], is_csv),
+                    "index": pc.cast(batch["index"], pa.int64()),
+                }
+            )
+            written += len(item_id_column)
+        return written
+
     def _write_map(
         self,
         item_ids: np.ndarray,
         origin_codes: np.ndarray,
         result: CollisionResolutionResult,
     ) -> None:
-        """Write the resolved map in chunks without a full final-code copy."""
+        """Write the corpus-complete item map.
+
+        In append mode the published rows are streamed through first and this
+        run's rows are appended, so the artifact stands alone and is exactly
+        what the next append consumes.
+        """
         output_path = self._config.output_path
         if output_path is None:
             raise RuntimeError("map output path was not validated.")
         with closing(self._make_writer(output_path)) as writer:
             is_csv = isinstance(writer, CsvWriter)
-            output_count = item_ids.shape[0]
             progress = ProgressLogger("Writing resolved item map", start_n=0)
-            last_progress_count = 0
-            write_chunk = _MAP_WRITE_ROWS
-            if not is_csv:
-                write_chunk = min(
-                    write_chunk,
-                    _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1],
-                )
-                if write_chunk < 1:
-                    raise ValueError("one SID row exceeds Arrow list offset capacity.")
-            for start in range(0, output_count, write_chunk):
-                end = min(start + write_chunk, output_count)
-                selection = slice(start, end)
-                origin_chunk = origin_codes[selection]
-                final_chunk = origin_chunk.copy()
-                final_chunk[:, -1] = result.resolved_last_codes[selection]
-                writer.write(
-                    {
-                        "item_id": self._item_id_array(item_ids[selection]),
-                        "origin_codebook": self._codes_column(origin_chunk, is_csv),
-                        "codebook": self._codes_column(final_chunk, is_csv),
-                        "index": pa.array(
-                            result.slot_indices[selection], type=pa.int64()
-                        ),
-                    }
-                )
-                if self._progress_interval_reached(end, last_progress_count):
-                    progress.log(end, suffix=f"{end} samples processed")
-                    last_progress_count = end
+            written = self._stream_existing_map_rows(writer, is_csv)
+            self._write_new_map_rows(
+                writer, is_csv, item_ids, origin_codes, result, progress, written
+            )
+
+        # Delta outputs describe what an append added, so they are ignored
+        # outside append mode rather than duplicating the full map.
+        delta_path = self._config.delta_map_output_path
+        if delta_path is None or not self._config.is_append:
+            return
+        with closing(self._make_writer(delta_path)) as writer:
+            self._write_new_map_rows(
+                writer,
+                isinstance(writer, CsvWriter),
+                item_ids,
+                origin_codes,
+                result,
+                ProgressLogger("Writing delta item map", start_n=0),
+                0,
+            )
 
     def _write_group_outputs(
         self,
@@ -644,6 +1239,18 @@ class CollisionResolutionRunner:
         else:
             grouping = original_grouping or build_original_item_grouping(plan)
             resolved_last_codes = None
+        if self._config.is_append:
+            existing_path = self._config.existing_sid_groups_path
+            assert existing_path is not None  # is_append means it is set
+            self._write_merged_sid_groups(
+                resolved_path,
+                existing_path,
+                item_ids,
+                origin_codes,
+                grouping,
+                resolved_last_codes,
+            )
+            return
         self._write_sid_groups(
             resolved_path,
             item_ids,
@@ -652,6 +1259,168 @@ class CollisionResolutionRunner:
             resolved_last_codes=resolved_last_codes,
             progress_description="Writing resolved SID item groups",
         )
+
+    def _emit_group_rows(
+        self,
+        writer: BaseWriter,
+        is_csv: bool,
+        codes: np.ndarray,
+        offsets: np.ndarray,
+        values: pa.Array,
+        rows: Optional[np.ndarray] = None,
+    ) -> None:
+        """Write one chunk of SID groups, optionally only ``rows`` of it.
+
+        Args:
+            writer: Destination writer.
+            is_csv: Whether ``writer`` is a CSV writer.
+            codes: Emitted SID per group.
+            offsets: CSR offsets into ``values``.
+            values: Flattened item IDs.
+            rows: Group rows to keep, or ``None`` for all of them.
+        """
+        lengths = np.diff(offsets)
+        if rows is not None:
+            if rows.size == 0:
+                return
+            lengths = lengths[rows]
+            values = values.take(
+                pa.array(concat_ranges(offsets[:-1][rows], lengths), type=pa.int64())
+            )
+            codes = codes[rows]
+            offsets = np.zeros(rows.shape[0] + 1, dtype=np.int64)
+            np.cumsum(lengths, out=offsets[1:])
+        writer.write(
+            {
+                "codebook": self._codes_column(codes, is_csv),
+                "itemids": self._grouped_item_ids_column(values, offsets, is_csv),
+            }
+        )
+
+    def _build_append_groups(
+        self,
+        item_ids: np.ndarray,
+        origin_codes: np.ndarray,
+        grouping: CodebookItemGrouping,
+        resolved_last_codes: Optional[np.ndarray],
+    ) -> _AppendGroups:
+        """Materialize this run's groups in the shape the merge consumes."""
+        offsets = grouping.offsets
+        representative_rows = grouping.row_order[offsets[:-1]]
+        codes = origin_codes[representative_rows]
+        if resolved_last_codes is not None:
+            codes = codes.copy()
+            codes[:, -1] = resolved_last_codes[representative_rows]
+        return _AppendGroups(
+            grouping=grouping,
+            codes=codes,
+            item_ids=self._item_id_array(item_ids[grouping.row_order]),
+        )
+
+    def _write_merged_sid_groups(
+        self,
+        resolved_path: str,
+        existing_path: str,
+        item_ids: np.ndarray,
+        origin_codes: np.ndarray,
+        grouping: CodebookItemGrouping,
+        resolved_last_codes: Optional[np.ndarray],
+    ) -> None:
+        """Merge this run's groups into the published groups and write both.
+
+        Streams the published groups once and interleaves this run's groups by
+        SID key, so the resolved output is corpus-complete and still ascending
+        -- which is exactly what the next append merge-joins against. The
+        optional delta output receives the same rows for the buckets this run
+        changed, so a serving index can upsert them idempotently.
+
+        Args:
+            resolved_path: Corpus-complete groups output.
+            existing_path: Previous round's groups artifact.
+            item_ids: Item IDs of the new batch in original row order.
+            origin_codes: Original full SID matrix of the new batch.
+            grouping: This run's resolved grouping.
+            resolved_last_codes: Final last-layer codes, or ``None``.
+        """
+        layer_sizes = self._config.layer_sizes
+        groups = self._build_append_groups(
+            item_ids, origin_codes, grouping, resolved_last_codes
+        )
+        group_count = groups.keys.shape[0]
+
+        with ExitStack() as stack:
+            writer = stack.enter_context(closing(self._make_writer(resolved_path)))
+            is_csv = isinstance(writer, CsvWriter)
+            delta_writer: Optional[BaseWriter] = None
+            delta_is_csv = False
+            if self._config.delta_sid_groups_output_path is not None:
+                delta_writer = stack.enter_context(
+                    closing(
+                        self._make_writer(self._config.delta_sid_groups_output_path)
+                    )
+                )
+                delta_is_csv = isinstance(delta_writer, CsvWriter)
+
+            def emit(
+                codes: np.ndarray,
+                offsets: np.ndarray,
+                values: pa.Array,
+                delta_rows: Optional[np.ndarray],
+            ) -> None:
+                """Write one chunk to the corpus output and the delta output."""
+                self._emit_group_rows(writer, is_csv, codes, offsets, values)
+                if delta_writer is not None:
+                    self._emit_group_rows(
+                        delta_writer, delta_is_csv, codes, offsets, values, delta_rows
+                    )
+
+            max_rows = _max_code_rows(is_csv, groups.codes.shape[1], group_count)
+
+            def emit_new_only(low: int, high: int) -> None:
+                """Write groups this run created in buckets nobody occupied."""
+                for start, stop in _group_chunk_bounds(
+                    groups.offsets, low, high, max_rows
+                ):
+                    child_low = int(groups.offsets[start])
+                    child_high = int(groups.offsets[stop])
+                    emit(
+                        groups.codes[start:stop],
+                        groups.offsets[start : stop + 1] - child_low,
+                        groups.item_ids.slice(child_low, child_high - child_low),
+                        np.arange(stop - start),
+                    )
+
+            cursor = 0
+            for batch in self._iter_state_batches(
+                existing_path,
+                ["codebook", "itemids"],
+                "Writing merged SID item groups",
+            ):
+                batch_codes = self._codes_matrix(batch["codebook"])
+                batch_keys = sid_bucket_keys(batch_codes, layer_sizes)
+                if batch_keys.size == 0:
+                    continue
+                low = int(np.searchsorted(groups.keys, batch_keys[0], side="left"))
+                if cursor < low:
+                    emit_new_only(cursor, low)
+                high = int(np.searchsorted(groups.keys, batch_keys[-1], side="right"))
+                batch_lengths, batch_values = self._decode_grouped_item_ids(
+                    batch["itemids"]
+                )
+                self._check_state_item_id_type(batch_values, "existing SID groups")
+                emit(
+                    *_merge_group_batch(
+                        batch_keys,
+                        batch_codes,
+                        batch_lengths,
+                        batch_values,
+                        groups,
+                        low,
+                        high,
+                    )
+                )
+                cursor = high
+            emit_new_only(cursor, group_count)
 
     def _write_sid_groups(
         self,
@@ -685,20 +1454,12 @@ class CollisionResolutionRunner:
             is_csv = isinstance(writer, CsvWriter)
             progress = ProgressLogger(progress_description, start_n=0)
             last_progress_count = 0
-            max_codebook_rows = (
-                group_count
-                if is_csv
-                else _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1]
+            max_codebook_rows = _max_code_rows(
+                is_csv, origin_codes.shape[1], group_count
             )
-            if not is_csv and max_codebook_rows < 1:
-                raise ValueError("one SID row exceeds Arrow list offset capacity.")
-            group_start = 0
-            while group_start < group_count:
-                child_limit = int(offsets[group_start]) + _GROUP_WRITE_ITEMS
-                group_end = int(np.searchsorted(offsets, child_limit, side="right") - 1)
-                group_end = max(group_end, group_start + 1)
-                group_end = min(group_end, group_start + max_codebook_rows)
-
+            for group_start, group_end in _group_chunk_bounds(
+                offsets, 0, group_count, max_codebook_rows
+            ):
                 child_start = int(offsets[group_start])
                 child_end = int(offsets[group_end])
                 rows = grouping.row_order[child_start:child_end]
@@ -718,13 +1479,178 @@ class CollisionResolutionRunner:
                         ),
                     }
                 )
-                group_start = group_end
                 if self._progress_interval_reached(child_end, last_progress_count):
                     progress.log(
                         child_end,
                         suffix=f"{child_end} samples processed",
                     )
                     last_progress_count = child_end
+
+
+def _max_code_rows(is_csv: bool, layer_count: int, row_cap: int) -> int:
+    """Return how many SID rows one write can encode.
+
+    Args:
+        is_csv: Whether the destination writer is a CSV writer, which encodes
+            codes as text and so has no Arrow list offset ceiling.
+        layer_count: Number of SID layers per row.
+        row_cap: Upper bound the caller already knows.
+
+    Returns:
+        The row count for one write.
+    """
+    if is_csv:
+        return row_cap
+    return min(row_cap, _ARROW_LIST_OFFSET_MAX // layer_count)
+
+
+def _group_chunk_bounds(
+    offsets: np.ndarray, low: int, high: int, max_rows: int
+) -> Iterator[Tuple[int, int]]:
+    """Split ``[low, high)`` groups into writable chunks.
+
+    A chunk holds at most ``_GROUP_WRITE_ITEMS`` child items and ``max_rows``
+    groups, and always advances by at least one group so a single oversized
+    group still makes progress.
+
+    Args:
+        offsets: CSR offsets of every group.
+        low: First group index.
+        high: One past the last group index.
+        max_rows: Largest number of groups one write may carry.
+
+    Yields:
+        Half-open ``(start, stop)`` group ranges covering ``[low, high)``.
+    """
+    while low < high:
+        child_limit = int(offsets[low]) + _GROUP_WRITE_ITEMS
+        stop = int(np.searchsorted(offsets, child_limit, side="right") - 1)
+        stop = min(max(stop, low + 1), low + max_rows, high)
+        yield low, stop
+        low = stop
+
+
+@dataclass(frozen=True)
+class _AppendGroups:
+    """This run's SID groups, prepared for merging into the published groups.
+
+    Args:
+        grouping: This run's resolved grouping; owns keys, counts and offsets.
+        codes: Emitted SID of every group, shape ``(len(keys), n_layers)``.
+        item_ids: Item IDs of every group flattened in group and slot order.
+    """
+
+    grouping: CodebookItemGrouping
+    codes: np.ndarray
+    item_ids: pa.Array
+
+    @property
+    def keys(self) -> np.ndarray:
+        """Ascending flattened SID key of every group."""
+        return self.grouping.sid_keys
+
+    @property
+    def counts(self) -> np.ndarray:
+        """Item count of every group."""
+        return self.grouping.counts
+
+    @property
+    def offsets(self) -> np.ndarray:
+        """CSR offsets into ``item_ids``."""
+        return self.grouping.offsets
+
+
+def _merge_group_batch(
+    batch_keys: np.ndarray,
+    batch_codes: np.ndarray,
+    batch_lengths: np.ndarray,
+    batch_values: pa.Array,
+    groups: _AppendGroups,
+    low: int,
+    high: int,
+) -> Tuple[np.ndarray, np.ndarray, pa.Array, np.ndarray]:
+    """Merge one batch of published groups with the new groups it overlaps.
+
+    Both sides are ascending by SID key, so the output is their sorted union:
+    a bucket present on both sides emits one row whose item list is the
+    published items followed by this run's items. That order is also slot
+    order, because published items hold slots ``1..P`` and new items continue
+    from ``P + 1``.
+
+    Args:
+        batch_keys: Ascending SID keys of the published batch.
+        batch_codes: SID matrix of the published batch.
+        batch_lengths: Item count of every published group.
+        batch_values: Flattened item IDs of the published batch.
+        groups: This run's groups.
+        low: First index of ``groups`` at or after ``batch_keys[0]``.
+        high: One past the last index of ``groups`` at or before the batch end.
+
+    Returns:
+        Emitted codes, CSR offsets, flattened item IDs, and the output rows
+        that this run changed.
+    """
+    batch_rows = batch_keys.shape[0]
+    candidate_keys = groups.keys[low:high]
+    positions = np.searchsorted(candidate_keys, batch_keys)
+    matched = positions < candidate_keys.shape[0]
+    matched[matched] = candidate_keys[positions[matched]] == batch_keys[matched]
+
+    new_for_batch = np.full(batch_rows, -1, dtype=np.int64)
+    new_for_batch[matched] = low + positions[matched]
+    consumed = np.zeros(candidate_keys.shape[0], dtype=bool)
+    consumed[positions[matched]] = True
+    unmatched = low + np.flatnonzero(~consumed)
+
+    # Interleave by key: every key is unique across the union because matched
+    # pairs collapse into a single row.
+    output_rows = batch_rows + unmatched.shape[0]
+    batch_slots = np.arange(batch_rows) + np.searchsorted(
+        groups.keys[unmatched], batch_keys, side="left"
+    )
+    unmatched_slots = np.arange(unmatched.shape[0]) + np.searchsorted(
+        batch_keys, groups.keys[unmatched], side="left"
+    )
+
+    batch_of_output = np.full(output_rows, -1, dtype=np.int64)
+    batch_of_output[batch_slots] = np.arange(batch_rows)
+    new_of_output = np.full(output_rows, -1, dtype=np.int64)
+    new_of_output[batch_slots] = new_for_batch
+    new_of_output[unmatched_slots] = unmatched
+
+    has_batch = batch_of_output >= 0
+    has_new = new_of_output >= 0
+    batch_index = np.maximum(batch_of_output, 0)
+    new_index = np.maximum(new_of_output, 0)
+
+    codes = np.empty((output_rows, batch_codes.shape[1]), dtype=np.int64)
+    codes[batch_slots] = batch_codes
+    if unmatched.size:
+        codes[unmatched_slots] = groups.codes[unmatched]
+
+    batch_part = np.where(has_batch, batch_lengths[batch_index], 0)
+    new_part = np.where(has_new, groups.counts[new_index], 0)
+    offsets = np.zeros(output_rows + 1, dtype=np.int64)
+    np.cumsum(batch_part + new_part, out=offsets[1:])
+
+    # Gather from the published child values followed by only the slice of new
+    # item IDs this batch needs, so the copy stays proportional to the batch.
+    child_low = int(groups.offsets[low])
+    child_high = int(groups.offsets[high])
+    combined = pa.concat_arrays(
+        [batch_values, groups.item_ids.slice(child_low, child_high - child_low)]
+    )
+    batch_child_starts = np.zeros(batch_rows + 1, dtype=np.int64)
+    np.cumsum(batch_lengths, out=batch_child_starts[1:])
+    gather = np.empty(int(offsets[-1]), dtype=np.int64)
+    gather[concat_ranges(offsets[:-1], batch_part)] = concat_ranges(
+        batch_child_starts[batch_index], batch_part
+    )
+    gather[concat_ranges(offsets[:-1] + batch_part, new_part)] = concat_ranges(
+        len(batch_values) + groups.offsets[new_index] - child_low, new_part
+    )
+    values = combined.take(pa.array(gather, type=pa.int64()))
+    return codes, offsets, values, np.flatnonzero(has_new)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -752,6 +1678,36 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Output grouped item IDs keyed by their resolved SID; required "
             "unless --rate_only is set."
+        ),
+    )
+    parser.add_argument(
+        "--existing_sid_groups_path",
+        default=None,
+        help=(
+            "Previous round's --resolved_sid_groups_output_path. Supplying it "
+            "selects append mode: the new items in --input_path are placed "
+            "without moving any already-published SID."
+        ),
+    )
+    parser.add_argument(
+        "--existing_sid_map_path",
+        default=None,
+        help=(
+            "Previous round's --output_path. Required in append mode unless "
+            "--rate_only, because only the map carries origin_codebook."
+        ),
+    )
+    parser.add_argument(
+        "--delta_map_output_path",
+        default=None,
+        help="Append mode only: map rows for the new items alone.",
+    )
+    parser.add_argument(
+        "--delta_sid_groups_output_path",
+        default=None,
+        help=(
+            "Append mode only: buckets this run changed, each with its complete "
+            "post-append item list, for an idempotent index upsert."
         ),
     )
     parser.add_argument(
