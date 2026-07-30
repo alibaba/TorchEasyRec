@@ -244,7 +244,14 @@ def export_model_normal(
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         init_parameters(model, torch.device("cpu"))
-        checkpoint_util.restore_model(checkpoint_path, model)
+        checkpoint_util.restore_model(
+            checkpoint_path,
+            model,
+            use_dense_ema=config_util.use_dense_ema(
+                pipeline_config.export_config,
+                pipeline_config.train_config,
+            ),
+        )
         # for mc modules, fix output_segments_tensor is a meta tensor.
         fix_mch_state(model)
 
@@ -1145,7 +1152,14 @@ def export_rtp_model(
     gm = _prune_unused_param_and_buffer(gm)
     init_parameters(gm, device)
     gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, gm)
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        gm,
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
+    )
 
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
@@ -1637,7 +1651,14 @@ def export_distributed_embedding(
 
     init_parameters(gm, device)
     gm.to(device)
-    checkpoint_util.restore_model(checkpoint_path, gm)
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        gm,
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
+    )
 
     if is_rank_zero:
         with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
@@ -2007,13 +2028,23 @@ def finalize_dense_export(
     device: torch.device,
     save_dir: str,
     dense_graph_config: Dict[str, Any],
-) -> None:
+    dense_model_traced: Optional[torch.fx.GraphModule] = None,
+) -> torch.fx.GraphModule:
     """Sanity-check and script a dense graph carrying its final weights.
 
     Runs the rewritten graph once on serving-style inputs rebuilt from the
     warm-up batch (so graph surgery or KeyedTensor regroup errors surface at
     export time instead of at serving time), then writes dense_meta.json,
     the graph dumps and the scripted model under ``save_dir``.
+
+    FX tracing patches ``torch.nn.Module.__call__`` process-wide for its
+    duration, so it is not safe to run concurrently with eager forwards.
+    Callers that export from a background thread (the online dense export)
+    trace once up front and pass the result via ``dense_model_traced``,
+    reusing it across versions; the traced module shares ``gm``'s parameters,
+    so reloading ``gm``'s weights is reflected without re-tracing. When no
+    traced module is supplied -- the standalone, single-threaded CLI path --
+    it is traced here.
 
     Args:
         model: model the dense graph was traced from.
@@ -2023,6 +2054,11 @@ def finalize_dense_export(
         device: device of ``gm``.
         save_dir: directory the export artifacts are written to.
         dense_graph_config: dense_meta config from build_dense_graph_module.
+        dense_model_traced: pre-traced ``gm`` to script; traced here if None.
+
+    Returns:
+        The traced module that was scripted, so a caller can reuse it across
+        exports without re-tracing.
     """
     graph_dir = os.path.join(save_dir, "graph")
     os.makedirs(save_dir, exist_ok=True)
@@ -2037,11 +2073,13 @@ def finalize_dense_export(
     with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
         f.write(str(gm.graph))
 
-    dense_model_traced = symbolic_trace(gm)
+    if dense_model_traced is None:
+        dense_model_traced = symbolic_trace(gm)
     with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
         f.write(dense_model_traced.code)
     dense_model_scripted = torch.jit.script(dense_model_traced)
     dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
+    return dense_model_traced
 
 
 def export_dense_model_cpu(
@@ -2070,7 +2108,15 @@ def export_dense_model_cpu(
         pipeline_config, model, device, data_input_path
     )
     gm, full_graph, dense_graph_config = build_dense_graph_module(model, data, device)
-    checkpoint_util.restore_model(checkpoint_path, gm, error_on_missing_keys=True)
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        gm,
+        error_on_missing_keys=True,
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
+    )
     finalize_dense_export(
         model, full_graph, gm, data, device, save_dir, dense_graph_config
     )

@@ -12,6 +12,35 @@
 # Copyright (c) 2026, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+r"""Utilities for exporting and atomically publishing online dense models.
+
+Serving publish contract:
+
+<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export/
+├── current.json                  # Atomic pointer to the latest version
+└── versions/
+    └── <yyyyMMddHHmmss>/         # Immutable version directory
+        ├── scripted_model.pt     # TorchScript dense model
+        ├── dense_meta.json       # Placeholder -> serving embedding mapping
+        ├── graph/                # Graph dump for debugging
+        └── READY                 # Completion marker written before the switch
+
+current.json:
+{
+  "checkpoint_step": 1200,
+  "created_at": "2026-07-24T05:20:00.000000+00:00",
+  "data_timestamp": 1782365432.0,
+  "version": "20260724052000"
+}
+
+- Build each version under a temporary directory, write ``READY``, then rename
+  it atomically into place.
+- Only after the rename, atomically replace ``current.json`` with ``version``,
+  ``checkpoint_step``, ``data_timestamp``, and ``created_at``.
+- The processor reads only the version named by ``current.json``; step/timestamp
+  align dense and sparse state.
+"""
+
 import datetime
 import json
 import os
@@ -29,6 +58,7 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
 
 from tzrec.acc import utils as acc_utils
+from tzrec.optim.ema import DenseEMA
 from tzrec.utils import config_util
 from tzrec.utils.checkpoint_util import (
     quorum_event_time,
@@ -252,6 +282,9 @@ class OnlineDenseExportManager:
         self._full_graph: Optional[torch.fx.Graph] = None
         self._warmup_data: Optional[Dict[str, Any]] = None
         self._dense_graph_config: Optional[Dict[str, Any]] = None
+        # FX-traced gm, traced once at construction and reused by every export
+        # so the worker never fx-traces concurrent with training forwards.
+        self._dense_model_traced: Optional[torch.fx.GraphModule] = None
 
         override = os.environ.get("ONLINE_DENSE_EXPORT_DIR")
         export_root = resolve_dense_export_root(model_dir)
@@ -392,10 +425,13 @@ class OnlineDenseExportManager:
                 twin_model, warmup_data, device
             )
             # Fail fast on trace/script errors instead of at the first export.
+            # Tracing happens here on the main thread and the traced module is
+            # reused by every export; fx-tracing on the worker would patch
+            # nn.Module.__call__ process-wide and race training forwards.
             with tempfile.TemporaryDirectory(
                 prefix="online_dense_export_dryrun_"
             ) as dry_run_dir:
-                finalize_dense_export(
+                dense_model_traced = finalize_dense_export(
                     twin_model,
                     full_graph,
                     gm,
@@ -449,6 +485,7 @@ class OnlineDenseExportManager:
         self._full_graph = full_graph
         self._warmup_data = warmup_data
         self._dense_graph_config = dense_graph_config
+        self._dense_model_traced = dense_model_traced
         return pairs
 
     def _verify_state_pairs(self, model: nn.Module) -> None:
@@ -492,6 +529,7 @@ class OnlineDenseExportManager:
         data_timestamp: float,
         model: nn.Module,
         final: bool = False,
+        dense_ema: Optional[DenseEMA] = None,
     ) -> None:
         """Export a dense version now if a configured trigger fires.
 
@@ -508,6 +546,7 @@ class OnlineDenseExportManager:
             model: the live DMP training model to gather weights from.
             final: force an export (still subject to the per-step dedupe),
                 e.g. at train end.
+            dense_ema: Dense EMA state to use for exported parameters.
         """
         if not self._enabled:
             return
@@ -529,10 +568,14 @@ class OnlineDenseExportManager:
         if data_ts is not None:
             # advance the watermark on every export
             self._last_data_ts = data_ts
-        self._gather_and_submit(step, data_timestamp, model)
+        self._gather_and_submit(step, data_timestamp, model, dense_ema)
 
     def _gather_and_submit(
-        self, step: int, data_timestamp: float, model: nn.Module
+        self,
+        step: int,
+        data_timestamp: float,
+        model: nn.Module,
+        dense_ema: Optional[DenseEMA] = None,
     ) -> None:
         """Gather the dense graph's weights from the DMP model (all ranks).
 
@@ -548,8 +591,9 @@ class OnlineDenseExportManager:
         gathered: Dict[str, torch.Tensor] = {}
         if self._state_pairs:
             source_state = model.state_dict()
+            ema_state = dense_ema.state_dict() if dense_ema is not None else {}
             for gm_key, source_key in self._state_pairs:
-                value = source_state[source_key]
+                value = ema_state.get(source_key, source_state[source_key])
                 if isinstance(value, DTensor):
                     # collective on the DTensor's mesh; all ranks participate
                     tensor = value.full_tensor()
@@ -713,6 +757,9 @@ class OnlineDenseExportManager:
             assert self._full_graph is not None
             assert self._warmup_data is not None
             assert self._dense_graph_config is not None
+            assert self._dense_model_traced is not None
+            # load_state_dict copies in place and the traced module shares these
+            # parameters, so it carries the reloaded weights without re-tracing.
             self._gm.load_state_dict(task["snapshot"])
             finalize_dense_export(
                 self._twin_model,
@@ -722,6 +769,7 @@ class OnlineDenseExportManager:
                 device,
                 tmp_dir,
                 self._dense_graph_config,
+                dense_model_traced=self._dense_model_traced,
             )
             ready_path = os.path.join(tmp_dir, "READY")
             with open(ready_path, "w") as f:

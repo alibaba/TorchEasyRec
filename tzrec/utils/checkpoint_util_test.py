@@ -36,6 +36,7 @@ from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
+from tzrec.optim.ema import DenseEMA
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.utils import checkpoint_util, misc_util
 from tzrec.utils.test_util import make_test_dir
@@ -497,6 +498,170 @@ class CheckpointUtilTest(unittest.TestCase):
                 )
         finally:
             dist.destroy_process_group()
+
+    def test_dense_ema_save_restore_and_inference_overlay(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = nn.Embedding(3, 2)
+                self.dense = nn.Linear(2, 1)
+                self.bn = nn.BatchNorm1d(1)
+
+        model = Model()
+        dense_ema = DenseEMA(
+            {
+                "dense.weight": model.dense.weight,
+                "dense.bias": model.dense.bias,
+            },
+            decay=0.5,
+        )
+        with torch.no_grad():
+            model.dense.weight.fill_(2.0)
+            model.dense.bias.fill_(2.0)
+            model.embedding.weight.fill_(5.0)
+            model.bn.running_mean.fill_(7.0)
+        dense_ema.update()
+        with torch.no_grad():
+            model.dense.weight.fill_(4.0)
+            model.dense.bias.fill_(4.0)
+        dense_ema.update()
+
+        with mock.patch.object(checkpoint_util, "has_dynamicemb", False):
+            checkpoint_util.save_model(
+                self.test_dir,
+                model,
+                dense_ema=dense_ema,
+            )
+
+            raw_model = Model()
+            checkpoint_util.restore_model(self.test_dir, raw_model)
+            torch.testing.assert_close(
+                raw_model.dense.weight,
+                torch.full_like(raw_model.dense.weight, 4.0),
+            )
+            torch.testing.assert_close(
+                raw_model.embedding.weight,
+                torch.full_like(raw_model.embedding.weight, 5.0),
+            )
+            torch.testing.assert_close(
+                raw_model.bn.running_mean,
+                torch.full_like(raw_model.bn.running_mean, 7.0),
+            )
+
+            inference_model = Model()
+            checkpoint_util.restore_model(
+                self.test_dir,
+                inference_model,
+                use_dense_ema=True,
+            )
+            torch.testing.assert_close(
+                inference_model.dense.weight,
+                torch.full_like(inference_model.dense.weight, 3.0),
+            )
+            torch.testing.assert_close(
+                inference_model.embedding.weight,
+                torch.full_like(inference_model.embedding.weight, 5.0),
+            )
+            torch.testing.assert_close(
+                inference_model.bn.running_mean,
+                torch.full_like(inference_model.bn.running_mean, 7.0),
+            )
+
+            resumed_model = Model()
+            resumed_ema = DenseEMA(
+                {
+                    "dense.weight": resumed_model.dense.weight,
+                    "dense.bias": resumed_model.dense.bias,
+                },
+                decay=0.5,
+            )
+            checkpoint_util.restore_model(
+                self.test_dir,
+                resumed_model,
+                dense_ema=resumed_ema,
+            )
+            torch.testing.assert_close(
+                resumed_model.dense.weight,
+                torch.full_like(resumed_model.dense.weight, 4.0),
+            )
+            torch.testing.assert_close(
+                resumed_ema.state_dict()["dense.weight"],
+                torch.full_like(resumed_model.dense.weight, 3.0),
+            )
+            self.assertEqual(resumed_ema.n_averaged.item(), 2)
+
+    def test_dense_ema_missing_checkpoint_resets_state(self):
+        model = nn.Linear(2, 1)
+        dense_ema = DenseEMA(
+            {
+                "weight": model.weight,
+                "bias": model.bias,
+            },
+            decay=0.5,
+        )
+        dense_ema.update()
+        self.assertEqual(dense_ema.n_averaged.item(), 1)
+        with torch.no_grad():
+            model.weight.fill_(3.0)
+            model.bias.fill_(4.0)
+
+        with mock.patch.object(checkpoint_util, "has_dynamicemb", False):
+            checkpoint_util.save_model(self.test_dir, model)
+            checkpoint_util.restore_model(
+                self.test_dir,
+                model,
+                dense_ema=dense_ema,
+            )
+        self.assertEqual(dense_ema.n_averaged.item(), 0)
+        torch.testing.assert_close(
+            dense_ema.state_dict()["weight"],
+            torch.full_like(model.weight, 3.0),
+        )
+        torch.testing.assert_close(
+            dense_ema.state_dict()["bias"],
+            torch.full_like(model.bias, 4.0),
+        )
+
+    def test_dense_ema_partial_checkpoint_keeps_restored_model_parameters(self):
+        model = nn.Linear(2, 1)
+        with torch.no_grad():
+            model.weight.fill_(2.0)
+            model.bias.fill_(3.0)
+        dense_ema = DenseEMA({"weight": model.weight}, decay=0.5)
+        dense_ema.update()
+        with torch.no_grad():
+            model.weight.fill_(4.0)
+            model.bias.fill_(5.0)
+
+        with mock.patch.object(checkpoint_util, "has_dynamicemb", False):
+            checkpoint_util.save_model(
+                self.test_dir,
+                model,
+                dense_ema=dense_ema,
+            )
+            resumed_model = nn.Linear(2, 1)
+            resumed_ema = DenseEMA(
+                {
+                    "weight": resumed_model.weight,
+                    "bias": resumed_model.bias,
+                },
+                decay=0.5,
+            )
+            checkpoint_util.restore_model(
+                self.test_dir,
+                resumed_model,
+                dense_ema=resumed_ema,
+            )
+
+        self.assertEqual(resumed_ema.n_averaged.item(), 1)
+        torch.testing.assert_close(
+            resumed_ema.state_dict()["weight"],
+            torch.full_like(resumed_model.weight, 2.0),
+        )
+        torch.testing.assert_close(
+            resumed_ema.state_dict()["bias"],
+            torch.full_like(resumed_model.bias, 5.0),
+        )
 
     def test_remap_input_tile_user_key_maps_user_twins(self) -> None:
         self.assertEqual(

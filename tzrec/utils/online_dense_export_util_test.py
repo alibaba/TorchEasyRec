@@ -35,6 +35,7 @@ from torch.distributed._shard.sharded_tensor.metadata import (
 from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed.device_mesh import init_device_mesh
 
+from tzrec.optim.ema import DenseEMA
 from tzrec.utils import misc_util
 from tzrec.utils.online_dense_export_util import (
     OnlineDenseExportManager,
@@ -659,7 +660,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                             mgr.maybe_export(step, -1.0, model)
                         gather.assert_not_called()
                         mgr.maybe_export(5, -1.0, model)
-                        gather.assert_called_once_with(5, -1.0, model)
+                        gather.assert_called_once_with(5, -1.0, model, None)
                         # same step (even forced) is deduped
                         mgr.maybe_export(5, -1.0, model, final=True)
                         gather.assert_called_once()
@@ -753,6 +754,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             self._full_graph = mock.Mock()
             self._warmup_data = {}
             self._dense_graph_config = {}
+            self._dense_model_traced = mock.Mock()
             return [("w", "model.w")]
 
         with (
@@ -801,6 +803,32 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             )
         torch.testing.assert_close(box["gm"].w, torch.full((2,), 7.0))
 
+    def test_gather_uses_ema_parameters_and_live_buffers(self) -> None:
+        manager = OnlineDenseExportManager.__new__(OnlineDenseExportManager)
+        manager._rank = 0
+        manager._state_pairs = [
+            ("w", "model.w"),
+            ("running", "model.running"),
+        ]
+        parameter = nn.Parameter(torch.full((2,), 2.0))
+        dense_ema = DenseEMA({"model.w": parameter}, decay=0.5)
+        dense_ema.update()
+        parameter.data.fill_(4.0)
+        dense_ema.update()
+        model = _mock_model(
+            {
+                "model.w": parameter,
+                "model.running": torch.full((2,), 7.0),
+            }
+        )
+
+        with mock.patch.object(manager, "_enqueue") as enqueue:
+            manager._gather_and_submit(5, 42.0, model, dense_ema)
+
+        snapshot = enqueue.call_args.args[2]
+        torch.testing.assert_close(snapshot["w"], torch.full((2,), 3.0))
+        torch.testing.assert_close(snapshot["running"], torch.full((2,), 7.0))
+
     def test_maybe_export_gathers_dtensor(self) -> None:
         """Sharded-as-DTensor state is all-gathered via full_tensor()."""
         port = misc_util.get_free_port()
@@ -818,6 +846,72 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         finally:
             dist.destroy_process_group()
         torch.testing.assert_close(box["gm"].w, torch.full((2,), 9.0))
+
+    def test_worker_reuses_construction_time_traced_module(self) -> None:
+        """The worker scripts the construction-time traced module, not a re-trace.
+
+        The manager traces once during the construction-time dry run and must
+        forward that exact traced module to every worker export. A regression
+        that re-traces on the worker would re-open the fx-trace race this fix
+        targets, yet still pass an output-equivalence check (re-tracing is
+        weight-correct in a single-threaded test), so assert object identity.
+        """
+        sentinel = mock.Mock(name="traced_sentinel")
+        seen: List[Dict[str, Any]] = []
+
+        def fake_finalize(*args: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs)
+            # construction dry run returns the cached traced module; the worker
+            # call (with dense_model_traced=) must forward it verbatim.
+            return sentinel
+
+        fake_gm = mock.Mock()
+        fake_gm.state_dict.return_value = {}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch(
+                    _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                    return_value=_dummy_pipeline_config(),
+                ),
+                mock.patch("tzrec.main._create_features", return_value=[]),
+                mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+                mock.patch("tzrec.models.model.ScriptWrapper", side_effect=lambda m: m),
+                mock.patch(
+                    _BUILD_PATCHES.format("create_dense_export_warmup_data"),
+                    return_value={},
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("build_dense_graph_module"),
+                    return_value=(fake_gm, mock.Mock(), {}),
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("finalize_dense_export"),
+                    side_effect=fake_finalize,
+                ),
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model({}),
+                )
+                try:
+                    # the real build stored the construction-time finalize
+                    # return as the cached traced module
+                    self.assertIs(mgr._dense_model_traced, sentinel)
+                    mgr.maybe_export(5, 42.0, _mock_model({}))
+                    current_path = os.path.join(
+                        tmp_dir, "serving_root", "dense_hot_export", "current.json"
+                    )
+                    self.assertTrue(_wait_for(lambda: os.path.exists(current_path)))
+                finally:
+                    mgr.close()
+            # one construction call (no cached module) then one worker call
+            # forwarding the construction-time sentinel verbatim
+            self.assertEqual(len(seen), 2)
+            self.assertNotIn("dense_model_traced", seen[0])
+            self.assertIn("dense_model_traced", seen[1])
+            self.assertIs(seen[1]["dense_model_traced"], sentinel)
 
     # --- publish helpers ---
 
