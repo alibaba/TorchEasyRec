@@ -141,6 +141,15 @@ def export_model(
     `data_input_path` (optional): override for the predict-mode dataloader
     input path; falls back to `pipeline_config.train_input_path` when None.
     """
+    model_type = pipeline_config.model_config.WhichOneof("model")
+    if model_type in ("dlrm_hstu", "ultra_hstu") and (
+        not additional_export_config or "cand_seq_pk" not in additional_export_config
+    ):
+        raise ValueError(
+            "additional_export_config must contain cand_seq_pk when exporting "
+            f"{model_type}."
+        )
+
     use_rtp = env_util.use_rtp()
     use_dist_embedding = acc_utils.use_distributed_embedding()
     if use_rtp:
