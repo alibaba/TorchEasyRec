@@ -21,6 +21,11 @@ feature_configs {
 
 - **zch_size**: 零冲突Hash的Bucket大小，Id数超过后会根据Id的驱逐策略进行淘汰
 
+  > **注意**：`continue_train` / `fine_tune` 时**不要修改**已有 checkpoint 对应特征的 `zch_size`。
+  > ZCH 的 Managed Collision 状态与 bucket 大小绑定；改大或改小都会在恢复 checkpoint 时失败
+  > （见 [Issue #176](https://github.com/alibaba/TorchEasyRec/issues/176)）。
+  > 若需要更大的动态容量，可考虑切换到 [DynamicEmbedding](./dynamicemb.md)（含 ZCH→dynamicemb 转换工具）。
+
 - **eviction_interval**: Id准入和驱逐策略执行的频率（训练步数间隔）
 
 - **eviction_policy**: 驱逐策略，可选`lfu`，`lru`，`distance_lfu`，详见下文驱逐策略

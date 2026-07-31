@@ -854,6 +854,52 @@ class RankIntegrationTest(unittest.TestCase):
             else:
                 os.environ["TEST_NPROC_PER_NODE"] = prev_nproc
 
+    @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
+    def test_multi_tower_din_zch_finetune_zch_size_change_fails(self):
+        # Changing zch_size on continue_train / fine_tune must fail fast with a
+        # clear error (issue #176), instead of MCH validate_state AssertionError.
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config",
+            os.path.join(self.test_dir, "train"),
+            user_id="user_id",
+            item_id="item_id",
+        )
+        self.assertTrue(self.success)
+
+        # Bump one ZCH table size in the saved pipeline config, then fine-tune.
+        finetune_dir = os.path.join(self.test_dir, "finetune")
+        os.makedirs(finetune_dir, exist_ok=True)
+        pipeline_config = config_util.load_pipeline_config(
+            os.path.join(self.test_dir, "train/pipeline.config")
+        )
+        changed = False
+        for feature in pipeline_config.feature_configs:
+            feature_type = feature.WhichOneof("feature")
+            feature_config = getattr(feature, feature_type)
+            if hasattr(feature_config, "zch") and feature_config.HasField("zch"):
+                feature_config.zch.zch_size = feature_config.zch.zch_size + 1
+                changed = True
+                break
+        self.assertTrue(changed, "expected at least one zch feature in mock config")
+        finetune_config_path = os.path.join(finetune_dir, "pipeline.config")
+        config_util.save_message(pipeline_config, finetune_config_path)
+
+        log_path = os.path.join(finetune_dir, "log_train_eval.txt")
+        self.success = utils.test_train_eval(
+            finetune_config_path,
+            finetune_dir,
+            user_id="user_id",
+            item_id="item_id",
+            args_str=(
+                f"--fine_tune_checkpoint {os.path.join(self.test_dir, 'train/train')}"
+            ),
+        )
+        self.assertFalse(self.success)
+        with open(log_path, "r") as f:
+            log = f.read()
+        self.assertIn("ZCH (MCH) table size mismatch", log)
+
     @mark_ci_scope("gpu")
     def test_multi_tower_din_with_fg_export_quant(self):
         self._test_rank_with_fg_quant(
