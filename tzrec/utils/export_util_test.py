@@ -14,6 +14,7 @@ import copy
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
 from tzrec.acc import utils as acc_utils
+from tzrec.constant import Mode
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.deepfm import DeepFM
@@ -54,6 +56,8 @@ from tzrec.utils.export_util import (
     create_dense_export_warmup_data,
     export_dense_model_cpu,
     export_distributed_embedding,
+    export_model_normal,
+    export_rtp_model,
     finalize_dense_export,
 )
 from tzrec.utils.state_dict_util import init_parameters
@@ -78,6 +82,78 @@ def _dequant_quint8_rowwise_f16(values: np.ndarray, emb_dim: int) -> np.ndarray:
 
 
 class ExportUtilTest(unittest.TestCase):
+    def test_normal_export_caps_actual_predict_batch_size(self) -> None:
+        pipeline_config = EasyRecConfig()
+        pipeline_config.data_config.batch_size = 16
+        pipeline_config.data_config.eval_batch_size = 96
+        model = SimpleNamespace(features=[])
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "WORLD_SIZE": "1"}),
+            mock.patch(
+                "tzrec.utils.export_util.dist.is_initialized", return_value=True
+            ),
+            mock.patch(
+                "tzrec.utils.export_util.acc_utils.is_cuda_export", return_value=True
+            ),
+            mock.patch(
+                "tzrec.utils.export_util.acc_utils.get_max_export_batch_size",
+                return_value=32,
+            ),
+            mock.patch(
+                "tzrec.utils.export_util.create_dataloader",
+                side_effect=RuntimeError("stop after config"),
+            ) as create_dataloader_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after config"):
+                export_model_normal(pipeline_config, model, "checkpoint", "save_dir")
+
+        data_config = create_dataloader_mock.call_args.args[0]
+        self.assertEqual(data_config.batch_size, 32)
+        self.assertEqual(data_config.eval_batch_size, 32)
+        self.assertEqual(create_dataloader_mock.call_args.kwargs["mode"], Mode.PREDICT)
+        self.assertEqual(pipeline_config.data_config.batch_size, 16)
+        self.assertEqual(pipeline_config.data_config.eval_batch_size, 96)
+
+    def test_rtp_export_syncs_predict_batch_size(self) -> None:
+        pipeline_config = EasyRecConfig()
+        pipeline_config.data_config.batch_size = 16
+        pipeline_config.data_config.eval_batch_size = 96
+        model = SimpleNamespace(features=[])
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {"torch_fx_tool": SimpleNamespace(ExportTorchFxTool=object)},
+                ),
+                mock.patch.dict(os.environ, {"RANK": "0", "WORLD_SIZE": "1"}),
+                mock.patch(
+                    "tzrec.utils.export_util.init_process_group",
+                    return_value=(torch.device("cpu"), None),
+                ),
+                mock.patch(
+                    "tzrec.utils.export_util._get_rtp_feature_to_embedding_info",
+                    return_value={},
+                ),
+                mock.patch("tzrec.utils.export_util.dist.barrier"),
+                mock.patch(
+                    "tzrec.utils.export_util.acc_utils.get_max_export_batch_size",
+                    return_value=32,
+                ),
+                mock.patch(
+                    "tzrec.utils.export_util.create_dataloader",
+                    side_effect=RuntimeError("stop after config"),
+                ) as create_dataloader_mock,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after config"):
+                    export_rtp_model(pipeline_config, model, "checkpoint", save_dir)
+
+        data_config = create_dataloader_mock.call_args.args[0]
+        self.assertEqual(data_config.batch_size, 32)
+        self.assertEqual(data_config.eval_batch_size, 32)
+        self.assertEqual(create_dataloader_mock.call_args.kwargs["mode"], Mode.PREDICT)
+
     def test_distributed_sparse_quant_env(self) -> None:
         old_env = {
             "DIST_QUANT": os.environ.get("DIST_QUANT"),

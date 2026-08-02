@@ -20,11 +20,12 @@ from unittest import mock
 
 import torch
 
-from tzrec.main import _train_and_evaluate
+from tzrec.main import _train_and_evaluate, predict, predict_checkpoint
 from tzrec.optim.ema import DenseEMA
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 
 
 class MainTest(unittest.TestCase):
@@ -154,6 +155,106 @@ class MainTest(unittest.TestCase):
         self.assertTrue(model.module.model.on_train_end.called)
         for call in exporter.maybe_export.call_args_list:
             self.assertIsNone(call.kwargs["dense_ema"])
+
+    def test_predict_batch_size_override_updates_eval_batch_size(self) -> None:
+        pipeline_config = EasyRecConfig()
+        pipeline_config.data_config.batch_size = 16
+        pipeline_config.data_config.eval_batch_size = 96
+
+        with (
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), None),
+            ),
+            mock.patch("tzrec.main.url_to_fs", return_value=(None, "model")),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config",
+                return_value=pipeline_config,
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32_for_export"),
+            mock.patch("tzrec.main.acc_utils.is_trt_predict", return_value=False),
+            mock.patch("tzrec.main.acc_utils.is_aot_predict", return_value=False),
+            mock.patch(
+                "tzrec.main.acc_utils.is_input_tile_predict", return_value=False
+            ),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch(
+                "tzrec.main.create_dataloader",
+                side_effect=RuntimeError("stop after config"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after config"):
+                predict("input", "output", "model", batch_size=7)
+
+        self.assertEqual(pipeline_config.data_config.batch_size, 7)
+        self.assertEqual(pipeline_config.data_config.eval_batch_size, 7)
+
+    def test_predict_trt_caps_actual_inference_batch_size(self) -> None:
+        pipeline_config = EasyRecConfig()
+        pipeline_config.data_config.batch_size = 16
+        pipeline_config.data_config.eval_batch_size = 8
+
+        def edit_config(config, _):  # type: ignore[no-untyped-def]
+            config.data_config.eval_batch_size = 96
+
+        with (
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), None),
+            ),
+            mock.patch("tzrec.main.url_to_fs", return_value=(None, "model")),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config",
+                return_value=pipeline_config,
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32_for_export"),
+            mock.patch("tzrec.main.acc_utils.is_trt_predict", return_value=True),
+            mock.patch("tzrec.main.acc_utils.is_aot_predict", return_value=False),
+            mock.patch(
+                "tzrec.main.acc_utils.is_input_tile_predict", return_value=False
+            ),
+            mock.patch(
+                "tzrec.main.acc_utils.get_max_export_batch_size", return_value=32
+            ),
+            mock.patch("tzrec.main.config_util.edit_config", side_effect=edit_config),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch(
+                "tzrec.main.create_dataloader",
+                side_effect=RuntimeError("stop after config"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after config"):
+                predict("input", "output", "model", edit_config_json="{}")
+
+        self.assertEqual(pipeline_config.data_config.batch_size, 32)
+        self.assertEqual(pipeline_config.data_config.eval_batch_size, 32)
+
+    def test_predict_checkpoint_batch_size_updates_eval_batch_size(self) -> None:
+        pipeline_config = EasyRecConfig()
+        pipeline_config.data_config.batch_size = 16
+        pipeline_config.data_config.eval_batch_size = 96
+
+        with (
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config",
+                return_value=pipeline_config,
+            ),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), None),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32"),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch(
+                "tzrec.main.create_dataloader",
+                side_effect=RuntimeError("stop after config"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after config"):
+                predict_checkpoint("pipeline.config", "input", "output", batch_size=7)
+
+        self.assertEqual(pipeline_config.data_config.batch_size, 7)
+        self.assertEqual(pipeline_config.data_config.eval_batch_size, 7)
 
 
 class TrainStepCounterMultiPassTest(unittest.TestCase):
