@@ -231,14 +231,9 @@ def export_model_normal(
     if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
         max_batch_size = acc_utils.get_max_export_batch_size()
-        inference_batch_size = (
-            data_config.eval_batch_size
-            if data_config.HasField("eval_batch_size")
-            else data_config.batch_size
-        )
+        inference_batch_size = config_util.get_inference_batch_size(data_config)
         inference_batch_size = min(inference_batch_size, max_batch_size)
-        data_config.batch_size = inference_batch_size
-        data_config.eval_batch_size = inference_batch_size
+        config_util.set_inference_batch_size(data_config, inference_batch_size)
         logger.info("using new batch_size: %s in export", inference_batch_size)
     data_config.num_workers = 1
     input_path = data_input_path or pipeline_config.train_input_path
@@ -909,8 +904,9 @@ def export_rtp_model(
     data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
-    data_config.batch_size = acc_utils.get_max_export_batch_size()
-    data_config.eval_batch_size = data_config.batch_size
+    config_util.set_inference_batch_size(
+        data_config, acc_utils.get_max_export_batch_size()
+    )
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(dataloader.get_iterator())  # pyre-ignore[16]

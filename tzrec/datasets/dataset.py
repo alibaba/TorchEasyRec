@@ -41,6 +41,7 @@ from tzrec.datasets.utils import (
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
 
@@ -190,8 +191,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
 
-        if mode != Mode.TRAIN and data_config.HasField("eval_batch_size"):
-            self._batch_size = data_config.eval_batch_size
+        if mode != Mode.TRAIN:
+            self._batch_size = config_util.get_inference_batch_size(data_config)
         else:
             self._batch_size = data_config.batch_size
 

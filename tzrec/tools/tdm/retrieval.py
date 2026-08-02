@@ -157,8 +157,7 @@ def tdm_retrieval(
         os.path.join(scripted_model_path, "pipeline.config")
     )
     if batch_size:
-        pipeline_config.data_config.batch_size = batch_size
-        pipeline_config.data_config.eval_batch_size = batch_size
+        config_util.set_inference_batch_size(pipeline_config.data_config, batch_size)
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
 

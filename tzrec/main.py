@@ -1255,8 +1255,7 @@ def predict(
         os.path.join(scripted_model_path, "pipeline.config"), allow_unknown_field=True
     )
     if batch_size:
-        pipeline_config.data_config.batch_size = batch_size
-        pipeline_config.data_config.eval_batch_size = batch_size
+        config_util.set_inference_batch_size(pipeline_config.data_config, batch_size)
 
     acc_utils.allow_tf32_for_export(pipeline_config)
 
@@ -1272,16 +1271,11 @@ def predict(
     if is_trt:
         # predict batch_size too large may out of range
         data_config = pipeline_config.data_config
-        inference_batch_size = (
-            data_config.eval_batch_size
-            if data_config.HasField("eval_batch_size")
-            else data_config.batch_size
-        )
+        inference_batch_size = config_util.get_inference_batch_size(data_config)
         inference_batch_size = min(
             inference_batch_size, acc_utils.get_max_export_batch_size()
         )
-        data_config.batch_size = inference_batch_size
-        data_config.eval_batch_size = inference_batch_size
+        config_util.set_inference_batch_size(data_config, inference_batch_size)
         logger.info("using new batch_size: %s in trt predict", inference_batch_size)
 
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -1489,8 +1483,7 @@ def predict_checkpoint(
     )
 
     if batch_size:
-        pipeline_config.data_config.batch_size = batch_size
-        pipeline_config.data_config.eval_batch_size = batch_size
+        config_util.set_inference_batch_size(pipeline_config.data_config, batch_size)
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
     if edit_config_json:
