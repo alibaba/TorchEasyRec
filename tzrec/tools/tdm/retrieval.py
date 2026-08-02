@@ -13,11 +13,14 @@ import argparse
 import copy
 import math
 import os
+import queue as queue_lib
 import time
+import traceback
 from collections import OrderedDict
-from multiprocessing import Process, Queue
+from dataclasses import dataclass
+from multiprocessing import Event, Process, Queue
 from threading import Thread
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -35,6 +38,141 @@ from tzrec.protos.data_pb2 import DatasetType
 from tzrec.utils import config_util
 from tzrec.utils.dist_util import init_process_group
 from tzrec.utils.logging_util import ProgressLogger, logger
+
+_PIPELINE_POLL_INTERVAL = 1.0
+_PIPELINE_CLEANUP_TIMEOUT = 10.0
+_PIPELINE_TERMINATE_TIMEOUT = 5.0
+_PIPELINE_KILL_TIMEOUT = 5.0
+
+
+@dataclass(frozen=True)
+class _PipelineFailure:
+    """Serializable failure raised by a background pipeline stage."""
+
+    stage: str
+    worker_id: Optional[int]
+    exception_type: str
+    message: str
+    traceback: str
+
+
+class _PipelineCancelled(RuntimeError):
+    """Signal that a pipeline queue operation was cancelled."""
+
+
+class _PipelineStageError(RuntimeError):
+    """Failure propagated from a background pipeline stage."""
+
+    def __init__(self, failure: _PipelineFailure) -> None:
+        worker = "" if failure.worker_id is None else f"[{failure.worker_id}]"
+        super().__init__(
+            f"TDM retrieval {failure.stage}{worker} failed with "
+            f"{failure.exception_type}: {failure.message}\n{failure.traceback}"
+        )
+
+
+def _report_failure(
+    failure_queue: Queue,
+    cancel_event: Any,
+    stage: str,
+    worker_id: Optional[int],
+    error: BaseException,
+) -> None:
+    """Report the active exception and cancel the pipeline."""
+    failure = _PipelineFailure(
+        stage=stage,
+        worker_id=worker_id,
+        exception_type=type(error).__name__,
+        message=str(error),
+        traceback=traceback.format_exc(),
+    )
+    try:
+        failure_queue.put_nowait(failure)
+    except Exception:
+        logger.exception("Failed to report TDM retrieval pipeline failure.")
+    finally:
+        cancel_event.set()
+
+
+def _raise_background_failure(failure_queue: Queue, wait: bool = False) -> None:
+    """Raise the oldest reported pipeline failure, if present."""
+    try:
+        failure = failure_queue.get(timeout=_PIPELINE_POLL_INTERVAL if wait else 0)
+    except queue_lib.Empty:
+        return
+    raise _PipelineStageError(failure)
+
+
+def _check_pipeline_health(
+    processes: Sequence[Process], failure_queue: Queue, cancel_event: Any
+) -> None:
+    """Raise reported failures or unexpected child process exits."""
+    _raise_background_failure(failure_queue)
+    if cancel_event.is_set():
+        _raise_background_failure(failure_queue, wait=True)
+        raise RuntimeError("TDM retrieval pipeline was cancelled without an error.")
+    failed_processes = [
+        p for p in processes if p.exitcode is not None and p.exitcode != 0
+    ]
+    if failed_processes:
+        cancel_event.set()
+        _raise_background_failure(failure_queue, wait=True)
+        details = ", ".join(
+            f"pid={p.pid}, exitcode={p.exitcode}" for p in failed_processes
+        )
+        raise RuntimeError(f"TDM retrieval data worker failed: {details}.")
+
+
+def _queue_get(
+    data_queue: Queue,
+    cancel_event: Any,
+    stage: str,
+    timeout: float = PREDICT_QUEUE_TIMEOUT,
+    health_check: Optional[Callable[[], None]] = None,
+) -> Any:
+    """Get a queue item while remaining responsive to cancellation."""
+    deadline = time.monotonic() + timeout
+    while not cancel_event.is_set():
+        if health_check is not None:
+            health_check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"TDM retrieval {stage} stalled waiting for queue input "
+                f"for {timeout} seconds."
+            )
+        try:
+            return data_queue.get(timeout=min(_PIPELINE_POLL_INTERVAL, remaining))
+        except queue_lib.Empty:
+            continue
+    raise _PipelineCancelled(f"TDM retrieval {stage} was cancelled.")
+
+
+def _queue_put(
+    data_queue: Queue,
+    item: Any,
+    cancel_event: Any,
+    stage: str,
+    timeout: float = PREDICT_QUEUE_TIMEOUT,
+    health_check: Optional[Callable[[], None]] = None,
+) -> None:
+    """Put a queue item while remaining responsive to cancellation."""
+    deadline = time.monotonic() + timeout
+    while not cancel_event.is_set():
+        if health_check is not None:
+            health_check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"TDM retrieval {stage} stalled waiting for queue capacity "
+                f"for {timeout} seconds."
+            )
+        try:
+            data_queue.put(item, timeout=min(_PIPELINE_POLL_INTERVAL, remaining))
+            return
+        except queue_lib.Full:
+            continue
+    raise _PipelineCancelled(f"TDM retrieval {stage} was cancelled.")
 
 
 def update_data(
@@ -78,44 +216,250 @@ def _tdm_predict_data_worker(
     out_queue: Queue,
     is_first_layer: bool,
     worker_id: int,
+    cancel_event: Any,
+    failure_queue: Queue,
 ) -> None:
-    item_id_field = sampler._item_id_field
-    sampler.init(worker_id)
-    sampler.init_sampler(n_cluster)
+    stage = "data worker"
+    try:
+        item_id_field = sampler._item_id_field
+        sampler.init(worker_id)
+        sampler.init_sampler(n_cluster)
 
+        while True:
+            record_batch_t, node_ids = _queue_get(
+                in_queue, cancel_event, f"{stage}[{worker_id}] input"
+            )
+
+            if record_batch_t is None:
+                _queue_put(
+                    out_queue,
+                    (None, None, None),
+                    cancel_event,
+                    f"{stage}[{worker_id}] completion",
+                )
+                break
+
+            record_batch = record_batch_t.get()
+            if is_first_layer:
+                sampler.init_sampler(1)
+
+                gt_node_ids = record_batch[item_id_field]
+                cur_batch_size = len(gt_node_ids)
+                node_ids = sampler.get(
+                    {item_id_field: pa.array([-1] * cur_batch_size)}
+                )[item_id_field]
+
+                # skip layers before first_recall_layer
+                sampler.init_sampler(n_cluster)
+                for _ in range(1, first_recall_layer):
+                    sampled_result_dict = sampler.get({item_id_field: node_ids})
+                    node_ids = sampled_result_dict[item_id_field]
+
+            sampled_result_dict = sampler.get({item_id_field: node_ids})
+            updated_inputs = update_data(record_batch, sampled_result_dict)
+            output_data = data_parser.parse(updated_inputs)
+            batch = data_parser.to_batch(output_data, force_no_tile=True)
+
+            _queue_put(
+                out_queue,
+                (batch, record_batch_t, updated_inputs[item_id_field]),
+                cancel_event,
+                f"{stage}[{worker_id}] output",
+            )
+    except _PipelineCancelled:
+        return
+    except BaseException as error:
+        _report_failure(failure_queue, cancel_event, stage, worker_id, error)
+        raise
+
+
+def _forward_loop(
+    data_queue: Queue,
+    pred_queue: Queue,
+    layer_id: int,
+    producer_count: int,
+    downstream_consumer_count: int,
+    forward_fn: Callable[
+        [Batch, RecordBatchTensor, pa.Array, int],
+        Tuple[RecordBatchTensor, pa.Array],
+    ],
+    cancel_event: Any,
+    failure_queue: Queue,
+) -> None:
+    """Forward one tree layer and propagate normal completion downstream."""
+    stage = "forward"
+    try:
+        completed_producers = 0
+        while completed_producers < producer_count:
+            batch, record_batch_t, node_ids = _queue_get(
+                data_queue, cancel_event, f"{stage}[{layer_id}] input"
+            )
+            if batch is None:
+                completed_producers += 1
+                continue
+            pred = forward_fn(batch, record_batch_t, node_ids, layer_id)
+            _queue_put(
+                pred_queue,
+                pred,
+                cancel_event,
+                f"{stage}[{layer_id}] output",
+            )
+        for _ in range(downstream_consumer_count):
+            _queue_put(
+                pred_queue,
+                (None, None),
+                cancel_event,
+                f"{stage}[{layer_id}] completion",
+            )
+    except _PipelineCancelled:
+        return
+    except BaseException as error:
+        _report_failure(failure_queue, cancel_event, stage, layer_id, error)
+
+
+def _write_loop(
+    pred_queue: Queue,
+    write_fn: Callable[[RecordBatchTensor, pa.Array], None],
+    cancel_event: Any,
+    failure_queue: Queue,
+) -> None:
+    """Write completed retrieval batches until normal completion."""
+    stage = "writer"
+    try:
+        while True:
+            record_batch_t, node_ids = _queue_get(
+                pred_queue, cancel_event, f"{stage} input"
+            )
+            if record_batch_t is None:
+                return
+            write_fn(record_batch_t, node_ids)
+    except _PipelineCancelled:
+        return
+    except BaseException as error:
+        _report_failure(failure_queue, cancel_event, stage, None, error)
+
+
+def _wait_for_pipeline(
+    processes: Sequence[Process],
+    threads: Sequence[Thread],
+    failure_queue: Queue,
+    cancel_event: Any,
+    timeout: float = PREDICT_QUEUE_TIMEOUT,
+) -> None:
+    """Wait for normal pipeline completion while monitoring failures."""
+    deadline = time.monotonic() + timeout
     while True:
-        record_batch_t, node_ids = in_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
+        _check_pipeline_health(processes, failure_queue, cancel_event)
 
-        if record_batch_t is None:
-            out_queue.put((None, None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-            time.sleep(10)
+        alive_processes = [p for p in processes if p.is_alive()]
+        alive_threads = [t for t in threads if t.is_alive()]
+        if not alive_processes and not alive_threads:
             break
+        if time.monotonic() >= deadline:
+            process_ids = [p.pid for p in alive_processes]
+            thread_names = [t.name for t in alive_threads]
+            raise TimeoutError(
+                "TDM retrieval pipeline stalled during completion; "
+                f"processes={process_ids}, threads={thread_names}."
+            )
+        time.sleep(_PIPELINE_POLL_INTERVAL)
 
-        record_batch = record_batch_t.get()
-        if is_first_layer:
-            sampler.init_sampler(1)
+    for process in processes:
+        process.join(timeout=0)
+    for thread in threads:
+        thread.join(timeout=0)
+    _raise_background_failure(failure_queue)
 
-            gt_node_ids = record_batch[item_id_field]
-            cur_batch_size = len(gt_node_ids)
-            node_ids = sampler.get({item_id_field: pa.array([-1] * cur_batch_size)})[
-                item_id_field
-            ]
 
-            # skip layers before first_recall_layer
-            sampler.init_sampler(n_cluster)
-            for _ in range(1, first_recall_layer):
-                sampled_result_dict = sampler.get({item_id_field: node_ids})
-                node_ids = sampled_result_dict[item_id_field]
+def _cleanup_pipeline(
+    processes: Sequence[Process],
+    threads: Sequence[Thread],
+    queues: Sequence[Queue],
+    cancel_event: Any,
+) -> None:
+    """Cancel and reap pipeline components within bounded deadlines."""
+    cancel_event.set()
+    graceful_deadline = time.monotonic() + _PIPELINE_CLEANUP_TIMEOUT
+    while time.monotonic() < graceful_deadline:
+        if not any(p.is_alive() for p in processes) and not any(
+            t.is_alive() for t in threads
+        ):
+            break
+        time.sleep(_PIPELINE_POLL_INTERVAL)
 
-        sampled_result_dict = sampler.get({item_id_field: node_ids})
-        updated_inputs = update_data(record_batch, sampled_result_dict)
-        output_data = data_parser.parse(updated_inputs)
-        batch = data_parser.to_batch(output_data, force_no_tile=True)
+    surviving_processes = [p for p in processes if p.is_alive()]
+    for process in surviving_processes:
+        try:
+            process.terminate()
+        except Exception:
+            logger.exception("Failed to terminate retrieval process %s.", process.pid)
 
-        out_queue.put(
-            (batch, record_batch_t, updated_inputs[item_id_field]),
-            timeout=PREDICT_QUEUE_TIMEOUT,
+    terminate_deadline = time.monotonic() + _PIPELINE_TERMINATE_TIMEOUT
+    while time.monotonic() < terminate_deadline and any(
+        p.is_alive() for p in surviving_processes
+    ):
+        time.sleep(_PIPELINE_POLL_INTERVAL)
+
+    surviving_processes = [p for p in surviving_processes if p.is_alive()]
+    for process in surviving_processes:
+        try:
+            process.kill()
+        except Exception:
+            logger.exception("Failed to kill retrieval process %s.", process.pid)
+
+    kill_deadline = time.monotonic() + _PIPELINE_KILL_TIMEOUT
+    while time.monotonic() < kill_deadline and any(
+        p.is_alive() for p in surviving_processes
+    ):
+        time.sleep(_PIPELINE_POLL_INTERVAL)
+    for process in surviving_processes:
+        if process.is_alive():
+            logger.warning("Retrieval process %s survived SIGKILL.", process.pid)
+
+    for process in processes:
+        try:
+            process.join(timeout=0)
+        except Exception:
+            logger.exception("Failed to reap retrieval process %s.", process.pid)
+    for thread in threads:
+        try:
+            thread.join(timeout=0)
+            if thread.is_alive():
+                logger.warning("Retrieval thread %s did not terminate.", thread.name)
+        except Exception:
+            logger.exception("Failed to join retrieval thread %s.", thread.name)
+    for data_queue in queues:
+        try:
+            cancel_join_thread = getattr(data_queue, "cancel_join_thread", None)
+            if cancel_join_thread is not None:
+                cancel_join_thread()
+            close = getattr(data_queue, "close", None)
+            if close is not None:
+                close()
+        except Exception:
+            logger.exception("Failed to close a retrieval pipeline queue.")
+
+
+def _validate_and_commit_writer(
+    writer: BaseWriter,
+    pipeline_succeeded: bool,
+    expected_batches: int,
+    expected_rows: int,
+    written_batches: int,
+    written_rows: int,
+) -> None:
+    """Commit output only after non-empty completeness validation."""
+    if not pipeline_succeeded:
+        raise RuntimeError("TDM retrieval pipeline failed; output was not committed.")
+    if expected_rows == 0:
+        raise RuntimeError("TDM retrieval input is empty; output was not committed.")
+    if expected_batches != written_batches or expected_rows != written_rows:
+        raise RuntimeError(
+            "TDM retrieval output is incomplete; "
+            f"submitted={expected_batches} batches/{expected_rows} rows, "
+            f"written={written_batches} batches/{written_rows} rows."
         )
+    writer.close()
 
 
 def tdm_retrieval(
@@ -243,6 +587,9 @@ def tdm_retrieval(
     num_class = pipeline_config.model_config.num_class
     pos_prob_name: str = "probs1" if num_class == 2 else "probs"
 
+    expected_batches = 0
+    expected_rows = 0
+    written_batches = 0
     total = 0
     recall = 0
 
@@ -289,29 +636,14 @@ def tdm_retrieval(
 
             return record_batch_t, node_ids
 
-    def _forward_loop(data_queue: Queue, pred_queue: Queue, layer_id: int) -> None:
-        stop_cnt = 0
-        while True:
-            batch, record_batch_t, node_ids = data_queue.get(
-                timeout=PREDICT_QUEUE_TIMEOUT
-            )
-            if batch is None:
-                stop_cnt += 1
-                if stop_cnt == num_worker_per_level:
-                    for _ in range(num_worker_per_level):
-                        pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-                    break
-                else:
-                    continue
-            assert batch is not None
-            pred = _forward(batch, record_batch_t, node_ids, layer_id)
-            pred_queue.put(pred, timeout=PREDICT_QUEUE_TIMEOUT)
-
     def _write(record_batch_t: RecordBatchTensor, node_ids: pa.Array) -> None:
+        nonlocal written_batches
         nonlocal total
         nonlocal recall
         output_dict = OrderedDict()
         reserve_batch_record = record_batch_t.get()
+        if reserve_batch_record is None:
+            raise RuntimeError("TDM retrieval output lost its reserved input batch.")
         gt_node_ids = reserve_batch_record[item_id_field]
         cur_batch_size = len(gt_node_ids)
         if reserved_cols is not None:
@@ -328,88 +660,189 @@ def tdm_retrieval(
             ),
             axis=1,
         )
+        written_batches += 1
         total += cur_batch_size
         recall += np.sum(retrieval_result)
 
-    def _write_loop(pred_queue: Queue) -> None:
-        while True:
-            record_batch_t, node_ids = pred_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
-            if record_batch_t is None:
-                break
-            _write(record_batch_t, node_ids)
-
     in_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer + 1)]
     out_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer)]
+    failure_queue = Queue()
+    cancel_event = Event()
+    all_queues = [*in_queues, *out_queues, failure_queue]
 
-    data_p_list = []
-    for i in range(max_level - first_recall_layer):
-        for j in range(num_worker_per_level):
-            p = Process(
-                target=_tdm_predict_data_worker,
-                args=(
-                    predict_sampler,
-                    parser,
-                    first_recall_layer,
-                    n_cluster,
-                    in_queues[i],
-                    out_queues[i],
-                    i == 0,
-                    i * num_worker_per_level + j,
-                ),
-            )
-            p.start()
-            data_p_list.append(p)
-
-    forward_t_list = []
-    for i in range(max_level - first_recall_layer):
-        t = Thread(
-            target=_forward_loop,
-            args=(out_queues[i], in_queues[i + 1], i + first_recall_layer),
-        )
-        t.start()
-        forward_t_list.append(t)
-
-    write_t = None
+    data_p_list: List[Process] = []
+    forward_t_list: List[Thread] = []
+    write_t: Optional[Thread] = None
+    pipeline_succeeded = False
     i_step = 0
-    while True:
-        try:
-            batch = next(infer_iterator)
-            in_queues[0].put((batch.reserves, None), timeout=PREDICT_QUEUE_TIMEOUT)
-            if i_step == 0:
-                # lazy init writer and create write thread
-                record_batch_t, node_ids = in_queues[-1].get(
-                    timeout=PREDICT_QUEUE_TIMEOUT
+    try:
+        for i in range(max_level - first_recall_layer):
+            for j in range(num_worker_per_level):
+                p = Process(
+                    target=_tdm_predict_data_worker,
+                    args=(
+                        predict_sampler,
+                        parser,
+                        first_recall_layer,
+                        n_cluster,
+                        in_queues[i],
+                        out_queues[i],
+                        i == 0,
+                        i * num_worker_per_level + j,
+                        cancel_event,
+                        failure_queue,
+                    ),
                 )
-                _write(record_batch_t, node_ids)
-                write_t = Thread(target=_write_loop, args=(in_queues[-1],))
-                write_t.start()
-            if is_local_rank_zero:
-                plogger.log(i_step)
-            if is_profiling:
-                prof.step()
-            i_step += 1
-        except StopIteration:
-            break
+                p.start()
+                data_p_list.append(p)
 
-    for _ in range(num_worker_per_level):
-        in_queues[0].put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-    for p in data_p_list:
-        p.join()
-    for t in forward_t_list:
-        t.join()
-    assert write_t is not None
-    write_t.join()
-    writer.close()
+        for i in range(max_level - first_recall_layer):
+            downstream_consumer_count = (
+                num_worker_per_level if i < max_level - first_recall_layer - 1 else 1
+            )
+            t = Thread(
+                target=_forward_loop,
+                args=(
+                    out_queues[i],
+                    in_queues[i + 1],
+                    i + first_recall_layer,
+                    num_worker_per_level,
+                    downstream_consumer_count,
+                    _forward,
+                    cancel_event,
+                    failure_queue,
+                ),
+                name=f"tdm-forward-{i + first_recall_layer}",
+                daemon=True,
+            )
+            t.start()
+            forward_t_list.append(t)
+    except BaseException:
+        _cleanup_pipeline(
+            data_p_list,
+            forward_t_list,
+            all_queues,
+            cancel_event,
+        )
+        if is_profiling:
+            prof.stop()
+        raise
 
-    total_t = torch.tensor(total, device=device)
-    recall_t = torch.tensor(recall, device=device)
-    dist.all_reduce(total_t, op=ReduceOp.SUM)
-    dist.all_reduce(recall_t, op=ReduceOp.SUM)
-    # pyre-ignore [6]
-    recall_ratio = recall_t.cpu().item() / total_t.cpu().item()
+    def _check_health() -> None:
+        """Check background pipeline health from the main thread."""
+        _check_pipeline_health(data_p_list, failure_queue, cancel_event)
 
-    if is_profiling:
-        prof.stop()
+    try:
+        while True:
+            try:
+                batch = next(infer_iterator)
+                reserve_batch_record = batch.reserves.get()
+                if reserve_batch_record is None:
+                    raise RuntimeError("TDM retrieval input has no reserved batch.")
+                _queue_put(
+                    in_queues[0],
+                    (batch.reserves, None),
+                    cancel_event,
+                    "input producer",
+                    health_check=_check_health,
+                )
+                expected_batches += 1
+                expected_rows += len(reserve_batch_record)
+                if i_step == 0:
+                    # Initialize distributed writers synchronously on the first batch.
+                    record_batch_t, node_ids = _queue_get(
+                        in_queues[-1],
+                        cancel_event,
+                        "first output",
+                        health_check=_check_health,
+                    )
+                    if record_batch_t is None:
+                        raise RuntimeError(
+                            "TDM retrieval completed before producing its first output."
+                        )
+                    _write(record_batch_t, node_ids)
+                    write_t = Thread(
+                        target=_write_loop,
+                        args=(in_queues[-1], _write, cancel_event, failure_queue),
+                        name="tdm-writer",
+                        daemon=True,
+                    )
+                    write_t.start()
+                if is_local_rank_zero:
+                    plogger.log(i_step)
+                if is_profiling:
+                    prof.step()
+                i_step += 1
+                _raise_background_failure(failure_queue)
+            except StopIteration:
+                break
+
+        for _ in range(num_worker_per_level):
+            _queue_put(
+                in_queues[0],
+                (None, None),
+                cancel_event,
+                "input completion",
+                health_check=_check_health,
+            )
+
+        if write_t is None:
+            record_batch_t, _ = _queue_get(
+                in_queues[-1],
+                cancel_event,
+                "empty input completion",
+                health_check=_check_health,
+            )
+            if record_batch_t is not None:
+                raise RuntimeError("Empty TDM retrieval produced unexpected output.")
+
+        pipeline_threads = [*forward_t_list]
+        if write_t is not None:
+            pipeline_threads.append(write_t)
+        _wait_for_pipeline(data_p_list, pipeline_threads, failure_queue, cancel_event)
+        pipeline_succeeded = True
+    except _PipelineCancelled as error:
+        _raise_background_failure(failure_queue, wait=True)
+        raise RuntimeError(
+            "TDM retrieval pipeline was cancelled without an error."
+        ) from error
+    finally:
+        pipeline_threads = [*forward_t_list]
+        if write_t is not None:
+            pipeline_threads.append(write_t)
+        _cleanup_pipeline(
+            data_p_list,
+            pipeline_threads,
+            all_queues,
+            cancel_event,
+        )
+        if is_profiling:
+            prof.stop()
+
+    if not pipeline_succeeded:
+        raise RuntimeError("TDM retrieval pipeline did not complete successfully.")
+
+    metric_t = torch.tensor(
+        [expected_batches, expected_rows, written_batches, total, recall],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(metric_t, op=ReduceOp.SUM)
+    global_expected_batches = int(metric_t[0].cpu().item())
+    global_expected_rows = int(metric_t[1].cpu().item())
+    global_written_batches = int(metric_t[2].cpu().item())
+    global_written_rows = int(metric_t[3].cpu().item())
+    global_recall = int(metric_t[4].cpu().item())
+    _validate_and_commit_writer(
+        writer,
+        pipeline_succeeded,
+        global_expected_batches,
+        global_expected_rows,
+        global_written_batches,
+        global_written_rows,
+    )
+    recall_ratio = global_recall / global_written_rows
+
     if is_rank_zero:
         logger.info(f"Retrieval Finished. Recall:{recall_ratio}")
 
