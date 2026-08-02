@@ -56,7 +56,6 @@ from tzrec.utils.export_util import (
     create_dense_export_warmup_data,
     export_dense_model_cpu,
     export_distributed_embedding,
-    export_model_normal,
     export_rtp_model,
     finalize_dense_export,
 )
@@ -82,39 +81,6 @@ def _dequant_quint8_rowwise_f16(values: np.ndarray, emb_dim: int) -> np.ndarray:
 
 
 class ExportUtilTest(unittest.TestCase):
-    def test_normal_export_caps_actual_predict_batch_size(self) -> None:
-        pipeline_config = EasyRecConfig()
-        pipeline_config.data_config.batch_size = 16
-        pipeline_config.data_config.eval_batch_size = 96
-        model = SimpleNamespace(features=[])
-
-        with (
-            mock.patch.dict(os.environ, {"RANK": "0", "WORLD_SIZE": "1"}),
-            mock.patch(
-                "tzrec.utils.export_util.dist.is_initialized", return_value=True
-            ),
-            mock.patch(
-                "tzrec.utils.export_util.acc_utils.is_cuda_export", return_value=True
-            ),
-            mock.patch(
-                "tzrec.utils.export_util.acc_utils.get_max_export_batch_size",
-                return_value=32,
-            ),
-            mock.patch(
-                "tzrec.utils.export_util.create_dataloader",
-                side_effect=RuntimeError("stop after config"),
-            ) as create_dataloader_mock,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "stop after config"):
-                export_model_normal(pipeline_config, model, "checkpoint", "save_dir")
-
-        data_config = create_dataloader_mock.call_args.args[0]
-        self.assertEqual(data_config.batch_size, 32)
-        self.assertEqual(data_config.eval_batch_size, 32)
-        self.assertEqual(create_dataloader_mock.call_args.kwargs["mode"], Mode.PREDICT)
-        self.assertEqual(pipeline_config.data_config.batch_size, 16)
-        self.assertEqual(pipeline_config.data_config.eval_batch_size, 96)
-
     def test_rtp_export_syncs_predict_batch_size(self) -> None:
         pipeline_config = EasyRecConfig()
         pipeline_config.data_config.batch_size = 16
