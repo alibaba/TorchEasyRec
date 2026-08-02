@@ -18,13 +18,18 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import pyarrow as pa
 import torch
 
-from tzrec.main import _train_and_evaluate
+from tzrec.datasets.utils import RecordBatchTensor
+from tzrec.main import _train_and_evaluate, predict, predict_checkpoint
 from tzrec.optim.ema import DenseEMA
+from tzrec.protos.data_pb2 import DataConfig
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.utils import predict_util
 
 
 class MainTest(unittest.TestCase):
@@ -154,6 +159,183 @@ class MainTest(unittest.TestCase):
         self.assertTrue(model.module.model.on_train_end.called)
         for call in exporter.maybe_export.call_args_list:
             self.assertIsNone(call.kwargs["dense_ema"])
+
+
+class PredictionLifecycleTest(unittest.TestCase):
+    """Tests for prediction lifecycle wiring."""
+
+    def _batch(self, rows: int) -> mock.Mock:
+        batch = mock.Mock()
+        batch.reserves = RecordBatchTensor(pa.record_batch({"id": list(range(rows))}))
+        batch.to_dict.return_value = {}
+        batch.dummy = False
+        return batch
+
+    def _pipeline_config(self) -> EasyRecConfig:
+        return EasyRecConfig(
+            train_input_path="",
+            eval_input_path="",
+            model_dir="model",
+            data_config=DataConfig(dataset_type=3, num_workers=1),
+        )
+
+    def _run_predict(
+        self, dataloader: mock.Mock, writer: mock.Mock, model: mock.Mock
+    ) -> None:
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.url_to_fs", return_value=(None, "model")),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config",
+                return_value=self._pipeline_config(),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32_for_export"),
+            mock.patch("tzrec.main.acc_utils.is_trt_predict", return_value=False),
+            mock.patch("tzrec.main.acc_utils.is_aot_predict", return_value=False),
+            mock.patch(
+                "tzrec.main.acc_utils.is_input_tile_predict", return_value=False
+            ),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch("tzrec.main.create_dataloader", return_value=dataloader),
+            mock.patch("tzrec.main.create_writer", return_value=writer),
+            mock.patch("tzrec.main.torch.jit.load", return_value=model),
+            mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01),
+        ):
+            predict(
+                "input",
+                "output",
+                "model",
+                reserved_columns="id",
+                writer_type="MockWriter",
+                predict_threads=1,
+            )
+
+    def _run_predict_checkpoint(self, pipeline: mock.Mock, writer: mock.Mock) -> None:
+        dataloader = mock.Mock()
+        dataloader.dataset.sampled_batch_size = 2
+        dataloader.get_iterator.return_value = iter([])
+        model = mock.Mock()
+        wrapped_model = mock.Mock()
+        distributed_model = mock.Mock()
+        distributed_model.device = torch.device("cpu")
+        ckpt_manager = mock.Mock()
+        planner = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config",
+                return_value=self._pipeline_config(),
+            ),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32"),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch("tzrec.main.create_dataloader", return_value=dataloader),
+            mock.patch("tzrec.main.create_writer", return_value=writer),
+            mock.patch("tzrec.main._create_model", return_value=model),
+            mock.patch("tzrec.main.PredictWrapper", return_value=wrapped_model),
+            mock.patch(
+                "tzrec.main.checkpoint_util.CheckpointManager",
+                return_value=ckpt_manager,
+            ),
+            mock.patch("tzrec.main.create_planner", return_value=planner),
+            mock.patch("tzrec.main.get_default_sharders", return_value=[]),
+            mock.patch(
+                "tzrec.main.DistributedModelParallel",
+                return_value=distributed_model,
+            ),
+            mock.patch("tzrec.main.config_util.use_dense_ema", return_value=False),
+            mock.patch("tzrec.main.PredictPipelineSparseDist", return_value=pipeline),
+            mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01),
+        ):
+            predict_checkpoint(
+                "pipeline.config",
+                "input",
+                "output",
+                checkpoint_path="checkpoint",
+                reserved_columns="id",
+                writer_type="MockWriter",
+                predict_steps=2,
+            )
+
+    def test_predict_counts_first_write_and_commits_once(self) -> None:
+        dataloader = mock.Mock()
+        dataloader.get_iterator.return_value = iter([self._batch(2), self._batch(3)])
+        writer = mock.Mock()
+        model = mock.Mock(
+            side_effect=[
+                {"score": torch.tensor([0.1, 0.2])},
+                {"score": torch.tensor([0.1, 0.2, 0.3])},
+            ]
+        )
+
+        self._run_predict(dataloader, writer, model)
+
+        self.assertEqual(writer.write.call_count, 2)
+        writer.close.assert_called_once_with()
+
+    def test_predict_background_failures_do_not_commit(self) -> None:
+        for stage in ("forward", "writer"):
+            with self.subTest(stage=stage):
+                dataloader = mock.Mock()
+                dataloader.get_iterator.return_value = iter(
+                    [self._batch(2), self._batch(2)]
+                )
+                writer = mock.Mock()
+                predictions = {"score": torch.tensor([0.1, 0.2])}
+                model = mock.Mock(
+                    side_effect=[predictions, predictions]
+                    if stage == "writer"
+                    else [predictions, RuntimeError("forward boom")]
+                )
+                if stage == "writer":
+                    writer.write.side_effect = [None, RuntimeError("writer boom")]
+
+                with self.assertRaises(
+                    predict_util.PredictPipelineStageError
+                ) as context:
+                    self._run_predict(dataloader, writer, model)
+
+                self.assertEqual(context.exception.failure.stage, stage)
+                self.assertEqual(context.exception.failure.message, f"{stage} boom")
+                writer.close.assert_not_called()
+
+    def test_predict_checkpoint_commits_only_after_writer_success(self) -> None:
+        for writer_fails in (False, True):
+            with self.subTest(writer_fails=writer_fails):
+                writer = mock.Mock()
+                if writer_fails:
+                    writer.write.side_effect = [
+                        None,
+                        RuntimeError("checkpoint writer boom"),
+                    ]
+                pipeline = mock.Mock()
+                pipeline.progress.side_effect = [
+                    ({"score": torch.tensor([0.1, 0.2])}, self._batch(2)),
+                    ({"score": torch.tensor([0.1, 0.2])}, self._batch(2)),
+                ]
+
+                if writer_fails:
+                    with self.assertRaises(
+                        predict_util.PredictPipelineStageError
+                    ) as context:
+                        self._run_predict_checkpoint(pipeline, writer)
+                    self.assertEqual(context.exception.failure.stage, "writer")
+                    self.assertEqual(
+                        context.exception.failure.message,
+                        "checkpoint writer boom",
+                    )
+                    writer.close.assert_not_called()
+                else:
+                    self._run_predict_checkpoint(pipeline, writer)
+                    self.assertEqual(writer.write.call_count, 2)
+                    writer.close.assert_called_once_with()
 
 
 class TrainStepCounterMultiPassTest(unittest.TestCase):

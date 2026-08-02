@@ -18,6 +18,7 @@ from unittest import mock
 from parameterized import parameterized
 
 from tzrec.tools.tdm import retrieval
+from tzrec.utils import predict_util
 from tzrec.utils.test_util import parameterized_name_func
 
 
@@ -126,12 +127,12 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
             )
 
         self.assertTrue(cancel_event.is_set())
-        with self.assertRaises(retrieval._PipelineStageError) as error:
-            retrieval._raise_background_failure(failure_queue)
+        with self.assertRaises(predict_util.PredictPipelineStageError) as error:
+            predict_util.raise_background_failure(failure_queue)
         self.assertIn(f"{stage} boom", str(error.exception))
         self.assertIn("ValueError", str(error.exception))
         with self.assertRaisesRegex(RuntimeError, "not committed"):
-            retrieval._validate_and_commit_writer(writer, False, 1, 1, 1, 1)
+            predict_util.validate_and_commit_writer(writer, False, 1, 1, 1, 1)
         writer.close.assert_not_called()
 
     def test_full_queue_is_interruptible_and_cleanup_is_bounded(self):
@@ -145,13 +146,13 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
 
         cancel_thread = threading.Thread(target=cancel)
         cancel_thread.start()
-        with mock.patch.object(retrieval, "_PIPELINE_POLL_INTERVAL", 0.01):
-            with self.assertRaises(retrieval._PipelineCancelled):
-                retrieval._queue_put(
+        with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
+            with self.assertRaises(predict_util.PredictPipelineCancelled):
+                predict_util.queue_put_interruptibly(
                     data_queue, "blocked", cancel_event, "test queue", timeout=1
                 )
             with self.assertRaisesRegex(TimeoutError, "test stall"):
-                retrieval._queue_put(
+                predict_util.queue_put_interruptibly(
                     data_queue,
                     "blocked",
                     threading.Event(),
@@ -163,7 +164,7 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
             failed_process.exitcode = -9
             failed_event = threading.Event()
             with self.assertRaisesRegex(RuntimeError, "exitcode=-9"):
-                retrieval._check_pipeline_health(
+                predict_util.check_pipeline_health(
                     [failed_process], queue.Queue(), failed_event
                 )
             self.assertTrue(failed_event.is_set())
@@ -172,11 +173,11 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
         process = _StubbornProcess()
         pipeline_queue = mock.Mock()
         with (
-            mock.patch.object(retrieval, "_PIPELINE_CLEANUP_TIMEOUT", 0),
-            mock.patch.object(retrieval, "_PIPELINE_TERMINATE_TIMEOUT", 0),
-            mock.patch.object(retrieval, "_PIPELINE_KILL_TIMEOUT", 0),
+            mock.patch.object(predict_util, "_PREDICT_PIPELINE_CLEANUP_TIMEOUT", 0),
+            mock.patch.object(predict_util, "_PREDICT_PIPELINE_TERMINATE_TIMEOUT", 0),
+            mock.patch.object(predict_util, "_PREDICT_PIPELINE_KILL_TIMEOUT", 0),
         ):
-            retrieval._cleanup_pipeline(
+            predict_util.cleanup_pipeline(
                 [process], [], [pipeline_queue], threading.Event()
             )
         self.assertTrue(process.terminate_called)
@@ -186,7 +187,7 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
 
     def test_commit_requires_complete_nonempty_success(self):
         writer = mock.Mock()
-        retrieval._validate_and_commit_writer(writer, True, 2, 8, 2, 8)
+        predict_util.validate_and_commit_writer(writer, True, 2, 8, 2, 8)
         writer.close.assert_called_once_with()
 
         invalid_cases = [
@@ -197,7 +198,7 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
         for args in invalid_cases:
             failed_writer = mock.Mock()
             with self.assertRaises(RuntimeError):
-                retrieval._validate_and_commit_writer(failed_writer, *args)
+                predict_util.validate_and_commit_writer(failed_writer, *args)
             failed_writer.close.assert_not_called()
 
 

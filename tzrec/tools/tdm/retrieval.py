@@ -13,14 +13,10 @@ import argparse
 import copy
 import math
 import os
-import queue as queue_lib
-import time
-import traceback
 from collections import OrderedDict
-from dataclasses import dataclass
 from multiprocessing import Event, Process, Queue
 from threading import Thread
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -28,151 +24,16 @@ import torch
 from torch import distributed as dist
 from torch.distributed import ReduceOp
 
-from tzrec.constant import PREDICT_QUEUE_TIMEOUT, Mode
+from tzrec.constant import Mode
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.dataset import BaseWriter, create_writer
 from tzrec.datasets.sampler import TDMPredictSampler
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.main import _create_features, create_dataloader
 from tzrec.protos.data_pb2 import DatasetType
-from tzrec.utils import config_util
+from tzrec.utils import config_util, predict_util
 from tzrec.utils.dist_util import init_process_group
 from tzrec.utils.logging_util import ProgressLogger, logger
-
-_PIPELINE_POLL_INTERVAL = 1.0
-_PIPELINE_CLEANUP_TIMEOUT = 10.0
-_PIPELINE_TERMINATE_TIMEOUT = 5.0
-_PIPELINE_KILL_TIMEOUT = 5.0
-
-
-@dataclass(frozen=True)
-class _PipelineFailure:
-    """Serializable failure raised by a background pipeline stage."""
-
-    stage: str
-    worker_id: Optional[int]
-    exception_type: str
-    message: str
-    traceback: str
-
-
-class _PipelineCancelled(RuntimeError):
-    """Signal that a pipeline queue operation was cancelled."""
-
-
-class _PipelineStageError(RuntimeError):
-    """Failure propagated from a background pipeline stage."""
-
-    def __init__(self, failure: _PipelineFailure) -> None:
-        worker = "" if failure.worker_id is None else f"[{failure.worker_id}]"
-        super().__init__(
-            f"TDM retrieval {failure.stage}{worker} failed with "
-            f"{failure.exception_type}: {failure.message}\n{failure.traceback}"
-        )
-
-
-def _report_failure(
-    failure_queue: Queue,
-    cancel_event: Any,
-    stage: str,
-    worker_id: Optional[int],
-    error: BaseException,
-) -> None:
-    """Report the active exception and cancel the pipeline."""
-    failure = _PipelineFailure(
-        stage=stage,
-        worker_id=worker_id,
-        exception_type=type(error).__name__,
-        message=str(error),
-        traceback=traceback.format_exc(),
-    )
-    try:
-        failure_queue.put_nowait(failure)
-    except Exception:
-        logger.exception("Failed to report TDM retrieval pipeline failure.")
-    finally:
-        cancel_event.set()
-
-
-def _raise_background_failure(failure_queue: Queue, wait: bool = False) -> None:
-    """Raise the oldest reported pipeline failure, if present."""
-    try:
-        failure = failure_queue.get(timeout=_PIPELINE_POLL_INTERVAL if wait else 0)
-    except queue_lib.Empty:
-        return
-    raise _PipelineStageError(failure)
-
-
-def _check_pipeline_health(
-    processes: Sequence[Process], failure_queue: Queue, cancel_event: Any
-) -> None:
-    """Raise reported failures or unexpected child process exits."""
-    _raise_background_failure(failure_queue)
-    if cancel_event.is_set():
-        _raise_background_failure(failure_queue, wait=True)
-        raise RuntimeError("TDM retrieval pipeline was cancelled without an error.")
-    failed_processes = [
-        p for p in processes if p.exitcode is not None and p.exitcode != 0
-    ]
-    if failed_processes:
-        cancel_event.set()
-        _raise_background_failure(failure_queue, wait=True)
-        details = ", ".join(
-            f"pid={p.pid}, exitcode={p.exitcode}" for p in failed_processes
-        )
-        raise RuntimeError(f"TDM retrieval data worker failed: {details}.")
-
-
-def _queue_get(
-    data_queue: Queue,
-    cancel_event: Any,
-    stage: str,
-    timeout: float = PREDICT_QUEUE_TIMEOUT,
-    health_check: Optional[Callable[[], None]] = None,
-) -> Any:
-    """Get a queue item while remaining responsive to cancellation."""
-    deadline = time.monotonic() + timeout
-    while not cancel_event.is_set():
-        if health_check is not None:
-            health_check()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"TDM retrieval {stage} stalled waiting for queue input "
-                f"for {timeout} seconds."
-            )
-        try:
-            return data_queue.get(timeout=min(_PIPELINE_POLL_INTERVAL, remaining))
-        except queue_lib.Empty:
-            continue
-    raise _PipelineCancelled(f"TDM retrieval {stage} was cancelled.")
-
-
-def _queue_put(
-    data_queue: Queue,
-    item: Any,
-    cancel_event: Any,
-    stage: str,
-    timeout: float = PREDICT_QUEUE_TIMEOUT,
-    health_check: Optional[Callable[[], None]] = None,
-) -> None:
-    """Put a queue item while remaining responsive to cancellation."""
-    deadline = time.monotonic() + timeout
-    while not cancel_event.is_set():
-        if health_check is not None:
-            health_check()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"TDM retrieval {stage} stalled waiting for queue capacity "
-                f"for {timeout} seconds."
-            )
-        try:
-            data_queue.put(item, timeout=min(_PIPELINE_POLL_INTERVAL, remaining))
-            return
-        except queue_lib.Full:
-            continue
-    raise _PipelineCancelled(f"TDM retrieval {stage} was cancelled.")
 
 
 def update_data(
@@ -226,12 +87,12 @@ def _tdm_predict_data_worker(
         sampler.init_sampler(n_cluster)
 
         while True:
-            record_batch_t, node_ids = _queue_get(
+            record_batch_t, node_ids = predict_util.queue_get_interruptibly(
                 in_queue, cancel_event, f"{stage}[{worker_id}] input"
             )
 
             if record_batch_t is None:
-                _queue_put(
+                predict_util.queue_put_interruptibly(
                     out_queue,
                     (None, None, None),
                     cancel_event,
@@ -260,16 +121,18 @@ def _tdm_predict_data_worker(
             output_data = data_parser.parse(updated_inputs)
             batch = data_parser.to_batch(output_data, force_no_tile=True)
 
-            _queue_put(
+            predict_util.queue_put_interruptibly(
                 out_queue,
                 (batch, record_batch_t, updated_inputs[item_id_field]),
                 cancel_event,
                 f"{stage}[{worker_id}] output",
             )
-    except _PipelineCancelled:
+    except predict_util.PredictPipelineCancelled:
         return
     except BaseException as error:
-        _report_failure(failure_queue, cancel_event, stage, worker_id, error)
+        predict_util.report_failure(
+            failure_queue, cancel_event, stage, worker_id, error
+        )
         raise
 
 
@@ -291,30 +154,30 @@ def _forward_loop(
     try:
         completed_producers = 0
         while completed_producers < producer_count:
-            batch, record_batch_t, node_ids = _queue_get(
+            batch, record_batch_t, node_ids = predict_util.queue_get_interruptibly(
                 data_queue, cancel_event, f"{stage}[{layer_id}] input"
             )
             if batch is None:
                 completed_producers += 1
                 continue
             pred = forward_fn(batch, record_batch_t, node_ids, layer_id)
-            _queue_put(
+            predict_util.queue_put_interruptibly(
                 pred_queue,
                 pred,
                 cancel_event,
                 f"{stage}[{layer_id}] output",
             )
         for _ in range(downstream_consumer_count):
-            _queue_put(
+            predict_util.queue_put_interruptibly(
                 pred_queue,
                 (None, None),
                 cancel_event,
                 f"{stage}[{layer_id}] completion",
             )
-    except _PipelineCancelled:
+    except predict_util.PredictPipelineCancelled:
         return
     except BaseException as error:
-        _report_failure(failure_queue, cancel_event, stage, layer_id, error)
+        predict_util.report_failure(failure_queue, cancel_event, stage, layer_id, error)
 
 
 def _write_loop(
@@ -327,139 +190,16 @@ def _write_loop(
     stage = "writer"
     try:
         while True:
-            record_batch_t, node_ids = _queue_get(
+            record_batch_t, node_ids = predict_util.queue_get_interruptibly(
                 pred_queue, cancel_event, f"{stage} input"
             )
             if record_batch_t is None:
                 return
             write_fn(record_batch_t, node_ids)
-    except _PipelineCancelled:
+    except predict_util.PredictPipelineCancelled:
         return
     except BaseException as error:
-        _report_failure(failure_queue, cancel_event, stage, None, error)
-
-
-def _wait_for_pipeline(
-    processes: Sequence[Process],
-    threads: Sequence[Thread],
-    failure_queue: Queue,
-    cancel_event: Any,
-    timeout: float = PREDICT_QUEUE_TIMEOUT,
-) -> None:
-    """Wait for normal pipeline completion while monitoring failures."""
-    deadline = time.monotonic() + timeout
-    while True:
-        _check_pipeline_health(processes, failure_queue, cancel_event)
-
-        alive_processes = [p for p in processes if p.is_alive()]
-        alive_threads = [t for t in threads if t.is_alive()]
-        if not alive_processes and not alive_threads:
-            break
-        if time.monotonic() >= deadline:
-            process_ids = [p.pid for p in alive_processes]
-            thread_names = [t.name for t in alive_threads]
-            raise TimeoutError(
-                "TDM retrieval pipeline stalled during completion; "
-                f"processes={process_ids}, threads={thread_names}."
-            )
-        time.sleep(_PIPELINE_POLL_INTERVAL)
-
-    for process in processes:
-        process.join(timeout=0)
-    for thread in threads:
-        thread.join(timeout=0)
-    _raise_background_failure(failure_queue)
-
-
-def _cleanup_pipeline(
-    processes: Sequence[Process],
-    threads: Sequence[Thread],
-    queues: Sequence[Queue],
-    cancel_event: Any,
-) -> None:
-    """Cancel and reap pipeline components within bounded deadlines."""
-    cancel_event.set()
-    graceful_deadline = time.monotonic() + _PIPELINE_CLEANUP_TIMEOUT
-    while time.monotonic() < graceful_deadline:
-        if not any(p.is_alive() for p in processes) and not any(
-            t.is_alive() for t in threads
-        ):
-            break
-        time.sleep(_PIPELINE_POLL_INTERVAL)
-
-    surviving_processes = [p for p in processes if p.is_alive()]
-    for process in surviving_processes:
-        try:
-            process.terminate()
-        except Exception:
-            logger.exception("Failed to terminate retrieval process %s.", process.pid)
-
-    terminate_deadline = time.monotonic() + _PIPELINE_TERMINATE_TIMEOUT
-    while time.monotonic() < terminate_deadline and any(
-        p.is_alive() for p in surviving_processes
-    ):
-        time.sleep(_PIPELINE_POLL_INTERVAL)
-
-    surviving_processes = [p for p in surviving_processes if p.is_alive()]
-    for process in surviving_processes:
-        try:
-            process.kill()
-        except Exception:
-            logger.exception("Failed to kill retrieval process %s.", process.pid)
-
-    kill_deadline = time.monotonic() + _PIPELINE_KILL_TIMEOUT
-    while time.monotonic() < kill_deadline and any(
-        p.is_alive() for p in surviving_processes
-    ):
-        time.sleep(_PIPELINE_POLL_INTERVAL)
-    for process in surviving_processes:
-        if process.is_alive():
-            logger.warning("Retrieval process %s survived SIGKILL.", process.pid)
-
-    for process in processes:
-        try:
-            process.join(timeout=0)
-        except Exception:
-            logger.exception("Failed to reap retrieval process %s.", process.pid)
-    for thread in threads:
-        try:
-            thread.join(timeout=0)
-            if thread.is_alive():
-                logger.warning("Retrieval thread %s did not terminate.", thread.name)
-        except Exception:
-            logger.exception("Failed to join retrieval thread %s.", thread.name)
-    for data_queue in queues:
-        try:
-            cancel_join_thread = getattr(data_queue, "cancel_join_thread", None)
-            if cancel_join_thread is not None:
-                cancel_join_thread()
-            close = getattr(data_queue, "close", None)
-            if close is not None:
-                close()
-        except Exception:
-            logger.exception("Failed to close a retrieval pipeline queue.")
-
-
-def _validate_and_commit_writer(
-    writer: BaseWriter,
-    pipeline_succeeded: bool,
-    expected_batches: int,
-    expected_rows: int,
-    written_batches: int,
-    written_rows: int,
-) -> None:
-    """Commit output only after non-empty completeness validation."""
-    if not pipeline_succeeded:
-        raise RuntimeError("TDM retrieval pipeline failed; output was not committed.")
-    if expected_rows == 0:
-        raise RuntimeError("TDM retrieval input is empty; output was not committed.")
-    if expected_batches != written_batches or expected_rows != written_rows:
-        raise RuntimeError(
-            "TDM retrieval output is incomplete; "
-            f"submitted={expected_batches} batches/{expected_rows} rows, "
-            f"written={written_batches} batches/{written_rows} rows."
-        )
-    writer.close()
+        predict_util.report_failure(failure_queue, cancel_event, stage, None, error)
 
 
 def tdm_retrieval(
@@ -718,19 +458,22 @@ def tdm_retrieval(
             t.start()
             forward_t_list.append(t)
     except BaseException:
-        _cleanup_pipeline(
+        predict_util.cleanup_pipeline(
             data_p_list,
             forward_t_list,
             all_queues,
             cancel_event,
         )
         if is_profiling:
-            prof.stop()
+            try:
+                prof.stop()
+            except Exception:
+                logger.exception("Failed to stop the retrieval profiler.")
         raise
 
     def _check_health() -> None:
         """Check background pipeline health from the main thread."""
-        _check_pipeline_health(data_p_list, failure_queue, cancel_event)
+        predict_util.check_pipeline_health(data_p_list, failure_queue, cancel_event)
 
     try:
         while True:
@@ -739,7 +482,7 @@ def tdm_retrieval(
                 reserve_batch_record = batch.reserves.get()
                 if reserve_batch_record is None:
                     raise RuntimeError("TDM retrieval input has no reserved batch.")
-                _queue_put(
+                predict_util.queue_put_interruptibly(
                     in_queues[0],
                     (batch.reserves, None),
                     cancel_event,
@@ -750,7 +493,7 @@ def tdm_retrieval(
                 expected_rows += len(reserve_batch_record)
                 if i_step == 0:
                     # Initialize distributed writers synchronously on the first batch.
-                    record_batch_t, node_ids = _queue_get(
+                    record_batch_t, node_ids = predict_util.queue_get_interruptibly(
                         in_queues[-1],
                         cancel_event,
                         "first output",
@@ -773,12 +516,12 @@ def tdm_retrieval(
                 if is_profiling:
                     prof.step()
                 i_step += 1
-                _raise_background_failure(failure_queue)
+                predict_util.raise_background_failure(failure_queue)
             except StopIteration:
                 break
 
         for _ in range(num_worker_per_level):
-            _queue_put(
+            predict_util.queue_put_interruptibly(
                 in_queues[0],
                 (None, None),
                 cancel_event,
@@ -787,7 +530,7 @@ def tdm_retrieval(
             )
 
         if write_t is None:
-            record_batch_t, _ = _queue_get(
+            record_batch_t, _ = predict_util.queue_get_interruptibly(
                 in_queues[-1],
                 cancel_event,
                 "empty input completion",
@@ -799,10 +542,12 @@ def tdm_retrieval(
         pipeline_threads = [*forward_t_list]
         if write_t is not None:
             pipeline_threads.append(write_t)
-        _wait_for_pipeline(data_p_list, pipeline_threads, failure_queue, cancel_event)
+        predict_util.wait_for_pipeline(
+            data_p_list, pipeline_threads, failure_queue, cancel_event
+        )
         pipeline_succeeded = True
-    except _PipelineCancelled as error:
-        _raise_background_failure(failure_queue, wait=True)
+    except predict_util.PredictPipelineCancelled as error:
+        predict_util.raise_background_failure(failure_queue, wait=True)
         raise RuntimeError(
             "TDM retrieval pipeline was cancelled without an error."
         ) from error
@@ -810,14 +555,17 @@ def tdm_retrieval(
         pipeline_threads = [*forward_t_list]
         if write_t is not None:
             pipeline_threads.append(write_t)
-        _cleanup_pipeline(
+        predict_util.cleanup_pipeline(
             data_p_list,
             pipeline_threads,
             all_queues,
             cancel_event,
         )
         if is_profiling:
-            prof.stop()
+            try:
+                prof.stop()
+            except Exception:
+                logger.exception("Failed to stop the retrieval profiler.")
 
     if not pipeline_succeeded:
         raise RuntimeError("TDM retrieval pipeline did not complete successfully.")
@@ -833,7 +581,7 @@ def tdm_retrieval(
     global_written_batches = int(metric_t[2].cpu().item())
     global_written_rows = int(metric_t[3].cpu().item())
     global_recall = int(metric_t[4].cpu().item())
-    _validate_and_commit_writer(
+    predict_util.validate_and_commit_writer(
         writer,
         pipeline_succeeded,
         global_expected_batches,
