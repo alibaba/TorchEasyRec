@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
@@ -53,6 +54,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
+from tzrec.utils.feature_store_delta_uploader import FeatureStoreDeltaUploader
 from tzrec.utils.logging_util import logger
 
 _CONSUMER = "delta_embedding_dump"
@@ -116,7 +118,17 @@ def validate_delta_embedding_dump_config(
             "delta_embedding_dump_config only supports CUDA training, "
             f"but got device={device}."
         )
-    if config.dump_interval_steps <= 0:
+    if config.HasField("dump_interval_minutes"):
+        if config.HasField("dump_interval_steps"):
+            raise ValueError(
+                "delta_embedding_dump_config must configure only one of "
+                "dump_interval_steps and dump_interval_minutes."
+            )
+        if config.dump_interval_minutes <= 0:
+            raise ValueError(
+                "delta_embedding_dump_config.dump_interval_minutes must be > 0."
+            )
+    elif config.dump_interval_steps <= 0:
         raise ValueError("delta_embedding_dump_config.dump_interval_steps must be > 0.")
 
 
@@ -565,13 +577,24 @@ class DeltaEmbeddingDumper:
         validate_delta_embedding_dump_no_zch_features(feature_configs)
         self._model = model
         self._config = config
-        self._interval = config.dump_interval_steps
+        self._interval_steps: Optional[int] = None
+        self._interval_secs: Optional[float] = None
+        if config.HasField("dump_interval_minutes"):
+            self._interval_secs = float(config.dump_interval_minutes * 60)
+        else:
+            self._interval_steps = int(config.dump_interval_steps)
+        self._next_dump_time: Optional[float] = None
+        self._last_dump_step: Optional[int] = None
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
         self._file_prefix = config.file_prefix or "delta_embedding"
         self._rank, self._world_size = _distributed_rank_world_size()
         self._tracking_pause_depth = 0
+        self._feature_store_enabled = config.HasField("feature_store_config")
+        self._retain_local_dump = self._feature_store_enabled and bool(
+            config.feature_store_config.retain_local_dump
+        )
         os.makedirs(self._output_dir, exist_ok=True)
 
         self._tracker = ModelDeltaTracker(
@@ -583,14 +606,35 @@ class DeltaEmbeddingDumper:
         self._table_shard_infos = self._collect_table_shard_infos()
         self._validate_supported_table_sharding(self._table_shard_infos)
         self._install_tracking_pause_guard()
+        self._uploader: Optional[FeatureStoreDeltaUploader] = None
+        if self._feature_store_enabled:
+            embedding_dimensions = {
+                fqn: int(info.global_cols)
+                for fqn, info in self._table_shard_infos.items()
+            }
+            self._uploader = FeatureStoreDeltaUploader(
+                config.feature_store_config,
+                embedding_dimensions=embedding_dimensions,
+                rank=self._rank,
+                world_size=self._world_size,
+                manage_remote_view=self._rank == 0,
+            )
+        interval_name = "minutes" if self._interval_secs is not None else "steps"
+        interval_value = (
+            config.dump_interval_minutes
+            if self._interval_secs is not None
+            else self._interval_steps
+        )
         logger.info(
-            "Delta embedding dump enabled: interval=%s output_dir=%s "
-            "rank=%s/%s tables=%s",
-            self._interval,
+            "Delta embedding dump enabled: interval_%s=%s output_dir=%s "
+            "rank=%s/%s tables=%s feature_store_upload=%s",
+            interval_name,
+            interval_value,
             self._output_dir,
             self._rank,
             self._world_size,
             sorted(self._tracker.fqn_to_feature_names),
+            self._feature_store_enabled,
         )
 
     def clear(self) -> None:
@@ -606,15 +650,68 @@ class DeltaEmbeddingDumper:
         finally:
             self._tracking_pause_depth -= 1
 
+    def start(self) -> None:
+        """Start timed cadence and per-rank FeatureStore publication.
+
+        The rank-zero view rendezvous (create the DynamicEmbedding view,
+        barrier, then non-primary ranks open it) lives in
+        :meth:`FeatureStoreDeltaUploader.start`; this method only delegates and
+        arms the timed cadence.
+        """
+        if self._uploader is not None:
+            self._uploader.start()
+        if self._interval_secs is not None:
+            self._next_dump_time = time.monotonic() + self._interval_secs
+
+    def close(self, raise_on_error: bool = True, drain: bool = True) -> None:
+        """Close this rank's uploader; abnormal shutdown can skip draining."""
+        if self._uploader is not None:
+            self._uploader.close(raise_on_error=raise_on_error, drain=drain)
+
+    def _feature_store_upload_error(self) -> Optional[BaseException]:
+        """Collect this rank's uploader error without changing control flow."""
+        if not self._feature_store_enabled:
+            return None
+        if self._uploader is not None:
+            try:
+                self._uploader.check_error()
+            except BaseException as exc:
+                return exc
+        return None
+
+    def _check_feature_store_upload_error(self) -> None:
+        """Surface this rank's background upload failure to the trainer."""
+        error = self._feature_store_upload_error()
+        if error is not None:
+            raise error.with_traceback(error.__traceback__)
+
     def maybe_dump(self, global_step: int) -> None:
-        """Dump on the configured global-step interval and advance tracker state.
+        """Dump on the configured step or time interval and advance tracker state.
 
         Args:
             global_step: Current training step.
         """
-        if global_step > 0 and global_step % self._interval == 0:
+        self._check_feature_store_upload_error()
+        if self._local_dump_decision(global_step):
             self.dump(global_step)
+            self._last_dump_step = global_step
+            if self._interval_secs is not None and self._next_dump_time is not None:
+                # Fixed-rate rescheduling keeps every rank's deadline sequence
+                # identical, so timed dumps stay step-aligned across ranks up to
+                # clock skew exactly astride a step boundary; missed deadlines
+                # are skipped instead of fired as a burst.
+                now = time.monotonic()
+                while self._next_dump_time <= now:
+                    self._next_dump_time += self._interval_secs
         self._tracker.step()
+
+    def _local_dump_decision(self, global_step: int) -> bool:
+        """Return whether this step triggers a delta dump."""
+        if self._interval_steps is not None:
+            return global_step > 0 and global_step % self._interval_steps == 0
+        if self._interval_secs is not None and self._next_dump_time is not None:
+            return time.monotonic() >= self._next_dump_time
+        return False
 
     def final_dump(self, global_step: int) -> Optional[str]:
         """Flush the trailing partial interval at the end of training.
@@ -629,15 +726,24 @@ class DeltaEmbeddingDumper:
         Returns:
             Path to the dumped parquet file, or None if skipped.
         """
+        if global_step <= 0:
+            logger.info("Skipping delta embedding dump at step %s.", global_step)
+            return None
         global_step = self._sync_final_step(global_step)
-        if global_step > 0 and global_step % self._interval == 0:
+        if self._interval_steps is not None and global_step % self._interval_steps == 0:
             # Boundary steps were already written (with full delta) by
             # ``maybe_dump``. Re-dumping here has no new delta to flush -- every
             # rank's consumer cursor has already advanced past the boundary's
-            # delta -- and torchrec's ``get_unique`` raises
-            # ``torch.cat(): expected a non-empty list of Tensors`` on the empty
-            # consumer window. Re-dumping would also overwrite the already-written
-            # boundary shards (with an empty file under multi-GPU), so skip.
+            # delta (all ranks run the same step count, so every rank
+            # participated in the boundary dump) -- and torchrec's
+            # ``get_unique`` raises ``torch.cat(): expected a non-empty list of
+            # Tensors`` on the empty consumer window. Re-dumping would also
+            # overwrite the already-written boundary shards (with an empty file
+            # under multi-GPU), so skip.
+            return None
+        if self._interval_secs is not None and global_step == self._last_dump_step:
+            # A timed dump can land on any step. Avoid replacing that step's full
+            # delta with an empty final shard when training ends immediately after.
             return None
         return self.dump(global_step)
 
@@ -673,6 +779,11 @@ class DeltaEmbeddingDumper:
         Returns:
             Path to the dumped parquet file, or None if no data to dump.
         """
+        global_step = int(global_step)
+        if global_step <= 0:
+            raise ValueError("delta embedding dump global_step must be > 0")
+        uploader = self._uploader
+        write_local = not self._feature_store_enabled or self._retain_local_dump
         table_weights = self._collect_table_weights()
         dynamic_modules = self._collect_dynamic_modules()
         table_chunks: List[pa.Table] = []
@@ -682,21 +793,31 @@ class DeltaEmbeddingDumper:
             table_weights=table_weights,
             dynamic_modules=dynamic_modules,
         )
-        if num_rows == 0:
-            if self._world_size == 1:
-                logger.info("No delta embedding rows to dump at step %s.", global_step)
-                return None
+        output_path: Optional[str] = None
+        if write_local and (num_rows > 0 or self._world_size > 1):
+            # Multi-rank shard sets stay complete even for an empty rank so
+            # per-step file consumers never observe a partial set.
             output_path = self._output_path(global_step)
             self._write_table_chunks(table_chunks, output_path)
-            logger.info(
-                "Dumped empty delta embedding shard to %s at step %s.",
-                output_path,
+        if uploader is not None and num_rows > 0:
+            uploader.submit(global_step, pa.concat_tables(table_chunks))
+        if num_rows == 0:
+            if output_path is None:
+                logger.debug("No delta embedding rows to dump at step %s.", global_step)
+            else:
+                logger.debug(
+                    "Dumped empty delta embedding shard to %s at step %s.",
+                    output_path,
+                    global_step,
+                )
+        elif output_path is None:
+            logger.debug(
+                "Submitted %s delta embedding rows for FeatureStore upload at step %s.",
+                num_rows,
                 global_step,
             )
-            return output_path
-        output_path = self._output_path(global_step)
-        self._write_table_chunks(table_chunks, output_path)
-        logger.info("Dumped %s delta embedding rows to %s.", num_rows, output_path)
+        else:
+            logger.debug("Dumped %s delta embedding rows to %s.", num_rows, output_path)
         return output_path
 
     def _output_path(self, global_step: int) -> str:

@@ -606,11 +606,9 @@ def _train_and_evaluate(
         _model.on_train_end()
         if delta_embedding_dumper is not None:
             # Flush the trailing partial interval before the final checkpoint.
-            # final_dump skips dump-boundary steps already written by maybe_dump,
-            # so it never overwrites their shards with an empty file. Ranks can
-            # reach here at different i_step (independent dataloader exhaustion with
-            # check_all_workers_data_status=False), so final_dump all-reduces the
-            # step across ranks to keep one complete shard set per step dir.
+            # final_dump skips dump-boundary steps already written by maybe_dump
+            # (all ranks run the same step count, so every rank participated in
+            # those dumps and reaches the same final step).
             delta_embedding_dumper.final_dump(i_step)
 
         _log_train(
@@ -900,6 +898,8 @@ def train_and_evaluate(
         with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
             f.write(tzrec_version + "\n")
 
+    if delta_embedding_dumper is not None:
+        delta_embedding_dumper.start()
     # when slice batch by sample cost, data on all workers may not be balanced
     check_all_workers_data_status = data_config.HasField("batch_cost_size")
     _train_and_evaluate(
@@ -922,6 +922,12 @@ def train_and_evaluate(
         dense_ema=dense_ema,
         export_config=pipeline_config.export_config,
     )
+    # Drain background uploads only after training succeeds. A training failure
+    # terminates the whole job (torchrun tears down every rank) and pending
+    # in-memory deltas are intentionally abandoned: the restarted run re-dumps
+    # from the latest checkpoint, so there is nothing to roll back or undo.
+    if delta_embedding_dumper is not None:
+        delta_embedding_dumper.close()
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
 
@@ -1249,7 +1255,7 @@ def predict(
         os.path.join(scripted_model_path, "pipeline.config"), allow_unknown_field=True
     )
     if batch_size:
-        pipeline_config.data_config.batch_size = batch_size
+        config_util.set_inference_batch_size(pipeline_config.data_config, batch_size)
 
     acc_utils.allow_tf32_for_export(pipeline_config)
 
@@ -1257,22 +1263,20 @@ def predict(
     is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
 
-    if is_trt:
-        # predict batch_size too large may out of range
-        max_batch_size = acc_utils.get_max_export_batch_size()
-        pipeline_config.data_config.batch_size = min(
-            pipeline_config.data_config.batch_size, max_batch_size
-        )
-        logger.info(
-            "using new batch_size: %s in trt predict",
-            pipeline_config.data_config.batch_size,
-        )
-
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
     if edit_config_json:
         edit_config_json = json.loads(edit_config_json)
         config_util.edit_config(pipeline_config, edit_config_json)
+    if is_trt:
+        # predict batch_size too large may out of range
+        data_config = pipeline_config.data_config
+        inference_batch_size = config_util.get_inference_batch_size(data_config)
+        inference_batch_size = min(
+            inference_batch_size, acc_utils.get_max_export_batch_size()
+        )
+        config_util.set_inference_batch_size(data_config, inference_batch_size)
+        logger.info("using new batch_size: %s in trt predict", inference_batch_size)
 
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
@@ -1479,7 +1483,7 @@ def predict_checkpoint(
     )
 
     if batch_size:
-        pipeline_config.data_config.batch_size = batch_size
+        config_util.set_inference_batch_size(pipeline_config.data_config, batch_size)
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
     if edit_config_json:

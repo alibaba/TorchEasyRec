@@ -16,6 +16,29 @@ from tzrec.utils import config_util
 
 
 class ConfigUtilTest(unittest.TestCase):
+    def test_get_inference_batch_size(self):
+        pipeline_config = EasyRecConfig()
+        pipeline_config.data_config.batch_size = 16
+
+        self.assertEqual(
+            config_util.get_inference_batch_size(pipeline_config.data_config), 16
+        )
+
+        pipeline_config.data_config.eval_batch_size = 96
+        self.assertEqual(
+            config_util.get_inference_batch_size(pipeline_config.data_config), 96
+        )
+
+    def test_set_inference_batch_size(self):
+        pipeline_config = EasyRecConfig()
+        pipeline_config.data_config.batch_size = 16
+        pipeline_config.data_config.eval_batch_size = 96
+
+        config_util.set_inference_batch_size(pipeline_config.data_config, 7)
+
+        self.assertEqual(pipeline_config.data_config.batch_size, 7)
+        self.assertEqual(pipeline_config.data_config.eval_batch_size, 7)
+
     def test_use_dense_ema(self):
         pipeline_config = EasyRecConfig()
         self.assertFalse(
