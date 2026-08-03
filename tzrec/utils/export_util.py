@@ -2520,6 +2520,11 @@ def _get_sparse_embedding_tensor(
             default_value, emb_dim, export_emb_name
         )
         emb_name_to_export_meta[export_emb_name] = export_meta
+        logger.info(
+            f"convert zch table {export_emb_name} to dynamic embedding table, "
+            f"{keys.numel()} of {mch._zch_size - 1} ids exported, ids not "
+            "exported are served the exported default embedding."
+        )
         key_name = f"{export_emb_name}.keys"
         value_name = f"{export_emb_name}.values"
         score_name = f"{export_emb_name}.scores"

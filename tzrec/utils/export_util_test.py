@@ -53,7 +53,7 @@ from tzrec.modules.dense_embedding_collection import (
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util, misc_util
+from tzrec.utils import checkpoint_util, config_util, export_util, misc_util
 from tzrec.utils.export_util import (
     _add_module_by_dotted_path,
     _dedup_key_files_by_realpath,
@@ -742,37 +742,38 @@ class ExportUtilTest(unittest.TestCase):
         old_env = {"DIST_QUANT": os.environ.get("DIST_QUANT")}
         try:
             os.environ.pop("DIST_QUANT", None)
-            out, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
-                model,
-                tmp,
-                {
-                    zch_ec_fqn: SimpleNamespace(
-                        name="seq_emb",
-                        embedding_dim=2,
-                        feature_names=["click_seq__cate"],
-                    )
-                },
-                {
-                    zch_ebc_fqn: SimpleNamespace(
-                        name="user_id_emb",
-                        embedding_dim=2,
-                        feature_names=["user_id"],
-                        pooling="SUM",
-                    ),
-                    zch_ebc_user_fqn: SimpleNamespace(
-                        name="user_id_emb",
-                        embedding_dim=2,
-                        feature_names=["user_id"],
-                        pooling="SUM",
-                    ),
-                    plain_fqn: SimpleNamespace(
-                        name="plain_emb",
-                        embedding_dim=2,
-                        feature_names=["plain_id"],
-                        pooling="SUM",
-                    ),
-                },
-            )
+            with mock.patch.object(export_util, "logger") as m_logger:
+                out, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                    model,
+                    tmp,
+                    {
+                        zch_ec_fqn: SimpleNamespace(
+                            name="seq_emb",
+                            embedding_dim=2,
+                            feature_names=["click_seq__cate"],
+                        )
+                    },
+                    {
+                        zch_ebc_fqn: SimpleNamespace(
+                            name="user_id_emb",
+                            embedding_dim=2,
+                            feature_names=["user_id"],
+                            pooling="SUM",
+                        ),
+                        zch_ebc_user_fqn: SimpleNamespace(
+                            name="user_id_emb",
+                            embedding_dim=2,
+                            feature_names=["user_id"],
+                            pooling="SUM",
+                        ),
+                        plain_fqn: SimpleNamespace(
+                            name="plain_emb",
+                            embedding_dim=2,
+                            feature_names=["plain_id"],
+                            pooling="SUM",
+                        ),
+                    },
+                )
 
             self.assertEqual(sorted(out.keys()), [plain_fqn])
             np.testing.assert_array_equal(
@@ -832,6 +833,25 @@ class ExportUtilTest(unittest.TestCase):
                 np.array([[6.0, 6.1]], dtype=np.float32),
             )
             self.assertTrue(emb_meta[zch_ec_fqn]["is_dynamic"])
+
+            zch_logs = [
+                call.args[0]
+                for call in m_logger.info.call_args_list
+                if "convert zch table" in call.args[0]
+            ]
+            self.assertEqual(
+                {log.split(" to dynamic")[0] for log in zch_logs},
+                {
+                    f"convert zch table {zch_ebc_fqn}",
+                    f"convert zch table {zch_ec_fqn}",
+                },
+            )
+            self.assertTrue(
+                any("3 of 3 ids exported" in log for log in zch_logs), zch_logs
+            )
+            self.assertTrue(
+                any("2 of 2 ids exported" in log for log in zch_logs), zch_logs
+            )
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
