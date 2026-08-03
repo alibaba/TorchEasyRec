@@ -44,6 +44,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
     get_embedding_names_by_table,
 )
+from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
 )
@@ -2294,6 +2295,113 @@ def _prepare_sparse_export_values(
     }
 
 
+def _get_zch_export_tables(
+    model: nn.Module, emb_name_to_emb_dim: Dict[str, int]
+) -> Dict[str, MCHManagedCollisionModule]:
+    """Collect ZCH modules keyed by the export name of the table they remap.
+
+    A managed collision wrapper holds its ZCH modules at
+    ``<P>._managed_collision_collection._managed_collision_modules.<table>`` and
+    the matching weight at
+    ``<P>._embedding_module.{embedding_bags,embeddings}.<table>``, for pooled
+    (``mc_ebc``) and sequence (``mc_ec_dict.<dim>``) collections alike, in both
+    the sharded and the unsharded module tree.
+
+    Args:
+        model: model to walk, sharded or not.
+        emb_name_to_emb_dim: export name to dim of all sparse tables.
+
+    Returns:
+        Dict {export table name -> ZCH module}.
+    """
+    zch_tables: Dict[str, MCHManagedCollisionModule] = {}
+    for mod_path, module in model.named_modules():
+        mc_collection = getattr(module, "_managed_collision_collection", None)
+        if mc_collection is None or not hasattr(module, "_embedding_module"):
+            continue
+        for table_name, mch in mc_collection._managed_collision_modules.items():
+            if not isinstance(mch, MCHManagedCollisionModule):
+                raise ValueError(
+                    f"unsupported managed collision module "
+                    f"{type(mch).__name__} of table {table_name} in {mod_path}."
+                )
+            table_candidates = [
+                f"{mod_path}._embedding_module.embedding_bags.{table_name}",
+                f"{mod_path}._embedding_module.embeddings.{table_name}",
+            ]
+            export_emb_name = next(
+                (
+                    table_fqn
+                    for table_fqn in map(
+                        checkpoint_util.remap_input_tile_user_key, table_candidates
+                    )
+                    if table_fqn in emb_name_to_emb_dim
+                ),
+                None,
+            )
+            if export_emb_name is None:
+                raise ValueError(
+                    f"zch table {table_name} in {mod_path} has no matching sparse "
+                    f"embedding config, tried {table_candidates}."
+                )
+            zch_tables[export_emb_name] = mch
+    return zch_tables
+
+
+def _zch_table_to_dynamic(
+    mch: MCHManagedCollisionModule,
+    local_tensor: np.ndarray,
+    shard_offset: int,
+    emb_name: str,
+) -> Tuple[torch.Tensor, np.ndarray, torch.Tensor]:
+    """Materialize the raw id to embedding binding of one ZCH table shard.
+
+    ZCH remaps raw feature ids to compact table rows inside the model, but
+    serving looks embeddings up by raw id, so a ZCH table is exported as a
+    dynamic table whose keys are the raw ids kept by the ZCH module.
+
+    Args:
+        mch: ZCH module holding the raw id to row mapping of this shard.
+        local_tensor: embedding rows of this shard.
+        shard_offset: global row offset of this shard.
+        emb_name: export table name, for error messages.
+
+    Returns:
+        keys: raw ids, ascending.
+        values: embedding row per key.
+        scores: eviction score per key.
+    """
+    raw_ids = mch._buffers["_mch_sorted_raw_ids"].cpu()
+    remapped_ids = mch._buffers["_mch_remapped_ids_mapping"].cpu()
+    # LFU keeps counts only, LRU keeps last access iter only, DistanceLFU keeps
+    # both and its recency part maps onto the dynamic table score.
+    score_buffer = None
+    for buffer_name in ("_mch_last_access_iter", "_mch_counts"):
+        score_buffer = mch._buffers.get(buffer_name)
+        if score_buffer is not None:
+            break
+    if score_buffer is None:
+        raise ValueError(
+            f"zch table {emb_name} has no eviction metadata buffer to export "
+            "as dynamic table score."
+        )
+
+    valid_mask = raw_ids != torch.iinfo(torch.int64).max
+    keys = raw_ids[valid_mask]
+    rows = remapped_ids[valid_mask] - shard_offset
+    scores = score_buffer.cpu()[valid_mask].to(torch.int64)
+    num_rows = local_tensor.shape[0]
+    if keys.numel() > 0 and (
+        int(rows.min().item()) < 0 or int(rows.max().item()) >= num_rows
+    ):
+        raise ValueError(
+            f"zch table {emb_name} remapped row range "
+            f"[{int(rows.min().item())}, {int(rows.max().item())}] is out of "
+            f"its {num_rows} embedding rows at shard offset {shard_offset}."
+        )
+    return keys, local_tensor[rows.numpy()], scores
+
+
 def _get_sparse_embedding_tensor(
     model: nn.Module,
     checkpoint_path: str,
@@ -2309,12 +2417,12 @@ def _get_sparse_embedding_tensor(
 
     Returns:
         out: regular sparse embedding tensors keyed by table FQN.
-        dynamic_out: dynamicemb keys/values/scores keyed by composite names. Empty if
-            no dynamic embedding tables exist.
+        dynamic_out: dynamicemb and zch keys/values/scores keyed by composite
+            names. Empty if no dynamic embedding table exists.
         emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
         feat_meta: feature -> embedding_name / pooling mapping.
     """
-    emb_name_to_emb_dim = dict()
+    emb_name_to_emb_dim: Dict[str, int] = dict()
     feat_name_to_pooling = dict()
 
     feat_name_impl_to_emb_name = dict()
@@ -2342,21 +2450,56 @@ def _get_sparse_embedding_tensor(
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
             feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[-1]
 
-    out = {}
+    out: Dict[str, Any] = {}
     # dynamicemb keys/values are saved into a separate npz, kept in this dict.
-    dynamic_out = {}
+    dynamic_out: Dict[str, Any] = {}
 
     # per-table export metadata (logical shape/dtype plus optional storage info).
-    emb_name_to_export_meta = {}
+    emb_name_to_export_meta: Dict[str, Any] = {}
     # set of emb_names that are dynamic embedding tables (loaded from
     # checkpoint's `dynamicemb/` directory rather than model state_dict).
-    dynamic_emb_names = set()
+    dynamic_emb_names: Set[str] = set()
     # per-emb_name npz entry names for dynamic tables on this rank.
-    dynamic_key_names = defaultdict(list)
-    dynamic_value_names = defaultdict(list)
-    dynamic_score_names = defaultdict(list)
+    dynamic_key_names: Dict[str, List[str]] = defaultdict(list)
+    dynamic_value_names: Dict[str, List[str]] = defaultdict(list)
+    dynamic_score_names: Dict[str, List[str]] = defaultdict(list)
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+    zch_tables: Dict[str, MCHManagedCollisionModule] = _get_zch_export_tables(
+        model, emb_name_to_emb_dim
+    )
+
+    def _add_sparse_table(
+        export_emb_name: str, local_tensor: np.ndarray, shard_offset: int
+    ) -> None:
+        emb_dim = emb_name_to_emb_dim[export_emb_name]
+        mch = zch_tables.get(export_emb_name)
+        if mch is None:
+            export_tensor, export_meta = _prepare_sparse_export_values(
+                local_tensor, emb_dim, export_emb_name
+            )
+            out[export_emb_name] = export_tensor
+            emb_name_to_export_meta[export_emb_name] = export_meta
+            return
+
+        keys, values, scores = _zch_table_to_dynamic(
+            mch, local_tensor, shard_offset, export_emb_name
+        )
+        export_tensor, export_meta = _prepare_sparse_export_values(
+            values, emb_dim, export_emb_name
+        )
+        emb_name_to_export_meta[export_emb_name] = export_meta
+        key_name = f"{export_emb_name}.keys"
+        value_name = f"{export_emb_name}.values"
+        score_name = f"{export_emb_name}.scores"
+        dynamic_out[key_name] = keys
+        dynamic_out[value_name] = export_tensor
+        dynamic_out[score_name] = scores
+        dynamic_emb_names.add(export_emb_name)
+        dynamic_key_names[export_emb_name].append(key_name)
+        dynamic_value_names[export_emb_name].append(value_name)
+        dynamic_score_names[export_emb_name].append(score_name)
+
     state_values_by_emb = {}
     for name, values in model.state_dict().items():
         if not name.endswith(".weight"):
@@ -2382,20 +2525,16 @@ def _get_sparse_embedding_tensor(
                         local_tensor = values.local_tensor().cpu().numpy()
                         if list(local_tensor.shape)[-1] == emb_dim:
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
-                            export_tensor, export_meta = _prepare_sparse_export_values(
-                                local_tensor, emb_dim, export_emb_name
+                            _add_sparse_table(
+                                export_emb_name,
+                                local_tensor,
+                                shards_meta.shard_offsets[0],
                             )
-                            out[export_emb_name] = export_tensor
-                            emb_name_to_export_meta[export_emb_name] = export_meta
                             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
             local_tensor = values.detach().cpu().numpy()
-            export_tensor, export_meta = _prepare_sparse_export_values(
-                local_tensor, emb_dim, export_emb_name
-            )
-            out[export_emb_name] = export_tensor
-            emb_name_to_export_meta[export_emb_name] = export_meta
+            _add_sparse_table(export_emb_name, local_tensor, 0)
             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
@@ -2508,8 +2647,6 @@ def _get_sparse_embedding_tensor(
             dynamic_key_names[emb_name].append(key_name)
             dynamic_value_names[emb_name].append(value_name)
             dynamic_score_names[emb_name].append(score_name)
-
-    # TODO(hongsheng.jhs): support mczch
 
     emb_meta = {}
     for emb_name, feat_name_impl_list in emb_name_to_feat_name_impl.items():

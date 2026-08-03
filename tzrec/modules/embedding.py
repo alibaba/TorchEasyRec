@@ -1160,6 +1160,17 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 ),
             )
 
+        self.mc_ec_dict_features = OrderedDict()
+        for k, mc_ec in self.mc_ec_dict.items():
+            feat_list = []
+            for emb_config in mc_ec._embedding_module._embedding_configs:
+                for feature_name in emb_config.feature_names:
+                    shared_name = emb_name_to_feature_to_shared_name[
+                        emb_config.name
+                    ].get(feature_name, feature_name)
+                    feat_list.append((feature_name, shared_name))
+            self.mc_ec_dict_features[k] = feat_list
+
         if need_input_tile_emb:
             self.ec_dict_user = nn.ModuleDict()
             for k, emb_configs in dim_to_emb_configs_user.items():
@@ -1185,6 +1196,17 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                         dim_to_mc_modules_user[k], list(emb_configs.values())
                     ),
                 )
+
+            self.mc_ec_dict_features_user = OrderedDict()
+            for k, mc_ec in self.mc_ec_dict_user.items():
+                feat_list = []
+                for emb_config in mc_ec._embedding_module._embedding_configs:
+                    for feature_name in emb_config.feature_names:
+                        shared_name = emb_name_to_feature_to_shared_name[
+                            emb_config.name
+                        ].get(feature_name, feature_name)
+                        feat_list.append((feature_name, shared_name))
+                self.mc_ec_dict_features_user[k] = feat_list
 
     def group_dims(self, group_name: str) -> List[int]:
         """Output dimension of each feature in a feature group."""
@@ -1248,8 +1270,16 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse:
-            for ec in self.mc_ec_dict.values():
-                sparse_jt_dict_list.append(ec(sparse_feature)[0])
+            for feature_keys, mc_ec in zip(
+                self.mc_ec_dict_features.values(), self.mc_ec_dict.values()
+            ):
+                d_jt = mc_ec(sparse_feature)[0]
+                new_d_jt = {}
+                for raw_key, shared_key in feature_keys:
+                    val = d_jt[raw_key]
+                    fx_mark_seq_ec_jt(shared_key, val)
+                    new_d_jt[shared_key] = val
+                sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mulval_seq:
             seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
@@ -1267,8 +1297,16 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse_user:
-            for ec in self.mc_ec_dict_user.values():
-                sparse_jt_dict_list.append(ec(sparse_feature_user)[0])
+            for feature_keys, mc_ec in zip(
+                self.mc_ec_dict_features_user.values(), self.mc_ec_dict_user.values()
+            ):
+                d_jt = mc_ec(sparse_feature_user)[0]
+                new_d_jt = {}
+                for raw_key, shared_key in feature_keys:
+                    val = d_jt[raw_key]
+                    fx_mark_seq_ec_jt(shared_key, val)
+                    new_d_jt[shared_key] = val
+                sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mulval_seq_user:
             seq_mulval_length_jt_dict_list.append(

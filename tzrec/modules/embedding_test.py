@@ -29,6 +29,7 @@ from tzrec.modules.embedding import (
     SequenceEmbeddingGroupImpl,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
+from tzrec.utils.fx_util import fx_mark_seq_ec_jt, symbolic_trace
 from tzrec.utils.test_util import TestGraphType, create_test_module
 
 
@@ -418,6 +419,37 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertTrue("deep___click_no_query.query" not in result)
         self.assertEqual(result["deep___click_no_query.sequence"].size(), (2, 3, 17))
         self.assertEqual(result["deep___click_no_query.sequence_length"].size(), (2,))
+
+    def test_sequence_embedding_group_impl_zch_marks_seq_jt(self) -> None:
+        """Distributed export splits the sparse part on fx_mark_seq_ec_jt marks."""
+        features = _create_test_sequence_features(has_zch=True)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="click",
+                feature_names=[
+                    "cat_a",
+                    "cat_b",
+                    "int_a",
+                    "click_seq__cat_a",
+                    "click_seq__cat_b",
+                    "click_seq__int_a",
+                ],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+        ]
+        embedding_group = SequenceEmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        embedding_group.eval()
+        graph = symbolic_trace(embedding_group).graph
+        marked = {
+            node.args[0]
+            for node in graph.nodes
+            if node.op == "call_function" and node.target == fx_mark_seq_ec_jt
+        }
+        self.assertEqual(
+            marked, {"cat_a", "cat_b", "click_seq__cat_a", "click_seq__cat_b"}
+        )
 
     @parameterized.expand(
         [

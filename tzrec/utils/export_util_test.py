@@ -24,8 +24,21 @@ import torch
 from torch import distributed as dist
 from torchrec import KeyedJaggedTensor, KeyedTensor
 from torchrec.distributed.train_pipeline.utils import Tracer
-from torchrec.modules.embedding_configs import EmbeddingBagConfig
-from torchrec.modules.embedding_modules import EmbeddingBagCollection
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
+from torchrec.modules.mc_embedding_modules import (
+    ManagedCollisionEmbeddingBagCollection,
+    ManagedCollisionEmbeddingCollection,
+)
+from torchrec.modules.mc_modules import (
+    DistanceLFU_EvictionPolicy,
+    LFU_EvictionPolicy,
+    ManagedCollisionCollection,
+    MCHManagedCollisionModule,
+)
 
 from tzrec.acc import utils as acc_utils
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
@@ -42,6 +55,7 @@ from tzrec.protos.models import rank_model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util, misc_util
 from tzrec.utils.export_util import (
+    _add_module_by_dotted_path,
     _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
     _get_sparse_embedding_tensor,
@@ -617,6 +631,194 @@ class ExportUtilTest(unittest.TestCase):
             self.assertEqual(emb_meta[table_fqn]["row_bytes"], 6)
             self.assertEqual(emb_meta[table_fqn]["quant"]["format"], "QUint8RowwiseF16")
             self.assertEqual(emb_meta[table_fqn]["value_name"], f"{table_fqn}.values")
+        finally:
+            _restore_env(old_env)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_sparse_export_converts_zch_tables_to_dynamic(self) -> None:
+        """ZCH tables serve by raw id, so they export as dynamic tables."""
+        invalid_raw_id = torch.iinfo(torch.int64).max
+
+        def _make_mch(zch_size, eviction_policy):  # type: ignore[no-untyped-def]
+            return MCHManagedCollisionModule(
+                zch_size=zch_size,
+                device=torch.device("cpu"),
+                eviction_policy=eviction_policy,
+                eviction_interval=2,
+            )
+
+        def _set_mch_state(mch, raw_ids, remapped_ids, metadata):  # type: ignore[no-untyped-def]
+            mch._buffers["_mch_sorted_raw_ids"].copy_(torch.tensor(raw_ids))
+            mch._buffers["_mch_remapped_ids_mapping"].copy_(torch.tensor(remapped_ids))
+            for name, value in metadata.items():
+                mch._buffers[name].copy_(torch.tensor(value))
+
+        model = torch.nn.Module()
+
+        user_id_config = EmbeddingBagConfig(
+            name="user_id_emb",
+            embedding_dim=2,
+            num_embeddings=4,
+            feature_names=["user_id"],
+        )
+        plain_config = EmbeddingBagConfig(
+            name="plain_emb",
+            embedding_dim=2,
+            num_embeddings=2,
+            feature_names=["plain_id"],
+        )
+        seq_config = EmbeddingConfig(
+            name="seq_emb",
+            embedding_dim=2,
+            num_embeddings=3,
+            feature_names=["click_seq__cate"],
+        )
+
+        mc_ebc_weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        for path in ("mc_ebc", "mc_ebc_user"):
+            mc_ebc = ManagedCollisionEmbeddingBagCollection(
+                EmbeddingBagCollection([user_id_config], device=torch.device("cpu")),
+                ManagedCollisionCollection(
+                    {"user_id_emb": _make_mch(4, LFU_EvictionPolicy())},
+                    [user_id_config],
+                ),
+            )
+            mc_ebc._embedding_module.embedding_bags["user_id_emb"].weight.data.copy_(
+                mc_ebc_weight
+            )
+            _set_mch_state(
+                mc_ebc._managed_collision_collection._managed_collision_modules[
+                    "user_id_emb"
+                ],
+                raw_ids=[101, 202, 303, invalid_raw_id],
+                remapped_ids=[2, 0, 3, 3],
+                metadata={"_mch_counts": [5, 7, 9, 0]},
+            )
+            _add_module_by_dotted_path(
+                model, f"model.embedding_group.emb_impls.__BASE__.{path}", mc_ebc
+            )
+
+        plain_ebc = EmbeddingBagCollection([plain_config], device=torch.device("cpu"))
+        plain_ebc.embedding_bags["plain_emb"].weight.data.copy_(
+            torch.tensor([[7.0, 7.1], [8.0, 8.1]])
+        )
+        _add_module_by_dotted_path(
+            model, "model.embedding_group.emb_impls.__BASE__.ebc", plain_ebc
+        )
+
+        mc_ec = ManagedCollisionEmbeddingCollection(
+            EmbeddingCollection([seq_config], device=torch.device("cpu")),
+            ManagedCollisionCollection(
+                {"seq_emb": _make_mch(3, DistanceLFU_EvictionPolicy())}, [seq_config]
+            ),
+        )
+        mc_ec._embedding_module.embeddings["seq_emb"].weight.data.copy_(
+            torch.tensor([[4.0, 4.1], [5.0, 5.1], [6.0, 6.1]])
+        )
+        _set_mch_state(
+            mc_ec._managed_collision_collection._managed_collision_modules["seq_emb"],
+            raw_ids=[11, 22, invalid_raw_id],
+            remapped_ids=[1, 2, 2],
+            metadata={"_mch_counts": [3, 4, 0], "_mch_last_access_iter": [30, 40, 0]},
+        )
+        _add_module_by_dotted_path(
+            model, "model.embedding_group.seq_emb_impls.__BASE__.mc_ec_dict.2", mc_ec
+        )
+
+        zch_ebc_fqn = (
+            "model.embedding_group.emb_impls.__BASE__.mc_ebc."
+            "_embedding_module.embedding_bags.user_id_emb"
+        )
+        zch_ebc_user_fqn = zch_ebc_fqn.replace("mc_ebc.", "mc_ebc_user.")
+        plain_fqn = (
+            "model.embedding_group.emb_impls.__BASE__.ebc.embedding_bags.plain_emb"
+        )
+        zch_ec_fqn = (
+            "model.embedding_group.seq_emb_impls.__BASE__.mc_ec_dict.2."
+            "_embedding_module.embeddings.seq_emb"
+        )
+
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_zch_")
+        old_env = {"DIST_QUANT": os.environ.get("DIST_QUANT")}
+        try:
+            os.environ.pop("DIST_QUANT", None)
+            out, dynamic_out, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                model,
+                tmp,
+                {
+                    zch_ec_fqn: SimpleNamespace(
+                        name="seq_emb",
+                        embedding_dim=2,
+                        feature_names=["click_seq__cate"],
+                    )
+                },
+                {
+                    zch_ebc_fqn: SimpleNamespace(
+                        name="user_id_emb",
+                        embedding_dim=2,
+                        feature_names=["user_id"],
+                        pooling="SUM",
+                    ),
+                    zch_ebc_user_fqn: SimpleNamespace(
+                        name="user_id_emb",
+                        embedding_dim=2,
+                        feature_names=["user_id"],
+                        pooling="SUM",
+                    ),
+                    plain_fqn: SimpleNamespace(
+                        name="plain_emb",
+                        embedding_dim=2,
+                        feature_names=["plain_id"],
+                        pooling="SUM",
+                    ),
+                },
+            )
+
+            self.assertEqual(sorted(out.keys()), [plain_fqn])
+            np.testing.assert_array_equal(
+                out[plain_fqn], np.array([[7.0, 7.1], [8.0, 8.1]], dtype=np.float32)
+            )
+            self.assertFalse(emb_meta[plain_fqn]["is_dynamic"])
+            self.assertNotIn(zch_ebc_user_fqn, emb_meta)
+
+            torch.testing.assert_close(
+                dynamic_out[f"{zch_ebc_fqn}.keys"], torch.tensor([101, 202, 303])
+            )
+            np.testing.assert_array_equal(
+                dynamic_out[f"{zch_ebc_fqn}.values"],
+                np.array([[2.0, 2.1], [0.0, 0.1], [3.0, 3.1]], dtype=np.float32),
+            )
+            torch.testing.assert_close(
+                dynamic_out[f"{zch_ebc_fqn}.scores"], torch.tensor([5, 7, 9])
+            )
+            self.assertTrue(emb_meta[zch_ebc_fqn]["is_dynamic"])
+            self.assertEqual(emb_meta[zch_ebc_fqn]["shape"], [3, 2])
+            self.assertEqual(emb_meta[zch_ebc_fqn]["key_dtype"], "int64")
+            self.assertEqual(emb_meta[zch_ebc_fqn]["score_dtype"], "int64")
+            self.assertEqual(emb_meta[zch_ebc_fqn]["key_name"], f"{zch_ebc_fqn}.keys")
+            self.assertEqual(
+                emb_meta[zch_ebc_fqn]["value_name"], f"{zch_ebc_fqn}.values"
+            )
+            self.assertEqual(
+                emb_meta[zch_ebc_fqn]["score_name"], f"{zch_ebc_fqn}.scores"
+            )
+            self.assertEqual(
+                feat_meta["user_id__ebc"],
+                {"embedding_name": zch_ebc_fqn, "pooling": "SUM"},
+            )
+
+            torch.testing.assert_close(
+                dynamic_out[f"{zch_ec_fqn}.keys"], torch.tensor([11, 22])
+            )
+            np.testing.assert_array_equal(
+                dynamic_out[f"{zch_ec_fqn}.values"],
+                np.array([[5.0, 5.1], [6.0, 6.1]], dtype=np.float32),
+            )
+            # DistanceLFU keeps counts and last access iter, recency is the score.
+            torch.testing.assert_close(
+                dynamic_out[f"{zch_ec_fqn}.scores"], torch.tensor([30, 40])
+            )
+            self.assertTrue(emb_meta[zch_ec_fqn]["is_dynamic"])
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
