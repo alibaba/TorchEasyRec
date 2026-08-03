@@ -1028,6 +1028,39 @@ class DatasetTest(unittest.TestCase):
         else:
             self.assertEqual(list(batch.reserves.get().column_names), ["label"])
 
+    def test_dataset_predict_all_effective_columns(self):
+        input_fields = [
+            pa.field(name="int_a", type=pa.int64()),
+            pa.field(name="float_b", type=pa.float64()),
+            pa.field(name="item_id", type=pa.int64()),
+        ]
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(feature_name="int_a")
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="float_b")
+            ),
+        ]
+        dataset = _TestDataset(
+            data_config=data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.OdpsDataset,
+                fg_mode=data_pb2.FgMode.FG_NONE,
+            ),
+            features=create_features(feature_cfgs),
+            input_path="",
+            reserved_columns=["ALL_EFFECTIVE_COLUMNS", "item_id"],
+            mode=Mode.PREDICT,
+            input_fields=input_fields,
+        )
+
+        self.assertEqual(dataset._selected_input_names, {"int_a", "float_b", "item_id"})
+        batch = next(iter(dataset))
+        self.assertEqual(
+            list(batch.reserves.get().column_names), ["int_a", "float_b", "item_id"]
+        )
+
     def test_dataset_with_tdm_sampler_and_remain_ratio(self):
         node = tempfile.NamedTemporaryFile("w")
         self._temp_files.append(node)
