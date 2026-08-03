@@ -91,6 +91,28 @@ def use_dense_ema(
     return train_config.dense_optimizer.HasField("ema")
 
 
+def get_inference_batch_size(data_config: data_pb2.DataConfig) -> int:
+    """Get the effective batch size for a non-training dataloader.
+
+    Args:
+        data_config: Data configuration containing batch-size settings.
+    """
+    if data_config.HasField("eval_batch_size"):
+        return data_config.eval_batch_size
+    return data_config.batch_size
+
+
+def set_inference_batch_size(data_config: data_pb2.DataConfig, batch_size: int) -> None:
+    """Set and synchronize the batch size used by inference paths.
+
+    Args:
+        data_config: Data configuration containing batch-size settings.
+        batch_size: Batch size to use for non-training dataloaders.
+    """
+    data_config.batch_size = batch_size
+    data_config.eval_batch_size = batch_size
+
+
 def _get_compatible_fg_mode(data_config: data_pb2.DataConfig) -> FgMode:
     """Compat for fg_encoded."""
     if data_config.HasField("fg_encoded"):

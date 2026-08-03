@@ -241,7 +241,7 @@ def tdm_retrieval(
         os.path.join(scripted_model_path, "pipeline.config")
     )
     if batch_size:
-        pipeline_config.data_config.batch_size = batch_size
+        config_util.set_inference_batch_size(pipeline_config.data_config, batch_size)
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
 
@@ -258,13 +258,18 @@ def tdm_retrieval(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
 
+    reserved_input_columns = [
+        "ALL_EFFECTIVE_COLUMNS",
+        data_config.tdm_sampler.item_id_field,
+        *(reserved_cols or []),
+    ]
     infer_data_config = copy.copy(data_config)
     infer_data_config.num_workers = 1
     infer_dataloader = create_dataloader(
         infer_data_config,
         features,
         predict_input_path,
-        reserved_columns=["ALL_COLUMNS"],
+        reserved_columns=reserved_input_columns,
         mode=Mode.PREDICT,
         debug_level=debug_level,
     )

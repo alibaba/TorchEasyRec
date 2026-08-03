@@ -41,6 +41,7 @@ from tzrec.datasets.utils import (
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
 
@@ -138,7 +139,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._selected_input_names = set()
         self._selected_input_names |= self._data_parser.feature_input_names
         if self._mode == Mode.PREDICT:
-            self._selected_input_names |= set(self._reserved_columns)
+            self._selected_input_names |= set(self._reserved_columns) - {
+                "ALL_EFFECTIVE_COLUMNS"
+            }
         else:
             self._selected_input_names |= set(data_config.label_fields)
             self._selected_input_names |= set(data_config.sample_weight_fields)
@@ -188,8 +191,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._fg_mode = data_config.fg_mode
         self._fg_encoded_multival_sep = data_config.fg_encoded_multival_sep
 
-        if mode != Mode.TRAIN and data_config.HasField("eval_batch_size"):
-            self._batch_size = data_config.eval_batch_size
+        if mode != Mode.TRAIN:
+            self._batch_size = config_util.get_inference_batch_size(data_config)
         else:
             self._batch_size = data_config.batch_size
 
@@ -365,9 +368,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._mode == Mode.PREDICT:
             batch = self._data_parser.to_batch(output_data, force_no_tile=True)
             reserved_data = {}
-            if (
-                len(self._reserved_columns) > 0
-                and self._reserved_columns[0] == "ALL_COLUMNS"
+            if len(self._reserved_columns) > 0 and self._reserved_columns[0] in (
+                "ALL_COLUMNS",
+                "ALL_EFFECTIVE_COLUMNS",
             ):
                 reserved_data = input_data
             else:
