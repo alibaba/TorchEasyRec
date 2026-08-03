@@ -2368,7 +2368,7 @@ def _get_zch_export_tables(
 
 def _zch_table_to_dynamic(
     mch: MCHManagedCollisionModule,
-    local_tensor: np.ndarray,
+    weight: torch.Tensor,
     shard_offset: int,
     emb_name: str,
 ) -> Tuple[torch.Tensor, np.ndarray, torch.Tensor, np.ndarray]:
@@ -2382,9 +2382,13 @@ def _zch_table_to_dynamic(
     that row is trained on all such ids, so it is exported as the default value
     of the dynamic table instead of being dropped with the unused rows.
 
+    The rows are selected on the weight's device and only the selected rows are
+    copied to host; copying the whole shard to host first would need a second
+    table-sized host array for the indexed rows.
+
     Args:
         mch: ZCH module holding the raw id to row mapping of this shard.
-        local_tensor: embedding rows of this shard.
+        weight: embedding rows of this shard.
         shard_offset: global row offset of this shard.
         emb_name: export table name, for error messages.
 
@@ -2394,8 +2398,8 @@ def _zch_table_to_dynamic(
         scores: eviction score per key.
         default_value: single embedding row served for any other key.
     """
-    raw_ids = mch._buffers["_mch_sorted_raw_ids"].cpu()
-    remapped_ids = mch._buffers["_mch_remapped_ids_mapping"].cpu()
+    raw_ids = mch._buffers["_mch_sorted_raw_ids"].to(weight.device)
+    remapped_ids = mch._buffers["_mch_remapped_ids_mapping"].to(weight.device)
     # LFU keeps counts only, LRU keeps last access iter only, DistanceLFU keeps
     # both and its recency part maps onto the dynamic table score.
     score_buffer = None
@@ -2408,12 +2412,13 @@ def _zch_table_to_dynamic(
             f"zch table {emb_name} has no eviction metadata buffer to export "
             "as dynamic table score."
         )
+    score_buffer = score_buffer.to(weight.device)
 
     valid_mask = raw_ids != torch.iinfo(torch.int64).max
     keys = raw_ids[valid_mask]
     rows = remapped_ids[valid_mask] - shard_offset
-    scores = score_buffer.cpu()[valid_mask].to(torch.int64)
-    num_rows = local_tensor.shape[0]
+    scores = score_buffer[valid_mask].to(torch.int64)
+    num_rows = weight.shape[0]
     if keys.numel() > 0 and (
         int(rows.min().item()) < 0 or int(rows.max().item()) >= num_rows
     ):
@@ -2430,10 +2435,10 @@ def _zch_table_to_dynamic(
             f"{num_rows} embedding rows at shard offset {shard_offset}."
         )
     return (
-        keys,
-        local_tensor[rows.numpy()],
-        scores,
-        local_tensor[default_row : default_row + 1],
+        keys.cpu(),
+        weight.index_select(0, rows).cpu().numpy(),
+        scores.cpu(),
+        weight[default_row : default_row + 1].cpu().numpy(),
     )
 
 
@@ -2509,20 +2514,21 @@ def _get_sparse_embedding_tensor(
     )
 
     def _add_sparse_table(
-        export_emb_name: str, local_tensor: np.ndarray, shard_offset: int
+        export_emb_name: str, weight: torch.Tensor, shard_offset: int
     ) -> None:
         emb_dim = emb_name_to_emb_dim[export_emb_name]
         mch = zch_tables.get(export_emb_name)
         if mch is None:
             export_tensor, export_meta = _prepare_sparse_export_values(
-                local_tensor, emb_dim, export_emb_name
+                weight.detach().cpu().numpy(), emb_dim, export_emb_name
             )
             out[export_emb_name] = export_tensor
             emb_name_to_export_meta[export_emb_name] = export_meta
             return
 
+        # zch rows are gathered on device, so only the exported rows reach host.
         keys, values, scores, default_value = _zch_table_to_dynamic(
-            mch, local_tensor, shard_offset, export_emb_name
+            mch, weight.detach(), shard_offset, export_emb_name
         )
         export_tensor, export_meta = _prepare_sparse_export_values(
             values, emb_dim, export_emb_name
@@ -2574,19 +2580,17 @@ def _get_sparse_embedding_tensor(
                     assert placement is not None
                     if placement.rank() == rank:
                         # name = name + f"/part_{idx}_{num_shards}"
-                        local_tensor = values.local_tensor().cpu().numpy()
-                        if list(local_tensor.shape)[-1] == emb_dim:
+                        if list(values.shape)[-1] == emb_dim:
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
                             _add_sparse_table(
                                 export_emb_name,
-                                local_tensor,
+                                values.local_tensor(),
                                 shards_meta.shard_offsets[0],
                             )
                             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
-            local_tensor = values.detach().cpu().numpy()
-            _add_sparse_table(export_emb_name, local_tensor, 0)
+            _add_sparse_table(export_emb_name, values, 0)
             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
