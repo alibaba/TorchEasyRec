@@ -76,7 +76,6 @@ generation needs a fresh output directory.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from contextlib import ExitStack, closing
 from dataclasses import dataclass
@@ -108,11 +107,9 @@ from tzrec.utils.sid.collision import (
     KnnCollisionResolver,
     PriorOccupancy,
     RandomCollisionResolver,
-    bands_of_bucket_keys,
     build_original_item_grouping,
     build_resolved_item_grouping,
     concat_ranges,
-    in_sorted_bands,
     lookup_sorted,
     prepare_collision_plan,
     sid_band_ids,
@@ -205,7 +202,6 @@ class ResolveSidCollisionsConfig:
     random_num_candidates: int
     rate_only: bool
     odps_data_quota_name: str
-    # Append mode; defaulted so full-resolve callers need not pass them.
     existing_sid_map_path: Optional[str] = None
     existing_sid_groups_path: Optional[str] = None
     delta_map_output_path: Optional[str] = None
@@ -236,7 +232,6 @@ class ResolveSidCollisionsConfig:
                 "is set; without it the merged map would hold only the new items."
             )
 
-        # Append-only paths are ignored, not rejected, outside append mode.
         candidates = [self.output_path, self.resolved_sid_groups_output_path]
         candidates.append(self.original_sid_groups_output_path)
         if self.is_append:
@@ -593,8 +588,6 @@ class CollisionResolutionRunner:
 
         layer_sizes = self._config.layer_sizes
         if codes.shape[1] != len(layer_sizes):
-            # prepare_collision_plan raises the same way, but only after these
-            # two corpus-sized passes would already have run.
             raise ValueError(
                 f"codes have {codes.shape[1]} layers but --codebook has "
                 f"{len(layer_sizes)}."
@@ -619,24 +612,22 @@ class CollisionResolutionRunner:
     def _decode_grouped_item_ids(self, values: pa.Array) -> Tuple[np.ndarray, pa.Array]:
         """Decode a grouped item-ID column into per-group counts and values.
 
-        Inverse of :meth:`_grouped_item_ids_column`. List columns stay
-        zero-copy; the CSV form is a JSON array string that must be parsed --
-        a comma count would be wrong for string IDs containing commas -- so
-        both halves come out of one parse rather than two.
+        Inverse of :meth:`_grouped_item_ids_column`: list columns stay
+        zero-copy, the CSV form splits on the comma it was joined with.
         """
         if _is_list_column(values):
-            lengths = (
-                pc.list_value_length(values)
-                .to_numpy(zero_copy_only=False)
-                .astype(np.int64, copy=False)
-            )
-            return lengths, values.flatten()
-        groups = [json.loads(text) for text in values.to_pylist()]
-        lengths = np.fromiter(
-            (len(group) for group in groups), dtype=np.int64, count=len(groups)
+            lists = values
+        else:
+            lists = pc.split_pattern(pc.cast(values, pa.string()), ",")
+        lengths = (
+            pc.list_value_length(lists)
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int64, copy=False)
         )
-        flat = [item_id for group in groups for item_id in group]
-        return lengths, pa.array(flat, type=self._item_id_type)
+        flat = lists.flatten()
+        if self._item_id_type is not None and flat.type != self._item_id_type:
+            flat = pc.cast(flat, self._item_id_type)
+        return lengths, flat
 
     def _align_codes_column(self, values: pa.Array, is_csv: bool) -> pa.Array:
         """Return an SID column in the encoding the destination writer needs.
@@ -703,8 +694,6 @@ class CollisionResolutionRunner:
 
             lengths, flat_ids = self._decode_grouped_item_ids(batch["itemids"])
             if len(flat_ids):
-                self._check_state_item_id_type(flat_ids, "existing SID groups")
-                # Hash membership avoids materializing IDs as Python objects.
                 published = pc.is_in(flat_ids, value_set=new_item_ids)
                 batch_overlap = int(pc.sum(published).as_py() or 0)
                 overlap_count += batch_overlap
@@ -713,7 +702,7 @@ class CollisionResolutionRunner:
                         flat_ids.filter(published).slice(0, 10).to_pylist()
                     )
 
-            keep = in_sorted_bands(keys, wanted_bands, layer_sizes[-1])
+            _, keep = lookup_sorted(wanted_bands, keys // layer_sizes[-1])
             if np.any(keep):
                 key_chunks.append(keys[keep])
                 count_chunks.append(lengths[keep])
@@ -745,10 +734,8 @@ class CollisionResolutionRunner:
             return
         layer_sizes = self._config.layer_sizes
         domain = prior.bucket_keys
-        bands = np.unique(bands_of_bucket_keys(domain, layer_sizes[-1]))
+        bands = np.unique(domain // layer_sizes[-1])
         unknown_keys: List[int] = []
-        # Reduce once at the end: a per-batch reduction would allocate a
-        # domain-sized accumulator for every batch.
         position_chunks: List[np.ndarray] = []
         index_chunks: List[np.ndarray] = []
 
@@ -758,8 +745,8 @@ class CollisionResolutionRunner:
             "Cross-checking published SID map",
         ):
             keys = sid_bucket_keys(self._codes_matrix(batch["codebook"]), layer_sizes)
-            # Buckets outside the new batch's bands cannot affect this run.
-            rows = np.flatnonzero(in_sorted_bands(keys, bands, layer_sizes[-1]))
+            _, known_band = lookup_sorted(bands, keys // layer_sizes[-1])
+            rows = np.flatnonzero(known_band)
             if rows.size == 0:
                 continue
             keys = keys[rows]
@@ -786,8 +773,6 @@ class CollisionResolutionRunner:
             sum_index = np.bincount(
                 positions, weights=indices, minlength=domain.shape[0]
             ).astype(np.int64, copy=False)
-            # Segment maximum via one stable sort plus reduceat; np.maximum.at
-            # is unbuffered and far slower at corpus scale.
             order = np.argsort(positions, kind="stable")
             sorted_positions = positions[order]
             starts = np.flatnonzero(
@@ -874,29 +859,14 @@ class CollisionResolutionRunner:
         if not is_csv:
             return pa.ListArray.from_arrays(arrow_offsets, values)
 
-        if pa.types.is_integer(values.type):
-            encoded_values = pc.cast(values, pa.string())
-        else:
-            try:
-                encoded_values = pa.array(
-                    [
-                        json.dumps(
-                            value,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
-                        for value in values.to_pylist()
-                    ],
-                    type=pa.string(),
-                )
-            except (TypeError, ValueError) as error:
-                raise ValueError(
-                    "CSV SID group output cannot JSON-encode item ID type "
-                    f"{values.type}."
-                ) from error
+        encoded_values = pc.cast(values, pa.string())
+        if pc.any(pc.match_substring(encoded_values, ",")).as_py():
+            raise ValueError(
+                "CSV SID group output joins item IDs with commas, so an item ID "
+                "cannot itself contain one; use parquet or ODPS for such IDs."
+            )
         encoded_lists = pa.ListArray.from_arrays(arrow_offsets, encoded_values)
-        joined_values = pc.binary_join(encoded_lists, ",")
-        return pc.binary_join_element_wise("[", joined_values, "]", "")
+        return pc.binary_join(encoded_lists, ",")
 
     @staticmethod
     def _codes_column(codes: np.ndarray, is_csv: bool) -> pa.Array:
@@ -926,25 +896,9 @@ class CollisionResolutionRunner:
         )
         return pa.ListArray.from_arrays(offsets, values)
 
-    def _map_write_chunk_rows(self, is_csv: bool, layer_count: int) -> int:
-        """Return the largest map row count one write can encode.
-
-        Args:
-            is_csv: Whether the destination writer is a CSV writer.
-            layer_count: Number of SID layers per row.
-
-        Returns:
-            The chunk size in rows.
-
-        Raises:
-            ValueError: If a single row exceeds Arrow list offset capacity.
-        """
-        return _max_code_rows(is_csv, layer_count, _MAP_WRITE_ROWS)
-
     def _write_new_map_rows(
         self,
         writer: BaseWriter,
-        is_csv: bool,
         item_ids: np.ndarray,
         origin_codes: np.ndarray,
         result: CollisionResolutionResult,
@@ -952,9 +906,10 @@ class CollisionResolutionRunner:
         written: int,
     ) -> None:
         """Write this run's own item rows in chunks, without a full code copy."""
+        is_csv = isinstance(writer, CsvWriter)
         output_count = item_ids.shape[0]
         last_progress_count = written
-        write_chunk = self._map_write_chunk_rows(is_csv, origin_codes.shape[1])
+        write_chunk = _max_code_rows(is_csv, origin_codes.shape[1], _MAP_WRITE_ROWS)
         for start in range(0, output_count, write_chunk):
             end = min(start + write_chunk, output_count)
             selection = slice(start, end)
@@ -974,7 +929,7 @@ class CollisionResolutionRunner:
                 progress.log(written, suffix=f"{written} samples processed")
                 last_progress_count = written
 
-    def _stream_existing_map_rows(self, writer: BaseWriter, is_csv: bool) -> int:
+    def _stream_existing_map_rows(self, writer: BaseWriter) -> int:
         """Copy every published map row into the merged output unchanged.
 
         Existing rows keep their item ID, both codebooks and their slot index
@@ -986,18 +941,15 @@ class CollisionResolutionRunner:
         path = self._config.existing_sid_map_path
         if path is None or not self._config.is_append:
             return 0
-        fields = [
-            "item_id",
-            "origin_codebook",
-            "codebook",
-            "index",
-        ]
+        is_csv = isinstance(writer, CsvWriter)
+        fields = ["item_id", "origin_codebook", "codebook", "index"]
         written = 0
-        for batch in self._iter_state_batches(
-            path, fields, "Copying published item map"
+        for index, batch in enumerate(
+            self._iter_state_batches(path, fields, "Copying published item map")
         ):
             item_id_column = batch["item_id"]
-            self._check_state_item_id_type(item_id_column, "existing SID map")
+            if index == 0:
+                self._check_state_item_id_type(item_id_column, "existing SID map")
             writer.write(
                 {
                     "item_id": item_id_column,
@@ -1027,21 +979,18 @@ class CollisionResolutionRunner:
         if output_path is None:
             raise RuntimeError("map output path was not validated.")
         with closing(self._make_writer(output_path)) as writer:
-            is_csv = isinstance(writer, CsvWriter)
             progress = ProgressLogger("Writing resolved item map", start_n=0)
-            written = self._stream_existing_map_rows(writer, is_csv)
+            written = self._stream_existing_map_rows(writer)
             self._write_new_map_rows(
-                writer, is_csv, item_ids, origin_codes, result, progress, written
+                writer, item_ids, origin_codes, result, progress, written
             )
 
-        # Ignored outside append mode; there it would duplicate the full map.
         delta_path = self._config.delta_map_output_path
         if delta_path is None or not self._config.is_append:
             return
         with closing(self._make_writer(delta_path)) as writer:
             self._write_new_map_rows(
                 writer,
-                isinstance(writer, CsvWriter),
                 item_ids,
                 origin_codes,
                 result,
@@ -1112,7 +1061,6 @@ class CollisionResolutionRunner:
     def _emit_group_rows(
         self,
         writer: BaseWriter,
-        is_csv: bool,
         codes: np.ndarray,
         offsets: np.ndarray,
         values: pa.Array,
@@ -1122,6 +1070,7 @@ class CollisionResolutionRunner:
 
         ``rows`` selects a subset of the groups, or ``None`` for all of them.
         """
+        is_csv = isinstance(writer, CsvWriter)
         lengths = np.diff(offsets)
         if rows is not None:
             if rows.size == 0:
@@ -1188,14 +1137,12 @@ class CollisionResolutionRunner:
             writer = stack.enter_context(closing(self._make_writer(resolved_path)))
             is_csv = isinstance(writer, CsvWriter)
             delta_writer: Optional[BaseWriter] = None
-            delta_is_csv = False
             if self._config.delta_sid_groups_output_path is not None:
                 delta_writer = stack.enter_context(
                     closing(
                         self._make_writer(self._config.delta_sid_groups_output_path)
                     )
                 )
-                delta_is_csv = isinstance(delta_writer, CsvWriter)
 
             def emit(
                 codes: np.ndarray,
@@ -1204,10 +1151,10 @@ class CollisionResolutionRunner:
                 delta_rows: Optional[np.ndarray],
             ) -> None:
                 """Write one chunk to the corpus output and the delta output."""
-                self._emit_group_rows(writer, is_csv, codes, offsets, values)
+                self._emit_group_rows(writer, codes, offsets, values)
                 if delta_writer is not None:
                     self._emit_group_rows(
-                        delta_writer, delta_is_csv, codes, offsets, values, delta_rows
+                        delta_writer, codes, offsets, values, delta_rows
                     )
 
             max_rows = _max_code_rows(is_csv, groups.codes.shape[1], group_count)
@@ -1243,7 +1190,6 @@ class CollisionResolutionRunner:
                 batch_lengths, batch_values = self._decode_grouped_item_ids(
                     batch["itemids"]
                 )
-                self._check_state_item_id_type(batch_values, "existing SID groups")
                 emit(
                     *_merge_group_batch(
                         batch_keys,
@@ -1411,8 +1357,6 @@ def _merge_group_batch(
     consumed[positions[matched]] = True
     unmatched = low + np.flatnonzero(~consumed)
 
-    # Interleave by key: every key is unique across the union because matched
-    # pairs collapse into a single row.
     output_rows = batch_rows + unmatched.shape[0]
     batch_slots = np.arange(batch_rows) + np.searchsorted(
         groups.keys[unmatched], batch_keys, side="left"
@@ -1442,8 +1386,6 @@ def _merge_group_batch(
     offsets = np.zeros(output_rows + 1, dtype=np.int64)
     np.cumsum(batch_part + new_part, out=offsets[1:])
 
-    # Take only the slice of new item IDs this batch needs, so the copy stays
-    # proportional to the batch.
     child_low = int(groups.offsets[low])
     child_high = int(groups.offsets[high])
     combined = pa.concat_arrays(

@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
 import shutil
 import unittest
@@ -124,7 +123,7 @@ def _groups_csv(path, rows):
         pa.table(
             {
                 "codebook": [",".join(map(str, r[0])) for r in rows],
-                "itemids": ["[" + ",".join(map(str, r[1])) + "]" for r in rows],
+                "itemids": [",".join(map(str, r[1])) for r in rows],
             }
         ),
         os.path.join(path, "part-0.csv"),
@@ -526,12 +525,12 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             for groups in (original, resolved):
                 self.assertEqual(groups.column_names, ["codebook", "itemids"])
                 self.assertEqual(groups.schema.field("itemids").type, pa.string())
-                self.assertTrue(
-                    all(
-                        isinstance(json.loads(itemids), list)
-                        for itemids in groups["itemids"].to_pylist()
-                    )
-                )
+                grouped = [
+                    item
+                    for itemids in groups["itemids"].to_pylist()
+                    for item in itemids.split(",")
+                ]
+                self.assertCountEqual(grouped, [str(i) for i in item_ids])
         else:
             result = parquet.read_table(os.path.join(out, "part-0.parquet"))
             self.assertEqual(result.schema.field("codebook").type, pa.list_(pa.int64()))
@@ -550,10 +549,10 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                     groups.schema.field("itemids").type, pa.list_(pa.string())
                 )
 
-    def test_csv_group_itemids_use_json_escaping(self) -> None:
+    def test_csv_group_itemids_are_comma_joined(self) -> None:
         inp = os.path.join(self.test_dir, "in.csv")
         out = os.path.join(self.test_dir, "out")
-        item_ids = ["a;b", "x|y", "with,comma", 'with"quote', "back\\slash"]
+        item_ids = ["a;b", "x|y", 'with"quote', "back\\slash"]
         _csv(inp, item_ids, [[0, 0]] * len(item_ids))
 
         self._run(
@@ -567,8 +566,21 @@ class ResolveSidCollisionsTest(unittest.TestCase):
 
         original_path, _ = self._group_paths(out)
         groups = csv.read_csv(os.path.join(original_path, "part-0.csv"))
-        decoded_ids = json.loads(groups["itemids"][0].as_py())
-        self.assertCountEqual(decoded_ids, item_ids)
+        self.assertCountEqual(groups["itemids"][0].as_py().split(","), item_ids)
+
+    def test_csv_group_itemids_reject_embedded_comma(self) -> None:
+        inp = os.path.join(self.test_dir, "in.csv")
+        out = os.path.join(self.test_dir, "out")
+        _csv(inp, ["ok", "with,comma"], [[0, 0]] * 2)
+
+        with self.assertRaisesRegex(ValueError, "cannot itself contain one"):
+            self._run(
+                inp,
+                out,
+                reader_type="CsvReader",
+                writer_type="CsvWriter",
+                max_items_per_codebook=4,
+            )
 
     def test_preserves_integer_item_id_type(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")

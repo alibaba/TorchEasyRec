@@ -72,8 +72,6 @@ def concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     total = int(lengths.sum())
     if total == 0:
         return np.empty(0, dtype=np.int64)
-    # Cumulative sum of per-position steps: 1 inside a range, and the jump to
-    # the next range's start at each boundary.
     steps = np.ones(total, dtype=np.int64)
     steps[0] = starts[0]
     if starts.shape[0] > 1:
@@ -92,26 +90,8 @@ def lookup_sorted(
     """
     positions = np.searchsorted(sorted_keys, keys)
     found = positions < sorted_keys.shape[0]
-    # Self-masking keeps the equality test to in-bounds positions only.
     found[found] = sorted_keys[positions[found]] == keys[found]
     return positions, found
-
-
-def bands_of_bucket_keys(bucket_keys: np.ndarray, last_size: int) -> np.ndarray:
-    """Return the band of every bucket key, inverting :func:`sid_bucket_keys`."""
-    return np.asarray(bucket_keys, dtype=np.int64) // last_size
-
-
-def in_sorted_bands(
-    bucket_keys: np.ndarray, bands: np.ndarray, last_size: int
-) -> np.ndarray:
-    """Return a mask of the keys whose band appears in ``bands``.
-
-    ``bands`` must be ascending and unique, so membership is a binary search
-    rather than the whole-set sort ``np.isin`` would do on every call.
-    """
-    _, found = lookup_sorted(bands, bands_of_bucket_keys(bucket_keys, last_size))
-    return found
 
 
 @dataclass(frozen=True)
@@ -481,19 +461,15 @@ class CollisionResolver(ABC):
         last_size = plan.config.layer_sizes[-1]
         capacity = plan.config.capacity
         prior_counts = plan.prior_bucket_counts
-        # The outer maximum matters: a bucket a previous run left over capacity
-        # keeps its true count, else it would re-issue published slot indices.
         initial_counts = np.maximum(
             prior_counts, np.minimum(prior_counts + plan.bucket_counts, capacity)
         )
         # Relocation only reads or writes buckets in a band with an overflow
         # row. Every other bucket keeps its capped initial count untouched.
         overflow_band_ids = np.unique(plan.overflow_bucket_key_prefixes // last_size)
-        in_overflow_band = in_sorted_bands(
-            plan.bucket_keys, overflow_band_ids, last_size
+        _, in_overflow_band = lookup_sorted(
+            overflow_band_ids, plan.bucket_keys // last_size
         )
-        # Placement treats a missing key as an empty bucket, so a prior-only
-        # bucket must be seeded or it would be overfilled past capacity.
         band_prior = plan.prior.restrict_to_bands(overflow_band_ids, last_size)
         slot_counts = dict(
             zip(band_prior.bucket_keys.tolist(), band_prior.bucket_counts.tolist())
@@ -740,8 +716,8 @@ def stable_order_hash(item_ids: np.ndarray) -> np.ndarray:
     return _splitmix64(base)
 
 
-def _band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
-    """Return the mixed-radix prefix key for each row."""
+def sid_band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
+    """Return the mixed-radix prefix key of every SID row (zeros if one layer)."""
     row_count, layer_count = codes.shape
     if layer_count == 1:
         return np.zeros(row_count, dtype=np.int64)
@@ -752,15 +728,10 @@ def _band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
     return keys
 
 
-def sid_band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
-    """Return the mixed-radix prefix key of every SID row (zeros if one layer)."""
-    return _band_ids(np.asarray(codes), layer_sizes)
-
-
 def sid_bucket_keys(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
     """Return ``band_id * layer_sizes[-1] + last_code`` for every SID row."""
     codes = np.asarray(codes)
-    return _band_ids(codes, layer_sizes) * layer_sizes[-1] + codes[:, -1].astype(
+    return sid_band_ids(codes, layer_sizes) * layer_sizes[-1] + codes[:, -1].astype(
         np.int64, copy=False
     )
 
@@ -873,7 +844,7 @@ def prepare_collision_plan(
             )
 
     original_last_codes = codes[:, -1].astype(np.int64, copy=False)
-    band_ids = _band_ids(codes, config.layer_sizes)
+    band_ids = sid_band_ids(codes, config.layer_sizes)
     order_hashes = stable_order_hash(item_ids)
     (
         bucket_ranks,
