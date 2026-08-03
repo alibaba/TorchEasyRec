@@ -691,7 +691,7 @@ class ExportUtilTest(unittest.TestCase):
                     "user_id_emb"
                 ],
                 raw_ids=[101, 202, 303, invalid_raw_id],
-                remapped_ids=[2, 0, 3, 3],
+                remapped_ids=[2, 0, 1, 3],
                 metadata={"_mch_counts": [5, 7, 9, 0]},
             )
             _add_module_by_dotted_path(
@@ -718,7 +718,7 @@ class ExportUtilTest(unittest.TestCase):
         _set_mch_state(
             mc_ec._managed_collision_collection._managed_collision_modules["seq_emb"],
             raw_ids=[11, 22, invalid_raw_id],
-            remapped_ids=[1, 2, 2],
+            remapped_ids=[1, 0, 2],
             metadata={"_mch_counts": [3, 4, 0], "_mch_last_access_iter": [30, 40, 0]},
         )
         _add_module_by_dotted_path(
@@ -786,10 +786,15 @@ class ExportUtilTest(unittest.TestCase):
             )
             np.testing.assert_array_equal(
                 dynamic_out[f"{zch_ebc_fqn}.values"],
-                np.array([[2.0, 2.1], [0.0, 0.1], [3.0, 3.1]], dtype=np.float32),
+                np.array([[2.0, 2.1], [0.0, 0.1], [1.0, 1.1]], dtype=np.float32),
             )
             torch.testing.assert_close(
                 dynamic_out[f"{zch_ebc_fqn}.scores"], torch.tensor([5, 7, 9])
+            )
+            # zch sends every id it does not hold to its reserved last row.
+            np.testing.assert_array_equal(
+                dynamic_out[f"{zch_ebc_fqn}.default_value"],
+                np.array([[3.0, 3.1]], dtype=np.float32),
             )
             self.assertTrue(emb_meta[zch_ebc_fqn]["is_dynamic"])
             self.assertEqual(emb_meta[zch_ebc_fqn]["shape"], [3, 2])
@@ -803,6 +808,10 @@ class ExportUtilTest(unittest.TestCase):
                 emb_meta[zch_ebc_fqn]["score_name"], f"{zch_ebc_fqn}.scores"
             )
             self.assertEqual(
+                emb_meta[zch_ebc_fqn]["default_value_name"],
+                f"{zch_ebc_fqn}.default_value",
+            )
+            self.assertEqual(
                 feat_meta["user_id__ebc"],
                 {"embedding_name": zch_ebc_fqn, "pooling": "SUM"},
             )
@@ -812,13 +821,93 @@ class ExportUtilTest(unittest.TestCase):
             )
             np.testing.assert_array_equal(
                 dynamic_out[f"{zch_ec_fqn}.values"],
-                np.array([[5.0, 5.1], [6.0, 6.1]], dtype=np.float32),
+                np.array([[5.0, 5.1], [4.0, 4.1]], dtype=np.float32),
             )
             # DistanceLFU keeps counts and last access iter, recency is the score.
             torch.testing.assert_close(
                 dynamic_out[f"{zch_ec_fqn}.scores"], torch.tensor([30, 40])
             )
+            np.testing.assert_array_equal(
+                dynamic_out[f"{zch_ec_fqn}.default_value"],
+                np.array([[6.0, 6.1]], dtype=np.float32),
+            )
             self.assertTrue(emb_meta[zch_ec_fqn]["is_dynamic"])
+        finally:
+            _restore_env(old_env)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_sparse_export_quantizes_zch_default_value(self) -> None:
+        """The default row is quantized like any other row of the table."""
+        weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        mc_ebc_config = EmbeddingBagConfig(
+            name="user_id_emb",
+            embedding_dim=2,
+            num_embeddings=4,
+            feature_names=["user_id"],
+        )
+        mc_ebc = ManagedCollisionEmbeddingBagCollection(
+            EmbeddingBagCollection([mc_ebc_config], device=torch.device("cpu")),
+            ManagedCollisionCollection(
+                {
+                    "user_id_emb": MCHManagedCollisionModule(
+                        zch_size=4,
+                        device=torch.device("cpu"),
+                        eviction_policy=LFU_EvictionPolicy(),
+                        eviction_interval=2,
+                    )
+                },
+                [mc_ebc_config],
+            ),
+        )
+        mc_ebc._embedding_module.embedding_bags["user_id_emb"].weight.data.copy_(weight)
+        mch = mc_ebc._managed_collision_collection._managed_collision_modules[
+            "user_id_emb"
+        ]
+        mch._buffers["_mch_sorted_raw_ids"].copy_(
+            torch.tensor([101, 202, 303, torch.iinfo(torch.int64).max])
+        )
+        mch._buffers["_mch_remapped_ids_mapping"].copy_(torch.tensor([2, 0, 1, 3]))
+        mch._buffers["_mch_counts"].copy_(torch.tensor([5, 7, 9, 0]))
+
+        model = torch.nn.Module()
+        _add_module_by_dotted_path(
+            model, "model.embedding_group.emb_impls.__BASE__.mc_ebc", mc_ebc
+        )
+        table_fqn = (
+            "model.embedding_group.emb_impls.__BASE__.mc_ebc."
+            "_embedding_module.embedding_bags.user_id_emb"
+        )
+
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_zch_quant_")
+        old_env = {"DIST_QUANT": os.environ.get("DIST_QUANT")}
+        try:
+            os.environ["DIST_QUANT"] = "INT8"
+            _, dynamic_out, emb_meta, _ = _get_sparse_embedding_tensor(
+                model,
+                tmp,
+                {},
+                {
+                    table_fqn: SimpleNamespace(
+                        name="user_id_emb",
+                        embedding_dim=2,
+                        feature_names=["user_id"],
+                        pooling="SUM",
+                    )
+                },
+            )
+
+            default_value = dynamic_out[f"{table_fqn}.default_value"]
+            self.assertEqual(default_value.dtype, np.uint8)
+            self.assertEqual(default_value.shape, (1, 6))
+            np.testing.assert_allclose(
+                _dequant_quint8_rowwise_f16(default_value, emb_dim=2),
+                weight[3:].numpy(),
+                atol=5e-3,
+            )
+            self.assertEqual(
+                emb_meta[table_fqn]["default_value_name"], f"{table_fqn}.default_value"
+            )
+            self.assertEqual(emb_meta[table_fqn]["shape"], [3, 2])
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)

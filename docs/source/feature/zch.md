@@ -31,7 +31,7 @@ feature_configs {
 
 配置了 zch 的模型在 `USE_DISTRIBUTED_EMBEDDING=1` 的导出模式下，zch 表会自动转换为动态表导出：导出产物中该表以「原始Id -> Embedding」的键值对形式保存（`sparse_dynamic_embedding-*.npz`，`sparse_embedding.json` 中 `is_dynamic` 为 `true`），推理服务直接用 FG 产出的原始Id查表，无需模型内的Id重映射。导出的Id数为 zch 表中已占用的槽位数，通常小于 `zch_size`。
 
-需要注意，转换后未命中的Id行为与训练不同：训练时未命中的Id会共享 zch 表的默认行，转换为动态表后未命中的Id取初始值（0）。
+需要注意，转换后未命中的Id会取导出的默认 Embedding：zch 表保留最后一行作为所有未准入Id的 Embedding，训练中这一行会被所有未命中的Id更新，导出时该行单独存为动态表的 `default_value`，从而与训练行为保持一致。
 
 导出时每个Id会带一个用于在线淘汰排序的 score，取值来自 zch 的驱逐元数据：`lfu` 取访问次数，`lru` 与 `distance_lfu` 取最近访问的迭代步数。
 
