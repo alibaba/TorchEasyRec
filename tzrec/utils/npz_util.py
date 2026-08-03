@@ -25,8 +25,10 @@ locate entries through the central directory and ignore the local header
 crc/sizes.
 """
 
+import contextlib
 import errno
 import os
+import uuid
 import zipfile
 from typing import Any, Mapping
 
@@ -82,29 +84,44 @@ class _Unseekable:
 def savez_streaming(path: str, arrays: Mapping[str, Any]) -> None:
     """Write *arrays* (name -> array-like) to *path* as an npz, fully streaming.
 
-    Entry naming and ``.npy`` payload match ``np.savez`` (entry ``"<name>.npy"``,
-    ``ZIP_STORED``, C-order little-endian), so the output is interchangeable with
-    ``np.savez`` for readers that go through the central directory (``np.load``,
-    libzip). Unlike ``np.savez`` it never seeks the output file and uses no
-    local temp file, making it safe on OSS-mounted filesystems and immune to
-    local-disk overflow on large shards.
+    Entry naming and payload match ``np.savez``: each value is written as entry
+    ``"<name>.npy"``, ``ZIP_STORED``, with NumPy's standard ``.npy``
+    serialization, so the output is interchangeable with ``np.savez`` for
+    readers that go through the central directory (``np.load``, libzip).
+    Unlike ``np.savez`` it never seeks the output file and uses no local temp
+    file, making it safe on OSS-mounted filesystems and immune to local-disk
+    overflow on large shards.
 
-    A ``<path>.part`` file is streamed first and renamed into place on success,
-    so a crashed export leaves a ``.part`` file that the serving shard-discovery
-    regex (anchored on ``.npz$``) never matches.
+    A unique ``<path>.part.<uuid>`` sibling is streamed first and renamed into
+    place only after it is complete and closed, so neither an in-flight nor a
+    crashed export is visible to the serving shard-discovery regex (anchored
+    on ``.npz$``); the staging file is unlinked if writing or renaming fails.
+    The publish assumes rename is atomic and cheap (a hierarchical-namespace
+    OSS bucket or a POSIX DFS); on a non-HNS OSS mount rename degrades to a
+    server-side copy-and-delete, which is slower and briefly doubles the
+    shard's DFS usage but still never stages the payload on local disk.
 
     Args:
         path: Destination ``.npz`` path on the (possibly seek-broken) DFS mount.
         arrays: Mapping of entry name to array-like value (numpy or torch
             tensor); names must not carry a ``.npy`` suffix, it is appended.
     """
-    part = f"{path}.part"
-    with open(part, "wb") as raw:
-        fp = _Unseekable(raw)
-        with zipfile.ZipFile(fp, "w", allowZip64=True) as zf:
-            for name, arr in arrays.items():
-                # force_zip64 keeps entries > ZIP64_LIMIT from raising and
-                # matches np.savez, which forces zip64 on every entry.
-                with zf.open(f"{name}.npy", "w", force_zip64=True) as ent:
-                    np.save(ent, arr)
-    os.rename(part, path)
+    part = f"{path}.part.{uuid.uuid4().hex}"
+    # "xb" creates the staging file exclusively, never over an existing path
+    # or symlink, so it is always owned by this writer; only after it exists
+    # may failure cleanup unlink it.
+    raw = open(part, "xb")
+    try:
+        with raw:
+            fp = _Unseekable(raw)
+            with zipfile.ZipFile(fp, "w", allowZip64=True) as zf:
+                for name, arr in arrays.items():
+                    # force_zip64 keeps entries > ZIP64_LIMIT from raising and
+                    # matches np.savez, which forces zip64 on every entry.
+                    with zf.open(f"{name}.npy", "w", force_zip64=True) as ent:
+                        np.save(ent, arr)
+        os.replace(part, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(part)
+        raise
