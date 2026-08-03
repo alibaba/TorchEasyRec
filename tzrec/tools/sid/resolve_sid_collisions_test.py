@@ -1265,6 +1265,20 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 ),
             )
 
+    def test_append_rejects_state_truncated_outside_touched_bands(self) -> None:
+        # Band 5 is untouched, so only the row totals can catch its missing group.
+        state_map = os.path.join(self.test_dir, "trunc_map")
+        state_groups = os.path.join(self.test_dir, "trunc_groups")
+        _map_parquet(state_map, [(0, [0, 0], [0, 0], 1), (1, [5, 5], [5, 5], 1)])
+        _groups_parquet(state_groups, [([0, 0], [0])])
+        with self.assertRaisesRegex(ValueError, "one of the two artifacts is"):
+            self._run(
+                self._prepare_single(10),
+                os.path.join(self.test_dir, "out"),
+                existing_sid_map_path=os.path.join(state_map, "*.parquet"),
+                existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
+            )
+
     def test_append_rejects_map_with_index_holes(self) -> None:
         # Two items share bucket (0, 0) but hold indices 1 and 3: a deleted item
         # left a hole, so appending would reuse slot 2.

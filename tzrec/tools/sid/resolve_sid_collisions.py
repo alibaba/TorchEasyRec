@@ -596,15 +596,15 @@ class CollisionResolutionRunner:
         layer_sizes = self._config.layer_sizes
         groups_path = self._config.existing_sid_groups_path
         assert groups_path is not None
-        prior = self._load_prior_occupancy(
+        prior, published_items = self._load_prior_occupancy(
             groups_path, sid_band_ids(codes, layer_sizes), item_ids
         )
-        self._cross_check_existing_map(prior)
+        self._cross_check_existing_map(prior, published_items)
         logger.info(
             "append mode: %d new items onto %d published items in %d touched "
             "buckets (groups=%s, map=%s)",
             item_ids.shape[0],
-            prior.total_items,
+            published_items,
             prior.bucket_keys.shape[0],
             self._config.existing_sid_groups_path,
             self._config.existing_sid_map_path,
@@ -656,8 +656,8 @@ class CollisionResolutionRunner:
 
     def _load_prior_occupancy(
         self, path: str, band_ids: np.ndarray, item_ids: np.ndarray
-    ) -> PriorOccupancy:
-        """Read published occupancy from the previous round's resolved groups."""
+    ) -> Tuple[PriorOccupancy, int]:
+        """Read published occupancy and total item count from the resolved groups."""
         layer_sizes = self._config.layer_sizes
         wanted_bands = np.unique(band_ids)
         new_item_ids = self._item_id_array(item_ids)
@@ -666,6 +666,7 @@ class CollisionResolutionRunner:
         count_chunks: List[np.ndarray] = []
         overlapping: List[object] = []
         overlap_count = 0
+        published_items = 0
         previous_max_key = -1
         for batch in self._iter_state_batches(
             path,
@@ -683,6 +684,7 @@ class CollisionResolutionRunner:
                 previous_max_key = int(keys[-1])
 
             lengths, flat_ids = self._decode_grouped_item_ids(batch["itemids"])
+            published_items += int(lengths.sum())
             if len(flat_ids):
                 published = pc.is_in(flat_ids, value_set=new_item_ids)
                 batch_overlap = published.true_count
@@ -705,13 +707,18 @@ class CollisionResolutionRunner:
                 f"offending IDs: {preview}."
             )
         if not key_chunks:
-            return PriorOccupancy.empty()
-        return PriorOccupancy(np.concatenate(key_chunks), np.concatenate(count_chunks))
+            return PriorOccupancy.empty(), published_items
+        return (
+            PriorOccupancy(np.concatenate(key_chunks), np.concatenate(count_chunks)),
+            published_items,
+        )
 
-    def _cross_check_existing_map(self, prior: PriorOccupancy) -> None:
+    def _cross_check_existing_map(
+        self, prior: PriorOccupancy, published_items: int
+    ) -> None:
         """Verify the existing map agrees with the published groups."""
         path = self._config.existing_sid_map_path
-        if path is None or prior.is_empty:
+        if path is None:
             return
         layer_sizes = self._config.layer_sizes
         domain = prior.bucket_keys
@@ -720,6 +727,7 @@ class CollisionResolutionRunner:
         counts = np.zeros(domain.shape[0], dtype=np.int64)
         max_index = np.zeros(domain.shape[0], dtype=np.int64)
         sum_index = np.zeros(domain.shape[0], dtype=np.int64)
+        map_rows = 0
 
         for batch in self._iter_state_batches(
             path,
@@ -727,6 +735,7 @@ class CollisionResolutionRunner:
             "Cross-checking published SID map",
         ):
             keys = sid_bucket_keys(self._codes_matrix(batch["codebook"]), layer_sizes)
+            map_rows += keys.shape[0]
             _, known_band = lookup_sorted(bands, keys // layer_sizes[-1])
             if not known_band.any():
                 continue
@@ -751,6 +760,14 @@ class CollisionResolutionRunner:
             )
 
         self._report_cross_check(prior, counts, max_index, sum_index, unknown_keys)
+        if map_rows != published_items:
+            raise ValueError(
+                f"existing map holds {map_rows} rows but the existing groups hold "
+                f"{published_items} item IDs; one of the two artifacts is "
+                "incomplete, and appending onto it would drop published items or "
+                "reuse their slots. The per-bucket checks only cover bands the new "
+                "items touch, so a truncated shard elsewhere shows up only here."
+            )
 
     @staticmethod
     def _report_cross_check(
