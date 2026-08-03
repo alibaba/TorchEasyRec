@@ -1088,8 +1088,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         inp = os.path.join(self.test_dir, "v2_in.parquet")
         out = os.path.join(self.test_dir, "v2")
         _parquet(inp, [10, 11, 12], [[0, 0], [4, 5], [7, 7]], [[[0, 0]]] * 3)
-        with mock.patch.object(resolve_sid_collisions, "_STATE_READ_ROWS", 1):
-            self._append(inp, out, base, batch_size=1)
+        self._append(inp, out, base, batch_size=1)
 
         groups = self._read_parquet(self._group_paths(out)[1])
         self.assertEqual(groups["codebook"], [[0, 0], [4, 4], [4, 5], [7, 7]])
@@ -1104,8 +1103,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         inp = os.path.join(self.test_dir, "v2_in.parquet")
         out = os.path.join(self.test_dir, "v2")
         _parquet(inp, [10, 11, 12], [[0, 0], [3, 3], [6, 6]], [[[0, 0]]] * 3)
-        with mock.patch.object(resolve_sid_collisions, "_STATE_READ_ROWS", 1):
-            self._append(inp, out, base, batch_size=1)
+        self._append(inp, out, base, batch_size=1)
 
         self._assert_dense_indices(out)
         self._assert_map_matches_resolved_groups(out)
@@ -1143,15 +1141,11 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         inp = os.path.join(self.test_dir, "v2_in.parquet")
         out = os.path.join(self.test_dir, "v2")
         _parquet(inp, [10, 11], [[0, 0], [2, 2]], [[[0, 2]]] * 2)
-        with self.assertLogs(level="WARNING") as logs:
-            self._run(
-                inp,
-                out,
-                existing_sid_map_path=os.path.join(state_map, "*.csv"),
-                existing_sid_groups_path=os.path.join(state_groups, "*.csv"),
-            )
-        self.assertTrue(
-            any("rewritten in the other format" in line for line in logs.output)
+        self._run(
+            inp,
+            out,
+            existing_sid_map_path=os.path.join(state_map, "*.csv"),
+            existing_sid_groups_path=os.path.join(state_groups, "*.csv"),
         )
 
         merged = self._map_rows(out)

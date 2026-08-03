@@ -62,15 +62,7 @@ class CollisionResolutionConfig:
 def concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     """Concatenate ``arange(start, start + length)`` for every aligned pair.
 
-    A vectorized replacement for a Python loop over ragged ranges. Pairs with a
-    non-positive length contribute nothing.
-
-    Args:
-        starts: First value of each range.
-        lengths: Number of values in each range, aligned with ``starts``.
-
-    Returns:
-        The concatenated ranges as one int64 array.
+    Pairs with a non-positive length contribute nothing.
     """
     starts = np.asarray(starts, dtype=np.int64)
     lengths = np.asarray(lengths, dtype=np.int64)
@@ -80,8 +72,8 @@ def concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     total = int(lengths.sum())
     if total == 0:
         return np.empty(0, dtype=np.int64)
-    # Build the result as a cumulative sum of per-position steps: 1 inside a
-    # range, and the jump to the next range's start at each boundary.
+    # Cumulative sum of per-position steps: 1 inside a range, and the jump to
+    # the next range's start at each boundary.
     steps = np.ones(total, dtype=np.int64)
     steps[0] = starts[0]
     if starts.shape[0] > 1:
@@ -95,35 +87,18 @@ def lookup_sorted(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Locate ``keys`` inside a strictly ascending ``sorted_keys``.
 
-    Args:
-        sorted_keys: Strictly ascending lookup domain.
-        keys: Keys to locate.
-
-    Returns:
-        Insertion positions aligned with ``keys``, and a boolean mask of the
-        keys actually present. Positions are only meaningful where the mask is
-        set; elsewhere they may be out of bounds.
+    Returns insertion positions and a mask of the keys actually present.
+    Positions are only meaningful where the mask is set.
     """
     positions = np.searchsorted(sorted_keys, keys)
     found = positions < sorted_keys.shape[0]
-    # Self-masking keeps the equality test to the in-bounds positions only.
+    # Self-masking keeps the equality test to in-bounds positions only.
     found[found] = sorted_keys[positions[found]] == keys[found]
     return positions, found
 
 
 def bands_of_bucket_keys(bucket_keys: np.ndarray, last_size: int) -> np.ndarray:
-    """Return the band identifier of every flattened bucket key.
-
-    Inverse of the ``band * last_size + last_code`` packing that
-    :func:`sid_bucket_keys` applies, so callers never open-code the division.
-
-    Args:
-        bucket_keys: Flattened SID keys.
-        last_size: Cardinality of the last SID layer.
-
-    Returns:
-        An int64 band identifier per key.
-    """
+    """Return the band of every bucket key, inverting :func:`sid_bucket_keys`."""
     return np.asarray(bucket_keys, dtype=np.int64) // last_size
 
 
@@ -132,17 +107,8 @@ def in_sorted_bands(
 ) -> np.ndarray:
     """Return a mask of the keys whose band appears in ``bands``.
 
-    ``bands`` must already be ascending and unique -- typically straight from
-    ``np.unique`` -- so membership is a binary search rather than the sort that
-    ``np.isin`` would perform against the whole band set on every call.
-
-    Args:
-        bucket_keys: Flattened SID keys to test.
-        bands: Ascending, unique band identifiers to keep.
-        last_size: Cardinality of the last SID layer.
-
-    Returns:
-        A boolean mask aligned with ``bucket_keys``.
+    ``bands`` must be ascending and unique, so membership is a binary search
+    rather than the whole-set sort ``np.isin`` would do on every call.
     """
     _, found = lookup_sorted(bands, bands_of_bucket_keys(bucket_keys, last_size))
     return found
@@ -152,19 +118,15 @@ def in_sorted_bands(
 class PriorOccupancy:
     """Per-bucket occupancy of an already-published corpus.
 
-    Append runs seed collision resolution with this instead of starting every
-    bucket empty, so new items continue an existing bucket's slot numbering
-    rather than colliding with published items.
+    Append seeds collision resolution with this instead of starting every
+    bucket empty, so new items continue a bucket's slot numbering.
 
     Args:
-        bucket_keys: Flattened SID keys ``prefix_key * last_size + last_code``
-            of occupied buckets, int64. Must be strictly ascending and unique;
-            the producer validates that while streaming, and ``counts_for`` and
-            ``restrict_to_bands`` both rely on it.
-        bucket_counts: Item count of every bucket, int64 and at least one,
-            aligned with ``bucket_keys``. Counts may legitimately exceed
-            capacity when a previous run left unresolved rows on their origin
-            SID.
+        bucket_keys: Occupied bucket keys, int64, strictly ascending and
+            unique. The producer validates that while streaming; both methods
+            here rely on it.
+        bucket_counts: Item count per bucket, aligned with ``bucket_keys``.
+            May exceed capacity where a previous run left unresolved rows.
     """
 
     bucket_keys: np.ndarray
@@ -186,14 +148,7 @@ class PriorOccupancy:
         return int(self.bucket_counts.sum())
 
     def counts_for(self, bucket_keys: np.ndarray) -> np.ndarray:
-        """Return prior counts aligned with ``bucket_keys``, zero when absent.
-
-        Args:
-            bucket_keys: Flattened SID keys to look up.
-
-        Returns:
-            An int64 array aligned with ``bucket_keys``.
-        """
+        """Return prior counts aligned with ``bucket_keys``, zero when absent."""
         keys = np.asarray(bucket_keys, dtype=np.int64)
         counts = np.zeros(keys.shape[0], dtype=np.int64)
         positions, found = lookup_sorted(self.bucket_keys, keys)
@@ -205,16 +160,8 @@ class PriorOccupancy:
     ) -> "PriorOccupancy":
         """Return the sub-occupancy of buckets lying in the given bands.
 
-        Every bucket of one band occupies the contiguous key range
-        ``[band * last_size, (band + 1) * last_size)``, so the selection is a
-        range gather rather than a membership test over every prior key.
-
-        Args:
-            band_ids: Band identifiers to keep; need not be sorted or unique.
-            last_size: Cardinality of the last SID layer.
-
-        Returns:
-            A new occupancy holding only buckets in ``band_ids``.
+        One band owns the contiguous key range ``[band * S, (band + 1) * S)``,
+        so this is a range gather, not a membership test over every prior key.
         """
         bands = np.unique(np.asarray(band_ids, dtype=np.int64))
         if self.is_empty or bands.size == 0:
@@ -427,8 +374,6 @@ class CollisionResolver(ABC):
         Returns:
             A collision result that preserves the original assignments.
         """
-        # Without overflow every planned bucket simply gains its new rows, so
-        # the final occupancy is the prior plus this plan's counts.
         final_counts = plan.prior_bucket_counts + plan.bucket_counts
         final_bucket_keys = (
             plan.bucket_keys.copy() if collect_grouping else np.empty(0, dtype=np.int64)
@@ -536,10 +481,8 @@ class CollisionResolver(ABC):
         last_size = plan.config.layer_sizes[-1]
         capacity = plan.config.capacity
         prior_counts = plan.prior_bucket_counts
-        # Occupancy after this plan's overflow rows are logically removed. The
-        # outer maximum keeps a bucket that a previous run already left over
-        # capacity at its true count -- capping it there would re-issue slot
-        # indices that published items already hold.
+        # The outer maximum matters: a bucket a previous run left over capacity
+        # keeps its true count, else it would re-issue published slot indices.
         initial_counts = np.maximum(
             prior_counts, np.minimum(prior_counts + plan.bucket_counts, capacity)
         )
@@ -549,9 +492,8 @@ class CollisionResolver(ABC):
         in_overflow_band = in_sorted_bands(
             plan.bucket_keys, overflow_band_ids, last_size
         )
-        # Seed prior-only buckets first: placement treats a missing key as an
-        # empty bucket, so an existing bucket that received no new row must be
-        # visible or it would be overfilled past capacity.
+        # Placement treats a missing key as an empty bucket, so a prior-only
+        # bucket must be seeded or it would be overfilled past capacity.
         band_prior = plan.prior.restrict_to_bands(overflow_band_ids, last_size)
         slot_counts = dict(
             zip(band_prior.bucket_keys.tolist(), band_prior.bucket_counts.tolist())
@@ -811,31 +753,12 @@ def _band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
 
 
 def sid_band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
-    """Return the mixed-radix prefix key of every SID row.
-
-    Args:
-        codes: Integer SID matrix with shape ``(N, len(layer_sizes))``.
-        layer_sizes: Cardinality of each SID layer.
-
-    Returns:
-        An int64 band identifier per row; all zeros for a single-layer SID.
-    """
+    """Return the mixed-radix prefix key of every SID row (zeros if one layer)."""
     return _band_ids(np.asarray(codes), layer_sizes)
 
 
 def sid_bucket_keys(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
-    """Return the flattened bucket key of every SID row.
-
-    The key is ``band_id * layer_sizes[-1] + last_code``, matching the keys
-    stored in :class:`CollisionPlan` and :class:`PriorOccupancy`.
-
-    Args:
-        codes: Integer SID matrix with shape ``(N, len(layer_sizes))``.
-        layer_sizes: Cardinality of each SID layer.
-
-    Returns:
-        An int64 bucket key per row.
-    """
+    """Return ``band_id * layer_sizes[-1] + last_code`` for every SID row."""
     codes = np.asarray(codes)
     return _band_ids(codes, layer_sizes) * layer_sizes[-1] + codes[:, -1].astype(
         np.int64, copy=False
@@ -965,13 +888,10 @@ def prepare_collision_plan(
         band_ids[representative_rows] * last_size
         + original_last_codes[representative_rows]
     )
-    # A row overflows once the items already in its bucket -- published plus
-    # better-ranked rows of this plan -- reach capacity.
     row_prior_counts = prior.counts_for(bucket_keys)[origin_bucket_indices]
     overflow_rows = sorted_rows[
         (row_prior_counts + bucket_ranks)[sorted_rows] >= config.capacity
     ]
-    # Turn 0-based ranks into 1-based slots that continue past the prior items.
     bucket_ranks += row_prior_counts + 1
     overflow_bucket_key_prefixes = band_ids[overflow_rows] * last_size
 
@@ -1085,9 +1005,6 @@ def build_resolved_item_grouping(
             "with collect_grouping=True."
         )
 
-    # ``result`` carries corpus-wide occupancy. Subtracting the prior turns it
-    # back into this plan's own rows: buckets that gained nothing drop out, and
-    # global slot indices become dense 1..count within each remaining bucket.
     final_prior_counts = plan.prior.counts_for(result.final_bucket_keys)
     delta_counts = result.final_bucket_counts - final_prior_counts
     gained = delta_counts > 0
