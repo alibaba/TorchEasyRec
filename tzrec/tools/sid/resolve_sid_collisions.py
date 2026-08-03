@@ -22,9 +22,10 @@ The runner retains the first capacity items in each SID bucket, attempts to
 relocate overflow items using fixed-width last-layer candidates, delegates
 placement to the pure NumPy core, and writes item-level and grouped SID results
 through TorchEasyRec readers and writers. CSV encodes each SID/candidate column
-as comma-separated codes and item-ID groups as JSON arrays because Arrow's CSV
-writer cannot serialize list columns; ``candidate_codes`` is a flat
-``topk * n_layers`` run split by the ``--codebook`` length.
+and each item-ID group as comma-separated values because Arrow's CSV writer
+cannot serialize list columns, so an item ID containing a comma is rejected at
+write time; ``candidate_codes`` is a flat ``topk * n_layers`` run split by the
+``--codebook`` length.
 
 The random strategy intentionally preserves the legacy deterministic baseline:
 it draws with replacement from the full last-layer space. Placement skips an
@@ -727,6 +728,7 @@ class CollisionResolutionRunner:
         counts = np.zeros(domain.shape[0], dtype=np.int64)
         max_index = np.zeros(domain.shape[0], dtype=np.int64)
         sum_index = np.zeros(domain.shape[0], dtype=np.int64)
+        sum_square_index = np.zeros(domain.shape[0], dtype=np.int64)
         map_rows = 0
 
         for batch in self._iter_state_batches(
@@ -755,11 +757,16 @@ class CollisionResolutionRunner:
             buckets = batch_positions[starts]
             counts[buckets] += np.diff(np.append(starts, batch_positions.shape[0]))
             sum_index[buckets] += np.add.reduceat(batch_indices, starts)
+            sum_square_index[buckets] += np.add.reduceat(
+                batch_indices * batch_indices, starts
+            )
             max_index[buckets] = np.maximum(
                 max_index[buckets], np.maximum.reduceat(batch_indices, starts)
             )
 
-        self._report_cross_check(prior, counts, max_index, sum_index, unknown_keys)
+        self._report_cross_check(
+            prior, counts, max_index, sum_index, sum_square_index, unknown_keys
+        )
         if map_rows != published_items:
             raise ValueError(
                 f"existing map holds {map_rows} rows but the existing groups hold "
@@ -775,6 +782,7 @@ class CollisionResolutionRunner:
         counts: np.ndarray,
         max_index: np.ndarray,
         sum_index: np.ndarray,
+        sum_square_index: np.ndarray,
         unknown_keys: List[int],
     ) -> None:
         """Raise on the first failing map/groups consistency check."""
@@ -808,14 +816,19 @@ class CollisionResolutionRunner:
                 "Item deletion is not supported -- tombstone instead."
             )
         expected_sum = counts * (counts + 1) // 2
-        duplicated = np.flatnonzero(sum_index != expected_sum)
+        expected_square_sum = counts * (counts + 1) * (2 * counts + 1) // 6
+        duplicated = np.flatnonzero(
+            (sum_index != expected_sum) | (sum_square_index != expected_square_sum)
+        )
         if duplicated.size:
             first = int(duplicated[0])
             raise ValueError(
                 f"existing map index space is not dense in {duplicated.size} "
                 f"buckets. Bucket key {int(prior.bucket_keys[first])} has index sum "
-                f"{int(sum_index[first])}, expected {int(expected_sum[first])} for "
-                f"{int(counts[first])} items."
+                f"{int(sum_index[first])} and square sum "
+                f"{int(sum_square_index[first])}, expected "
+                f"{int(expected_sum[first])} and {int(expected_square_sum[first])} "
+                f"for {int(counts[first])} items."
             )
 
     def _make_writer(self, output_path: str) -> BaseWriter:

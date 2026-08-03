@@ -1296,7 +1296,8 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             )
 
     def test_append_rejects_map_with_duplicate_indices(self) -> None:
-        # max(index) == count hides it; only the index sum catches this one.
+        # Indices [1, 1, 4, 4] match {1..4} on count, max and sum alike; only the
+        # index square sum separates them.
         state_map = os.path.join(self.test_dir, "dup_map")
         state_groups = os.path.join(self.test_dir, "dup_groups")
         _map_parquet(
@@ -1304,15 +1305,16 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             [
                 (0, [0, 0], [0, 0], 1),
                 (1, [0, 0], [0, 0], 1),
-                (2, [0, 0], [0, 0], 3),
+                (2, [0, 0], [0, 0], 4),
+                (3, [0, 0], [0, 0], 4),
             ],
         )
-        _groups_parquet(state_groups, [([0, 0], [0, 1, 2])])
+        _groups_parquet(state_groups, [([0, 0], [0, 1, 2, 3])])
         with self.assertRaisesRegex(ValueError, "not dense"):
             self._run(
                 self._prepare_single(10),
                 os.path.join(self.test_dir, "out"),
-                max_items_per_codebook=4,
+                max_items_per_codebook=5,
                 existing_sid_map_path=os.path.join(state_map, "*.parquet"),
                 existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
             )
