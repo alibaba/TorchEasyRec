@@ -399,8 +399,12 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         original_path, resolved_path = self._group_paths(out)
         original = parquet.read_table(os.path.join(original_path, "part-0.parquet"))
         resolved = parquet.read_table(os.path.join(resolved_path, "part-0.parquet"))
-        self.assertEqual(original.column_names, ["codebook", "itemids"])
-        self.assertEqual(resolved.column_names, ["codebook", "itemids"])
+        self.assertEqual(
+            original.column_names, ["codebook", "offset_codebook", "itemids"]
+        )
+        self.assertEqual(
+            resolved.column_names, ["codebook", "offset_codebook", "itemids"]
+        )
         original_groups = original.to_pydict()
         self.assertCountEqual(
             [item_id for group in original_groups["itemids"] for item_id in group],
@@ -523,7 +527,9 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             self.assertEqual(original["codebook"].to_pylist(), ["0,0,0"])
             self.assertCountEqual(resolved["codebook"].to_pylist(), ["0,0,0", "0,0,1"])
             for groups in (original, resolved):
-                self.assertEqual(groups.column_names, ["codebook", "itemids"])
+                self.assertEqual(
+                    groups.column_names, ["codebook", "offset_codebook", "itemids"]
+                )
                 self.assertEqual(groups.schema.field("itemids").type, pa.string())
                 grouped = [
                     item
@@ -544,7 +550,9 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             self.assertEqual(result["origin_codebook"].to_pylist(), [[0, 0, 0]] * 3)
             for path in (original_path, resolved_path):
                 groups = parquet.read_table(os.path.join(path, "part-0.parquet"))
-                self.assertEqual(groups.column_names, ["codebook", "itemids"])
+                self.assertEqual(
+                    groups.column_names, ["codebook", "offset_codebook", "itemids"]
+                )
                 self.assertEqual(
                     groups.schema.field("itemids").type, pa.list_(pa.string())
                 )
@@ -800,7 +808,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertTrue(all(writer.closed for _, writer in created_writers))
         for _, writer in created_writers[:2]:
             columns = writer.writes[0]
-            self.assertEqual(list(columns), ["codebook", "itemids"])
+            self.assertEqual(list(columns), ["codebook", "offset_codebook", "itemids"])
             self.assertEqual(columns["codebook"].type, pa.list_(pa.int64()))
             self.assertEqual(columns["itemids"].type, pa.list_(pa.int32()))
 
@@ -1019,6 +1027,82 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "codebook"):
             ResolveSidCollisionsConfig.from_namespace(args)
+
+    # ---- offset SID column ----
+
+    def test_offset_codebook_shifts_layers_in_map_and_groups(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, [0, 1], [[1, 2], [3, 4]], [[[0, 0]]] * 2)
+        self._run(inp, out, include_original=True, layer_sizes=(8, 8))
+
+        # layer 1 is shifted by layer_sizes[0]
+        item_map = self._read_parquet(out)
+        by_item = dict(zip(item_map["item_id"], item_map["offset_codebook"]))
+        self.assertEqual(by_item[0], [1, 2 + 8])
+        self.assertEqual(by_item[1], [3, 4 + 8])
+
+        original_path, resolved_path = self._group_paths(out)
+        for path in (original_path, resolved_path):
+            groups = self._read_parquet(path)
+            for codebook, offset in zip(groups["codebook"], groups["offset_codebook"]):
+                self.assertEqual(offset, [codebook[0], codebook[1] + 8])
+
+    def test_offset_codebook_tracks_the_resolved_not_the_origin_sid(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        # three items collide at capacity 2, so one relocates
+        _parquet(inp, [0, 1, 2], [[0, 0]] * 3, [[[0, 5]]] * 3)
+        self._run(inp, out, layer_sizes=(8, 8))
+
+        item_map = self._read_parquet(out)
+        relocated = [
+            i
+            for i, (origin, final) in enumerate(
+                zip(item_map["origin_codebook"], item_map["codebook"])
+            )
+            if origin != final
+        ]
+        self.assertTrue(relocated)
+        for i in range(len(item_map["item_id"])):
+            final = item_map["codebook"][i]
+            self.assertEqual(item_map["offset_codebook"][i], [final[0], final[1] + 8])
+
+    def test_append_recomputes_offset_for_state_written_without_it(self) -> None:
+        # the published fixtures carry no offset_codebook column, so the merged
+        # map must derive it rather than pass it through
+        base = self._seed_generation()
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        _parquet(inp, [10], [[2, 2]], [[[0, 2]]])
+        self._append(inp, out, base)
+
+        item_map = self._read_parquet(out)
+        self.assertEqual(len(item_map["item_id"]), 6)
+        for codebook, offset in zip(item_map["codebook"], item_map["offset_codebook"]):
+            self.assertEqual(offset, [codebook[0], codebook[1] + 8])
+
+    def test_delta_outputs_carry_offset_codebook(self) -> None:
+        base = self._seed_generation()
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        out = os.path.join(self.test_dir, "v2")
+        delta_map = os.path.join(self.test_dir, "delta_map")
+        delta_groups = os.path.join(self.test_dir, "delta_groups")
+        _parquet(inp, [10, 11], [[0, 0], [3, 3]], [[[0, 2], [0, 3]]] * 2)
+        self._append(
+            inp,
+            out,
+            base,
+            delta_map_output_path=delta_map,
+            delta_sid_groups_output_path=delta_groups,
+        )
+
+        delta = self._read_parquet(delta_map)
+        for codebook, offset in zip(delta["codebook"], delta["offset_codebook"]):
+            self.assertEqual(offset, [codebook[0], codebook[1] + 8])
+        groups = self._read_parquet(delta_groups)
+        for codebook, offset in zip(groups["codebook"], groups["offset_codebook"]):
+            self.assertEqual(offset, [codebook[0], codebook[1] + 8])
 
     # ---- append mode ----
 

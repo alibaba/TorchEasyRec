@@ -728,6 +728,19 @@ def sid_band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
     return keys
 
 
+def sid_offset_codes(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
+    """Shift each layer's codes into one contiguous vocabulary.
+
+    Layer ``i`` is offset by ``sum(layer_sizes[:i])``, so codes from different
+    layers never collide: ``[1, 2, 3]`` under ``(64, 64, 64)`` becomes
+    ``[1, 66, 131]``.
+    """
+    starts = np.concatenate(
+        ([0], np.cumsum(np.asarray(layer_sizes[:-1], dtype=np.int64)))
+    )
+    return np.asarray(codes) + starts
+
+
 def sid_bucket_keys(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
     """Return ``band_id * layer_sizes[-1] + last_code`` for every SID row."""
     codes = np.asarray(codes)

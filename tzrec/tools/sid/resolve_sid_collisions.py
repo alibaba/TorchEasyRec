@@ -30,6 +30,13 @@ The random strategy intentionally preserves the legacy deterministic baseline:
 it draws with replacement from the full last-layer space. Placement skips an
 item's origin, so an origin draw or a duplicate draw is not replaced.
 
+Both the item map and the SID groups carry an ``offset_codebook`` column
+alongside ``codebook``: the same SID with each layer shifted into one
+contiguous vocabulary, so layer ``i`` is offset by ``sum(codebook[:i])``. With
+``--codebook 64,64,64`` the SID ``[1, 2, 3]`` is written as ``[1, 66, 131]``.
+It is derived from the emitted SID, so a relocated item's offset SID follows
+where it landed, not what the model predicted.
+
 It is a single-process tool -- launch it with ``python -m`` (no torchrun /
 process group). The input is a Semantic-ID table from ``tzrec.predict`` (an
 ``item_id`` column, a ``codes`` ``list<int>`` column, and -- for the default
@@ -114,6 +121,7 @@ from tzrec.utils.sid.collision import (
     prepare_collision_plan,
     sid_band_ids,
     sid_bucket_keys,
+    sid_offset_codes,
 )
 
 _MAP_WRITE_ROWS = 1_000_000
@@ -629,6 +637,12 @@ class CollisionResolutionRunner:
             flat = pc.cast(flat, self._item_id_type)
         return lengths, flat
 
+    def _offset_codes_column(self, codes: np.ndarray, is_csv: bool) -> pa.Array:
+        """Encode an SID matrix shifted into one contiguous vocabulary."""
+        return self._codes_column(
+            sid_offset_codes(codes, self._config.layer_sizes), is_csv
+        )
+
     def _align_codes_column(self, values: pa.Array, is_csv: bool) -> pa.Array:
         """Return an SID column in the encoding the destination writer needs.
 
@@ -921,6 +935,7 @@ class CollisionResolutionRunner:
                     "item_id": self._item_id_array(item_ids[selection]),
                     "origin_codebook": self._codes_column(origin_chunk, is_csv),
                     "codebook": self._codes_column(final_chunk, is_csv),
+                    "offset_codebook": self._offset_codes_column(final_chunk, is_csv),
                     "index": pa.array(result.slot_indices[selection], type=pa.int64()),
                 }
             )
@@ -957,6 +972,9 @@ class CollisionResolutionRunner:
                         batch["origin_codebook"], is_csv
                     ),
                     "codebook": self._align_codes_column(batch["codebook"], is_csv),
+                    "offset_codebook": self._offset_codes_column(
+                        self._codes_matrix(batch["codebook"]), is_csv
+                    ),
                     "index": pc.cast(batch["index"], pa.int64()),
                 }
             )
@@ -1085,6 +1103,7 @@ class CollisionResolutionRunner:
         writer.write(
             {
                 "codebook": self._codes_column(codes, is_csv),
+                "offset_codebook": self._offset_codes_column(codes, is_csv),
                 "itemids": self._grouped_item_ids_column(values, offsets, is_csv),
             }
         )
@@ -1256,6 +1275,9 @@ class CollisionResolutionRunner:
                 writer.write(
                     {
                         "codebook": self._codes_column(code_chunk, is_csv),
+                        "offset_codebook": self._offset_codes_column(
+                            code_chunk, is_csv
+                        ),
                         "itemids": self._grouped_item_ids_column(
                             flat_item_ids, local_offsets, is_csv
                         ),

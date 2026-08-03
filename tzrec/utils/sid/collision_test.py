@@ -27,6 +27,7 @@ from tzrec.utils.sid.collision import (
     concat_ranges,
     prepare_collision_plan,
     sid_bucket_keys,
+    sid_offset_codes,
 )
 from tzrec.utils.test_util import parameterized_name_func
 
@@ -515,6 +516,38 @@ class ConcatRangesTest(unittest.TestCase):
         np.testing.assert_array_equal(concat_ranges([5, 10, 20], [2, 0, 1]), [5, 6, 20])
         self.assertEqual(concat_ranges([3], [0]).shape, (0,))
         self.assertEqual(concat_ranges([], []).shape, (0,))
+
+
+class SidOffsetCodesTest(unittest.TestCase):
+    def test_shifts_each_layer_by_the_preceding_sizes(self) -> None:
+        np.testing.assert_array_equal(
+            sid_offset_codes(np.asarray([[1, 2, 3]]), (64, 64, 64)), [[1, 66, 131]]
+        )
+
+    def test_supports_non_uniform_codebooks(self) -> None:
+        # offsets are 0, 4, 4 + 8
+        np.testing.assert_array_equal(
+            sid_offset_codes(np.asarray([[1, 2, 3]]), (4, 8, 16)), [[1, 6, 15]]
+        )
+
+    def test_single_layer_is_unchanged(self) -> None:
+        np.testing.assert_array_equal(
+            sid_offset_codes(np.asarray([[7], [0]]), (64,)), [[7], [0]]
+        )
+
+    def test_layers_occupy_disjoint_ranges(self) -> None:
+        layer_sizes = (4, 8, 16)
+        codes = np.stack(
+            np.meshgrid(*[np.arange(size) for size in layer_sizes], indexing="ij"),
+            axis=-1,
+        ).reshape(-1, len(layer_sizes))
+        offset = sid_offset_codes(codes, layer_sizes)
+        for layer, size in enumerate(layer_sizes):
+            start = sum(layer_sizes[:layer])
+            column = offset[:, layer]
+            self.assertEqual(int(column.min()), start)
+            self.assertEqual(int(column.max()), start + size - 1)
+        self.assertEqual(int(offset.max()), sum(layer_sizes) - 1)
 
 
 class PriorOccupancyTest(unittest.TestCase):
