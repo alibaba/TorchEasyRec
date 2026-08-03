@@ -9,14 +9,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import multiprocessing
 import queue
 import threading
 import time
 import unittest
 from unittest import mock
 
+import pyarrow as pa
 from parameterized import parameterized
 
+from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.tools.tdm import retrieval
 from tzrec.utils import predict_util
 from tzrec.utils.test_util import parameterized_name_func
@@ -27,6 +30,27 @@ class _FailingSampler:
 
     def init(self, worker_id):
         raise ValueError("worker boom")
+
+
+class _PassingSampler:
+    _item_id_field = "item_id"
+
+    def init(self, worker_id):
+        return None
+
+    def init_sampler(self, n_cluster):
+        return None
+
+    def get(self, input_data):
+        return {"item_id": pa.array([2])}
+
+
+class _PassingParser:
+    def parse(self, input_data):
+        return input_data
+
+    def to_batch(self, output_data, force_no_tile=False):
+        return Batch()
 
 
 class _StubbornProcess:
@@ -60,6 +84,7 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
             pred_queue = queue.Queue(maxsize=2 if downstream_count == 1 else 0)
             cancel_event = threading.Event()
             failure_queue = queue.Queue()
+            input_drained_event = threading.Event()
             for _ in range(worker_count):
                 data_queue.put((None, None, None))
 
@@ -70,6 +95,7 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
                 worker_count,
                 downstream_count,
                 mock.Mock(),
+                input_drained_event,
                 cancel_event,
                 failure_queue,
             )
@@ -79,6 +105,51 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
                 self.assertEqual(pred_queue.get_nowait(), (None, None))
             self.assertFalse(cancel_event.is_set())
             self.assertTrue(failure_queue.empty())
+            self.assertTrue(input_drained_event.is_set())
+
+    def test_data_worker_keeps_shared_storage_alive_until_drained(self):
+        in_queue = multiprocessing.Queue()
+        out_queue = multiprocessing.Queue()
+        output_drained_event = multiprocessing.Event()
+        cancel_event = multiprocessing.Event()
+        failure_queue = multiprocessing.Queue()
+        record_batch_t = RecordBatchTensor(pa.record_batch({"item_id": [1]}))
+        in_queue.put((record_batch_t, pa.array([1])))
+        in_queue.put((None, None))
+        worker = multiprocessing.Process(
+            target=retrieval._tdm_predict_data_worker,
+            args=(
+                _PassingSampler(),
+                _PassingParser(),
+                1,
+                2,
+                in_queue,
+                out_queue,
+                False,
+                0,
+                output_drained_event,
+                cancel_event,
+                failure_queue,
+            ),
+        )
+        worker.start()
+
+        batch, output_record_batch_t, node_ids = out_queue.get(timeout=2)
+        self.assertIsInstance(batch, Batch)
+        self.assertEqual(output_record_batch_t.get()["item_id"].to_pylist(), [1])
+        self.assertEqual(node_ids.to_pylist(), [2])
+        self.assertEqual(out_queue.get(timeout=1), (None, None, None))
+        self.assertTrue(worker.is_alive())
+        output_drained_event.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(worker.exitcode, 0)
+        self.assertFalse(cancel_event.is_set())
+        self.assertTrue(failure_queue.empty())
+        for data_queue in (in_queue, out_queue, failure_queue):
+            data_queue.close()
+            data_queue.join_thread()
 
     @parameterized.expand(
         [["worker"], ["forward"], ["writer"]],
@@ -100,6 +171,7 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
                     queue.Queue(),
                     True,
                     7,
+                    threading.Event(),
                     cancel_event,
                     failure_queue,
                 )
@@ -113,6 +185,7 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
                 1,
                 1,
                 mock.Mock(side_effect=ValueError("forward boom")),
+                threading.Event(),
                 cancel_event,
                 failure_queue,
             )

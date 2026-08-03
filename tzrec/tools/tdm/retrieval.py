@@ -77,6 +77,7 @@ def _tdm_predict_data_worker(
     out_queue: Queue,
     is_first_layer: bool,
     worker_id: int,
+    output_drained_event: Any,
     cancel_event: Any,
     failure_queue: Queue,
 ) -> None:
@@ -98,7 +99,11 @@ def _tdm_predict_data_worker(
                     cancel_event,
                     f"{stage}[{worker_id}] completion",
                 )
-                break
+                # Keep shared-storage handles alive through deserialization.
+                while not output_drained_event.wait(timeout=1):
+                    if cancel_event.is_set():
+                        return
+                return
 
             record_batch = record_batch_t.get()
             if is_first_layer:
@@ -146,6 +151,7 @@ def _forward_loop(
         [Batch, RecordBatchTensor, pa.Array, int],
         Tuple[RecordBatchTensor, pa.Array],
     ],
+    input_drained_event: Any,
     cancel_event: Any,
     failure_queue: Queue,
 ) -> None:
@@ -167,6 +173,7 @@ def _forward_loop(
                 cancel_event,
                 f"{stage}[{layer_id}] output",
             )
+        input_drained_event.set()
         for _ in range(downstream_consumer_count):
             predict_util.queue_put_interruptibly(
                 pred_queue,
@@ -413,6 +420,9 @@ def tdm_retrieval(
     out_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer)]
     failure_queue = Queue()
     cancel_event = Event()
+    data_output_drained_events = [
+        Event() for _ in range(max_level - first_recall_layer)
+    ]
     all_queues = [*in_queues, *out_queues, failure_queue]
 
     data_p_list: List[Process] = []
@@ -434,6 +444,7 @@ def tdm_retrieval(
                         out_queues[i],
                         i == 0,
                         i * num_worker_per_level + j,
+                        data_output_drained_events[i],
                         cancel_event,
                         failure_queue,
                     ),
@@ -454,6 +465,7 @@ def tdm_retrieval(
                     num_worker_per_level,
                     downstream_consumer_count,
                     _forward,
+                    data_output_drained_events[i],
                     cancel_event,
                     failure_queue,
                 ),
