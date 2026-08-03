@@ -60,10 +60,7 @@ class CollisionResolutionConfig:
 
 
 def concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
-    """Concatenate ``arange(start, start + length)`` for every aligned pair.
-
-    Pairs with a non-positive length contribute nothing.
-    """
+    """Concatenate ``arange(start, start + length)`` for every aligned pair."""
     starts = np.asarray(starts, dtype=np.int64)
     lengths = np.asarray(lengths, dtype=np.int64)
     keep = lengths > 0
@@ -83,11 +80,7 @@ def concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
 def lookup_sorted(
     sorted_keys: np.ndarray, keys: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Locate ``keys`` inside a strictly ascending ``sorted_keys``.
-
-    Returns insertion positions and a mask of the keys actually present.
-    Positions are only meaningful where the mask is set.
-    """
+    """Locate ``keys`` inside a strictly ascending ``sorted_keys``."""
     positions = np.searchsorted(sorted_keys, keys)
     found = positions < sorted_keys.shape[0]
     found[found] = sorted_keys[positions[found]] == keys[found]
@@ -96,18 +89,7 @@ def lookup_sorted(
 
 @dataclass(frozen=True)
 class PriorOccupancy:
-    """Per-bucket occupancy of an already-published corpus.
-
-    Append seeds collision resolution with this instead of starting every
-    bucket empty, so new items continue a bucket's slot numbering.
-
-    Args:
-        bucket_keys: Occupied bucket keys, int64, strictly ascending and
-            unique. The producer validates that while streaming; both methods
-            here rely on it.
-        bucket_counts: Item count per bucket, aligned with ``bucket_keys``.
-            May exceed capacity where a previous run left unresolved rows.
-    """
+    """Per-bucket occupancy of an already-published corpus."""
 
     bucket_keys: np.ndarray
     bucket_counts: np.ndarray
@@ -144,8 +126,6 @@ class PriorOccupancy:
         so this is a range gather, not a membership test over every prior key.
         """
         bands = np.unique(np.asarray(band_ids, dtype=np.int64))
-        if self.is_empty or bands.size == 0:
-            return PriorOccupancy.empty()
         starts = np.searchsorted(self.bucket_keys, bands * last_size, side="left")
         stops = np.searchsorted(self.bucket_keys, (bands + 1) * last_size, side="left")
         selected = concat_ranges(starts, stops - starts)
@@ -359,7 +339,7 @@ class CollisionResolver(ABC):
             plan.bucket_keys.copy() if collect_grouping else np.empty(0, dtype=np.int64)
         )
         final_bucket_counts = (
-            final_counts.copy() if collect_grouping else np.empty(0, dtype=np.int64)
+            final_counts if collect_grouping else np.empty(0, dtype=np.int64)
         )
         max_final_bucket_size = int(final_counts.max()) if final_counts.size else 0
         stats = CollisionResolutionStats(
@@ -729,12 +709,7 @@ def sid_band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
 
 
 def sid_offset_codes(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
-    """Shift each layer's codes into one contiguous vocabulary.
-
-    Layer ``i`` is offset by ``sum(layer_sizes[:i])``, so codes from different
-    layers never collide: ``[1, 2, 3]`` under ``(64, 64, 64)`` becomes
-    ``[1, 66, 131]``.
-    """
+    """Shift each layer's codes into one contiguous vocabulary."""
     starts = np.concatenate(
         ([0], np.cumsum(np.asarray(layer_sizes[:-1], dtype=np.int64)))
     )

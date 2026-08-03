@@ -49,8 +49,8 @@ Example::
         --input_path 'sid_predict_output/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
         --strategy candidate \
-        --output_path sid_collision/map_v1 \
-        --resolved_sid_groups_output_path sid_collision/groups_v1
+        --output_path sid_collision/map \
+        --resolved_sid_groups_output_path sid_collision/resolved_groups
 
 To also write the optional original-SID audit grouping, add
 ``--original_sid_groups_output_path sid_collision/original_groups``.
@@ -67,12 +67,12 @@ the published occupancy instead of restarting at one::
 
     python -m tzrec.tools.sid.resolve_sid_collisions \
         --input_path 'sid_predict_new_20260731/*.parquet' \
-        --existing_sid_map_path    'sid_collision/map_v1/*.parquet' \
-        --existing_sid_groups_path 'sid_collision/groups_v1/*.parquet' \
+        --existing_sid_map_path    'sid_collision/map/*.parquet' \
+        --existing_sid_groups_path 'sid_collision/resolved_groups/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
         --strategy candidate \
-        --output_path sid_collision/map_v2 \
-        --resolved_sid_groups_output_path sid_collision/groups_v2 \
+        --output_path sid_collision/map_20260731 \
+        --resolved_sid_groups_output_path sid_collision/resolved_groups_20260731 \
         --delta_map_output_path sid_collision/delta_20260731
 
 Both outputs stay corpus-complete, so generation *n*'s outputs are exactly
@@ -174,12 +174,8 @@ class _ItemIdLookup:
 
     def match(self, item_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Return matching source rows and requested-ID positions."""
-        positions = np.searchsorted(self._sorted_ids, item_ids)
-        source_rows = np.flatnonzero(positions < self._sorted_ids.shape[0])
-        if source_rows.size:
-            source_rows = source_rows[
-                self._sorted_ids[positions[source_rows]] == item_ids[source_rows]
-            ]
+        positions, found = lookup_sorted(self._sorted_ids, item_ids)
+        source_rows = np.flatnonzero(found)
         return source_rows, self._sorted_to_requested[positions[source_rows]]
 
     def broadcast_duplicate_targets(self, values: np.ndarray) -> None:
@@ -240,17 +236,18 @@ class ResolveSidCollisionsConfig:
                 "is set; without it the merged map would hold only the new items."
             )
 
-        candidates = [self.output_path, self.resolved_sid_groups_output_path]
-        candidates.append(self.original_sid_groups_output_path)
+        candidates = [
+            self.output_path,
+            self.resolved_sid_groups_output_path,
+            self.original_sid_groups_output_path,
+        ]
         if self.is_append:
-            candidates.extend(
-                (
-                    self.existing_sid_map_path,
-                    self.existing_sid_groups_path,
-                    self.delta_map_output_path,
-                    self.delta_sid_groups_output_path,
-                )
-            )
+            candidates += [
+                self.existing_sid_map_path,
+                self.existing_sid_groups_path,
+                self.delta_map_output_path,
+                self.delta_sid_groups_output_path,
+            ]
         paths = [self.input_path]
         paths.extend(path for path in candidates if path)
         has_conflict, conflict_message = check_path_conflict(paths)
@@ -338,6 +335,11 @@ class CollisionResolutionRunner:
         """Read, resolve collisions, and write the resulting SID map."""
         _require_single_process()
         item_ids, codes = self._load_codes()
+        if codes.shape[1] != len(self._config.layer_sizes):
+            raise ValueError(
+                f"codes have {codes.shape[1]} layers but --codebook has "
+                f"{len(self._config.layer_sizes)}."
+            )
         prior = self._load_prior_state(item_ids, codes)
         plan = prepare_collision_plan(
             item_ids, codes, self._config.resolution_config, prior=prior
@@ -586,20 +588,12 @@ class CollisionResolutionRunner:
     def _load_prior_state(
         self, item_ids: np.ndarray, codes: np.ndarray
     ) -> PriorOccupancy:
-        """Load and verify published state, or return empty for a full resolve.
-
-        The result is restricted to the bands this run can touch.
-        """
+        """Load and verify published state, or return empty for a full resolve."""
         if not self._config.is_append:
             logger.info("full-resolve mode: no existing SID state supplied")
             return PriorOccupancy.empty()
 
         layer_sizes = self._config.layer_sizes
-        if codes.shape[1] != len(layer_sizes):
-            raise ValueError(
-                f"codes have {codes.shape[1]} layers but --codebook has "
-                f"{len(layer_sizes)}."
-            )
         groups_path = self._config.existing_sid_groups_path
         assert groups_path is not None
         prior = self._load_prior_occupancy(
@@ -618,11 +612,7 @@ class CollisionResolutionRunner:
         return prior
 
     def _decode_grouped_item_ids(self, values: pa.Array) -> Tuple[np.ndarray, pa.Array]:
-        """Decode a grouped item-ID column into per-group counts and values.
-
-        Inverse of :meth:`_grouped_item_ids_column`: list columns stay
-        zero-copy, the CSV form splits on the comma it was joined with.
-        """
+        """Decode a grouped item-ID column into per-group counts and values."""
         if _is_list_column(values):
             lists = values
         else:
@@ -644,12 +634,7 @@ class CollisionResolutionRunner:
         )
 
     def _align_codes_column(self, values: pa.Array, is_csv: bool) -> pa.Array:
-        """Return an SID column in the encoding the destination writer needs.
-
-        Passes the column straight through when the source encoding already
-        matches the writer, and re-encodes otherwise, so a mixed-format append
-        still produces one valid artifact.
-        """
+        """Return an SID column in the encoding the destination writer needs."""
         source_is_text = pa.types.is_string(values.type) or pa.types.is_large_string(
             values.type
         )
@@ -672,16 +657,7 @@ class CollisionResolutionRunner:
     def _load_prior_occupancy(
         self, path: str, band_ids: np.ndarray, item_ids: np.ndarray
     ) -> PriorOccupancy:
-        """Read published occupancy from the previous round's resolved groups.
-
-        This is pass 1. Only buckets in a band the new batch touches are kept:
-        relocation never leaves a row's own band, so no other bucket can be
-        read or written by this run. The same scan probes for item IDs that are
-        already published, which is the only place that can be detected.
-
-        Raises if the stream is not ascending by SID key, or if any new item
-        ID is already published.
-        """
+        """Read published occupancy from the previous round's resolved groups."""
         layer_sizes = self._config.layer_sizes
         wanted_bands = np.unique(band_ids)
         new_item_ids = self._item_id_array(item_ids)
@@ -709,7 +685,7 @@ class CollisionResolutionRunner:
             lengths, flat_ids = self._decode_grouped_item_ids(batch["itemids"])
             if len(flat_ids):
                 published = pc.is_in(flat_ids, value_set=new_item_ids)
-                batch_overlap = int(pc.sum(published).as_py() or 0)
+                batch_overlap = published.true_count
                 overlap_count += batch_overlap
                 if batch_overlap and len(overlapping) < 10:
                     overlapping.extend(
@@ -733,16 +709,7 @@ class CollisionResolutionRunner:
         return PriorOccupancy(np.concatenate(key_chunks), np.concatenate(count_chunks))
 
     def _cross_check_existing_map(self, prior: PriorOccupancy) -> None:
-        """Verify the existing map agrees with the published groups.
-
-        This is pass 2. The two state artifacts encode the same occupancy in
-        different shapes, so comparing them catches a mismatched generation
-        pair, a mis-pointed directory and a truncated artifact. It is also the
-        only verification of the map's own ``index`` space: density is
-        structural in the groups artifact (list position is the slot) but not
-        in the map, where ``index`` is a stored value.
-
-        """
+        """Verify the existing map agrees with the published groups."""
         path = self._config.existing_sid_map_path
         if path is None or prior.is_empty:
             return
@@ -750,8 +717,9 @@ class CollisionResolutionRunner:
         domain = prior.bucket_keys
         bands = np.unique(domain // layer_sizes[-1])
         unknown_keys: List[int] = []
-        position_chunks: List[np.ndarray] = []
-        index_chunks: List[np.ndarray] = []
+        counts = np.zeros(domain.shape[0], dtype=np.int64)
+        max_index = np.zeros(domain.shape[0], dtype=np.int64)
+        sum_index = np.zeros(domain.shape[0], dtype=np.int64)
 
         for batch in self._iter_state_batches(
             path,
@@ -760,40 +728,26 @@ class CollisionResolutionRunner:
         ):
             keys = sid_bucket_keys(self._codes_matrix(batch["codebook"]), layer_sizes)
             _, known_band = lookup_sorted(bands, keys // layer_sizes[-1])
-            rows = np.flatnonzero(known_band)
-            if rows.size == 0:
+            if not known_band.any():
                 continue
-            keys = keys[rows]
-            indices = (
-                batch["index"]
-                .take(pa.array(rows, type=pa.int64()))
-                .to_numpy(zero_copy_only=False)
-                .astype(np.int64, copy=False)
-            )
+            keys = keys[known_band]
+            indices = batch["index"].to_numpy(zero_copy_only=False)[known_band]
             positions, known = lookup_sorted(domain, keys)
             if not np.all(known) and len(unknown_keys) < 10:
                 unknown_keys.extend(keys[~known][:10].tolist())
-            if np.any(known):
-                position_chunks.append(positions[known])
-                index_chunks.append(indices[known])
-
-        counts = np.zeros(domain.shape[0], dtype=np.int64)
-        max_index = np.zeros(domain.shape[0], dtype=np.int64)
-        sum_index = np.zeros(domain.shape[0], dtype=np.int64)
-        if position_chunks:
-            positions = np.concatenate(position_chunks)
-            indices = np.concatenate(index_chunks)
-            counts = np.bincount(positions, minlength=domain.shape[0])
-            sum_index = np.bincount(
-                positions, weights=indices, minlength=domain.shape[0]
-            ).astype(np.int64, copy=False)
-            order = np.argsort(positions, kind="stable")
-            sorted_positions = positions[order]
+            if not known.any():
+                continue
+            order = np.argsort(positions[known], kind="stable")
+            batch_positions = positions[known][order]
+            batch_indices = indices[known][order].astype(np.int64, copy=False)
             starts = np.flatnonzero(
-                np.concatenate(([True], sorted_positions[1:] != sorted_positions[:-1]))
+                np.concatenate(([True], batch_positions[1:] != batch_positions[:-1]))
             )
-            max_index[sorted_positions[starts]] = np.maximum.reduceat(
-                indices[order], starts
+            buckets = batch_positions[starts]
+            counts[buckets] += np.diff(np.append(starts, batch_positions.shape[0]))
+            sum_index[buckets] += np.add.reduceat(batch_indices, starts)
+            max_index[buckets] = np.maximum(
+                max_index[buckets], np.maximum.reduceat(batch_indices, starts)
             )
 
         self._report_cross_check(prior, counts, max_index, sum_index, unknown_keys)
@@ -945,26 +899,18 @@ class CollisionResolutionRunner:
                 last_progress_count = written
 
     def _stream_existing_map_rows(self, writer: BaseWriter) -> int:
-        """Copy every published map row into the merged output unchanged.
-
-        Existing rows keep their item ID, both codebooks and their slot index
-        verbatim; that copy is the guarantee that no published SID moves.
-
-        Returns zero outside append mode, where the published-state flags are
-        ignored rather than rejected.
-        """
+        """Copy every published map row into the merged output unchanged."""
         path = self._config.existing_sid_map_path
         if path is None or not self._config.is_append:
             return 0
         is_csv = isinstance(writer, CsvWriter)
         fields = ["item_id", "origin_codebook", "codebook", "index"]
         written = 0
-        for index, batch in enumerate(
-            self._iter_state_batches(path, fields, "Copying published item map")
+        for batch in self._iter_state_batches(
+            path, fields, "Copying published item map"
         ):
             item_id_column = batch["item_id"]
-            if index == 0:
-                self._check_state_item_id_type(item_id_column, "existing SID map")
+            self._check_state_item_id_type(item_id_column, "existing SID map")
             writer.write(
                 {
                     "item_id": item_id_column,
@@ -1084,16 +1030,12 @@ class CollisionResolutionRunner:
         values: pa.Array,
         rows: Optional[np.ndarray] = None,
     ) -> None:
-        """Write one chunk of SID groups, optionally only ``rows`` of it.
-
-        ``rows`` selects a subset of the groups, or ``None`` for all of them.
-        """
+        """Write one chunk of SID groups, optionally only ``rows`` of it."""
         is_csv = isinstance(writer, CsvWriter)
-        lengths = np.diff(offsets)
         if rows is not None:
             if rows.size == 0:
                 return
-            lengths = lengths[rows]
+            lengths = np.diff(offsets)[rows]
             values = values.take(
                 pa.array(concat_ranges(offsets[:-1][rows], lengths), type=pa.int64())
             )
@@ -1123,7 +1065,9 @@ class CollisionResolutionRunner:
             codes = codes.copy()
             codes[:, -1] = resolved_last_codes[representative_rows]
         return _AppendGroups(
-            grouping=grouping,
+            keys=grouping.sid_keys,
+            counts=grouping.counts,
+            offsets=offsets,
             codes=codes,
             item_ids=self._item_id_array(item_ids[grouping.row_order]),
         )
@@ -1137,15 +1081,7 @@ class CollisionResolutionRunner:
         grouping: CodebookItemGrouping,
         resolved_last_codes: Optional[np.ndarray],
     ) -> None:
-        """Merge this run's groups into the published groups and write both.
-
-        Streams the published groups once and interleaves this run's groups by
-        SID key, so the resolved output is corpus-complete and still ascending
-        -- which is exactly what the next append merge-joins against. The
-        optional delta output receives the same rows for the buckets this run
-        changed, so a serving index can upsert them idempotently.
-
-        """
+        """Merge this run's groups into the published groups and write both."""
         layer_sizes = self._config.layer_sizes
         groups = self._build_append_groups(
             item_ids, origin_codes, grouping, resolved_last_codes
@@ -1189,7 +1125,7 @@ class CollisionResolutionRunner:
                         groups.codes[start:stop],
                         groups.offsets[start : stop + 1] - child_low,
                         groups.item_ids.slice(child_low, child_high - child_low),
-                        np.arange(stop - start),
+                        None,
                     )
 
             cursor = 0
@@ -1264,24 +1200,16 @@ class CollisionResolutionRunner:
                 child_start = int(offsets[group_start])
                 child_end = int(offsets[group_end])
                 rows = grouping.row_order[child_start:child_end]
-                local_offsets = (
-                    offsets[group_start : group_end + 1] - child_start
-                ).astype(np.int32, copy=False)
+                local_offsets = offsets[group_start : group_end + 1] - child_start
                 representative_rows = grouping.row_order[offsets[group_start:group_end]]
                 code_chunk = origin_codes[representative_rows]
                 if resolved_last_codes is not None:
                     code_chunk[:, -1] = resolved_last_codes[representative_rows]
-                flat_item_ids = self._item_id_array(item_ids[rows])
-                writer.write(
-                    {
-                        "codebook": self._codes_column(code_chunk, is_csv),
-                        "offset_codebook": self._offset_codes_column(
-                            code_chunk, is_csv
-                        ),
-                        "itemids": self._grouped_item_ids_column(
-                            flat_item_ids, local_offsets, is_csv
-                        ),
-                    }
+                self._emit_group_rows(
+                    writer,
+                    code_chunk,
+                    local_offsets,
+                    self._item_id_array(item_ids[rows]),
                 )
                 if self._progress_interval_reached(child_end, last_progress_count):
                     progress.log(
@@ -1292,10 +1220,7 @@ class CollisionResolutionRunner:
 
 
 def _max_code_rows(is_csv: bool, layer_count: int, row_cap: int) -> int:
-    """Return how many SID rows one write can encode.
-
-    CSV encodes codes as text and so has no Arrow list offset ceiling.
-    """
+    """Return how many SID rows one write can encode."""
     if is_csv:
         return row_cap
     return min(row_cap, _ARROW_LIST_OFFSET_MAX // layer_count)
@@ -1304,11 +1229,7 @@ def _max_code_rows(is_csv: bool, layer_count: int, row_cap: int) -> int:
 def _group_chunk_bounds(
     offsets: np.ndarray, low: int, high: int, max_rows: int
 ) -> Iterator[Tuple[int, int]]:
-    """Split ``[low, high)`` groups into writable ``(start, stop)`` chunks.
-
-    A chunk holds at most ``_GROUP_WRITE_ITEMS`` child items and ``max_rows``
-    groups, and always advances by one group so an oversized group progresses.
-    """
+    """Split ``[low, high)`` groups into writable ``(start, stop)`` chunks."""
     while low < high:
         child_limit = int(offsets[low]) + _GROUP_WRITE_ITEMS
         stop = int(np.searchsorted(offsets, child_limit, side="right") - 1)
@@ -1319,32 +1240,13 @@ def _group_chunk_bounds(
 
 @dataclass(frozen=True)
 class _AppendGroups:
-    """This run's SID groups, prepared for merging into the published groups.
+    """This run's SID groups, prepared for merging into the published groups."""
 
-    Args:
-        grouping: This run's resolved grouping; owns keys, counts and offsets.
-        codes: Emitted SID of every group, shape ``(len(keys), n_layers)``.
-        item_ids: Item IDs of every group flattened in group and slot order.
-    """
-
-    grouping: CodebookItemGrouping
+    keys: np.ndarray
+    counts: np.ndarray
+    offsets: np.ndarray
     codes: np.ndarray
     item_ids: pa.Array
-
-    @property
-    def keys(self) -> np.ndarray:
-        """Ascending flattened SID key of every group."""
-        return self.grouping.sid_keys
-
-    @property
-    def counts(self) -> np.ndarray:
-        """Item count of every group."""
-        return self.grouping.counts
-
-    @property
-    def offsets(self) -> np.ndarray:
-        """CSR offsets into ``item_ids``."""
-        return self.grouping.offsets
 
 
 def _merge_group_batch(
@@ -1356,22 +1258,10 @@ def _merge_group_batch(
     low: int,
     high: int,
 ) -> Tuple[np.ndarray, np.ndarray, pa.Array, np.ndarray]:
-    """Merge one batch of published groups with the new groups it overlaps.
-
-    Both sides are ascending by SID key, so the output is their sorted union:
-    a bucket on both sides emits one row whose item list is the published items
-    followed by this run's. That is also slot order, because published items
-    hold ``1..P`` and new items continue from ``P + 1``.
-
-    ``low`` / ``high`` bound the slice of ``groups`` overlapping this batch.
-    Returns emitted codes, CSR offsets, flattened item IDs, and the output rows
-    this run changed.
-    """
+    """Merge one batch of published groups with the new groups it overlaps."""
     batch_rows = batch_keys.shape[0]
     candidate_keys = groups.keys[low:high]
-    positions = np.searchsorted(candidate_keys, batch_keys)
-    matched = positions < candidate_keys.shape[0]
-    matched[matched] = candidate_keys[positions[matched]] == batch_keys[matched]
+    positions, matched = lookup_sorted(candidate_keys, batch_keys)
 
     new_for_batch = np.full(batch_rows, -1, dtype=np.int64)
     new_for_batch[matched] = low + positions[matched]
@@ -1400,8 +1290,7 @@ def _merge_group_batch(
 
     codes = np.empty((output_rows, batch_codes.shape[1]), dtype=np.int64)
     codes[batch_slots] = batch_codes
-    if unmatched.size:
-        codes[unmatched_slots] = groups.codes[unmatched]
+    codes[unmatched_slots] = groups.codes[unmatched]
 
     batch_part = np.where(has_batch, batch_lengths[batch_index], 0)
     new_part = np.where(has_new, groups.counts[new_index], 0)
@@ -1410,7 +1299,7 @@ def _merge_group_batch(
 
     child_low = int(groups.offsets[low])
     child_high = int(groups.offsets[high])
-    combined = pa.concat_arrays(
+    combined = pa.chunked_array(
         [batch_values, groups.item_ids.slice(child_low, child_high - child_low)]
     )
     batch_child_starts = np.zeros(batch_rows + 1, dtype=np.int64)
@@ -1422,7 +1311,7 @@ def _merge_group_batch(
     gather[concat_ranges(offsets[:-1] + batch_part, new_part)] = concat_ranges(
         len(batch_values) + groups.offsets[new_index] - child_low, new_part
     )
-    values = combined.take(pa.array(gather, type=pa.int64()))
+    values = combined.take(pa.array(gather, type=pa.int64())).combine_chunks()
     return codes, offsets, values, np.flatnonzero(has_new)
 
 

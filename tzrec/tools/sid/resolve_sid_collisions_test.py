@@ -1069,39 +1069,23 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             self.assertEqual(item_map["offset_codebook"][i], [final[0], final[1] + 8])
 
     def test_append_recomputes_offset_for_state_written_without_it(self) -> None:
-        # the published fixtures carry no offset_codebook column, so the merged
-        # map must derive it rather than pass it through
-        base = self._seed_generation()
-        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        # a map published before offset_codebook existed must still merge: the
+        # column is derived from the published codebook, not passed through
+        state_map = os.path.join(self.test_dir, "old_map")
+        state_groups = os.path.join(self.test_dir, "old_groups")
+        _map_parquet(state_map, [(0, [0, 0], [0, 0], 1), (1, [1, 1], [1, 1], 1)])
+        _groups_parquet(state_groups, [([0, 0], [0]), ([1, 1], [1])])
         out = os.path.join(self.test_dir, "v2")
-        _parquet(inp, [10], [[2, 2]], [[[0, 2]]])
-        self._append(inp, out, base)
-
-        item_map = self._read_parquet(out)
-        self.assertEqual(len(item_map["item_id"]), 6)
-        for codebook, offset in zip(item_map["codebook"], item_map["offset_codebook"]):
-            self.assertEqual(offset, [codebook[0], codebook[1] + 8])
-
-    def test_delta_outputs_carry_offset_codebook(self) -> None:
-        base = self._seed_generation()
-        inp = os.path.join(self.test_dir, "v2_in.parquet")
-        out = os.path.join(self.test_dir, "v2")
-        delta_map = os.path.join(self.test_dir, "delta_map")
-        delta_groups = os.path.join(self.test_dir, "delta_groups")
-        _parquet(inp, [10, 11], [[0, 0], [3, 3]], [[[0, 2], [0, 3]]] * 2)
-        self._append(
-            inp,
+        self._run(
+            self._prepare_single(10),
             out,
-            base,
-            delta_map_output_path=delta_map,
-            delta_sid_groups_output_path=delta_groups,
+            existing_sid_map_path=os.path.join(state_map, "*.parquet"),
+            existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
         )
 
-        delta = self._read_parquet(delta_map)
-        for codebook, offset in zip(delta["codebook"], delta["offset_codebook"]):
-            self.assertEqual(offset, [codebook[0], codebook[1] + 8])
-        groups = self._read_parquet(delta_groups)
-        for codebook, offset in zip(groups["codebook"], groups["offset_codebook"]):
+        item_map = self._read_parquet(out)
+        self.assertEqual(len(item_map["item_id"]), 3)
+        for codebook, offset in zip(item_map["codebook"], item_map["offset_codebook"]):
             self.assertEqual(offset, [codebook[0], codebook[1] + 8])
 
     # ---- append mode ----
@@ -1176,6 +1160,11 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             self.assertEqual(item_group, full[tuple(codebook)])
         touched = {item for group in delta["itemids"] for item in group}
         self.assertTrue({10, 11}.issubset(touched))
+        for artifact in (self._read_parquet(delta_map), delta):
+            for codebook, offset in zip(
+                artifact["codebook"], artifact["offset_codebook"]
+            ):
+                self.assertEqual(offset, [codebook[0], codebook[1] + 8])
 
     def test_append_creates_buckets_before_between_and_after(self) -> None:
         # New SIDs sort before, between and after every published bucket, which
@@ -1194,7 +1183,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     def test_append_merges_across_reader_batches(self) -> None:
         base = self._seed_generation(
             item_ids=list(range(6)),
-            codes=[[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5]],
+            codes=[[0, 0], [0, 0], [2, 2], [3, 3], [4, 4], [5, 5]],
         )
         inp = os.path.join(self.test_dir, "v2_in.parquet")
         out = os.path.join(self.test_dir, "v2")
