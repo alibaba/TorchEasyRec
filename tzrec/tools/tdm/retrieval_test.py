@@ -250,11 +250,11 @@ class TDMRetrievalTest(unittest.TestCase):
     def _run_retrieval(
         self, batch_count: int, writer: mock.Mock, num_worker_per_level: int
     ) -> None:
-        def bounded(fn):
+        def bounded(fn, name="timeout"):
             """Fail fast instead of stalling for the production queue timeout."""
 
             def wrapper(*args, **kwargs):
-                kwargs.setdefault("timeout", 20)
+                kwargs.setdefault(name, 20)
                 return fn(*args, **kwargs)
 
             return wrapper
@@ -301,7 +301,7 @@ class TDMRetrievalTest(unittest.TestCase):
             mock.patch.object(
                 predict_util,
                 "wait_for_pipeline",
-                bounded(predict_util.wait_for_pipeline),
+                bounded(predict_util.wait_for_pipeline, "stall_timeout"),
             ),
         ):
             retrieval.tdm_retrieval(

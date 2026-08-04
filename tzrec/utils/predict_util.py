@@ -257,16 +257,14 @@ def wait_for_pipeline(
     threads: Sequence[Thread],
     failure_queue: Any,
     cancel_event: Any,
-    timeout: float = PREDICT_QUEUE_TIMEOUT,
+    stall_timeout: float = PREDICT_QUEUE_TIMEOUT,
 ) -> None:
     """Wait for normal completion, failing only once the pipeline stalls.
 
-    ``timeout`` bounds time without progress, never total drain time, so a slow
-    but advancing pipeline is never reported as stalled. Progress is one
-    completed queue operation or one component finishing, which makes a stage
-    visible only while it moves work through this module's queue helpers. A
-    single operation lasting longer than ``timeout`` still counts as a stall:
-    nothing observable from outside separates it from a wedged stage.
+    ``stall_timeout`` bounds time without progress, not total drain time, so a
+    slow but advancing pipeline never trips it. Progress is one completed queue
+    operation or one finished component; work that advances more slowly, or
+    outside this module's queue helpers, reads as a stall.
     """
 
     def _completed() -> bool:
@@ -282,9 +280,9 @@ def wait_for_pipeline(
             sum(thread.is_alive() for thread in threads),
         )
 
-    if not _poll_until(_completed, timeout, progress=_progress):
+    if not _poll_until(_completed, stall_timeout, progress=_progress):
         raise TimeoutError(
-            f"Prediction pipeline made no progress for {timeout} seconds; "
+            f"Prediction pipeline made no progress for {stall_timeout} seconds; "
             f"processes={[p.pid for p in processes if p.is_alive()]}, "
             f"threads={[t.name for t in threads if t.is_alive()]}."
         )

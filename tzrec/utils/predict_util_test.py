@@ -142,7 +142,7 @@ class PredictUtilTest(unittest.TestCase):
         started = time.monotonic()
         with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
             predict_util.wait_for_pipeline(
-                [], [thread], queue.Queue(), cancel_event, timeout=0.2
+                [], [thread], queue.Queue(), cancel_event, stall_timeout=0.2
             )
         elapsed = time.monotonic() - started
 
@@ -168,7 +168,7 @@ class PredictUtilTest(unittest.TestCase):
 
         with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
             predict_util.wait_for_pipeline(
-                [], [thread, producer], queue.Queue(), cancel_event, timeout=0.2
+                [], [thread, producer], queue.Queue(), cancel_event, stall_timeout=0.2
             )
 
         self.assertFalse(thread.is_alive())
@@ -185,7 +185,7 @@ class PredictUtilTest(unittest.TestCase):
         with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
             with self.assertRaisesRegex(TimeoutError, "no progress.*wedged-writer"):
                 predict_util.wait_for_pipeline(
-                    [], [idle], queue.Queue(), cancel_event, timeout=0.2
+                    [], [idle], queue.Queue(), cancel_event, stall_timeout=0.2
                 )
         elapsed = time.monotonic() - started
         cancel_event.set()
@@ -323,7 +323,7 @@ class PredictUtilTest(unittest.TestCase):
             thread.start()
         with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
             predict_util.wait_for_pipeline(
-                [], forward_threads, failure_queue, cancel_event, timeout=1
+                [], forward_threads, failure_queue, cancel_event, stall_timeout=1
             )
             predict_util.queue_put_interruptibly(
                 output_queue,
@@ -333,7 +333,7 @@ class PredictUtilTest(unittest.TestCase):
                 timeout=1,
             )
             predict_util.wait_for_pipeline(
-                [], [writer_thread], failure_queue, cancel_event, timeout=1
+                [], [writer_thread], failure_queue, cancel_event, stall_timeout=1
             )
 
         writer = mock.Mock()
