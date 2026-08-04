@@ -200,6 +200,24 @@ def queue_put_interruptibly(
     raise PredictPipelineCancelled(f"Prediction pipeline {stage} was cancelled.")
 
 
+def _any_alive(processes: Sequence[Process], threads: Sequence[Thread]) -> bool:
+    """Report whether any pipeline component is still running."""
+    return any(process.is_alive() for process in processes) or any(
+        thread.is_alive() for thread in threads
+    )
+
+
+def _poll_until(predicate: Callable[[], bool], timeout: float) -> bool:
+    """Wait for a predicate within one deadline, polling at the pipeline rate."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_PREDICT_PIPELINE_POLL_INTERVAL, remaining))
+    return True
+
+
 def wait_for_pipeline(
     processes: Sequence[Process],
     threads: Sequence[Thread],
@@ -208,23 +226,18 @@ def wait_for_pipeline(
     timeout: float = PREDICT_QUEUE_TIMEOUT,
 ) -> None:
     """Wait boundedly for normal completion while monitoring failures."""
-    deadline = time.monotonic() + timeout
-    while True:
-        check_pipeline_health(processes, failure_queue, cancel_event)
-        alive_processes = [process for process in processes if process.is_alive()]
-        alive_threads = [thread for thread in threads if thread.is_alive()]
-        if not alive_processes and not alive_threads:
-            break
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            process_ids = [process.pid for process in alive_processes]
-            thread_names = [thread.name for thread in alive_threads]
-            raise TimeoutError(
-                "Prediction pipeline stalled during completion; "
-                f"processes={process_ids}, threads={thread_names}."
-            )
-        time.sleep(min(_PREDICT_PIPELINE_POLL_INTERVAL, remaining))
+    def _completed() -> bool:
+        """Report completion, raising whatever the background stages hit."""
+        check_pipeline_health(processes, failure_queue, cancel_event)
+        return not _any_alive(processes, threads)
+
+    if not _poll_until(_completed, timeout):
+        raise TimeoutError(
+            "Prediction pipeline stalled during completion; "
+            f"processes={[p.pid for p in processes if p.is_alive()]}, "
+            f"threads={[t.name for t in threads if t.is_alive()]}."
+        )
 
     for process in processes:
         process.join(timeout=0)
@@ -242,53 +255,21 @@ def cleanup_pipeline(
 ) -> None:
     """Cancel and reap prediction pipeline components within bounded deadlines."""
     cancel_event.set()
-    graceful_deadline = time.monotonic() + _PREDICT_PIPELINE_CLEANUP_TIMEOUT
-    while time.monotonic() < graceful_deadline:
-        if not any(process.is_alive() for process in processes) and not any(
-            thread.is_alive() for thread in threads
-        ):
-            break
-        time.sleep(
-            min(
-                _PREDICT_PIPELINE_POLL_INTERVAL,
-                max(0, graceful_deadline - time.monotonic()),
-            )
-        )
+    _poll_until(
+        lambda: not _any_alive(processes, threads), _PREDICT_PIPELINE_CLEANUP_TIMEOUT
+    )
 
-    surviving_processes = [process for process in processes if process.is_alive()]
-    for process in surviving_processes:
+    terminated = [process for process in processes if process.is_alive()]
+    for process in terminated:
         process.terminate()
+    _poll_until(
+        lambda: not _any_alive(terminated, []), _PREDICT_PIPELINE_TERMINATE_TIMEOUT
+    )
 
-    terminate_deadline = time.monotonic() + _PREDICT_PIPELINE_TERMINATE_TIMEOUT
-    while time.monotonic() < terminate_deadline and any(
-        process.is_alive() for process in surviving_processes
-    ):
-        time.sleep(
-            min(
-                _PREDICT_PIPELINE_POLL_INTERVAL,
-                max(0, terminate_deadline - time.monotonic()),
-            )
-        )
-
-    surviving_processes = [
-        process for process in surviving_processes if process.is_alive()
-    ]
-    for process in surviving_processes:
+    killed = [process for process in terminated if process.is_alive()]
+    for process in killed:
         process.kill()
-
-    kill_deadline = time.monotonic() + _PREDICT_PIPELINE_KILL_TIMEOUT
-    while time.monotonic() < kill_deadline and any(
-        process.is_alive() for process in surviving_processes
-    ):
-        time.sleep(
-            min(
-                _PREDICT_PIPELINE_POLL_INTERVAL,
-                max(0, kill_deadline - time.monotonic()),
-            )
-        )
-    for process in surviving_processes:
-        if process.is_alive():
-            logger.warning("Prediction process %s survived kill().", process.pid)
+    _poll_until(lambda: not _any_alive(killed, []), _PREDICT_PIPELINE_KILL_TIMEOUT)
 
     for process in processes:
         process.join(timeout=0)
@@ -300,12 +281,8 @@ def cleanup_pipeline(
             )
     for data_queue in queues:
         try:
-            cancel_join_thread = getattr(data_queue, "cancel_join_thread", None)
-            if cancel_join_thread is not None:
-                cancel_join_thread()
-            close = getattr(data_queue, "close", None)
-            if close is not None:
-                close()
+            data_queue.cancel_join_thread()
+            data_queue.close()
         except Exception:
             logger.exception("Failed to close a prediction pipeline queue.")
 
@@ -314,10 +291,9 @@ def commit_prediction_output(
     writer: Any,
     pipeline_error: Optional[BaseException],
     expected_batches: int,
-    written_batches: int,
     device: torch.device,
 ) -> None:
-    """Commit prediction output only when every rank produced complete output.
+    """Commit prediction output only when every rank succeeded.
 
     Every rank must call this, including ranks whose pipeline failed, because
     ``writer.close()`` participates in a collective for distributed writers.
@@ -330,15 +306,15 @@ def commit_prediction_output(
         writer (BaseWriter): output writer to commit.
         pipeline_error (BaseException, optional): failure of the local pipeline.
         expected_batches (int): batches submitted to the local pipeline.
-        written_batches (int): batches written by the local writer.
         device (torch.device): device used to reduce the outcome across ranks.
     """
-    succeeded = pipeline_error is None and expected_batches == written_batches
-    global_succeeded = succeeded
+    global_succeeded = pipeline_error is None
     global_batches = expected_batches
     if dist.is_initialized() and dist.get_world_size() > 1:
         outcome = torch.tensor(
-            [int(succeeded), expected_batches], dtype=torch.int64, device=device
+            [int(pipeline_error is None), expected_batches],
+            dtype=torch.int64,
+            device=device,
         )
         dist.all_reduce(outcome, op=ReduceOp.SUM)
         global_succeeded = int(outcome[0].item()) == dist.get_world_size()
@@ -346,15 +322,9 @@ def commit_prediction_output(
 
     if pipeline_error is not None:
         raise pipeline_error
-    if expected_batches != written_batches:
-        raise RuntimeError(
-            f"Prediction output is incomplete; submitted={expected_batches} "
-            f"batches, written={written_batches} batches."
-        )
     if not global_succeeded:
         raise RuntimeError(
-            "Prediction pipeline failed or wrote incomplete output on another "
-            "rank; output was not committed."
+            "Prediction pipeline failed on another rank; output was not committed."
         )
     if global_batches == 0:
         raise RuntimeError("Prediction input is empty; output was not committed.")

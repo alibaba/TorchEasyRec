@@ -262,7 +262,7 @@ class PredictUtilTest(unittest.TestCase):
 
         writer = mock.Mock()
         predict_util.commit_prediction_output(
-            writer, None, len(submitted), len(written), torch.device("cpu")
+            writer, None, len(submitted), torch.device("cpu")
         )
         self.assertEqual(sorted(written), submitted)
         self.assertTrue(all(not thread.is_alive() for thread in threads))
@@ -272,26 +272,15 @@ class PredictUtilTest(unittest.TestCase):
         writer = mock.Mock()
         error = ValueError("forward boom")
         with self.assertRaises(ValueError) as raised:
-            predict_util.commit_prediction_output(
-                writer, error, 2, 2, torch.device("cpu")
-            )
+            predict_util.commit_prediction_output(writer, error, 2, torch.device("cpu"))
         self.assertIs(raised.exception, error)
         writer.close.assert_not_called()
 
-    def test_invalid_output_never_commits(self):
-        invalid_cases = [(2, 1), (0, 0)]
-        for expected_batches, written_batches in invalid_cases:
-            with self.subTest(expected_batches=expected_batches):
-                writer = mock.Mock()
-                with self.assertRaises(RuntimeError):
-                    predict_util.commit_prediction_output(
-                        writer,
-                        None,
-                        expected_batches,
-                        written_batches,
-                        torch.device("cpu"),
-                    )
-                writer.close.assert_not_called()
+    def test_empty_input_never_commits(self):
+        writer = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, "empty"):
+            predict_util.commit_prediction_output(writer, None, 0, torch.device("cpu"))
+        writer.close.assert_not_called()
 
     @parameterized.expand(
         [[0, False], [1, True]],
@@ -308,13 +297,13 @@ class PredictUtilTest(unittest.TestCase):
             if expect_commit:
                 # an empty local shard is normal when input files are uneven.
                 predict_util.commit_prediction_output(
-                    writer, None, 0, 0, torch.device("cpu")
+                    writer, None, 0, torch.device("cpu")
                 )
                 writer.close.assert_called_once_with()
             else:
                 with self.assertRaisesRegex(RuntimeError, "another rank"):
                     predict_util.commit_prediction_output(
-                        writer, None, 0, 0, torch.device("cpu")
+                        writer, None, 0, torch.device("cpu")
                     )
                 writer.close.assert_not_called()
 

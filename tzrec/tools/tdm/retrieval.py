@@ -364,7 +364,6 @@ def tdm_retrieval(
     pos_prob_name: str = "probs1" if num_class == 2 else "probs"
 
     expected_batches = 0
-    written_batches = 0
     total = 0
     recall = 0
 
@@ -412,7 +411,6 @@ def tdm_retrieval(
             return record_batch_t, node_ids
 
     def _write(record_batch_t: RecordBatchTensor, node_ids: pa.Array) -> None:
-        nonlocal written_batches
         nonlocal total
         nonlocal recall
         output_dict = OrderedDict()
@@ -433,7 +431,6 @@ def tdm_retrieval(
             ),
             axis=1,
         )
-        written_batches += 1
         total += cur_batch_size
         recall += np.sum(retrieval_result)
 
@@ -574,7 +571,7 @@ def tdm_retrieval(
                 logger.exception("Failed to stop the retrieval profiler.")
 
     predict_util.commit_prediction_output(
-        writer, pipeline_error, expected_batches, written_batches, device
+        writer, pipeline_error, expected_batches, device
     )
 
     metric_t = torch.tensor([total, recall], dtype=torch.int64, device=device)

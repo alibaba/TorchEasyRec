@@ -1344,9 +1344,7 @@ def predict(
     )
     failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
     cancel_event: Event = Event()
-    all_queues = [data_queue, pred_queue, failure_queue]
     expected_batches = 0
-    written_batches = 0
 
     def _forward(
         batch: Batch,
@@ -1367,9 +1365,7 @@ def predict(
         reserves: RecordBatchTensor,
         output_cols: List[str],
     ) -> None:
-        nonlocal written_batches
         _write_predictions(writer, predictions, reserves, output_cols)
-        written_batches += 1
 
     def _write_loop(output_cols: List[str]) -> None:
         stage = "writer"
@@ -1484,7 +1480,7 @@ def predict(
         pipeline_threads = [*forward_t_list]
         if write_t is not None:
             pipeline_threads.append(write_t)
-        predict_util.cleanup_pipeline([], pipeline_threads, all_queues, cancel_event)
+        predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
         if is_profiling:
             # nothing here may raise, or this rank skips the commit rendezvous.
             try:
@@ -1493,7 +1489,7 @@ def predict(
                 logger.exception("Failed to stop the prediction profiler.")
 
     predict_util.commit_prediction_output(
-        writer, pipeline_error, expected_batches, written_batches, device
+        writer, pipeline_error, expected_batches, device
     )
     if is_local_rank_zero:
         logger.info("Predict Finished.")
@@ -1642,18 +1638,14 @@ def predict_checkpoint(
     )
     failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
     cancel_event: Event = Event()
-    all_queues = [pred_queue, failure_queue]
     expected_batches = 0
-    written_batches = 0
 
     def _write(
         predictions: Dict[str, torch.Tensor],
         reserves: RecordBatchTensor,
         output_cols: List[str],
     ) -> None:
-        nonlocal written_batches
         _write_predictions(writer, predictions, reserves, output_cols)
-        written_batches += 1
 
     def _write_loop(output_cols: List[str]) -> None:
         stage = "writer"
@@ -1737,12 +1729,10 @@ def predict_checkpoint(
             pipeline_error = predict_util.resolve_pipeline_error(error, failure_queue)
         finally:
             pipeline_threads = [] if write_t is None else [write_t]
-            predict_util.cleanup_pipeline(
-                [], pipeline_threads, all_queues, cancel_event
-            )
+            predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
 
     predict_util.commit_prediction_output(
-        writer, pipeline_error, expected_batches, written_batches, device
+        writer, pipeline_error, expected_batches, device
     )
 
     logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")

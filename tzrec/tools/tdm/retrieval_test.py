@@ -212,7 +212,7 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
         self.assertIn("ValueError", str(error.exception))
         with self.assertRaises(predict_util.PredictPipelineStageError):
             predict_util.commit_prediction_output(
-                writer, error.exception, 1, 1, torch.device("cpu")
+                writer, error.exception, 1, torch.device("cpu")
             )
         writer.close.assert_not_called()
 
