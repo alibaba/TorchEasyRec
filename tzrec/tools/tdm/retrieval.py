@@ -81,6 +81,30 @@ def _tdm_predict_data_worker(
     cancel_event: Any,
     failure_queue: Queue,
 ) -> None:
+    """Sample one tree layer for the forward coordinator of that layer.
+
+    The worker samples candidates for every input batch until the input
+    sentinel arrives, forwards one completion sentinel downstream, and only
+    then waits for ``output_drained_event``. The wait is required because the
+    queued ``Batch`` and ``RecordBatchTensor`` payloads are backed by Torch
+    shared storage owned by this process: exiting before the forward
+    coordinator has deserialized them tears down the multiprocessing
+    resource-sharer endpoint. Cancellation is the abnormal escape.
+
+    Args:
+        sampler (TDMPredictSampler): sampler of tree nodes.
+        data_parser (DataParser): parser of sampled features.
+        first_recall_layer (int): first tree layer to recall.
+        n_cluster (int): tree cluster num.
+        in_queue (Queue): queue of upstream layer results.
+        out_queue (Queue): queue of sampled batches for this layer.
+        is_first_layer (bool): whether the worker serves the first layer.
+        worker_id (int): id of the worker.
+        output_drained_event (Event): set when this layer's forward
+            coordinator has consumed every queued payload.
+        cancel_event (Event): set when the pipeline is cancelled.
+        failure_queue (Queue): queue to report failures on.
+    """
     stage = "data worker"
     try:
         item_id_field = sampler._item_id_field
@@ -340,7 +364,6 @@ def tdm_retrieval(
     pos_prob_name: str = "probs1" if num_class == 2 else "probs"
 
     expected_batches = 0
-    expected_rows = 0
     written_batches = 0
     total = 0
     recall = 0
@@ -394,8 +417,6 @@ def tdm_retrieval(
         nonlocal recall
         output_dict = OrderedDict()
         reserve_batch_record = record_batch_t.get()
-        if reserve_batch_record is None:
-            raise RuntimeError("TDM retrieval output lost its reserved input batch.")
         gt_node_ids = reserve_batch_record[item_id_field]
         cur_batch_size = len(gt_node_ids)
         if reserved_cols is not None:
@@ -418,18 +439,23 @@ def tdm_retrieval(
 
     in_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer + 1)]
     out_queues = [Queue(maxsize=2) for _ in range(max_level - first_recall_layer)]
-    failure_queue = Queue()
-    cancel_event = Event()
-    data_output_drained_events = [
+    failure_queue: Any = Queue()
+    cancel_event: Any = Event()
+    data_output_drained_events: List[Any] = [
         Event() for _ in range(max_level - first_recall_layer)
     ]
     all_queues = [*in_queues, *out_queues, failure_queue]
 
     data_p_list: List[Process] = []
-    forward_t_list: List[Thread] = []
+    pipeline_t_list: List[Thread] = []
     write_t: Optional[Thread] = None
-    pipeline_succeeded = False
+    pipeline_error: Optional[BaseException] = None
     i_step = 0
+
+    def _check_health() -> None:
+        """Check background pipeline health from the main thread."""
+        predict_util.check_pipeline_health(data_p_list, failure_queue, cancel_event)
+
     try:
         for i in range(max_level - first_recall_layer):
             for j in range(num_worker_per_level):
@@ -473,32 +499,11 @@ def tdm_retrieval(
                 daemon=True,
             )
             t.start()
-            forward_t_list.append(t)
-    except BaseException:
-        predict_util.cleanup_pipeline(
-            data_p_list,
-            forward_t_list,
-            all_queues,
-            cancel_event,
-        )
-        if is_profiling:
-            try:
-                prof.stop()
-            except Exception:
-                logger.exception("Failed to stop the retrieval profiler.")
-        raise
+            pipeline_t_list.append(t)
 
-    def _check_health() -> None:
-        """Check background pipeline health from the main thread."""
-        predict_util.check_pipeline_health(data_p_list, failure_queue, cancel_event)
-
-    try:
         while True:
             try:
                 batch = next(infer_iterator)
-                reserve_batch_record = batch.reserves.get()
-                if reserve_batch_record is None:
-                    raise RuntimeError("TDM retrieval input has no reserved batch.")
                 predict_util.queue_put_interruptibly(
                     in_queues[0],
                     (batch.reserves, None),
@@ -507,7 +512,6 @@ def tdm_retrieval(
                     health_check=_check_health,
                 )
                 expected_batches += 1
-                expected_rows += len(reserve_batch_record)
                 if i_step == 0:
                     # Initialize distributed writers synchronously on the first batch.
                     record_batch_t, node_ids = predict_util.queue_get_interruptibly(
@@ -516,10 +520,6 @@ def tdm_retrieval(
                         "first output",
                         health_check=_check_health,
                     )
-                    if record_batch_t is None:
-                        raise RuntimeError(
-                            "TDM retrieval completed before producing its first output."
-                        )
                     _write(record_batch_t, node_ids)
                     write_t = Thread(
                         target=_write_loop,
@@ -528,12 +528,12 @@ def tdm_retrieval(
                         daemon=True,
                     )
                     write_t.start()
+                    pipeline_t_list.append(write_t)
                 if is_local_rank_zero:
                     plogger.log(i_step)
                 if is_profiling:
                     prof.step()
                 i_step += 1
-                predict_util.raise_background_failure(failure_queue)
             except StopIteration:
                 break
 
@@ -547,34 +547,30 @@ def tdm_retrieval(
             )
 
         if write_t is None:
-            record_batch_t, _ = predict_util.queue_get_interruptibly(
+            predict_util.queue_get_interruptibly(
                 in_queues[-1],
                 cancel_event,
                 "empty input completion",
                 health_check=_check_health,
             )
-            if record_batch_t is not None:
-                raise RuntimeError("Empty TDM retrieval produced unexpected output.")
 
-        pipeline_threads = [*forward_t_list]
-        if write_t is not None:
-            pipeline_threads.append(write_t)
         predict_util.wait_for_pipeline(
-            data_p_list, pipeline_threads, failure_queue, cancel_event
+            data_p_list, pipeline_t_list, failure_queue, cancel_event
         )
-        pipeline_succeeded = True
     except predict_util.PredictPipelineCancelled as error:
-        predict_util.raise_background_failure(failure_queue, wait=True)
-        raise RuntimeError(
-            "TDM retrieval pipeline was cancelled without an error."
-        ) from error
+        try:
+            predict_util.raise_background_failure(failure_queue, wait=True)
+            raise RuntimeError(
+                "TDM retrieval pipeline was cancelled without an error."
+            ) from error
+        except Exception as cancel_error:
+            pipeline_error = cancel_error
+    except Exception as error:
+        pipeline_error = error
     finally:
-        pipeline_threads = [*forward_t_list]
-        if write_t is not None:
-            pipeline_threads.append(write_t)
         predict_util.cleanup_pipeline(
             data_p_list,
-            pipeline_threads,
+            pipeline_t_list,
             all_queues,
             cancel_event,
         )
@@ -584,29 +580,13 @@ def tdm_retrieval(
             except Exception:
                 logger.exception("Failed to stop the retrieval profiler.")
 
-    if not pipeline_succeeded:
-        raise RuntimeError("TDM retrieval pipeline did not complete successfully.")
+    predict_util.commit_prediction_output(
+        writer, pipeline_error, expected_batches, written_batches, device
+    )
 
-    metric_t = torch.tensor(
-        [expected_batches, expected_rows, written_batches, total, recall],
-        dtype=torch.int64,
-        device=device,
-    )
+    metric_t = torch.tensor([total, recall], dtype=torch.int64, device=device)
     dist.all_reduce(metric_t, op=ReduceOp.SUM)
-    global_expected_batches = int(metric_t[0].cpu().item())
-    global_expected_rows = int(metric_t[1].cpu().item())
-    global_written_batches = int(metric_t[2].cpu().item())
-    global_written_rows = int(metric_t[3].cpu().item())
-    global_recall = int(metric_t[4].cpu().item())
-    predict_util.validate_and_commit_writer(
-        writer,
-        pipeline_succeeded,
-        global_expected_batches,
-        global_expected_rows,
-        global_written_batches,
-        global_written_rows,
-    )
-    recall_ratio = global_recall / global_written_rows
+    recall_ratio = int(metric_t[1].cpu().item()) / int(metric_t[0].cpu().item())
 
     if is_rank_zero:
         logger.info(f"Retrieval Finished. Recall:{recall_ratio}")

@@ -10,19 +10,27 @@
 # limitations under the License.
 
 import multiprocessing
+import os
 import queue
 import threading
-import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import pyarrow as pa
+import torch
 from parameterized import parameterized
 
 from tzrec.datasets.utils import Batch, RecordBatchTensor
+from tzrec.protos.data_pb2 import DataConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.protos.sampler_pb2 import TDMSampler
 from tzrec.tools.tdm import retrieval
 from tzrec.utils import predict_util
 from tzrec.utils.test_util import parameterized_name_func
+
+_BATCH_SIZE = 2
+_SAMPLE_PER_BATCH = 8
 
 
 class _FailingSampler:
@@ -51,6 +59,27 @@ class _PassingParser:
 
     def to_batch(self, output_data, force_no_tile=False):
         return Batch()
+
+
+class _RetrievalSampler:
+    """Sampler stub expanding every input batch to a fixed candidate count."""
+
+    _item_id_field = "item_id"
+
+    def init(self, worker_id):
+        return None
+
+    def init_cluster(self, num_client_per_rank):
+        return None
+
+    def launch_server(self):
+        return None
+
+    def init_sampler(self, n_cluster):
+        return None
+
+    def get(self, input_data):
+        return {"item_id": pa.array(list(range(_SAMPLE_PER_BATCH)))}
 
 
 class _StubbornProcess:
@@ -204,75 +233,131 @@ class TDMRetrievalLifecycleTest(unittest.TestCase):
             predict_util.raise_background_failure(failure_queue)
         self.assertIn(f"{stage} boom", str(error.exception))
         self.assertIn("ValueError", str(error.exception))
-        with self.assertRaisesRegex(RuntimeError, "not committed"):
-            predict_util.validate_and_commit_writer(writer, False, 1, 1, 1, 1)
+        with self.assertRaises(predict_util.PredictPipelineStageError):
+            predict_util.commit_prediction_output(
+                writer, error.exception, 1, 1, torch.device("cpu")
+            )
         writer.close.assert_not_called()
 
-    def test_full_queue_is_interruptible_and_cleanup_is_bounded(self):
-        data_queue = queue.Queue(maxsize=1)
-        data_queue.put("full")
-        cancel_event = threading.Event()
 
-        def cancel():
-            time.sleep(0.02)
-            cancel_event.set()
+class TDMRetrievalTest(unittest.TestCase):
+    """Tests for the ``tdm_retrieval`` queue topology, end to end."""
 
-        cancel_thread = threading.Thread(target=cancel)
-        cancel_thread.start()
-        with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
-            with self.assertRaises(predict_util.PredictPipelineCancelled):
-                predict_util.queue_put_interruptibly(
-                    data_queue, "blocked", cancel_event, "test queue", timeout=1
+    def _batch(self):
+        return SimpleNamespace(
+            reserves=RecordBatchTensor(
+                pa.record_batch(
+                    {
+                        "item_id": list(range(_BATCH_SIZE)),
+                        "user_id": list(range(_BATCH_SIZE)),
+                    }
                 )
-            with self.assertRaisesRegex(TimeoutError, "test stall"):
-                predict_util.queue_put_interruptibly(
-                    data_queue,
-                    "blocked",
-                    threading.Event(),
-                    "test stall",
-                    timeout=0.02,
-                )
-            failed_process = _StubbornProcess()
-            failed_process._alive = False
-            failed_process.exitcode = -9
-            failed_event = threading.Event()
-            with self.assertRaisesRegex(RuntimeError, "exitcode=-9"):
-                predict_util.check_pipeline_health(
-                    [failed_process], queue.Queue(), failed_event
-                )
-            self.assertTrue(failed_event.is_set())
-        cancel_thread.join(timeout=1)
-
-        process = _StubbornProcess()
-        pipeline_queue = mock.Mock()
-        with (
-            mock.patch.object(predict_util, "_PREDICT_PIPELINE_CLEANUP_TIMEOUT", 0),
-            mock.patch.object(predict_util, "_PREDICT_PIPELINE_TERMINATE_TIMEOUT", 0),
-            mock.patch.object(predict_util, "_PREDICT_PIPELINE_KILL_TIMEOUT", 0),
-        ):
-            predict_util.cleanup_pipeline(
-                [process], [], [pipeline_queue], threading.Event()
             )
-        self.assertTrue(process.terminate_called)
-        self.assertTrue(process.kill_called)
-        pipeline_queue.cancel_join_thread.assert_called_once_with()
-        pipeline_queue.close.assert_called_once_with()
+        )
 
-    def test_commit_requires_complete_nonempty_success(self):
+    def _pipeline_config(self):
+        return EasyRecConfig(
+            data_config=DataConfig(
+                dataset_type=3,
+                num_workers=1,
+                tdm_sampler=TDMSampler(
+                    item_input_path="item",
+                    edge_input_path="edge",
+                    predict_edge_input_path="predict_edge",
+                    item_id_field="item_id",
+                    layer_num_sample=[1, 2, 4, 8],
+                ),
+            )
+        )
+
+    def _run_retrieval(
+        self, batch_count: int, writer: mock.Mock, num_worker_per_level: int
+    ) -> None:
+        def bounded(fn):
+            """Fail fast instead of stalling for the production queue timeout."""
+
+            def wrapper(*args, **kwargs):
+                kwargs.setdefault("timeout", 20)
+                return fn(*args, **kwargs)
+
+            return wrapper
+
+        dataloader = mock.Mock()
+        dataloader.get_iterator.return_value = iter(
+            [self._batch() for _ in range(batch_count)]
+        )
+        model = mock.Mock(return_value={"probs": torch.rand(_SAMPLE_PER_BATCH)})
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch(
+                "tzrec.tools.tdm.retrieval.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.tools.tdm.retrieval.dist"),
+            mock.patch(
+                "tzrec.tools.tdm.retrieval.config_util.load_pipeline_config",
+                return_value=self._pipeline_config(),
+            ),
+            mock.patch("tzrec.tools.tdm.retrieval._create_features", return_value=[]),
+            mock.patch(
+                "tzrec.tools.tdm.retrieval.create_dataloader", return_value=dataloader
+            ),
+            mock.patch("tzrec.tools.tdm.retrieval.create_writer", return_value=writer),
+            mock.patch(
+                "tzrec.tools.tdm.retrieval.TDMPredictSampler",
+                return_value=_RetrievalSampler(),
+            ),
+            mock.patch(
+                "tzrec.tools.tdm.retrieval.DataParser", return_value=_PassingParser()
+            ),
+            mock.patch("tzrec.tools.tdm.retrieval.torch.jit.load", return_value=model),
+            mock.patch.object(
+                predict_util,
+                "queue_get_interruptibly",
+                bounded(predict_util.queue_get_interruptibly),
+            ),
+            mock.patch.object(
+                predict_util,
+                "queue_put_interruptibly",
+                bounded(predict_util.queue_put_interruptibly),
+            ),
+            mock.patch.object(
+                predict_util,
+                "wait_for_pipeline",
+                bounded(predict_util.wait_for_pipeline),
+            ),
+        ):
+            retrieval.tdm_retrieval(
+                predict_input_path="input",
+                predict_output_path="output",
+                scripted_model_path="model",
+                recall_num=1,
+                n_cluster=2,
+                reserved_columns="user_id",
+                writer_type="MockWriter",
+                num_worker_per_level=num_worker_per_level,
+            )
+
+    @parameterized.expand([[1], [4]], name_func=parameterized_name_func)
+    def test_retrieval_writes_every_batch_and_commits_once(self, num_worker_per_level):
         writer = mock.Mock()
-        predict_util.validate_and_commit_writer(writer, True, 2, 8, 2, 8)
+        batch_count = 3
+
+        self._run_retrieval(batch_count, writer, num_worker_per_level)
+
+        self.assertEqual(writer.write.call_count, batch_count)
+        recall_ids = writer.write.call_args.args[0]["recall_ids"]
+        self.assertEqual(len(recall_ids), _BATCH_SIZE)
         writer.close.assert_called_once_with()
 
-        invalid_cases = [
-            (False, 2, 8, 2, 8),
-            (True, 0, 0, 0, 0),
-            (True, 2, 8, 1, 4),
-        ]
-        for args in invalid_cases:
-            failed_writer = mock.Mock()
-            with self.assertRaises(RuntimeError):
-                predict_util.validate_and_commit_writer(failed_writer, *args)
-            failed_writer.close.assert_not_called()
+    def test_empty_input_drains_without_commit(self):
+        writer = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "empty"):
+            self._run_retrieval(0, writer, num_worker_per_level=2)
+
+        writer.write.assert_not_called()
+        writer.close.assert_not_called()
 
 
 if __name__ == "__main__":

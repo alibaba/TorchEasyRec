@@ -15,6 +15,7 @@ import time
 import unittest
 from unittest import mock
 
+import torch
 from parameterized import parameterized
 
 from tzrec.utils import predict_util
@@ -82,6 +83,20 @@ class PredictUtilTest(unittest.TestCase):
                     timeout=1,
                 )
             timer.join(timeout=1)
+
+    def test_empty_queue_uses_one_total_timeout(self):
+        started = time.monotonic()
+        with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
+            with self.assertRaisesRegex(TimeoutError, "input queue.*queue input.*0.03"):
+                predict_util.queue_get_interruptibly(
+                    queue.Queue(),
+                    threading.Event(),
+                    "input queue",
+                    timeout=0.03,
+                )
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.025)
+        self.assertLess(elapsed, 0.2)
 
     def test_full_queue_uses_one_total_timeout(self):
         full_queue = queue.Queue(maxsize=1)
@@ -207,25 +222,61 @@ class PredictUtilTest(unittest.TestCase):
             )
 
         writer = mock.Mock()
-        predict_util.validate_and_commit_writer(
-            writer, True, len(submitted), len(submitted), len(written), len(written)
+        predict_util.commit_prediction_output(
+            writer, None, len(submitted), len(written), torch.device("cpu")
         )
         self.assertEqual(sorted(written), submitted)
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         writer.close.assert_called_once_with()
 
+    def test_local_failure_reraises_original_error(self):
+        writer = mock.Mock()
+        error = ValueError("forward boom")
+        with self.assertRaises(ValueError) as raised:
+            predict_util.commit_prediction_output(
+                writer, error, 2, 2, torch.device("cpu")
+            )
+        self.assertIs(raised.exception, error)
+        writer.close.assert_not_called()
+
     def test_invalid_output_never_commits(self):
-        invalid_cases = [
-            (False, 1, 1, 1, 1),
-            (True, 0, 0, 0, 0),
-            (True, 2, 2, 1, 2),
-            (True, 2, 2, 2, 1),
-        ]
-        for args in invalid_cases:
-            with self.subTest(args=args):
+        invalid_cases = [(2, 1), (0, 0)]
+        for expected_batches, written_batches in invalid_cases:
+            with self.subTest(expected_batches=expected_batches):
                 writer = mock.Mock()
                 with self.assertRaises(RuntimeError):
-                    predict_util.validate_and_commit_writer(writer, *args)
+                    predict_util.commit_prediction_output(
+                        writer,
+                        None,
+                        expected_batches,
+                        written_batches,
+                        torch.device("cpu"),
+                    )
+                writer.close.assert_not_called()
+
+    @parameterized.expand(
+        [[0, False], [1, True]],
+        name_func=parameterized_name_func,
+    )
+    def test_commit_follows_the_other_rank(self, peer_succeeded, expect_commit):
+        writer = mock.Mock()
+        with mock.patch.object(predict_util, "dist") as dist:
+            dist.is_initialized.return_value = True
+            dist.get_world_size.return_value = 2
+            dist.all_reduce.side_effect = lambda outcome, op: outcome.add_(
+                torch.tensor([peer_succeeded, 3], dtype=torch.int64)
+            )
+            if expect_commit:
+                # an empty local shard is normal when input files are uneven.
+                predict_util.commit_prediction_output(
+                    writer, None, 0, 0, torch.device("cpu")
+                )
+                writer.close.assert_called_once_with()
+            else:
+                with self.assertRaisesRegex(RuntimeError, "another rank"):
+                    predict_util.commit_prediction_output(
+                        writer, None, 0, 0, torch.device("cpu")
+                    )
                 writer.close.assert_not_called()
 
     def test_cleanup_cancels_terminates_kills_and_reaps(self):

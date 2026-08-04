@@ -20,6 +20,7 @@ from unittest import mock
 
 import pyarrow as pa
 import torch
+from parameterized import parameterized
 
 from tzrec.datasets.utils import RecordBatchTensor
 from tzrec.main import _train_and_evaluate, predict, predict_checkpoint
@@ -30,6 +31,7 @@ from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import predict_util
+from tzrec.utils.test_util import parameterized_name_func
 
 
 class MainTest(unittest.TestCase):
@@ -180,7 +182,11 @@ class PredictionLifecycleTest(unittest.TestCase):
         )
 
     def _run_predict(
-        self, dataloader: mock.Mock, writer: mock.Mock, model: mock.Mock
+        self,
+        dataloader: mock.Mock,
+        writer: mock.Mock,
+        model: mock.Mock,
+        predict_threads: int = 1,
     ) -> None:
         with (
             mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
@@ -211,7 +217,7 @@ class PredictionLifecycleTest(unittest.TestCase):
                 "model",
                 reserved_columns="id",
                 writer_type="MockWriter",
-                predict_threads=1,
+                predict_threads=predict_threads,
             )
 
     def _run_predict_checkpoint(self, pipeline: mock.Mock, writer: mock.Mock) -> None:
@@ -264,20 +270,21 @@ class PredictionLifecycleTest(unittest.TestCase):
                 predict_steps=2,
             )
 
-    def test_predict_counts_first_write_and_commits_once(self) -> None:
+    @parameterized.expand([[1], [2]], name_func=parameterized_name_func)
+    def test_predict_counts_first_write_and_commits_once(
+        self, predict_threads: int
+    ) -> None:
+        batch_count = predict_threads + 2
         dataloader = mock.Mock()
-        dataloader.get_iterator.return_value = iter([self._batch(2), self._batch(3)])
-        writer = mock.Mock()
-        model = mock.Mock(
-            side_effect=[
-                {"score": torch.tensor([0.1, 0.2])},
-                {"score": torch.tensor([0.1, 0.2, 0.3])},
-            ]
+        dataloader.get_iterator.return_value = iter(
+            [self._batch(2) for _ in range(batch_count)]
         )
+        writer = mock.Mock()
+        model = mock.Mock(return_value={"score": torch.tensor([0.1, 0.2])})
 
-        self._run_predict(dataloader, writer, model)
+        self._run_predict(dataloader, writer, model, predict_threads=predict_threads)
 
-        self.assertEqual(writer.write.call_count, 2)
+        self.assertEqual(writer.write.call_count, batch_count)
         writer.close.assert_called_once_with()
 
     def test_predict_background_failures_do_not_commit(self) -> None:
