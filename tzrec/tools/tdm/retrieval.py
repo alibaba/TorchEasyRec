@@ -363,7 +363,7 @@ def tdm_retrieval(
     num_class = pipeline_config.model_config.num_class
     pos_prob_name: str = "probs1" if num_class == 2 else "probs"
 
-    expected_batches = 0
+    input_batches = 0
     total = 0
     recall = 0
 
@@ -508,7 +508,7 @@ def tdm_retrieval(
                     "input producer",
                     health_check=_check_health,
                 )
-                expected_batches += 1
+                input_batches += 1
                 if i_step == 0:
                     # Initialize distributed writers synchronously on the first batch.
                     record_batch_t, node_ids = predict_util.queue_get_interruptibly(
@@ -570,9 +570,7 @@ def tdm_retrieval(
             except Exception:
                 logger.exception("Failed to stop the retrieval profiler.")
 
-    predict_util.commit_prediction_output(
-        writer, pipeline_error, expected_batches, device
-    )
+    predict_util.commit_prediction_output(writer, pipeline_error, input_batches, device)
 
     metric_t = torch.tensor([total, recall], dtype=torch.int64, device=device)
     dist.all_reduce(metric_t, op=ReduceOp.SUM)

@@ -1344,7 +1344,7 @@ def predict(
     )
     failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
     cancel_event: Event = Event()
-    expected_batches = 0
+    input_batches = 0
 
     def _forward(
         batch: Batch,
@@ -1418,7 +1418,7 @@ def predict(
                 batch = next(infer_iterator)
                 if i_step == 0:
                     predictions, reserves = _forward(batch)
-                    expected_batches += 1
+                    input_batches += 1
                     if output_cols is None:
                         output_cols = sorted(predictions.keys())
                     _write(predictions, reserves, output_cols)
@@ -1446,7 +1446,7 @@ def predict(
                         cancel_event,
                         "input producer",
                     )
-                    expected_batches += 1
+                    input_batches += 1
 
                 if is_local_rank_zero:
                     plogger.log(i_step)
@@ -1488,9 +1488,7 @@ def predict(
             except Exception:
                 logger.exception("Failed to stop the prediction profiler.")
 
-    predict_util.commit_prediction_output(
-        writer, pipeline_error, expected_batches, device
-    )
+    predict_util.commit_prediction_output(writer, pipeline_error, input_batches, device)
     if is_local_rank_zero:
         logger.info("Predict Finished.")
 
@@ -1638,7 +1636,7 @@ def predict_checkpoint(
     )
     failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
     cancel_event: Event = Event()
-    expected_batches = 0
+    input_batches = 0
 
     def _write(
         predictions: Dict[str, torch.Tensor],
@@ -1691,7 +1689,7 @@ def predict_checkpoint(
                         torch.cuda.synchronize()
                     if i_step == 0:
                         output_cols = sorted(predictions.keys())
-                        expected_batches += 1
+                        input_batches += 1
                         _write(predictions, batch.reserves, output_cols)
                         t = Thread(
                             target=_write_loop,
@@ -1708,7 +1706,7 @@ def predict_checkpoint(
                             cancel_event,
                             "checkpoint output",
                         )
-                        expected_batches += 1
+                        input_batches += 1
                     if plogger and i_step % 100 == 0:
                         plogger.log(i_step)
                 except StopIteration:
@@ -1731,8 +1729,6 @@ def predict_checkpoint(
             pipeline_threads = [] if write_t is None else [write_t]
             predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
 
-    predict_util.commit_prediction_output(
-        writer, pipeline_error, expected_batches, device
-    )
+    predict_util.commit_prediction_output(writer, pipeline_error, input_batches, device)
 
     logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")

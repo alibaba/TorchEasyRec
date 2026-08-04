@@ -290,7 +290,7 @@ def cleanup_pipeline(
 def commit_prediction_output(
     writer: Any,
     pipeline_error: Optional[BaseException],
-    expected_batches: int,
+    input_batches: int,
     device: torch.device,
 ) -> None:
     """Commit prediction output only when every rank succeeded.
@@ -305,14 +305,14 @@ def commit_prediction_output(
     Args:
         writer (BaseWriter): output writer to commit.
         pipeline_error (BaseException, optional): failure of the local pipeline.
-        expected_batches (int): batches submitted to the local pipeline.
+        input_batches (int): input batches submitted to the local pipeline.
         device (torch.device): device used to reduce the outcome across ranks.
     """
     global_succeeded = pipeline_error is None
-    global_batches = expected_batches
+    global_batches = input_batches
     if dist.is_initialized() and dist.get_world_size() > 1:
         outcome = torch.tensor(
-            [int(pipeline_error is None), expected_batches],
+            [int(pipeline_error is None), input_batches],
             dtype=torch.int64,
             device=device,
         )
