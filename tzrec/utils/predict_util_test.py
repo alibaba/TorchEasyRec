@@ -117,6 +117,82 @@ class PredictUtilTest(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.025)
         self.assertLess(elapsed, 0.2)
 
+    def _drain_thread(self, data_queue, cancel_event, item_count, item_seconds):
+        """Consume item_count items, spending item_seconds on each."""
+
+        def drain():
+            for _ in range(item_count):
+                predict_util.queue_get_interruptibly(
+                    data_queue, cancel_event, "writer input", timeout=1
+                )
+                time.sleep(item_seconds)
+
+        thread = threading.Thread(target=drain, name="slow-writer", daemon=True)
+        thread.start()
+        return thread
+
+    def test_slow_drain_is_not_a_stall(self):
+        # total drain far exceeds the timeout, but no single gap approaches it.
+        data_queue = queue.Queue()
+        cancel_event = threading.Event()
+        for value in range(10):
+            data_queue.put(value)
+        thread = self._drain_thread(data_queue, cancel_event, 10, 0.05)
+
+        started = time.monotonic()
+        with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
+            predict_util.wait_for_pipeline(
+                [], [thread], queue.Queue(), cancel_event, timeout=0.2
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertGreater(elapsed, 0.4)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(data_queue.empty())
+
+    def test_saturated_drain_is_not_a_stall(self):
+        # a queue pinned at its maxsize still flows; depth alone cannot see it.
+        data_queue = queue.Queue(maxsize=1)
+        cancel_event = threading.Event()
+        data_queue.put("first")
+        thread = self._drain_thread(data_queue, cancel_event, 10, 0.05)
+
+        def refill():
+            for _ in range(9):
+                predict_util.queue_put_interruptibly(
+                    data_queue, "item", cancel_event, "producer", timeout=1
+                )
+
+        producer = threading.Thread(target=refill, name="producer", daemon=True)
+        producer.start()
+
+        with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
+            predict_util.wait_for_pipeline(
+                [], [thread, producer], queue.Queue(), cancel_event, timeout=0.2
+            )
+
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(producer.is_alive())
+
+    def test_stalled_pipeline_times_out(self):
+        cancel_event = threading.Event()
+        idle = threading.Thread(
+            target=cancel_event.wait, name="wedged-writer", daemon=True
+        )
+        idle.start()
+
+        started = time.monotonic()
+        with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
+            with self.assertRaisesRegex(TimeoutError, "no progress.*wedged-writer"):
+                predict_util.wait_for_pipeline(
+                    [], [idle], queue.Queue(), cancel_event, timeout=0.2
+                )
+        elapsed = time.monotonic() - started
+        cancel_event.set()
+
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertLess(elapsed, 1)
+
     @parameterized.expand(
         [["forward", 8], ["writer", None]],
         name_func=parameterized_name_func,
