@@ -839,6 +839,7 @@ def create_dataloader(
         batch_size=None,
         pin_memory=data_config.pin_memory if mode != Mode.PREDICT else False,
         collate_fn=lambda x: x,
+        in_order=data_config.in_order,
         **kwargs,
     )
     # For PyTorch versions 2.6 and above, we initialize the data iterator before
