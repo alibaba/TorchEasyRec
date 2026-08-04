@@ -1412,10 +1412,6 @@ def predict(
                 failure_queue, cancel_event, stage, worker_id, error
             )
 
-    def _check_health() -> None:
-        """Check background prediction threads from the main thread."""
-        predict_util.check_pipeline_health([], failure_queue, cancel_event)
-
     forward_t_list: List[Thread] = []
     write_t: Optional[Thread] = None
     pipeline_error: Optional[BaseException] = None
@@ -1453,7 +1449,6 @@ def predict(
                         batch,
                         cancel_event,
                         "input producer",
-                        health_check=_check_health,
                     )
                     expected_batches += 1
 
@@ -1473,7 +1468,6 @@ def predict(
                 None,
                 cancel_event,
                 "input completion",
-                health_check=_check_health,
             )
         predict_util.wait_for_pipeline([], forward_t_list, failure_queue, cancel_event)
         if write_t is not None:
@@ -1482,7 +1476,6 @@ def predict(
                 None,
                 cancel_event,
                 "writer completion",
-                health_check=_check_health,
             )
             predict_util.wait_for_pipeline([], [write_t], failure_queue, cancel_event)
     except predict_util.PredictPipelineCancelled as error:
@@ -1685,10 +1678,6 @@ def predict_checkpoint(
         except BaseException as error:
             predict_util.report_failure(failure_queue, cancel_event, stage, None, error)
 
-    def _check_health() -> None:
-        """Check the checkpoint prediction writer from the main thread."""
-        predict_util.check_pipeline_health([], failure_queue, cancel_event)
-
     pipeline = PredictPipelineSparseDist(
         model,
         None,
@@ -1733,7 +1722,6 @@ def predict_checkpoint(
                             (predictions, batch.reserves),
                             cancel_event,
                             "checkpoint output",
-                            health_check=_check_health,
                         )
                         expected_batches += 1
                     if plogger and i_step % 100 == 0:
@@ -1748,7 +1736,6 @@ def predict_checkpoint(
                     None,
                     cancel_event,
                     "checkpoint writer completion",
-                    health_check=_check_health,
                 )
                 predict_util.wait_for_pipeline(
                     [], [write_t], failure_queue, cancel_event

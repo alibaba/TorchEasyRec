@@ -142,6 +142,18 @@ class PredictUtilTest(unittest.TestCase):
         self.assertIn('raise ValueError(f"{stage} boom")', failure.traceback)
         self.assertIn(f"ValueError: {stage} boom", failure.traceback)
 
+    def test_failed_child_process_is_detected(self):
+        process = _StubbornProcess([])
+        process._alive = False
+        process.exitcode = -9
+        cancel_event = threading.Event()
+        with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
+            with self.assertRaisesRegex(RuntimeError, "exitcode=-9"):
+                predict_util.check_pipeline_health(
+                    [process], queue.Queue(), cancel_event
+                )
+        self.assertTrue(cancel_event.is_set())
+
     @parameterized.expand([[1], [4]], name_func=parameterized_name_func)
     def test_multi_worker_completion_drains_before_commit(self, worker_count):
         input_queue = queue.Queue()

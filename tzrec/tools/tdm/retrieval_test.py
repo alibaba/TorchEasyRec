@@ -82,29 +82,6 @@ class _RetrievalSampler:
         return {"item_id": pa.array(list(range(_SAMPLE_PER_BATCH)))}
 
 
-class _StubbornProcess:
-    def __init__(self):
-        self.pid = 123
-        self.exitcode = None
-        self.terminate_called = False
-        self.kill_called = False
-        self._alive = True
-
-    def is_alive(self):
-        return self._alive
-
-    def terminate(self):
-        self.terminate_called = True
-
-    def kill(self):
-        self.kill_called = True
-        self._alive = False
-        self.exitcode = -9
-
-    def join(self, timeout=None):
-        return None
-
-
 class TDMRetrievalLifecycleTest(unittest.TestCase):
     @parameterized.expand([[1], [2], [4], [8]], name_func=parameterized_name_func)
     def test_normal_sentinel_fanout(self, worker_count):
