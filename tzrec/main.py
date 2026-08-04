@@ -1478,22 +1478,15 @@ def predict(
                 "writer completion",
             )
             predict_util.wait_for_pipeline([], [write_t], failure_queue, cancel_event)
-    except predict_util.PredictPipelineCancelled as error:
-        try:
-            predict_util.raise_background_failure(failure_queue, wait=True)
-            raise RuntimeError(
-                "Prediction pipeline was cancelled without an error."
-            ) from error
-        except Exception as cancel_error:
-            pipeline_error = cancel_error
     except Exception as error:
-        pipeline_error = error
+        pipeline_error = predict_util.resolve_pipeline_error(error, failure_queue)
     finally:
         pipeline_threads = [*forward_t_list]
         if write_t is not None:
             pipeline_threads.append(write_t)
         predict_util.cleanup_pipeline([], pipeline_threads, all_queues, cancel_event)
         if is_profiling:
+            # nothing here may raise, or this rank skips the commit rendezvous.
             try:
                 prof.stop()
             except Exception:
@@ -1740,16 +1733,8 @@ def predict_checkpoint(
                 predict_util.wait_for_pipeline(
                     [], [write_t], failure_queue, cancel_event
                 )
-        except predict_util.PredictPipelineCancelled as error:
-            try:
-                predict_util.raise_background_failure(failure_queue, wait=True)
-                raise RuntimeError(
-                    "Checkpoint prediction pipeline was cancelled without an error."
-                ) from error
-            except Exception as cancel_error:
-                pipeline_error = cancel_error
         except Exception as error:
-            pipeline_error = error
+            pipeline_error = predict_util.resolve_pipeline_error(error, failure_queue)
         finally:
             pipeline_threads = [] if write_t is None else [write_t]
             predict_util.cleanup_pipeline(

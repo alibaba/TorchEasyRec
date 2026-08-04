@@ -142,6 +142,33 @@ class PredictUtilTest(unittest.TestCase):
         self.assertIn('raise ValueError(f"{stage} boom")', failure.traceback)
         self.assertIn(f"ValueError: {stage} boom", failure.traceback)
 
+    def test_cancellation_resolves_to_the_background_failure(self):
+        failure_queue = queue.Queue()
+        cancelled = predict_util.PredictPipelineCancelled("input producer cancelled")
+
+        with mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01):
+            # cancellation without a report stays as-is: it names the stalled stage.
+            self.assertIs(
+                predict_util.resolve_pipeline_error(cancelled, failure_queue), cancelled
+            )
+
+            try:
+                raise ValueError("forward boom")
+            except ValueError as error:
+                predict_util.report_failure(
+                    failure_queue, threading.Event(), "forward", 0, error
+                )
+            resolved = predict_util.resolve_pipeline_error(cancelled, failure_queue)
+            self.assertIsInstance(resolved, predict_util.PredictPipelineStageError)
+            self.assertEqual(resolved.failure.stage, "forward")
+            self.assertEqual(resolved.failure.message, "forward boom")
+
+            # a real pipeline error is never replaced.
+            timeout = TimeoutError("writer stalled")
+            self.assertIs(
+                predict_util.resolve_pipeline_error(timeout, failure_queue), timeout
+            )
+
     def test_failed_child_process_is_detected(self):
         process = _StubbornProcess([])
         process._alive = False

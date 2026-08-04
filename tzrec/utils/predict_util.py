@@ -80,15 +80,44 @@ def report_failure(
         cancel_event.set()
 
 
-def raise_background_failure(failure_queue: Any, wait: bool = False) -> None:
-    """Raise the oldest reported prediction failure, if present."""
+def _background_failure(
+    failure_queue: Any, wait: bool
+) -> Optional[PredictPipelineStageError]:
+    """Return the oldest reported prediction failure, if present."""
     try:
         failure = failure_queue.get(
             timeout=_PREDICT_PIPELINE_POLL_INTERVAL if wait else 0
         )
     except queue_lib.Empty:
-        return
-    raise PredictPipelineStageError(failure)
+        return None
+    return PredictPipelineStageError(failure)
+
+
+def raise_background_failure(failure_queue: Any, wait: bool = False) -> None:
+    """Raise the oldest reported prediction failure, if present."""
+    error = _background_failure(failure_queue, wait)
+    if error is not None:
+        raise error
+
+
+def resolve_pipeline_error(error: Exception, failure_queue: Any) -> Exception:
+    """Replace a cancellation with the background failure that caused it.
+
+    Cancellation reaches the main thread as ``PredictPipelineCancelled`` from
+    whichever queue wait noticed it, which says nothing about why the pipeline
+    stopped. Call this while the failure queue is still open, before
+    ``cleanup_pipeline`` closes it.
+
+    Args:
+        error (Exception): failure raised out of the pipeline body.
+        failure_queue (Queue): queue background stages report failures on.
+
+    Returns:
+        the reported background failure, or the original error.
+    """
+    if not isinstance(error, PredictPipelineCancelled):
+        return error
+    return _background_failure(failure_queue, wait=True) or error
 
 
 def check_pipeline_health(
