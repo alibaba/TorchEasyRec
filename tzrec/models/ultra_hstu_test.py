@@ -18,7 +18,6 @@ from typing import List, Tuple
 import torch
 from hypothesis import Verbosity, assume, given
 from hypothesis import strategies as st
-from parameterized import parameterized
 from torchrec import JaggedTensor, KeyedJaggedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
@@ -39,6 +38,7 @@ from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
+    cleanup_cuda_memory,
     create_test_model,
     gpu_unavailable,
     make_test_dir,
@@ -328,29 +328,39 @@ def _build_batch(device: torch.device, channel_names: List[str]) -> Batch:
 
 @mark_ci_scope("gpu")
 class UltraHSTUTest(unittest.TestCase):
+    def teardown_example(self, example):
+        try:
+            cleanup_cuda_memory()
+        finally:
+            self._cleanup_test_dir()
+
     def setUp(self):
         self.test_dir = None
 
     def tearDown(self):
+        self._cleanup_test_dir()
+
+    def _cleanup_test_dir(self):
         if self.test_dir is not None and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
+        self.test_dir = None
 
-    @parameterized.expand(
-        [
-            # Single channel exercises the bare-HSTUTransducer return
-            # path (no _HSTUTransducerStack wrapper).
-            ("single", [("a", 256)]),
-            # Two channels at the same STU dim exercise the wrapper +
-            # concat path.
-            ("multi_uniform", [("a", 256), ("b", 256)]),
-            # Two channels at distinct STU dims so that
-            # _stu_embedding_dim's `sum` is the only correct answer
-            # (it can't collapse to N*dim or max(dims)).
-            ("multi_hetero", [("a", 256), ("b", 512)]),
-        ]
-    )
     @unittest.skipIf(*gpu_unavailable)
     @given(
+        channel_specs=st.sampled_from(
+            [
+                # Single channel exercises the bare-HSTUTransducer return
+                # path (no _HSTUTransducerStack wrapper).
+                [("a", 256)],
+                # Two channels at the same STU dim exercise the wrapper +
+                # concat path.
+                [("a", 256), ("b", 256)],
+                # Two channels at distinct STU dims so that
+                # _stu_embedding_dim's `sum` is the only correct answer
+                # (it can't collapse to N*dim or max(dims)).
+                [("a", 256), ("b", 512)],
+            ]
+        ),
         graph_type=st.sampled_from(
             [
                 TestGraphType.NORMAL,
@@ -369,12 +379,11 @@ class UltraHSTUTest(unittest.TestCase):
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=6,
+        max_examples=20,
         deadline=None,
     )
     def test_ultra_hstu(
         self,
-        case_name,
         channel_specs,
         graph_type,
         kernel,

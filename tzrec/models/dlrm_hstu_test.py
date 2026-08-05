@@ -37,6 +37,7 @@ from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
+    cleanup_cuda_memory,
     create_test_model,
     gpu_unavailable,
     make_test_dir,
@@ -366,12 +367,22 @@ def _build_batch(
 
 @mark_ci_scope("gpu")
 class DlrmHSTUTest(unittest.TestCase):
+    def teardown_example(self, example):
+        try:
+            cleanup_cuda_memory()
+        finally:
+            self._cleanup_test_dir()
+
     def setUp(self):
         self.test_dir = None
 
     def tearDown(self):
+        self._cleanup_test_dir()
+
+    def _cleanup_test_dir(self):
         if self.test_dir is not None and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
+        self.test_dir = None
 
     @unittest.skipIf(*gpu_unavailable)
     @given(

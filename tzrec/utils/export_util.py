@@ -16,7 +16,6 @@ import operator
 import os
 import re
 import shutil
-import tempfile
 from collections import OrderedDict, defaultdict
 from queue import Queue
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
@@ -68,7 +67,7 @@ from tzrec.features.feature import (
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util, env_util, quant_util
+from tzrec.utils import checkpoint_util, config_util, env_util, npz_util, quant_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
@@ -141,6 +140,15 @@ def export_model(
     `data_input_path` (optional): override for the predict-mode dataloader
     input path; falls back to `pipeline_config.train_input_path` when None.
     """
+    model_type = pipeline_config.model_config.WhichOneof("model")
+    if model_type in ("dlrm_hstu", "ultra_hstu") and (
+        not additional_export_config or "cand_seq_pk" not in additional_export_config
+    ):
+        raise ValueError(
+            "additional_export_config must contain cand_seq_pk when exporting "
+            f"{model_type}."
+        )
+
     use_rtp = env_util.use_rtp()
     use_dist_embedding = acc_utils.use_distributed_embedding()
     if use_rtp:
@@ -231,8 +239,10 @@ def export_model_normal(
     if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
         max_batch_size = acc_utils.get_max_export_batch_size()
-        data_config.batch_size = min(data_config.batch_size, max_batch_size)
-        logger.info("using new batch_size: %s in export", data_config.batch_size)
+        inference_batch_size = config_util.get_inference_batch_size(data_config)
+        inference_batch_size = min(inference_batch_size, max_batch_size)
+        config_util.set_inference_batch_size(data_config, inference_batch_size)
+        logger.info("using new batch_size: %s in export", inference_batch_size)
     data_config.num_workers = 1
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
@@ -902,7 +912,9 @@ def export_rtp_model(
     data_config = copy.deepcopy(pipeline_config.data_config)
     features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
-    data_config.batch_size = acc_utils.get_max_export_batch_size()
+    config_util.set_inference_batch_size(
+        data_config, acc_utils.get_max_export_batch_size()
+    )
     input_path = data_input_path or pipeline_config.train_input_path
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(dataloader.get_iterator())  # pyre-ignore[16]
@@ -1542,17 +1554,10 @@ def export_distributed_embedding(
     )
     local_tensor_name = f"sparse_embeddings-{rank:02d}-of-{world_size:02d}"
     save_dir_sparse = f"{save_dir}/sparse"
-    if not os.path.exists(save_dir_sparse):
-        os.makedirs(save_dir_sparse)
+    os.makedirs(save_dir_sparse, exist_ok=True)
     local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
     logger.info(f"save sparse tensors to {local_tensor_path}")
-
-    # OSS mounted file system may have problem in file seek, so first
-    # save to a temp file then move to target path
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
-        temp_path = f.name
-        np.savez(f, **local_tensor)
-    shutil.move(temp_path, local_tensor_path)
+    npz_util.savez_streaming(local_tensor_path, local_tensor)
 
     if dynamic_local_tensor:
         dynamic_tensor_name = f"sparse_dynamic_embedding-{rank:02d}-of-{world_size:02d}"
@@ -1560,10 +1565,7 @@ def export_distributed_embedding(
             save_dir_sparse, f"{dynamic_tensor_name}.npz"
         )
         logger.info(f"save dynamic sparse tensors to {dynamic_tensor_path}")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
-            np.savez(f, **dynamic_local_tensor)
-            temp_path = f.name
-        shutil.move(temp_path, dynamic_tensor_path)
+        npz_util.savez_streaming(dynamic_tensor_path, dynamic_local_tensor)
 
     with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
         json.dump(emb_meta, f, indent=4)
@@ -2028,13 +2030,23 @@ def finalize_dense_export(
     device: torch.device,
     save_dir: str,
     dense_graph_config: Dict[str, Any],
-) -> None:
+    dense_model_traced: Optional[torch.fx.GraphModule] = None,
+) -> torch.fx.GraphModule:
     """Sanity-check and script a dense graph carrying its final weights.
 
     Runs the rewritten graph once on serving-style inputs rebuilt from the
     warm-up batch (so graph surgery or KeyedTensor regroup errors surface at
     export time instead of at serving time), then writes dense_meta.json,
     the graph dumps and the scripted model under ``save_dir``.
+
+    FX tracing patches ``torch.nn.Module.__call__`` process-wide for its
+    duration, so it is not safe to run concurrently with eager forwards.
+    Callers that export from a background thread (the online dense export)
+    trace once up front and pass the result via ``dense_model_traced``,
+    reusing it across versions; the traced module shares ``gm``'s parameters,
+    so reloading ``gm``'s weights is reflected without re-tracing. When no
+    traced module is supplied -- the standalone, single-threaded CLI path --
+    it is traced here.
 
     Args:
         model: model the dense graph was traced from.
@@ -2044,6 +2056,11 @@ def finalize_dense_export(
         device: device of ``gm``.
         save_dir: directory the export artifacts are written to.
         dense_graph_config: dense_meta config from build_dense_graph_module.
+        dense_model_traced: pre-traced ``gm`` to script; traced here if None.
+
+    Returns:
+        The traced module that was scripted, so a caller can reuse it across
+        exports without re-tracing.
     """
     graph_dir = os.path.join(save_dir, "graph")
     os.makedirs(save_dir, exist_ok=True)
@@ -2058,11 +2075,13 @@ def finalize_dense_export(
     with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
         f.write(str(gm.graph))
 
-    dense_model_traced = symbolic_trace(gm)
+    if dense_model_traced is None:
+        dense_model_traced = symbolic_trace(gm)
     with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
         f.write(dense_model_traced.code)
     dense_model_scripted = torch.jit.script(dense_model_traced)
     dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
+    return dense_model_traced
 
 
 def export_dense_model_cpu(

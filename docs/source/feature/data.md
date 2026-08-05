@@ -335,6 +335,12 @@ pipeline.global-job-parameters: |
 - 每个`proc`上的读数据并发度，`nproc-per-node * num_workers`建议小于单机CPU核数
 - 如果`num_workers==0`，数据进程和训练进程将会在一个进程中，便于调试
 
+### in_order
+
+- 是否按dataloader任务提交顺序返回batch，默认为true；仅在`num_workers > 0`时生效
+- 设置为false时，先处理完的worker可以先返回batch，避免慢worker阻塞其他worker，但可能降低可复现性，并改变训练样本或预测结果的输出顺序
+- 对于样本分布不均衡的数据，设置为false可能使训练过程看到的数据分布产生偏差
+
 ### shuffle
 
 - 是否训练时打散数据，默认为false

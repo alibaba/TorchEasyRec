@@ -16,7 +16,7 @@ import os
 from collections import OrderedDict
 from contextlib import nullcontext
 from queue import Queue
-from threading import Thread
+from threading import Event, Thread
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pyarrow as pa
@@ -37,7 +37,6 @@ from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
-    PREDICT_QUEUE_TIMEOUT,
     TARGET_REPEAT_INTERLEAVE_KEY,
     TENSORBOARD_SUMMARIES,
     TRAIN_EVAL_RESULT_FILENAME,
@@ -85,7 +84,7 @@ from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
-from tzrec.utils import checkpoint_util, config_util
+from tzrec.utils import checkpoint_util, config_util, predict_util
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
@@ -631,11 +630,9 @@ def _train_and_evaluate(
         _model.on_train_end()
         if delta_embedding_dumper is not None:
             # Flush the trailing partial interval before the final checkpoint.
-            # final_dump skips dump-boundary steps already written by maybe_dump,
-            # so it never overwrites their shards with an empty file. Ranks can
-            # reach here at different i_step (independent dataloader exhaustion with
-            # check_all_workers_data_status=False), so final_dump all-reduces the
-            # step across ranks to keep one complete shard set per step dir.
+            # final_dump skips dump-boundary steps already written by maybe_dump
+            # (all ranks run the same step count, so every rank participated in
+            # those dumps and reaches the same final step).
             delta_embedding_dumper.final_dump(i_step)
 
         _log_train(
@@ -934,6 +931,8 @@ def train_and_evaluate(
         with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
             f.write(tzrec_version + "\n")
 
+    if delta_embedding_dumper is not None:
+        delta_embedding_dumper.start()
     # when slice batch by sample cost, data on all workers may not be balanced
     check_all_workers_data_status = data_config.HasField("batch_cost_size")
     _train_and_evaluate(
@@ -956,6 +955,12 @@ def train_and_evaluate(
         dense_ema=dense_ema,
         export_config=pipeline_config.export_config,
     )
+    # Drain background uploads only after training succeeds. A training failure
+    # terminates the whole job (torchrun tears down every rank) and pending
+    # in-memory deltas are intentionally abandoned: the restarted run re-dumps
+    # from the latest checkpoint, so there is nothing to roll back or undo.
+    if delta_embedding_dumper is not None:
+        delta_embedding_dumper.close()
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
 
@@ -1238,6 +1243,7 @@ def _write_predictions(
     reserves: RecordBatchTensor,
     output_cols: List[str],
 ) -> None:
+    """Write predictions."""
     output_dict = OrderedDict()
     repeat_offsets = None
     if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
@@ -1327,7 +1333,7 @@ def predict(
         os.path.join(scripted_model_path, "pipeline.config"), allow_unknown_field=True
     )
     if batch_size:
-        pipeline_config.data_config.batch_size = batch_size
+        config_util.set_inference_batch_size(pipeline_config.data_config, batch_size)
 
     acc_utils.allow_tf32_for_export(pipeline_config)
 
@@ -1335,22 +1341,20 @@ def predict(
     is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
 
-    if is_trt:
-        # predict batch_size too large may out of range
-        max_batch_size = acc_utils.get_max_export_batch_size()
-        pipeline_config.data_config.batch_size = min(
-            pipeline_config.data_config.batch_size, max_batch_size
-        )
-        logger.info(
-            "using new batch_size: %s in trt predict",
-            pipeline_config.data_config.batch_size,
-        )
-
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
     if edit_config_json:
         edit_config_json = json.loads(edit_config_json)
         config_util.edit_config(pipeline_config, edit_config_json)
+    if is_trt:
+        # predict batch_size too large may out of range
+        data_config = pipeline_config.data_config
+        inference_batch_size = config_util.get_inference_batch_size(data_config)
+        inference_batch_size = min(
+            inference_batch_size, acc_utils.get_max_export_batch_size()
+        )
+        config_util.set_inference_batch_size(data_config, inference_batch_size)
+        logger.info("using new batch_size: %s in trt predict", inference_batch_size)
 
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
@@ -1415,11 +1419,16 @@ def predict(
     if predict_threads is None:
         predict_threads = max(data_config.num_workers, 1)
     data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
-    pred_queue: Queue[
-        Tuple[Optional[Dict[str, torch.Tensor]], Optional[RecordBatchTensor]]
-    ] = Queue(maxsize=predict_threads * 2)
+    pred_queue: Queue[Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]] = (
+        Queue(maxsize=predict_threads * 2)
+    )
+    failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
+    cancel_event: Event = Event()
+    input_batches = 0
 
-    def _forward(batch: Batch) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
+    def _forward(
+        batch: Batch,
+    ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
             parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
             if is_input_tile:
@@ -1431,46 +1440,93 @@ def predict(
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
 
+    def _write(
+        predictions: Dict[str, torch.Tensor],
+        reserves: RecordBatchTensor,
+        output_cols: List[str],
+    ) -> None:
+        _write_predictions(writer, predictions, reserves, output_cols)
+
     def _write_loop(output_cols: List[str]) -> None:
-        while True:
-            predictions, reserves = pred_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
-            if predictions is None:
-                break
-            assert predictions is not None and reserves is not None
-            _write_predictions(writer, predictions, reserves, output_cols)
+        stage = "writer"
+        try:
+            while True:
+                pred = predict_util.queue_get_interruptibly(
+                    pred_queue, cancel_event, f"{stage} input"
+                )
+                if pred is None:
+                    return
+                predictions, reserves = pred
+                _write(predictions, reserves, output_cols)
+        except predict_util.PredictPipelineCancelled:
+            return
+        except BaseException as error:
+            predict_util.report_failure(failure_queue, cancel_event, stage, None, error)
 
-    def _forward_loop() -> None:
-        while True:
-            batch = data_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
-            if batch is None:
-                break
-            assert batch is not None
-            pred = _forward(batch)
-            pred_queue.put(pred, timeout=PREDICT_QUEUE_TIMEOUT)
+    def _forward_loop(worker_id: int) -> None:
+        stage = "forward"
+        try:
+            while True:
+                batch = predict_util.queue_get_interruptibly(
+                    data_queue,
+                    cancel_event,
+                    f"{stage}[{worker_id}] input",
+                )
+                if batch is None:
+                    return
+                pred = _forward(batch)
+                predict_util.queue_put_interruptibly(
+                    pred_queue,
+                    pred,
+                    cancel_event,
+                    f"{stage}[{worker_id}] output",
+                )
+        except predict_util.PredictPipelineCancelled:
+            return
+        except BaseException as error:
+            predict_util.report_failure(
+                failure_queue, cancel_event, stage, worker_id, error
+            )
 
-    forward_t_list = []
-    write_t = None
+    forward_t_list: List[Thread] = []
+    write_t: Optional[Thread] = None
+    pipeline_error: Optional[BaseException] = None
     i_step = 0
     try:
         while True:
             try:
                 batch = next(infer_iterator)
-
                 if i_step == 0:
-                    # lazy init writer and create write and forward thread
                     predictions, reserves = _forward(batch)
+                    input_batches += 1
                     if output_cols is None:
                         output_cols = sorted(predictions.keys())
-                    _write_predictions(writer, predictions, reserves, output_cols)
-                    for _ in range(predict_threads):
-                        t = Thread(target=_forward_loop)
+                    _write(predictions, reserves, output_cols)
+                    for worker_id in range(predict_threads):
+                        t = Thread(
+                            target=_forward_loop,
+                            args=(worker_id,),
+                            name=f"predict-forward-{worker_id}",
+                            daemon=True,
+                        )
                         t.start()
                         forward_t_list.append(t)
-                    t = Thread(target=_write_loop, args=(output_cols,))
+                    t = Thread(
+                        target=_write_loop,
+                        args=(output_cols,),
+                        name="predict-writer",
+                        daemon=True,
+                    )
                     t.start()
                     write_t = t
                 else:
-                    data_queue.put(batch, timeout=PREDICT_QUEUE_TIMEOUT)
+                    predict_util.queue_put_interruptibly(
+                        data_queue,
+                        batch,
+                        cancel_event,
+                        "input producer",
+                    )
+                    input_batches += 1
 
                 if is_local_rank_zero:
                     plogger.log(i_step)
@@ -1481,31 +1537,38 @@ def predict(
                     break
             except StopIteration:
                 break
-    finally:
-        for _ in range(len(forward_t_list)):
-            try:
-                data_queue.put(None, timeout=PREDICT_QUEUE_TIMEOUT)
-            except Exception as e:
-                logger.warning(f"Failed to send sentinel to data_queue: {e}")
-        for t in forward_t_list:
-            t.join(timeout=PREDICT_QUEUE_TIMEOUT)
-            if t.is_alive():
-                logger.warning(f"Forward thread {t.name} did not terminate in time.")
-        if write_t is not None:
-            try:
-                pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-            except Exception as e:
-                logger.warning(f"Failed to send sentinel to pred_queue: {e}")
-            write_t.join(timeout=PREDICT_QUEUE_TIMEOUT)
-            if write_t.is_alive():
-                logger.warning("Write thread did not terminate in time.")
-        try:
-            writer.close()
-        except Exception as e:
-            logger.warning(f"Failed to close writer: {e}")
 
-    if is_profiling:
-        prof.stop()
+        for _ in range(len(forward_t_list)):
+            predict_util.queue_put_interruptibly(
+                data_queue,
+                None,
+                cancel_event,
+                "input completion",
+            )
+        predict_util.wait_for_pipeline([], forward_t_list, failure_queue, cancel_event)
+        if write_t is not None:
+            predict_util.queue_put_interruptibly(
+                pred_queue,
+                None,
+                cancel_event,
+                "writer completion",
+            )
+            predict_util.wait_for_pipeline([], [write_t], failure_queue, cancel_event)
+    except Exception as error:
+        pipeline_error = predict_util.resolve_pipeline_error(error, failure_queue)
+    finally:
+        pipeline_threads = [*forward_t_list]
+        if write_t is not None:
+            pipeline_threads.append(write_t)
+        predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
+        if is_profiling:
+            # nothing here may raise, or this rank skips the commit rendezvous.
+            try:
+                prof.stop()
+            except Exception:
+                logger.exception("Failed to stop the prediction profiler.")
+
+    predict_util.commit_prediction_output(writer, pipeline_error, input_batches, device)
     if is_local_rank_zero:
         logger.info("Predict Finished.")
 
@@ -1559,7 +1622,7 @@ def predict_checkpoint(
     )
 
     if batch_size:
-        pipeline_config.data_config.batch_size = batch_size
+        config_util.set_inference_batch_size(pipeline_config.data_config, batch_size)
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
     if edit_config_json:
@@ -1652,17 +1715,35 @@ def predict_checkpoint(
     else:
         raise ValueError("Predict checkpoint path should be specified.")
 
-    pred_queue: Queue[
-        Tuple[Optional[Dict[str, torch.Tensor]], Optional[RecordBatchTensor]]
-    ] = Queue(maxsize=3)
+    pred_queue: Queue[Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]] = (
+        Queue(maxsize=3)
+    )
+    failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
+    cancel_event: Event = Event()
+    input_batches = 0
+
+    def _write(
+        predictions: Dict[str, torch.Tensor],
+        reserves: RecordBatchTensor,
+        output_cols: List[str],
+    ) -> None:
+        _write_predictions(writer, predictions, reserves, output_cols)
 
     def _write_loop(output_cols: List[str]) -> None:
-        while True:
-            predictions, reserves = pred_queue.get(timeout=PREDICT_QUEUE_TIMEOUT)
-            if predictions is None:
-                break
-            assert predictions is not None and reserves is not None
-            _write_predictions(writer, predictions, reserves, output_cols)
+        stage = "writer"
+        try:
+            while True:
+                pred = predict_util.queue_get_interruptibly(
+                    pred_queue, cancel_event, f"{stage} input"
+                )
+                if pred is None:
+                    return
+                predictions, reserves = pred
+                _write(predictions, reserves, output_cols)
+        except predict_util.PredictPipelineCancelled:
+            return
+        except BaseException as error:
+            predict_util.report_failure(failure_queue, cancel_event, stage, None, error)
 
     pipeline = PredictPipelineSparseDist(
         model,
@@ -1680,7 +1761,8 @@ def predict_checkpoint(
     if is_local_rank_zero:
         plogger = ProgressLogger(desc=f"Predicting{desc_suffix}")
 
-    write_t = None
+    write_t: Optional[Thread] = None
+    pipeline_error: Optional[BaseException] = None
     with torch.no_grad():
         i_step = 0
         try:
@@ -1690,37 +1772,47 @@ def predict_checkpoint(
                     if device.type == "cuda":
                         torch.cuda.synchronize()
                     if i_step == 0:
-                        # lazy init writer and create write thread
                         output_cols = sorted(predictions.keys())
-                        _write_predictions(
-                            writer, predictions, batch.reserves, output_cols
+                        input_batches += 1
+                        _write(predictions, batch.reserves, output_cols)
+                        t = Thread(
+                            target=_write_loop,
+                            args=(output_cols,),
+                            name="checkpoint-predict-writer",
+                            daemon=True,
                         )
-                        t = Thread(target=_write_loop, args=(output_cols,))
                         t.start()
                         write_t = t
                     elif not batch.dummy:
-                        pred_queue.put(
+                        predict_util.queue_put_interruptibly(
+                            pred_queue,
                             (predictions, batch.reserves),
-                            timeout=PREDICT_QUEUE_TIMEOUT,
+                            cancel_event,
+                            "checkpoint output",
                         )
+                        input_batches += 1
                     if plogger and i_step % 100 == 0:
                         plogger.log(i_step)
                 except StopIteration:
                     break
             if plogger is not None:
                 plogger.log(i_step)
-        finally:
             if write_t is not None:
-                try:
-                    pred_queue.put((None, None), timeout=PREDICT_QUEUE_TIMEOUT)
-                except Exception as e:
-                    logger.warning(f"Failed to send sentinel to pred_queue: {e}")
-                write_t.join(timeout=PREDICT_QUEUE_TIMEOUT)
-                if write_t.is_alive():
-                    logger.warning("Write thread did not terminate in time.")
-            try:
-                writer.close()
-            except Exception as e:
-                logger.warning(f"Failed to close writer: {e}")
+                predict_util.queue_put_interruptibly(
+                    pred_queue,
+                    None,
+                    cancel_event,
+                    "checkpoint writer completion",
+                )
+                predict_util.wait_for_pipeline(
+                    [], [write_t], failure_queue, cancel_event
+                )
+        except Exception as error:
+            pipeline_error = predict_util.resolve_pipeline_error(error, failure_queue)
+        finally:
+            pipeline_threads = [] if write_t is None else [write_t]
+            predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
+
+    predict_util.commit_prediction_output(writer, pipeline_error, input_batches, device)
 
     logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")
