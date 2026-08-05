@@ -197,6 +197,35 @@ class CompilePromptTest(unittest.TestCase):
         self.assertIsNotNone(reloaded.token_to_id("<|sid_0|>"))
         self.assertIsNotNone(reloaded.token_to_id("<|sid_7|>"))
 
+    def test_answer_width_comes_from_the_codebook(self) -> None:
+        cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        answer = _feature(
+            'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }'
+        )
+        compiled = self._compile(cfg, [_feature(_HIST), answer])
+
+        seg = next(
+            s for s in compiled.prompt_plan.response_segments if isinstance(s, SlotSeg)
+        )
+        # the answer is one SID item, so its width needs no sequence_length
+        self.assertIs(seg.width.kind, WidthKind.STATIC)
+        self.assertEqual(seg.width.n, 3)
+        # +1 because HF shifts logits: the window opens one column before the
+        # first supervised label
+        self.assertEqual(compiled.prompt_plan.suffix_keep, 4)
+
+    def test_unbounded_response_is_rejected(self) -> None:
+        # with no sid_space the response has no codebook-derived width, so the
+        # supervised window is unbounded and the logits would cover every
+        # position
+        cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
+        answer = _feature(
+            'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }'
+        )
+        with self.assertRaisesRegex(ValueError, "window cannot be bounded"):
+            self._compile(cfg, [_feature(_HIST), answer])
+
 
 if __name__ == "__main__":
     unittest.main()

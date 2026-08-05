@@ -72,13 +72,19 @@ def _resolve_slot(name: str, declared: Dict[str, PromptSlot]) -> PromptSlot:
 
 
 def _slot_width(
-    members: Sequence[BaseFeature], group_type: "FeatureGroupType.ValueType"
+    members: Sequence[BaseFeature],
+    group_type: "FeatureGroupType.ValueType",
+    answer_levels: Optional[int] = None,
 ) -> Width:
     """Derive a slot's position count from its members.
 
-    A DEEP slot pools to exactly one position. A sequence slot is bounded by
-    the members' ``sequence_length``, and unbounded when none declares one.
+    A DEEP slot pools to exactly one position. The answer is exactly one SID
+    item, so its width is the codebook depth and needs no sequence_length. Any
+    other sequence slot is bounded by its members' sequence_length, and
+    unbounded when none declares one.
     """
+    if answer_levels is not None:
+        return Width(WidthKind.STATIC, answer_levels)
     if group_type == FeatureGroupType.DEEP:
         return Width(WidthKind.STATIC, 1)
     caps = [
@@ -274,9 +280,17 @@ def compile_prompt(
         tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
 
     slot_ids = {n: i for i, n in enumerate(slots)}
+    answer_names = set(resp_names)
     segs: Dict[str, SlotSeg] = {}
     for name, slot in slots.items():
         seq = types[name] == FeatureGroupType.JAGGED_SEQUENCE
+        levels = (
+            sid_space.num_levels
+            if sid_space is not None
+            and name in answer_names
+            and fills[name] is FillMode.INLINE
+            else None
+        )
         segs[name] = SlotSeg(
             slot_id=slot_ids[name],
             name=name,
@@ -284,7 +298,7 @@ def compile_prompt(
             group_type=types[name],
             output_key=".sequence" if seq else "",
             fill=fills[name],
-            width=_slot_width(members[name], types[name]),
+            width=_slot_width(members[name], types[name], levels),
             droppable=bool(slot.drop_if_empty),
         )
 
@@ -451,6 +465,13 @@ def _validate(
                 f"static_prefix_len is {plan.static_prefix_len}, which bounds "
                 "what a serving prefix cache may reuse."
             )
+    if plan.response_segments and plan.suffix_keep is None:
+        raise ValueError(
+            "the response has an unbounded slot, so the supervised logits "
+            "window cannot be bounded. A decoder-only model would then "
+            "materialize logits for every position, which is (batch x length x "
+            "vocab) and will not fit. Give the response slot a fixed width."
+        )
     if plan.static_prefix_len == 0:
         logger.warning(
             "static_prefix_len is 0: no leading run of the prompt is "
