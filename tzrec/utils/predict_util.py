@@ -14,8 +14,8 @@ import time
 import traceback
 from dataclasses import dataclass
 from multiprocessing import Process
-from threading import Thread
-from typing import Any, Callable, Optional, Sequence
+from threading import Lock, Thread
+from typing import Any, Callable, Optional, Sequence, Tuple
 
 import torch
 from torch import distributed as dist
@@ -28,6 +28,16 @@ _PREDICT_PIPELINE_POLL_INTERVAL = 0.1
 _PREDICT_PIPELINE_CLEANUP_TIMEOUT = 10.0
 _PREDICT_PIPELINE_TERMINATE_TIMEOUT = 5.0
 _PREDICT_PIPELINE_KILL_TIMEOUT = 5.0
+
+_progress_lock = Lock()
+_progress_count = 0
+
+
+def _record_progress() -> None:
+    """Count one completed queue operation, so stall detection sees a flow."""
+    global _progress_count
+    with _progress_lock:
+        _progress_count += 1
 
 
 @dataclass(frozen=True)
@@ -163,11 +173,13 @@ def queue_get_interruptibly(
                 f"for {timeout} seconds."
             )
         try:
-            return data_queue.get(
+            item = data_queue.get(
                 timeout=min(_PREDICT_PIPELINE_POLL_INTERVAL, remaining)
             )
         except queue_lib.Empty:
             continue
+        _record_progress()
+        return item
     raise PredictPipelineCancelled(f"Prediction pipeline {stage} was cancelled.")
 
 
@@ -194,9 +206,10 @@ def queue_put_interruptibly(
             data_queue.put(
                 item, timeout=min(_PREDICT_PIPELINE_POLL_INTERVAL, remaining)
             )
-            return
         except queue_lib.Full:
             continue
+        _record_progress()
+        return
     raise PredictPipelineCancelled(f"Prediction pipeline {stage} was cancelled.")
 
 
@@ -207,10 +220,31 @@ def _any_alive(processes: Sequence[Process], threads: Sequence[Thread]) -> bool:
     )
 
 
-def _poll_until(predicate: Callable[[], bool], timeout: float) -> bool:
-    """Wait for a predicate within one deadline, polling at the pipeline rate."""
+def _poll_until(
+    predicate: Callable[[], bool],
+    timeout: float,
+    progress: Optional[Callable[[], Any]] = None,
+) -> bool:
+    """Wait for a predicate, polling at the pipeline rate.
+
+    Args:
+        predicate (callable): condition to wait for.
+        timeout (float): seconds to wait. Without ``progress`` this bounds the
+            total wait; with it, it bounds time without progress.
+        progress (callable, optional): pipeline state whose every change
+            restarts the deadline.
+
+    Returns:
+        whether the predicate was met before the deadline.
+    """
+    marker = progress() if progress is not None else None
     deadline = time.monotonic() + timeout
     while not predicate():
+        if progress is not None:
+            current = progress()
+            if current != marker:
+                marker = current
+                deadline = time.monotonic() + timeout
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -223,18 +257,32 @@ def wait_for_pipeline(
     threads: Sequence[Thread],
     failure_queue: Any,
     cancel_event: Any,
-    timeout: float = PREDICT_QUEUE_TIMEOUT,
+    stall_timeout: float = PREDICT_QUEUE_TIMEOUT,
 ) -> None:
-    """Wait boundedly for normal completion while monitoring failures."""
+    """Wait for normal completion, failing only once the pipeline stalls.
+
+    ``stall_timeout`` bounds time without progress, not total drain time, so a
+    slow but advancing pipeline never trips it. Progress is one completed queue
+    operation or one finished component; work that advances more slowly, or
+    outside this module's queue helpers, reads as a stall.
+    """
 
     def _completed() -> bool:
         """Report completion, raising whatever the background stages hit."""
         check_pipeline_health(processes, failure_queue, cancel_event)
         return not _any_alive(processes, threads)
 
-    if not _poll_until(_completed, timeout):
+    def _progress() -> Tuple[int, int, int]:
+        """Report pipeline state that changes only when something advances."""
+        return (
+            _progress_count,
+            sum(process.is_alive() for process in processes),
+            sum(thread.is_alive() for thread in threads),
+        )
+
+    if not _poll_until(_completed, stall_timeout, progress=_progress):
         raise TimeoutError(
-            "Prediction pipeline stalled during completion; "
+            f"Prediction pipeline made no progress for {stall_timeout} seconds; "
             f"processes={[p.pid for p in processes if p.is_alive()]}, "
             f"threads={[t.name for t in threads if t.is_alive()]}."
         )
