@@ -183,10 +183,9 @@ class PromptGenerativeQwen(BaseModel):
         Returns:
             The loss when training, the decoded SIDs otherwise.
         """
-        embeds = self._prompt_embeds(batch)
         if self.is_inference:
-            return {self._generated_sids_key: self._generate(embeds, batch)}
-        return self._forward_loss(embeds, batch)
+            return {self._generated_sids_key: _fx_wrapped_generate(self, batch)}
+        return self._forward_loss(self._prompt_embeds(batch), batch)
 
     def _sid_token_bands(self) -> "tuple[torch.Tensor, torch.Tensor]":
         """Inclusive token-id band of every SID level, as device tensors."""
@@ -197,16 +196,16 @@ class PromptGenerativeQwen(BaseModel):
             torch.tensor(space.band_hi, device=device),
         )
 
-    def _generate(self, embeds: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def _generate(self, batch: Batch) -> torch.Tensor:
         """Beam-search the SID answer.
 
         Args:
-            embeds: the assembled prompt embeddings, packed.
-            batch: carries ``prompt_cu_seqlens`` and the collator's width.
+            batch: carries the packed prompt and the collator's width.
 
         Returns:
             ``(B, num_return, num_levels)`` local codes, best first.
         """
+        embeds = self._prompt_embeds(batch)
         infos = batch.additional_infos
         padded, mask, _ = _unpack(
             embeds,
@@ -374,3 +373,14 @@ def _unpack(
     padded[mask] = embeds
     out_labels[mask] = labels
     return padded, mask.long(), out_labels
+
+
+@torch.fx.wrap
+def _fx_wrapped_generate(model: "PromptGenerativeQwen", batch: Batch) -> torch.Tensor:
+    """Hide the decode loop from FX.
+
+    ``PredictPipelineSparseDist`` FX-traces the model, and beam decode reads
+    host ints and branches on them. Wrapping an inner helper only moves the
+    failure to the next such read, so the whole loop is one leaf.
+    """
+    return model._generate(batch)

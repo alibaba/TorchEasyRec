@@ -1591,6 +1591,7 @@ def predict_checkpoint(
         pipeline_config.model_config,
         features,
         [],
+        prompt=prompt,
     )
     model.set_is_inference(True)
     model = PredictWrapper(
