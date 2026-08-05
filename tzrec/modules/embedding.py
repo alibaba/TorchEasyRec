@@ -104,6 +104,32 @@ def _merge_list_of_jt_dict(
     return result
 
 
+def _remap_mark_jt_dict(
+    d_jt: Dict[str, JaggedTensor],
+    feature_keys: List[Tuple[str, str]],
+) -> Dict[str, JaggedTensor]:
+    """Remap EmbeddingCollection output keys to shared keys and mark seq jts.
+
+    EmbeddingCollection output keys are paired with the shared feature names the
+    downstream feature groups consume; each shared-name JaggedTensor is also
+    marked for torch.fx sequence tracing. Left unwrapped so the per-feature
+    ``fx_mark_seq_ec_jt`` calls stay individual graph nodes.
+
+    Args:
+        d_jt: EmbeddingCollection output keyed by output key.
+        feature_keys: list of (output_key, shared_key) pairs.
+
+    Returns:
+        Dict keyed by shared_key.
+    """
+    new_d_jt: Dict[str, JaggedTensor] = {}
+    for output_key, shared_key in feature_keys:
+        val = d_jt[output_key]
+        fx_mark_seq_ec_jt(shared_key, val)
+        new_d_jt[shared_key] = val
+    return new_d_jt
+
+
 @torch.fx.wrap
 def _tile_and_combine_dense_kt(
     user_kt: Optional[KeyedTensor], item_kt: Optional[KeyedTensor], tile_size: int
@@ -1271,25 +1297,17 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             for feature_keys, ec in zip(
                 self.ec_dict_features.values(), self.ec_dict.values()
             ):
-                d_jt = ec(sparse_feature)
-                new_d_jt = {}
-                for output_key, shared_key in feature_keys:
-                    val = d_jt[output_key]
-                    fx_mark_seq_ec_jt(shared_key, val)
-                    new_d_jt[shared_key] = val
-                sparse_jt_dict_list.append(new_d_jt)
+                sparse_jt_dict_list.append(
+                    _remap_mark_jt_dict(ec(sparse_feature), feature_keys)
+                )
 
         if self.has_mc_sparse:
             for feature_keys, mc_ec in zip(
                 self.mc_ec_dict_features.values(), self.mc_ec_dict.values()
             ):
-                d_jt = mc_ec(sparse_feature)[0]
-                new_d_jt = {}
-                for output_key, shared_key in feature_keys:
-                    val = d_jt[output_key]
-                    fx_mark_seq_ec_jt(shared_key, val)
-                    new_d_jt[shared_key] = val
-                sparse_jt_dict_list.append(new_d_jt)
+                sparse_jt_dict_list.append(
+                    _remap_mark_jt_dict(mc_ec(sparse_feature)[0], feature_keys)
+                )
 
         if self.has_mulval_seq:
             seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
@@ -1298,25 +1316,17 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             for feature_keys, ec in zip(
                 self.ec_dict_features_user.values(), self.ec_dict_user.values()
             ):
-                d_jt = ec(sparse_feature_user)
-                new_d_jt = {}
-                for output_key, shared_key in feature_keys:
-                    val = d_jt[output_key]
-                    fx_mark_seq_ec_jt(shared_key, val)
-                    new_d_jt[shared_key] = val
-                sparse_jt_dict_list.append(new_d_jt)
+                sparse_jt_dict_list.append(
+                    _remap_mark_jt_dict(ec(sparse_feature_user), feature_keys)
+                )
 
         if self.has_mc_sparse_user:
             for feature_keys, mc_ec in zip(
                 self.mc_ec_dict_features_user.values(), self.mc_ec_dict_user.values()
             ):
-                d_jt = mc_ec(sparse_feature_user)[0]
-                new_d_jt = {}
-                for output_key, shared_key in feature_keys:
-                    val = d_jt[output_key]
-                    fx_mark_seq_ec_jt(shared_key, val)
-                    new_d_jt[shared_key] = val
-                sparse_jt_dict_list.append(new_d_jt)
+                sparse_jt_dict_list.append(
+                    _remap_mark_jt_dict(mc_ec(sparse_feature_user)[0], feature_keys)
+                )
 
         if self.has_mulval_seq_user:
             seq_mulval_length_jt_dict_list.append(
