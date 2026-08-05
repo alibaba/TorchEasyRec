@@ -932,6 +932,91 @@ class ExportUtilTest(unittest.TestCase):
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_sparse_export_zch_without_eviction_metadata_emits_zero_scores(
+        self,
+    ) -> None:
+        """A zch table with no eviction metadata exports zero scores, not an error."""
+        invalid_raw_id = torch.iinfo(torch.int64).max
+        weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        mc_ebc_config = EmbeddingBagConfig(
+            name="user_id_emb",
+            embedding_dim=2,
+            num_embeddings=4,
+            feature_names=["user_id"],
+        )
+        mc_ebc = ManagedCollisionEmbeddingBagCollection(
+            EmbeddingBagCollection([mc_ebc_config], device=torch.device("cpu")),
+            ManagedCollisionCollection(
+                {
+                    "user_id_emb": MCHManagedCollisionModule(
+                        zch_size=4,
+                        device=torch.device("cpu"),
+                        eviction_policy=LFU_EvictionPolicy(),
+                        eviction_interval=2,
+                    )
+                },
+                [mc_ebc_config],
+            ),
+        )
+        mc_ebc._embedding_module.embedding_bags["user_id_emb"].weight.data.copy_(weight)
+        mch = mc_ebc._managed_collision_collection._managed_collision_modules[
+            "user_id_emb"
+        ]
+        mch._buffers["_mch_sorted_raw_ids"].copy_(
+            torch.tensor([101, 202, 303, invalid_raw_id])
+        )
+        mch._buffers["_mch_remapped_ids_mapping"].copy_(torch.tensor([2, 0, 1, 3]))
+        # No eviction metadata buffer: export must fall back to zero scores.
+        for buffer_name in ("_mch_counts", "_mch_last_access_iter"):
+            mch._buffers.pop(buffer_name, None)
+
+        model = torch.nn.Module()
+        _add_module_by_dotted_path(
+            model, "model.embedding_group.emb_impls.__BASE__.mc_ebc", mc_ebc
+        )
+        table_fqn = (
+            "model.embedding_group.emb_impls.__BASE__.mc_ebc."
+            "_embedding_module.embedding_bags.user_id_emb"
+        )
+
+        tmp = tempfile.mkdtemp(prefix="tzrec_export_zch_noscore_")
+        old_env = {"DIST_QUANT": os.environ.get("DIST_QUANT")}
+        try:
+            os.environ.pop("DIST_QUANT", None)
+            _, dynamic_out, emb_meta, _ = _get_sparse_embedding_tensor(
+                model,
+                tmp,
+                {},
+                {
+                    table_fqn: SimpleNamespace(
+                        name="user_id_emb",
+                        embedding_dim=2,
+                        feature_names=["user_id"],
+                        pooling="SUM",
+                    )
+                },
+            )
+
+            torch.testing.assert_close(
+                dynamic_out[f"{table_fqn}.keys"], torch.tensor([101, 202, 303])
+            )
+            np.testing.assert_array_equal(
+                dynamic_out[f"{table_fqn}.values"],
+                np.array([[2.0, 2.1], [0.0, 0.1], [1.0, 1.1]], dtype=np.float32),
+            )
+            torch.testing.assert_close(
+                dynamic_out[f"{table_fqn}.scores"], torch.tensor([0, 0, 0])
+            )
+            np.testing.assert_array_equal(
+                dynamic_out[f"{table_fqn}.default_value"],
+                np.array([[3.0, 3.1]], dtype=np.float32),
+            )
+            self.assertTrue(emb_meta[table_fqn]["is_dynamic"])
+            self.assertEqual(emb_meta[table_fqn]["score_dtype"], "int64")
+        finally:
+            _restore_env(old_env)
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_sparse_export_disambiguates_ec_ebc_embedding_name_collision(
         self,
     ) -> None:

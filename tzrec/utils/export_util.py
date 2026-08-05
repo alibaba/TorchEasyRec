@@ -2395,29 +2395,30 @@ def _zch_table_to_dynamic(
     Returns:
         keys: raw ids, ascending.
         values: embedding row per key.
-        scores: eviction score per key.
+        scores: eviction score per key, zero when no eviction metadata is kept.
         default_value: single embedding row served for any other key.
     """
     raw_ids = mch._buffers["_mch_sorted_raw_ids"].to(weight.device)
     remapped_ids = mch._buffers["_mch_remapped_ids_mapping"].to(weight.device)
     # LFU keeps counts only, LRU keeps last access iter only, DistanceLFU keeps
-    # both and its recency part maps onto the dynamic table score.
+    # both; the present one maps onto the dynamic table score. Export and serving
+    # do not require score semantics, so a table with no eviction metadata emits
+    # a zero score per key instead of failing the export.
     score_buffer = None
     for buffer_name in ("_mch_last_access_iter", "_mch_counts"):
         score_buffer = mch._buffers.get(buffer_name)
         if score_buffer is not None:
             break
-    if score_buffer is None:
-        raise ValueError(
-            f"zch table {emb_name} has no eviction metadata buffer to export "
-            "as dynamic table score."
-        )
-    score_buffer = score_buffer.to(weight.device)
+    if score_buffer is not None:
+        score_buffer = score_buffer.to(weight.device)
 
     valid_mask = raw_ids != torch.iinfo(torch.int64).max
     keys = raw_ids[valid_mask]
     rows = remapped_ids[valid_mask] - shard_offset
-    scores = score_buffer[valid_mask].to(torch.int64)
+    if score_buffer is not None:
+        scores = score_buffer[valid_mask].to(torch.int64)
+    else:
+        scores = torch.zeros(keys.numel(), dtype=torch.int64, device=weight.device)
     num_rows = weight.shape[0]
     if keys.numel() > 0 and (
         int(rows.min().item()) < 0 or int(rows.max().item()) >= num_rows
