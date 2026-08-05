@@ -22,6 +22,7 @@ from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.persist import (
     PROMPT_DIR,
     check_prompt_assets,
+    copy_prompt_assets,
     read_prompt_hashes,
     save_prompt_assets,
 )
@@ -113,6 +114,27 @@ class PromptPersistTest(unittest.TestCase):
 
     def test_no_prompt_config_is_a_no_op(self) -> None:
         check_prompt_assets(None, os.path.join(self.test_dir, "nowhere"))
+
+    def test_export_carries_the_contract_forward(self) -> None:
+        ckpt = os.path.join(self.test_dir, "model.ckpt-1")
+        save_prompt_assets(self._compile(), ckpt)
+        export = os.path.join(self.test_dir, "export")
+        copy_prompt_assets(ckpt, export)
+
+        # the HF branch never builds a model, so save_assets cannot run there
+        self.assertEqual(read_prompt_hashes(export), read_prompt_hashes(ckpt))
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(export, PROMPT_DIR, "tokenizer", "tokenizer.json")
+            )
+        )
+
+    def test_copying_from_a_bare_checkpoint_only_warns(self) -> None:
+        bare = os.path.join(self.test_dir, "bare")
+        os.makedirs(bare, exist_ok=True)
+        export = os.path.join(self.test_dir, "export_bare")
+        copy_prompt_assets(bare, export)
+        self.assertIsNone(read_prompt_hashes(export))
 
 
 if __name__ == "__main__":

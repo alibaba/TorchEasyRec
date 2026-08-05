@@ -74,7 +74,7 @@ from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.prompt.compile import compile_prompt
-from tzrec.prompt.persist import check_prompt_assets
+from tzrec.prompt.persist import check_prompt_assets, copy_prompt_assets
 from tzrec.prompt.plan import CompiledPrompt
 from tzrec.protos import export_pb2
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
@@ -1124,6 +1124,16 @@ def export(
             checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
     # HF export converts the checkpoint dir directly -- no model build, no DCP restore.
+    if pipeline_config.HasField("prompt_config") and (
+        pipeline_config.export_config.export_format != export_pb2.ExportFormat.HF
+    ):
+        raise ValueError(
+            "a prompt-native model exports to a HuggingFace directory, not "
+            "TorchScript: its input is an assembled token stream the dataloader "
+            "builds, which an export-time dummy batch cannot supply. Set "
+            "export_config.export_format to HF."
+        )
+
     if pipeline_config.export_config.export_format == export_pb2.ExportFormat.HF:
         if config_util.use_dense_ema(
             pipeline_config.export_config, pipeline_config.train_config
@@ -1146,6 +1156,9 @@ def export(
             from tzrec.utils.hf_export_util import dcp_to_hf
 
             dcp_to_hf(checkpoint_path, export_dir)
+            # this branch never builds a model, so save_assets cannot run; the
+            # checkpoint already carries the contract, so copy it forward
+            copy_prompt_assets(checkpoint_path, export_dir)
         return
 
     data_config = pipeline_config.data_config

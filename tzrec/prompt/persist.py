@@ -122,3 +122,20 @@ def check_prompt_assets(prompt: Optional[CompiledPrompt], ckpt_dir: str) -> None
             f"matches, so the weights are usable, but the template, slots or "
             f"projections changed."
         )
+
+
+def copy_prompt_assets(source_dir: str, target_dir: str) -> None:
+    """Carry a checkpoint's prompt contract into an export directory.
+
+    Args:
+        source_dir: the checkpoint being exported.
+        target_dir: the export directory.
+    """
+    source = os.path.join(source_dir, PROMPT_DIR)
+    if not os.path.isdir(source):
+        logger.warning(
+            f"checkpoint [{source_dir}] carries no prompt assets, so the export "
+            f"will not describe its own vocabulary."
+        )
+        return
+    shutil.copytree(source, os.path.join(target_dir, PROMPT_DIR), dirs_exist_ok=True)
