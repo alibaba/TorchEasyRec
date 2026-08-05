@@ -45,7 +45,7 @@ class _FakeTokenizer:
 
 
 class _GenRec(nn.Module):
-    """Stand-in for BaseGenerativeModel: an HF backbone plus unrelated params."""
+    """Stand-in for a prompt-native model: an HF backbone plus unrelated params."""
 
     def __init__(self, lm):
         super().__init__()

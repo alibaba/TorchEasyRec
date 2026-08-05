@@ -128,7 +128,7 @@ class DynamicBeamSearchTest(unittest.TestCase):
             _decode(lm, ids, pairs, beam_widths=[2, 0, 4])
 
     def test_tokens_stay_inside_arbitrary_bands(self) -> None:
-        # bands the GenerativeQwen caller can never produce: descending, disjoint,
+        # bands the PromptGenerativeQwen caller can never produce: descending, disjoint,
         # unequal width -- the kernel's contract is per-level (lo, hi), not a
         # contiguous codebook layout.
         pairs = [(5, 6), (20, 24), (11, 13)]
