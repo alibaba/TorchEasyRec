@@ -34,7 +34,7 @@ def _decode(lm, ids, pairs, width=8, beam_widths=None, attention_mask=None):
         beam_widths = [width] * len(pairs)
     return dynamic_beam_search(
         lm,
-        ids,
+        lm.get_input_embeddings()(ids),
         torch.ones_like(ids) if attention_mask is None else attention_mask,
         beam_widths=beam_widths,
         lo_tok=torch.tensor([p[0] for p in pairs]),
@@ -54,8 +54,14 @@ class _RowSpy:
         self.rows: List[int] = []
         self._lm = lm
 
+    def get_input_embeddings(self):
+        return self._lm.get_input_embeddings()
+
     def model(self, **kwargs: Any) -> Any:
-        self.rows.append(kwargs["input_ids"].shape[0])
+        first = kwargs.get("input_ids")
+        if first is None:
+            first = kwargs["inputs_embeds"]
+        self.rows.append(first.shape[0])
         return self._lm.model(**kwargs)
 
 

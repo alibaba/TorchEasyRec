@@ -14,6 +14,7 @@ import unittest
 import torch
 
 from tzrec.models.prompt_generative_qwen import _unpack
+from tzrec.prompt.plan import SidSpace
 
 
 class UnpackTest(unittest.TestCase):
@@ -65,6 +66,42 @@ class UnpackTest(unittest.TestCase):
 
         self.assertIsNotNone(embeds.grad)
         torch.testing.assert_close(embeds.grad, torch.ones(3, 2))
+
+
+class DetokenizeTest(unittest.TestCase):
+    """Both shifts must come back off, in the right order."""
+
+    def _space(self) -> SidSpace:
+        return SidSpace(
+            codebook=(4, 4, 4),
+            num_levels=3,
+            base_vocab=1000,
+            level_offsets=(0, 4, 8),
+            band_lo=(1000, 1004, 1008),
+            band_hi=(1003, 1007, 1011),
+            target_vocab=1152,
+            sentinel_token_id=None,
+            eos_token_id=2,
+            pad_token_id=3,
+        )
+
+    def test_token_ids_become_local_codes(self) -> None:
+        space = self._space()
+        # one beam row: level 0 code 1, level 1 code 2, level 2 code 3
+        tokens = torch.tensor([[1000 + 1, 1000 + 4 + 2, 1000 + 8 + 3]])
+        offsets = torch.tensor(space.level_offsets)
+        codes = (tokens - space.base_vocab - offsets).view(1, -1, 3)
+
+        self.assertEqual(codes[0, 0].tolist(), [1, 2, 3])
+        # every code lands back inside its own codebook
+        self.assertTrue(bool(((codes >= 0) & (codes < 4)).all()))
+
+    def test_a_band_edge_maps_to_the_last_code(self) -> None:
+        space = self._space()
+        tokens = torch.tensor([list(space.band_hi)])
+        offsets = torch.tensor(space.level_offsets)
+        codes = tokens - space.base_vocab - offsets
+        self.assertEqual(codes[0].tolist(), [3, 3, 3])
 
 
 if __name__ == "__main__":

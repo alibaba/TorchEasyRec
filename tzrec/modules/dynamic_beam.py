@@ -24,7 +24,7 @@ from transformers import PreTrainedModel
 @torch.no_grad()
 def dynamic_beam_search(
     model: PreTrainedModel,
-    input_ids: torch.Tensor,
+    prompt_embeds: torch.Tensor,
     attention_mask: torch.Tensor,
     beam_widths: List[int],
     lo_tok: torch.Tensor,
@@ -34,7 +34,8 @@ def dynamic_beam_search(
 
     Args:
         model: an HF causal LM exposing ``.model`` / ``.lm_head`` (Qwen layout).
-        input_ids: left-padded prompt ids ``(B, P)``.
+        prompt_embeds: left-padded prompt embeddings ``(B, P, D)``. Embeddings
+            rather than ids, because a projected slot has no vocabulary id.
         attention_mask: prompt mask ``(B, P)``.
         beam_widths: requested width per SID level; each is capped to what its
             band and the surviving prefixes supply.
@@ -45,8 +46,8 @@ def dynamic_beam_search(
         The SID token tail ``(B * W, num_levels)``, score-ordered best-first.
         The answer is fixed-length and EOS-free, so no beam bookkeeping.
     """
-    device = input_ids.device
-    batch_size = input_ids.shape[0]
+    device = prompt_embeds.device
+    batch_size = prompt_embeds.shape[0]
     num_levels = lo_tok.shape[0]
     if len(beam_widths) != num_levels:
         raise ValueError(
@@ -79,7 +80,7 @@ def dynamic_beam_search(
 
     position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
     outputs = model.model(
-        input_ids=input_ids,
+        inputs_embeds=prompt_embeds,
         attention_mask=attention_mask,
         position_ids=position_ids,
         use_cache=True,

@@ -26,6 +26,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.model import BaseModel
+from tzrec.modules.dynamic_beam import dynamic_beam_search
 from tzrec.modules.prompt_projection import PromptProjection
 from tzrec.prompt.plan import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
@@ -165,10 +166,53 @@ class PromptGenerativeQwen(BaseModel):
             batch: carries the packed prompt in ``additional_infos``.
 
         Returns:
-            The loss.
+            The loss when training, the decoded SIDs otherwise.
         """
         embeds = self._prompt_embeds(batch)
+        if self.is_inference:
+            return {self._generated_sids_key: self._generate(embeds, batch)}
         return self._forward_loss(embeds, batch)
+
+    def _sid_token_bands(self) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Inclusive token-id band of every SID level, as device tensors."""
+        space = self._prompt.sid_space
+        device = self.lm.get_input_embeddings().weight.device
+        return (
+            torch.tensor(space.band_lo, device=device),
+            torch.tensor(space.band_hi, device=device),
+        )
+
+    def _generate(self, embeds: torch.Tensor, batch: Batch) -> torch.Tensor:
+        """Beam-search the SID answer.
+
+        Args:
+            embeds: the assembled prompt embeddings, packed.
+            batch: carries ``prompt_cu_seqlens`` and the collator's width.
+
+        Returns:
+            ``(B, num_return, num_levels)`` local codes, best first.
+        """
+        infos = batch.additional_infos
+        padded, mask, _ = _unpack(
+            embeds,
+            infos[_PROMPT_CU_SEQLENS],
+            infos[_PROMPT_LABELS],
+            int(infos[_PROMPT_MAX_SEQLEN]),
+            self._ignore_index,
+        )
+        lo_tok, hi_tok = self._sid_token_bands()
+        tokens = dynamic_beam_search(
+            self.lm, padded, mask, self._beam_widths, lo_tok, hi_tok
+        )
+        return self._detokenize(tokens, padded.shape[0])
+
+    def _detokenize(self, tokens: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Undo both shifts: token id back to a local 0-based code."""
+        space = self._prompt.sid_space
+        offsets = torch.tensor(space.level_offsets, device=tokens.device)
+        codes = tokens - space.base_vocab - offsets
+        codes = codes.view(batch_size, -1, space.num_levels)
+        return codes[:, : self._num_return, :]
 
     def _prompt_embeds(self, batch: Batch) -> torch.Tensor:
         """Gather the token stream, then overwrite the projected positions."""
