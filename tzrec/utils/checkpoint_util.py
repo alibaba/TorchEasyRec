@@ -332,6 +332,23 @@ def best_checkpoint(
         return latest_checkpoint(model_dir)
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    """Walk DMP/TrainWrapper layers down to the model that owns the hooks."""
+    inner = model
+    seen = set()
+    while not hasattr(inner, "save_assets"):
+        if id(inner) in seen:
+            return model
+        seen.add(id(inner))
+        if hasattr(inner, "module"):
+            inner = inner.module
+        elif hasattr(inner, "model"):
+            inner = inner.model
+        else:
+            return model
+    return inner
+
+
 class CheckpointManager:
     """Saves training checkpoints and prunes old ones asynchronously.
 
@@ -410,6 +427,13 @@ class CheckpointManager:
             logger.warning(
                 f"write_hf_assets failed for {ckpt_dir}: {e} -- checkpoint "
                 f"weights are saved; skipping HF assets."
+            )
+        try:
+            _unwrap_model(model).save_assets(ckpt_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"save_assets failed for {ckpt_dir}: {e} -- checkpoint weights "
+                f"are saved; skipping model assets."
             )
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)

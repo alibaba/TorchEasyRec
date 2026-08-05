@@ -43,6 +43,7 @@ from tzrec.prompt.assembler import (
 from tzrec.prompt.assembler import (
     PROMPT_MAX_SEQLEN as _PROMPT_MAX_SEQLEN,
 )
+from tzrec.prompt.persist import save_prompt_assets
 from tzrec.prompt.plan import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.prompt_model_pb2 import PromptModelConfig
@@ -267,6 +268,14 @@ class PromptGenerativeQwen(BaseModel):
             ignore_index=self._ignore_index,
         )
         return {"loss": loss}
+
+    def save_assets(self, target_dir: str) -> None:
+        """Co-locate the prompt contract, so the checkpoint is self-describing.
+
+        Args:
+            target_dir: the checkpoint or export directory.
+        """
+        save_prompt_assets(self._prompt, target_dir)
 
     def init_from_pretrained(self) -> None:
         """Load HF weights once, on a cold start only."""

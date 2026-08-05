@@ -74,6 +74,7 @@ from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.persist import check_prompt_assets
 from tzrec.prompt.plan import CompiledPrompt
 from tzrec.protos import export_pb2
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
@@ -759,6 +760,8 @@ def train_and_evaluate(
 
     # Restore dataloader state before create_dataloader starts its workers
     dataloader_state: Optional[Dict[str, Any]] = None
+    if ckpt_path:
+        check_prompt_assets(prompt, ckpt_path)
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
         if dataloader_state and not restore_from_model_dir:
@@ -1033,6 +1036,7 @@ def evaluate(
     )
 
     if checkpoint_path:
+        check_prompt_assets(prompt, checkpoint_path)
         ckpt_manager.restore(
             checkpoint_path,
             model,
@@ -1620,6 +1624,7 @@ def predict_checkpoint(
     model.eval()
 
     if checkpoint_path:
+        check_prompt_assets(prompt, checkpoint_path)
         ckpt_manager.restore(
             checkpoint_path,
             model,

@@ -94,6 +94,18 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         """
         raise NotImplementedError
 
+    def save_assets(self, target_dir: str) -> None:
+        """Write any contract a checkpoint needs to describe itself.
+
+        Lifecycle hook symmetric with ``init_from_pretrained``, called for every
+        ``model.ckpt-N/`` and for the export directory. The default is a no-op;
+        models whose weights are meaningless without a companion artifact -- a
+        vocabulary, a plan -- override it.
+
+        Args:
+            target_dir: the checkpoint or export directory.
+        """
+
     def init_from_pretrained(self) -> None:
         """Load pretrained weights at cold start (no checkpoint to restore).
 
