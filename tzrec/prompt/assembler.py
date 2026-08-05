@@ -21,7 +21,20 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from tzrec.prompt.plan import FillMode, PromptPlan, SidSpace, SlotSeg, Static
+from tzrec.prompt.plan import (
+    CompiledPrompt,
+    FillMode,
+    PromptPlan,
+    SidSpace,
+    SlotSeg,
+    Static,
+)
+
+PROMPT_INPUT_IDS = "prompt_input_ids"
+PROMPT_CU_SEQLENS = "prompt_cu_seqlens"
+PROMPT_HOLE_POSITIONS = "prompt_hole_positions"
+PROMPT_LABELS = "prompt_labels"
+PROMPT_MAX_SEQLEN = "prompt_max_seqlen"
 
 
 @dataclass
@@ -40,6 +53,13 @@ class AssembledPrompt:
     cu_seqlens: np.ndarray
     hole_positions: np.ndarray
     labels: np.ndarray
+
+    @property
+    def max_seqlen(self) -> int:
+        """Widest row, computed on the host so the model never derives it."""
+        if self.cu_seqlens.size < 2:
+            return 0
+        return int(np.max(np.diff(self.cu_seqlens)))
 
 
 class PromptAssembler:
@@ -179,3 +199,50 @@ class PromptAssembler:
             hole_positions=np.asarray(holes, dtype=np.int64),
             labels=np.asarray(labels, dtype=np.int64),
         )
+
+
+def assemble_into(
+    prompt: CompiledPrompt,
+    parsed: Dict[str, "np.ndarray"],
+    ignore_index: int = -100,
+) -> Dict[str, np.ndarray]:
+    """Run the assembler over one parsed batch and key it for the batch.
+
+    Args:
+        prompt: the compiled prompt.
+        parsed: ``{feature}.values`` / ``{feature}.lengths`` as the data parser
+            emits them.
+        ignore_index: label value outside the supervised span.
+
+    Returns:
+        The five streams, keyed as ``additional_infos`` expects them.
+    """
+    plan = prompt.prompt_plan
+    values: Dict[str, List[np.ndarray]] = {}
+    counts: Dict[str, np.ndarray] = {}
+    batch_size = 0
+    for seg in plan.segments + plan.response_segments:
+        if not isinstance(seg, SlotSeg):
+            continue
+        source = seg.sources[0]
+        lengths = np.asarray(parsed[f"{source}.lengths"])
+        batch_size = max(batch_size, int(lengths.size))
+        if seg.fill is FillMode.INLINE:
+            flat = np.asarray(parsed[f"{source}.values"])
+            bounds = np.concatenate(([0], np.cumsum(lengths)))
+            values[seg.name] = [
+                flat[bounds[i] : bounds[i + 1]] for i in range(lengths.size)
+            ]
+        else:
+            counts[seg.name] = lengths
+
+    out = PromptAssembler(plan, prompt.sid_space, ignore_index).assemble(
+        values, counts, batch_size=batch_size
+    )
+    return {
+        PROMPT_INPUT_IDS: out.input_ids,
+        PROMPT_CU_SEQLENS: out.cu_seqlens,
+        PROMPT_HOLE_POSITIONS: out.hole_positions,
+        PROMPT_LABELS: out.labels,
+        PROMPT_MAX_SEQLEN: np.asarray(out.max_seqlen, dtype=np.int64),
+    }

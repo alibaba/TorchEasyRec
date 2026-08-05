@@ -28,16 +28,25 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models.model import BaseModel
 from tzrec.modules.dynamic_beam import dynamic_beam_search
 from tzrec.modules.prompt_projection import PromptProjection
+from tzrec.prompt.assembler import (
+    PROMPT_CU_SEQLENS as _PROMPT_CU_SEQLENS,
+)
+from tzrec.prompt.assembler import (
+    PROMPT_HOLE_POSITIONS as _PROMPT_HOLE_POSITIONS,
+)
+from tzrec.prompt.assembler import (
+    PROMPT_INPUT_IDS as _PROMPT_INPUT_IDS,
+)
+from tzrec.prompt.assembler import (
+    PROMPT_LABELS as _PROMPT_LABELS,
+)
+from tzrec.prompt.assembler import (
+    PROMPT_MAX_SEQLEN as _PROMPT_MAX_SEQLEN,
+)
 from tzrec.prompt.plan import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.prompt_model_pb2 import PromptModelConfig
 from tzrec.utils.logging_util import logger
-
-_PROMPT_INPUT_IDS = "prompt_input_ids"
-_PROMPT_CU_SEQLENS = "prompt_cu_seqlens"
-_PROMPT_HOLE_POSITIONS = "prompt_hole_positions"
-_PROMPT_LABELS = "prompt_labels"
-_PROMPT_MAX_SEQLEN = "prompt_max_seqlen"
 
 _PARAM_DTYPE: Dict[int, torch.dtype] = {
     PromptModelConfig.FP32: torch.float32,

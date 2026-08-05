@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import torch
 from torch import distributed as dist
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
@@ -40,6 +41,8 @@ from tzrec.datasets.utils import (
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
+from tzrec.prompt.assembler import assemble_into
+from tzrec.prompt.plan import CompiledPrompt
 from tzrec.protos import data_pb2
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
@@ -106,8 +109,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         reserved_columns: Optional[List[str]] = None,
         mode: Mode = Mode.EVAL,
         debug_level: int = 0,
+        prompt: Optional[CompiledPrompt] = None,
     ) -> None:
         super(BaseDataset, self).__init__()
+        self._prompt = prompt
         self._data_config = data_config
         self._features = features
         self._input_path = input_path
@@ -381,6 +386,14 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                 batch.reserves = RecordBatchTensor(pa.record_batch(reserved_data))
         else:
             batch = self._data_parser.to_batch(output_data)
+
+        if self._prompt is not None:
+            batch.additional_infos.update(
+                {
+                    k: torch.from_numpy(np.asarray(v))
+                    for k, v in assemble_into(self._prompt, output_data).items()
+                }
+            )
 
         # Set checkpoint info on batch
         batch.checkpoint_info = checkpoint_info
@@ -759,6 +772,7 @@ def create_dataloader(
     gl_cluster: Optional[Dict[str, Union[int, str]]] = None,
     debug_level: int = 0,
     checkpoint_state: Optional[Dict[str, Any]] = None,
+    prompt: Optional[CompiledPrompt] = None,
 ) -> DataLoader:
     """Build dataloader.
 
@@ -773,6 +787,8 @@ def create_dataloader(
             debug_level > 0, will dump fg encoded data to debug_str
         checkpoint_state (dict, optional): resume state, applied before the
             eager ``iter()`` forks workers so it reaches them.
+        prompt (CompiledPrompt, optional): when set, each batch carries the
+            assembled prompt streams in ``additional_infos``.
 
     Return:
         dataloader (dataloader): a DataLoader.
@@ -787,6 +803,7 @@ def create_dataloader(
         reserved_columns=reserved_columns,
         mode=mode,
         debug_level=debug_level,
+        prompt=prompt,
     )
     if checkpoint_state:
         dataset.load_state_dict(dict(checkpoint_state))

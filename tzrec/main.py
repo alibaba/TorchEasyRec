@@ -73,6 +73,8 @@ from tzrec.optim import optimizer_builder
 from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
+from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.plan import CompiledPrompt
 from tzrec.protos import export_pb2
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
@@ -80,6 +82,7 @@ from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper
@@ -121,6 +124,21 @@ def _create_features(
     return features
 
 
+def _compile_prompt(
+    pipeline_config: EasyRecConfig, features: List[BaseFeature]
+) -> Optional[CompiledPrompt]:
+    """Compile prompt_config when the pipeline declares one.
+
+    Runs on every entry point, so the plan the data layer walks and the vocab
+    the model resizes to are produced by one code path.
+    """
+    if not pipeline_config.HasField("prompt_config"):
+        return None
+    return compile_prompt(
+        pipeline_config.prompt_config, features, model_dir=pipeline_config.model_dir
+    )
+
+
 def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
     try:
         sampler_type = (
@@ -139,6 +157,7 @@ def _create_model(
     labels: List[str],
     sample_weights: Optional[List[str]] = None,
     sampler_type: Optional[str] = None,
+    prompt: Optional[CompiledPrompt] = None,
 ) -> BaseModel:
     """Build model.
 
@@ -148,6 +167,8 @@ def _create_model(
         labels (list): list of label names.
         sample_weights (list): list of sample weight names.
         sampler_type (str): negative sampler type
+        prompt (CompiledPrompt, optional): forwarded to prompt-native models.
+
     Return:
         model: a EasyRec Model.
     """
@@ -155,12 +176,14 @@ def _create_model(
     # pyre-ignore [16]
     model_cls = BaseModel.create_class(model_cls_name)
 
+    extra: Dict[str, Any] = {"prompt": prompt} if prompt is not None else {}
     model: BaseModel = model_cls(
         model_config,
         features,
         labels,
         sample_weights=sample_weights,
         sampler_type=sampler_type,
+        **extra,
     )
 
     kernel = Kernel[KernelProto.Name(model_config.kernel)]
@@ -697,6 +720,7 @@ def train_and_evaluate(
     data_config = pipeline_config.data_config
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+    prompt = _compile_prompt(pipeline_config, features)
 
     ckpt_manager = checkpoint_util.CheckpointManager(
         pipeline_config.model_dir,
@@ -747,6 +771,7 @@ def train_and_evaluate(
         features,
         pipeline_config.train_input_path,
         mode=Mode.TRAIN,
+        prompt=prompt,
         checkpoint_state=dataloader_state,
     )
     eval_dataloader = None
@@ -758,6 +783,7 @@ def train_and_evaluate(
             features,
             pipeline_config.eval_input_path,
             mode=Mode.EVAL,
+            prompt=prompt,
             gl_cluster=gl_cluster,
         )
 
@@ -957,12 +983,14 @@ def evaluate(
     data_config = pipeline_config.data_config
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+    prompt = _compile_prompt(pipeline_config, features)
 
     eval_dataloader = create_dataloader(
         data_config,
         features,
         eval_input_path or pipeline_config.eval_input_path,
         mode=Mode.EVAL,
+        prompt=prompt,
     )
 
     sampler_type = _get_sampler_type(data_config)
@@ -1118,6 +1146,7 @@ def export(
 
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+    prompt = _compile_prompt(pipeline_config, features)
 
     # Build model
     model = _create_model(
@@ -1125,6 +1154,7 @@ def export(
         features,
         list(data_config.label_fields),
         sampler_type=None,
+        prompt=prompt,
     )
     InferWrapper = ScriptWrapper
     # Flip to inference *before* wrapping so view-dependent state
@@ -1310,6 +1340,7 @@ def predict(
     data_config.drop_remainder = False
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+    prompt = _compile_prompt(pipeline_config, features)
 
     infer_dataloader = create_dataloader(
         data_config,
@@ -1317,6 +1348,7 @@ def predict(
         predict_input_path,
         reserved_columns=reserved_cols,
         mode=Mode.PREDICT,
+        prompt=prompt,
         debug_level=debug_level,
     )
     infer_iterator = infer_dataloader.get_iterator()  # pyre-ignore[16]
@@ -1524,6 +1556,7 @@ def predict_checkpoint(
     data_config = pipeline_config.data_config
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+    prompt = _compile_prompt(pipeline_config, features)
 
     # Build dataloader
     predict_dataloader = create_dataloader(
@@ -1532,6 +1565,7 @@ def predict_checkpoint(
         predict_input_path,
         reserved_columns=reserved_cols,
         mode=Mode.PREDICT,
+        prompt=prompt,
         debug_level=debug_level,
     )
 
