@@ -52,10 +52,15 @@ def _plain(value: Any) -> Any:
 def save_prompt_assets(prompt: CompiledPrompt, target_dir: str) -> None:
     """Write the prompt contract into a checkpoint or export directory.
 
+    Rank 0 only: every rank reaches here on save, and concurrent json.dump and
+    copytree to one path can interleave into a truncated file.
+
     Args:
         prompt: the compiled prompt.
         target_dir: the checkpoint or export directory.
     """
+    if int(os.environ.get("RANK", 0)) != 0:
+        return
     out = os.path.join(target_dir, PROMPT_DIR)
     os.makedirs(out, exist_ok=True)
 

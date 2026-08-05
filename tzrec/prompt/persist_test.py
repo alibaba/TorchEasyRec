@@ -13,6 +13,7 @@ import dataclasses
 import json
 import os
 import unittest
+from unittest import mock
 
 from google.protobuf import text_format
 from tokenizers import Tokenizer, models, pre_tokenizers
@@ -135,6 +136,17 @@ class PromptPersistTest(unittest.TestCase):
         export = os.path.join(self.test_dir, "export_bare")
         copy_prompt_assets(bare, export)
         self.assertIsNone(read_prompt_hashes(export))
+
+    def test_only_rank_zero_writes(self) -> None:
+        ckpt = os.path.join(self.test_dir, "model.ckpt-rank")
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            save_prompt_assets(self._compile(), ckpt)
+        # a non-zero rank must not race rank 0's json.dump and copytree
+        self.assertFalse(os.path.exists(os.path.join(ckpt, PROMPT_DIR)))
+
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            save_prompt_assets(self._compile(), ckpt)
+        self.assertIsNotNone(read_prompt_hashes(ckpt))
 
 
 if __name__ == "__main__":
