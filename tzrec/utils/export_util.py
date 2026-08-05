@@ -16,7 +16,6 @@ import operator
 import os
 import re
 import shutil
-import tempfile
 from collections import OrderedDict, defaultdict
 from queue import Queue
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
@@ -69,7 +68,7 @@ from tzrec.features.feature import (
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util, env_util, quant_util
+from tzrec.utils import checkpoint_util, config_util, env_util, npz_util, quant_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
@@ -1556,17 +1555,10 @@ def export_distributed_embedding(
     )
     local_tensor_name = f"sparse_embeddings-{rank:02d}-of-{world_size:02d}"
     save_dir_sparse = f"{save_dir}/sparse"
-    if not os.path.exists(save_dir_sparse):
-        os.makedirs(save_dir_sparse)
+    os.makedirs(save_dir_sparse, exist_ok=True)
     local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
     logger.info(f"save sparse tensors to {local_tensor_path}")
-
-    # OSS mounted file system may have problem in file seek, so first
-    # save to a temp file then move to target path
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
-        temp_path = f.name
-        np.savez(f, **local_tensor)
-    shutil.move(temp_path, local_tensor_path)
+    npz_util.savez_streaming(local_tensor_path, local_tensor)
 
     if dynamic_local_tensor:
         dynamic_tensor_name = f"sparse_dynamic_embedding-{rank:02d}-of-{world_size:02d}"
@@ -1574,10 +1566,7 @@ def export_distributed_embedding(
             save_dir_sparse, f"{dynamic_tensor_name}.npz"
         )
         logger.info(f"save dynamic sparse tensors to {dynamic_tensor_path}")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
-            np.savez(f, **dynamic_local_tensor)
-            temp_path = f.name
-        shutil.move(temp_path, dynamic_tensor_path)
+        npz_util.savez_streaming(dynamic_tensor_path, dynamic_local_tensor)
 
     with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
         json.dump(emb_meta, f, indent=4)
