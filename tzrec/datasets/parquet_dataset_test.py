@@ -262,8 +262,10 @@ class ParquetDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 num_workers=2,
             )
+            self.assertTrue(data_config.in_order)
 
             dataloader1 = create_dataloader(data_config, features, input_path)
+            self.assertTrue(dataloader1.in_order)
             iterator1 = iter(dataloader1)
             checkpoint_state = {}
             for _ in range(4):
@@ -336,10 +338,12 @@ class ParquetDatasetTest(unittest.TestCase):
                 fg_mode=data_pb2.FgMode.FG_NONE,
                 label_fields=["label"],
                 num_workers=2,
+                in_order=False,
             )
 
             # full pass to learn the per-worker interval keys + total rows
             dataloader0 = create_dataloader(data_config, features, input_path)
+            self.assertFalse(dataloader0.in_order)
             full_state = {}
             num_total_rows = 0
             for batch in dataloader0.get_iterator():  # pyre-ignore[16]
@@ -359,6 +363,7 @@ class ParquetDatasetTest(unittest.TestCase):
             dataloader = create_dataloader(
                 data_config, features, input_path, checkpoint_state=tail_state
             )
+            self.assertFalse(dataloader.in_order)
             # first get_iterator() == the eager iterator -> resumed tail only
             num_tail_rows = _drain(dataloader.get_iterator())  # pyre-ignore[16]
             self.assertEqual(num_tail_rows, expected_tail_rows)

@@ -153,6 +153,9 @@ message DataConfig {
     // type names follow ODPS conventions with aliases: BIGINT->INT64, INT->INT32
     optional string input_fields_str = 27;
 
+    // whether dataloader batches are returned in first-in, first-out order
+    optional bool in_order = 28 [default = true];
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;
