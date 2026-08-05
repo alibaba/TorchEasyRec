@@ -228,7 +228,9 @@ def assemble_into(
         lengths = np.asarray(parsed[f"{source}.lengths"])
         batch_size = max(batch_size, int(lengths.size))
         if seg.fill is FillMode.INLINE:
-            flat = np.asarray(parsed[f"{source}.values"])
+            # a dense sequence feature emits (total, value_dim); the stream is
+            # one code per position, so value_dim is always 1 here
+            flat = np.asarray(parsed[f"{source}.values"]).reshape(-1)
             bounds = np.concatenate(([0], np.cumsum(lengths)))
             values[seg.name] = [
                 flat[bounds[i] : bounds[i + 1]] for i in range(lengths.size)

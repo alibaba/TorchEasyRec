@@ -165,6 +165,28 @@ class PromptAssemblerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no sid_space was compiled"):
             PromptAssembler(plan, None)
 
+    def test_column_shaped_values_are_flattened(self) -> None:
+        # the data parser emits (total, value_dim) for a dense sequence feature
+        from tzrec.prompt.assembler import assemble_into
+        from tzrec.prompt.plan import CompiledPrompt, ModulePlan
+
+        plan = _plan((_slot("hist", FillMode.INLINE),))
+        prompt = CompiledPrompt(
+            sid_space=_sid_space(),
+            prompt_plan=plan,
+            module_plan=ModulePlan(projections={}, slot_to_module={}),
+            tokenizer_dir="",
+            vocab_hash="v",
+            plan_hash="p",
+        )
+        parsed = {
+            "hist.values": np.array([[1], [6], [11], [0], [4], [8]]),
+            "hist.lengths": np.array([3, 3]),
+        }
+        out = assemble_into(prompt, parsed)
+        self.assertEqual(out["prompt_cu_seqlens"].tolist(), [0, 3, 6])
+        self.assertEqual(out["prompt_input_ids"].tolist()[0], _BASE + 1)
+
     def test_rows_of_different_lengths_pack_without_padding(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
         asm = PromptAssembler(plan, _sid_space())

@@ -20,6 +20,7 @@ the positions the projected slots must overwrite.
 from typing import Any, Dict, List, Optional
 
 import torch
+import torchmetrics
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -268,6 +269,54 @@ class PromptGenerativeQwen(BaseModel):
             ignore_index=self._ignore_index,
         )
         return {"loss": loss}
+
+    def init_loss(self) -> None:
+        """No-op: the LM computes its own CE inside ``predict``."""
+        return
+
+    def loss(
+        self, predictions: Dict[str, torch.Tensor], batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Surface the CE already computed in ``predict``.
+
+        Args:
+            predictions: what ``predict`` returned.
+            batch: the batch, unused.
+
+        Returns:
+            The named loss.
+        """
+        return {"ce_loss": predictions["loss"]}
+
+    def init_metric(self) -> None:
+        """Register a mean-CE metric for the eval loop."""
+        self._metric_modules["ce_loss"] = torchmetrics.MeanMetric()
+
+    def update_metric(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Batch,
+        losses: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> None:
+        """Update the mean-CE metric with this batch's loss.
+
+        Args:
+            predictions: what ``predict`` returned.
+            batch: the batch, unused.
+            losses: the named losses, unused.
+        """
+        self._metric_modules["ce_loss"].update(predictions["loss"].detach())
+
+    def update_train_metric(
+        self, predictions: Dict[str, torch.Tensor], batch: Batch
+    ) -> None:
+        """No-op: nothing beyond the logged CE.
+
+        Args:
+            predictions: what ``predict`` returned.
+            batch: the batch, unused.
+        """
+        return
 
     def save_assets(self, target_dir: str) -> None:
         """Co-locate the prompt contract, so the checkpoint is self-describing.

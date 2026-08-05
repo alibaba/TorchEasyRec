@@ -81,7 +81,11 @@ def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
     gen_cfg = getattr(backbone, "generation_config", None)
     if gen_cfg is not None:
         gen_cfg.save_pretrained(save_dir)
-    inner.hf_tokenizer().save_pretrained(save_dir)
+    # A prompt-native model owns no HF tokenizer: its extended vocabulary is a
+    # separately versioned artifact that save_assets writes to prompt/tokenizer.
+    tokenizer = getattr(inner, "hf_tokenizer", None)
+    if tokenizer is not None:
+        tokenizer().save_pretrained(save_dir)
 
     # named_modules() FQNs carry the DMP prefix that state_dict() strips.
     raw_prefix = next(

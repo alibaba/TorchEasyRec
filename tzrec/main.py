@@ -799,6 +799,7 @@ def train_and_evaluate(
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
+        prompt=prompt,
     )
     # Cold start only; a resumed or fine-tuned run gets its weights from DCP.
     if ckpt_path is None:
@@ -1005,6 +1006,7 @@ def evaluate(
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
+        prompt=prompt,
     )
     model = TrainWrapper(
         model, device=device, mixed_precision=train_config.mixed_precision
