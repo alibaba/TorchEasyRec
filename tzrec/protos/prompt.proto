@@ -1,0 +1,74 @@
+syntax = "proto2";
+package tzrec.protos;
+
+import "tzrec/protos/module.proto";
+
+// Rendering of an LM prompt. Peer of data_config and model_config: extraction
+// stays in feature_configs, this owns order, literal text and composition.
+message PromptConfig {
+    // BASE tokenizer, path or hub id. Distinct from hf_model_id, which names
+    // the WEIGHTS and is read only at cold start.
+    required string tokenizer = 1;
+    // Rewritten by export to the content-addressed asset directory.
+    optional string asset_dir = 2;
+
+    // Static text between {{name}} placeholders is the prefix and suffix of
+    // the surrounding slots; there are no per-slot text fields.
+    required string prompt = 3;
+    // Supervised answer. Defines the loss span; absent at inference.
+    optional string response = 4;
+
+    // A placeholder resolves to a slot with that name, else to an implicit
+    // single-feature slot named after it.
+    repeated PromptSlot slots = 5;
+
+    // Required when any slot renders SIDs.
+    optional SidSpace sid_space = 6;
+
+    // Validation ceiling, not a truncation trigger: an over-long row is an
+    // error, never truncated.
+    optional uint32 max_length = 7 [default = 0];
+
+    // Reserves a position filled by a projected slot. Materialized only when
+    // at least one slot has a projection.
+    optional string sentinel_token = 8 [default = "<|pg_hole|>"];
+
+    // Length buckets for the training sampler and graph capture.
+    repeated uint32 length_buckets = 9;
+}
+
+message PromptSlot {
+    // {{name}} in the template; also the name of the derived feature_group.
+    required string name = 1;
+    // Features rendered at this position. Several are concatenated per
+    // position; the compiler derives the FeatureGroupConfig from this list.
+    repeated string feature_names = 2;
+    // Omit the slot and the static text folded into it when the value is empty.
+    optional bool drop_if_empty = 3 [default = false];
+    // Reconciles this slot's width with the LM hidden size. Illegal on an
+    // INLINE slot. Carries no dimensions: the model resolves them.
+    optional PromptProjection projection = 4;
+    // Weight-sharing key across slots. Derived groups dedupe automatically;
+    // modules share only on request.
+    optional string projection_name = 5;
+}
+
+// An optional body plus a final bare Linear to the LM hidden size. The final
+// map never carries an activation, and no field here states a dimension.
+message PromptProjection {
+    optional bool bias = 1 [default = true];
+    oneof body {
+        MLP mlp = 10;
+    }
+}
+
+message SidSpace {
+    // Per-level sizes; codes are local 0-based in [0, codebook[l]).
+    repeated uint32 codebook = 1;
+    // {i} is the flat atom index.
+    optional string atom_token_format = 2 [default = "<|sid_{i}|>"];
+    optional uint32 vocab_pad_to_multiple_of = 3 [default = 128];
+    // SID manifest to cross-check codebook against. A mismatch is fatal: it
+    // means the data and the decode bands disagree.
+    optional string manifest_path = 4;
+}
