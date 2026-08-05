@@ -28,6 +28,7 @@ from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.model import BaseModel
 from tzrec.modules.dynamic_beam import dynamic_beam_search
+from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.prompt_projection import PromptProjection
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS as _PROMPT_CU_SEQLENS,
@@ -95,6 +96,9 @@ class PromptGenerativeQwen(BaseModel):
         self.lm = self._build_backbone(cfg.hf_model_id, common.param_dtype)
         self.lm.resize_token_embeddings(
             prompt.sid_space.target_vocab, mean_resizing=True
+        )
+        self.embedding_group = EmbeddingGroup(
+            self._features, list(self._prompt.module_plan.feature_groups)
         )
         self._build_projections()
 

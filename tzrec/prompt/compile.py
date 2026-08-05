@@ -37,7 +37,7 @@ from tzrec.prompt.plan import (
     Width,
     WidthKind,
 )
-from tzrec.protos.model_pb2 import FeatureGroupType
+from tzrec.protos.model_pb2 import FeatureGroupConfig, FeatureGroupType
 from tzrec.protos.prompt_pb2 import PromptConfig, PromptProjection, PromptSlot
 from tzrec.utils.logging_util import logger
 
@@ -360,7 +360,20 @@ def _build_module_plan(
         else:
             projections[module_id] = projection
         slot_to_module[seg.slot_id] = module_id
-    return ModulePlan(projections=projections, slot_to_module=slot_to_module)
+
+    groups = tuple(
+        FeatureGroupConfig(
+            group_name=seg.name,
+            feature_names=list(seg.sources),
+            group_type=seg.group_type,
+        )
+        for seg in projected
+    )
+    return ModulePlan(
+        projections=projections,
+        slot_to_module=slot_to_module,
+        feature_groups=groups,
+    )
 
 
 def _max_total_length(segments: Sequence[Segment]) -> Optional[int]:

@@ -55,11 +55,17 @@ def _tokenizer(path: str) -> str:
     return path
 
 
-def _features():
+_PROF = (
+    'sequence_id_feature { feature_name: "prof" expression: "user:prof" '
+    "num_buckets: 32 embedding_dim: 8 sequence_length: 4 }"
+)
+
+
+def _features(extra=()):
     text = (
         'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }',
         'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }',
-    )
+    ) + tuple(extra)
     out = []
     for one in text:
         fc = feature_pb2.FeatureConfig()
@@ -172,6 +178,66 @@ class PromptStackIntegrationTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "offset_codebook column"):
             assemble_into(self.prompt, parsed)
+
+
+class ProjectedSlotTest(unittest.TestCase):
+    """A slot whose value reaches the LM through a table and a projection."""
+
+    def setUp(self) -> None:
+        self.test_dir = make_test_dir()
+        self.backbone = _tiny_backbone(os.path.join(self.test_dir, "backbone"))
+        self.tok = _tokenizer(os.path.join(self.test_dir, "tok.json"))
+        self.features = _features(extra=(_PROF,))
+
+        cfg = PromptConfig(
+            tokenizer=self.tok,
+            prompt="History : {{hist}} . Predict {{prof}} :",
+            response="{{answer}}",
+        )
+        cfg.sid_space.codebook.extend(_CODEBOOK)
+        self.prompt = compile_prompt(cfg, self.features, model_dir=self.test_dir)
+
+    def test_compiler_derives_one_group_per_projected_slot(self) -> None:
+        groups = self.prompt.module_plan.feature_groups
+        self.assertEqual([g.group_name for g in groups], ["prof"])
+        self.assertEqual(list(groups[0].feature_names), ["prof"])
+        # the INLINE slot produces none: its tokens are already in the stream
+        self.assertEqual(
+            [s.name for s in self.prompt.prompt_plan.projected_slots], ["prof"]
+        )
+
+    def test_sentinel_is_materialized_and_holes_recorded(self) -> None:
+        space = self.prompt.sid_space
+        self.assertIsNotNone(space.sentinel_token_id)
+
+        parsed = {
+            "hist.values": torch.tensor(_offset([0, 1, 2])).reshape(-1, 1),
+            "hist.lengths": torch.tensor([3]),
+            "answer.values": torch.tensor(_offset([1, 2, 3])),
+            "answer.lengths": torch.tensor([3]),
+            "prof.values": torch.tensor([5, 9]),
+            "prof.lengths": torch.tensor([2]),
+        }
+        streams = assemble_into(self.prompt, parsed)
+        # two profile items -> two sentinels -> two holes
+        self.assertEqual(streams["prompt_hole_positions"].tolist(), [7, 8])
+        ids = streams["prompt_input_ids"]
+        self.assertTrue(all(ids[p] == space.sentinel_token_id for p in [7, 8]))
+
+    def test_projection_receives_gradient(self) -> None:
+        model_config = ModelConfig()
+        qwen = model_config.prompt_generative_qwen
+        qwen.hf_model_id = self.backbone
+        qwen.common.beam_widths.extend([2, 2, 2])
+        qwen.common.num_return_sequences = 2
+        model = _create_model(
+            model_config, self.features, ["answer"], prompt=self.prompt
+        )
+        self.assertEqual(len(model.projections), 1)
+
+        # the scatter is what puts the projection on the autograd path at all
+        proj = next(iter(model.projections.values()))
+        self.assertIsNone(proj.head.weight.grad)
 
 
 if __name__ == "__main__":

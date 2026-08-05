@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Optional, Tuple, Union
 
-from tzrec.protos.model_pb2 import FeatureGroupType
+from tzrec.protos.model_pb2 import FeatureGroupConfig, FeatureGroupType
 from tzrec.protos.prompt_pb2 import PromptProjection
 
 
@@ -182,10 +182,14 @@ class ModulePlan:
         projections: resolved module id to its configuration.
         slot_to_module: slot id to the module id it uses, so slots sharing a
             ``projection_name`` resolve to one module.
+        feature_groups: one derived group per PROJECTED slot. Derived rather
+            than declared: a prompt group is never shared with a model tower,
+            and four of FeatureGroupConfig's six fields are meaningless here.
     """
 
     projections: Mapping[str, PromptProjection]
     slot_to_module: Mapping[int, str]
+    feature_groups: Tuple[FeatureGroupConfig, ...] = ()
 
 
 @dataclass(frozen=True)
