@@ -6,6 +6,7 @@ import "tzrec/protos/models/multi_task_rank.proto";
 import "tzrec/protos/models/match_model.proto";
 import "tzrec/protos/models/general_rank_model.proto";
 import "tzrec/protos/models/generative_model.proto";
+import "tzrec/protos/models/prompt_model.proto";
 import "tzrec/protos/models/sid_model.proto";
 import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
@@ -85,6 +86,7 @@ message ModelConfig {
 
         // Generative (causal-LM) models; the 700-block keeps clear of the SID 600s.
         GenerativeQwen generative_qwen = 700;
+        PromptGenerativeQwen prompt_generative_qwen = 701;
     }
 
     optional uint32 num_class = 2 [default = 1];
