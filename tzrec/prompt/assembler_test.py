@@ -1,0 +1,179 @@
+# Copyright (c) 2026, Alibaba Group;
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#    http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import unittest
+
+import numpy as np
+
+from tzrec.prompt.assembler import PromptAssembler
+from tzrec.prompt.plan import (
+    FillMode,
+    PromptPlan,
+    SidSpace,
+    SlotSeg,
+    Static,
+    Width,
+    WidthKind,
+)
+from tzrec.protos.model_pb2 import FeatureGroupType
+
+_BASE = 1000
+_SENTINEL = 1099
+
+
+def _sid_space(codebook=(4, 4, 4)) -> SidSpace:
+    offsets, running = [], 0
+    for size in codebook:
+        offsets.append(running)
+        running += size
+    return SidSpace(
+        codebook=tuple(codebook),
+        num_levels=len(codebook),
+        base_vocab=_BASE,
+        level_offsets=tuple(offsets),
+        band_lo=tuple(_BASE + o for o in offsets),
+        band_hi=tuple(_BASE + o + s - 1 for o, s in zip(offsets, codebook)),
+        target_vocab=1152,
+        sentinel_token_id=_SENTINEL,
+        eos_token_id=2,
+        pad_token_id=3,
+    )
+
+
+def _slot(name, fill, width_n=None) -> SlotSeg:
+    return SlotSeg(
+        slot_id=0,
+        name=name,
+        sources=(name,),
+        group_type=FeatureGroupType.JAGGED_SEQUENCE,
+        output_key=".sequence",
+        fill=fill,
+        width=Width(WidthKind.BOUNDED, width_n)
+        if width_n
+        else Width(WidthKind.STATIC, 1),
+        droppable=False,
+    )
+
+
+def _plan(segments, response=(), max_length=0) -> PromptPlan:
+    projected = tuple(
+        s
+        for s in segments + tuple(response)
+        if isinstance(s, SlotSeg) and s.fill is FillMode.PROJECTED
+    )
+    return PromptPlan(
+        segments=tuple(segments),
+        response_segments=tuple(response),
+        max_length=max_length,
+        max_total_length=None,
+        max_holes=0,
+        suffix_keep=None,
+        static_prefix_len=0,
+        length_buckets=(),
+        slot_index={s.name: i for i, s in enumerate(projected)},
+        projected_slots=projected,
+    )
+
+
+class PromptAssemblerTest(unittest.TestCase):
+    def test_inline_sid_gets_the_base_vocab_shift(self) -> None:
+        plan = _plan((Static((7, 8), None), _slot("hist", FillMode.INLINE)))
+        asm = PromptAssembler(plan, _sid_space())
+        # offset codes for one item: level 0 -> 1, level 1 -> 4+2, level 2 -> 8+3
+        out = asm.assemble({"hist": [np.array([1, 6, 11])]})
+
+        self.assertEqual(
+            out.input_ids.tolist(), [7, 8, _BASE + 1, _BASE + 6, _BASE + 11]
+        )
+        self.assertEqual(out.cu_seqlens.tolist(), [0, 5])
+        self.assertEqual(out.hole_positions.size, 0)
+
+    def test_projected_emits_sentinels_and_records_holes(self) -> None:
+        plan = _plan((Static((7,), None), _slot("prof", FillMode.PROJECTED, 4)))
+        asm = PromptAssembler(plan, _sid_space())
+        out = asm.assemble({}, {"prof": np.array([2, 3])}, batch_size=2)
+
+        # row 0: [7, S, S]   row 1: [7, S, S, S]
+        self.assertEqual(
+            out.input_ids.tolist(),
+            [7, _SENTINEL, _SENTINEL, 7, _SENTINEL, _SENTINEL, _SENTINEL],
+        )
+        self.assertEqual(out.cu_seqlens.tolist(), [0, 3, 7])
+        # absolute indices into the flat buffer, which is what index_copy needs
+        self.assertEqual(out.hole_positions.tolist(), [1, 2, 4, 5, 6])
+
+    def test_hole_positions_index_the_flat_buffer_exactly(self) -> None:
+        plan = _plan((_slot("prof", FillMode.PROJECTED, 2),))
+        asm = PromptAssembler(plan, _sid_space())
+        out = asm.assemble({}, {"prof": np.array([2, 2])}, batch_size=2)
+        # index_copy requires index.numel() == source.size(0)
+        self.assertEqual(out.hole_positions.size, 4)
+        self.assertTrue(np.all(out.input_ids[out.hole_positions] == _SENTINEL))
+
+    def test_labels_cover_the_response_span_only(self) -> None:
+        plan = _plan(
+            (Static((7, 8), None),),
+            response=(Static((9,), None), _slot("answer", FillMode.INLINE)),
+        )
+        asm = PromptAssembler(plan, _sid_space())
+        out = asm.assemble({"answer": [np.array([0, 4, 8])]})
+
+        self.assertEqual(out.input_ids.tolist(), [7, 8, 9, _BASE, _BASE + 4, _BASE + 8])
+        # the prompt is context; supervision starts at the response
+        self.assertEqual(
+            out.labels.tolist(), [-100, -100, 9, _BASE, _BASE + 4, _BASE + 8]
+        )
+
+    def test_rejects_raw_codes_that_carry_no_offset(self) -> None:
+        plan = _plan((_slot("hist", FillMode.INLINE),))
+        asm = PromptAssembler(plan, _sid_space())
+        # [1, 2, 3] is a valid raw SID but level 1 and 2 are below their bands
+        with self.assertRaisesRegex(ValueError, "offset_codebook column"):
+            asm.assemble({"hist": [np.array([1, 2, 3])]})
+
+    def test_rejects_a_partial_item(self) -> None:
+        plan = _plan((_slot("hist", FillMode.INLINE),))
+        asm = PromptAssembler(plan, _sid_space())
+        with self.assertRaisesRegex(ValueError, "whole number of 3-level items"):
+            asm.assemble({"hist": [np.array([1, 6])]})
+
+    def test_rejects_an_out_of_band_code(self) -> None:
+        plan = _plan((_slot("hist", FillMode.INLINE),))
+        asm = PromptAssembler(plan, _sid_space())
+        # level 2 admits [8, 12); 12 is the first value past it
+        with self.assertRaisesRegex(ValueError, "offset_codebook column"):
+            asm.assemble({"hist": [np.array([1, 6, 12])]})
+
+    def test_over_long_row_is_an_error_not_a_truncation(self) -> None:
+        plan = _plan(
+            (Static((7, 8, 9), None), _slot("hist", FillMode.INLINE)), max_length=4
+        )
+        asm = PromptAssembler(plan, _sid_space())
+        with self.assertRaisesRegex(ValueError, "never truncated"):
+            asm.assemble({"hist": [np.array([1, 6, 11])]})
+
+    def test_inline_without_a_sid_space_is_rejected_at_construction(self) -> None:
+        plan = _plan((_slot("hist", FillMode.INLINE),))
+        with self.assertRaisesRegex(ValueError, "no sid_space was compiled"):
+            PromptAssembler(plan, None)
+
+    def test_rows_of_different_lengths_pack_without_padding(self) -> None:
+        plan = _plan((_slot("hist", FillMode.INLINE),))
+        asm = PromptAssembler(plan, _sid_space())
+        out = asm.assemble(
+            {"hist": [np.array([1, 6, 11]), np.array([0, 4, 8, 2, 5, 9])]}
+        )
+        self.assertEqual(out.cu_seqlens.tolist(), [0, 3, 9])
+        self.assertEqual(out.input_ids.size, 9)
+
+
+if __name__ == "__main__":
+    unittest.main()
