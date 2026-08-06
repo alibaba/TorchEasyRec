@@ -71,16 +71,14 @@ def manifest_path(bundle_root: str, partition: str) -> str:
 class ArtifactEntry:
     """Where one artifact landed and what it holds.
 
-    ``save_type`` selects how to open it and which location fields are set:
-    ``odps`` fills ``table`` and ``partition``, ``parquet`` and ``csv`` fill
-    ``path``.
+    ``location`` is the address in the form this repository's readers take, so
+    an ODPS artifact carries its full ``odps://`` URL rather than a split table
+    and partition; ``save_type`` says how to open it.
     """
 
     save_type: str
     rows: int
-    path: Optional[str] = None
-    table: Optional[str] = None
-    partition: Optional[str] = None
+    location: str
 
 
 @dataclass
@@ -93,16 +91,11 @@ class BundleManifest:
     max_observed_items_per_sid: int
     artifacts: Dict[str, ArtifactEntry] = field(default_factory=dict)
     since_bundle_uuid: Optional[str] = None
-    source_model: Optional[str] = None
     item_id_type: Optional[str] = None
 
     def to_json(self) -> str:
         """Serialize, dropping keys that carry no value."""
         payload: Dict[str, Any] = asdict(self)
-        payload["artifacts"] = {
-            name: {k: v for k, v in entry.items() if v is not None}
-            for name, entry in payload["artifacts"].items()
-        }
         return json.dumps({k: v for k, v in payload.items() if v is not None}, indent=2)
 
     @classmethod
@@ -134,22 +127,6 @@ class BundleManifest:
                     "is always parquet, so this bundle cannot be opened."
                 )
         return cls(artifacts=entries, **payload)
-
-
-def artifact_entry(
-    root: str, artifact: str, partition: str, save_type: str, rows: int
-) -> ArtifactEntry:
-    """Describe where one artifact landed, in the shape the manifest records."""
-    location = artifact_location(root, artifact, partition)
-    if is_odps_path(root):
-        table = root.rstrip("/").rpartition("/tables/")[2]
-        return ArtifactEntry(
-            save_type="odps",
-            rows=rows,
-            table=table,
-            partition=f"artifact={artifact}/generation={partition}",
-        )
-    return ArtifactEntry(save_type=save_type, rows=rows, path=location)
 
 
 def write_manifest(path: str, manifest: BundleManifest) -> None:
@@ -188,7 +165,7 @@ class BundleLayout:
     bundle_root: Optional[str]
     partition: Optional[str]
     from_partition: Optional[str]
-    map_read_suffix: str
+    reader_type: Optional[str] = None
 
     def root_for(self, artifact: str) -> str:
         """Return the root that owns one artifact's family."""
@@ -207,17 +184,19 @@ class BundleLayout:
         """Return where the appended-onto generation holds one artifact."""
         if self.from_partition is None:
             raise RuntimeError("no from_partition is configured to read.")
-        suffix = "parquet" if artifact in GROUPS_ARTIFACTS else self.map_read_suffix
+        is_csv_map = artifact in MAP_ARTIFACTS and self.reader_type == "CsvReader"
+        suffix = "csv" if is_csv_map else "parquet"
         return artifact_read_pattern(
             self.root_for(artifact), artifact, self.from_partition, suffix
         )
 
-    def entry(self, artifact: str, save_type: str, rows: int) -> ArtifactEntry:
+    def entry(self, artifact: str, file_save_type: str, rows: int) -> ArtifactEntry:
         """Describe where one artifact landed, for the manifest."""
-        if self.partition is None:
-            raise RuntimeError("no partition is configured to write.")
-        return artifact_entry(
-            self.root_for(artifact), artifact, self.partition, save_type, rows
+        odps = is_odps_path(self.root_for(artifact))
+        return ArtifactEntry(
+            save_type="odps" if odps else file_save_type,
+            rows=rows,
+            location=self.write_path(artifact),
         )
 
     def write_manifest(self, manifest: "BundleManifest") -> str:
@@ -233,24 +212,3 @@ class BundleLayout:
         if self.bundle_root is None or self.from_partition is None:
             raise RuntimeError("no prior manifest location is configured.")
         return manifest_path(self.bundle_root, self.from_partition)
-
-    def read_prior_manifest(self) -> "BundleManifest":
-        """Read the manifest of the generation being appended onto."""
-        return read_manifest(self.prior_manifest_path())
-
-
-def resolve_layout(
-    map_root: Optional[str],
-    bundle_root: Optional[str],
-    partition: Optional[str],
-    from_partition: Optional[str],
-    reader_type: Optional[str],
-) -> BundleLayout:
-    """Resolve every location this run needs from the roots it was given."""
-    return BundleLayout(
-        map_root=map_root,
-        bundle_root=bundle_root,
-        partition=partition,
-        from_partition=from_partition,
-        map_read_suffix="csv" if reader_type == "CsvReader" else "parquet",
-    )

@@ -436,9 +436,8 @@ class CollisionResolver(ABC):
         last_size = plan.config.layer_sizes[-1]
         capacity = plan.config.capacity
         prior_counts = plan.prior_bucket_counts
-        initial_counts = np.maximum(
-            prior_counts, np.minimum(prior_counts + plan.bucket_counts, capacity)
-        )
+        combined_counts = prior_counts + plan.bucket_counts
+        initial_counts = np.maximum(prior_counts, np.minimum(combined_counts, capacity))
         # Relocation only reads or writes buckets in a band with an overflow
         # row. Every other bucket keeps its capped initial count untouched.
         overflow_band_ids = np.unique(plan.overflow_bucket_key_prefixes // last_size)
@@ -512,9 +511,7 @@ class CollisionResolver(ABC):
         unresolved_array = np.asarray(unresolved_rows, dtype=np.int64)
         stats = CollisionResolutionStats(
             total_items=plan.item_count,
-            raw_collision_buckets=int(
-                ((prior_counts + plan.bucket_counts) > capacity).sum()
-            ),
+            raw_collision_buckets=int((combined_counts > capacity).sum()),
             final_collision_buckets=final_collision_buckets,
             relocated_count=relocated_count,
             unresolved_count=len(unresolved_rows),
@@ -842,11 +839,10 @@ def prepare_collision_plan(
         band_ids[representative_rows] * last_size
         + original_last_codes[representative_rows]
     )
-    row_prior_counts = prior.counts_for(bucket_keys)[origin_bucket_indices]
-    overflow_rows = sorted_rows[
-        (row_prior_counts + bucket_ranks)[sorted_rows] >= config.capacity
-    ]
-    bucket_ranks += row_prior_counts + 1
+    if not prior.is_empty:
+        bucket_ranks += prior.counts_for(bucket_keys)[origin_bucket_indices]
+    overflow_rows = sorted_rows[bucket_ranks[sorted_rows] >= config.capacity]
+    bucket_ranks += 1
     overflow_bucket_key_prefixes = band_ids[overflow_rows] * last_size
 
     return CollisionPlan(

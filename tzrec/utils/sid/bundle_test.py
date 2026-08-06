@@ -27,7 +27,7 @@ def _manifest(**kw):
             bundle.GROUPS_ARTIFACT: bundle.ArtifactEntry(
                 save_type="parquet",
                 rows=4,
-                path="./sid/sid_to_item_groups/v2",
+                location="./sid/sid_to_item_groups/v2",
             )
         },
     )
@@ -86,7 +86,7 @@ class BundleLayoutTest(unittest.TestCase):
             reader_type=None,
         )
         base.update(kw)
-        return bundle.resolve_layout(**base)
+        return bundle.BundleLayout(**base)
 
     def test_each_family_resolves_under_its_own_root(self) -> None:
         layout = self._layout()
@@ -156,19 +156,14 @@ class BundleManifestTest(unittest.TestCase):
         self.test_dir = make_test_dir()
 
     def test_round_trip_preserves_every_field(self) -> None:
-        original = _manifest(
-            since_bundle_uuid="uuid-v1", source_model="rqvae", item_id_type="int64"
-        )
+        original = _manifest(since_bundle_uuid="uuid-v1", item_id_type="int64")
         restored = bundle.BundleManifest.from_json(original.to_json())
         self.assertEqual(restored, original)
 
     def test_absent_optional_fields_are_omitted_not_null(self) -> None:
         payload = json.loads(_manifest().to_json())
         self.assertNotIn("since_bundle_uuid", payload)
-        self.assertNotIn("source_model", payload)
-        entry = payload["artifacts"][bundle.GROUPS_ARTIFACT]
-        self.assertNotIn("table", entry)
-        self.assertIn("path", entry)
+        self.assertIn("location", payload["artifacts"][bundle.GROUPS_ARTIFACT])
 
     def test_rejects_a_manifest_missing_required_keys(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing required keys"):
@@ -180,22 +175,27 @@ class BundleManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_observed_items_per_sid"):
             bundle.BundleManifest.from_json(json.dumps(payload))
 
-    def test_artifact_entry_records_an_odps_table_and_partition(self) -> None:
-        entry = bundle.artifact_entry(
-            "odps://prj/tables/sid", bundle.MAP_ARTIFACT, "v2", "parquet", 9
+    def test_an_odps_entry_keeps_the_url_its_readers_take(self) -> None:
+        layout = bundle.BundleLayout(
+            map_root="odps://prj/tables/sid",
+            bundle_root="./sid",
+            partition="v2",
+            from_partition=None,
         )
+        entry = layout.entry(bundle.MAP_ARTIFACT, "parquet", 9)
         self.assertEqual(entry.save_type, "odps")
-        self.assertEqual(entry.table, "sid")
-        self.assertEqual(entry.partition, "artifact=item_to_sid_map/generation=v2")
-        self.assertIsNone(entry.path)
-
-    def test_artifact_entry_records_a_file_path(self) -> None:
-        entry = bundle.artifact_entry(
-            "./sid", bundle.GROUPS_ARTIFACT, "v2", "parquet", 4
+        self.assertEqual(
+            entry.location,
+            "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v2",
         )
-        self.assertEqual(entry.save_type, "parquet")
-        self.assertEqual(entry.path, "./sid/sid_to_item_groups/v2")
-        self.assertIsNone(entry.table)
+
+    def test_a_file_entry_keeps_the_writer_format(self) -> None:
+        layout = bundle.BundleLayout(
+            map_root="./map", bundle_root="./sid", partition="v2", from_partition=None
+        )
+        entry = layout.entry(bundle.MAP_ARTIFACT, "csv", 4)
+        self.assertEqual(entry.save_type, "csv")
+        self.assertEqual(entry.location, "./map/item_to_sid_map/v2")
 
     def test_rejects_a_serving_artifact_that_is_not_parquet(self) -> None:
         payload = json.loads(_manifest().to_json())
@@ -208,11 +208,13 @@ class BundleManifestTest(unittest.TestCase):
         payload["artifacts"][bundle.MAP_ARTIFACT] = {
             "save_type": "odps",
             "rows": 9,
-            "table": "prj.sid",
-            "partition": "artifact=item_to_sid_map/generation=v2",
+            "location": "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v2",
         }
         restored = bundle.BundleManifest.from_json(json.dumps(payload))
-        self.assertEqual(restored.artifacts[bundle.MAP_ARTIFACT].table, "prj.sid")
+        self.assertEqual(
+            restored.artifacts[bundle.MAP_ARTIFACT].location,
+            "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v2",
+        )
 
     def test_write_then_read_from_disk(self) -> None:
         path = bundle.manifest_path(self.test_dir, "v2")

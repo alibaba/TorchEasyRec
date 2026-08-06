@@ -115,11 +115,10 @@ from tzrec.utils.sid.bundle import (
     GROUPS_ARTIFACT,
     MAP_ARTIFACT,
     MAP_ARTIFACTS,
-    ArtifactEntry,
     BundleLayout,
     BundleManifest,
     is_odps_path,
-    resolve_layout,
+    read_manifest,
 )
 from tzrec.utils.sid.collision import (
     CodebookItemGrouping,
@@ -144,6 +143,7 @@ from tzrec.utils.sid.collision import (
 _MAP_WRITE_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
+_NO_ROWS = np.empty(0, dtype=np.int64)
 
 
 def _is_list_column(values: pa.Array) -> bool:
@@ -301,12 +301,12 @@ class ResolveSidCollisionsConfig:
     @cached_property
     def layout(self) -> BundleLayout:
         """Every artifact location this run reads and writes."""
-        return resolve_layout(
-            self.output_path,
-            self.bundle_root,
-            self.partition,
-            self.from_partition,
-            self.reader_type,
+        return BundleLayout(
+            map_root=self.output_path,
+            bundle_root=self.bundle_root,
+            partition=self.partition,
+            from_partition=self.from_partition,
+            reader_type=self.reader_type,
         )
 
     @cached_property
@@ -338,6 +338,7 @@ class CollisionResolutionRunner:
             )
         self._default_writer_type: Optional[str] = None
         self._item_id_type: Optional[pa.DataType] = None
+        self._layout = config.layout
         self._bundle_uuid = uuid.uuid4().hex
         self._written_rows: Dict[str, int] = {}
 
@@ -385,13 +386,11 @@ class CollisionResolutionRunner:
         wanted = [("--input_path", self._config.input_path)]
         if self._config.is_append:
             wanted += [
-                (GROUPS_ARTIFACT, self._config.layout.read_path(GROUPS_ARTIFACT)),
-                ("manifest", self._config.layout.prior_manifest_path()),
+                (GROUPS_ARTIFACT, self._layout.read_path(GROUPS_ARTIFACT)),
+                ("manifest", self._layout.prior_manifest_path()),
             ]
             if self._config.output_path is not None:
-                wanted.append(
-                    (MAP_ARTIFACT, self._config.layout.read_path(MAP_ARTIFACT))
-                )
+                wanted.append((MAP_ARTIFACT, self._layout.read_path(MAP_ARTIFACT)))
         missing = [
             f"{name} -> {path}"
             for name, path in wanted
@@ -410,13 +409,20 @@ class CollisionResolutionRunner:
 
         Its presence is the completion marker, so nothing may be written after it.
         """
-        layout = self._config.layout
-        prior = layout.read_prior_manifest() if self._config.is_append else None
+        layout = self._layout
+        prior = (
+            read_manifest(layout.prior_manifest_path())
+            if self._config.is_append
+            else None
+        )
         observed = result.stats.max_final_bucket_size
         if prior is not None:
             observed = max(observed, prior.max_observed_items_per_sid)
+        map_save_type = "csv" if self._default_writer_type == "CsvWriter" else "parquet"
         artifacts = {
-            name: self._artifact_entry(name, rows)
+            name: layout.entry(
+                name, map_save_type if name in MAP_ARTIFACTS else "parquet", rows
+            )
             for name, rows in self._written_rows.items()
         }
         manifest = BundleManifest(
@@ -430,15 +436,6 @@ class CollisionResolutionRunner:
         )
         path = layout.write_manifest(manifest)
         logger.info("wrote bundle %s manifest to %s", self._bundle_uuid, path)
-
-    def _artifact_entry(self, artifact: str, rows: int) -> ArtifactEntry:
-        """Record where one artifact landed and what it holds."""
-        is_csv_map = (
-            artifact in MAP_ARTIFACTS and self._default_writer_type == "CsvWriter"
-        )
-        return self._config.layout.entry(
-            artifact, "csv" if is_csv_map else "parquet", rows
-        )
 
     def _make_reader(
         self, selected_cols: List[str], input_path: Optional[str] = None
@@ -666,7 +663,7 @@ class CollisionResolutionRunner:
             return PriorOccupancy.empty()
 
         layer_sizes = self._config.layer_sizes
-        groups_path = self._config.layout.read_path(GROUPS_ARTIFACT)
+        groups_path = self._layout.read_path(GROUPS_ARTIFACT)
         prior, published_items = self._load_prior_occupancy(
             groups_path, sid_band_ids(codes, layer_sizes), item_ids
         )
@@ -715,7 +712,7 @@ class CollisionResolutionRunner:
 
     def _check_state_item_id_type(self, values: pa.Array, source: str) -> None:
         """Reject an existing artifact whose item ID type differs from the input."""
-        if len(values) == 0 or self._item_id_type is None:
+        if len(values) == 0:
             return
         if values.type != self._item_id_type:
             raise ValueError(
@@ -787,7 +784,7 @@ class CollisionResolutionRunner:
         """Reject a published map whose size disagrees with the groups."""
         if self._config.output_path is None:
             return
-        path = self._config.layout.read_path(MAP_ARTIFACT)
+        path = self._layout.read_path(MAP_ARTIFACT)
         map_rows = 0
         for batch in self._iter_state_batches(
             path, ["index"], "Counting published SID map"
@@ -889,7 +886,7 @@ class CollisionResolutionRunner:
         """Copy every published map row into the merged output unchanged."""
         if not self._config.is_append:
             return 0
-        path = self._config.layout.read_path(MAP_ARTIFACT)
+        path = self._layout.read_path(MAP_ARTIFACT)
         is_csv = isinstance(writer, CsvWriter)
         fields = ["item_id", "origin_codebook", "codebook", "index"]
         written = 0
@@ -926,7 +923,7 @@ class CollisionResolutionRunner:
         run's rows are appended, so the artifact stands alone and is exactly
         what the next append consumes.
         """
-        output_path = self._config.layout.write_path(MAP_ARTIFACT)
+        output_path = self._layout.write_path(MAP_ARTIFACT)
         with closing(self._make_writer(output_path)) as writer:
             progress = ProgressLogger("Writing resolved item map", start_n=0)
             written = self._stream_existing_map_rows(writer)
@@ -937,7 +934,7 @@ class CollisionResolutionRunner:
 
         if not self._config.is_append:
             return
-        delta_path = self._config.layout.write_path(DELTA_MAP_ARTIFACT)
+        delta_path = self._layout.write_path(DELTA_MAP_ARTIFACT)
         self._written_rows[DELTA_MAP_ARTIFACT] = item_ids.shape[0]
         with closing(self._make_writer(delta_path)) as writer:
             self._write_new_map_rows(
@@ -964,31 +961,16 @@ class CollisionResolutionRunner:
             plan: Original SID aggregation and overflow plan.
             result: Completed collision-resolution result.
         """
-        resolved_path = self._config.layout.write_path(GROUPS_ARTIFACT)
         if plan.overflow_rows.size:
             grouping = build_resolved_item_grouping(plan, result)
-            resolved_last_codes = result.resolved_last_codes
         else:
             grouping = build_original_item_grouping(plan)
-            resolved_last_codes = None
-        if self._config.is_append:
-            self._write_merged_sid_groups(
-                resolved_path,
-                self._config.layout.read_path(GROUPS_ARTIFACT),
-                item_ids,
-                origin_codes,
-                grouping,
-                resolved_last_codes,
-            )
-            return
-        self._write_sid_groups(
-            resolved_path,
-            item_ids,
-            origin_codes,
-            grouping,
-            resolved_last_codes=resolved_last_codes,
-            progress_description="Writing resolved SID item groups",
+        write = (
+            self._write_merged_sid_groups
+            if self._config.is_append
+            else self._write_sid_groups
         )
+        write(item_ids, origin_codes, grouping, result.resolved_last_codes)
 
     def _emit_group_rows(
         self,
@@ -999,23 +981,17 @@ class CollisionResolutionRunner:
         rows: Optional[np.ndarray] = None,
     ) -> None:
         """Write one chunk of SID groups, optionally only ``rows`` of it."""
+        itemids = pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), values)
         if rows is not None:
             if rows.size == 0:
                 return
-            lengths = np.diff(offsets)[rows]
-            values = values.take(
-                pa.array(concat_ranges(offsets[:-1][rows], lengths), type=pa.int64())
-            )
+            itemids = itemids.take(pa.array(rows, type=pa.int64()))
             codes = codes[rows]
-            offsets = np.zeros(rows.shape[0] + 1, dtype=np.int64)
-            np.cumsum(lengths, out=offsets[1:])
         writer.write(
             {
                 "codebook": self._codes_column(codes, False),
                 "offset_codebook": self._offset_codes_column(codes, False),
-                "itemids": pa.ListArray.from_arrays(
-                    pa.array(offsets, type=pa.int32()), values
-                ),
+                "itemids": itemids,
             }
         )
 
@@ -1024,14 +1000,13 @@ class CollisionResolutionRunner:
         item_ids: np.ndarray,
         origin_codes: np.ndarray,
         grouping: CodebookItemGrouping,
-        resolved_last_codes: Optional[np.ndarray],
+        resolved_last_codes: np.ndarray,
     ) -> _AppendGroups:
         """Materialize this run's groups in the shape the merge consumes."""
         offsets = grouping.offsets
         representative_rows = grouping.row_order[offsets[:-1]]
         codes = origin_codes[representative_rows]
-        if resolved_last_codes is not None:
-            codes[:, -1] = resolved_last_codes[representative_rows]
+        codes[:, -1] = resolved_last_codes[representative_rows]
         return _AppendGroups(
             keys=grouping.sid_keys,
             counts=grouping.counts,
@@ -1042,14 +1017,14 @@ class CollisionResolutionRunner:
 
     def _write_merged_sid_groups(
         self,
-        resolved_path: str,
-        existing_path: str,
         item_ids: np.ndarray,
         origin_codes: np.ndarray,
         grouping: CodebookItemGrouping,
-        resolved_last_codes: Optional[np.ndarray],
+        resolved_last_codes: np.ndarray,
     ) -> None:
         """Merge this run's groups into the published groups and write both."""
+        resolved_path = self._layout.write_path(GROUPS_ARTIFACT)
+        existing_path = self._layout.read_path(GROUPS_ARTIFACT)
         layer_sizes = self._config.layer_sizes
         groups = self._build_append_groups(
             item_ids, origin_codes, grouping, resolved_last_codes
@@ -1063,7 +1038,7 @@ class CollisionResolutionRunner:
             delta_writer = stack.enter_context(
                 closing(
                     self._make_group_writer(
-                        self._config.layout.write_path(DELTA_GROUPS_ARTIFACT)
+                        self._layout.write_path(DELTA_GROUPS_ARTIFACT)
                     )
                 )
             )
@@ -1116,17 +1091,24 @@ class CollisionResolutionRunner:
                 batch_lengths, batch_values = self._decode_grouped_item_ids(
                     batch["itemids"]
                 )
-                emit(
-                    *_merge_group_batch(
-                        batch_keys,
-                        batch_codes,
-                        batch_lengths,
-                        batch_values,
-                        groups,
-                        low,
-                        high,
+                if low == high:
+                    # No new group lands in this batch's key range, so the merge
+                    # would rebuild the batch it was handed.
+                    batch_offsets = np.zeros(batch_keys.shape[0] + 1, dtype=np.int64)
+                    np.cumsum(batch_lengths, out=batch_offsets[1:])
+                    emit(batch_codes, batch_offsets, batch_values, _NO_ROWS)
+                else:
+                    emit(
+                        *_merge_group_batch(
+                            batch_keys,
+                            batch_codes,
+                            batch_lengths,
+                            batch_values,
+                            groups,
+                            low,
+                            high,
+                        )
                     )
-                )
                 cursor = high
             emit_new_only(cursor, group_count)
         self._written_rows[GROUPS_ARTIFACT] = corpus_rows
@@ -1134,27 +1116,24 @@ class CollisionResolutionRunner:
 
     def _write_sid_groups(
         self,
-        output_path: str,
         item_ids: np.ndarray,
         origin_codes: np.ndarray,
         grouping: CodebookItemGrouping,
-        resolved_last_codes: Optional[np.ndarray],
-        progress_description: str,
+        resolved_last_codes: np.ndarray,
     ) -> None:
         """Write codebook-to-item-ID groups in SID and slot order.
 
         Args:
-            output_path: Destination passed to the selected repository writer.
             item_ids: Input item IDs in original row order.
             origin_codes: Original full SID matrix.
             grouping: Sorted SID groups and their flattened original row order.
-            resolved_last_codes: Final last-layer values, or ``None`` when
-                writing original SIDs.
-            progress_description: Description identifying the group output.
+            resolved_last_codes: Final last-layer value of every input row.
 
         Raises:
             ValueError: If one group exceeds Arrow list offset capacity.
         """
+        output_path = self._layout.write_path(GROUPS_ARTIFACT)
+        progress_description = "Writing resolved SID item groups"
         group_count = grouping.counts.shape[0]
         if np.any(grouping.counts > _ARROW_LIST_OFFSET_MAX):
             raise ValueError("one SID group exceeds Arrow list offset capacity.")
@@ -1175,8 +1154,7 @@ class CollisionResolutionRunner:
                 local_offsets = offsets[group_start : group_end + 1] - child_start
                 representative_rows = grouping.row_order[offsets[group_start:group_end]]
                 code_chunk = origin_codes[representative_rows]
-                if resolved_last_codes is not None:
-                    code_chunk[:, -1] = resolved_last_codes[representative_rows]
+                code_chunk[:, -1] = resolved_last_codes[representative_rows]
                 self._emit_group_rows(
                     writer,
                     code_chunk,
