@@ -88,7 +88,6 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-import uuid
 from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from functools import cached_property
@@ -98,9 +97,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-# Register the local reader/writer classes used through create_reader/writer.
-import tzrec.datasets.parquet_dataset  # noqa: F401
-from tzrec.datasets.csv_dataset import CsvWriter
 from tzrec.datasets.dataset import (
     BaseReader,
     BaseWriter,
@@ -108,18 +104,8 @@ from tzrec.datasets.dataset import (
     create_writer,
 )
 from tzrec.utils.logging_util import ProgressLogger, logger
-from tzrec.utils.path_util import check_path_conflict
-from tzrec.utils.sid.bundle import (
-    DELTA_GROUPS_ARTIFACT,
-    DELTA_MAP_ARTIFACT,
-    GROUPS_ARTIFACT,
-    MAP_ARTIFACT,
-    MAP_ARTIFACTS,
-    BundleLayout,
-    BundleManifest,
-    is_odps_path,
-    read_manifest,
-)
+from tzrec.utils.path_util import check_path_conflict, is_odps_path
+from tzrec.utils.sid.bundle import Bundle, BundleLayout
 from tzrec.utils.sid.collision import (
     CodebookItemGrouping,
     CollisionPlan,
@@ -241,11 +227,6 @@ class ResolveSidCollisionsConfig:
         for name in ("output_path", "bundle_root", "partition"):
             if not self.rate_only and not getattr(self, name):
                 raise ValueError(f"{name} is required unless rate_only is set.")
-        if self.bundle_root and is_odps_path(self.bundle_root):
-            raise ValueError(
-                "bundle_root holds the SID groups and the manifest, which are "
-                f"always files; got {self.bundle_root!r}."
-            )
         if self.from_partition is not None and self.from_partition == self.partition:
             raise ValueError(
                 f"from_partition and partition are both {self.partition!r}; writing "
@@ -258,9 +239,10 @@ class ResolveSidCollisionsConfig:
         if has_conflict:
             raise ValueError(conflict_message)
 
-        # Eagerly build the resolution config so its validation (layer_sizes,
-        # capacity) fails fast here rather than lazily inside run().
+        # Eagerly build both so their validation fails here rather than lazily
+        # inside run().
         _ = self.resolution_config
+        _ = self.layout
 
     @property
     def is_append(self) -> bool:
@@ -336,11 +318,9 @@ class CollisionResolutionRunner:
             self._resolver = KnnCollisionResolver(
                 progress_interval=self._config.progress_interval
             )
-        self._default_writer_type: Optional[str] = None
+        self._resolved_writer_type: Optional[str] = None
         self._item_id_type: Optional[pa.DataType] = None
-        self._layout = config.layout
-        self._bundle_uuid = uuid.uuid4().hex
-        self._written_rows: Dict[str, int] = {}
+        self._bundle = Bundle(config.layout)
 
     def run(self) -> CollisionResolutionStats:
         """Read, resolve collisions, and write the resulting SID map."""
@@ -385,12 +365,7 @@ class CollisionResolutionRunner:
         """Reject a run whose inputs are not all present, before any pass runs."""
         wanted = [("--input_path", self._config.input_path)]
         if self._config.is_append:
-            wanted += [
-                (GROUPS_ARTIFACT, self._layout.read_path(GROUPS_ARTIFACT)),
-                ("manifest", self._layout.prior_manifest_path()),
-            ]
-            if self._config.output_path is not None:
-                wanted.append((MAP_ARTIFACT, self._layout.read_path(MAP_ARTIFACT)))
+            wanted += self._bundle.prior_locations()
         missing = [
             f"{name} -> {path}"
             for name, path in wanted
@@ -409,33 +384,14 @@ class CollisionResolutionRunner:
 
         Its presence is the completion marker, so nothing may be written after it.
         """
-        layout = self._layout
-        prior = (
-            read_manifest(layout.prior_manifest_path())
-            if self._config.is_append
-            else None
-        )
-        observed = result.stats.max_final_bucket_size
-        if prior is not None:
-            observed = max(observed, prior.max_observed_items_per_sid)
-        map_save_type = "csv" if self._default_writer_type == "CsvWriter" else "parquet"
-        artifacts = {
-            name: layout.entry(
-                name, map_save_type if name in MAP_ARTIFACTS else "parquet", rows
-            )
-            for name, rows in self._written_rows.items()
-        }
-        manifest = BundleManifest(
-            bundle_uuid=self._bundle_uuid,
-            since_bundle_uuid=prior.bundle_uuid if prior is not None else None,
+        path = self._bundle.publish(
             codebook=list(self._config.layer_sizes),
             capacity=self._config.max_items_per_codebook,
-            max_observed_items_per_sid=observed,
+            observed=result.stats.max_final_bucket_size,
             item_id_type=str(self._item_id_type) if self._item_id_type else None,
-            artifacts=artifacts,
+            writer_type=self._resolved_writer_type,
         )
-        path = layout.write_manifest(manifest)
-        logger.info("wrote bundle %s manifest to %s", self._bundle_uuid, path)
+        logger.info("wrote bundle %s manifest to %s", self._bundle.uuid, path)
 
     def _make_reader(
         self, selected_cols: List[str], input_path: Optional[str] = None
@@ -540,7 +496,7 @@ class CollisionResolutionRunner:
         reader = self._make_reader(
             [self._config.item_id_field, self._config.code_field]
         )
-        self._default_writer_type = self._config.writer_type or (
+        self._resolved_writer_type = self._config.writer_type or (
             reader.__class__.__name__.replace("Reader", "Writer")
         )
         progress = ProgressLogger("Reading SID input", start_n=0)
@@ -663,9 +619,8 @@ class CollisionResolutionRunner:
             return PriorOccupancy.empty()
 
         layer_sizes = self._config.layer_sizes
-        groups_path = self._layout.read_path(GROUPS_ARTIFACT)
         prior, published_items = self._load_prior_occupancy(
-            groups_path, sid_band_ids(codes, layer_sizes), item_ids
+            self._bundle.prior_groups_path, sid_band_ids(codes, layer_sizes), item_ids
         )
         self._check_existing_map_size(published_items)
         logger.info(
@@ -784,10 +739,9 @@ class CollisionResolutionRunner:
         """Reject a published map whose size disagrees with the groups."""
         if self._config.output_path is None:
             return
-        path = self._layout.read_path(MAP_ARTIFACT)
         map_rows = 0
         for batch in self._iter_state_batches(
-            path, ["index"], "Counting published SID map"
+            self._bundle.prior_map_path, ["index"], "Counting published SID map"
         ):
             map_rows += len(batch["index"])
         if map_rows != published_items:
@@ -801,11 +755,11 @@ class CollisionResolutionRunner:
 
     def _make_writer(self, output_path: str) -> BaseWriter:
         """Create a repository writer for one independently resolved output."""
-        if self._default_writer_type is None:
+        if self._resolved_writer_type is None:
             raise RuntimeError("writer type is unavailable before reading input.")
         return create_writer(
             output_path,
-            writer_type=self._default_writer_type,
+            writer_type=self._resolved_writer_type,
             quota_name=self._config.odps_data_quota_name,
             world_size=1,
         )
@@ -856,9 +810,13 @@ class CollisionResolutionRunner:
         result: CollisionResolutionResult,
         progress: ProgressLogger,
         written: int,
-    ) -> None:
-        """Write this run's own item rows in chunks, without a full code copy."""
-        is_csv = isinstance(writer, CsvWriter)
+    ) -> int:
+        """Write this run's own item rows in chunks, without a full code copy.
+
+        Returns:
+            How many item rows this run added.
+        """
+        is_csv = self._resolved_writer_type == "CsvWriter"
         output_count = item_ids.shape[0]
         last_progress_count = written
         write_chunk = _max_code_rows(is_csv, origin_codes.shape[1], _MAP_WRITE_ROWS)
@@ -881,13 +839,14 @@ class CollisionResolutionRunner:
             if self._progress_interval_reached(written, last_progress_count):
                 progress.log(written, suffix=f"{written} samples processed")
                 last_progress_count = written
+        return output_count
 
     def _stream_existing_map_rows(self, writer: BaseWriter) -> int:
         """Copy every published map row into the merged output unchanged."""
         if not self._config.is_append:
             return 0
-        path = self._layout.read_path(MAP_ARTIFACT)
-        is_csv = isinstance(writer, CsvWriter)
+        path = self._bundle.prior_map_path
+        is_csv = self._resolved_writer_type == "CsvWriter"
         fields = ["item_id", "origin_codebook", "codebook", "index"]
         written = 0
         for batch in self._iter_state_batches(
@@ -923,27 +882,26 @@ class CollisionResolutionRunner:
         run's rows are appended, so the artifact stands alone and is exactly
         what the next append consumes.
         """
-        output_path = self._layout.write_path(MAP_ARTIFACT)
-        with closing(self._make_writer(output_path)) as writer:
+        with closing(self._make_writer(self._bundle.map_path)) as writer:
             progress = ProgressLogger("Writing resolved item map", start_n=0)
             written = self._stream_existing_map_rows(writer)
-            self._write_new_map_rows(
+            written += self._write_new_map_rows(
                 writer, item_ids, origin_codes, result, progress, written
             )
-            self._written_rows[MAP_ARTIFACT] = written + item_ids.shape[0]
+            self._bundle.record_map(written)
 
         if not self._config.is_append:
             return
-        delta_path = self._layout.write_path(DELTA_MAP_ARTIFACT)
-        self._written_rows[DELTA_MAP_ARTIFACT] = item_ids.shape[0]
-        with closing(self._make_writer(delta_path)) as writer:
-            self._write_new_map_rows(
-                writer,
-                item_ids,
-                origin_codes,
-                result,
-                ProgressLogger("Writing delta item map", start_n=0),
-                0,
+        with closing(self._make_writer(self._bundle.delta_map_path)) as writer:
+            self._bundle.record_delta_map(
+                self._write_new_map_rows(
+                    writer,
+                    item_ids,
+                    origin_codes,
+                    result,
+                    ProgressLogger("Writing delta item map", start_n=0),
+                    0,
+                )
             )
 
     def _write_group_outputs(
@@ -953,14 +911,7 @@ class CollisionResolutionRunner:
         plan: CollisionPlan,
         result: CollisionResolutionResult,
     ) -> None:
-        """Build and write original and resolved SID item groups sequentially.
-
-        Args:
-            item_ids: Input item IDs in original row order.
-            origin_codes: Original full SID matrix.
-            plan: Original SID aggregation and overflow plan.
-            result: Completed collision-resolution result.
-        """
+        """Group this run's rows by emitted SID and write them."""
         if plan.overflow_rows.size:
             grouping = build_resolved_item_grouping(plan, result)
         else:
@@ -979,12 +930,16 @@ class CollisionResolutionRunner:
         offsets: np.ndarray,
         values: pa.Array,
         rows: Optional[np.ndarray] = None,
-    ) -> None:
-        """Write one chunk of SID groups, optionally only ``rows`` of it."""
+    ) -> int:
+        """Write one chunk of SID groups, optionally only ``rows`` of it.
+
+        Returns:
+            How many group rows were written.
+        """
         itemids = pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), values)
         if rows is not None:
             if rows.size == 0:
-                return
+                return 0
             itemids = itemids.take(pa.array(rows, type=pa.int64()))
             codes = codes[rows]
         writer.write(
@@ -994,6 +949,7 @@ class CollisionResolutionRunner:
                 "itemids": itemids,
             }
         )
+        return codes.shape[0]
 
     def _build_append_groups(
         self,
@@ -1023,24 +979,22 @@ class CollisionResolutionRunner:
         resolved_last_codes: np.ndarray,
     ) -> None:
         """Merge this run's groups into the published groups and write both."""
-        resolved_path = self._layout.write_path(GROUPS_ARTIFACT)
-        existing_path = self._layout.read_path(GROUPS_ARTIFACT)
+        resolved_path = self._bundle.groups_path
+        existing_path = self._bundle.prior_groups_path
         layer_sizes = self._config.layer_sizes
         groups = self._build_append_groups(
             item_ids, origin_codes, grouping, resolved_last_codes
         )
         group_count = groups.keys.shape[0]
 
+        corpus_rows = 0
+        delta_rows = 0
         with ExitStack() as stack:
             writer = stack.enter_context(
                 closing(self._make_group_writer(resolved_path))
             )
             delta_writer = stack.enter_context(
-                closing(
-                    self._make_group_writer(
-                        self._layout.write_path(DELTA_GROUPS_ARTIFACT)
-                    )
-                )
+                closing(self._make_group_writer(self._bundle.delta_groups_path))
             )
 
             def emit(
@@ -1051,13 +1005,11 @@ class CollisionResolutionRunner:
             ) -> None:
                 """Write one chunk to the corpus output and the delta output."""
                 nonlocal corpus_rows, delta_rows
-                self._emit_group_rows(writer, codes, offsets, values)
-                corpus_rows += codes.shape[0]
-                delta_rows += codes.shape[0] if rows is None else int(rows.shape[0])
-                self._emit_group_rows(delta_writer, codes, offsets, values, rows)
+                corpus_rows += self._emit_group_rows(writer, codes, offsets, values)
+                delta_rows += self._emit_group_rows(
+                    delta_writer, codes, offsets, values, rows
+                )
 
-            corpus_rows = 0
-            delta_rows = 0
             max_rows = _max_code_rows(False, groups.codes.shape[1], group_count)
 
             def emit_new_only(low: int, high: int) -> None:
@@ -1111,8 +1063,8 @@ class CollisionResolutionRunner:
                     )
                 cursor = high
             emit_new_only(cursor, group_count)
-        self._written_rows[GROUPS_ARTIFACT] = corpus_rows
-        self._written_rows[DELTA_GROUPS_ARTIFACT] = delta_rows
+        self._bundle.record_groups(corpus_rows)
+        self._bundle.record_delta_groups(delta_rows)
 
     def _write_sid_groups(
         self,
@@ -1132,9 +1084,10 @@ class CollisionResolutionRunner:
         Raises:
             ValueError: If one group exceeds Arrow list offset capacity.
         """
-        output_path = self._layout.write_path(GROUPS_ARTIFACT)
+        output_path = self._bundle.groups_path
         progress_description = "Writing resolved SID item groups"
         group_count = grouping.counts.shape[0]
+        written = 0
         if np.any(grouping.counts > _ARROW_LIST_OFFSET_MAX):
             raise ValueError("one SID group exceeds Arrow list offset capacity.")
 
@@ -1155,7 +1108,7 @@ class CollisionResolutionRunner:
                 representative_rows = grouping.row_order[offsets[group_start:group_end]]
                 code_chunk = origin_codes[representative_rows]
                 code_chunk[:, -1] = resolved_last_codes[representative_rows]
-                self._emit_group_rows(
+                written += self._emit_group_rows(
                     writer,
                     code_chunk,
                     local_offsets,
@@ -1167,7 +1120,7 @@ class CollisionResolutionRunner:
                         suffix=f"{child_end} samples processed",
                     )
                     last_progress_count = child_end
-        self._written_rows[GROUPS_ARTIFACT] = group_count
+        self._bundle.record_groups(written)
 
 
 def _max_code_rows(is_csv: bool, layer_count: int, row_cap: int) -> int:

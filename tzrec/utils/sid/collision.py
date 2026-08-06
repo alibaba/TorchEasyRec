@@ -182,11 +182,9 @@ class CollisionPlan:
     overflow_origin_last_codes: np.ndarray
     config: CollisionResolutionConfig
     prior: PriorOccupancy = field(default_factory=PriorOccupancy.empty)
-
-    @cached_property
-    def prior_bucket_counts(self) -> np.ndarray:
-        """Prior occupancy of every planned bucket, aligned with bucket_keys."""
-        return self.prior.counts_for(self.bucket_keys)
+    prior_bucket_counts: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64)
+    )
 
 
 @dataclass(frozen=True)
@@ -839,8 +837,9 @@ def prepare_collision_plan(
         band_ids[representative_rows] * last_size
         + original_last_codes[representative_rows]
     )
+    prior_bucket_counts = prior.counts_for(bucket_keys)
     if not prior.is_empty:
-        bucket_ranks += prior.counts_for(bucket_keys)[origin_bucket_indices]
+        bucket_ranks += prior_bucket_counts[origin_bucket_indices]
     overflow_rows = sorted_rows[bucket_ranks[sorted_rows] >= config.capacity]
     bucket_ranks += 1
     overflow_bucket_key_prefixes = band_ids[overflow_rows] * last_size
@@ -858,6 +857,7 @@ def prepare_collision_plan(
         overflow_origin_last_codes=original_last_codes[overflow_rows],
         config=config,
         prior=prior,
+        prior_bucket_counts=prior_bucket_counts,
     )
 
 
@@ -965,17 +965,17 @@ def build_resolved_item_grouping(
     def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         for start in range(0, plan.item_count, _ROW_CHUNK_SIZE):
             end = min(start + _ROW_CHUNK_SIZE, plan.item_count)
-            rows = np.arange(start, end, dtype=np.int64)
-            emitted_sid_keys = plan.bucket_keys[plan.origin_bucket_indices[rows]]
-            emitted_sid_keys -= plan.original_last_codes[rows]
-            emitted_sid_keys += result.resolved_last_codes[rows]
+            chunk = slice(start, end)
+            emitted_sid_keys = plan.bucket_keys[plan.origin_bucket_indices[chunk]]
+            emitted_sid_keys -= plan.original_last_codes[chunk]
+            emitted_sid_keys += result.resolved_last_codes[chunk]
             bucket_ids, found = lookup_sorted(sid_keys, emitted_sid_keys)
             if not np.all(found):
                 raise RuntimeError("final bucket keys do not cover every emitted SID.")
             yield (
-                rows,
+                np.arange(start, end, dtype=np.int64),
                 bucket_ids,
-                result.slot_indices[rows] - prior_counts[bucket_ids],
+                result.slot_indices[chunk] - prior_counts[bucket_ids],
             )
 
     return _scatter_item_grouping(sid_keys, counts, plan.item_count, row_chunks())

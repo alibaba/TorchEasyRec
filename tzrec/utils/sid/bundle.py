@@ -26,8 +26,11 @@ partition to be ``key=value``.
 
 import json
 import os
+import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from tzrec.utils.path_util import is_odps_path
 
 MAP_ARTIFACT = "item_to_sid_map"
 DELTA_MAP_ARTIFACT = "delta_item_to_sid_map"
@@ -36,11 +39,6 @@ DELTA_GROUPS_ARTIFACT = "delta_sid_to_item_groups"
 
 MAP_ARTIFACTS = (MAP_ARTIFACT, DELTA_MAP_ARTIFACT)
 GROUPS_ARTIFACTS = (GROUPS_ARTIFACT, DELTA_GROUPS_ARTIFACT)
-
-
-def is_odps_path(path: str) -> bool:
-    """Whether a root addresses ODPS rather than a filesystem."""
-    return path.startswith("odps://")
 
 
 def artifact_location(root: str, artifact: str, partition: str) -> str:
@@ -167,6 +165,13 @@ class BundleLayout:
     from_partition: Optional[str]
     reader_type: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        if self.bundle_root is not None and is_odps_path(self.bundle_root):
+            raise ValueError(
+                "bundle_root holds the SID groups and the manifest, which are "
+                f"always files; got {self.bundle_root!r}."
+            )
+
     def root_for(self, artifact: str) -> str:
         """Return the root that owns one artifact's family."""
         root = self.bundle_root if artifact in GROUPS_ARTIFACTS else self.map_root
@@ -190,13 +195,23 @@ class BundleLayout:
             self.root_for(artifact), artifact, self.from_partition, suffix
         )
 
-    def entry(self, artifact: str, file_save_type: str, rows: int) -> ArtifactEntry:
-        """Describe where one artifact landed, for the manifest."""
-        odps = is_odps_path(self.root_for(artifact))
+    def entry(
+        self, artifact: str, rows: int, writer_type: Optional[str]
+    ) -> ArtifactEntry:
+        """Describe where one artifact landed, for the manifest.
+
+        ``save_type`` is read off the address, so it cannot contradict
+        ``location``; the serving set can only be parquet because a root that
+        would make it otherwise is refused at construction.
+        """
+        if is_odps_path(self.root_for(artifact)):
+            save_type = "odps"
+        elif artifact in GROUPS_ARTIFACTS:
+            save_type = "parquet"
+        else:
+            save_type = "csv" if writer_type == "CsvWriter" else "parquet"
         return ArtifactEntry(
-            save_type="odps" if odps else file_save_type,
-            rows=rows,
-            location=self.write_path(artifact),
+            save_type=save_type, rows=rows, location=self.write_path(artifact)
         )
 
     def write_manifest(self, manifest: "BundleManifest") -> str:
@@ -212,3 +227,109 @@ class BundleLayout:
         if self.bundle_root is None or self.from_partition is None:
             raise RuntimeError("no prior manifest location is configured.")
         return manifest_path(self.bundle_root, self.from_partition)
+
+
+class Bundle:
+    """The generation a run publishes: where each artifact goes, and its manifest.
+
+    Artifact names live here rather than at the call site, so a caller says
+    which artifact it wrote rather than naming it. Only artifacts it is told
+    about reach the manifest, which is how a full resolve records that it
+    published no delta.
+    """
+
+    def __init__(self, layout: BundleLayout) -> None:
+        self._layout = layout
+        self._rows: Dict[str, int] = {}
+        self.uuid = uuid.uuid4().hex
+
+    @property
+    def map_path(self) -> str:
+        """Where this generation's item map is written."""
+        return self._layout.write_path(MAP_ARTIFACT)
+
+    @property
+    def delta_map_path(self) -> str:
+        """Where this generation's added item rows are written."""
+        return self._layout.write_path(DELTA_MAP_ARTIFACT)
+
+    @property
+    def groups_path(self) -> str:
+        """Where this generation's SID groups are written."""
+        return self._layout.write_path(GROUPS_ARTIFACT)
+
+    @property
+    def delta_groups_path(self) -> str:
+        """Where this generation's touched buckets are written."""
+        return self._layout.write_path(DELTA_GROUPS_ARTIFACT)
+
+    @property
+    def prior_map_path(self) -> str:
+        """Where the appended-onto generation holds its item map."""
+        return self._layout.read_path(MAP_ARTIFACT)
+
+    @property
+    def prior_groups_path(self) -> str:
+        """Where the appended-onto generation holds its SID groups."""
+        return self._layout.read_path(GROUPS_ARTIFACT)
+
+    def prior_locations(self) -> List[Tuple[str, str]]:
+        """Every published location an append reads, labelled for errors."""
+        wanted = [
+            (GROUPS_ARTIFACT, self.prior_groups_path),
+            ("manifest", self._layout.prior_manifest_path()),
+        ]
+        if self._layout.map_root is not None:
+            wanted.append((MAP_ARTIFACT, self.prior_map_path))
+        return wanted
+
+    def record_map(self, rows: int) -> None:
+        """Record how many rows the merged item map holds."""
+        self._rows[MAP_ARTIFACT] = rows
+
+    def record_delta_map(self, rows: int) -> None:
+        """Record how many rows this run added to the item map."""
+        self._rows[DELTA_MAP_ARTIFACT] = rows
+
+    def record_groups(self, rows: int) -> None:
+        """Record how many buckets the merged SID groups hold."""
+        self._rows[GROUPS_ARTIFACT] = rows
+
+    def record_delta_groups(self, rows: int) -> None:
+        """Record how many buckets this run touched."""
+        self._rows[DELTA_GROUPS_ARTIFACT] = rows
+
+    def publish(
+        self,
+        codebook: List[int],
+        capacity: int,
+        observed: int,
+        item_id_type: Optional[str],
+        writer_type: Optional[str],
+    ) -> str:
+        """Write the manifest last and return where it landed.
+
+        ``observed`` is carried forward as a running maximum: an append only
+        sees the buckets it touched, so the published ceiling is the larger of
+        this run's and the one it appended onto.
+        """
+        prior = (
+            read_manifest(self._layout.prior_manifest_path())
+            if self._layout.from_partition is not None
+            else None
+        )
+        if prior is not None:
+            observed = max(observed, prior.max_observed_items_per_sid)
+        manifest = BundleManifest(
+            bundle_uuid=self.uuid,
+            since_bundle_uuid=prior.bundle_uuid if prior is not None else None,
+            codebook=codebook,
+            capacity=capacity,
+            max_observed_items_per_sid=observed,
+            item_id_type=item_id_type,
+            artifacts={
+                name: self._layout.entry(name, rows, writer_type)
+                for name, rows in self._rows.items()
+            },
+        )
+        return self._layout.write_manifest(manifest)

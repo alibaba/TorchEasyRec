@@ -1022,6 +1022,50 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self._run(inp, out, partition="v1")
         return out
 
+    def _assert_manifest_rows_match_artifacts(self, out, partition):
+        """Every manifest row count must equal what its artifact actually holds."""
+        manifest = self._manifest(out, partition)
+        dirs = {
+            bundle.MAP_ARTIFACT: self._map_dir(out, partition),
+            bundle.DELTA_MAP_ARTIFACT: self._delta_map_dir(out, partition),
+            bundle.GROUPS_ARTIFACT: self._groups_dir(out, partition),
+            bundle.DELTA_GROUPS_ARTIFACT: self._delta_groups_dir(out, partition),
+        }
+        for name, entry in manifest.artifacts.items():
+            actual = len(self._read_parquet(dirs[name])["codebook"])
+            self.assertEqual(entry.rows, actual, f"{name} rows")
+        return manifest
+
+    def test_manifest_rows_match_the_artifacts_on_a_full_resolve(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, list(range(5)), [[0, 0], [0, 0], [0, 1], [1, 0], [1, 1]])
+        self._run(inp, out)
+
+        manifest = self._assert_manifest_rows_match_artifacts(out, "v1")
+        # a full resolve publishes no delta, so the manifest names neither
+        self.assertEqual(
+            set(manifest.artifacts),
+            {bundle.MAP_ARTIFACT, bundle.GROUPS_ARTIFACT},
+        )
+        self.assertIsNone(manifest.since_bundle_uuid)
+
+    def test_manifest_rows_match_the_artifacts_on_an_append(self) -> None:
+        out = self._seed_generation()
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        _parquet(inp, [10, 11, 12], [[0, 0], [4, 4], [7, 7]], [[[0, 2], [0, 3]]] * 3)
+        self._append(inp, out)
+
+        manifest = self._assert_manifest_rows_match_artifacts(out, "v2")
+        self.assertEqual(
+            set(manifest.artifacts),
+            set(bundle.MAP_ARTIFACTS) | set(bundle.GROUPS_ARTIFACTS),
+        )
+        self.assertEqual(manifest.artifacts[bundle.DELTA_MAP_ARTIFACT].rows, 3)
+        self.assertEqual(
+            manifest.since_bundle_uuid, self._manifest(out, "v1").bundle_uuid
+        )
+
     def test_append_never_moves_a_published_item(self) -> None:
         out = self._seed_generation()
         published = self._map_rows(self._map_dir(out, "v1"))

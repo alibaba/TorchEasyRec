@@ -145,6 +145,17 @@ class BundleLayoutTest(unittest.TestCase):
             layout.write_path(bundle.GROUPS_ARTIFACT), "./sid/sid_to_item_groups/v2"
         )
 
+    def test_an_odps_bundle_root_is_refused(self) -> None:
+        # the serving set is always files, so a root that would make it
+        # otherwise cannot be built rather than being written and rejected later
+        with self.assertRaisesRegex(ValueError, "always files"):
+            bundle.BundleLayout(
+                map_root="./map",
+                bundle_root="odps://prj/tables/g",
+                partition="v2",
+                from_partition=None,
+            )
+
     def test_a_full_resolve_has_nothing_to_read(self) -> None:
         layout = self._layout(from_partition=None)
         with self.assertRaisesRegex(RuntimeError, "from_partition"):
@@ -182,7 +193,7 @@ class BundleManifestTest(unittest.TestCase):
             partition="v2",
             from_partition=None,
         )
-        entry = layout.entry(bundle.MAP_ARTIFACT, "parquet", 9)
+        entry = layout.entry(bundle.MAP_ARTIFACT, 9, "ParquetWriter")
         self.assertEqual(entry.save_type, "odps")
         self.assertEqual(
             entry.location,
@@ -193,9 +204,17 @@ class BundleManifestTest(unittest.TestCase):
         layout = bundle.BundleLayout(
             map_root="./map", bundle_root="./sid", partition="v2", from_partition=None
         )
-        entry = layout.entry(bundle.MAP_ARTIFACT, "csv", 4)
+        entry = layout.entry(bundle.MAP_ARTIFACT, 4, "CsvWriter")
         self.assertEqual(entry.save_type, "csv")
         self.assertEqual(entry.location, "./map/item_to_sid_map/v2")
+
+    def test_a_csv_writer_never_makes_the_serving_set_csv(self) -> None:
+        layout = bundle.BundleLayout(
+            map_root="./map", bundle_root="./sid", partition="v2", from_partition=None
+        )
+        self.assertEqual(
+            layout.entry(bundle.GROUPS_ARTIFACT, 4, "CsvWriter").save_type, "parquet"
+        )
 
     def test_rejects_a_serving_artifact_that_is_not_parquet(self) -> None:
         payload = json.loads(_manifest().to_json())
