@@ -29,7 +29,12 @@ from tzrec.modules.embedding import (
     SequenceEmbeddingGroupImpl,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
-from tzrec.utils.test_util import TestGraphType, create_test_module
+from tzrec.utils.fx_util import fx_mark_seq_ec_jt, symbolic_trace
+from tzrec.utils.test_util import (
+    TestGraphType,
+    create_test_module,
+    parameterized_name_func,
+)
 
 
 def _create_test_features(has_zch=False):
@@ -418,6 +423,87 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertTrue("deep___click_no_query.query" not in result)
         self.assertEqual(result["deep___click_no_query.sequence"].size(), (2, 3, 17))
         self.assertEqual(result["deep___click_no_query.sequence_length"].size(), (2,))
+
+    def test_sequence_embedding_group_impl_zch_marks_seq_jt(self) -> None:
+        """Distributed export splits the sparse part on fx_mark_seq_ec_jt marks."""
+        features = _create_test_sequence_features(has_zch=True)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="click",
+                feature_names=[
+                    "cat_a",
+                    "cat_b",
+                    "int_a",
+                    "click_seq__cat_a",
+                    "click_seq__cat_b",
+                    "click_seq__int_a",
+                ],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+        ]
+        embedding_group = SequenceEmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        embedding_group.eval()
+        graph = symbolic_trace(embedding_group).graph
+        marked = {
+            node.args[0]
+            for node in graph.nodes
+            if node.op == "call_function" and node.target == fx_mark_seq_ec_jt
+        }
+        self.assertEqual(
+            marked, {"cat_a", "cat_b", "click_seq__cat_a", "click_seq__cat_b"}
+        )
+
+    @parameterized.expand([[False], [True]], name_func=parameterized_name_func)
+    def test_sequence_embedding_group_impl_emb_name_suffix(self, has_zch) -> None:
+        features = _create_test_sequence_features(has_zch=has_zch)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name=f"click_{suffix}",
+                feature_names=[
+                    "cat_a",
+                    "int_a",
+                    "click_seq__cat_a",
+                    "click_seq__int_a",
+                ],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+                embedding_name_suffix=suffix,
+            )
+            for suffix in ["x", "y"]
+        ]
+        embedding_group = SequenceEmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        embedding_group.eval()
+
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["cat_a", "click_seq__cat_a"],
+            values=torch.tensor(list(range(10))),
+            lengths=torch.tensor([1, 1, 3, 5]),
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        sequence_dense_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["click_seq__int_a"],
+            values=torch.tensor([[x] for x in range(8)], dtype=torch.float32),
+            lengths=torch.tensor([3, 5]),
+        ).to_dict()
+        result = embedding_group(
+            sparse_feature,
+            dense_feature,
+            sequence_dense_feature,
+            EMPTY_KJT,
+            EMPTY_KJT,
+            EMPTY_KJT,
+        )
+        for suffix in ["x", "y"]:
+            self.assertEqual(result[f"click_{suffix}.query"].size(), (2, 17))
+            self.assertEqual(result[f"click_{suffix}.sequence"].size(), (2, 5, 17))
+        self.assertFalse(
+            torch.allclose(result["click_x.query"], result["click_y.query"])
+        )
 
     @parameterized.expand(
         [
