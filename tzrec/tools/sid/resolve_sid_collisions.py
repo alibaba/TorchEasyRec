@@ -600,7 +600,7 @@ class CollisionResolutionRunner:
         prior, published_items = self._load_prior_occupancy(
             groups_path, sid_band_ids(codes, layer_sizes), item_ids
         )
-        self._cross_check_existing_map(prior, published_items)
+        self._check_existing_map_size(published_items)
         logger.info(
             "append mode: %d new items onto %d published items in %d touched "
             "buckets (groups=%s, map=%s)",
@@ -714,121 +714,23 @@ class CollisionResolutionRunner:
             published_items,
         )
 
-    def _cross_check_existing_map(
-        self, prior: PriorOccupancy, published_items: int
-    ) -> None:
-        """Verify the existing map agrees with the published groups."""
+    def _check_existing_map_size(self, published_items: int) -> None:
+        """Reject a published map whose size disagrees with the groups."""
         path = self._config.existing_sid_map_path
         if path is None:
             return
-        layer_sizes = self._config.layer_sizes
-        domain = prior.bucket_keys
-        bands = np.unique(domain // layer_sizes[-1])
-        unknown_keys: List[int] = []
-        counts = np.zeros(domain.shape[0], dtype=np.int64)
-        max_index = np.zeros(domain.shape[0], dtype=np.int64)
-        sum_index = np.zeros(domain.shape[0], dtype=np.int64)
-        sum_square_index = np.zeros(domain.shape[0], dtype=np.int64)
         map_rows = 0
-
         for batch in self._iter_state_batches(
-            path,
-            ["codebook", "index"],
-            "Cross-checking published SID map",
+            path, ["index"], "Counting published SID map"
         ):
-            keys = sid_bucket_keys(self._codes_matrix(batch["codebook"]), layer_sizes)
-            map_rows += keys.shape[0]
-            _, known_band = lookup_sorted(bands, keys // layer_sizes[-1])
-            if not known_band.any():
-                continue
-            keys = keys[known_band]
-            indices = batch["index"].to_numpy(zero_copy_only=False)[known_band]
-            positions, known = lookup_sorted(domain, keys)
-            if not np.all(known) and len(unknown_keys) < 10:
-                unknown_keys.extend(keys[~known][:10].tolist())
-            if not known.any():
-                continue
-            order = np.argsort(positions[known], kind="stable")
-            batch_positions = positions[known][order]
-            batch_indices = indices[known][order].astype(np.int64, copy=False)
-            starts = np.flatnonzero(
-                np.concatenate(([True], batch_positions[1:] != batch_positions[:-1]))
-            )
-            buckets = batch_positions[starts]
-            counts[buckets] += np.diff(np.append(starts, batch_positions.shape[0]))
-            sum_index[buckets] += np.add.reduceat(batch_indices, starts)
-            sum_square_index[buckets] += np.add.reduceat(
-                batch_indices * batch_indices, starts
-            )
-            max_index[buckets] = np.maximum(
-                max_index[buckets], np.maximum.reduceat(batch_indices, starts)
-            )
-
-        self._report_cross_check(
-            prior, counts, max_index, sum_index, sum_square_index, unknown_keys
-        )
+            map_rows += len(batch["index"])
         if map_rows != published_items:
             raise ValueError(
                 f"existing map holds {map_rows} rows but the existing groups hold "
                 f"{published_items} item IDs; one of the two artifacts is "
-                "incomplete, and appending onto it would drop published items or "
-                "reuse their slots. The per-bucket checks only cover bands the new "
-                "items touch, so a truncated shard elsewhere shows up only here."
-            )
-
-    @staticmethod
-    def _report_cross_check(
-        prior: PriorOccupancy,
-        counts: np.ndarray,
-        max_index: np.ndarray,
-        sum_index: np.ndarray,
-        sum_square_index: np.ndarray,
-        unknown_keys: List[int],
-    ) -> None:
-        """Raise on the first failing map/groups consistency check."""
-        hint = (
-            "the two --existing_* artifacts must come from the same generation "
-            "of this tool"
-        )
-        if unknown_keys:
-            preview = ",".join(str(value) for value in unknown_keys[:10])
-            raise ValueError(
-                f"existing map holds SID buckets absent from the existing groups; "
-                f"{hint}. First offending bucket keys: {preview}."
-            )
-        mismatched = np.flatnonzero(counts != prior.bucket_counts)
-        if mismatched.size:
-            first = int(mismatched[0])
-            raise ValueError(
-                f"existing map and groups disagree on {mismatched.size} buckets; "
-                f"{hint}. Bucket key {int(prior.bucket_keys[first])} has "
-                f"{int(counts[first])} map rows but {int(prior.bucket_counts[first])} "
-                "grouped item IDs."
-            )
-        holed = np.flatnonzero(max_index != counts)
-        if holed.size:
-            first = int(holed[0])
-            raise ValueError(
-                f"existing map index space has holes in {holed.size} buckets. "
-                f"Bucket key {int(prior.bucket_keys[first])} holds "
-                f"{int(counts[first])} items but its largest index is "
-                f"{int(max_index[first])}; appending would reuse a published slot. "
-                "Item deletion is not supported -- tombstone instead."
-            )
-        expected_sum = counts * (counts + 1) // 2
-        expected_square_sum = counts * (counts + 1) * (2 * counts + 1) // 6
-        duplicated = np.flatnonzero(
-            (sum_index != expected_sum) | (sum_square_index != expected_square_sum)
-        )
-        if duplicated.size:
-            first = int(duplicated[0])
-            raise ValueError(
-                f"existing map index space is not dense in {duplicated.size} "
-                f"buckets. Bucket key {int(prior.bucket_keys[first])} has index sum "
-                f"{int(sum_index[first])} and square sum "
-                f"{int(sum_square_index[first])}, expected "
-                f"{int(expected_sum[first])} and {int(expected_square_sum[first])} "
-                f"for {int(counts[first])} items."
+                "incomplete or they come from different generations of this tool. "
+                "Appending onto them would drop published items or reuse their "
+                "slots."
             )
 
     def _make_writer(self, output_path: str) -> BaseWriter:

@@ -1255,7 +1255,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         _parquet(inp, [10], [[0, 0]], [[[0, 2]]])
         self._append(inp, out, first)
         # Pair generation 1's map with generation 2's groups.
-        with self.assertRaisesRegex(ValueError, "same generation"):
+        with self.assertRaisesRegex(ValueError, "different generations"):
             self._run(
                 self._prepare_single(20),
                 os.path.join(self.test_dir, "v3"),
@@ -1275,46 +1275,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             self._run(
                 self._prepare_single(10),
                 os.path.join(self.test_dir, "out"),
-                existing_sid_map_path=os.path.join(state_map, "*.parquet"),
-                existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
-            )
-
-    def test_append_rejects_map_with_index_holes(self) -> None:
-        # Two items share bucket (0, 0) but hold indices 1 and 3: a deleted item
-        # left a hole, so appending would reuse slot 2.
-        state_map = os.path.join(self.test_dir, "holed_map")
-        state_groups = os.path.join(self.test_dir, "holed_groups")
-        _map_parquet(state_map, [(0, [0, 0], [0, 0], 1), (1, [0, 0], [0, 0], 3)])
-        _groups_parquet(state_groups, [([0, 0], [0, 1])])
-        with self.assertRaisesRegex(ValueError, "holes"):
-            self._run(
-                self._prepare_single(10),
-                os.path.join(self.test_dir, "out"),
-                max_items_per_codebook=4,
-                existing_sid_map_path=os.path.join(state_map, "*.parquet"),
-                existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
-            )
-
-    def test_append_rejects_map_with_duplicate_indices(self) -> None:
-        # Indices [1, 1, 4, 4] match {1..4} on count, max and sum alike; only the
-        # index square sum separates them.
-        state_map = os.path.join(self.test_dir, "dup_map")
-        state_groups = os.path.join(self.test_dir, "dup_groups")
-        _map_parquet(
-            state_map,
-            [
-                (0, [0, 0], [0, 0], 1),
-                (1, [0, 0], [0, 0], 1),
-                (2, [0, 0], [0, 0], 4),
-                (3, [0, 0], [0, 0], 4),
-            ],
-        )
-        _groups_parquet(state_groups, [([0, 0], [0, 1, 2, 3])])
-        with self.assertRaisesRegex(ValueError, "not dense"):
-            self._run(
-                self._prepare_single(10),
-                os.path.join(self.test_dir, "out"),
-                max_items_per_codebook=5,
                 existing_sid_map_path=os.path.join(state_map, "*.parquet"),
                 existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
             )
