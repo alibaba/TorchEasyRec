@@ -27,6 +27,10 @@ feature_configs {
 
 - **threshold_filtering_func**: 准入策略lambda函数，默认为全部准入，详见下文准入策略
 
+## 分布式 Embedding 导出
+
+配置了 zch 的模型在 `USE_DISTRIBUTED_EMBEDDING=1` 的导出模式下，zch 表会自动转换为dynamic embedding表导出。
+
 ## 驱逐策略
 
 ### LFU_EvictionPolicy
