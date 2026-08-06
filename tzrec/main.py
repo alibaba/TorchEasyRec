@@ -176,14 +176,13 @@ def _create_model(
     # pyre-ignore [16]
     model_cls = BaseModel.create_class(model_cls_name)
 
-    extra: Dict[str, Any] = {"prompt": prompt} if prompt is not None else {}
     model: BaseModel = model_cls(
         model_config,
         features,
         labels,
         sample_weights=sample_weights,
         sampler_type=sampler_type,
-        **extra,
+        prompt=prompt,
     )
 
     kernel = Kernel[KernelProto.Name(model_config.kernel)]
