@@ -692,7 +692,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
             self._runner("input", "map", progress_interval=0)
 
-    def test_odps_group_writes_use_native_array_columns(self) -> None:
+    def test_serving_set_stays_parquet_under_an_odps_writer_type(self) -> None:
         class OdpsWriter:
             def __init__(self) -> None:
                 self.writes = []
@@ -717,9 +717,9 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
         created_writers = []
 
-        def make_writer(output_path):
+        def make_writer(output_path, writer_type=None):
             writer = OdpsWriter()
-            created_writers.append((output_path, writer))
+            created_writers.append((output_path, writer_type, writer))
             return writer
 
         with mock.patch.object(
@@ -732,8 +732,15 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 max_items_per_codebook=1,
             )
 
-        self.assertEqual([path for path, _ in created_writers], [self._map_dir(out)])
-        self.assertTrue(all(writer.closed for _, writer in created_writers))
+        # the map follows --writer_type; the serving set overrides it
+        self.assertEqual(
+            {path: kind for path, kind, _ in created_writers},
+            {
+                self._map_dir(out): None,
+                self._groups_dir(out): "ParquetWriter",
+            },
+        )
+        self.assertTrue(all(writer.closed for _, _, writer in created_writers))
 
     def test_writer_closes_when_write_fails(self) -> None:
         class FailingWriter:

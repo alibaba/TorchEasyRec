@@ -753,20 +753,19 @@ class CollisionResolutionRunner:
                 "slots."
             )
 
-    def _make_writer(self, output_path: str) -> BaseWriter:
-        """Create a repository writer for one independently resolved output."""
-        if self._resolved_writer_type is None:
+    def _make_writer(
+        self, output_path: str, writer_type: Optional[str] = None
+    ) -> BaseWriter:
+        """Create a repository writer, defaulting to the resolved writer type."""
+        writer_type = writer_type or self._resolved_writer_type
+        if writer_type is None:
             raise RuntimeError("writer type is unavailable before reading input.")
         return create_writer(
             output_path,
-            writer_type=self._resolved_writer_type,
+            writer_type=writer_type,
             quota_name=self._config.odps_data_quota_name,
             world_size=1,
         )
-
-    def _make_group_writer(self, output_path: str) -> BaseWriter:
-        """Create the writer for a serving-set artifact, which is always parquet."""
-        return create_writer(output_path, writer_type="ParquetWriter", world_size=1)
 
     def _item_id_array(self, values: np.ndarray) -> pa.Array:
         """Encode item IDs with the input Arrow type preserved."""
@@ -991,10 +990,12 @@ class CollisionResolutionRunner:
         delta_rows = 0
         with ExitStack() as stack:
             writer = stack.enter_context(
-                closing(self._make_group_writer(resolved_path))
+                closing(self._make_writer(resolved_path, "ParquetWriter"))
             )
             delta_writer = stack.enter_context(
-                closing(self._make_group_writer(self._bundle.delta_groups_path))
+                closing(
+                    self._make_writer(self._bundle.delta_groups_path, "ParquetWriter")
+                )
             )
 
             def emit(
@@ -1092,7 +1093,7 @@ class CollisionResolutionRunner:
             raise ValueError("one SID group exceeds Arrow list offset capacity.")
 
         offsets = grouping.offsets
-        with closing(self._make_group_writer(output_path)) as writer:
+        with closing(self._make_writer(output_path, "ParquetWriter")) as writer:
             progress = ProgressLogger(progress_description, start_n=0)
             last_progress_count = 0
             max_codebook_rows = _max_code_rows(
