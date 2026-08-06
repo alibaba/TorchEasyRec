@@ -16,7 +16,6 @@ import numpy as np
 import torch
 from google.protobuf import text_format
 from tokenizers import Tokenizer, models, pre_tokenizers
-from transformers import Qwen2Config
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import FgMode, create_features
@@ -26,23 +25,15 @@ from tzrec.prompt.compile import compile_prompt
 from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
 _CODEBOOK = [4, 4, 4]
 _WORDS = ["History", "Predict", ":", ".", "<unk>", "<|im_end|>"]
 
 
 def _tiny_backbone(path: str) -> str:
-    """A two-layer Qwen saved locally, so no download is needed."""
-    Qwen2Config(
-        vocab_size=64,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=256,
-    ).save_pretrained(path)
+    """The shared tiny Qwen, saved locally so no download is needed."""
+    create_tiny_causal_lm(64).save_pretrained(path)
     return path
 
 

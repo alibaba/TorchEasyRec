@@ -80,6 +80,9 @@ class PromptAssembler:
         self._plan = plan
         self._sid = sid_space
         self._ignore_index = ignore_index
+        if sid_space is not None:
+            self._lo = np.asarray(sid_space.level_offsets, dtype=np.int64)
+            self._hi = self._lo + np.asarray(sid_space.codebook, dtype=np.int64)
         inline = [
             s
             for s in plan.segments + plan.response_segments
@@ -105,9 +108,7 @@ class PromptAssembler:
                 f"number of {levels}-level items."
             )
         by_level = values.reshape(-1, levels)
-        lo = np.asarray(self._sid.level_offsets, dtype=np.int64)
-        hi = lo + np.asarray(self._sid.codebook, dtype=np.int64)
-        if np.any(by_level < lo) or np.any(by_level >= hi):
+        if np.any(by_level < self._lo) or np.any(by_level >= self._hi):
             raise ValueError(
                 f"prompt slot [{name}]: SID values must already carry their "
                 f"level offset, so level l lies in "

@@ -15,7 +15,7 @@ The caller owns the width schedule; this module only enforces what each level
 can supply.
 """
 
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import torch
 from transformers import PreTrainedModel
@@ -27,8 +27,7 @@ def dynamic_beam_search(
     prompt_embeds: torch.Tensor,
     attention_mask: torch.Tensor,
     beam_widths: List[int],
-    lo_tok: torch.Tensor,
-    hi_tok: torch.Tensor,
+    bands: Sequence[Tuple[int, int]],
 ) -> torch.Tensor:
     """Decode SID answers with a caller-supplied per-level beam width.
 
@@ -39,8 +38,8 @@ def dynamic_beam_search(
         attention_mask: prompt mask ``(B, P)``.
         beam_widths: requested width per SID level; each is capped to what its
             band and the surviving prefixes supply.
-        lo_tok: inclusive lower per-level token band edge, ``(num_levels,)``.
-        hi_tok: inclusive upper per-level token band edge, ``(num_levels,)``.
+        bands: inclusive ``(lo, hi)`` token-id edge per SID level. Host ints,
+            because every use of them is a host-side slice bound.
 
     Returns:
         The SID token tail ``(B * W, num_levels)``, score-ordered best-first.
@@ -48,7 +47,7 @@ def dynamic_beam_search(
     """
     device = prompt_embeds.device
     batch_size = prompt_embeds.shape[0]
-    num_levels = lo_tok.shape[0]
+    num_levels = len(bands)
     if len(beam_widths) != num_levels:
         raise ValueError(
             f"dynamic_beam_search: beam_widths has {len(beam_widths)} entries "
@@ -58,10 +57,6 @@ def dynamic_beam_search(
         raise ValueError(
             f"dynamic_beam_search: beam_widths must be >= 1, got {list(beam_widths)}."
         )
-    # Hoist the band edges to host once to keep the level loop sync-free.
-    bands: List[Tuple[int, int]] = [
-        (int(lo_tok[level]), int(hi_tok[level])) for level in range(num_levels)
-    ]
     capped_widths: List[int] = []
     prev_width = 1
     for requested, (band_lo, band_hi) in zip(beam_widths, bands):

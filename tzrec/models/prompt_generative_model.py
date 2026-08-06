@@ -22,7 +22,7 @@ encoder-decoder passes labels and gets a loss back -- so they are abstract here
 rather than parameterized.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 import torchmetrics
@@ -39,7 +39,7 @@ from tzrec.prompt.assembler import (
     PROMPT_INPUT_IDS,
 )
 from tzrec.prompt.persist import save_prompt_assets
-from tzrec.prompt.plan import CompiledPrompt, SlotSeg
+from tzrec.prompt.plan import CompiledPrompt
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.prompt_model_pb2 import PromptModelConfig
 from tzrec.utils.logging_util import logger
@@ -94,6 +94,12 @@ class BasePromptGenerativeModel(BaseModel):
             self._features, list(self._prompt.module_plan.feature_groups)
         )
         self._build_projections()
+        # decode subtracts these every step; a buffer follows the module's device
+        self.register_buffer(
+            "_level_offsets",
+            torch.tensor(prompt.sid_space.level_offsets),
+            persistent=False,
+        )
 
     def _build_backbone(self, hf_model_id: str, param_dtype: int) -> nn.Module:
         """Build the LM empty, so HF weights load only on cold start.
@@ -120,35 +126,26 @@ class BasePromptGenerativeModel(BaseModel):
         hidden = int(self.lm.config.hidden_size)
 
         built: Dict[str, PromptProjection] = {}
+        widths: Dict[str, int] = {}
         aligned: List[PromptProjection] = []
         for seg in plan.projected_slots:
             module_id = modules.slot_to_module[seg.slot_id]
-            in_dim = self._slot_in_dim(seg)
+            in_dim = self.embedding_group.group_total_dim(seg.name + seg.output_key)
             if module_id not in built:
                 built[module_id] = PromptProjection(
                     modules.projections[module_id], in_dim, hidden
                 )
-            elif built[module_id].in_dim != in_dim:
+                widths[module_id] = in_dim
+            elif widths[module_id] != in_dim:
                 raise ValueError(
                     f"prompt slots sharing projection_name [{module_id}] have "
-                    f"different group widths ({built[module_id].in_dim} vs "
+                    f"different group widths ({widths[module_id]} vs "
                     f"{in_dim}); they cannot share a module."
                 )
             aligned.append(built[module_id])
         self.projections = nn.ModuleDict(built)
         # zipped with plan.projected_slots; shared modules appear by reference
         self._slot_projections = aligned
-
-    def _slot_in_dim(self, seg: SlotSeg) -> int:
-        """Total group output width of a projected slot.
-
-        Args:
-            seg: the projected slot.
-
-        Returns:
-            Its ``group_total_dim``.
-        """
-        return self.embedding_group.group_total_dim(seg.name + seg.output_key)
 
     def hf_backbone(self) -> nn.Module:
         """The HF module export and checkpointing reach for."""
@@ -181,15 +178,6 @@ class BasePromptGenerativeModel(BaseModel):
             0, batch.additional_infos[PROMPT_HOLE_POSITIONS], torch.cat(parts)
         )
 
-    def _sid_token_bands(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Inclusive token-id band of every SID level, as device tensors."""
-        space = self._prompt.sid_space
-        device = self.lm.get_input_embeddings().weight.device
-        return (
-            torch.tensor(space.band_lo, device=device),
-            torch.tensor(space.band_hi, device=device),
-        )
-
     def _detokenize(self, tokens: torch.Tensor, batch_size: int) -> torch.Tensor:
         """Undo both shifts: token id back to a local 0-based code.
 
@@ -201,8 +189,7 @@ class BasePromptGenerativeModel(BaseModel):
             ``(batch_size, beams, num_levels)`` local codes.
         """
         space = self._prompt.sid_space
-        offsets = torch.tensor(space.level_offsets, device=tokens.device)
-        codes = tokens - space.base_vocab - offsets
+        codes = tokens - space.base_vocab - self._level_offsets
         return codes.view(batch_size, -1, space.num_levels)
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:

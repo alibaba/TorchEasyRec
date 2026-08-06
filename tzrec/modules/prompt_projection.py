@@ -42,18 +42,12 @@ class PromptProjection(nn.Module):
         hidden_size: int,
     ) -> None:
         super().__init__()
-        self._in_dim = in_dim
         dim = in_dim
         self.body: Optional[MLP] = None
         if config.HasField("mlp"):
             self.body = MLP(dim, **config_to_kwargs(config.mlp))
             dim = self.body.output_dim()
         self.head = nn.Linear(dim, hidden_size, bias=config.bias)
-
-    @property
-    def in_dim(self) -> int:
-        """Input width this module was sized for."""
-        return self._in_dim
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """Project a slot's group output into the LM input space.

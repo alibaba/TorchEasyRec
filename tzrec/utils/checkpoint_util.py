@@ -332,20 +332,31 @@ def best_checkpoint(
         return latest_checkpoint(model_dir)
 
 
-def _unwrap_model(model: nn.Module) -> nn.Module:
-    """Walk DMP/TrainWrapper layers down to the model that owns the hooks."""
+def unwrap_to(model: nn.Module, attr: str) -> Optional[nn.Module]:
+    """Walk DMP/TrainWrapper layers down to the module declaring ``attr``.
+
+    ``seen`` bounds the walk: a ``.model``/``.module`` cycle would otherwise
+    hang inside a checkpoint save.
+
+    Args:
+        model: the outermost wrapper.
+        attr: the attribute that marks the module being looked for.
+
+    Returns:
+        That module, or None when the chain has none.
+    """
     inner = model
     seen = set()
-    while not hasattr(inner, "save_assets"):
+    while not hasattr(inner, attr):
         if id(inner) in seen:
-            return model
+            return None
         seen.add(id(inner))
         if hasattr(inner, "module"):
             inner = inner.module
         elif hasattr(inner, "model"):
             inner = inner.model
         else:
-            return model
+            return None
     return inner
 
 
@@ -429,7 +440,9 @@ class CheckpointManager:
                 f"weights are saved; skipping HF assets."
             )
         try:
-            _unwrap_model(model).save_assets(ckpt_dir)
+            inner = unwrap_to(model, "save_assets")
+            if inner is not None:
+                inner.save_assets(ckpt_dir)
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"save_assets failed for {ckpt_dir}: {e} -- checkpoint weights "

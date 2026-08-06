@@ -321,7 +321,6 @@ def compile_prompt(
         suffix_keep=_suffix_keep(response),
         static_prefix_len=_static_prefix_len(body),
         length_buckets=tuple(int(b) for b in cfg.length_buckets),
-        slot_index={s.name: i for i, s in enumerate(projected)},
         projected_slots=projected,
     )
     _validate(cfg, plan, sid_space)
@@ -347,7 +346,7 @@ def _weave(
     for i, run in enumerate(runs):
         if run:
             ids = tuple(tok.encode(run, add_special_tokens=False).ids)
-            out.append(Static(token_ids=ids, owner_slot_id=None))
+            out.append(Static(token_ids=ids))
         if i < len(names):
             out.append(segs[names[i]])
     return tuple(out)

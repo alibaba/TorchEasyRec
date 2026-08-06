@@ -41,28 +41,6 @@ _HF_ASSET_FILES = (
 _HF_EXPORT_META_FILENAME = "hf_export_meta.json"
 
 
-def _unwrap_hf_model(wrapped_model: nn.Module) -> Optional[nn.Module]:
-    """Walk DMP/TrainWrapper layers down to the model exposing ``hf_backbone``.
-
-    ``None`` when the chain has none, so callers no-op. ``seen`` bounds the
-    walk: every checkpoint save reaches here, and a ``.model``/``.module`` cycle
-    would hang inside ``save()``.
-    """
-    m = wrapped_model
-    seen = set()
-    while not hasattr(m, "hf_backbone"):
-        if id(m) in seen:
-            return None
-        seen.add(id(m))
-        if hasattr(m, "module"):  # DMP / DDP-style wrapper
-            m = m.module
-        elif hasattr(m, "model"):  # Train/Predict/Script wrapper
-            m = m.model
-        else:
-            return None
-    return m
-
-
 def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
     """Co-locate the HF config + tokenizer (NO weights) in a checkpoint dir.
 
@@ -71,7 +49,7 @@ def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
     """
     if int(os.environ.get("RANK", 0)) != 0:
         return
-    inner = _unwrap_hf_model(wrapped_model)
+    inner = checkpoint_util.unwrap_to(wrapped_model, "hf_backbone")
     if inner is None:
         return
     os.makedirs(save_dir, exist_ok=True)

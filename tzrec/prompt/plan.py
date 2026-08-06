@@ -109,12 +109,9 @@ class Static:
 
     Args:
         token_ids: the tokenized run.
-        owner_slot_id: slot this run was folded into, so it vanishes when that
-            slot is dropped. None when the run belongs to no slot.
     """
 
     token_ids: Tuple[int, ...]
-    owner_slot_id: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -158,7 +155,6 @@ class PromptPlan:
         suffix_keep: upper bound on the supervised logits window.
         static_prefix_len: leading positions that are request-invariant.
         length_buckets: sampler and graph-capture buckets.
-        slot_index: slot name to its index in ``projected_slots``.
         projected_slots: fixes the order hole positions are written in.
     """
 
@@ -170,7 +166,6 @@ class PromptPlan:
     suffix_keep: Optional[int]
     static_prefix_len: int
     length_buckets: Tuple[int, ...]
-    slot_index: Mapping[str, int]
     projected_slots: Tuple[SlotSeg, ...]
 
 

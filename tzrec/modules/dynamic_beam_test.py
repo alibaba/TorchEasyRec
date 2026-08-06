@@ -37,8 +37,7 @@ def _decode(lm, ids, pairs, width=8, beam_widths=None, attention_mask=None):
         lm.get_input_embeddings()(ids),
         torch.ones_like(ids) if attention_mask is None else attention_mask,
         beam_widths=beam_widths,
-        lo_tok=torch.tensor([p[0] for p in pairs]),
-        hi_tok=torch.tensor([p[1] for p in pairs]),
+        bands=pairs,
     )
 
 

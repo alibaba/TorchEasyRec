@@ -78,14 +78,13 @@ def _plan(segments, response=(), max_length=0) -> PromptPlan:
         suffix_keep=None,
         static_prefix_len=0,
         length_buckets=(),
-        slot_index={s.name: i for i, s in enumerate(projected)},
         projected_slots=projected,
     )
 
 
 class PromptAssemblerTest(unittest.TestCase):
     def test_inline_sid_gets_the_base_vocab_shift(self) -> None:
-        plan = _plan((Static((7, 8), None), _slot("hist", FillMode.INLINE)))
+        plan = _plan((Static((7, 8)), _slot("hist", FillMode.INLINE)))
         asm = PromptAssembler(plan, _sid_space())
         # offset codes for one item: level 0 -> 1, level 1 -> 4+2, level 2 -> 8+3
         out = asm.assemble({"hist": [np.array([1, 6, 11])]})
@@ -97,7 +96,7 @@ class PromptAssemblerTest(unittest.TestCase):
         self.assertEqual(out.hole_positions.size, 0)
 
     def test_projected_emits_sentinels_and_records_holes(self) -> None:
-        plan = _plan((Static((7,), None), _slot("prof", FillMode.PROJECTED, 4)))
+        plan = _plan((Static((7,)), _slot("prof", FillMode.PROJECTED, 4)))
         asm = PromptAssembler(plan, _sid_space())
         out = asm.assemble({}, {"prof": np.array([2, 3])}, batch_size=2)
 
@@ -120,8 +119,8 @@ class PromptAssemblerTest(unittest.TestCase):
 
     def test_labels_cover_the_response_span_only(self) -> None:
         plan = _plan(
-            (Static((7, 8), None),),
-            response=(Static((9,), None), _slot("answer", FillMode.INLINE)),
+            (Static((7, 8)),),
+            response=(Static((9,)), _slot("answer", FillMode.INLINE)),
         )
         asm = PromptAssembler(plan, _sid_space())
         out = asm.assemble({"answer": [np.array([0, 4, 8])]})
@@ -153,9 +152,7 @@ class PromptAssemblerTest(unittest.TestCase):
             asm.assemble({"hist": [np.array([1, 6, 12])]})
 
     def test_over_long_row_is_an_error_not_a_truncation(self) -> None:
-        plan = _plan(
-            (Static((7, 8, 9), None), _slot("hist", FillMode.INLINE)), max_length=4
-        )
+        plan = _plan((Static((7, 8, 9)), _slot("hist", FillMode.INLINE)), max_length=4)
         asm = PromptAssembler(plan, _sid_space())
         with self.assertRaisesRegex(ValueError, "never truncated"):
             asm.assemble({"hist": [np.array([1, 6, 11])]})

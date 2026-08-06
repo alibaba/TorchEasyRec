@@ -155,13 +155,17 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         padded, mask, _ = _unpack(
             embeds,
             infos[PROMPT_CU_SEQLENS],
-            infos[PROMPT_LABELS],
+            None,
             int(infos[PROMPT_MAX_SEQLEN]),
             self._ignore_index,
         )
-        lo_tok, hi_tok = self._sid_token_bands()
+        space = self._prompt.sid_space
         tokens = dynamic_beam_search(
-            self.lm, padded, mask, self._beam_widths, lo_tok, hi_tok
+            self.lm,
+            padded,
+            mask,
+            self._beam_widths,
+            list(zip(space.band_lo, space.band_hi)),
         )
         codes = self._detokenize(tokens, padded.shape[0])
         return codes[:, : self._num_return, :]
@@ -170,10 +174,10 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
 def _unpack(
     embeds: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    labels: torch.Tensor,
+    labels: Optional[torch.Tensor],
     max_seqlen: int,
     ignore_index: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Pad a packed varlen batch at the LM boundary.
 
     Padding lives in this one adapter. ``max_seqlen`` is the collator's, not
@@ -183,7 +187,7 @@ def _unpack(
     Args:
         embeds: packed embeddings, ``(total_tokens, hidden)``.
         cu_seqlens: row boundaries, ``(batch_size + 1,)``.
-        labels: packed labels, ``(total_tokens,)``.
+        labels: packed labels, or None at inference where nothing is scored.
         max_seqlen: the collator's padded width.
         ignore_index: label value for padding.
 
@@ -199,14 +203,17 @@ def _unpack(
     mask = columns[None, :] < lengths[:, None]
 
     padded = embeds.new_zeros((batch_size, max_seqlen, hidden))
+    # mask selects row-major, which is the order embeds and labels are packed in
+    padded[mask] = embeds
+    if labels is None:
+        return padded, mask.long(), None
+
     out_labels = torch.full(
         (batch_size, max_seqlen),
         ignore_index,
         dtype=labels.dtype,
         device=embeds.device,
     )
-    # mask selects row-major, which is the order embeds and labels are packed in
-    padded[mask] = embeds
     out_labels[mask] = labels
     return padded, mask.long(), out_labels
 

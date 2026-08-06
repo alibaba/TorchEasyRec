@@ -20,10 +20,9 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
-from tzrec.utils.checkpoint_util import save_model
+from tzrec.utils.checkpoint_util import save_model, unwrap_to
 from tzrec.utils.hf_export_util import (
     _HF_EXPORT_META_FILENAME,
-    _unwrap_hf_model,
     dcp_to_hf,
     write_hf_assets,
 )
@@ -84,12 +83,12 @@ class HfExportUtilTest(unittest.TestCase):
 
     def test_unwrap_walks_dmp_and_train_wrapper(self) -> None:
         inner = _GenRec(_tied_lm())
-        self.assertIs(_unwrap_hf_model(inner), inner)
-        self.assertIs(_unwrap_hf_model(_TrainWrapper(inner)), inner)
-        self.assertIs(_unwrap_hf_model(_DmpLike(_TrainWrapper(inner))), inner)
+        self.assertIs(unwrap_to_hf(inner), inner)
+        self.assertIs(unwrap_to_hf(_TrainWrapper(inner)), inner)
+        self.assertIs(unwrap_to_hf(_DmpLike(_TrainWrapper(inner))), inner)
 
     def test_unwrap_returns_none_for_non_hf_model(self) -> None:
-        self.assertIsNone(_unwrap_hf_model(_TrainWrapper(nn.Linear(4, 4))))
+        self.assertIsNone(unwrap_to_hf(_TrainWrapper(nn.Linear(4, 4))))
 
     def test_unwrap_terminates_on_a_wrapper_cycle(self) -> None:
         """A .model/.module cycle must return None, not spin.
@@ -103,7 +102,7 @@ class HfExportUtilTest(unittest.TestCase):
         object.__setattr__(a, "model", b)
         object.__setattr__(b, "model", a)
         out = []
-        t = threading.Thread(target=lambda: out.append(_unwrap_hf_model(a)))
+        t = threading.Thread(target=lambda: out.append(unwrap_to_hf(a)))
         t.daemon = True
         t.start()
         t.join(timeout=5)
@@ -182,6 +181,11 @@ class HfExportUtilTest(unittest.TestCase):
         os.makedirs(empty, exist_ok=True)
         with self.assertRaisesRegex(RuntimeError, "not exists"):
             dcp_to_hf(empty, os.path.join(self.test_dir, "hf_out_missing"))
+
+
+def unwrap_to_hf(model):
+    """The walk write_hf_assets performs, under test."""
+    return unwrap_to(model, "hf_backbone")
 
 
 if __name__ == "__main__":
