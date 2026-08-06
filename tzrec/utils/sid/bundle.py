@@ -78,7 +78,6 @@ class ArtifactEntry:
 
     save_type: str
     rows: int
-    schema: Dict[str, str]
     path: Optional[str] = None
     table: Optional[str] = None
     partition: Optional[str] = None
@@ -138,12 +137,7 @@ class BundleManifest:
 
 
 def artifact_entry(
-    root: str,
-    artifact: str,
-    partition: str,
-    save_type: str,
-    rows: int,
-    schema: Dict[str, str],
+    root: str, artifact: str, partition: str, save_type: str, rows: int
 ) -> ArtifactEntry:
     """Describe where one artifact landed, in the shape the manifest records."""
     location = artifact_location(root, artifact, partition)
@@ -152,11 +146,10 @@ def artifact_entry(
         return ArtifactEntry(
             save_type="odps",
             rows=rows,
-            schema=schema,
             table=table,
             partition=f"artifact={artifact}/generation={partition}",
         )
-    return ArtifactEntry(save_type=save_type, rows=rows, schema=schema, path=location)
+    return ArtifactEntry(save_type=save_type, rows=rows, path=location)
 
 
 def write_manifest(path: str, manifest: BundleManifest) -> None:
@@ -180,3 +173,84 @@ def read_manifest(path: str) -> BundleManifest:
         )
     with open(path) as handle:
         return BundleManifest.from_json(handle.read())
+
+
+@dataclass(frozen=True)
+class BundleLayout:
+    """Every location one run reads and writes, resolved once.
+
+    Binding the two roots and the partitions here is what keeps the family rule
+    -- the serving set under ``bundle_root``, the map family under ``map_root``
+    -- in this module instead of at each call site.
+    """
+
+    map_root: Optional[str]
+    bundle_root: Optional[str]
+    partition: Optional[str]
+    from_partition: Optional[str]
+    map_read_suffix: str
+
+    def root_for(self, artifact: str) -> str:
+        """Return the root that owns one artifact's family."""
+        root = self.bundle_root if artifact in GROUPS_ARTIFACTS else self.map_root
+        if root is None:
+            raise RuntimeError(f"no root is configured for {artifact}.")
+        return root
+
+    def write_path(self, artifact: str) -> str:
+        """Return where this generation writes one artifact."""
+        if self.partition is None:
+            raise RuntimeError("no partition is configured to write.")
+        return artifact_location(self.root_for(artifact), artifact, self.partition)
+
+    def read_path(self, artifact: str) -> str:
+        """Return where the appended-onto generation holds one artifact."""
+        if self.from_partition is None:
+            raise RuntimeError("no from_partition is configured to read.")
+        suffix = "parquet" if artifact in GROUPS_ARTIFACTS else self.map_read_suffix
+        return artifact_read_pattern(
+            self.root_for(artifact), artifact, self.from_partition, suffix
+        )
+
+    def entry(self, artifact: str, save_type: str, rows: int) -> ArtifactEntry:
+        """Describe where one artifact landed, for the manifest."""
+        if self.partition is None:
+            raise RuntimeError("no partition is configured to write.")
+        return artifact_entry(
+            self.root_for(artifact), artifact, self.partition, save_type, rows
+        )
+
+    def write_manifest(self, manifest: "BundleManifest") -> str:
+        """Write this generation's manifest and return where it landed."""
+        if self.bundle_root is None or self.partition is None:
+            raise RuntimeError("no manifest location is configured.")
+        path = manifest_path(self.bundle_root, self.partition)
+        write_manifest(path, manifest)
+        return path
+
+    def prior_manifest_path(self) -> str:
+        """Return the manifest of the generation being appended onto."""
+        if self.bundle_root is None or self.from_partition is None:
+            raise RuntimeError("no prior manifest location is configured.")
+        return manifest_path(self.bundle_root, self.from_partition)
+
+    def read_prior_manifest(self) -> "BundleManifest":
+        """Read the manifest of the generation being appended onto."""
+        return read_manifest(self.prior_manifest_path())
+
+
+def resolve_layout(
+    map_root: Optional[str],
+    bundle_root: Optional[str],
+    partition: Optional[str],
+    from_partition: Optional[str],
+    reader_type: Optional[str],
+) -> BundleLayout:
+    """Resolve every location this run needs from the roots it was given."""
+    return BundleLayout(
+        map_root=map_root,
+        bundle_root=bundle_root,
+        partition=partition,
+        from_partition=from_partition,
+        map_read_suffix="csv" if reader_type == "CsvReader" else "parquet",
+    )

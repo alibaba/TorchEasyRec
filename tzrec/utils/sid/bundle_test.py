@@ -27,7 +27,6 @@ def _manifest(**kw):
             bundle.GROUPS_ARTIFACT: bundle.ArtifactEntry(
                 save_type="parquet",
                 rows=4,
-                schema={"codebook": "list<int64>"},
                 path="./sid/sid_to_item_groups/v2",
             )
         },
@@ -77,6 +76,81 @@ class BundleLocationTest(unittest.TestCase):
         self.assertEqual(bundle.manifest_path("./sid", "v2"), "./sid/manifest/v2.json")
 
 
+class BundleLayoutTest(unittest.TestCase):
+    def _layout(self, **kw):
+        base = dict(
+            map_root="./map",
+            bundle_root="./sid",
+            partition="v2",
+            from_partition="v1",
+            reader_type=None,
+        )
+        base.update(kw)
+        return bundle.resolve_layout(**base)
+
+    def test_each_family_resolves_under_its_own_root(self) -> None:
+        layout = self._layout()
+        self.assertEqual(
+            layout.write_path(bundle.MAP_ARTIFACT), "./map/item_to_sid_map/v2"
+        )
+        self.assertEqual(
+            layout.write_path(bundle.DELTA_MAP_ARTIFACT),
+            "./map/delta_item_to_sid_map/v2",
+        )
+        self.assertEqual(
+            layout.write_path(bundle.GROUPS_ARTIFACT), "./sid/sid_to_item_groups/v2"
+        )
+        self.assertEqual(
+            layout.write_path(bundle.DELTA_GROUPS_ARTIFACT),
+            "./sid/delta_sid_to_item_groups/v2",
+        )
+
+    def test_reads_come_from_the_appended_onto_partition(self) -> None:
+        layout = self._layout()
+        self.assertEqual(
+            layout.read_path(bundle.MAP_ARTIFACT),
+            "./map/item_to_sid_map/v1/part-*.parquet",
+        )
+        self.assertEqual(
+            layout.read_path(bundle.GROUPS_ARTIFACT),
+            "./sid/sid_to_item_groups/v1/part-*.parquet",
+        )
+
+    def test_reader_type_selects_the_map_suffix_but_never_the_groups(self) -> None:
+        layout = self._layout(reader_type="CsvReader")
+        self.assertTrue(layout.read_path(bundle.MAP_ARTIFACT).endswith("part-*.csv"))
+        self.assertTrue(
+            layout.read_path(bundle.GROUPS_ARTIFACT).endswith("part-*.parquet")
+        )
+
+    def test_an_odps_map_root_leaves_the_serving_set_on_files(self) -> None:
+        layout = self._layout(map_root="odps://prj/tables/sid")
+        self.assertEqual(
+            layout.write_path(bundle.MAP_ARTIFACT),
+            "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v2",
+        )
+        self.assertEqual(
+            layout.write_path(bundle.GROUPS_ARTIFACT), "./sid/sid_to_item_groups/v2"
+        )
+
+    def test_manifest_locations_track_the_two_partitions(self) -> None:
+        layout = self._layout()
+        self.assertEqual(layout.prior_manifest_path(), "./sid/manifest/v1.json")
+
+    def test_a_missing_root_is_reported_against_its_artifact(self) -> None:
+        layout = self._layout(map_root=None)
+        with self.assertRaisesRegex(RuntimeError, "item_to_sid_map"):
+            layout.write_path(bundle.MAP_ARTIFACT)
+        self.assertEqual(
+            layout.write_path(bundle.GROUPS_ARTIFACT), "./sid/sid_to_item_groups/v2"
+        )
+
+    def test_a_full_resolve_has_nothing_to_read(self) -> None:
+        layout = self._layout(from_partition=None)
+        with self.assertRaisesRegex(RuntimeError, "from_partition"):
+            layout.read_path(bundle.GROUPS_ARTIFACT)
+
+
 class BundleManifestTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
@@ -108,7 +182,7 @@ class BundleManifestTest(unittest.TestCase):
 
     def test_artifact_entry_records_an_odps_table_and_partition(self) -> None:
         entry = bundle.artifact_entry(
-            "odps://prj/tables/sid", bundle.MAP_ARTIFACT, "v2", "parquet", 9, {}
+            "odps://prj/tables/sid", bundle.MAP_ARTIFACT, "v2", "parquet", 9
         )
         self.assertEqual(entry.save_type, "odps")
         self.assertEqual(entry.table, "sid")
@@ -117,7 +191,7 @@ class BundleManifestTest(unittest.TestCase):
 
     def test_artifact_entry_records_a_file_path(self) -> None:
         entry = bundle.artifact_entry(
-            "./sid", bundle.GROUPS_ARTIFACT, "v2", "parquet", 4, {}
+            "./sid", bundle.GROUPS_ARTIFACT, "v2", "parquet", 4
         )
         self.assertEqual(entry.save_type, "parquet")
         self.assertEqual(entry.path, "./sid/sid_to_item_groups/v2")
@@ -134,7 +208,6 @@ class BundleManifestTest(unittest.TestCase):
         payload["artifacts"][bundle.MAP_ARTIFACT] = {
             "save_type": "odps",
             "rows": 9,
-            "schema": {"item_id": "int64"},
             "table": "prj.sid",
             "partition": "artifact=item_to_sid_map/generation=v2",
         }

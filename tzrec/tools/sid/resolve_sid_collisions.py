@@ -113,18 +113,13 @@ from tzrec.utils.sid.bundle import (
     DELTA_GROUPS_ARTIFACT,
     DELTA_MAP_ARTIFACT,
     GROUPS_ARTIFACT,
-    GROUPS_ARTIFACTS,
     MAP_ARTIFACT,
     MAP_ARTIFACTS,
     ArtifactEntry,
+    BundleLayout,
     BundleManifest,
-    artifact_entry,
-    artifact_location,
-    artifact_read_pattern,
     is_odps_path,
-    manifest_path,
-    read_manifest,
-    write_manifest,
+    resolve_layout,
 )
 from tzrec.utils.sid.collision import (
     CodebookItemGrouping,
@@ -149,19 +144,6 @@ from tzrec.utils.sid.collision import (
 _MAP_WRITE_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
-
-_MAP_SCHEMA = {
-    "item_id": "item id type of the input",
-    "origin_codebook": "list<int64>",
-    "codebook": "list<int64>",
-    "offset_codebook": "list<int64>",
-    "index": "int64",
-}
-_GROUPS_SCHEMA = {
-    "codebook": "list<int64>",
-    "offset_codebook": "list<int64>",
-    "itemids": "list<item id type of the input>",
-}
 
 
 def _is_list_column(values: pa.Array) -> bool:
@@ -316,20 +298,16 @@ class ResolveSidCollisionsConfig:
             odps_data_quota_name=args.odps_data_quota_name,
         )
 
-    def artifact_write_path(self, artifact: str) -> str:
-        """Return where one artifact of this run's partition is written."""
-        root = self.bundle_root if artifact in GROUPS_ARTIFACTS else self.output_path
-        assert root is not None and self.partition is not None
-        return artifact_location(root, artifact, self.partition)
-
-    def artifact_read_path(self, artifact: str) -> str:
-        """Return where one artifact of the appended-onto partition is read."""
-        root = self.bundle_root if artifact in GROUPS_ARTIFACTS else self.output_path
-        assert root is not None and self.from_partition is not None
-        suffix = "parquet"
-        if artifact in MAP_ARTIFACTS and self.reader_type == "CsvReader":
-            suffix = "csv"
-        return artifact_read_pattern(root, artifact, self.from_partition, suffix)
+    @cached_property
+    def layout(self) -> BundleLayout:
+        """Every artifact location this run reads and writes."""
+        return resolve_layout(
+            self.output_path,
+            self.bundle_root,
+            self.partition,
+            self.from_partition,
+            self.reader_type,
+        )
 
     @cached_property
     def resolution_config(self) -> CollisionResolutionConfig:
@@ -407,12 +385,12 @@ class CollisionResolutionRunner:
         wanted = [("--input_path", self._config.input_path)]
         if self._config.is_append:
             wanted += [
-                (GROUPS_ARTIFACT, self._config.artifact_read_path(GROUPS_ARTIFACT)),
-                ("manifest", self._prior_manifest_path()),
+                (GROUPS_ARTIFACT, self._config.layout.read_path(GROUPS_ARTIFACT)),
+                ("manifest", self._config.layout.prior_manifest_path()),
             ]
             if self._config.output_path is not None:
                 wanted.append(
-                    (MAP_ARTIFACT, self._config.artifact_read_path(MAP_ARTIFACT))
+                    (MAP_ARTIFACT, self._config.layout.read_path(MAP_ARTIFACT))
                 )
         missing = [
             f"{name} -> {path}"
@@ -427,24 +405,13 @@ class CollisionResolutionRunner:
                 "missing, because the readers cannot tell the two apart."
             )
 
-    def _prior_manifest_path(self) -> str:
-        """Return the manifest of the generation being appended onto."""
-        assert self._config.bundle_root is not None
-        assert self._config.from_partition is not None
-        return manifest_path(self._config.bundle_root, self._config.from_partition)
-
     def _write_manifest(self, result: CollisionResolutionResult) -> None:
         """Describe every artifact this run published, written last.
 
         Its presence is the completion marker, so nothing may be written after it.
         """
-        assert self._config.bundle_root is not None
-        assert self._config.partition is not None
-        prior = (
-            read_manifest(self._prior_manifest_path())
-            if self._config.is_append
-            else None
-        )
+        layout = self._config.layout
+        prior = layout.read_prior_manifest() if self._config.is_append else None
         observed = result.stats.max_final_bucket_size
         if prior is not None:
             observed = max(observed, prior.max_observed_items_per_sid)
@@ -461,24 +428,16 @@ class CollisionResolutionRunner:
             item_id_type=str(self._item_id_type) if self._item_id_type else None,
             artifacts=artifacts,
         )
-        path = manifest_path(self._config.bundle_root, self._config.partition)
-        write_manifest(path, manifest)
+        path = layout.write_manifest(manifest)
         logger.info("wrote bundle %s manifest to %s", self._bundle_uuid, path)
 
     def _artifact_entry(self, artifact: str, rows: int) -> ArtifactEntry:
         """Record where one artifact landed and what it holds."""
-        is_map = artifact in MAP_ARTIFACTS
-        root = self._config.output_path if is_map else self._config.bundle_root
-        assert root is not None and self._config.partition is not None
-        is_csv_map = is_map and self._default_writer_type == "CsvWriter"
-        save_type = "csv" if is_csv_map else "parquet"
-        return artifact_entry(
-            root,
-            artifact,
-            self._config.partition,
-            save_type,
-            rows,
-            _MAP_SCHEMA if is_map else _GROUPS_SCHEMA,
+        is_csv_map = (
+            artifact in MAP_ARTIFACTS and self._default_writer_type == "CsvWriter"
+        )
+        return self._config.layout.entry(
+            artifact, "csv" if is_csv_map else "parquet", rows
         )
 
     def _make_reader(
@@ -707,7 +666,7 @@ class CollisionResolutionRunner:
             return PriorOccupancy.empty()
 
         layer_sizes = self._config.layer_sizes
-        groups_path = self._config.artifact_read_path(GROUPS_ARTIFACT)
+        groups_path = self._config.layout.read_path(GROUPS_ARTIFACT)
         prior, published_items = self._load_prior_occupancy(
             groups_path, sid_band_ids(codes, layer_sizes), item_ids
         )
@@ -828,7 +787,7 @@ class CollisionResolutionRunner:
         """Reject a published map whose size disagrees with the groups."""
         if self._config.output_path is None:
             return
-        path = self._config.artifact_read_path(MAP_ARTIFACT)
+        path = self._config.layout.read_path(MAP_ARTIFACT)
         map_rows = 0
         for batch in self._iter_state_batches(
             path, ["index"], "Counting published SID map"
@@ -930,7 +889,7 @@ class CollisionResolutionRunner:
         """Copy every published map row into the merged output unchanged."""
         if not self._config.is_append:
             return 0
-        path = self._config.artifact_read_path(MAP_ARTIFACT)
+        path = self._config.layout.read_path(MAP_ARTIFACT)
         is_csv = isinstance(writer, CsvWriter)
         fields = ["item_id", "origin_codebook", "codebook", "index"]
         written = 0
@@ -967,7 +926,7 @@ class CollisionResolutionRunner:
         run's rows are appended, so the artifact stands alone and is exactly
         what the next append consumes.
         """
-        output_path = self._config.artifact_write_path(MAP_ARTIFACT)
+        output_path = self._config.layout.write_path(MAP_ARTIFACT)
         with closing(self._make_writer(output_path)) as writer:
             progress = ProgressLogger("Writing resolved item map", start_n=0)
             written = self._stream_existing_map_rows(writer)
@@ -978,7 +937,7 @@ class CollisionResolutionRunner:
 
         if not self._config.is_append:
             return
-        delta_path = self._config.artifact_write_path(DELTA_MAP_ARTIFACT)
+        delta_path = self._config.layout.write_path(DELTA_MAP_ARTIFACT)
         self._written_rows[DELTA_MAP_ARTIFACT] = item_ids.shape[0]
         with closing(self._make_writer(delta_path)) as writer:
             self._write_new_map_rows(
@@ -1005,7 +964,7 @@ class CollisionResolutionRunner:
             plan: Original SID aggregation and overflow plan.
             result: Completed collision-resolution result.
         """
-        resolved_path = self._config.artifact_write_path(GROUPS_ARTIFACT)
+        resolved_path = self._config.layout.write_path(GROUPS_ARTIFACT)
         if plan.overflow_rows.size:
             grouping = build_resolved_item_grouping(plan, result)
             resolved_last_codes = result.resolved_last_codes
@@ -1015,7 +974,7 @@ class CollisionResolutionRunner:
         if self._config.is_append:
             self._write_merged_sid_groups(
                 resolved_path,
-                self._config.artifact_read_path(GROUPS_ARTIFACT),
+                self._config.layout.read_path(GROUPS_ARTIFACT),
                 item_ids,
                 origin_codes,
                 grouping,
@@ -1104,7 +1063,7 @@ class CollisionResolutionRunner:
             delta_writer = stack.enter_context(
                 closing(
                     self._make_group_writer(
-                        self._config.artifact_write_path(DELTA_GROUPS_ARTIFACT)
+                        self._config.layout.write_path(DELTA_GROUPS_ARTIFACT)
                     )
                 )
             )

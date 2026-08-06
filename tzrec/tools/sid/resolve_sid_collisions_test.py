@@ -229,7 +229,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                     bundle.GROUPS_ARTIFACT: bundle.ArtifactEntry(
                         save_type="parquet",
                         rows=len(group_rows),
-                        schema={},
                         path=self._groups_dir(out, partition),
                     )
                 },
