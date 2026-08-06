@@ -51,40 +51,44 @@ Example::
         --codebook 256,256,256 --max_items_per_codebook 5 \
         --strategy candidate \
         --output_path sid_collision/map \
-        --resolved_sid_groups_output_path sid_collision/resolved_groups
+        --bundle_root sid_collision/bundle \
+        --partition v1
 
-To also write the optional original-SID audit grouping, add
-``--original_sid_groups_output_path sid_collision/original_groups``.
+Artifacts land at ``<root>/<artifact>/<partition>``: the item map under
+``--output_path``, the SID groups and the manifest under ``--bundle_root``. The
+manifest is written last, so its presence marks the generation complete.
 
 Append mode
 -----------
 
-Supplying ``--existing_sid_groups_path`` switches the tool to appending new
-items onto an already-published corpus: ``--input_path`` then holds only the
-new items, and **no published SID is ever moved**. Published items are never
-rows in the plan, so they cannot be re-ranked; they are read only to be copied
-into the merged outputs. A new item continues its bucket's slot numbering from
-the published occupancy instead of restarting at one::
+Supplying ``--from_partition`` switches the tool to appending new items onto an
+already-published generation: ``--input_path`` then holds only the new items,
+and **no published SID is ever moved**. Published items are never rows in the
+plan, so they cannot be re-ranked; they are read only to be copied into the
+merged outputs. A new item continues its bucket's slot numbering from the
+published occupancy instead of restarting at one::
 
     python -m tzrec.tools.sid.resolve_sid_collisions \
         --input_path 'sid_predict_new_20260731/*.parquet' \
-        --existing_sid_map_path    'sid_collision/map/*.parquet' \
-        --existing_sid_groups_path 'sid_collision/resolved_groups/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
         --strategy candidate \
-        --output_path sid_collision/map_20260731 \
-        --resolved_sid_groups_output_path sid_collision/resolved_groups_20260731 \
-        --delta_map_output_path sid_collision/delta_20260731
+        --output_path sid_collision/map \
+        --bundle_root sid_collision/bundle \
+        --partition v2 --from_partition v1
 
-Both outputs stay corpus-complete, so generation *n*'s outputs are exactly
-generation *n+1*'s ``--existing_*`` inputs; writers truncate, so each
-generation needs a fresh output directory.
+An append also writes ``delta_item_to_sid_map`` and
+``delta_sid_to_item_groups``, holding this run's rows and every bucket it
+touched. Both corpus outputs stay complete, so generation *n* is exactly what
+generation *n+1* reads at ``--from_partition``.
+
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import os
+import uuid
 from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from functools import cached_property
@@ -105,6 +109,22 @@ from tzrec.datasets.dataset import (
 )
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.path_util import check_path_conflict
+from tzrec.utils.sid.bundle import (
+    DELTA_GROUPS_ARTIFACT,
+    DELTA_MAP_ARTIFACT,
+    GROUPS_ARTIFACT,
+    GROUPS_ARTIFACTS,
+    MAP_ARTIFACT,
+    MAP_ARTIFACTS,
+    ArtifactEntry,
+    BundleManifest,
+    artifact_location,
+    artifact_read_pattern,
+    is_odps_path,
+    manifest_path,
+    read_manifest,
+    write_manifest,
+)
 from tzrec.utils.sid.collision import (
     CodebookItemGrouping,
     CollisionPlan,
@@ -128,6 +148,19 @@ from tzrec.utils.sid.collision import (
 _MAP_WRITE_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
+
+_MAP_SCHEMA = {
+    "item_id": "item id type of the input",
+    "origin_codebook": "list<int64>",
+    "codebook": "list<int64>",
+    "offset_codebook": "list<int64>",
+    "index": "int64",
+}
+_GROUPS_SCHEMA = {
+    "codebook": "list<int64>",
+    "offset_codebook": "list<int64>",
+    "itemids": "list<item id type of the input>",
+}
 
 
 def _is_list_column(values: pa.Array) -> bool:
@@ -192,8 +225,8 @@ class ResolveSidCollisionsConfig:
 
     input_path: str
     output_path: Optional[str]
-    original_sid_groups_output_path: Optional[str]
-    resolved_sid_groups_output_path: Optional[str]
+    bundle_root: Optional[str]
+    partition: Optional[str]
     reader_type: Optional[str]
     writer_type: Optional[str]
     batch_size: int
@@ -207,10 +240,8 @@ class ResolveSidCollisionsConfig:
     random_num_candidates: int
     rate_only: bool
     odps_data_quota_name: str
-    existing_sid_map_path: Optional[str] = None
-    existing_sid_groups_path: Optional[str] = None
-    delta_map_output_path: Optional[str] = None
-    delta_sid_groups_output_path: Optional[str] = None
+    from_partition: Optional[str] = None
+    source_model: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -225,32 +256,22 @@ class ResolveSidCollisionsConfig:
             )
         if self.strategy not in {"candidate", "random"}:
             raise ValueError(f"unsupported strategy: {self.strategy!r}.")
-        if not self.rate_only and not self.output_path:
-            raise ValueError("output_path is required unless rate_only is set.")
-        if not self.rate_only and not self.resolved_sid_groups_output_path:
+        for name in ("output_path", "bundle_root", "partition"):
+            if not self.rate_only and not getattr(self, name):
+                raise ValueError(f"{name} is required unless rate_only is set.")
+        if self.bundle_root and is_odps_path(self.bundle_root):
             raise ValueError(
-                "resolved_sid_groups_output_path is required unless rate_only is set."
+                "bundle_root holds the SID groups and the manifest, which are "
+                f"always files; got {self.bundle_root!r}."
             )
-        if self.is_append and not self.rate_only and not self.existing_sid_map_path:
+        if self.from_partition is not None and self.from_partition == self.partition:
             raise ValueError(
-                "existing_sid_map_path is required in append mode unless rate_only "
-                "is set; without it the merged map would hold only the new items."
+                f"from_partition and partition are both {self.partition!r}; writing "
+                "over the artifacts being read destroys them mid-run."
             )
 
-        candidates = [
-            self.output_path,
-            self.resolved_sid_groups_output_path,
-            self.original_sid_groups_output_path,
-        ]
-        if self.is_append:
-            candidates += [
-                self.existing_sid_map_path,
-                self.existing_sid_groups_path,
-                self.delta_map_output_path,
-                self.delta_sid_groups_output_path,
-            ]
         paths = [self.input_path]
-        paths.extend(path for path in candidates if path)
+        paths.extend(path for path in (self.output_path, self.bundle_root) if path)
         has_conflict, conflict_message = check_path_conflict(paths)
         if has_conflict:
             raise ValueError(conflict_message)
@@ -261,12 +282,8 @@ class ResolveSidCollisionsConfig:
 
     @property
     def is_append(self) -> bool:
-        """Whether this run appends onto an already-published corpus.
-
-        The previous round's resolved groups is the occupancy authority and is
-        required by every append, so its presence selects the mode.
-        """
-        return self.existing_sid_groups_path is not None
+        """Whether this run appends onto an already-published generation."""
+        return self.from_partition is not None
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "ResolveSidCollisionsConfig":
@@ -281,12 +298,10 @@ class ResolveSidCollisionsConfig:
         return cls(
             input_path=args.input_path,
             output_path=args.output_path,
-            original_sid_groups_output_path=args.original_sid_groups_output_path,
-            resolved_sid_groups_output_path=args.resolved_sid_groups_output_path,
-            existing_sid_map_path=args.existing_sid_map_path,
-            existing_sid_groups_path=args.existing_sid_groups_path,
-            delta_map_output_path=args.delta_map_output_path,
-            delta_sid_groups_output_path=args.delta_sid_groups_output_path,
+            bundle_root=args.bundle_root,
+            partition=args.partition,
+            from_partition=args.from_partition,
+            source_model=args.source_model,
             reader_type=args.reader_type,
             writer_type=args.writer_type,
             batch_size=args.batch_size,
@@ -301,6 +316,21 @@ class ResolveSidCollisionsConfig:
             rate_only=args.rate_only,
             odps_data_quota_name=args.odps_data_quota_name,
         )
+
+    def artifact_write_path(self, artifact: str) -> str:
+        """Return where one artifact of this run's partition is written."""
+        root = self.bundle_root if artifact in GROUPS_ARTIFACTS else self.output_path
+        assert root is not None and self.partition is not None
+        return artifact_location(root, artifact, self.partition)
+
+    def artifact_read_path(self, artifact: str) -> str:
+        """Return where one artifact of the appended-onto partition is read."""
+        root = self.bundle_root if artifact in GROUPS_ARTIFACTS else self.output_path
+        assert root is not None and self.from_partition is not None
+        suffix = "parquet"
+        if artifact in MAP_ARTIFACTS and self.reader_type == "CsvReader":
+            suffix = "csv"
+        return artifact_read_pattern(root, artifact, self.from_partition, suffix)
 
     @cached_property
     def resolution_config(self) -> CollisionResolutionConfig:
@@ -331,10 +361,13 @@ class CollisionResolutionRunner:
             )
         self._default_writer_type: Optional[str] = None
         self._item_id_type: Optional[pa.DataType] = None
+        self._bundle_uuid = uuid.uuid4().hex
+        self._written_rows: Dict[str, int] = {}
 
     def run(self) -> CollisionResolutionStats:
         """Read, resolve collisions, and write the resulting SID map."""
         _require_single_process()
+        self._check_input_locations()
         item_ids, codes = self._load_codes()
         if codes.shape[1] != len(self._config.layer_sizes):
             raise ValueError(
@@ -365,9 +398,92 @@ class CollisionResolutionRunner:
             self._write_group_outputs(item_ids, codes, plan, result)
             del plan
             self._write_map(item_ids, codes, result)
+            self._write_manifest(result)
 
         logger.info("SID collision resolution finished: %s", result.stats)
         return result.stats
+
+    def _check_input_locations(self) -> None:
+        """Reject a run whose inputs are not all present, before any pass runs."""
+        wanted = [("--input_path", self._config.input_path)]
+        if self._config.is_append:
+            wanted += [
+                (GROUPS_ARTIFACT, self._config.artifact_read_path(GROUPS_ARTIFACT)),
+                ("manifest", self._prior_manifest_path()),
+            ]
+            if self._config.output_path is not None:
+                wanted.append(
+                    (MAP_ARTIFACT, self._config.artifact_read_path(MAP_ARTIFACT))
+                )
+        missing = [
+            f"{name} -> {path}"
+            for name, path in wanted
+            if not is_odps_path(path) and not glob.glob(path)
+        ]
+        if missing:
+            raise ValueError(
+                "these input locations hold no files:\n  "
+                + "\n  ".join(missing)
+                + "\nA directory that exists but holds no part files counts as "
+                "missing, because the readers cannot tell the two apart."
+            )
+
+    def _prior_manifest_path(self) -> str:
+        """Return the manifest of the generation being appended onto."""
+        assert self._config.bundle_root is not None
+        assert self._config.from_partition is not None
+        return manifest_path(self._config.bundle_root, self._config.from_partition)
+
+    def _write_manifest(self, result: CollisionResolutionResult) -> None:
+        """Describe every artifact this run published, written last.
+
+        Its presence is the completion marker, so nothing may be written after it.
+        """
+        assert self._config.bundle_root is not None
+        assert self._config.partition is not None
+        prior = (
+            read_manifest(self._prior_manifest_path())
+            if self._config.is_append
+            else None
+        )
+        observed = result.stats.max_final_bucket_size
+        if prior is not None:
+            observed = max(observed, prior.max_observed_items_per_sid)
+        artifacts = {
+            name: self._artifact_entry(name, rows)
+            for name, rows in self._written_rows.items()
+        }
+        manifest = BundleManifest(
+            bundle_uuid=self._bundle_uuid,
+            since_bundle_uuid=prior.bundle_uuid if prior is not None else None,
+            codebook=list(self._config.layer_sizes),
+            capacity=self._config.max_items_per_codebook,
+            max_observed_items_per_sid=observed,
+            source_model=self._config.source_model,
+            item_id_type=str(self._item_id_type) if self._item_id_type else None,
+            artifacts=artifacts,
+        )
+        path = manifest_path(self._config.bundle_root, self._config.partition)
+        write_manifest(path, manifest)
+        logger.info("wrote bundle %s manifest to %s", self._bundle_uuid, path)
+
+    def _artifact_entry(self, artifact: str, rows: int) -> ArtifactEntry:
+        """Record where one artifact landed and what it holds."""
+        location = self._config.artifact_write_path(artifact)
+        schema = _MAP_SCHEMA if artifact in MAP_ARTIFACTS else _GROUPS_SCHEMA
+        if artifact in MAP_ARTIFACTS and is_odps_path(location):
+            table, _, partition = location.rpartition("/tables/")[2].partition("/")
+            return ArtifactEntry(
+                type="odps",
+                rows=rows,
+                schema=schema,
+                table=table,
+                partition=partition,
+            )
+        kind = "parquet"
+        if artifact in MAP_ARTIFACTS and self._default_writer_type == "CsvWriter":
+            kind = "csv"
+        return ArtifactEntry(type=kind, rows=rows, schema=schema, path=location)
 
     def _make_reader(
         self, selected_cols: List[str], input_path: Optional[str] = None
@@ -595,20 +711,18 @@ class CollisionResolutionRunner:
             return PriorOccupancy.empty()
 
         layer_sizes = self._config.layer_sizes
-        groups_path = self._config.existing_sid_groups_path
-        assert groups_path is not None
+        groups_path = self._config.artifact_read_path(GROUPS_ARTIFACT)
         prior, published_items = self._load_prior_occupancy(
             groups_path, sid_band_ids(codes, layer_sizes), item_ids
         )
         self._check_existing_map_size(published_items)
         logger.info(
             "append mode: %d new items onto %d published items in %d touched "
-            "buckets (groups=%s, map=%s)",
+            "buckets, from partition %s",
             item_ids.shape[0],
             published_items,
             prior.bucket_keys.shape[0],
-            self._config.existing_sid_groups_path,
-            self._config.existing_sid_map_path,
+            self._config.from_partition,
         )
         return prior
 
@@ -716,9 +830,9 @@ class CollisionResolutionRunner:
 
     def _check_existing_map_size(self, published_items: int) -> None:
         """Reject a published map whose size disagrees with the groups."""
-        path = self._config.existing_sid_map_path
-        if path is None:
+        if self._config.output_path is None:
             return
+        path = self._config.artifact_read_path(MAP_ARTIFACT)
         map_rows = 0
         for batch in self._iter_state_batches(
             path, ["index"], "Counting published SID map"
@@ -743,6 +857,10 @@ class CollisionResolutionRunner:
             quota_name=self._config.odps_data_quota_name,
             world_size=1,
         )
+
+    def _make_group_writer(self, output_path: str) -> BaseWriter:
+        """Create the writer for a serving-set artifact, which is always parquet."""
+        return create_writer(output_path, writer_type="ParquetWriter", world_size=1)
 
     def _item_id_array(self, values: np.ndarray) -> pa.Array:
         """Encode item IDs with the input Arrow type preserved."""
@@ -832,9 +950,9 @@ class CollisionResolutionRunner:
 
     def _stream_existing_map_rows(self, writer: BaseWriter) -> int:
         """Copy every published map row into the merged output unchanged."""
-        path = self._config.existing_sid_map_path
-        if path is None or not self._config.is_append:
+        if not self._config.is_append:
             return 0
+        path = self._config.artifact_read_path(MAP_ARTIFACT)
         is_csv = isinstance(writer, CsvWriter)
         fields = ["item_id", "origin_codebook", "codebook", "index"]
         written = 0
@@ -871,19 +989,19 @@ class CollisionResolutionRunner:
         run's rows are appended, so the artifact stands alone and is exactly
         what the next append consumes.
         """
-        output_path = self._config.output_path
-        if output_path is None:
-            raise RuntimeError("map output path was not validated.")
+        output_path = self._config.artifact_write_path(MAP_ARTIFACT)
         with closing(self._make_writer(output_path)) as writer:
             progress = ProgressLogger("Writing resolved item map", start_n=0)
             written = self._stream_existing_map_rows(writer)
             self._write_new_map_rows(
                 writer, item_ids, origin_codes, result, progress, written
             )
+            self._written_rows[MAP_ARTIFACT] = written + item_ids.shape[0]
 
-        delta_path = self._config.delta_map_output_path
-        if delta_path is None or not self._config.is_append:
+        if not self._config.is_append:
             return
+        delta_path = self._config.artifact_write_path(DELTA_MAP_ARTIFACT)
+        self._written_rows[DELTA_MAP_ARTIFACT] = item_ids.shape[0]
         with closing(self._make_writer(delta_path)) as writer:
             self._write_new_map_rows(
                 writer,
@@ -909,36 +1027,17 @@ class CollisionResolutionRunner:
             plan: Original SID aggregation and overflow plan.
             result: Completed collision-resolution result.
         """
-        original_path = self._config.original_sid_groups_output_path
-        resolved_path = self._config.resolved_sid_groups_output_path
-        if resolved_path is None:
-            raise RuntimeError("resolved SID group output path was not validated.")
-
-        original_grouping: Optional[CodebookItemGrouping] = None
-        if original_path is not None:
-            original_grouping = build_original_item_grouping(plan)
-            self._write_sid_groups(
-                original_path,
-                item_ids,
-                origin_codes,
-                original_grouping,
-                resolved_last_codes=None,
-                progress_description="Writing original SID item groups",
-            )
-
+        resolved_path = self._config.artifact_write_path(GROUPS_ARTIFACT)
         if plan.overflow_rows.size:
-            del original_grouping
             grouping = build_resolved_item_grouping(plan, result)
             resolved_last_codes = result.resolved_last_codes
         else:
-            grouping = original_grouping or build_original_item_grouping(plan)
+            grouping = build_original_item_grouping(plan)
             resolved_last_codes = None
         if self._config.is_append:
-            existing_path = self._config.existing_sid_groups_path
-            assert existing_path is not None
             self._write_merged_sid_groups(
                 resolved_path,
-                existing_path,
+                self._config.artifact_read_path(GROUPS_ARTIFACT),
                 item_ids,
                 origin_codes,
                 grouping,
@@ -1021,29 +1120,34 @@ class CollisionResolutionRunner:
         group_count = groups.keys.shape[0]
 
         with ExitStack() as stack:
-            writer = stack.enter_context(closing(self._make_writer(resolved_path)))
+            writer = stack.enter_context(
+                closing(self._make_group_writer(resolved_path))
+            )
             is_csv = isinstance(writer, CsvWriter)
             delta_writer: Optional[BaseWriter] = None
-            if self._config.delta_sid_groups_output_path is not None:
-                delta_writer = stack.enter_context(
-                    closing(
-                        self._make_writer(self._config.delta_sid_groups_output_path)
+            delta_writer = stack.enter_context(
+                closing(
+                    self._make_group_writer(
+                        self._config.artifact_write_path(DELTA_GROUPS_ARTIFACT)
                     )
                 )
+            )
 
             def emit(
                 codes: np.ndarray,
                 offsets: np.ndarray,
                 values: pa.Array,
-                delta_rows: Optional[np.ndarray],
+                rows: Optional[np.ndarray],
             ) -> None:
                 """Write one chunk to the corpus output and the delta output."""
+                nonlocal corpus_rows, delta_rows
                 self._emit_group_rows(writer, codes, offsets, values)
-                if delta_writer is not None:
-                    self._emit_group_rows(
-                        delta_writer, codes, offsets, values, delta_rows
-                    )
+                corpus_rows += codes.shape[0]
+                delta_rows += codes.shape[0] if rows is None else int(rows.shape[0])
+                self._emit_group_rows(delta_writer, codes, offsets, values, rows)
 
+            corpus_rows = 0
+            delta_rows = 0
             max_rows = _max_code_rows(is_csv, groups.codes.shape[1], group_count)
 
             def emit_new_only(low: int, high: int) -> None:
@@ -1090,6 +1194,8 @@ class CollisionResolutionRunner:
                 )
                 cursor = high
             emit_new_only(cursor, group_count)
+        self._written_rows[GROUPS_ARTIFACT] = corpus_rows
+        self._written_rows[DELTA_GROUPS_ARTIFACT] = delta_rows
 
     def _write_sid_groups(
         self,
@@ -1119,8 +1225,8 @@ class CollisionResolutionRunner:
             raise ValueError("one SID group exceeds Arrow list offset capacity.")
 
         offsets = grouping.offsets
-        with closing(self._make_writer(output_path)) as writer:
-            is_csv = isinstance(writer, CsvWriter)
+        with closing(self._make_group_writer(output_path)) as writer:
+            is_csv = False
             progress = ProgressLogger(progress_description, start_n=0)
             last_progress_count = 0
             max_codebook_rows = _max_code_rows(
@@ -1149,6 +1255,7 @@ class CollisionResolutionRunner:
                         suffix=f"{child_end} samples processed",
                     )
                     last_progress_count = child_end
+        self._written_rows[GROUPS_ARTIFACT] = group_count
 
 
 def _max_code_rows(is_csv: bool, layer_count: int, row_cap: int) -> int:
@@ -1259,50 +1366,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output_path",
         default=None,
-        help="Resolved item map output; required unless --rate_only is set.",
-    )
-    parser.add_argument(
-        "--original_sid_groups_output_path",
-        default=None,
-        help=("Optional audit output grouping item IDs by their original SID."),
-    )
-    parser.add_argument(
-        "--resolved_sid_groups_output_path",
-        default=None,
         help=(
-            "Output grouped item IDs keyed by their resolved SID; required "
+            "Root of the item-map family. May be an odps:// table or a file/OSS "
+            "path; artifacts land at <root>/<artifact>/<partition>. Required "
             "unless --rate_only is set."
         ),
     )
     parser.add_argument(
-        "--existing_sid_groups_path",
+        "--bundle_root",
         default=None,
         help=(
-            "Previous round's --resolved_sid_groups_output_path. Supplying it "
-            "selects append mode: the new items in --input_path are placed "
-            "without moving any already-published SID."
+            "Root of the serving set -- SID groups and the manifest. Always a "
+            "file or OSS path. Required unless --rate_only is set."
         ),
     )
     parser.add_argument(
-        "--existing_sid_map_path",
+        "--partition",
+        default=None,
+        help="Generation being written, e.g. 'v2'. Required unless --rate_only.",
+    )
+    parser.add_argument(
+        "--from_partition",
         default=None,
         help=(
-            "Previous round's --output_path. Required in append mode unless "
-            "--rate_only, because only the map carries origin_codebook."
+            "Generation to append onto. Supplying it selects append mode: the new "
+            "items in --input_path are placed without moving any published SID."
         ),
     )
     parser.add_argument(
-        "--delta_map_output_path",
+        "--source_model",
         default=None,
-        help="Append mode only: map rows for the new items alone.",
-    )
-    parser.add_argument(
-        "--delta_sid_groups_output_path",
-        default=None,
-        help=(
-            "Append mode only: buckets this run changed, each with its complete "
-            "post-append item list, for an idempotent index upsert."
-        ),
+        help="Optional manifest field naming the quantizer that produced the SIDs.",
     )
     parser.add_argument(
         "--reader_type",

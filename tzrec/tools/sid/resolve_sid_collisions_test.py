@@ -25,6 +25,7 @@ from tzrec.tools.sid.resolve_sid_collisions import (
     CollisionResolutionRunner,
     ResolveSidCollisionsConfig,
 )
+from tzrec.utils.sid import bundle
 from tzrec.utils.sid.collision import stable_order_hash
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
@@ -138,15 +139,12 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
-    def _runner(self, inp, out, include_original=False, **kw):
-        original_groups, resolved_groups = self._group_paths(out)
+    def _runner(self, inp, out, **kw):
         config = dict(
             input_path=inp,
             output_path=out,
-            original_sid_groups_output_path=(
-                original_groups if include_original else None
-            ),
-            resolved_sid_groups_output_path=resolved_groups,
+            bundle_root=self._bundle_root(out),
+            partition="v1",
             reader_type=None,
             writer_type=None,
             batch_size=100000,
@@ -168,15 +166,36 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         return self._runner(inp, out, **kw).run()
 
     @staticmethod
-    def _group_paths(out):
-        return f"{out}_original_groups", f"{out}_resolved_groups"
+    def _bundle_root(out):
+        """The serving-set root this suite pairs with a given map root."""
+        return f"{out}_bundle"
+
+    def _map_dir(self, out, partition="v1"):
+        """Where the item map for one generation lands."""
+        return os.path.join(out, bundle.MAP_ARTIFACT, partition)
+
+    def _delta_map_dir(self, out, partition="v1"):
+        return os.path.join(out, bundle.DELTA_MAP_ARTIFACT, partition)
+
+    def _groups_dir(self, out, partition="v1"):
+        return os.path.join(self._bundle_root(out), bundle.GROUPS_ARTIFACT, partition)
+
+    def _delta_groups_dir(self, out, partition="v1"):
+        return os.path.join(
+            self._bundle_root(out), bundle.DELTA_GROUPS_ARTIFACT, partition
+        )
+
+    def _manifest(self, out, partition="v1"):
+        return bundle.read_manifest(
+            bundle.manifest_path(self._bundle_root(out), partition)
+        )
 
     def _read_parquet(self, out_dir):
         return parquet.read_table(os.path.join(out_dir, _PART_FILE)).to_pydict()
 
-    def _assert_map_matches_resolved_groups(self, out):
-        item_map = self._read_parquet(out)
-        _, resolved_path = self._group_paths(out)
+    def _assert_map_matches_resolved_groups(self, out, partition="v1"):
+        item_map = self._read_parquet(self._map_dir(out, partition))
+        resolved_path = self._groups_dir(out, partition)
         resolved = self._read_parquet(resolved_path)
         resolved_items = {
             tuple(codebook): item_group
@@ -191,9 +210,9 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         ):
             self.assertEqual(resolved_items[tuple(codebook)][index - 1], item_id)
 
-    def _map_rows(self, out):
+    def _map_rows(self, map_dir):
         """Return {item_id: (origin_codebook, codebook, index)} for a map."""
-        item_map = self._read_parquet(out)
+        item_map = self._read_parquet(map_dir)
         return {
             item_id: (tuple(origin), tuple(codebook), index)
             for item_id, origin, codebook, index in zip(
@@ -204,26 +223,44 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             )
         }
 
-    def _append_paths(self, previous_out):
-        """Return the two state reader paths for the previous generation."""
-        _, previous_groups = self._group_paths(previous_out)
-        return {
-            "existing_sid_map_path": os.path.join(previous_out, "*.parquet"),
-            "existing_sid_groups_path": os.path.join(previous_groups, "*.parquet"),
-        }
+    def _append(self, inp, out, previous="v1", partition="v2", **kw):
+        """Append onto a published generation under the same pair of roots."""
+        return self._run(inp, out, partition=partition, from_partition=previous, **kw)
 
-    def _append(self, inp, out, previous_out, **kw):
-        return self._run(inp, out, **self._append_paths(previous_out), **kw)
+    def _seed_state(self, out, map_rows, group_rows, partition="v1", csv=False):
+        """Publish a hand-built generation at the locations the tool derives."""
+        write_map = _map_csv if csv else _map_parquet
+        write_groups = _groups_parquet
+        write_map(self._map_dir(out, partition), map_rows)
+        write_groups(self._groups_dir(out, partition), group_rows)
+        bundle.write_manifest(
+            bundle.manifest_path(self._bundle_root(out), partition),
+            bundle.BundleManifest(
+                bundle_uuid=f"uuid-{partition}",
+                codebook=[8, 8],
+                capacity=2,
+                max_observed_items_per_sid=len(map_rows),
+                artifacts={
+                    bundle.GROUPS_ARTIFACT: bundle.ArtifactEntry(
+                        type="parquet",
+                        rows=len(group_rows),
+                        schema={},
+                        path=self._groups_dir(out, partition),
+                    )
+                },
+            ),
+        )
+        return out
 
     def _prepare_single(self, item_id):
         path = os.path.join(self.test_dir, f"single_{item_id}.parquet")
         _parquet(path, [item_id], [[0, 0]], [[[0, 2]]])
         return path
 
-    def _assert_dense_indices(self, out):
+    def _assert_dense_indices(self, map_dir):
         """Every bucket's index multiset must be exactly 1..count."""
         by_bucket = {}
-        for _item, (_origin, codebook, index) in self._map_rows(out).items():
+        for _item, (_origin, codebook, index) in self._map_rows(map_dir).items():
             by_bucket.setdefault(codebook, []).append(index)
         for codebook, indices in by_bucket.items():
             self.assertEqual(
@@ -244,7 +281,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(stats.relocated_count, 3)
         self.assertEqual(stats.unresolved_count, 0)
         self.assertEqual(stats.max_final_bucket_size, 2)
-        d = self._read_parquet(out)
+        d = self._read_parquet(self._map_dir(out))
         # every final SID keeps prefix 0 (stays in band) ...
         self.assertTrue(all(cb[0] == 0 for cb in d["codebook"]))
         # ... and no bucket exceeds the cap.
@@ -267,7 +304,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(stats.relocated_count, 1)
         self.assertEqual(stats.unresolved_count, 0)
         self.assertEqual(stats.max_final_bucket_size, 2)
-        d = self._read_parquet(out)
+        d = self._read_parquet(self._map_dir(out))
         # The relocated item took the first free candidate last code (1); every
         # SID keeps its (0, 0) band prefix.
         self.assertEqual(
@@ -283,7 +320,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         stats = self._run(inp, out, max_items_per_codebook=2)
         self.assertEqual(stats.relocated_count, 0)
         self.assertEqual(stats.unresolved_count, 3)
-        d = self._read_parquet(out)
+        d = self._read_parquet(self._map_dir(out))
         self.assertEqual(len(d["item_id"]), 5)  # every item preserved
         self.assertTrue(all(tuple(cb) == (0, 0) for cb in d["codebook"]))
         self._assert_map_matches_resolved_groups(out)
@@ -351,7 +388,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             expected_projections,
         )
         self.assertEqual(stats.relocated_count, expected_relocated)
-        self.assertEqual(len(self._read_parquet(out)["item_id"]), 3)
+        self.assertEqual(len(self._read_parquet(self._map_dir(out))["item_id"]), 3)
 
     def test_raises_when_overflow_but_no_candidates(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -376,7 +413,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         candidates = [[[0, code]] for code in [1, 2, 5, 3, 6]]
         _parquet(inp, list(range(5)), [[0, 0]] * 5, candidates)
         self._run(inp, out, batch_size=2, max_items_per_codebook=2)
-        result = self._read_parquet(out)
+        result = self._read_parquet(self._map_dir(out))
         by_id = dict(zip(result["item_id"], result["codebook"]))
         self.assertEqual(by_id[0], [0, 1])
         self.assertEqual(by_id[1], [0, 2])
@@ -394,28 +431,17 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         candidates[8] = [[1, 0], [1, 1], [1, 2]]
         _parquet(inp, item_ids, codes, candidates)
 
-        self._run(inp, out, include_original=True, max_items_per_codebook=2)
+        self._run(inp, out, max_items_per_codebook=2)
 
-        original_path, resolved_path = self._group_paths(out)
-        original = parquet.read_table(os.path.join(original_path, "part-0.parquet"))
+        resolved_path = self._groups_dir(out)
         resolved = parquet.read_table(os.path.join(resolved_path, "part-0.parquet"))
-        self.assertEqual(
-            original.column_names, ["codebook", "offset_codebook", "itemids"]
-        )
         self.assertEqual(
             resolved.column_names, ["codebook", "offset_codebook", "itemids"]
         )
-        original_groups = original.to_pydict()
         self.assertCountEqual(
-            [item_id for group in original_groups["itemids"] for item_id in group],
+            [item_id for group in resolved.to_pydict()["itemids"] for item_id in group],
             item_ids,
         )
-        original_code_by_item = dict(zip(item_ids, codes))
-        for codebook, item_group in zip(
-            original_groups["codebook"], original_groups["itemids"]
-        ):
-            for item_id in item_group:
-                self.assertEqual(codebook, original_code_by_item[item_id])
         self._assert_map_matches_resolved_groups(out)
 
     def test_no_overflow_reuses_groups_with_gapped_prefixes(self) -> None:
@@ -430,20 +456,15 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self._run(
             inp,
             out,
-            include_original=True,
             layer_sizes=(16, 16),
             max_items_per_codebook=2,
         )
 
-        original_path, resolved_path = self._group_paths(out)
-        original = parquet.read_table(
-            os.path.join(original_path, "part-0.parquet")
-        ).to_pydict()
+        resolved_path = self._groups_dir(out)
         resolved = parquet.read_table(
             os.path.join(resolved_path, "part-0.parquet")
         ).to_pydict()
-        self.assertEqual(original, resolved)
-        self.assertEqual(original["codebook"], [[7, 2], [7, 10], [12, 1]])
+        self.assertEqual(resolved["codebook"], [[7, 2], [7, 10], [12, 1]])
 
     # ---- random strategy ----
 
@@ -458,7 +479,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             strategy="random",
         )
         self.assertEqual(stats.relocated_count, 3)
-        d = self._read_parquet(out)
+        d = self._read_parquet(self._map_dir(out))
         self.assertTrue(all(cb[0] == 0 for cb in d["codebook"]))
         self.assertLessEqual(max(Counter(map(tuple, d["codebook"])).values()), 2)
         self._assert_map_matches_resolved_groups(out)
@@ -475,7 +496,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             layer_sizes=(16,),
         )
         self.assertEqual(stats.relocated_count, 3)
-        d = self._read_parquet(out)
+        d = self._read_parquet(self._map_dir(out))
         self.assertEqual(len({tuple(cb) for cb in d["codebook"]}), 4)
 
     # ---- CSV backend ----
@@ -504,7 +525,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         stats = self._run(
             inp,
             out,
-            include_original=True,
             reader_type=reader_type,
             writer_type=writer_type,
             layer_sizes=(2, 2, 3),
@@ -512,9 +532,9 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
 
         self.assertEqual(stats.relocated_count, 1)
-        original_path, resolved_path = self._group_paths(out)
+        resolved_path = self._groups_dir(out)
         if writer_type == "CsvWriter":
-            result = csv.read_csv(os.path.join(out, "part-0.csv"))
+            result = csv.read_csv(os.path.join(self._map_dir(out), "part-0.csv"))
             self.assertEqual(result.schema.field("codebook").type, pa.string())
             self.assertEqual(result.schema.field("origin_codebook").type, pa.string())
             self.assertCountEqual(
@@ -522,23 +542,22 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 ["0,0,0", "0,0,0", "0,0,1"],
             )
             self.assertEqual(result["origin_codebook"].to_pylist(), ["0,0,0"] * 3)
-            original = csv.read_csv(os.path.join(original_path, "part-0.csv"))
-            resolved = csv.read_csv(os.path.join(resolved_path, "part-0.csv"))
-            self.assertEqual(original["codebook"].to_pylist(), ["0,0,0"])
-            self.assertCountEqual(resolved["codebook"].to_pylist(), ["0,0,0", "0,0,1"])
-            for groups in (original, resolved):
-                self.assertEqual(
-                    groups.column_names, ["codebook", "offset_codebook", "itemids"]
-                )
-                self.assertEqual(groups.schema.field("itemids").type, pa.string())
-                grouped = [
-                    item
-                    for itemids in groups["itemids"].to_pylist()
-                    for item in itemids.split(",")
-                ]
-                self.assertCountEqual(grouped, [str(i) for i in item_ids])
+            # the serving set is parquet whatever --writer_type says
+            groups = parquet.read_table(os.path.join(resolved_path, "part-0.parquet"))
+            self.assertCountEqual(
+                groups["codebook"].to_pylist(), [[0, 0, 0], [0, 0, 1]]
+            )
+            self.assertEqual(
+                groups.column_names, ["codebook", "offset_codebook", "itemids"]
+            )
+            grouped = [
+                item for group in groups["itemids"].to_pylist() for item in group
+            ]
+            self.assertCountEqual(grouped, item_ids)
         else:
-            result = parquet.read_table(os.path.join(out, "part-0.parquet"))
+            result = parquet.read_table(
+                os.path.join(self._map_dir(out), "part-0.parquet")
+            )
             self.assertEqual(result.schema.field("codebook").type, pa.list_(pa.int64()))
             self.assertEqual(
                 result.schema.field("origin_codebook").type, pa.list_(pa.int64())
@@ -548,7 +567,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 [[0, 0, 0], [0, 0, 0], [0, 0, 1]],
             )
             self.assertEqual(result["origin_codebook"].to_pylist(), [[0, 0, 0]] * 3)
-            for path in (original_path, resolved_path):
+            for path in (resolved_path,):
                 groups = parquet.read_table(os.path.join(path, "part-0.parquet"))
                 self.assertEqual(
                     groups.column_names, ["codebook", "offset_codebook", "itemids"]
@@ -556,39 +575,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 self.assertEqual(
                     groups.schema.field("itemids").type, pa.list_(pa.string())
                 )
-
-    def test_csv_group_itemids_are_comma_joined(self) -> None:
-        inp = os.path.join(self.test_dir, "in.csv")
-        out = os.path.join(self.test_dir, "out")
-        item_ids = ["a;b", "x|y", 'with"quote', "back\\slash"]
-        _csv(inp, item_ids, [[0, 0]] * len(item_ids))
-
-        self._run(
-            inp,
-            out,
-            include_original=True,
-            reader_type="CsvReader",
-            writer_type="CsvWriter",
-            max_items_per_codebook=len(item_ids),
-        )
-
-        original_path, _ = self._group_paths(out)
-        groups = csv.read_csv(os.path.join(original_path, "part-0.csv"))
-        self.assertCountEqual(groups["itemids"][0].as_py().split(","), item_ids)
-
-    def test_csv_group_itemids_reject_embedded_comma(self) -> None:
-        inp = os.path.join(self.test_dir, "in.csv")
-        out = os.path.join(self.test_dir, "out")
-        _csv(inp, ["ok", "with,comma"], [[0, 0]] * 2)
-
-        with self.assertRaisesRegex(ValueError, "cannot itself contain one"):
-            self._run(
-                inp,
-                out,
-                reader_type="CsvReader",
-                writer_type="CsvWriter",
-                max_items_per_codebook=4,
-            )
 
     def test_preserves_integer_item_id_type(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -605,15 +591,16 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             ),
             inp,
         )
-        self._run(inp, out, include_original=True, max_items_per_codebook=1)
-        schema = parquet.read_table(os.path.join(out, "part-0.parquet")).schema
+        self._run(inp, out, max_items_per_codebook=1)
+        schema = parquet.read_table(
+            os.path.join(self._map_dir(out), "part-0.parquet")
+        ).schema
         self.assertEqual(schema.field("item_id").type, pa.int32())
-        original_path, resolved_path = self._group_paths(out)
-        for path in (original_path, resolved_path):
-            group_schema = parquet.read_table(
-                os.path.join(path, "part-0.parquet")
-            ).schema
-            self.assertEqual(group_schema.field("itemids").type, pa.list_(pa.int32()))
+        resolved_path = self._groups_dir(out)
+        group_schema = parquet.read_table(
+            os.path.join(resolved_path, "part-0.parquet")
+        ).schema
+        self.assertEqual(group_schema.field("itemids").type, pa.list_(pa.int32()))
 
     # ---- misc ----
 
@@ -647,7 +634,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 out,
                 batch_size=2,
                 progress_interval=3,
-                include_original=True,
                 max_items_per_codebook=2,
             )
 
@@ -671,20 +657,11 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 progress_by_description[description][0].log.call_args_list,
                 expected_progress,
             )
-        self.assertEqual(
-            progress_by_description["Writing original SID item groups"][
-                0
-            ].log.call_args_list,
-            [mock.call(8, suffix="8 samples processed")],
-        )
 
     @parameterized.expand(
         [
-            (
-                "resolved_groups",
-                {"resolved_sid_groups_output_path": None},
-                "resolved_sid_groups_output_path",
-            ),
+            ("bundle_root", {"bundle_root": None}, "bundle_root"),
+            ("partition", {"partition": None}, "partition"),
             ("map", {"output_path": None}, "output_path"),
         ],
         name_func=parameterized_name_func,
@@ -695,34 +672,12 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, expected_field):
             self._runner("input", "map", **overrides)
 
-    def test_original_group_output_is_optional(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        original_path, resolved_path = self._group_paths(out)
-        _parquet(inp, [0, 1, 2], [[0, 0]] * 3, [[[0, 1]]] * 3)
-
-        with mock.patch.object(
-            resolve_sid_collisions,
-            "build_original_item_grouping",
-            wraps=resolve_sid_collisions.build_original_item_grouping,
-        ) as original_builder:
-            self._run(
-                inp,
-                out,
-                max_items_per_codebook=2,
-            )
-
-        original_builder.assert_not_called()
-        self.assertFalse(os.path.exists(original_path))
-        self.assertTrue(os.path.exists(os.path.join(out, "part-0.parquet")))
-        self.assertTrue(os.path.exists(os.path.join(resolved_path, "part-0.parquet")))
-
     def test_resolved_groups_are_written_without_original_output_or_overflow(
         self,
     ) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
-        _, resolved_path = self._group_paths(out)
+        resolved_path = self._groups_dir(out)
         _parquet(inp, [0, 1], [[0, 0], [0, 1]])
 
         self._run(
@@ -751,8 +706,8 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         config = ResolveSidCollisionsConfig.from_namespace(args)
 
         self.assertIsNone(config.output_path)
-        self.assertIsNone(config.original_sid_groups_output_path)
-        self.assertIsNone(config.resolved_sid_groups_output_path)
+        self.assertIsNone(config.bundle_root)
+        self.assertIsNone(config.partition)
         self.assertEqual(config.progress_interval, 1_000_000)
 
     def test_rejects_invalid_progress_interval(self) -> None:
@@ -795,18 +750,13 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             self._run(
                 inp,
                 out,
-                include_original=True,
                 writer_type="OdpsWriter",
                 max_items_per_codebook=1,
             )
 
-        original_path, resolved_path = self._group_paths(out)
-        self.assertEqual(
-            [path for path, _ in created_writers],
-            [original_path, resolved_path, out],
-        )
+        self.assertEqual([path for path, _ in created_writers], [self._map_dir(out)])
         self.assertTrue(all(writer.closed for _, writer in created_writers))
-        for _, writer in created_writers[:2]:
+        for _, writer in []:
             columns = writer.writes[0]
             self.assertEqual(list(columns), ["codebook", "offset_codebook", "itemids"])
             self.assertEqual(columns["codebook"].type, pa.list_(pa.int64()))
@@ -844,10 +794,10 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         _parquet(inp, list(range(4)), [[0, 0], [0, 0], [0, 0], [0, 1]])
 
         with mock.patch("tzrec.tools.sid.resolve_sid_collisions._GROUP_WRITE_ITEMS", 2):
-            self._run(inp, out, include_original=True, max_items_per_codebook=3)
+            self._run(inp, out, max_items_per_codebook=3)
 
-        original_path, _ = self._group_paths(out)
-        output_file = os.path.join(original_path, "part-0.parquet")
+        resolved_path = self._groups_dir(out)
+        output_file = os.path.join(resolved_path, "part-0.parquet")
         self.assertEqual(parquet.ParquetFile(output_file).metadata.num_row_groups, 2)
         groups = parquet.read_table(output_file).to_pydict()
         self.assertEqual([len(group) for group in groups["itemids"]], [3, 1])
@@ -860,7 +810,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         with mock.patch("tzrec.tools.sid.resolve_sid_collisions._MAP_WRITE_ROWS", 2):
             self._run(inp, out, max_items_per_codebook=1)
 
-        output_file = os.path.join(out, "part-0.parquet")
+        output_file = os.path.join(self._map_dir(out), "part-0.parquet")
         self.assertEqual(parquet.ParquetFile(output_file).metadata.num_row_groups, 3)
 
     def test_writers_bound_codebook_list_offsets(self) -> None:
@@ -877,10 +827,10 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 "tzrec.tools.sid.resolve_sid_collisions._GROUP_WRITE_ITEMS", 100
             ),
         ):
-            self._run(inp, out, include_original=True, max_items_per_codebook=1)
+            self._run(inp, out, max_items_per_codebook=1)
 
-        original_path, resolved_path = self._group_paths(out)
-        for path in (out, original_path, resolved_path):
+        resolved_path = self._groups_dir(out)
+        for path in (self._map_dir(out), resolved_path):
             output_file = os.path.join(path, "part-0.parquet")
             self.assertEqual(
                 parquet.ParquetFile(output_file).metadata.num_row_groups, 2
@@ -896,8 +846,8 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             inp,
             out,
             output_path=None,
-            original_sid_groups_output_path=None,
-            resolved_sid_groups_output_path=None,
+            bundle_root=None,
+            partition=None,
             max_items_per_codebook=2,
             rate_only=True,
         )
@@ -914,11 +864,10 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(stats.total_items, 5)
         self.assertEqual(stats.relocated_count, 3)
         self.assertEqual(stats.unresolved_count, 0)
-        self.assertFalse(os.path.exists(os.path.join(out, "part-0.parquet")))
-        original_path, resolved_path = self._group_paths(out)
-        self.assertFalse(os.path.exists(original_path))
+        resolved_path = self._groups_dir(out)
         self.assertFalse(os.path.exists(resolved_path))
         self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.exists(self._bundle_root(out)))
 
     def test_empty_input_raises(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -956,20 +905,19 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             inp,
             out,
             batch_size=batch_size,
-            include_original=True,
             max_items_per_codebook=1,
         )
 
         self.assertEqual(stats.total_items, 3)
         self.assertEqual(stats.relocated_count, 2)
-        result = self._read_parquet(out)
+        result = self._read_parquet(self._map_dir(out))
         self.assertEqual(result["item_id"], [keeper, duplicate, duplicate])
         self.assertEqual(result["item_id"].count(duplicate), 2)
         self._assert_map_matches_resolved_groups(out)
-        original_path, _ = self._group_paths(out)
-        original_groups = self._read_parquet(original_path)
+        resolved_path = self._groups_dir(out)
+        groups = self._read_parquet(resolved_path)
         self.assertCountEqual(
-            [item_id for group in original_groups["itemids"] for item_id in group],
+            [item_id for group in groups["itemids"] for item_id in group],
             [keeper, duplicate, duplicate],
         )
 
@@ -1009,7 +957,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
 
         self.assertEqual(stats.total_items, 3)
-        result = self._read_parquet(out)
+        result = self._read_parquet(self._map_dir(out))
         self.assertEqual(result["item_id"], ["b", "a", "a"])
         self._assert_map_matches_resolved_groups(out)
 
@@ -1034,19 +982,18 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, [0, 1], [[1, 2], [3, 4]], [[[0, 0]]] * 2)
-        self._run(inp, out, include_original=True, layer_sizes=(8, 8))
+        self._run(inp, out, layer_sizes=(8, 8))
 
         # layer 1 is shifted by layer_sizes[0]
-        item_map = self._read_parquet(out)
+        item_map = self._read_parquet(self._map_dir(out))
         by_item = dict(zip(item_map["item_id"], item_map["offset_codebook"]))
         self.assertEqual(by_item[0], [1, 2 + 8])
         self.assertEqual(by_item[1], [3, 4 + 8])
 
-        original_path, resolved_path = self._group_paths(out)
-        for path in (original_path, resolved_path):
-            groups = self._read_parquet(path)
-            for codebook, offset in zip(groups["codebook"], groups["offset_codebook"]):
-                self.assertEqual(offset, [codebook[0], codebook[1] + 8])
+        resolved_path = self._groups_dir(out)
+        groups = self._read_parquet(resolved_path)
+        for codebook, offset in zip(groups["codebook"], groups["offset_codebook"]):
+            self.assertEqual(offset, [codebook[0], codebook[1] + 8])
 
     def test_offset_codebook_tracks_the_resolved_not_the_origin_sid(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -1055,7 +1002,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         _parquet(inp, [0, 1, 2], [[0, 0]] * 3, [[[0, 5]]] * 3)
         self._run(inp, out, layer_sizes=(8, 8))
 
-        item_map = self._read_parquet(out)
+        item_map = self._read_parquet(self._map_dir(out))
         relocated = [
             i
             for i, (origin, final) in enumerate(
@@ -1071,19 +1018,15 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     def test_append_recomputes_offset_for_state_written_without_it(self) -> None:
         # a map published before offset_codebook existed must still merge: the
         # column is derived from the published codebook, not passed through
-        state_map = os.path.join(self.test_dir, "old_map")
-        state_groups = os.path.join(self.test_dir, "old_groups")
-        _map_parquet(state_map, [(0, [0, 0], [0, 0], 1), (1, [1, 1], [1, 1], 1)])
-        _groups_parquet(state_groups, [([0, 0], [0]), ([1, 1], [1])])
-        out = os.path.join(self.test_dir, "v2")
-        self._run(
-            self._prepare_single(10),
+        out = os.path.join(self.test_dir, "out")
+        self._seed_state(
             out,
-            existing_sid_map_path=os.path.join(state_map, "*.parquet"),
-            existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
+            [(0, [0, 0], [0, 0], 1), (1, [1, 1], [1, 1], 1)],
+            [([0, 0], [0]), ([1, 1], [1])],
         )
+        self._append(self._prepare_single(10), out)
 
-        item_map = self._read_parquet(out)
+        item_map = self._read_parquet(self._map_dir(out, "v2"))
         self.assertEqual(len(item_map["item_id"]), 3)
         for codebook, offset in zip(item_map["codebook"], item_map["offset_codebook"]):
             self.assertEqual(offset, [codebook[0], codebook[1] + 8])
@@ -1091,62 +1034,53 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     # ---- append mode ----
 
     def _seed_generation(self, name="v1", item_ids=None, codes=None):
-        """Run a full resolve to produce the state a later append consumes."""
+        """Run a full resolve at partition v1, the state a later append consumes."""
         inp = os.path.join(self.test_dir, f"{name}_in.parquet")
         out = os.path.join(self.test_dir, name)
         item_ids = list(range(5)) if item_ids is None else item_ids
         codes = [[0, 0], [0, 0], [0, 1], [1, 0], [1, 1]] if codes is None else codes
         _parquet(inp, item_ids, codes, [[[0, 2], [0, 3]]] * len(item_ids))
-        self._run(inp, out)
+        self._run(inp, out, partition="v1")
         return out
 
     def test_append_never_moves_a_published_item(self) -> None:
-        base = self._seed_generation()
-        published = self._map_rows(base)
+        out = self._seed_generation()
+        published = self._map_rows(self._map_dir(out, "v1"))
 
         inp = os.path.join(self.test_dir, "v2_in.parquet")
-        out = os.path.join(self.test_dir, "v2")
         # Rows 10 and 11 land in the already-full bucket (0, 0).
         _parquet(inp, [10, 11, 12], [[0, 0], [0, 0], [1, 1]], [[[0, 2], [0, 3]]] * 3)
-        stats = self._append(inp, out, base)
+        stats = self._append(inp, out)
 
         self.assertEqual(stats.total_items, 3)
-        merged = self._map_rows(out)
+        merged = self._map_rows(self._map_dir(out, "v2"))
         self.assertEqual(len(merged), 8)
         for item_id, row in published.items():
             self.assertEqual(merged[item_id], row, f"item {item_id} moved")
-        self._assert_dense_indices(out)
-        self._assert_map_matches_resolved_groups(out)
+        self._assert_dense_indices(self._map_dir(out, "v2"))
+        self._assert_map_matches_resolved_groups(out, "v2")
 
     def test_append_continues_slot_numbering(self) -> None:
-        base = self._seed_generation(item_ids=[0], codes=[[0, 0]])
+        out = self._seed_generation(item_ids=[0], codes=[[0, 0]])
         inp = os.path.join(self.test_dir, "v2_in.parquet")
-        out = os.path.join(self.test_dir, "v2")
         _parquet(inp, [10], [[0, 0]], [[[0, 0]]])
-        self._append(inp, out, base)
+        self._append(inp, out)
 
-        merged = self._map_rows(out)
+        merged = self._map_rows(self._map_dir(out, "v2"))
         self.assertEqual(merged[0][2], 1)
         # Capacity is 2, so the new row is retained and continues at slot 2.
         self.assertEqual(merged[10], ((0, 0), (0, 0), 2))
 
     def test_append_emits_delta_outputs(self) -> None:
-        base = self._seed_generation()
+        out = self._seed_generation()
         inp = os.path.join(self.test_dir, "v2_in.parquet")
-        out = os.path.join(self.test_dir, "v2")
-        delta_map = os.path.join(self.test_dir, "delta_map")
-        delta_groups = os.path.join(self.test_dir, "delta_groups")
         _parquet(inp, [10, 11], [[0, 0], [3, 3]], [[[0, 2], [0, 3]]] * 2)
-        self._append(
-            inp,
-            out,
-            base,
-            delta_map_output_path=delta_map,
-            delta_sid_groups_output_path=delta_groups,
-        )
+        self._append(inp, out)
 
+        delta_map = self._delta_map_dir(out, "v2")
+        delta_groups = self._delta_groups_dir(out, "v2")
         self.assertCountEqual(self._read_parquet(delta_map)["item_id"], [10, 11])
-        merged_groups = self._read_parquet(self._group_paths(out)[1])
+        merged_groups = self._read_parquet(self._groups_dir(out, "v2"))
         full = {
             tuple(codebook): item_group
             for codebook, item_group in zip(
@@ -1169,36 +1103,34 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     def test_append_creates_buckets_before_between_and_after(self) -> None:
         # New SIDs sort before, between and after every published bucket, which
         # exercises all three branches of the groups merge.
-        base = self._seed_generation(item_ids=[0], codes=[[4, 4]])
+        out = self._seed_generation(item_ids=[0], codes=[[4, 4]])
         inp = os.path.join(self.test_dir, "v2_in.parquet")
-        out = os.path.join(self.test_dir, "v2")
         _parquet(inp, [10, 11, 12], [[0, 0], [4, 5], [7, 7]], [[[0, 0]]] * 3)
-        self._append(inp, out, base, batch_size=1)
+        self._append(inp, out, batch_size=1)
 
-        groups = self._read_parquet(self._group_paths(out)[1])
+        groups = self._read_parquet(self._groups_dir(out, "v2"))
         self.assertEqual(groups["codebook"], [[0, 0], [4, 4], [4, 5], [7, 7]])
         self.assertEqual(groups["itemids"], [[10], [0], [11], [12]])
-        self._assert_map_matches_resolved_groups(out)
+        self._assert_map_matches_resolved_groups(out, "v2")
 
     def test_append_merges_across_reader_batches(self) -> None:
-        base = self._seed_generation(
+        out = self._seed_generation(
             item_ids=list(range(6)),
             codes=[[0, 0], [0, 0], [2, 2], [3, 3], [4, 4], [5, 5]],
         )
         inp = os.path.join(self.test_dir, "v2_in.parquet")
-        out = os.path.join(self.test_dir, "v2")
         _parquet(inp, [10, 11, 12], [[0, 0], [3, 3], [6, 6]], [[[0, 0]]] * 3)
-        self._append(inp, out, base, batch_size=1)
+        self._append(inp, out, batch_size=1)
 
-        self._assert_dense_indices(out)
-        self._assert_map_matches_resolved_groups(out)
-        self.assertEqual(len(self._map_rows(out)), 9)
+        self._assert_dense_indices(self._map_dir(out, "v2"))
+        self._assert_map_matches_resolved_groups(out, "v2")
+        self.assertEqual(len(self._map_rows(self._map_dir(out, "v2"))), 9)
 
     def test_append_chain_stays_consistent(self) -> None:
-        previous = self._seed_generation()
+        out = self._seed_generation()
         for generation in range(2, 5):
             inp = os.path.join(self.test_dir, f"v{generation}_in.parquet")
-            out = os.path.join(self.test_dir, f"v{generation}")
+            previous, current = f"v{generation - 1}", f"v{generation}"
             base = 100 * generation
             _parquet(
                 inp,
@@ -1206,111 +1138,91 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 [[0, 0], [generation, generation]],
                 [[[0, 2], [0, 3]]] * 2,
             )
-            published = self._map_rows(previous)
-            self._append(inp, out, previous)
-            merged = self._map_rows(out)
+            published = self._map_rows(self._map_dir(out, previous))
+            self._append(inp, out, previous=previous, partition=current)
+            merged = self._map_rows(self._map_dir(out, current))
             for item_id, row in published.items():
                 self.assertEqual(merged[item_id], row)
-            self._assert_dense_indices(out)
-            self._assert_map_matches_resolved_groups(out)
-            previous = out
+            self._assert_dense_indices(self._map_dir(out, current))
+            self._assert_map_matches_resolved_groups(out, current)
 
     def test_append_reads_csv_state_and_converts_format(self) -> None:
-        # CSV state exercises the JSON branch of the grouped item-ID decoder,
-        # and a parquet new-items input drives _align_codes_column's re-encode.
-        state_map = os.path.join(self.test_dir, "csv_map")
-        state_groups = os.path.join(self.test_dir, "csv_groups")
-        _map_csv(state_map, [(0, [0, 0], [0, 0], 1), (1, [1, 1], [1, 1], 1)])
-        _groups_csv(state_groups, [([0, 0], [0]), ([1, 1], [1])])
-
-        inp = os.path.join(self.test_dir, "v2_in.parquet")
-        out = os.path.join(self.test_dir, "v2")
-        _parquet(inp, [10, 11], [[0, 0], [2, 2]], [[[0, 2]]] * 2)
-        self._run(
-            inp,
+        # A CSV published map with a parquet new-items input drives
+        # _align_codes_column's re-encode on the copy-through path.
+        out = os.path.join(self.test_dir, "out")
+        self._seed_state(
             out,
-            existing_sid_map_path=os.path.join(state_map, "*.csv"),
-            existing_sid_groups_path=os.path.join(state_groups, "*.csv"),
+            [(0, [0, 0], [0, 0], 1), (1, [1, 1], [1, 1], 1)],
+            [([0, 0], [0]), ([1, 1], [1])],
+            csv=True,
         )
 
-        merged = self._map_rows(out)
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        _parquet(inp, [10, 11], [[0, 0], [2, 2]], [[[0, 2]]] * 2)
+        self._append(inp, out, reader_type="CsvReader")
+
+        merged = self._map_rows(self._map_dir(out, "v2"))
         self.assertEqual(len(merged), 4)
         self.assertEqual(merged[0], ((0, 0), (0, 0), 1))
         self.assertEqual(merged[10], ((0, 0), (0, 0), 2))
-        self._assert_dense_indices(out)
-        self._assert_map_matches_resolved_groups(out)
+        self._assert_dense_indices(self._map_dir(out, "v2"))
+        self._assert_map_matches_resolved_groups(out, "v2")
 
     def test_append_rejects_already_published_item_id(self) -> None:
-        base = self._seed_generation()
+        out = self._seed_generation()
         inp = os.path.join(self.test_dir, "v2_in.parquet")
-        out = os.path.join(self.test_dir, "v2")
         _parquet(inp, [0, 99], [[0, 0], [2, 2]], [[[0, 2]]] * 2)
         with self.assertRaisesRegex(ValueError, "already published"):
-            self._append(inp, out, base)
+            self._append(inp, out)
 
     def test_append_rejects_mismatched_generation_pair(self) -> None:
-        first = self._seed_generation("v1")
+        out = self._seed_generation("v1")
         inp = os.path.join(self.test_dir, "v2_in.parquet")
-        out = os.path.join(self.test_dir, "v2")
         _parquet(inp, [10], [[0, 0]], [[[0, 2]]])
-        self._append(inp, out, first)
-        # Pair generation 1's map with generation 2's groups.
+        self._append(inp, out)
+        # Leave v1's map beside v2's groups: the row totals no longer agree.
+        shutil.rmtree(self._groups_dir(out, "v1"))
+        shutil.copytree(self._groups_dir(out, "v2"), self._groups_dir(out, "v1"))
         with self.assertRaisesRegex(ValueError, "different generations"):
-            self._run(
-                self._prepare_single(20),
-                os.path.join(self.test_dir, "v3"),
-                existing_sid_map_path=os.path.join(first, "*.parquet"),
-                existing_sid_groups_path=os.path.join(
-                    self._group_paths(out)[1], "*.parquet"
-                ),
-            )
+            self._append(self._prepare_single(20), out, previous="v1", partition="v3")
 
     def test_append_rejects_state_truncated_outside_touched_bands(self) -> None:
         # Band 5 is untouched, so only the row totals can catch its missing group.
-        state_map = os.path.join(self.test_dir, "trunc_map")
-        state_groups = os.path.join(self.test_dir, "trunc_groups")
-        _map_parquet(state_map, [(0, [0, 0], [0, 0], 1), (1, [5, 5], [5, 5], 1)])
-        _groups_parquet(state_groups, [([0, 0], [0])])
+        out = os.path.join(self.test_dir, "out")
+        self._seed_state(
+            out,
+            [(0, [0, 0], [0, 0], 1), (1, [5, 5], [5, 5], 1)],
+            [([0, 0], [0])],
+        )
         with self.assertRaisesRegex(ValueError, "one of the two artifacts is"):
-            self._run(
-                self._prepare_single(10),
-                os.path.join(self.test_dir, "out"),
-                existing_sid_map_path=os.path.join(state_map, "*.parquet"),
-                existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
-            )
+            self._append(self._prepare_single(10), out)
 
     def test_append_rejects_unsorted_existing_groups(self) -> None:
-        state_map = os.path.join(self.test_dir, "unsorted_map")
-        state_groups = os.path.join(self.test_dir, "unsorted_groups")
-        _map_parquet(state_map, [(0, [1, 1], [1, 1], 1), (1, [0, 0], [0, 0], 1)])
-        _groups_parquet(state_groups, [([1, 1], [0]), ([0, 0], [1])])
+        out = os.path.join(self.test_dir, "out")
+        self._seed_state(
+            out,
+            [(0, [1, 1], [1, 1], 1), (1, [0, 0], [0, 0], 1)],
+            [([1, 1], [0]), ([0, 0], [1])],
+        )
         with self.assertRaisesRegex(ValueError, "ascending"):
-            self._run(
-                self._prepare_single(10),
-                os.path.join(self.test_dir, "out"),
-                existing_sid_map_path=os.path.join(state_map, "*.parquet"),
-                existing_sid_groups_path=os.path.join(state_groups, "*.parquet"),
-            )
+            self._append(self._prepare_single(10), out)
 
     def test_append_rate_only_needs_no_map(self) -> None:
-        base = self._seed_generation()
+        out = self._seed_generation()
         stats = self._run(
             self._prepare_single(10),
-            os.path.join(self.test_dir, "unused"),
+            out,
             rate_only=True,
             output_path=None,
-            resolved_sid_groups_output_path=None,
-            existing_sid_groups_path=os.path.join(
-                self._group_paths(base)[1], "*.parquet"
-            ),
+            bundle_root=self._bundle_root(out),
+            partition=None,
+            from_partition="v1",
         )
         self.assertEqual(stats.total_items, 1)
 
     @parameterized.expand(
         [
-            ({"existing_sid_map_path": "state/*.parquet"},),
-            ({"delta_map_output_path": "delta"},),
-            ({"delta_sid_groups_output_path": "delta"},),
+            ({"source_model": "rqvae"},),
         ],
         name_func=parameterized_name_func,
     )
@@ -1320,18 +1232,17 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         _parquet(inp, [0, 1], [[0, 0], [1, 1]], [[[0, 2]]] * 2)
         self._run(inp, out, **overrides)
 
-        self.assertCountEqual(self._read_parquet(out)["item_id"], [0, 1])
+        self.assertCountEqual(self._read_parquet(self._map_dir(out))["item_id"], [0, 1])
         self._assert_map_matches_resolved_groups(out)
-        delta = overrides.get("delta_map_output_path")
-        if delta is not None:
-            self.assertFalse(os.path.exists(delta))
+        self.assertFalse(os.path.exists(self._delta_map_dir(out)))
 
-    def test_append_requires_map_unless_rate_only(self) -> None:
-        with self.assertRaisesRegex(ValueError, "existing_sid_map_path is required"):
+    def test_append_rejects_writing_over_the_partition_it_reads(self) -> None:
+        with self.assertRaisesRegex(ValueError, "writing over the artifacts"):
             self._runner(
                 os.path.join(self.test_dir, "in.parquet"),
                 os.path.join(self.test_dir, "out"),
-                existing_sid_groups_path="groups/*.parquet",
+                partition="v1",
+                from_partition="v1",
             )
 
 
