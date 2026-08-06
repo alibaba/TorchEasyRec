@@ -104,11 +104,6 @@ class PriorOccupancy:
         """Whether no bucket is occupied."""
         return self.bucket_keys.shape[0] == 0
 
-    @cached_property
-    def total_items(self) -> int:
-        """Total number of already-published items."""
-        return int(self.bucket_counts.sum())
-
     def counts_for(self, bucket_keys: np.ndarray) -> np.ndarray:
         """Return prior counts aligned with ``bucket_keys``, zero when absent."""
         keys = np.asarray(bucket_keys, dtype=np.int64)

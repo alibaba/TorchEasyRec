@@ -140,7 +140,6 @@ class CollisionTest(unittest.TestCase):
         np.testing.assert_array_equal(result.final_bucket_keys, [0, 1, 2, 3, 4, 5])
         np.testing.assert_array_equal(result.final_bucket_counts, [2, 2, 2, 1, 2, 1])
         self.assertTrue(result.grouping_collected)
-        self.assertEqual(result.stats.total_items, 10)
         self.assertEqual(result.stats.raw_collision_buckets, 2)
         self.assertEqual(result.stats.final_collision_buckets, 0)
         self.assertEqual(result.stats.relocated_count, 3)
@@ -554,7 +553,6 @@ class PriorOccupancyTest(unittest.TestCase):
     def test_empty_has_no_items(self) -> None:
         prior = PriorOccupancy.empty()
         self.assertTrue(prior.is_empty)
-        self.assertEqual(prior.total_items, 0)
         np.testing.assert_array_equal(prior.counts_for(np.asarray([3, 7])), [0, 0])
 
     def test_counts_for_returns_zero_for_absent_buckets(self) -> None:
@@ -562,7 +560,6 @@ class PriorOccupancyTest(unittest.TestCase):
         np.testing.assert_array_equal(
             prior.counts_for(np.asarray([9, 0, 5, 100, 2])), [2, 0, 4, 0, 1]
         )
-        self.assertEqual(prior.total_items, 7)
 
     def test_restrict_to_bands_keeps_only_requested_bands(self) -> None:
         # last_size 4 -> band 0 spans keys 0..3, band 2 spans keys 8..11.

@@ -117,20 +117,6 @@ def _map_csv(path, rows):
     )
 
 
-def _groups_csv(path, rows):
-    """Write a groups artifact in the CSV encoding this tool emits."""
-    os.makedirs(path, exist_ok=True)
-    csv.write_csv(
-        pa.table(
-            {
-                "codebook": [",".join(map(str, r[0])) for r in rows],
-                "itemids": [",".join(map(str, r[1])) for r in rows],
-            }
-        ),
-        os.path.join(path, "part-0.csv"),
-    )
-
-
 class ResolveSidCollisionsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
@@ -230,9 +216,8 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     def _seed_state(self, out, map_rows, group_rows, partition="v1", csv=False):
         """Publish a hand-built generation at the locations the tool derives."""
         write_map = _map_csv if csv else _map_parquet
-        write_groups = _groups_parquet
         write_map(self._map_dir(out, partition), map_rows)
-        write_groups(self._groups_dir(out, partition), group_rows)
+        _groups_parquet(self._groups_dir(out, partition), group_rows)
         bundle.write_manifest(
             bundle.manifest_path(self._bundle_root(out), partition),
             bundle.BundleManifest(
@@ -756,11 +741,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
 
         self.assertEqual([path for path, _ in created_writers], [self._map_dir(out)])
         self.assertTrue(all(writer.closed for _, writer in created_writers))
-        for _, writer in []:
-            columns = writer.writes[0]
-            self.assertEqual(list(columns), ["codebook", "offset_codebook", "itemids"])
-            self.assertEqual(columns["codebook"].type, pa.list_(pa.int64()))
-            self.assertEqual(columns["itemids"].type, pa.list_(pa.int32()))
 
     def test_writer_closes_when_write_fails(self) -> None:
         class FailingWriter:
@@ -1220,17 +1200,11 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
         self.assertEqual(stats.total_items, 1)
 
-    @parameterized.expand(
-        [
-            ({"source_model": "rqvae"},),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_append_only_flags_are_ignored_outside_append_mode(self, overrides) -> None:
+    def test_full_resolve_writes_no_delta_artifacts(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, [0, 1], [[0, 0], [1, 1]], [[[0, 2]]] * 2)
-        self._run(inp, out, **overrides)
+        self._run(inp, out)
 
         self.assertCountEqual(self._read_parquet(self._map_dir(out))["item_id"], [0, 1])
         self._assert_map_matches_resolved_groups(out)

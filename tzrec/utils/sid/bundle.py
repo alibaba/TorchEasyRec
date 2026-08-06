@@ -37,8 +37,6 @@ DELTA_GROUPS_ARTIFACT = "delta_sid_to_item_groups"
 MAP_ARTIFACTS = (MAP_ARTIFACT, DELTA_MAP_ARTIFACT)
 GROUPS_ARTIFACTS = (GROUPS_ARTIFACT, DELTA_GROUPS_ARTIFACT)
 
-_WRITER_TYPE_SUFFIX = {"ParquetWriter": "parquet", "CsvWriter": "csv"}
-
 
 def is_odps_path(path: str) -> bool:
     """Whether a root addresses ODPS rather than a filesystem."""
@@ -62,13 +60,6 @@ def artifact_read_pattern(root: str, artifact: str, partition: str, suffix: str)
     if is_odps_path(root):
         return location
     return os.path.join(location, f"part-*.{suffix}")
-
-
-def writer_suffix(writer_type: str) -> str:
-    """Return the file extension a file writer emits."""
-    if writer_type not in _WRITER_TYPE_SUFFIX:
-        raise ValueError(f"{writer_type} does not write files.")
-    return _WRITER_TYPE_SUFFIX[writer_type]
 
 
 def manifest_path(bundle_root: str, partition: str) -> str:
@@ -116,7 +107,13 @@ class BundleManifest:
         payload = json.loads(text)
         missing = [
             key
-            for key in ("bundle_uuid", "codebook", "capacity", "artifacts")
+            for key in (
+                "bundle_uuid",
+                "codebook",
+                "capacity",
+                "max_observed_items_per_sid",
+                "artifacts",
+            )
             if key not in payload
         ]
         if missing:
@@ -132,8 +129,29 @@ class BundleManifest:
                     f"manifest declares {name} as {entry.type!r}; the serving set "
                     "is always parquet, so this bundle cannot be opened."
                 )
-        payload.setdefault("max_observed_items_per_sid", payload["capacity"])
         return cls(artifacts=entries, **payload)
+
+
+def artifact_entry(
+    root: str,
+    artifact: str,
+    partition: str,
+    kind: str,
+    rows: int,
+    schema: Dict[str, str],
+) -> ArtifactEntry:
+    """Describe where one artifact landed, in the shape the manifest records."""
+    location = artifact_location(root, artifact, partition)
+    if is_odps_path(root):
+        table = root.rstrip("/").rpartition("/tables/")[2]
+        return ArtifactEntry(
+            type="odps",
+            rows=rows,
+            schema=schema,
+            table=table,
+            partition=f"artifact={artifact}/generation={partition}",
+        )
+    return ArtifactEntry(type=kind, rows=rows, schema=schema, path=location)
 
 
 def write_manifest(path: str, manifest: BundleManifest) -> None:

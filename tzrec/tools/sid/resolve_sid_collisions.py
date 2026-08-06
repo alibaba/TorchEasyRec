@@ -22,10 +22,10 @@ The runner retains the first capacity items in each SID bucket, attempts to
 relocate overflow items using fixed-width last-layer candidates, delegates
 placement to the pure NumPy core, and writes item-level and grouped SID results
 through TorchEasyRec readers and writers. CSV encodes each SID/candidate column
-and each item-ID group as comma-separated values because Arrow's CSV writer
-cannot serialize list columns, so an item ID containing a comma is rejected at
-write time; ``candidate_codes`` is a flat ``topk * n_layers`` run split by the
-``--codebook`` length.
+as comma-separated codes because Arrow's CSV writer cannot serialize list
+columns; ``candidate_codes`` is a flat ``topk * n_layers`` run split by the
+``--codebook`` length. The SID groups are always parquet, so they keep native
+list columns whatever ``--writer_type`` says.
 
 The random strategy intentionally preserves the legacy deterministic baseline:
 it draws with replacement from the full last-layer space. Placement skips an
@@ -118,6 +118,7 @@ from tzrec.utils.sid.bundle import (
     MAP_ARTIFACTS,
     ArtifactEntry,
     BundleManifest,
+    artifact_entry,
     artifact_location,
     artifact_read_pattern,
     is_odps_path,
@@ -241,7 +242,6 @@ class ResolveSidCollisionsConfig:
     rate_only: bool
     odps_data_quota_name: str
     from_partition: Optional[str] = None
-    source_model: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -301,7 +301,6 @@ class ResolveSidCollisionsConfig:
             bundle_root=args.bundle_root,
             partition=args.partition,
             from_partition=args.from_partition,
-            source_model=args.source_model,
             reader_type=args.reader_type,
             writer_type=args.writer_type,
             batch_size=args.batch_size,
@@ -459,7 +458,6 @@ class CollisionResolutionRunner:
             codebook=list(self._config.layer_sizes),
             capacity=self._config.max_items_per_codebook,
             max_observed_items_per_sid=observed,
-            source_model=self._config.source_model,
             item_id_type=str(self._item_id_type) if self._item_id_type else None,
             artifacts=artifacts,
         )
@@ -469,21 +467,19 @@ class CollisionResolutionRunner:
 
     def _artifact_entry(self, artifact: str, rows: int) -> ArtifactEntry:
         """Record where one artifact landed and what it holds."""
-        location = self._config.artifact_write_path(artifact)
-        schema = _MAP_SCHEMA if artifact in MAP_ARTIFACTS else _GROUPS_SCHEMA
-        if artifact in MAP_ARTIFACTS and is_odps_path(location):
-            table, _, partition = location.rpartition("/tables/")[2].partition("/")
-            return ArtifactEntry(
-                type="odps",
-                rows=rows,
-                schema=schema,
-                table=table,
-                partition=partition,
-            )
-        kind = "parquet"
-        if artifact in MAP_ARTIFACTS and self._default_writer_type == "CsvWriter":
-            kind = "csv"
-        return ArtifactEntry(type=kind, rows=rows, schema=schema, path=location)
+        is_map = artifact in MAP_ARTIFACTS
+        root = self._config.output_path if is_map else self._config.bundle_root
+        assert root is not None and self._config.partition is not None
+        is_csv_map = is_map and self._default_writer_type == "CsvWriter"
+        kind = "csv" if is_csv_map else "parquet"
+        return artifact_entry(
+            root,
+            artifact,
+            self._config.partition,
+            kind,
+            rows,
+            _MAP_SCHEMA if is_map else _GROUPS_SCHEMA,
+        )
 
     def _make_reader(
         self, selected_cols: List[str], input_path: Optional[str] = None
@@ -869,24 +865,6 @@ class CollisionResolutionRunner:
         return pa.array(values, type=self._item_id_type)
 
     @staticmethod
-    def _grouped_item_ids_column(
-        values: pa.Array, offsets: np.ndarray, is_csv: bool
-    ) -> pa.Array:
-        """Encode flat item IDs and offsets as one grouped output column."""
-        arrow_offsets = pa.array(offsets, type=pa.int32())
-        if not is_csv:
-            return pa.ListArray.from_arrays(arrow_offsets, values)
-
-        encoded_values = pc.cast(values, pa.string())
-        if pc.any(pc.match_substring(encoded_values, ",")).as_py():
-            raise ValueError(
-                "CSV SID group output joins item IDs with commas, so an item ID "
-                "cannot itself contain one; use parquet or ODPS for such IDs."
-            )
-        encoded_lists = pa.ListArray.from_arrays(arrow_offsets, encoded_values)
-        return pc.binary_join(encoded_lists, ",")
-
-    @staticmethod
     def _codes_column(codes: np.ndarray, is_csv: bool) -> pa.Array:
         """Encode an SID matrix for the actual output writer."""
         row_count, layer_count = codes.shape
@@ -1062,7 +1040,6 @@ class CollisionResolutionRunner:
         rows: Optional[np.ndarray] = None,
     ) -> None:
         """Write one chunk of SID groups, optionally only ``rows`` of it."""
-        is_csv = isinstance(writer, CsvWriter)
         if rows is not None:
             if rows.size == 0:
                 return
@@ -1075,9 +1052,11 @@ class CollisionResolutionRunner:
             np.cumsum(lengths, out=offsets[1:])
         writer.write(
             {
-                "codebook": self._codes_column(codes, is_csv),
-                "offset_codebook": self._offset_codes_column(codes, is_csv),
-                "itemids": self._grouped_item_ids_column(values, offsets, is_csv),
+                "codebook": self._codes_column(codes, False),
+                "offset_codebook": self._offset_codes_column(codes, False),
+                "itemids": pa.ListArray.from_arrays(
+                    pa.array(offsets, type=pa.int32()), values
+                ),
             }
         )
 
@@ -1093,7 +1072,6 @@ class CollisionResolutionRunner:
         representative_rows = grouping.row_order[offsets[:-1]]
         codes = origin_codes[representative_rows]
         if resolved_last_codes is not None:
-            codes = codes.copy()
             codes[:, -1] = resolved_last_codes[representative_rows]
         return _AppendGroups(
             keys=grouping.sid_keys,
@@ -1123,8 +1101,6 @@ class CollisionResolutionRunner:
             writer = stack.enter_context(
                 closing(self._make_group_writer(resolved_path))
             )
-            is_csv = isinstance(writer, CsvWriter)
-            delta_writer: Optional[BaseWriter] = None
             delta_writer = stack.enter_context(
                 closing(
                     self._make_group_writer(
@@ -1148,7 +1124,7 @@ class CollisionResolutionRunner:
 
             corpus_rows = 0
             delta_rows = 0
-            max_rows = _max_code_rows(is_csv, groups.codes.shape[1], group_count)
+            max_rows = _max_code_rows(False, groups.codes.shape[1], group_count)
 
             def emit_new_only(low: int, high: int) -> None:
                 """Write groups this run created in buckets nobody occupied."""
@@ -1226,11 +1202,10 @@ class CollisionResolutionRunner:
 
         offsets = grouping.offsets
         with closing(self._make_group_writer(output_path)) as writer:
-            is_csv = False
             progress = ProgressLogger(progress_description, start_n=0)
             last_progress_count = 0
             max_codebook_rows = _max_code_rows(
-                is_csv, origin_codes.shape[1], group_count
+                False, origin_codes.shape[1], group_count
             )
             for group_start, group_end in _group_chunk_bounds(
                 offsets, 0, group_count, max_codebook_rows
@@ -1392,11 +1367,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Generation to append onto. Supplying it selects append mode: the new "
             "items in --input_path are placed without moving any published SID."
         ),
-    )
-    parser.add_argument(
-        "--source_model",
-        default=None,
-        help="Optional manifest field naming the quantizer that produced the SIDs.",
     )
     parser.add_argument(
         "--reader_type",

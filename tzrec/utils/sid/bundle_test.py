@@ -73,11 +73,6 @@ class BundleLocationTest(unittest.TestCase):
             "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v1",
         )
 
-    def test_writer_suffix_rejects_a_non_file_writer(self) -> None:
-        self.assertEqual(bundle.writer_suffix("CsvWriter"), "csv")
-        with self.assertRaisesRegex(ValueError, "does not write files"):
-            bundle.writer_suffix("OdpsWriter")
-
     def test_manifest_path_is_per_generation(self) -> None:
         self.assertEqual(bundle.manifest_path("./sid", "v2"), "./sid/manifest/v2.json")
 
@@ -104,6 +99,29 @@ class BundleManifestTest(unittest.TestCase):
     def test_rejects_a_manifest_missing_required_keys(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing required keys"):
             bundle.BundleManifest.from_json(json.dumps({"bundle_uuid": "x"}))
+
+    def test_rejects_a_manifest_without_the_observed_ceiling(self) -> None:
+        payload = json.loads(_manifest().to_json())
+        del payload["max_observed_items_per_sid"]
+        with self.assertRaisesRegex(ValueError, "max_observed_items_per_sid"):
+            bundle.BundleManifest.from_json(json.dumps(payload))
+
+    def test_artifact_entry_records_an_odps_table_and_partition(self) -> None:
+        entry = bundle.artifact_entry(
+            "odps://prj/tables/sid", bundle.MAP_ARTIFACT, "v2", "parquet", 9, {}
+        )
+        self.assertEqual(entry.type, "odps")
+        self.assertEqual(entry.table, "sid")
+        self.assertEqual(entry.partition, "artifact=item_to_sid_map/generation=v2")
+        self.assertIsNone(entry.path)
+
+    def test_artifact_entry_records_a_file_path(self) -> None:
+        entry = bundle.artifact_entry(
+            "./sid", bundle.GROUPS_ARTIFACT, "v2", "parquet", 4, {}
+        )
+        self.assertEqual(entry.type, "parquet")
+        self.assertEqual(entry.path, "./sid/sid_to_item_groups/v2")
+        self.assertIsNone(entry.table)
 
     def test_rejects_a_serving_artifact_that_is_not_parquet(self) -> None:
         payload = json.loads(_manifest().to_json())
