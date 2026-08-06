@@ -87,11 +87,9 @@ def _slot_width(
         return Width(WidthKind.STATIC, answer_levels)
     if group_type == FeatureGroupType.DEEP:
         return Width(WidthKind.STATIC, 1)
-    caps = [
-        int(f.config.sequence_length)
-        for f in members
-        if f.config.HasField("sequence_length")
-    ]
+    # BaseFeature.sequence_length, not config: a member of a SequenceFeature
+    # group inherits the group's cap and never sets its own field.
+    caps = [f.sequence_length for f in members if f.sequence_length]
     if not caps:
         return Width(WidthKind.UNBOUNDED)
     return Width(WidthKind.BOUNDED, max(caps))

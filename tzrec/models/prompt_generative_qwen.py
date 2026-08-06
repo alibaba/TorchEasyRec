@@ -103,7 +103,10 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         """
         if self.is_inference:
             return {self._generated_sids_key: _fx_wrapped_generate(self, batch)}
-        return self._forward_loss(self._prompt_embeds(batch), batch)
+        # the embedding lookup stays traceable so the train pipeline can still
+        # see the sharded module and prefetch it; only the padding and the LM,
+        # which read the collator's width as a host int, are hidden.
+        return _fx_wrapped_loss(self, self._prompt_embeds(batch), batch)
 
     def _forward_loss(
         self, embeds: torch.Tensor, batch: Batch
@@ -216,6 +219,26 @@ def _unpack(
     )
     out_labels[mask] = labels
     return padded, mask.long(), out_labels
+
+
+@torch.fx.wrap
+def _fx_wrapped_loss(
+    model: "PromptGenerativeQwen", embeds: torch.Tensor, batch: Batch
+) -> Dict[str, torch.Tensor]:
+    """Hide the padded forward from FX.
+
+    ``TrainPipelineSparseDist`` symbolically traces the model whenever a
+    sharded module exists, and ``_unpack`` reads ``max_seqlen`` as a host int.
+
+    Args:
+        model: the model whose loss to compute.
+        embeds: the assembled prompt embeddings, packed.
+        batch: the batch being scored.
+
+    Returns:
+        The loss.
+    """
+    return model._forward_loss(embeds, batch)
 
 
 @torch.fx.wrap

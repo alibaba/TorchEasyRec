@@ -226,6 +226,29 @@ class CompilePromptTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "window cannot be bounded"):
             self._compile(cfg, [_feature(_HIST), answer])
 
+    def test_a_grouped_feature_inherits_the_group_cap(self) -> None:
+        # a SequenceFeature member never sets its own sequence_length; the cap
+        # comes from the group, so reading .config here would say UNBOUNDED
+        fc = feature_pb2.FeatureConfig()
+        text_format.Merge(
+            """sequence_feature {
+                 sequence_name: "clk" sequence_length: 16 sequence_delim: ";"
+                 features { id_feature { feature_name: "h" expression: "item:h"
+                            num_buckets: 8 embedding_dim: 4 } }
+               }""",
+            fc,
+        )
+        grouped = create_features([fc], fg_mode=FgMode.FG_NONE)
+        self.assertFalse(grouped[0].config.HasField("sequence_length"))
+
+        cfg = self._config(prompt="History : {{clk__h}}")
+        cfg.sid_space.codebook.extend([4])
+        compiled = self._compile(cfg, grouped)
+
+        seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
+        self.assertIs(seg.width.kind, WidthKind.BOUNDED)
+        self.assertEqual(seg.width.n, 16)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ import unittest
 
 import numpy as np
 import torch
+import torch.fx
 from google.protobuf import text_format
 from tokenizers import Tokenizer, models, pre_tokenizers
 
@@ -158,6 +159,26 @@ class PromptStackIntegrationTest(unittest.TestCase):
         labels = batch.additional_infos["prompt_labels"]
         supervised = labels[labels != -100]
         self.assertEqual(supervised.numel(), 3)
+
+    def test_training_forward_survives_fx_tracing(self) -> None:
+        # TrainPipelineSparseDist symbolically traces the model whenever a
+        # sharded module exists, and the padded forward reads the collator's
+        # width as a host int
+        model = self._model()
+
+        class _Wrapper(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, batch):
+                return self.inner.predict(batch)
+
+        graph = torch.fx.symbolic_trace(_Wrapper(model))
+        leaves = [
+            str(n.target) for n in graph.graph.nodes if "_fx_wrapped" in str(n.target)
+        ]
+        self.assertTrue(leaves, "the padded forward must be opaque to FX")
 
     def test_raw_codes_are_rejected_before_the_model_sees_them(self) -> None:
         parsed = {
