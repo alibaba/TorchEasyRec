@@ -227,7 +227,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 max_observed_items_per_sid=len(map_rows),
                 artifacts={
                     bundle.GROUPS_ARTIFACT: bundle.ArtifactEntry(
-                        type="parquet",
+                        save_type="parquet",
                         rows=len(group_rows),
                         schema={},
                         path=self._groups_dir(out, partition),

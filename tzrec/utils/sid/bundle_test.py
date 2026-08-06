@@ -25,7 +25,7 @@ def _manifest(**kw):
         max_observed_items_per_sid=3,
         artifacts={
             bundle.GROUPS_ARTIFACT: bundle.ArtifactEntry(
-                type="parquet",
+                save_type="parquet",
                 rows=4,
                 schema={"codebook": "list<int64>"},
                 path="./sid/sid_to_item_groups/v2",
@@ -110,7 +110,7 @@ class BundleManifestTest(unittest.TestCase):
         entry = bundle.artifact_entry(
             "odps://prj/tables/sid", bundle.MAP_ARTIFACT, "v2", "parquet", 9, {}
         )
-        self.assertEqual(entry.type, "odps")
+        self.assertEqual(entry.save_type, "odps")
         self.assertEqual(entry.table, "sid")
         self.assertEqual(entry.partition, "artifact=item_to_sid_map/generation=v2")
         self.assertIsNone(entry.path)
@@ -119,20 +119,20 @@ class BundleManifestTest(unittest.TestCase):
         entry = bundle.artifact_entry(
             "./sid", bundle.GROUPS_ARTIFACT, "v2", "parquet", 4, {}
         )
-        self.assertEqual(entry.type, "parquet")
+        self.assertEqual(entry.save_type, "parquet")
         self.assertEqual(entry.path, "./sid/sid_to_item_groups/v2")
         self.assertIsNone(entry.table)
 
     def test_rejects_a_serving_artifact_that_is_not_parquet(self) -> None:
         payload = json.loads(_manifest().to_json())
-        payload["artifacts"][bundle.GROUPS_ARTIFACT]["type"] = "odps"
+        payload["artifacts"][bundle.GROUPS_ARTIFACT]["save_type"] = "odps"
         with self.assertRaisesRegex(ValueError, "serving set is always parquet"):
             bundle.BundleManifest.from_json(json.dumps(payload))
 
     def test_map_artifact_may_be_odps(self) -> None:
         payload = json.loads(_manifest().to_json())
         payload["artifacts"][bundle.MAP_ARTIFACT] = {
-            "type": "odps",
+            "save_type": "odps",
             "rows": 9,
             "schema": {"item_id": "int64"},
             "table": "prj.sid",

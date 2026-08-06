@@ -471,12 +471,12 @@ class CollisionResolutionRunner:
         root = self._config.output_path if is_map else self._config.bundle_root
         assert root is not None and self._config.partition is not None
         is_csv_map = is_map and self._default_writer_type == "CsvWriter"
-        kind = "csv" if is_csv_map else "parquet"
+        save_type = "csv" if is_csv_map else "parquet"
         return artifact_entry(
             root,
             artifact,
             self._config.partition,
-            kind,
+            save_type,
             rows,
             _MAP_SCHEMA if is_map else _GROUPS_SCHEMA,
         )

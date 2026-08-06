@@ -69,9 +69,14 @@ def manifest_path(bundle_root: str, partition: str) -> str:
 
 @dataclass
 class ArtifactEntry:
-    """Where one artifact landed and what it holds."""
+    """Where one artifact landed and what it holds.
 
-    type: str
+    ``save_type`` selects how to open it and which location fields are set:
+    ``odps`` fills ``table`` and ``partition``, ``parquet`` and ``csv`` fill
+    ``path``.
+    """
+
+    save_type: str
     rows: int
     schema: Dict[str, str]
     path: Optional[str] = None
@@ -124,9 +129,9 @@ class BundleManifest:
         }
         for name in GROUPS_ARTIFACTS:
             entry = entries.get(name)
-            if entry is not None and entry.type != "parquet":
+            if entry is not None and entry.save_type != "parquet":
                 raise ValueError(
-                    f"manifest declares {name} as {entry.type!r}; the serving set "
+                    f"manifest declares {name} as {entry.save_type!r}; the serving set "
                     "is always parquet, so this bundle cannot be opened."
                 )
         return cls(artifacts=entries, **payload)
@@ -136,7 +141,7 @@ def artifact_entry(
     root: str,
     artifact: str,
     partition: str,
-    kind: str,
+    save_type: str,
     rows: int,
     schema: Dict[str, str],
 ) -> ArtifactEntry:
@@ -145,13 +150,13 @@ def artifact_entry(
     if is_odps_path(root):
         table = root.rstrip("/").rpartition("/tables/")[2]
         return ArtifactEntry(
-            type="odps",
+            save_type="odps",
             rows=rows,
             schema=schema,
             table=table,
             partition=f"artifact={artifact}/generation={partition}",
         )
-    return ArtifactEntry(type=kind, rows=rows, schema=schema, path=location)
+    return ArtifactEntry(save_type=save_type, rows=rows, schema=schema, path=location)
 
 
 def write_manifest(path: str, manifest: BundleManifest) -> None:
