@@ -24,10 +24,10 @@ def _manifest(**kw):
         capacity=5,
         max_observed_items_per_sid=3,
         artifacts={
-            bundle.GROUPS_ARTIFACT: bundle.ArtifactEntry(
+            bundle.SID_TO_ITEMS_ARTIFACT: bundle.ArtifactEntry(
                 save_type="parquet",
                 rows=4,
-                location="./sid/sid_to_item_groups/v2",
+                location="./sid/v2/sid_to_items",
             )
         },
     )
@@ -38,52 +38,45 @@ def _manifest(**kw):
 class BundleLocationTest(unittest.TestCase):
     def test_file_root_puts_the_artifact_in_a_directory(self) -> None:
         self.assertEqual(
-            bundle.artifact_location("./sid", bundle.GROUPS_ARTIFACT, "v2"),
-            "./sid/sid_to_item_groups/v2",
-        )
-
-    def test_odps_root_makes_the_artifact_a_partition_key(self) -> None:
-        self.assertEqual(
-            bundle.artifact_location(
-                "odps://prj/tables/sid", bundle.MAP_ARTIFACT, "v2"
-            ),
-            "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v2",
+            bundle.artifact_location("./sid", "v2", bundle.SID_TO_ITEMS_ARTIFACT),
+            "./sid/v2/sid_to_items",
         )
 
     def test_odps_root_tolerates_a_trailing_slash(self) -> None:
         self.assertEqual(
             bundle.artifact_location(
-                "odps://prj/tables/sid/", bundle.MAP_ARTIFACT, "v1"
+                "odps://prj/tables/sid/", "v1", bundle.ITEM_TO_SID_ARTIFACT
             ),
-            "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v1",
+            "odps://prj/tables/sid/generation=v1/artifact=item_to_sid",
         )
 
     def test_file_read_pattern_globs_the_part_files(self) -> None:
         self.assertEqual(
-            bundle.artifact_read_pattern("./sid", bundle.MAP_ARTIFACT, "v1", "parquet"),
-            "./sid/item_to_sid_map/v1/part-*.parquet",
+            bundle.artifact_read_pattern(
+                "./sid", "v1", bundle.ITEM_TO_SID_ARTIFACT, "parquet"
+            ),
+            "./sid/v1/item_to_sid/part-*.parquet",
         )
 
     def test_odps_read_pattern_is_the_partition_itself(self) -> None:
         self.assertEqual(
             bundle.artifact_read_pattern(
-                "odps://prj/tables/sid", bundle.MAP_ARTIFACT, "v1", "parquet"
+                "odps://prj/tables/sid", "v1", bundle.ITEM_TO_SID_ARTIFACT, "parquet"
             ),
-            "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v1",
+            "odps://prj/tables/sid/generation=v1/artifact=item_to_sid",
         )
 
-    def test_manifest_path_is_per_generation(self) -> None:
-        self.assertEqual(bundle.manifest_path("./sid", "v2"), "./sid/manifest/v2.json")
+    def test_manifest_sits_inside_its_generation(self) -> None:
+        self.assertEqual(bundle.manifest_path("./sid", "v2"), "./sid/v2/manifest.json")
 
 
 class BundleLayoutTest(unittest.TestCase):
     def _layout(self, **kw):
         base = dict(
-            map_root="./map",
-            bundle_root="./sid",
-            partition="v2",
-            from_partition="v1",
-            reader_type=None,
+            output_path="./sid",
+            item_to_sid_root="./map",
+            generation="v2",
+            from_generation="v1",
         )
         base.update(kw)
         return bundle.BundleLayout(**base)
@@ -91,75 +84,70 @@ class BundleLayoutTest(unittest.TestCase):
     def test_each_family_resolves_under_its_own_root(self) -> None:
         layout = self._layout()
         self.assertEqual(
-            layout.write_path(bundle.MAP_ARTIFACT), "./map/item_to_sid_map/v2"
+            layout.write_path(bundle.ITEM_TO_SID_ARTIFACT), "./map/v2/item_to_sid"
         )
         self.assertEqual(
-            layout.write_path(bundle.DELTA_MAP_ARTIFACT),
-            "./map/delta_item_to_sid_map/v2",
+            layout.write_path(bundle.DELTA_ITEM_TO_SID_ARTIFACT),
+            "./map/v2/delta_item_to_sid",
         )
         self.assertEqual(
-            layout.write_path(bundle.GROUPS_ARTIFACT), "./sid/sid_to_item_groups/v2"
+            layout.write_path(bundle.SID_TO_ITEMS_ARTIFACT), "./sid/v2/sid_to_items"
         )
         self.assertEqual(
-            layout.write_path(bundle.DELTA_GROUPS_ARTIFACT),
-            "./sid/delta_sid_to_item_groups/v2",
+            layout.write_path(bundle.DELTA_SID_TO_ITEMS_ARTIFACT),
+            "./sid/v2/delta_sid_to_items",
         )
 
-    def test_reads_come_from_the_appended_onto_partition(self) -> None:
+    def test_reads_come_from_the_appended_onto_generation(self) -> None:
         layout = self._layout()
         self.assertEqual(
-            layout.read_path(bundle.MAP_ARTIFACT),
-            "./map/item_to_sid_map/v1/part-*.parquet",
+            layout.read_path(bundle.ITEM_TO_SID_ARTIFACT, "parquet"),
+            "./map/v1/item_to_sid/part-*.parquet",
         )
         self.assertEqual(
-            layout.read_path(bundle.GROUPS_ARTIFACT),
-            "./sid/sid_to_item_groups/v1/part-*.parquet",
-        )
-
-    def test_reader_type_selects_the_map_suffix_but_never_the_groups(self) -> None:
-        layout = self._layout(reader_type="CsvReader")
-        self.assertTrue(layout.read_path(bundle.MAP_ARTIFACT).endswith("part-*.csv"))
-        self.assertTrue(
-            layout.read_path(bundle.GROUPS_ARTIFACT).endswith("part-*.parquet")
-        )
-
-    def test_an_odps_map_root_leaves_the_serving_set_on_files(self) -> None:
-        layout = self._layout(map_root="odps://prj/tables/sid")
-        self.assertEqual(
-            layout.write_path(bundle.MAP_ARTIFACT),
-            "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v2",
+            layout.read_path(bundle.SID_TO_ITEMS_ARTIFACT, "parquet"),
+            "./sid/v1/sid_to_items/part-*.parquet",
         )
         self.assertEqual(
-            layout.write_path(bundle.GROUPS_ARTIFACT), "./sid/sid_to_item_groups/v2"
+            layout.read_path(bundle.ITEM_TO_SID_ARTIFACT, "csv"),
+            "./map/v1/item_to_sid/part-*.csv",
         )
 
-    def test_manifest_locations_track_the_two_partitions(self) -> None:
+    def test_an_odps_item_to_sid_root_leaves_the_serving_set_on_files(self) -> None:
+        layout = self._layout(item_to_sid_root="odps://prj/tables/sid")
+        self.assertEqual(
+            layout.write_path(bundle.ITEM_TO_SID_ARTIFACT),
+            "odps://prj/tables/sid/generation=v2/artifact=item_to_sid",
+        )
+        self.assertEqual(
+            layout.write_path(bundle.SID_TO_ITEMS_ARTIFACT), "./sid/v2/sid_to_items"
+        )
+
+    def test_manifest_locations_track_the_two_generations(self) -> None:
         layout = self._layout()
-        self.assertEqual(layout.prior_manifest_path(), "./sid/manifest/v1.json")
+        self.assertEqual(layout.prior_manifest_path(), "./sid/v1/manifest.json")
 
     def test_a_missing_root_is_reported_against_its_artifact(self) -> None:
-        layout = self._layout(map_root=None)
-        with self.assertRaisesRegex(RuntimeError, "item_to_sid_map"):
-            layout.write_path(bundle.MAP_ARTIFACT)
+        layout = self._layout(item_to_sid_root=None)
+        with self.assertRaisesRegex(RuntimeError, "item_to_sid"):
+            layout.write_path(bundle.ITEM_TO_SID_ARTIFACT)
         self.assertEqual(
-            layout.write_path(bundle.GROUPS_ARTIFACT), "./sid/sid_to_item_groups/v2"
+            layout.write_path(bundle.SID_TO_ITEMS_ARTIFACT), "./sid/v2/sid_to_items"
         )
 
-    def test_an_odps_bundle_root_is_refused(self) -> None:
-        # the serving set is always files, so a root that would make it
-        # otherwise cannot be built rather than being written and rejected later
+    def test_an_odps_output_path_is_refused(self) -> None:
         with self.assertRaisesRegex(ValueError, "always files"):
             bundle.BundleLayout(
-                map_root="./map",
-                bundle_root="odps://prj/tables/g",
-                partition="v2",
-                from_partition=None,
+                output_path="odps://prj/tables/g",
+                item_to_sid_root="./map",
+                generation="v2",
+                from_generation=None,
             )
 
     def test_a_full_resolve_has_nothing_to_read(self) -> None:
-        layout = self._layout(from_partition=None)
-        with self.assertRaisesRegex(RuntimeError, "from_partition"):
-            layout.read_path(bundle.GROUPS_ARTIFACT)
+        layout = self._layout(from_generation=None)
+        with self.assertRaisesRegex(RuntimeError, "from_generation"):
+            layout.read_path(bundle.SID_TO_ITEMS_ARTIFACT, "parquet")
 
 
 class BundleManifestTest(unittest.TestCase):
@@ -174,7 +162,7 @@ class BundleManifestTest(unittest.TestCase):
     def test_absent_optional_fields_are_omitted_not_null(self) -> None:
         payload = json.loads(_manifest().to_json())
         self.assertNotIn("since_bundle_uuid", payload)
-        self.assertIn("location", payload["artifacts"][bundle.GROUPS_ARTIFACT])
+        self.assertIn("location", payload["artifacts"][bundle.SID_TO_ITEMS_ARTIFACT])
 
     def test_rejects_a_manifest_missing_required_keys(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing required keys"):
@@ -188,51 +176,58 @@ class BundleManifestTest(unittest.TestCase):
 
     def test_an_odps_entry_keeps_the_url_its_readers_take(self) -> None:
         layout = bundle.BundleLayout(
-            map_root="odps://prj/tables/sid",
-            bundle_root="./sid",
-            partition="v2",
-            from_partition=None,
+            output_path="./sid",
+            item_to_sid_root="odps://prj/tables/sid",
+            generation="v2",
+            from_generation=None,
         )
-        entry = layout.entry(bundle.MAP_ARTIFACT, 9, "ParquetWriter")
+        entry = layout.entry(bundle.ITEM_TO_SID_ARTIFACT, 9, "ParquetWriter")
         self.assertEqual(entry.save_type, "odps")
         self.assertEqual(
             entry.location,
-            "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v2",
+            "odps://prj/tables/sid/generation=v2/artifact=item_to_sid",
         )
 
     def test_a_file_entry_keeps_the_writer_format(self) -> None:
         layout = bundle.BundleLayout(
-            map_root="./map", bundle_root="./sid", partition="v2", from_partition=None
+            output_path="./sid",
+            item_to_sid_root="./map",
+            generation="v2",
+            from_generation=None,
         )
-        entry = layout.entry(bundle.MAP_ARTIFACT, 4, "CsvWriter")
+        entry = layout.entry(bundle.ITEM_TO_SID_ARTIFACT, 4, "CsvWriter")
         self.assertEqual(entry.save_type, "csv")
-        self.assertEqual(entry.location, "./map/item_to_sid_map/v2")
+        self.assertEqual(entry.location, "./map/v2/item_to_sid")
 
     def test_a_csv_writer_never_makes_the_serving_set_csv(self) -> None:
         layout = bundle.BundleLayout(
-            map_root="./map", bundle_root="./sid", partition="v2", from_partition=None
+            output_path="./sid",
+            item_to_sid_root="./map",
+            generation="v2",
+            from_generation=None,
         )
         self.assertEqual(
-            layout.entry(bundle.GROUPS_ARTIFACT, 4, "CsvWriter").save_type, "parquet"
+            layout.entry(bundle.SID_TO_ITEMS_ARTIFACT, 4, "CsvWriter").save_type,
+            "parquet",
         )
 
     def test_rejects_a_serving_artifact_that_is_not_parquet(self) -> None:
         payload = json.loads(_manifest().to_json())
-        payload["artifacts"][bundle.GROUPS_ARTIFACT]["save_type"] = "odps"
+        payload["artifacts"][bundle.SID_TO_ITEMS_ARTIFACT]["save_type"] = "odps"
         with self.assertRaisesRegex(ValueError, "serving set is always parquet"):
             bundle.BundleManifest.from_json(json.dumps(payload))
 
-    def test_map_artifact_may_be_odps(self) -> None:
+    def test_item_to_sid_artifact_may_be_odps(self) -> None:
         payload = json.loads(_manifest().to_json())
-        payload["artifacts"][bundle.MAP_ARTIFACT] = {
+        payload["artifacts"][bundle.ITEM_TO_SID_ARTIFACT] = {
             "save_type": "odps",
             "rows": 9,
-            "location": "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v2",
+            "location": "odps://prj/tables/sid/generation=v2/artifact=item_to_sid",
         }
         restored = bundle.BundleManifest.from_json(json.dumps(payload))
         self.assertEqual(
-            restored.artifacts[bundle.MAP_ARTIFACT].location,
-            "odps://prj/tables/sid/artifact=item_to_sid_map/generation=v2",
+            restored.artifacts[bundle.ITEM_TO_SID_ARTIFACT].location,
+            "odps://prj/tables/sid/generation=v2/artifact=item_to_sid",
         )
 
     def test_write_then_read_from_disk(self) -> None:
