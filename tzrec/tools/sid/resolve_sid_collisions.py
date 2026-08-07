@@ -238,8 +238,8 @@ class ResolveSidCollisionsConfig:
                 "writing over the artifacts being read destroys them mid-run."
             )
 
-        # Eagerly build both so their validation fails here rather than lazily
-        # inside run(), and before output_path is treated as a local path below.
+        # Validate here, not lazily in run(), and before output_path is
+        # treated as a local path below.
         _ = self.resolution_config
         _ = self.layout
 
@@ -263,21 +263,13 @@ class ResolveSidCollisionsConfig:
             return []
         if is_odps_path(root):
             return [root]
-        inner, outer = os.path.realpath(root), os.path.realpath(output_path)
-        if inner == outer:
+        if os.path.realpath(root) == os.path.realpath(output_path):
             logger.warning(
                 "--item_to_sid_root %s is the same location as --output_path, so "
                 "the flag has no effect and is ignored",
                 root,
             )
             return []
-        if os.path.commonpath([inner, outer]) == outer:
-            logger.warning(
-                "--item_to_sid_root %s sits inside --output_path %s, where the "
-                "generation directories live; writing there anyway",
-                root,
-                output_path,
-            )
         return [root]
 
     @property
@@ -735,16 +727,7 @@ class CollisionResolutionRunner:
             ["codebook", "itemids"],
             "Reading published sid_to_items",
         ):
-            codes = self._codes_matrix(batch["codebook"])
-            if codes.shape[1] != len(layer_sizes):
-                raise ValueError(
-                    f"generation {self._config.from_generation!r} holds "
-                    f"{codes.shape[1]}-layer SIDs but --codebook has "
-                    f"{len(layer_sizes)}; its manifest disagrees with its own "
-                    "artifacts, so every published SID would be re-keyed under "
-                    "the wrong radix."
-                )
-            keys = sid_bucket_keys(codes, layer_sizes)
+            keys = sid_bucket_keys(self._codes_matrix(batch["codebook"]), layer_sizes)
             if keys.size:
                 if int(keys[0]) <= previous_max_key or np.any(keys[1:] <= keys[:-1]):
                     raise ValueError(
@@ -1101,8 +1084,7 @@ class CollisionResolutionRunner:
                     batch["itemids"]
                 )
                 if low == high:
-                    # No new bucket lands in this batch's key range, so the
-                    # merge would rebuild the batch it was handed.
+                    # No new bucket in range: the merge would rebuild the batch.
                     batch_offsets = np.zeros(batch_keys.shape[0] + 1, dtype=np.int64)
                     np.cumsum(batch_lengths, out=batch_offsets[1:])
                     emit(batch_codes, batch_offsets, batch_values, _NO_ROWS)

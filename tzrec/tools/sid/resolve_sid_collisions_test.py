@@ -46,7 +46,7 @@ def _parquet(
         "codes": pa.array(codes, type=pa.list_(pa.int64())),
     }
     if candidate_codes is not None:
-        # flatten each row's [[c0, ..], ..] (topk x n_layers) to a flat list<int>
+        # (topk x n_layers) per row, flattened to one list<int>
         flat = [[code for cand in row for code in cand] for row in candidate_codes]
         cols["candidate_codes"] = pa.array(flat, type=pa.list_(pa.int64()))
     parquet.write_table(pa.table(cols), path)
@@ -978,8 +978,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             self.assertEqual(item_map["offset_codebook"][i], [final[0], final[1] + 8])
 
     def test_append_recomputes_offset_for_state_written_without_it(self) -> None:
-        # offset_codebook is derived from the published codebook, so a
-        # generation written before that column existed still merges
+        # offset_codebook is derived, so a generation without it still merges
         out = os.path.join(self.test_dir, "out")
         self._seed_state(
             out,
@@ -1092,8 +1091,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             )
         }
         delta = self._read_parquet(delta_groups)
-        # Delta rows carry the whole post-append bucket, byte-identical to the
-        # corpus output, so a consumer can upsert them idempotently.
+        # Delta rows are the whole post-append bucket, so upserts are idempotent.
         for codebook, item_group in zip(delta["codebook"], delta["itemids"]):
             self.assertEqual(item_group, full[tuple(codebook)])
         touched = {item for group in delta["itemids"] for item in group}
@@ -1105,8 +1103,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 self.assertEqual(offset, [codebook[0], codebook[1] + 8])
 
     def test_append_creates_buckets_before_between_and_after(self) -> None:
-        # New SIDs sort before, between and after every published bucket, which
-        # exercises all three branches of the merge.
+        # Before, between and after every published bucket: all merge branches.
         out = self._seed_generation(item_ids=[0], codes=[[4, 4]])
         inp = os.path.join(self.test_dir, "v2_in.parquet")
         _parquet(inp, [10, 11, 12], [[0, 0], [4, 5], [7, 7]], [[[0, 0]]] * 3)
@@ -1184,7 +1181,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         inp = os.path.join(self.test_dir, "v2_in.parquet")
         _parquet(inp, [10], [[0, 0]], [[[0, 2]]])
         self._append(inp, out)
-        # Leave v1's item_to_sid beside v2's sid_to_items: the totals disagree.
+        # v1's item_to_sid beside v2's sid_to_items: the totals disagree.
         shutil.rmtree(self._sid_to_items_dir(out, "v1"))
         shutil.copytree(
             self._sid_to_items_dir(out, "v2"), self._sid_to_items_dir(out, "v1")
@@ -1193,7 +1190,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             self._append(self._prepare_single(20), out, previous="v1", generation="v3")
 
     def test_append_rejects_state_truncated_outside_touched_bands(self) -> None:
-        # Band 5 is untouched, so only the row totals catch its missing bucket.
+        # Band 5 is untouched, so only the totals catch its missing bucket.
         out = os.path.join(self.test_dir, "out")
         self._seed_state(
             out,
