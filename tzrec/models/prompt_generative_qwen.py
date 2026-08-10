@@ -181,11 +181,16 @@ def _unpack(
     max_seqlen: int,
     ignore_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Pad a packed varlen batch at the LM boundary.
+    """Left-pad a packed varlen batch at the LM boundary.
 
     Padding lives in this one adapter. ``max_seqlen`` is the collator's, not
     ``lengths.max()``: deriving it here would sync the device to the host every
     step, which the design forbids.
+
+    Pads go on the left so that every row ends on a real token. Both consumers
+    index from the right -- the loss keeps a fixed-width suffix and decode
+    prefills from ``[:, -1, :]`` -- so right-padding would hand a short row its
+    padding instead of its answer.
 
     Args:
         embeds: packed embeddings, ``(total_tokens, hidden)``.
@@ -203,7 +208,7 @@ def _unpack(
     hidden = embeds.shape[-1]
 
     columns = torch.arange(max_seqlen, device=embeds.device)
-    mask = columns[None, :] < lengths[:, None]
+    mask = columns[None, :] >= (max_seqlen - lengths)[:, None]
 
     padded = embeds.new_zeros((batch_size, max_seqlen, hidden))
     # mask selects row-major, which is the order embeds and labels are packed in

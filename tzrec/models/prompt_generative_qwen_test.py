@@ -29,12 +29,13 @@ class UnpackTest(unittest.TestCase):
         padded, mask, out = _unpack(embeds, cu, labels, max_seqlen=3, ignore_index=-100)
 
         self.assertEqual(padded.shape, (2, 3, 4))
-        self.assertEqual(mask.tolist(), [[1, 1, 0], [1, 1, 1]])
-        torch.testing.assert_close(padded[0, :2], embeds[:2])
+        # pads go on the left, so every row ends on a real token
+        self.assertEqual(mask.tolist(), [[0, 1, 1], [1, 1, 1]])
+        torch.testing.assert_close(padded[0, 1:], embeds[:2])
         torch.testing.assert_close(padded[1, :3], embeds[2:])
         # the pad column is zero, and its label is ignored
-        torch.testing.assert_close(padded[0, 2], torch.zeros(4))
-        self.assertEqual(out.tolist(), [[10, 11, -100], [20, 21, 22]])
+        torch.testing.assert_close(padded[0, 0], torch.zeros(4))
+        self.assertEqual(out.tolist(), [[-100, 10, 11], [20, 21, 22]])
 
     def test_uses_the_given_width_not_the_observed_max(self) -> None:
         # the collator's bucket may exceed the widest row; §7.4 forbids
@@ -54,8 +55,32 @@ class UnpackTest(unittest.TestCase):
         labels = torch.zeros(4, dtype=torch.long)
         padded, _, _ = _unpack(embeds, cu, labels, max_seqlen=3, ignore_index=-100)
 
-        self.assertEqual(padded[0, 0].item(), 1.0)
+        self.assertEqual(padded[0, :, 0].tolist(), [0.0, 0.0, 1.0])
         self.assertEqual(padded[1, :, 0].tolist(), [2.0, 3.0, 4.0])
+
+    def test_every_row_ends_on_its_own_last_token(self) -> None:
+        # decode prefills from [:, -1, :]; a right-padded short row would
+        # hand it padding instead of the row's final token
+        embeds = torch.tensor([[1.0], [2.0], [3.0], [11.0], [12.0], [13.0], [14.0]])
+        cu = torch.tensor([0, 3, 7])
+        labels = torch.zeros(7, dtype=torch.long)
+        padded, _, _ = _unpack(embeds, cu, labels, max_seqlen=4, ignore_index=-100)
+
+        self.assertEqual(padded[:, -1, 0].tolist(), [3.0, 14.0])
+
+    def test_a_short_row_keeps_its_answer_in_the_suffix_window(self) -> None:
+        # the loss scores a fixed-width suffix; every row must contribute the
+        # same number of supervised positions regardless of its length
+        embeds = torch.ones(9, 1)
+        cu = torch.tensor([0, 4, 9])
+        ignore = -100
+        # each row ends on 2 real labels, preceded by unsupervised context
+        labels = torch.tensor([ignore, ignore, 7, 8, ignore, ignore, ignore, 7, 8])
+        _, _, out = _unpack(embeds, cu, labels, max_seqlen=5, ignore_index=ignore)
+
+        window = out[:, -2:]
+        self.assertEqual((window != ignore).sum(dim=1).tolist(), [2, 2])
+        self.assertEqual(window.tolist(), [[7, 8], [7, 8]])
 
     def test_gradient_reaches_the_packed_input(self) -> None:
         embeds = torch.ones(3, 2, requires_grad=True)
