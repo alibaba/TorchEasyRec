@@ -1091,7 +1091,11 @@ class DeltaEmbeddingDumper:
         A sharded managed collision wrapper tracks lookups through its inner
         sharded embedding collection, so the mapping keys each MCH module by
         the inner module object and then re-derives the tracker's owner FQN,
-        which is prefix-independent unlike module path names.
+        which is prefix-independent unlike module path names. Every tracked
+        table of a ZCH inner module must resolve to an MCH module: the lookup
+        wrapper records the whole inner collection, and an unresolved table
+        would fall through to the plain path and emit its remapped rows as
+        serving keys.
         """
         zch_modules: Dict[str, MCHManagedCollisionModule] = {}
         self._zch_inner_module_ids: Set[int] = set()
@@ -1113,10 +1117,20 @@ class DeltaEmbeddingDumper:
                     table_name
                 ] = mch
         for module_fqn, module in self._tracker.tracked_modules.items():
-            for table_name, mch in mch_by_inner_module.get(id(module), {}).items():
+            if id(module) not in self._zch_inner_module_ids:
+                continue
+            for table_name in module._table_name_to_config:
                 table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
-                if table_fqn in self._tracker.fqn_to_feature_names:
-                    zch_modules[table_fqn] = mch
+                if table_fqn not in self._tracker.fqn_to_feature_names:
+                    continue
+                mch = mch_by_inner_module[id(module)].get(table_name)
+                if mch is None:
+                    raise ValueError(
+                        f"ZCH table {table_fqn} did not resolve to an MCH module; "
+                        "dumping it as a plain table would emit its remapped "
+                        "rows as serving keys."
+                    )
+                zch_modules[table_fqn] = mch
         return zch_modules
 
     def _install_zch_tracking(self) -> None:

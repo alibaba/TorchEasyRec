@@ -573,6 +573,18 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                     torch.device("cpu"),
                 )
 
+    def _build_zch_collect_model(self, mch_modules):
+        inner_module = torch.nn.Module()
+        inner_module._table_name_to_config = dict.fromkeys(mch_modules)
+        wrapper = torch.nn.Module()
+        wrapper._managed_collision_collection = SimpleNamespace(
+            _managed_collision_modules=mch_modules
+        )
+        wrapper._embedding_module = inner_module
+        model = torch.nn.Module()
+        model.mc_ebc = wrapper
+        return model, inner_module
+
     def test_collect_zch_modules_maps_tracked_table_fqns(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         mch = MCHManagedCollisionModule(
@@ -581,14 +593,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             eviction_policy=LFU_EvictionPolicy(),
             eviction_interval=2,
         )
-        inner_module = torch.nn.Module()
-        wrapper = torch.nn.Module()
-        wrapper._managed_collision_collection = SimpleNamespace(
-            _managed_collision_modules={"user_emb": mch}
-        )
-        wrapper._embedding_module = inner_module
-        model = torch.nn.Module()
-        model.mc_ebc = wrapper
+        model, inner_module = self._build_zch_collect_model({"user_emb": mch})
         dumper._model = model
         table_fqn = "mc_ebc._embedding_module.embedding_bags.user_emb"
         dumper._tracker = SimpleNamespace(
@@ -602,6 +607,36 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             ),
         ):
             self.assertEqual(dumper._collect_zch_modules(), {table_fqn: mch})
+
+    def test_collect_zch_modules_fails_fast_on_unresolved_table(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        mch = MCHManagedCollisionModule(
+            zch_size=4,
+            device=torch.device("cpu"),
+            eviction_policy=LFU_EvictionPolicy(),
+            eviction_interval=2,
+        )
+        model, inner_module = self._build_zch_collect_model({"user_emb": mch})
+        # The tracker also owns a second table of the same ZCH inner module
+        # that the MCH collection does not cover; dumping it plain would emit
+        # remapped rows as serving keys.
+        inner_module._table_name_to_config["stray_emb"] = None
+        dumper._model = model
+        dumper._tracker = SimpleNamespace(
+            fqn_to_feature_names={
+                "mc_ebc._embedding_module.embedding_bags.user_emb": ["user_id"],
+                "mc_ebc._embedding_module.embedding_bags.stray_emb": ["stray_id"],
+            },
+            tracked_modules={"mc_ebc._embedding_module": inner_module},
+        )
+        with mock.patch(
+            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+            side_effect=lambda module_fqn, _module, table_name: (
+                f"{module_fqn}.embedding_bags.{table_name}"
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "stray_emb"):
+                dumper._collect_zch_modules()
 
     def test_collect_zch_modules_rejects_non_mch_module(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
