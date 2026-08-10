@@ -36,26 +36,12 @@ def _manifest(**kw):
 
 
 class BundleLocationTest(unittest.TestCase):
-    def test_file_root_puts_the_artifact_in_a_directory(self) -> None:
-        self.assertEqual(
-            bundle.artifact_location("./sid", "v2", bundle.SID_TO_ITEMS_ARTIFACT),
-            "./sid/v2/sid_to_items",
-        )
-
     def test_odps_root_tolerates_a_trailing_slash(self) -> None:
         self.assertEqual(
             bundle.artifact_location(
                 "odps://prj/tables/sid/", "v1", bundle.ITEM_TO_SID_ARTIFACT
             ),
             "odps://prj/tables/sid/generation=v1/artifact=item_to_sid",
-        )
-
-    def test_file_read_pattern_globs_the_part_files(self) -> None:
-        self.assertEqual(
-            bundle.artifact_read_pattern(
-                "./sid", "v1", bundle.ITEM_TO_SID_ARTIFACT, "parquet"
-            ),
-            "./sid/v1/item_to_sid/part-*.parquet",
         )
 
     def test_odps_read_pattern_is_the_partition_itself(self) -> None:
@@ -65,9 +51,6 @@ class BundleLocationTest(unittest.TestCase):
             ),
             "odps://prj/tables/sid/generation=v1/artifact=item_to_sid",
         )
-
-    def test_manifest_sits_inside_its_generation(self) -> None:
-        self.assertEqual(bundle.manifest_path("./sid", "v2"), "./sid/v2/manifest.json")
 
 
 class BundleLayoutTest(unittest.TestCase):

@@ -55,7 +55,7 @@ def artifact_location(root: str, generation: str, artifact: str) -> str:
 
 
 def artifact_read_pattern(
-    root: str, generation: str, artifact: str, suffix: str
+    root: str, generation: str, artifact: str, save_type: str
 ) -> str:
     """Return the reader path for one artifact of one generation.
 
@@ -65,7 +65,7 @@ def artifact_read_pattern(
     location = artifact_location(root, generation, artifact)
     if is_odps_path(root):
         return location
-    return os.path.join(location, f"part-*.{suffix}")
+    return os.path.join(location, f"part-*.{save_type}")
 
 
 def manifest_path(output_path: str, generation: str) -> str:
@@ -203,17 +203,17 @@ class BundleLayout:
             raise RuntimeError("no generation is configured to write.")
         return artifact_location(self.root_for(artifact), self.generation, artifact)
 
-    def read_path(self, artifact: str, suffix: str) -> str:
+    def read_path(self, artifact: str, save_type: str) -> str:
         """Return where the appended-onto generation holds one artifact.
 
-        ``suffix`` comes from what that generation recorded it wrote, not from
+        ``save_type`` comes from what that generation recorded it wrote, not from
         this run's flags, so a chain does not depend on the reader type being
         repeated.
         """
         if self.from_generation is None:
             raise RuntimeError("no from_generation is configured to read.")
         return artifact_read_pattern(
-            self.root_for(artifact), self.from_generation, artifact, suffix
+            self.root_for(artifact), self.from_generation, artifact, save_type
         )
 
     def entry(
@@ -221,9 +221,10 @@ class BundleLayout:
     ) -> ArtifactEntry:
         """Describe where one artifact landed, for the manifest.
 
-        ``save_type`` is read off the address, so it cannot contradict
+        An ODPS root fixes ``save_type`` to ``odps``, so it cannot contradict
         ``location``; the serving set can only be parquet because a root that
-        would make it otherwise is refused at construction.
+        would make it otherwise is refused at construction, and the
+        item-to-SID set follows ``writer_type``.
         """
         if is_odps_path(self.root_for(artifact)):
             save_type = "odps"
@@ -332,6 +333,9 @@ class Bundle:
         The codebook fixes how a SID packs into a bucket key and how its layers
         shift into one vocabulary, so appending under a different one re-keys
         every published SID and rewrites its ``offset_codebook``.
+
+        A differing ``capacity`` is only warned about: published buckets keep
+        the occupancy they were published with.
 
         Raises:
             ValueError: If the codebook differs from the published generation's.

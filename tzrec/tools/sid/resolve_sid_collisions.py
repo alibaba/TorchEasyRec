@@ -418,7 +418,7 @@ class CollisionResolutionRunner:
             codebook=list(self._config.layer_sizes),
             capacity=self._config.max_items_per_codebook,
             observed=result.stats.max_final_bucket_size,
-            item_id_type=str(self._item_id_type) if self._item_id_type else None,
+            item_id_type=str(self._item_id_type),
             writer_type=self._resolved_writer_type,
         )
         logger.info("wrote bundle %s manifest to %s", self._bundle.uuid, path)
@@ -454,8 +454,8 @@ class CollisionResolutionRunner:
         missing = [name for name in fields if name not in reader.schema.names]
         if missing:
             raise ValueError(
-                f"columns {missing} are missing from {path!r}; point the flag at "
-                "an output directory written by this tool."
+                f"columns {missing} are missing from {path!r}; it is not an "
+                "artifact this tool published."
             )
         progress = ProgressLogger(description, start_n=0)
         scanned = 0
@@ -656,8 +656,8 @@ class CollisionResolutionRunner:
         )
         self._check_existing_item_to_sid_size(published_items)
         logger.info(
-            "append mode: %d new items onto %d published items in %d touched "
-            "buckets, from generation %s",
+            "append mode: %d new items onto %d published items; %d published "
+            "buckets loaded from the bands this run touches, generation %s",
             item_ids.shape[0],
             published_items,
             prior.bucket_keys.shape[0],
@@ -677,7 +677,7 @@ class CollisionResolutionRunner:
             .astype(np.int64, copy=False)
         )
         flat = lists.flatten()
-        if self._item_id_type is not None and flat.type != self._item_id_type:
+        if flat.type != self._item_id_type:
             flat = pc.cast(flat, self._item_id_type)
         return lengths, flat
 
@@ -697,13 +697,13 @@ class CollisionResolutionRunner:
             return values
         return self._codes_column(self._codes_matrix(values), is_csv)
 
-    def _check_state_item_id_type(self, values: pa.Array, source: str) -> None:
+    def _check_state_item_id_type(self, values: pa.Array) -> None:
         """Reject an existing artifact whose item ID type differs from the input."""
         if len(values) == 0:
             return
         if values.type != self._item_id_type:
             raise ValueError(
-                f"{source} item ID type {values.type} differs from the new-items "
+                f"existing item_to_sid item ID type {values.type} differs from the "
                 f"input type {self._item_id_type}; the merged item_to_sid cannot mix "
                 "them. Re-export the state or the prediction with one type."
             )
@@ -711,7 +711,7 @@ class CollisionResolutionRunner:
     def _load_prior_occupancy(
         self, path: str, band_ids: np.ndarray, item_ids: np.ndarray
     ) -> Tuple[PriorOccupancy, int]:
-        """Read published occupancy and total item count from the resolved groups."""
+        """Read touched-band occupancy and item count from published sid_to_items."""
         layer_sizes = self._config.layer_sizes
         wanted_bands = np.unique(band_ids)
         new_item_ids = self._item_id_array(item_ids)
@@ -768,7 +768,7 @@ class CollisionResolutionRunner:
         )
 
     def _check_existing_item_to_sid_size(self, published_items: int) -> None:
-        """Reject a published map whose size disagrees with the groups."""
+        """Reject published item_to_sid whose row count disagrees with sid_to_items."""
         item_to_sid_rows = 0
         for batch in self._iter_state_batches(
             self._bundle.prior_item_to_sid_path,
@@ -791,8 +791,6 @@ class CollisionResolutionRunner:
     ) -> BaseWriter:
         """Create a repository writer, defaulting to the resolved writer type."""
         writer_type = writer_type or self._resolved_writer_type
-        if writer_type is None:
-            raise RuntimeError("writer type is unavailable before reading input.")
         return create_writer(
             output_path,
             writer_type=writer_type,
@@ -836,7 +834,7 @@ class CollisionResolutionRunner:
 
     def _write_new_item_to_sid_rows(
         self,
-        writer: BaseWriter,
+        writers: List[BaseWriter],
         item_ids: np.ndarray,
         origin_codes: np.ndarray,
         result: CollisionResolutionResult,
@@ -845,30 +843,35 @@ class CollisionResolutionRunner:
     ) -> int:
         """Write this run's own item rows in chunks, without a full code copy.
 
+        Each chunk is encoded once and handed to every writer, so the corpus
+        artifact and the delta do not pay for the same encode twice.
+
         Returns:
             How many item rows this run added.
         """
         is_csv = self._resolved_writer_type == "CsvWriter"
         output_count = item_ids.shape[0]
         last_progress_count = written
-        write_chunk = _max_code_rows(
-            is_csv, origin_codes.shape[1], _ITEM_TO_SID_WRITE_ROWS
-        )
+        write_chunk = _ITEM_TO_SID_WRITE_ROWS
+        if not is_csv:
+            write_chunk = min(
+                write_chunk, _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1]
+            )
         for start in range(0, output_count, write_chunk):
             end = min(start + write_chunk, output_count)
             selection = slice(start, end)
             origin_chunk = origin_codes[selection]
             final_chunk = origin_chunk.copy()
             final_chunk[:, -1] = result.resolved_last_codes[selection]
-            writer.write(
-                {
-                    "item_id": self._item_id_array(item_ids[selection]),
-                    "origin_codebook": self._codes_column(origin_chunk, is_csv),
-                    "codebook": self._codes_column(final_chunk, is_csv),
-                    "offset_codebook": self._offset_codes_column(final_chunk, is_csv),
-                    "index": pa.array(result.slot_indices[selection], type=pa.int64()),
-                }
-            )
+            columns = {
+                "item_id": self._item_id_array(item_ids[selection]),
+                "origin_codebook": self._codes_column(origin_chunk, is_csv),
+                "codebook": self._codes_column(final_chunk, is_csv),
+                "offset_codebook": self._offset_codes_column(final_chunk, is_csv),
+                "index": pa.array(result.slot_indices[selection], type=pa.int64()),
+            }
+            for writer in writers:
+                writer.write(columns)
             written += end - start
             if self._progress_interval_reached(written, last_progress_count):
                 progress.log(written, suffix=f"{written} samples processed")
@@ -876,7 +879,11 @@ class CollisionResolutionRunner:
         return output_count
 
     def _stream_existing_item_to_sid_rows(self, writer: BaseWriter) -> int:
-        """Copy every published item_to_sid row into the merged output unchanged."""
+        """Copy every published item_to_sid row into the merged output.
+
+        The SID assignment is untouched; codes are re-encoded for this run's
+        writer and ``offset_codebook`` is re-derived from ``codebook``.
+        """
         if not self._config.is_append:
             return 0
         path = self._bundle.prior_item_to_sid_path
@@ -887,7 +894,7 @@ class CollisionResolutionRunner:
             path, fields, "Copying published item_to_sid"
         ):
             item_id_column = batch["item_id"]
-            self._check_state_item_id_type(item_id_column, "existing item_to_sid")
+            self._check_state_item_id_type(item_id_column)
             writer.write(
                 {
                     "item_id": item_id_column,
@@ -916,27 +923,29 @@ class CollisionResolutionRunner:
         run's rows are appended, so the artifact stands alone and is exactly
         what the next append consumes.
         """
-        with closing(self._make_writer(self._bundle.item_to_sid_path)) as writer:
-            progress = ProgressLogger("Writing resolved item_to_sid", start_n=0)
-            written = self._stream_existing_item_to_sid_rows(writer)
-            written += self._write_new_item_to_sid_rows(
-                writer, item_ids, origin_codes, result, progress, written
+        with ExitStack() as stack:
+            writer = stack.enter_context(
+                closing(self._make_writer(self._bundle.item_to_sid_path))
             )
-            self._bundle.record_item_to_sid(written)
-
-        if not self._config.is_append:
-            return
-        with closing(self._make_writer(self._bundle.delta_item_to_sid_path)) as writer:
-            self._bundle.record_delta_item_to_sid(
-                self._write_new_item_to_sid_rows(
-                    writer,
-                    item_ids,
-                    origin_codes,
-                    result,
-                    ProgressLogger("Writing delta item_to_sid", start_n=0),
-                    0,
+            writers = [writer]
+            if self._config.is_append:
+                writers.append(
+                    stack.enter_context(
+                        closing(self._make_writer(self._bundle.delta_item_to_sid_path))
+                    )
                 )
+            copied = self._stream_existing_item_to_sid_rows(writer)
+            added = self._write_new_item_to_sid_rows(
+                writers,
+                item_ids,
+                origin_codes,
+                result,
+                ProgressLogger("Writing resolved item_to_sid", start_n=0),
+                copied,
             )
+            self._bundle.record_item_to_sid(copied + added)
+            if self._config.is_append:
+                self._bundle.record_delta_item_to_sid(added)
 
     def _write_sid_to_items_outputs(
         self,
@@ -999,7 +1008,6 @@ class CollisionResolutionRunner:
         codes[:, -1] = resolved_last_codes[representative_rows]
         return _AppendGroups(
             keys=grouping.sid_keys,
-            counts=grouping.counts,
             offsets=offsets,
             codes=codes,
             item_ids=self._item_id_array(item_ids[grouping.row_order]),
@@ -1050,15 +1058,13 @@ class CollisionResolutionRunner:
                     delta_writer, codes, offsets, values, rows
                 )
 
-            max_rows = _max_code_rows(False, groups.codes.shape[1], group_count)
+            max_rows = _ARROW_LIST_OFFSET_MAX // groups.codes.shape[1]
 
             def emit_new_only(low: int, high: int) -> None:
                 """Write rows this run created in buckets nobody occupied."""
-                for start, stop in _group_chunk_bounds(
+                for start, stop, child_low, child_high in _group_chunk_bounds(
                     groups.offsets, low, high, max_rows
                 ):
-                    child_low = int(groups.offsets[start])
-                    child_high = int(groups.offsets[stop])
                     emit(
                         groups.codes[start:stop],
                         groups.offsets[start : stop + 1] - child_low,
@@ -1134,14 +1140,10 @@ class CollisionResolutionRunner:
         with closing(self._make_writer(output_path, "ParquetWriter")) as writer:
             progress = ProgressLogger(progress_description, start_n=0)
             last_progress_count = 0
-            max_codebook_rows = _max_code_rows(
-                False, origin_codes.shape[1], group_count
-            )
-            for group_start, group_end in _group_chunk_bounds(
+            max_codebook_rows = _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1]
+            for group_start, group_end, child_start, child_end in _group_chunk_bounds(
                 offsets, 0, group_count, max_codebook_rows
             ):
-                child_start = int(offsets[group_start])
-                child_end = int(offsets[group_end])
                 rows = grouping.row_order[child_start:child_end]
                 local_offsets = offsets[group_start : group_end + 1] - child_start
                 representative_rows = grouping.row_order[offsets[group_start:group_end]]
@@ -1162,22 +1164,15 @@ class CollisionResolutionRunner:
         self._bundle.record_sid_to_items(written)
 
 
-def _max_code_rows(is_csv: bool, layer_count: int, row_cap: int) -> int:
-    """Return how many SID rows one write can encode."""
-    if is_csv:
-        return row_cap
-    return min(row_cap, _ARROW_LIST_OFFSET_MAX // layer_count)
-
-
 def _group_chunk_bounds(
     offsets: np.ndarray, low: int, high: int, max_rows: int
-) -> Iterator[Tuple[int, int]]:
-    """Split ``[low, high)`` groups into writable ``(start, stop)`` chunks."""
+) -> Iterator[Tuple[int, int, int, int]]:
+    """Split ``[low, high)`` groups into writable chunks and their child spans."""
     while low < high:
         child_limit = int(offsets[low]) + _SID_TO_ITEMS_WRITE_SIZE
         stop = int(np.searchsorted(offsets, child_limit, side="right") - 1)
         stop = min(max(stop, low + 1), low + max_rows, high)
-        yield low, stop
+        yield low, stop, int(offsets[low]), int(offsets[stop])
         low = stop
 
 
@@ -1186,7 +1181,6 @@ class _AppendGroups:
     """This run's SID groups, prepared for merging into the published groups."""
 
     keys: np.ndarray
-    counts: np.ndarray
     offsets: np.ndarray
     codes: np.ndarray
     item_ids: pa.Array
@@ -1216,27 +1210,25 @@ def _merge_group_batch(
     batch_slots = np.arange(batch_rows) + np.searchsorted(
         groups.keys[unmatched], batch_keys, side="left"
     )
-    unmatched_slots = np.arange(unmatched.shape[0]) + np.searchsorted(
-        batch_keys, groups.keys[unmatched], side="left"
-    )
+    taken = np.zeros(output_rows, dtype=bool)
+    taken[batch_slots] = True
+    unmatched_slots = np.flatnonzero(~taken)
 
-    batch_of_output = np.full(output_rows, -1, dtype=np.int64)
-    batch_of_output[batch_slots] = np.arange(batch_rows)
     new_of_output = np.full(output_rows, -1, dtype=np.int64)
     new_of_output[batch_slots] = new_for_batch
     new_of_output[unmatched_slots] = unmatched
-
-    has_batch = batch_of_output >= 0
     has_new = new_of_output >= 0
-    batch_index = np.maximum(batch_of_output, 0)
     new_index = np.maximum(new_of_output, 0)
 
     codes = np.empty((output_rows, batch_codes.shape[1]), dtype=np.int64)
     codes[batch_slots] = batch_codes
     codes[unmatched_slots] = groups.codes[unmatched]
 
-    batch_part = np.where(has_batch, batch_lengths[batch_index], 0)
-    new_part = np.where(has_new, groups.counts[new_index], 0)
+    batch_part = np.zeros(output_rows, dtype=np.int64)
+    batch_part[batch_slots] = batch_lengths
+    new_part = np.where(
+        has_new, groups.offsets[new_index + 1] - groups.offsets[new_index], 0
+    )
     offsets = np.zeros(output_rows + 1, dtype=np.int64)
     np.cumsum(batch_part + new_part, out=offsets[1:])
 
@@ -1245,14 +1237,14 @@ def _merge_group_batch(
     combined = pa.chunked_array(
         [batch_values, groups.item_ids.slice(child_low, child_high - child_low)]
     )
-    batch_child_starts = np.zeros(batch_rows + 1, dtype=np.int64)
-    np.cumsum(batch_lengths, out=batch_child_starts[1:])
+    # both sides are consumed in order, so each gather source is a plain arange
+    batch_children = len(batch_values)
     gather = np.empty(int(offsets[-1]), dtype=np.int64)
-    gather[concat_ranges(offsets[:-1], batch_part)] = concat_ranges(
-        batch_child_starts[batch_index], batch_part
+    gather[concat_ranges(offsets[batch_slots], batch_lengths)] = np.arange(
+        batch_children, dtype=np.int64
     )
-    gather[concat_ranges(offsets[:-1] + batch_part, new_part)] = concat_ranges(
-        len(batch_values) + groups.offsets[new_index] - child_low, new_part
+    gather[concat_ranges(offsets[:-1] + batch_part, new_part)] = np.arange(
+        batch_children, batch_children + child_high - child_low, dtype=np.int64
     )
     values = combined.take(pa.array(gather, type=pa.int64())).combine_chunks()
     return codes, offsets, values, np.flatnonzero(has_new)
@@ -1272,11 +1264,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Bundle root. Artifacts land at <root>/<generation>/<artifact>, so "
-            "one generation is one self-contained directory. Holds the SID "
-            "sid_to_items and the manifest, which are always files, so it can be a "
-            "file or OSS path but never an odps:// table. Required unless "
-            "--rate_only is set without --from_generation, since an append "
-            "reads the published groups and manifest from it."
+            "one generation is one self-contained directory. Holds sid_to_items, "
+            "delta_sid_to_items and the manifest, which are always files, so it "
+            "can be a file or OSS path but never an odps:// table. Required "
+            "unless --rate_only is set without --from_generation, since an "
+            "append reads the published sid_to_items and manifest from it."
         ),
     )
     parser.add_argument(
@@ -1317,7 +1309,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Writer for the item_to_sid family only; defaults to matching the "
-            "input reader. The SID groups and the manifest are always parquet "
+            "input reader. sid_to_items and the manifest are always parquet "
             "and JSON."
         ),
     )
@@ -1327,8 +1319,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=100000,
         help=(
             "Reader I/O batch size; does not limit the in-memory collision working "
-            "set. In append mode it also governs the scans of the published map "
-            "and groups, so raise it for a large corpus."
+            "set. In append mode it also governs the scans of the published "
+            "item_to_sid and sid_to_items, so raise it for a large corpus."
         ),
     )
     parser.add_argument(
@@ -1361,7 +1353,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rate_only",
         action="store_true",
-        help="Compute and log metrics without writing map or SID group outputs.",
+        help="Compute and log metrics without writing item_to_sid or sid_to_items.",
     )
     parser.add_argument("--odps_data_quota_name", default="pay-as-you-go")
     return parser

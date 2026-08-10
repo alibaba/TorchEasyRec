@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 from typing import Iterable, Optional
 
@@ -80,7 +80,12 @@ def concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
 def lookup_sorted(
     sorted_keys: np.ndarray, keys: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Locate ``keys`` inside a strictly ascending ``sorted_keys``."""
+    """Locate ``keys`` inside an ascending ``sorted_keys``.
+
+    Returns the insertion positions and a mask of exact hits; a position is
+    meaningful only where the mask is set, and repeated keys resolve to their
+    first occurrence.
+    """
     positions = np.searchsorted(sorted_keys, keys)
     found = positions < sorted_keys.shape[0]
     found[found] = sorted_keys[positions[found]] == keys[found]
@@ -89,7 +94,13 @@ def lookup_sorted(
 
 @dataclass(frozen=True)
 class PriorOccupancy:
-    """Per-bucket occupancy of an already-published corpus."""
+    """Per-bucket occupancy of an already-published corpus.
+
+    Args:
+        bucket_keys: Occupied bucket keys, int64, strictly ascending.
+        bucket_counts: Published item count of each key, aligned with
+            ``bucket_keys``.
+    """
 
     bucket_keys: np.ndarray
     bucket_counts: np.ndarray
@@ -144,14 +155,16 @@ class CollisionPlan:
             *within* ``bucket_keys`` / ``bucket_counts`` (a row->bucket
             index in ``[0, num_buckets)``, not a key value), int64 shape
             ``(item_count,)`` in original row order.
-        initial_slot_indices: One-based rank of each row within its origin
-            bucket in deterministic (hash) order, int64 shape ``(item_count,)``
-            in original row order.
+        initial_slot_indices: One-based slot of each row within its origin
+            bucket in deterministic (hash) order, continuing the published
+            occupancy when appending; int64 shape ``(item_count,)`` in
+            original row order.
         bucket_keys: Flattened SID key ``prefix_key * last_size + last_code``
             for every occupied bucket, int64 shape ``(num_buckets,)`` indexed by
             bucket index (the values in ``origin_bucket_indices``) and ascending.
-        bucket_counts: Item count of every bucket before capacity capping,
-            int64 shape ``(num_buckets,)`` aligned with ``bucket_keys``.
+        bucket_counts: Number of this plan's rows in every bucket before
+            capacity capping, int64 shape ``(num_buckets,)`` aligned with
+            ``bucket_keys``; add ``prior_bucket_counts`` for the corpus total.
         overflow_rows: Original row indices ranked at or beyond ``capacity``
             within their bucket (the rows to relocate), int64 in deterministic
             processing order.
@@ -168,6 +181,10 @@ class CollisionPlan:
             resolve; for an append it must cover at least every bucket of every
             band touched by the planned rows, because relocation can read any
             bucket inside those bands.
+        prior_bucket_counts: Published occupancy of every bucket in
+            ``bucket_keys``, int64 aligned with it and zero where the bucket
+            is new; ``prior_bucket_counts + bucket_counts`` is a bucket's
+            uncapped total over the published corpus and these rows.
     """
 
     item_count: int
@@ -181,10 +198,8 @@ class CollisionPlan:
     overflow_bucket_key_prefixes: np.ndarray
     overflow_origin_last_codes: np.ndarray
     config: CollisionResolutionConfig
-    prior: PriorOccupancy = field(default_factory=PriorOccupancy.empty)
-    prior_bucket_counts: np.ndarray = field(
-        default_factory=lambda: np.empty(0, dtype=np.int64)
-    )
+    prior: PriorOccupancy
+    prior_bucket_counts: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -365,7 +380,9 @@ class CollisionResolver(ABC):
 
         Args:
             plan: Collision plan defining original bucket keys and capacity.
-            initial_counts: Original bucket counts capped at capacity.
+            initial_counts: Corpus bucket counts before relocation -- published
+                plus new, capped at capacity but never below the prior
+                occupancy.
             in_overflow_band: Mask selecting buckets affected by relocation.
             slot_counts: Final counts for buckets in affected bands.
             collect_grouping: Whether to build sorted final bucket arrays.
@@ -934,9 +951,10 @@ def build_original_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
 def build_resolved_item_grouping(
     plan: CollisionPlan, result: CollisionResolutionResult
 ) -> CodebookItemGrouping:
-    """Group all rows by emitted SID and final one-based slot index.
+    """Group this plan's rows by emitted SID and bucket-local slot index.
 
-    The grouping uses a linear scatter from final one-based slot indices.
+    Only buckets that gained rows appear, and slot indices have the prior
+    occupancy subtracted, so the grouping covers only this plan's rows.
 
     Args:
         plan: Grouping and overflow plan from :func:`prepare_collision_plan`.
