@@ -1122,11 +1122,13 @@ class DeltaEmbeddingDumper:
     def _install_zch_tracking(self) -> None:
         """Record ZCH lookups on the inner collection's compute.
 
-        torchrec fires the post-lookup tracker only from
-        ``compute_and_output_dist``, but a sharded managed collision wrapper
-        drives its inner sharded collection through plain ``compute``, so ZCH
-        lookups would never be tracked. Wrap the inner collection's
-        ``compute`` to record the remapped ids there instead.
+        torchrec fires the post-lookup and post-odist tracker callbacks only
+        from ``compute_and_output_dist``, but a sharded managed collision
+        wrapper drives its inner sharded collection through plain ``compute``,
+        so ZCH lookups would never be tracked or auto-compacted. Wrap the
+        inner collection's ``compute`` to fire both callbacks per sharding,
+        mirroring torchrec's compute_and_output_dist pairing;
+        trigger_compaction is idempotent per batch.
         """
         for module in self._tracker.tracked_modules.values():
             if id(module) not in self._zch_inner_module_ids:
@@ -1144,6 +1146,8 @@ class DeltaEmbeddingDumper:
                 result = orig(ctx, dist_input)
                 for features in dist_input:
                     record(features, torch.empty(0), owner, None)
+                    if owner.post_odist_tracker_fn is not None:
+                        owner.post_odist_tracker_fn()
                 return result
 
             module.compute = tracked_compute

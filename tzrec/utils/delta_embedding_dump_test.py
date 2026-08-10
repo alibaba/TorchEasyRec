@@ -468,7 +468,7 @@ def _run_zch_delta_embedding_dump(rank: int, world_size: int, output_dir: str):
         dumper = DeltaEmbeddingDumper(
             model,
             DeltaEmbeddingDumpConfig(
-                dump_interval_steps=1,
+                dump_interval_steps=10,
                 output_dir=output_dir,
                 file_prefix="delta",
             ),
@@ -486,9 +486,19 @@ def _run_zch_delta_embedding_dump(rank: int, world_size: int, output_dir: str):
         )
         # The ZCH module coalesces its profiled ids on the second forward, so
         # the first step hashes ids to the fallback row and only the second
-        # step's lookup resolves them to real ZCH slots.
-        for _ in range(2):
+        # step's lookup resolves them to real ZCH slots. maybe_dump advances
+        # the tracker step without dumping (interval 10 > 3 steps), mirroring
+        # the training loop's forward/dump cadence.
+        for step in range(1, 4):
             model(features).sum().backward()
+            dumper.maybe_dump(step)
+        # The per-forward post-odist callback keeps every completed batch
+        # compacted; the trailing batch is compacted only by the next forward
+        # or the dump's get_unique.
+        testcase.assertEqual(
+            dumper._tracker.curr_compact_index,
+            dumper._tracker.curr_batch_idx - 1,
+        )
         output_path = dumper.dump(50)
         testcase.assertIsNotNone(output_path)
 
