@@ -16,14 +16,17 @@ import numpy as np
 import torch
 from google.protobuf import text_format
 from tokenizers import Tokenizer, models, pre_tokenizers
-from transformers import AutoModelForCausalLM
-
 from torchrec import KeyedJaggedTensor
+from transformers import AutoModelForCausalLM
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import FgMode, create_features
 from tzrec.main import _create_model
-from tzrec.prompt.assembler import PROMPT_HOLE_POSITIONS, PROMPT_INPUT_IDS, assemble_into
+from tzrec.prompt.assembler import (
+    PROMPT_HOLE_POSITIONS,
+    PROMPT_INPUT_IDS,
+    assemble_into,
+)
 from tzrec.prompt.compile import compile_prompt
 from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import ModelConfig
