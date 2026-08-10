@@ -79,7 +79,8 @@ message FeatureStoreConfig {
 }
 
 message DeltaEmbeddingDumpConfig {
-    // MC/ZCH features are not supported; use dynamicemb for delta dump.
+    // ZCH features dump raw feature ids resolved through the ZCH module, so
+    // the serving contract (raw id -> embedding) holds for them as well.
     // Dump touched ids and their latest embedding every N training steps. Do not
     // set this together with dump_interval_minutes.
     // Larger intervals retain a longer id window in memory; auto compaction reduces

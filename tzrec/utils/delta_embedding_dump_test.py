@@ -35,16 +35,27 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingTable,
 )
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.mc_embeddingbag import (
+    ManagedCollisionEmbeddingBagCollectionSharder,
+)
 from torchrec.distributed.planner import (
     EmbeddingShardingPlanner,
     ParameterConstraints,
     Topology,
 )
+from torchrec.distributed.sharding_plan import (
+    construct_module_sharding_plan,
+    row_wise,
+)
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-from torchrec.distributed.types import ParameterSharding, ShardingType
+from torchrec.distributed.types import (
+    ParameterSharding,
+    ShardingPlan,
+    ShardingType,
+)
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
@@ -54,9 +65,16 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
+from torchrec.modules.mc_embedding_modules import (
+    ManagedCollisionEmbeddingBagCollection,
+)
+from torchrec.modules.mc_modules import (
+    LFU_EvictionPolicy,
+    ManagedCollisionCollection,
+    MCHManagedCollisionModule,
+)
 from torchrec.types import DataType
 
-from tzrec.protos import feature_pb2
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
 from tzrec.tests import utils as test_utils
 from tzrec.utils import config_util
@@ -70,7 +88,6 @@ from tzrec.utils.delta_embedding_dump import (
     _TableWeight,
     _validate_table_shard_info,
     validate_delta_embedding_dump_config,
-    validate_delta_embedding_dump_no_zch_features,
 )
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
@@ -272,7 +289,6 @@ def _run_sharded_delta_embedding_dump(rank: int, world_size: int, output_dir: st
             ),
             output_dir,
             torch.device(f"cuda:{rank}"),
-            [],
         )
         output = model(_sharded_features(rank))
         output.sum().backward()
@@ -313,7 +329,6 @@ def _run_shared_table_fqn_delta_embedding_dump(
             ),
             output_dir,
             device,
-            [],
         )
 
         sharded_model(_shared_table_features(rank)).backward()
@@ -371,6 +386,141 @@ def _run_shared_table_fqn_delta_embedding_dump(
             )
 
 
+_ZCH_TABLE_NAME = "zch_table"
+_ZCH_FEATURE_NAME = "zch_feat"
+_ZCH_SIZE = 8
+_ZCH_EMBEDDING_DIM = 4
+_ZCH_INPUT_IDS = [123456, 789012, 555555]
+
+
+class _DeltaDumpZchEBCModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        tables = [
+            EmbeddingBagConfig(
+                name=_ZCH_TABLE_NAME,
+                num_embeddings=_ZCH_SIZE,
+                embedding_dim=_ZCH_EMBEDDING_DIM,
+                feature_names=[_ZCH_FEATURE_NAME],
+                pooling=PoolingType.SUM,
+            )
+        ]
+        self._mc_ebc = ManagedCollisionEmbeddingBagCollection(
+            EmbeddingBagCollection(tables=tables, device=torch.device("meta")),
+            ManagedCollisionCollection(
+                {
+                    _ZCH_TABLE_NAME: MCHManagedCollisionModule(
+                        zch_size=_ZCH_SIZE,
+                        device=torch.device("meta"),
+                        eviction_policy=LFU_EvictionPolicy(),
+                        eviction_interval=2,
+                    )
+                },
+                tables,
+            ),
+        )
+
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        # The sharded MC-EBC returns (embeddings, remapped_features_or_None).
+        output = self._mc_ebc(features)
+        if isinstance(output, tuple):
+            output = output[0]
+        return output.values()
+
+
+def _build_sharded_zch_delta_dump_model(rank: int, world_size: int, ctx):
+    torch.manual_seed(2026)
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    model = _DeltaDumpZchEBCModel()
+    sharder = ManagedCollisionEmbeddingBagCollectionSharder(
+        ebc_sharder=EmbeddingBagCollectionSharder(
+            fused_params={"optimizer": OptimType.EXACT_ROWWISE_ADAGRAD}
+        )
+    )
+    module_sharding_plan = construct_module_sharding_plan(
+        model._mc_ebc,
+        per_param_sharding={
+            _ZCH_TABLE_NAME: row_wise(compute_kernel=EmbeddingComputeKernel.FUSED.value)
+        },
+        world_size=world_size,
+        device_type="cuda",
+        sharder=sharder,
+    )
+    return DistributedModelParallel(
+        module=model,
+        device=device,
+        env=ShardingEnv.from_process_group(ctx.pg),
+        plan=ShardingPlan({"_mc_ebc": module_sharding_plan}),
+        sharders=[sharder],
+    )
+
+
+def _run_zch_delta_embedding_dump(rank: int, world_size: int, output_dir: str):
+    testcase = unittest.TestCase()
+    with MultiProcessContext(rank=rank, world_size=world_size, backend="nccl") as ctx:
+        device = torch.device(f"cuda:{rank}")
+        model = _build_sharded_zch_delta_dump_model(rank, world_size, ctx)
+        # tzrec's patched mc-ebc input_dist lazy-initializes on the first
+        # forward gated on this flag; tzrec's train wrapper sets it, but this
+        # test builds the DMP module directly.
+        model.module._mc_ebc._embedding_module._has_uninitialized_input_dist = True
+        dumper = DeltaEmbeddingDumper(
+            model,
+            DeltaEmbeddingDumpConfig(
+                dump_interval_steps=1,
+                output_dir=output_dir,
+                file_prefix="delta",
+            ),
+            output_dir,
+            device,
+        )
+        testcase.assertEqual(
+            set(dumper._zch_modules),
+            {f"_mc_ebc._embedding_module.embedding_bags.{_ZCH_TABLE_NAME}"},
+        )
+        features = KeyedJaggedTensor.from_offsets_sync(
+            keys=[_ZCH_FEATURE_NAME],
+            values=torch.tensor(_ZCH_INPUT_IDS, device=device, dtype=torch.int64),
+            offsets=torch.tensor([0, len(_ZCH_INPUT_IDS)], device=device),
+        )
+        # The ZCH module coalesces its profiled ids on the second forward, so
+        # the first step hashes ids to the fallback row and only the second
+        # step's lookup resolves them to real ZCH slots.
+        for _ in range(2):
+            model(features).sum().backward()
+        output_path = dumper.dump(50)
+        testcase.assertIsNotNone(output_path)
+
+        table = pq.read_table(output_path)
+        testcase.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+        key_ids = sorted(table["key_id"].to_pylist())
+        testcase.assertTrue(set(key_ids).issubset(set(_ZCH_INPUT_IDS)))
+        # Recompute the expected rows straight from the ZCH buffers with a
+        # forward searchsorted lookup, independent of the dump's inverse map.
+        table_fqn = f"_mc_ebc._embedding_module.embedding_bags.{_ZCH_TABLE_NAME}"
+        mch = dumper._zch_modules[table_fqn]
+        weight = dumper._collect_table_weights()[table_fqn].tensor.to(device)
+        raw_ids = torch.tensor(key_ids, device=device, dtype=torch.int64)
+        slots = torch.searchsorted(mch._mch_sorted_raw_ids, raw_ids)
+        rows = mch._mch_remapped_ids_mapping[slots] - mch._output_global_offset
+        expected = weight[rows.long()].detach().cpu().to(torch.float32)
+        order = torch.argsort(raw_ids).cpu()
+        actual = torch.tensor(
+            table["embedding"].to_pylist(), dtype=torch.float32
+        ).reshape(-1, _ZCH_EMBEDDING_DIM)
+        torch.testing.assert_close(actual[order], expected)
+
+        # Row-wise sharding splits the ZCH slots across ranks, so every input
+        # id is dumped by exactly one rank; the union of shards covers all.
+        torch.distributed.barrier()
+        dumped_ids: set = set()
+        for shard in glob.glob(os.path.join(output_dir, "step_50", "*.parquet")):
+            dumped_ids.update(pq.read_table(shard)["key_id"].to_pylist())
+        testcase.assertEqual(dumped_ids, set(_ZCH_INPUT_IDS))
+        torch.distributed.barrier()
+
+
 class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_missing_config_skips_runtime_validation(self):
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
@@ -402,33 +552,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dump_interval_minutes"):
             validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
 
-    def test_zch_feature_fails_fast(self):
-        feature_configs = [
-            feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(
-                    feature_name="user_id",
-                    expression="user:user_id",
-                    embedding_dim=8,
-                    zch=feature_pb2.ZeroCollisionHash(zch_size=1024),
-                )
-            )
-        ]
-        with self.assertRaisesRegex(ValueError, "user_id"):
-            validate_delta_embedding_dump_no_zch_features(feature_configs)
-
-    def test_dynamicemb_feature_is_allowed(self):
-        feature_configs = [
-            feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(
-                    feature_name="user_id",
-                    expression="user:user_id",
-                    embedding_dim=8,
-                    dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=1024),
-                )
-            )
-        ]
-        validate_delta_embedding_dump_no_zch_features(feature_configs)
-
     def test_init_validates_cuda_device(self):
         config = DeltaEmbeddingDumpConfig(dump_interval_steps=10)
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -438,30 +561,55 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                     config,
                     tmp_dir,
                     torch.device("cpu"),
-                    [],
                 )
 
-    def test_init_validates_no_zch_features(self):
-        config = DeltaEmbeddingDumpConfig(dump_interval_steps=10)
-        feature_configs = [
-            feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(
-                    feature_name="user_id",
-                    expression="user:user_id",
-                    embedding_dim=8,
-                    zch=feature_pb2.ZeroCollisionHash(zch_size=1024),
-                )
-            )
-        ]
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            with self.assertRaisesRegex(ValueError, "user_id"):
-                DeltaEmbeddingDumper(
-                    torch.nn.Module(),
-                    config,
-                    tmp_dir,
-                    torch.device("cuda"),
-                    feature_configs,
-                )
+    def test_collect_zch_modules_maps_tracked_table_fqns(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        mch = MCHManagedCollisionModule(
+            zch_size=4,
+            device=torch.device("cpu"),
+            eviction_policy=LFU_EvictionPolicy(),
+            eviction_interval=2,
+        )
+        inner_module = torch.nn.Module()
+        wrapper = torch.nn.Module()
+        wrapper._managed_collision_collection = SimpleNamespace(
+            _managed_collision_modules={"user_emb": mch}
+        )
+        wrapper._embedding_module = inner_module
+        model = torch.nn.Module()
+        model.mc_ebc = wrapper
+        dumper._model = model
+        table_fqn = "mc_ebc._embedding_module.embedding_bags.user_emb"
+        dumper._tracker = SimpleNamespace(
+            fqn_to_feature_names={table_fqn: ["user_id"]},
+            tracked_modules={"mc_ebc._embedding_module": inner_module},
+        )
+        with mock.patch(
+            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+            side_effect=lambda module_fqn, _module, table_name: (
+                f"{module_fqn}.embedding_bags.{table_name}"
+            ),
+        ):
+            self.assertEqual(dumper._collect_zch_modules(), {table_fqn: mch})
+
+    def test_collect_zch_modules_rejects_non_mch_module(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        wrapper = torch.nn.Module()
+        wrapper._managed_collision_collection = SimpleNamespace(
+            _managed_collision_modules={"user_emb": torch.nn.Module()}
+        )
+        wrapper._embedding_module = torch.nn.Module()
+        model = torch.nn.Module()
+        model.mc_ebc = wrapper
+        dumper._model = model
+        dumper._tracker = SimpleNamespace(
+            fqn_to_feature_names={
+                "mc_ebc._embedding_module.embedding_bags.user_emb": ["user_id"]
+            }
+        )
+        with self.assertRaisesRegex(TypeError, "MCHManagedCollisionModule"):
+            dumper._collect_zch_modules()
 
     def test_row_wise_shard_info_uses_row_offset(self):
         table_config = ShardedEmbeddingTable(
@@ -807,7 +955,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 DeltaEmbeddingDumpConfig(dump_interval_steps=10),
                 tmp_dir,
                 torch.device("cuda"),
-                [],
             )
 
         self.assertTrue(tracker_cls.call_args.kwargs["auto_compact"])
@@ -828,7 +975,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 DeltaEmbeddingDumpConfig(dump_interval_minutes=2),
                 tmp_dir,
                 torch.device("cuda"),
-                [],
             )
 
         self.assertIsNone(dumper._interval_steps)
@@ -1285,6 +1431,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_row_wise_lookup_outputs_global_key_ids(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
+        dumper._zch_modules = {}
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
         table_fqn = "model.ebc.embedding_bags.user_emb"
         embeddings, key_ids = dumper._lookup_embeddings(
@@ -1311,6 +1458,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_lookup_filters_out_of_range_ids(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
+        dumper._zch_modules = {}
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
         table_fqn = "model.ebc.embedding_bags.user_emb"
         embeddings, key_ids = dumper._lookup_embeddings(
@@ -1334,9 +1482,55 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         torch.testing.assert_close(embeddings, weight[[0, 2]])
         torch.testing.assert_close(key_ids, torch.tensor([32, 34]))
 
+    def test_zch_lookup_maps_local_rows_back_to_raw_ids(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._world_size = 2
+        mch = MCHManagedCollisionModule(
+            zch_size=4,
+            device=torch.device("cpu"),
+            eviction_policy=LFU_EvictionPolicy(),
+            eviction_interval=2,
+        )
+        # slot -> raw id: slots 0/1 hold raw ids 101/105, slots 2/3 are empty
+        # (slot 3 is the fallback row served for unmatched ids).
+        mch._mch_sorted_raw_ids.copy_(
+            torch.tensor(
+                [101, 105, torch.iinfo(torch.int64).max, torch.iinfo(torch.int64).max]
+            )
+        )
+        # slot -> global row, permuted so the slot/row inverse matters.
+        mch._mch_remapped_ids_mapping.copy_(torch.tensor([0, 2, 1, 3]))
+        dumper._zch_modules = {}
+        weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        table_fqn = "model.mc_ebc._embedding_module.embedding_bags.user_emb"
+        dumper._zch_modules[table_fqn] = mch
+        embeddings, key_ids = dumper._lookup_embeddings(
+            table_fqn,
+            # local rows touched by the tracker: rows 0 and 2 resolve to raw
+            # ids; row 1 maps to an empty slot and row 3 is the fallback row.
+            torch.tensor([0, 2, 1, 3]),
+            table_weights={
+                table_fqn: _TableWeight(
+                    tensor=weight,
+                    shard_info=_TableShardInfo(
+                        row_offset=0,
+                        local_rows=4,
+                        local_cols=2,
+                        global_rows=4,
+                        global_cols=2,
+                        has_shard_metadata=True,
+                    ),
+                )
+            },
+            dynamic_modules={},
+        )
+        torch.testing.assert_close(embeddings, weight[[0, 2]])
+        torch.testing.assert_close(key_ids, torch.tensor([101, 105]))
+
     def test_lookup_handles_empty_ids(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
+        dumper._zch_modules = {}
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
         table_fqn = "model.ebc.embedding_bags.user_emb"
         embeddings, key_ids = dumper._lookup_embeddings(
@@ -1363,6 +1557,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_row_wise_lookup_requires_shard_metadata(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
+        dumper._zch_modules = {}
         table_fqn = "model.ebc.embedding_bags.user_emb"
         with self.assertRaisesRegex(ValueError, "shard metadata"):
             dumper._lookup_embeddings(
@@ -1462,6 +1657,36 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
         ):
             self._run_multi_process_test(
                 callable=_run_sharded_delta_embedding_dump,
+                world_size=self.world_size,
+                output_dir=tmp_dir,
+            )
+            for rank in range(self.world_size):
+                self.assertTrue(
+                    os.path.exists(
+                        os.path.join(
+                            tmp_dir,
+                            "step_50",
+                            f"delta_step_50_rank_{rank}_of_{self.world_size}.parquet",
+                        )
+                    )
+                )
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
+    @mark_ci_scope("gpu")
+    def test_zch_sharded_dump_writes_raw_ids(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "NCCL_DEBUG": "WARN",
+                    "FORCED_NCCL_DEBUG": "WARN",
+                    "NCCL_DEBUG_SUBSYS": "",
+                },
+            ),
+        ):
+            self._run_multi_process_test(
+                callable=_run_zch_delta_embedding_dump,
                 world_size=self.world_size,
                 output_dir=tmp_dir,
             )
@@ -1577,6 +1802,81 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
         self.assertTrue(
             dumped_real_rows,
             "no dynamic delta rows dumped; flush()/find() path not exercised",
+        )
+
+
+class DeltaEmbeddingDumpZchIntegrationTest(unittest.TestCase):
+    """End-to-end multi-process delta dump over a sharded ZCH model.
+
+    Runs the real tzrec train pipeline (torchrun, row-wise sharded ZCH
+    tables) with delta dump enabled, so the ZCH lookup path (slot inverse
+    mapping back to raw feature ids) is exercised under genuine multi-rank
+    sharding.
+    """
+
+    def setUp(self):
+        self.success = False
+        self.test_dir = make_test_dir(prefix="tzrec_delta_zch_")
+
+    def tearDown(self):
+        if self.success and os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
+    def test_zch_multi_gpu_delta_dump_writes_raw_ids(self):
+        world_size = int(os.getenv("TEST_NPROC_PER_NODE", "2"))
+        pipeline_config = config_util.load_pipeline_config(
+            "tzrec/tests/configs/multi_tower_din_zch_fg_mock.config"
+        )
+        dump_dir = os.path.abspath(os.path.join(self.test_dir, "delta_dump"))
+        dump_cfg = pipeline_config.train_config.delta_embedding_dump_config
+        dump_cfg.dump_interval_steps = 1
+        dump_cfg.output_dir = dump_dir
+        dump_cfg.file_prefix = "delta_embedding"
+        new_config_path = os.path.join(self.test_dir, "new_pipeline.config")
+        config_util.save_message(pipeline_config, new_config_path)
+
+        self.success = test_utils.test_train_eval(
+            new_config_path,
+            self.test_dir,
+            user_id="user_id",
+            item_id="item_id",
+        )
+        self.assertTrue(self.success)
+
+        step_dirs = sorted(glob.glob(os.path.join(dump_dir, "step_*")))
+        self.assertTrue(step_dirs, f"no delta dump produced under {dump_dir}")
+
+        dumped_zch_rows = False
+        for step_dir in step_dirs:
+            shards = sorted(glob.glob(os.path.join(step_dir, "*.parquet")))
+            self.assertEqual(
+                len(shards),
+                world_size,
+                f"{step_dir} has {len(shards)} shards, expected {world_size}",
+            )
+            for shard in shards:
+                table = pq.read_table(shard)
+                self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+                for feature_name, key_id, emb in zip(
+                    table["feature_name"].to_pylist(),
+                    table["key_id"].to_pylist(),
+                    table["embedding"].to_pylist(),
+                ):
+                    if feature_name not in ("user_id", "item_id"):
+                        continue
+                    dumped_zch_rows = True
+                    self.assertEqual(len(emb), 16)
+                    # Mock data generates raw ids in [0, 10000) while the
+                    # per-rank ZCH row ranges reach 500000, so raw-id keys
+                    # are distinguishable from (wrong) remapped local rows.
+                    self.assertGreaterEqual(key_id, 0)
+                    self.assertLess(key_id, 10000)
+
+        self.assertTrue(
+            dumped_zch_rows,
+            "no ZCH delta rows dumped; the ZCH lookup path was not exercised",
         )
 
 

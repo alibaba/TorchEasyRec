@@ -809,7 +809,6 @@ def train_and_evaluate(
             train_config.delta_embedding_dump_config,
             pipeline_config.model_dir,
             device,
-            pipeline_config.feature_configs,
         )
 
     dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
