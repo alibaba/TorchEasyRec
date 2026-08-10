@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
+from typing import Dict, List
 from unittest import mock
 
 import pyarrow as pa
@@ -394,7 +395,7 @@ _ZCH_INPUT_IDS = [123456, 789012, 555555]
 
 
 class _DeltaDumpZchEBCModel(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, eviction_policy=None, eviction_interval: int = 2) -> None:
         super().__init__()
         tables = [
             EmbeddingBagConfig(
@@ -412,8 +413,8 @@ class _DeltaDumpZchEBCModel(nn.Module):
                     _ZCH_TABLE_NAME: MCHManagedCollisionModule(
                         zch_size=_ZCH_SIZE,
                         device=torch.device("meta"),
-                        eviction_policy=LFU_EvictionPolicy(),
-                        eviction_interval=2,
+                        eviction_policy=eviction_policy or LFU_EvictionPolicy(),
+                        eviction_interval=eviction_interval,
                     )
                 },
                 tables,
@@ -428,11 +429,19 @@ class _DeltaDumpZchEBCModel(nn.Module):
         return output.values()
 
 
-def _build_sharded_zch_delta_dump_model(rank: int, world_size: int, ctx):
+def _build_sharded_zch_delta_dump_model(
+    rank: int,
+    world_size: int,
+    ctx,
+    eviction_policy=None,
+    eviction_interval: int = 2,
+):
     torch.manual_seed(2026)
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-    model = _DeltaDumpZchEBCModel()
+    model = _DeltaDumpZchEBCModel(
+        eviction_policy=eviction_policy, eviction_interval=eviction_interval
+    )
     sharder = ManagedCollisionEmbeddingBagCollectionSharder(
         ebc_sharder=EmbeddingBagCollectionSharder(
             fused_params={"optimizer": OptimType.EXACT_ROWWISE_ADAGRAD}
@@ -528,6 +537,100 @@ def _run_zch_delta_embedding_dump(rank: int, world_size: int, output_dir: str):
         for shard in glob.glob(os.path.join(output_dir, "step_50", "*.parquet")):
             dumped_ids.update(pq.read_table(shard)["key_id"].to_pylist())
         testcase.assertEqual(dumped_ids, set(_ZCH_INPUT_IDS))
+        torch.distributed.barrier()
+
+
+# ZCH_SIZE=8 leaves 7 usable rows (the last row is the fallback row), so
+# exactly one batch of 7 ids fills the table. LFU admission breaks count
+# ties by ascending raw id, so the low X ids win slots over the Y ids and
+# the B ids (count 2) evict the X ids (count 1) deterministically.
+_ZCH_LIFECYCLE_IDS_X = [11, 12, 13, 14, 15, 16, 17]
+_ZCH_LIFECYCLE_IDS_Y = [21, 22, 23, 24, 25, 26, 27]
+_ZCH_LIFECYCLE_IDS_B = [31, 32, 33, 34, 35, 36, 37]
+
+
+def _zch_kjt(rank: int, ids: List[int]) -> KeyedJaggedTensor:
+    device = torch.device(f"cuda:{rank}")
+    return KeyedJaggedTensor.from_offsets_sync(
+        keys=[_ZCH_FEATURE_NAME],
+        values=torch.tensor(ids, device=device, dtype=torch.int64),
+        offsets=torch.tensor([0, len(ids)], device=device),
+    )
+
+
+def _read_dump_keys(output_dir: str, step: int) -> Dict[int, torch.Tensor]:
+    rows_by_key: Dict[int, torch.Tensor] = {}
+    shards = glob.glob(
+        os.path.join(output_dir, f"delta_step_{step}.parquet")
+    ) + glob.glob(
+        os.path.join(output_dir, "step_*", f"delta_step_{step}_rank_*.parquet")
+    )
+    for shard in shards:
+        table = pq.read_table(shard)
+        for key_id, embedding in zip(
+            table["key_id"].to_pylist(), table["embedding"].to_pylist()
+        ):
+            rows_by_key[int(key_id)] = torch.tensor(embedding, dtype=torch.float32)
+    return rows_by_key
+
+
+def _run_zch_lifecycle_delta_embedding_dump(
+    rank: int, world_size: int, output_dir: str
+):
+    """Drive one admission cycle and one eviction cycle through the dump.
+
+    With eviction_interval=2 the coalesce runs on even forwards. Step 1 looks
+    up X (hits the fallback row, only profiled); step 2 looks up Y, whose
+    coalesce admits X (same count, lower ids win) but not Y, so X must be
+    published by dump 1 although it was never looked up after admission.
+    Steps 3-4 look up B twice; the step-4 coalesce evicts X (count 1 < B's
+    count 2) and admits B, so dump 2 must publish B's trained rows and X's
+    fallback row.
+    """
+    testcase = unittest.TestCase()
+    testcase.assertEqual(world_size, 1)
+    with MultiProcessContext(rank=rank, world_size=world_size, backend="nccl") as ctx:
+        device = torch.device(f"cuda:{rank}")
+        model = _build_sharded_zch_delta_dump_model(rank, world_size, ctx)
+        model.module._mc_ebc._embedding_module._has_uninitialized_input_dist = True
+        dumper = DeltaEmbeddingDumper(
+            model,
+            DeltaEmbeddingDumpConfig(
+                dump_interval_steps=10,
+                output_dir=output_dir,
+                file_prefix="delta",
+            ),
+            output_dir,
+            device,
+        )
+        for step, ids in ((1, _ZCH_LIFECYCLE_IDS_X), (2, _ZCH_LIFECYCLE_IDS_Y)):
+            model(_zch_kjt(rank, ids)).sum().backward()
+            dumper.maybe_dump(step)
+        dumper.dump(10)
+        keys_dump1 = _read_dump_keys(output_dir, 10)
+        testcase.assertEqual(set(keys_dump1), set(_ZCH_LIFECYCLE_IDS_X))
+
+        for step, ids in ((3, _ZCH_LIFECYCLE_IDS_B), (4, _ZCH_LIFECYCLE_IDS_B)):
+            model(_zch_kjt(rank, ids)).sum().backward()
+            dumper.maybe_dump(step)
+        dumper.dump(20)
+        keys_dump2 = _read_dump_keys(output_dir, 20)
+        testcase.assertEqual(
+            set(keys_dump2), set(_ZCH_LIFECYCLE_IDS_X + _ZCH_LIFECYCLE_IDS_B)
+        )
+
+        table_fqn = f"_mc_ebc._embedding_module.embedding_bags.{_ZCH_TABLE_NAME}"
+        mch = dumper._zch_modules[table_fqn]
+        weight = dumper._collect_table_weights()[table_fqn].tensor.to(device)
+        fallback_row = weight[mch._zch_size - 1].detach().cpu().to(torch.float32)
+        for key_id in _ZCH_LIFECYCLE_IDS_X:
+            torch.testing.assert_close(keys_dump2[key_id], fallback_row)
+        raw_ids = torch.tensor(_ZCH_LIFECYCLE_IDS_B, device=device, dtype=torch.int64)
+        slots = torch.searchsorted(mch._mch_sorted_raw_ids, raw_ids)
+        rows = mch._mch_remapped_ids_mapping[slots] - mch._output_global_offset
+        expected_b = weight[rows.long()].detach().cpu().to(torch.float32)
+        actual_b = torch.stack([keys_dump2[key_id] for key_id in _ZCH_LIFECYCLE_IDS_B])
+        torch.testing.assert_close(actual_b, expected_b)
         torch.distributed.barrier()
 
 
@@ -1572,6 +1675,105 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         torch.testing.assert_close(embeddings, weight[[0, 2]])
         torch.testing.assert_close(key_ids, torch.tensor([101, 105]))
 
+    def _build_zch_snapshot_dumper(self, raw_ids_per_slot, mapping, offset, zch_size=4):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._world_size = 1
+        dumper._rank = 0
+        mch = MCHManagedCollisionModule(
+            zch_size=zch_size,
+            device=torch.device("cpu"),
+            eviction_policy=LFU_EvictionPolicy(),
+            eviction_interval=2,
+        )
+        mch._mch_sorted_raw_ids.copy_(
+            torch.tensor(
+                [
+                    int(x) if x is not None else torch.iinfo(torch.int64).max
+                    for x in raw_ids_per_slot
+                ],
+                dtype=torch.int64,
+            )
+        )
+        mch._mch_remapped_ids_mapping.copy_(
+            torch.tensor(mapping, dtype=torch.int64) + offset
+        )
+        mch._output_global_offset = offset
+        dumper._zch_snapshots = {}
+        weight = torch.arange(
+            zch_size * _SHARED_EBC_EMBEDDING_DIM, dtype=torch.float32
+        ).reshape(zch_size, _SHARED_EBC_EMBEDDING_DIM)
+        table_fqn = "model.mc_ebc._embedding_module.embedding_bags.zch_tbl"
+        dumper._zch_modules = {table_fqn: mch}
+        dumper._tracker = SimpleNamespace(fqn_to_feature_names={table_fqn: ["feat"]})
+        table_weights = {
+            table_fqn: _TableWeight(
+                tensor=weight,
+                shard_info=_TableShardInfo(
+                    row_offset=offset,
+                    local_rows=zch_size,
+                    local_cols=_SHARED_EBC_EMBEDDING_DIM,
+                    global_rows=zch_size,
+                    global_cols=_SHARED_EBC_EMBEDDING_DIM,
+                    has_shard_metadata=True,
+                ),
+            )
+        }
+        return dumper, mch, weight, table_fqn, table_weights
+
+    def test_zch_delta_publishes_admitted_ids_without_tracker_hits(self):
+        dumper, mch, weight, table_fqn, table_weights = self._build_zch_snapshot_dumper(
+            raw_ids_per_slot=[101, 102, None, None],
+            mapping=[0, 1, 2, 3],
+            offset=0,
+        )
+        # The snapshot holds only 101, so 102 counts as admitted since the
+        # previous dump even though the tracker recorded no lookup for it.
+        dumper._zch_snapshots[table_fqn] = torch.tensor([101], dtype=torch.int64)
+        table_chunks: list = []
+        num_rows = dumper._append_zch_delta_rows(
+            table_chunks, 5, table_weights, zch_touched={}
+        )
+        self.assertEqual(num_rows, 1)
+        rows = table_chunks[0]
+        self.assertEqual(rows["key_id"].to_pylist(), [102])
+        self.assertEqual(rows["embedding"].to_pylist(), [weight[1].tolist()])
+        self.assertEqual(sorted(dumper._zch_snapshots[table_fqn].tolist()), [101, 102])
+
+    def test_zch_delta_publishes_evicted_ids_with_fallback_row(self):
+        dumper, mch, weight, table_fqn, table_weights = self._build_zch_snapshot_dumper(
+            raw_ids_per_slot=[102, None, None, None],
+            mapping=[1, 0, 2, 3],
+            offset=0,
+        )
+        # 101 was evicted out of the table; the dump must overwrite its stale
+        # FeatureStore entry with the fallback row the model now serves.
+        dumper._zch_snapshots[table_fqn] = torch.tensor([101, 102], dtype=torch.int64)
+        table_chunks: list = []
+        num_rows = dumper._append_zch_delta_rows(
+            table_chunks, 5, table_weights, zch_touched={}
+        )
+        # 101 evicted (fallback row), 102 unchanged since the snapshot.
+        self.assertEqual(num_rows, 1)
+        rows = table_chunks[0]
+        self.assertEqual(rows["key_id"].to_pylist(), [101])
+        self.assertEqual(
+            rows["embedding"].to_pylist(), [weight[mch._zch_size - 1].tolist()]
+        )
+
+    def test_zch_delta_first_dump_publishes_all_held_ids(self):
+        dumper, mch, weight, table_fqn, table_weights = self._build_zch_snapshot_dumper(
+            raw_ids_per_slot=[101, 102, None, None],
+            mapping=[0, 1, 2, 3],
+            offset=0,
+        )
+        table_chunks: list = []
+        num_rows = dumper._append_zch_delta_rows(
+            table_chunks, 5, table_weights, zch_touched={}
+        )
+        self.assertEqual(num_rows, 2)
+        rows = table_chunks[0]
+        self.assertEqual(sorted(rows["key_id"].to_pylist()), [101, 102])
+
     def test_lookup_handles_empty_ids(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
@@ -1745,6 +1947,26 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
                         )
                     )
                 )
+
+    @unittest.skipIf(torch.cuda.device_count() < 1, "test requires a GPU")
+    @mark_ci_scope("gpu")
+    def test_zch_lifecycle_dump_publishes_admitted_and_evicted_ids(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "NCCL_DEBUG": "WARN",
+                    "FORCED_NCCL_DEBUG": "WARN",
+                    "NCCL_DEBUG_SUBSYS": "",
+                },
+            ),
+        ):
+            self._run_multi_process_test(
+                callable=_run_zch_lifecycle_delta_embedding_dump,
+                world_size=1,
+                output_dir=tmp_dir,
+            )
 
     @unittest.skipIf(torch.cuda.device_count() < 1, "test requires a GPU")
     @mark_ci_scope("gpu")

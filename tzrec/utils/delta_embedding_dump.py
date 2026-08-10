@@ -567,6 +567,7 @@ class DeltaEmbeddingDumper:
             auto_compact=True,
         )
         self._zch_modules = self._collect_zch_modules()
+        self._zch_snapshots: Dict[str, torch.Tensor] = {}
         self._table_shard_infos = self._collect_table_shard_infos()
         self._validate_supported_table_sharding(self._table_shard_infos)
         self._install_tracking_pause_guard()
@@ -603,8 +604,18 @@ class DeltaEmbeddingDumper:
         )
 
     def clear(self) -> None:
-        """Clear tracked sparse ids, usually after restore-time dummy steps."""
+        """Clear tracked sparse ids, usually after restore-time dummy steps.
+
+        The restored model state is the baseline the serving side already
+        holds, so re-snapshot the ZCH tables here; the next dump then reports
+        only the delta against the restored state instead of republishing it.
+        """
         self._tracker.clear(_CONSUMER)
+        table_weights = self._collect_table_weights()
+        for fqn, mch in self._zch_modules.items():
+            self._zch_snapshots[fqn] = self._zch_current_rows(mch, fqn, table_weights)[
+                0
+            ].cpu()
 
     @contextmanager
     def pause_tracking(self) -> Iterator[None]:
@@ -832,11 +843,17 @@ class DeltaEmbeddingDumper:
         # keys; flush() flushes the whole module, so track which
         # modules were already flushed this dump and skip the redundant repeats.
         flushed_module_ids: Set[int] = set()
+        zch_touched: Dict[str, torch.Tensor] = {}
         for fqn, unique_rows in self._tracker.get_unique(_CONSUMER).items():
             ids = unique_rows.ids
             if ids.numel() == 0:
                 continue
             ids = ids.unique(sorted=True)
+            if fqn in self._zch_modules:
+                # ZCH rows are emitted by the snapshot diff, which merges the
+                # touched ids with admitted ids and adds eviction corrections.
+                zch_touched[fqn] = ids
+                continue
             embeddings, key_ids = self._lookup_embeddings(
                 fqn,
                 ids,
@@ -856,6 +873,12 @@ class DeltaEmbeddingDumper:
                 embeddings=embeddings,
                 source="model_delta_tracker",
             )
+        num_rows += self._append_zch_delta_rows(
+            table_chunks,
+            global_step=global_step,
+            table_weights=table_weights,
+            zch_touched=zch_touched,
+        )
         return num_rows
 
     def _lookup_embeddings(
@@ -969,6 +992,91 @@ class DeltaEmbeddingDumper:
             ids = ids[held_mask]
             raw_ids = raw_ids[held_mask]
         return weight[ids].detach(), raw_ids.detach()
+
+    def _zch_current_rows(
+        self,
+        zch_module: MCHManagedCollisionModule,
+        fqn: str,
+        table_weights: Dict[str, _TableWeight],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (raw ids, local rows) currently held by one ZCH table shard.
+
+        The fallback row is excluded because its slot holds no raw id; an
+        empty-slot entry is the int64-max sentinel and the validity mask drops
+        it together with any other unoccupied slot.
+        """
+        if fqn not in table_weights:
+            raise KeyError(f"Embedding table {fqn} not found in sharded model.")
+        weight = table_weights[fqn].tensor
+        device = weight.device
+        raw_ids = zch_module._mch_sorted_raw_ids.to(device)
+        rows = zch_module._mch_remapped_ids_mapping.to(device)
+        valid_mask = raw_ids != torch.iinfo(torch.int64).max
+        return raw_ids[valid_mask], rows[valid_mask] - zch_module._output_global_offset
+
+    def _append_zch_delta_rows(
+        self,
+        table_chunks: List[pa.Table],
+        global_step: int,
+        table_weights: Dict[str, _TableWeight],
+        zch_touched: Dict[str, torch.Tensor],
+    ) -> int:
+        """Publish ZCH lifecycle deltas the tracker alone cannot see.
+
+        Beyond the tracker-touched rows, two lifecycle events are invisible
+        to lookup tracking: an id admitted after its only lookup (published
+        here with its trained row), and an id evicted from the table, whose
+        stale FeatureStore entry would otherwise live forever (republished
+        here with the fallback row the model now serves for it).
+        """
+        num_rows = 0
+        for fqn, mch in self._zch_modules.items():
+            raw_ids, rows = self._zch_current_rows(mch, fqn, table_weights)
+            weight = table_weights[fqn].tensor
+            device = weight.device
+            prev = self._zch_snapshots.get(fqn)
+            prev = (
+                prev.to(device)
+                if prev is not None
+                else torch.empty(0, dtype=torch.long, device=device)
+            )
+            touched = zch_touched.get(fqn)
+            touched_raw_ids = (
+                self._lookup_zch_embeddings(mch, fqn, touched, table_weights)[1]
+                if touched is not None
+                else torch.empty(0, dtype=torch.long, device=device)
+            )
+            publish_mask = ~torch.isin(raw_ids, prev)
+            if touched_raw_ids.numel() > 0:
+                publish_mask |= torch.isin(raw_ids, touched_raw_ids)
+            num_rows += self._append_table_chunk(
+                table_chunks,
+                global_step=global_step,
+                feature_name=_feature_name(
+                    self._tracker.fqn_to_feature_names.get(fqn, [])
+                ),
+                table_fqn=fqn,
+                key_ids=raw_ids[publish_mask],
+                embeddings=weight[rows[publish_mask]].detach(),
+                source="model_delta_tracker",
+            )
+            evicted = prev[~torch.isin(prev, raw_ids)]
+            if evicted.numel() > 0:
+                num_rows += self._append_table_chunk(
+                    table_chunks,
+                    global_step=global_step,
+                    feature_name=_feature_name(
+                        self._tracker.fqn_to_feature_names.get(fqn, [])
+                    ),
+                    table_fqn=fqn,
+                    key_ids=evicted,
+                    embeddings=weight[mch._zch_size - 1].expand(
+                        evicted.numel(), weight.size(1)
+                    ),
+                    source="model_delta_tracker",
+                )
+            self._zch_snapshots[fqn] = raw_ids.cpu()
+        return num_rows
 
     def _lookup_dynamic_embeddings(
         self,
