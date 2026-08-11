@@ -41,7 +41,7 @@ from tzrec.datasets.utils import (
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
-from tzrec.prompt.assembler import assemble_into
+from tzrec.prompt.assembler import PromptAssembler
 from tzrec.prompt.plan import CompiledPrompt
 from tzrec.protos import data_pb2
 from tzrec.utils import config_util
@@ -113,7 +113,12 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         prompt: Optional[CompiledPrompt] = None,
     ) -> None:
         super(BaseDataset, self).__init__()
-        self._prompt = prompt
+        # built once per worker: the plan it walks is fixed for the run
+        self._assembler = (
+            PromptAssembler(prompt.prompt_plan, prompt.sid_space)
+            if prompt is not None
+            else None
+        )
         self._data_config = data_config
         self._features = features
         self._input_path = input_path
@@ -390,11 +395,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         else:
             batch = self._data_parser.to_batch(output_data)
 
-        if self._prompt is not None:
+        if self._assembler is not None:
             batch.additional_infos.update(
                 {
                     k: torch.from_numpy(np.asarray(v))
-                    for k, v in assemble_into(self._prompt, output_data).items()
+                    for k, v in self._assembler.assemble_batch(output_data).items()
                 }
             )
 

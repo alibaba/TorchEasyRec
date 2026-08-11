@@ -201,13 +201,55 @@ class PromptAssembler:
             labels=np.asarray(labels, dtype=np.int64),
         )
 
+    def assemble_batch(self, parsed: Dict[str, "np.ndarray"]) -> Dict[str, np.ndarray]:
+        """Reshape one parsed batch, assemble it, and key it for the batch.
+
+        Args:
+            parsed: ``{feature}.values`` / ``{feature}.lengths`` as the data
+                parser emits them.
+
+        Returns:
+            The five streams, keyed as ``additional_infos`` expects them.
+        """
+        values: Dict[str, List[np.ndarray]] = {}
+        counts: Dict[str, np.ndarray] = {}
+        batch_size = 0
+        for seg in self._plan.segments + self._plan.response_segments:
+            if not isinstance(seg, SlotSeg):
+                continue
+            source = seg.sources[0]
+            lengths = np.asarray(parsed[f"{source}.lengths"])
+            batch_size = max(batch_size, int(lengths.size))
+            if seg.fill is FillMode.INLINE:
+                # a dense sequence feature emits (total, value_dim); the stream
+                # is one code per position, so value_dim is always 1 here
+                flat = np.asarray(parsed[f"{source}.values"]).reshape(-1)
+                bounds = np.concatenate(([0], np.cumsum(lengths)))
+                values[seg.name] = [
+                    flat[bounds[i] : bounds[i + 1]] for i in range(lengths.size)
+                ]
+            else:
+                counts[seg.name] = lengths
+
+        out = self.assemble(values, counts, batch_size=batch_size)
+        return {
+            PROMPT_INPUT_IDS: out.input_ids,
+            PROMPT_CU_SEQLENS: out.cu_seqlens,
+            PROMPT_HOLE_POSITIONS: out.hole_positions,
+            PROMPT_LABELS: out.labels,
+            PROMPT_MAX_SEQLEN: np.asarray(out.max_seqlen, dtype=np.int64),
+        }
+
 
 def assemble_into(
     prompt: CompiledPrompt,
     parsed: Dict[str, "np.ndarray"],
     ignore_index: int = -100,
 ) -> Dict[str, np.ndarray]:
-    """Run the assembler over one parsed batch and key it for the batch.
+    """Assemble one batch with a throwaway assembler.
+
+    A caller that assembles every batch should hold a ``PromptAssembler`` and
+    call ``assemble_batch`` instead; this builds one per call.
 
     Args:
         prompt: the compiled prompt.
@@ -218,34 +260,6 @@ def assemble_into(
     Returns:
         The five streams, keyed as ``additional_infos`` expects them.
     """
-    plan = prompt.prompt_plan
-    values: Dict[str, List[np.ndarray]] = {}
-    counts: Dict[str, np.ndarray] = {}
-    batch_size = 0
-    for seg in plan.segments + plan.response_segments:
-        if not isinstance(seg, SlotSeg):
-            continue
-        source = seg.sources[0]
-        lengths = np.asarray(parsed[f"{source}.lengths"])
-        batch_size = max(batch_size, int(lengths.size))
-        if seg.fill is FillMode.INLINE:
-            # a dense sequence feature emits (total, value_dim); the stream is
-            # one code per position, so value_dim is always 1 here
-            flat = np.asarray(parsed[f"{source}.values"]).reshape(-1)
-            bounds = np.concatenate(([0], np.cumsum(lengths)))
-            values[seg.name] = [
-                flat[bounds[i] : bounds[i + 1]] for i in range(lengths.size)
-            ]
-        else:
-            counts[seg.name] = lengths
-
-    out = PromptAssembler(plan, prompt.sid_space, ignore_index).assemble(
-        values, counts, batch_size=batch_size
-    )
-    return {
-        PROMPT_INPUT_IDS: out.input_ids,
-        PROMPT_CU_SEQLENS: out.cu_seqlens,
-        PROMPT_HOLE_POSITIONS: out.hole_positions,
-        PROMPT_LABELS: out.labels,
-        PROMPT_MAX_SEQLEN: np.asarray(out.max_seqlen, dtype=np.int64),
-    }
+    return PromptAssembler(
+        prompt.prompt_plan, prompt.sid_space, ignore_index
+    ).assemble_batch(parsed)
