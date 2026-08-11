@@ -1817,9 +1817,13 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mapping=[0, 1, 2, 3],
             offset=0,
         )
-        # The snapshot holds only 101, so 102 counts as admitted since the
-        # previous dump even though the tracker recorded no lookup for it.
-        dumper._zch_snapshots[table_fqn] = torch.tensor([101], dtype=torch.int64)
+        # The snapshot holds only 101 (bound to row 0), so 102 counts as
+        # admitted since the previous dump even though the tracker recorded no
+        # lookup for it.
+        dumper._zch_snapshots[table_fqn] = (
+            torch.tensor([101], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int64),
+        )
         table_chunks: list = []
         num_rows = dumper._append_zch_delta_rows(
             table_chunks, 5, table_weights, zch_touched={}
@@ -1828,7 +1832,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         rows = table_chunks[0]
         self.assertEqual(rows["key_id"].to_pylist(), [102])
         self.assertEqual(rows["embedding"].to_pylist(), [weight[1].tolist()])
-        self.assertEqual(sorted(dumper._zch_snapshots[table_fqn].tolist()), [101, 102])
+        self.assertEqual(
+            sorted(dumper._zch_snapshots[table_fqn][0].tolist()), [101, 102]
+        )
 
     def test_zch_delta_publishes_evicted_ids_with_fallback_row(self):
         dumper, mch, weight, table_fqn, table_weights = self._build_zch_snapshot_dumper(
@@ -1837,8 +1843,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             offset=0,
         )
         # 101 was evicted out of the table; the dump must overwrite its stale
-        # FeatureStore entry with the fallback row the model now serves.
-        dumper._zch_snapshots[table_fqn] = torch.tensor([101, 102], dtype=torch.int64)
+        # FeatureStore entry with the fallback row the model now serves. 102 is
+        # still bound to row 1, unchanged since the snapshot.
+        dumper._zch_snapshots[table_fqn] = (
+            torch.tensor([101, 102], dtype=torch.int64),
+            torch.tensor([0, 1], dtype=torch.int64),
+        )
         table_chunks: list = []
         num_rows = dumper._append_zch_delta_rows(
             table_chunks, 5, table_weights, zch_touched={}
@@ -1864,6 +1874,38 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(num_rows, 2)
         rows = table_chunks[0]
         self.assertEqual(sorted(rows["key_id"].to_pylist()), [101, 102])
+
+    def test_zch_delta_republishes_readmitted_id_with_new_row(self):
+        dumper, mch, weight, table_fqn, table_weights = self._build_zch_snapshot_dumper(
+            raw_ids_per_slot=[101, None, None, None],
+            mapping=[1, 0, 2, 3],
+            offset=0,
+        )
+        # 101 was evicted and re-admitted between two dumps: it is present in
+        # both snapshots but now bound to row 1 instead of row 0, whose
+        # embedding was reset on eviction, so the dump must republish it with
+        # its new row even though its id membership is unchanged.
+        dumper._zch_snapshots[table_fqn] = (
+            torch.tensor([101], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int64),
+        )
+        table_chunks: list = []
+        num_rows = dumper._append_zch_delta_rows(
+            table_chunks, 5, table_weights, zch_touched={}
+        )
+        self.assertEqual(num_rows, 1)
+        rows = table_chunks[0]
+        self.assertEqual(rows["key_id"].to_pylist(), [101])
+        self.assertEqual(rows["embedding"].to_pylist(), [weight[1].tolist()])
+
+    def test_zch_current_rows_fails_on_row_outside_local_shard(self):
+        dumper, mch, weight, table_fqn, table_weights = self._build_zch_snapshot_dumper(
+            raw_ids_per_slot=[101, 102, None, None],
+            mapping=[0, 99, 2, 3],
+            offset=0,
+        )
+        with self.assertRaisesRegex(ValueError, "outside the local shard"):
+            dumper._zch_current_rows(mch, table_fqn, table_weights)
 
     def test_lookup_handles_empty_ids(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
