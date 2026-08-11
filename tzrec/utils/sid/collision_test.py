@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import unittest
 from unittest import mock
 
@@ -19,19 +20,30 @@ from tzrec.utils.sid import collision
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     KnnCollisionResolver,
+    PriorOccupancy,
     RandomCollisionResolver,
     build_original_item_grouping,
     build_resolved_item_grouping,
+    concat_ranges,
     prepare_collision_plan,
+    sid_bucket_keys,
+    sid_offset_codes,
 )
 from tzrec.utils.test_util import parameterized_name_func
 
 
-def _plan(layer_sizes, capacity, item_ids, codes):
+def _plan(layer_sizes, capacity, item_ids, codes, prior=None):
     return prepare_collision_plan(
         np.asarray(item_ids, dtype=np.int64),
         np.asarray(codes, dtype=np.int64),
         CollisionResolutionConfig(layer_sizes, capacity),
+        prior=prior,
+    )
+
+
+def _prior(keys, counts):
+    return PriorOccupancy(
+        np.asarray(keys, dtype=np.int64), np.asarray(counts, dtype=np.int64)
     )
 
 
@@ -128,7 +140,6 @@ class CollisionTest(unittest.TestCase):
         np.testing.assert_array_equal(result.final_bucket_keys, [0, 1, 2, 3, 4, 5])
         np.testing.assert_array_equal(result.final_bucket_counts, [2, 2, 2, 1, 2, 1])
         self.assertTrue(result.grouping_collected)
-        self.assertEqual(result.stats.total_items, 10)
         self.assertEqual(result.stats.raw_collision_buckets, 2)
         self.assertEqual(result.stats.final_collision_buckets, 0)
         self.assertEqual(result.stats.relocated_count, 3)
@@ -492,6 +503,151 @@ class CollisionTest(unittest.TestCase):
         self.assertEqual(grouped.stats.max_final_bucket_size, 2)
         _assert_same_assignments(self, rate_only, grouped)
         self.assertFalse(rate_only.grouping_collected)
+
+
+class ConcatRangesTest(unittest.TestCase):
+    def test_concatenates_ragged_ranges(self) -> None:
+        np.testing.assert_array_equal(
+            concat_ranges([5, 10], [2, 3]), [5, 6, 10, 11, 12]
+        )
+
+    def test_skips_empty_ranges(self) -> None:
+        np.testing.assert_array_equal(concat_ranges([5, 10, 20], [2, 0, 1]), [5, 6, 20])
+        self.assertEqual(concat_ranges([3], [0]).shape, (0,))
+        self.assertEqual(concat_ranges([], []).shape, (0,))
+
+
+class SidOffsetCodesTest(unittest.TestCase):
+    def test_shifts_each_layer_by_the_preceding_sizes(self) -> None:
+        np.testing.assert_array_equal(
+            sid_offset_codes(np.asarray([[1, 2, 3]]), (64, 64, 64)), [[1, 66, 131]]
+        )
+
+    def test_supports_non_uniform_codebooks(self) -> None:
+        # offsets are 0, 4, 4 + 8
+        np.testing.assert_array_equal(
+            sid_offset_codes(np.asarray([[1, 2, 3]]), (4, 8, 16)), [[1, 6, 15]]
+        )
+
+    def test_single_layer_is_unchanged(self) -> None:
+        np.testing.assert_array_equal(
+            sid_offset_codes(np.asarray([[7], [0]]), (64,)), [[7], [0]]
+        )
+
+    def test_layers_occupy_disjoint_ranges(self) -> None:
+        layer_sizes = (4, 8, 16)
+        codes = np.stack(
+            np.meshgrid(*[np.arange(size) for size in layer_sizes], indexing="ij"),
+            axis=-1,
+        ).reshape(-1, len(layer_sizes))
+        offset = sid_offset_codes(codes, layer_sizes)
+        for layer, size in enumerate(layer_sizes):
+            start = sum(layer_sizes[:layer])
+            column = offset[:, layer]
+            self.assertEqual(int(column.min()), start)
+            self.assertEqual(int(column.max()), start + size - 1)
+        self.assertEqual(int(offset.max()), sum(layer_sizes) - 1)
+
+
+class PriorOccupancyTest(unittest.TestCase):
+    def test_empty_has_no_items(self) -> None:
+        prior = PriorOccupancy.empty()
+        self.assertTrue(prior.is_empty)
+        np.testing.assert_array_equal(prior.counts_for(np.asarray([3, 7])), [0, 0])
+
+    def test_counts_for_returns_zero_for_absent_buckets(self) -> None:
+        prior = _prior([2, 5, 9], [1, 4, 2])
+        np.testing.assert_array_equal(
+            prior.counts_for(np.asarray([9, 0, 5, 100, 2])), [2, 0, 4, 0, 1]
+        )
+
+    def test_restrict_to_bands_keeps_only_requested_bands(self) -> None:
+        # last_size 4 -> band 0 spans keys 0..3, band 2 spans keys 8..11.
+        prior = _prior([0, 3, 5, 9, 11, 12], [1, 2, 3, 4, 5, 6])
+        restricted = prior.restrict_to_bands(np.asarray([2, 0]), 4)
+        np.testing.assert_array_equal(restricted.bucket_keys, [0, 3, 9, 11])
+        np.testing.assert_array_equal(restricted.bucket_counts, [1, 2, 4, 5])
+        self.assertTrue(prior.restrict_to_bands(np.asarray([7]), 4).is_empty)
+
+
+class AppendPlanTest(unittest.TestCase):
+    def test_zero_prior_matches_full_resolve(self) -> None:
+        codes = [[0, 0], [0, 0], [1, 3], [0, 2]]
+        without = _plan((2, 4), 2, range(4), codes)
+        with_empty = _plan((2, 4), 2, range(4), codes, prior=PriorOccupancy.empty())
+        # Enumerate the array fields so a newly added one is covered too.
+        for field in dataclasses.fields(without):
+            if field.name in ("item_count", "config", "prior"):
+                continue
+            np.testing.assert_array_equal(
+                getattr(without, field.name),
+                getattr(with_empty, field.name),
+                err_msg=field.name,
+            )
+        self.assertEqual(without.item_count, with_empty.item_count)
+
+    def test_prior_consumes_capacity_and_continues_slots(self) -> None:
+        # Bucket (0, 0) is key 0 and already holds one published item, so with
+        # capacity 2 only one of the two new rows can be retained there.
+        plan = _plan((2, 4), 2, [10, 11], [[0, 0], [0, 0]], prior=_prior([0], [1]))
+        np.testing.assert_array_equal(plan.prior_bucket_counts, [1])
+        self.assertEqual(plan.overflow_rows.size, 1)
+        retained = int(np.setdiff1d(np.arange(2), plan.overflow_rows)[0])
+        # The retained row continues the published slot sequence at 2, not 1.
+        self.assertEqual(int(plan.initial_slot_indices[retained]), 2)
+
+    def test_full_prior_bucket_overflows_every_new_row(self) -> None:
+        plan = _plan((2, 4), 2, [10, 11], [[0, 0], [0, 0]], prior=_prior([0], [2]))
+        np.testing.assert_array_equal(np.sort(plan.overflow_rows), [0, 1])
+
+    def test_prior_over_capacity_never_reissues_a_published_slot(self) -> None:
+        # A previous run left three items on key 0 at capacity 1 (unresolved
+        # overflow). The new row cannot relocate, so it must land at slot 4.
+        plan = _plan((2, 4), 1, [10], [[0, 0]], prior=_prior([0], [3]))
+        result = KnnCollisionResolver().resolve(plan, np.asarray([[0]], dtype=np.int64))
+        self.assertEqual(result.stats.unresolved_count, 1)
+        self.assertEqual(int(result.slot_indices[0]), 4)
+
+    def test_relocation_sees_prior_only_buckets_in_the_band(self) -> None:
+        # Key 0 is full, and key 1 -- in the same band but holding no new row --
+        # is already full too. The only free candidate is key 2.
+        plan = _plan((1, 4), 1, [10], [[0, 0]], prior=_prior([0, 1], [1, 1]))
+        result = KnnCollisionResolver().resolve(
+            plan, np.asarray([[1, 2]], dtype=np.int64)
+        )
+        self.assertEqual(result.stats.relocated_count, 1)
+        self.assertEqual(int(result.resolved_last_codes[0]), 2)
+        self.assertEqual(int(result.slot_indices[0]), 1)
+
+    def test_final_counts_are_corpus_totals(self) -> None:
+        plan = _plan((2, 4), 3, [10], [[0, 0]], prior=_prior([0], [2]))
+        result = KnnCollisionResolver().resolve(plan, None)
+        self.assertEqual(plan.overflow_rows.size, 0)
+        np.testing.assert_array_equal(result.final_bucket_keys, [0])
+        np.testing.assert_array_equal(result.final_bucket_counts, [3])
+        self.assertEqual(result.stats.max_final_bucket_size, 3)
+
+    def test_groupings_cover_only_the_appended_rows(self) -> None:
+        prior = _prior([0], [1])
+        plan = _plan((2, 4), 3, [10, 11], [[0, 0], [0, 1]], prior=prior)
+        result = KnnCollisionResolver().resolve(plan, None)
+
+        resolved = build_resolved_item_grouping(plan, result)
+        np.testing.assert_array_equal(np.sort(resolved.row_order), [0, 1])
+        self.assertEqual(int(resolved.counts.sum()), 2)
+        # Key 0 already held one item, so the delta grouping keeps one row there
+        # and the local slot restarts at 1 even though the global slot is 2.
+        keys = sid_bucket_keys(np.asarray([[0, 0], [0, 1]]), (2, 4))
+        np.testing.assert_array_equal(resolved.sid_keys, np.sort(keys))
+        self.assertEqual(int(result.slot_indices[0]), 2)
+
+        original = build_original_item_grouping(plan)
+        np.testing.assert_array_equal(np.sort(original.row_order), [0, 1])
+        self.assertEqual(int(original.counts.sum()), 2)
+
+    def test_rejects_prior_outside_the_key_space(self) -> None:
+        with self.assertRaisesRegex(ValueError, "outside the key space"):
+            _plan((2, 4), 2, [10], [[0, 0]], prior=_prior([8], [1]))
 
 
 if __name__ == "__main__":

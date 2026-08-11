@@ -21,6 +21,11 @@ from tzrec.datasets.odps_dataset import _parse_table_path
 _OdpsPathIdentity = Tuple[str, Optional[str], str, Optional[str]]
 
 
+def is_odps_path(path: str) -> bool:
+    """Whether a path addresses ODPS rather than a filesystem."""
+    return path.startswith("odps://")
+
+
 def _local_path_identities(path: str) -> Set[str]:
     """Return resolved local write locations represented by one path group."""
     identities: Set[str] = set()
@@ -150,7 +155,7 @@ def check_path_conflict(paths: Sequence[str]) -> Tuple[bool, Optional[str]]:
     local_paths: List[str] = []
     odps_paths: List[str] = []
     for path in paths:
-        if path.startswith("odps://"):
+        if is_odps_path(path):
             odps_paths.append(path)
         else:
             local_paths.append(path)
