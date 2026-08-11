@@ -741,23 +741,81 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "stray_emb"):
                 dumper._collect_zch_modules()
 
-    def test_collect_zch_modules_rejects_non_mch_module(self):
+    def test_collect_zch_modules_skips_untracked_non_mch_module(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         wrapper = torch.nn.Module()
         wrapper._managed_collision_collection = SimpleNamespace(
             _managed_collision_modules={"user_emb": torch.nn.Module()}
         )
-        wrapper._embedding_module = torch.nn.Module()
+        inner_module = torch.nn.Module()
+        inner_module._table_name_to_config = {"user_emb": None}
+        wrapper._embedding_module = inner_module
         model = torch.nn.Module()
         model.mc_ebc = wrapper
         dumper._model = model
         dumper._tracker = SimpleNamespace(
-            fqn_to_feature_names={
-                "mc_ebc._embedding_module.embedding_bags.user_emb": ["user_id"]
-            }
+            fqn_to_feature_names={},
+            tracked_modules={"mc_ebc._embedding_module": inner_module},
         )
-        with self.assertRaisesRegex(TypeError, "MCHManagedCollisionModule"):
-            dumper._collect_zch_modules()
+        with mock.patch(
+            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+            side_effect=lambda module_fqn, _module, table_name: (
+                f"{module_fqn}.embedding_bags.{table_name}"
+            ),
+        ):
+            with self.assertLogs("tzrec", level="WARNING") as logged:
+                self.assertEqual(dumper._collect_zch_modules(), {})
+        self.assertTrue(
+            any("unsupported" in line for line in logged.output), logged.output
+        )
+
+    def test_collect_zch_modules_fails_on_tracked_non_mch_module(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        wrapper = torch.nn.Module()
+        wrapper._managed_collision_collection = SimpleNamespace(
+            _managed_collision_modules={"user_emb": torch.nn.Module()}
+        )
+        inner_module = torch.nn.Module()
+        inner_module._table_name_to_config = {"user_emb": None}
+        wrapper._embedding_module = inner_module
+        model = torch.nn.Module()
+        model.mc_ebc = wrapper
+        dumper._model = model
+        table_fqn = "mc_ebc._embedding_module.embedding_bags.user_emb"
+        dumper._tracker = SimpleNamespace(
+            fqn_to_feature_names={table_fqn: ["user_id"]},
+            tracked_modules={"mc_ebc._embedding_module": inner_module},
+        )
+        with mock.patch(
+            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+            side_effect=lambda module_fqn, _module, table_name: (
+                f"{module_fqn}.embedding_bags.{table_name}"
+            ),
+        ):
+            with self.assertLogs("tzrec", level="WARNING"):
+                with self.assertRaisesRegex(ValueError, "user_emb"):
+                    dumper._collect_zch_modules()
+
+    def test_close_uninstalls_zch_compute_wrapper(self):
+        class _ComputeModule(nn.Module):
+            def compute(self, ctx, dist_input):
+                return None
+
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        module = _ComputeModule()
+        orig_compute = module.compute
+
+        def tracked_compute(ctx, dist_input):
+            return None
+
+        module.compute = tracked_compute
+        dumper._zch_compute_wrappers = {id(module): (module, orig_compute)}
+        dumper._uploader = None
+
+        dumper.close()
+
+        self.assertIs(module.compute, orig_compute)
+        self.assertEqual(dumper._zch_compute_wrappers, {})
 
     def test_row_wise_shard_info_uses_row_offset(self):
         table_config = ShardedEmbeddingTable(
@@ -1674,6 +1732,59 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
         torch.testing.assert_close(embeddings, weight[[0, 2]])
         torch.testing.assert_close(key_ids, torch.tensor([101, 105]))
+
+    def _make_zch_lookup_dumper(self, mapping, offset=0):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._world_size = 2
+        mch = MCHManagedCollisionModule(
+            zch_size=4,
+            device=torch.device("cpu"),
+            eviction_policy=LFU_EvictionPolicy(),
+            eviction_interval=2,
+        )
+        mch._mch_sorted_raw_ids.copy_(torch.tensor([101, 102, 103, 104]))
+        mch._mch_remapped_ids_mapping.copy_(torch.tensor(mapping))
+        mch._output_global_offset = offset
+        table_fqn = "model.mc_ebc._embedding_module.embedding_bags.user_emb"
+        dumper._zch_modules = {table_fqn: mch}
+        weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
+        return (
+            dumper,
+            table_fqn,
+            {
+                table_fqn: _TableWeight(
+                    tensor=weight,
+                    shard_info=_TableShardInfo(
+                        row_offset=offset,
+                        local_rows=4,
+                        local_cols=2,
+                        global_rows=4,
+                        global_cols=2,
+                        has_shard_metadata=True,
+                    ),
+                )
+            },
+        )
+
+    def test_zch_lookup_fails_on_row_with_no_slot(self):
+        dumper, table_fqn, table_weights = self._make_zch_lookup_dumper([0, 0, 1, 3])
+        with self.assertRaisesRegex(ValueError, "does not cover local rows"):
+            dumper._lookup_embeddings(
+                table_fqn,
+                torch.tensor([2]),
+                table_weights=table_weights,
+                dynamic_modules={},
+            )
+
+    def test_zch_lookup_fails_on_row_outside_local_shard(self):
+        dumper, table_fqn, table_weights = self._make_zch_lookup_dumper([0, 1, 99, 3])
+        with self.assertRaisesRegex(ValueError, "outside the local shard"):
+            dumper._lookup_embeddings(
+                table_fqn,
+                torch.tensor([0]),
+                table_weights=table_weights,
+                dynamic_modules={},
+            )
 
     def _build_zch_snapshot_dumper(self, raw_ids_per_slot, mapping, offset, zch_size=4):
         dumper = object.__new__(DeltaEmbeddingDumper)

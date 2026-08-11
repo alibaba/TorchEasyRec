@@ -643,6 +643,7 @@ class DeltaEmbeddingDumper:
         """Close this rank's uploader; abnormal shutdown can skip draining."""
         if self._uploader is not None:
             self._uploader.close(raise_on_error=raise_on_error, drain=drain)
+        self._uninstall_zch_tracking()
 
     def _feature_store_upload_error(self) -> Optional[BaseException]:
         """Collect this rank's uploader error without changing control flow."""
@@ -974,14 +975,18 @@ class DeltaEmbeddingDumper:
         # _mch_sorted_raw_ids maps slot -> raw id while
         # _mch_remapped_ids_mapping maps slot -> global row, so inverting the
         # mapping turns the tracker's local rows back into ZCH slots.
-        mapping = zch_module._mch_remapped_ids_mapping.to(weight.device)
-        slot_of_row = torch.empty(
-            mapping.size(0), dtype=torch.long, device=weight.device
+        slot_of_row = self._zch_slot_of_row(
+            zch_module, fqn, weight.device, weight.size(0)
         )
-        slot_of_row[mapping - zch_module._output_global_offset] = torch.arange(
-            mapping.size(0), dtype=torch.long, device=weight.device
-        )
-        raw_ids = zch_module._mch_sorted_raw_ids.to(weight.device)[slot_of_row[ids]]
+        slots = slot_of_row[ids]
+        if bool((slots < 0).any().item()):
+            raise ValueError(
+                f"ZCH table {fqn} slot mapping does not cover local rows "
+                f"{ids[slots < 0].tolist()} of the embedding shard; "
+                "_mch_remapped_ids_mapping is not a permutation of the shard "
+                "row range."
+            )
+        raw_ids = zch_module._mch_sorted_raw_ids.to(weight.device)[slots]
         held_mask = raw_ids != torch.iinfo(torch.int64).max
         if not bool(held_mask.all().item()):
             logger.warning(
@@ -992,6 +997,36 @@ class DeltaEmbeddingDumper:
             ids = ids[held_mask]
             raw_ids = raw_ids[held_mask]
         return weight[ids].detach(), raw_ids.detach()
+
+    def _zch_slot_of_row(
+        self,
+        zch_module: MCHManagedCollisionModule,
+        fqn: str,
+        device: torch.device,
+        num_local_rows: int,
+    ) -> torch.Tensor:
+        """Invert the slot -> global-row mapping into local-row -> slot.
+
+        ``_mch_remapped_ids_mapping`` must be an exact permutation of the
+        shard's row range; rows no slot maps to stay -1 so callers fail loudly
+        instead of reading a garbage slot, and rows outside the local shard
+        raise here instead of hitting a device-side index assert (e.g. a
+        resharded checkpoint whose offsets no longer match this shard).
+        """
+        mapping = zch_module._mch_remapped_ids_mapping.to(device)
+        local_rows = mapping - zch_module._output_global_offset
+        out_of_range = (local_rows < 0) | (local_rows >= num_local_rows)
+        if bool(out_of_range.any().item()):
+            raise ValueError(
+                f"ZCH table {fqn} remapped rows fall outside the local shard "
+                f"row range [0, {num_local_rows}); the checkpoint's ZCH "
+                "sharding does not match this shard."
+            )
+        slot_of_row = torch.full((num_local_rows,), -1, dtype=torch.long, device=device)
+        slot_of_row[local_rows] = torch.arange(
+            mapping.size(0), dtype=torch.long, device=device
+        )
+        return slot_of_row
 
     def _zch_current_rows(
         self,
@@ -1212,15 +1247,21 @@ class DeltaEmbeddingDumper:
             mc_collection = getattr(module, "_managed_collision_collection", None)
             if mc_collection is None or not hasattr(module, "_embedding_module"):
                 continue
+            self._zch_inner_module_ids.add(id(module._embedding_module))
             for table_name, mch in mc_collection._managed_collision_modules.items():
                 if not isinstance(mch, MCHManagedCollisionModule):
-                    raise TypeError(
-                        "delta embedding dump does not support managed collision "
-                        f"module {type(mch).__name__} of table {table_name} in "
-                        f"{named_path}; only MCHManagedCollisionModule (zch) is "
-                        "supported."
+                    # Like the export path, skip unsupported collision module
+                    # types instead of failing: if the dump tracks the table
+                    # the resolution check below still fails loudly.
+                    logger.warning(
+                        "Skipping managed collision table %s in %s: unsupported "
+                        "module %s; only MCHManagedCollisionModule (zch) is "
+                        "supported.",
+                        table_name,
+                        named_path,
+                        type(mch).__name__,
                     )
-                self._zch_inner_module_ids.add(id(module._embedding_module))
+                    continue
                 mch_by_inner_module.setdefault(id(module._embedding_module), {})[
                     table_name
                 ] = mch
@@ -1231,7 +1272,7 @@ class DeltaEmbeddingDumper:
                 table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
                 if table_fqn not in self._tracker.fqn_to_feature_names:
                     continue
-                mch = mch_by_inner_module[id(module)].get(table_name)
+                mch = mch_by_inner_module.get(id(module), {}).get(table_name)
                 if mch is None:
                     raise ValueError(
                         f"ZCH table {table_fqn} did not resolve to an MCH module; "
@@ -1252,6 +1293,7 @@ class DeltaEmbeddingDumper:
         mirroring torchrec's compute_and_output_dist pairing;
         trigger_compaction is idempotent per batch.
         """
+        self._zch_compute_wrappers: Dict[int, Tuple[nn.Module, Any]] = {}
         for module in self._tracker.tracked_modules.values():
             if id(module) not in self._zch_inner_module_ids:
                 continue
@@ -1273,6 +1315,17 @@ class DeltaEmbeddingDumper:
                 return result
 
             module.compute = tracked_compute
+            self._zch_compute_wrappers[id(module)] = (module, orig_compute)
+
+    def _uninstall_zch_tracking(self) -> None:
+        """Restore the wrapped inner collections' original compute.
+
+        Leaves no wrapper behind keeping the dumper (and its tracker) alive
+        via the compute attribute after the dumper is closed.
+        """
+        for module, orig_compute in self._zch_compute_wrappers.values():
+            module.compute = orig_compute
+        self._zch_compute_wrappers.clear()
 
     def _append_table_chunk(
         self,
