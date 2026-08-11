@@ -937,13 +937,6 @@ class DeltaEmbeddingDumper:
         _validate_table_shard_info(fqn, table_weight.shard_info)
         weight = table_weight.tensor
         ids = ids.to(weight.device, dtype=torch.long)
-        if ids.numel() == 0:
-            return (
-                torch.empty(
-                    0, weight.size(1), device=weight.device, dtype=weight.dtype
-                ),
-                torch.empty(0, device=weight.device, dtype=torch.int64),
-            )
         valid_mask = (ids >= 0) & (ids < weight.size(0))
         if not bool(valid_mask.all().item()):
             logger.warning(
@@ -1084,12 +1077,13 @@ class DeltaEmbeddingDumper:
             publish_mask = ~torch.isin(raw_ids, prev)
             if touched_raw_ids.numel() > 0:
                 publish_mask |= torch.isin(raw_ids, touched_raw_ids)
+            feature_name = _feature_name(
+                self._tracker.fqn_to_feature_names.get(fqn, [])
+            )
             num_rows += self._append_table_chunk(
                 table_chunks,
                 global_step=global_step,
-                feature_name=_feature_name(
-                    self._tracker.fqn_to_feature_names.get(fqn, [])
-                ),
+                feature_name=feature_name,
                 table_fqn=fqn,
                 key_ids=raw_ids[publish_mask],
                 embeddings=weight[rows[publish_mask]].detach(),
@@ -1100,9 +1094,7 @@ class DeltaEmbeddingDumper:
                 num_rows += self._append_table_chunk(
                     table_chunks,
                     global_step=global_step,
-                    feature_name=_feature_name(
-                        self._tracker.fqn_to_feature_names.get(fqn, [])
-                    ),
+                    feature_name=feature_name,
                     table_fqn=fqn,
                     key_ids=evicted,
                     embeddings=weight[mch._zch_size - 1].expand(

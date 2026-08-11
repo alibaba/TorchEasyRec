@@ -423,10 +423,7 @@ class _DeltaDumpZchEBCModel(nn.Module):
 
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         # The sharded MC-EBC returns (embeddings, remapped_features_or_None).
-        output = self._mc_ebc(features)
-        if isinstance(output, tuple):
-            output = output[0]
-        return output.values()
+        return self._mc_ebc(features)[0].values()
 
 
 def _build_sharded_zch_delta_dump_model(
@@ -559,19 +556,14 @@ def _zch_kjt(rank: int, ids: List[int]) -> KeyedJaggedTensor:
 
 
 def _read_dump_keys(output_dir: str, step: int) -> Dict[int, torch.Tensor]:
-    rows_by_key: Dict[int, torch.Tensor] = {}
-    shards = glob.glob(
-        os.path.join(output_dir, f"delta_step_{step}.parquet")
-    ) + glob.glob(
-        os.path.join(output_dir, "step_*", f"delta_step_{step}_rank_*.parquet")
-    )
-    for shard in shards:
-        table = pq.read_table(shard)
+    # Single-rank dumps use the flat <prefix>_step_<N>.parquet layout.
+    table = pq.read_table(os.path.join(output_dir, f"delta_step_{step}.parquet"))
+    return {
+        int(key_id): torch.tensor(embedding, dtype=torch.float32)
         for key_id, embedding in zip(
             table["key_id"].to_pylist(), table["embedding"].to_pylist()
-        ):
-            rows_by_key[int(key_id)] = torch.tensor(embedding, dtype=torch.float32)
-    return rows_by_key
+        )
+    }
 
 
 def _run_zch_lifecycle_delta_embedding_dump(
@@ -743,15 +735,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def test_collect_zch_modules_skips_untracked_non_mch_module(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        wrapper = torch.nn.Module()
-        wrapper._managed_collision_collection = SimpleNamespace(
-            _managed_collision_modules={"user_emb": torch.nn.Module()}
+        model, inner_module = self._build_zch_collect_model(
+            {"user_emb": torch.nn.Module()}
         )
-        inner_module = torch.nn.Module()
-        inner_module._table_name_to_config = {"user_emb": None}
-        wrapper._embedding_module = inner_module
-        model = torch.nn.Module()
-        model.mc_ebc = wrapper
         dumper._model = model
         dumper._tracker = SimpleNamespace(
             fqn_to_feature_names={},
@@ -771,15 +757,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def test_collect_zch_modules_fails_on_tracked_non_mch_module(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        wrapper = torch.nn.Module()
-        wrapper._managed_collision_collection = SimpleNamespace(
-            _managed_collision_modules={"user_emb": torch.nn.Module()}
+        model, inner_module = self._build_zch_collect_model(
+            {"user_emb": torch.nn.Module()}
         )
-        inner_module = torch.nn.Module()
-        inner_module._table_name_to_config = {"user_emb": None}
-        wrapper._embedding_module = inner_module
-        model = torch.nn.Module()
-        model.mc_ebc = wrapper
         dumper._model = model
         table_fqn = "mc_ebc._embedding_module.embedding_bags.user_emb"
         dumper._tracker = SimpleNamespace(
