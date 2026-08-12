@@ -64,6 +64,7 @@ from tzrec.utils.export_util import (
     _merge_sharded_embedding_json,
     _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
+    _shrink_sparse_embedding_tables,
     build_dense_graph_module,
     create_dense_export_warmup_data,
     export_dense_model_cpu,
@@ -1769,6 +1770,215 @@ class ExportUtilTest(unittest.TestCase):
                     for key in out_reload_reuse
                 ),
                 "weight reload was not reflected by the reused traced module",
+            )
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_shrink_sparse_embedding_tables(self) -> None:
+        """EBC / EC tables and zch buffers shrink to one row in place.
+
+        Covers plain EBC, sequence EC, and the MC-EBC wrapper whose inner
+        EBC is reached through ``_embedding_module``; meta device must be
+        preserved so materialization still happens later, at 1 row.
+        """
+        ebc_config = EmbeddingBagConfig(
+            name="huge_emb",
+            embedding_dim=16,
+            num_embeddings=10_000_000,
+            feature_names=["huge"],
+        )
+        ebc = EmbeddingBagCollection(tables=[ebc_config], device=torch.device("meta"))
+        ec = EmbeddingCollection(
+            tables=[
+                EmbeddingConfig(
+                    name="seq_emb",
+                    embedding_dim=8,
+                    num_embeddings=5_000_000,
+                    feature_names=["seq_feat"],
+                )
+            ],
+            device=torch.device("meta"),
+        )
+        zch_config = EmbeddingBagConfig(
+            name="zch_emb",
+            embedding_dim=8,
+            num_embeddings=1000,
+            feature_names=["zch_feat"],
+        )
+        mch = MCHManagedCollisionModule(
+            zch_size=1000,
+            device=torch.device("meta"),
+            eviction_policy=LFU_EvictionPolicy(),
+            eviction_interval=5,
+        )
+        mc_ebc = ManagedCollisionEmbeddingBagCollection(
+            EmbeddingBagCollection(tables=[zch_config], device=torch.device("meta")),
+            ManagedCollisionCollection({"zch_emb": mch}, [zch_config]),
+        )
+        root = torch.nn.ModuleDict({"ebc": ebc, "ec": ec, "mc_ebc": mc_ebc})
+
+        # zch-sized buffers (_mch_sorted_raw_ids, _mch_slots (zch_size - 1),
+        # _mch_remapped_ids_mapping, eviction metadata) all carry zch_size
+        # rows; the (1025,)-long output-segments buffer is unrelated.
+        zch_sized = {
+            name
+            for name, buffer in mch._buffers.items()
+            if isinstance(buffer, torch.Tensor)
+            and buffer.dim() >= 1
+            and buffer.shape[0] in (1000, 999)
+        }
+        self.assertTrue(zch_sized)
+
+        _shrink_sparse_embedding_tables(root)
+
+        self.assertEqual(ebc.embedding_bags["huge_emb"].weight.shape, (1, 16))
+        self.assertTrue(ebc.embedding_bags["huge_emb"].weight.is_meta)
+        self.assertEqual(ec.embeddings["seq_emb"].weight.shape, (1, 8))
+        self.assertEqual(
+            mc_ebc._embedding_module.embedding_bags["zch_emb"].weight.shape, (1, 8)
+        )
+        self.assertEqual(mch._zch_size, 1)
+        for name in zch_sized:
+            self.assertEqual(mch._buffers[name].shape[0], 1)
+
+    def test_export_dense_model_cpu_materializes_only_shrunken_tables(self) -> None:
+        """Sparse tables must be shrunk before any parameter materialization.
+
+        Regression for the online dense export OOM kill: init_parameters
+        materializes every meta parameter at full shape, so a dynamicemb
+        table at its max_capacity row count exhausts host memory before the
+        sparse pruning ever runs. Guard init_parameters and fail the moment
+        a sparse table reaches it with more than one row.
+        """
+        test_dir = make_test_dir()
+        try:
+            feature_cfgs = [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_a",
+                        embedding_dim=16,
+                        num_buckets=1_000_000,
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_b", embedding_dim=16, num_buckets=1000
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    raw_feature=feature_pb2.RawFeature(feature_name="int_a")
+                ),
+            ]
+            features = create_features(feature_cfgs)
+            model_config = model_pb2.ModelConfig(
+                feature_groups=[
+                    model_pb2.FeatureGroupConfig(
+                        group_name="wide",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.WIDE,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="fm",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="deep",
+                        feature_names=["cat_a", "cat_b", "int_a"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                ],
+                deepfm=rank_model_pb2.DeepFM(
+                    deep=module_pb2.MLP(hidden_units=[8, 4]),
+                    final=module_pb2.MLP(hidden_units=[2]),
+                ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            )
+
+            def _build_model() -> DeepFM:
+                return DeepFM(
+                    model_config=model_config, features=features, labels=["label"]
+                )
+
+            def _build_wrapped_model() -> ScriptWrapper:
+                model = _build_model()
+                init_parameters(model, device=torch.device("cpu"))
+                return ScriptWrapper(model)
+
+            batch = Batch(
+                dense_features={
+                    BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                        keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+                    )
+                },
+                sparse_features={
+                    BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                        keys=["cat_a", "cat_b"],
+                        values=torch.tensor([2100765614044343531, 2, 3, 4, 5, 6, 7]),
+                        lengths=torch.tensor([1, 2, 1, 3]),
+                    )
+                },
+                labels={},
+            )
+
+            pipeline_config = EasyRecConfig()
+            pipeline_config.train_input_path = "unused-mocked"
+
+            real_init_parameters = export_util.init_parameters
+
+            def guarded_init_parameters(module, device):
+                for sub in module.modules():
+                    tables = None
+                    if isinstance(sub, EmbeddingBagCollection):
+                        tables = list(sub.embedding_bags.values())
+                    elif isinstance(sub, EmbeddingCollection):
+                        tables = list(sub.embeddings.values())
+                    for table in tables or []:
+                        self.assertEqual(
+                            table.weight.shape[0],
+                            1,
+                            "sparse table not shrunk before materialization",
+                        )
+                real_init_parameters(module, device)
+
+            ckpt_dir = os.path.join(test_dir, "model.ckpt-0")
+            export_dir = os.path.join(test_dir, "dense_export")
+            port = misc_util.get_free_port()
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"tcp://127.0.0.1:{port}",
+                world_size=1,
+                rank=0,
+            )
+            try:
+                with (
+                    mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False),
+                    mock.patch(
+                        "tzrec.utils.export_util.create_dataloader",
+                        return_value=iter([batch]),
+                    ),
+                    mock.patch.object(
+                        export_util,
+                        "init_parameters",
+                        side_effect=guarded_init_parameters,
+                    ),
+                ):
+                    checkpoint_util.save_model(ckpt_dir, _build_wrapped_model())
+                    export_dense_model_cpu(
+                        pipeline_config=pipeline_config,
+                        model=ScriptWrapper(_build_model()),
+                        checkpoint_path=ckpt_dir,
+                        save_dir=export_dir,
+                    )
+            finally:
+                dist.destroy_process_group()
+
+            self.assertTrue(
+                os.path.exists(os.path.join(export_dir, "scripted_model.pt"))
             )
         finally:
             shutil.rmtree(test_dir, ignore_errors=True)

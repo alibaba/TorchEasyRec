@@ -1862,6 +1862,65 @@ def create_dense_export_warmup_data(
     return batch.to_dict(sparse_dtype=torch.int64)
 
 
+def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
+    """Shrink sparse lookup tables to one row in place.
+
+    The dense export never consumes sparse table values: warm-up input ids
+    are zeroed, the sparse lookups are cut out of the traced graph, and
+    their parameters are pruned before the caller loads real weights. But
+    ``init_parameters`` materializes every meta parameter at full shape
+    first, so dynamicemb / zch tables (100M+ rows) -- plus the zch-sized
+    MCH buffers -- can exhaust host memory and get the process OOM-killed
+    before the pruning ever runs.
+
+    Replace each sparse table weight with a same-dtype 1-row parameter
+    and each zch-sized MCH buffer with a 1-row buffer. Index 0, the only
+    id the zeroed warm-up batch looks up, stays valid; with zch_size=1 the
+    MCH remap also sends every id to row 0.
+
+    Args:
+        model: export-side model, mutated in place before its meta
+            parameters are materialized.
+    """
+    for module in model.modules():
+        if isinstance(module, EmbeddingBagCollection):
+            tables = list(module.embedding_bags.values())
+        elif isinstance(module, EmbeddingCollection):
+            tables = list(module.embeddings.values())
+        else:
+            tables = None
+        if tables is not None:
+            for table in tables:
+                weight = table.weight
+                table.weight = nn.Parameter(
+                    torch.empty(
+                        (1, weight.shape[1]),
+                        dtype=weight.dtype,
+                        device=weight.device,
+                    ),
+                    requires_grad=weight.requires_grad,
+                )
+        elif isinstance(module, MCHManagedCollisionModule):
+            zch_size = module._zch_size
+            if zch_size <= 1:
+                continue
+            module._zch_size = 1
+            # All zch-sized buffers (_mch_sorted_raw_ids,
+            # _mch_remapped_ids_mapping, _mch_<metadata>). In eval mode only
+            # remap() runs, and with zch_size=1 it maps every id to row 0.
+            for name, buffer in module._buffers.items():
+                if (
+                    isinstance(buffer, torch.Tensor)
+                    and buffer.dim() >= 1
+                    and buffer.shape[0] in (zch_size, zch_size - 1)
+                ):
+                    module._buffers[name] = torch.zeros(
+                        [1] + list(buffer.shape[1:]),
+                        dtype=buffer.dtype,
+                        device=buffer.device,
+                    )
+
+
 def build_dense_graph_module(
     model: BaseModule,
     data: Dict[str, Any],
@@ -1894,6 +1953,10 @@ def build_dense_graph_module(
     # FX trace those shapes become Proxy objects and cannot construct
     # Parameters.
     logger.info("running pre-trace warm-up for CPU dense export...")
+    # Shrink sparse tables to 1 row before materialization: their values are
+    # never used by the dense graph (pruned after surgery), and full-size
+    # dynamicemb / zch tables can OOM the host before the pruning runs.
+    _shrink_sparse_embedding_tables(model)
     # Materialize meta params; real weights are loaded by the caller.
     init_parameters(model, device)
     with torch.no_grad():
