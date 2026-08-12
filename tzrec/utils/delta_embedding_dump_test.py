@@ -2245,6 +2245,16 @@ class DeltaEmbeddingDumpZchIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(self.success)
 
+        # FG_DAG mode hashes raw ids through a 2^63-1 bucket before ZCH
+        # admission, so the dump's key_ids are FG-hashed values far larger
+        # than any per-table zch_size; a remapped local row (the wrong key)
+        # would fall in [0, zch_size), so key_id >= zch_size proves the dump
+        # resolved the slot inverse back to a raw id.
+        zch_sizes: Dict[str, int] = {}
+        for fc in pipeline_config.feature_configs:
+            if fc.HasField("id_feature") and fc.id_feature.HasField("zch"):
+                zch_sizes[fc.id_feature.feature_name] = fc.id_feature.zch.zch_size
+
         step_dirs = sorted(glob.glob(os.path.join(dump_dir, "step_*")))
         self.assertTrue(step_dirs, f"no delta dump produced under {dump_dir}")
 
@@ -2268,11 +2278,14 @@ class DeltaEmbeddingDumpZchIntegrationTest(unittest.TestCase):
                         continue
                     dumped_zch_rows = True
                     self.assertEqual(len(emb), 16)
-                    # Mock data generates raw ids in [0, 10000) while the
-                    # per-rank ZCH row ranges reach 500000, so raw-id keys
-                    # are distinguishable from (wrong) remapped local rows.
                     self.assertGreaterEqual(key_id, 0)
-                    self.assertLess(key_id, 10000)
+                    self.assertGreaterEqual(
+                        key_id,
+                        zch_sizes.get(feature_name, 0),
+                        f"key_id {key_id} for {feature_name} is within the "
+                        f"remapped row range [0, {zch_sizes.get(feature_name, 0)});"
+                        " expected a raw FG-hashed id.",
+                    )
 
         self.assertTrue(
             dumped_zch_rows,
