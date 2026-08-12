@@ -87,8 +87,10 @@ class BasePromptGenerativeModel(BaseModel):
         cfg = self._model_config
 
         self.lm = self._build_backbone(cfg.hf_model_id, cfg.common.param_dtype)
+        # only the shape matters here: every path overwrites these rows, from
+        # init_from_pretrained on a cold start or from the DCP restore otherwise
         self.lm.resize_token_embeddings(
-            prompt.sid_space.target_vocab, mean_resizing=True
+            prompt.sid_space.target_vocab, mean_resizing=False
         )
         self.embedding_group = EmbeddingGroup(
             self._features, list(self._prompt.projection_plan.feature_groups)
