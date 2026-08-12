@@ -1896,8 +1896,11 @@ def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
         if tables is not None:
             for table in tables:
                 weight = table.weight
+                # zeros, not empty: if the model is already materialized,
+                # init_parameters skips it and uninitialized memory would
+                # flow through the warm-up and sanity forwards.
                 table.weight = nn.Parameter(
-                    torch.empty(
+                    torch.zeros(
                         (1, weight.shape[1]),
                         dtype=weight.dtype,
                         device=weight.device,
