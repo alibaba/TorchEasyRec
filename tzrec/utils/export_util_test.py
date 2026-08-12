@@ -1817,17 +1817,14 @@ class ExportUtilTest(unittest.TestCase):
         )
         root = torch.nn.ModuleDict({"ebc": ebc, "ec": ec, "mc_ebc": mc_ebc})
 
-        # zch-sized buffers (_mch_sorted_raw_ids, _mch_slots (zch_size - 1),
-        # _mch_remapped_ids_mapping, eviction metadata) all carry zch_size
-        # rows; the (1025,)-long output-segments buffer is unrelated.
-        zch_sized = {
-            name
-            for name, buffer in mch._buffers.items()
-            if isinstance(buffer, torch.Tensor)
-            and buffer.dim() >= 1
-            and buffer.shape[0] in (1000, 999)
+        # the zch-sized buffers shrink selects by name
+        mch_buffer_names = {"_mch_sorted_raw_ids", "_mch_remapped_ids_mapping"} | {
+            f"_mch_{name}" for name in mch._mch_metadata
         }
-        self.assertTrue(zch_sized)
+        # (1,)-shaped sentinels that a shape heuristic would mishandle:
+        # _mch_slots carries the *value* zch_size - 1, _delimiter iinfo.max
+        sentinel_names = ["_mch_slots", "_delimiter", "_output_segments_tensor"]
+        sentinels_before = {name: mch._buffers[name] for name in sentinel_names}
 
         _shrink_sparse_embedding_tables(root)
 
@@ -1838,8 +1835,44 @@ class ExportUtilTest(unittest.TestCase):
             mc_ebc._embedding_module.embedding_bags["zch_emb"].weight.shape, (1, 8)
         )
         self.assertEqual(mch._zch_size, 1)
-        for name in zch_sized:
+        for name in mch_buffer_names:
             self.assertEqual(mch._buffers[name].shape[0], 1)
+        for name in sentinel_names:
+            self.assertIs(mch._buffers[name], sentinels_before[name])
+
+    def test_shrink_sparse_embedding_tables_preserves_sentinels_at_zch_size_2(
+        self,
+    ) -> None:
+        """zch_size=2: (1,)-shaped sentinel buffers must survive untouched.
+
+        With zch_size=2 every (1,)-shaped buffer's shape[0] equals
+        zch_size - 1, so a shape-based match would zero the sentinels
+        (_mch_slots=[1], _delimiter=iinfo.max) while the name-based match
+        only shrinks the zch-sized remap buffers.
+        """
+        zch_config = EmbeddingBagConfig(
+            name="zch_emb", embedding_dim=8, num_embeddings=2, feature_names=["f"]
+        )
+        mch = MCHManagedCollisionModule(
+            zch_size=2,
+            device=torch.device("cpu"),
+            eviction_policy=LFU_EvictionPolicy(),
+            eviction_interval=5,
+        )
+        mc_ebc = ManagedCollisionEmbeddingBagCollection(
+            EmbeddingBagCollection(tables=[zch_config], device=torch.device("cpu")),
+            ManagedCollisionCollection({"zch_emb": mch}, [zch_config]),
+        )
+
+        _shrink_sparse_embedding_tables(mc_ebc)
+
+        self.assertEqual(mch._zch_size, 1)
+        self.assertEqual(mch._buffers["_mch_sorted_raw_ids"].shape[0], 1)
+        self.assertEqual(mch._buffers["_mch_remapped_ids_mapping"].shape[0], 1)
+        self.assertEqual(mch._buffers["_mch_slots"].item(), 1)
+        self.assertEqual(
+            mch._buffers["_delimiter"].item(), torch.iinfo(torch.int64).max
+        )
 
     def test_export_dense_model_cpu_materializes_only_shrunken_tables(self) -> None:
         """Sparse tables must be shrunk before any parameter materialization.

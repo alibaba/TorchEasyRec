@@ -1874,9 +1874,13 @@ def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
     before the pruning ever runs.
 
     Replace each sparse table weight with a same-dtype 1-row parameter
-    and each zch-sized MCH buffer with a 1-row buffer. Index 0, the only
-    id the zeroed warm-up batch looks up, stays valid; with zch_size=1 the
-    MCH remap also sends every id to row 0.
+    and each zch-sized MCH buffer (_mch_sorted_raw_ids,
+    _mch_remapped_ids_mapping and the _mch_<metadata> eviction buffers)
+    with a 1-row buffer. Index 0, the only id the zeroed warm-up batch
+    looks up, stays valid; with zch_size=1 the MCH remap also sends every
+    id to row 0. Shape matching is avoided: sentinels like _mch_slots and
+    _delimiter are (1,)-shaped but carry zch_size, and
+    _output_segments_tensor is fixed-length 1025.
 
     Args:
         model: export-side model, mutated in place before its meta
@@ -1905,20 +1909,22 @@ def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
             if zch_size <= 1:
                 continue
             module._zch_size = 1
-            # All zch-sized buffers (_mch_sorted_raw_ids,
-            # _mch_remapped_ids_mapping, _mch_<metadata>). In eval mode only
-            # remap() runs, and with zch_size=1 it maps every id to row 0.
-            for name, buffer in module._buffers.items():
-                if (
-                    isinstance(buffer, torch.Tensor)
-                    and buffer.dim() >= 1
-                    and buffer.shape[0] in (zch_size, zch_size - 1)
-                ):
-                    module._buffers[name] = torch.zeros(
-                        [1] + list(buffer.shape[1:]),
-                        dtype=buffer.dtype,
-                        device=buffer.device,
-                    )
+            # Select the zch-sized buffers by name: the shape heuristic
+            # catches the (1,)-shaped _mch_slots sentinel when zch_size==2
+            # and the fixed-length-1025 _output_segments_tensor when
+            # zch_size is 1025/1026. In eval mode only remap() runs, and
+            # with zch_size=1 it maps every id to row 0.
+            mch_buffer_names = ["_mch_sorted_raw_ids", "_mch_remapped_ids_mapping"]
+            mch_buffer_names += [
+                f"_mch_{metadata_name}" for metadata_name in module._mch_metadata
+            ]
+            for name in mch_buffer_names:
+                buffer = module._buffers[name]
+                module._buffers[name] = torch.zeros(
+                    [1] + list(buffer.shape[1:]),
+                    dtype=buffer.dtype,
+                    device=buffer.device,
+                )
 
 
 def build_dense_graph_module(
