@@ -1876,9 +1876,14 @@ def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
     Replace each sparse table weight with a same-dtype 1-row parameter
     and each zch-sized MCH buffer (_mch_sorted_raw_ids,
     _mch_remapped_ids_mapping and the _mch_<metadata> eviction buffers)
-    with a 1-row buffer. Index 0, the only id the zeroed warm-up batch
-    looks up, stays valid; with zch_size=1 the MCH remap also sends every
-    id to row 0. Shape matching is avoided: sentinels like _mch_slots and
+    with a 1-row buffer. The zeroed warm-up batch looks up only id 0, and
+    it lands on row 0 because _mch_sorted_raw_ids is zeroed (so id 0 hits
+    the match branch at index 0) and _mch_remapped_ids_mapping is zeroed
+    (so the match maps to row 0) -- not merely because zch_size is 1.
+    Non-matching ids fall to _output_global_offset + zch_size - 1, which
+    equals row 0 only because the export twin is unsharded
+    (_output_global_offset == 0); a sharded twin would send them past the
+    single row. Shape matching is avoided: sentinels like _mch_slots and
     _delimiter are (1,)-shaped but carry zch_size, and
     _output_segments_tensor is fixed-length 1025.
 
