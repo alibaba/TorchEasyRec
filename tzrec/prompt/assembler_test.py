@@ -17,7 +17,7 @@ from tzrec.prompt.assembler import PromptAssembler
 from tzrec.prompt.plan import (
     FillMode,
     PromptPlan,
-    SidSpace,
+    ResolvedSidSpace,
     SlotSeg,
     Static,
     Width,
@@ -29,12 +29,12 @@ _BASE = 1000
 _SENTINEL = 1099
 
 
-def _sid_space(codebook=(4, 4, 4)) -> SidSpace:
+def _sid_space(codebook=(4, 4, 4)) -> ResolvedSidSpace:
     offsets, running = [], 0
     for size in codebook:
         offsets.append(running)
         running += size
-    return SidSpace(
+    return ResolvedSidSpace(
         codebook=tuple(codebook),
         num_levels=len(codebook),
         base_vocab=_BASE,
@@ -52,7 +52,7 @@ def _slot(name, fill, width_n=None) -> SlotSeg:
     return SlotSeg(
         slot_id=0,
         name=name,
-        sources=(name,),
+        feature_names=(name,),
         group_type=FeatureGroupType.JAGGED_SEQUENCE,
         output_key=".sequence",
         fill=fill,
@@ -75,7 +75,7 @@ def _plan(segments, response=(), max_length=0) -> PromptPlan:
         max_length=max_length,
         max_total_length=None,
         max_holes=0,
-        suffix_keep=None,
+        logits_suffix_len=None,
         static_prefix_len=0,
         length_buckets=(),
         projected_slots=projected,
@@ -165,13 +165,13 @@ class PromptAssemblerTest(unittest.TestCase):
     def test_column_shaped_values_are_flattened(self) -> None:
         # the data parser emits (total, value_dim) for a dense sequence feature
         from tzrec.prompt.assembler import assemble_into
-        from tzrec.prompt.plan import CompiledPrompt, ModulePlan
+        from tzrec.prompt.plan import CompiledPrompt, ProjectionPlan
 
         plan = _plan((_slot("hist", FillMode.INLINE),))
         prompt = CompiledPrompt(
             sid_space=_sid_space(),
             prompt_plan=plan,
-            module_plan=ModulePlan(projections={}, slot_to_module={}),
+            projection_plan=ProjectionPlan(projections={}, slot_to_module={}),
             tokenizer_dir="",
             vocab_hash="v",
             plan_hash="p",

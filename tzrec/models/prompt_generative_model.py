@@ -91,7 +91,7 @@ class BasePromptGenerativeModel(BaseModel):
             prompt.sid_space.target_vocab, mean_resizing=True
         )
         self.embedding_group = EmbeddingGroup(
-            self._features, list(self._prompt.module_plan.feature_groups)
+            self._features, list(self._prompt.projection_plan.feature_groups)
         )
         self._build_projections()
         # decode subtracts these every step; a buffer follows the module's device
@@ -116,35 +116,35 @@ class BasePromptGenerativeModel(BaseModel):
         return model.to(_PARAM_DTYPE[param_dtype])
 
     def _build_projections(self) -> None:
-        """One module per resolved id, aligned with ``plan.projected_slots``.
+        """One module per resolved id, aligned with ``prompt_plan.projected_slots``.
 
         Slots sharing a ``projection_name`` share a module by reference, so
         they must agree on ``group_total_dim``.
         """
-        plan = self._prompt.prompt_plan
-        modules = self._prompt.module_plan
-        hidden = int(self.lm.config.hidden_size)
+        prompt_plan = self._prompt.prompt_plan
+        projection_plan = self._prompt.projection_plan
+        hidden_size = int(self.lm.config.hidden_size)
 
         built: Dict[str, PromptProjection] = {}
-        widths: Dict[str, int] = {}
+        in_dims: Dict[str, int] = {}
         aligned: List[PromptProjection] = []
-        for seg in plan.projected_slots:
-            module_id = modules.slot_to_module[seg.slot_id]
+        for seg in prompt_plan.projected_slots:
+            module_id = projection_plan.slot_to_module[seg.slot_id]
             in_dim = self.embedding_group.group_total_dim(seg.name + seg.output_key)
             if module_id not in built:
                 built[module_id] = PromptProjection(
-                    modules.projections[module_id], in_dim, hidden
+                    projection_plan.projections[module_id], in_dim, hidden_size
                 )
-                widths[module_id] = in_dim
-            elif widths[module_id] != in_dim:
+                in_dims[module_id] = in_dim
+            elif in_dims[module_id] != in_dim:
                 raise ValueError(
                     f"prompt slots sharing projection_name [{module_id}] have "
-                    f"different group widths ({widths[module_id]} vs "
+                    f"different group dims ({in_dims[module_id]} vs "
                     f"{in_dim}); they cannot share a module."
                 )
             aligned.append(built[module_id])
         self.projections = nn.ModuleDict(built)
-        # zipped with plan.projected_slots; shared modules appear by reference
+        # zipped with prompt_plan.projected_slots; shared modules appear by reference
         self._slot_projections = aligned
 
     def hf_backbone(self) -> nn.Module:
@@ -158,27 +158,29 @@ class BasePromptGenerativeModel(BaseModel):
             batch: carries the packed prompt in ``additional_infos``.
 
         Returns:
-            ``(total_tokens, hidden)``.
+            ``(total_tokens, hidden_size)``.
         """
         ids = batch.additional_infos[PROMPT_INPUT_IDS]
         embeds = self.lm.get_input_embeddings()(ids)
 
-        plan = self._prompt.prompt_plan
-        if not plan.projected_slots:
+        prompt_plan = self._prompt.prompt_plan
+        if not prompt_plan.projected_slots:
             return embeds
 
         grouped = self.embedding_group(batch)
-        hidden = embeds.shape[-1]
+        hidden_size = embeds.shape[-1]
         parts = [
-            proj(grouped[seg.name + seg.output_key]).reshape(-1, hidden)
-            for seg, proj in zip(plan.projected_slots, self._slot_projections)
+            proj(grouped[seg.name + seg.output_key]).reshape(-1, hidden_size)
+            for seg, proj in zip(prompt_plan.projected_slots, self._slot_projections)
         ]
         # out of place: embeds carries grad from the embedding lookup
         return embeds.index_copy(
             0, batch.additional_infos[PROMPT_HOLE_POSITIONS], torch.cat(parts)
         )
 
-    def _detokenize(self, tokens: torch.Tensor, batch_size: int) -> torch.Tensor:
+    def _tokens_to_local_codes(
+        self, tokens: torch.Tensor, batch_size: int
+    ) -> torch.Tensor:
         """Undo both shifts: token id back to a local 0-based code.
 
         Args:

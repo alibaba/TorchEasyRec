@@ -25,7 +25,7 @@ from tzrec.prompt.plan import (
     CompiledPrompt,
     FillMode,
     PromptPlan,
-    SidSpace,
+    ResolvedSidSpace,
     SlotSeg,
     Static,
 )
@@ -66,26 +66,28 @@ class PromptAssembler:
     """Walks a ``PromptPlan`` to build token streams.
 
     Args:
-        plan: the compiled walk order.
+        prompt_plan: the compiled walk order.
         sid_space: resolved SID token space; required when a slot renders SIDs.
         ignore_index: label value outside the supervised span.
     """
 
     def __init__(
         self,
-        plan: PromptPlan,
-        sid_space: Optional[SidSpace] = None,
+        prompt_plan: PromptPlan,
+        sid_space: Optional[ResolvedSidSpace] = None,
         ignore_index: int = -100,
     ) -> None:
-        self._plan = plan
-        self._sid = sid_space
+        self._prompt_plan = prompt_plan
+        self._sid_space = sid_space
         self._ignore_index = ignore_index
         if sid_space is not None:
-            self._lo = np.asarray(sid_space.level_offsets, dtype=np.int64)
-            self._hi = self._lo + np.asarray(sid_space.codebook, dtype=np.int64)
+            self._flat_lo = np.asarray(sid_space.level_offsets, dtype=np.int64)
+            self._flat_hi = self._flat_lo + np.asarray(
+                sid_space.codebook, dtype=np.int64
+            )
         inline = [
             s
-            for s in plan.segments + plan.response_segments
+            for s in prompt_plan.segments + prompt_plan.response_segments
             if isinstance(s, SlotSeg) and s.fill is FillMode.INLINE
         ]
         if inline and sid_space is None:
@@ -100,29 +102,29 @@ class PromptAssembler:
         The data carries ``level_offsets[l] + code``; the LM vocabulary needs
         one further uniform shift by ``base_vocab``.
         """
-        assert self._sid is not None
-        levels = self._sid.num_levels
+        assert self._sid_space is not None
+        levels = self._sid_space.num_levels
         if values.size % levels:
             raise ValueError(
                 f"prompt slot [{name}]: {values.size} values is not a whole "
                 f"number of {levels}-level items."
             )
         by_level = values.reshape(-1, levels)
-        if np.any(by_level < self._lo) or np.any(by_level >= self._hi):
+        if np.any(by_level < self._flat_lo) or np.any(by_level >= self._flat_hi):
             raise ValueError(
                 f"prompt slot [{name}]: SID values must already carry their "
                 f"level offset, so level l lies in "
                 f"[level_offsets[l], level_offsets[l] + codebook[l]). Read the "
                 f"offset_codebook column, not codebook or origin_codebook."
             )
-        return values.astype(np.int64, copy=False) + self._sid.base_vocab
+        return values.astype(np.int64, copy=False) + self._sid_space.base_vocab
 
     def _emit_row(
         self,
         segments: Sequence[object],
         row: int,
         values: Dict[str, List[np.ndarray]],
-        counts: Dict[str, np.ndarray],
+        slot_lengths: Dict[str, np.ndarray],
         out: List[int],
         holes: List[int],
         base: int,
@@ -136,28 +138,28 @@ class PromptAssembler:
             if seg.fill is FillMode.INLINE:
                 out.extend(self._inline_tokens(seg.name, values[seg.name][row]))
             else:
-                assert self._sid is not None
-                width = int(counts[seg.name][row])
+                assert self._sid_space is not None
+                width = int(slot_lengths[seg.name][row])
                 holes.extend(range(base + len(out), base + len(out) + width))
-                out.extend([self._sid.sentinel_token_id] * width)
+                out.extend([self._sid_space.sentinel_token_id] * width)
 
     def assemble(
         self,
         values: Dict[str, List[np.ndarray]],
-        counts: Optional[Dict[str, np.ndarray]] = None,
+        slot_lengths: Optional[Dict[str, np.ndarray]] = None,
         batch_size: Optional[int] = None,
     ) -> AssembledPrompt:
         """Assemble one batch.
 
         Args:
             values: INLINE slot name to its per-row value arrays.
-            counts: PROJECTED slot name to its per-row position count.
+            slot_lengths: PROJECTED slot name to its per-row position count.
             batch_size: row count; inferred from ``values`` when omitted.
 
         Returns:
             The packed streams.
         """
-        counts = counts or {}
+        slot_lengths = slot_lengths or {}
         if batch_size is None:
             if not values:
                 raise ValueError("batch_size is required when no INLINE slot exists.")
@@ -166,37 +168,46 @@ class PromptAssembler:
         ids: List[int] = []
         labels: List[int] = []
         holes: List[int] = []
-        cu = [0]
+        cu_seqlens = [0]
         for row in range(batch_size):
             row_ids: List[int] = []
             self._emit_row(
-                self._plan.segments, row, values, counts, row_ids, holes, len(ids)
+                self._prompt_plan.segments,
+                row,
+                values,
+                slot_lengths,
+                row_ids,
+                holes,
+                len(ids),
             )
             prompt_len = len(row_ids)
             self._emit_row(
-                self._plan.response_segments,
+                self._prompt_plan.response_segments,
                 row,
                 values,
-                counts,
+                slot_lengths,
                 row_ids,
                 holes,
                 len(ids),
             )
             # supervision covers the response span only; the prompt is context.
             row_labels = [self._ignore_index] * prompt_len + row_ids[prompt_len:]
-            if self._plan.max_length and len(row_ids) > self._plan.max_length:
+            if (
+                self._prompt_plan.max_length
+                and len(row_ids) > self._prompt_plan.max_length
+            ):
                 raise ValueError(
                     f"assembled row {row} is {len(row_ids)} tokens, over "
-                    f"max_length {self._plan.max_length}. Rows are never "
+                    f"max_length {self._prompt_plan.max_length}. Rows are never "
                     f"truncated: cap the source features instead."
                 )
             ids.extend(row_ids)
             labels.extend(row_labels)
-            cu.append(len(ids))
+            cu_seqlens.append(len(ids))
 
         return AssembledPrompt(
             input_ids=np.asarray(ids, dtype=np.int64),
-            cu_seqlens=np.asarray(cu, dtype=np.int64),
+            cu_seqlens=np.asarray(cu_seqlens, dtype=np.int64),
             hole_positions=np.asarray(holes, dtype=np.int64),
             labels=np.asarray(labels, dtype=np.int64),
         )
@@ -212,12 +223,12 @@ class PromptAssembler:
             The five streams, keyed as ``additional_infos`` expects them.
         """
         values: Dict[str, List[np.ndarray]] = {}
-        counts: Dict[str, np.ndarray] = {}
+        slot_lengths: Dict[str, np.ndarray] = {}
         batch_size = 0
-        for seg in self._plan.segments + self._plan.response_segments:
+        for seg in self._prompt_plan.segments + self._prompt_plan.response_segments:
             if not isinstance(seg, SlotSeg):
                 continue
-            source = seg.sources[0]
+            source = seg.feature_names[0]
             lengths = np.asarray(parsed[f"{source}.lengths"])
             batch_size = max(batch_size, int(lengths.size))
             if seg.fill is FillMode.INLINE:
@@ -229,9 +240,9 @@ class PromptAssembler:
                     flat[bounds[i] : bounds[i + 1]] for i in range(lengths.size)
                 ]
             else:
-                counts[seg.name] = lengths
+                slot_lengths[seg.name] = lengths
 
-        out = self.assemble(values, counts, batch_size=batch_size)
+        out = self.assemble(values, slot_lengths, batch_size=batch_size)
         return {
             PROMPT_INPUT_IDS: out.input_ids,
             PROMPT_CU_SEQLENS: out.cu_seqlens,

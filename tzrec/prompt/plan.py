@@ -11,7 +11,7 @@
 
 """Products of ``compile_prompt``.
 
-This namespace disambiguates ``plan.SidSpace``, the resolved token space, from
+This namespace disambiguates ``plan.ResolvedSidSpace``, the resolved token space, from
 ``prompt_pb2.SidSpace``, the four knobs a user declares. Nothing here stores a
 physical dimension: the model resolves those at ``__init__``.
 """
@@ -46,25 +46,25 @@ class Width:
     Args:
         kind: STATIC when the count is exact, BOUNDED when only a ceiling is
             known, UNBOUNDED when neither.
-        n: the exact count or the ceiling; None when UNBOUNDED.
+        num_positions: the exact count or the ceiling; None when UNBOUNDED.
     """
 
     kind: WidthKind
-    n: Optional[int] = None
+    num_positions: Optional[int] = None
 
     def __post_init__(self) -> None:
         """Reject a count that contradicts the kind."""
         if self.kind is WidthKind.UNBOUNDED:
-            if self.n is not None:
+            if self.num_positions is not None:
                 raise ValueError("UNBOUNDED width cannot carry a count.")
-        elif self.n is None or self.n < 0:
+        elif self.num_positions is None or self.num_positions < 0:
             raise ValueError(
                 f"{self.kind.name} width needs a count >= 0, got {self.n}."
             )
 
 
 @dataclass(frozen=True)
-class SidSpace:
+class ResolvedSidSpace:
     """The resolved SID token space, read by the data layer, model and serving.
 
     Three coordinate systems and the constants that convert between them: a
@@ -121,7 +121,7 @@ class SlotSeg:
     Args:
         slot_id: index into ``PromptPlan.projected_slots`` ordering.
         name: the placeholder name; also the derived group name.
-        sources: member feature names.
+        feature_names: member feature names.
         group_type: DEEP or JAGGED_SEQUENCE.
         output_key: "" for DEEP, ".sequence" otherwise.
         fill: INLINE writes token ids, PROJECTED writes sentinels and a hole.
@@ -131,7 +131,7 @@ class SlotSeg:
 
     slot_id: int
     name: str
-    sources: Tuple[str, ...]
+    feature_names: Tuple[str, ...]
     group_type: "FeatureGroupType.ValueType"
     output_key: str
     fill: FillMode
@@ -152,7 +152,7 @@ class PromptPlan:
         max_length: validation ceiling; an over-long row is an error.
         max_total_length: proven ceiling when every slot is bounded, else None.
         max_holes: per-row projected-position ceiling, not a runtime shape.
-        suffix_keep: upper bound on the supervised logits window.
+        logits_suffix_len: upper bound on the supervised logits window.
         static_prefix_len: leading positions that are request-invariant.
         length_buckets: sampler and graph-capture buckets.
         projected_slots: fixes the order hole positions are written in.
@@ -163,14 +163,14 @@ class PromptPlan:
     max_length: int
     max_total_length: Optional[int]
     max_holes: int
-    suffix_keep: Optional[int]
+    logits_suffix_len: Optional[int]
     static_prefix_len: int
     length_buckets: Tuple[int, ...]
     projected_slots: Tuple[SlotSeg, ...]
 
 
 @dataclass(frozen=True)
-class ModulePlan:
+class ProjectionPlan:
     """Projection topology. Model-only, never persisted.
 
     Args:
@@ -194,15 +194,15 @@ class CompiledPrompt:
     Args:
         sid_space: the resolved SID token space.
         prompt_plan: assembler walk order and ceilings.
-        module_plan: projection topology.
+        projection_plan: projection topology.
         tokenizer_dir: where the extended tokenizer was written.
         vocab_hash: over sid_space and tokenizer.json; fatal on mismatch.
         plan_hash: over all four parts; warns on mismatch.
     """
 
-    sid_space: Optional[SidSpace]
+    sid_space: Optional[ResolvedSidSpace]
     prompt_plan: PromptPlan
-    module_plan: ModulePlan
+    projection_plan: ProjectionPlan
     tokenizer_dir: str
     vocab_hash: str
     plan_hash: str

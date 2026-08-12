@@ -154,7 +154,7 @@ class PromptStackIntegrationTest(unittest.TestCase):
             int(infos[PROMPT_MAX_SEQLEN]),
             -100,
         )
-        window = labels[:, -self.prompt.prompt_plan.suffix_keep :]
+        window = labels[:, -self.prompt.prompt_plan.logits_suffix_len :]
         supervised = (window != -100).sum(dim=1).tolist()
         self.assertEqual(supervised[0], supervised[1])
         self.assertEqual(supervised[0], self.prompt.sid_space.num_levels)
@@ -256,7 +256,7 @@ class ProjectedSlotTest(unittest.TestCase):
         self.prompt = compile_prompt(cfg, self.features, model_dir=self.test_dir)
 
     def test_compiler_derives_one_group_per_projected_slot(self) -> None:
-        groups = self.prompt.module_plan.feature_groups
+        groups = self.prompt.projection_plan.feature_groups
         self.assertEqual([g.group_name for g in groups], ["prof"])
         self.assertEqual(list(groups[0].feature_names), ["prof"])
         # the INLINE slot produces none: its tokens are already in the stream

@@ -82,8 +82,8 @@ def dynamic_beam_search(
     )
     cache = outputs.past_key_values
     scores = _band_logp(model.lm_head(outputs.last_hidden_state[:, -1, :]), 0)
-    beam_scores, in_band = scores.topk(capped_widths[0], dim=-1)
-    seq = (in_band + bands[0][0]).reshape(-1, 1)
+    beam_scores, band_idx = scores.topk(capped_widths[0], dim=-1)
+    seq = (band_idx + bands[0][0]).reshape(-1, 1)
     beam_scores = beam_scores.reshape(-1)
     row_starts = torch.arange(batch_size, device=device)
     cache.reorder_cache(row_starts.repeat_interleave(capped_widths[0]))

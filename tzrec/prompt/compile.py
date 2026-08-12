@@ -28,17 +28,22 @@ from tzrec.features.feature import BaseFeature
 from tzrec.prompt.plan import (
     CompiledPrompt,
     FillMode,
-    ModulePlan,
+    ProjectionPlan,
     PromptPlan,
+    ResolvedSidSpace,
     Segment,
-    SidSpace,
     SlotSeg,
     Static,
     Width,
     WidthKind,
 )
 from tzrec.protos.model_pb2 import FeatureGroupConfig, FeatureGroupType
-from tzrec.protos.prompt_pb2 import PromptConfig, PromptProjection, PromptSlot
+from tzrec.protos.prompt_pb2 import (
+    PromptConfig,
+    PromptProjection,
+    PromptSlot,
+    SidSpace,
+)
 from tzrec.utils.logging_util import logger
 
 _PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
@@ -116,7 +121,7 @@ def _group_type(
     return FeatureGroupType.JAGGED_SEQUENCE if kinds.pop() else FeatureGroupType.DEEP
 
 
-def _atom_tokens(sid_space: Any) -> List[str]:
+def _atom_tokens(sid_space: SidSpace) -> List[str]:
     """Render the SID atom tokens, one per flat index."""
     fmt = sid_space.atom_token_format
     return [fmt.replace("{i}", str(i)) for i in range(sum(sid_space.codebook))]
@@ -132,7 +137,7 @@ def _read_manifest_codebook(path: str) -> Optional[List[int]]:
 
 def _build_sid_space(
     cfg: PromptConfig, tok: Tokenizer, base_vocab: int, has_projection: bool
-) -> Optional[SidSpace]:
+) -> Optional[ResolvedSidSpace]:
     """Extend the tokenizer with SID atoms and resolve the token space."""
     if not cfg.HasField("sid_space"):
         return None
@@ -180,7 +185,7 @@ def _build_sid_space(
     lo = [base_vocab + o for o in offsets]
     hi = [lo[i] + codebook[i] - 1 for i in range(len(codebook))]
 
-    return SidSpace(
+    return ResolvedSidSpace(
         codebook=tuple(codebook),
         num_levels=len(codebook),
         base_vocab=base_vocab,
@@ -292,7 +297,7 @@ def compile_prompt(
         segs[name] = SlotSeg(
             slot_id=slot_ids[name],
             name=name,
-            sources=tuple(slot.feature_names),
+            feature_names=tuple(slot.feature_names),
             group_type=types[name],
             output_key=".sequence" if seq else "",
             fill=fills[name],
@@ -308,7 +313,7 @@ def compile_prompt(
         for s in body + response
         if isinstance(s, SlotSeg) and s.fill is FillMode.PROJECTED
     )
-    module_plan = _build_module_plan(projected, slots)
+    projection_plan = _build_module_plan(projected, slots)
 
     plan = PromptPlan(
         segments=body,
@@ -316,7 +321,7 @@ def compile_prompt(
         max_length=int(cfg.max_length),
         max_total_length=_max_total_length(body + response),
         max_holes=_max_holes(projected),
-        suffix_keep=_suffix_keep(response),
+        logits_suffix_len=_suffix_keep(response),
         static_prefix_len=_static_prefix_len(body),
         length_buckets=tuple(int(b) for b in cfg.length_buckets),
         projected_slots=projected,
@@ -326,10 +331,12 @@ def compile_prompt(
     return CompiledPrompt(
         sid_space=sid_space,
         prompt_plan=plan,
-        module_plan=module_plan,
+        projection_plan=projection_plan,
         tokenizer_dir=tokenizer_dir,
         vocab_hash=_hash(sid_space, tok.to_str()),
-        plan_hash=_hash(sid_space, plan, sorted(module_plan.projections), tok.to_str()),
+        plan_hash=_hash(
+            sid_space, plan, sorted(projection_plan.projections), tok.to_str()
+        ),
     )
 
 
@@ -352,7 +359,7 @@ def _weave(
 
 def _build_module_plan(
     projected: Sequence[SlotSeg], slots: Dict[str, PromptSlot]
-) -> ModulePlan:
+) -> ProjectionPlan:
     """One module per distinct ``projection_name``, else one per slot."""
     projections: Dict[str, PromptProjection] = {}
     slot_to_module: Dict[int, str] = {}
@@ -375,12 +382,12 @@ def _build_module_plan(
     groups = tuple(
         FeatureGroupConfig(
             group_name=seg.name,
-            feature_names=list(seg.sources),
+            feature_names=list(seg.feature_names),
             group_type=seg.group_type,
         )
         for seg in projected
     )
-    return ModulePlan(
+    return ProjectionPlan(
         projections=projections,
         slot_to_module=slot_to_module,
         feature_groups=groups,
@@ -396,8 +403,8 @@ def _max_total_length(segments: Sequence[Segment]) -> Optional[int]:
         elif seg.width.kind is WidthKind.UNBOUNDED:
             return None
         else:
-            assert seg.width.n is not None
-            total += seg.width.n
+            assert seg.width.num_positions is not None
+            total += seg.width.num_positions
     return total
 
 
@@ -410,8 +417,8 @@ def _max_holes(projected: Sequence[SlotSeg]) -> int:
                 f"prompt slot [{seg.name}] is PROJECTED and unbounded, so its "
                 f"hole count is unknowable; give its members a sequence_length."
             )
-        assert seg.width.n is not None
-        total += seg.width.n
+        assert seg.width.num_positions is not None
+        total += seg.width.num_positions
     return total
 
 
@@ -434,7 +441,7 @@ def _static_prefix_len(segments: Sequence[Segment]) -> int:
 
 
 def _validate(
-    cfg: PromptConfig, plan: PromptPlan, sid_space: Optional[SidSpace]
+    cfg: PromptConfig, plan: PromptPlan, sid_space: Optional[ResolvedSidSpace]
 ) -> None:
     """Apply the checks that need the whole plan."""
     if plan.max_length and plan.max_total_length is not None:
@@ -462,7 +469,7 @@ def _validate(
                 f"static_prefix_len is {plan.static_prefix_len}, which bounds "
                 "what a serving prefix cache may reuse."
             )
-    if plan.response_segments and plan.suffix_keep is None:
+    if plan.response_segments and plan.logits_suffix_len is None:
         raise ValueError(
             "the response has an unbounded slot, so the supervised logits "
             "window cannot be bounded. A decoder-only model would then "
@@ -479,9 +486,10 @@ def _validate(
         for seg in answer:
             if (
                 seg.width.kind is WidthKind.STATIC
-                and seg.width.n != sid_space.num_levels
+                and seg.width.num_positions != sid_space.num_levels
             ):
                 raise ValueError(
-                    f"response slot [{seg.name}] is {seg.width.n} positions but "
-                    f"the codebook has {sid_space.num_levels} levels."
+                    f"response slot [{seg.name}] is "
+                    f"{seg.width.num_positions} positions but the codebook has "
+                    f"{sid_space.num_levels} levels."
                 )

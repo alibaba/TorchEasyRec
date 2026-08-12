@@ -72,7 +72,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
             common: the shared model config.
         """
         space = self._prompt.sid_space
-        self._num_return = int(common.num_return_sequences)
+        self._num_return_sequences = int(common.num_return_sequences)
         self._beam_widths: List[int] = list(common.beam_widths)
         if not self._beam_widths:
             raise ValueError(
@@ -85,10 +85,10 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
                 f"{len(self._beam_widths)} entries but the codebook has "
                 f"{space.num_levels} levels; give one width per level."
             )
-        if self._num_return > self._beam_widths[-1]:
+        if self._num_return_sequences > self._beam_widths[-1]:
             raise ValueError(
                 f"{type(self).__name__}: num_return_sequences "
-                f"({self._num_return}) must not exceed the final beam width "
+                f"({self._num_return_sequences}) must not exceed the final beam width "
                 f"({self._beam_widths[-1]})."
             )
 
@@ -133,7 +133,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         )
         outputs = self.lm.model(inputs_embeds=padded, attention_mask=mask)
 
-        suffix = self._prompt.prompt_plan.suffix_keep
+        suffix = self._prompt.prompt_plan.logits_suffix_len
         window = slice(-suffix, None) if suffix else slice(None)
         logits = self.lm.lm_head(outputs.last_hidden_state[:, window, :])
         loss = self.lm.loss_function(
@@ -170,8 +170,8 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
             self._beam_widths,
             list(zip(space.band_lo, space.band_hi)),
         )
-        codes = self._detokenize(tokens, padded.shape[0])
-        return codes[:, : self._num_return, :]
+        codes = self._tokens_to_local_codes(tokens, padded.shape[0])
+        return codes[:, : self._num_return_sequences, :]
 
 
 def _unpack(

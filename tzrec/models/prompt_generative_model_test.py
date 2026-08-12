@@ -107,7 +107,7 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         )
         return batch
 
-    def test_detokenize_undoes_both_shifts(self) -> None:
+    def test_tokens_to_local_codes_undoes_both_shifts(self) -> None:
         model = self._model()
         space = self.prompt.sid_space
         # one row, one beam: level 0 code 1, level 1 code 2, level 2 code 3
@@ -120,24 +120,26 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
                 ]
             ]
         )
-        codes = model._detokenize(tokens, batch_size=1)
+        codes = model._tokens_to_local_codes(tokens, batch_size=1)
 
         self.assertEqual(codes.shape, (1, 1, space.num_levels))
         self.assertEqual(codes[0, 0].tolist(), [1, 2, 3])
 
-    def test_detokenize_maps_band_edges_to_the_last_code(self) -> None:
+    def test_tokens_to_local_codes_maps_band_edges_to_the_last_code(self) -> None:
         model = self._model()
         space = self.prompt.sid_space
-        codes = model._detokenize(torch.tensor([list(space.band_hi)]), batch_size=1)
+        codes = model._tokens_to_local_codes(
+            torch.tensor([list(space.band_hi)]), batch_size=1
+        )
 
         self.assertEqual(codes[0, 0].tolist(), [c - 1 for c in _CODEBOOK])
 
-    def test_detokenize_groups_beams_under_their_row(self) -> None:
+    def test_tokens_to_local_codes_groups_beams_under_their_row(self) -> None:
         model = self._model()
         space = self.prompt.sid_space
         base = torch.tensor(space.level_offsets) + space.base_vocab
         # four beam rows over a batch of two
-        codes = model._detokenize(base.repeat(4, 1), batch_size=2)
+        codes = model._tokens_to_local_codes(base.repeat(4, 1), batch_size=2)
 
         self.assertEqual(codes.shape, (2, 2, space.num_levels))
 

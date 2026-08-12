@@ -114,7 +114,7 @@ class CompilePromptTest(unittest.TestCase):
         self.assertIs(seg.fill, FillMode.PROJECTED)
         self.assertEqual(seg.output_key, "")
         self.assertIs(seg.width.kind, WidthKind.STATIC)
-        self.assertEqual(seg.width.n, 1)
+        self.assertEqual(seg.width.num_positions, 1)
 
     def test_manifest_mismatch_is_fatal(self) -> None:
         manifest = os.path.join(self.test_dir, "manifest.json")
@@ -210,10 +210,10 @@ class CompilePromptTest(unittest.TestCase):
         )
         # the answer is one SID item, so its width needs no sequence_length
         self.assertIs(seg.width.kind, WidthKind.STATIC)
-        self.assertEqual(seg.width.n, 3)
+        self.assertEqual(seg.width.num_positions, 3)
         # +1 because HF shifts logits: the window opens one column before the
         # first supervised label
-        self.assertEqual(compiled.prompt_plan.suffix_keep, 4)
+        self.assertEqual(compiled.prompt_plan.logits_suffix_len, 4)
 
     def test_unbounded_response_is_rejected(self) -> None:
         # with no sid_space the response has no codebook-derived width, so the
@@ -247,7 +247,7 @@ class CompilePromptTest(unittest.TestCase):
 
         seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
         self.assertIs(seg.width.kind, WidthKind.BOUNDED)
-        self.assertEqual(seg.width.n, 16)
+        self.assertEqual(seg.width.num_positions, 16)
 
 
 if __name__ == "__main__":
