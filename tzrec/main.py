@@ -1128,16 +1128,6 @@ def export(
             checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
     # HF export converts the checkpoint dir directly -- no model build, no DCP restore.
-    if pipeline_config.HasField("prompt_config") and (
-        pipeline_config.export_config.export_format != export_pb2.ExportFormat.HF
-    ):
-        raise ValueError(
-            "a prompt-native model exports to a HuggingFace directory, not "
-            "TorchScript: its input is an assembled token stream the dataloader "
-            "builds, which an export-time dummy batch cannot supply. Set "
-            "export_config.export_format to HF."
-        )
-
     if pipeline_config.export_config.export_format == export_pb2.ExportFormat.HF:
         if config_util.use_dense_ema(
             pipeline_config.export_config, pipeline_config.train_config
@@ -1164,6 +1154,14 @@ def export(
             # checkpoint already carries the contract, so copy it forward
             copy_prompt_assets(checkpoint_path, export_dir)
         return
+
+    if pipeline_config.HasField("prompt_config"):
+        raise ValueError(
+            "a prompt-native model exports to a HuggingFace directory, not "
+            "TorchScript: its input is an assembled token stream the dataloader "
+            "builds, which an export-time dummy batch cannot supply. Set "
+            "export_config.export_format to HF."
+        )
 
     data_config = pipeline_config.data_config
 
