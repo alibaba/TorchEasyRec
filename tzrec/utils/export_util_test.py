@@ -1837,6 +1837,13 @@ class ExportUtilTest(unittest.TestCase):
         self.assertEqual(mch._zch_size, 1)
         for name in mch_buffer_names:
             self.assertEqual(mch._buffers[name].shape[0], 1)
+        # _mch_metadata caches references to the eviction buffers; without
+        # a refresh it would keep pointing at the old zch-sized tensors.
+        for metadata_name in mch._mch_metadata:
+            self.assertIs(
+                mch._mch_metadata[metadata_name],
+                mch._buffers[f"_mch_{metadata_name}"],
+            )
         for name in sentinel_names:
             self.assertIs(mch._buffers[name], sentinels_before[name])
 

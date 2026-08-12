@@ -1909,22 +1909,28 @@ def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
             if zch_size <= 1:
                 continue
             module._zch_size = 1
+
             # Select the zch-sized buffers by name: the shape heuristic
             # catches the (1,)-shaped _mch_slots sentinel when zch_size==2
             # and the fixed-length-1025 _output_segments_tensor when
             # zch_size is 1025/1026. In eval mode only remap() runs, and
             # with zch_size=1 it maps every id to row 0.
-            mch_buffer_names = ["_mch_sorted_raw_ids", "_mch_remapped_ids_mapping"]
-            mch_buffer_names += [
-                f"_mch_{metadata_name}" for metadata_name in module._mch_metadata
-            ]
-            for name in mch_buffer_names:
-                buffer = module._buffers[name]
-                module._buffers[name] = torch.zeros(
+            def _shrink_buffer(buffer: torch.Tensor) -> torch.Tensor:
+                return torch.zeros(
                     [1] + list(buffer.shape[1:]),
                     dtype=buffer.dtype,
                     device=buffer.device,
                 )
+
+            for name in ["_mch_sorted_raw_ids", "_mch_remapped_ids_mapping"]:
+                module._buffers[name] = _shrink_buffer(module._buffers[name])
+            # _init_metadata_buffers caches a reference to each eviction
+            # buffer in _mch_metadata; refresh it alongside the buffer so
+            # the module state stays self-consistent.
+            for metadata_name in module._mch_metadata:
+                name = f"_mch_{metadata_name}"
+                module._buffers[name] = _shrink_buffer(module._buffers[name])
+                module._mch_metadata[metadata_name] = module._buffers[name]
 
 
 def build_dense_graph_module(
