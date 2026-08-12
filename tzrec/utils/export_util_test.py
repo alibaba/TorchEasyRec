@@ -1881,6 +1881,136 @@ class ExportUtilTest(unittest.TestCase):
             mch._buffers["_delimiter"].item(), torch.iinfo(torch.int64).max
         )
 
+    def test_export_dense_model_cpu_with_zch_end_to_end(self) -> None:
+        """A zch (MC-EBC) model traces, prunes and scripts after shrinking.
+
+        Locks the MCH branch of the shrink: the zeroed warm-up batch must
+        trace through the MC remap, the sparse lookups and their zch buffers
+        must be pruned out of the dense graph, and the sanitized module must
+        script -- i.e. the MCH shrink keeps the export runnable end to end.
+        """
+        test_dir = make_test_dir()
+        try:
+            feature_cfgs = [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_zch",
+                        embedding_dim=16,
+                        num_buckets=10_000,
+                        zch=feature_pb2.ZeroCollisionHash(
+                            zch_size=1000,
+                            eviction_interval=5,
+                            lfu=feature_pb2.LFU_EvictionPolicy(),
+                        ),
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_b", embedding_dim=16, num_buckets=100
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    raw_feature=feature_pb2.RawFeature(feature_name="int_a")
+                ),
+            ]
+            features = create_features(feature_cfgs)
+            model_config = model_pb2.ModelConfig(
+                feature_groups=[
+                    model_pb2.FeatureGroupConfig(
+                        group_name="wide",
+                        feature_names=["cat_zch", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.WIDE,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="fm",
+                        feature_names=["cat_zch", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="deep",
+                        feature_names=["cat_zch", "cat_b", "int_a"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                ],
+                deepfm=rank_model_pb2.DeepFM(
+                    deep=module_pb2.MLP(hidden_units=[8, 4]),
+                    final=module_pb2.MLP(hidden_units=[2]),
+                ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            )
+
+            def _build_model() -> DeepFM:
+                return DeepFM(
+                    model_config=model_config, features=features, labels=["label"]
+                )
+
+            batch = Batch(
+                dense_features={
+                    BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                        keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+                    )
+                },
+                sparse_features={
+                    BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                        keys=["cat_zch", "cat_b"],
+                        values=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
+                        lengths=torch.tensor([1, 2, 1, 3]),
+                    )
+                },
+                labels={},
+            )
+            # mirror create_dense_export_warmup_data: zero the sparse ids so
+            # the shrunken tables' only valid index (0) is the one looked up.
+            for kjt in batch.sparse_features.values():
+                kjt.values().zero_()
+            data = batch.to_dict(sparse_dtype=torch.int64)
+
+            model = ScriptWrapper(_build_model())
+            mch_modules = [
+                m for m in model.modules() if isinstance(m, MCHManagedCollisionModule)
+            ]
+            self.assertTrue(mch_modules)
+            gm, full_graph, dense_graph_config = build_dense_graph_module(
+                model, data, torch.device("cpu")
+            )
+            # build_dense_graph_module shrank the model's zch tables in place.
+            for mch_module in mch_modules:
+                self.assertEqual(mch_module._zch_size, 1)
+            # the sparse lookups and their zch buffers are pruned out of the
+            # dense graph; no _mch_* state may survive into gm.
+            self.assertTrue(gm.state_dict())
+            for key in gm.state_dict():
+                self.assertNotIn("_mch_", key)
+
+            export_dir = os.path.join(test_dir, "dense_export")
+            finalize_dense_export(
+                model,
+                full_graph,
+                gm,
+                data,
+                torch.device("cpu"),
+                export_dir,
+                dense_graph_config,
+            )
+            scripted = torch.jit.load(os.path.join(export_dir, "scripted_model.pt"))
+            with open(os.path.join(export_dir, "dense_meta.json")) as f:
+                dense_meta = json.load(f)
+            ebc_groups = {k: v for k, v in dense_meta.items() if k != "sequence__ec"}
+            serving_data = dict(batch.to_dict())
+            for group_name, names in ebc_groups.items():
+                dims = [4 if "_wide" in n else 16 for n in names]
+                serving_data[group_name] = torch.rand(2, sum(dims))
+            serving_data["batch_size"] = torch.tensor(2)
+            predictions = scripted(serving_data)
+            self.assertEqual(predictions["logits"].size(), (2,))
+            self.assertEqual(predictions["probs"].size(), (2,))
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
     def test_export_dense_model_cpu_materializes_only_shrunken_tables(self) -> None:
         """Sparse tables must be shrunk before any parameter materialization.
 
