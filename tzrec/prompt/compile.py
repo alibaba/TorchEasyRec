@@ -67,10 +67,12 @@ def _ceil_to(value: int, multiple: int) -> int:
     return -(-value // multiple) * multiple
 
 
-def _resolve_slot(name: str, declared: Dict[str, PromptSlot]) -> PromptSlot:
+def _resolve_slot(
+    name: str, declared_slots_by_name: Dict[str, PromptSlot]
+) -> PromptSlot:
     """Return the declared slot, or an implicit single-feature slot."""
-    if name in declared:
-        return declared[name]
+    if name in declared_slots_by_name:
+        return declared_slots_by_name[name]
     implicit = PromptSlot(name=name)
     implicit.feature_names.append(name)
     return implicit
@@ -100,25 +102,27 @@ def _slot_width(
     return Width(WidthKind.BOUNDED, max(caps))
 
 
-def _derive_fill(members: Sequence[BaseFeature]) -> FillMode:
-    """INLINE only for a lone sequence member that declares no embedding."""
-    if len(members) == 1 and members[0].is_sequence and not members[0].has_embedding:
-        return FillMode.INLINE
-    return FillMode.PROJECTED
-
-
-def _group_type(
+def _derive_slot_layout(
     name: str, members: Sequence[BaseFeature]
-) -> "FeatureGroupType.ValueType":
-    """JAGGED_SEQUENCE for sequence members, DEEP for scalars; never mixed."""
-    kinds = {f.is_sequence for f in members}
-    if len(kinds) != 1:
+) -> Tuple["FeatureGroupType.ValueType", FillMode]:
+    """Derive how a prompt slot is grouped and emitted."""
+    sequence_flags = {member.is_sequence for member in members}
+    if len(sequence_flags) != 1:
         raise ValueError(
             f"prompt slot [{name}] mixes sequence and scalar features "
-            f"{[f.name for f in members]}; a slot must be all one kind, or its "
-            f"group would carry a '.query' output the prompt cannot place."
+            f"{[member.name for member in members]}; a slot must be all one kind, "
+            "or its group would carry a '.query' output the prompt cannot place."
         )
-    return FeatureGroupType.JAGGED_SEQUENCE if kinds.pop() else FeatureGroupType.DEEP
+    is_sequence = sequence_flags.pop()
+    group_type = (
+        FeatureGroupType.JAGGED_SEQUENCE if is_sequence else FeatureGroupType.DEEP
+    )
+    fill_mode = (
+        FillMode.INLINE
+        if is_sequence and len(members) == 1 and not members[0].has_embedding
+        else FillMode.PROJECTED
+    )
+    return group_type, fill_mode
 
 
 def _atom_tokens(sid_space: SidSpace) -> List[str]:
@@ -237,14 +241,17 @@ def compile_prompt(
     Returns:
         The compiled prompt.
     """
-    by_name = {f.name: f for f in features}
-    declared = {s.name: s for s in cfg.slots}
+    features_by_name = {feature.name: feature for feature in features}
+    declared_slots_by_name = {slot.name: slot for slot in cfg.slots}
 
     body_runs, body_names = _split_template(cfg.prompt)
     resp_runs, resp_names = _split_template(cfg.response or "")
-    slots = {n: _resolve_slot(n, declared) for n in body_names + resp_names}
+    resolved_slots_by_name = {
+        name: _resolve_slot(name, declared_slots_by_name)
+        for name in body_names + resp_names
+    }
 
-    unreferenced = set(declared) - set(slots)
+    unreferenced = set(declared_slots_by_name) - set(resolved_slots_by_name)
     if unreferenced:
         raise ValueError(
             f"declared prompt slots {sorted(unreferenced)} are never referenced "
@@ -252,27 +259,37 @@ def compile_prompt(
         )
 
     members: Dict[str, List[BaseFeature]] = {}
-    for name, slot in slots.items():
-        missing = [f for f in slot.feature_names if f not in by_name]
-        if missing:
+    for name, slot in resolved_slots_by_name.items():
+        missing_feature_names = [
+            feature_name
+            for feature_name in slot.feature_names
+            if feature_name not in features_by_name
+        ]
+        if missing_feature_names:
             raise ValueError(
-                f"prompt slot [{name}] names features {missing} that are not in "
-                f"feature_configs."
+                f"prompt slot [{name}] names features {missing_feature_names} that "
+                "are not in feature_configs."
             )
-        members[name] = [by_name[f] for f in slot.feature_names]
+        members[name] = [
+            features_by_name[feature_name] for feature_name in slot.feature_names
+        ]
 
-    types = {n: _group_type(n, members[n]) for n in slots}
-    fills = {n: _derive_fill(members[n]) for n in slots}
-    for name in resp_names:
-        if fills[name] is FillMode.PROJECTED:
+    response_slot_names = set(resp_names)
+    group_types_by_slot_name: Dict[str, "FeatureGroupType.ValueType"] = {}
+    fill_modes_by_slot_name: Dict[str, FillMode] = {}
+    for name, slot_members in members.items():
+        group_type, fill_mode = _derive_slot_layout(name, slot_members)
+        if name in response_slot_names and fill_mode is FillMode.PROJECTED:
             raise ValueError(
                 f"response slot [{name}] is PROJECTED; response slots must be "
                 "INLINE because the LM generates them as vocabulary tokens."
             )
-    has_projection = any(f is FillMode.PROJECTED for f in fills.values())
-
-    for name, slot in slots.items():
-        if fills[name] is FillMode.INLINE and slot.HasField("projection"):
+        group_types_by_slot_name[name] = group_type
+        fill_modes_by_slot_name[name] = fill_mode
+    for name, slot in resolved_slots_by_name.items():
+        if fill_modes_by_slot_name[name] is FillMode.INLINE and slot.HasField(
+            "projection"
+        ):
             raise ValueError(
                 f"prompt slot [{name}] is INLINE -- one sequence feature with no "
                 f"embedding -- so it has no group to project; drop its projection."
@@ -280,6 +297,10 @@ def compile_prompt(
 
     tok = Tokenizer.from_file(cfg.tokenizer)
     base_vocab = tok.get_vocab_size(with_added_tokens=True)
+    has_projection = any(
+        fill_mode is FillMode.PROJECTED
+        for fill_mode in fill_modes_by_slot_name.values()
+    )
     sid_space = _build_sid_space(cfg, tok, base_vocab, has_projection)
 
     tokenizer_dir = ""
@@ -288,37 +309,39 @@ def compile_prompt(
         os.makedirs(tokenizer_dir, exist_ok=True)
         tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
 
-    slot_ids = {n: i for i, n in enumerate(slots)}
-    answer_names = set(resp_names)
+    slot_ids = {name: i for i, name in enumerate(resolved_slots_by_name)}
     segs: Dict[str, SlotSeg] = {}
-    for name, slot in slots.items():
-        seq = types[name] == FeatureGroupType.JAGGED_SEQUENCE
+    for name, slot in resolved_slots_by_name.items():
+        group_type = group_types_by_slot_name[name]
+        fill_mode = fill_modes_by_slot_name[name]
         levels = (
             sid_space.num_levels
             if sid_space is not None
-            and name in answer_names
-            and fills[name] is FillMode.INLINE
+            and name in response_slot_names
+            and fill_mode is FillMode.INLINE
             else None
         )
         segs[name] = SlotSeg(
             slot_id=slot_ids[name],
             name=name,
             feature_names=tuple(slot.feature_names),
-            group_type=types[name],
-            output_key=".sequence" if seq else "",
-            fill=fills[name],
-            width=_slot_width(members[name], types[name], levels),
+            group_type=group_type,
+            output_key=(
+                ".sequence" if group_type == FeatureGroupType.JAGGED_SEQUENCE else ""
+            ),
+            fill=fill_mode,
+            width=_slot_width(members[name], group_type, levels),
         )
 
-    body = _weave(body_runs, body_names, segs, tok)
-    response = _weave(resp_runs, resp_names, segs, tok)
+    body = _build_template_segments(body_runs, body_names, segs, tok)
+    response = _build_template_segments(resp_runs, resp_names, segs, tok)
 
     projected = tuple(
         s
         for s in body + response
         if isinstance(s, SlotSeg) and s.fill is FillMode.PROJECTED
     )
-    projection_plan = _build_module_plan(projected, slots)
+    projection_plan = _build_projection_plan(projected, resolved_slots_by_name)
 
     plan = PromptPlan(
         segments=body,
@@ -344,31 +367,33 @@ def compile_prompt(
     )
 
 
-def _weave(
-    runs: Sequence[str],
-    names: Sequence[str],
-    segs: Dict[str, SlotSeg],
-    tok: Tokenizer,
+def _build_template_segments(
+    static_text_parts: Sequence[str],
+    slot_names: Sequence[str],
+    slot_segments_by_name: Dict[str, SlotSeg],
+    tokenizer: Tokenizer,
 ) -> Tuple[Segment, ...]:
-    """Interleave tokenized static runs with their slots, dropping empty runs."""
-    out: List[Segment] = []
-    for i, run in enumerate(runs):
-        if run:
-            ids = tuple(tok.encode(run, add_special_tokens=False).ids)
-            out.append(Static(token_ids=ids))
-        if i < len(names):
-            out.append(segs[names[i]])
-    return tuple(out)
+    """Interleave tokenized static text parts with their slots."""
+    segments: List[Segment] = []
+    for index, static_text in enumerate(static_text_parts):
+        if static_text:
+            token_ids = tuple(
+                tokenizer.encode(static_text, add_special_tokens=False).ids
+            )
+            segments.append(Static(token_ids=token_ids))
+        if index < len(slot_names):
+            segments.append(slot_segments_by_name[slot_names[index]])
+    return tuple(segments)
 
 
-def _build_module_plan(
-    projected: Sequence[SlotSeg], slots: Dict[str, PromptSlot]
+def _build_projection_plan(
+    projected: Sequence[SlotSeg], slots_by_name: Dict[str, PromptSlot]
 ) -> ProjectionPlan:
     """One module per distinct ``projection_name``, else one per slot."""
     projections: Dict[str, PromptProjection] = {}
     slot_to_module: Dict[int, str] = {}
     for seg in projected:
-        slot = slots[seg.name]
+        slot = slots_by_name[seg.name]
         module_id = slot.projection_name or seg.name
         projection = (
             slot.projection if slot.HasField("projection") else PromptProjection()
