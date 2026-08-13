@@ -22,7 +22,6 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 from tzrec.prompt.plan import (
-    CompiledPrompt,
     FillMode,
     PromptPlan,
     ResolvedSidSpace,
@@ -42,10 +41,10 @@ class AssembledPrompt:
     """One batch of assembled prompts, in packed varlen form.
 
     Args:
-        input_ids: every row's tokens concatenated, ``(total_tokens,)``.
-        cu_seqlens: row boundaries into ``input_ids``, ``(batch_size + 1,)``.
+        input_ids: every sample's tokens concatenated, ``(total_tokens,)``.
+        cu_seqlens: sample boundaries into ``input_ids``, ``(batch_size + 1,)``.
         hole_positions: absolute indices the projected embeddings overwrite,
-            in ``PromptPlan.projected_slots`` order within each row.
+            in ``PromptPlan.projected_slots`` order within each sample.
         labels: ``ignore_index`` outside the response span.
     """
 
@@ -56,7 +55,7 @@ class AssembledPrompt:
 
     @property
     def max_seqlen(self) -> int:
-        """Widest row, computed on the host so the model never derives it."""
+        """Widest sample, computed on the host so the model never derives it."""
         if self.cu_seqlens.size < 2:
             return 0
         return int(np.max(np.diff(self.cu_seqlens)))
@@ -119,94 +118,105 @@ class PromptAssembler:
             )
         return values.astype(np.int64, copy=False) + self._sid_space.base_vocab
 
-    def _emit_row(
+    def _emit_sample(
         self,
         segments: Sequence[object],
-        row: int,
-        values: Dict[str, List[np.ndarray]],
-        slot_lengths: Dict[str, np.ndarray],
+        sample_index: int,
+        inline_values: Dict[str, List[np.ndarray]],
+        projected_lengths: Dict[str, np.ndarray],
         out: List[int],
         holes: List[int],
-        base: int,
+        sample_start: int,
     ) -> None:
-        """Append one row's tokens for one segment list, recording holes."""
+        """Append one sample's tokens for one segment list, recording holes."""
         for seg in segments:
             if isinstance(seg, Static):
                 out.extend(seg.token_ids)
                 continue
             assert isinstance(seg, SlotSeg)
             if seg.fill is FillMode.INLINE:
-                out.extend(self._inline_tokens(seg.name, values[seg.name][row]))
+                out.extend(
+                    self._inline_tokens(seg.name, inline_values[seg.name][sample_index])
+                )
             else:
                 assert self._sid_space is not None
-                width = int(slot_lengths[seg.name][row])
-                holes.extend(range(base + len(out), base + len(out) + width))
+                width = int(projected_lengths[seg.name][sample_index])
+                holes.extend(
+                    range(
+                        sample_start + len(out),
+                        sample_start + len(out) + width,
+                    )
+                )
                 out.extend([self._sid_space.sentinel_token_id] * width)
 
     def assemble(
         self,
-        values: Dict[str, List[np.ndarray]],
-        slot_lengths: Optional[Dict[str, np.ndarray]] = None,
+        inline_values: Dict[str, List[np.ndarray]],
+        projected_lengths: Optional[Dict[str, np.ndarray]] = None,
         batch_size: Optional[int] = None,
     ) -> AssembledPrompt:
         """Assemble one batch.
 
         Args:
-            values: INLINE slot name to its per-row value arrays.
-            slot_lengths: PROJECTED slot name to its per-row position count.
-            batch_size: row count; inferred from ``values`` when omitted.
+            inline_values: INLINE slot name to its per-sample value arrays.
+            projected_lengths: PROJECTED slot name to its per-sample position count.
+            batch_size: sample count; inferred from ``inline_values`` when omitted.
 
         Returns:
             The packed streams.
         """
-        slot_lengths = slot_lengths or {}
+        projected_lengths = projected_lengths or {}
         if batch_size is None:
-            if not values:
+            if not inline_values:
                 raise ValueError("batch_size is required when no INLINE slot exists.")
-            batch_size = len(next(iter(values.values())))
+            first_inline_values = next(iter(inline_values.values()))
+            batch_size = len(first_inline_values)
 
-        ids: List[int] = []
+        jagged_token_ids: List[int] = []
         labels: List[int] = []
         holes: List[int] = []
         cu_seqlens = [0]
-        for row in range(batch_size):
-            row_ids: List[int] = []
-            self._emit_row(
+        for sample_index in range(batch_size):
+            sample_token_ids: List[int] = []
+            self._emit_sample(
                 self._prompt_plan.segments,
-                row,
-                values,
-                slot_lengths,
-                row_ids,
+                sample_index,
+                inline_values,
+                projected_lengths,
+                sample_token_ids,
                 holes,
-                len(ids),
+                len(jagged_token_ids),
             )
-            prompt_len = len(row_ids)
-            self._emit_row(
+            prompt_len = len(sample_token_ids)
+            self._emit_sample(
                 self._prompt_plan.response_segments,
-                row,
-                values,
-                slot_lengths,
-                row_ids,
+                sample_index,
+                inline_values,
+                projected_lengths,
+                sample_token_ids,
                 holes,
-                len(ids),
+                len(jagged_token_ids),
             )
             # supervision covers the response span only; the prompt is context.
-            row_labels = [self._ignore_index] * prompt_len + row_ids[prompt_len:]
+            sample_labels = [self._ignore_index] * prompt_len + sample_token_ids[
+                prompt_len:
+            ]
             if (
                 self._prompt_plan.max_length
-                and len(row_ids) > self._prompt_plan.max_length
+                and len(sample_token_ids) > self._prompt_plan.max_length
             ):
                 raise ValueError(
-                    f"assembled row {row} is {len(row_ids)} tokens, over "
-                    f"max_length {self._prompt_plan.max_length}. Rows are never "
-                    f"truncated: cap the source features instead."
+                    f"assembled sample {sample_index} is "
+                    f"{len(sample_token_ids)} tokens, over "
+                    f"max_length {self._prompt_plan.max_length}. Samples are "
+                    f"never truncated: cap the source features instead."
                 )
-            ids.extend(row_ids)
-            labels.extend(row_labels)
-            cu_seqlens.append(len(ids))
+            jagged_token_ids.extend(sample_token_ids)
+            labels.extend(sample_labels)
+            cu_seqlens.append(len(jagged_token_ids))
 
         return AssembledPrompt(
-            input_ids=np.asarray(ids, dtype=np.int64),
+            input_ids=np.asarray(jagged_token_ids, dtype=np.int64),
             cu_seqlens=np.asarray(cu_seqlens, dtype=np.int64),
             hole_positions=np.asarray(holes, dtype=np.int64),
             labels=np.asarray(labels, dtype=np.int64),
@@ -222,8 +232,8 @@ class PromptAssembler:
         Returns:
             The five streams, keyed as ``additional_infos`` expects them.
         """
-        values: Dict[str, List[np.ndarray]] = {}
-        slot_lengths: Dict[str, np.ndarray] = {}
+        inline_values: Dict[str, List[np.ndarray]] = {}
+        projected_lengths: Dict[str, np.ndarray] = {}
         batch_size = 0
         for seg in self._prompt_plan.segments + self._prompt_plan.response_segments:
             if not isinstance(seg, SlotSeg):
@@ -236,13 +246,13 @@ class PromptAssembler:
                 # is one code per position, so value_dim is always 1 here
                 flat = np.asarray(parsed[f"{source}.values"]).reshape(-1)
                 bounds = np.concatenate(([0], np.cumsum(lengths)))
-                values[seg.name] = [
+                inline_values[seg.name] = [
                     flat[bounds[i] : bounds[i + 1]] for i in range(lengths.size)
                 ]
             else:
-                slot_lengths[seg.name] = lengths
+                projected_lengths[seg.name] = lengths
 
-        out = self.assemble(values, slot_lengths, batch_size=batch_size)
+        out = self.assemble(inline_values, projected_lengths, batch_size=batch_size)
         return {
             PROMPT_INPUT_IDS: out.input_ids,
             PROMPT_CU_SEQLENS: out.cu_seqlens,
@@ -250,27 +260,3 @@ class PromptAssembler:
             PROMPT_LABELS: out.labels,
             PROMPT_MAX_SEQLEN: np.asarray(out.max_seqlen, dtype=np.int64),
         }
-
-
-def assemble_into(
-    prompt: CompiledPrompt,
-    parsed: Dict[str, "np.ndarray"],
-    ignore_index: int = -100,
-) -> Dict[str, np.ndarray]:
-    """Assemble one batch with a throwaway assembler.
-
-    A caller that assembles every batch should hold a ``PromptAssembler`` and
-    call ``assemble_batch`` instead; this builds one per call.
-
-    Args:
-        prompt: the compiled prompt.
-        parsed: ``{feature}.values`` / ``{feature}.lengths`` as the data parser
-            emits them.
-        ignore_index: label value outside the supervised span.
-
-    Returns:
-        The five streams, keyed as ``additional_infos`` expects them.
-    """
-    return PromptAssembler(
-        prompt.prompt_plan, prompt.sid_space, ignore_index
-    ).assemble_batch(parsed)

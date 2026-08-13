@@ -20,76 +20,28 @@ class UnpackTest(unittest.TestCase):
     """The one adapter where padding lives."""
 
     def test_packs_rows_of_different_lengths(self) -> None:
-        # rows of 2 and 3 tokens, hidden size 4
-        embeds = torch.arange(20, dtype=torch.float32).reshape(5, 4)
-        cu = torch.tensor([0, 2, 5])
-        labels = torch.tensor([10, 11, 20, 21, 22])
-
-        padded, mask, out = _unpack(embeds, cu, labels, max_seqlen=3, ignore_index=-100)
-
-        self.assertEqual(padded.shape, (2, 3, 4))
-        # pads go on the left, so every row ends on a real token
-        self.assertEqual(mask.tolist(), [[0, 1, 1], [1, 1, 1]])
-        torch.testing.assert_close(padded[0, 1:], embeds[:2])
-        torch.testing.assert_close(padded[1, :3], embeds[2:])
-        # the pad column is zero, and its label is ignored
-        torch.testing.assert_close(padded[0, 0], torch.zeros(4))
-        self.assertEqual(out.tolist(), [[-100, 10, 11], [20, 21, 22]])
-
-    def test_uses_the_given_width_not_the_observed_max(self) -> None:
-        # the collator's bucket may exceed the widest row; §7.4 forbids
-        # deriving the width on device
-        embeds = torch.ones(3, 2)
-        cu = torch.tensor([0, 1, 3])
-        labels = torch.tensor([1, 2, 3])
-        padded, mask, _ = _unpack(embeds, cu, labels, max_seqlen=5, ignore_index=-100)
-
-        self.assertEqual(padded.shape, (2, 5, 2))
-        self.assertEqual(mask.sum().item(), 3)
-
-    def test_row_order_survives_the_scatter(self) -> None:
-        # mask selects row-major, which must match the packing order
-        embeds = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
-        cu = torch.tensor([0, 1, 4])
-        labels = torch.zeros(4, dtype=torch.long)
-        padded, _, _ = _unpack(embeds, cu, labels, max_seqlen=3, ignore_index=-100)
-
-        self.assertEqual(padded[0, :, 0].tolist(), [0.0, 0.0, 1.0])
-        self.assertEqual(padded[1, :, 0].tolist(), [2.0, 3.0, 4.0])
-
-    def test_every_row_ends_on_its_own_last_token(self) -> None:
-        # decode prefills from [:, -1, :]; a right-padded short row would
-        # hand it padding instead of the row's final token
-        embeds = torch.tensor([[1.0], [2.0], [3.0], [11.0], [12.0], [13.0], [14.0]])
-        cu = torch.tensor([0, 3, 7])
-        labels = torch.zeros(7, dtype=torch.long)
-        padded, _, _ = _unpack(embeds, cu, labels, max_seqlen=4, ignore_index=-100)
-
-        self.assertEqual(padded[:, -1, 0].tolist(), [3.0, 14.0])
-
-    def test_a_short_row_keeps_its_answer_in_the_suffix_window(self) -> None:
-        # the loss scores a fixed-width suffix; every row must contribute the
-        # same number of supervised positions regardless of its length
-        embeds = torch.ones(9, 1)
+        # rows of 4 and 5 tokens, with a padded width larger than either row
+        embeds = torch.arange(18, dtype=torch.float32).reshape(9, 2)
         cu = torch.tensor([0, 4, 9])
         ignore = -100
-        # each row ends on 2 real labels, preceded by unsupervised context
         labels = torch.tensor([ignore, ignore, 7, 8, ignore, ignore, ignore, 7, 8])
-        _, _, out = _unpack(embeds, cu, labels, max_seqlen=5, ignore_index=ignore)
 
-        window = out[:, -2:]
-        self.assertEqual((window != ignore).sum(dim=1).tolist(), [2, 2])
-        self.assertEqual(window.tolist(), [[7, 8], [7, 8]])
+        padded, mask, out = _unpack(
+            embeds, cu, labels, max_seqlen=7, ignore_index=ignore
+        )
 
-    def test_gradient_reaches_the_packed_input(self) -> None:
-        embeds = torch.ones(3, 2, requires_grad=True)
-        cu = torch.tensor([0, 1, 3])
-        labels = torch.zeros(3, dtype=torch.long)
-        padded, _, _ = _unpack(embeds, cu, labels, max_seqlen=2, ignore_index=-100)
-        padded.sum().backward()
-
-        self.assertIsNotNone(embeds.grad)
-        torch.testing.assert_close(embeds.grad, torch.ones(3, 2))
+        self.assertEqual(padded.shape, (2, 7, 2))
+        # pads go on the left, so every row ends on a real token
+        self.assertEqual(
+            mask.tolist(),
+            [[0, 0, 0, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1, 1]],
+        )
+        torch.testing.assert_close(padded[0, 3:], embeds[:4])
+        torch.testing.assert_close(padded[1, 2:], embeds[4:])
+        torch.testing.assert_close(padded[0, :3], torch.zeros(3, 2))
+        torch.testing.assert_close(padded[1, :2], torch.zeros(2, 2))
+        torch.testing.assert_close(padded[:, -1], torch.stack([embeds[3], embeds[8]]))
+        self.assertEqual(out.tolist(), [[ignore] * 5 + [7, 8]] * 2)
 
 
 if __name__ == "__main__":

@@ -25,12 +25,12 @@ from tzrec.main import _create_model
 from tzrec.prompt.assembler import (
     PROMPT_HOLE_POSITIONS,
     PROMPT_INPUT_IDS,
-    assemble_into,
 )
 from tzrec.prompt.compile import compile_prompt
 from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
+from tzrec.tests.prompt_test_util import assemble_into
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
@@ -107,41 +107,22 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         )
         return batch
 
-    def test_tokens_to_local_codes_undoes_both_shifts(self) -> None:
+    def test_tokens_to_local_codes_undoes_shifts_and_groups_beams(self) -> None:
         model = self._model()
         space = self.prompt.sid_space
-        # one row, one beam: level 0 code 1, level 1 code 2, level 2 code 3
-        tokens = torch.tensor(
+        local_codes = torch.tensor(
             [
-                [
-                    space.base_vocab + space.level_offsets[0] + 1,
-                    space.base_vocab + space.level_offsets[1] + 2,
-                    space.base_vocab + space.level_offsets[2] + 3,
-                ]
+                [0, 1, 3],
+                [3, 0, 2],
+                [1, 3, 0],
+                [2, 2, 1],
             ]
         )
-        codes = model._tokens_to_local_codes(tokens, batch_size=1)
-
-        self.assertEqual(codes.shape, (1, 1, space.num_levels))
-        self.assertEqual(codes[0, 0].tolist(), [1, 2, 3])
-
-    def test_tokens_to_local_codes_maps_band_edges_to_the_last_code(self) -> None:
-        model = self._model()
-        space = self.prompt.sid_space
-        codes = model._tokens_to_local_codes(
-            torch.tensor([list(space.band_hi)]), batch_size=1
-        )
-
-        self.assertEqual(codes[0, 0].tolist(), [c - 1 for c in _CODEBOOK])
-
-    def test_tokens_to_local_codes_groups_beams_under_their_row(self) -> None:
-        model = self._model()
-        space = self.prompt.sid_space
-        base = torch.tensor(space.level_offsets) + space.base_vocab
-        # four beam rows over a batch of two
-        codes = model._tokens_to_local_codes(base.repeat(4, 1), batch_size=2)
+        tokens = local_codes + torch.tensor(space.level_offsets) + space.base_vocab
+        codes = model._tokens_to_local_codes(tokens, batch_size=2)
 
         self.assertEqual(codes.shape, (2, 2, space.num_levels))
+        self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1).tolist())
 
     def test_rejects_a_model_built_without_a_prompt(self) -> None:
         with self.assertRaisesRegex(ValueError, "needs a compiled prompt"):
@@ -176,7 +157,7 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot share a module"):
             self._model(features=features, prompt=prompt)
 
-    def test_projected_slot_overwrites_only_its_sentinel_positions(self) -> None:
+    def test_projected_slot_overwrites_sentinels_and_backpropagates(self) -> None:
         features = [_feature(_HIST), _feature(_ANSWER), _feature(_projected("prof", 8))]
         prompt = self._compile(
             features,
@@ -210,6 +191,10 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
 
         changed = ~torch.isclose(embeds, raw).all(dim=-1)
         self.assertEqual(sorted(changed.nonzero().flatten().tolist()), holes.tolist())
+
+        embeds[holes].sum().backward()
+        proj = next(iter(model.projections.values()))
+        self.assertIsNotNone(proj.head.weight.grad)
 
     def test_loss_surfaces_the_ce_computed_in_predict(self) -> None:
         model = self._model()

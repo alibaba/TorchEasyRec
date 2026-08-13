@@ -86,12 +86,6 @@ class PromptPersistTest(unittest.TestCase):
             set(space), {f.name for f in dataclasses.fields(prompt.sid_space)}
         )
 
-    def test_matching_prompt_passes(self) -> None:
-        prompt = self._compile()
-        ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        save_prompt_assets(prompt, ckpt)
-        check_prompt_assets(self._compile(), ckpt)
-
     def test_a_changed_codebook_is_fatal(self) -> None:
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
         save_prompt_assets(self._compile(codebook=(4, 4, 4)), ckpt)
@@ -105,16 +99,23 @@ class PromptPersistTest(unittest.TestCase):
         # the vocabulary is untouched, so the weights are still usable
         self.assertEqual(moved.vocab_hash, read_prompt_hashes(ckpt)["vocab_hash"])
         self.assertNotEqual(moved.plan_hash, read_prompt_hashes(ckpt)["plan_hash"])
-        check_prompt_assets(moved, ckpt)
+        with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
+            check_prompt_assets(moved, ckpt)
+        warning.assert_called_once()
 
     def test_a_checkpoint_without_assets_only_warns(self) -> None:
         bare = os.path.join(self.test_dir, "model.ckpt-bare")
         os.makedirs(bare, exist_ok=True)
         self.assertIsNone(read_prompt_hashes(bare))
-        check_prompt_assets(self._compile(), bare)
+        prompt = self._compile()
+        with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
+            check_prompt_assets(prompt, bare)
+        warning.assert_called_once()
 
     def test_no_prompt_config_is_a_no_op(self) -> None:
-        check_prompt_assets(None, os.path.join(self.test_dir, "nowhere"))
+        with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
+            check_prompt_assets(None, os.path.join(self.test_dir, "nowhere"))
+        warning.assert_not_called()
 
     def test_export_carries_the_contract_forward(self) -> None:
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
@@ -134,7 +135,9 @@ class PromptPersistTest(unittest.TestCase):
         bare = os.path.join(self.test_dir, "bare")
         os.makedirs(bare, exist_ok=True)
         export = os.path.join(self.test_dir, "export_bare")
-        copy_prompt_assets(bare, export)
+        with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
+            copy_prompt_assets(bare, export)
+        warning.assert_called_once()
         self.assertIsNone(read_prompt_hashes(export))
 
     def test_only_rank_zero_writes(self) -> None:

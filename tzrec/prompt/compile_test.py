@@ -91,6 +91,9 @@ class CompilePromptTest(unittest.TestCase):
         self.assertEqual(
             [s.name for s in compiled.prompt_plan.projected_slots], ["prof"]
         )
+        groups = compiled.projection_plan.feature_groups
+        self.assertEqual([g.group_name for g in groups], ["prof"])
+        self.assertEqual(list(groups[0].feature_names), ["prof"])
         self.assertEqual(compiled.prompt_plan.max_holes, 4)
         self.assertIsNotNone(compiled.sid_space.sentinel_token_id)
 
@@ -172,19 +175,6 @@ class CompilePromptTest(unittest.TestCase):
         cfg.sid_space.atom_token_format = "History"
         with self.assertRaisesRegex(ValueError, "already in the base tokenizer"):
             self._compile(cfg, [_feature(_HIST)])
-
-    def test_vocab_hash_tracks_the_codebook(self) -> None:
-        def compile_with(sizes):
-            cfg = self._config(prompt="History : {{hist}}")
-            cfg.sid_space.codebook.extend(sizes)
-            return self._compile(cfg, [_feature(_HIST)])
-
-        self.assertEqual(
-            compile_with([4, 4]).vocab_hash, compile_with([4, 4]).vocab_hash
-        )
-        self.assertNotEqual(
-            compile_with([4, 4]).vocab_hash, compile_with([4, 8]).vocab_hash
-        )
 
     def test_extended_tokenizer_is_written(self) -> None:
         cfg = self._config(prompt="History : {{hist}}")

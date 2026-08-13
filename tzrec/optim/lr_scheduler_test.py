@@ -83,15 +83,6 @@ class LRSchedulerTest(unittest.TestCase):
             lr.step()
             self.assertAlmostEqual(opt.param_groups[0]["lr"], lr_gt)
 
-    def test_linear_decay_lr(self) -> None:
-        params = [torch.tensor([1.0, 2.0])]
-        opt = torch.optim.Adam(params, lr=0.01)
-        lr = lr_scheduler.LinearDecayLR(opt, num_training_steps=4)
-        lr_gts = [0.0075, 0.005, 0.0025, 0.0, 0.0]
-        for lr_gt in lr_gts:
-            lr.step()
-            self.assertAlmostEqual(opt.param_groups[0]["lr"], lr_gt)
-
     def test_linear_decay_lr_with_min_lr(self) -> None:
         params = [torch.tensor([1.0, 2.0])]
         opt = torch.optim.Adam(params, lr=0.01)

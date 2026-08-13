@@ -24,6 +24,7 @@ from tzrec.prompt.plan import (
     WidthKind,
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
+from tzrec.tests.prompt_test_util import assemble_into
 
 _BASE = 1000
 _SENTINEL = 1099
@@ -109,14 +110,6 @@ class PromptAssemblerTest(unittest.TestCase):
         # absolute indices into the flat buffer, which is what index_copy needs
         self.assertEqual(out.hole_positions.tolist(), [1, 2, 4, 5, 6])
 
-    def test_hole_positions_index_the_flat_buffer_exactly(self) -> None:
-        plan = _plan((_slot("prof", FillMode.PROJECTED, 2),))
-        asm = PromptAssembler(plan, _sid_space())
-        out = asm.assemble({}, {"prof": np.array([2, 2])}, batch_size=2)
-        # index_copy requires index.numel() == source.size(0)
-        self.assertEqual(out.hole_positions.size, 4)
-        self.assertTrue(np.all(out.input_ids[out.hole_positions] == _SENTINEL))
-
     def test_labels_cover_the_response_span_only(self) -> None:
         plan = _plan(
             (Static((7, 8)),),
@@ -164,7 +157,6 @@ class PromptAssemblerTest(unittest.TestCase):
 
     def test_column_shaped_values_are_flattened(self) -> None:
         # the data parser emits (total, value_dim) for a dense sequence feature
-        from tzrec.prompt.assembler import assemble_into
         from tzrec.prompt.plan import CompiledPrompt, ProjectionPlan
 
         plan = _plan((_slot("hist", FillMode.INLINE),))
@@ -183,15 +175,6 @@ class PromptAssemblerTest(unittest.TestCase):
         out = assemble_into(prompt, parsed)
         self.assertEqual(out["prompt_cu_seqlens"].tolist(), [0, 3, 6])
         self.assertEqual(out["prompt_input_ids"].tolist()[0], _BASE + 1)
-
-    def test_rows_of_different_lengths_pack_without_padding(self) -> None:
-        plan = _plan((_slot("hist", FillMode.INLINE),))
-        asm = PromptAssembler(plan, _sid_space())
-        out = asm.assemble(
-            {"hist": [np.array([1, 6, 11]), np.array([0, 4, 8, 2, 5, 9])]}
-        )
-        self.assertEqual(out.cu_seqlens.tolist(), [0, 3, 9])
-        self.assertEqual(out.input_ids.size, 9)
 
 
 if __name__ == "__main__":

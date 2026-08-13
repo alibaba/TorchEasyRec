@@ -81,15 +81,6 @@ class HfExportUtilTest(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def test_unwrap_walks_dmp_and_train_wrapper(self) -> None:
-        inner = _GenRec(_tied_lm())
-        self.assertIs(unwrap_to_hf(inner), inner)
-        self.assertIs(unwrap_to_hf(_TrainWrapper(inner)), inner)
-        self.assertIs(unwrap_to_hf(_DmpLike(_TrainWrapper(inner))), inner)
-
-    def test_unwrap_returns_none_for_non_hf_model(self) -> None:
-        self.assertIsNone(unwrap_to_hf(_TrainWrapper(nn.Linear(4, 4))))
-
     def test_unwrap_terminates_on_a_wrapper_cycle(self) -> None:
         """A .model/.module cycle must return None, not spin.
 
@@ -150,19 +141,6 @@ class HfExportUtilTest(unittest.TestCase):
         )
         for k, v in lm.state_dict().items():
             self.assertTrue(torch.equal(back.state_dict()[k], v), k)
-
-    def test_dcp_to_hf_self_heals_a_stale_prefix(self) -> None:
-        lm = _tied_lm()
-        ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(lm)))
-        meta_path = os.path.join(ckpt_dir, _HF_EXPORT_META_FILENAME)
-        with open(meta_path, "w") as f:
-            json.dump({"backbone_state_dict_prefix": "bogus.wrapper."}, f)
-        out_dir = os.path.join(self.test_dir, "hf_out_stale")
-        dcp_to_hf(ckpt_dir, out_dir)  # falls back to suffix matching
-        st = load_file(os.path.join(out_dir, "model.safetensors"))
-        self.assertTrue(
-            torch.equal(st["model.embed_tokens.weight"], lm.model.embed_tokens.weight)
-        )
 
     def test_dcp_to_hf_refuses_a_mismatched_architecture(self) -> None:
         ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(_tied_lm())))

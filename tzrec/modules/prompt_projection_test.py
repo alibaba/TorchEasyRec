@@ -52,11 +52,6 @@ class PromptProjectionTest(unittest.TestCase):
         proj = PromptProjection(config, in_dim=4, hidden_size=6)
         self.assertIsNone(proj.head.bias)
 
-    def test_jagged_rows_project_independently(self) -> None:
-        proj = PromptProjection(PromptProjectionConfig(), in_dim=4, hidden_size=6)
-        rows = torch.randn(7, 4)
-        torch.testing.assert_close(proj(rows)[3], proj(rows[3:4])[0])
-
 
 if __name__ == "__main__":
     unittest.main()

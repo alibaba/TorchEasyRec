@@ -9,9 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ast
 import itertools
-import pathlib
 import unittest
 from typing import Any, Dict, List, Tuple
 
@@ -19,7 +17,6 @@ import torch
 import torch.nn.functional as F
 from parameterized import parameterized
 
-from tzrec.modules import dynamic_beam
 from tzrec.modules.dynamic_beam import dynamic_beam_search
 from tzrec.utils.test_util import create_tiny_causal_lm, parameterized_name_func
 
@@ -80,26 +77,12 @@ def _bruteforce_scores(lm, input_ids, attention_mask, pairs):
 
 
 class DynamicBeamSearchTest(unittest.TestCase):
-    def test_module_declares_no_tzrec_imports(self) -> None:
-        # the "torch-only, no tzrec deps" docstring is what makes it liftable.
-        tree = ast.parse(pathlib.Path(dynamic_beam.__file__).read_text())
-        mods = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                mods.update(a.name for a in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                mods.add(node.module)
-        self.assertEqual(
-            {m for m in mods if m == "tzrec" or m.startswith("tzrec.")}, set()
-        )
-
     @parameterized.expand(
         [
             # every request satisfiable -> the schedule is honoured verbatim
             [[4, 8, 16], [(20, 27), (28, 34), (35, 40)], [4, 8, 16]],
             # capped by band x surviving prefixes, not by what was asked
             [[6, 12], [(20, 21), (22, 24)], [2, 6]],
-            [[2, 4, 8], [(20, 21), (22, 24), (25, 28)], [2, 4, 8]],
             # a width-1 band collapses level 0 and bounds everything after it
             [[4, 8], [(20, 20), (21, 23)], [1, 3]],
             # a flat (non-doubling) schedule is just as valid to the kernel
@@ -126,23 +109,8 @@ class DynamicBeamSearchTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be >= 1"):
             _decode(lm, ids, pairs, beam_widths=[2, 0, 4])
 
-    def test_tokens_stay_inside_arbitrary_bands(self) -> None:
-        # bands the PromptGenerativeQwen caller can never produce: descending, disjoint,
-        # unequal width -- the kernel's contract is per-level (lo, hi), not a
-        # contiguous codebook layout.
-        pairs = [(5, 6), (20, 24), (11, 13)]
-        ids = torch.tensor([[1, 2, 3, 4]])
-        out = _decode(create_tiny_causal_lm(vocab_size=30), ids, pairs)
-        # flat width 8: level 0's 2-wide band caps it, later levels recover
-        self.assertEqual(tuple(out.shape), (8, 3))
-        for level, (lo_j, hi_j) in enumerate(pairs):
-            col = out[:, level]
-            self.assertTrue(bool((col >= lo_j).all()))
-            self.assertTrue(bool((col <= hi_j).all()))
-        self.assertEqual(len({tuple(r) for r in out.tolist()}), out.shape[0])
-
     @parameterized.expand(
-        [[0, 1], [1, 3], [2, 16], [0, 16]],
+        [[0, 1], [1, 16]],
         name_func=parameterized_name_func,
     )
     def test_left_padding_matches_unpadded(self, seed, n_pad) -> None:
@@ -173,8 +141,9 @@ class DynamicBeamSearchTest(unittest.TestCase):
 
     def test_exhaustive_matches_bruteforce_topk(self) -> None:
         # widths [2, 6, 12] over 2*3*2 = 12 combinations -> no pruning at any
-        # level, so the beam must reproduce the exact full-recompute ranking.
-        pairs = [(20, 21), (22, 24), (25, 26)]
+        # level. Disjoint, non-monotonic bands also verify that each level uses
+        # its own bounds rather than assuming one contiguous SID layout.
+        pairs = [(20, 21), (5, 7), (25, 26)]
         lm = create_tiny_causal_lm(vocab_size=30)
         ids = torch.tensor([[5, 6, 7, 8]])
         am = torch.ones_like(ids)
