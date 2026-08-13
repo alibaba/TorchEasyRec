@@ -24,10 +24,9 @@ from tzrec.utils.config_util import config_to_kwargs
 class PromptProjection(nn.Module):
     """An optional body followed by a bare Linear to the LM hidden size.
 
-    The final map never carries an activation: every ``Perceptron`` applies one,
-    so ending on an MLP would zero half the dimensions feeding the LM input
-    space. An empty MLP does not degrade to a linear either -- ``output_dim()``
-    raises -- which is why the Linear is structural rather than configurable.
+    The final map has no activation, so it can span the full LM embedding space.
+    Omit ``mlp`` for a plain linear projection; an explicitly empty ``mlp {}``
+    is rejected as an incomplete body configuration.
 
     Args:
         config: the slot's projection config; an empty one is a plain linear.
@@ -45,6 +44,11 @@ class PromptProjection(nn.Module):
         dim = in_dim
         self.body: Optional[MLP] = None
         if config.HasField("mlp"):
+            if not config.mlp.hidden_units:
+                raise ValueError(
+                    "PromptProjection.mlp.hidden_units must not be empty; omit "
+                    "mlp for a plain linear projection."
+                )
             self.body = MLP(dim, **config_to_kwargs(config.mlp))
             dim = self.body.output_dim()
         self.head = nn.Linear(dim, hidden_size, bias=config.bias)

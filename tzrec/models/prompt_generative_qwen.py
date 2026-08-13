@@ -11,12 +11,13 @@
 
 """Decoder-only forward and decode over a Qwen backbone.
 
-Everything backbone-agnostic is in ``BasePromptGenerativeModel``. What is here
-is what a decoder-only family does differently: it reaches past ``lm(...)`` into
-``lm.model`` and ``lm.lm_head`` so logits are materialized for a suffix window
-only, and it decodes by prefilling once and stepping a self-attention cache.
+Shared causal-LM plumbing is in ``BasePromptGenerativeModel``. This subclass
+reaches past ``lm(...)`` into ``lm.model`` and ``lm.lm_head`` so logits are
+materialized for a suffix window only, and it decodes by prefilling once and
+stepping a self-attention cache.
 
-The layout is Qwen's, and Llama and Mistral share it exactly.
+This implementation targets the Qwen HuggingFace module and cache interfaces;
+other causal-LM families need their own compatibility verification.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,7 +27,7 @@ import torch
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.prompt_generative_model import BasePromptGenerativeModel
-from tzrec.modules.dynamic_beam import dynamic_beam_search
+from tzrec.modules.dynamic_beam import _capped_beam_widths, dynamic_beam_search
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS,
     PROMPT_LABELS,
@@ -85,15 +86,26 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
                 f"{len(self._beam_widths)} entries but the codebook has "
                 f"{space.num_levels} levels; give one width per level."
             )
-        if self._num_return_sequences > self._beam_widths[-1]:
+        if any(width < 1 for width in self._beam_widths):
+            raise ValueError(
+                f"{type(self).__name__}: beam_widths must be >= 1, got "
+                f"{self._beam_widths}."
+            )
+        if self._num_return_sequences < 1:
+            raise ValueError(
+                f"{type(self).__name__}: num_return_sequences must be >= 1, got "
+                f"{self._num_return_sequences}."
+            )
+        final_width = _capped_beam_widths(self._beam_widths, space.codebook)[-1]
+        if self._num_return_sequences > final_width:
             raise ValueError(
                 f"{type(self).__name__}: num_return_sequences "
-                f"({self._num_return_sequences}) must not exceed the final beam width "
-                f"({self._beam_widths[-1]})."
+                f"({self._num_return_sequences}) must not exceed the final capped "
+                f"beam width ({final_width})."
             )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Teacher-forced forward over the assembled stream.
+        """Run teacher-forced loss or inference decode over the assembled stream.
 
         Args:
             batch: carries the packed prompt in ``additional_infos``.

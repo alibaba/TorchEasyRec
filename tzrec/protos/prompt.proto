@@ -6,11 +6,12 @@ import "tzrec/protos/module.proto";
 // Rendering of an LM prompt. Peer of data_config and model_config: extraction
 // stays in feature_configs, this owns order, literal text and composition.
 message PromptConfig {
-    // BASE tokenizer, path or hub id. Distinct from hf_model_id, which names
-    // the WEIGHTS and is read only at cold start.
+    reserved 2, 9;
+    reserved "asset_dir", "length_buckets";
+
+    // BASE tokenizer JSON file. Distinct from hf_model_id, which supplies the
+    // model architecture and cold-start weights.
     required string tokenizer = 1;
-    // Rewritten by export to the content-addressed asset directory.
-    optional string asset_dir = 2;
 
     // Static text between {{name}} placeholders is the prefix and suffix of
     // the surrounding slots; there are no per-slot text fields.
@@ -30,21 +31,20 @@ message PromptConfig {
     optional uint32 max_length = 7 [default = 0];
 
     // Reserves a position filled by a projected slot. Materialized only when
-    // at least one slot has a projection.
+    // at least one slot is PROJECTED.
     optional string sentinel_token = 8 [default = "<|pg_hole|>"];
-
-    // Length buckets for the training sampler and graph capture.
-    repeated uint32 length_buckets = 9;
 }
 
 message PromptSlot {
-    // {{name}} in the template; also the name of the derived feature_group.
+    reserved 3;
+    reserved "drop_if_empty";
+
+    // {{name}} in the template; also the derived feature_group name when the
+    // slot is PROJECTED.
     required string name = 1;
     // Features rendered at this position. Several are concatenated per
     // position; the compiler derives the FeatureGroupConfig from this list.
     repeated string feature_names = 2;
-    // Omit the slot and the static text folded into it when the value is empty.
-    optional bool drop_if_empty = 3 [default = false];
     // Reconciles this slot's width with the LM hidden size. Illegal on an
     // INLINE slot. Carries no dimensions: the model resolves them.
     optional PromptProjection projection = 4;

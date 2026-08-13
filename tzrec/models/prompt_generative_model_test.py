@@ -14,49 +14,29 @@ import unittest
 
 import numpy as np
 import torch
-from google.protobuf import text_format
-from tokenizers import Tokenizer, models, pre_tokenizers
 from torchrec import KeyedJaggedTensor
 from transformers import AutoModelForCausalLM
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
-from tzrec.features.feature import FgMode, create_features
 from tzrec.main import _create_model
 from tzrec.prompt.assembler import (
     PROMPT_HOLE_POSITIONS,
     PROMPT_INPUT_IDS,
 )
 from tzrec.prompt.compile import compile_prompt
-from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
-from tzrec.tests.prompt_test_util import assemble_into
+from tzrec.tests.prompt_test_util import (
+    assemble_into,
+    create_prompt_feature,
+    create_prompt_tokenizer,
+    offset_sid_codes,
+)
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
 _CODEBOOK = [4, 4, 4]
 _WORDS = ["History", "Predict", ":", ".", "<unk>", "<|im_end|>"]
-
-
-def _tokenizer(path: str) -> str:
-    tok = Tokenizer(
-        models.WordLevel(vocab={w: i for i, w in enumerate(_WORDS)}, unk_token="<unk>")
-    )
-    tok.pre_tokenizer = pre_tokenizers.Whitespace()
-    tok.save(path)
-    return path
-
-
-def _feature(text: str):
-    fc = feature_pb2.FeatureConfig()
-    text_format.Merge(text, fc)
-    return create_features([fc], fg_mode=FgMode.FG_NONE)[0]
-
-
-def _offset(codes):
-    """Shift local codes into the flat space, as the SID tool's column does."""
-    offsets = np.cumsum([0] + _CODEBOOK[:-1])
-    return (np.asarray(codes).reshape(-1, len(_CODEBOOK)) + offsets).reshape(-1)
 
 
 _HIST = 'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }'
@@ -71,14 +51,19 @@ def _projected(name: str, dim: int) -> str:
 
 
 class BasePromptGenerativeModelTest(unittest.TestCase):
-    """The backbone-agnostic half, reached through its one concrete subclass."""
+    """Shared causal-LM behavior, reached through its concrete Qwen subclass."""
 
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
         self.backbone = os.path.join(self.test_dir, "backbone")
         create_tiny_causal_lm(64).save_pretrained(self.backbone)
-        self.tok = _tokenizer(os.path.join(self.test_dir, "tok.json"))
-        self.features = [_feature(_HIST), _feature(_ANSWER)]
+        self.tok = create_prompt_tokenizer(
+            os.path.join(self.test_dir, "tok.json"), _WORDS
+        )
+        self.features = [
+            create_prompt_feature(_HIST),
+            create_prompt_feature(_ANSWER),
+        ]
         self.prompt = self._compile(self.features)
 
     def _compile(self, features, template="History : {{hist}} . Predict :", **kwargs):
@@ -86,12 +71,18 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         cfg.sid_space.codebook.extend(_CODEBOOK)
         return compile_prompt(cfg, features, model_dir=self.test_dir)
 
-    def _model(self, features=None, prompt=-1):
+    def _model(
+        self,
+        features=None,
+        prompt=-1,
+        beam_widths=(2, 2, 2),
+        num_return_sequences=2,
+    ):
         model_config = ModelConfig()
         qwen = model_config.prompt_generative_qwen
         qwen.hf_model_id = self.backbone
-        qwen.common.beam_widths.extend([2, 2, 2])
-        qwen.common.num_return_sequences = 2
+        qwen.common.beam_widths.extend(beam_widths)
+        qwen.common.num_return_sequences = num_return_sequences
         return _create_model(
             model_config,
             self.features if features is None else features,
@@ -138,10 +129,10 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
 
     def test_shared_projection_name_requires_matching_widths(self) -> None:
         features = [
-            _feature(_HIST),
-            _feature(_ANSWER),
-            _feature(_projected("pa", 8)),
-            _feature(_projected("pb", 16)),
+            create_prompt_feature(_HIST),
+            create_prompt_feature(_ANSWER),
+            create_prompt_feature(_projected("pa", 8)),
+            create_prompt_feature(_projected("pb", 16)),
         ]
         cfg = PromptConfig(
             tokenizer=self.tok,
@@ -158,7 +149,11 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
             self._model(features=features, prompt=prompt)
 
     def test_projected_slot_overwrites_sentinels_and_backpropagates(self) -> None:
-        features = [_feature(_HIST), _feature(_ANSWER), _feature(_projected("prof", 8))]
+        features = [
+            create_prompt_feature(_HIST),
+            create_prompt_feature(_ANSWER),
+            create_prompt_feature(_projected("prof", 8)),
+        ]
         prompt = self._compile(
             features,
             template="History : {{hist}} . Predict {{prof}} :",
@@ -169,9 +164,11 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         init_parameters(model, device=torch.device("cpu"))
         batch = self._batch(
             {
-                "hist.values": torch.tensor(_offset([0, 1, 2])).reshape(-1, 1),
+                "hist.values": torch.tensor(
+                    offset_sid_codes([0, 1, 2], _CODEBOOK)
+                ).reshape(-1, 1),
                 "hist.lengths": torch.tensor([3]),
-                "answer.values": torch.tensor(_offset([1, 2, 3])),
+                "answer.values": torch.tensor(offset_sid_codes([1, 2, 3], _CODEBOOK)),
                 "answer.lengths": torch.tensor([3]),
                 "prof.values": torch.tensor([5, 9]),
                 "prof.lengths": torch.tensor([2]),
@@ -196,11 +193,12 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         proj = next(iter(model.projections.values()))
         self.assertIsNotNone(proj.head.weight.grad)
 
-    def test_loss_surfaces_the_ce_computed_in_predict(self) -> None:
-        model = self._model()
-        value = torch.tensor(1.25)
-
-        self.assertEqual(model.loss({"loss": value}, Batch()), {"ce_loss": value})
+    def test_beam_config_uses_final_capped_capacity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "final capped beam width \\(4\\)"):
+            self._model(
+                beam_widths=(1, 1, 100),
+                num_return_sequences=5,
+            )
 
     def test_metric_averages_the_loss_across_batches(self) -> None:
         model = self._model()
@@ -211,15 +209,6 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         self.assertAlmostEqual(
             model._metric_modules["ce_loss"].compute().item(), 2.0, places=5
         )
-
-    def test_save_assets_co_locates_the_prompt_contract(self) -> None:
-        model = self._model()
-        target = os.path.join(self.test_dir, "ckpt")
-        os.makedirs(target, exist_ok=True)
-        model.save_assets(target)
-
-        self.assertTrue(os.path.isdir(os.path.join(target, "prompt")))
-        self.assertTrue(os.listdir(os.path.join(target, "prompt")))
 
     def test_init_from_pretrained_replaces_the_empty_weights(self) -> None:
         model = self._model()

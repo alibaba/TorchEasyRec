@@ -9,12 +9,64 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict
+from typing import Any, Dict, Sequence
 
 import numpy as np
+from google.protobuf import text_format
+from tokenizers import Tokenizer, models, pre_tokenizers
 
+from tzrec.features.feature import BaseFeature, FgMode, create_features
 from tzrec.prompt.assembler import PromptAssembler
 from tzrec.prompt.plan import CompiledPrompt
+from tzrec.protos import feature_pb2
+
+
+def create_prompt_tokenizer(path: str, words: Sequence[str]) -> str:
+    """Write a word-level tokenizer used by prompt tests.
+
+    Args:
+        path: destination JSON path.
+        words: vocabulary entries in token-id order.
+
+    Returns:
+        The destination path.
+    """
+    tokenizer = Tokenizer(
+        models.WordLevel(
+            vocab={word: i for i, word in enumerate(words)}, unk_token="<unk>"
+        )
+    )
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.save(path)
+    return path
+
+
+def create_prompt_feature(text: str) -> BaseFeature:
+    """Create one prompt test feature from text-format protobuf.
+
+    Args:
+        text: text-format ``FeatureConfig``.
+
+    Returns:
+        The created feature.
+    """
+    config = feature_pb2.FeatureConfig()
+    text_format.Merge(text, config)
+    return create_features([config], fg_mode=FgMode.FG_NONE)[0]
+
+
+def offset_sid_codes(codes: Sequence[Any], codebook: Sequence[int]) -> np.ndarray:
+    """Shift local SID codes into the flattened per-level space.
+
+    Args:
+        codes: local codes grouped by SID item.
+        codebook: vocabulary size for each SID level.
+
+    Returns:
+        Flat offset codes in item-major order.
+    """
+    offsets = np.cumsum([0, *codebook[:-1]])
+    return (np.asarray(codes).reshape(-1, len(codebook)) + offsets).reshape(-1)
 
 
 def assemble_into(

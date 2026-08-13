@@ -42,7 +42,7 @@ _HF_EXPORT_META_FILENAME = "hf_export_meta.json"
 
 
 def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
-    """Co-locate the HF config + tokenizer (NO weights) in a checkpoint dir.
+    """Write HF config, optional tokenizer, and export metadata beside a checkpoint.
 
     The backbone's FQN prefix goes into ``hf_export_meta.json`` so ``dcp_to_hf``
     can strip it without hard-coding a wrapper convention. Rank 0 only.
@@ -76,7 +76,7 @@ def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
 
 
 def dcp_to_hf(ckpt_dir: str, out_dir: str) -> None:
-    """Convert a self-contained checkpoint dir to a ``from_pretrained`` HF dir.
+    """Convert a checkpoint with co-located HF assets to a ``from_pretrained`` dir.
 
     Keys that do not map 1:1 onto the co-located ``config.json`` raise rather
     than write a partial model.

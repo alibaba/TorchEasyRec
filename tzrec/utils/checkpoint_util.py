@@ -420,11 +420,9 @@ class CheckpointManager:
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune.
 
-        For HF-backed models, co-locates the HF config + tokenizer (no weights)
-        in this checkpoint dir so each ``model.ckpt-N/`` is self-contained and
-        convertible to HF. Deliberately not gated on ``export_format``: that is
-        an export-time knob, and gating it would make a run trained with the
-        default format permanently unexportable to HF.
+        For HF-backed models, writes the config, optional tokenizer, and state
+        dict metadata needed by HF conversion. This is not gated on
+        ``export_format`` because that setting is selected at export time.
         """
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer, dense_ema)

@@ -15,10 +15,6 @@ import os
 import unittest
 from unittest import mock
 
-from google.protobuf import text_format
-from tokenizers import Tokenizer, models, pre_tokenizers
-
-from tzrec.features.feature import FgMode, create_features
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.persist import (
     PROMPT_DIR,
@@ -27,8 +23,11 @@ from tzrec.prompt.persist import (
     read_prompt_hashes,
     save_prompt_assets,
 )
-from tzrec.protos import feature_pb2
 from tzrec.protos.prompt_pb2 import PromptConfig
+from tzrec.tests.prompt_test_util import (
+    create_prompt_feature,
+    create_prompt_tokenizer,
+)
 from tzrec.utils.test_util import make_test_dir
 
 _WORDS = ["History", "Predict", ":", "<unk>", "<|im_end|>"]
@@ -37,21 +36,14 @@ _WORDS = ["History", "Predict", ":", "<unk>", "<|im_end|>"]
 class PromptPersistTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
-        tok_path = os.path.join(self.test_dir, "tok.json")
-        tok = Tokenizer(
-            models.WordLevel(
-                vocab={w: i for i, w in enumerate(_WORDS)}, unk_token="<unk>"
+        self.tok_path = create_prompt_tokenizer(
+            os.path.join(self.test_dir, "tok.json"), _WORDS
+        )
+        self.features = [
+            create_prompt_feature(
+                'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }'
             )
-        )
-        tok.pre_tokenizer = pre_tokenizers.Whitespace()
-        tok.save(tok_path)
-        self.tok_path = tok_path
-
-        fc = feature_pb2.FeatureConfig()
-        text_format.Merge(
-            'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }', fc
-        )
-        self.features = create_features([fc], fg_mode=FgMode.FG_NONE)
+        ]
 
     def _compile(self, codebook=(4, 4, 4), prompt="History : {{hist}}"):
         cfg = PromptConfig(tokenizer=self.tok_path, prompt=prompt)

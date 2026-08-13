@@ -9,17 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backbone-agnostic half of a prompt-native generative model.
+"""Shared causal-LM plumbing for prompt-native generative models.
 
-Everything here is independent of how a family runs its transformer: building
-the LM empty, resizing to the compiled vocabulary, wiring slot projections,
-converting between the SID coordinate systems, and the checkpoint hooks.
-
-What a subclass owns is the forward: ``predict``, the teacher-forced loss and
-the decode loop. Those differ irreducibly -- a decoder-only model reaches past
-``lm(...)`` into body and head so it can score a suffix window, while an
-encoder-decoder passes labels and gets a loss back -- so they are abstract here
-rather than parameterized.
+This layer builds an empty causal LM, resizes its vocabulary, wires slot
+projections, converts SID coordinate systems and implements checkpoint hooks.
+A family subclass owns its forward and decode path.
 """
 
 from typing import Any, Dict, List, Optional
@@ -87,8 +81,7 @@ class BasePromptGenerativeModel(BaseModel):
         cfg = self._model_config
 
         self.lm = self._build_backbone(cfg.hf_model_id, cfg.common.param_dtype)
-        # only the shape matters here: every path overwrites these rows, from
-        # init_from_pretrained on a cold start or from the DCP restore otherwise
+        # Every run replaces this initialization from pretrained or DCP weights.
         self.lm.resize_token_embeddings(
             prompt.sid_space.target_vocab, mean_resizing=False
         )
@@ -104,14 +97,15 @@ class BasePromptGenerativeModel(BaseModel):
         )
 
     def _build_backbone(self, hf_model_id: str, param_dtype: int) -> nn.Module:
-        """Build the LM empty, so HF weights load only on cold start.
+        """Build the LM from config, so HF weights load only on cold start.
 
         Args:
-            hf_model_id: hub id or local directory naming the weights.
+            hf_model_id: hub id or local directory naming the architecture and
+                cold-start weights.
             param_dtype: master-weight dtype.
 
         Returns:
-            The uninitialized backbone.
+            A randomly initialized backbone with the requested parameter dtype.
         """
         config = AutoConfig.from_pretrained(hf_model_id)
         model = AutoModelForCausalLM.from_config(config)
@@ -146,7 +140,6 @@ class BasePromptGenerativeModel(BaseModel):
                 )
             aligned.append(built[module_id])
         self.projections = nn.ModuleDict(built)
-        # zipped with prompt_plan.projected_slots; shared modules appear by reference
         self._slot_projections = aligned
 
     def hf_backbone(self) -> nn.Module:
@@ -175,6 +168,7 @@ class BasePromptGenerativeModel(BaseModel):
             proj(grouped[seg.name + seg.output_key]).reshape(-1, hidden_size)
             for seg, proj in zip(prompt_plan.projected_slots, self._slot_projections)
         ]
+        # The assembler records holes in this projected-occurrence-major order.
         # out of place: embeds carries grad from the embedding lookup
         return embeds.index_copy(
             0, batch.additional_infos[PROMPT_HOLE_POSITIONS], torch.cat(parts)
@@ -195,17 +189,6 @@ class BasePromptGenerativeModel(BaseModel):
         space = self._prompt.sid_space
         codes = tokens - space.base_vocab - self._level_offsets
         return codes.view(batch_size, -1, space.num_levels)
-
-    def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Run the model over an assembled prompt.
-
-        Args:
-            batch: carries the packed prompt in ``additional_infos``.
-
-        Returns:
-            The loss when training, the decoded SIDs otherwise.
-        """
-        raise NotImplementedError
 
     def init_loss(self) -> None:
         """No-op: an LM computes its own CE inside ``predict``."""

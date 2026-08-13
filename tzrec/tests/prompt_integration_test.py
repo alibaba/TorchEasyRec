@@ -15,11 +15,8 @@ import unittest
 import numpy as np
 import torch
 import torch.fx
-from google.protobuf import text_format
-from tokenizers import Tokenizer, models, pre_tokenizers
 
 from tzrec.datasets.utils import Batch
-from tzrec.features.feature import FgMode, create_features
 from tzrec.main import _create_model
 from tzrec.models.prompt_generative_qwen import _unpack
 from tzrec.prompt.assembler import (
@@ -28,48 +25,18 @@ from tzrec.prompt.assembler import (
     PROMPT_MAX_SEQLEN,
 )
 from tzrec.prompt.compile import compile_prompt
-from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
-from tzrec.tests.prompt_test_util import assemble_into
+from tzrec.tests.prompt_test_util import (
+    assemble_into,
+    create_prompt_feature,
+    create_prompt_tokenizer,
+    offset_sid_codes,
+)
 from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
 _CODEBOOK = [4, 4, 4]
 _WORDS = ["History", "Predict", ":", ".", "<unk>", "<|im_end|>"]
-
-
-def _tiny_backbone(path: str) -> str:
-    """The shared tiny Qwen, saved locally so no download is needed."""
-    create_tiny_causal_lm(64).save_pretrained(path)
-    return path
-
-
-def _tokenizer(path: str) -> str:
-    tok = Tokenizer(
-        models.WordLevel(vocab={w: i for i, w in enumerate(_WORDS)}, unk_token="<unk>")
-    )
-    tok.pre_tokenizer = pre_tokenizers.Whitespace()
-    tok.save(path)
-    return path
-
-
-def _features():
-    text = (
-        'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }',
-        'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }',
-    )
-    out = []
-    for one in text:
-        fc = feature_pb2.FeatureConfig()
-        text_format.Merge(one, fc)
-        out.append(create_features([fc], fg_mode=FgMode.FG_NONE)[0])
-    return out
-
-
-def _offset(codes):
-    """Shift local codes into the flat space, as the SID tool's column does."""
-    offsets = np.cumsum([0] + _CODEBOOK[:-1])
-    return (np.asarray(codes).reshape(-1, len(_CODEBOOK)) + offsets).reshape(-1)
 
 
 class PromptStackIntegrationTest(unittest.TestCase):
@@ -77,9 +44,19 @@ class PromptStackIntegrationTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
-        self.backbone = _tiny_backbone(os.path.join(self.test_dir, "backbone"))
-        self.tok = _tokenizer(os.path.join(self.test_dir, "tok.json"))
-        self.features = _features()
+        self.backbone = os.path.join(self.test_dir, "backbone")
+        create_tiny_causal_lm(64).save_pretrained(self.backbone)
+        self.tok = create_prompt_tokenizer(
+            os.path.join(self.test_dir, "tok.json"), _WORDS
+        )
+        self.features = [
+            create_prompt_feature(text)
+            for text in (
+                'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }',
+                'sequence_raw_feature { feature_name: "answer" '
+                'expression: "item:answer" }',
+            )
+        ]
 
         cfg = PromptConfig(
             tokenizer=self.tok,
@@ -100,26 +77,19 @@ class PromptStackIntegrationTest(unittest.TestCase):
         )
 
     def _batch(self, hist, answer):
-        parsed = {
-            "hist.values": torch.tensor(_offset(hist)),
-            "hist.lengths": torch.tensor([len(hist)]),
-            "answer.values": torch.tensor(_offset(answer)),
-            "answer.lengths": torch.tensor([len(answer)]),
-        }
-        streams = assemble_into(self.prompt, parsed)
-        batch = Batch()
-        batch.additional_infos.update(
-            {k: torch.from_numpy(np.asarray(v)) for k, v in streams.items()}
-        )
-        return batch
+        return self._batch_rows([(hist, answer)])
 
     def _batch_rows(self, rows):
         hist = [h for h, _ in rows]
         answer = [a for _, a in rows]
         parsed = {
-            "hist.values": torch.tensor(_offset([c for h in hist for c in h])),
+            "hist.values": torch.tensor(
+                offset_sid_codes([c for h in hist for c in h], _CODEBOOK)
+            ),
             "hist.lengths": torch.tensor([len(h) for h in hist]),
-            "answer.values": torch.tensor(_offset([c for a in answer for c in a])),
+            "answer.values": torch.tensor(
+                offset_sid_codes([c for a in answer for c in a], _CODEBOOK)
+            ),
             "answer.lengths": torch.tensor([len(a) for a in answer]),
         }
         streams = assemble_into(self.prompt, parsed)
@@ -132,7 +102,6 @@ class PromptStackIntegrationTest(unittest.TestCase):
     def test_every_row_is_supervised_whatever_its_length(self) -> None:
         # a short row must not lose its answer to padding: the loss keeps a
         # fixed-width suffix, so both rows have to contribute equally
-        # one history item against two, so the assembled rows differ in width
         batch = self._batch_rows(
             [([0, 1, 2], [1, 2, 3]), ([0, 1, 2, 3, 0, 1], [2, 3, 0])]
         )
@@ -157,7 +126,6 @@ class PromptStackIntegrationTest(unittest.TestCase):
         model = self._model()
         rows = model.lm.get_input_embeddings().weight.shape[0]
         self.assertEqual(rows, self.prompt.sid_space.target_vocab)
-        # every SID atom has a row
         self.assertGreater(rows, self.prompt.sid_space.band_hi[-1])
 
     def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:

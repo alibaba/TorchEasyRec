@@ -21,6 +21,18 @@ import torch
 from transformers import PreTrainedModel
 
 
+def _capped_beam_widths(
+    beam_widths: Sequence[int], band_sizes: Sequence[int]
+) -> List[int]:
+    """Cap each requested width to the candidates reachable at that level."""
+    capped_widths: List[int] = []
+    previous_width = 1
+    for requested, band_size in zip(beam_widths, band_sizes):
+        capped_widths.append(min(requested, previous_width * band_size))
+        previous_width = capped_widths[-1]
+    return capped_widths
+
+
 @torch.no_grad()
 def dynamic_beam_search(
     model: PreTrainedModel,
@@ -43,7 +55,7 @@ def dynamic_beam_search(
 
     Returns:
         The SID token tail ``(B * W, num_levels)``, score-ordered best-first.
-        The answer is fixed-length and EOS-free, so no beam bookkeeping.
+        The fixed-length, EOS-free answer needs no finished-sequence bookkeeping.
     """
     device = prompt_embeds.device
     batch_size = prompt_embeds.shape[0]
@@ -57,17 +69,15 @@ def dynamic_beam_search(
         raise ValueError(
             f"dynamic_beam_search: beam_widths must be >= 1, got {list(beam_widths)}."
         )
-    capped_widths: List[int] = []
-    prev_width = 1
-    for requested, (band_lo, band_hi) in zip(beam_widths, bands):
-        capped_widths.append(min(requested, prev_width * (band_hi - band_lo + 1)))
-        prev_width = capped_widths[-1]
+    capped_widths = _capped_beam_widths(
+        beam_widths, [band_hi - band_lo + 1 for band_lo, band_hi in bands]
+    )
 
     def _band_logp(logits: torch.Tensor, level: int) -> torch.Tensor:
         """Full-vocab log-probs, narrowed to ``level``'s band ``(rows, band)``.
 
-        Normalize then slice: same ranking as a full-vocab log_softmax, 21x less
-        memory at production vocab.
+        Normalize then slice: same ranking as a full-vocab log_softmax without
+        materializing a second full-vocabulary log-probability tensor.
         """
         band_lo, band_hi = bands[level]
         log_z = torch.logsumexp(logits.float(), dim=-1, keepdim=True)

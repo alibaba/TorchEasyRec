@@ -124,7 +124,6 @@ def create_tiny_causal_lm(
     vocab_size: int,
     seed: int = 0,
     tie_word_embeddings: bool = False,
-    max_position_embeddings: int = 64,
 ) -> nn.Module:
     """A 2-layer Qwen2 causal LM cheap enough to build inside a unit test.
 
@@ -135,25 +134,25 @@ def create_tiny_causal_lm(
         vocab_size (int): rows in the embedding table.
         seed (int): torch seed the random init draws from.
         tie_word_embeddings (bool): tie ``lm_head`` to the input embedding.
-        max_position_embeddings (int): longest sequence the backbone accepts.
 
     Returns:
         an eval-mode ``Qwen2ForCausalLM``.
     """
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
-    torch.manual_seed(seed)
-    config = Qwen2Config(
-        vocab_size=vocab_size,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=max_position_embeddings,
-        tie_word_embeddings=tie_word_embeddings,
-    )
-    return Qwen2ForCausalLM(config).eval()
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        config = Qwen2Config(
+            vocab_size=vocab_size,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            tie_word_embeddings=tie_word_embeddings,
+        )
+        return Qwen2ForCausalLM(config).eval()
 
 
 # pyre-ignore [2]

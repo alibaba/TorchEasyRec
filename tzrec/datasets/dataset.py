@@ -42,7 +42,7 @@ from tzrec.datasets.utils import (
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.prompt.assembler import PromptAssembler
-from tzrec.prompt.plan import CompiledPrompt
+from tzrec.prompt.plan import CompiledPrompt, SlotSeg
 from tzrec.protos import data_pb2
 from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
@@ -100,6 +100,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         mode (Mode): train or eval or predict.
         debug_level (int): dataset debug level, when mode=predict and
             debug_level > 0, will dump fg encoded data to debug_str
+        prompt (CompiledPrompt, optional): compiled prompt assembly contract.
+        prompt_ignore_index (int): label value outside the supervised response.
     """
 
     def __init__(
@@ -111,11 +113,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         mode: Mode = Mode.EVAL,
         debug_level: int = 0,
         prompt: Optional[CompiledPrompt] = None,
+        prompt_ignore_index: int = -100,
     ) -> None:
         super(BaseDataset, self).__init__()
-        # built once per worker: the plan it walks is fixed for the run
         self._assembler = (
-            PromptAssembler(prompt.prompt_plan, prompt.sid_space)
+            PromptAssembler(
+                prompt.prompt_plan,
+                prompt.sid_space,
+                ignore_index=prompt_ignore_index,
+                include_response=mode != Mode.PREDICT,
+            )
             if prompt is not None
             else None
         )
@@ -131,8 +138,25 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             else None
         )
 
+        parser_features = features
+        if prompt is not None and mode == Mode.PREDICT:
+            prompt_feature_names = {
+                feature_name
+                for segment in prompt.prompt_plan.segments
+                if isinstance(segment, SlotSeg)
+                for feature_name in segment.feature_names
+            }
+            response_feature_names = {
+                feature_name
+                for segment in prompt.prompt_plan.response_segments
+                if isinstance(segment, SlotSeg)
+                for feature_name in segment.feature_names
+            }
+            response_only = response_feature_names - prompt_feature_names
+            parser_features = [f for f in features if f.name not in response_only]
+
         self._data_parser = DataParser(
-            features=features,
+            features=parser_features,
             labels=list(data_config.label_fields)
             if self._mode != Mode.PREDICT
             else None,
@@ -781,6 +805,7 @@ def create_dataloader(
     debug_level: int = 0,
     checkpoint_state: Optional[Dict[str, Any]] = None,
     prompt: Optional[CompiledPrompt] = None,
+    prompt_ignore_index: int = -100,
 ) -> DataLoader:
     """Build dataloader.
 
@@ -797,6 +822,7 @@ def create_dataloader(
             eager ``iter()`` forks workers so it reaches them.
         prompt (CompiledPrompt, optional): when set, each batch carries the
             assembled prompt streams in ``additional_infos``.
+        prompt_ignore_index (int): label value outside the supervised response.
 
     Return:
         dataloader (dataloader): a DataLoader.
@@ -812,6 +838,7 @@ def create_dataloader(
         mode=mode,
         debug_level=debug_level,
         prompt=prompt,
+        prompt_ignore_index=prompt_ignore_index,
     )
     if checkpoint_state:
         dataset.load_state_dict(dict(checkpoint_state))

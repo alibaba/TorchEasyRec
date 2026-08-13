@@ -59,7 +59,7 @@ class Width:
                 raise ValueError("UNBOUNDED width cannot carry a count.")
         elif self.num_positions is None or self.num_positions < 0:
             raise ValueError(
-                f"{self.kind.name} width needs a count >= 0, got {self.n}."
+                f"{self.kind.name} width needs a count >= 0, got {self.num_positions}."
             )
 
 
@@ -97,11 +97,6 @@ class ResolvedSidSpace:
     eos_token_id: int
     pad_token_id: int
 
-    @property
-    def sid_vocab_size(self) -> int:
-        """Atoms appended to the backbone vocabulary."""
-        return sum(self.codebook)
-
 
 @dataclass(frozen=True)
 class Static:
@@ -119,14 +114,13 @@ class SlotSeg:
     """One ``{{name}}`` position in the assembled stream.
 
     Args:
-        slot_id: index into ``PromptPlan.projected_slots`` ordering.
+        slot_id: stable identifier assigned to the distinct prompt slot.
         name: the placeholder name; also the derived group name.
         feature_names: member feature names.
         group_type: DEEP or JAGGED_SEQUENCE.
         output_key: "" for DEEP, ".sequence" otherwise.
         fill: INLINE writes token ids, PROJECTED writes sentinels and a hole.
         width: position count of this slot.
-        droppable: whether an empty value removes the slot and its folded text.
     """
 
     slot_id: int
@@ -136,7 +130,6 @@ class SlotSeg:
     output_key: str
     fill: FillMode
     width: Width
-    droppable: bool
 
 
 Segment = Union[Static, SlotSeg]
@@ -154,8 +147,7 @@ class PromptPlan:
         max_holes: per-row projected-position ceiling, not a runtime shape.
         logits_suffix_len: upper bound on the supervised logits window.
         static_prefix_len: leading positions that are request-invariant.
-        length_buckets: sampler and graph-capture buckets.
-        projected_slots: fixes the order hole positions are written in.
+        projected_slots: PROJECTED occurrences in emission order.
     """
 
     segments: Tuple[Segment, ...]
@@ -165,7 +157,6 @@ class PromptPlan:
     max_holes: int
     logits_suffix_len: Optional[int]
     static_prefix_len: int
-    length_buckets: Tuple[int, ...]
     projected_slots: Tuple[SlotSeg, ...]
 
 

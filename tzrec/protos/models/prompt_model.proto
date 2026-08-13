@@ -20,7 +20,7 @@ message PromptModelConfig {
     // REQUIRED. Beam width per SID level, one entry per level; [100, 200, 400]
     // is the escalating beam. Each entry is capped to what its band supplies.
     repeated uint32 beam_widths = 2;
-    // Must not exceed the final beam width.
+    // Must not exceed the final width after per-level candidate capping.
     required uint32 num_return_sequences = 3;
 
     optional string generated_sids_key = 4 [default = "generated_sids"];
@@ -34,7 +34,8 @@ message PromptModelConfig {
 message PromptGenerativeQwen {
     optional PromptModelConfig common = 1;
 
-    // HF hub id or local path. Names the WEIGHTS only, and is read solely by
-    // init_from_pretrained at cold start; the vocabulary is prompt_config's.
+    // HF hub id or local path. Names the architecture used for every model build
+    // and the weights loaded by init_from_pretrained at cold start; the vocabulary
+    // is prompt_config's.
     optional string hf_model_id = 2 [default = "Qwen/Qwen2.5-0.5B"];
 }

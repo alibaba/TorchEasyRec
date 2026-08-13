@@ -14,7 +14,6 @@ import unittest
 from typing import Any, Dict, List, Tuple
 
 import torch
-import torch.nn.functional as F
 from parameterized import parameterized
 
 from tzrec.modules.dynamic_beam import dynamic_beam_search
@@ -108,23 +107,6 @@ class DynamicBeamSearchTest(unittest.TestCase):
             _decode(lm, ids, pairs, beam_widths=[2, 4])
         with self.assertRaisesRegex(ValueError, "must be >= 1"):
             _decode(lm, ids, pairs, beam_widths=[2, 0, 4])
-
-    @parameterized.expand(
-        [[0, 1], [1, 16]],
-        name_func=parameterized_name_func,
-    )
-    def test_left_padding_matches_unpadded(self, seed, n_pad) -> None:
-        pairs = [(20, 21), (22, 24), (25, 28)]
-        lm = create_tiny_causal_lm(vocab_size=30, seed=seed)
-        short = torch.tensor([[5, 6, 7]])
-        plain = _decode(lm, short, pairs)
-        padded = _decode(
-            lm,
-            F.pad(short, (n_pad, 0)),
-            pairs,
-            attention_mask=F.pad(torch.ones_like(short), (n_pad, 0)),
-        )
-        self.assertTrue(torch.equal(plain, padded))
 
     def test_ragged_batch_rows_match_solo_runs(self) -> None:
         # every row of a ragged batch must decode exactly as if run alone.

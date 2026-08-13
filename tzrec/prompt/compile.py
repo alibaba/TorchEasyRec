@@ -127,8 +127,8 @@ def _atom_tokens(sid_space: SidSpace) -> List[str]:
     return [fmt.replace("{i}", str(i)) for i in range(sum(sid_space.codebook))]
 
 
-def _read_manifest_codebook(path: str) -> Optional[List[int]]:
-    """Read ``codebook`` from a SID manifest, or None when there is no file."""
+def _read_manifest_codebook(path: str) -> List[int]:
+    """Read ``codebook`` from a SID manifest."""
     if not os.path.exists(path):
         raise ValueError(f"sid_space.manifest_path [{path}] does not exist.")
     with open(path, "r") as f:
@@ -263,6 +263,12 @@ def compile_prompt(
 
     types = {n: _group_type(n, members[n]) for n in slots}
     fills = {n: _derive_fill(members[n]) for n in slots}
+    for name in resp_names:
+        if fills[name] is FillMode.PROJECTED:
+            raise ValueError(
+                f"response slot [{name}] is PROJECTED; response slots must be "
+                "INLINE because the LM generates them as vocabulary tokens."
+            )
     has_projection = any(f is FillMode.PROJECTED for f in fills.values())
 
     for name, slot in slots.items():
@@ -302,7 +308,6 @@ def compile_prompt(
             output_key=".sequence" if seq else "",
             fill=fills[name],
             width=_slot_width(members[name], types[name], levels),
-            droppable=bool(slot.drop_if_empty),
         )
 
     body = _weave(body_runs, body_names, segs, tok)
@@ -323,7 +328,6 @@ def compile_prompt(
         max_holes=_max_holes(projected),
         logits_suffix_len=_suffix_keep(response),
         static_prefix_len=_static_prefix_len(body),
-        length_buckets=tuple(int(b) for b in cfg.length_buckets),
         projected_slots=projected,
     )
     _validate(cfg, plan, sid_space)
@@ -455,20 +459,20 @@ def _validate(
             "prompt has an unbounded slot and max_length is 0; graph-captured "
             "serving cannot size its buckets."
         )
-    if any(isinstance(s, SlotSeg) for s in plan.segments):
-        first_slot = next(
-            i for i, s in enumerate(plan.segments) if isinstance(s, SlotSeg)
-        )
-        later_static = any(
-            isinstance(s, SlotSeg) and s.width.kind is WidthKind.STATIC
-            for s in plan.segments[first_slot + 1 :]
-        )
-        if later_static:
+    variable_slot_seen = False
+    for seg in plan.segments:
+        if not isinstance(seg, SlotSeg):
+            continue
+        if seg.width.kind is WidthKind.STATIC:
+            if not variable_slot_seen:
+                continue
             logger.warning(
                 "a variable-width prompt slot precedes a fixed-width one; "
                 f"static_prefix_len is {plan.static_prefix_len}, which bounds "
                 "what a serving prefix cache may reuse."
             )
+            break
+        variable_slot_seen = True
     if plan.response_segments and plan.logits_suffix_len is None:
         raise ValueError(
             "the response has an unbounded slot, so the supervised logits "

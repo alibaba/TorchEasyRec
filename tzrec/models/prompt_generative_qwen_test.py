@@ -20,7 +20,6 @@ class UnpackTest(unittest.TestCase):
     """The one adapter where padding lives."""
 
     def test_packs_rows_of_different_lengths(self) -> None:
-        # rows of 4 and 5 tokens, with a padded width larger than either row
         embeds = torch.arange(18, dtype=torch.float32).reshape(9, 2)
         cu = torch.tensor([0, 4, 9])
         ignore = -100
@@ -31,7 +30,6 @@ class UnpackTest(unittest.TestCase):
         )
 
         self.assertEqual(padded.shape, (2, 7, 2))
-        # pads go on the left, so every row ends on a real token
         self.assertEqual(
             mask.tolist(),
             [[0, 0, 0, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1, 1]],

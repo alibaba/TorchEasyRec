@@ -49,18 +49,25 @@ def _sid_space(codebook=(4, 4, 4)) -> ResolvedSidSpace:
     )
 
 
-def _slot(name, fill, width_n=None) -> SlotSeg:
+def _slot(
+    name,
+    fill,
+    width_n=None,
+    feature_names=None,
+    group_type=FeatureGroupType.JAGGED_SEQUENCE,
+) -> SlotSeg:
     return SlotSeg(
         slot_id=0,
         name=name,
-        feature_names=(name,),
-        group_type=FeatureGroupType.JAGGED_SEQUENCE,
-        output_key=".sequence",
+        feature_names=tuple(feature_names) if feature_names is not None else (name,),
+        group_type=group_type,
+        output_key=".sequence"
+        if group_type == FeatureGroupType.JAGGED_SEQUENCE
+        else "",
         fill=fill,
         width=Width(WidthKind.BOUNDED, width_n)
         if width_n
         else Width(WidthKind.STATIC, 1),
-        droppable=False,
     )
 
 
@@ -78,7 +85,6 @@ def _plan(segments, response=(), max_length=0) -> PromptPlan:
         max_holes=0,
         logits_suffix_len=None,
         static_prefix_len=0,
-        length_buckets=(),
         projected_slots=projected,
     )
 
@@ -101,7 +107,7 @@ class PromptAssemblerTest(unittest.TestCase):
         asm = PromptAssembler(plan, _sid_space())
         out = asm.assemble({}, {"prof": np.array([2, 3])}, batch_size=2)
 
-        # row 0: [7, S, S]   row 1: [7, S, S, S]
+        # sample 0: [7, S, S]   sample 1: [7, S, S, S]
         self.assertEqual(
             out.input_ids.tolist(),
             [7, _SENTINEL, _SENTINEL, 7, _SENTINEL, _SENTINEL, _SENTINEL],
@@ -110,19 +116,40 @@ class PromptAssemblerTest(unittest.TestCase):
         # absolute indices into the flat buffer, which is what index_copy needs
         self.assertEqual(out.hole_positions.tolist(), [1, 2, 4, 5, 6])
 
+    def test_holes_are_grouped_by_projected_occurrence_then_sample(self) -> None:
+        plan = _plan(
+            (
+                _slot("a", FillMode.PROJECTED, 2),
+                Static((7,)),
+                _slot("b", FillMode.PROJECTED, 2),
+                _slot("a", FillMode.PROJECTED, 2),
+            )
+        )
+        asm = PromptAssembler(plan, _sid_space())
+        out = asm.assemble(
+            {},
+            {"a": np.array([1, 2]), "b": np.array([2, 1])},
+            batch_size=2,
+        )
+
+        self.assertEqual(out.cu_seqlens.tolist(), [0, 5, 11])
+        self.assertEqual(out.hole_positions.tolist(), [0, 5, 6, 2, 3, 8, 4, 9, 10])
+
     def test_labels_cover_the_response_span_only(self) -> None:
         plan = _plan(
             (Static((7, 8)),),
             response=(Static((9,)), _slot("answer", FillMode.INLINE)),
         )
-        asm = PromptAssembler(plan, _sid_space())
+        asm = PromptAssembler(plan, _sid_space(), ignore_index=-7)
         out = asm.assemble({"answer": [np.array([0, 4, 8])]})
 
         self.assertEqual(out.input_ids.tolist(), [7, 8, 9, _BASE, _BASE + 4, _BASE + 8])
-        # the prompt is context; supervision starts at the response
-        self.assertEqual(
-            out.labels.tolist(), [-100, -100, 9, _BASE, _BASE + 4, _BASE + 8]
-        )
+        self.assertEqual(out.labels.tolist(), [-7, -7, 9, _BASE, _BASE + 4, _BASE + 8])
+
+        prompt_only = PromptAssembler(
+            plan, _sid_space(), ignore_index=-7, include_response=False
+        ).assemble({}, batch_size=1)
+        self.assertEqual(prompt_only.input_ids.tolist(), [7, 8])
 
     def test_rejects_raw_codes_that_carry_no_offset(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
@@ -175,6 +202,72 @@ class PromptAssemblerTest(unittest.TestCase):
         out = assemble_into(prompt, parsed)
         self.assertEqual(out["prompt_cu_seqlens"].tolist(), [0, 3, 6])
         self.assertEqual(out["prompt_input_ids"].tolist()[0], _BASE + 1)
+
+    def test_rejects_inconsistent_slot_batch_sizes(self) -> None:
+        plan = _plan(
+            (
+                _slot("hist", FillMode.INLINE),
+                _slot("answer", FillMode.INLINE),
+            )
+        )
+        asm = PromptAssembler(plan, _sid_space())
+        parsed = {
+            "hist.values": np.array([1, 6, 11]),
+            "hist.lengths": np.array([3]),
+            "answer.values": np.array([0, 4, 8, 1, 6, 11]),
+            "answer.lengths": np.array([3, 3]),
+        }
+        with self.assertRaisesRegex(
+            ValueError, r"prompt slot \[answer\] has 2 samples, expected 1"
+        ):
+            asm.assemble_batch(parsed)
+
+    def test_rejects_mismatched_projected_member_lengths(self) -> None:
+        plan = _plan(
+            (
+                _slot(
+                    "profile",
+                    FillMode.PROJECTED,
+                    4,
+                    feature_names=("age", "country"),
+                ),
+            )
+        )
+        asm = PromptAssembler(plan, _sid_space())
+        parsed = {
+            "age.lengths": np.array([2, 1]),
+            "country.lengths": np.array([2, 2]),
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"PROJECTED features \[age\] and \[country\] have different",
+        ):
+            asm.assemble_batch(parsed)
+
+    def test_deep_projected_members_emit_one_hole_per_sample(self) -> None:
+        plan = _plan(
+            (
+                _slot(
+                    "profile",
+                    FillMode.PROJECTED,
+                    feature_names=("dense", "sparse"),
+                    group_type=FeatureGroupType.DEEP,
+                ),
+            )
+        )
+        asm = PromptAssembler(plan, _sid_space())
+        out = asm.assemble_batch(
+            {
+                "dense.values": np.array([[1.0, 2.0], [3.0, 4.0]]),
+                "sparse.values": np.array([5, 6, 7]),
+                "sparse.lengths": np.array([2, 1]),
+            }
+        )
+
+        self.assertEqual(out["prompt_input_ids"].tolist(), [_SENTINEL, _SENTINEL])
+        self.assertEqual(out["prompt_cu_seqlens"].tolist(), [0, 1, 2])
+        self.assertEqual(out["prompt_hole_positions"].tolist(), [0, 1])
 
 
 if __name__ == "__main__":

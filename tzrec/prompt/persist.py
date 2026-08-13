@@ -13,8 +13,8 @@
 
 A checkpoint that cannot describe its own vocabulary is a checkpoint serving
 has to be told about out of band, which is where offline/online skew comes
-from. ``ProjectionPlan`` is deliberately absent: it is model-only and rebuilt from
-config at every ``__init__``.
+from. ``ProjectionPlan`` is deliberately absent: it is model-only and rebuilt by
+``compile_prompt`` from config before model construction.
 """
 
 import dataclasses

@@ -44,7 +44,7 @@ class _FakeTokenizer:
 
 
 class _GenRec(nn.Module):
-    """Stand-in for a prompt-native model: an HF backbone plus unrelated params."""
+    """Stand-in for an HF-backed model exposing the optional tokenizer protocol."""
 
     def __init__(self, lm):
         super().__init__()
@@ -93,11 +93,11 @@ class HfExportUtilTest(unittest.TestCase):
         object.__setattr__(a, "model", b)
         object.__setattr__(b, "model", a)
         out = []
-        t = threading.Thread(target=lambda: out.append(unwrap_to_hf(a)))
+        t = threading.Thread(target=lambda: out.append(unwrap_to(a, "hf_backbone")))
         t.daemon = True
         t.start()
         t.join(timeout=5)
-        self.assertFalse(t.is_alive(), "_unwrap_hf_model did not terminate")
+        self.assertFalse(t.is_alive(), "unwrap_to did not terminate")
         self.assertEqual(out, [None])
 
     def test_write_hf_assets_noop_for_non_hf_model(self) -> None:
@@ -105,8 +105,8 @@ class HfExportUtilTest(unittest.TestCase):
         write_hf_assets(_TrainWrapper(nn.Linear(4, 4)), save_dir)
         self.assertFalse(os.path.exists(save_dir))
 
-    def _save_ckpt(self, wrapped, name="model.ckpt-1"):
-        ckpt_dir = os.path.join(self.test_dir, name)
+    def _save_ckpt(self, wrapped):
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-1")
         save_model(ckpt_dir, wrapped)
         write_hf_assets(wrapped, ckpt_dir)
         return ckpt_dir
@@ -159,11 +159,6 @@ class HfExportUtilTest(unittest.TestCase):
         os.makedirs(empty, exist_ok=True)
         with self.assertRaisesRegex(RuntimeError, "not exists"):
             dcp_to_hf(empty, os.path.join(self.test_dir, "hf_out_missing"))
-
-
-def unwrap_to_hf(model):
-    """The walk write_hf_assets performs, under test."""
-    return unwrap_to(model, "hf_backbone")
 
 
 if __name__ == "__main__":

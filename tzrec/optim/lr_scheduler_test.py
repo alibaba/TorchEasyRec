@@ -101,13 +101,10 @@ class LRSchedulerTest(unittest.TestCase):
             opt, num_training_steps=6, warmup_size=2, warmup_learning_rate=0.002
         )
         self.assertFalse(lr.by_epoch)
-        # warmup step 0->1: scale=0.5, lr=0.002+(0.01-0.002)*0.5=0.006
         lr.step()
         self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.006)
-        # warmup step 1->2: scale=1.0, lr=0.01
         lr.step()
         self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.01)
-        # decay over remaining 4 steps: 0.0075, 0.005, 0.0025, 0.0
         for lr_gt in [0.0075, 0.005, 0.0025, 0.0, 0.0]:
             lr.step()
             self.assertAlmostEqual(opt.param_groups[0]["lr"], lr_gt)

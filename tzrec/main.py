@@ -127,16 +127,20 @@ def _create_features(
 def _compile_prompt(
     pipeline_config: EasyRecConfig, features: List[BaseFeature]
 ) -> Optional[CompiledPrompt]:
-    """Compile prompt_config when the pipeline declares one.
-
-    Runs on every entry point, so the plan the data layer walks and the vocab
-    the model resizes to are produced by one code path.
-    """
+    """Compile prompt_config for entry points that build prompt-aware objects."""
     if not pipeline_config.HasField("prompt_config"):
         return None
     return compile_prompt(
         pipeline_config.prompt_config, features, model_dir=pipeline_config.model_dir
     )
+
+
+def _prompt_ignore_index(pipeline_config: EasyRecConfig) -> int:
+    """Return the label sentinel configured by a prompt-native model."""
+    model_type = pipeline_config.model_config.WhichOneof("model")
+    if model_type != "prompt_generative_qwen":
+        return -100
+    return int(getattr(pipeline_config.model_config, model_type).common.ignore_index)
 
 
 def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
@@ -718,6 +722,7 @@ def train_and_evaluate(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
     prompt = _compile_prompt(pipeline_config, features)
+    prompt_ignore_index = _prompt_ignore_index(pipeline_config)
 
     ckpt_manager = checkpoint_util.CheckpointManager(
         pipeline_config.model_dir,
@@ -771,6 +776,7 @@ def train_and_evaluate(
         pipeline_config.train_input_path,
         mode=Mode.TRAIN,
         prompt=prompt,
+        prompt_ignore_index=prompt_ignore_index,
         checkpoint_state=dataloader_state,
     )
     eval_dataloader = None
@@ -783,6 +789,7 @@ def train_and_evaluate(
             pipeline_config.eval_input_path,
             mode=Mode.EVAL,
             prompt=prompt,
+            prompt_ignore_index=prompt_ignore_index,
             gl_cluster=gl_cluster,
         )
 
@@ -999,6 +1006,7 @@ def evaluate(
         eval_input_path or pipeline_config.eval_input_path,
         mode=Mode.EVAL,
         prompt=prompt,
+        prompt_ignore_index=_prompt_ignore_index(pipeline_config),
     )
 
     sampler_type = _get_sampler_type(data_config)
@@ -1150,8 +1158,7 @@ def export(
             from tzrec.utils.hf_export_util import dcp_to_hf
 
             dcp_to_hf(checkpoint_path, export_dir)
-            # this branch never builds a model, so save_assets cannot run; the
-            # checkpoint already carries the contract, so copy it forward
+            # Carry the prompt contract saved alongside the checkpoint.
             copy_prompt_assets(checkpoint_path, export_dir)
         return
 
@@ -1167,7 +1174,6 @@ def export(
 
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
-    prompt = _compile_prompt(pipeline_config, features)
 
     # Build model
     model = _create_model(
@@ -1175,7 +1181,6 @@ def export(
         features,
         list(data_config.label_fields),
         sampler_type=None,
-        prompt=prompt,
     )
     InferWrapper = ScriptWrapper
     # Flip to inference *before* wrapping so view-dependent state
