@@ -567,10 +567,10 @@ class DeltaEmbeddingDumper:
             auto_compact=True,
         )
         self._zch_modules = self._collect_zch_modules()
-        # Per-table snapshot of the previous dump's (raw id, local row) binding,
-        # kept on CPU; comparing bindings, not just id membership, catches an id
-        # evicted and re-admitted between two dumps.
-        self._zch_snapshots: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        # Raw ids evicted since the last dump, appended by the admit/evict
+        # event hook and drained per dump; kept apart from the tracker store
+        # because evicted ids are published with the fallback row.
+        self._zch_evicted: Dict[str, List[torch.Tensor]] = {}
         self._table_shard_infos = self._collect_table_shard_infos()
         self._validate_supported_table_sharding(self._table_shard_infos)
         self._install_tracking_pause_guard()
@@ -610,14 +610,12 @@ class DeltaEmbeddingDumper:
         """Clear tracked sparse ids, usually after restore-time dummy steps.
 
         The restored model state is the baseline the serving side already
-        holds, so re-snapshot the ZCH tables here; the next dump then reports
-        only the delta against the restored state instead of republishing it.
+        holds, so admit/evict events recorded during the dummy forwards are
+        dropped together with the tracked ids; the next dump then reports
+        only the delta against the restored state.
         """
         self._tracker.clear(_CONSUMER)
-        table_weights = self._collect_table_weights()
-        for fqn, mch in self._zch_modules.items():
-            raw_ids, rows = self._zch_current_rows(mch, fqn, table_weights)
-            self._zch_snapshots[fqn] = (raw_ids.cpu(), rows.cpu())
+        self._zch_evicted.clear()
 
     @contextmanager
     def pause_tracking(self) -> Iterator[None]:
@@ -853,8 +851,8 @@ class DeltaEmbeddingDumper:
                 continue
             ids = ids.unique(sorted=True)
             if fqn in self._zch_modules:
-                # ZCH rows are emitted by the snapshot diff, which merges the
-                # touched ids with admitted ids and adds eviction corrections.
+                # ZCH tracker ids are raw ids; their rows are emitted together
+                # with the admit/evict event corrections below.
                 zch_touched[fqn] = ids
                 continue
             embeddings, key_ids = self._lookup_embeddings(
@@ -892,9 +890,6 @@ class DeltaEmbeddingDumper:
         dynamic_modules: Dict[str, nn.Module],
         flushed_module_ids: Optional[Set[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        zch_module = self._zch_modules.get(fqn)
-        if zch_module is not None:
-            return self._lookup_zch_embeddings(zch_module, fqn, ids, table_weights)
         dynamic_module = dynamic_modules.get(fqn)
         if dynamic_module is not None:
             return self._lookup_dynamic_embeddings(
@@ -926,166 +921,53 @@ class DeltaEmbeddingDumper:
         key_ids = local_ids + table_weight.shard_info.row_offset
         return weight[local_ids].detach(), key_ids
 
-    def _lookup_zch_embeddings(
+    def _zch_rows_of_raw_ids(
         self,
         zch_module: MCHManagedCollisionModule,
         fqn: str,
-        ids: torch.Tensor,
-        table_weights: Dict[str, _TableWeight],
+        weight: torch.Tensor,
+        raw_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Look up embeddings for tracker-touched rows of one ZCH table.
+        """Map unique raw ids to the local rows one ZCH table shard holds.
+
+        ``_mch_sorted_raw_ids`` is kept sorted by the MCH module, so a
+        forward searchsorted resolves each raw id to its slot and row without
+        inverting the slot to row mapping.
 
         Args:
             zch_module: ZCH module owning the table shard's id to row mapping.
-            fqn: tracked table FQN, for the weight lookup and error messages.
-            ids: remapped local embedding rows the tracker recorded as touched.
-            table_weights: per-table local weight shards.
+            fqn: tracked table FQN, for error messages.
+            weight: the table's local weight shard.
+            raw_ids: unique raw ids to resolve.
 
         Returns:
-            The touched rows' embeddings and the raw ZCH feature ids they are
-            bound to. Keys are raw ids, not rows, because serving looks ZCH
-            embeddings up by raw id; rows bound to the fallback row are dropped
-            since that row is served for every unmatched id at once.
+            A mask over ``raw_ids`` marking the ids currently held by the
+            shard, and the local embedding row bound to each held id.
 
         Raises:
-            KeyError: if the table has no local weight shard.
-            ValueError: if the row to slot mapping is not a permutation of the
-                shard row range, or a touched row falls outside the shard.
-        """
-        if fqn not in table_weights:
-            raise KeyError(f"Embedding table {fqn} not found in sharded model.")
-        table_weight = table_weights[fqn]
-        _validate_table_shard_info(fqn, table_weight.shard_info)
-        weight = table_weight.tensor
-        ids = ids.to(weight.device, dtype=torch.long)
-        valid_mask = (ids >= 0) & (ids < weight.size(0))
-        if not bool(valid_mask.all().item()):
-            logger.warning(
-                "Skip %s ids outside table %s row range [0, %s).",
-                int((~valid_mask).sum().item()),
-                fqn,
-                weight.size(0),
-            )
-            ids = ids[valid_mask]
-        # The row remap() serves unmatched raw ids on; its embedding is the
-        # whole shard's fallback, not the delta of any single raw id, so the
-        # rows tracked through it are dropped from the delta.
-        default_row = zch_module._zch_size - 1
-        default_mask = ids != default_row
-        if not bool(default_mask.all().item()):
-            logger.debug(
-                "Skip %s zch fallback-row ids for table %s.",
-                int((~default_mask).sum().item()),
-                fqn,
-            )
-            ids = ids[default_mask]
-        if ids.numel() == 0:
-            return (
-                torch.empty(
-                    0, weight.size(1), device=weight.device, dtype=weight.dtype
-                ),
-                torch.empty(0, device=weight.device, dtype=torch.int64),
-            )
-        # _mch_sorted_raw_ids maps slot -> raw id while
-        # _mch_remapped_ids_mapping maps slot -> global row, so inverting the
-        # mapping turns the tracker's local rows back into ZCH slots.
-        slot_of_row = self._zch_slot_of_row(
-            zch_module, fqn, weight.device, weight.size(0)
-        )
-        slots = slot_of_row[ids]
-        if bool((slots < 0).any().item()):
-            raise ValueError(
-                f"ZCH table {fqn} slot mapping does not cover local rows "
-                f"{ids[slots < 0].tolist()} of the embedding shard; "
-                "_mch_remapped_ids_mapping is not a permutation of the shard "
-                "row range."
-            )
-        raw_ids = zch_module._mch_sorted_raw_ids.to(weight.device)[slots]
-        held_mask = raw_ids != torch.iinfo(torch.int64).max
-        if not bool(held_mask.all().item()):
-            logger.warning(
-                "Skip %s zch slots without a raw id for table %s.",
-                int((~held_mask).sum().item()),
-                fqn,
-            )
-            ids = ids[held_mask]
-            raw_ids = raw_ids[held_mask]
-        return weight[ids].detach(), raw_ids.detach()
-
-    def _zch_slot_of_row(
-        self,
-        zch_module: MCHManagedCollisionModule,
-        fqn: str,
-        device: torch.device,
-        num_local_rows: int,
-    ) -> torch.Tensor:
-        """Invert the slot -> global-row mapping into local-row -> slot.
-
-        ``_mch_remapped_ids_mapping`` must be an exact permutation of the
-        shard's row range; rows no slot maps to stay -1 so callers fail loudly
-        instead of reading a garbage slot, and rows outside the local shard
-        raise here instead of hitting a device-side index assert (e.g. a
-        resharded checkpoint whose offsets no longer match this shard).
-        """
-        mapping = zch_module._mch_remapped_ids_mapping.to(device)
-        local_rows = mapping - zch_module._output_global_offset
-        out_of_range = (local_rows < 0) | (local_rows >= num_local_rows)
-        if bool(out_of_range.any().item()):
-            raise ValueError(
-                f"ZCH table {fqn} remapped rows fall outside the local shard "
-                f"row range [0, {num_local_rows}); the checkpoint's ZCH "
-                "sharding does not match this shard."
-            )
-        slot_of_row = torch.full((num_local_rows,), -1, dtype=torch.long, device=device)
-        slot_of_row[local_rows] = torch.arange(
-            mapping.size(0), dtype=torch.long, device=device
-        )
-        return slot_of_row
-
-    def _zch_current_rows(
-        self,
-        zch_module: MCHManagedCollisionModule,
-        fqn: str,
-        table_weights: Dict[str, _TableWeight],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (raw ids, local rows) currently held by one ZCH table shard.
-
-        The fallback row is excluded because its slot holds no raw id; an
-        empty-slot entry is the int64-max sentinel and the validity mask drops
-        it together with any other unoccupied slot.
-
-        Args:
-            zch_module: ZCH module owning the table shard's id to row mapping.
-            fqn: tracked table FQN, for the weight lookup and error messages.
-            table_weights: per-table local weight shards.
-
-        Returns:
-            Ascending raw ids and the local embedding row each is bound to.
-
-        Raises:
-            KeyError: if the table has no local weight shard.
-            ValueError: if a remapped row falls outside the local shard row
+            ValueError: if a held id's row falls outside the local shard row
                 range, e.g. a resharded checkpoint whose offsets no longer
-                match this shard. Without this check a negative row would index
-                the weight from the end and an oversized row would hit a
-                device-side assert.
+                match this shard. Without this check a negative row would
+                index the weight from the end and an oversized row would hit
+                a device-side assert.
         """
-        if fqn not in table_weights:
-            raise KeyError(f"Embedding table {fqn} not found in sharded model.")
-        weight = table_weights[fqn].tensor
-        device = weight.device
-        raw_ids = zch_module._mch_sorted_raw_ids.to(device)
-        rows = zch_module._mch_remapped_ids_mapping.to(device)
-        valid_mask = raw_ids != torch.iinfo(torch.int64).max
-        local_rows = rows[valid_mask] - zch_module._output_global_offset
-        out_of_range = (local_rows < 0) | (local_rows >= weight.size(0))
+        sorted_raw_ids = zch_module._mch_sorted_raw_ids.to(weight.device)
+        slots = torch.searchsorted(sorted_raw_ids, raw_ids).clamp(
+            max=sorted_raw_ids.numel() - 1
+        )
+        held_mask = sorted_raw_ids[slots] == raw_ids
+        rows = (
+            zch_module._mch_remapped_ids_mapping.to(weight.device)[slots[held_mask]]
+            - zch_module._output_global_offset
+        )
+        out_of_range = (rows < 0) | (rows >= weight.size(0))
         if bool(out_of_range.any().item()):
             raise ValueError(
                 f"ZCH table {fqn} remapped rows fall outside the local shard "
                 f"row range [0, {weight.size(0)}); the checkpoint's ZCH "
                 "sharding does not match this shard."
             )
-        return raw_ids[valid_mask], local_rows
+        return held_mask, rows
 
     def _append_zch_delta_rows(
         self,
@@ -1094,51 +976,49 @@ class DeltaEmbeddingDumper:
         table_weights: Dict[str, _TableWeight],
         zch_touched: Dict[str, torch.Tensor],
     ) -> int:
-        """Publish ZCH lifecycle deltas the tracker alone cannot see.
+        """Publish ZCH rows for tracked raw ids and admit/evict events.
 
-        Beyond the tracker-touched rows, three lifecycle events are invisible
-        to lookup tracking: an id admitted after its only lookup (published
-        here with its trained row), an id evicted and re-admitted between two
-        dumps (present in both snapshots, but re-admission moves it to a new
-        row whose embedding was reset, so its changed binding is republished),
-        and an id evicted from the table, whose stale FeatureStore entry would
-        otherwise live forever (republished here with the fallback row the
-        model now serves for it). The published fallback row is a point-in-time
-        snapshot: the fallback row keeps training on later unmatched lookups,
+        The tracker store carries the raw ids the lookups touched plus the
+        ids the admission hook recorded, so an id admitted after its only
+        lookup is still published with its trained row. Ids no longer held by
+        the table split on the drained eviction events: an evicted id is
+        republished with the fallback row the model now serves for it, so its
+        stale FeatureStore entry cannot live forever, while a touched id that
+        was never admitted is dropped -- it keeps being served the shared
+        fallback row, and publishing per-id copies of that row would flood
+        the store with long-tail ids. The published fallback row is a
+        point-in-time snapshot: it keeps training on later unmatched lookups,
         so a permanently evicted id's value can drift until re-admission
         republishes its trained row.
+
+        Raises:
+            KeyError: if a ZCH table has no local weight shard.
         """
         num_rows = 0
         for fqn, mch in self._zch_modules.items():
-            raw_ids, rows = self._zch_current_rows(mch, fqn, table_weights)
+            evicted_chunks = self._zch_evicted.pop(fqn, [])
+            touched = zch_touched.get(fqn)
+            if touched is None and not evicted_chunks:
+                continue
+            if fqn not in table_weights:
+                raise KeyError(f"Embedding table {fqn} not found in sharded model.")
             weight = table_weights[fqn].tensor
             device = weight.device
-            prev_snapshot = self._zch_snapshots.get(fqn)
-            if prev_snapshot is not None:
-                prev_raw_ids = prev_snapshot[0].to(device)
-                prev_rows = prev_snapshot[1].to(device)
-            else:
-                prev_raw_ids = torch.empty(0, dtype=torch.long, device=device)
-                prev_rows = torch.empty(0, dtype=torch.long, device=device)
-            touched = zch_touched.get(fqn)
-            touched_raw_ids = (
-                self._lookup_zch_embeddings(mch, fqn, touched, table_weights)[1]
-                if touched is not None
-                else torch.empty(0, dtype=torch.long, device=device)
+            evicted = (
+                torch.cat(evicted_chunks).to(device).unique()
+                if evicted_chunks
+                else torch.empty(0, dtype=torch.int64, device=device)
             )
-            # raw_ids and prev_raw_ids are both ascending, so searchsorted
-            # aligns each current id with its previous binding to detect ids
-            # whose row changed since the last dump.
-            if prev_raw_ids.numel() > 0:
-                prev_index = torch.searchsorted(prev_raw_ids, raw_ids).clamp(
-                    max=prev_raw_ids.numel() - 1
-                )
-                in_prev = prev_raw_ids[prev_index] == raw_ids
-                publish_mask = (~in_prev) | (prev_rows[prev_index] != rows)
-            else:
-                publish_mask = torch.ones_like(raw_ids, dtype=torch.bool)
-            if touched_raw_ids.numel() > 0:
-                publish_mask |= torch.isin(raw_ids, touched_raw_ids, assume_unique=True)
+            parts = [evicted]
+            if touched is not None:
+                parts.append(touched.to(device, dtype=torch.long))
+            ids = torch.cat(parts).unique()
+            # The int64-max sentinel marks empty slots; a raw id colliding
+            # with it would resolve to an arbitrary free slot's row.
+            ids = ids[ids != torch.iinfo(torch.int64).max]
+            if ids.numel() == 0:
+                continue
+            held_mask, rows = self._zch_rows_of_raw_ids(mch, fqn, weight, ids)
             feature_name = _feature_name(
                 self._tracker.fqn_to_feature_names.get(fqn, [])
             )
@@ -1147,26 +1027,29 @@ class DeltaEmbeddingDumper:
                 global_step=global_step,
                 feature_name=feature_name,
                 table_fqn=fqn,
-                key_ids=raw_ids[publish_mask],
-                embeddings=weight[rows[publish_mask]].detach(),
+                key_ids=ids[held_mask],
+                embeddings=weight[rows].detach(),
                 source="model_delta_tracker",
             )
-            evicted = prev_raw_ids[
-                ~torch.isin(prev_raw_ids, raw_ids, assume_unique=True)
-            ]
-            if evicted.numel() > 0:
+            missing = ids[~held_mask]
+            stale = missing[torch.isin(missing, evicted, assume_unique=True)]
+            if stale.numel() > 0:
                 num_rows += self._append_table_chunk(
                     table_chunks,
                     global_step=global_step,
                     feature_name=feature_name,
                     table_fqn=fqn,
-                    key_ids=evicted,
+                    key_ids=stale,
                     embeddings=weight[mch._zch_size - 1].expand(
-                        evicted.numel(), weight.size(1)
+                        stale.numel(), weight.size(1)
                     ),
                     source="model_delta_tracker",
                 )
-            self._zch_snapshots[fqn] = (raw_ids.cpu(), rows.cpu())
+            dropped = int(missing.numel() - stale.numel())
+            if dropped:
+                logger.debug(
+                    "Skip %s zch ids never admitted to table %s.", dropped, fqn
+                )
         return num_rows
 
     def _lookup_dynamic_embeddings(
@@ -1298,12 +1181,14 @@ class DeltaEmbeddingDumper:
         """
         zch_modules: Dict[str, MCHManagedCollisionModule] = {}
         self._zch_inner_module_ids: Set[int] = set()
+        self._zch_outer_by_inner: Dict[int, nn.Module] = {}
         mch_by_inner_module: Dict[int, Dict[str, MCHManagedCollisionModule]] = {}
         for named_path, module in self._model.named_modules():
             mc_collection = getattr(module, "_managed_collision_collection", None)
             if mc_collection is None or not hasattr(module, "_embedding_module"):
                 continue
             self._zch_inner_module_ids.add(id(module._embedding_module))
+            self._zch_outer_by_inner[id(module._embedding_module)] = module
             for table_name, mch in mc_collection._managed_collision_modules.items():
                 if not isinstance(mch, MCHManagedCollisionModule):
                     # Like the export path, skip unsupported collision module
@@ -1339,21 +1224,33 @@ class DeltaEmbeddingDumper:
         return zch_modules
 
     def _install_zch_tracking(self) -> None:
-        """Record ZCH lookups on the inner collection's compute.
+        """Record ZCH raw ids and admit/evict events at their sources.
 
-        torchrec fires the post-lookup and post-odist tracker callbacks only
-        from ``compute_and_output_dist``, but a sharded managed collision
-        wrapper drives its inner sharded collection through plain ``compute``,
-        so ZCH lookups would never be tracked or auto-compacted. Wrap the
-        inner collection's ``compute`` to fire both callbacks per sharding,
-        mirroring torchrec's compute_and_output_dist pairing;
-        trigger_compaction is idempotent per batch.
+        The tracker uniformly stores the ids fed to a sparse module, but for
+        a ZCH table the inner sharded collection only ever sees remapped
+        rows. Wrap the sharded managed collision wrapper's ``compute``
+        instead: its ``dist_input`` still carries this shard's raw ids, and
+        torchrec never fires tracker callbacks on this path. Recording is
+        attributed to the inner collection, whose registered (pause-guarded)
+        callbacks route feature names to table FQNs; the post-odist callback
+        is fired alongside, mirroring torchrec's compute_and_output_dist
+        pairing, and trigger_compaction is idempotent per batch.
+
+        Admissions and evictions never pass through a lookup, and the
+        wrapper-level ``evict()`` only exposes reset rows after
+        ``_update_and_evict`` has already overwritten the evicted raw ids in
+        place, so each MCH module's ``_update_and_evict`` -- the admit/evict
+        transaction itself -- is wrapped to compare the held raw ids around
+        the call: admitted ids join the tracker store and are published like
+        touched ids, evicted ids accumulate for the fallback-row correction.
         """
         self._zch_compute_wrappers: Dict[int, Tuple[nn.Module, Any]] = {}
+        self._zch_event_wrappers: Dict[int, Tuple[MCHManagedCollisionModule, Any]] = {}
         for module in self._tracker.tracked_modules.values():
             if id(module) not in self._zch_inner_module_ids:
                 continue
-            orig_compute = module.compute
+            outer = self._zch_outer_by_inner[id(module)]
+            orig_compute = outer.compute
             record_fn = module.post_lookup_tracker_fn
 
             def tracked_compute(
@@ -1370,18 +1267,59 @@ class DeltaEmbeddingDumper:
                         owner.post_odist_tracker_fn()
                 return result
 
-            module.compute = tracked_compute
-            self._zch_compute_wrappers[id(module)] = (module, orig_compute)
+            outer.compute = tracked_compute
+            self._zch_compute_wrappers[id(outer)] = (outer, orig_compute)
+        for fqn, mch in self._zch_modules.items():
+            self._install_zch_event_hook(fqn, mch)
+
+    def _install_zch_event_hook(self, fqn: str, mch: MCHManagedCollisionModule) -> None:
+        """Wrap one MCH module's admit/evict transaction to record raw ids.
+
+        ``_update_and_evict`` overwrites the evicted slots' raw ids in place
+        and re-sorts the buffers, so the held-id set is captured before the
+        call and compared after it; both captures exclude the int64-max
+        empty-slot sentinel and stay sorted and unique, keeping the set
+        difference a pair of ``isin`` calls sized to the shard.
+        """
+        orig_update = mch._update_and_evict
+        sentinel = torch.iinfo(torch.int64).max
+
+        def tracked_update_and_evict(*args: Any, **kwargs: Any) -> Any:
+            if self._tracking_pause_depth > 0:
+                return orig_update(*args, **kwargs)
+            raw_ids = mch._mch_sorted_raw_ids
+            prev = raw_ids[raw_ids != sentinel]
+            result = orig_update(*args, **kwargs)
+            raw_ids = mch._mch_sorted_raw_ids
+            cur = raw_ids[raw_ids != sentinel]
+            admitted = cur[~torch.isin(cur, prev, assume_unique=True)]
+            evicted = prev[~torch.isin(prev, cur, assume_unique=True)]
+            if admitted.numel() > 0:
+                self._tracker.store.append(
+                    batch_idx=self._tracker.curr_batch_idx,
+                    fqn=fqn,
+                    ids=admitted,
+                    states=None,
+                )
+            if evicted.numel() > 0:
+                self._zch_evicted.setdefault(fqn, []).append(evicted.cpu())
+            return result
+
+        mch._update_and_evict = tracked_update_and_evict
+        self._zch_event_wrappers[id(mch)] = (mch, orig_update)
 
     def _uninstall_zch_tracking(self) -> None:
-        """Restore the wrapped inner collections' original compute.
+        """Restore the wrapped computes and admit/evict transactions.
 
         Leaves no wrapper behind keeping the dumper (and its tracker) alive
-        via the compute attribute after the dumper is closed.
+        via the patched attributes after the dumper is closed.
         """
         for module, orig_compute in self._zch_compute_wrappers.values():
             module.compute = orig_compute
         self._zch_compute_wrappers.clear()
+        for mch, orig_update in self._zch_event_wrappers.values():
+            mch._update_and_evict = orig_update
+        self._zch_event_wrappers.clear()
 
     def _append_table_chunk(
         self,
