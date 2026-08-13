@@ -48,6 +48,7 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
 - USE_DISTRIBUTED_EMBEDDING: 开启分布式 embedding 导出模式，导出 dense graph 与分片 sparse embedding 参数；该模式会自动使用 `INPUT_TILE=3`
   - **USE_DISTRIBUTED_EMBEDDING=1**：启用分布式 embedding 导出
+  - 配置了 zch 的特征会自动转换为动态表导出，详见 [零冲突Hash Embedding](../feature/zch.md) 的分布式 Embedding 导出章节
 - DIST_QUANT: 分布式 embedding 导出模式下的 sparse embedding 参数量化开关，默认关闭；当前仅支持 INT8，与普通导出的 `QUANT_EMB` / `QUANT_EC_EMB` 不同
   - **USE_DISTRIBUTED_EMBEDDING=1 DIST_QUANT=INT8**：启用分布式 sparse embedding INT8 量化
   - 未设置 **DIST_QUANT** 时，不启用分布式 sparse embedding 量化

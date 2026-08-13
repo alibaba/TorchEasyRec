@@ -59,6 +59,85 @@ class CollisionResolutionConfig:
             )
 
 
+def concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Concatenate ``arange(start, start + length)`` for every aligned pair."""
+    starts = np.asarray(starts, dtype=np.int64)
+    lengths = np.asarray(lengths, dtype=np.int64)
+    keep = lengths > 0
+    starts = starts[keep]
+    lengths = lengths[keep]
+    total = int(lengths.sum())
+    if total == 0:
+        return np.empty(0, dtype=np.int64)
+    steps = np.ones(total, dtype=np.int64)
+    steps[0] = starts[0]
+    if starts.shape[0] > 1:
+        boundaries = np.cumsum(lengths)[:-1]
+        steps[boundaries] = starts[1:] - (starts[:-1] + lengths[:-1]) + 1
+    return np.cumsum(steps)
+
+
+def lookup_sorted(
+    sorted_keys: np.ndarray, keys: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Locate ``keys`` inside an ascending ``sorted_keys``.
+
+    Returns the insertion positions and a mask of exact hits; a position is
+    meaningful only where the mask is set, and repeated keys resolve to their
+    first occurrence.
+    """
+    positions = np.searchsorted(sorted_keys, keys)
+    found = positions < sorted_keys.shape[0]
+    found[found] = sorted_keys[positions[found]] == keys[found]
+    return positions, found
+
+
+@dataclass(frozen=True)
+class PriorOccupancy:
+    """Per-bucket occupancy of an already-published corpus.
+
+    Args:
+        bucket_keys: Occupied bucket keys, int64, strictly ascending.
+        bucket_counts: Published item count of each key, aligned with
+            ``bucket_keys``.
+    """
+
+    bucket_keys: np.ndarray
+    bucket_counts: np.ndarray
+
+    @classmethod
+    def empty(cls) -> "PriorOccupancy":
+        """Return the occupancy of a corpus with no published items."""
+        return cls(np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64))
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether no bucket is occupied."""
+        return self.bucket_keys.shape[0] == 0
+
+    def counts_for(self, bucket_keys: np.ndarray) -> np.ndarray:
+        """Return prior counts aligned with ``bucket_keys``, zero when absent."""
+        keys = np.asarray(bucket_keys, dtype=np.int64)
+        counts = np.zeros(keys.shape[0], dtype=np.int64)
+        positions, found = lookup_sorted(self.bucket_keys, keys)
+        counts[found] = self.bucket_counts[positions[found]]
+        return counts
+
+    def restrict_to_bands(
+        self, band_ids: np.ndarray, last_size: int
+    ) -> "PriorOccupancy":
+        """Return the sub-occupancy of buckets lying in the given bands.
+
+        One band owns the contiguous key range ``[band * S, (band + 1) * S)``,
+        so this is a range gather, not a membership test over every prior key.
+        """
+        bands = np.unique(np.asarray(band_ids, dtype=np.int64))
+        starts = np.searchsorted(self.bucket_keys, bands * last_size, side="left")
+        stops = np.searchsorted(self.bucket_keys, (bands + 1) * last_size, side="left")
+        selected = concat_ranges(starts, stops - starts)
+        return PriorOccupancy(self.bucket_keys[selected], self.bucket_counts[selected])
+
+
 @dataclass(frozen=True)
 class CollisionPlan:
     """Compact grouping plan consumed by collision resolution.
@@ -76,14 +155,16 @@ class CollisionPlan:
             *within* ``bucket_keys`` / ``bucket_counts`` (a row->bucket
             index in ``[0, num_buckets)``, not a key value), int64 shape
             ``(item_count,)`` in original row order.
-        initial_slot_indices: One-based rank of each row within its origin
-            bucket in deterministic (hash) order, int64 shape ``(item_count,)``
-            in original row order.
+        initial_slot_indices: One-based slot of each row within its origin
+            bucket in deterministic (hash) order, continuing the published
+            occupancy when appending; int64 shape ``(item_count,)`` in
+            original row order.
         bucket_keys: Flattened SID key ``prefix_key * last_size + last_code``
             for every occupied bucket, int64 shape ``(num_buckets,)`` indexed by
             bucket index (the values in ``origin_bucket_indices``) and ascending.
-        bucket_counts: Item count of every bucket before capacity capping,
-            int64 shape ``(num_buckets,)`` aligned with ``bucket_keys``.
+        bucket_counts: Number of this plan's rows in every bucket before
+            capacity capping, int64 shape ``(num_buckets,)`` aligned with
+            ``bucket_keys``; add ``prior_bucket_counts`` for the corpus total.
         overflow_rows: Original row indices ranked at or beyond ``capacity``
             within their bucket (the rows to relocate), int64 in deterministic
             processing order.
@@ -96,6 +177,14 @@ class CollisionPlan:
             (used to skip a candidate equal to the origin), int64 aligned with
             ``overflow_rows``.
         config: Collision capacity and SID shape configuration.
+        prior: Occupancy of the already-published corpus. Empty for a full
+            resolve; for an append it must cover at least every bucket of every
+            band touched by the planned rows, because relocation can read any
+            bucket inside those bands.
+        prior_bucket_counts: Published occupancy of every bucket in
+            ``bucket_keys``, int64 aligned with it and zero where the bucket
+            is new; ``prior_bucket_counts + bucket_counts`` is a bucket's
+            uncapped total over the published corpus and these rows.
     """
 
     item_count: int
@@ -109,6 +198,8 @@ class CollisionPlan:
     overflow_bucket_key_prefixes: np.ndarray
     overflow_origin_last_codes: np.ndarray
     config: CollisionResolutionConfig
+    prior: PriorOccupancy
+    prior_bucket_counts: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -251,17 +342,14 @@ class CollisionResolver(ABC):
         Returns:
             A collision result that preserves the original assignments.
         """
+        final_counts = plan.prior_bucket_counts + plan.bucket_counts
         final_bucket_keys = (
             plan.bucket_keys.copy() if collect_grouping else np.empty(0, dtype=np.int64)
         )
         final_bucket_counts = (
-            plan.bucket_counts.copy()
-            if collect_grouping
-            else np.empty(0, dtype=np.int64)
+            final_counts if collect_grouping else np.empty(0, dtype=np.int64)
         )
-        max_final_bucket_size = (
-            int(plan.bucket_counts.max()) if plan.bucket_counts.size else 0
-        )
+        max_final_bucket_size = int(final_counts.max()) if final_counts.size else 0
         stats = CollisionResolutionStats(
             total_items=plan.item_count,
             raw_collision_buckets=0,
@@ -292,7 +380,9 @@ class CollisionResolver(ABC):
 
         Args:
             plan: Collision plan defining original bucket keys and capacity.
-            initial_counts: Original bucket counts capped at capacity.
+            initial_counts: Corpus bucket counts before relocation -- published
+                plus new, capped at capacity but never below the prior
+                occupancy.
             in_overflow_band: Mask selecting buckets affected by relocation.
             slot_counts: Final counts for buckets in affected bands.
             collect_grouping: Whether to build sorted final bucket arrays.
@@ -360,12 +450,20 @@ class CollisionResolver(ABC):
 
         last_size = plan.config.layer_sizes[-1]
         capacity = plan.config.capacity
-        initial_counts = np.minimum(plan.bucket_counts, capacity)
+        prior_counts = plan.prior_bucket_counts
+        combined_counts = prior_counts + plan.bucket_counts
+        initial_counts = np.maximum(prior_counts, np.minimum(combined_counts, capacity))
         # Relocation only reads or writes buckets in a band with an overflow
         # row. Every other bucket keeps its capped initial count untouched.
-        overflow_band_ids = plan.overflow_bucket_key_prefixes // last_size
-        in_overflow_band = np.isin(plan.bucket_keys // last_size, overflow_band_ids)
+        overflow_band_ids = np.unique(plan.overflow_bucket_key_prefixes // last_size)
+        _, in_overflow_band = lookup_sorted(
+            overflow_band_ids, plan.bucket_keys // last_size
+        )
+        band_prior = plan.prior.restrict_to_bands(overflow_band_ids, last_size)
         slot_counts = dict(
+            zip(band_prior.bucket_keys.tolist(), band_prior.bucket_counts.tolist())
+        )
+        slot_counts.update(
             zip(
                 plan.bucket_keys[in_overflow_band].tolist(),
                 initial_counts[in_overflow_band].tolist(),
@@ -428,7 +526,7 @@ class CollisionResolver(ABC):
         unresolved_array = np.asarray(unresolved_rows, dtype=np.int64)
         stats = CollisionResolutionStats(
             total_items=plan.item_count,
-            raw_collision_buckets=int((plan.bucket_counts > capacity).sum()),
+            raw_collision_buckets=int((combined_counts > capacity).sum()),
             final_collision_buckets=final_collision_buckets,
             relocated_count=relocated_count,
             unresolved_count=len(unresolved_rows),
@@ -605,8 +703,8 @@ def stable_order_hash(item_ids: np.ndarray) -> np.ndarray:
     return _splitmix64(base)
 
 
-def _band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
-    """Return the mixed-radix prefix key for each row."""
+def sid_band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
+    """Return the mixed-radix prefix key of every SID row (zeros if one layer)."""
     row_count, layer_count = codes.shape
     if layer_count == 1:
         return np.zeros(row_count, dtype=np.int64)
@@ -615,6 +713,22 @@ def _band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
         keys *= layer_sizes[layer]
         keys += codes[:, layer]
     return keys
+
+
+def sid_offset_codes(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
+    """Shift each layer's codes into one contiguous vocabulary."""
+    starts = np.concatenate(
+        ([0], np.cumsum(np.asarray(layer_sizes[:-1], dtype=np.int64)))
+    )
+    return np.asarray(codes) + starts
+
+
+def sid_bucket_keys(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
+    """Return ``band_id * layer_sizes[-1] + last_code`` for every SID row."""
+    codes = np.asarray(codes)
+    return sid_band_ids(codes, layer_sizes) * layer_sizes[-1] + codes[:, -1].astype(
+        np.int64, copy=False
+    )
 
 
 def _within_bucket_rank(
@@ -662,20 +776,33 @@ def prepare_collision_plan(
     item_ids: np.ndarray,
     codes: np.ndarray,
     config: CollisionResolutionConfig,
+    prior: Optional[PriorOccupancy] = None,
 ) -> CollisionPlan:
     """Group SID buckets and identify overflow rows in stable processing order.
+
+    With a ``prior``, the rows are treated as an append onto an existing
+    corpus: a bucket already holding ``P`` items admits only ``capacity - P``
+    more, and retained rows are numbered from ``P + 1`` so they continue the
+    published slot sequence instead of restarting at one. Published items are
+    never rows here, which is what makes them impossible to move.
 
     Args:
         item_ids: One-dimensional item IDs aligned with ``codes``.
         codes: Integer SID matrix with shape ``(N, number_of_layers)``.
         config: Collision capacity and SID shape configuration.
+        prior: Occupancy of the already-published corpus, or ``None`` for a
+            full resolve. It must cover every bucket of every band these rows
+            touch, because relocation can address any bucket inside a band.
 
     Returns:
         A compact plan for candidate loading and collision resolution.
 
     Raises:
-        ValueError: If input dimensions, row counts, or layer counts disagree.
+        ValueError: If input dimensions, row counts, or layer counts disagree,
+            or if prior bucket keys fall outside the configured key space.
     """
+    if prior is None:
+        prior = PriorOccupancy.empty()
     item_ids = np.asarray(item_ids)
     codes = np.asarray(codes)
     if item_ids.ndim != 1:
@@ -702,8 +829,17 @@ def prepare_collision_plan(
             "produced the SID table."
         )
 
+    if not prior.is_empty:
+        key_space = math.prod(config.layer_sizes)
+        if int(prior.bucket_keys[0]) < 0 or int(prior.bucket_keys[-1]) >= key_space:
+            raise ValueError(
+                "prior bucket keys fall outside the key space of layer_sizes "
+                f"{config.layer_sizes}; check that --codebook matches the run "
+                "that produced the existing SID artifacts."
+            )
+
     original_last_codes = codes[:, -1].astype(np.int64, copy=False)
-    band_ids = _band_ids(codes, config.layer_sizes)
+    band_ids = sid_band_ids(codes, config.layer_sizes)
     order_hashes = stable_order_hash(item_ids)
     (
         bucket_ranks,
@@ -713,13 +849,16 @@ def prepare_collision_plan(
         bucket_counts,
     ) = _within_bucket_rank(band_ids, original_last_codes, order_hashes)
 
-    overflow_rows = sorted_rows[bucket_ranks[sorted_rows] >= config.capacity]
-    bucket_ranks += 1
     last_size = config.layer_sizes[-1]
     bucket_keys = (
         band_ids[representative_rows] * last_size
         + original_last_codes[representative_rows]
     )
+    prior_bucket_counts = prior.counts_for(bucket_keys)
+    if not prior.is_empty:
+        bucket_ranks += prior_bucket_counts[origin_bucket_indices]
+    overflow_rows = sorted_rows[bucket_ranks[sorted_rows] >= config.capacity]
+    bucket_ranks += 1
     overflow_bucket_key_prefixes = band_ids[overflow_rows] * last_size
 
     return CollisionPlan(
@@ -734,6 +873,8 @@ def prepare_collision_plan(
         overflow_bucket_key_prefixes=overflow_bucket_key_prefixes,
         overflow_origin_last_codes=original_last_codes[overflow_rows],
         config=config,
+        prior=prior,
+        prior_bucket_counts=prior_bucket_counts,
     )
 
 
@@ -778,20 +919,25 @@ def _scatter_item_grouping(
 def build_original_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
     """Group all original rows by SID and initial one-based slot index.
 
+    Slot indices are made bucket-local by subtracting the prior occupancy, so
+    the grouping covers only this plan's rows even when appending to a corpus.
+
     Args:
         plan: Grouping and overflow plan from :func:`prepare_collision_plan`.
 
     Returns:
         Sorted original SID keys, bucket counts, and grouped original row order.
     """
+    prior_bucket_counts = plan.prior_bucket_counts
 
     def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         for start in range(0, plan.item_count, _ROW_CHUNK_SIZE):
             end = min(start + _ROW_CHUNK_SIZE, plan.item_count)
+            bucket_ids = plan.origin_bucket_indices[start:end]
             yield (
                 np.arange(start, end, dtype=np.int64),
-                plan.origin_bucket_indices[start:end],
-                plan.initial_slot_indices[start:end],
+                bucket_ids,
+                plan.initial_slot_indices[start:end] - prior_bucket_counts[bucket_ids],
             )
 
     return _scatter_item_grouping(
@@ -805,9 +951,10 @@ def build_original_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
 def build_resolved_item_grouping(
     plan: CollisionPlan, result: CollisionResolutionResult
 ) -> CodebookItemGrouping:
-    """Group all rows by emitted SID and final one-based slot index.
+    """Group this plan's rows by emitted SID and bucket-local slot index.
 
-    The grouping uses a linear scatter from final one-based slot indices.
+    Only buckets that gained rows appear, and slot indices have the prior
+    occupancy subtracted, so the grouping covers only this plan's rows.
 
     Args:
         plan: Grouping and overflow plan from :func:`prepare_collision_plan`.
@@ -826,24 +973,27 @@ def build_resolved_item_grouping(
             "with collect_grouping=True."
         )
 
+    final_prior_counts = plan.prior.counts_for(result.final_bucket_keys)
+    delta_counts = result.final_bucket_counts - final_prior_counts
+    gained = delta_counts > 0
+    sid_keys = result.final_bucket_keys[gained]
+    counts = delta_counts[gained]
+    prior_counts = final_prior_counts[gained]
+
     def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         for start in range(0, plan.item_count, _ROW_CHUNK_SIZE):
             end = min(start + _ROW_CHUNK_SIZE, plan.item_count)
-            rows = np.arange(start, end, dtype=np.int64)
-            emitted_sid_keys = plan.bucket_keys[plan.origin_bucket_indices[rows]]
-            emitted_sid_keys -= plan.original_last_codes[rows]
-            emitted_sid_keys += result.resolved_last_codes[rows]
-            bucket_ids = np.searchsorted(result.final_bucket_keys, emitted_sid_keys)
-            in_bounds = bucket_ids < result.final_bucket_keys.shape[0]
-            if not np.all(in_bounds) or not np.all(
-                result.final_bucket_keys[bucket_ids] == emitted_sid_keys
-            ):
+            chunk = slice(start, end)
+            emitted_sid_keys = plan.bucket_keys[plan.origin_bucket_indices[chunk]]
+            emitted_sid_keys -= plan.original_last_codes[chunk]
+            emitted_sid_keys += result.resolved_last_codes[chunk]
+            bucket_ids, found = lookup_sorted(sid_keys, emitted_sid_keys)
+            if not np.all(found):
                 raise RuntimeError("final bucket keys do not cover every emitted SID.")
-            yield rows, bucket_ids, result.slot_indices[rows]
+            yield (
+                np.arange(start, end, dtype=np.int64),
+                bucket_ids,
+                result.slot_indices[chunk] - prior_counts[bucket_ids],
+            )
 
-    return _scatter_item_grouping(
-        result.final_bucket_keys,
-        result.final_bucket_counts,
-        plan.item_count,
-        row_chunks(),
-    )
+    return _scatter_item_grouping(sid_keys, counts, plan.item_count, row_chunks())
