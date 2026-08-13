@@ -18,12 +18,6 @@ import torch.fx
 
 from tzrec.datasets.utils import Batch
 from tzrec.main import _create_model
-from tzrec.models.prompt_generative_qwen import _unpack
-from tzrec.prompt.assembler import (
-    PROMPT_CU_SEQLENS,
-    PROMPT_LABELS,
-    PROMPT_MAX_SEQLEN,
-)
 from tzrec.prompt.compile import compile_prompt
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
@@ -77,20 +71,11 @@ class PromptStackIntegrationTest(unittest.TestCase):
         )
 
     def _batch(self, hist, answer):
-        return self._batch_rows([(hist, answer)])
-
-    def _batch_rows(self, rows):
-        hist = [h for h, _ in rows]
-        answer = [a for _, a in rows]
         parsed = {
-            "hist.values": torch.tensor(
-                offset_sid_codes([c for h in hist for c in h], _CODEBOOK)
-            ),
-            "hist.lengths": torch.tensor([len(h) for h in hist]),
-            "answer.values": torch.tensor(
-                offset_sid_codes([c for a in answer for c in a], _CODEBOOK)
-            ),
-            "answer.lengths": torch.tensor([len(a) for a in answer]),
+            "hist.values": torch.tensor(offset_sid_codes(hist, _CODEBOOK)),
+            "hist.lengths": torch.tensor([len(hist)]),
+            "answer.values": torch.tensor(offset_sid_codes(answer, _CODEBOOK)),
+            "answer.lengths": torch.tensor([len(answer)]),
         }
         streams = assemble_into(self.prompt, parsed)
         batch = Batch()
@@ -98,29 +83,6 @@ class PromptStackIntegrationTest(unittest.TestCase):
             {k: torch.from_numpy(np.asarray(v)) for k, v in streams.items()}
         )
         return batch
-
-    def test_every_row_is_supervised_whatever_its_length(self) -> None:
-        # a short row must not lose its answer to padding: the loss keeps a
-        # fixed-width suffix, so both rows have to contribute equally
-        batch = self._batch_rows(
-            [([0, 1, 2], [1, 2, 3]), ([0, 1, 2, 3, 0, 1], [2, 3, 0])]
-        )
-        infos = batch.additional_infos
-        cu = infos[PROMPT_CU_SEQLENS]
-        lengths = (cu[1:] - cu[:-1]).tolist()
-        self.assertNotEqual(lengths[0], lengths[1], "rows must differ to be a test")
-
-        _, _, labels = _unpack(
-            torch.ones(int(cu[-1]), 1),
-            cu,
-            infos[PROMPT_LABELS],
-            int(infos[PROMPT_MAX_SEQLEN]),
-            -100,
-        )
-        window = labels[:, -self.prompt.prompt_plan.logits_suffix_len :]
-        supervised = (window != -100).sum(dim=1).tolist()
-        self.assertEqual(supervised[0], supervised[1])
-        self.assertEqual(supervised[0], self.prompt.sid_space.num_levels)
 
     def test_model_resizes_to_target_vocab(self) -> None:
         model = self._model()

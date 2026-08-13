@@ -135,21 +135,22 @@ class PromptAssemblerTest(unittest.TestCase):
         self.assertEqual(out.cu_seqlens.tolist(), [0, 5, 11])
         self.assertEqual(out.hole_positions.tolist(), [0, 5, 6, 2, 3, 8, 4, 9, 10])
 
-    def test_labels_cover_the_response_span_only(self) -> None:
+    def test_response_is_optional_and_its_length_is_recorded(self) -> None:
         plan = _plan(
             (Static((7, 8)),),
             response=(Static((9,)), _slot("answer", FillMode.INLINE)),
         )
-        asm = PromptAssembler(plan, _sid_space(), ignore_index=-7)
+        asm = PromptAssembler(plan, _sid_space())
         out = asm.assemble({"answer": [np.array([0, 4, 8])]})
 
         self.assertEqual(out.input_ids.tolist(), [7, 8, 9, _BASE, _BASE + 4, _BASE + 8])
-        self.assertEqual(out.labels.tolist(), [-7, -7, 9, _BASE, _BASE + 4, _BASE + 8])
+        self.assertEqual(out.response_lengths.tolist(), [4])
 
         prompt_only = PromptAssembler(
-            plan, _sid_space(), ignore_index=-7, include_response=False
+            plan, _sid_space(), include_response=False
         ).assemble({}, batch_size=1)
         self.assertEqual(prompt_only.input_ids.tolist(), [7, 8])
+        self.assertEqual(prompt_only.response_lengths.tolist(), [0])
 
     def test_rejects_raw_codes_that_carry_no_offset(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))

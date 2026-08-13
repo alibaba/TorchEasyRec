@@ -33,8 +33,8 @@ from tzrec.protos.model_pb2 import FeatureGroupType
 PROMPT_INPUT_IDS = "prompt_input_ids"
 PROMPT_CU_SEQLENS = "prompt_cu_seqlens"
 PROMPT_HOLE_POSITIONS = "prompt_hole_positions"
-PROMPT_LABELS = "prompt_labels"
 PROMPT_MAX_SEQLEN = "prompt_max_seqlen"
+PROMPT_RESPONSE_LENGTHS = "prompt_response_lengths"
 
 
 @dataclass
@@ -47,13 +47,13 @@ class AssembledPrompt:
         hole_positions: absolute indices the projected embeddings overwrite,
             grouped by included projected occurrence in
             ``PromptPlan.projected_slots`` order, then by sample.
-        labels: ``ignore_index`` outside the response span.
+        response_lengths: number of response tokens in each sample.
     """
 
     input_ids: np.ndarray
     cu_seqlens: np.ndarray
     hole_positions: np.ndarray
-    labels: np.ndarray
+    response_lengths: np.ndarray
 
     @property
     def max_seqlen(self) -> int:
@@ -69,7 +69,6 @@ class PromptAssembler:
     Args:
         prompt_plan: the compiled walk order.
         sid_space: resolved SID token space; required when a slot renders SIDs.
-        ignore_index: label value outside the supervised span.
         include_response: whether to read and emit the supervised response.
     """
 
@@ -77,12 +76,10 @@ class PromptAssembler:
         self,
         prompt_plan: PromptPlan,
         sid_space: Optional[ResolvedSidSpace] = None,
-        ignore_index: int = -100,
         include_response: bool = True,
     ) -> None:
         self._prompt_plan = prompt_plan
         self._sid_space = sid_space
-        self._ignore_index = ignore_index
         self._response_segments = (
             prompt_plan.response_segments if include_response else ()
         )
@@ -183,7 +180,7 @@ class PromptAssembler:
             batch_size = len(first_inline_values)
 
         jagged_token_ids: List[int] = []
-        labels: List[int] = []
+        response_lengths: List[int] = []
         holes_by_occurrence = [
             []
             for seg in self._prompt_plan.segments + self._response_segments
@@ -213,10 +210,7 @@ class PromptAssembler:
                 projected_occurrence_index,
                 len(jagged_token_ids),
             )
-            # supervision covers the response span only; the prompt is context.
-            sample_labels = [self._ignore_index] * prompt_len + sample_token_ids[
-                prompt_len:
-            ]
+            response_lengths.append(len(sample_token_ids) - prompt_len)
             if (
                 self._prompt_plan.max_length
                 and len(sample_token_ids) > self._prompt_plan.max_length
@@ -228,7 +222,6 @@ class PromptAssembler:
                     f"never truncated: cap the source features instead."
                 )
             jagged_token_ids.extend(sample_token_ids)
-            labels.extend(sample_labels)
             cu_seqlens.append(len(jagged_token_ids))
 
         holes = [
@@ -240,7 +233,7 @@ class PromptAssembler:
             input_ids=np.asarray(jagged_token_ids, dtype=np.int64),
             cu_seqlens=np.asarray(cu_seqlens, dtype=np.int64),
             hole_positions=np.asarray(holes, dtype=np.int64),
-            labels=np.asarray(labels, dtype=np.int64),
+            response_lengths=np.asarray(response_lengths, dtype=np.int64),
         )
 
     def assemble_batch(
@@ -317,6 +310,6 @@ class PromptAssembler:
             PROMPT_INPUT_IDS: out.input_ids,
             PROMPT_CU_SEQLENS: out.cu_seqlens,
             PROMPT_HOLE_POSITIONS: out.hole_positions,
-            PROMPT_LABELS: out.labels,
             PROMPT_MAX_SEQLEN: np.asarray(out.max_seqlen, dtype=np.int64),
+            PROMPT_RESPONSE_LENGTHS: out.response_lengths,
         }

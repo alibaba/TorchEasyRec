@@ -135,14 +135,6 @@ def _compile_prompt(
     )
 
 
-def _prompt_ignore_index(pipeline_config: EasyRecConfig) -> int:
-    """Return the label sentinel configured by a prompt-native model."""
-    model_type = pipeline_config.model_config.WhichOneof("model")
-    if model_type != "prompt_generative_qwen":
-        return -100
-    return int(getattr(pipeline_config.model_config, model_type).common.ignore_index)
-
-
 def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
     try:
         sampler_type = (
@@ -722,7 +714,6 @@ def train_and_evaluate(
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
     prompt = _compile_prompt(pipeline_config, features)
-    prompt_ignore_index = _prompt_ignore_index(pipeline_config)
 
     ckpt_manager = checkpoint_util.CheckpointManager(
         pipeline_config.model_dir,
@@ -776,7 +767,6 @@ def train_and_evaluate(
         pipeline_config.train_input_path,
         mode=Mode.TRAIN,
         prompt=prompt,
-        prompt_ignore_index=prompt_ignore_index,
         checkpoint_state=dataloader_state,
     )
     eval_dataloader = None
@@ -789,7 +779,6 @@ def train_and_evaluate(
             pipeline_config.eval_input_path,
             mode=Mode.EVAL,
             prompt=prompt,
-            prompt_ignore_index=prompt_ignore_index,
             gl_cluster=gl_cluster,
         )
 
@@ -1006,7 +995,6 @@ def evaluate(
         eval_input_path or pipeline_config.eval_input_path,
         mode=Mode.EVAL,
         prompt=prompt,
-        prompt_ignore_index=_prompt_ignore_index(pipeline_config),
     )
 
     sampler_type = _get_sampler_type(data_config)

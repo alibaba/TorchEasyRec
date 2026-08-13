@@ -22,11 +22,17 @@ class UnpackTest(unittest.TestCase):
     def test_packs_rows_of_different_lengths(self) -> None:
         embeds = torch.arange(18, dtype=torch.float32).reshape(9, 2)
         cu = torch.tensor([0, 4, 9])
-        ignore = -100
-        labels = torch.tensor([ignore, ignore, 7, 8, ignore, ignore, ignore, 7, 8])
+        input_ids = torch.tensor([1, 2, 7, 8, 3, 4, 5, 7, 8])
+        response_lengths = torch.tensor([1, 2])
+        ignore = -7
 
         padded, mask, out = _unpack(
-            embeds, cu, labels, max_seqlen=7, ignore_index=ignore
+            embeds,
+            cu,
+            max_seqlen=7,
+            input_ids=input_ids,
+            response_lengths=response_lengths,
+            ignore_index=ignore,
         )
 
         self.assertEqual(padded.shape, (2, 7, 2))
@@ -39,7 +45,10 @@ class UnpackTest(unittest.TestCase):
         torch.testing.assert_close(padded[0, :3], torch.zeros(3, 2))
         torch.testing.assert_close(padded[1, :2], torch.zeros(2, 2))
         torch.testing.assert_close(padded[:, -1], torch.stack([embeds[3], embeds[8]]))
-        self.assertEqual(out.tolist(), [[ignore] * 5 + [7, 8]] * 2)
+        self.assertEqual(
+            out.tolist(),
+            [[ignore] * 6 + [8], [ignore] * 5 + [7, 8]],
+        )
 
 
 if __name__ == "__main__":

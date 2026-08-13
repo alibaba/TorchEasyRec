@@ -101,7 +101,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         debug_level (int): dataset debug level, when mode=predict and
             debug_level > 0, will dump fg encoded data to debug_str
         prompt (CompiledPrompt, optional): compiled prompt assembly contract.
-        prompt_ignore_index (int): label value outside the supervised response.
     """
 
     def __init__(
@@ -113,14 +112,12 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         mode: Mode = Mode.EVAL,
         debug_level: int = 0,
         prompt: Optional[CompiledPrompt] = None,
-        prompt_ignore_index: int = -100,
     ) -> None:
         super(BaseDataset, self).__init__()
         self._assembler = (
             PromptAssembler(
                 prompt.prompt_plan,
                 prompt.sid_space,
-                ignore_index=prompt_ignore_index,
                 include_response=mode != Mode.PREDICT,
             )
             if prompt is not None
@@ -805,7 +802,6 @@ def create_dataloader(
     debug_level: int = 0,
     checkpoint_state: Optional[Dict[str, Any]] = None,
     prompt: Optional[CompiledPrompt] = None,
-    prompt_ignore_index: int = -100,
 ) -> DataLoader:
     """Build dataloader.
 
@@ -822,7 +818,6 @@ def create_dataloader(
             eager ``iter()`` forks workers so it reaches them.
         prompt (CompiledPrompt, optional): when set, each batch carries the
             assembled prompt streams in ``additional_infos``.
-        prompt_ignore_index (int): label value outside the supervised response.
 
     Return:
         dataloader (dataloader): a DataLoader.
@@ -838,7 +833,6 @@ def create_dataloader(
         mode=mode,
         debug_level=debug_level,
         prompt=prompt,
-        prompt_ignore_index=prompt_ignore_index,
     )
     if checkpoint_state:
         dataset.load_state_dict(dict(checkpoint_state))

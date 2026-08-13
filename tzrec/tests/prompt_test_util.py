@@ -71,20 +71,18 @@ def offset_sid_codes(codes: Sequence[Any], codebook: Sequence[int]) -> np.ndarra
 
 def assemble_into(
     prompt: CompiledPrompt,
-    parsed: Dict[str, "np.ndarray"],
-    ignore_index: int = -100,
+    parsed_features: Dict[str, "np.ndarray"],
 ) -> Dict[str, np.ndarray]:
     """Assemble one parsed batch with a temporary assembler.
 
     Args:
         prompt: the compiled prompt.
-        parsed: ``{feature}.values`` / ``{feature}.lengths`` as the data parser
-            emits them.
-        ignore_index: label value outside the supervised span.
+        parsed_features: ``{feature}.values`` / ``{feature}.lengths`` as the
+            data parser emits them.
 
     Returns:
         The assembled streams keyed for ``additional_infos``.
     """
-    return PromptAssembler(
-        prompt.prompt_plan, prompt.sid_space, ignore_index
-    ).assemble_batch(parsed)
+    return PromptAssembler(prompt.prompt_plan, prompt.sid_space).assemble_batch(
+        parsed_features
+    )

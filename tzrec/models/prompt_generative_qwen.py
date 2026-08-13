@@ -30,8 +30,9 @@ from tzrec.models.prompt_generative_model import BasePromptGenerativeModel
 from tzrec.modules.dynamic_beam import _capped_beam_widths, dynamic_beam_search
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS,
-    PROMPT_LABELS,
+    PROMPT_INPUT_IDS,
     PROMPT_MAX_SEQLEN,
+    PROMPT_RESPONSE_LENGTHS,
 )
 from tzrec.prompt.plan import CompiledPrompt
 from tzrec.protos.model_pb2 import ModelConfig
@@ -139,9 +140,10 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         padded, mask, labels = _unpack(
             embeds,
             infos[PROMPT_CU_SEQLENS],
-            infos[PROMPT_LABELS],
             int(infos[PROMPT_MAX_SEQLEN]),
-            self._ignore_index,
+            input_ids=infos[PROMPT_INPUT_IDS],
+            response_lengths=infos[PROMPT_RESPONSE_LENGTHS],
+            ignore_index=self._ignore_index,
         )
         outputs = self.lm.model(inputs_embeds=padded, attention_mask=mask)
 
@@ -170,9 +172,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         padded, mask, _ = _unpack(
             embeds,
             infos[PROMPT_CU_SEQLENS],
-            None,
             int(infos[PROMPT_MAX_SEQLEN]),
-            self._ignore_index,
         )
         space = self._prompt.sid_space
         tokens = dynamic_beam_search(
@@ -189,11 +189,12 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
 def _unpack(
     embeds: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    labels: Optional[torch.Tensor],
     max_seqlen: int,
-    ignore_index: int,
+    input_ids: Optional[torch.Tensor] = None,
+    response_lengths: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Left-pad a packed varlen batch at the LM boundary.
+    """Left-pad a packed batch and build response labels for training.
 
     Padding lives in this one adapter. ``max_seqlen`` is the collator's, not
     ``lengths.max()``: deriving it here would sync the device to the host every
@@ -207,9 +208,10 @@ def _unpack(
     Args:
         embeds: packed embeddings, ``(total_tokens, hidden)``.
         cu_seqlens: row boundaries, ``(batch_size + 1,)``.
-        labels: packed labels, or None at inference where nothing is scored.
         max_seqlen: the collator's padded width.
-        ignore_index: label value for padding.
+        input_ids: packed token ids, or None at inference where nothing is scored.
+        response_lengths: number of supervised response tokens in each row.
+        ignore_index: label value outside the response span.
 
     Returns:
         Padded embeddings, attention mask and labels.
@@ -223,19 +225,22 @@ def _unpack(
     mask = columns[None, :] >= (max_seqlen - lengths)[:, None]
 
     padded = embeds.new_zeros((batch_size, max_seqlen, hidden))
-    # mask selects row-major, which is the order embeds and labels are packed in
+    # mask selects row-major, which is how embeds and input_ids are packed
     padded[mask] = embeds
-    if labels is None:
+    if input_ids is None:
         return padded, mask.long(), None
 
-    out_labels = torch.full(
+    assert response_lengths is not None
+    labels = torch.full(
         (batch_size, max_seqlen),
         ignore_index,
-        dtype=labels.dtype,
+        dtype=input_ids.dtype,
         device=embeds.device,
     )
-    out_labels[mask] = labels
-    return padded, mask.long(), out_labels
+    labels[mask] = input_ids
+    response_mask = columns[None, :] >= (max_seqlen - response_lengths)[:, None]
+    labels[~response_mask] = ignore_index
+    return padded, mask.long(), labels
 
 
 @torch.fx.wrap
