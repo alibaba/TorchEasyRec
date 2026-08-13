@@ -78,6 +78,11 @@ message FeatureStoreConfig {
     optional string upload_format = 18 [default = "ARROW"];
 }
 
+enum DeltaEmbeddingQuantType {
+    DELTA_EMBEDDING_QUANT_NONE = 0;
+    DELTA_EMBEDDING_QUANT_INT8 = 1;
+}
+
 message DeltaEmbeddingDumpConfig {
     // MC/ZCH features are not supported; use dynamicemb for delta dump.
     // Dump touched ids and their latest embedding every N training steps. Do not
@@ -94,6 +99,12 @@ message DeltaEmbeddingDumpConfig {
     // Dump after this many elapsed minutes. The timer starts when training starts.
     // Do not set this together with dump_interval_steps.
     optional uint32 dump_interval_minutes = 5;
+    // Quantization format for dumped embeddings. INT8 applies rowwise uint8
+    // quantization (QUint8RowwiseF16: uint8 values + fp16 scale/offset, 4 extra
+    // bytes per row) using the same format as distributed sparse export. Requires
+    // even embedding_dim.
+    optional DeltaEmbeddingQuantType quant_type = 6
+        [default = DELTA_EMBEDDING_QUANT_NONE];
 }
 
 message TrainConfig {
