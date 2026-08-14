@@ -13,10 +13,17 @@ import unittest
 
 import torch
 
-from tzrec.models.prompt_generative_qwen import _unpack
+from tzrec.datasets.utils import Batch
+from tzrec.models.prompt_generative_qwen import PromptGenerativeQwen
+from tzrec.prompt.assembler import (
+    PROMPT_CU_SEQLENS,
+    PROMPT_INPUT_IDS,
+    PROMPT_MAX_SEQLEN,
+    PROMPT_RESPONSE_LENGTHS,
+)
 
 
-class UnpackTest(unittest.TestCase):
+class LeftPadPackedInputsTest(unittest.TestCase):
     """The one adapter where padding lives."""
 
     def test_packs_rows_of_different_lengths(self) -> None:
@@ -25,14 +32,20 @@ class UnpackTest(unittest.TestCase):
         input_ids = torch.tensor([1, 2, 7, 8, 3, 4, 5, 7, 8])
         response_lengths = torch.tensor([1, 2])
         ignore = -7
+        batch = Batch(
+            additional_infos={
+                PROMPT_CU_SEQLENS: cu,
+                PROMPT_INPUT_IDS: input_ids,
+                PROMPT_MAX_SEQLEN: torch.tensor(7),
+                PROMPT_RESPONSE_LENGTHS: response_lengths,
+            }
+        )
+        model = PromptGenerativeQwen.__new__(PromptGenerativeQwen)
+        torch.nn.Module.__init__(model)
+        model._ignore_index = ignore
 
-        padded, mask, out = _unpack(
-            embeds,
-            cu,
-            max_seqlen=7,
-            input_ids=input_ids,
-            response_lengths=response_lengths,
-            ignore_index=ignore,
+        padded, mask, out = model._left_pad_packed_inputs(
+            embeds, batch, build_labels=True
         )
 
         self.assertEqual(padded.shape, (2, 7, 2))

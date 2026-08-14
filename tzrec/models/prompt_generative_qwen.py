@@ -141,14 +141,8 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         Returns:
             The loss.
         """
-        infos = batch.additional_infos
-        padded, mask, labels = _unpack(
-            embeds,
-            infos[PROMPT_CU_SEQLENS],
-            int(infos[PROMPT_MAX_SEQLEN]),
-            input_ids=infos[PROMPT_INPUT_IDS],
-            response_lengths=infos[PROMPT_RESPONSE_LENGTHS],
-            ignore_index=self._ignore_index,
+        padded, mask, labels = self._left_pad_packed_inputs(
+            embeds, batch, build_labels=True
         )
         outputs = self.lm.model(inputs_embeds=padded, attention_mask=mask)
 
@@ -173,12 +167,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
             ``(B, num_return, num_levels)`` local codes, best first.
         """
         embeds = self.build_input(batch)
-        infos = batch.additional_infos
-        padded, mask, _ = _unpack(
-            embeds,
-            infos[PROMPT_CU_SEQLENS],
-            int(infos[PROMPT_MAX_SEQLEN]),
-        )
+        padded, mask, _ = self._left_pad_packed_inputs(embeds, batch)
         space = self._prompt.sid_space
         tokens = dynamic_beam_search(
             self.lm,
@@ -190,62 +179,51 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         codes = self._tokens_to_local_codes(tokens, padded.shape[0])
         return codes[:, : self._num_return_sequences, :]
 
+    def _left_pad_packed_inputs(
+        self,
+        embeds: torch.Tensor,
+        batch: Batch,
+        build_labels: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Left-pad packed prompt embeddings for the causal LM.
 
-def _unpack(
-    embeds: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-    input_ids: Optional[torch.Tensor] = None,
-    response_lengths: Optional[torch.Tensor] = None,
-    ignore_index: int = -100,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Left-pad a packed batch and build response labels for training.
+        Args:
+            embeds: packed embeddings, ``(total_tokens, hidden)``.
+            batch: carries the packed prompt metadata.
+            build_labels: whether to build response-only training labels.
 
-    Padding lives in this one adapter. ``max_seqlen`` is the collator's, not
-    ``lengths.max()``: deriving it here would sync the device to the host every
-    step, which the design forbids.
+        Returns:
+            Padded embeddings, attention mask and optional labels.
+        """
+        infos = batch.additional_infos
+        cu_seqlens = infos[PROMPT_CU_SEQLENS]
+        max_seqlen = int(infos[PROMPT_MAX_SEQLEN])
+        starts = cu_seqlens[:-1]
+        lengths = cu_seqlens[1:] - starts
+        batch_size = lengths.numel()
+        hidden = embeds.shape[-1]
 
-    Pads go on the left so that every row ends on a real token. Both consumers
-    index from the right -- the loss keeps a fixed-width suffix and decode
-    prefills from ``[:, -1, :]`` -- so right-padding would hand a short row its
-    padding instead of its answer.
+        columns = torch.arange(max_seqlen, device=embeds.device)
+        mask = columns[None, :] >= (max_seqlen - lengths)[:, None]
 
-    Args:
-        embeds: packed embeddings, ``(total_tokens, hidden)``.
-        cu_seqlens: row boundaries, ``(batch_size + 1,)``.
-        max_seqlen: the collator's padded width.
-        input_ids: packed token ids, or None at inference where nothing is scored.
-        response_lengths: number of supervised response tokens in each row.
-        ignore_index: label value outside the response span.
+        padded = embeds.new_zeros((batch_size, max_seqlen, hidden))
+        # mask selects row-major, which is how embeds and input_ids are packed
+        padded[mask] = embeds
+        if not build_labels:
+            return padded, mask.long(), None
 
-    Returns:
-        Padded embeddings, attention mask and labels.
-    """
-    starts = cu_seqlens[:-1]
-    lengths = cu_seqlens[1:] - starts
-    batch_size = lengths.numel()
-    hidden = embeds.shape[-1]
-
-    columns = torch.arange(max_seqlen, device=embeds.device)
-    mask = columns[None, :] >= (max_seqlen - lengths)[:, None]
-
-    padded = embeds.new_zeros((batch_size, max_seqlen, hidden))
-    # mask selects row-major, which is how embeds and input_ids are packed
-    padded[mask] = embeds
-    if input_ids is None:
-        return padded, mask.long(), None
-
-    assert response_lengths is not None
-    labels = torch.full(
-        (batch_size, max_seqlen),
-        ignore_index,
-        dtype=input_ids.dtype,
-        device=embeds.device,
-    )
-    labels[mask] = input_ids
-    response_mask = columns[None, :] >= (max_seqlen - response_lengths)[:, None]
-    labels[~response_mask] = ignore_index
-    return padded, mask.long(), labels
+        input_ids = infos[PROMPT_INPUT_IDS]
+        response_lengths = infos[PROMPT_RESPONSE_LENGTHS]
+        labels = torch.full(
+            (batch_size, max_seqlen),
+            self._ignore_index,
+            dtype=input_ids.dtype,
+            device=embeds.device,
+        )
+        labels[mask] = input_ids
+        response_mask = columns[None, :] >= (max_seqlen - response_lengths)[:, None]
+        labels[~response_mask] = self._ignore_index
+        return padded, mask.long(), labels
 
 
 @torch.fx.wrap
@@ -255,7 +233,8 @@ def _fx_wrapped_loss(
     """Hide the padded forward from FX.
 
     ``TrainPipelineSparseDist`` symbolically traces the model whenever a
-    sharded module exists, and ``_unpack`` reads ``max_seqlen`` as a host int.
+    sharded module exists, and ``_left_pad_packed_inputs`` reads
+    ``max_seqlen`` as a host int.
 
     Args:
         model: the model whose loss to compute.
