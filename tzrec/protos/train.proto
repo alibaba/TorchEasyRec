@@ -79,7 +79,10 @@ message FeatureStoreConfig {
 }
 
 message DeltaEmbeddingDumpConfig {
-    // MC/ZCH features are not supported; use dynamicemb for delta dump.
+    // ZCH features publish raw feature ids: touched and newly admitted ids
+    // with their trained rows, and evicted ids with the fallback row the
+    // model now serves for them (FeatureStore has no delete, so the old
+    // vector must be overwritten explicitly).
     // Dump touched ids and their latest embedding every N training steps. Do not
     // set this together with dump_interval_minutes.
     // Larger intervals retain a longer id window in memory; auto compaction reduces
