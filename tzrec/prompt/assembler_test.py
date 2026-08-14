@@ -26,7 +26,7 @@ from tzrec.prompt.plan import (
 from tzrec.protos.model_pb2 import FeatureGroupType
 from tzrec.tests.prompt_test_util import assemble_into
 
-_BASE = 1000
+_BASE_VOCAB_SIZE = 1000
 _SENTINEL = 1099
 
 
@@ -38,11 +38,11 @@ def _sid_space(codebook=(4, 4, 4)) -> ResolvedSidSpace:
     return ResolvedSidSpace(
         codebook=tuple(codebook),
         num_levels=len(codebook),
-        base_vocab=_BASE,
+        base_vocab_size=_BASE_VOCAB_SIZE,
         level_offsets=tuple(offsets),
-        band_lo=tuple(_BASE + o for o in offsets),
-        band_hi=tuple(_BASE + o + s - 1 for o, s in zip(offsets, codebook)),
-        target_vocab=1152,
+        band_lo=tuple(_BASE_VOCAB_SIZE + o for o in offsets),
+        band_hi=tuple(_BASE_VOCAB_SIZE + o + s - 1 for o, s in zip(offsets, codebook)),
+        target_vocab_size=1152,
         sentinel_token_id=_SENTINEL,
         eos_token_id=2,
         pad_token_id=3,
@@ -97,7 +97,14 @@ class PromptAssemblerTest(unittest.TestCase):
         out = asm.assemble({"hist": [np.array([1, 6, 11])]})
 
         self.assertEqual(
-            out.input_ids.tolist(), [7, 8, _BASE + 1, _BASE + 6, _BASE + 11]
+            out.input_ids.tolist(),
+            [
+                7,
+                8,
+                _BASE_VOCAB_SIZE + 1,
+                _BASE_VOCAB_SIZE + 6,
+                _BASE_VOCAB_SIZE + 11,
+            ],
         )
         self.assertEqual(out.cu_seqlens.tolist(), [0, 5])
         self.assertEqual(out.hole_positions.size, 0)
@@ -143,7 +150,17 @@ class PromptAssemblerTest(unittest.TestCase):
         asm = PromptAssembler(plan, _sid_space())
         out = asm.assemble({"answer": [np.array([0, 4, 8])]})
 
-        self.assertEqual(out.input_ids.tolist(), [7, 8, 9, _BASE, _BASE + 4, _BASE + 8])
+        self.assertEqual(
+            out.input_ids.tolist(),
+            [
+                7,
+                8,
+                9,
+                _BASE_VOCAB_SIZE,
+                _BASE_VOCAB_SIZE + 4,
+                _BASE_VOCAB_SIZE + 8,
+            ],
+        )
         self.assertEqual(out.response_lengths.tolist(), [4])
 
         prompt_only = PromptAssembler(
@@ -188,7 +205,7 @@ class PromptAssemblerTest(unittest.TestCase):
         from tzrec.prompt.plan import CompiledPrompt, ProjectionPlan
 
         plan = _plan((_slot("hist", FillMode.INLINE),))
-        prompt = CompiledPrompt(
+        compiled_prompt = CompiledPrompt(
             sid_space=_sid_space(),
             prompt_plan=plan,
             projection_plan=ProjectionPlan(projections={}, slot_to_module={}),
@@ -200,9 +217,9 @@ class PromptAssemblerTest(unittest.TestCase):
             "hist.values": np.array([[1], [6], [11], [0], [4], [8]]),
             "hist.lengths": np.array([3, 3]),
         }
-        out = assemble_into(prompt, parsed)
+        out = assemble_into(compiled_prompt, parsed)
         self.assertEqual(out["prompt_cu_seqlens"].tolist(), [0, 3, 6])
-        self.assertEqual(out["prompt_input_ids"].tolist()[0], _BASE + 1)
+        self.assertEqual(out["prompt_input_ids"].tolist()[0], _BASE_VOCAB_SIZE + 1)
 
     def test_rejects_inconsistent_slot_batch_sizes(self) -> None:
         plan = _plan(

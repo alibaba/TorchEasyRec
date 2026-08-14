@@ -46,7 +46,7 @@ class CompilePromptTest(unittest.TestCase):
         )
 
     def _config(self, **kwargs) -> PromptConfig:
-        cfg = PromptConfig(tokenizer=self.tok_path, **kwargs)
+        cfg = PromptConfig(tokenizer_path=self.tok_path, **kwargs)
         return cfg
 
     def _compile(self, cfg, features):
@@ -58,15 +58,21 @@ class CompilePromptTest(unittest.TestCase):
         compiled = self._compile(cfg, [create_prompt_feature(_HIST)])
         space = compiled.sid_space
 
-        base = space.base_vocab
+        base_vocab_size = space.base_vocab_size
         self.assertEqual(space.num_levels, 3)
         self.assertEqual(sum(space.codebook), 12)
         self.assertEqual(space.level_offsets, (0, 4, 8))
-        self.assertEqual(space.band_lo, (base, base + 4, base + 8))
-        self.assertEqual(space.band_hi, (base + 3, base + 7, base + 11))
+        self.assertEqual(
+            space.band_lo,
+            (base_vocab_size, base_vocab_size + 4, base_vocab_size + 8),
+        )
+        self.assertEqual(
+            space.band_hi,
+            (base_vocab_size + 3, base_vocab_size + 7, base_vocab_size + 11),
+        )
         # no slot projects, so no sentinel is materialized
         self.assertIsNone(space.sentinel_token_id)
-        self.assertEqual(space.target_vocab % 128, 0)
+        self.assertEqual(space.target_vocab_size % 128, 0)
 
     def test_inline_needs_no_group_projected_gets_one(self) -> None:
         cfg = self._config(prompt="History : {{hist}} . Profile : {{prof}}")
@@ -167,10 +173,10 @@ class CompilePromptTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "is INLINE"):
             self._compile(cfg, [create_prompt_feature(_HIST)])
 
-    def test_atoms_absent_from_the_base_tokenizer(self) -> None:
+    def test_sid_tokens_absent_from_the_base_tokenizer(self) -> None:
         cfg = self._config(prompt="X : {{hist}}")
         cfg.sid_space.codebook.extend([4])
-        cfg.sid_space.atom_token_format = "History"
+        cfg.sid_space.token_format = "History"
         with self.assertRaisesRegex(ValueError, "already in the base tokenizer"):
             self._compile(cfg, [create_prompt_feature(_HIST)])
 
@@ -180,7 +186,7 @@ class CompilePromptTest(unittest.TestCase):
         compiled = self._compile(cfg, [create_prompt_feature(_HIST)])
         written = os.path.join(compiled.tokenizer_dir, "tokenizer.json")
         self.assertTrue(os.path.exists(written))
-        # the atoms round-trip, which is what serving reloads
+        # the SID tokens round-trip, which is what serving reloads
         reloaded = Tokenizer.from_file(written)
         self.assertIsNotNone(reloaded.token_to_id("<|sid_0|>"))
         self.assertIsNotNone(reloaded.token_to_id("<|sid_7|>"))

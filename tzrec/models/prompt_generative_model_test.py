@@ -64,34 +64,36 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
             create_prompt_feature(_HIST),
             create_prompt_feature(_ANSWER),
         ]
-        self.prompt = self._compile(self.features)
+        self.compiled_prompt = self._compile(self.features)
 
     def _compile(self, features, template="History : {{hist}} . Predict :", **kwargs):
-        cfg = PromptConfig(tokenizer=self.tok, prompt=template, **kwargs)
+        cfg = PromptConfig(tokenizer_path=self.tok, prompt=template, **kwargs)
         cfg.sid_space.codebook.extend(_CODEBOOK)
         return compile_prompt(cfg, features, model_dir=self.test_dir)
 
     def _model(
         self,
         features=None,
-        prompt=-1,
+        compiled_prompt=-1,
         beam_widths=(2, 2, 2),
         num_return_sequences=2,
     ):
         model_config = ModelConfig()
         qwen = model_config.prompt_generative_qwen
-        qwen.hf_model_id = self.backbone
+        qwen.hf_model_name_or_path = self.backbone
         qwen.common.beam_widths.extend(beam_widths)
         qwen.common.num_return_sequences = num_return_sequences
         return _create_model(
             model_config,
             self.features if features is None else features,
             ["answer"],
-            prompt=self.prompt if prompt == -1 else prompt,
+            compiled_prompt=(
+                self.compiled_prompt if compiled_prompt == -1 else compiled_prompt
+            ),
         )
 
-    def _batch(self, parsed, prompt=None, sparse=None):
-        streams = assemble_into(prompt or self.prompt, parsed)
+    def _batch(self, parsed, compiled_prompt=None, sparse=None):
+        streams = assemble_into(compiled_prompt or self.compiled_prompt, parsed)
         batch = Batch(sparse_features={BASE_DATA_GROUP: sparse} if sparse else {})
         batch.additional_infos.update(
             {k: torch.from_numpy(np.asarray(v)) for k, v in streams.items()}
@@ -100,7 +102,7 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
 
     def test_tokens_to_local_codes_undoes_shifts_and_groups_beams(self) -> None:
         model = self._model()
-        space = self.prompt.sid_space
+        space = self.compiled_prompt.sid_space
         local_codes = torch.tensor(
             [
                 [0, 1, 3],
@@ -109,7 +111,7 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
                 [2, 2, 1],
             ]
         )
-        tokens = local_codes + torch.tensor(space.level_offsets) + space.base_vocab
+        tokens = local_codes + torch.tensor(space.level_offsets) + space.base_vocab_size
         codes = model._tokens_to_local_codes(tokens, batch_size=2)
 
         self.assertEqual(codes.shape, (2, 2, space.num_levels))
@@ -117,15 +119,15 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
 
     def test_rejects_a_model_built_without_a_prompt(self) -> None:
         with self.assertRaisesRegex(ValueError, "needs a compiled prompt"):
-            self._model(prompt=None)
+            self._model(compiled_prompt=None)
 
     def test_rejects_a_prompt_that_declares_no_sid_space(self) -> None:
-        cfg = PromptConfig(tokenizer=self.tok, prompt="History : {{hist}} .")
-        prompt = compile_prompt(cfg, self.features, model_dir=self.test_dir)
-        self.assertIsNone(prompt.sid_space)
+        cfg = PromptConfig(tokenizer_path=self.tok, prompt="History : {{hist}} .")
+        compiled_prompt = compile_prompt(cfg, self.features, model_dir=self.test_dir)
+        self.assertIsNone(compiled_prompt.sid_space)
 
         with self.assertRaisesRegex(ValueError, "declares no sid_space"):
-            self._model(prompt=prompt)
+            self._model(compiled_prompt=compiled_prompt)
 
     def test_shared_projection_name_requires_matching_widths(self) -> None:
         features = [
@@ -135,7 +137,7 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
             create_prompt_feature(_projected("pb", 16)),
         ]
         cfg = PromptConfig(
-            tokenizer=self.tok,
+            tokenizer_path=self.tok,
             prompt="History : {{hist}} . {{pa}} {{pb}} Predict :",
             response="{{answer}}",
         )
@@ -143,10 +145,10 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         for name in ("pa", "pb"):
             slot = cfg.slots.add(name=name, projection_name="shared")
             slot.feature_names.append(name)
-        prompt = compile_prompt(cfg, features, model_dir=self.test_dir)
+        compiled_prompt = compile_prompt(cfg, features, model_dir=self.test_dir)
 
         with self.assertRaisesRegex(ValueError, "cannot share a module"):
-            self._model(features=features, prompt=prompt)
+            self._model(features=features, compiled_prompt=compiled_prompt)
 
     def test_projected_slot_overwrites_sentinels_and_backpropagates(self) -> None:
         features = [
@@ -154,12 +156,12 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
             create_prompt_feature(_ANSWER),
             create_prompt_feature(_projected("prof", 8)),
         ]
-        prompt = self._compile(
+        compiled_prompt = self._compile(
             features,
             template="History : {{hist}} . Predict {{prof}} :",
             response="{{answer}}",
         )
-        model = self._model(features=features, prompt=prompt)
+        model = self._model(features=features, compiled_prompt=compiled_prompt)
         # the embedding table is built on meta until something materializes it
         init_parameters(model, device=torch.device("cpu"))
         batch = self._batch(
@@ -173,7 +175,7 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
                 "prof.values": torch.tensor([5, 9]),
                 "prof.lengths": torch.tensor([2]),
             },
-            prompt=prompt,
+            compiled_prompt=compiled_prompt,
             sparse=KeyedJaggedTensor.from_lengths_sync(
                 keys=["prof"],
                 values=torch.tensor([5, 9]),
@@ -181,7 +183,7 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
             ),
         )
 
-        embeds = model._prompt_embeds(batch)
+        embeds = model.build_input(batch)
         raw = model.lm.get_input_embeddings()(batch.additional_infos[PROMPT_INPUT_IDS])
         holes = batch.additional_infos[PROMPT_HOLE_POSITIONS]
         self.assertGreater(holes.numel(), 0)
@@ -212,14 +214,14 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
 
     def test_init_from_pretrained_replaces_the_empty_weights(self) -> None:
         model = self._model()
-        base_vocab = self.prompt.sid_space.base_vocab
-        before = model.lm.get_input_embeddings().weight[:base_vocab].clone()
+        base_vocab_size = self.compiled_prompt.sid_space.base_vocab_size
+        before = model.lm.get_input_embeddings().weight[:base_vocab_size].clone()
         model.init_from_pretrained()
-        after = model.lm.get_input_embeddings().weight[:base_vocab]
+        after = model.lm.get_input_embeddings().weight[:base_vocab_size]
 
         # the checkpoint rows land verbatim; only the appended SID rows are new
         reference = AutoModelForCausalLM.from_pretrained(self.backbone)
-        expected = reference.get_input_embeddings().weight[:base_vocab]
+        expected = reference.get_input_embeddings().weight[:base_vocab_size]
         self.assertFalse(torch.allclose(before, expected))
         torch.testing.assert_close(after, expected)
 

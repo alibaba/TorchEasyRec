@@ -69,17 +69,17 @@ class ResolvedSidSpace:
 
     Three coordinate systems and the constants that convert between them: a
     local code in ``[0, codebook[l])``, a flat index ``level_offsets[l] + code``
-    which is what the data carries, and an LM token id ``base_vocab + flat``
+    which is what the data carries, and an LM token id ``base_vocab_size + flat``
     which is what ``lm_head`` generates.
 
     Args:
         codebook: per-level vocabulary sizes.
         num_levels: codes per item; also the answer width.
-        base_vocab: tokenizer size before the SID atoms were appended.
+        base_vocab_size: tokenizer size before the SID tokens were appended.
         level_offsets: ``cumsum(codebook) - codebook``.
         band_lo: inclusive lower token-id bound of each level.
         band_hi: inclusive upper token-id bound of each level.
-        target_vocab: embedding rows after padding, what the LM resizes to.
+        target_vocab_size: embedding rows after padding, what the LM resizes to.
         sentinel_token_id: id reserved for projected positions, None when no
             slot is projected.
         eos_token_id: end-of-sequence id of the extended tokenizer.
@@ -88,11 +88,11 @@ class ResolvedSidSpace:
 
     codebook: Tuple[int, ...]
     num_levels: int
-    base_vocab: int
+    base_vocab_size: int
     level_offsets: Tuple[int, ...]
     band_lo: Tuple[int, ...]
     band_hi: Tuple[int, ...]
-    target_vocab: int
+    target_vocab_size: int
     sentinel_token_id: Optional[int]
     eos_token_id: int
     pad_token_id: int

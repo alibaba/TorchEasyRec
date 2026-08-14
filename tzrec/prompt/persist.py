@@ -49,14 +49,14 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def save_prompt_assets(prompt: CompiledPrompt, target_dir: str) -> None:
+def save_prompt_assets(compiled_prompt: CompiledPrompt, target_dir: str) -> None:
     """Write the prompt contract into a checkpoint or export directory.
 
     Rank 0 only: every rank reaches here on save, and concurrent json.dump and
     copytree to one path can interleave into a truncated file.
 
     Args:
-        prompt: the compiled prompt.
+        compiled_prompt: the compiled prompt.
         target_dir: the checkpoint or export directory.
     """
     if int(os.environ.get("RANK", 0)) != 0:
@@ -65,19 +65,24 @@ def save_prompt_assets(prompt: CompiledPrompt, target_dir: str) -> None:
     os.makedirs(out, exist_ok=True)
 
     with open(os.path.join(out, _SID_SPACE), "w") as f:
-        json.dump(_plain(prompt.sid_space), f, indent=2)
+        json.dump(_plain(compiled_prompt.sid_space), f, indent=2)
     with open(os.path.join(out, _PROMPT_PLAN), "w") as f:
-        json.dump(_plain(prompt.prompt_plan), f, indent=2)
+        json.dump(_plain(compiled_prompt.prompt_plan), f, indent=2)
     with open(os.path.join(out, _HASHES), "w") as f:
         json.dump(
-            {"vocab_hash": prompt.vocab_hash, "plan_hash": prompt.plan_hash},
+            {
+                "vocab_hash": compiled_prompt.vocab_hash,
+                "plan_hash": compiled_prompt.plan_hash,
+            },
             f,
             indent=2,
         )
 
-    if prompt.tokenizer_dir and os.path.isdir(prompt.tokenizer_dir):
+    if compiled_prompt.tokenizer_dir and os.path.isdir(compiled_prompt.tokenizer_dir):
         shutil.copytree(
-            prompt.tokenizer_dir, os.path.join(out, _TOKENIZER), dirs_exist_ok=True
+            compiled_prompt.tokenizer_dir,
+            os.path.join(out, _TOKENIZER),
+            dirs_exist_ok=True,
         )
 
 
@@ -90,7 +95,9 @@ def read_prompt_hashes(source_dir: str) -> Optional[Dict[str, str]]:
         return json.load(f)
 
 
-def check_prompt_assets(prompt: Optional[CompiledPrompt], ckpt_dir: str) -> None:
+def check_prompt_assets(
+    compiled_prompt: Optional[CompiledPrompt], ckpt_dir: str
+) -> None:
     """Compare a compiled prompt against what a checkpoint recorded.
 
     A ``vocab_hash`` mismatch is fatal: the decode bands would point at token
@@ -99,11 +106,11 @@ def check_prompt_assets(prompt: Optional[CompiledPrompt], ckpt_dir: str) -> None
     warns.
 
     Args:
-        prompt: the freshly compiled prompt, or None when the pipeline declares
-            no prompt_config.
+        compiled_prompt: the freshly compiled prompt, or None when the pipeline
+            declares no prompt_config.
         ckpt_dir: the checkpoint being restored.
     """
-    if prompt is None:
+    if compiled_prompt is None:
         return
     recorded = read_prompt_hashes(ckpt_dir)
     if recorded is None:
@@ -113,15 +120,16 @@ def check_prompt_assets(prompt: Optional[CompiledPrompt], ckpt_dir: str) -> None
         )
         return
 
-    if recorded.get("vocab_hash") != prompt.vocab_hash:
+    if recorded.get("vocab_hash") != compiled_prompt.vocab_hash:
         raise ValueError(
             f"prompt vocabulary does not match checkpoint [{ckpt_dir}]: the "
             f"checkpoint was trained against {recorded.get('vocab_hash')} but "
-            f"prompt_config now compiles to {prompt.vocab_hash}. The SID space "
+            f"prompt_config now compiles to {compiled_prompt.vocab_hash}. The SID "
+            f"space "
             f"or the tokenizer changed, so the decode bands no longer address "
             f"the rows these weights learned."
         )
-    if recorded.get("plan_hash") != prompt.plan_hash:
+    if recorded.get("plan_hash") != compiled_prompt.plan_hash:
         logger.warning(
             f"prompt plan differs from checkpoint [{ckpt_dir}]: the vocabulary "
             f"matches, so the weights are usable, but the template, slots or "

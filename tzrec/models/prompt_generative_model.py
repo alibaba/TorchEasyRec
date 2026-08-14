@@ -53,7 +53,7 @@ class BasePromptGenerativeModel(BaseModel):
         features: every created feature.
         labels: data_config label fields.
         sample_weights: optional sample weight fields.
-        prompt: the compiled prompt; required.
+        compiled_prompt: the compiled prompt; required.
     """
 
     def __init__(
@@ -62,54 +62,63 @@ class BasePromptGenerativeModel(BaseModel):
         features: List[BaseFeature],
         labels: List[str],
         sample_weights: Optional[List[str]] = None,
-        prompt: Optional[CompiledPrompt] = None,
+        compiled_prompt: Optional[CompiledPrompt] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        if prompt is None:
+        if compiled_prompt is None:
             raise ValueError(
                 f"{type(self).__name__} needs a compiled prompt; call "
                 f"compile_prompt(pipeline_config.prompt_config, features) and "
                 f"pass it to _create_model."
             )
-        if prompt.sid_space is None:
+        if compiled_prompt.sid_space is None:
             raise ValueError(
                 f"{type(self).__name__}: prompt_config declares no sid_space, "
                 f"so there is no SID vocabulary to extend or decode."
             )
-        self._prompt = prompt
+        self._prompt = compiled_prompt
         cfg = self._model_config
 
-        self.lm = self._build_backbone(cfg.hf_model_id, cfg.common.param_dtype)
+        self.lm = self._build_backbone(
+            cfg.hf_model_name_or_path, cfg.common.lm_parameter_dtype
+        )
         # Every run replaces this initialization from pretrained or DCP weights.
         self.lm.resize_token_embeddings(
-            prompt.sid_space.target_vocab, mean_resizing=False
+            compiled_prompt.sid_space.target_vocab_size, mean_resizing=False
         )
+        self.init_input()
+
+        # decode subtracts these every step; a buffer follows the module's device
+        self.register_buffer(
+            "_level_offsets",
+            torch.tensor(compiled_prompt.sid_space.level_offsets),
+            persistent=False,
+        )
+
+    def init_input(self) -> None:
+        """Build the projected-slot embedding groups and projection modules."""
         self.embedding_group = EmbeddingGroup(
             self._features, list(self._prompt.projection_plan.feature_groups)
         )
         self._build_projections()
-        # decode subtracts these every step; a buffer follows the module's device
-        self.register_buffer(
-            "_level_offsets",
-            torch.tensor(prompt.sid_space.level_offsets),
-            persistent=False,
-        )
 
-    def _build_backbone(self, hf_model_id: str, param_dtype: int) -> nn.Module:
+    def _build_backbone(
+        self, hf_model_name_or_path: str, lm_parameter_dtype: int
+    ) -> nn.Module:
         """Build the LM from config, so HF weights load only on cold start.
 
         Args:
-            hf_model_id: hub id or local directory naming the architecture and
-                cold-start weights.
-            param_dtype: master-weight dtype.
+            hf_model_name_or_path: hub id or local directory naming the
+                architecture and cold-start weights.
+            lm_parameter_dtype: dtype of the LM parameters.
 
         Returns:
             A randomly initialized backbone with the requested parameter dtype.
         """
-        config = AutoConfig.from_pretrained(hf_model_id)
+        config = AutoConfig.from_pretrained(hf_model_name_or_path)
         model = AutoModelForCausalLM.from_config(config)
-        return model.to(_PARAM_DTYPE[param_dtype])
+        return model.to(_PARAM_DTYPE[lm_parameter_dtype])
 
     def _build_projections(self) -> None:
         """One module per resolved id, aligned with ``prompt_plan.projected_slots``.
@@ -121,14 +130,14 @@ class BasePromptGenerativeModel(BaseModel):
         projection_plan = self._prompt.projection_plan
         hidden_size = int(self.lm.config.hidden_size)
 
-        built: Dict[str, PromptProjection] = {}
+        modules_by_id: Dict[str, PromptProjection] = {}
         in_dims: Dict[str, int] = {}
-        aligned: List[PromptProjection] = []
+        aligned_modules: List[PromptProjection] = []
         for seg in prompt_plan.projected_slots:
             module_id = projection_plan.slot_to_module[seg.slot_id]
             in_dim = self.embedding_group.group_total_dim(seg.name + seg.output_key)
-            if module_id not in built:
-                built[module_id] = PromptProjection(
+            if module_id not in modules_by_id:
+                modules_by_id[module_id] = PromptProjection(
                     projection_plan.projections[module_id], in_dim, hidden_size
                 )
                 in_dims[module_id] = in_dim
@@ -138,16 +147,16 @@ class BasePromptGenerativeModel(BaseModel):
                     f"different group dims ({in_dims[module_id]} vs "
                     f"{in_dim}); they cannot share a module."
                 )
-            aligned.append(built[module_id])
-        self.projections = nn.ModuleDict(built)
-        self._slot_projections = aligned
+            aligned_modules.append(modules_by_id[module_id])
+        self.projections = nn.ModuleDict(modules_by_id)
+        self._slot_projections = aligned_modules
 
     def hf_backbone(self) -> nn.Module:
         """The HF module export and checkpointing reach for."""
         return self.lm
 
-    def _prompt_embeds(self, batch: Batch) -> torch.Tensor:
-        """Gather the token stream, then overwrite the projected positions.
+    def build_input(self, batch: Batch) -> torch.Tensor:
+        """Build packed LM input embeddings and fill projected positions.
 
         Args:
             batch: carries the packed prompt in ``additional_infos``.
@@ -164,14 +173,16 @@ class BasePromptGenerativeModel(BaseModel):
 
         grouped = self.embedding_group(batch)
         hidden_size = embeds.shape[-1]
-        parts = [
+        projected_embeddings = [
             proj(grouped[seg.name + seg.output_key]).reshape(-1, hidden_size)
             for seg, proj in zip(prompt_plan.projected_slots, self._slot_projections)
         ]
         # The assembler records holes in this projected-occurrence-major order.
         # out of place: embeds carries grad from the embedding lookup
         return embeds.index_copy(
-            0, batch.additional_infos[PROMPT_HOLE_POSITIONS], torch.cat(parts)
+            0,
+            batch.additional_infos[PROMPT_HOLE_POSITIONS],
+            torch.cat(projected_embeddings),
         )
 
     def _tokens_to_local_codes(
@@ -187,7 +198,7 @@ class BasePromptGenerativeModel(BaseModel):
             ``(batch_size, beams, num_levels)`` local codes.
         """
         space = self._prompt.sid_space
-        codes = tokens - space.base_vocab - self._level_offsets
+        codes = tokens - space.base_vocab_size - self._level_offsets
         return codes.view(batch_size, -1, space.num_levels)
 
     def init_loss(self) -> None:
@@ -248,11 +259,11 @@ class BasePromptGenerativeModel(BaseModel):
 
     def init_from_pretrained(self) -> None:
         """Load HF weights once, on a cold start only."""
-        source = self._model_config.hf_model_id
+        source = self._model_config.hf_model_name_or_path
         logger.info(f"loading pretrained weights from [{source}].")
         pretrained = AutoModelForCausalLM.from_pretrained(source)
         pretrained.resize_token_embeddings(
-            self._prompt.sid_space.target_vocab, mean_resizing=True
+            self._prompt.sid_space.target_vocab_size, mean_resizing=True
         )
         self.lm.load_state_dict(pretrained.state_dict())
         del pretrained

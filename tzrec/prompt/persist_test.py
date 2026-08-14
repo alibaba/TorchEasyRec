@@ -46,14 +46,14 @@ class PromptPersistTest(unittest.TestCase):
         ]
 
     def _compile(self, codebook=(4, 4, 4), prompt="History : {{hist}}"):
-        cfg = PromptConfig(tokenizer=self.tok_path, prompt=prompt)
+        cfg = PromptConfig(tokenizer_path=self.tok_path, prompt=prompt)
         cfg.sid_space.codebook.extend(codebook)
         return compile_prompt(cfg, self.features, model_dir=self.test_dir)
 
     def test_writes_a_self_describing_directory(self) -> None:
-        prompt = self._compile()
+        compiled_prompt = self._compile()
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        save_prompt_assets(prompt, ckpt)
+        save_prompt_assets(compiled_prompt, ckpt)
 
         out = os.path.join(ckpt, PROMPT_DIR)
         for name in ("sid_space.json", "prompt_plan.json", "prompt_hashes.json"):
@@ -64,18 +64,19 @@ class PromptPersistTest(unittest.TestCase):
         )
 
     def test_sid_space_round_trips_as_plain_json(self) -> None:
-        prompt = self._compile()
+        compiled_prompt = self._compile()
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        save_prompt_assets(prompt, ckpt)
+        save_prompt_assets(compiled_prompt, ckpt)
 
         with open(os.path.join(ckpt, PROMPT_DIR, "sid_space.json")) as f:
             space = json.load(f)
         self.assertEqual(space["codebook"], [4, 4, 4])
         self.assertEqual(space["level_offsets"], [0, 4, 8])
-        self.assertEqual(space["band_lo"][0], prompt.sid_space.base_vocab)
+        self.assertEqual(space["band_lo"][0], compiled_prompt.sid_space.base_vocab_size)
         # every declared field survives, so serving needs no tzrec code
         self.assertEqual(
-            set(space), {f.name for f in dataclasses.fields(prompt.sid_space)}
+            set(space),
+            {f.name for f in dataclasses.fields(compiled_prompt.sid_space)},
         )
 
     def test_a_changed_codebook_is_fatal(self) -> None:
@@ -87,21 +88,27 @@ class PromptPersistTest(unittest.TestCase):
     def test_a_changed_template_only_warns(self) -> None:
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
         save_prompt_assets(self._compile(), ckpt)
-        moved = self._compile(prompt="Predict : {{hist}}")
+        changed_compiled_prompt = self._compile(prompt="Predict : {{hist}}")
         # the vocabulary is untouched, so the weights are still usable
-        self.assertEqual(moved.vocab_hash, read_prompt_hashes(ckpt)["vocab_hash"])
-        self.assertNotEqual(moved.plan_hash, read_prompt_hashes(ckpt)["plan_hash"])
+        self.assertEqual(
+            changed_compiled_prompt.vocab_hash,
+            read_prompt_hashes(ckpt)["vocab_hash"],
+        )
+        self.assertNotEqual(
+            changed_compiled_prompt.plan_hash,
+            read_prompt_hashes(ckpt)["plan_hash"],
+        )
         with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
-            check_prompt_assets(moved, ckpt)
+            check_prompt_assets(changed_compiled_prompt, ckpt)
         warning.assert_called_once()
 
     def test_a_checkpoint_without_assets_only_warns(self) -> None:
         bare = os.path.join(self.test_dir, "model.ckpt-bare")
         os.makedirs(bare, exist_ok=True)
         self.assertIsNone(read_prompt_hashes(bare))
-        prompt = self._compile()
+        compiled_prompt = self._compile()
         with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
-            check_prompt_assets(prompt, bare)
+            check_prompt_assets(compiled_prompt, bare)
         warning.assert_called_once()
 
     def test_no_prompt_config_is_a_no_op(self) -> None:

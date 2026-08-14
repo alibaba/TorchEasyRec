@@ -9,9 +9,9 @@ message PromptConfig {
     reserved 2, 9;
     reserved "asset_dir", "length_buckets";
 
-    // BASE tokenizer JSON file. Distinct from hf_model_id, which supplies the
-    // model architecture and cold-start weights.
-    required string tokenizer = 1;
+    // BASE tokenizer JSON file. Distinct from hf_model_name_or_path, which
+    // supplies the model architecture and cold-start weights.
+    required string tokenizer_path = 1;
 
     // Static text between {{name}} placeholders is the prefix and suffix of
     // the surrounding slots; there are no per-slot text fields.
@@ -65,8 +65,8 @@ message PromptProjection {
 message SidSpace {
     // Per-level sizes; codes are local 0-based in [0, codebook[l]).
     repeated uint32 codebook = 1;
-    // {i} is the flat atom index.
-    optional string atom_token_format = 2 [default = "<|sid_{i}|>"];
+    // {i} is the flattened SID code index.
+    optional string token_format = 2 [default = "<|sid_{i}|>"];
     optional uint32 vocab_pad_to_multiple_of = 3 [default = 128];
     // SID manifest to cross-check codebook against. A mismatch is fatal: it
     // means the data and the decode bands disagree.

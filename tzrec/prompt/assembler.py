@@ -103,7 +103,7 @@ class PromptAssembler:
         """Validate offset SID codes against their bands and shift to token ids.
 
         The data carries ``level_offsets[l] + code``; the LM vocabulary needs
-        one further uniform shift by ``base_vocab``.
+        one further uniform shift by ``base_vocab_size``.
         """
         assert self._sid_space is not None
         levels = self._sid_space.num_levels
@@ -120,7 +120,7 @@ class PromptAssembler:
                 f"[level_offsets[l], level_offsets[l] + codebook[l]). Read the "
                 f"offset_codebook column, not codebook or origin_codebook."
             )
-        return values.astype(np.int64, copy=False) + self._sid_space.base_vocab
+        return values.astype(np.int64, copy=False) + self._sid_space.base_vocab_size
 
     def _emit_sample(
         self,

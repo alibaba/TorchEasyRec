@@ -25,9 +25,9 @@ message PromptModelConfig {
 
     optional string generated_sids_key = 4 [default = "generated_sids"];
 
-    // MASTER weights. FP32 avoids bf16-ULP underflow of Adam's small updates;
-    // bf16 COMPUTE comes from mixed_precision, not from this.
-    optional ParamDtype param_dtype = 5 [default = FP32];
+    // LM parameters. FP32 avoids bf16-ULP underflow of Adam's small updates;
+    // bf16 compute comes from mixed_precision, not from this.
+    optional ParamDtype lm_parameter_dtype = 5 [default = FP32];
 }
 
 // Qwen family (Qwen2.5, Qwen3, ...).
@@ -37,5 +37,5 @@ message PromptGenerativeQwen {
     // HF hub id or local path. Names the architecture used for every model build
     // and the weights loaded by init_from_pretrained at cold start; the vocabulary
     // is prompt_config's.
-    optional string hf_model_id = 2 [default = "Qwen/Qwen2.5-0.5B"];
+    optional string hf_model_name_or_path = 2 [default = "Qwen/Qwen2.5-0.5B"];
 }

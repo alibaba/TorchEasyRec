@@ -53,21 +53,26 @@ class PromptStackIntegrationTest(unittest.TestCase):
         ]
 
         cfg = PromptConfig(
-            tokenizer=self.tok,
+            tokenizer_path=self.tok,
             prompt="History : {{hist}} . Predict :",
             response="{{answer}}",
         )
         cfg.sid_space.codebook.extend(_CODEBOOK)
-        self.prompt = compile_prompt(cfg, self.features, model_dir=self.test_dir)
+        self.compiled_prompt = compile_prompt(
+            cfg, self.features, model_dir=self.test_dir
+        )
 
     def _model(self):
         model_config = ModelConfig()
         qwen = model_config.prompt_generative_qwen
-        qwen.hf_model_id = self.backbone
+        qwen.hf_model_name_or_path = self.backbone
         qwen.common.beam_widths.extend([2, 2, 2])
         qwen.common.num_return_sequences = 2
         return _create_model(
-            model_config, self.features, ["answer"], prompt=self.prompt
+            model_config,
+            self.features,
+            ["answer"],
+            compiled_prompt=self.compiled_prompt,
         )
 
     def _batch(self, hist, answer):
@@ -77,18 +82,18 @@ class PromptStackIntegrationTest(unittest.TestCase):
             "answer.values": torch.tensor(offset_sid_codes(answer, _CODEBOOK)),
             "answer.lengths": torch.tensor([len(answer)]),
         }
-        streams = assemble_into(self.prompt, parsed)
+        streams = assemble_into(self.compiled_prompt, parsed)
         batch = Batch()
         batch.additional_infos.update(
             {k: torch.from_numpy(np.asarray(v)) for k, v in streams.items()}
         )
         return batch
 
-    def test_model_resizes_to_target_vocab(self) -> None:
+    def test_model_resizes_to_target_vocab_size(self) -> None:
         model = self._model()
         rows = model.lm.get_input_embeddings().weight.shape[0]
-        self.assertEqual(rows, self.prompt.sid_space.target_vocab)
-        self.assertGreater(rows, self.prompt.sid_space.band_hi[-1])
+        self.assertEqual(rows, self.compiled_prompt.sid_space.target_vocab_size)
+        self.assertGreater(rows, self.compiled_prompt.sid_space.band_hi[-1])
 
     def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
         model = self._model()

@@ -125,9 +125,9 @@ def _derive_slot_layout(
     return group_type, fill_mode
 
 
-def _atom_tokens(sid_space: SidSpace) -> List[str]:
-    """Render the SID atom tokens, one per flat index."""
-    fmt = sid_space.atom_token_format
+def _render_sid_tokens(sid_space: SidSpace) -> List[str]:
+    """Render the SID tokens, one per flat index."""
+    fmt = sid_space.token_format
     return [fmt.replace("{i}", str(i)) for i in range(sum(sid_space.codebook))]
 
 
@@ -140,9 +140,9 @@ def _read_manifest_codebook(path: str) -> List[int]:
 
 
 def _build_sid_space(
-    cfg: PromptConfig, tok: Tokenizer, base_vocab: int, has_projection: bool
+    cfg: PromptConfig, tok: Tokenizer, base_vocab_size: int, has_projection: bool
 ) -> Optional[ResolvedSidSpace]:
-    """Extend the tokenizer with SID atoms and resolve the token space."""
+    """Extend the tokenizer with SID tokens and resolve the token space."""
     if not cfg.HasField("sid_space"):
         return None
     space = cfg.sid_space
@@ -161,14 +161,16 @@ def _build_sid_space(
                 f"and the decode bands would disagree."
             )
 
-    atoms = _atom_tokens(space)
-    present = [a for a in atoms if tok.token_to_id(a) is not None]
-    if present:
+    sid_tokens = _render_sid_tokens(space)
+    existing_sid_tokens = [
+        token for token in sid_tokens if tok.token_to_id(token) is not None
+    ]
+    if existing_sid_tokens:
         raise ValueError(
-            f"SID atoms are already in the base tokenizer, e.g. {present[:3]}; "
-            f"change sid_space.atom_token_format."
+            "SID tokens are already in the base tokenizer, e.g. "
+            f"{existing_sid_tokens[:3]}; change sid_space.token_format."
         )
-    tok.add_special_tokens(atoms)
+    tok.add_special_tokens(sid_tokens)
 
     sentinel_id = None
     if has_projection:
@@ -186,17 +188,17 @@ def _build_sid_space(
     for size in codebook:
         offsets.append(running)
         running += size
-    lo = [base_vocab + o for o in offsets]
+    lo = [base_vocab_size + o for o in offsets]
     hi = [lo[i] + codebook[i] - 1 for i in range(len(codebook))]
 
     return ResolvedSidSpace(
         codebook=tuple(codebook),
         num_levels=len(codebook),
-        base_vocab=base_vocab,
+        base_vocab_size=base_vocab_size,
         level_offsets=tuple(offsets),
         band_lo=tuple(lo),
         band_hi=tuple(hi),
-        target_vocab=_ceil_to(
+        target_vocab_size=_ceil_to(
             tok.get_vocab_size(with_added_tokens=True),
             space.vocab_pad_to_multiple_of,
         ),
@@ -295,13 +297,13 @@ def compile_prompt(
                 f"embedding -- so it has no group to project; drop its projection."
             )
 
-    tok = Tokenizer.from_file(cfg.tokenizer)
-    base_vocab = tok.get_vocab_size(with_added_tokens=True)
+    tok = Tokenizer.from_file(cfg.tokenizer_path)
+    base_vocab_size = tok.get_vocab_size(with_added_tokens=True)
     has_projection = any(
         fill_mode is FillMode.PROJECTED
         for fill_mode in fill_modes_by_slot_name.values()
     )
-    sid_space = _build_sid_space(cfg, tok, base_vocab, has_projection)
+    sid_space = _build_sid_space(cfg, tok, base_vocab_size, has_projection)
 
     tokenizer_dir = ""
     if model_dir:

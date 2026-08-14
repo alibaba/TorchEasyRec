@@ -47,7 +47,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         features: every created feature.
         labels: data_config label fields.
         sample_weights: optional sample weight fields.
-        prompt: the compiled prompt; required.
+        compiled_prompt: the compiled prompt; required.
     """
 
     def __init__(
@@ -56,11 +56,16 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         features: List[BaseFeature],
         labels: List[str],
         sample_weights: Optional[List[str]] = None,
-        prompt: Optional[CompiledPrompt] = None,
+        compiled_prompt: Optional[CompiledPrompt] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
-            model_config, features, labels, sample_weights, prompt, **kwargs
+            model_config,
+            features,
+            labels,
+            sample_weights,
+            compiled_prompt=compiled_prompt,
+            **kwargs,
         )
         common = self._model_config.common
         self._ignore_index = int(common.ignore_index)
@@ -119,7 +124,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         # the embedding lookup stays traceable so the train pipeline can still
         # see the sharded module and prefetch it; only the padding and the LM,
         # which read the collator's width as a host int, are hidden.
-        return _fx_wrapped_loss(self, self._prompt_embeds(batch), batch)
+        return _fx_wrapped_loss(self, self.build_input(batch), batch)
 
     def _forward_loss(
         self, embeds: torch.Tensor, batch: Batch
@@ -167,7 +172,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         Returns:
             ``(B, num_return, num_levels)`` local codes, best first.
         """
-        embeds = self._prompt_embeds(batch)
+        embeds = self.build_input(batch)
         infos = batch.additional_infos
         padded, mask, _ = _unpack(
             embeds,
