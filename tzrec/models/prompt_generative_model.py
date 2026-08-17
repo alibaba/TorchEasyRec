@@ -182,7 +182,7 @@ class BasePromptGenerativeModel(BaseModel):
         return embeds.index_copy(
             0,
             batch.additional_infos[PROMPT_HOLE_POSITIONS],
-            torch.cat(projected_embeddings),
+            torch.cat(projected_embeddings).to(embeds.dtype),
         )
 
     def _tokens_to_local_codes(

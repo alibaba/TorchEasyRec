@@ -9,22 +9,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import os
 import unittest
 
 import numpy as np
 import torch
+from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
 from transformers import AutoModelForCausalLM
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.main import _create_model
+from tzrec.models.prompt_generative_model import _PARAM_DTYPE
 from tzrec.prompt.assembler import (
     PROMPT_HOLE_POSITIONS,
     PROMPT_INPUT_IDS,
 )
 from tzrec.prompt.compile import compile_prompt
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.models.prompt_model_pb2 import PromptModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.tests.prompt_test_util import (
     assemble_into,
@@ -33,7 +37,11 @@ from tzrec.tests.prompt_test_util import (
     offset_sid_codes,
 )
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
+from tzrec.utils.test_util import (
+    create_tiny_causal_lm,
+    make_test_dir,
+    parameterized_name_func,
+)
 
 _CODEBOOK = [4, 4, 4]
 _WORDS = ["History", "Predict", ":", ".", "<unk>", "<|im_end|>"]
@@ -67,6 +75,7 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         self.compiled_prompt = self._compile(self.features)
 
     def _compile(self, features, template="History : {{hist}} . Predict :", **kwargs):
+        kwargs.setdefault("response", "{{answer}}")
         cfg = PromptConfig(tokenizer_path=self.tok, prompt=template, **kwargs)
         cfg.sid_space.codebook.extend(_CODEBOOK)
         return compile_prompt(cfg, features, model_dir=self.test_dir)
@@ -77,12 +86,15 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         compiled_prompt=-1,
         beam_widths=(2, 2, 2),
         num_return_sequences=2,
+        lm_parameter_dtype=None,
     ):
         model_config = ModelConfig()
         qwen = model_config.prompt_generative_qwen
         qwen.hf_model_name_or_path = self.backbone
         qwen.common.beam_widths.extend(beam_widths)
         qwen.common.num_return_sequences = num_return_sequences
+        if lm_parameter_dtype is not None:
+            qwen.common.lm_parameter_dtype = lm_parameter_dtype
         return _create_model(
             model_config,
             self.features if features is None else features,
@@ -122,9 +134,9 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
             self._model(compiled_prompt=None)
 
     def test_rejects_a_prompt_that_declares_no_sid_space(self) -> None:
-        cfg = PromptConfig(tokenizer_path=self.tok, prompt="History : {{hist}} .")
-        compiled_prompt = compile_prompt(cfg, self.features, model_dir=self.test_dir)
-        self.assertIsNone(compiled_prompt.sid_space)
+        # compile_prompt refuses this config, so the model precondition is
+        # reachable only by constructing a prompt directly
+        compiled_prompt = dataclasses.replace(self.compiled_prompt, sid_space=None)
 
         with self.assertRaisesRegex(ValueError, "declares no sid_space"):
             self._model(compiled_prompt=compiled_prompt)
@@ -194,6 +206,57 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         embeds[holes].sum().backward()
         proj = next(iter(model.projections.values()))
         self.assertIsNotNone(proj.head.weight.grad)
+
+    @parameterized.expand(
+        [[PromptModelConfig.BF16], [PromptModelConfig.FP16]],
+        name_func=parameterized_name_func,
+    )
+    def test_projected_slot_follows_a_narrow_lm_dtype(self, lm_parameter_dtype) -> None:
+        features = [
+            create_prompt_feature(_HIST),
+            create_prompt_feature(_ANSWER),
+            create_prompt_feature(_projected("prof", 8)),
+        ]
+        compiled_prompt = self._compile(
+            features,
+            template="History : {{hist}} . Predict {{prof}} :",
+            response="{{answer}}",
+        )
+        model = self._model(
+            features=features,
+            compiled_prompt=compiled_prompt,
+            lm_parameter_dtype=lm_parameter_dtype,
+        )
+        init_parameters(model, device=torch.device("cpu"))
+        batch = self._batch(
+            {
+                "hist.values": torch.tensor(
+                    offset_sid_codes([0, 1, 2], _CODEBOOK)
+                ).reshape(-1, 1),
+                "hist.lengths": torch.tensor([3]),
+                "answer.values": torch.tensor(offset_sid_codes([1, 2, 3], _CODEBOOK)),
+                "answer.lengths": torch.tensor([3]),
+                "prof.values": torch.tensor([5, 9]),
+                "prof.lengths": torch.tensor([2]),
+            },
+            compiled_prompt=compiled_prompt,
+            sparse=KeyedJaggedTensor.from_lengths_sync(
+                keys=["prof"],
+                values=torch.tensor([5, 9]),
+                lengths=torch.tensor([2]),
+            ),
+        )
+
+        embeds = model.build_input(batch)
+        self.assertIs(embeds.dtype, _PARAM_DTYPE[lm_parameter_dtype])
+
+        loss = model.predict(batch)["loss"]
+        self.assertTrue(bool(torch.isfinite(loss)))
+        loss.backward()
+        # the projection keeps fp32 masters, so only the spliced values convert
+        proj = next(iter(model.projections.values()))
+        self.assertIs(proj.head.weight.dtype, torch.float32)
+        self.assertGreater(float(proj.head.weight.grad.abs().sum()), 0.0)
 
     def test_beam_config_uses_final_capped_capacity(self) -> None:
         with self.assertRaisesRegex(ValueError, "final capped beam width \\(4\\)"):
