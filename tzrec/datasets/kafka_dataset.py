@@ -32,6 +32,7 @@ from tzrec.datasets.utils import (
     DATA_TIMESTAMP,
     FIELD_TYPE_TO_PA,
     get_input_fields_proto,
+    remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -94,6 +95,58 @@ def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any], Optional[int]]:
     params["bootstrap.servers"] = broker
 
     return topic, params, start_timestamp_ms
+
+
+def _build_projection(
+    src_schema: pa.Schema, dst_schema: pa.Schema
+) -> Optional[List[int]]:
+    """Map every field of dst_schema onto a column index of src_schema.
+
+    Matching is by name, so an upstream producer may append new columns or reorder
+    existing ones without breaking the reader.  A column dst_schema needs but
+    src_schema does not have is an error: filling it with nulls would silently turn
+    a broken upstream into a model trained on default values.
+
+    Args:
+        src_schema (pa.Schema): schema of the incoming record batch.
+        dst_schema (pa.Schema): schema the reader is contracted to produce.
+
+    Returns:
+        list: src_schema column index per dst_schema field, or ``None`` when the two
+            schemas already line up and no projection is needed.
+
+    Raises:
+        ValueError: if a dst_schema column is missing from src_schema or has a
+            different type there.
+    """
+    indices = []
+    missing = []
+    mismatched = []
+    for field in dst_schema:
+        idx = src_schema.get_field_index(field.name)
+        if idx < 0:
+            missing.append(field.name)
+            continue
+        src_type = remove_nullable(src_schema.field(idx).type)
+        if src_type != remove_nullable(field.type):
+            mismatched.append(f"{field.name}: {field.type} -> {src_type}")
+        indices.append(idx)
+
+    if missing or mismatched:
+        reasons = []
+        if missing:
+            reasons.append(f"missing column(s) {missing}")
+        if mismatched:
+            reasons.append(f"changed column type(s) {mismatched}")
+        raise ValueError(
+            f"kafka message schema is incompatible with the reader schema: "
+            f"{'; '.join(reasons)}. message columns: {src_schema.names}, "
+            f"reader columns: {dst_schema.names}."
+        )
+
+    if len(src_schema) == len(dst_schema) and indices == list(range(len(indices))):
+        return None
+    return indices
 
 
 def _offsets_for_times_batched(
@@ -223,7 +276,6 @@ class KafkaReader(BaseReader):
             drop_remainder,
         )
 
-        self._drop_columns = []
         self._has_embedded_schema = False
 
         if input_fields:
@@ -240,8 +292,6 @@ class KafkaReader(BaseReader):
                 if field.name in self._selected_cols:
                     fields.append(field)
                     self._ordered_cols.append(field.name)
-                else:
-                    self._drop_columns.append(field.name)
             self._schema = pa.schema(fields)
         else:
             self._schema = self._full_schema
@@ -431,6 +481,9 @@ class KafkaReader(BaseReader):
         heartbeat_thread.start()
 
         batch_size_per_msg = None
+        # name-based projection per seen message schema, so an upstream schema
+        # change costs one recompute rather than one per message.
+        projections: Dict[pa.Schema, Optional[List[int]]] = {}
         try:
             while True:
                 num_messages = (
@@ -485,6 +538,27 @@ class KafkaReader(BaseReader):
                         record_batch = pa.ipc.read_record_batch(
                             msg_data, self._full_schema
                         )
+
+                    # Project onto the reader schema by column name. For embedded
+                    # schemas this absorbs upstream columns being added or
+                    # reordered; for schema-less ones it only selects columns.
+                    msg_schema = record_batch.schema
+                    if msg_schema not in projections:
+                        if projections:
+                            logger.info(
+                                f"new kafka message schema {msg_schema.names}, "
+                                f"reading columns {self._schema.names}."
+                            )
+                        projections[msg_schema] = _build_projection(
+                            msg_schema, self._schema
+                        )
+                    projection = projections[msg_schema]
+                    if projection is not None:
+                        record_batch = pa.RecordBatch.from_arrays(
+                            [record_batch.column(i) for i in projection],
+                            names=self._schema.names,
+                        )
+
                     current_batch_size += len(record_batch)
                     record_batchs.append(record_batch)
 
@@ -515,11 +589,7 @@ class KafkaReader(BaseReader):
                     )
 
                 # combine into one record batch
-                t = (
-                    pa.Table.from_batches(record_batchs)
-                    .drop_columns(self._drop_columns)
-                    .combine_chunks()
-                )
+                t = pa.Table.from_batches(record_batchs).combine_chunks()
 
                 # Add checkpoint metadata columns
                 t = t.append_column(
@@ -536,7 +606,7 @@ class KafkaReader(BaseReader):
                 for batch in t.to_batches():
                     yield batch
         except Exception as e:
-            logger.error(f"KafkaReader exception: {e}", flush=True)
+            logger.error(f"KafkaReader exception: {e}")
             raise e
         finally:
             stop_event.set()

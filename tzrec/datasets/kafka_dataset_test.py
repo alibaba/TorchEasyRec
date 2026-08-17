@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 
 from tzrec.datasets.kafka_dataset import (
     KafkaDataset,
+    _build_projection,
     _offsets_for_times_batched,
     _parse_kafka_uri,
 )
@@ -190,6 +191,82 @@ class OffsetsForTimesBatchedTest(unittest.TestCase):
         self.assertEqual(sleep_fn.call_count, 1)
 
 
+class BuildProjectionTest(unittest.TestCase):
+    """Unit tests for _build_projection."""
+
+    DST = pa.schema(
+        [
+            pa.field("id_a", pa.string()),
+            pa.field("raw_c", pa.int64()),
+            pa.field("label", pa.int64()),
+        ]
+    )
+
+    def test_identical_schema_needs_no_projection(self):
+        self.assertIsNone(_build_projection(self.DST, self.DST))
+
+    def test_upstream_added_column(self):
+        src = pa.schema(
+            [
+                pa.field("id_a", pa.string()),
+                pa.field("raw_c", pa.int64()),
+                pa.field("label", pa.int64()),
+                pa.field("new_col", pa.float32()),
+            ]
+        )
+        self.assertEqual(_build_projection(src, self.DST), [0, 1, 2])
+
+    def test_upstream_reordered_column(self):
+        src = pa.schema(
+            [
+                pa.field("label", pa.int64()),
+                pa.field("new_col", pa.float32()),
+                pa.field("id_a", pa.string()),
+                pa.field("raw_c", pa.int64()),
+            ]
+        )
+        projection = _build_projection(src, self.DST)
+        self.assertEqual(projection, [2, 3, 0])
+        batch = pa.record_batch(
+            [
+                pa.array([7], type=pa.int64()),
+                pa.array([1.5], type=pa.float32()),
+                pa.array(["a"], type=pa.string()),
+                pa.array([3], type=pa.int64()),
+            ],
+            schema=src,
+        )
+        projected = pa.RecordBatch.from_arrays(
+            [batch.column(i) for i in projection], names=self.DST.names
+        )
+        self.assertEqual(
+            projected.to_pydict(), {"id_a": ["a"], "raw_c": [3], "label": [7]}
+        )
+
+    def test_missing_column_raises(self):
+        src = pa.schema([pa.field("id_a", pa.string()), pa.field("label", pa.int64())])
+        with self.assertRaisesRegex(ValueError, r"missing column\(s\) \['raw_c'\]"):
+            _build_projection(src, self.DST)
+
+    def test_changed_column_type_raises(self):
+        src = pa.schema(
+            [
+                pa.field("id_a", pa.string()),
+                pa.field("raw_c", pa.int32()),
+                pa.field("label", pa.int64()),
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, r"changed column type\(s\).*raw_c"):
+            _build_projection(src, self.DST)
+
+    def test_nested_nullability_is_ignored(self):
+        dst = pa.schema([pa.field("raw_g", pa.list_(pa.field("item", pa.float32())))])
+        src = pa.schema(
+            [pa.field("raw_g", pa.list_(pa.field("element", pa.float32(), False)))]
+        )
+        self.assertIsNone(_build_projection(src, dst))
+
+
 class KafkaDatasetTest(unittest.TestCase):
     def setUp(self):
         credential = CredClient()
@@ -257,25 +334,28 @@ class KafkaDatasetTest(unittest.TestCase):
         config = {"bootstrap.servers": self.brokers}
         producer = Producer(config)
 
-        for _ in range(10000):
-            record_batch = pa.record_batch(
-                {
-                    "unused": pa.array(["unused"] * 128, type=pa.string()),
-                    "id_a": pa.array(["1"] * 128, type=pa.string()),
-                    "tag_b": pa.array(["2\x1d3"] * 128, type=pa.string()),
-                    "raw_c": pa.array([4] * 128, type=pa.int64()),
-                    "raw_d": pa.array([5.0] * 128, type=pa.float64()),
-                    "raw_e": pa.array([3] * 128, type=pa.int32()),
-                    "raw_f": pa.array([4.0] * 128, type=pa.float32()),
-                    "raw_g": pa.array(
-                        [[1.0, 2.0, 3.0]] * 128, type=pa.list_(pa.float32())
-                    ),
-                    "map_h": pa.array(
-                        [{"1": 1, "2": 2}] * 128, type=pa.map_(pa.string(), pa.int64())
-                    ),
-                    "label": pa.array([0] * 128, type=pa.int64()),
-                }
-            )
+        for i in range(10000):
+            columns = {
+                "unused": pa.array(["unused"] * 128, type=pa.string()),
+                "id_a": pa.array(["1"] * 128, type=pa.string()),
+                "tag_b": pa.array(["2\x1d3"] * 128, type=pa.string()),
+                "raw_c": pa.array([4] * 128, type=pa.int64()),
+                "raw_d": pa.array([5.0] * 128, type=pa.float64()),
+                "raw_e": pa.array([3] * 128, type=pa.int32()),
+                "raw_f": pa.array([4.0] * 128, type=pa.float32()),
+                "raw_g": pa.array([[1.0, 2.0, 3.0]] * 128, type=pa.list_(pa.float32())),
+                "map_h": pa.array(
+                    [{"1": 1, "2": 2}] * 128, type=pa.map_(pa.string(), pa.int64())
+                ),
+                "label": pa.array([0] * 128, type=pa.int64()),
+            }
+            # emulate an upstream schema change: a new column appears and the
+            # existing ones are reordered. Alternating per message so that a
+            # single consume() call mixes both schemas.
+            if embedded_schema and i % 2 == 1:
+                columns["added_i"] = pa.array([6] * 128, type=pa.int64())
+                columns = dict(reversed(list(columns.items())))
+            record_batch = pa.record_batch(columns)
             if embedded_schema:
                 # Serialize with embedded schema using IPC stream format
                 sink = io.BytesIO()
