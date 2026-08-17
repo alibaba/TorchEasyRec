@@ -378,6 +378,9 @@ def compile_prompt(
             # items(), not the bare dict: iterating a dict yields only its keys,
             # which would leave a changed projection body out of the digest
             sorted(projection_plan.projections.items()),
+            # routing too: slots can swap projection_name with matching bodies,
+            # which loads each slot with the other's learned weights
+            sorted(projection_plan.slot_to_module.items()),
             tok.to_str(),
         ),
     )

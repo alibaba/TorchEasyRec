@@ -103,22 +103,28 @@ def check_prompt_assets(
     A ``vocab_hash`` mismatch is fatal: the decode bands would point at token
     ranges the weights never learned, which produces plausible output rather
     than an error. A ``plan_hash`` mismatch only reshapes the prompt, so it
-    warns.
+    warns. Absent assets are fatal too -- restoring unchecked is the one case
+    the guard exists to prevent.
 
     Args:
         compiled_prompt: the freshly compiled prompt, or None when the pipeline
             declares no prompt_config.
         ckpt_dir: the checkpoint being restored.
+
+    Raises:
+        ValueError: if the checkpoint records no prompt assets, or its
+            ``vocab_hash`` disagrees with the compiled prompt.
     """
     if compiled_prompt is None:
         return
     recorded = read_prompt_hashes(ckpt_dir)
     if recorded is None:
-        logger.warning(
+        raise ValueError(
             f"checkpoint [{ckpt_dir}] records no prompt assets, so its "
-            f"vocabulary cannot be checked against the current prompt_config."
+            f"vocabulary cannot be checked against the current prompt_config. "
+            f"Restoring unchecked risks decode bands that address rows these "
+            f"weights never learned, so this is fatal rather than a warning."
         )
-        return
 
     if recorded.get("vocab_hash") != compiled_prompt.vocab_hash:
         raise ValueError(

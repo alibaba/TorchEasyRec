@@ -123,6 +123,39 @@ class PromptPersistTest(unittest.TestCase):
             check_prompt_assets(widened, ckpt)
         warning.assert_called_once()
 
+    def test_swapped_projection_routing_warns(self) -> None:
+        # identical bodies, so only slot_to_module differs -- without it each
+        # slot would silently load the other's learned weights
+        def compile_with(pa_module, pb_module):
+            cfg = PromptConfig(
+                tokenizer_path=self.tok_path,
+                prompt="History : {{hist}} {{pa}} {{pb}}",
+                response="{{answer}}",
+            )
+            cfg.sid_space.codebook.extend((4, 4, 4))
+            features = list(self.features)
+            for name, module_id in (("pa", pa_module), ("pb", pb_module)):
+                slot = cfg.slots.add(name=name, projection_name=module_id)
+                slot.feature_names.append(name)
+                slot.projection.mlp.hidden_units.extend([16])
+                features.append(
+                    create_prompt_feature(
+                        f'sequence_id_feature {{ feature_name: "{name}" '
+                        f'expression: "user:{name}" num_buckets: 16 '
+                        "embedding_dim: 8 sequence_length: 2 }"
+                    )
+                )
+            return compile_prompt(cfg, features, model_dir=self.test_dir)
+
+        ckpt = os.path.join(self.test_dir, "model.ckpt-route")
+        save_prompt_assets(compile_with("X", "Y"), ckpt)
+        swapped = compile_with("Y", "X")
+        self.assertEqual(swapped.vocab_hash, read_prompt_hashes(ckpt)["vocab_hash"])
+        self.assertNotEqual(swapped.plan_hash, read_prompt_hashes(ckpt)["plan_hash"])
+        with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
+            check_prompt_assets(swapped, ckpt)
+        warning.assert_called_once()
+
     def test_a_changed_template_only_warns(self) -> None:
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
         save_prompt_assets(self._compile(), ckpt)
@@ -140,14 +173,14 @@ class PromptPersistTest(unittest.TestCase):
             check_prompt_assets(changed_compiled_prompt, ckpt)
         warning.assert_called_once()
 
-    def test_a_checkpoint_without_assets_only_warns(self) -> None:
+    def test_a_checkpoint_without_assets_is_fatal(self) -> None:
+        # CheckpointManager.save swallows asset-write failures, so a bare
+        # checkpoint must not restore with the vocabulary guard disabled
         bare = os.path.join(self.test_dir, "model.ckpt-bare")
         os.makedirs(bare, exist_ok=True)
         self.assertIsNone(read_prompt_hashes(bare))
-        compiled_prompt = self._compile()
-        with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
-            check_prompt_assets(compiled_prompt, bare)
-        warning.assert_called_once()
+        with self.assertRaisesRegex(ValueError, "records no prompt assets"):
+            check_prompt_assets(self._compile(), bare)
 
     def test_no_prompt_config_is_a_no_op(self) -> None:
         with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
