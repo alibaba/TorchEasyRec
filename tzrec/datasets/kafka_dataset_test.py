@@ -23,7 +23,7 @@ from alibabacloud_credentials.client import Client as CredClient
 from alibabacloud_tea_openapi import models as openapi_models
 from alibabacloud_tea_util import models as util_models
 from confluent_kafka import KafkaException, Producer, TopicPartition
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.datasets.kafka_dataset import (
@@ -259,12 +259,37 @@ class BuildProjectionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"changed column type\(s\).*raw_c"):
             _build_projection(src, self.DST)
 
-    def test_nested_nullability_is_ignored(self):
-        dst = pa.schema([pa.field("raw_g", pa.list_(pa.field("item", pa.float32())))])
-        src = pa.schema(
-            [pa.field("raw_g", pa.list_(pa.field("element", pa.float32(), False)))]
-        )
-        self.assertIsNone(_build_projection(src, dst))
+    @parameterized.expand(
+        [
+            param(
+                "list",
+                dst_type=pa.list_(pa.float32()),
+                src_type=pa.list_(pa.field("element", pa.float32(), False)),
+            ),
+            param(
+                "map",
+                dst_type=pa.map_(pa.string(), pa.int64()),
+                src_type=pa.map_(
+                    pa.field("key", pa.string(), False),
+                    pa.field("value", pa.int64(), False),
+                ),
+            ),
+        ]
+    )
+    def test_nested_nullability_is_normalized(self, _name, dst_type, src_type):
+        """A nullability-only delta is accepted, and casting makes batches combine."""
+        dst = pa.schema([pa.field("raw_g", dst_type)])
+        src = pa.schema([pa.field("raw_g", src_type)])
+        projection = _build_projection(src, dst)
+        self.assertEqual(projection, [0])
+
+        value = [1.0, 2.0] if pa.types.is_list(dst_type) else [("k", 1)]
+        src_batch = pa.record_batch([pa.array([value], type=src_type)], schema=src)
+        dst_batch = pa.record_batch([pa.array([value], type=dst_type)], schema=dst)
+        projected = pa.RecordBatch.from_arrays(
+            [src_batch.column(i) for i in projection], names=dst.names
+        ).cast(dst)
+        self.assertEqual(len(pa.Table.from_batches([projected, dst_batch])), 2)
 
 
 class KafkaDatasetTest(unittest.TestCase):

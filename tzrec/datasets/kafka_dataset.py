@@ -113,12 +113,15 @@ def _build_projection(
 
     Returns:
         list: src_schema column index per dst_schema field, or ``None`` when the two
-            schemas already line up and no projection is needed.
+            schemas are already identical and no projection is needed.
 
     Raises:
         ValueError: if a dst_schema column is missing from src_schema or has a
             different type there.
     """
+    if src_schema.equals(dst_schema):
+        return None
+
     indices = []
     missing = []
     mismatched = []
@@ -144,8 +147,6 @@ def _build_projection(
             f"reader columns: {dst_schema.names}."
         )
 
-    if len(src_schema) == len(dst_schema) and indices == list(range(len(indices))):
-        return None
     return indices
 
 
@@ -554,10 +555,13 @@ class KafkaReader(BaseReader):
                         )
                     projection = projections[msg_schema]
                     if projection is not None:
+                        # cast normalizes the nested nullability differences
+                        # _build_projection tolerates, so that batches read from
+                        # either schema still combine into one table below.
                         record_batch = pa.RecordBatch.from_arrays(
                             [record_batch.column(i) for i in projection],
                             names=self._schema.names,
-                        )
+                        ).cast(self._schema)
 
                     current_batch_size += len(record_batch)
                     record_batchs.append(record_batch)
