@@ -99,14 +99,7 @@ data_config {
 - 输入消息流的内容是序列化的ArrowRecordBatch，支持两种序列化格式:
 
   - schema-less格式 (`record_batch.serialize()`): 需设置`data_config.input_fields`或`data_config.input_fields_str`来指定数据的schema
-  - 带schema的格式 (Arrow IPC Stream): 无需设置`input_fields`，schema从消息中自动推断，但schema会占用消息体大小
-
-- 上游schema变更:
-
-  - 使用带schema的格式 (Arrow IPC Stream) 时，KafkaDataset按**列名**从消息中取数，因此上游新增列或调整列顺序无需重启训练即可自动适配：新增的列如果没有被任何特征、label等使用，会被自动忽略；列顺序变化不影响取数结果。schema变更时会打印一条INFO日志
-  - 训练用到的列（特征输入列、label_fields、sample_weight_fields等）如果在上游被删除或改名，会直接报错并中断训练，报错信息中会列出缺失的列名。这里不会用空值填充，否则上游故障会被静默地当作特征默认值训练进模型
-  - 训练用到的列在上游发生类型变更时同样直接报错，报错信息中会给出变更前后的类型
-  - schema-less格式的消息体中不包含schema，无法感知上游变更，因此不支持上述能力。上游schema会变更时请使用带schema的格式
+  - 带schema的格式 (Arrow IPC Stream): 无需设置`input_fields`，schema从消息中自动推断，上游新增列或调整列顺序无需重启训练即可自动适配，但schema会占用消息体大小
 
 - input_path: 按如下格式设置
 
