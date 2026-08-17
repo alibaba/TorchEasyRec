@@ -119,12 +119,13 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         Returns:
             The loss when training, the decoded SIDs otherwise.
         """
+        # the embedding lookup stays outside the leaf on both paths, so the
+        # pipeline still sees the sharded module and can prefetch it; only the
+        # padding and the LM, which branch on host ints, are hidden
+        embeds = self.build_input(batch)
         if self.is_inference:
-            return {self._generated_sids_key: _fx_wrapped_generate(self, batch)}
-        # the embedding lookup stays traceable so the train pipeline can still
-        # see the sharded module and prefetch it; only the padding and the LM,
-        # which read the collator's width as a host int, are hidden.
-        return _fx_wrapped_loss(self, self.build_input(batch), batch)
+            return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
+        return _fx_wrapped_loss(self, embeds, batch)
 
     def _forward_loss(
         self, embeds: torch.Tensor, batch: Batch
@@ -157,16 +158,16 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         )
         return {"loss": loss}
 
-    def _generate(self, batch: Batch) -> torch.Tensor:
+    def _generate(self, embeds: torch.Tensor, batch: Batch) -> torch.Tensor:
         """Beam-search the SID answer.
 
         Args:
-            batch: carries the packed prompt and the collator's width.
+            embeds: the assembled prompt embeddings, packed.
+            batch: carries the packed prompt and the padded width.
 
         Returns:
             ``(B, num_return, num_levels)`` local codes, best first.
         """
-        embeds = self.build_input(batch)
         padded, mask, _ = self._left_pad_packed_inputs(embeds, batch)
         space = self._prompt.sid_space
         tokens = dynamic_beam_search(
@@ -248,7 +249,9 @@ def _fx_wrapped_loss(
 
 
 @torch.fx.wrap
-def _fx_wrapped_generate(model: "PromptGenerativeQwen", batch: Batch) -> torch.Tensor:
+def _fx_wrapped_generate(
+    model: "PromptGenerativeQwen", embeds: torch.Tensor, batch: Batch
+) -> torch.Tensor:
     """Hide the decode loop from FX.
 
     ``PredictPipelineSparseDist`` FX-traces the model, and beam decode reads
@@ -257,9 +260,10 @@ def _fx_wrapped_generate(model: "PromptGenerativeQwen", batch: Batch) -> torch.T
 
     Args:
         model: the model whose decode loop to run.
+        embeds: the assembled prompt embeddings, packed.
         batch: the batch to decode.
 
     Returns:
         The decoded local codes.
     """
-    return model._generate(batch)
+    return model._generate(embeds, batch)
