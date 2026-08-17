@@ -91,6 +91,38 @@ class PromptPersistTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match checkpoint"):
             check_prompt_assets(self._compile(codebook=(8, 8, 8)), ckpt)
 
+    def test_a_changed_projection_body_warns(self) -> None:
+        # iterating a dict yields only its keys, so a body change must not be
+        # able to hide behind an unchanged projection name
+        def compile_with(hidden_units):
+            cfg = PromptConfig(
+                tokenizer_path=self.tok_path,
+                prompt="History : {{hist}} {{prof}}",
+                response="{{answer}}",
+            )
+            cfg.sid_space.codebook.extend((4, 4, 4))
+            slot = cfg.slots.add(name="prof")
+            slot.feature_names.append("prof")
+            slot.projection.mlp.hidden_units.extend(hidden_units)
+            features = self.features + [
+                create_prompt_feature(
+                    'sequence_id_feature { feature_name: "prof" '
+                    'expression: "user:prof" num_buckets: 16 embedding_dim: 8 '
+                    "sequence_length: 2 }"
+                )
+            ]
+            return compile_prompt(cfg, features, model_dir=self.test_dir)
+
+        ckpt = os.path.join(self.test_dir, "model.ckpt-proj")
+        save_prompt_assets(compile_with([16]), ckpt)
+        widened = compile_with([256, 128])
+        # only the projection changed, so the vocabulary is still usable
+        self.assertEqual(widened.vocab_hash, read_prompt_hashes(ckpt)["vocab_hash"])
+        self.assertNotEqual(widened.plan_hash, read_prompt_hashes(ckpt)["plan_hash"])
+        with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
+            check_prompt_assets(widened, ckpt)
+        warning.assert_called_once()
+
     def test_a_changed_template_only_warns(self) -> None:
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
         save_prompt_assets(self._compile(), ckpt)

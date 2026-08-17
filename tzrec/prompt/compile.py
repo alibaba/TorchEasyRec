@@ -375,7 +375,9 @@ def compile_prompt(
         plan_hash=_hash(
             sid_space,
             plan,
-            sorted(projection_plan.projections),
+            # items(), not the bare dict: iterating a dict yields only its keys,
+            # which would leave a changed projection body out of the digest
+            sorted(projection_plan.projections.items()),
             tok.to_str(),
         ),
     )
