@@ -119,9 +119,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         Returns:
             The loss when training, the decoded SIDs otherwise.
         """
-        # the embedding lookup stays outside the leaf on both paths, so the
-        # pipeline still sees the sharded module and can prefetch it; only the
-        # padding and the LM, which branch on host ints, are hidden
+        # outside the leaf on both paths, so the pipeline can prefetch it
         embeds = self.build_input(batch)
         if self.is_inference:
             return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}

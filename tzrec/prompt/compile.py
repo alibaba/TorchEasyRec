@@ -375,11 +375,9 @@ def compile_prompt(
         plan_hash=_hash(
             sid_space,
             plan,
-            # items(), not the bare dict: iterating a dict yields only its keys,
-            # which would leave a changed projection body out of the digest
+            # items(), not the bare dict: iterating one yields only its keys
             sorted(projection_plan.projections.items()),
-            # routing too: slots can swap projection_name with matching bodies,
-            # which loads each slot with the other's learned weights
+            # routing too: matching bodies can still be wired to other slots
             sorted(projection_plan.slot_to_module.items()),
             tok.to_str(),
         ),

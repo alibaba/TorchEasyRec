@@ -92,8 +92,7 @@ class PromptPersistTest(unittest.TestCase):
             check_prompt_assets(self._compile(codebook=(8, 8, 8)), ckpt)
 
     def test_a_changed_projection_body_warns(self) -> None:
-        # iterating a dict yields only its keys, so a body change must not be
-        # able to hide behind an unchanged projection name
+        # a body change must not hide behind an unchanged projection name
         def compile_with(hidden_units):
             cfg = PromptConfig(
                 tokenizer_path=self.tok_path,
@@ -124,8 +123,7 @@ class PromptPersistTest(unittest.TestCase):
         warning.assert_called_once()
 
     def test_swapped_projection_routing_warns(self) -> None:
-        # identical bodies, so only slot_to_module differs -- without it each
-        # slot would silently load the other's learned weights
+        # identical bodies, so only slot_to_module differs
         def compile_with(pa_module, pb_module):
             cfg = PromptConfig(
                 tokenizer_path=self.tok_path,
@@ -174,8 +172,7 @@ class PromptPersistTest(unittest.TestCase):
         warning.assert_called_once()
 
     def test_a_checkpoint_without_assets_is_fatal(self) -> None:
-        # CheckpointManager.save swallows asset-write failures, so a bare
-        # checkpoint must not restore with the vocabulary guard disabled
+        # save() swallows asset-write failures, so a bare checkpoint must fail
         bare = os.path.join(self.test_dir, "model.ckpt-bare")
         os.makedirs(bare, exist_ok=True)
         self.assertIsNone(read_prompt_hashes(bare))

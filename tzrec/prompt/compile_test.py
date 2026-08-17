@@ -225,16 +225,14 @@ class CompilePromptTest(unittest.TestCase):
             )
 
     def test_missing_sid_space_is_rejected(self) -> None:
-        # the SID vocabulary is what gives the response its codebook-derived
-        # width; without it no prompt-native model can be built at all
+        # the response width is codebook-derived, so sid_space must exist
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
         cfg.ClearField("sid_space")
         with self.assertRaisesRegex(ValueError, "sid_space is required"):
             self._compile(cfg, [create_prompt_feature(_HIST)])
 
     def test_token_format_without_a_placeholder_is_rejected(self) -> None:
-        # without {i} every SID token renders the same string, so the tokenizer
-        # gains one row while the bands assume sum(codebook)
+        # without {i} every token renders alike: one row, not sum(codebook)
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
         cfg.sid_space.token_format = "<|sid|>"
@@ -251,8 +249,7 @@ class CompilePromptTest(unittest.TestCase):
         self.assertEqual(space.band_hi[-1] - space.band_lo[0] + 1, 12)
 
     def test_missing_response_is_rejected(self) -> None:
-        # without a response the supervised window collapses to one ignored
-        # position and the loss is nan
+        # no response collapses the window to one ignored position: nan loss
         cfg = self._config(prompt="History : {{hist}}", response="")
         cfg.sid_space.codebook.extend([4, 4, 4])
         cfg.ClearField("response")
