@@ -6,39 +6,33 @@ import "tzrec/protos/module.proto";
 // Rendering of an LM prompt. Peer of data_config and model_config: extraction
 // stays in feature_configs, this owns order, literal text and composition.
 message PromptConfig {
-    reserved 2, 9;
-    reserved "asset_dir", "length_buckets";
-
     // BASE tokenizer JSON file. Distinct from hf_model_name_or_path, which
     // supplies the model architecture and cold-start weights.
     required string tokenizer_path = 1;
 
     // Static text between {{name}} placeholders is the prefix and suffix of
     // the surrounding slots; there are no per-slot text fields.
-    required string prompt = 3;
+    required string prompt = 2;
     // Supervised answer. Defines the loss span; absent at inference.
-    optional string response = 4;
+    optional string response = 3;
 
     // A placeholder resolves to a slot with that name, else to an implicit
     // single-feature slot named after it.
-    repeated PromptSlot slots = 5;
+    repeated PromptSlot slots = 4;
 
     // Required when any slot renders SIDs.
-    optional SidSpace sid_space = 6;
+    optional SidSpace sid_space = 5;
 
     // Validation ceiling, not a truncation trigger: an over-long row is an
     // error, never truncated.
-    optional uint32 max_length = 7 [default = 0];
+    optional uint32 max_length = 6 [default = 0];
 
     // Reserves a position filled by a projected slot. Materialized only when
     // at least one slot is PROJECTED.
-    optional string sentinel_token = 8 [default = "<|pg_hole|>"];
+    optional string sentinel_token = 7 [default = "<|pg_hole|>"];
 }
 
 message PromptSlot {
-    reserved 3;
-    reserved "drop_if_empty";
-
     // {{name}} in the template; also the derived feature_group name when the
     // slot is PROJECTED.
     required string name = 1;
@@ -47,10 +41,10 @@ message PromptSlot {
     repeated string feature_names = 2;
     // Reconciles this slot's width with the LM hidden size. Illegal on an
     // INLINE slot. Carries no dimensions: the model resolves them.
-    optional PromptProjection projection = 4;
+    optional PromptProjection projection = 3;
     // Weight-sharing key across slots. Derived groups dedupe automatically;
     // modules share only on request.
-    optional string projection_name = 5;
+    optional string projection_name = 4;
 }
 
 // An optional body plus a final bare Linear to the LM hidden size. The final
