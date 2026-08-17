@@ -79,10 +79,10 @@ message FeatureStoreConfig {
 }
 
 message DeltaEmbeddingDumpConfig {
-    // ZCH features publish raw feature ids: touched and newly admitted ids
-    // with their trained rows, and evicted ids with the fallback row the
-    // model now serves for them (FeatureStore has no delete, so the old
-    // vector must be overwritten explicitly).
+    // ZCH features publish raw feature ids: every id touched, admitted or
+    // evicted, each with the row the model now serves for it -- its trained row
+    // while the table holds it, the shared fallback row once it does not
+    // (FeatureStore has no delete, so a stale vector must be overwritten).
     // Dump touched ids and their latest embedding every N training steps. Do not
     // set this together with dump_interval_minutes.
     // Larger intervals retain a longer id window in memory; auto compaction reduces

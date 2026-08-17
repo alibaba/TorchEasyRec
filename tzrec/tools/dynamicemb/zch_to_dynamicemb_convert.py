@@ -60,16 +60,13 @@ from torch.distributed.checkpoint import (
     TensorStorageMetadata,
     load,
 )
-from torchrec.modules.mc_embedding_modules import (
-    ManagedCollisionEmbeddingBagCollection,
-    ManagedCollisionEmbeddingCollection,
-)
 from torchrec.modules.mc_modules import MCHManagedCollisionModule
 
 from tzrec.main import _create_features, _create_model
 from tzrec.models.model import TrainWrapper
 from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.logging_util import logger
+from tzrec.utils.zch_util import iter_zch_tables
 
 # dynamicemb is an optional dependency. Import lazily so the module is
 # loadable on CPU-only / non-dynamicemb environments (e.g. CI test discovery
@@ -198,80 +195,65 @@ def _find_zch_tables(
     instances do not collide.
     """
     out: Dict[Tuple[str, str], _SourceZchTable] = {}
-    for raw_mod_name, m in model.named_modules():
-        if not isinstance(
-            m,
-            (
-                ManagedCollisionEmbeddingBagCollection,
-                ManagedCollisionEmbeddingCollection,
-            ),
-        ):
-            continue
-        mod_name = checkpoint_util._strip_dmp_prefix(raw_mod_name)
+    for zch_table in iter_zch_tables(model):
+        mod_name = checkpoint_util._strip_dmp_prefix(zch_table.wrapper_fqn)
         group_path = _strip_collection_suffix(mod_name)
         group_key = _normalize_group_key(group_path)
 
-        mc_coll = m._managed_collision_collection
-        emb_coll = m._embedding_module
-
-        if isinstance(m, ManagedCollisionEmbeddingBagCollection):
-            emb_configs = emb_coll.embedding_bag_configs()
-            inner_kind = "embedding_bags"
+        tbl_name = zch_table.table_name
+        mch = zch_table.mc_module
+        if not isinstance(mch, MCHManagedCollisionModule):
+            logger.warning(
+                f"Skipping table '{tbl_name}' under {mod_name}: "
+                f"unsupported MCH type {type(mch).__name__}. "
+                "Only MCHManagedCollisionModule is supported for now."
+            )
+            continue
+        if zch_table.inner_kind == "embedding_bags":
+            emb_configs = zch_table.inner.embedding_bag_configs()
         else:
-            emb_configs = emb_coll.embedding_configs()
-            inner_kind = "embeddings"
+            emb_configs = zch_table.inner.embedding_configs()
         name_to_dim = {c.name: c.embedding_dim for c in emb_configs}
 
-        for tbl_name, mch in mc_coll._managed_collision_modules.items():
-            if not isinstance(mch, MCHManagedCollisionModule):
-                logger.warning(
-                    f"Skipping table '{tbl_name}' under {mod_name}: "
-                    f"unsupported MCH type {type(mch).__name__}. "
-                    "Only MCHManagedCollisionModule is supported for now."
-                )
+        metadata_buffers: List[str] = []
+        zch_size = int(mch._zch_size)
+        non_persistent = set(mch._non_persistent_buffers_set)
+        for buf_name, buf in mch._buffers.items():
+            if not buf_name.startswith("_mch_"):
                 continue
-            metadata_buffers: List[str] = []
-            zch_size = int(mch._zch_size)
-            non_persistent = set(mch._non_persistent_buffers_set)
-            for buf_name, buf in mch._buffers.items():
-                if not buf_name.startswith("_mch_"):
-                    continue
-                if buf_name in ("_mch_sorted_raw_ids", "_mch_remapped_ids_mapping"):
-                    continue
-                if buf_name in non_persistent:
-                    continue
-                if buf is None or buf.dim() != 1 or buf.shape[0] != zch_size:
-                    continue
-                metadata_buffers.append(buf_name)
+            if buf_name in ("_mch_sorted_raw_ids", "_mch_remapped_ids_mapping"):
+                continue
+            if buf_name in non_persistent:
+                continue
+            if buf is None or buf.dim() != 1 or buf.shape[0] != zch_size:
+                continue
+            metadata_buffers.append(buf_name)
 
-            policy = _classify_eviction_policy(metadata_buffers)
-            weight_fqn = f"{mod_name}._embedding_module.{inner_kind}.{tbl_name}.weight"
-            mch_prefix = (
-                f"{mod_name}._managed_collision_collection."
-                f"_managed_collision_modules.{tbl_name}"
+        policy = _classify_eviction_policy(metadata_buffers)
+        weight_fqn = f"{checkpoint_util._strip_dmp_prefix(zch_table.table_fqn)}.weight"
+        mch_prefix = checkpoint_util._strip_dmp_prefix(zch_table.mc_module_fqn)
+        key = (group_key, tbl_name)
+        if key in out:
+            raise RuntimeError(
+                f"Duplicate ZCH-wrapped table '{tbl_name}' found under the "
+                f"same group '{group_key}' (existing: {out[key].mch_prefix}, "
+                f"new: {mch_prefix}). This indicates a misconfigured model."
             )
-            key = (group_key, tbl_name)
-            if key in out:
-                raise RuntimeError(
-                    f"Duplicate ZCH-wrapped table '{tbl_name}' found under the "
-                    f"same group '{group_key}' (existing: {out[key].mch_prefix}, "
-                    f"new: {mch_prefix}). This indicates a misconfigured model."
-                )
-            if tbl_name not in name_to_dim:
-                raise RuntimeError(
-                    f"Table '{tbl_name}' has an MCH module but no matching "
-                    f"embedding config under {mod_name}._embedding_module."
-                )
-            out[key] = _SourceZchTable(
-                group_key=group_key,
-                emb_name=tbl_name,
-                embedding_dim=int(name_to_dim[tbl_name]),
-                zch_size=zch_size,
-                mch_prefix=mch_prefix,
-                weight_fqn=weight_fqn,
-                metadata_buffer_names=metadata_buffers,
-                eviction_policy=policy,
+        if tbl_name not in name_to_dim:
+            raise RuntimeError(
+                f"Table '{tbl_name}' has an MCH module but no matching "
+                f"embedding config under {mod_name}._embedding_module."
             )
+        out[key] = _SourceZchTable(
+            group_key=group_key,
+            emb_name=tbl_name,
+            embedding_dim=int(name_to_dim[tbl_name]),
+            zch_size=zch_size,
+            mch_prefix=mch_prefix,
+            weight_fqn=weight_fqn,
+            metadata_buffer_names=metadata_buffers,
+            eviction_policy=policy,
+        )
     return out
 
 

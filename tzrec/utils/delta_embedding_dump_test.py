@@ -92,6 +92,7 @@ from tzrec.utils.delta_embedding_dump import (
 )
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
+from tzrec.utils.zch_util import register_post_zch_event_tracker_fn
 
 _SHARDED_TABLE_NAME = "table_1"
 _SHARDED_FEATURE_NAME = "feature_1"
@@ -573,8 +574,9 @@ def _run_zch_lifecycle_delta_embedding_dump(
 
     With eviction_interval=2 the coalesce runs on even forwards. Step 1 looks
     up X (hits the fallback row, only profiled); step 2 looks up Y, whose
-    coalesce admits X (same count, lower ids win) but not Y, so X must be
-    published by dump 1 although it was never looked up after admission.
+    coalesce admits X (same count, lower ids win) but not Y, so dump 1 must
+    publish X with its trained rows although it was never looked up after
+    admission, and Y with the fallback row the model serves it.
     Steps 3-4 look up B twice; the step-4 coalesce evicts X (count 1 < B's
     count 2) and admits B, so dump 2 must publish B's trained rows and X's
     fallback row.
@@ -595,12 +597,37 @@ def _run_zch_lifecycle_delta_embedding_dump(
             output_dir,
             device,
         )
+        table_fqn = f"_mc_ebc._embedding_module.embedding_bags.{_ZCH_TABLE_NAME}"
+        mch = dumper._zch_modules[table_fqn]
+
+        def held_rows(ids: List[int]) -> torch.Tensor:
+            weight = dumper._collect_table_weights()[table_fqn].tensor.to(device)
+            raw_ids = torch.tensor(ids, device=device, dtype=torch.int64)
+            slots = torch.searchsorted(mch._mch_sorted_raw_ids, raw_ids)
+            rows = mch._mch_remapped_ids_mapping[slots] - mch._output_global_offset
+            return weight[rows.long()].detach().cpu().to(torch.float32)
+
+        def fallback_rows(count: int) -> torch.Tensor:
+            weight = dumper._collect_table_weights()[table_fqn].tensor.to(device)
+            row = weight[mch._zch_size - 1].detach().cpu().to(torch.float32)
+            return row.expand(count, -1)
+
         for step, ids in ((1, _ZCH_LIFECYCLE_IDS_X), (2, _ZCH_LIFECYCLE_IDS_Y)):
             model(_zch_kjt(rank, ids)).sum().backward()
             dumper.maybe_dump(step)
         dumper.dump(10)
         keys_dump1 = _read_dump_keys(output_dir, 10)
-        testcase.assertEqual(set(keys_dump1), set(_ZCH_LIFECYCLE_IDS_X))
+        testcase.assertEqual(
+            set(keys_dump1), set(_ZCH_LIFECYCLE_IDS_X + _ZCH_LIFECYCLE_IDS_Y)
+        )
+        torch.testing.assert_close(
+            torch.stack([keys_dump1[key_id] for key_id in _ZCH_LIFECYCLE_IDS_X]),
+            held_rows(_ZCH_LIFECYCLE_IDS_X),
+        )
+        torch.testing.assert_close(
+            torch.stack([keys_dump1[key_id] for key_id in _ZCH_LIFECYCLE_IDS_Y]),
+            fallback_rows(len(_ZCH_LIFECYCLE_IDS_Y)),
+        )
 
         for step, ids in ((3, _ZCH_LIFECYCLE_IDS_B), (4, _ZCH_LIFECYCLE_IDS_B)):
             model(_zch_kjt(rank, ids)).sum().backward()
@@ -610,19 +637,14 @@ def _run_zch_lifecycle_delta_embedding_dump(
         testcase.assertEqual(
             set(keys_dump2), set(_ZCH_LIFECYCLE_IDS_X + _ZCH_LIFECYCLE_IDS_B)
         )
-
-        table_fqn = f"_mc_ebc._embedding_module.embedding_bags.{_ZCH_TABLE_NAME}"
-        mch = dumper._zch_modules[table_fqn]
-        weight = dumper._collect_table_weights()[table_fqn].tensor.to(device)
-        fallback_row = weight[mch._zch_size - 1].detach().cpu().to(torch.float32)
-        for key_id in _ZCH_LIFECYCLE_IDS_X:
-            torch.testing.assert_close(keys_dump2[key_id], fallback_row)
-        raw_ids = torch.tensor(_ZCH_LIFECYCLE_IDS_B, device=device, dtype=torch.int64)
-        slots = torch.searchsorted(mch._mch_sorted_raw_ids, raw_ids)
-        rows = mch._mch_remapped_ids_mapping[slots] - mch._output_global_offset
-        expected_b = weight[rows.long()].detach().cpu().to(torch.float32)
-        actual_b = torch.stack([keys_dump2[key_id] for key_id in _ZCH_LIFECYCLE_IDS_B])
-        torch.testing.assert_close(actual_b, expected_b)
+        torch.testing.assert_close(
+            torch.stack([keys_dump2[key_id] for key_id in _ZCH_LIFECYCLE_IDS_X]),
+            fallback_rows(len(_ZCH_LIFECYCLE_IDS_X)),
+        )
+        torch.testing.assert_close(
+            torch.stack([keys_dump2[key_id] for key_id in _ZCH_LIFECYCLE_IDS_B]),
+            held_rows(_ZCH_LIFECYCLE_IDS_B),
+        )
         torch.distributed.barrier()
 
 
@@ -668,148 +690,49 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                     torch.device("cpu"),
                 )
 
-    def _build_zch_collect_model(self, mch_modules):
-        inner_module = torch.nn.Module()
-        inner_module._table_name_to_config = dict.fromkeys(mch_modules)
-        wrapper = torch.nn.Module()
-        wrapper._managed_collision_collection = SimpleNamespace(
-            _managed_collision_modules=mch_modules
-        )
-        wrapper._embedding_module = inner_module
-        model = torch.nn.Module()
-        model.mc_ebc = wrapper
-        return model, inner_module
-
-    def test_collect_zch_modules_maps_tracked_table_fqns(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        mch = MCHManagedCollisionModule(
-            zch_size=4,
+    @staticmethod
+    def _make_mch(zch_size=4, eviction_interval=2):
+        return MCHManagedCollisionModule(
+            zch_size=zch_size,
             device=torch.device("cpu"),
             eviction_policy=LFU_EvictionPolicy(),
-            eviction_interval=2,
+            eviction_interval=eviction_interval,
         )
-        model, inner_module = self._build_zch_collect_model({"user_emb": mch})
-        dumper._model = model
+
+    def _make_zch_tracker(self):
+        tracker = object.__new__(ModelDeltaTracker)
+        tracker.zch_modules = {}
+        tracker._zch_fqn_by_mc_module = {}
+        return tracker
+
+    def test_tracker_binds_zch_table_to_mch_module(self):
+        tracker = self._make_zch_tracker()
+        mch = self._make_mch()
         table_fqn = "mc_ebc._embedding_module.embedding_bags.user_emb"
-        dumper._tracker = SimpleNamespace(
-            fqn_to_feature_names={table_fqn: ["user_id"]},
-            tracked_modules={"mc_ebc._embedding_module": inner_module},
-        )
-        with mock.patch(
-            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
-            side_effect=lambda module_fqn, _module, table_name: (
-                f"{module_fqn}.embedding_bags.{table_name}"
-            ),
-        ):
-            self.assertEqual(dumper._collect_zch_modules(), {table_fqn: mch})
-        self.assertEqual(dumper._zch_outer_by_inner, {id(inner_module): model.mc_ebc})
+        tracker._track_zch_table(table_fqn, "user_emb", {"user_emb": mch})
+        self.assertEqual(tracker.zch_modules, {table_fqn: mch})
+        self.assertEqual(tracker._zch_fqn_by_mc_module, {id(mch): table_fqn})
 
-    def test_collect_zch_modules_fails_fast_on_unresolved_table(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        mch = MCHManagedCollisionModule(
-            zch_size=4,
-            device=torch.device("cpu"),
-            eviction_policy=LFU_EvictionPolicy(),
-            eviction_interval=2,
-        )
-        model, inner_module = self._build_zch_collect_model({"user_emb": mch})
-        # The tracker also owns a second table of the same ZCH inner module
-        # that the MCH collection does not cover; dumping it plain would emit
-        # remapped rows as serving keys.
-        inner_module._table_name_to_config["stray_emb"] = None
-        dumper._model = model
-        dumper._tracker = SimpleNamespace(
-            fqn_to_feature_names={
-                "mc_ebc._embedding_module.embedding_bags.user_emb": ["user_id"],
-                "mc_ebc._embedding_module.embedding_bags.stray_emb": ["stray_id"],
-            },
-            tracked_modules={"mc_ebc._embedding_module": inner_module},
-        )
-        with mock.patch(
-            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
-            side_effect=lambda module_fqn, _module, table_name: (
-                f"{module_fqn}.embedding_bags.{table_name}"
-            ),
-        ):
-            with self.assertRaisesRegex(ValueError, "stray_emb"):
-                dumper._collect_zch_modules()
+    def test_tracker_fails_on_table_without_managed_collision_module(self):
+        # The lookups of a managed collision wrapper are recorded as raw ids
+        # for every one of its tables, so a table the collection does not cover
+        # would be dumped plain and emit remapped rows as serving keys.
+        tracker = self._make_zch_tracker()
+        with self.assertRaisesRegex(ValueError, "stray_emb"):
+            tracker._track_zch_table(
+                "mc_ebc._embedding_module.embedding_bags.stray_emb",
+                "stray_emb",
+                {"user_emb": self._make_mch()},
+            )
 
-    def test_collect_zch_modules_skips_untracked_non_mch_module(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        model, inner_module = self._build_zch_collect_model(
-            {"user_emb": torch.nn.Module()}
-        )
-        dumper._model = model
-        dumper._tracker = SimpleNamespace(
-            fqn_to_feature_names={},
-            tracked_modules={"mc_ebc._embedding_module": inner_module},
-        )
-        with mock.patch(
-            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
-            side_effect=lambda module_fqn, _module, table_name: (
-                f"{module_fqn}.embedding_bags.{table_name}"
-            ),
-        ):
-            with self.assertLogs("tzrec", level="WARNING") as logged:
-                self.assertEqual(dumper._collect_zch_modules(), {})
-        self.assertTrue(
-            any("unsupported" in line for line in logged.output), logged.output
-        )
-
-    def test_collect_zch_modules_fails_on_tracked_non_mch_module(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        model, inner_module = self._build_zch_collect_model(
-            {"user_emb": torch.nn.Module()}
-        )
-        dumper._model = model
-        table_fqn = "mc_ebc._embedding_module.embedding_bags.user_emb"
-        dumper._tracker = SimpleNamespace(
-            fqn_to_feature_names={table_fqn: ["user_id"]},
-            tracked_modules={"mc_ebc._embedding_module": inner_module},
-        )
-        with mock.patch(
-            "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
-            side_effect=lambda module_fqn, _module, table_name: (
-                f"{module_fqn}.embedding_bags.{table_name}"
-            ),
-        ):
-            with self.assertLogs("tzrec", level="WARNING"):
-                with self.assertRaisesRegex(ValueError, "user_emb"):
-                    dumper._collect_zch_modules()
-
-    def test_close_uninstalls_zch_compute_wrapper(self):
-        class _ComputeModule(nn.Module):
-            def compute(self, ctx, dist_input):
-                return None
-
-        class _EventModule(nn.Module):
-            def _update_and_evict(self, uniq_ids, uniq_ids_counts, uniq_ids_metadata):
-                return None
-
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        module = _ComputeModule()
-        orig_compute = module.compute
-        mch = _EventModule()
-        orig_update = mch._update_and_evict
-
-        def tracked_compute(ctx, dist_input):
-            return None
-
-        def tracked_update_and_evict(*args, **kwargs):
-            return None
-
-        module.compute = tracked_compute
-        mch._update_and_evict = tracked_update_and_evict
-        dumper._zch_compute_wrappers = {id(module): (module, orig_compute)}
-        dumper._zch_event_wrappers = {id(mch): (mch, orig_update)}
-        dumper._uploader = None
-
-        dumper.close()
-
-        self.assertIs(module.compute, orig_compute)
-        self.assertIs(mch._update_and_evict, orig_update)
-        self.assertEqual(dumper._zch_compute_wrappers, {})
-        self.assertEqual(dumper._zch_event_wrappers, {})
+    def test_tracker_fails_on_non_mch_managed_collision_module(self):
+        tracker = self._make_zch_tracker()
+        with self.assertRaisesRegex(ValueError, "user_emb"):
+            tracker._track_zch_table(
+                "mc_ebc._embedding_module.embedding_bags.user_emb",
+                "user_emb",
+                {"user_emb": torch.nn.Module()},
+            )
 
     def test_row_wise_shard_info_uses_row_offset(self):
         table_config = ShardedEmbeddingTable(
@@ -1182,6 +1105,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def test_model_delta_tracker_records_same_table_name_by_owner_fqn(self):
         tracker = object.__new__(ModelDeltaTracker)
+        tracker.pause_depth = 0
         ebc_module = torch.nn.Module()
         ec_module = torch.nn.Module()
         ebc_fqn = "model.ebc.embedding_bags.shared"
@@ -1291,6 +1215,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def test_model_delta_tracker_auto_compacts_once_per_batch(self):
         tracker = object.__new__(ModelDeltaTracker)
+        tracker.pause_depth = 0
         tracker.per_consumer_batch_idx = {"delta": -1}
         tracker.curr_batch_idx = 2
         tracker.curr_compact_index = 0
@@ -1490,38 +1415,38 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertIsNone(output_path)
 
     def test_pause_tracking_suppresses_post_lookup_recording(self):
-        lookup_fn = mock.MagicMock()
-        odist_fn = mock.MagicMock()
-        sharded_module = SimpleNamespace(
-            post_lookup_tracker_fn=lookup_fn,
-            post_odist_tracker_fn=odist_fn,
+        tracker = object.__new__(ModelDeltaTracker)
+        tracker.pause_depth = 0
+        tracker.curr_batch_idx = 0
+        tracker.curr_compact_index = -1
+        tracker.per_consumer_batch_idx = {"consumer": -1}
+        appended = []
+        tracker.store = SimpleNamespace(
+            append=lambda batch_idx, fqn, ids, states: appended.append(fqn),
+            compact=lambda start_idx, end_idx: appended.append("compact"),
+        )
+        module = torch.nn.Module()
+        tracker._feature_to_fqn_by_module = {module: {"user_id": "user_emb"}}
+        kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["user_id"],
+            values=torch.tensor([1], dtype=torch.int64),
+            lengths=torch.tensor([1], dtype=torch.int64),
         )
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._tracking_pause_depth = 0
-        dumper._tracker = SimpleNamespace(tracked_modules={"user_emb": sharded_module})
-        dumper._install_tracking_pause_guard()
+        dumper._tracker = tracker
 
-        sharded_module.post_lookup_tracker_fn("train")
-        sharded_module.post_odist_tracker_fn()
-        lookup_fn.assert_called_once_with("train")
-        odist_fn.assert_called_once_with()
+        tracker.record_lookup(kjt, torch.empty(0), module)
+        tracker.trigger_compaction()
+        self.assertEqual(appended, ["user_emb", "compact"])
 
         with dumper.pause_tracking():
-            sharded_module.post_lookup_tracker_fn("eval")
-            sharded_module.post_odist_tracker_fn()
-        lookup_fn.assert_called_once_with("train")
-        odist_fn.assert_called_once_with()
+            tracker.record_lookup(kjt, torch.empty(0), module)
+            tracker.trigger_compaction()
+        self.assertEqual(appended, ["user_emb", "compact"])
 
-        sharded_module.post_lookup_tracker_fn("train2", source="train")
-        sharded_module.post_odist_tracker_fn()
-        self.assertEqual(
-            lookup_fn.call_args_list,
-            [
-                mock.call("train"),
-                mock.call("train2", source="train"),
-            ],
-        )
-        self.assertEqual(odist_fn.call_args_list, [mock.call(), mock.call()])
+        tracker.curr_batch_idx = 1
+        tracker.record_lookup(kjt, torch.empty(0), module)
+        self.assertEqual(appended, ["user_emb", "compact", "user_emb"])
 
     def test_collect_table_shard_infos_prefers_grouped_embedding_metadata(self):
         grouped_config = GroupedEmbeddingConfig(
@@ -1631,6 +1556,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_row_wise_lookup_outputs_global_key_ids(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
+        dumper._zch_modules = {}
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
         table_fqn = "model.ebc.embedding_bags.user_emb"
         embeddings, key_ids = dumper._lookup_embeddings(
@@ -1654,82 +1580,68 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         torch.testing.assert_close(embeddings, weight[[0, 2]])
         torch.testing.assert_close(key_ids, torch.tensor([32, 34]))
 
-    def test_lookup_filters_out_of_range_ids(self):
+    def test_lookup_fails_on_ids_outside_table_rows(self):
+        # A looked-up id outside the table's rows means the feature's id space
+        # does not match the table, so the rows the model trained on are not
+        # the ones it will serve.
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
+        dumper._zch_modules = {}
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
         table_fqn = "model.ebc.embedding_bags.user_emb"
-        embeddings, key_ids = dumper._lookup_embeddings(
-            table_fqn,
-            torch.tensor([0, 2, 99, -1]),
-            table_weights={
-                table_fqn: _TableWeight(
-                    tensor=weight,
-                    shard_info=_TableShardInfo(
-                        row_offset=32,
-                        local_rows=4,
-                        local_cols=2,
-                        global_rows=64,
-                        global_cols=2,
-                        has_shard_metadata=True,
-                    ),
-                )
-            },
-            dynamic_modules={},
-        )
-        torch.testing.assert_close(embeddings, weight[[0, 2]])
-        torch.testing.assert_close(key_ids, torch.tensor([32, 34]))
-
-    def test_zch_rows_of_raw_ids_resolves_held_ids(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        mch = MCHManagedCollisionModule(
-            zch_size=4,
-            device=torch.device("cpu"),
-            eviction_policy=LFU_EvictionPolicy(),
-            eviction_interval=2,
-        )
-        # slot -> raw id: slots 0/1 hold raw ids 101/105, slots 2/3 are empty
-        # (slot 3 is the fallback row served for unmatched ids).
-        mch._mch_sorted_raw_ids.copy_(
-            torch.tensor(
-                [101, 105, torch.iinfo(torch.int64).max, torch.iinfo(torch.int64).max]
+        with self.assertRaisesRegex(ValueError, "outside its local row range"):
+            dumper._lookup_embeddings(
+                table_fqn,
+                torch.tensor([0, 2, 99, -1]),
+                table_weights={
+                    table_fqn: _TableWeight(
+                        tensor=weight,
+                        shard_info=_TableShardInfo(
+                            row_offset=32,
+                            local_rows=4,
+                            local_cols=2,
+                            global_rows=64,
+                            global_cols=2,
+                            has_shard_metadata=True,
+                        ),
+                    )
+                },
+                dynamic_modules={},
             )
-        )
-        # slot -> global row, permuted so the slot resolution matters.
-        mch._mch_remapped_ids_mapping.copy_(torch.tensor([0, 2, 1, 3]))
-        weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
-        table_fqn = "model.mc_ebc._embedding_module.embedding_bags.user_emb"
-        held_mask, rows = dumper._zch_rows_of_raw_ids(
-            mch, table_fqn, weight, torch.tensor([90, 101, 105, 200])
-        )
-        torch.testing.assert_close(held_mask, torch.tensor([False, True, True, False]))
-        torch.testing.assert_close(rows, torch.tensor([0, 2]))
 
-    def test_zch_rows_of_raw_ids_fails_on_row_outside_local_shard(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        mch = MCHManagedCollisionModule(
-            zch_size=4,
-            device=torch.device("cpu"),
-            eviction_policy=LFU_EvictionPolicy(),
-            eviction_interval=2,
+    def test_zch_lookup_binds_held_ids_to_their_rows(self):
+        dumper, mch, weight, table_fqn, table_weights = self._build_zch_event_dumper(
+            # slots 0/1 hold raw ids 101/105, slots 2/3 are empty (slot 3 is
+            # the fallback row served for unmatched ids); the slot -> row
+            # mapping is permuted so the slot resolution matters.
+            raw_ids_per_slot=[101, 105, None, None],
+            mapping=[0, 2, 1, 3],
+            offset=0,
         )
-        mch._mch_sorted_raw_ids.copy_(torch.tensor([101, 102, 103, 104]))
-        mch._mch_remapped_ids_mapping.copy_(torch.tensor([0, 1, 99, 3]))
-        weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
-        table_fqn = "model.mc_ebc._embedding_module.embedding_bags.user_emb"
+        embeddings, key_ids = self._lookup_zch(
+            dumper, table_fqn, table_weights, [90, 101, 105, 200]
+        )
+        self.assertEqual(key_ids.tolist(), [90, 101, 105, 200])
+        fallback = weight[mch._zch_size - 1].tolist()
+        self.assertEqual(
+            embeddings.tolist(),
+            [fallback, weight[0].tolist(), weight[2].tolist(), fallback],
+        )
+
+    def test_zch_lookup_fails_on_row_outside_local_shard(self):
+        dumper, mch, weight, table_fqn, table_weights = self._build_zch_event_dumper(
+            raw_ids_per_slot=[101, 102, 103, 104],
+            mapping=[0, 1, 99, 3],
+            offset=0,
+        )
         with self.assertRaisesRegex(ValueError, "outside the local shard"):
-            dumper._zch_rows_of_raw_ids(mch, table_fqn, weight, torch.tensor([103]))
+            self._lookup_zch(dumper, table_fqn, table_weights, [103])
 
     def _build_zch_event_dumper(self, raw_ids_per_slot, mapping, offset, zch_size=4):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 1
         dumper._rank = 0
-        mch = MCHManagedCollisionModule(
-            zch_size=zch_size,
-            device=torch.device("cpu"),
-            eviction_policy=LFU_EvictionPolicy(),
-            eviction_interval=2,
-        )
+        mch = self._make_mch(zch_size=zch_size)
         mch._mch_sorted_raw_ids.copy_(
             torch.tensor(
                 [
@@ -1743,7 +1655,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             torch.tensor(mapping, dtype=torch.int64) + offset
         )
         mch._output_global_offset = offset
-        dumper._zch_evicted = {}
         weight = torch.arange(
             zch_size * _SHARED_EBC_EMBEDDING_DIM, dtype=torch.float32
         ).reshape(zch_size, _SHARED_EBC_EMBEDDING_DIM)
@@ -1765,25 +1676,25 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         }
         return dumper, mch, weight, table_fqn, table_weights
 
+    def _lookup_zch(self, dumper, table_fqn, table_weights, ids):
+        return dumper._lookup_embeddings(
+            table_fqn,
+            torch.tensor(ids, dtype=torch.int64),
+            table_weights=table_weights,
+            dynamic_modules={},
+        )
+
     def test_zch_delta_publishes_touched_held_id_with_row(self):
         dumper, mch, weight, table_fqn, table_weights = self._build_zch_event_dumper(
             raw_ids_per_slot=[101, 102, None, None],
             mapping=[0, 1, 2, 3],
             offset=0,
         )
-        # 102 reached the tracker store through the admission hook without a
+        # 102 reached the tracker store through the admission event without a
         # post-admission lookup; the dump publishes its currently bound row.
-        table_chunks: list = []
-        num_rows = dumper._append_zch_delta_rows(
-            table_chunks,
-            5,
-            table_weights,
-            zch_touched={table_fqn: torch.tensor([102], dtype=torch.int64)},
-        )
-        self.assertEqual(num_rows, 1)
-        rows = table_chunks[0]
-        self.assertEqual(rows["key_id"].to_pylist(), [102])
-        self.assertEqual(rows["embedding"].to_pylist(), [weight[1].tolist()])
+        embeddings, key_ids = self._lookup_zch(dumper, table_fqn, table_weights, [102])
+        self.assertEqual(key_ids.tolist(), [102])
+        self.assertEqual(embeddings.tolist(), [weight[1].tolist()])
 
     def test_zch_delta_publishes_evicted_ids_with_fallback_row(self):
         dumper, mch, weight, table_fqn, table_weights = self._build_zch_event_dumper(
@@ -1791,20 +1702,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mapping=[1, 0, 2, 3],
             offset=0,
         )
-        # The event hook recorded 101's eviction; the dump must overwrite its
-        # stale FeatureStore entry with the fallback row the model now serves.
-        dumper._zch_evicted[table_fqn] = [torch.tensor([101], dtype=torch.int64)]
-        table_chunks: list = []
-        num_rows = dumper._append_zch_delta_rows(
-            table_chunks, 5, table_weights, zch_touched={}
-        )
-        self.assertEqual(num_rows, 1)
-        rows = table_chunks[0]
-        self.assertEqual(rows["key_id"].to_pylist(), [101])
-        self.assertEqual(
-            rows["embedding"].to_pylist(), [weight[mch._zch_size - 1].tolist()]
-        )
-        self.assertEqual(dumper._zch_evicted, {})
+        # 101 was evicted, so the dump must overwrite its stale FeatureStore
+        # entry with the fallback row the model now serves for it.
+        embeddings, key_ids = self._lookup_zch(dumper, table_fqn, table_weights, [101])
+        self.assertEqual(key_ids.tolist(), [101])
+        self.assertEqual(embeddings.tolist(), [weight[mch._zch_size - 1].tolist()])
 
     def test_zch_delta_republishes_readmitted_id_with_new_row(self):
         dumper, mch, weight, table_fqn, table_weights = self._build_zch_event_dumper(
@@ -1812,75 +1714,42 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mapping=[1, 0, 2, 3],
             offset=0,
         )
-        # 101 was evicted and re-admitted between two dumps: the eviction
-        # event is pending, but the id is held again on a row whose embedding
-        # was reset on eviction, so the dump republishes its new row instead
-        # of the fallback correction.
-        dumper._zch_evicted[table_fqn] = [torch.tensor([101], dtype=torch.int64)]
-        table_chunks: list = []
-        num_rows = dumper._append_zch_delta_rows(
-            table_chunks, 5, table_weights, zch_touched={}
-        )
-        self.assertEqual(num_rows, 1)
-        rows = table_chunks[0]
-        self.assertEqual(rows["key_id"].to_pylist(), [101])
-        self.assertEqual(rows["embedding"].to_pylist(), [weight[1].tolist()])
+        # 101 was evicted and re-admitted between two dumps, so it is held
+        # again on a row whose embedding was reset on eviction; the dump
+        # republishes that new row rather than the fallback correction.
+        embeddings, key_ids = self._lookup_zch(dumper, table_fqn, table_weights, [101])
+        self.assertEqual(key_ids.tolist(), [101])
+        self.assertEqual(embeddings.tolist(), [weight[1].tolist()])
 
-    def test_zch_delta_drops_touched_never_admitted_id(self):
+    def test_zch_delta_publishes_never_admitted_id_with_fallback_row(self):
         dumper, mch, weight, table_fqn, table_weights = self._build_zch_event_dumper(
             raw_ids_per_slot=[101, None, None, None],
             mapping=[0, 1, 2, 3],
             offset=0,
         )
-        # 200 was looked up but never admitted, so it keeps being served the
-        # shared fallback row; publishing it would flood the store with
-        # long-tail ids.
-        table_chunks: list = []
-        num_rows = dumper._append_zch_delta_rows(
-            table_chunks,
-            5,
-            table_weights,
-            zch_touched={table_fqn: torch.tensor([200], dtype=torch.int64)},
-        )
-        self.assertEqual(num_rows, 0)
+        # 200 was looked up but never admitted, so the model serves it the
+        # shared fallback row and the dump publishes exactly that.
+        embeddings, key_ids = self._lookup_zch(dumper, table_fqn, table_weights, [200])
+        self.assertEqual(key_ids.tolist(), [200])
+        self.assertEqual(embeddings.tolist(), [weight[mch._zch_size - 1].tolist()])
 
-    def test_zch_delta_skips_table_without_touch_or_events(self):
-        dumper, mch, weight, table_fqn, table_weights = self._build_zch_event_dumper(
-            raw_ids_per_slot=[101, 102, None, None],
-            mapping=[0, 1, 2, 3],
-            offset=0,
-        )
-        table_chunks: list = []
-        num_rows = dumper._append_zch_delta_rows(
-            table_chunks, 5, table_weights, zch_touched={}
-        )
-        self.assertEqual(num_rows, 0)
-        self.assertEqual(table_chunks, [])
-
-    def _make_zch_event_hook_dumper(self):
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._tracking_pause_depth = 0
-        dumper._zch_evicted = {}
-        dumper._zch_event_wrappers = {}
+    def _make_zch_event_tracker(self):
+        tracker = object.__new__(ModelDeltaTracker)
+        tracker.pause_depth = 0
+        tracker.curr_batch_idx = 0
         appended = []
-        dumper._tracker = SimpleNamespace(
-            curr_batch_idx=0,
-            store=SimpleNamespace(
-                append=lambda batch_idx, fqn, ids, states: appended.append(
-                    (batch_idx, fqn, sorted(ids.tolist()))
-                )
-            ),
+        tracker.store = SimpleNamespace(
+            append=lambda batch_idx, fqn, ids, states: appended.append(
+                (batch_idx, fqn, sorted(ids.tolist()))
+            )
         )
         # eviction_interval=1 coalesces the profiled history on every forward.
-        mch = MCHManagedCollisionModule(
-            zch_size=4,
-            device=torch.device("cpu"),
-            eviction_policy=LFU_EvictionPolicy(),
-            eviction_interval=1,
-        )
+        mch = self._make_mch(eviction_interval=1)
         table_fqn = "model.mc_ebc._embedding_module.embedding_bags.zch_tbl"
-        dumper._install_zch_event_hook(table_fqn, mch)
-        return dumper, mch, table_fqn, appended
+        tracker.zch_modules = {table_fqn: mch}
+        tracker._zch_fqn_by_mc_module = {id(mch): table_fqn}
+        register_post_zch_event_tracker_fn(mch, tracker.record_zch_event)
+        return tracker, mch, table_fqn, appended
 
     @staticmethod
     def _profile_zch_ids(mch, ids):
@@ -1893,10 +1762,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             }
         )
 
-    def test_zch_event_hook_records_admitted_and_evicted_ids(self):
-        dumper, mch, table_fqn, appended = self._make_zch_event_hook_dumper()
+    def test_zch_event_records_admitted_and_evicted_ids(self):
+        tracker, mch, table_fqn, appended = self._make_zch_event_tracker()
         # zch_size=4 leaves 3 usable slots. Counts 10:2/11:1 fill two free
-        # slots, 20:2 the last one; 30:3 then outscores 11 (LFU count 1).
+        # slots, 20:2 the last one; 30:3 then outscores 11 (LFU count 1) and
+        # evicts it, so 11 and 30 are recorded together.
         self._profile_zch_ids(mch, [10, 10, 11])
         self._profile_zch_ids(mch, [20, 20])
         self._profile_zch_ids(mch, [30, 30, 30])
@@ -1905,27 +1775,35 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             [
                 (0, table_fqn, [10, 11]),
                 (0, table_fqn, [20]),
-                (0, table_fqn, [30]),
+                (0, table_fqn, [11, 30]),
             ],
         )
-        self.assertEqual(
-            [chunk.tolist() for chunk in dumper._zch_evicted[table_fqn]], [[11]]
-        )
 
-    def test_zch_event_hook_skips_recording_while_paused(self):
-        dumper, mch, table_fqn, appended = self._make_zch_event_hook_dumper()
+    def test_zch_event_records_while_paused(self):
+        tracker, mch, table_fqn, appended = self._make_zch_event_tracker()
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._tracker = tracker
         self._profile_zch_ids(mch, [10, 10, 11])
         with dumper.pause_tracking():
             self._profile_zch_ids(mch, [40, 40, 40, 40])
-        # The eviction itself still ran inside the MCH module; only the
-        # recording was suppressed.
-        self.assertEqual(appended, [(0, table_fqn, [10, 11])])
-        self.assertNotIn(table_fqn, dumper._zch_evicted)
+        # A non-training forward still mutates the table, and an eviction
+        # dropped here would never be published at all.
+        self.assertEqual(appended, [(0, table_fqn, [10, 11]), (0, table_fqn, [40])])
         self.assertIn(40, mch._mch_sorted_raw_ids.tolist())
+
+    def test_zch_event_fails_on_unknown_module(self):
+        tracker, mch, _, _ = self._make_zch_event_tracker()
+        with self.assertRaisesRegex(ValueError, "Unrecognized zch module"):
+            tracker.record_zch_event(
+                torch.nn.Module(),
+                torch.tensor([1], dtype=torch.int64),
+                torch.tensor([2], dtype=torch.int64),
+            )
 
     def test_lookup_handles_empty_ids(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
+        dumper._zch_modules = {}
         weight = torch.tensor([[0.0, 0.1], [1.0, 1.1], [2.0, 2.1], [3.0, 3.1]])
         table_fqn = "model.ebc.embedding_bags.user_emb"
         embeddings, key_ids = dumper._lookup_embeddings(
@@ -1952,6 +1830,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_row_wise_lookup_requires_shard_metadata(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._world_size = 2
+        dumper._zch_modules = {}
         table_fqn = "model.ebc.embedding_bags.user_emb"
         with self.assertRaisesRegex(ValueError, "shard metadata"):
             dumper._lookup_embeddings(
