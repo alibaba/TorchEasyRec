@@ -27,10 +27,11 @@ from tzrec.tests.prompt_test_util import (
 )
 from tzrec.utils.test_util import make_test_dir
 
-_WORDS = ["History", "Profile", "Predict", ":", ".", "<unk>", "<|im_end|>"]
+_WORDS = ["History", "Profile", "Predict", ":", ".", "Histor0", "<unk>", "<|im_end|>"]
 
 
 _HIST = 'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }'
+_ANSWER = 'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }'
 _PROF = (
     'sequence_id_feature { feature_name: "prof" expression: "user:prof" '
     "num_buckets: 768 embedding_dim: 16 sequence_length: 4 }"
@@ -46,10 +47,14 @@ class CompilePromptTest(unittest.TestCase):
         )
 
     def _config(self, **kwargs) -> PromptConfig:
+        kwargs.setdefault("response", "{{answer}}")
         cfg = PromptConfig(tokenizer_path=self.tok_path, **kwargs)
         return cfg
 
     def _compile(self, cfg, features):
+        named = {f.name for f in features}
+        if "{{answer}}" in cfg.response and "answer" not in named:
+            features = list(features) + [create_prompt_feature(_ANSWER)]
         return compile_prompt(cfg, features, model_dir=self.test_dir)
 
     def test_sid_space_resolves_offsets_and_bands(self) -> None:
@@ -176,7 +181,8 @@ class CompilePromptTest(unittest.TestCase):
     def test_sid_tokens_absent_from_the_base_tokenizer(self) -> None:
         cfg = self._config(prompt="X : {{hist}}")
         cfg.sid_space.codebook.extend([4])
-        cfg.sid_space.token_format = "History"
+        # renders Histor0..Histor3, and Histor0 is already in the base vocab
+        cfg.sid_space.token_format = "Histor{i}"
         with self.assertRaisesRegex(ValueError, "already in the base tokenizer"):
             self._compile(cfg, [create_prompt_feature(_HIST)])
 
@@ -218,16 +224,40 @@ class CompilePromptTest(unittest.TestCase):
                 cfg, [create_prompt_feature(_HIST), create_prompt_feature(_PROF)]
             )
 
-    def test_unbounded_response_is_rejected(self) -> None:
-        # with no sid_space the response has no codebook-derived width, so the
-        # supervised window is unbounded and the logits would cover every
-        # position
+    def test_missing_sid_space_is_rejected(self) -> None:
+        # the SID vocabulary is what gives the response its codebook-derived
+        # width; without it no prompt-native model can be built at all
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
-        answer = create_prompt_feature(
-            'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }'
-        )
-        with self.assertRaisesRegex(ValueError, "window cannot be bounded"):
-            self._compile(cfg, [create_prompt_feature(_HIST), answer])
+        cfg.ClearField("sid_space")
+        with self.assertRaisesRegex(ValueError, "sid_space is required"):
+            self._compile(cfg, [create_prompt_feature(_HIST)])
+
+    def test_token_format_without_a_placeholder_is_rejected(self) -> None:
+        # without {i} every SID token renders the same string, so the tokenizer
+        # gains one row while the bands assume sum(codebook)
+        cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        cfg.sid_space.token_format = "<|sid|>"
+        with self.assertRaisesRegex(ValueError, "has no '{i}' placeholder"):
+            self._compile(cfg, [create_prompt_feature(_HIST)])
+
+    def test_a_custom_token_format_with_a_placeholder_compiles(self) -> None:
+        cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        cfg.sid_space.token_format = "C{i}"
+        compiled = self._compile(cfg, [create_prompt_feature(_HIST)])
+
+        space = compiled.sid_space
+        self.assertEqual(space.band_hi[-1] - space.band_lo[0] + 1, 12)
+
+    def test_missing_response_is_rejected(self) -> None:
+        # without a response the supervised window collapses to one ignored
+        # position and the loss is nan
+        cfg = self._config(prompt="History : {{hist}}", response="")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        cfg.ClearField("response")
+        with self.assertRaisesRegex(ValueError, "response is required"):
+            self._compile(cfg, [create_prompt_feature(_HIST)])
 
     def test_a_grouped_feature_inherits_the_group_cap(self) -> None:
         # a SequenceFeature member never sets its own sequence_length; the cap

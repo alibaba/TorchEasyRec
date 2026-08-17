@@ -42,11 +42,17 @@ class PromptPersistTest(unittest.TestCase):
         self.features = [
             create_prompt_feature(
                 'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }'
-            )
+            ),
+            create_prompt_feature(
+                'sequence_raw_feature { feature_name: "answer" '
+                'expression: "item:answer" }'
+            ),
         ]
 
     def _compile(self, codebook=(4, 4, 4), prompt="History : {{hist}}"):
-        cfg = PromptConfig(tokenizer_path=self.tok_path, prompt=prompt)
+        cfg = PromptConfig(
+            tokenizer_path=self.tok_path, prompt=prompt, response="{{answer}}"
+        )
         cfg.sid_space.codebook.extend(codebook)
         return compile_prompt(cfg, self.features, model_dir=self.test_dir)
 

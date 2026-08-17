@@ -128,6 +128,13 @@ def _derive_slot_layout(
 def _render_sid_tokens(sid_space: SidSpace) -> List[str]:
     """Render the SID tokens, one per flat index."""
     fmt = sid_space.token_format
+    if "{i}" not in fmt:
+        raise ValueError(
+            f"sid_space.token_format [{fmt}] has no '{{i}}' placeholder, so "
+            f"every SID token would render the same string and the tokenizer "
+            f"would gain one row where the bands assume "
+            f"{sum(sid_space.codebook)}."
+        )
     return [fmt.replace("{i}", str(i)) for i in range(sum(sid_space.codebook))]
 
 
@@ -141,10 +148,14 @@ def _read_manifest_codebook(path: str) -> List[int]:
 
 def _build_sid_space(
     cfg: PromptConfig, tok: Tokenizer, base_vocab_size: int, has_projection: bool
-) -> Optional[ResolvedSidSpace]:
+) -> ResolvedSidSpace:
     """Extend the tokenizer with SID tokens and resolve the token space."""
     if not cfg.HasField("sid_space"):
-        return None
+        raise ValueError(
+            "prompt_config.sid_space is required: it declares the codebook the "
+            "SID vocabulary is built from, and every prompt-native model needs "
+            "one to extend its embedding table and to decode."
+        )
     space = cfg.sid_space
     codebook = [int(c) for c in space.codebook]
     if not codebook:
@@ -318,9 +329,7 @@ def compile_prompt(
         fill_mode = fill_modes_by_slot_name[name]
         levels = (
             sid_space.num_levels
-            if sid_space is not None
-            and name in response_slot_names
-            and fill_mode is FillMode.INLINE
+            if name in response_slot_names and fill_mode is FillMode.INLINE
             else None
         )
         segs[name] = SlotSeg(
@@ -355,7 +364,7 @@ def compile_prompt(
         static_prefix_len=_static_prefix_len(body),
         projected_slots=projected,
     )
-    _validate(cfg, plan, sid_space)
+    _validate(plan)
 
     return CompiledPrompt(
         sid_space=sid_space,
@@ -364,7 +373,10 @@ def compile_prompt(
         tokenizer_dir=tokenizer_dir,
         vocab_hash=_hash(sid_space, tok.to_str()),
         plan_hash=_hash(
-            sid_space, plan, sorted(projection_plan.projections), tok.to_str()
+            sid_space,
+            plan,
+            sorted(projection_plan.projections),
+            tok.to_str(),
         ),
     )
 
@@ -471,9 +483,7 @@ def _static_prefix_len(segments: Sequence[Segment]) -> int:
     return total
 
 
-def _validate(
-    cfg: PromptConfig, plan: PromptPlan, sid_space: Optional[ResolvedSidSpace]
-) -> None:
+def _validate(plan: PromptPlan) -> None:
     """Apply the checks that need the whole plan."""
     if plan.max_length and plan.max_total_length is not None:
         if plan.max_total_length > plan.max_length:
@@ -500,27 +510,15 @@ def _validate(
             )
             break
         variable_slot_seen = True
-    if plan.response_segments and plan.logits_suffix_len is None:
+    if not plan.response_segments:
         raise ValueError(
-            "the response has an unbounded slot, so the supervised logits "
-            "window cannot be bounded. A decoder-only model would then "
-            "materialize logits for every position, which is (batch x length x "
-            "vocab) and will not fit. Give the response slot a fixed width."
+            "prompt_config.response is required: it defines the supervised "
+            "span, and without it the loss window collapses to one ignored "
+            "position and the loss is nan. Inference drops the response by "
+            "mode, so a predict-only run keeps it declared."
         )
     if plan.static_prefix_len == 0:
         logger.warning(
             "static_prefix_len is 0: no leading run of the prompt is "
             "request-invariant, so a serving prefix cache can share nothing."
         )
-    if sid_space is not None and cfg.HasField("response"):
-        answer = [s for s in plan.response_segments if isinstance(s, SlotSeg)]
-        for seg in answer:
-            if (
-                seg.width.kind is WidthKind.STATIC
-                and seg.width.num_positions != sid_space.num_levels
-            ):
-                raise ValueError(
-                    f"response slot [{seg.name}] is "
-                    f"{seg.width.num_positions} positions but the codebook has "
-                    f"{sid_space.num_levels} levels."
-                )
