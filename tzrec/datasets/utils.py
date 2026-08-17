@@ -915,7 +915,7 @@ def calc_slice_intervals(
 
 
 def remove_nullable(field_type: pa.DataType) -> pa.DataType:
-    """Recursive removal of the null=False property from lists and nested lists."""
+    """Recursive removal of the null=False property from lists, nested lists, maps."""
     if pa.types.is_list(field_type):
         # Get element fields
         value_field = field_type.value_field
@@ -925,6 +925,11 @@ def remove_nullable(field_type: pa.DataType) -> pa.DataType:
         normalized_value_type = remove_nullable(normalized_value_field.type)
         # Construct a new list type
         return pa.list_(normalized_value_type)
+
+    elif pa.types.is_map(field_type):
+        return pa.map_(
+            remove_nullable(field_type.key_type), remove_nullable(field_type.item_type)
+        )
 
     else:
         return field_type
