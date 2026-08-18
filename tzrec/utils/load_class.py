@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import os
 import pkgutil
 import pydoc
@@ -143,6 +144,30 @@ def get_register_class_meta(class_map):
             return newclass
 
     return RegisterABCMeta
+
+
+def import_class(class_path):
+    """Import a class by its full python path.
+
+    Unlike :func:`load_by_path`, import errors are not swallowed, they propagate
+    with their original traceback.
+
+    Args:
+        class_path: full path of a class, such as: my_models.models.rank.MyModel
+
+    Return:
+        a class.
+    """
+    module_path, _, class_name = class_path.rpartition(".")
+    if not module_path:
+        raise ValueError(
+            f"{class_path} is not a full class path, expect a path like "
+            "my_models.models.rank.MyModel."
+        )
+    module = importlib.import_module(module_path)
+    if not hasattr(module, class_name):
+        raise ValueError(f"class {class_name} is not found in module {module_path}.")
+    return getattr(module, class_name)
 
 
 def load_by_path(path):

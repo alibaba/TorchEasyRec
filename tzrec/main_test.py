@@ -23,11 +23,14 @@ import torch
 from parameterized import parameterized
 
 from tzrec.datasets.utils import RecordBatchTensor
-from tzrec.main import _train_and_evaluate, predict, predict_checkpoint
+from tzrec.main import _create_model, _train_and_evaluate, predict, predict_checkpoint
+from tzrec.models.model import BaseModel
 from tzrec.optim.ema import DenseEMA
 from tzrec.protos.data_pb2 import DataConfig
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.export_pb2 import ExportConfig
+from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import predict_util
@@ -36,6 +39,35 @@ from tzrec.utils.test_util import parameterized_name_func
 
 class MainTest(unittest.TestCase):
     """Tests for tzrec.main orchestration."""
+
+    def test_create_custom_model(self) -> None:
+        """A custom model receives its unpacked protobuf configuration."""
+        model_config = ModelConfig()
+        model_config.custom_model.class_path = "tzrec.models.model.BaseModel"
+        model_config.custom_model.config.Pack(MLP(hidden_units=[32, 16]))
+
+        model = _create_model(model_config, [], [])
+
+        self.assertIsInstance(model, BaseModel)
+        self.assertEqual(list(model._model_config.hidden_units), [32, 16])
+
+    def test_create_custom_model_without_config(self) -> None:
+        """A custom model may omit its protobuf configuration."""
+        model_config = ModelConfig()
+        model_config.custom_model.class_path = "tzrec.models.model.BaseModel"
+
+        model = _create_model(model_config, [], [])
+
+        self.assertIsNone(model._model_config)
+
+    def test_create_custom_model_requires_base_model(self) -> None:
+        """Reject custom classes that do not implement the model contract."""
+        model_config = ModelConfig()
+        model_config.custom_model.class_path = "torch.nn.Linear"
+        model_config.custom_model.config.Pack(MLP(hidden_units=[32]))
+
+        with self.assertRaisesRegex(ValueError, "must inherit BaseModel"):
+            _create_model(model_config, [], [])
 
     def test_train_and_evaluate_closes_exporter_and_ckpt_on_exception(self) -> None:
         """A training exception must still drain the exporter and ckpt manager.
