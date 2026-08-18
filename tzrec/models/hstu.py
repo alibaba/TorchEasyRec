@@ -41,15 +41,15 @@ torch.fx.wrap(_fx_flip_tensor_dict)
 
 
 @torch.fx.wrap
-def _fx_filter_grouped_feature(
-    grouped_features: Dict[str, torch.Tensor], grouped_feature_name: str
+def _fix_filter_tensor_dict(
+    tensor_dict: Dict[str, torch.Tensor], filter_keys: List[str]
 ) -> Dict[str, torch.Tensor]:
-    """Return grouped features without the named feature tensor."""
-    filtered_features = {}
-    for key, value in grouped_features.items():
-        if key != grouped_feature_name:
-            filtered_features[key] = value
-    return filtered_features
+    """Return a tensor dictionary without the filtered keys."""
+    filtered_tensor_dict = {}
+    for key, value in tensor_dict.items():
+        if key not in filter_keys:
+            filtered_tensor_dict[key] = value
+    return filtered_tensor_dict
 
 
 class HSTUUserTower(MatchTowerWoEG):
@@ -402,8 +402,8 @@ class HSTUMatch(MatchModel):
         grouped_features = self.embedding_group(batch)
 
         item_emb = self.item_tower(grouped_features)
-        user_grouped_features = _fx_filter_grouped_feature(
-            grouped_features, self.item_tower.grouped_feature_name
+        user_grouped_features = _fix_filter_tensor_dict(
+            grouped_features, [self.item_tower.grouped_feature_name]
         )
         user_emb = self.user_tower(user_grouped_features)
 
