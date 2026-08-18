@@ -246,6 +246,7 @@ class HSTUMatchItemTower(MatchTowerWoEG):
     @property
     def grouped_feature_name(self) -> str:
         """Grouped candidate feature name in the current inference view."""
+        # `.sequence` (jagged) at training, `.query` (scalar) at export.
         suffix = ".query" if self._is_inference else ".sequence"
         return self._group_name + suffix
 
