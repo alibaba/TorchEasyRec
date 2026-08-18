@@ -39,13 +39,22 @@ from tzrec.utils.config_util import config_to_kwargs
 
 @torch.fx.wrap
 def _fx_flip_user_tensor_dict(
-    grouped_features: Dict[str, torch.Tensor], candidate_group_name: str
+    grouped_features: Dict[str, torch.Tensor],
 ) -> Dict[str, torch.Tensor]:
-    candidate_prefix = candidate_group_name + "."
-    return {
-        key: value if key.startswith(candidate_prefix) else torch.flip(value, [0])
-        for key, value in grouped_features.items()
-    }
+    """Reverse every user-side grouped feature tensor."""
+    return {key: torch.flip(value, [0]) for key, value in grouped_features.items()}
+
+
+@torch.fx.wrap
+def _fx_filter_grouped_feature(
+    grouped_features: Dict[str, torch.Tensor], grouped_feature_name: str
+) -> Dict[str, torch.Tensor]:
+    """Return grouped features without the named feature tensor."""
+    filtered_features = {}
+    for key, value in grouped_features.items():
+        if key != grouped_feature_name:
+            filtered_features[key] = value
+    return filtered_features
 
 
 class HSTUUserTower(MatchTowerWoEG):
@@ -73,8 +82,6 @@ class HSTUUserTower(MatchTowerWoEG):
             resolve per-group dims at construction time (not stored).
         sequence_timestamp_is_ascending (bool): whether UIH timestamps are
             ordered from oldest to newest.
-        candidate_group_name (str): candidate feature group whose tensors must
-            retain sampler order while user-side tensors are reversed.
     """
 
     def __init__(
@@ -86,11 +93,9 @@ class HSTUUserTower(MatchTowerWoEG):
         features: List[BaseFeature],
         embedding_group: EmbeddingGroup,
         sequence_timestamp_is_ascending: bool,
-        candidate_group_name: str,
     ) -> None:
         super().__init__(tower_config, output_dim, similarity, feature_groups, features)
         self._sequence_timestamp_is_ascending = sequence_timestamp_is_ascending
-        self._candidate_group_name = candidate_group_name
 
         contextual_feature_group = next(
             (
@@ -151,9 +156,7 @@ class HSTUUserTower(MatchTowerWoEG):
             user embeddings of shape (B, D), last-position embedding per user.
         """
         if not self._sequence_timestamp_is_ascending:
-            grouped_features = _fx_flip_user_tensor_dict(
-                grouped_features, self._candidate_group_name
-            )
+            grouped_features = _fx_flip_user_tensor_dict(grouped_features)
         user_emb = self._hstu_encoder(grouped_features)
         if not self._sequence_timestamp_is_ascending:
             user_emb = torch.flip(user_emb, [0])
@@ -240,6 +243,12 @@ class HSTUMatchItemTower(MatchTowerWoEG):
             return self._feature_groups_scalar
         return self._feature_groups
 
+    @property
+    def grouped_feature_name(self) -> str:
+        """Grouped candidate feature name in the current inference view."""
+        suffix = ".query" if self._is_inference else ".sequence"
+        return self._group_name + suffix
+
     def _build_scalar_features(self) -> None:
         """Project each grouped sequence sub-feature into a scalar export feature."""
         scalar_configs = [
@@ -273,9 +282,7 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         Returns:
             item embeddings of shape (sum_candidates, D).
         """
-        # `.sequence` (jagged) at training, `.query` (scalar) at export.
-        suffix = ".query" if self._is_inference else ".sequence"
-        cand_emb = grouped_features[self._group_name + suffix]
+        cand_emb = grouped_features[self.grouped_feature_name]
         item_emb = self.mlp(cand_emb)
         if self._output_dim > 0:
             item_emb = self.output(item_emb)
@@ -374,7 +381,6 @@ class HSTUMatch(MatchModel):
             sequence_timestamp_is_ascending=(
                 self._model_config.sequence_timestamp_is_ascending
             ),
-            candidate_group_name=item_tower_cfg.input,
         )
 
         self.item_tower = HSTUMatchItemTower(
@@ -399,8 +405,11 @@ class HSTUMatch(MatchModel):
         """
         grouped_features = self.embedding_group(batch)
 
-        user_emb = self.user_tower(grouped_features)
         item_emb = self.item_tower(grouped_features)
+        user_grouped_features = _fx_filter_grouped_feature(
+            grouped_features, self.item_tower.grouped_feature_name
+        )
+        user_emb = self.user_tower(user_grouped_features)
 
         pos_lengths_t = batch.additional_infos.get(CAND_POS_LENGTHS, None)
         assert pos_lengths_t is not None, (

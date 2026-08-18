@@ -279,6 +279,7 @@ class HSTUMatchTest(unittest.TestCase):
         # The query_time DEEP group is detected and threaded as the per-row
         # time-bias anchor (request-time anchoring, not the last UIH event).
         self.assertEqual(hstu.user_tower._hstu_encoder._query_time_key, "query_time")
+        self.assertEqual(hstu.item_tower.grouped_feature_name, "candidate.sequence")
         hstu.set_kernel(kernel)
         batch = _build_batch(
             device=device,
@@ -309,6 +310,7 @@ class HSTUMatchTest(unittest.TestCase):
         self.assertFalse(scalar_features[0].is_grouped_sequence)
         self.assertEqual(scalar_feature_groups[0].feature_names, ["video_id"])
         self.assertEqual(scalar_feature_groups[0].group_name, "candidate")
+        self.assertEqual(hstu.item_tower.grouped_feature_name, "candidate.query")
 
     def test_sequence_timestamp_order_parity(self) -> None:
         """Equivalent ascending and descending UIH inputs produce equal outputs."""
