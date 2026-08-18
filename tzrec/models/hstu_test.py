@@ -19,7 +19,7 @@ from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, CAND_POS_LENGTHS, Batch
 from tzrec.features.feature import create_features
-from tzrec.models.hstu import HSTUMatch
+from tzrec.models.hstu import HSTUMatch, _fx_filter_tensor_dict
 from tzrec.models.match_model import TowerWoEGWrapper
 from tzrec.models.model import TrainWrapper
 from tzrec.ops import Kernel
@@ -279,7 +279,6 @@ class HSTUMatchTest(unittest.TestCase):
         # The query_time DEEP group is detected and threaded as the per-row
         # time-bias anchor (request-time anchoring, not the last UIH event).
         self.assertEqual(hstu.user_tower._hstu_encoder._query_time_key, "query_time")
-        self.assertEqual(hstu.item_tower.grouped_feature_name, "candidate.sequence")
         hstu.set_kernel(kernel)
         batch = _build_batch(
             device=device,
@@ -310,7 +309,27 @@ class HSTUMatchTest(unittest.TestCase):
         self.assertFalse(scalar_features[0].is_grouped_sequence)
         self.assertEqual(scalar_feature_groups[0].feature_names, ["video_id"])
         self.assertEqual(scalar_feature_groups[0].group_name, "candidate")
-        self.assertEqual(hstu.item_tower.grouped_feature_name, "candidate.query")
+
+    def test_filter_tensor_dict_by_prefix(self) -> None:
+        """Candidate prefix filtering leaves unrelated grouped features intact."""
+        value = torch.tensor([1])
+        grouped_features = {
+            "candidate.query": value,
+            "candidate.sequence": value,
+            "candidate.sequence_length": value,
+            "candidate_aux.sequence": value,
+            "uih.sequence": value,
+        }
+
+        filtered_features = _fx_filter_tensor_dict(
+            grouped_features,
+            "candidate.",
+        )
+
+        self.assertEqual(
+            list(filtered_features.keys()),
+            ["candidate_aux.sequence", "uih.sequence"],
+        )
 
     def test_sequence_timestamp_order_parity(self) -> None:
         """Equivalent ascending and descending UIH inputs produce equal outputs."""
@@ -379,6 +398,18 @@ class HSTUMatchTest(unittest.TestCase):
             sequence_timestamp_is_ascending=sequence_timestamp_is_ascending,
         )
         hstu_wrapped = create_test_model(hstu, graph_type)
+        if graph_type == TestGraphType.FX_TRACE:
+            filter_nodes = [
+                node
+                for node in hstu_wrapped.graph.nodes
+                if node.target == _fx_filter_tensor_dict
+            ]
+            self.assertEqual(
+                len(filter_nodes),
+                int(not sequence_timestamp_is_ascending),
+            )
+            if filter_nodes:
+                self.assertEqual(filter_nodes[0].args[1], "candidate.")
         if graph_type == TestGraphType.JIT_SCRIPT:
             predictions = hstu_wrapped(batch.to_dict(), device)
         else:

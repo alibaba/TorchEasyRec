@@ -42,12 +42,12 @@ torch.fx.wrap(fx_flip_tensor_dict)
 
 @torch.fx.wrap
 def _fx_filter_tensor_dict(
-    tensor_dict: Dict[str, torch.Tensor], filter_keys: List[str]
+    tensor_dict: Dict[str, torch.Tensor], filter_prefix: str
 ) -> Dict[str, torch.Tensor]:
-    """Return a tensor dictionary without the filtered keys."""
+    """Return a tensor dictionary without keys matching a prefix."""
     filtered_tensor_dict = {}
     for key, value in tensor_dict.items():
-        if key not in filter_keys:
+        if not key.startswith(filter_prefix):
             filtered_tensor_dict[key] = value
     return filtered_tensor_dict
 
@@ -238,13 +238,6 @@ class HSTUMatchItemTower(MatchTowerWoEG):
             return self._feature_groups_scalar
         return self._feature_groups
 
-    @property
-    def grouped_feature_name(self) -> str:
-        """Grouped candidate feature name in the current inference view."""
-        # `.sequence` (jagged) at training, `.query` (scalar) at export.
-        suffix = ".query" if self._is_inference else ".sequence"
-        return self._group_name + suffix
-
     def _build_scalar_features(self) -> None:
         """Project each grouped sequence sub-feature into a scalar export feature."""
         scalar_configs = [
@@ -278,7 +271,9 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         Returns:
             item embeddings of shape (sum_candidates, D).
         """
-        cand_emb = grouped_features[self.grouped_feature_name]
+        # `.sequence` (jagged) at training, `.query` (scalar) at export.
+        suffix = ".query" if self._is_inference else ".sequence"
+        cand_emb = grouped_features[self._group_name + suffix]
         item_emb = self.mlp(cand_emb)
         if self._output_dim > 0:
             item_emb = self.output(item_emb)
@@ -341,7 +336,7 @@ class HSTUMatch(MatchModel):
         )
 
         user_tower_cfg = self._model_config.user_tower
-        item_tower_cfg = self._model_config.item_tower
+        self.item_tower_cfg = self._model_config.item_tower
         set_static_max_seq_lens([user_tower_cfg.max_seq_len])
 
         self.embedding_group = EmbeddingGroup(
@@ -349,7 +344,7 @@ class HSTUMatch(MatchModel):
         )
 
         name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}
-        candidate_feature_group = name_to_feature_group[item_tower_cfg.input]
+        candidate_feature_group = name_to_feature_group[self.item_tower_cfg.input]
         # User tower consumes every feature group except the candidate. That
         # includes the primary uih group, optional contextual, and any
         # auxiliary uih_* groups (uih_action / uih_watchtime / uih_timestamp)
@@ -360,7 +355,7 @@ class HSTUMatch(MatchModel):
         user_feature_groups = [
             feature_group
             for feature_group in model_config.feature_groups
-            if feature_group.group_name != item_tower_cfg.input
+            if feature_group.group_name != self.item_tower_cfg.input
         ]
         user_features = self.get_features_in_feature_groups(user_feature_groups)
         candidate_features = self.get_features_in_feature_groups(
@@ -380,7 +375,7 @@ class HSTUMatch(MatchModel):
         )
 
         self.item_tower = HSTUMatchItemTower(
-            tower_config=item_tower_cfg,
+            tower_config=self.item_tower_cfg,
             output_dim=self._model_config.output_dim,
             similarity=self._model_config.similarity,
             feature_groups=[candidate_feature_group],
@@ -401,11 +396,15 @@ class HSTUMatch(MatchModel):
         """
         grouped_features = self.embedding_group(batch)
 
+        if self._model_config.sequence_timestamp_is_ascending:
+            user_emb = self.user_tower(grouped_features)
+        else:
+            user_grouped_features = _fx_filter_tensor_dict(
+                grouped_features,
+                self.item_tower_cfg.input + ".",
+            )
+            user_emb = self.user_tower(user_grouped_features)
         item_emb = self.item_tower(grouped_features)
-        user_grouped_features = _fx_filter_tensor_dict(
-            grouped_features, [self.item_tower.grouped_feature_name]
-        )
-        user_emb = self.user_tower(user_grouped_features)
 
         pos_lengths_t = batch.additional_infos.get(CAND_POS_LENGTHS, None)
         assert pos_lengths_t is not None, (
