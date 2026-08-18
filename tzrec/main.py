@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pyarrow as pa
 import torch
+from google.protobuf import symbol_database
+from google.protobuf.message import Message
 from torch import distributed as dist
 from torch import nn, optim
 from torch.amp import GradScaler
@@ -92,6 +94,7 @@ from tzrec.utils.export_util import (
     export_model,
 )
 from tzrec.utils.filesystem_util import url_to_fs
+from tzrec.utils.load_class import load_by_path
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
 from tzrec.utils.plan_util import create_planner, get_default_sharders
@@ -149,17 +152,39 @@ def _create_model(
     Return:
         model: a EasyRec Model.
     """
-    model_cls_name = config_util.which_msg(model_config, "model")
-    # pyre-ignore [16]
-    model_cls = BaseModel.create_class(model_cls_name)
+    custom_config: Optional[Message] = None
+    if model_config.WhichOneof("model") == "custom_model":
+        custom_model_config = model_config.custom_model
+        model_cls = load_by_path(custom_model_config.class_path)
+        if not isinstance(model_cls, type) or not issubclass(model_cls, BaseModel):
+            raise ValueError(
+                f"Custom model class {custom_model_config.class_path} must inherit "
+                "BaseModel."
+            )
+        any_config = custom_model_config.config
+        try:
+            config_cls = symbol_database.Default().GetSymbol(any_config.TypeName())
+        except KeyError as e:
+            raise ValueError(
+                f"Custom model config type {any_config.TypeName()} is not registered."
+            ) from e
+        custom_config = config_cls()
+        if not any_config.Unpack(custom_config):
+            raise ValueError(
+                f"Failed to unpack custom model config {any_config.TypeName()}."
+            )
+    else:
+        model_cls_name = config_util.which_msg(model_config, "model")
+        # pyre-ignore [16]
+        model_cls = BaseModel.create_class(model_cls_name)
 
-    model: BaseModel = model_cls(
-        model_config,
-        features,
-        labels,
-        sample_weights=sample_weights,
-        sampler_type=sampler_type,
-    )
+    model_kwargs = {
+        "sample_weights": sample_weights,
+        "sampler_type": sampler_type,
+    }
+    if custom_config is not None:
+        model_kwargs["custom_config"] = custom_config
+    model: BaseModel = model_cls(model_config, features, labels, **model_kwargs)
 
     kernel = Kernel[KernelProto.Name(model_config.kernel)]
     model.set_kernel(kernel)

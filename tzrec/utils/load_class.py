@@ -9,11 +9,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import os
 import pkgutil
 import pydoc
 import traceback
 from abc import ABCMeta
+
+_CUSTOM_PACKAGE_ENV = "TZREC_CUSTOM_PACKAGE"
+_DEFAULT_CUSTOM_PACKAGE = "tzrec_custom"
 
 
 def import_pkg(pkg_info, prefix_to_remove=None):
@@ -48,6 +52,34 @@ def import_pkg(pkg_info, prefix_to_remove=None):
                 raise ValueError(
                     "import module %s failed: %s" % (module_path, str(e))
                 ) from e
+
+
+def auto_import_package(package_name):
+    """Import every non-test module in a Python package recursively.
+
+    Args:
+        package_name: fully qualified Python package name.
+    """
+    package = importlib.import_module(package_name)
+    if not hasattr(package, "__path__"):
+        raise ValueError(f"{package_name} is not a Python package")
+    prefix = package.__name__ + "."
+    for pkg_info in pkgutil.walk_packages(package.__path__, prefix):
+        if not pkg_info.name.endswith("_test"):
+            importlib.import_module(pkg_info.name)
+
+
+def _auto_import_custom_models():
+    """Import models from the configured optional custom package."""
+    configured_package = os.getenv(_CUSTOM_PACKAGE_ENV)
+    custom_package = configured_package or _DEFAULT_CUSTOM_PACKAGE
+    models_package = f"{custom_package}.models"
+    try:
+        auto_import_package(models_package)
+    except ModuleNotFoundError as e:
+        missing_optional_package = e.name in {custom_package, models_package}
+        if configured_package is not None or not missing_optional_package:
+            raise
 
 
 def auto_import(user_path=None):
@@ -97,6 +129,8 @@ def auto_import(user_path=None):
                     dirname = os.path.join(root, subdir)
                     for pkg_info in pkgutil.iter_modules([dirname]):
                         import_pkg(pkg_info, prefix_to_remove)
+
+    _auto_import_custom_models()
 
 
 def register_class(class_map, class_name, cls):

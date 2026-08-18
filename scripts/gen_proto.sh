@@ -21,3 +21,10 @@ if [ ! -d protoc ]; then
 fi
 
 python -m grpc_tools.protoc -I . tzrec/protos/*.proto tzrec/protos/models/*.proto  --python_out=. --pyi_out=. --doc_out=html,proto.html:docs/source --plugin=protoc-gen-doc=./${PROTO_DIR}/protoc-gen-doc
+
+CUSTOM_PACKAGE="${TZREC_CUSTOM_PACKAGE:-tzrec_custom}"
+CUSTOM_PROTO_DIR="${CUSTOM_PACKAGE//.//}/protos"
+CUSTOM_PROTO_FILES=("${CUSTOM_PROTO_DIR}"/*.proto)
+if [ -e "${CUSTOM_PROTO_FILES[0]}" ]; then
+    python -m grpc_tools.protoc -I . "${CUSTOM_PROTO_FILES[@]}" --python_out=. --pyi_out=.
+fi

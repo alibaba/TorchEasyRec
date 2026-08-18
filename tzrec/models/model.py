@@ -17,6 +17,7 @@ from typing import Any, Dict, Final, Iterable, List, Optional, Tuple
 
 import torch
 import torchmetrics
+from google.protobuf.message import Message
 from torch import nn
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollectionInterface,
@@ -46,6 +47,7 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         features (list): list of features.
         labels (list): list of label names.
         sample_weights (list): sample weight names.
+        custom_config (Message, optional): unpacked custom model config.
     """
 
     def __init__(
@@ -54,6 +56,7 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         features: List[BaseFeature],
         labels: List[str],
         sample_weights: Optional[List[str]] = None,
+        custom_config: Optional[Message] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -62,9 +65,11 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         self._features = features
         self._feature_groups = list(model_config.feature_groups)
         self._labels = labels
-        self._model_config = (
-            getattr(model_config, self._model_type) if self._model_type else None
-        )
+        self._model_config = custom_config
+        if self._model_config is None:
+            self._model_config = (
+                getattr(model_config, self._model_type) if self._model_type else None
+            )
         self._metric_modules = nn.ModuleDict()
         self._loss_modules = nn.ModuleDict()
 

@@ -9,13 +9,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
 
+from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util
+from tzrec.utils.test_util import make_test_dir
 
 
 class ConfigUtilTest(unittest.TestCase):
+    def test_load_custom_model_any_config(self):
+        config_path = os.path.join(make_test_dir(), "custom_model.config")
+        with open(config_path, "w") as f:
+            f.write(
+                """
+                model_config {
+                  custom_model {
+                    class_path: "tzrec_custom.models.CustomRankModel"
+                    config {
+                      [type.googleapis.com/tzrec.protos.MLP] {
+                        hidden_units: 32
+                        hidden_units: 16
+                      }
+                    }
+                  }
+                }
+                """
+            )
+
+        pipeline_config = config_util.load_pipeline_config(config_path)
+        mlp_config = MLP()
+        self.assertTrue(
+            pipeline_config.model_config.custom_model.config.Unpack(mlp_config)
+        )
+        self.assertEqual(list(mlp_config.hidden_units), [32, 16])
+
     def test_get_inference_batch_size(self):
         pipeline_config = EasyRecConfig()
         pipeline_config.data_config.batch_size = 16
