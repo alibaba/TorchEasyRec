@@ -36,8 +36,9 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_int_item, fx_numel
+from tzrec.utils.fx_util import _fx_flip_tensor_dict, fx_int_item, fx_numel
 
+torch.fx.wrap(_fx_flip_tensor_dict)
 torch.fx.wrap(fx_int_item)
 torch.fx.wrap(fx_numel)
 
@@ -67,16 +68,6 @@ def _fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
     if dist.is_initialized():
         dist.all_reduce(batch_size, op=dist.ReduceOp.AVG)
     return batch_size
-
-
-@torch.fx.wrap
-def _fx_flip_tensor_dict(
-    grouped_features: Dict[str, torch.Tensor],
-) -> Dict[str, torch.Tensor]:
-    new_grouped_features = {}
-    for k, v in grouped_features.items():
-        new_grouped_features[k] = torch.flip(v, [0])
-    return new_grouped_features
 
 
 class DlrmHSTU(RankModel):

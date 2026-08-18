@@ -35,14 +35,9 @@ from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import match_model_pb2
 from tzrec.utils.config_util import config_to_kwargs
+from tzrec.utils.fx_util import _fx_flip_tensor_dict
 
-
-@torch.fx.wrap
-def _fx_flip_user_tensor_dict(
-    grouped_features: Dict[str, torch.Tensor],
-) -> Dict[str, torch.Tensor]:
-    """Reverse every user-side grouped feature tensor."""
-    return {key: torch.flip(value, [0]) for key, value in grouped_features.items()}
+torch.fx.wrap(_fx_flip_tensor_dict)
 
 
 @torch.fx.wrap
@@ -156,7 +151,7 @@ class HSTUUserTower(MatchTowerWoEG):
             user embeddings of shape (B, D), last-position embedding per user.
         """
         if not self._sequence_timestamp_is_ascending:
-            grouped_features = _fx_flip_user_tensor_dict(grouped_features)
+            grouped_features = _fx_flip_tensor_dict(grouped_features)
         user_emb = self._hstu_encoder(grouped_features)
         if not self._sequence_timestamp_is_ascending:
             user_emb = torch.flip(user_emb, [0])
