@@ -53,6 +53,7 @@ import logging as _logging  # NOQA
 import torch as _torch  # NOQA
 import numpy as _np  # NOQA
 from tzrec.utils import load_class as _load_class  # NOQA
+from tzrec.version import __version__ as _tzrec_version  # NOQA
 
 _log_level = _os.getenv("LOG_LEVEL")
 if _log_level:
@@ -60,6 +61,10 @@ if _log_level:
 _logging.basicConfig(
     format="[%(asctime)s][%(levelname)s] %(message)s", level=_log_level
 )
+_logger = _logging.getLogger("tzrec")
+_logger.setLevel(_logging.INFO)
+if int(_os.environ.get("RANK", 0)) == 0:
+    _logger.info(f"TorchEasyRec version: {_tzrec_version}")
 
 # reproducibility
 _python_random_seed = _os.getenv("PYTHON_RANDOM_SEED")
