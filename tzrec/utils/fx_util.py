@@ -83,7 +83,7 @@ def fx_numel(x: torch.Tensor) -> int:
 
 
 @torch.fx.wrap
-def _fx_flip_tensor_dict(
+def fx_flip_tensor_dict(
     tensor_dict: Dict[str, torch.Tensor],
 ) -> Dict[str, torch.Tensor]:
     """Reverse every tensor in a dictionary along its first dimension."""

@@ -35,13 +35,13 @@ from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import match_model_pb2
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import _fx_flip_tensor_dict
+from tzrec.utils.fx_util import fx_flip_tensor_dict
 
-torch.fx.wrap(_fx_flip_tensor_dict)
+torch.fx.wrap(fx_flip_tensor_dict)
 
 
 @torch.fx.wrap
-def _fix_filter_tensor_dict(
+def _fx_filter_tensor_dict(
     tensor_dict: Dict[str, torch.Tensor], filter_keys: List[str]
 ) -> Dict[str, torch.Tensor]:
     """Return a tensor dictionary without the filtered keys."""
@@ -151,7 +151,7 @@ class HSTUUserTower(MatchTowerWoEG):
             user embeddings of shape (B, D), last-position embedding per user.
         """
         if not self._sequence_timestamp_is_ascending:
-            grouped_features = _fx_flip_tensor_dict(grouped_features)
+            grouped_features = fx_flip_tensor_dict(grouped_features)
         user_emb = self._hstu_encoder(grouped_features)
         if not self._sequence_timestamp_is_ascending:
             user_emb = torch.flip(user_emb, [0])
@@ -402,7 +402,7 @@ class HSTUMatch(MatchModel):
         grouped_features = self.embedding_group(batch)
 
         item_emb = self.item_tower(grouped_features)
-        user_grouped_features = _fix_filter_tensor_dict(
+        user_grouped_features = _fx_filter_tensor_dict(
             grouped_features, [self.item_tower.grouped_feature_name]
         )
         user_emb = self.user_tower(user_grouped_features)
