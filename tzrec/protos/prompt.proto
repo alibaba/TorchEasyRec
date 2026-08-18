@@ -20,8 +20,11 @@ message PromptConfig {
     // single-feature slot named after it.
     repeated PromptSlot slots = 4;
 
-    // Required when any slot renders SIDs.
-    optional SidSpace sid_space = 5;
+    // The codebook sizes the answer, extends the vocabulary and fixes the
+    // decode bands. Required in this version because every prompt-native
+    // model here emits SIDs; relax it once a non-SID one exists. text_format
+    // does not enforce required, so compile_prompt raises the actual error.
+    required SidSpace sid_space = 5;
 
     // Validation ceiling, not a truncation trigger: an over-long row is an
     // error, never truncated.
