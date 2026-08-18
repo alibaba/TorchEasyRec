@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import os as _os
+import random as _random
 import warnings as _warnings
 
 # Disable ECS metadata credential provider when ALIBABA_CLOUD_ECS_METADATA is not set.
@@ -61,6 +62,9 @@ _logging.basicConfig(
 )
 
 # reproducibility
+_python_random_seed = _os.getenv("PYTHON_RANDOM_SEED")
+if _python_random_seed:
+    _random.seed(int(_python_random_seed))
 _torch_manual_seed = _os.getenv("TORCH_MANUAL_SEED")
 if _torch_manual_seed:
     _torch.manual_seed(int(_torch_manual_seed))
