@@ -32,6 +32,8 @@ message HSTUMatch {
     optional float temperature = 4 [default = 1.0];
     // use in batch items as negative items.
     optional bool in_batch_negative = 5 [default = false];
+    // timestamp of sequence is ascending or descending
+    optional bool sequence_timestamp_is_ascending = 8 [default = true];
 }
 
 message DSSMV2 {

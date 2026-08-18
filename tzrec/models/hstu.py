@@ -37,6 +37,17 @@ from tzrec.protos.models import match_model_pb2
 from tzrec.utils.config_util import config_to_kwargs
 
 
+@torch.fx.wrap
+def _fx_flip_user_tensor_dict(
+    grouped_features: Dict[str, torch.Tensor], candidate_group_name: str
+) -> Dict[str, torch.Tensor]:
+    candidate_prefix = candidate_group_name + "."
+    return {
+        key: value if key.startswith(candidate_prefix) else torch.flip(value, [0])
+        for key, value in grouped_features.items()
+    }
+
+
 class HSTUUserTower(MatchTowerWoEG):
     """HSTU user tower (reusable beyond match — produces a user embedding).
 
@@ -60,6 +71,10 @@ class HSTUUserTower(MatchTowerWoEG):
         features (list): list of features for every group in `feature_groups`.
         embedding_group (EmbeddingGroup): shared embedding group used to
             resolve per-group dims at construction time (not stored).
+        sequence_timestamp_is_ascending (bool): whether UIH timestamps are
+            ordered from oldest to newest.
+        candidate_group_name (str): candidate feature group whose tensors must
+            retain sampler order while user-side tensors are reversed.
     """
 
     def __init__(
@@ -70,8 +85,12 @@ class HSTUUserTower(MatchTowerWoEG):
         feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         embedding_group: EmbeddingGroup,
+        sequence_timestamp_is_ascending: bool,
+        candidate_group_name: str,
     ) -> None:
         super().__init__(tower_config, output_dim, similarity, feature_groups, features)
+        self._sequence_timestamp_is_ascending = sequence_timestamp_is_ascending
+        self._candidate_group_name = candidate_group_name
 
         contextual_feature_group = next(
             (
@@ -131,7 +150,13 @@ class HSTUUserTower(MatchTowerWoEG):
         Returns:
             user embeddings of shape (B, D), last-position embedding per user.
         """
+        if not self._sequence_timestamp_is_ascending:
+            grouped_features = _fx_flip_user_tensor_dict(
+                grouped_features, self._candidate_group_name
+            )
         user_emb = self._hstu_encoder(grouped_features)
+        if not self._sequence_timestamp_is_ascending:
+            user_emb = torch.flip(user_emb, [0])
         if self._output_dim > 0:
             user_emb = self.output(user_emb)
         if self._similarity == simi_pb2.Similarity.COSINE:
@@ -346,6 +371,10 @@ class HSTUMatch(MatchModel):
             feature_groups=user_feature_groups,
             features=user_features,
             embedding_group=self.embedding_group,
+            sequence_timestamp_is_ascending=(
+                self._model_config.sequence_timestamp_is_ascending
+            ),
+            candidate_group_name=item_tower_cfg.input,
         )
 
         self.item_tower = HSTUMatchItemTower(
