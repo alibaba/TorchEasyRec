@@ -382,6 +382,8 @@ class KafkaDatasetTest(unittest.TestCase):
                 columns = dict(reversed(list(columns.items())))
             record_batch = pa.record_batch(columns)
             if embedded_schema:
+                # real producers stamp key-value metadata on the embedded schema
+                record_batch = record_batch.replace_schema_metadata({b"pandas": b"{}"})
                 # Serialize with embedded schema using IPC stream format
                 sink = io.BytesIO()
                 with pa.ipc.new_stream(sink, record_batch.schema) as writer:

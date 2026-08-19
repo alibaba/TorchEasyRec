@@ -540,10 +540,10 @@ class KafkaReader(BaseReader):
                             msg_data, self._full_schema
                         )
 
-                    # Project onto the reader schema by column name. For embedded
-                    # schemas this absorbs upstream columns being added or
-                    # reordered; for schema-less ones it only selects columns.
-                    msg_schema = record_batch.schema
+                    # Project onto the reader schema by column name, so upstream
+                    # columns may be added or reordered. Metadata is dropped as
+                    # a schema carrying it is unhashable and never projected on.
+                    msg_schema = record_batch.schema.remove_metadata()
                     if msg_schema not in projections:
                         if projections:
                             logger.info(
