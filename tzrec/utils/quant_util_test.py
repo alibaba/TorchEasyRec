@@ -109,6 +109,30 @@ class QuantUtilTest(unittest.TestCase):
                 quant_format="FP16",
             )
 
+    def test_dequantize_quint8_rowwise_f16(self) -> None:
+        scale = np.array([0.5], dtype=np.float16)
+        offset = np.array([-1.0], dtype=np.float16)
+        rows = np.concatenate(
+            [
+                np.array([[10, 200]], dtype=np.uint8),
+                scale.view(np.uint8).reshape(1, -1),
+                offset.view(np.uint8).reshape(1, -1),
+            ],
+            axis=1,
+        )
+
+        dequantized = quant_util.dequantize_quint8_rowwise_f16(rows, emb_dim=2)
+
+        self.assertEqual(dequantized.dtype, np.float32)
+        self.assertEqual(dequantized.shape, (1, 2))
+        np.testing.assert_allclose(dequantized[0], [4.0, 99.0])
+
+    def test_dequantize_quint8_rowwise_f16_rejects_wrong_row_width(self) -> None:
+        with self.assertRaisesRegex(ValueError, "row width"):
+            quant_util.dequantize_quint8_rowwise_f16(
+                np.ones((1, 5), dtype=np.uint8), emb_dim=2
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -38,10 +38,11 @@ import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, DefaultDict, Dict, List, Optional, Sequence, Tuple
+from typing import Any, DefaultDict, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tzrec.utils import config_util
@@ -51,16 +52,25 @@ from tzrec.utils.feature_store_delta_uploader import (
     FEATURE_STORE_VALUE_FIELD,
     FeatureStoreUploadSettings,
 )
+from tzrec.utils.quant_util import (
+    DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES,
+    dequantize_quint8_rowwise_f16,
+)
 
 
 @dataclass(frozen=True)
 class LocalSample:
-    """One local parquet record selected for remote readback."""
+    """One local parquet record selected for remote readback.
+
+    ``embedding`` holds float32 values, or the raw QUint8RowwiseF16 payload
+    bytes (uint8, width embedding_dim+4) when ``quantized`` is set.
+    """
 
     embedding_name: str
     key_id: int
-    embedding: npt.NDArray[np.float32] = field(repr=False)
+    embedding: Union[npt.NDArray[np.float32], npt.NDArray[np.uint8]] = field(repr=False)
     source_path: str
+    quantized: bool = False
 
 
 def resolve_output_dir(
@@ -193,7 +203,11 @@ def sample_local_records(
     sample_count: int,
     embedding_name: Optional[str] = None,
 ) -> List[LocalSample]:
-    """Read a bounded set of unique records from canonical parquet shards."""
+    """Read a bounded set of unique records from canonical parquet shards.
+
+    A uint8 embedding column marks quantized rows: the embedding is kept as
+    the raw payload bytes (width embedding_dim+4) with ``quantized`` set.
+    """
     if sample_count <= 0:
         raise ValueError("sample_count must be > 0")
 
@@ -213,6 +227,8 @@ def sample_local_records(
             raise ValueError(
                 f"delta parquet {path} is missing columns {missing_columns}"
             )
+        value_field = parquet_file.schema_arrow.field(FEATURE_STORE_VALUE_FIELD)
+        quantized = pa.types.is_uint8(value_field.type.value_type)
         for batch in parquet_file.iter_batches(batch_size=1024, columns=columns):
             values = batch.to_pydict()
             for name, key_id, vector in zip(
@@ -235,8 +251,11 @@ def sample_local_records(
                     LocalSample(
                         embedding_name=name,
                         key_id=int(key_id),
-                        embedding=np.asarray(vector, dtype=np.float32),
+                        embedding=np.asarray(
+                            vector, dtype=np.uint8 if quantized else np.float32
+                        ),
                         source_path=path,
+                        quantized=quantized,
                     )
                 )
                 if len(samples) >= sample_count:
@@ -259,7 +278,12 @@ def verify_samples(
     version: str,
     samples: Sequence[LocalSample],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Query sampled keys and classify presence and value equality."""
+    """Query sampled keys and classify presence and value equality.
+
+    Quantized samples match when the remote row is byte-identical to the
+    local payload or equals the dequantized local values within float16
+    scale/offset rounding tolerance.
+    """
     grouped: DefaultDict[str, List[LocalSample]] = defaultdict(list)
     for sample in samples:
         grouped[sample.embedding_name].append(sample)
@@ -297,6 +321,7 @@ def verify_samples(
                 "key_id": sample.key_id,
                 "local_dimension": int(sample.embedding.size),
                 "source_path": sample.source_path,
+                "quantized": sample.quantized,
             }
             if remote is None:
                 result.update(
@@ -307,15 +332,36 @@ def verify_samples(
                     }
                 )
             else:
-                same_shape = remote.shape == sample.embedding.shape
-                matches = same_shape and bool(
-                    np.allclose(remote, sample.embedding, rtol=1e-5, atol=1e-6)
-                )
-                max_abs_diff = (
-                    float(np.max(np.abs(remote - sample.embedding)))
-                    if same_shape and remote.size > 0
-                    else None
-                )
+                expected: Optional[np.ndarray] = None
+                rtol = 0.0
+                atol = 0.0
+                if sample.quantized:
+                    payload_len = int(sample.embedding.size)
+                    emb_dim = payload_len - DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES
+                    if remote.size == payload_len:
+                        # Equal payload bytes prove upload fidelity.
+                        expected = np.asarray(sample.embedding, dtype=np.float32)
+                    elif remote.size == emb_dim:
+                        expected = dequantize_quint8_rowwise_f16(
+                            np.asarray(sample.embedding).reshape(1, -1), emb_dim
+                        )[0]
+                        # fp16 scale/offset rounding needs a looser tolerance.
+                        rtol = 1e-3
+                        atol = 1e-3
+                else:
+                    expected = np.asarray(sample.embedding)
+                    rtol = 1e-5
+                    atol = 1e-6
+                if expected is None or expected.shape != remote.shape:
+                    matches = False
+                    max_abs_diff = None
+                else:
+                    matches = bool(np.allclose(remote, expected, rtol=rtol, atol=atol))
+                    max_abs_diff = (
+                        float(np.max(np.abs(remote - expected)))
+                        if remote.size > 0
+                        else None
+                    )
                 result.update(
                     {
                         "status": "MATCH" if matches else "PRESENT_DIFFERENT",
