@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Dict, List
 from unittest import mock
@@ -77,7 +78,11 @@ from torchrec.modules.mc_modules import (
 )
 from torchrec.types import DataType
 
-from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, DeltaEmbeddingQuantType
+from tzrec.protos.train_pb2 import (
+    DeltaEmbeddingDumpConfig,
+    DeltaEmbeddingQuantType,
+    FeatureStoreConfig,
+)
 from tzrec.tests import utils as test_utils
 from tzrec.utils import config_util
 from tzrec.utils.delta_embedding_dump import (
@@ -93,6 +98,10 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_config,
 )
 from tzrec.utils.dynamicemb_util import has_dynamicemb
+from tzrec.utils.feature_store_delta_uploader import (
+    FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
+    FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+)
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 from tzrec.utils.zch_util import register_post_zch_event_tracker_fn
 
@@ -691,6 +700,152 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                     tmp_dir,
                     torch.device("cpu"),
                 )
+
+    _USER_EMB_TABLE_FQN = "model.ebc.embedding_bags.user_emb"
+
+    @staticmethod
+    def _fake_sharded_ebc(emb_dim):
+        module = torch.nn.Module()
+        module._table_name_to_config = {
+            "user_emb": EmbeddingBagConfig(
+                name="user_emb",
+                num_embeddings=64,
+                embedding_dim=emb_dim,
+                feature_names=["user_id"],
+            )
+        }
+        module._lookups = []
+        module.module_sharding_plan = {}
+        return module
+
+    @contextmanager
+    def _patched_init_dependencies(self, tracked_module):
+        tracker = mock.MagicMock()
+        tracker.tracked_modules = {"model.ebc": tracked_module}
+        tracker.zch_modules = {}
+        tracker.fqn_to_feature_names = {self._USER_EMB_TABLE_FQN: ["user_id"]}
+        with (
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.ModelDeltaTracker",
+                return_value=tracker,
+            ),
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+                side_effect=lambda module_fqn, _module, table_name: (
+                    f"{module_fqn}.embedding_bags.{table_name}"
+                ),
+            ),
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.FeatureStoreDeltaUploader"
+            ) as uploader_cls,
+        ):
+            yield uploader_cls
+
+    @staticmethod
+    def _feature_store_delta_config(quant_type):
+        return DeltaEmbeddingDumpConfig(
+            dump_interval_steps=10,
+            quant_type=quant_type,
+            feature_store_config=FeatureStoreConfig(
+                region="cn-test",
+                project_name="project_a",
+                feature_view_name="shared_embeddings",
+                version="model_a@export_1",
+            ),
+        )
+
+    def test_init_int8_selects_quant_schema_and_wires_uint8_uploader(self):
+        config = self._feature_store_delta_config(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        )
+        with self._patched_init_dependencies(
+            self._fake_sharded_ebc(emb_dim=8)
+        ) as uploader_cls:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                dumper = DeltaEmbeddingDumper(
+                    torch.nn.Module(),
+                    config,
+                    tmp_dir,
+                    torch.device("cuda"),
+                )
+        self.assertIs(dumper._schema, _DELTA_DUMP_QUANT_SCHEMA)
+        self.assertIs(dumper._uploader, uploader_cls.return_value)
+        uploader_cls.assert_called_once()
+        kwargs = uploader_cls.call_args.kwargs
+        # QUint8RowwiseF16 appends a 4-byte fp16 scale/offset trailer per row.
+        self.assertEqual(kwargs["embedding_dimensions"], {self._USER_EMB_TABLE_FQN: 12})
+        self.assertEqual(
+            kwargs["embedding_field_type"], FEATURE_STORE_EMBEDDING_TYPE_UINT8
+        )
+
+    def test_init_int8_rejects_odd_embedding_dim(self):
+        config = self._feature_store_delta_config(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        )
+        with self._patched_init_dependencies(
+            self._fake_sharded_ebc(emb_dim=3)
+        ) as uploader_cls:
+            with self.assertRaisesRegex(ValueError, "requires even embedding_dim"):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    DeltaEmbeddingDumper(
+                        torch.nn.Module(),
+                        config,
+                        tmp_dir,
+                        torch.device("cuda"),
+                    )
+        uploader_cls.assert_not_called()
+
+    def test_init_default_quant_wires_float_uploader_without_overhead(self):
+        config = self._feature_store_delta_config(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+        )
+        with self._patched_init_dependencies(
+            self._fake_sharded_ebc(emb_dim=8)
+        ) as uploader_cls:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                dumper = DeltaEmbeddingDumper(
+                    torch.nn.Module(),
+                    config,
+                    tmp_dir,
+                    torch.device("cuda"),
+                )
+        self.assertIs(dumper._schema, _DELTA_DUMP_SCHEMA)
+        uploader_cls.assert_called_once()
+        kwargs = uploader_cls.call_args.kwargs
+        self.assertEqual(kwargs["embedding_dimensions"], {self._USER_EMB_TABLE_FQN: 8})
+        self.assertEqual(
+            kwargs["embedding_field_type"], FEATURE_STORE_EMBEDDING_TYPE_FLOAT
+        )
+
+    def test_init_int8_rejects_unresolved_shard_info(self):
+        # A table present only in module_sharding_plan with no usable
+        # sharding_spec resolves to global_cols=0; zero is even, so without
+        # the guard the uploader would register dimension 4 and fail only in
+        # its background thread.
+        module = torch.nn.Module()
+        module._table_name_to_config = {}
+        module._lookups = []
+        module.module_sharding_plan = {
+            "user_emb": ParameterSharding(
+                sharding_type=ShardingType.ROW_WISE.value,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                ranks=None,
+                sharding_spec=None,
+            )
+        }
+        config = self._feature_store_delta_config(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        )
+        with self._patched_init_dependencies(module) as uploader_cls:
+            with self.assertRaisesRegex(ValueError, "cannot resolve embedding_dim"):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    DeltaEmbeddingDumper(
+                        torch.nn.Module(),
+                        config,
+                        tmp_dir,
+                        torch.device("cuda"),
+                    )
+        uploader_cls.assert_not_called()
 
     @staticmethod
     def _make_mch(zch_size=4, eviction_interval=2):

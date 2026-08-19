@@ -696,6 +696,15 @@ class DeltaEmbeddingDumper:
         self._validate_supported_table_sharding(self._table_shard_infos)
         if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
             for fqn, info in self._table_shard_infos.items():
+                if info.global_cols <= 0:
+                    # Unresolved shard info yields global_cols=0, which the
+                    # even check below cannot reject.
+                    raise ValueError(
+                        "delta_embedding_dump_config.quant_type=INT8 cannot "
+                        f"resolve embedding_dim for table '{fqn}' (shard info "
+                        "unresolved); refusing to register a FeatureStore "
+                        "view with an invalid dimension."
+                    )
                 if info.global_cols % 2 != 0:
                     raise ValueError(
                         "delta_embedding_dump_config.quant_type=INT8 requires even "
