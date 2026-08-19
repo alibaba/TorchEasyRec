@@ -48,6 +48,12 @@ FEATURE_STORE_WRITE_MODE = "MERGE"
 FEATURE_STORE_SDK_BATCH_SIZE = 1000
 FEATURE_STORE_UPLOAD_FORMAT_DEFAULT = "ARROW"
 FEATURE_STORE_UPLOAD_FORMATS = ("ARROW", "JSON")
+FEATURE_STORE_EMBEDDING_TYPE_FLOAT = "ARRAY<FLOAT>"
+FEATURE_STORE_EMBEDDING_TYPE_UINT8 = "ARRAY<UINT8>"
+FEATURE_STORE_EMBEDDING_TYPES = (
+    FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
+    FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+)
 
 # Default FeatureStore entity used when a DynamicEmbedding FeatureView has to be
 # created. The entity is provisioned on demand by the rank-zero uploader, so
@@ -207,6 +213,7 @@ class FeatureStoreDeltaUploader:
         self,
         config: FeatureStoreConfig,
         embedding_dimensions: Mapping[str, int],
+        embedding_field_type: str = FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
         rank: int = 0,
         world_size: int = 1,
         manage_remote_view: bool = True,
@@ -221,6 +228,12 @@ class FeatureStoreDeltaUploader:
             str(name): int(dimension)
             for name, dimension in embedding_dimensions.items()
         }
+        if embedding_field_type not in FEATURE_STORE_EMBEDDING_TYPES:
+            raise ValueError(
+                "embedding_field_type must be one of "
+                f"{FEATURE_STORE_EMBEDDING_TYPES}, got {embedding_field_type!r}"
+            )
+        self._embedding_field_type = embedding_field_type
 
         self._credentials_client = self._create_credentials_client()
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
@@ -737,6 +750,28 @@ class FeatureStoreDeltaUploader:
                 "DynamicEmbedding FeatureView schema mismatch: "
                 f"expected={expected_fields}, actual={actual_fields}"
             )
+        actual_field_type = getattr(view, "embedding_field_type", None)
+        if not actual_field_type:
+            # An untyped handle predates UINT8 support and is float by definition.
+            if self._embedding_field_type != FEATURE_STORE_EMBEDDING_TYPE_FLOAT:
+                raise RuntimeError(
+                    "DynamicEmbedding FeatureView embedding type mismatch: "
+                    f"existing view {self._settings.feature_view_name!r} reports "
+                    "no embedding_field_type (a legacy float view, or "
+                    "feature_store_py older than 2.2.8), but the current delta "
+                    f"dump requires {self._embedding_field_type!r}; keep "
+                    "delta_embedding_dump_config.quant_type as NONE, or "
+                    "recreate the feature view with feature_store_py >= 2.2.8"
+                )
+        elif actual_field_type != self._embedding_field_type:
+            raise RuntimeError(
+                "DynamicEmbedding FeatureView embedding type mismatch: existing "
+                f"view {self._settings.feature_view_name!r} uses "
+                f"{actual_field_type!r}, but the current delta dump "
+                f"requires {self._embedding_field_type!r}; delete the feature "
+                "view and let training recreate it, or adjust "
+                "delta_embedding_dump_config.quant_type to match"
+            )
         sdk_batch_size = getattr(view, "_batch_size", FEATURE_STORE_SDK_BATCH_SIZE)
         if (
             type(sdk_batch_size) is not int
@@ -814,8 +849,18 @@ class FeatureStoreDeltaUploader:
                     ttl=self._settings.feature_view_ttl_secs,
                     shard_count=self._settings.feature_view_shard_count,
                     replication_count=self._settings.feature_view_replication_count,
+                    embedding_field_type=self._embedding_field_type,
                 )
                 provisioned = True
+            except TypeError as exc:
+                # A signature TypeError is deterministic; the wait/retry loop
+                # cannot fix an SDK that lacks the embedding_field_type kwarg.
+                raise RuntimeError(
+                    "failed to create configured DynamicEmbedding FeatureView: "
+                    "the installed feature_store_py does not accept "
+                    "embedding_field_type; upgrade to feature_store_py >= 2.2.8 "
+                    "as pinned in requirements/runtime.txt"
+                ) from exc
             except Exception as exc:
                 create_error = exc
                 view = self._wait_for_dynamic_embedding_view(project)
@@ -829,10 +874,12 @@ class FeatureStoreDeltaUploader:
             self._view = view
         if provisioned:
             logger.info(
-                "Created DynamicEmbedding FeatureView: project=%s entity=%s view=%s",
+                "Created DynamicEmbedding FeatureView: project=%s entity=%s "
+                "view=%s embedding_field_type=%s",
                 self._settings.project_name,
                 FEATURE_STORE_DEFAULT_ENTITY_NAME,
                 self._settings.feature_view_name,
+                self._embedding_field_type,
             )
         return view
 

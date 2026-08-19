@@ -14,10 +14,12 @@ import os
 import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Dict, List
 from unittest import mock
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
@@ -76,10 +78,15 @@ from torchrec.modules.mc_modules import (
 )
 from torchrec.types import DataType
 
-from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
+from tzrec.protos.train_pb2 import (
+    DeltaEmbeddingDumpConfig,
+    DeltaEmbeddingQuantType,
+    FeatureStoreConfig,
+)
 from tzrec.tests import utils as test_utils
 from tzrec.utils import config_util
 from tzrec.utils.delta_embedding_dump import (
+    _DELTA_DUMP_QUANT_SCHEMA,
     _DELTA_DUMP_SCHEMA,
     DeltaEmbeddingDumper,
     ModelDeltaTracker,
@@ -91,6 +98,10 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_config,
 )
 from tzrec.utils.dynamicemb_util import has_dynamicemb
+from tzrec.utils.feature_store_delta_uploader import (
+    FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
+    FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+)
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 from tzrec.utils.zch_util import register_post_zch_event_tracker_fn
 
@@ -690,6 +701,152 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                     torch.device("cpu"),
                 )
 
+    _USER_EMB_TABLE_FQN = "model.ebc.embedding_bags.user_emb"
+
+    @staticmethod
+    def _fake_sharded_ebc(emb_dim):
+        module = torch.nn.Module()
+        module._table_name_to_config = {
+            "user_emb": EmbeddingBagConfig(
+                name="user_emb",
+                num_embeddings=64,
+                embedding_dim=emb_dim,
+                feature_names=["user_id"],
+            )
+        }
+        module._lookups = []
+        module.module_sharding_plan = {}
+        return module
+
+    @contextmanager
+    def _patched_init_dependencies(self, tracked_module):
+        tracker = mock.MagicMock()
+        tracker.tracked_modules = {"model.ebc": tracked_module}
+        tracker.zch_modules = {}
+        tracker.fqn_to_feature_names = {self._USER_EMB_TABLE_FQN: ["user_id"]}
+        with (
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.ModelDeltaTracker",
+                return_value=tracker,
+            ),
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
+                side_effect=lambda module_fqn, _module, table_name: (
+                    f"{module_fqn}.embedding_bags.{table_name}"
+                ),
+            ),
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.FeatureStoreDeltaUploader"
+            ) as uploader_cls,
+        ):
+            yield uploader_cls
+
+    @staticmethod
+    def _feature_store_delta_config(quant_type):
+        return DeltaEmbeddingDumpConfig(
+            dump_interval_steps=10,
+            quant_type=quant_type,
+            feature_store_config=FeatureStoreConfig(
+                region="cn-test",
+                project_name="project_a",
+                feature_view_name="shared_embeddings",
+                version="model_a@export_1",
+            ),
+        )
+
+    def test_init_int8_selects_quant_schema_and_wires_uint8_uploader(self):
+        config = self._feature_store_delta_config(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        )
+        with self._patched_init_dependencies(
+            self._fake_sharded_ebc(emb_dim=8)
+        ) as uploader_cls:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                dumper = DeltaEmbeddingDumper(
+                    torch.nn.Module(),
+                    config,
+                    tmp_dir,
+                    torch.device("cuda"),
+                )
+        self.assertIs(dumper._schema, _DELTA_DUMP_QUANT_SCHEMA)
+        self.assertIs(dumper._uploader, uploader_cls.return_value)
+        uploader_cls.assert_called_once()
+        kwargs = uploader_cls.call_args.kwargs
+        # QUint8RowwiseF16 appends a 4-byte fp16 scale/offset trailer per row.
+        self.assertEqual(kwargs["embedding_dimensions"], {self._USER_EMB_TABLE_FQN: 12})
+        self.assertEqual(
+            kwargs["embedding_field_type"], FEATURE_STORE_EMBEDDING_TYPE_UINT8
+        )
+
+    def test_init_int8_rejects_odd_embedding_dim(self):
+        config = self._feature_store_delta_config(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        )
+        with self._patched_init_dependencies(
+            self._fake_sharded_ebc(emb_dim=3)
+        ) as uploader_cls:
+            with self.assertRaisesRegex(ValueError, "requires even embedding_dim"):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    DeltaEmbeddingDumper(
+                        torch.nn.Module(),
+                        config,
+                        tmp_dir,
+                        torch.device("cuda"),
+                    )
+        uploader_cls.assert_not_called()
+
+    def test_init_default_quant_wires_float_uploader_without_overhead(self):
+        config = self._feature_store_delta_config(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+        )
+        with self._patched_init_dependencies(
+            self._fake_sharded_ebc(emb_dim=8)
+        ) as uploader_cls:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                dumper = DeltaEmbeddingDumper(
+                    torch.nn.Module(),
+                    config,
+                    tmp_dir,
+                    torch.device("cuda"),
+                )
+        self.assertIs(dumper._schema, _DELTA_DUMP_SCHEMA)
+        uploader_cls.assert_called_once()
+        kwargs = uploader_cls.call_args.kwargs
+        self.assertEqual(kwargs["embedding_dimensions"], {self._USER_EMB_TABLE_FQN: 8})
+        self.assertEqual(
+            kwargs["embedding_field_type"], FEATURE_STORE_EMBEDDING_TYPE_FLOAT
+        )
+
+    def test_init_int8_rejects_unresolved_shard_info(self):
+        # A table present only in module_sharding_plan with no usable
+        # sharding_spec resolves to global_cols=0; zero is even, so without
+        # the guard the uploader would register dimension 4 and fail only in
+        # its background thread.
+        module = torch.nn.Module()
+        module._table_name_to_config = {}
+        module._lookups = []
+        module.module_sharding_plan = {
+            "user_emb": ParameterSharding(
+                sharding_type=ShardingType.ROW_WISE.value,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                ranks=None,
+                sharding_spec=None,
+            )
+        }
+        config = self._feature_store_delta_config(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        )
+        with self._patched_init_dependencies(module) as uploader_cls:
+            with self.assertRaisesRegex(ValueError, "cannot resolve embedding_dim"):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    DeltaEmbeddingDumper(
+                        torch.nn.Module(),
+                        config,
+                        tmp_dir,
+                        torch.device("cuda"),
+                    )
+        uploader_cls.assert_not_called()
+
     @staticmethod
     def _make_mch(zch_size=4, eviction_interval=2):
         return MCHManagedCollisionModule(
@@ -773,6 +930,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 1
         dumper._world_size = 4
+        dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+        dumper._schema = _DELTA_DUMP_SCHEMA
         table_chunks = []
         num_rows = dumper._append_table_chunk(
             table_chunks,
@@ -796,6 +955,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 0
         dumper._world_size = 1
+        dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+        dumper._schema = _DELTA_DUMP_SCHEMA
         table_chunks = []
         dumper._append_table_chunk(
             table_chunks,
@@ -819,6 +980,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_write_empty_table_chunks_preserves_parquet_schema(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 0
+        dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+        dumper._schema = _DELTA_DUMP_SCHEMA
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_path = os.path.join(tmp_dir, "delta.parquet")
             dumper._write_table_chunks([], output_path)
@@ -830,6 +993,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_write_table_chunks_leaves_no_partial_shard_on_error(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 0
+        dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+        dumper._schema = _DELTA_DUMP_SCHEMA
         writer = mock.MagicMock()
         writer.__enter__.return_value = writer
         writer.write_table.side_effect = RuntimeError("boom mid-write")
@@ -844,6 +1009,103 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             # Neither the canonical shard nor the temp file should survive, so
             # a downstream glob(*.parquet) never observes a truncated write.
             self.assertEqual(os.listdir(tmp_dir), [])
+
+    def test_quant_dump_produces_uint8_schema_and_content(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        dumper._schema = _DELTA_DUMP_QUANT_SCHEMA
+        embeddings = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        table_chunks = []
+        num_rows = dumper._append_table_chunk(
+            table_chunks,
+            global_step=5,
+            feature_name="user_id",
+            table_fqn="model.ebc.user_emb",
+            key_ids=torch.tensor([7, 8]),
+            embeddings=embeddings,
+            source="model_delta_tracker",
+        )
+        self.assertEqual(num_rows, 2)
+        table = table_chunks[0]
+        self.assertEqual(table.schema, _DELTA_DUMP_QUANT_SCHEMA)
+        self.assertEqual(table["embedding"].type, pa.list_(pa.uint8()))
+        emb_lists = table["embedding"].to_pylist()
+        self.assertEqual(len(emb_lists), 2)
+        for row in emb_lists:
+            self.assertEqual(len(row), 6)
+            self.assertTrue(all(isinstance(v, int) and 0 <= v <= 255 for v in row))
+        from tzrec.utils.quant_util import (
+            DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS,
+            distributed_quantize_embeddings,
+        )
+
+        expected = distributed_quantize_embeddings(
+            embeddings,
+            2,
+            "user_id",
+            DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
+        )
+        actual = np.array(emb_lists, dtype=np.uint8)
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_quant_write_table_chunks_preserves_uint8_schema(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        dumper._schema = _DELTA_DUMP_QUANT_SCHEMA
+        table_chunks = []
+        dumper._append_table_chunk(
+            table_chunks,
+            global_step=5,
+            feature_name="user_id",
+            table_fqn="model.ebc.user_emb",
+            key_ids=torch.tensor([7, 8]),
+            embeddings=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            source="model_delta_tracker",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = os.path.join(tmp_dir, "delta.parquet")
+            dumper._write_table_chunks(table_chunks, output_path)
+            table = pq.read_table(output_path)
+        self.assertEqual(table.schema, _DELTA_DUMP_QUANT_SCHEMA)
+        self.assertEqual(table["embedding"].type, pa.list_(pa.uint8()))
+        self.assertEqual(table["key_id"].to_pylist(), [7, 8])
+        emb_lists = table["embedding"].to_pylist()
+        self.assertEqual(len(emb_lists), 2)
+        for row in emb_lists:
+            self.assertEqual(len(row), 6)
+
+    def test_quant_failure_error_mentions_delta_dump_switch(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        dumper._schema = _DELTA_DUMP_QUANT_SCHEMA
+        with self.assertRaises(ValueError) as ctx:
+            dumper._append_table_chunk(
+                [],
+                global_step=5,
+                feature_name="user_id",
+                table_fqn="model.ebc.user_emb",
+                key_ids=torch.tensor([7, 8]),
+                embeddings=torch.tensor([[float("nan"), 2.0], [3.0, 4.0]]),
+                source="model_delta_tracker",
+            )
+        msg = str(ctx.exception)
+        self.assertIn("Delta embedding dump INT8 quantization failed", msg)
+        self.assertIn("delta_embedding_dump_config.quant_type", msg)
+        self.assertIn("DELTA_EMBEDDING_QUANT_NONE", msg)
+        self.assertIn("user_id", msg)
+        self.assertIn("finite", msg)
+
+    def test_default_quant_type_is_none(self):
+        cfg = DeltaEmbeddingDumpConfig()
+        self.assertEqual(
+            cfg.quant_type, DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+        )
 
     def test_final_dump_skips_boundary_step_to_avoid_overwrite(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -1376,6 +1638,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._feature_store_enabled = False
             dumper._uploader = None
             dumper._retain_local_dump = False
+            dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+            dumper._schema = _DELTA_DUMP_SCHEMA
             with (
                 mock.patch.object(dumper, "_collect_table_weights", return_value={}),
                 mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
@@ -1405,6 +1669,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._feature_store_enabled = False
             dumper._uploader = None
             dumper._retain_local_dump = False
+            dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+            dumper._schema = _DELTA_DUMP_SCHEMA
             with (
                 mock.patch.object(dumper, "_collect_table_weights", return_value={}),
                 mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
