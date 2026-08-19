@@ -94,6 +94,25 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         """
         raise NotImplementedError
 
+    def save_assets(self, target_dir: str) -> None:
+        """Write model-specific assets alongside a checkpoint.
+
+        ``CheckpointManager`` calls this hook after saving checkpoint weights.
+        The default is a no-op; models that require companion artifacts such as
+        a vocabulary or plan override it.
+
+        Args:
+            target_dir: the checkpoint directory.
+        """
+
+    def init_from_pretrained(self) -> None:
+        """Load pretrained weights at cold start (no checkpoint to restore).
+
+        The training pipeline calls this hook before distributed wrapping when
+        no checkpoint was selected. The default is a no-op; models backed by an
+        external pretrained source, such as an HF backbone, override it.
+        """
+
     def init_loss(self) -> None:
         """Initialize loss modules."""
         raise NotImplementedError

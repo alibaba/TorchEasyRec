@@ -1,6 +1,11 @@
 syntax = "proto2";
 package tzrec.protos;
 
+enum ExportFormat {
+    TORCHSCRIPT = 0;
+    HF = 1;
+}
+
 message ExportConfig {
     // type of exporter [latest | best] when train_and_evaluation
     // latest: regularly exports the serving graph and checkpoints
@@ -23,4 +28,5 @@ message ExportConfig {
     optional bool cuda_matmul_allow_tf32 = 6 [default = false];
     // Whether export uses dense EMA parameters.
     optional bool use_dense_ema = 7;
+    optional ExportFormat export_format = 8 [default = TORCHSCRIPT];
 }

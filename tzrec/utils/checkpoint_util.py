@@ -332,6 +332,34 @@ def best_checkpoint(
         return latest_checkpoint(model_dir)
 
 
+def unwrap_to(model: nn.Module, attr: str) -> Optional[nn.Module]:
+    """Walk DMP/TrainWrapper layers down to the module declaring ``attr``.
+
+    ``seen`` bounds the walk: a ``.model``/``.module`` cycle would otherwise
+    hang inside a checkpoint save.
+
+    Args:
+        model: the outermost wrapper.
+        attr: the attribute that marks the module being looked for.
+
+    Returns:
+        That module, or None when the chain has none.
+    """
+    inner = model
+    seen = set()
+    while not hasattr(inner, attr):
+        if id(inner) in seen:
+            return None
+        seen.add(id(inner))
+        if hasattr(inner, "module"):
+            inner = inner.module
+        elif hasattr(inner, "model"):
+            inner = inner.model
+        else:
+            return None
+    return inner
+
+
 class CheckpointManager:
     """Saves training checkpoints and prunes old ones asynchronously.
 
@@ -390,9 +418,34 @@ class CheckpointManager:
         dataloader_state: Optional[Dict[str, Any]] = None,
         dense_ema: Optional[DenseEMA] = None,
     ) -> str:
-        """Save a checkpoint at the given step, then request an async prune."""
+        """Save a checkpoint at the given step, then request an async prune.
+
+        For HF-backed models, writes the config, optional tokenizer, and state
+        dict metadata needed by HF conversion. This is not gated on
+        ``export_format`` because that setting is selected at export time.
+        """
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer, dense_ema)
+        # Local import avoids a circular import (hf_export_util imports us).
+        from tzrec.utils.hf_export_util import write_hf_assets
+
+        # a raise here skips save_dataloader_state's all_gather and hangs other ranks.
+        try:
+            write_hf_assets(model, ckpt_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"write_hf_assets failed for {ckpt_dir}: {e} -- checkpoint "
+                f"weights are saved; skipping HF assets."
+            )
+        try:
+            inner = unwrap_to(model, "save_assets")
+            if inner is not None:
+                inner.save_assets(ckpt_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"save_assets failed for {ckpt_dir}: {e} -- checkpoint weights "
+                f"are saved; skipping model assets."
+            )
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
         self._last_ckpt_dir = ckpt_dir

@@ -7,6 +7,7 @@ import "tzrec/protos/export.proto";
 import "tzrec/protos/data.proto";
 import "tzrec/protos/feature.proto";
 import "tzrec/protos/model.proto";
+import "tzrec/protos/prompt.proto";
 
 message EasyRecConfig {
     required string train_input_path = 1;
@@ -26,4 +27,6 @@ message EasyRecConfig {
     repeated FeatureConfig feature_configs = 8;
 
     optional ModelConfig model_config = 9;
+
+    optional PromptConfig prompt_config = 10;
 }
