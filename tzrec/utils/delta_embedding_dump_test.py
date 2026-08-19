@@ -923,6 +923,29 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         for row in emb_lists:
             self.assertEqual(len(row), 6)
 
+    def test_quant_failure_error_mentions_delta_dump_switch(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        dumper._schema = _DELTA_DUMP_QUANT_SCHEMA
+        with self.assertRaises(ValueError) as ctx:
+            dumper._append_table_chunk(
+                [],
+                global_step=5,
+                feature_name="user_id",
+                table_fqn="model.ebc.user_emb",
+                key_ids=torch.tensor([7, 8]),
+                embeddings=torch.tensor([[float("nan"), 2.0], [3.0, 4.0]]),
+                source="model_delta_tracker",
+            )
+        msg = str(ctx.exception)
+        self.assertIn("Delta embedding dump INT8 quantization failed", msg)
+        self.assertIn("delta_embedding_dump_config.quant_type", msg)
+        self.assertIn("DELTA_EMBEDDING_QUANT_NONE", msg)
+        self.assertIn("user_id", msg)
+        self.assertIn("finite", msg)
+
     def test_default_quant_type_is_none(self):
         cfg = DeltaEmbeddingDumpConfig()
         self.assertEqual(

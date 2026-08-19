@@ -1222,12 +1222,23 @@ class DeltaEmbeddingDumper:
             )
         if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
             emb_dim = embeddings_cpu.size(1)
-            quantized = distributed_quantize_embeddings(
-                embeddings_cpu,
-                emb_dim,
-                feature_name,
-                DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
-            )
+            try:
+                quantized = distributed_quantize_embeddings(
+                    embeddings_cpu,
+                    emb_dim,
+                    feature_name,
+                    DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
+                )
+            except ValueError as e:
+                # quant_util errors address the distributed-export DIST_QUANT
+                # switch; delta dump quantization is toggled by quant_type.
+                raise ValueError(
+                    "Delta embedding dump INT8 quantization failed for "
+                    f"feature '{feature_name}' (table '{table_fqn}'): {e}. "
+                    "Disable delta dump quantization by setting "
+                    "delta_embedding_dump_config.quant_type to "
+                    "DELTA_EMBEDDING_QUANT_NONE."
+                ) from e
             embeddings_cpu = torch.from_numpy(quantized)
             value_type = pa.uint8()
         else:
