@@ -1,77 +1,86 @@
 # 自定义模型
 
-## 编写模型proto文件
+TorchEasyRec 支持从独立 Python 包加载自定义模型。用户无需修改
+`tzrec/protos/model.proto` 或 `tzrec/protos/models/` 下的公共配置，模型代码和
+配置 proto 可以单独维护，减少升级 TorchEasyRec 时的代码冲突。
 
-TorchEasyRec使用 [Protocol Buffer](https://developers.google.com/protocol-buffers/docs/pythontutorial) 定义配置文件格式。
+## 目录结构
 
-在 `tzrec/protos/models/rank_model.proto` 中增加一个 `CustomRankModel` Message来定义模型配置
+默认自定义包名为 `tzrec_custom`，推荐使用以下结构：
 
-```protobuf
-message CustomRankModel {
-  required MLP mlp = 1;
-  ...
-};
+```text
+tzrec_custom/
+├── __init__.py
+├── models/
+│   ├── __init__.py
+│   └── custom_rank_model.py
+└── protos/
+    ├── __init__.py
+    └── custom_rank_model.proto
 ```
 
-在 `tzrec/protos/model.proto的在` 的 `oneof model`里面增加 `CustomRankModel`
+一个自定义包可以包含多个模型。TorchEasyRec 启动时会递归导入
+`tzrec_custom.models` 下的非测试模块，具体使用哪个模型由 pipeline config 中的
+`class_path` 决定。
+
+如需使用其他包名，在第一次导入 `tzrec` 前设置环境变量：
+
+```bash
+export TZREC_CUSTOM_PACKAGE=my_project.tzrec_custom
+```
+
+环境变量填写完整 Python 包名。运行命令时还需通过 `PYTHONPATH` 或安装 wheel
+确保该包可以被 Python 导入。显式配置的包不存在时，TorchEasyRec 会直接报错；
+未配置环境变量且默认 `tzrec_custom` 不存在时则保持原有行为。
+
+## 编写模型配置 proto
+
+自定义 proto 可以直接复用 TorchEasyRec 的公共 message。以下模型配置使用了
+`tzrec.protos.MLP`：
 
 ```protobuf
-message ModelConfig {
-   ...
+syntax = "proto2";
+package tzrec_custom.protos;
 
-   oneof model {
-      ...
-      CustomRankModel custom_rank_model = 1001;
-      ...
-   }
-   ...
+import "tzrec/protos/module.proto";
+
+message CustomRankModelConfig {
+    required tzrec.protos.MLP mlp = 1;
 }
 ```
 
-生成proto python `*_pb2.py` 文件
+生成 Python binding：
 
 ```bash
-bash scripts/gen_proto.sh
+PYTHONPATH=. bash scripts/gen_proto.sh
 ```
 
-## 编写模型文件
+`scripts/gen_proto.sh` 会在生成公共 proto 后，检查
+`tzrec_custom/protos/*.proto` 并生成对应的 `*_pb2.py` 和 `*_pb2.pyi`。自定义包名
+不是 `tzrec_custom` 时，生成命令需要使用相同的环境变量：
 
-### 继承
+```bash
+TZREC_CUSTOM_PACKAGE=my_project.tzrec_custom \
+PYTHONPATH=. bash scripts/gen_proto.sh
+```
 
-继承 `tzrec.models.model.BaseModel` 来实现自定义模型，需重载以下函数
+如果自定义包作为独立 wheel 发布，也可以在该包的构建流程中自行生成 binding。
 
-### 初始化: \_\_init\_\_
+## 编写模型
 
-- 根据模型配置`model_config`和特征配置`features`构建子模块
+自定义模型需要继承 `tzrec.models.model.BaseModel`。排序、多目标排序和召回场景
+通常可以分别继承：
 
-### 前向: predict
+- `tzrec.models.rank_model.RankModel`
+- `tzrec.models.multi_task_rank.MultiTaskRank`
+- `tzrec.models.match_model.MatchModel`
 
-- 根据输入的`batch`数据，进行前向推理，得到`predictions`
-  - `batch`为`tzrec.datasets.utils.Batch`的数据结构，包含`dense_features`（稠密特征）、`sparse_features`（稀疏特征）、`sequence_dense_features` (序列稠密特征)
-  - 一般可以将`batch` 传给`EmbeddingGroup`模块`tzrec.modules.embedding.EmbeddingGroup`得到分组的Embedding结果后，再进行进一步前向推理
+模型模块必须在顶层导入对应的 `*_pb2.py`。这样自动导入模型时会同时注册
+protobuf descriptor，pipeline config 中的 `Any` 配置才能被解析。
 
-### 损失: init_loss & loss
-
-- `init_loss`函数用于根据模型损失函数配置初始化loss模块，写入到`self._loss_modules`中
-- `loss`函数用于根据输入的`predictions`和`batch`中的label，实际计算每个step的loss，返回一个`loss_dict`
-
-### 评估: init_metric & update_metric
-
-- `init_metric`函数用于根据模型初始化metric模块，写入到`self._metric_modules`中
-- `update_metric`函数用于根据输入的`predictions`和`batch`中的label，更新metric模块的状态
-
-### 常用继承
-
-在排序、多目标排序、召回的场景下，可以直接继承以下子模型，可以只用重置前向推理函数
-
-- 排序模型可直接继承 `tzrec.models.rank_model.RankModel`
-- 多目标模型可直接继承 `tzrec.models.multi_task_rank.MultiTaskRank`
-- 召回模型可直接继承 `tzrec.models.match_model.MatchModel`
-
-以排序模型为例
+以下代码展示了排序模型的主要结构：
 
 ```python
-# tzrec/models/custom_rank_model.py
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -84,16 +93,11 @@ from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.mlp import MLP
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.utils.config_util import config_to_kwargs
+from tzrec_custom.protos.custom_rank_model_pb2 import CustomRankModelConfig
 
 
 class CustomRankModel(RankModel):
-    """CustomRankModel.
-
-    Args:
-        model_config (ModelConfig): an instance of ModelConfig.
-        features (list): list of features.
-        labels (list): list of label names.
-    """
+    """Example custom ranking model."""
 
     def __init__(
         self,
@@ -101,98 +105,74 @@ class CustomRankModel(RankModel):
         features: List[BaseFeature],
         labels: List[str],
         sample_weights: Optional[List[str]] = None,
+        custom_config: Optional[CustomRankModelConfig] = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        # 构建EmbeddingGroup
-        self.embedding_group = EmbeddingGroup(
-            features, list(model_config.feature_groups)
+        super().__init__(
+            model_config,
+            features,
+            labels,
+            sample_weights,
+            custom_config=custom_config,
+            **kwargs,
         )
-        # 构建MLP
-        total_in_dim = sum(self.embedding_group.group_total_dim(n) for n in self.embedding_group.group_names())
+        self.embedding_group = EmbeddingGroup(features, self.feature_groups)
+        input_dim = sum(
+            self.embedding_group.group_total_dim(name)
+            for name in self.embedding_group.group_names()
+        )
         self.mlp = MLP(
-            in_features=total_in_dim,
+            in_features=input_dim,
             **config_to_kwargs(self._model_config.mlp),
         )
-        final_dim = self.mlp.output_dim()
-        self.output_mlp = nn.Linear(final_dim, self._num_class)
-        # 初始化其他模块
-        ...
-
+        self.output = nn.Linear(self.mlp.output_dim(), self._num_class)
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Forward the model.
-
-        Args:
-            batch (Batch): input batch data.
-
-        Return:
-            predictions (dict): a dict of predicted result.
-        """
-        grouped_features = self.embedding_group(
-            batch
+        """Run model prediction."""
+        grouped_features = self.embedding_group(batch)
+        features = torch.cat(
+            [
+                grouped_features[name]
+                for name in self.embedding_group.group_names()
+            ],
+            dim=-1,
         )
-        features = torch.cat([grouped_features[name] for name in self.embedding_group.group_names()], dim=-1)
-        tower_output = self.mlp(features)
-        y = self.output_mlp(tower_output)
-        # 其他前向推理
-        ...
-
-        return self._output_to_prediction(y)
+        return self._output_to_prediction(self.output(self.mlp(features)))
 ```
 
-## 测试
+框架会将 `custom_model.config` 解包成强类型 message，并通过 `custom_config` 参数
+传入模型。`BaseModel` 同时会将 `self._model_config` 设置为该 message，因此继承
+现有基础模型时可以继续使用相同的配置访问方式。
 
-编写 custom_rank_model.config
+自定义模型仍需按所继承基础模型的要求实现或复用 `predict`、`init_loss`、
+`loss`、`init_metric` 和 `update_metric` 等接口。
 
-```
+## 配置 pipeline
 
-# 数据相关参数配置
-data_config {
-  ...
-}
+`custom_model.config` 使用 `google.protobuf.Any` 保存用户定义的强类型配置：
 
-# 特征相关参数配置
-feature_configs {
-  ...
-}
-feature_configs {
-  ...
-}
-
-# 训练相关的参数配置
-train_config {
-  ...
-}
-
-# 评估相关参数配置
-eval_config {
-  ...
-}
-
-# 模型相关参数配置
+```protobuf
 model_config {
     feature_groups {
-        group_name: 'group1'
-        feature_names: 'f1'
-        feature_names: 'f2'
-        ...
-        wide_deep: DEEP
+        group_name: "group1"
+        feature_names: "f1"
+        feature_names: "f2"
+        group_type: DEEP
     }
-    feature_groups {
-        group_name: 'group2'
-        feature_names: 'f3'
-        feature_names: 'f4'
-        ...
-        wide_deep: DEEP
-    }
-    ...
-    custom_rank_model {
-        mlp {
-            hidden_units: [64]
+
+    custom_model {
+        class_path: "tzrec_custom.models.custom_rank_model.CustomRankModel"
+        config {
+            [type.googleapis.com/tzrec_custom.protos.CustomRankModelConfig] {
+                mlp {
+                    hidden_units: 128
+                    hidden_units: 64
+                    dropout_ratio: 0.1
+                }
+            }
         }
-        ...
     }
+
     metrics {
         auc {}
     }
@@ -202,7 +182,13 @@ model_config {
 }
 ```
 
-运行
+方括号中的名称是 proto 文件声明的 package 与 message 名，不是 Python 文件
+路径。模型模块会在 pipeline config 解析前自动导入，因此对应 descriptor 已经
+注册。
+
+## 运行
+
+默认使用 `tzrec_custom` 包时：
 
 ```bash
 PYTHONPATH=. torchrun --master_addr=localhost --master_port=32555 \
@@ -214,6 +200,10 @@ PYTHONPATH=. torchrun --master_addr=localhost --master_port=32555 \
     --model_dir ${MODEL_DIR}
 ```
 
+使用其他自定义包时，训练、评估、预测和导出命令都需要设置同一个
+`TZREC_CUSTOM_PACKAGE`。`torchrun` 启动的各个 worker 会继承该环境变量。
+
 ### 打包发布
 
-参考[开发指南](../develop.md)
+参考[开发指南](../develop.md)。自定义包需要包含模型代码和生成的 protobuf
+binding，并保证运行环境可以导入该包。
