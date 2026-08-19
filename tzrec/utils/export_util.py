@@ -82,6 +82,7 @@ from tzrec.utils.fx_util import (
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
+from tzrec.utils.zch_util import iter_zch_tables
 
 
 def ensure_input_tile_for_distributed_embedding() -> None:
@@ -2377,13 +2378,6 @@ def _get_zch_export_tables(
 ) -> Dict[str, MCHManagedCollisionModule]:
     """Collect ZCH modules keyed by the export name of the table they remap.
 
-    A managed collision wrapper holds its ZCH modules at
-    ``<P>._managed_collision_collection._managed_collision_modules.<table>`` and
-    the matching weight at
-    ``<P>._embedding_module.{embedding_bags,embeddings}.<table>``, for pooled
-    (``mc_ebc``) and sequence (``mc_ec_dict.<dim>``) collections alike, in both
-    the sharded and the unsharded module tree.
-
     Args:
         model: model to walk, sharded or not.
         emb_name_to_emb_dim: export name to dim of all sparse tables.
@@ -2392,36 +2386,20 @@ def _get_zch_export_tables(
         Dict {export table name -> ZCH module}.
     """
     zch_tables: Dict[str, MCHManagedCollisionModule] = {}
-    for mod_path, module in model.named_modules():
-        mc_collection = getattr(module, "_managed_collision_collection", None)
-        if mc_collection is None or not hasattr(module, "_embedding_module"):
-            continue
-        for table_name, mch in mc_collection._managed_collision_modules.items():
-            if not isinstance(mch, MCHManagedCollisionModule):
-                raise ValueError(
-                    f"unsupported managed collision module "
-                    f"{type(mch).__name__} of table {table_name} in {mod_path}."
-                )
-            table_candidates = [
-                f"{mod_path}._embedding_module.embedding_bags.{table_name}",
-                f"{mod_path}._embedding_module.embeddings.{table_name}",
-            ]
-            export_emb_name = next(
-                (
-                    table_fqn
-                    for table_fqn in map(
-                        checkpoint_util.remap_input_tile_user_key, table_candidates
-                    )
-                    if table_fqn in emb_name_to_emb_dim
-                ),
-                None,
+    for zch_table in iter_zch_tables(model):
+        mch = zch_table.mc_module
+        if not isinstance(mch, MCHManagedCollisionModule):
+            raise ValueError(
+                f"unsupported managed collision module {type(mch).__name__} of "
+                f"table {zch_table.table_name} in {zch_table.wrapper_fqn}."
             )
-            if export_emb_name is None:
-                raise ValueError(
-                    f"zch table {table_name} in {mod_path} has no matching sparse "
-                    f"embedding config, tried {table_candidates}."
-                )
-            zch_tables[export_emb_name] = mch
+        export_emb_name = checkpoint_util.remap_input_tile_user_key(zch_table.table_fqn)
+        if export_emb_name not in emb_name_to_emb_dim:
+            raise ValueError(
+                f"zch table {zch_table.table_name} in {zch_table.wrapper_fqn} has "
+                f"no matching sparse embedding config, tried {export_emb_name}."
+            )
+        zch_tables[export_emb_name] = mch
     return zch_tables
 
 

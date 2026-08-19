@@ -200,6 +200,7 @@ model_config {
         }
         similarity: COSINE
         temperature: 0.05
+        sequence_timestamp_is_ascending: true
     }
     metrics {
         recall_at_k {
@@ -254,6 +255,7 @@ model_config {
   - output_dim: 可选，user/item 输出 embedding 维度；默认 0，表示不再追加 output Linear，由 user 塔的 STU 输出与 item 塔的 MLP 输出直接对齐
   - similarity: 向量相似度函数，包括 [COSINE, INNER_PRODUCT]，默认 INNER_PRODUCT (示例使用 COSINE)
   - temperature: 相似度缩放因子，softmax 前对 logits 除以该值，默认 1.0
+  - sequence_timestamp_is_ascending: UIH 时间戳是否按从旧到新的顺序排列，默认 true；输入按从新到旧排列时设为 false。该配置只调整用户侧序列，候选 Item 与负采样结果的顺序保持不变
 
 - kernel: 算子实现，可选 TRITON/PYTORCH/CUTLASS，详见 [DLRM-HSTU](dlrm_hstu.md) 文档
 

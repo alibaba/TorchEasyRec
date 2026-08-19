@@ -99,7 +99,7 @@ data_config {
 - 输入消息流的内容是序列化的ArrowRecordBatch，支持两种序列化格式:
 
   - schema-less格式 (`record_batch.serialize()`): 需设置`data_config.input_fields`或`data_config.input_fields_str`来指定数据的schema
-  - 带schema的格式 (Arrow IPC Stream): 无需设置`input_fields`，schema从消息中自动推断，但schema会占用消息体大小
+  - 带schema的格式 (Arrow IPC Stream): 无需设置`input_fields`，schema从消息中自动推断，上游新增列或调整列顺序无需重启训练即可自动适配，上游删除或修改Reader所需列（列名/类型）时会报错，且schema会占用消息体大小
 
 - input_path: 按如下格式设置
 

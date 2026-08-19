@@ -35,6 +35,21 @@ from tzrec.protos import model_pb2, simi_pb2, tower_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import match_model_pb2
 from tzrec.utils.config_util import config_to_kwargs
+from tzrec.utils.fx_util import fx_flip_tensor_dict
+
+torch.fx.wrap(fx_flip_tensor_dict)
+
+
+@torch.fx.wrap
+def _fx_filter_tensor_dict(
+    tensor_dict: Dict[str, torch.Tensor], filter_prefix: str
+) -> Dict[str, torch.Tensor]:
+    """Return a tensor dictionary without keys matching a prefix."""
+    filtered_tensor_dict = {}
+    for key, value in tensor_dict.items():
+        if not key.startswith(filter_prefix):
+            filtered_tensor_dict[key] = value
+    return filtered_tensor_dict
 
 
 class HSTUUserTower(MatchTowerWoEG):
@@ -60,6 +75,8 @@ class HSTUUserTower(MatchTowerWoEG):
         features (list): list of features for every group in `feature_groups`.
         embedding_group (EmbeddingGroup): shared embedding group used to
             resolve per-group dims at construction time (not stored).
+        sequence_timestamp_is_ascending (bool): whether UIH timestamps are
+            ordered from oldest to newest.
     """
 
     def __init__(
@@ -70,8 +87,10 @@ class HSTUUserTower(MatchTowerWoEG):
         feature_groups: List[model_pb2.FeatureGroupConfig],
         features: List[BaseFeature],
         embedding_group: EmbeddingGroup,
+        sequence_timestamp_is_ascending: bool,
     ) -> None:
         super().__init__(tower_config, output_dim, similarity, feature_groups, features)
+        self._sequence_timestamp_is_ascending = sequence_timestamp_is_ascending
 
         contextual_feature_group = next(
             (
@@ -131,7 +150,11 @@ class HSTUUserTower(MatchTowerWoEG):
         Returns:
             user embeddings of shape (B, D), last-position embedding per user.
         """
+        if not self._sequence_timestamp_is_ascending:
+            grouped_features = fx_flip_tensor_dict(grouped_features)
         user_emb = self._hstu_encoder(grouped_features)
+        if not self._sequence_timestamp_is_ascending:
+            user_emb = torch.flip(user_emb, [0])
         if self._output_dim > 0:
             user_emb = self.output(user_emb)
         if self._similarity == simi_pb2.Similarity.COSINE:
@@ -313,7 +336,7 @@ class HSTUMatch(MatchModel):
         )
 
         user_tower_cfg = self._model_config.user_tower
-        item_tower_cfg = self._model_config.item_tower
+        self.item_tower_cfg = self._model_config.item_tower
         set_static_max_seq_lens([user_tower_cfg.max_seq_len])
 
         self.embedding_group = EmbeddingGroup(
@@ -321,7 +344,7 @@ class HSTUMatch(MatchModel):
         )
 
         name_to_feature_group = {x.group_name: x for x in model_config.feature_groups}
-        candidate_feature_group = name_to_feature_group[item_tower_cfg.input]
+        candidate_feature_group = name_to_feature_group[self.item_tower_cfg.input]
         # User tower consumes every feature group except the candidate. That
         # includes the primary uih group, optional contextual, and any
         # auxiliary uih_* groups (uih_action / uih_watchtime / uih_timestamp)
@@ -332,7 +355,7 @@ class HSTUMatch(MatchModel):
         user_feature_groups = [
             feature_group
             for feature_group in model_config.feature_groups
-            if feature_group.group_name != item_tower_cfg.input
+            if feature_group.group_name != self.item_tower_cfg.input
         ]
         user_features = self.get_features_in_feature_groups(user_feature_groups)
         candidate_features = self.get_features_in_feature_groups(
@@ -346,10 +369,13 @@ class HSTUMatch(MatchModel):
             feature_groups=user_feature_groups,
             features=user_features,
             embedding_group=self.embedding_group,
+            sequence_timestamp_is_ascending=(
+                self._model_config.sequence_timestamp_is_ascending
+            ),
         )
 
         self.item_tower = HSTUMatchItemTower(
-            tower_config=item_tower_cfg,
+            tower_config=self.item_tower_cfg,
             output_dim=self._model_config.output_dim,
             similarity=self._model_config.similarity,
             feature_groups=[candidate_feature_group],
@@ -370,7 +396,14 @@ class HSTUMatch(MatchModel):
         """
         grouped_features = self.embedding_group(batch)
 
-        user_emb = self.user_tower(grouped_features)
+        if self._model_config.sequence_timestamp_is_ascending:
+            user_emb = self.user_tower(grouped_features)
+        else:
+            user_grouped_features = _fx_filter_tensor_dict(
+                grouped_features,
+                self.item_tower_cfg.input + ".",
+            )
+            user_emb = self.user_tower(user_grouped_features)
         item_emb = self.item_tower(grouped_features)
 
         pos_lengths_t = batch.additional_infos.get(CAND_POS_LENGTHS, None)
