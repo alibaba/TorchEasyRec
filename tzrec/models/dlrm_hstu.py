@@ -36,8 +36,9 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_int_item, fx_numel
+from tzrec.utils.fx_util import fx_flip_tensor_dict, fx_int_item, fx_numel
 
+torch.fx.wrap(fx_flip_tensor_dict)
 torch.fx.wrap(fx_int_item)
 torch.fx.wrap(fx_numel)
 
@@ -67,16 +68,6 @@ def _fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
     if dist.is_initialized():
         dist.all_reduce(batch_size, op=dist.ReduceOp.AVG)
     return batch_size
-
-
-@torch.fx.wrap
-def _fx_flip_tensor_dict(
-    grouped_features: Dict[str, torch.Tensor],
-) -> Dict[str, torch.Tensor]:
-    new_grouped_features = {}
-    for k, v in grouped_features.items():
-        new_grouped_features[k] = torch.flip(v, [0])
-    return new_grouped_features
 
 
 class DlrmHSTU(RankModel):
@@ -208,7 +199,7 @@ class DlrmHSTU(RankModel):
         if not self._model_config.sequence_timestamp_is_ascending:
             # if timestamp of sequence is descending,
             # we should reverse all features
-            grouped_features = _fx_flip_tensor_dict(grouped_features)
+            grouped_features = fx_flip_tensor_dict(grouped_features)
 
         with record_function("## item_forward ##"):
             candidates_item_embeddings = self._item_embedding_mlp(
@@ -225,7 +216,7 @@ class DlrmHSTU(RankModel):
         if not self._model_config.sequence_timestamp_is_ascending:
             # if timestamp of sequence is descending,
             # we should reverse predictions back to input order
-            mt_preds = _fx_flip_tensor_dict(mt_preds)
+            mt_preds = fx_flip_tensor_dict(mt_preds)
 
         predictions = {}
         for task_cfg in self._task_configs:

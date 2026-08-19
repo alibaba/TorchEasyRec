@@ -83,6 +83,17 @@ def fx_numel(x: torch.Tensor) -> int:
 
 
 @torch.fx.wrap
+def fx_flip_tensor_dict(
+    tensor_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Reverse every tensor in a dictionary along its first dimension."""
+    flipped_tensor_dict = {}
+    for key, value in tensor_dict.items():
+        flipped_tensor_dict[key] = torch.flip(value, [0])
+    return flipped_tensor_dict
+
+
+@torch.fx.wrap
 def fx_mark_keyed_tensor(name: str, x: KeyedTensor, is_dense: bool = False) -> None:
     """Mark a KeyedTensor in fx.graph.
 

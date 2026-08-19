@@ -14,8 +14,6 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
-    Any,
-    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -29,7 +27,6 @@ from typing import (
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-from google.protobuf.message import Message
 from torch import nn
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import ShardedTensor
@@ -50,9 +47,9 @@ from torchrec.distributed.model_tracker.model_delta_tracker import (
 from torchrec.distributed.model_tracker.types import UniqueRows, UpdateMode
 from torchrec.distributed.types import ParameterSharding
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
+from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, DeltaEmbeddingQuantType
 from tzrec.utils.feature_store_delta_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
@@ -63,6 +60,11 @@ from tzrec.utils.logging_util import logger
 from tzrec.utils.quant_util import (
     DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS,
     distributed_quantize_embeddings,
+)
+from tzrec.utils.zch_util import (
+    ZCH_EMPTY_SLOT,
+    iter_zch_tables,
+    register_post_zch_event_tracker_fn,
 )
 
 _CONSUMER = "delta_embedding_dump"
@@ -150,42 +152,6 @@ def validate_delta_embedding_dump_config(
             )
     elif config.dump_interval_steps <= 0:
         raise ValueError("delta_embedding_dump_config.dump_interval_steps must be > 0.")
-
-
-def _has_proto_field(config: Message, field_name: str) -> bool:
-    if field_name not in config.DESCRIPTOR.fields_by_name:
-        return False
-    return config.HasField(field_name)
-
-
-def _zch_feature_names(feature_configs: Iterable[FeatureConfig]) -> Set[str]:
-    zch_feature_names: Set[str] = set()
-    for feature_config in feature_configs:
-        feature_type = feature_config.WhichOneof("feature")
-        if feature_type is None:
-            continue
-        config = getattr(feature_config, feature_type)
-        if _has_proto_field(config, "zch"):
-            feature_name = config.feature_name or feature_type
-            zch_feature_names.add(feature_name)
-    return zch_feature_names
-
-
-def validate_delta_embedding_dump_no_zch_features(
-    feature_configs: Iterable[FeatureConfig],
-) -> None:
-    """Validate that delta embedding dump is not used with MC/ZCH features.
-
-    Args:
-        feature_configs: Iterable of feature configuration protos to check.
-    """
-    zch_feature_names = _zch_feature_names(feature_configs)
-    if zch_feature_names:
-        raise ValueError(
-            "delta_embedding_dump_config does not support MC/ZCH features. "
-            "Please convert these zch features to dynamicemb before enabling "
-            f"delta embedding dump: {sorted(zch_feature_names)}"
-        )
 
 
 def _feature_name(feature_names: Iterable[str]) -> str:
@@ -385,8 +351,10 @@ def _embedding_table_fqn(
 class ModelDeltaTracker(TorchRecModelDeltaTracker):
     """Track touched embedding IDs by owner-qualified table FQN.
 
-    This ID-only tracker uses the lookup callback's owning module to keep
-    same-named tables in different sharded modules independent.
+    The lookup callback's owning module keeps same-named tables in different
+    sharded modules independent. A ZCH table is tracked through its managed
+    collision wrapper, which sees raw ids rather than the remapped rows its
+    inner collection sees, and its ZCH modules also report admits and evicts.
 
     Args:
         model: Sharded model whose sparse lookups should be tracked.
@@ -409,10 +377,19 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         self.curr_compact_index = 0
         self.tracked_modules: Dict[str, _ShardedEmbeddingModule] = {}
         self.fqn_to_feature_names: Dict[str, List[str]] = {}
-        self._feature_to_fqn_by_module: Dict[
-            _ShardedEmbeddingModule, Dict[str, str]
-        ] = {}
+        self.pause_depth = 0
+        self.zch_modules: Dict[str, MCHManagedCollisionModule] = {}
+        self._zch_fqn_by_mc_module: Dict[int, str] = {}
+        self._feature_to_fqn_by_module: Dict[nn.Module, Dict[str, str]] = {}
         self.store = DeltaStoreTrec(UpdateMode.NONE)
+
+        lookup_modules: List[nn.Module] = []
+        mc_modules_by_inner: Dict[int, Tuple[nn.Module, Dict[str, nn.Module]]] = {}
+        for zch_table in iter_zch_tables(model):
+            _, tables = mc_modules_by_inner.setdefault(
+                id(zch_table.inner), (zch_table.wrapper, {})
+            )
+            tables[zch_table.table_name] = zch_table.mc_module
 
         for named_fqn, module in model.named_modules():
             if not isinstance(
@@ -424,6 +401,8 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
             if not module_fqn:
                 module_fqn = self._clean_module_fqn(named_fqn)
             self.tracked_modules[module_fqn] = module
+            wrapper, mc_modules = mc_modules_by_inner.get(id(module), (module, {}))
+            lookup_modules.append(wrapper)
 
             feature_to_fqn: Dict[str, str] = {}
             for table_name, config in module._table_name_to_config.items():
@@ -434,17 +413,63 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                 self.fqn_to_feature_names[table_fqn] = feature_names
                 for feature_name in feature_names:
                     feature_to_fqn[feature_name] = table_fqn
-            self._feature_to_fqn_by_module[module] = feature_to_fqn
+                if wrapper is not module:
+                    self._track_zch_table(table_fqn, table_name, mc_modules)
+            self._feature_to_fqn_by_module[wrapper] = feature_to_fqn
 
-        for module in self.tracked_modules.values():
+        for module in lookup_modules:
             module.register_post_lookup_tracker_fn(self.record_lookup)
             if auto_compact:
                 module.register_post_odist_tracker_fn(self.trigger_compaction)
+        for mc_module in self.zch_modules.values():
+            register_post_zch_event_tracker_fn(mc_module, self.record_zch_event)
+
+    @contextmanager
+    def pause_tracking(self) -> Iterator[None]:
+        """Stop recording lookups for non-training forward passes.
+
+        Admissions and evictions stay recorded: a paused forward still mutates
+        the ZCH tables it runs through, and a dropped one is never published.
+        """
+        self.pause_depth += 1
+        try:
+            yield
+        finally:
+            self.pause_depth -= 1
+
+    def _track_zch_table(
+        self, table_fqn: str, table_name: str, mc_modules: Dict[str, nn.Module]
+    ) -> None:
+        """Bind one table of a managed collision wrapper to its ZCH module.
+
+        Args:
+            table_fqn: Tracked FQN of the table.
+            table_name: Raw table name within the collection.
+            mc_modules: Managed collision modules of the owning wrapper.
+
+        Raises:
+            ValueError: if the table is not remapped by an MCH module. Its
+                lookups are recorded as raw ids either way, so dumping it as a
+                plain table would emit remapped rows as serving keys.
+        """
+        mc_module = mc_modules.get(table_name)
+        if not isinstance(mc_module, MCHManagedCollisionModule):
+            raise ValueError(
+                f"ZCH table {table_fqn} is remapped by {type(mc_module).__name__}, "
+                "but only MCHManagedCollisionModule is supported; dumping it as a "
+                "plain table would emit its remapped rows as serving keys."
+            )
+        self.zch_modules[table_fqn] = mc_module
+        self._zch_fqn_by_mc_module[id(mc_module)] = table_fqn
 
     @staticmethod
     def _clean_module_fqn(fqn: str) -> str:
         """Strip wrapper prefixes from a sharded module FQN."""
-        for prefix in ("_dmp_wrapped_module.module.", "module."):
+        for prefix in (
+            "_dmp_wrapped_module.module.",
+            "_dmp_wrapped_module.",
+            "module.",
+        ):
             if fqn.startswith(prefix):
                 return fqn[len(prefix) :]
         return fqn
@@ -464,6 +489,8 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
             emb_module: Sharded module that performed the lookup.
             raw_ids: Optional unprocessed IDs, unused by delta embedding dump.
         """
+        if self.pause_depth > 0:
+            return
         if emb_module is None:
             raise ValueError("Embedding module is required for FQN delta tracking.")
         feature_to_fqn = self._feature_to_fqn_by_module.get(emb_module)
@@ -477,6 +504,43 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
             table_fqn = feature_to_fqn[feature_name]
             ids_by_fqn.setdefault(table_fqn, []).append(kjt[feature_name].values())
         for table_fqn, ids in ids_by_fqn.items():
+            self.store.append(
+                batch_idx=self.curr_batch_idx,
+                fqn=table_fqn,
+                ids=torch.cat(ids),
+                states=None,
+            )
+
+    def record_zch_event(
+        self,
+        mc_module: nn.Module,
+        evicted_raw_ids: torch.Tensor,
+        admitted_raw_ids: torch.Tensor,
+    ) -> None:
+        """Record the raw IDs a ZCH table admitted and evicted this round.
+
+        Both join the touched IDs of the table they belong to: the dump
+        publishes the row the model now serves for an ID, which is its trained
+        row while it is held and the shared fallback row once it is not, so
+        neither needs to be told apart from a lookup afterwards.
+
+        Args:
+            mc_module: ZCH module that admitted and evicted the IDs.
+            evicted_raw_ids: Raw IDs that lost their row.
+            admitted_raw_ids: Raw IDs that gained one.
+
+        Raises:
+            ValueError: if the module is not a tracked ZCH module.
+        """
+        table_fqn = self._zch_fqn_by_mc_module.get(id(mc_module))
+        if table_fqn is None:
+            raise ValueError(
+                f"Unrecognized zch module for FQN delta tracking: {mc_module}"
+            )
+        # A free slot being filled reports the empty-slot delimiter, not an id.
+        evicted_raw_ids = evicted_raw_ids[evicted_raw_ids != ZCH_EMPTY_SLOT]
+        ids = [t for t in (admitted_raw_ids, evicted_raw_ids) if t.numel() > 0]
+        if ids:
             self.store.append(
                 batch_idx=self.curr_batch_idx,
                 fqn=table_fqn,
@@ -549,6 +613,8 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
 
     def trigger_compaction(self) -> None:
         """Compact newly recorded IDs once per completed batch."""
+        if self.pause_depth > 0:
+            return
         if self.curr_compact_index >= self.curr_batch_idx:
             return
         start_idx = max(self.per_consumer_batch_idx.values())
@@ -581,8 +647,6 @@ class DeltaEmbeddingDumper:
         config: Configuration for delta embedding dump behavior.
         model_dir: Base directory for model outputs; used as default output location.
         device: Training device; validated to be CUDA.
-        feature_configs: Feature configuration protos; validated to be free of
-            MC/ZCH features.
     """
 
     def __init__(
@@ -591,10 +655,8 @@ class DeltaEmbeddingDumper:
         config: DeltaEmbeddingDumpConfig,
         model_dir: str,
         device: torch.device,
-        feature_configs: Iterable[FeatureConfig],
     ) -> None:
         validate_delta_embedding_dump_config(config, device)
-        validate_delta_embedding_dump_no_zch_features(feature_configs)
         self._model = model
         self._config = config
         self._quant_type = config.quant_type
@@ -616,7 +678,6 @@ class DeltaEmbeddingDumper:
         )
         self._file_prefix = config.file_prefix or "delta_embedding"
         self._rank, self._world_size = _distributed_rank_world_size()
-        self._tracking_pause_depth = 0
         self._feature_store_enabled = config.HasField("feature_store_config")
         self._retain_local_dump = self._feature_store_enabled and bool(
             config.feature_store_config.retain_local_dump
@@ -629,6 +690,7 @@ class DeltaEmbeddingDumper:
             delete_on_read=True,
             auto_compact=True,
         )
+        self._zch_modules = self._tracker.zch_modules
         self._table_shard_infos = self._collect_table_shard_infos()
         self._validate_supported_table_sharding(self._table_shard_infos)
         if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
@@ -640,7 +702,6 @@ class DeltaEmbeddingDumper:
                         f"{info.global_cols}. QUint8RowwiseF16 format requires "
                         "row_bytes=emb_dim+4 to be even."
                     )
-        self._install_tracking_pause_guard()
         self._uploader: Optional[FeatureStoreDeltaUploader] = None
         if self._feature_store_enabled:
             # QUint8RowwiseF16 rows are uint8 values plus a 4-byte fp16
@@ -685,17 +746,20 @@ class DeltaEmbeddingDumper:
         )
 
     def clear(self) -> None:
-        """Clear tracked sparse ids, usually after restore-time dummy steps."""
+        """Clear tracked sparse ids, usually after restore-time dummy steps.
+
+        The restored model state is the baseline the serving side already
+        holds, so admit/evict events recorded during the dummy forwards are
+        dropped together with the tracked ids; the next dump then reports
+        only the delta against the restored state.
+        """
         self._tracker.clear(_CONSUMER)
 
     @contextmanager
     def pause_tracking(self) -> Iterator[None]:
         """Temporarily skip delta tracking for non-training forward passes."""
-        self._tracking_pause_depth += 1
-        try:
+        with self._tracker.pause_tracking():
             yield
-        finally:
-            self._tracking_pause_depth -= 1
 
     def start(self) -> None:
         """Start timed cadence and per-rank FeatureStore publication.
@@ -882,26 +946,6 @@ class DeltaEmbeddingDumper:
             ),
         )
 
-    def _install_tracking_pause_guard(self) -> None:
-        for module in self._tracker.tracked_modules.values():
-            post_lookup_fn = module.post_lookup_tracker_fn
-            post_odist_fn = module.post_odist_tracker_fn
-            if post_lookup_fn is None or post_odist_fn is None:
-                raise RuntimeError(
-                    "Delta embedding tracker callbacks were not registered for "
-                    f"sharded embedding module {module._module_fqn}."
-                )
-            module.post_lookup_tracker_fn = self._wrap_tracker_fn(post_lookup_fn)
-            module.post_odist_tracker_fn = self._wrap_tracker_fn(post_odist_fn)
-
-    def _wrap_tracker_fn(self, tracker_fn: Callable[..., Any]) -> Callable[..., Any]:
-        def guarded_tracker_fn(*args: Any, **kwargs: Any) -> Any:
-            if self._tracking_pause_depth > 0:
-                return None
-            return tracker_fn(*args, **kwargs)
-
-        return guarded_tracker_fn
-
     def _append_model_delta_rows(
         self,
         table_chunks: List[pa.Table],
@@ -956,8 +1000,6 @@ class DeltaEmbeddingDumper:
         if fqn not in table_weights:
             raise KeyError(f"Embedding table {fqn} not found in sharded model.")
         table_weight = table_weights[fqn]
-        _validate_table_shard_info(fqn, table_weight.shard_info)
-        self._validate_row_shard_metadata(fqn, table_weight.shard_info)
         weight = table_weight.tensor
         ids = ids.to(weight.device, dtype=torch.long)
         if ids.numel() == 0:
@@ -967,17 +1009,76 @@ class DeltaEmbeddingDumper:
                 ),
                 torch.empty(0, device=weight.device, dtype=torch.int64),
             )
-        valid_mask = (ids >= 0) & (ids < weight.size(0))
-        if not bool(valid_mask.all().item()):
-            logger.warning(
-                "Skip %s ids outside table %s row range [0, %s).",
-                int((~valid_mask).sum().item()),
-                fqn,
-                weight.size(0),
+        zch_module = self._zch_modules.get(fqn)
+        if zch_module is not None:
+            return self._lookup_zch_embeddings(zch_module, fqn, weight, ids)
+        # ZCH keys are raw ids, so only the plain path converts local rows to
+        # global key ids and needs the shard offset.
+        self._validate_row_shard_metadata(fqn, table_weight.shard_info)
+        invalid_mask = (ids < 0) | (ids >= weight.size(0))
+        if bool(invalid_mask.any().item()):
+            raise ValueError(
+                f"Embedding table {fqn} was looked up with "
+                f"{int(invalid_mask.sum().item())} ids outside its local row "
+                f"range [0, {weight.size(0)}), e.g. "
+                f"{ids[invalid_mask][:8].tolist()}; the feature's id space does "
+                "not match the table it is embedded in."
             )
-        local_ids = ids[valid_mask]
-        key_ids = local_ids + table_weight.shard_info.row_offset
-        return weight[local_ids].detach(), key_ids
+        key_ids = ids + table_weight.shard_info.row_offset
+        return weight[ids].detach(), key_ids
+
+    def _lookup_zch_embeddings(
+        self,
+        zch_module: MCHManagedCollisionModule,
+        fqn: str,
+        weight: torch.Tensor,
+        raw_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Publish the row a ZCH table currently serves for each raw id.
+
+        Held ids resolve through the MCH module's own matcher, the one
+        ``remap()`` is built on, and the rest get the shared fallback row. That
+        fallback row keeps training, so an evicted id's value drifts until
+        re-admission republishes its own row.
+
+        Args:
+            zch_module: ZCH module owning the table shard's id to row mapping.
+            fqn: tracked table FQN, for error messages.
+            weight: the table's local weight shard.
+            raw_ids: unique raw ids to publish.
+
+        Returns:
+            The embedding row published for each id, and the ids themselves as
+            serving keys.
+
+        Raises:
+            ValueError: if a held id's row falls outside the local shard row
+                range, e.g. a resharded checkpoint whose offsets no longer
+                match this shard. Without this check a negative row would
+                index the weight from the end and an oversized row would hit
+                a device-side assert.
+        """
+        sorted_raw_ids = zch_module._mch_sorted_raw_ids.to(weight.device)
+        held_mask, matched = zch_module._match_indices(sorted_raw_ids, raw_ids)
+        rows = (
+            zch_module._mch_remapped_ids_mapping.to(weight.device)[matched]
+            - zch_module._output_global_offset
+        )
+        out_of_range = (rows < 0) | (rows >= weight.size(0))
+        if bool(out_of_range.any().item()):
+            raise ValueError(
+                f"ZCH table {fqn} remapped rows fall outside the local shard "
+                f"row range [0, {weight.size(0)}); the checkpoint's ZCH "
+                "sharding does not match this shard."
+            )
+        embeddings = (
+            weight[zch_module._zch_size - 1]
+            .detach()
+            .expand(raw_ids.numel(), weight.size(1))
+            .clone()
+        )
+        embeddings[held_mask] = weight[rows].detach()
+        return embeddings, raw_ids
 
     def _lookup_dynamic_embeddings(
         self,
