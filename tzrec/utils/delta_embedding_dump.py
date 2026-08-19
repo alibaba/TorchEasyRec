@@ -58,6 +58,7 @@ from tzrec.utils.feature_store_delta_uploader import (
 )
 from tzrec.utils.logging_util import logger
 from tzrec.utils.quant_util import (
+    DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES,
     DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS,
     distributed_quantize_embeddings,
 )
@@ -700,7 +701,8 @@ class DeltaEmbeddingDumper:
                         "delta_embedding_dump_config.quant_type=INT8 requires even "
                         f"embedding_dim, but table '{fqn}' has emb_dim="
                         f"{info.global_cols}. QUint8RowwiseF16 format requires "
-                        "row_bytes=emb_dim+4 to be even."
+                        f"row_bytes=emb_dim+"
+                        f"{DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES} to be even."
                     )
         self._uploader: Optional[FeatureStoreDeltaUploader] = None
         if self._feature_store_enabled:
@@ -709,7 +711,9 @@ class DeltaEmbeddingDumper:
             is_quantized = (
                 self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
             )
-            quant_overhead = 4 if is_quantized else 0
+            quant_overhead = (
+                DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES if is_quantized else 0
+            )
             embedding_dimensions = {
                 fqn: int(info.global_cols) + quant_overhead
                 for fqn, info in self._table_shard_infos.items()

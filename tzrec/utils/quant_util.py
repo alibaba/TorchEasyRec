@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 _DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE = "uint8"
-_DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES = 4
+DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES = 4
 _DISTRIBUTED_SPARSE_QUANT_CHUNK_ROWS = 64 * 1024
 _DISTRIBUTED_SPARSE_QUANT_CHUNK_BYTES = 64 * 1024 * 1024
 DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS: List[str] = ["QUint8RowwiseF16"]
@@ -35,14 +35,16 @@ def _quantize_quint8_rowwise_f16(
         )
 
     rows = src.shape[0]
-    row_bytes = emb_dim + _DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES
+    row_bytes = emb_dim + DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES
     if row_bytes % 2 != 0:
         raise ValueError(
             "Distributed sparse quant export failed for embedding "
             f"'{emb_name}': DIST_QUANT=INT8 is exported as nvembedding "
             "QUint8RowwiseF16, whose stored row is "
             "[uint8 values][float16 scale][float16 offset]. This makes "
-            f"row_bytes = embedding_dim + 4 = {emb_dim} + 4 = {row_bytes}. "
+            f"row_bytes = embedding_dim + "
+            f"{DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES} = {emb_dim} + "
+            f"{DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES} = {row_bytes}. "
             "nvembedding GPU lookup requires quantized stored row_bytes to be "
             "even, but this table has an odd embedding_dim, so row_bytes is "
             "odd. QUint8RowwiseF16 is affine uint8 rowwise quantization, "
