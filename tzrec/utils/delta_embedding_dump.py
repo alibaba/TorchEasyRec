@@ -1268,10 +1268,8 @@ class DeltaEmbeddingDumper:
     def _embedding_array(
         self,
         embeddings: torch.Tensor,
-        value_type: Optional[pa.DataType] = None,
+        value_type: pa.DataType,
     ) -> pa.ListArray:
-        if value_type is None:
-            value_type = pa.float32()
         num_rows = embeddings.size(0)
         emb_dim = embeddings.size(1)
         if emb_dim == 0:
