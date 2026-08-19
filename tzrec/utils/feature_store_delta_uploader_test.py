@@ -21,10 +21,15 @@ import pyarrow as pa
 from google.protobuf.descriptor import FieldDescriptor
 
 from tzrec.protos.train_pb2 import FeatureStoreConfig
-from tzrec.utils.delta_embedding_dump import _DELTA_DUMP_SCHEMA
+from tzrec.utils.delta_embedding_dump import (
+    _DELTA_DUMP_QUANT_SCHEMA,
+    _DELTA_DUMP_SCHEMA,
+)
 from tzrec.utils.feature_store_delta_uploader import (
     FEATURE_STORE_DEFAULT_ENTITY_JOIN_ID,
     FEATURE_STORE_DEFAULT_ENTITY_NAME,
+    FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
+    FEATURE_STORE_EMBEDDING_TYPE_UINT8,
     FeatureStoreDeltaUploader,
     FeatureStoreUploadError,
     FeatureStoreUploadSettings,
@@ -80,11 +85,18 @@ class _FakeView:
     sk_field = "key_id"
     embedding_field = "embedding"
 
-    def __init__(self, summaries=None, close_error=None, max_workers=4):
+    def __init__(
+        self,
+        summaries=None,
+        close_error=None,
+        max_workers=4,
+        embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
+    ):
         self.calls = []
         self.arrow_calls = []
         self.closed = []
         self.flush_calls = []
+        self.embedding_field_type = embedding_field_type
         self._summaries = list(summaries or [])
         self._close_error = close_error
         self._batch_size = 1000
@@ -196,6 +208,10 @@ class _FakeProject:
             self._view = self._view_after_create_error
             raise self._create_error
         self._view = self._created_view or _FakeView()
+        # The created handle carries the created embedding_field_type.
+        self._view.embedding_field_type = kwargs.get(
+            "embedding_field_type", FEATURE_STORE_EMBEDDING_TYPE_FLOAT
+        )
         return self._view
 
     def get_entity(self, name):
@@ -423,11 +439,90 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                     "ttl": 1296000,
                     "shard_count": 20,
                     "replication_count": 1,
+                    "embedding_field_type": FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
                 }
             ],
         )
         self.assertEqual(factory.project.entity_create_calls, [])
         self.assertEqual(created_view.closed, [True])
+
+    def test_start_creates_quantized_view_with_uint8_embedding_type(self):
+        created_view = _FakeView()
+        factory = _FakeClientFactory(None, created_view=created_view)
+        uploader = self._uploader(
+            client_factory=factory,
+            embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+        )
+
+        uploader.start()
+        uploader.close()
+
+        self.assertEqual(
+            factory.project.create_calls[0]["embedding_field_type"],
+            FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+        )
+        self.assertEqual(
+            created_view.embedding_field_type, FEATURE_STORE_EMBEDDING_TYPE_UINT8
+        )
+        self.assertEqual(created_view.closed, [True])
+
+    def test_quantized_uint8_batch_keeps_wire_type_on_arrow_path(self):
+        view = _FakeView(embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8)
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(
+            client_factory=factory,
+            embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+            embedding_dimensions={"model.ebc.embedding_bags.user_emb": 6},
+        )
+        table = pa.Table.from_pylist(
+            [_row(10, 0, 7, [1, 2, 3, 250, 251, 252])],
+            schema=_DELTA_DUMP_QUANT_SCHEMA,
+        )
+
+        uploader.start()
+        uploader.submit(10, table)
+        uploader.close()
+
+        wire_batch = view.arrow_calls[0]["batch"]
+        self.assertEqual(
+            wire_batch.schema.field("embedding").type, pa.list_(pa.uint8())
+        )
+        self.assertEqual(
+            view.calls[0]["data"][0]["embedding"].tolist(),
+            [1, 2, 3, 250, 251, 252],
+        )
+
+    def test_start_fails_when_existing_view_embedding_type_mismatches(self):
+        view = _FakeView(embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_FLOAT)
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(
+            client_factory=factory,
+            embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "embedding type mismatch"):
+            uploader.start()
+
+        self.assertEqual(factory.project.create_calls, [])
+        self.assertEqual(view.closed, [True])
+
+    def test_non_primary_start_fails_on_existing_view_embedding_type_mismatch(self):
+        view = _FakeView(embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8)
+        factory = _FakeClientFactory(view)
+        uploader = self._uploader(
+            rank=1,
+            manage_remote_view=False,
+            client_factory=factory,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "embedding type mismatch"):
+            uploader.start()
+
+        self.assertEqual(view.closed, [True])
+
+    def test_rejects_unknown_embedding_field_type(self):
+        with self.assertRaisesRegex(ValueError, "embedding_field_type"):
+            self._uploader(embedding_field_type="ARRAY<FP16>")
 
     def test_start_recovers_from_concurrent_feature_view_creation(self):
         concurrent_view = _FakeView()

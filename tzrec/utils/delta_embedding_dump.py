@@ -54,7 +54,11 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, DeltaEmbeddingQuantType
-from tzrec.utils.feature_store_delta_uploader import FeatureStoreDeltaUploader
+from tzrec.utils.feature_store_delta_uploader import (
+    FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
+    FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+    FeatureStoreDeltaUploader,
+)
 from tzrec.utils.logging_util import logger
 from tzrec.utils.quant_util import (
     DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS,
@@ -639,12 +643,12 @@ class DeltaEmbeddingDumper:
         self._install_tracking_pause_guard()
         self._uploader: Optional[FeatureStoreDeltaUploader] = None
         if self._feature_store_enabled:
-            quant_overhead = (
-                4
-                if self._quant_type
-                == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
-                else 0
+            # QUint8RowwiseF16 rows are uint8 values plus a 4-byte fp16
+            # scale/offset trailer, so quantized dumps need ARRAY<UINT8> views.
+            is_quantized = (
+                self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
             )
+            quant_overhead = 4 if is_quantized else 0
             embedding_dimensions = {
                 fqn: int(info.global_cols) + quant_overhead
                 for fqn, info in self._table_shard_infos.items()
@@ -652,6 +656,11 @@ class DeltaEmbeddingDumper:
             self._uploader = FeatureStoreDeltaUploader(
                 config.feature_store_config,
                 embedding_dimensions=embedding_dimensions,
+                embedding_field_type=(
+                    FEATURE_STORE_EMBEDDING_TYPE_UINT8
+                    if is_quantized
+                    else FEATURE_STORE_EMBEDDING_TYPE_FLOAT
+                ),
                 rank=self._rank,
                 world_size=self._world_size,
                 manage_remote_view=self._rank == 0,
