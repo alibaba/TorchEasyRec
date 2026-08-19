@@ -506,6 +506,40 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self.assertEqual(factory.project.create_calls, [])
         self.assertEqual(view.closed, [True])
 
+    def test_legacy_untyped_view_accepts_float_dump(self):
+        # A view handle that reports no embedding_field_type (legacy view or old
+        # SDK) is float by definition, so the default FLOAT dump must proceed.
+        for untyped in (None, ""):
+            with self.subTest(embedding_field_type=untyped):
+                view = _FakeView(embedding_field_type=untyped)
+                factory = _FakeClientFactory(view)
+                uploader = self._uploader(client_factory=factory)
+
+                uploader.start()
+                uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+                uploader.close()
+
+                self.assertEqual(factory.project.create_calls, [])
+                self.assertEqual(len(view.calls), 1)
+                self.assertEqual(view.closed, [True])
+
+    def test_legacy_untyped_view_rejects_uint8_dump(self):
+        # A UINT8 dump must not write into an untyped legacy (float) view.
+        for untyped in (None, ""):
+            with self.subTest(embedding_field_type=untyped):
+                view = _FakeView(embedding_field_type=untyped)
+                factory = _FakeClientFactory(view)
+                uploader = self._uploader(
+                    client_factory=factory,
+                    embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "embedding type mismatch"):
+                    uploader.start()
+
+                self.assertEqual(factory.project.create_calls, [])
+                self.assertEqual(view.closed, [True])
+
     def test_non_primary_start_fails_on_existing_view_embedding_type_mismatch(self):
         view = _FakeView(embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8)
         factory = _FakeClientFactory(view)
@@ -577,6 +611,26 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
 
         self.assertEqual(len(factory.project.create_calls), 1)
         self.assertEqual(factory.project.entity_create_calls, [])
+
+    def test_create_type_error_reports_feature_store_py_version(self):
+        # An old feature_store_py rejects the embedding_field_type kwarg with a
+        # TypeError; the uploader must surface the pinned SDK version instead of
+        # burning the wait/retry loop and re-raising a generic failure.
+        factory = _FakeClientFactory(
+            None,
+            create_error=TypeError(
+                "create_dynamic_embedding_feature_view() got an unexpected "
+                "keyword argument 'embedding_field_type'"
+            ),
+        )
+        uploader = self._uploader(client_factory=factory)
+
+        with self.assertRaisesRegex(RuntimeError, "feature_store_py.*2.2.8") as ctx:
+            uploader.start()
+
+        self.assertIsInstance(ctx.exception.__cause__, TypeError)
+        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(len(factory.project.create_calls), 1)
 
     def test_start_creates_default_entity_when_it_does_not_exist(self):
         created_view = _FakeView()

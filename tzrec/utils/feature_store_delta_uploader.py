@@ -750,11 +750,24 @@ class FeatureStoreDeltaUploader:
                 "DynamicEmbedding FeatureView schema mismatch: "
                 f"expected={expected_fields}, actual={actual_fields}"
             )
-        if view.embedding_field_type != self._embedding_field_type:
+        actual_field_type = getattr(view, "embedding_field_type", None)
+        if not actual_field_type:
+            # An untyped handle predates UINT8 support and is float by definition.
+            if self._embedding_field_type != FEATURE_STORE_EMBEDDING_TYPE_FLOAT:
+                raise RuntimeError(
+                    "DynamicEmbedding FeatureView embedding type mismatch: "
+                    f"existing view {self._settings.feature_view_name!r} reports "
+                    "no embedding_field_type (a legacy float view, or "
+                    "feature_store_py older than 2.2.8), but the current delta "
+                    f"dump requires {self._embedding_field_type!r}; keep "
+                    "delta_embedding_dump_config.quant_type as NONE, or "
+                    "recreate the feature view with feature_store_py >= 2.2.8"
+                )
+        elif actual_field_type != self._embedding_field_type:
             raise RuntimeError(
                 "DynamicEmbedding FeatureView embedding type mismatch: existing "
                 f"view {self._settings.feature_view_name!r} uses "
-                f"{view.embedding_field_type!r}, but the current delta dump "
+                f"{actual_field_type!r}, but the current delta dump "
                 f"requires {self._embedding_field_type!r}; delete the feature "
                 "view and let training recreate it, or adjust "
                 "delta_embedding_dump_config.quant_type to match"
@@ -839,6 +852,15 @@ class FeatureStoreDeltaUploader:
                     embedding_field_type=self._embedding_field_type,
                 )
                 provisioned = True
+            except TypeError as exc:
+                # A signature TypeError is deterministic; the wait/retry loop
+                # cannot fix an SDK that lacks the embedding_field_type kwarg.
+                raise RuntimeError(
+                    "failed to create configured DynamicEmbedding FeatureView: "
+                    "the installed feature_store_py does not accept "
+                    "embedding_field_type; upgrade to feature_store_py >= 2.2.8 "
+                    "as pinned in requirements/runtime.txt"
+                ) from exc
             except Exception as exc:
                 create_error = exc
                 view = self._wait_for_dynamic_embedding_view(project)
