@@ -151,6 +151,12 @@ class BaseSidModel(BaseModel):
     ) -> Dict[str, torch.Tensor]:
         """Compute the configured SID losses from ``predictions``.
 
+        In mixed reconstruction + contrastive training, reconstruction and
+        contrastive modules each return a conditional mean over their valid
+        rows. Reweight those means by the corresponding row fraction so their
+        sum is normalized by the full batch size. Commitment loss remains an
+        unscaled mean over the quantized paths.
+
         Args:
             predictions (dict): a dict of predicted result (the raw tensors the
                 losses consume — ``x_hat``/``recon_target`` for reconstruction,
@@ -177,6 +183,9 @@ class BaseSidModel(BaseModel):
                 predictions["recon_target"],
                 predictions.get("recon_mask"),
             )
+            recon_mask = predictions.get("recon_mask")
+            if recon_mask is not None:
+                loss = loss * recon_mask.to(dtype=loss.dtype).mean()
             return {"recon_loss": loss}
         elif loss_type == "commitment_loss":
             loss = self._loss_modules["commitment_loss"](
@@ -191,6 +200,7 @@ class BaseSidModel(BaseModel):
                 predictions["embed_b_ori"],
                 predictions["pair_mask"],
             )
+            loss = loss * predictions["pair_mask"].to(dtype=loss.dtype).mean()
             return {"contrastive_loss": loss}
         else:
             raise ValueError(f"unsupported sid_loss variant: {loss_type!r}")
