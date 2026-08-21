@@ -78,6 +78,7 @@ from torchrec.modules.mc_modules import (
 )
 from torchrec.types import DataType
 
+from tzrec.protos import feature_pb2
 from tzrec.protos.train_pb2 import (
     DeltaEmbeddingDumpConfig,
     DeltaEmbeddingQuantType,
@@ -86,6 +87,7 @@ from tzrec.protos.train_pb2 import (
 from tzrec.tests import utils as test_utils
 from tzrec.utils import config_util
 from tzrec.utils.delta_embedding_dump import (
+    _CONSUMER,
     _DELTA_DUMP_QUANT_SCHEMA,
     _DELTA_DUMP_SCHEMA,
     DeltaEmbeddingDumper,
@@ -97,11 +99,16 @@ from tzrec.utils.delta_embedding_dump import (
     _validate_table_shard_info,
     validate_delta_embedding_dump_config,
 )
-from tzrec.utils.dynamicemb_util import has_dynamicemb
+from tzrec.utils.dynamicemb_util import (
+    build_dynamicemb_constraints,
+    has_dynamicemb,
+    set_auto_retain_evicted_keys,
+)
 from tzrec.utils.feature_store_delta_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
 )
+from tzrec.utils.quant_util import dequantize_quint8_rowwise_f16
 from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 from tzrec.utils.zch_util import register_post_zch_event_tracker_fn
 
@@ -117,6 +124,14 @@ _SHARED_EBC_INPUT_IDS = [1, 2]
 _SHARED_EC_INPUT_IDS = [5, 6]
 _SHARED_EBC_EMBEDDING_DIM = 4
 _SHARED_EC_EMBEDDING_DIM = 8
+
+try:
+    from dynamicemb.dynamicemb_config import EvictedItemMode
+
+    _HAS_EVICTED_ITEM_MODE = True
+except ImportError:
+    EvictedItemMode = None
+    _HAS_EVICTED_ITEM_MODE = False
 
 
 class _DeltaDumpEBCModel(nn.Module):
@@ -1640,6 +1655,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._retain_local_dump = False
             dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
             dumper._schema = _DELTA_DUMP_SCHEMA
+            dumper._dump_evicted_tombstones = False
             with (
                 mock.patch.object(dumper, "_collect_table_weights", return_value={}),
                 mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
@@ -1671,6 +1687,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._retain_local_dump = False
             dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
             dumper._schema = _DELTA_DUMP_SCHEMA
+            dumper._dump_evicted_tombstones = False
             with (
                 mock.patch.object(dumper, "_collect_table_weights", return_value={}),
                 mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
@@ -2174,6 +2191,310 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         # once per dump rather than once per table.
         dynamic_module.flush.assert_called_once_with()
 
+    _DYN_TABLE_FQN = "model.ec.embeddings.dyn_table"
+
+    def _eviction_dumper(self, quant_type=None):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._quant_type = (
+            quant_type or DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+        )
+        dumper._schema = (
+            _DELTA_DUMP_QUANT_SCHEMA
+            if dumper._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+            else _DELTA_DUMP_SCHEMA
+        )
+        dumper._tracker = SimpleNamespace(
+            fqn_to_feature_names={self._DYN_TABLE_FQN: ["user_id"]}
+        )
+        dumper._warned_no_retain_tables = set()
+        return dumper
+
+    def _eviction_module(self, evicted_keys):
+        return SimpleNamespace(
+            table_names=[self._DYN_TABLE_FQN.rsplit(".", maxsplit=1)[-1]],
+            _dynamicemb_options=[SimpleNamespace(dim=2)],
+            flush=mock.MagicMock(),
+            pop_evicted_keys=mock.MagicMock(
+                return_value={
+                    self._DYN_TABLE_FQN.rsplit(".", maxsplit=1)[-1]: torch.tensor(
+                        evicted_keys, dtype=torch.int64
+                    )
+                }
+            ),
+        )
+
+    def test_append_dynamic_evicted_rows_publishes_zero_tombstones(self):
+        dumper = self._eviction_dumper()
+        dynamic_module = self._eviction_module([7, 9])
+        table_chunks = []
+
+        num_rows = dumper._append_dynamic_evicted_rows(
+            table_chunks,
+            global_step=5,
+            dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
+            published_key_ids={},
+            flushed_module_ids=set(),
+        )
+
+        self.assertEqual(num_rows, 2)
+        # flush() precedes the pop so flush-induced evictions join the drain.
+        dynamic_module.flush.assert_called_once_with()
+        dynamic_module.pop_evicted_keys.assert_called_once_with(["dyn_table"])
+        table = pa.concat_tables(table_chunks)
+        self.assertEqual(table["key_id"].to_pylist(), [7, 9])
+        self.assertEqual(table["embedding"].to_pylist(), [[0.0, 0.0], [0.0, 0.0]])
+        self.assertEqual(
+            table["source"].to_pylist(), ["dynamicemb_evicted", "dynamicemb_evicted"]
+        )
+        self.assertEqual(table["feature_name"].to_pylist(), ["user_id", "user_id"])
+
+    def test_append_dynamic_evicted_rows_subtracts_republished_keys(self):
+        # 7 and 9 were evicted but reinserted and published as real rows this
+        # dump; a tombstone would race the fresh row in the MERGE upload.
+        dumper = self._eviction_dumper()
+        dynamic_module = self._eviction_module([7, 8, 9])
+        table_chunks = []
+
+        num_rows = dumper._append_dynamic_evicted_rows(
+            table_chunks,
+            global_step=5,
+            dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
+            published_key_ids={
+                self._DYN_TABLE_FQN: torch.tensor([7, 9], dtype=torch.int64)
+            },
+            flushed_module_ids=set(),
+        )
+
+        self.assertEqual(num_rows, 1)
+        table = pa.concat_tables(table_chunks)
+        self.assertEqual(table["key_id"].to_pylist(), [8])
+
+    def test_append_dynamic_evicted_rows_tombstones_tracked_missing_ids(self):
+        # 102 was tracked but find() missed it (founds=False), so it is absent
+        # from the published ids; its eviction still gets a tombstone.
+        dumper = self._eviction_dumper()
+        dynamic_module = self._eviction_module([102])
+        table_chunks = []
+
+        num_rows = dumper._append_dynamic_evicted_rows(
+            table_chunks,
+            global_step=5,
+            dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
+            published_key_ids={
+                self._DYN_TABLE_FQN: torch.tensor([101, 103], dtype=torch.int64)
+            },
+            flushed_module_ids=set(),
+        )
+
+        self.assertEqual(num_rows, 1)
+        table = pa.concat_tables(table_chunks)
+        self.assertEqual(table["key_id"].to_pylist(), [102])
+
+    def test_append_dynamic_evicted_rows_skips_discard_and_empty_tables(self):
+        dumper = self._eviction_dumper()
+        discard_module = SimpleNamespace(
+            table_names=["discard_table"],
+            _dynamicemb_options=[SimpleNamespace(dim=2)],
+            flush=mock.MagicMock(),
+            pop_evicted_keys=mock.MagicMock(return_value={}),
+        )
+        empty_module = SimpleNamespace(
+            table_names=["empty_table"],
+            _dynamicemb_options=[SimpleNamespace(dim=2)],
+            flush=mock.MagicMock(),
+            pop_evicted_keys=mock.MagicMock(
+                return_value={"empty_table": torch.tensor([], dtype=torch.int64)}
+            ),
+        )
+        old_module = SimpleNamespace(  # dynamicemb without pop_evicted_keys
+            table_names=["old_table"],
+            _dynamicemb_options=[SimpleNamespace(dim=2)],
+            flush=mock.MagicMock(),
+        )
+        dynamic_modules = {
+            "model.ec.embeddings.discard_table": discard_module,
+            "model.ec.embeddings.empty_table": empty_module,
+            "model.ec.embeddings.old_table": old_module,
+        }
+        table_chunks = []
+
+        with mock.patch("tzrec.utils.delta_embedding_dump.logger") as log:
+            num_rows = dumper._append_dynamic_evicted_rows(
+                table_chunks,
+                global_step=5,
+                dynamic_modules=dynamic_modules,
+                published_key_ids={},
+                flushed_module_ids=set(),
+            )
+
+        self.assertEqual(num_rows, 0)
+        self.assertEqual(table_chunks, [])
+        # DISCARD tables and pop-less builds warn once each; an empty eviction
+        # buffer is silent.
+        self.assertEqual(log.warning.call_count, 2)
+        warned = " ".join(str(call) for call in log.warning.call_args_list)
+        self.assertIn("model.ec.embeddings.discard_table", warned)
+        self.assertIn("model.ec.embeddings.old_table", warned)
+        self.assertNotIn("model.ec.embeddings.empty_table", warned)
+        # The one-time warnings do not repeat on the next dump.
+        with mock.patch("tzrec.utils.delta_embedding_dump.logger") as log:
+            dumper._append_dynamic_evicted_rows(
+                [],
+                global_step=6,
+                dynamic_modules=dynamic_modules,
+                published_key_ids={},
+                flushed_module_ids=set(),
+            )
+        log.warning.assert_not_called()
+
+    def test_append_dynamic_evicted_rows_flushes_module_once(self):
+        dumper = self._eviction_dumper()
+        dynamic_module = SimpleNamespace(
+            table_names=["dyn_a", "dyn_b"],
+            _dynamicemb_options=[SimpleNamespace(dim=2), SimpleNamespace(dim=2)],
+            flush=mock.MagicMock(),
+            pop_evicted_keys=mock.MagicMock(
+                side_effect=lambda names: {
+                    name: torch.tensor([5], dtype=torch.int64) for name in names
+                }
+            ),
+        )
+        flushed_module_ids = set()
+        table_chunks = []
+        for table_name in ("dyn_a", "dyn_b"):
+            dumper._append_dynamic_evicted_rows(
+                table_chunks,
+                global_step=5,
+                dynamic_modules={f"model.ec.embeddings.{table_name}": dynamic_module},
+                published_key_ids={},
+                flushed_module_ids=flushed_module_ids,
+            )
+        # Both tables share the module; flush() flushes all tables, so the
+        # tombstone pass flushes it at most once per dump.
+        dynamic_module.flush.assert_called_once_with()
+
+        # A module already flushed by the tracker pass is not flushed again.
+        dynamic_module.flush.reset_mock()
+        dumper._append_dynamic_evicted_rows(
+            [],
+            global_step=6,
+            dynamic_modules={"model.ec.embeddings.dyn_a": dynamic_module},
+            published_key_ids={},
+            flushed_module_ids={id(dynamic_module)},
+        )
+        dynamic_module.flush.assert_not_called()
+
+    def test_append_dynamic_evicted_rows_quant_bytes_pin_tombstone_format(self):
+        # A zero row through INT8 quantization is exactly [codes=0,0][fp16
+        # scale 1.0 little-endian 0x00,0x3C=60][fp16 offset 0.0] -- the byte
+        # contract the processor's tombstone detector is pinned to (the raw
+        # bytes are NOT all zero).
+        dumper = self._eviction_dumper(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        )
+        dynamic_module = self._eviction_module([11])
+        table_chunks = []
+
+        num_rows = dumper._append_dynamic_evicted_rows(
+            table_chunks,
+            global_step=5,
+            dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
+            published_key_ids={},
+            flushed_module_ids=set(),
+        )
+
+        self.assertEqual(num_rows, 1)
+        table = pa.concat_tables(table_chunks)
+        rows = table["embedding"].to_pylist()
+        self.assertEqual(rows, [[0, 0, 0, 60, 0, 0]])
+        decoded = dequantize_quint8_rowwise_f16(
+            np.asarray(rows, dtype=np.uint8), emb_dim=2
+        )
+        np.testing.assert_array_equal(decoded, np.zeros((1, 2), dtype=np.float32))
+        # Bitwise +0.0, not -0.0: NvEmbeddings dequantizes to fp16 0x0000.
+        self.assertFalse(np.signbit(decoded).any())
+
+    def test_clear_discards_retained_evicted_keys(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._dump_evicted_tombstones = True
+        tracker = SimpleNamespace(clear=mock.MagicMock())
+        dumper._tracker = tracker
+        dynamic_module = SimpleNamespace(
+            table_names=["dyn_a", "dyn_b"],
+            pop_evicted_keys=mock.MagicMock(return_value={}),
+        )
+        old_module = SimpleNamespace(table_names=["old_table"])
+        with mock.patch.object(
+            dumper,
+            "_collect_dynamic_modules",
+            return_value={
+                "model.ec.embeddings.dyn_a": dynamic_module,
+                "model.ec.embeddings.dyn_b": dynamic_module,
+                "model.ec.embeddings.old_table": old_module,
+            },
+        ):
+            dumper.clear()
+
+        tracker.clear.assert_called_once_with(_CONSUMER)
+        # One module hosts several tables; pop() drains them all, once.
+        dynamic_module.pop_evicted_keys.assert_called_once_with()
+
+    def test_clear_without_tombstones_keeps_eviction_buffer(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._dump_evicted_tombstones = False
+        dumper._tracker = SimpleNamespace(clear=mock.MagicMock())
+        dynamic_module = SimpleNamespace(
+            table_names=["dyn_table"],
+            pop_evicted_keys=mock.MagicMock(return_value={}),
+        )
+        with mock.patch.object(
+            dumper,
+            "_collect_dynamic_modules",
+            return_value={"model.ec.embeddings.dyn_table": dynamic_module},
+        ):
+            dumper.clear()
+
+        dumper._tracker.clear.assert_called_once_with(_CONSUMER)
+        dynamic_module.pop_evicted_keys.assert_not_called()
+
+
+@unittest.skipUnless(
+    has_dynamicemb and _HAS_EVICTED_ITEM_MODE,
+    "dynamicemb without EvictedItemMode is not installed; skipping.",
+)
+@mark_ci_scope("gpu")
+class DynamicembUtilAutoRetainTest(unittest.TestCase):
+    def setUp(self):
+        set_auto_retain_evicted_keys(False)
+        self.addCleanup(set_auto_retain_evicted_keys, False)
+        self.dynamicemb_cfg = feature_pb2.DynamicEmbedding(max_capacity=1024)
+        self.emb_config = EmbeddingBagConfig(
+            name="dyn_table",
+            num_embeddings=1024,
+            embedding_dim=8,
+            feature_names=["user_id"],
+        )
+
+    def test_auto_retain_arms_evicted_item_mode(self):
+        set_auto_retain_evicted_keys(True)
+
+        constraints = build_dynamicemb_constraints(self.dynamicemb_cfg, self.emb_config)
+
+        self.assertEqual(
+            constraints.dynamicemb_options.evicted_item_mode,
+            EvictedItemMode.RETAIN_KEY,
+        )
+
+    def test_auto_retain_off_keeps_discard_mode(self):
+        constraints = build_dynamicemb_constraints(self.dynamicemb_cfg, self.emb_config)
+
+        self.assertEqual(
+            constraints.dynamicemb_options.evicted_item_mode,
+            EvictedItemMode.DISCARD,
+        )
+
 
 class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
     def __init__(self, methodName="runTest") -> None:
@@ -2332,6 +2653,7 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
         self.assertTrue(step_dirs, f"no delta dump produced under {dump_dir}")
 
         dumped_real_rows = False
+        dumped_tombstone_rows = False
         for step_dir in step_dirs:
             shards = sorted(glob.glob(os.path.join(step_dir, "*.parquet")))
             # Every rank writes a shard even with no delta, so each step dir
@@ -2346,21 +2668,46 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
                 self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
                 if table.num_rows == 0:
                     continue
-                dumped_real_rows = True
                 self.assertEqual(set(table["world_size"].to_pylist()), {world_size})
-                self.assertEqual(
-                    set(table["source"].to_pylist()), {"model_delta_tracker"}
+                table_fqns = table["table_fqn"].to_pylist()
+                key_ids = table["key_id"].to_pylist()
+                sources = table["source"].to_pylist()
+                embeddings = table["embedding"].to_pylist()
+                self.assertLessEqual(
+                    set(sources), {"model_delta_tracker", "dynamicemb_evicted"}
                 )
                 # dynamic lookup must return a real embedding vector per id.
-                self.assertTrue(
-                    all(len(emb) > 0 for emb in table["embedding"].to_pylist())
-                )
+                self.assertTrue(all(len(emb) > 0 for emb in embeddings))
+                real_keys = {
+                    (fqn, key)
+                    for fqn, key, source in zip(table_fqns, key_ids, sources)
+                    if source == "model_delta_tracker"
+                }
+                if real_keys:
+                    dumped_real_rows = True
+                for fqn, key, source, emb in zip(
+                    table_fqns, key_ids, sources, embeddings
+                ):
+                    if source != "dynamicemb_evicted":
+                        continue
+                    dumped_tombstone_rows = True
+                    # A tombstone is an all-zero row for a key this dump did
+                    # not also publish as a real row (reinserted keys win).
+                    self.assertEqual(emb, [0.0] * len(emb))
+                    self.assertNotIn((fqn, key), real_keys)
 
         # If no rank ever dumped a real row, the flush()/find() lookup path was
         # not actually exercised and the test would be vacuous.
         self.assertTrue(
             dumped_real_rows,
             "no dynamic delta rows dumped; flush()/find() path not exercised",
+        )
+        # The tiny initial table capacity evicts keys during training; they
+        # must reach the shards as tombstones or the pop_evicted_keys drain
+        # was never exercised.
+        self.assertTrue(
+            dumped_tombstone_rows,
+            "no evicted-key tombstones dumped; pop_evicted_keys path not exercised",
         )
 
 

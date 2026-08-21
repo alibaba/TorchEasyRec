@@ -12,7 +12,7 @@
 import dataclasses
 import math
 import os
-from typing import Any, List, Optional, Tuple, Type, cast
+from typing import Any, Dict, List, Optional, Tuple, Type, cast
 
 import torch
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -51,6 +51,50 @@ from tzrec.utils.logging_util import logger
 _DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
 _DYNAMICEMB_HYBRID_X_EFF_BASE = 0.11
 _DYNAMICEMB_X_EFF_TIEBREAK = 0.01
+
+# Armed by train() when delta dump publishes evicted-key tombstones: that
+# dump's pop_evicted_keys drain is the only consumer of the evicted-key
+# buffer, so retention is enabled exactly when a consumer exists (an
+# unconsumed buffer would grow without bound in GPU memory).
+_auto_retain_evicted_keys = False
+_warned_missing_evicted_item_mode = False
+
+
+def set_auto_retain_evicted_keys(enabled: bool) -> None:
+    """Toggle RETAIN_KEY eviction recording for dynamicemb tables built later.
+
+    Takes effect at plan/shard time (``build_dynamicemb_constraints``), which
+    cannot see the train config, hence this module-level switch.
+
+    Args:
+        enabled: Whether new dynamicemb tables should retain evicted keys.
+    """
+    global _auto_retain_evicted_keys
+    _auto_retain_evicted_keys = bool(enabled)
+
+
+def _arm_evicted_key_retention(demb_opt_kwargs: Dict[str, Any]) -> None:
+    """Add evicted_item_mode=RETAIN_KEY to table options when auto-retain is on.
+
+    Older dynamicemb builds have no EvictedItemMode; warn once and keep the
+    default DISCARD mode rather than raise, so the default-on tombstone dump
+    cannot break existing jobs -- tombstones are then silently missing.
+
+    Args:
+        demb_opt_kwargs: Keyword arguments for DynamicEmbTableOptions.
+    """
+    global _warned_missing_evicted_item_mode
+    try:
+        from dynamicemb.dynamicemb_config import EvictedItemMode
+    except ImportError:
+        if not _warned_missing_evicted_item_mode:
+            _warned_missing_evicted_item_mode = True
+            logger.warning(
+                "dynamicemb lacks EvictedItemMode; evicted-key tombstones "
+                "will be missing from delta embedding dumps."
+            )
+        return
+    demb_opt_kwargs["evicted_item_mode"] = EvictedItemMode.RETAIN_KEY
 
 
 def _dynamicemb_effective_cache_ratio(
@@ -294,6 +338,8 @@ def build_dynamicemb_constraints(
     demb_opt_kwargs = {}
     if dynamicemb_cfg.HasField("bucket_capacity"):
         demb_opt_kwargs["bucket_capacity"] = dynamicemb_cfg.bucket_capacity
+    if _auto_retain_evicted_keys:
+        _arm_evicted_key_retention(demb_opt_kwargs)
 
     dynamicemb_options = dynamicemb.DynamicEmbTableOptions(
         max_capacity=dynamicemb_cfg.max_capacity,
