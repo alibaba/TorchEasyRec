@@ -2638,6 +2638,8 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
         dump_cfg.dump_interval_steps = 1
         dump_cfg.output_dir = dump_dir
         dump_cfg.file_prefix = "delta_embedding"
+        # Tombstones are opt-in; enable them so the eviction drain is covered.
+        dump_cfg.dump_evicted_tombstones = True
         new_config_path = os.path.join(self.test_dir, "new_pipeline.config")
         config_util.save_message(pipeline_config, new_config_path)
 

@@ -112,9 +112,12 @@ message DeltaEmbeddingDumpConfig {
     // last dump; the polling processor detects them and deletes the key from
     // NvEmbeddings, reclaiming its memory (FeatureStore has no delete). While
     // enabled, delta dump mode also arms dynamicemb's evicted-key recording
-    // (evicted_item_mode=RETAIN_KEY) automatically. Requires a dynamicemb
-    // build with EvictedItemMode; older builds degrade to a warning.
-    optional bool dump_evicted_tombstones = 7 [default = true];
+    // (evicted_item_mode=RETAIN_KEY) automatically; the retained keys live in
+    // per-rank GPU memory and grow with eviction volume until each dump
+    // drains them, so keep the dump interval short on high-churn tables.
+    // Requires a dynamicemb build with EvictedItemMode; older builds degrade
+    // to a warning.
+    optional bool dump_evicted_tombstones = 7 [default = false];
 }
 
 message TrainConfig {
