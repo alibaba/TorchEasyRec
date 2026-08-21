@@ -108,6 +108,13 @@ message DeltaEmbeddingDumpConfig {
     // even embedding_dim.
     optional DeltaEmbeddingQuantType quant_type = 6
         [default = DELTA_EMBEDDING_QUANT_NONE];
+    // Publish all-zero tombstone rows for dynamicemb keys evicted since the
+    // last dump; the polling processor detects them and deletes the key from
+    // NvEmbeddings, reclaiming its memory (FeatureStore has no delete). While
+    // enabled, delta dump mode also arms dynamicemb's evicted-key recording
+    // (evicted_item_mode=RETAIN_KEY) automatically. Requires a dynamicemb
+    // build with EvictedItemMode; older builds degrade to a warning.
+    optional bool dump_evicted_tombstones = 7 [default = true];
 }
 
 message TrainConfig {
