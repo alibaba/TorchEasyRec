@@ -92,6 +92,7 @@ from tzrec.utils.delta_embedding_dump import (
     _DELTA_DUMP_SCHEMA,
     DeltaEmbeddingDumper,
     ModelDeltaTracker,
+    _dynamicemb_pop_evicted_keys_supported,
     _local_table_weight,
     _table_shard_info_from_config,
     _TableShardInfo,
@@ -2616,11 +2617,22 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
     @mark_ci_scope("gpu")
     def test_dynamicemb_multi_gpu_delta_dump_writes_uniform_shards(self):
         world_size = int(os.getenv("TEST_NPROC_PER_NODE", "2"))
-        pipeline_config = config_util.load_pipeline_config(
-            "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config"
+        config_path = "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config"
+        # Prepare mock data against the config's original (large) id space
+        # before shrinking max_capacity: a dynamicemb feature's mock ids are
+        # drawn from [0, num_embeddings) and num_embeddings == max_capacity,
+        # so data generated after the shrink could never overflow the tables.
+        prepared_config = test_utils.load_config_for_test(
+            config_path, self.test_dir, user_id="user_id", item_id="item_id"
         )
+        pipeline_config = config_util.load_pipeline_config(config_path)
+        pipeline_config.train_input_path = prepared_config.train_input_path
+        pipeline_config.eval_input_path = prepared_config.eval_input_path
+        pipeline_config.data_config.num_workers = 2
         # Admit every id immediately so the find() lookup returns embeddings
-        # for the touched ids (default frequency admission would hide them).
+        # for the touched ids (default frequency admission would hide them),
+        # and shrink the dynamic tables far below the prepared id space so
+        # they overflow and evict keys deterministically.
         for feature_config in pipeline_config.feature_configs:
             feature_type = feature_config.WhichOneof("feature")
             if feature_type is None:
@@ -2632,6 +2644,7 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
                 admission = feature.dynamicemb.WhichOneof("admission_strategy")
                 if admission is not None:
                     feature.dynamicemb.ClearField(admission)
+                feature.dynamicemb.max_capacity = 1024
 
         dump_dir = os.path.abspath(os.path.join(self.test_dir, "delta_dump"))
         dump_cfg = pipeline_config.train_config.delta_embedding_dump_config
@@ -2704,13 +2717,15 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
             dumped_real_rows,
             "no dynamic delta rows dumped; flush()/find() path not exercised",
         )
-        # The tiny initial table capacity evicts keys during training; they
+        # The shrunken max_capacity forces evictions during training; they
         # must reach the shards as tombstones or the pop_evicted_keys drain
-        # was never exercised.
-        self.assertTrue(
-            dumped_tombstone_rows,
-            "no evicted-key tombstones dumped; pop_evicted_keys path not exercised",
-        )
+        # was never exercised. Old dynamicemb builds lack pop_evicted_keys
+        # and degrade to a warning, so only assert where it exists.
+        if _dynamicemb_pop_evicted_keys_supported():
+            self.assertTrue(
+                dumped_tombstone_rows,
+                "no evicted-key tombstones dumped; pop_evicted_keys path not exercised",
+            )
 
 
 class DeltaEmbeddingDumpZchIntegrationTest(unittest.TestCase):
