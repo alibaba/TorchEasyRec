@@ -907,36 +907,43 @@ def train_and_evaluate(
         with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
             f.write(tzrec_version + "\n")
 
-    if delta_embedding_dumper is not None:
-        delta_embedding_dumper.start()
-    # when slice batch by sample cost, data on all workers may not be balanced
-    check_all_workers_data_status = data_config.HasField("batch_cost_size")
-    _train_and_evaluate(
-        model,
-        optimizer,
-        train_dataloader,
-        eval_dataloader,
-        [sparse_lr, dense_lr, *part_lrs],
-        pipeline_config.model_dir,
-        train_config=train_config,
-        eval_config=pipeline_config.eval_config,
-        ckpt_manager=ckpt_manager,
-        skip_steps=skip_steps,
-        ckpt_path=ckpt_path,
-        check_all_workers_data_status=check_all_workers_data_status,
-        ignore_restore_optimizer=ignore_restore_optimizer,
-        dataloader_state=dataloader_state,
-        delta_embedding_dumper=delta_embedding_dumper,
-        pipeline_config_path=os.path.join(pipeline_config.model_dir, "pipeline.config"),
-        dense_ema=dense_ema,
-        export_config=pipeline_config.export_config,
-    )
-    # Drain background uploads only after training succeeds. A training failure
-    # terminates the whole job (torchrun tears down every rank) and pending
-    # in-memory deltas are intentionally abandoned: the restarted run re-dumps
-    # from the latest checkpoint, so there is nothing to roll back or undo.
-    if delta_embedding_dumper is not None:
-        delta_embedding_dumper.close()
+    try:
+        if delta_embedding_dumper is not None:
+            delta_embedding_dumper.start()
+        # when slice batch by sample cost, data on all workers may not be balanced
+        check_all_workers_data_status = data_config.HasField("batch_cost_size")
+        _train_and_evaluate(
+            model,
+            optimizer,
+            train_dataloader,
+            eval_dataloader,
+            [sparse_lr, dense_lr, *part_lrs],
+            pipeline_config.model_dir,
+            train_config=train_config,
+            eval_config=pipeline_config.eval_config,
+            ckpt_manager=ckpt_manager,
+            skip_steps=skip_steps,
+            ckpt_path=ckpt_path,
+            check_all_workers_data_status=check_all_workers_data_status,
+            ignore_restore_optimizer=ignore_restore_optimizer,
+            dataloader_state=dataloader_state,
+            delta_embedding_dumper=delta_embedding_dumper,
+            pipeline_config_path=os.path.join(
+                pipeline_config.model_dir, "pipeline.config"
+            ),
+            dense_ema=dense_ema,
+            export_config=pipeline_config.export_config,
+        )
+        # Drain background uploads only after training succeeds. A training failure
+        # terminates the whole job (torchrun tears down every rank) and pending
+        # in-memory deltas are intentionally abandoned: the restarted run re-dumps
+        # from the latest checkpoint, so there is nothing to roll back or undo.
+        if delta_embedding_dumper is not None:
+            delta_embedding_dumper.close()
+    finally:
+        # Evicted-key retention is process-global; disarm so anything running
+        # after training in this process never sees it left armed.
+        dynamicemb_util.set_auto_retain_evicted_keys(False)
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
 
