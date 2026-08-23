@@ -75,3 +75,9 @@ bash scripts/build_wheel.sh release
 ```bash
 bash scripts/build_docker.sh
 ```
+
+**构建PPU镜像**
+
+```bash
+bash scripts/build_docker_ppu.sh
+```
