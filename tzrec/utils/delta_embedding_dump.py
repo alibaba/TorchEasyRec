@@ -69,6 +69,9 @@ from tzrec.utils.zch_util import (
 )
 
 _CONSUMER = "delta_embedding_dump"
+# Rows per tombstone chunk: chunks alias one zero buffer of this size so an
+# eviction drain never materializes a single huge zero matrix.
+_TOMBSTONE_CHUNK_ROWS = 65536
 _ShardedEmbeddingModule = Union[
     ShardedEmbeddingCollection, ShardedEmbeddingBagCollection
 ]
@@ -1233,6 +1236,10 @@ class DeltaEmbeddingDumper:
         reinserted key keeps its fresh row instead of racing a tombstone in the
         MERGE upload. Each rank drains only its local shard (row-wise sharding
         keeps shards disjoint), so no cross-rank collective is needed.
+        Tombstone rows are appended in chunks of at most
+        ``_TOMBSTONE_CHUNK_ROWS`` rows whose embeddings all alias one
+        chunk-sized zero buffer, so host memory for the zeros stays bounded
+        regardless of eviction volume.
 
         Args:
             table_chunks: List to append the per-table parquet chunks to.
@@ -1280,17 +1287,24 @@ class DeltaEmbeddingDumper:
             table_id = dynamic_module.table_names.index(table_name)
             # pyre-ignore [29]
             emb_dim = dynamic_module._dynamicemb_options[table_id].dim
-            num_rows += self._append_table_chunk(
-                table_chunks,
-                global_step=global_step,
-                feature_name=_feature_name(
-                    self._tracker.fqn_to_feature_names.get(fqn, [])
-                ),
-                table_fqn=fqn,
-                key_ids=evicted,
-                embeddings=torch.zeros((evicted.numel(), emb_dim), dtype=torch.float32),
-                source="dynamicemb_evicted",
-            )
+            # One zero buffer backs every chunk: _append_table_chunk wraps
+            # row-slice views zero-copy, so Arrow chunks share this storage
+            # and retained tombstone zeros stay one chunk-sized buffer.
+            chunk_rows = min(_TOMBSTONE_CHUNK_ROWS, evicted.numel())
+            zero_rows = torch.zeros((chunk_rows, emb_dim), dtype=torch.float32)
+            for start in range(0, evicted.numel(), chunk_rows):
+                key_chunk = evicted[start : start + chunk_rows]
+                num_rows += self._append_table_chunk(
+                    table_chunks,
+                    global_step=global_step,
+                    feature_name=_feature_name(
+                        self._tracker.fqn_to_feature_names.get(fqn, [])
+                    ),
+                    table_fqn=fqn,
+                    key_ids=key_chunk,
+                    embeddings=zero_rows[: key_chunk.numel()],
+                    source="dynamicemb_evicted",
+                )
         return num_rows
 
     def _collect_table_shard_infos(self) -> Dict[str, _TableShardInfo]:

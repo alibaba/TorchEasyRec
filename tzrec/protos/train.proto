@@ -115,9 +115,11 @@ message DeltaEmbeddingDumpConfig {
     // (evicted_item_mode=RETAIN_KEY) automatically; the retained keys live in
     // per-rank GPU memory and grow with eviction volume until each dump
     // drains them, so keep the dump interval short on high-churn tables.
-    // Requires a dynamicemb build with EvictedItemMode; older builds degrade
-    // to a warning.
-    optional bool dump_evicted_tombstones = 7 [default = false];
+    // Tombstone rows are emitted in bounded chunks that share one zero
+    // buffer, so host memory for them stays capped regardless of eviction
+    // volume. Requires a dynamicemb build with EvictedItemMode; older builds
+    // degrade to a warning.
+    optional bool dump_evicted_tombstones = 7 [default = true];
 }
 
 message TrainConfig {

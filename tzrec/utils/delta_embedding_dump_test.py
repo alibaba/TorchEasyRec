@@ -2417,6 +2417,37 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         # Bitwise +0.0, not -0.0: NvEmbeddings dequantizes to fp16 0x0000.
         self.assertFalse(np.signbit(decoded).any())
 
+    def test_append_dynamic_evicted_rows_chunks_large_evictions(self):
+        # Evictions beyond the chunk size split into ordered chunks whose
+        # embeddings all alias one chunk-sized zero buffer.
+        dumper = self._eviction_dumper()
+        evicted_keys = list(range(10))
+        dynamic_module = self._eviction_module(evicted_keys)
+        table_chunks = []
+
+        with mock.patch("tzrec.utils.delta_embedding_dump._TOMBSTONE_CHUNK_ROWS", 3):
+            num_rows = dumper._append_dynamic_evicted_rows(
+                table_chunks,
+                global_step=5,
+                dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
+                published_key_ids={},
+                flushed_module_ids=set(),
+            )
+
+        self.assertEqual(num_rows, 10)
+        # 3 + 3 + 3 + 1 rows: chunk boundaries at the constant, order kept.
+        self.assertEqual([chunk.num_rows for chunk in table_chunks], [3, 3, 3, 1])
+        table = pa.concat_tables(table_chunks)
+        self.assertEqual(table["key_id"].to_pylist(), evicted_keys)
+        self.assertEqual(table["embedding"].to_pylist(), [[0.0, 0.0]] * 10)
+        # Every chunk's embedding values wrap the same storage, so retained
+        # tombstone zeros stay one chunk regardless of eviction count.
+        addresses = [
+            chunk.column("embedding").chunk(0).values.buffers()[1].address
+            for chunk in table_chunks
+        ]
+        self.assertEqual(len(set(addresses)), 1)
+
     def test_clear_discards_retained_evicted_keys(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._dump_evicted_tombstones = True
@@ -2651,8 +2682,6 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
         dump_cfg.dump_interval_steps = 1
         dump_cfg.output_dir = dump_dir
         dump_cfg.file_prefix = "delta_embedding"
-        # Tombstones are opt-in; enable them so the eviction drain is covered.
-        dump_cfg.dump_evicted_tombstones = True
         new_config_path = os.path.join(self.test_dir, "new_pipeline.config")
         config_util.save_message(pipeline_config, new_config_path)
 
