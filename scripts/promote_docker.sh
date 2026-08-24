@@ -9,7 +9,7 @@ REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 SRC_REPO=tzrec-test
 DST_REPO=tzrec-devel
 DOCKER_TAG=1.4
-DOCKER_TAG_SUFFIX=
+DOCKER_TAG_SUFFIX=-u1
 
 for DEVICE in cpu cu126 cu130
 do
