@@ -1052,12 +1052,10 @@ class DeltaEmbeddingDumper:
                 flushed_module_ids=flushed_module_ids,
             )
             if published_dynamic_key_ids is not None and fqn in dynamic_modules:
-                published_ids = key_ids.detach().cpu().to(torch.int64)
-                if fqn in published_dynamic_key_ids:
-                    published_ids = torch.cat(
-                        [published_dynamic_key_ids[fqn], published_ids]
-                    )
-                published_dynamic_key_ids[fqn] = published_ids
+                # Materialize once on host; _append_table_chunk reuses it and
+                # its D2H copy becomes a no-op.
+                key_ids = key_ids.detach().cpu().to(torch.int64)
+                published_dynamic_key_ids[fqn] = key_ids
             feature_name = _feature_name(
                 self._tracker.fqn_to_feature_names.get(fqn, [])
             )
