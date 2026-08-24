@@ -60,7 +60,7 @@ class PromptStackIntegrationTest(unittest.TestCase):
         )
         cfg.sid_space.codebook.extend(_CODEBOOK)
         self.compiled_prompt = compile_prompt(
-            cfg, self.features, model_dir=self.test_dir
+            cfg, self.features, ["answer"], model_dir=self.test_dir
         )
 
     def _model(self):

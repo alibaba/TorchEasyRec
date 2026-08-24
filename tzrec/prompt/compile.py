@@ -81,17 +81,13 @@ def _resolve_slot(
 def _slot_width(
     members: Sequence[BaseFeature],
     group_type: "FeatureGroupType.ValueType",
-    answer_levels: Optional[int] = None,
 ) -> Width:
     """Derive a slot's position count from its members.
 
-    A DEEP slot pools to exactly one position. The answer is exactly one SID
-    item, so its width is the codebook depth and needs no sequence_length. Any
-    other sequence slot is bounded by its members' sequence_length, and
-    unbounded when none declares one.
+    A DEEP slot pools to exactly one position. Any other sequence slot is
+    bounded by its members' sequence_length, and unbounded when none declares
+    one.
     """
-    if answer_levels is not None:
-        return Width(WidthKind.STATIC, answer_levels)
     if group_type == FeatureGroupType.DEEP:
         return Width(WidthKind.STATIC, 1)
     # BaseFeature.sequence_length, not config: a member of a SequenceFeature
@@ -242,13 +238,15 @@ def _hash(*parts: Any) -> str:
 def compile_prompt(
     cfg: PromptConfig,
     features: Sequence[BaseFeature],
+    label_fields: Sequence[str] = (),
     model_dir: Optional[str] = None,
 ) -> CompiledPrompt:
     """Compile a prompt config into its plan, module and vocabulary artifacts.
 
     Args:
         cfg: the prompt config to compile.
-        features: every feature the config may reference, already created.
+        features: every feature a body slot may reference, already created.
+        label_fields: data_config.label_fields; a response slot names these.
         model_dir: where to write the extended tokenizer; skipped when None.
 
     Returns:
@@ -271,32 +269,44 @@ def compile_prompt(
             f"by a {{{{name}}}} placeholder."
         )
 
+    response_slot_names = set(resp_names)
+    label_field_names = set(label_fields)
+
     members: Dict[str, List[BaseFeature]] = {}
     for name, slot in resolved_slots_by_name.items():
-        missing_feature_names = [
-            feature_name
-            for feature_name in slot.feature_names
-            if feature_name not in features_by_name
+        # the answer is the supervised target, so it is declared as a label; it
+        # is deliberately not a feature, which is what lets it be absent at
+        # inference without the parser demanding its column
+        source = label_field_names if name in response_slot_names else features_by_name
+        missing = [
+            source_name
+            for source_name in slot.feature_names
+            if source_name not in source
         ]
-        if missing_feature_names:
-            raise ValueError(
-                f"prompt slot [{name}] names features {missing_feature_names} that "
-                "are not in feature_configs."
+        if missing:
+            declared_in = (
+                "data_config.label_fields"
+                if name in response_slot_names
+                else "feature_configs"
             )
-        members[name] = [
-            features_by_name[feature_name] for feature_name in slot.feature_names
-        ]
+            raise ValueError(
+                f"prompt slot [{name}] names {missing}, which are not in {declared_in}."
+            )
+        members[name] = (
+            []
+            if name in response_slot_names
+            else [features_by_name[source_name] for source_name in slot.feature_names]
+        )
 
-    response_slot_names = set(resp_names)
     group_types_by_slot_name: Dict[str, "FeatureGroupType.ValueType"] = {}
     fill_modes_by_slot_name: Dict[str, FillMode] = {}
     for name, slot_members in members.items():
-        group_type, fill_mode = _derive_slot_layout(name, slot_members)
-        if name in response_slot_names and fill_mode is FillMode.PROJECTED:
-            raise ValueError(
-                f"response slot [{name}] is PROJECTED; response slots must be "
-                "INLINE because the LM generates them as vocabulary tokens."
-            )
+        if name in response_slot_names:
+            # a label carries no schema, so the layout is fixed rather than
+            # derived: the LM emits the answer as vocabulary tokens
+            group_type, fill_mode = FeatureGroupType.JAGGED_SEQUENCE, FillMode.INLINE
+        else:
+            group_type, fill_mode = _derive_slot_layout(name, slot_members)
         group_types_by_slot_name[name] = group_type
         fill_modes_by_slot_name[name] = fill_mode
     for name, slot in resolved_slots_by_name.items():
@@ -327,11 +337,6 @@ def compile_prompt(
     for name, slot in resolved_slots_by_name.items():
         group_type = group_types_by_slot_name[name]
         fill_mode = fill_modes_by_slot_name[name]
-        levels = (
-            sid_space.num_levels
-            if name in response_slot_names and fill_mode is FillMode.INLINE
-            else None
-        )
         segs[name] = SlotSeg(
             slot_id=slot_ids[name],
             name=name,
@@ -341,7 +346,12 @@ def compile_prompt(
                 ".sequence" if group_type == FeatureGroupType.JAGGED_SEQUENCE else ""
             ),
             fill=fill_mode,
-            width=_slot_width(members[name], group_type, levels),
+            width=(
+                # exactly one SID item, so the codebook depth sizes it
+                Width(WidthKind.STATIC, sid_space.num_levels)
+                if name in response_slot_names
+                else _slot_width(members[name], group_type)
+            ),
         )
 
     body = _build_template_segments(body_runs, body_names, segs, tok)

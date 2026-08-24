@@ -54,7 +54,7 @@ class PromptPersistTest(unittest.TestCase):
             tokenizer_path=self.tok_path, prompt=prompt, response="{{answer}}"
         )
         cfg.sid_space.codebook.extend(codebook)
-        return compile_prompt(cfg, self.features, model_dir=self.test_dir)
+        return compile_prompt(cfg, self.features, ["answer"], model_dir=self.test_dir)
 
     def test_writes_a_self_describing_directory(self) -> None:
         compiled_prompt = self._compile()
@@ -110,7 +110,7 @@ class PromptPersistTest(unittest.TestCase):
                     "sequence_length: 2 }"
                 )
             ]
-            return compile_prompt(cfg, features, model_dir=self.test_dir)
+            return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
 
         ckpt = os.path.join(self.test_dir, "model.ckpt-proj")
         save_prompt_assets(compile_with([16]), ckpt)
@@ -143,7 +143,7 @@ class PromptPersistTest(unittest.TestCase):
                         "embedding_dim: 8 sequence_length: 2 }"
                     )
                 )
-            return compile_prompt(cfg, features, model_dir=self.test_dir)
+            return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
 
         ckpt = os.path.join(self.test_dir, "model.ckpt-route")
         save_prompt_assets(compile_with("X", "Y"), ckpt)

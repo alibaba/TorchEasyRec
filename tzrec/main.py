@@ -131,7 +131,10 @@ def _compile_prompt(
     if not pipeline_config.HasField("prompt_config"):
         return None
     return compile_prompt(
-        pipeline_config.prompt_config, features, model_dir=pipeline_config.model_dir
+        pipeline_config.prompt_config,
+        features,
+        list(pipeline_config.data_config.label_fields),
+        model_dir=pipeline_config.model_dir,
     )
 
 

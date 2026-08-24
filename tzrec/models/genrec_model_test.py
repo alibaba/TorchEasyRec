@@ -78,7 +78,7 @@ class BaseGenrecModelTest(unittest.TestCase):
         kwargs.setdefault("response", "{{answer}}")
         cfg = PromptConfig(tokenizer_path=self.tok, prompt=template, **kwargs)
         cfg.sid_space.codebook.extend(_CODEBOOK)
-        return compile_prompt(cfg, features, model_dir=self.test_dir)
+        return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
 
     def _model(
         self,
@@ -169,7 +169,9 @@ class BaseGenrecModelTest(unittest.TestCase):
         for name in ("pa", "pb"):
             slot = cfg.slots.add(name=name, projection_name="shared")
             slot.feature_names.append(name)
-        compiled_prompt = compile_prompt(cfg, features, model_dir=self.test_dir)
+        compiled_prompt = compile_prompt(
+            cfg, features, ["answer"], model_dir=self.test_dir
+        )
 
         with self.assertRaisesRegex(ValueError, "cannot share a module"):
             self._model(features=features, compiled_prompt=compiled_prompt)

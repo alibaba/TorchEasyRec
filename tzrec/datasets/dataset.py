@@ -42,7 +42,7 @@ from tzrec.datasets.utils import (
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.prompt.assembler import PromptAssembler
-from tzrec.prompt.types import CompiledPrompt, SlotSeg
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import data_pb2
 from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
@@ -135,25 +135,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             else None
         )
 
-        parser_features = features
-        if compiled_prompt is not None and mode == Mode.PREDICT:
-            prompt_feature_names = {
-                feature_name
-                for segment in compiled_prompt.prompt_plan.segments
-                if isinstance(segment, SlotSeg)
-                for feature_name in segment.feature_names
-            }
-            response_feature_names = {
-                feature_name
-                for segment in compiled_prompt.prompt_plan.response_segments
-                if isinstance(segment, SlotSeg)
-                for feature_name in segment.feature_names
-            }
-            response_only = response_feature_names - prompt_feature_names
-            parser_features = [f for f in features if f.name not in response_only]
-
         self._data_parser = DataParser(
-            features=parser_features,
+            features=features,
             labels=list(data_config.label_fields)
             if self._mode != Mode.PREDICT
             else None,

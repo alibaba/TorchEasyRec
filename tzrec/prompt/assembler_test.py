@@ -30,7 +30,11 @@ _BASE_VOCAB_SIZE = 1000
 _SENTINEL = 1099
 
 
-def _sid_space(codebook=(4, 4, 4)) -> ResolvedSidSpace:
+_CODEBOOK = (4, 4, 4)
+_NUM_LEVELS = len(_CODEBOOK)
+
+
+def _sid_space(codebook=_CODEBOOK) -> ResolvedSidSpace:
     offsets, running = [], 0
     for size in codebook:
         offsets.append(running)
@@ -65,9 +69,10 @@ def _slot(
         if group_type == FeatureGroupType.JAGGED_SEQUENCE
         else "",
         fill=fill,
+        # a response slot compiles to STATIC(num_levels); _NUM_LEVELS mirrors it
         width=Width(WidthKind.BOUNDED, width_n)
         if width_n
-        else Width(WidthKind.STATIC, 1),
+        else Width(WidthKind.STATIC, _NUM_LEVELS),
     )
 
 

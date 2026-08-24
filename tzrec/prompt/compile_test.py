@@ -55,7 +55,7 @@ class CompilePromptTest(unittest.TestCase):
         named = {f.name for f in features}
         if "{{answer}}" in cfg.response and "answer" not in named:
             features = list(features) + [create_prompt_feature(_ANSWER)]
-        return compile_prompt(cfg, features, model_dir=self.test_dir)
+        return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
 
     def test_sid_space_resolves_offsets_and_bands(self) -> None:
         cfg = self._config(prompt="History : {{hist}}")
@@ -215,14 +215,30 @@ class CompilePromptTest(unittest.TestCase):
         # first supervised label
         self.assertEqual(compiled.prompt_plan.logits_suffix_len, 4)
 
-    def test_response_slot_must_be_inline(self) -> None:
+    def test_response_must_name_a_label_field(self) -> None:
+        # the answer is the supervised target, so it is declared in
+        # label_fields; naming a feature instead is the common mistake
         cfg = self._config(prompt="History : {{hist}}", response="{{prof}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
 
-        with self.assertRaisesRegex(ValueError, r"response slot \[prof\] is PROJECTED"):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"\[prof\] names \['prof'\], which are not in "
+            r"data_config.label_fields",
+        ):
             self._compile(
                 cfg, [create_prompt_feature(_HIST), create_prompt_feature(_PROF)]
             )
+
+    def test_response_slot_may_not_declare_a_projection(self) -> None:
+        cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        slot = cfg.slots.add(name="answer")
+        slot.feature_names.append("answer")
+        slot.projection.SetInParent()
+
+        with self.assertRaisesRegex(ValueError, "drop its projection"):
+            self._compile(cfg, [create_prompt_feature(_HIST)])
 
     def test_missing_sid_space_is_rejected(self) -> None:
         # the response width is codebook-derived, so sid_space must exist

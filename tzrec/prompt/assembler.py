@@ -99,11 +99,19 @@ class PromptAssembler:
                 f"means SID codes, but no sid_space was compiled."
             )
 
-    def _inline_tokens(self, name: str, values: np.ndarray) -> np.ndarray:
+    def _inline_tokens(
+        self, name: str, values: np.ndarray, exact_width: Optional[int] = None
+    ) -> np.ndarray:
         """Validate offset SID codes against their bands and shift to token ids.
 
         The data carries ``level_offsets[l] + code``; the LM vocabulary needs
         one further uniform shift by ``base_vocab_size``.
+
+        Args:
+            name: the slot, for the message.
+            values: the slot's offset SID codes for one sample.
+            exact_width: required position count, for a slot whose width is
+                fixed at compile time; any whole number of items otherwise.
         """
         assert self._sid_space is not None
         levels = self._sid_space.num_levels
@@ -111,6 +119,12 @@ class PromptAssembler:
             raise ValueError(
                 f"prompt slot [{name}]: {values.size} values is not a whole "
                 f"number of {levels}-level items."
+            )
+        if exact_width is not None and values.size != exact_width:
+            raise ValueError(
+                f"prompt slot [{name}]: {values.size} values, but the compiled "
+                f"width is {exact_width}. The loss window is sized from that "
+                f"width, so a wider row would be supervised only in part."
             )
         by_level = values.reshape(-1, levels)
         if np.any(by_level < self._flat_lo) or np.any(by_level >= self._flat_hi):
@@ -132,8 +146,13 @@ class PromptAssembler:
         holes_by_occurrence: List[List[int]],
         projected_occurrence_index: int,
         sample_start: int,
+        exact_widths: bool = False,
     ) -> int:
-        """Append one sample's tokens for one segment list, recording holes."""
+        """Append one sample's tokens for one segment list, recording holes.
+
+        ``exact_widths`` holds the response to its compiled width: the loss
+        window is sized from it, so a wider row would be supervised in part.
+        """
         for seg in segments:
             if isinstance(seg, Static):
                 out.extend(seg.token_ids)
@@ -141,7 +160,11 @@ class PromptAssembler:
             assert isinstance(seg, SlotSeg)
             if seg.fill is FillMode.INLINE:
                 out.extend(
-                    self._inline_tokens(seg.name, inline_values[seg.name][sample_index])
+                    self._inline_tokens(
+                        seg.name,
+                        inline_values[seg.name][sample_index],
+                        exact_width=(seg.width.num_positions if exact_widths else None),
+                    )
                 )
             else:
                 assert self._sid_space is not None
@@ -209,6 +232,7 @@ class PromptAssembler:
                 holes_by_occurrence,
                 projected_occurrence_index,
                 len(jagged_token_ids),
+                exact_widths=True,
             )
             response_lengths.append(len(sample_token_ids) - prompt_len)
             if (
