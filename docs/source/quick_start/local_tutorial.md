@@ -15,11 +15,11 @@ pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nig
 ```bash
 conda create -n tzrec python=3.11
 conda activate tzrec
-pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu129
-pip install fbgemm-gpu==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu129/repo.html
+pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+pip install fbgemm-gpu==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu130/repo.html
 pip install torchmetrics==1.0.3 tensordict
-pip install torchrec==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install torchrec==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html
+pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
 ### Docker镜像启动 (推荐)
@@ -27,14 +27,12 @@ pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyu
 ```bash
 docker run -td --gpus all --shm-size 10gb  --network host mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}
 docker exec -it <CONTAINER_ID> bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
 注：
 
 ```
-GPU版本（CUDA 12.9) 镜像地址:
-  mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu129
 GPU版本（CUDA 12.6) 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu126
 GPU版本（CUDA 13.0，含 TensorRT) 镜像地址:
@@ -45,15 +43,13 @@ CPU版本 镜像地址:
 
 注意：GPU 镜像中 PyTorch 编译的 SASS 目标及 CUDA 版本不同，请按显卡 CC 与需求选择：
 
-- **CUDA 12.9** 镜像：`sm_75 / 80 / 86 / 90 / 100 / 120`（含
-  `compute_120` PTX）。覆盖 Turing (T4)、Ampere (A10/A30/A100、
-  L4/L20)、Hopper (H100/H200)、Blackwell (B100/B200) 等
-  CC 7.5–12.0 的卡。
-- **CUDA 12.6** 镜像：`sm_60 / 70 / 75 / 80 / 86 / 90`。覆盖 Pascal
-  (P100)、Volta (V100)、Turing (T4)、Ampere (A10/A30/A100、L4/L20)、
-  Hopper (H100) 等 CC 6.0–9.0 的卡，不支持 Blackwell。
-- **CUDA 13.0（含 TensorRT）** 镜像：在 CUDA 12.9 软件栈基础上改用 CUDA 13.0
-  工具链，并预装 torch-tensorrt 2.12 / TensorRT 10.16，用于 TRT 导出与推理。
+- **CUDA 13.0（含 TensorRT）** 镜像（默认）：`sm_75 / 80 / 86 / 90 / 100 / 120`
+  （含 `compute_120` PTX）。覆盖 Turing (T4)、Ampere (A10/A30/A100、
+  L4/L20)、Hopper (H100/H200)、Blackwell (B100/B200) 等 CC 7.5–12.0 的卡，
+  并预装 torch-tensorrt 2.13 / TensorRT 11.0，用于 TRT 导出与推理。
+- **CUDA 12.6** 镜像：`sm_50 / 60 / 70 / 75 / 80 / 86 / 90`。覆盖 Maxwell
+  (M40)、Pascal (P100)、Volta (V100)、Turing (T4)、Ampere (A10/A30/A100、
+  L4/L20)、Hopper (H100) 等 CC 5.0–9.0 的卡，不支持 Blackwell，不含 TensorRT。
 
 ## 前置准备
 

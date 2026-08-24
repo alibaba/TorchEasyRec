@@ -45,49 +45,6 @@ def _aoti_compile_cfg() -> Dict[str, Any]:
     return cfg
 
 
-def _backport_pt178147_int_array_dedup() -> None:
-    """Backport pytorch/pytorch#178147 onto torch < 2.13.0.
-
-    ``CppWrapperCpu.codegen_int_array_var`` keys its int_array dedup cache on
-    ``id(writeline)`` -- a fresh bound-method whose address CPython recycles, so
-    two distinct IndentedBuffers can collide; a false cache hit then emits an
-    ``int_array_NN`` reference ahead of its declaration ("was not declared in
-    this scope"). #178147 (torch 2.13.0+) keys on ``id(writeline.__self__)``
-    (the buffer) instead; still absent in 2.12.1.
-
-    REMOVE THIS PATCH once the torch pin reaches >= 2.13.0.
-    """
-    from torch._inductor.codegen import cpp_wrapper_cpu as _cwc
-
-    cls = _cwc.CppWrapperCpu
-
-    if getattr(cls.codegen_int_array_var, "_tzrec_pt178147_backport", False):
-        return
-
-    def codegen_int_array_var(
-        self,
-        int_array,
-        writeline,
-        known_statically=False,
-        graph=None,
-    ):
-        wl_key = id(getattr(writeline, "__self__", writeline))
-        cache_key = (
-            int_array,
-            wl_key,
-            known_statically,
-            id(graph) if graph else None,
-        )
-        if cache_key not in self.codegen_int_array_var_cache:
-            self.codegen_int_array_var_cache[cache_key] = (
-                self._codegen_int_array_var_impl(int_array, writeline, known_statically)
-            )
-        return self.codegen_int_array_var_cache[cache_key]
-
-    codegen_int_array_var._tzrec_pt178147_backport = True  # type: ignore[attr-defined]
-    cls.codegen_int_array_var = codegen_int_array_var
-
-
 def load_model_aot(
     model_path: str, device: torch.device
 ) -> Union[CombinedModelWrapper, UnifiedAOTIModelWrapper]:
@@ -212,7 +169,6 @@ def export_model_aot(
             args=(sparse_output,),
             dynamic_shapes=(dynamic_shapes,),
         )
-    _backport_pt178147_int_array_dedup()
     with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
@@ -482,7 +438,6 @@ def export_unified_model_aot(
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
-    _backport_pt178147_int_array_dedup()
     with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
