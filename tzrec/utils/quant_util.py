@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 _DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE = "uint8"
-_DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES = 4
+DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES = 4
 _DISTRIBUTED_SPARSE_QUANT_CHUNK_ROWS = 64 * 1024
 _DISTRIBUTED_SPARSE_QUANT_CHUNK_BYTES = 64 * 1024 * 1024
 DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS: List[str] = ["QUint8RowwiseF16"]
@@ -35,14 +35,16 @@ def _quantize_quint8_rowwise_f16(
         )
 
     rows = src.shape[0]
-    row_bytes = emb_dim + _DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES
+    row_bytes = emb_dim + DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES
     if row_bytes % 2 != 0:
         raise ValueError(
             "Distributed sparse quant export failed for embedding "
             f"'{emb_name}': DIST_QUANT=INT8 is exported as nvembedding "
             "QUint8RowwiseF16, whose stored row is "
             "[uint8 values][float16 scale][float16 offset]. This makes "
-            f"row_bytes = embedding_dim + 4 = {emb_dim} + 4 = {row_bytes}. "
+            f"row_bytes = embedding_dim + "
+            f"{DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES} = {emb_dim} + "
+            f"{DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES} = {row_bytes}. "
             "nvembedding GPU lookup requires quantized stored row_bytes to be "
             "even, but this table has an odd embedding_dim, so row_bytes is "
             "odd. QUint8RowwiseF16 is affine uint8 rowwise quantization, "
@@ -155,3 +157,42 @@ def distributed_quantize_embeddings(
         f"Unsupported distributed sparse quant format: {quant_format}; "
         f"supported formats: {DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS}"
     )
+
+
+def dequantize_quint8_rowwise_f16(rows: Any, emb_dim: int) -> np.ndarray:
+    """Decode nvembedding QUint8RowwiseF16 rows into float32 values.
+
+    Args:
+        rows: 2D uint8 array whose rows are
+            [uint8 values][float16 scale][float16 offset] bytes.
+        emb_dim: Logical embedding dimension.
+
+    Returns:
+        Dequantized values with shape (rows.shape[0], emb_dim), computed
+        per row as value * scale + offset.
+
+    Raises:
+        ValueError: If rows is not a 2D array whose width is
+            emb_dim + DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES.
+    """
+    src = np.ascontiguousarray(rows)
+    row_bytes = emb_dim + DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES
+    if src.ndim != 2 or src.shape[1] != row_bytes:
+        raise ValueError(
+            f"Expected a 2D QUint8RowwiseF16 array with row width={row_bytes} "
+            f"(embedding_dim={emb_dim}), got shape={list(src.shape)}"
+        )
+    quantized = src[:, :emb_dim].astype(np.float32)
+    scale = (
+        np.ascontiguousarray(src[:, emb_dim : emb_dim + 2])
+        .view(np.float16)
+        .astype(np.float32)
+        .reshape(-1, 1)
+    )
+    offset = (
+        np.ascontiguousarray(src[:, emb_dim + 2 : emb_dim + 4])
+        .view(np.float16)
+        .astype(np.float32)
+        .reshape(-1, 1)
+    )
+    return quantized * scale + offset

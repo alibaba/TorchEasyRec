@@ -50,9 +50,18 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig
-from tzrec.utils.feature_store_delta_uploader import FeatureStoreDeltaUploader
+from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, DeltaEmbeddingQuantType
+from tzrec.utils.feature_store_delta_uploader import (
+    FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
+    FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+    FeatureStoreDeltaUploader,
+)
 from tzrec.utils.logging_util import logger
+from tzrec.utils.quant_util import (
+    DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES,
+    DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS,
+    distributed_quantize_embeddings,
+)
 from tzrec.utils.zch_util import (
     ZCH_EMPTY_SLOT,
     iter_zch_tables,
@@ -73,6 +82,18 @@ _DELTA_DUMP_SCHEMA = pa.schema(
         ("table_fqn", pa.string()),
         ("key_id", pa.int64()),
         ("embedding", pa.list_(pa.float32())),
+        ("source", pa.string()),
+    ]
+)
+_DELTA_DUMP_QUANT_SCHEMA = pa.schema(
+    [
+        ("global_step", pa.int64()),
+        ("rank", pa.int32()),
+        ("world_size", pa.int32()),
+        ("feature_name", pa.string()),
+        ("table_fqn", pa.string()),
+        ("key_id", pa.int64()),
+        ("embedding", pa.list_(pa.uint8())),
         ("source", pa.string()),
     ]
 )
@@ -639,6 +660,12 @@ class DeltaEmbeddingDumper:
         validate_delta_embedding_dump_config(config, device)
         self._model = model
         self._config = config
+        self._quant_type = config.quant_type
+        self._schema = (
+            _DELTA_DUMP_QUANT_SCHEMA
+            if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+            else _DELTA_DUMP_SCHEMA
+        )
         self._interval_steps: Optional[int] = None
         self._interval_secs: Optional[float] = None
         if config.HasField("dump_interval_minutes"):
@@ -667,15 +694,47 @@ class DeltaEmbeddingDumper:
         self._zch_modules = self._tracker.zch_modules
         self._table_shard_infos = self._collect_table_shard_infos()
         self._validate_supported_table_sharding(self._table_shard_infos)
+        if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
+            for fqn, info in self._table_shard_infos.items():
+                if info.global_cols <= 0:
+                    # Unresolved shard info yields global_cols=0, which the
+                    # even check below cannot reject.
+                    raise ValueError(
+                        "delta_embedding_dump_config.quant_type=INT8 cannot "
+                        f"resolve embedding_dim for table '{fqn}' (shard info "
+                        "unresolved); refusing to register a FeatureStore "
+                        "view with an invalid dimension."
+                    )
+                if info.global_cols % 2 != 0:
+                    raise ValueError(
+                        "delta_embedding_dump_config.quant_type=INT8 requires even "
+                        f"embedding_dim, but table '{fqn}' has emb_dim="
+                        f"{info.global_cols}. QUint8RowwiseF16 format requires "
+                        f"row_bytes=emb_dim+"
+                        f"{DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES} to be even."
+                    )
         self._uploader: Optional[FeatureStoreDeltaUploader] = None
         if self._feature_store_enabled:
+            # QUint8RowwiseF16 rows are uint8 values plus a 4-byte fp16
+            # scale/offset trailer, so quantized dumps need ARRAY<UINT8> views.
+            is_quantized = (
+                self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+            )
+            quant_overhead = (
+                DISTRIBUTED_SPARSE_QUANT_SCALE_OFFSET_BYTES if is_quantized else 0
+            )
             embedding_dimensions = {
-                fqn: int(info.global_cols)
+                fqn: int(info.global_cols) + quant_overhead
                 for fqn, info in self._table_shard_infos.items()
             }
             self._uploader = FeatureStoreDeltaUploader(
                 config.feature_store_config,
                 embedding_dimensions=embedding_dimensions,
+                embedding_field_type=(
+                    FEATURE_STORE_EMBEDDING_TYPE_UINT8
+                    if is_quantized
+                    else FEATURE_STORE_EMBEDDING_TYPE_FLOAT
+                ),
                 rank=self._rank,
                 world_size=self._world_size,
                 manage_remote_view=self._rank == 0,
@@ -688,7 +747,7 @@ class DeltaEmbeddingDumper:
         )
         logger.info(
             "Delta embedding dump enabled: interval_%s=%s output_dir=%s "
-            "rank=%s/%s tables=%s feature_store_upload=%s",
+            "rank=%s/%s tables=%s feature_store_upload=%s quant_type=%s",
             interval_name,
             interval_value,
             self._output_dir,
@@ -696,6 +755,7 @@ class DeltaEmbeddingDumper:
             self._world_size,
             sorted(self._tracker.fqn_to_feature_names),
             self._feature_store_enabled,
+            DeltaEmbeddingQuantType.Name(self._quant_type),
         )
 
     def clear(self) -> None:
@@ -1173,6 +1233,29 @@ class DeltaEmbeddingDumper:
                 "delta embedding dump key ids and embeddings row count mismatch: "
                 f"key_ids={num_rows}, embeddings={embeddings_cpu.size(0)}."
             )
+        if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
+            emb_dim = embeddings_cpu.size(1)
+            try:
+                quantized = distributed_quantize_embeddings(
+                    embeddings_cpu,
+                    emb_dim,
+                    feature_name,
+                    DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
+                )
+            except ValueError as e:
+                # quant_util errors address the distributed-export DIST_QUANT
+                # switch; delta dump quantization is toggled by quant_type.
+                raise ValueError(
+                    "Delta embedding dump INT8 quantization failed for "
+                    f"feature '{feature_name}' (table '{table_fqn}'): {e}. "
+                    "Disable delta dump quantization by setting "
+                    "delta_embedding_dump_config.quant_type to "
+                    "DELTA_EMBEDDING_QUANT_NONE."
+                ) from e
+            embeddings_cpu = torch.from_numpy(quantized)
+            value_type = pa.uint8()
+        else:
+            value_type = pa.float32()
 
         table_chunks.append(
             pa.Table.from_arrays(
@@ -1183,15 +1266,19 @@ class DeltaEmbeddingDumper:
                     pa.repeat(pa.scalar(feature_name, pa.string()), num_rows),
                     pa.repeat(pa.scalar(table_fqn, pa.string()), num_rows),
                     pa.array(key_ids_cpu.numpy(), type=pa.int64()),
-                    self._embedding_array(embeddings_cpu),
+                    self._embedding_array(embeddings_cpu, value_type),
                     pa.repeat(pa.scalar(source, pa.string()), num_rows),
                 ],
-                schema=_DELTA_DUMP_SCHEMA,
+                schema=self._schema,
             )
         )
         return num_rows
 
-    def _embedding_array(self, embeddings: torch.Tensor) -> pa.ListArray:
+    def _embedding_array(
+        self,
+        embeddings: torch.Tensor,
+        value_type: pa.DataType,
+    ) -> pa.ListArray:
         num_rows = embeddings.size(0)
         emb_dim = embeddings.size(1)
         if emb_dim == 0:
@@ -1203,7 +1290,7 @@ class DeltaEmbeddingDumper:
                 emb_dim,
                 dtype=torch.int32,
             ).numpy()
-        values = pa.array(embeddings.reshape(-1).numpy(), type=pa.float32())
+        values = pa.array(embeddings.reshape(-1).numpy(), type=value_type)
         return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), values)
 
     def _write_table_chunks(
@@ -1215,8 +1302,8 @@ class DeltaEmbeddingDumper:
         # ignores), never a truncated shard at the canonical path.
         tmp_path = f"{output_path}.rank{self._rank}.tmp"
         try:
-            with pq.ParquetWriter(tmp_path, _DELTA_DUMP_SCHEMA) as writer:
-                chunks = table_chunks or [_DELTA_DUMP_SCHEMA.empty_table()]
+            with pq.ParquetWriter(tmp_path, self._schema) as writer:
+                chunks = table_chunks or [self._schema.empty_table()]
                 for table_chunk in chunks:
                     writer.write_table(table_chunk)
             os.replace(tmp_path, output_path)

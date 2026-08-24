@@ -244,6 +244,118 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             },
         )
 
+    def test_sample_local_records_detects_quantized_rows(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            quant_path = os.path.join(output_dir, "delta__fs_target_step_20.parquet")
+            pq.write_table(
+                pa.table(
+                    {
+                        "embedding_name": ["table_a"],
+                        "key_id": pa.array([1], type=pa.int64()),
+                        "embedding": pa.array(
+                            [[1, 2, 3, 250, 251, 252]], type=pa.list_(pa.uint8())
+                        ),
+                    }
+                ),
+                quant_path,
+            )
+            float_path = os.path.join(output_dir, "delta__fs_target_step_21.parquet")
+            pq.write_table(
+                pa.table(
+                    {
+                        "embedding_name": ["table_a"],
+                        "key_id": pa.array([2], type=pa.int64()),
+                        "embedding": pa.array(
+                            [[1.0, 2.0]], type=pa.list_(pa.float32())
+                        ),
+                    }
+                ),
+                float_path,
+            )
+
+            samples = sample_local_records([quant_path, float_path], 2)
+
+        self.assertTrue(samples[0].quantized)
+        self.assertEqual(samples[0].embedding.dtype, np.uint8)
+        np.testing.assert_array_equal(samples[0].embedding, [1, 2, 3, 250, 251, 252])
+        self.assertFalse(samples[1].quantized)
+        self.assertEqual(samples[1].embedding.dtype, np.float32)
+
+    def test_verify_samples_quantized_raw_payload_bytes(self):
+        payload = [1, 2, 3, 250, 251, 252]
+        remote_rows = {
+            1: payload,
+            2: [1, 2, 3, 250, 251, 253],
+            3: [1, 2, 3, 250, 251],
+        }
+
+        class RawPayloadView:
+            def get_online_features(self, feature_name, keys, version):
+                return [{"sk": str(key), "embedding": remote_rows[key]} for key in keys]
+
+        samples = [
+            LocalSample(
+                "table_a",
+                key_id,
+                np.array(payload, dtype=np.uint8),
+                "a",
+                quantized=True,
+            )
+            for key_id in (1, 2, 3)
+        ]
+
+        results, summary = verify_samples(RawPayloadView(), "v1", samples)
+
+        self.assertEqual(
+            [result["status"] for result in results],
+            ["MATCH", "PRESENT_DIFFERENT", "PRESENT_DIFFERENT"],
+        )
+        self.assertTrue(results[0]["quantized"])
+        self.assertEqual(results[0]["remote_dimension"], 6)
+        self.assertEqual(results[0]["max_abs_diff"], 0.0)
+        self.assertEqual(results[1]["max_abs_diff"], 1.0)
+        self.assertIsNone(results[2]["max_abs_diff"])
+        self.assertEqual(summary["matching"], 1)
+        self.assertEqual(summary["present_different"], 2)
+
+    def test_verify_samples_quantized_dequantized_remote(self):
+        scale = np.array([0.5], dtype=np.float16)
+        offset = np.array([-1.0], dtype=np.float16)
+        payload = np.concatenate(
+            [
+                np.array([[10, 200]], dtype=np.uint8),
+                scale.view(np.uint8).reshape(1, -1),
+                offset.view(np.uint8).reshape(1, -1),
+            ],
+            axis=1,
+        )[0]
+        remote_rows = {
+            1: [4.0, 99.0],
+            2: [4.0005, 99.0],
+            3: [4.0, 100.0],
+        }
+
+        class DequantizedView:
+            def get_online_features(self, feature_name, keys, version):
+                return [{"sk": str(key), "embedding": remote_rows[key]} for key in keys]
+
+        samples = [
+            LocalSample("table_a", key_id, payload.copy(), "a", quantized=True)
+            for key_id in (1, 2, 3)
+        ]
+
+        results, summary = verify_samples(DequantizedView(), "v1", samples)
+
+        self.assertEqual(
+            [result["status"] for result in results],
+            ["MATCH", "MATCH", "PRESENT_DIFFERENT"],
+        )
+        self.assertEqual(results[0]["local_dimension"], 6)
+        self.assertEqual(results[0]["remote_dimension"], 2)
+        self.assertEqual(results[2]["max_abs_diff"], 1.0)
+        self.assertEqual(summary["matching"], 2)
+        self.assertEqual(summary["present_different"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
