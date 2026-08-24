@@ -27,7 +27,7 @@ import torch
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.genrec_model import BaseGenrecModel
-from tzrec.modules.dynamic_beam import _capped_beam_widths, dynamic_beam_search
+from tzrec.modules.dynamic_beam import dynamic_beam_search
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS,
     PROMPT_INPUT_IDS,
@@ -102,7 +102,18 @@ class GenrecCausalLMModel(BaseGenrecModel):
                 f"{type(self).__name__}: num_return_sequences must be >= 1, got "
                 f"{self._num_return_sequences}."
             )
-        final_width = _capped_beam_widths(self._beam_widths, space.codebook)[-1]
+        # bands, not codebook: the kernel slices by band and does not assume
+        # the bands are contiguous
+        self._bands: List[Tuple[int, int]] = list(zip(space.band_lo, space.band_hi))
+        self._capped_widths: List[int] = []
+        previous_width = 1
+        for requested, (band_lo, band_hi) in zip(self._beam_widths, self._bands):
+            self._capped_widths.append(
+                min(requested, previous_width * (band_hi - band_lo + 1))
+            )
+            previous_width = self._capped_widths[-1]
+
+        final_width = self._capped_widths[-1]
         if self._num_return_sequences > final_width:
             raise ValueError(
                 f"{type(self).__name__}: num_return_sequences "
@@ -165,13 +176,8 @@ class GenrecCausalLMModel(BaseGenrecModel):
             ``(B, num_return, num_levels)`` local codes, best first.
         """
         padded, mask, _ = self._left_pad_packed_inputs(embeds, batch)
-        space = self._prompt.sid_space
         tokens = dynamic_beam_search(
-            self.lm,
-            padded,
-            mask,
-            self._beam_widths,
-            list(zip(space.band_lo, space.band_hi)),
+            self.lm, padded, mask, self._capped_widths, self._bands
         )
         codes = self._tokens_to_local_codes(tokens, padded.shape[0])
         return codes[:, : self._num_return_sequences, :]

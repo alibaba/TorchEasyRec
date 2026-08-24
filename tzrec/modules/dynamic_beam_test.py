@@ -20,11 +20,21 @@ from tzrec.modules.dynamic_beam import dynamic_beam_search
 from tzrec.utils.test_util import create_tiny_causal_lm, parameterized_name_func
 
 
+def _capped(widths, pairs):
+    """Cap each width the way the model does before calling the kernel."""
+    out, previous = [], 1
+    for requested, (lo, hi) in zip(widths, pairs):
+        out.append(min(requested, previous * (hi - lo + 1)))
+        previous = out[-1]
+    return out
+
+
 def _decode(lm, ids, pairs, width=8, beam_widths=None, attention_mask=None):
     """Run the kernel over ``pairs`` of inclusive per-level (lo, hi) band edges.
 
     Defaults to a FLAT schedule: the kernel is policy-free, so only the cases
-    about scheduling spell one out. Widths are capped per level anyway.
+    about scheduling spell one out. The kernel takes already-capped widths, so
+    the helper caps them the way the model does.
     """
     if beam_widths is None:
         beam_widths = [width] * len(pairs)
@@ -32,7 +42,7 @@ def _decode(lm, ids, pairs, width=8, beam_widths=None, attention_mask=None):
         lm,
         lm.get_input_embeddings()(ids),
         torch.ones_like(ids) if attention_mask is None else attention_mask,
-        beam_widths=beam_widths,
+        capped_widths=_capped(beam_widths, pairs),
         bands=pairs,
     )
 
@@ -98,15 +108,6 @@ class DynamicBeamSearchTest(unittest.TestCase):
         self.assertEqual(spy.rows[0], 1)
         self.assertEqual(widths, expected_widths)
         self.assertEqual(tuple(out.shape), (expected_widths[-1], len(pairs)))
-
-    def test_rejects_a_schedule_that_does_not_match_the_bands(self) -> None:
-        lm = create_tiny_causal_lm(vocab_size=30)
-        ids = torch.tensor([[5, 6]])
-        pairs = [(20, 21), (22, 24), (25, 28)]
-        with self.assertRaisesRegex(ValueError, "2 entries but the bands"):
-            _decode(lm, ids, pairs, beam_widths=[2, 4])
-        with self.assertRaisesRegex(ValueError, "must be >= 1"):
-            _decode(lm, ids, pairs, beam_widths=[2, 0, 4])
 
     def test_ragged_batch_rows_match_solo_runs(self) -> None:
         # every row of a ragged batch must decode exactly as if run alone.

@@ -286,6 +286,32 @@ class BaseGenrecModelTest(unittest.TestCase):
         self.assertIs(proj.head.weight.dtype, torch.float32)
         self.assertGreater(float(proj.head.weight.grad.abs().sum()), 0.0)
 
+    @parameterized.expand(
+        [
+            # every request satisfiable -> the schedule is honoured verbatim
+            [[2, 3, 4], [2, 3, 4]],
+            # capped by band x surviving prefixes, not by what was asked
+            [[6, 12, 12], [4, 12, 12]],
+            # a flat schedule is just as valid
+            [[2, 2, 2], [2, 2, 2]],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_beam_widths_are_capped_once_at_init(self, beam_widths, expected) -> None:
+        # the kernel takes these already capped, so the derivation lives here
+        model = self._model(beam_widths=beam_widths, num_return_sequences=1)
+        self.assertEqual(model._capped_widths, expected)
+        space = self.compiled_prompt.sid_space
+        self.assertEqual(model._bands, list(zip(space.band_lo, space.band_hi)))
+
+    def test_rejects_a_schedule_that_does_not_match_the_codebook(self) -> None:
+        with self.assertRaisesRegex(ValueError, "entries but the codebook has"):
+            self._model(beam_widths=(2, 2))
+
+    def test_rejects_a_non_positive_beam_width(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be >= 1"):
+            self._model(beam_widths=(2, 0, 2))
+
     def test_beam_config_uses_final_capped_capacity(self) -> None:
         with self.assertRaisesRegex(ValueError, "final capped beam width \\(4\\)"):
             self._model(
