@@ -240,6 +240,7 @@ def compile_prompt(
     features: Sequence[BaseFeature],
     label_fields: Sequence[str] = (),
     model_dir: Optional[str] = None,
+    tokenizer_dir: Optional[str] = None,
 ) -> CompiledPrompt:
     """Compile a prompt config into its plan, module and vocabulary artifacts.
 
@@ -247,7 +248,10 @@ def compile_prompt(
         cfg: the prompt config to compile.
         features: every feature a body slot may reference, already created.
         label_fields: data_config.label_fields; a response slot names these.
-        model_dir: where to write the extended tokenizer; skipped when None.
+        model_dir: where to write the extended tokenizer, under
+            ``prompt/tokenizer``; skipped when None.
+        tokenizer_dir: write the extended tokenizer here instead, flat, which
+            is what an exported HuggingFace directory loads.
 
     Returns:
         The compiled prompt.
@@ -326,11 +330,12 @@ def compile_prompt(
     )
     sid_space = _build_sid_space(cfg, tok, base_vocab_size, has_projection)
 
-    tokenizer_dir = ""
-    if model_dir:
-        tokenizer_dir = os.path.join(model_dir, "prompt", "tokenizer")
-        os.makedirs(tokenizer_dir, exist_ok=True)
-        tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
+    out_dir = tokenizer_dir or (
+        os.path.join(model_dir, "prompt", "tokenizer") if model_dir else ""
+    )
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        tok.save(os.path.join(out_dir, "tokenizer.json"))
 
     slot_ids = {name: i for i, name in enumerate(resolved_slots_by_name)}
     segs: Dict[str, SlotSeg] = {}
@@ -380,7 +385,7 @@ def compile_prompt(
         sid_space=sid_space,
         prompt_plan=plan,
         projection_plan=projection_plan,
-        tokenizer_dir=tokenizer_dir,
+        tokenizer_dir=out_dir,
         vocab_hash=_hash(sid_space, tok.to_str()),
         plan_hash=_hash(
             sid_space,

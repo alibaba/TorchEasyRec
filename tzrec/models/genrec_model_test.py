@@ -130,6 +130,19 @@ class BaseGenrecModelTest(unittest.TestCase):
         self.assertEqual(codes.shape, (2, 2, space.num_levels))
         self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1).tolist())
 
+    def test_written_digests_satisfy_the_restore_guard(self) -> None:
+        # write_hf_assets is the only writer and check_prompt_assets the only
+        # reader, so a round trip is what proves they agree on the location
+        from tzrec.prompt.persist import check_prompt_assets
+        from tzrec.utils.hf_export_util import write_hf_assets
+
+        model = self._model()
+        ckpt = os.path.join(self.test_dir, "model.ckpt-1")
+        write_hf_assets(model, ckpt)
+
+        check_prompt_assets(self.compiled_prompt, ckpt)
+        self.assertTrue(os.path.exists(os.path.join(ckpt, "hf_export_meta.json")))
+
     def test_rejects_a_model_built_without_a_prompt(self) -> None:
         with self.assertRaisesRegex(ValueError, "needs a compiled prompt"):
             self._model(compiled_prompt=None)

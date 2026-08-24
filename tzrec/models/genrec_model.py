@@ -32,7 +32,6 @@ from tzrec.prompt.assembler import (
     PROMPT_HOLE_POSITIONS,
     PROMPT_INPUT_IDS,
 )
-from tzrec.prompt.persist import save_prompt_assets
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
@@ -293,13 +292,12 @@ class BaseGenrecModel(BaseModel):
         """
         return
 
-    def save_assets(self, target_dir: str) -> None:
-        """Co-locate the prompt contract, so the checkpoint is self-describing.
-
-        Args:
-            target_dir: the checkpoint or export directory.
-        """
-        save_prompt_assets(self._prompt, target_dir)
+    def prompt_digests(self) -> Dict[str, str]:
+        """The contract digests the checkpoint records, for restore checking."""
+        return {
+            "vocab_hash": self._prompt.vocab_hash,
+            "plan_hash": self._prompt.plan_hash,
+        }
 
     def init_from_pretrained(self) -> None:
         """Load HF weights once, on a cold start only."""

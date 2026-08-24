@@ -420,9 +420,9 @@ class CheckpointManager:
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune.
 
-        For HF-backed models, writes the config, optional tokenizer, and state
-        dict metadata needed by HF conversion. This is not gated on
-        ``export_format`` because that setting is selected at export time.
+        For HF-backed models, writes the config, optional tokenizer, and the
+        state dict metadata and contract digests HF conversion and restore
+        checking read.
         """
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer, dense_ema)
@@ -436,15 +436,6 @@ class CheckpointManager:
             logger.warning(
                 f"write_hf_assets failed for {ckpt_dir}: {e} -- checkpoint "
                 f"weights are saved; skipping HF assets."
-            )
-        try:
-            inner = unwrap_to(model, "save_assets")
-            if inner is not None:
-                inner.save_assets(ckpt_dir)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"save_assets failed for {ckpt_dir}: {e} -- checkpoint weights "
-                f"are saved; skipping model assets."
             )
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)

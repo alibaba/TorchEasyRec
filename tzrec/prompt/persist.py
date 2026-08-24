@@ -9,90 +9,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Writes the prompt contract beside the weights, and checks it on restore.
+"""Checks a checkpoint's prompt contract on restore.
 
-A checkpoint that cannot describe its own vocabulary is a checkpoint serving
-has to be told about out of band, which is where offline/online skew comes
-from. ``ProjectionPlan`` is deliberately absent: it is model-only and rebuilt by
-``compile_prompt`` from config before model construction.
+The digests ride in the HF export metadata the checkpoint already carries, so
+there is no second file that can drift from the weights beside it.
 """
 
-import dataclasses
 import json
 import os
-import shutil
-from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.utils.logging_util import logger
 
-PROMPT_DIR = "prompt"
-_SID_SPACE = "sid_space.json"
-_PROMPT_PLAN = "prompt_plan.json"
-_HASHES = "prompt_hashes.json"
-_TOKENIZER = "tokenizer"
+_HF_EXPORT_META_FILENAME = "hf_export_meta.json"
 
 
-def _plain(value: Any) -> Any:
-    """Render a compiled artifact as JSON-safe values."""
-    if isinstance(value, Enum):
-        return value.value
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {
-            f.name: _plain(getattr(value, f.name)) for f in dataclasses.fields(value)
-        }
-    if isinstance(value, (list, tuple)):
-        return [_plain(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): _plain(v) for k, v in value.items()}
-    return value
-
-
-def save_prompt_assets(compiled_prompt: CompiledPrompt, target_dir: str) -> None:
-    """Write the prompt contract into a checkpoint or export directory.
-
-    Rank 0 only: every rank reaches here on save, and concurrent json.dump and
-    copytree to one path can interleave into a truncated file.
-
-    Args:
-        compiled_prompt: the compiled prompt.
-        target_dir: the checkpoint or export directory.
-    """
-    if int(os.environ.get("RANK", 0)) != 0:
-        return
-    out = os.path.join(target_dir, PROMPT_DIR)
-    os.makedirs(out, exist_ok=True)
-
-    with open(os.path.join(out, _SID_SPACE), "w") as f:
-        json.dump(_plain(compiled_prompt.sid_space), f, indent=2)
-    with open(os.path.join(out, _PROMPT_PLAN), "w") as f:
-        json.dump(_plain(compiled_prompt.prompt_plan), f, indent=2)
-    with open(os.path.join(out, _HASHES), "w") as f:
-        json.dump(
-            {
-                "vocab_hash": compiled_prompt.vocab_hash,
-                "plan_hash": compiled_prompt.plan_hash,
-            },
-            f,
-            indent=2,
-        )
-
-    if compiled_prompt.tokenizer_dir and os.path.isdir(compiled_prompt.tokenizer_dir):
-        shutil.copytree(
-            compiled_prompt.tokenizer_dir,
-            os.path.join(out, _TOKENIZER),
-            dirs_exist_ok=True,
-        )
-
-
-def read_prompt_hashes(source_dir: str) -> Optional[Dict[str, str]]:
-    """Read the hashes a checkpoint recorded, or None when it has none."""
-    path = os.path.join(source_dir, PROMPT_DIR, _HASHES)
+def read_prompt_digests(source_dir: str) -> Optional[Dict[str, str]]:
+    """Read the digests a checkpoint recorded, or None when it has none."""
+    path = os.path.join(source_dir, _HF_EXPORT_META_FILENAME)
     if not os.path.exists(path):
         return None
     with open(path, "r") as f:
-        return json.load(f)
+        recorded = json.load(f)
+    if "vocab_hash" not in recorded:
+        return None
+    return recorded
 
 
 def check_prompt_assets(
@@ -103,7 +45,7 @@ def check_prompt_assets(
     A ``vocab_hash`` mismatch is fatal: the decode bands would point at token
     ranges the weights never learned, which produces plausible output rather
     than an error. A ``plan_hash`` mismatch only reshapes the prompt, so it
-    warns. Absent assets are fatal too -- restoring unchecked is the one case
+    warns. Absent digests are fatal too -- restoring unchecked is the one case
     the guard exists to prevent.
 
     Args:
@@ -112,15 +54,15 @@ def check_prompt_assets(
         ckpt_dir: the checkpoint being restored.
 
     Raises:
-        ValueError: if the checkpoint records no prompt assets, or its
-            ``vocab_hash`` disagrees with the compiled prompt.
+        ValueError: if the checkpoint records no digests, or its ``vocab_hash``
+            disagrees with the compiled prompt.
     """
     if compiled_prompt is None:
         return
-    recorded = read_prompt_hashes(ckpt_dir)
+    recorded = read_prompt_digests(ckpt_dir)
     if recorded is None:
         raise ValueError(
-            f"checkpoint [{ckpt_dir}] records no prompt assets, so its "
+            f"checkpoint [{ckpt_dir}] records no prompt digests, so its "
             f"vocabulary cannot be checked against the current prompt_config. "
             f"Restoring unchecked risks decode bands that address rows these "
             f"weights never learned, so this is fatal rather than a warning."
@@ -130,10 +72,9 @@ def check_prompt_assets(
         raise ValueError(
             f"prompt vocabulary does not match checkpoint [{ckpt_dir}]: the "
             f"checkpoint was trained against {recorded.get('vocab_hash')} but "
-            f"prompt_config now compiles to {compiled_prompt.vocab_hash}. The SID "
-            f"space "
-            f"or the tokenizer changed, so the decode bands no longer address "
-            f"the rows these weights learned."
+            f"prompt_config now compiles to {compiled_prompt.vocab_hash}. The "
+            f"SID space or the tokenizer changed, so the decode bands no longer "
+            f"address the rows these weights learned."
         )
     if recorded.get("plan_hash") != compiled_prompt.plan_hash:
         logger.warning(
@@ -141,20 +82,3 @@ def check_prompt_assets(
             f"matches, so the weights are usable, but the template, slots or "
             f"projections changed."
         )
-
-
-def copy_prompt_assets(source_dir: str, target_dir: str) -> None:
-    """Carry a checkpoint's prompt contract into an export directory.
-
-    Args:
-        source_dir: the checkpoint being exported.
-        target_dir: the export directory.
-    """
-    source = os.path.join(source_dir, PROMPT_DIR)
-    if not os.path.isdir(source):
-        logger.warning(
-            f"checkpoint [{source_dir}] carries no prompt assets, so the export "
-            f"will not describe its own vocabulary."
-        )
-        return
-    shutil.copytree(source, os.path.join(target_dir, PROMPT_DIR), dirs_exist_ok=True)

@@ -28,7 +28,7 @@ from tzrec.main import _train_and_evaluate, export, predict, predict_checkpoint
 from tzrec.optim.ema import DenseEMA
 from tzrec.protos.data_pb2 import DataConfig
 from tzrec.protos.eval_pb2 import EvalConfig
-from tzrec.protos.export_pb2 import ExportConfig, ExportFormat
+from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import predict_util
@@ -173,7 +173,8 @@ class MainTest(unittest.TestCase):
             config.model_dir = os.path.join(test_dir, "train")
             os.makedirs(config.model_dir)
             config.train_config.dense_optimizer.ema.CopyFrom(EMAConfig())
-            config.export_config.export_format = ExportFormat.HF
+            # the HF path is selected by the model, not by a flag
+            config.prompt_config.SetInParent()
             config_path = os.path.join(test_dir, "pipeline.config")
             with open(config_path, "w") as f:
                 f.write(text_format.MessageToString(config))

@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dataclasses
 import json
 import os
 import unittest
@@ -17,11 +16,9 @@ from unittest import mock
 
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.persist import (
-    PROMPT_DIR,
+    _HF_EXPORT_META_FILENAME,
     check_prompt_assets,
-    copy_prompt_assets,
-    read_prompt_hashes,
-    save_prompt_assets,
+    read_prompt_digests,
 )
 from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.tests.prompt_test_util import (
@@ -31,6 +28,20 @@ from tzrec.tests.prompt_test_util import (
 from tzrec.utils.test_util import make_test_dir
 
 _WORDS = ["History", "Predict", ":", "<unk>", "<|im_end|>"]
+
+
+def _record(compiled_prompt, ckpt_dir: str) -> None:
+    """Write the digests where write_hf_assets puts them."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    with open(os.path.join(ckpt_dir, _HF_EXPORT_META_FILENAME), "w") as f:
+        json.dump(
+            {
+                "backbone_state_dict_prefix": "lm.",
+                "vocab_hash": compiled_prompt.vocab_hash,
+                "plan_hash": compiled_prompt.plan_hash,
+            },
+            f,
+        )
 
 
 class PromptPersistTest(unittest.TestCase):
@@ -56,38 +67,9 @@ class PromptPersistTest(unittest.TestCase):
         cfg.sid_space.codebook.extend(codebook)
         return compile_prompt(cfg, self.features, ["answer"], model_dir=self.test_dir)
 
-    def test_writes_a_self_describing_directory(self) -> None:
-        compiled_prompt = self._compile()
-        ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        save_prompt_assets(compiled_prompt, ckpt)
-
-        out = os.path.join(ckpt, PROMPT_DIR)
-        for name in ("sid_space.json", "prompt_plan.json", "prompt_hashes.json"):
-            self.assertTrue(os.path.exists(os.path.join(out, name)), name)
-        # serving reloads the extended tokenizer from the checkpoint
-        self.assertTrue(
-            os.path.exists(os.path.join(out, "tokenizer", "tokenizer.json"))
-        )
-
-    def test_sid_space_round_trips_as_plain_json(self) -> None:
-        compiled_prompt = self._compile()
-        ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        save_prompt_assets(compiled_prompt, ckpt)
-
-        with open(os.path.join(ckpt, PROMPT_DIR, "sid_space.json")) as f:
-            space = json.load(f)
-        self.assertEqual(space["codebook"], [4, 4, 4])
-        self.assertEqual(space["level_offsets"], [0, 4, 8])
-        self.assertEqual(space["band_lo"][0], compiled_prompt.sid_space.base_vocab_size)
-        # every declared field survives, so serving needs no tzrec code
-        self.assertEqual(
-            set(space),
-            {f.name for f in dataclasses.fields(compiled_prompt.sid_space)},
-        )
-
     def test_a_changed_codebook_is_fatal(self) -> None:
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        save_prompt_assets(self._compile(codebook=(4, 4, 4)), ckpt)
+        _record(self._compile(codebook=(4, 4, 4)), ckpt)
         with self.assertRaisesRegex(ValueError, "does not match checkpoint"):
             check_prompt_assets(self._compile(codebook=(8, 8, 8)), ckpt)
 
@@ -113,11 +95,11 @@ class PromptPersistTest(unittest.TestCase):
             return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
 
         ckpt = os.path.join(self.test_dir, "model.ckpt-proj")
-        save_prompt_assets(compile_with([16]), ckpt)
+        _record(compile_with([16]), ckpt)
         widened = compile_with([256, 128])
         # only the projection changed, so the vocabulary is still usable
-        self.assertEqual(widened.vocab_hash, read_prompt_hashes(ckpt)["vocab_hash"])
-        self.assertNotEqual(widened.plan_hash, read_prompt_hashes(ckpt)["plan_hash"])
+        self.assertEqual(widened.vocab_hash, read_prompt_digests(ckpt)["vocab_hash"])
+        self.assertNotEqual(widened.plan_hash, read_prompt_digests(ckpt)["plan_hash"])
         with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
             check_prompt_assets(widened, ckpt)
         warning.assert_called_once()
@@ -146,26 +128,26 @@ class PromptPersistTest(unittest.TestCase):
             return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
 
         ckpt = os.path.join(self.test_dir, "model.ckpt-route")
-        save_prompt_assets(compile_with("X", "Y"), ckpt)
+        _record(compile_with("X", "Y"), ckpt)
         swapped = compile_with("Y", "X")
-        self.assertEqual(swapped.vocab_hash, read_prompt_hashes(ckpt)["vocab_hash"])
-        self.assertNotEqual(swapped.plan_hash, read_prompt_hashes(ckpt)["plan_hash"])
+        self.assertEqual(swapped.vocab_hash, read_prompt_digests(ckpt)["vocab_hash"])
+        self.assertNotEqual(swapped.plan_hash, read_prompt_digests(ckpt)["plan_hash"])
         with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
             check_prompt_assets(swapped, ckpt)
         warning.assert_called_once()
 
     def test_a_changed_template_only_warns(self) -> None:
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        save_prompt_assets(self._compile(), ckpt)
+        _record(self._compile(), ckpt)
         changed_compiled_prompt = self._compile(prompt="Predict : {{hist}}")
         # the vocabulary is untouched, so the weights are still usable
         self.assertEqual(
             changed_compiled_prompt.vocab_hash,
-            read_prompt_hashes(ckpt)["vocab_hash"],
+            read_prompt_digests(ckpt)["vocab_hash"],
         )
         self.assertNotEqual(
             changed_compiled_prompt.plan_hash,
-            read_prompt_hashes(ckpt)["plan_hash"],
+            read_prompt_digests(ckpt)["plan_hash"],
         )
         with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
             check_prompt_assets(changed_compiled_prompt, ckpt)
@@ -175,48 +157,25 @@ class PromptPersistTest(unittest.TestCase):
         # save() swallows asset-write failures, so a bare checkpoint must fail
         bare = os.path.join(self.test_dir, "model.ckpt-bare")
         os.makedirs(bare, exist_ok=True)
-        self.assertIsNone(read_prompt_hashes(bare))
-        with self.assertRaisesRegex(ValueError, "records no prompt assets"):
+        self.assertIsNone(read_prompt_digests(bare))
+        with self.assertRaisesRegex(ValueError, "records no prompt digests"):
             check_prompt_assets(self._compile(), bare)
+
+    def test_hf_metadata_without_digests_is_fatal(self) -> None:
+        # a non-prompt HF model writes the metadata file with no digests in it
+        ckpt = os.path.join(self.test_dir, "model.ckpt-nodigest")
+        os.makedirs(ckpt, exist_ok=True)
+        with open(os.path.join(ckpt, _HF_EXPORT_META_FILENAME), "w") as f:
+            json.dump({"backbone_state_dict_prefix": "lm."}, f)
+
+        self.assertIsNone(read_prompt_digests(ckpt))
+        with self.assertRaisesRegex(ValueError, "records no prompt digests"):
+            check_prompt_assets(self._compile(), ckpt)
 
     def test_no_prompt_config_is_a_no_op(self) -> None:
         with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
             check_prompt_assets(None, os.path.join(self.test_dir, "nowhere"))
         warning.assert_not_called()
-
-    def test_export_carries_the_contract_forward(self) -> None:
-        ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        save_prompt_assets(self._compile(), ckpt)
-        export = os.path.join(self.test_dir, "export")
-        copy_prompt_assets(ckpt, export)
-
-        # the HF branch never builds a model, so save_assets cannot run there
-        self.assertEqual(read_prompt_hashes(export), read_prompt_hashes(ckpt))
-        self.assertTrue(
-            os.path.exists(
-                os.path.join(export, PROMPT_DIR, "tokenizer", "tokenizer.json")
-            )
-        )
-
-    def test_copying_from_a_bare_checkpoint_only_warns(self) -> None:
-        bare = os.path.join(self.test_dir, "bare")
-        os.makedirs(bare, exist_ok=True)
-        export = os.path.join(self.test_dir, "export_bare")
-        with mock.patch("tzrec.prompt.persist.logger.warning") as warning:
-            copy_prompt_assets(bare, export)
-        warning.assert_called_once()
-        self.assertIsNone(read_prompt_hashes(export))
-
-    def test_only_rank_zero_writes(self) -> None:
-        ckpt = os.path.join(self.test_dir, "model.ckpt-rank")
-        with mock.patch.dict(os.environ, {"RANK": "1"}):
-            save_prompt_assets(self._compile(), ckpt)
-        # a non-zero rank must not race rank 0's json.dump and copytree
-        self.assertFalse(os.path.exists(os.path.join(ckpt, PROMPT_DIR)))
-
-        with mock.patch.dict(os.environ, {"RANK": "0"}):
-            save_prompt_assets(self._compile(), ckpt)
-        self.assertIsNotNone(read_prompt_hashes(ckpt))
 
 
 if __name__ == "__main__":

@@ -73,9 +73,8 @@ from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.prompt.compile import compile_prompt
-from tzrec.prompt.persist import check_prompt_assets, copy_prompt_assets
+from tzrec.prompt.persist import check_prompt_assets
 from tzrec.prompt.types import CompiledPrompt
-from tzrec.protos import export_pb2
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.export_pb2 import ExportConfig
@@ -1125,8 +1124,10 @@ def export(
         else:
             checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
-    # HF export converts the checkpoint dir directly -- no model build, no DCP restore.
-    if pipeline_config.export_config.export_format == export_pb2.ExportFormat.HF:
+    # A prompt-native model converts the checkpoint dir directly -- no model
+    # build, no DCP restore -- because its input is an assembled token stream
+    # that an export-time dummy batch cannot supply.
+    if pipeline_config.HasField("prompt_config"):
         if config_util.use_dense_ema(
             pipeline_config.export_config, pipeline_config.train_config
         ):
@@ -1144,21 +1145,35 @@ def export(
             )
         if assets:
             logger.warning(f"HF export ignores asset_files: {assets}.")
+        # the serving contract is regenerated from the config, never copied out
+        # of a training checkpoint; compiled before anything is written so a
+        # refused export leaves no half-built directory
+        features = _create_features(
+            list(pipeline_config.feature_configs), pipeline_config.data_config
+        )
+        compiled_prompt = compile_prompt(
+            pipeline_config.prompt_config,
+            features,
+            list(pipeline_config.data_config.label_fields),
+        )
+        if compiled_prompt.prompt_plan.projected_slots:
+            raise ValueError(
+                "HF export drops projected-slot state: dcp_to_hf keeps only "
+                "backbone keys, so embedding_group and projections would be "
+                "absent and the artifact could not reproduce checkpoint "
+                "inference."
+            )
         if is_rank_zero:
             from tzrec.utils.hf_export_util import dcp_to_hf
 
             dcp_to_hf(checkpoint_path, export_dir)
-            # Carry the prompt contract saved alongside the checkpoint.
-            copy_prompt_assets(checkpoint_path, export_dir)
+            compile_prompt(
+                pipeline_config.prompt_config,
+                features,
+                list(pipeline_config.data_config.label_fields),
+                tokenizer_dir=export_dir,
+            )
         return
-
-    if pipeline_config.HasField("prompt_config"):
-        raise ValueError(
-            "a prompt-native model exports to a HuggingFace directory, not "
-            "TorchScript: its input is an assembled token stream the dataloader "
-            "builds, which an export-time dummy batch cannot supply. Set "
-            "export_config.export_format to HF."
-        )
 
     data_config = pipeline_config.data_config
 
