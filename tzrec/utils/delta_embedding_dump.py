@@ -782,13 +782,10 @@ class DeltaEmbeddingDumper:
     def clear(self) -> None:
         """Clear tracked sparse ids, usually after restore-time dummy steps.
 
-        The restored model state is the baseline the serving side already
-        holds, so admit/evict events recorded during the dummy forwards are
-        dropped together with the tracked ids; the next dump then reports
-        only the delta against the restored state. Retained evicted keys are
-        popped and discarded for the same reason: they predate the restored
-        baseline and must not be tombstoned by the next dump (the retain
-        buffer is process-local GPU memory and never survives a restart).
+        The restored state is the baseline the serving side already holds, so
+        events recorded during the dummy forwards must not show up in the next
+        dump; retained evicted keys are popped and discarded for the same
+        reason.
         """
         self._tracker.clear(_CONSUMER)
         if not self._dump_evicted_tombstones:
@@ -1229,17 +1226,13 @@ class DeltaEmbeddingDumper:
     ) -> int:
         """Append zero-row tombstones for dynamicemb keys evicted since the last dump.
 
-        The authoritative eviction source is ``pop_evicted_keys`` (read-and-clear
-        semantics), not the tracker lookup's ``founds`` mask, which cannot tell
-        an evicted key from one never admitted. Keys already published as real
-        rows by this dump's tracker pass are subtracted, so an evicted-then-
-        reinserted key keeps its fresh row instead of racing a tombstone in the
-        MERGE upload. Each rank drains only its local shard (row-wise sharding
-        keeps shards disjoint), so no cross-rank collective is needed.
-        Tombstone rows are appended in chunks of at most
-        ``_TOMBSTONE_CHUNK_ROWS`` rows whose embeddings all alias one
-        chunk-sized zero buffer, so host memory for the zeros stays bounded
-        regardless of eviction volume.
+        Evictions come from ``pop_evicted_keys`` (read-and-clear semantics),
+        not the tracker lookup's ``founds`` mask, which cannot tell an evicted
+        key from one never admitted. Keys already published as real rows this
+        dump are subtracted, so an evicted-then-reinserted key keeps its fresh
+        row instead of racing a tombstone in the MERGE upload. Row-wise
+        sharding keeps rank-local shards disjoint, so no cross-rank collective
+        is needed.
 
         Args:
             table_chunks: List to append the per-table parquet chunks to.
