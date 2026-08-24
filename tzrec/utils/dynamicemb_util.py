@@ -97,6 +97,38 @@ def _arm_evicted_key_retention(demb_opt_kwargs: Dict[str, Any]) -> None:
     demb_opt_kwargs["evicted_item_mode"] = EvictedItemMode.RETAIN_KEY
 
 
+def _validate_eval_initializer_for_tombstones(
+    dynamicemb_cfg: feature_pb2.DynamicEmbedding, table_name: str
+) -> None:
+    """Reject non-zero eval initializers when evicted-key tombstones are armed.
+
+    Tombstone dumps publish constant-zero rows for evicted keys, so a
+    non-zero eval initializer would make the same missing key resolve to
+    different values on the dump consumer and in eval lookups.
+
+    Args:
+        dynamicemb_cfg: The feature's dynamic embedding config.
+        table_name: Embedding table name, for the error message.
+
+    Raises:
+        ValueError: if eval_initializer_args is set and not CONSTANT 0.0.
+    """
+    if not _auto_retain_evicted_keys:
+        return
+    if not dynamicemb_cfg.HasField("eval_initializer_args"):
+        return
+    init_cfg = dynamicemb_cfg.eval_initializer_args
+    mode = init_cfg.mode if init_cfg.HasField("mode") else "CONSTANT"
+    if mode != "CONSTANT" or init_cfg.value != 0.0:
+        raise ValueError(
+            f"dynamic embedding table {table_name} sets eval_initializer_args "
+            f"(mode={mode}, value={init_cfg.value}), but delta embedding dump "
+            "with dump_evicted_tombstones publishes constant-zero tombstones "
+            "for evicted keys; leave eval_initializer_args unset or set it "
+            "to CONSTANT 0.0."
+        )
+
+
 def _dynamicemb_effective_cache_ratio(
     cache_load_factor: Optional[float],
     caching: bool,
@@ -290,6 +322,7 @@ def build_dynamicemb_constraints(
             "dynamicemb is not installed; required by features with "
             "`dynamicemb { }` set."
         )
+    _validate_eval_initializer_for_tombstones(dynamicemb_cfg, emb_config.name)
     embedding_dim = emb_config.embedding_dim
     num_embeddings = emb_config.num_embeddings
 

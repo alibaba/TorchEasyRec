@@ -102,6 +102,7 @@ from tzrec.utils.delta_embedding_dump import (
     validate_delta_embedding_dump_config,
 )
 from tzrec.utils.dynamicemb_util import (
+    _validate_eval_initializer_for_tombstones,
     build_dynamicemb_constraints,
     has_dynamicemb,
     set_auto_retain_evicted_keys,
@@ -2568,6 +2569,52 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dynamic_module.pop_evicted_keys.assert_not_called()
 
 
+class DynamicembTombstoneEvalInitializerTest(unittest.TestCase):
+    def setUp(self):
+        set_auto_retain_evicted_keys(False)
+        self.addCleanup(set_auto_retain_evicted_keys, False)
+
+    def _cfg(self, **init_kwargs):
+        cfg = feature_pb2.DynamicEmbedding(max_capacity=1024)
+        if init_kwargs:
+            cfg.eval_initializer_args.CopyFrom(
+                feature_pb2.DynamicEmbInitializerArgs(**init_kwargs)
+            )
+        return cfg
+
+    def test_unset_eval_initializer_is_allowed(self):
+        set_auto_retain_evicted_keys(True)
+        _validate_eval_initializer_for_tombstones(self._cfg(), "dyn_table")
+
+    def test_constant_zero_eval_initializer_is_allowed(self):
+        set_auto_retain_evicted_keys(True)
+        _validate_eval_initializer_for_tombstones(
+            self._cfg(mode="CONSTANT"), "dyn_table"
+        )
+        _validate_eval_initializer_for_tombstones(
+            self._cfg(mode="CONSTANT", value=0.0), "dyn_table"
+        )
+
+    def test_nonzero_constant_eval_initializer_rejected(self):
+        set_auto_retain_evicted_keys(True)
+        with self.assertRaisesRegex(ValueError, "dyn_table"):
+            _validate_eval_initializer_for_tombstones(
+                self._cfg(mode="CONSTANT", value=0.5), "dyn_table"
+            )
+
+    def test_nonconstant_eval_initializer_rejected(self):
+        set_auto_retain_evicted_keys(True)
+        with self.assertRaisesRegex(ValueError, "mode=NORMAL"):
+            _validate_eval_initializer_for_tombstones(
+                self._cfg(mode="NORMAL"), "dyn_table"
+            )
+
+    def test_validation_inactive_when_tombstones_off(self):
+        _validate_eval_initializer_for_tombstones(
+            self._cfg(mode="CONSTANT", value=0.5), "dyn_table"
+        )
+
+
 @unittest.skipUnless(
     has_dynamicemb and _HAS_EVICTED_ITEM_MODE,
     "dynamicemb without EvictedItemMode is not installed; skipping.",
@@ -2602,6 +2649,15 @@ class DynamicembUtilAutoRetainTest(unittest.TestCase):
             constraints.dynamicemb_options.evicted_item_mode,
             EvictedItemMode.DISCARD,
         )
+
+    def test_auto_retain_rejects_nonzero_eval_initializer(self):
+        set_auto_retain_evicted_keys(True)
+        self.dynamicemb_cfg.eval_initializer_args.CopyFrom(
+            feature_pb2.DynamicEmbInitializerArgs(mode="CONSTANT", value=0.5)
+        )
+
+        with self.assertRaisesRegex(ValueError, "dump_evicted_tombstones"):
+            build_dynamicemb_constraints(self.dynamicemb_cfg, self.emb_config)
 
 
 class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
