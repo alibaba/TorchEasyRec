@@ -189,24 +189,23 @@ class _SharedTableECAndEBCModel(nn.Module):
 
 
 class _FakeDynamicTables:
-    def __init__(self) -> None:
+    def __init__(self, founds=None, values=None) -> None:
         self.ids = None
         self.table_ids = None
         self.copy_mode = None
+        self._founds = founds if founds is not None else [True, False, True]
+        self._values = (
+            values
+            if values is not None
+            else [[1.0, 2.0, 20.0], [3.0, 4.0, 40.0], [5.0, 6.0, 60.0]]
+        )
 
     def find(self, ids, table_ids, copy_mode):
         self.ids = ids.detach().clone()
         self.table_ids = table_ids.detach().clone()
         self.copy_mode = copy_mode
-        founds = torch.tensor([True, False, True], device=ids.device)
-        values = torch.tensor(
-            [
-                [1.0, 2.0, 20.0],
-                [3.0, 4.0, 40.0],
-                [5.0, 6.0, 60.0],
-            ],
-            device=ids.device,
-        )
+        founds = torch.tensor(self._founds, device=ids.device)
+        values = torch.tensor(self._values, device=ids.device)
         return None, None, None, None, None, founds, None, values
 
 
@@ -1859,7 +1858,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                     ),
                 )
             },
-            dynamic_modules={},
         )
         torch.testing.assert_close(embeddings, weight[[0, 2]])
         torch.testing.assert_close(key_ids, torch.tensor([32, 34]))
@@ -1890,7 +1888,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                         ),
                     )
                 },
-                dynamic_modules={},
             )
 
     def test_zch_lookup_binds_held_ids_to_their_rows(self):
@@ -1965,7 +1962,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             table_fqn,
             torch.tensor(ids, dtype=torch.int64),
             table_weights=table_weights,
-            dynamic_modules={},
         )
 
     def test_zch_delta_publishes_touched_held_id_with_row(self):
@@ -2106,7 +2102,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                     ),
                 )
             },
-            dynamic_modules={},
         )
         self.assertEqual(embeddings.shape, (0, 2))
         self.assertEqual(key_ids.shape, (0,))
@@ -2131,17 +2126,16 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                         ),
                     )
                 },
-                dynamic_modules={},
             )
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
     @mark_ci_scope("gpu")
-    def test_lookup_dynamic_embeddings_filters_missing_ids(self):
+    def test_append_dynamic_rows_publishes_found_rows_only(self):
         from dynamicemb.types import CopyMode
 
         torch.cuda.set_device(0)
-        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper = self._eviction_dumper()
         fake_tables = _FakeDynamicTables()
         dynamic_module = SimpleNamespace(
             table_names=["dyn_table"],
@@ -2149,28 +2143,37 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             flush=mock.MagicMock(),
             _dynamicemb_options=[SimpleNamespace(dim=2)],
         )
+        table_chunks = []
 
-        embeddings, key_ids = dumper._lookup_dynamic_embeddings(
-            dynamic_module,
-            "model.ec.embeddings.dyn_table",
-            torch.tensor([101, 102, 103]),
+        num_rows = dumper._append_dynamic_rows(
+            table_chunks,
+            global_step=5,
+            fqn=self._DYN_TABLE_FQN,
+            dynamic_module=dynamic_module,
+            tracker_ids=torch.tensor([101, 102, 103]),
+            flushed_module_ids=set(),
+            dump_evicted_tombstones=False,
         )
 
+        self.assertEqual(num_rows, 2)
         dynamic_module.flush.assert_called_once_with()
         self.assertIs(fake_tables.copy_mode, CopyMode.EMBEDDING)
         torch.testing.assert_close(fake_tables.ids.cpu(), torch.tensor([101, 102, 103]))
         torch.testing.assert_close(fake_tables.table_ids.cpu(), torch.tensor([0, 0, 0]))
-        torch.testing.assert_close(key_ids.cpu(), torch.tensor([101, 103]))
-        torch.testing.assert_close(
-            embeddings.cpu(), torch.tensor([[1.0, 2.0], [5.0, 6.0]])
+        table = pa.concat_tables(table_chunks)
+        self.assertEqual(table["key_id"].to_pylist(), [101, 103])
+        self.assertEqual(table["embedding"].to_pylist(), [[1.0, 2.0], [5.0, 6.0]])
+        self.assertEqual(
+            table["source"].to_pylist(),
+            ["model_delta_tracker", "model_delta_tracker"],
         )
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
     @mark_ci_scope("gpu")
-    def test_lookup_dynamic_embeddings_flushes_module_once_per_dump(self):
+    def test_append_dynamic_rows_flushes_module_once_per_dump(self):
         torch.cuda.set_device(0)
-        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper = self._eviction_dumper()
         # One module hosting two tables, reachable under both table_name keys.
         dynamic_module = SimpleNamespace(
             table_names=["dyn_a", "dyn_b"],
@@ -2181,16 +2184,31 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         flushed_module_ids = set()
         for table_name in ("dyn_a", "dyn_b"):
-            dumper._lookup_dynamic_embeddings(
-                dynamic_module,
-                f"model.ec.embeddings.{table_name}",
-                torch.tensor([101, 102, 103]),
-                flushed_module_ids,
+            dumper._append_dynamic_rows(
+                [],
+                global_step=5,
+                fqn=f"model.ec.embeddings.{table_name}",
+                dynamic_module=dynamic_module,
+                tracker_ids=torch.tensor([101, 102, 103]),
+                flushed_module_ids=flushed_module_ids,
+                dump_evicted_tombstones=False,
             )
 
         # Both tables share the module; flush() flushes all tables, so it runs
         # once per dump rather than once per table.
         dynamic_module.flush.assert_called_once_with()
+        # A module already flushed this dump is not flushed again.
+        dynamic_module.flush.reset_mock()
+        dumper._append_dynamic_rows(
+            [],
+            global_step=6,
+            fqn="model.ec.embeddings.dyn_a",
+            dynamic_module=dynamic_module,
+            tracker_ids=torch.tensor([101, 102, 103]),
+            flushed_module_ids={id(dynamic_module)},
+            dump_evicted_tombstones=False,
+        )
+        dynamic_module.flush.assert_not_called()
 
     _DYN_TABLE_FQN = "model.ec.embeddings.dyn_table"
 
@@ -2212,31 +2230,39 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._warned_no_retain_tables = set()
         return dumper
 
-    def _eviction_module(self, evicted_keys):
+    def _eviction_module(self, evicted_keys, founds, values):
+        table_name = self._DYN_TABLE_FQN.rsplit(".", maxsplit=1)[-1]
         return SimpleNamespace(
-            table_names=[self._DYN_TABLE_FQN.rsplit(".", maxsplit=1)[-1]],
+            table_names=[table_name],
             _dynamicemb_options=[SimpleNamespace(dim=2)],
+            tables=_FakeDynamicTables(founds=founds, values=values),
             flush=mock.MagicMock(),
             pop_evicted_keys=mock.MagicMock(
-                return_value={
-                    self._DYN_TABLE_FQN.rsplit(".", maxsplit=1)[-1]: torch.tensor(
-                        evicted_keys, dtype=torch.int64
-                    )
-                }
+                return_value={table_name: torch.tensor(evicted_keys, dtype=torch.int64)}
             ),
         )
 
-    def test_append_dynamic_evicted_rows_publishes_zero_tombstones(self):
+    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    @mark_ci_scope("gpu")
+    def test_append_dynamic_rows_tombstones_evicted_keys(self):
+        torch.cuda.set_device(0)
         dumper = self._eviction_dumper()
-        dynamic_module = self._eviction_module([7, 9])
+        dynamic_module = self._eviction_module(
+            [7, 9],
+            founds=[False, False],
+            values=[[0.0, 0.0], [0.0, 0.0]],
+        )
         table_chunks = []
 
-        num_rows = dumper._append_dynamic_evicted_rows(
+        num_rows = dumper._append_dynamic_rows(
             table_chunks,
             global_step=5,
-            dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
-            published_key_ids={},
+            fqn=self._DYN_TABLE_FQN,
+            dynamic_module=dynamic_module,
+            tracker_ids=torch.empty(0, dtype=torch.int64),
             flushed_module_ids=set(),
+            dump_evicted_tombstones=True,
         )
 
         self.assertEqual(num_rows, 2)
@@ -2251,87 +2277,105 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
         self.assertEqual(table["feature_name"].to_pylist(), ["user_id", "user_id"])
 
-    def test_append_dynamic_evicted_rows_subtracts_republished_keys(self):
-        # 7 and 9 were evicted but reinserted and published as real rows this
-        # dump; a tombstone would race the fresh row in the MERGE upload.
+    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    @mark_ci_scope("gpu")
+    def test_append_dynamic_rows_publishes_fresh_row_for_reinserted_key(self):
+        # 7 and 9 were evicted but reinserted, so the merged lookup finds them
+        # and each publishes exactly one fresh row; 8 stayed evicted and
+        # publishes one tombstone.
+        torch.cuda.set_device(0)
         dumper = self._eviction_dumper()
-        dynamic_module = self._eviction_module([7, 8, 9])
+        dynamic_module = self._eviction_module(
+            [7, 8, 9],
+            founds=[True, False, True],
+            values=[[1.0, 2.0, 0.0], [3.0, 4.0, 0.0], [5.0, 6.0, 0.0]],
+        )
         table_chunks = []
 
-        num_rows = dumper._append_dynamic_evicted_rows(
+        num_rows = dumper._append_dynamic_rows(
             table_chunks,
             global_step=5,
-            dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
-            published_key_ids={
-                self._DYN_TABLE_FQN: torch.tensor([7, 9], dtype=torch.int64)
-            },
+            fqn=self._DYN_TABLE_FQN,
+            dynamic_module=dynamic_module,
+            tracker_ids=torch.tensor([7, 9]),
             flushed_module_ids=set(),
+            dump_evicted_tombstones=True,
         )
 
-        self.assertEqual(num_rows, 1)
+        self.assertEqual(num_rows, 3)
         table = pa.concat_tables(table_chunks)
-        self.assertEqual(table["key_id"].to_pylist(), [8])
+        self.assertEqual(table["key_id"].to_pylist(), [7, 9, 8])
+        self.assertEqual(
+            table["embedding"].to_pylist(), [[1.0, 2.0], [5.0, 6.0], [0.0, 0.0]]
+        )
+        self.assertEqual(
+            table["source"].to_pylist(),
+            ["model_delta_tracker", "model_delta_tracker", "dynamicemb_evicted"],
+        )
 
-    def test_append_dynamic_evicted_rows_tombstones_tracked_missing_ids(self):
-        # 102 was tracked but find() missed it (founds=False), so it is absent
-        # from the published ids; its eviction still gets a tombstone.
+    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    @mark_ci_scope("gpu")
+    def test_append_dynamic_rows_tombstones_tracked_then_evicted_key(self):
+        # 102 was tracked but find() misses it because it was evicted after
+        # the touch; the merged lookup tombstones it directly.
+        torch.cuda.set_device(0)
         dumper = self._eviction_dumper()
-        dynamic_module = self._eviction_module([102])
+        dynamic_module = self._eviction_module(
+            [102],
+            founds=[True, False, True],
+            values=[[1.0, 2.0, 0.0], [3.0, 4.0, 0.0], [5.0, 6.0, 0.0]],
+        )
         table_chunks = []
 
-        num_rows = dumper._append_dynamic_evicted_rows(
+        num_rows = dumper._append_dynamic_rows(
             table_chunks,
             global_step=5,
-            dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
-            published_key_ids={
-                self._DYN_TABLE_FQN: torch.tensor([101, 103], dtype=torch.int64)
-            },
+            fqn=self._DYN_TABLE_FQN,
+            dynamic_module=dynamic_module,
+            tracker_ids=torch.tensor([101, 102, 103]),
             flushed_module_ids=set(),
+            dump_evicted_tombstones=True,
         )
 
-        self.assertEqual(num_rows, 1)
+        self.assertEqual(num_rows, 3)
         table = pa.concat_tables(table_chunks)
-        self.assertEqual(table["key_id"].to_pylist(), [102])
+        self.assertEqual(table["key_id"].to_pylist(), [101, 103, 102])
+        self.assertEqual(
+            table["source"].to_pylist(),
+            ["model_delta_tracker", "model_delta_tracker", "dynamicemb_evicted"],
+        )
 
-    def test_append_dynamic_evicted_rows_skips_discard_and_empty_tables(self):
+    def test_pop_evicted_key_ids_warns_on_discard_and_old_builds(self):
         dumper = self._eviction_dumper()
         discard_module = SimpleNamespace(
-            table_names=["discard_table"],
-            _dynamicemb_options=[SimpleNamespace(dim=2)],
-            flush=mock.MagicMock(),
-            pop_evicted_keys=mock.MagicMock(return_value={}),
+            pop_evicted_keys=mock.MagicMock(return_value={})
         )
         empty_module = SimpleNamespace(
-            table_names=["empty_table"],
-            _dynamicemb_options=[SimpleNamespace(dim=2)],
-            flush=mock.MagicMock(),
             pop_evicted_keys=mock.MagicMock(
                 return_value={"empty_table": torch.tensor([], dtype=torch.int64)}
-            ),
+            )
         )
-        old_module = SimpleNamespace(  # dynamicemb without pop_evicted_keys
-            table_names=["old_table"],
-            _dynamicemb_options=[SimpleNamespace(dim=2)],
-            flush=mock.MagicMock(),
-        )
-        dynamic_modules = {
+        old_module = SimpleNamespace()  # dynamicemb without pop_evicted_keys
+        modules = {
             "model.ec.embeddings.discard_table": discard_module,
             "model.ec.embeddings.empty_table": empty_module,
             "model.ec.embeddings.old_table": old_module,
         }
-        table_chunks = []
 
         with mock.patch("tzrec.utils.delta_embedding_dump.logger") as log:
-            num_rows = dumper._append_dynamic_evicted_rows(
-                table_chunks,
-                global_step=5,
-                dynamic_modules=dynamic_modules,
-                published_key_ids={},
-                flushed_module_ids=set(),
-            )
+            popped = {
+                fqn: dumper._pop_evicted_key_ids(
+                    fqn, module, fqn.rsplit(".", maxsplit=1)[-1]
+                )
+                for fqn, module in modules.items()
+            }
 
-        self.assertEqual(num_rows, 0)
-        self.assertEqual(table_chunks, [])
+        self.assertIsNone(popped["model.ec.embeddings.discard_table"])
+        self.assertIsNone(popped["model.ec.embeddings.old_table"])
+        self.assertIsNotNone(popped["model.ec.embeddings.empty_table"])
+        self.assertEqual(popped["model.ec.embeddings.empty_table"].numel(), 0)
         # DISCARD tables and pop-less builds warn once each; an empty eviction
         # buffer is silent.
         self.assertEqual(log.warning.call_count, 2)
@@ -2341,53 +2385,13 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertNotIn("model.ec.embeddings.empty_table", warned)
         # The one-time warnings do not repeat on the next dump.
         with mock.patch("tzrec.utils.delta_embedding_dump.logger") as log:
-            dumper._append_dynamic_evicted_rows(
-                [],
-                global_step=6,
-                dynamic_modules=dynamic_modules,
-                published_key_ids={},
-                flushed_module_ids=set(),
-            )
+            for fqn, module in modules.items():
+                dumper._pop_evicted_key_ids(
+                    fqn, module, fqn.rsplit(".", maxsplit=1)[-1]
+                )
         log.warning.assert_not_called()
 
-    def test_append_dynamic_evicted_rows_flushes_module_once(self):
-        dumper = self._eviction_dumper()
-        dynamic_module = SimpleNamespace(
-            table_names=["dyn_a", "dyn_b"],
-            _dynamicemb_options=[SimpleNamespace(dim=2), SimpleNamespace(dim=2)],
-            flush=mock.MagicMock(),
-            pop_evicted_keys=mock.MagicMock(
-                side_effect=lambda names: {
-                    name: torch.tensor([5], dtype=torch.int64) for name in names
-                }
-            ),
-        )
-        flushed_module_ids = set()
-        table_chunks = []
-        for table_name in ("dyn_a", "dyn_b"):
-            dumper._append_dynamic_evicted_rows(
-                table_chunks,
-                global_step=5,
-                dynamic_modules={f"model.ec.embeddings.{table_name}": dynamic_module},
-                published_key_ids={},
-                flushed_module_ids=flushed_module_ids,
-            )
-        # Both tables share the module; flush() flushes all tables, so the
-        # tombstone pass flushes it at most once per dump.
-        dynamic_module.flush.assert_called_once_with()
-
-        # A module already flushed by the tracker pass is not flushed again.
-        dynamic_module.flush.reset_mock()
-        dumper._append_dynamic_evicted_rows(
-            [],
-            global_step=6,
-            dynamic_modules={"model.ec.embeddings.dyn_a": dynamic_module},
-            published_key_ids={},
-            flushed_module_ids={id(dynamic_module)},
-        )
-        dynamic_module.flush.assert_not_called()
-
-    def test_append_dynamic_evicted_rows_quant_bytes_pin_tombstone_format(self):
+    def test_append_tombstone_chunks_quant_bytes_pin_tombstone_format(self):
         # A zero row through INT8 quantization is exactly [codes=0,0][fp16
         # scale 1.0 little-endian 0x00,0x3C=60][fp16 offset 0.0] -- the byte
         # contract the processor's tombstone detector is pinned to (the raw
@@ -2395,15 +2399,14 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper = self._eviction_dumper(
             DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
         )
-        dynamic_module = self._eviction_module([11])
         table_chunks = []
 
-        num_rows = dumper._append_dynamic_evicted_rows(
+        num_rows = dumper._append_tombstone_chunks(
             table_chunks,
             global_step=5,
-            dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
-            published_key_ids={},
-            flushed_module_ids=set(),
+            fqn=self._DYN_TABLE_FQN,
+            tombstone_ids=torch.tensor([11], dtype=torch.int64),
+            emb_dim=2,
         )
 
         self.assertEqual(num_rows, 1)
@@ -2417,28 +2420,27 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         # Bitwise +0.0, not -0.0: NvEmbeddings dequantizes to fp16 0x0000.
         self.assertFalse(np.signbit(decoded).any())
 
-    def test_append_dynamic_evicted_rows_chunks_large_evictions(self):
+    def test_append_tombstone_chunks_chunks_large_evictions(self):
         # Evictions beyond the chunk size split into ordered chunks whose
         # embeddings all alias one chunk-sized zero buffer.
         dumper = self._eviction_dumper()
-        evicted_keys = list(range(10))
-        dynamic_module = self._eviction_module(evicted_keys)
+        tombstone_ids = torch.tensor(list(range(10)), dtype=torch.int64)
         table_chunks = []
 
         with mock.patch("tzrec.utils.delta_embedding_dump._TOMBSTONE_CHUNK_ROWS", 3):
-            num_rows = dumper._append_dynamic_evicted_rows(
+            num_rows = dumper._append_tombstone_chunks(
                 table_chunks,
                 global_step=5,
-                dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
-                published_key_ids={},
-                flushed_module_ids=set(),
+                fqn=self._DYN_TABLE_FQN,
+                tombstone_ids=tombstone_ids,
+                emb_dim=2,
             )
 
         self.assertEqual(num_rows, 10)
         # 3 + 3 + 3 + 1 rows: chunk boundaries at the constant, order kept.
         self.assertEqual([chunk.num_rows for chunk in table_chunks], [3, 3, 3, 1])
         table = pa.concat_tables(table_chunks)
-        self.assertEqual(table["key_id"].to_pylist(), evicted_keys)
+        self.assertEqual(table["key_id"].to_pylist(), list(range(10)))
         self.assertEqual(table["embedding"].to_pylist(), [[0.0, 0.0]] * 10)
         # Every chunk's embedding values wrap the same storage, so retained
         # tombstone zeros stay one chunk regardless of eviction count.
