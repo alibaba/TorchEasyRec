@@ -1,0 +1,46 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN sed -i "s@http://archive.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i "s@http://security.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i "s@http://ports.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/sources.list.d/ubuntu.sources && \
+    apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+        build-essential ca-certificates \
+        ccache cmake gcc git vim watchman wget curl sudo iproute2 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN wget https://tzrec.oss-accelerate.aliyuncs.com/third_party/libidn11_1.33-2.2ubuntu2_amd64.deb && \
+    apt-get install ./libidn11_1.33-2.2ubuntu2_amd64.deb && rm libidn11_1.33-2.2ubuntu2_amd64.deb
+
+ARG PIP_MIRROR=mirrors.aliyun.com
+RUN mkdir -p /root/.config/pip && \
+    printf '[global]\nindex-url = http://%s/pypi/simple\ntrusted-host = %s\ntimeout = 120\n' "${PIP_MIRROR}" "${PIP_MIRROR}" > /root/.config/pip/pip.conf
+
+ARG PPU_PIP_INDEX
+RUN pip install torch==2.11.0 triton==3.6.0 -i ${PPU_PIP_INDEX} && \
+    pip install fbgemm-gpu==1.6.0 faiss==1.14.1 -i ${PPU_PIP_INDEX} && \
+    pip install torchmetrics==1.0.3 tensordict && \
+    pip install torchrec==1.6.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
+    pip cache purge
+
+ENV NVIDIA_VISIBLE_DEVICES all
+ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
+
+ADD requirements /root/requirements
+ADD requirements.txt /root/requirements.txt
+RUN cd /root && \
+    pip install -r requirements.txt && \
+    rm -rf requirements requirements.txt && \
+    pip cache purge
+
+RUN mkdir -p /home/pai/bin && \
+    wget -O /home/pai/bin/prepare_dlc_environment https://tzrec.oss-accelerate.aliyuncs.com/third_party/pai/prepare_dlc_environment.sh && \
+    chmod +x /home/pai/bin/prepare_dlc_environment && \
+    apt-get update && apt-get install -y --no-install-recommends openssh-server && rm -rf /var/lib/apt/lists/* && service ssh start
+ENV PATH $PATH:/home/pai/bin
+
+ENV SHELL=/bin/bash
+RUN echo "dash dash/sh boolean false" | debconf-set-selections \
+    && DEBIAN_FRONTEND=noninteractive dpkg-reconfigure dash
