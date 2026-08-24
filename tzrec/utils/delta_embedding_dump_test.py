@@ -2525,6 +2525,36 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         ]
         self.assertEqual(len(set(addresses)), 1)
 
+    def test_append_tombstone_chunks_int8_chunks_share_one_buffer(self):
+        # INT8 tombstones quantize the zero buffer once up front; every chunk
+        # aliases that one buffer, so retained tombstone zeros stay one chunk
+        # regardless of eviction count instead of one allocation per chunk.
+        dumper = self._eviction_dumper(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
+        )
+        tombstone_ids = torch.tensor(list(range(10)), dtype=torch.int64)
+        table_chunks = []
+
+        with mock.patch("tzrec.utils.delta_embedding_dump._TOMBSTONE_CHUNK_ROWS", 3):
+            num_rows = dumper._append_tombstone_chunks(
+                table_chunks,
+                global_step=5,
+                fqn=self._DYN_TABLE_FQN,
+                tombstone_ids=tombstone_ids,
+                emb_dim=2,
+            )
+
+        self.assertEqual(num_rows, 10)
+        self.assertEqual([chunk.num_rows for chunk in table_chunks], [3, 3, 3, 1])
+        table = pa.concat_tables(table_chunks)
+        self.assertEqual(table["key_id"].to_pylist(), list(range(10)))
+        self.assertEqual(table["embedding"].to_pylist(), [[0, 0, 0, 60, 0, 0]] * 10)
+        addresses = [
+            chunk.column("embedding").chunk(0).values.buffers()[1].address
+            for chunk in table_chunks
+        ]
+        self.assertEqual(len(set(addresses)), 1)
+
     def test_clear_discards_retained_evicted_keys(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._dump_evicted_tombstones = True

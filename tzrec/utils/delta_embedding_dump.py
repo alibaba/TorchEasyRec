@@ -1325,7 +1325,9 @@ class DeltaEmbeddingDumper:
         One zero buffer backs every chunk: _append_table_chunk wraps
         row-slice views zero-copy, so Arrow chunks share this storage and
         retained tombstone zeros stay one chunk-sized buffer regardless of
-        eviction volume.
+        eviction volume. Under INT8 quantization the zero buffer is
+        quantized once up front and shared the same way, because
+        quantizing per chunk would allocate a separate buffer per chunk.
 
         Args:
             table_chunks: List to append the per-table parquet chunks to.
@@ -1341,7 +1343,30 @@ class DeltaEmbeddingDumper:
             return 0
         feature_name = _feature_name(self._tracker.fqn_to_feature_names.get(fqn, []))
         chunk_rows = min(_TOMBSTONE_CHUNK_ROWS, tombstone_ids.numel())
-        zero_rows = torch.zeros((chunk_rows, emb_dim), dtype=torch.float32)
+        zero_rows: torch.Tensor = torch.zeros(
+            (chunk_rows, emb_dim), dtype=torch.float32
+        )
+        pre_quantized = False
+        if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
+            try:
+                quantized_zero = distributed_quantize_embeddings(
+                    zero_rows,
+                    emb_dim,
+                    feature_name,
+                    DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
+                )
+            except ValueError as e:
+                # quant_util errors address the distributed-export DIST_QUANT
+                # switch; delta dump quantization is toggled by quant_type.
+                raise ValueError(
+                    "Delta embedding dump INT8 quantization failed for "
+                    f"feature '{feature_name}' (table '{fqn}'): {e}. "
+                    "Disable delta dump quantization by setting "
+                    "delta_embedding_dump_config.quant_type to "
+                    "DELTA_EMBEDDING_QUANT_NONE."
+                ) from e
+            zero_rows = torch.from_numpy(quantized_zero)
+            pre_quantized = True
         num_rows = 0
         for start in range(0, tombstone_ids.numel(), chunk_rows):
             key_chunk = tombstone_ids[start : start + chunk_rows]
@@ -1353,6 +1378,7 @@ class DeltaEmbeddingDumper:
                 key_ids=key_chunk,
                 embeddings=zero_rows[: key_chunk.numel()],
                 source="dynamicemb_evicted",
+                pre_quantized=pre_quantized,
             )
         return num_rows
 
@@ -1443,9 +1469,13 @@ class DeltaEmbeddingDumper:
         key_ids: torch.Tensor,
         embeddings: torch.Tensor,
         source: str,
+        pre_quantized: bool = False,
     ) -> int:
         key_ids_cpu = key_ids.detach().cpu().to(torch.int64).contiguous()
-        embeddings_cpu = embeddings.detach().cpu().to(torch.float32).contiguous()
+        if pre_quantized:
+            embeddings_cpu = embeddings.detach().cpu().contiguous()
+        else:
+            embeddings_cpu = embeddings.detach().cpu().to(torch.float32).contiguous()
         if embeddings_cpu.dim() != 2:
             raise ValueError(
                 "delta embedding dump expects a 2-D embedding tensor, "
@@ -1460,25 +1490,27 @@ class DeltaEmbeddingDumper:
                 f"key_ids={num_rows}, embeddings={embeddings_cpu.size(0)}."
             )
         if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
-            emb_dim = embeddings_cpu.size(1)
-            try:
-                quantized = distributed_quantize_embeddings(
-                    embeddings_cpu,
-                    emb_dim,
-                    feature_name,
-                    DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
-                )
-            except ValueError as e:
-                # quant_util errors address the distributed-export DIST_QUANT
-                # switch; delta dump quantization is toggled by quant_type.
-                raise ValueError(
-                    "Delta embedding dump INT8 quantization failed for "
-                    f"feature '{feature_name}' (table '{table_fqn}'): {e}. "
-                    "Disable delta dump quantization by setting "
-                    "delta_embedding_dump_config.quant_type to "
-                    "DELTA_EMBEDDING_QUANT_NONE."
-                ) from e
-            embeddings_cpu = torch.from_numpy(quantized)
+            if not pre_quantized:
+                emb_dim = embeddings_cpu.size(1)
+                try:
+                    quantized = distributed_quantize_embeddings(
+                        embeddings_cpu,
+                        emb_dim,
+                        feature_name,
+                        DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
+                    )
+                except ValueError as e:
+                    # quant_util errors address the distributed-export
+                    # DIST_QUANT switch; delta dump quantization is
+                    # toggled by quant_type.
+                    raise ValueError(
+                        "Delta embedding dump INT8 quantization failed for "
+                        f"feature '{feature_name}' (table '{table_fqn}'): {e}. "
+                        "Disable delta dump quantization by setting "
+                        "delta_embedding_dump_config.quant_type to "
+                        "DELTA_EMBEDDING_QUANT_NONE."
+                    ) from e
+                embeddings_cpu = torch.from_numpy(quantized)
             value_type = pa.uint8()
         else:
             value_type = pa.float32()
