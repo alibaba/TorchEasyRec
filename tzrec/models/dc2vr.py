@@ -43,7 +43,7 @@ class DC2VR(MultiTaskRank):
         )
         assert isinstance(self._model_config, multi_task_rank_pb2.DC2VR)
 
-        self._task_tower_cfgs = self._model_config.task_towers
+        self._task_tower_cfgs = list(self._model_config.task_towers)
         self.init_input()
         self.group_name = self.embedding_group.group_names()[0]
         feature_in = self.embedding_group.group_total_dim(self.group_name)

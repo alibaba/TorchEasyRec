@@ -220,6 +220,7 @@ class NpzUtilTest(unittest.TestCase):
         }
         with mock.patch("zipfile.ZIP64_LIMIT", 64):
             npz_util.savez_streaming(path, arrays)
+        assert _UNZIP is not None
         result = subprocess.run([_UNZIP, "-t", path], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("No errors detected", result.stdout)

@@ -17,7 +17,7 @@ import random
 import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import graphlearn as gl
 import numpy as np
@@ -427,8 +427,9 @@ class BaseSampler(metaclass=_meta_cls):
         """
         features = []
         # pyre-ignore [16]
-        if len(nodes.indices) == 0:
-            return features, nodes.indices
+        indices = cast(np.ndarray, nodes.indices)
+        if len(indices) == 0:
+            return features, indices
         int_idx = 0
         float_idx = 0
         string_idx = 0
@@ -453,7 +454,7 @@ class BaseSampler(metaclass=_meta_cls):
             feature = feature.astype(attr_np_type)
             feature = _to_arrow_array(feature, attr_type)
             features.append(feature)
-        return features, nodes.indices
+        return features, indices
 
     @property
     def estimated_sample_num(self) -> int:
@@ -534,6 +535,7 @@ class NegativeSampler(BaseSampler):
     @property
     def estimated_sample_num(self) -> int:
         """Estimated number of sampled num examples."""
+        assert self._num_sample is not None
         return self._num_sample
 
 
@@ -633,6 +635,7 @@ class NegativeSamplerV2(BaseSampler):
     @property
     def estimated_sample_num(self) -> int:
         """Estimated number of sampled num examples."""
+        assert self._num_sample is not None
         return self._num_sample
 
 
@@ -975,7 +978,9 @@ class TDMSampler(BaseSampler):
         else:
             self.get({self._item_id_field: pa.array([0])})
 
-    def get(self, input_data: Dict[str, pa.Array]) -> Dict[str, pa.Array]:
+    def get(
+        self, input_data: Dict[str, pa.Array]
+    ) -> Tuple[Dict[str, pa.Array], Dict[str, pa.Array]]:
         """Sampling method.
 
         Args:

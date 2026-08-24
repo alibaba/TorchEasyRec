@@ -563,7 +563,7 @@ def _build_layer_rows(
     layer_metrics: Sequence[SidLayerQualityMetrics],
 ) -> List["OrderedDict[str, object]"]:
     """Build ordered long-format per-layer metric rows for one view."""
-    rows = []
+    rows: List["OrderedDict[str, object]"] = []
     for metrics in layer_metrics:
         rows.append(
             OrderedDict(

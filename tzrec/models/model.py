@@ -13,7 +13,7 @@
 import threading
 from collections import OrderedDict
 from queue import Queue
-from typing import Any, Dict, Final, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Final, Iterable, List, Optional, Tuple, cast
 
 import torch
 import torchmetrics
@@ -365,12 +365,12 @@ class ScriptWrapper(BaseModule):
     @property
     def features(self) -> List[BaseFeature]:
         """Live read of the wrapped module's features (no snapshot)."""
-        return self.model.features
+        return cast(List[BaseFeature], self.model.features)
 
     @property
     def feature_groups(self) -> List[FeatureGroupConfig]:
         """Live read of the wrapped module's feature_groups."""
-        return self.model.feature_groups
+        return cast(List[FeatureGroupConfig], self.model.feature_groups)
 
     def get_batch(
         self,
@@ -497,7 +497,7 @@ class CombinedModelWrapper(nn.Module):
         device: torch.device,
     ) -> Dict[str, torch.Tensor]:
         torch.cuda.set_device(device)
-        with self._lock:
+        with cast(Any, self._lock):
             return self.dense_model(sparse_out)
 
     def forward(
@@ -556,8 +556,9 @@ class UnifiedAOTIModelWrapper(nn.Module):
         """
         if self._key_order is None:
             object.__setattr__(self, "_key_order", sorted(data.keys()))
-        data = OrderedDict((k, data[k]) for k in self._key_order)
+        key_order = cast(List[str], self._key_order)
+        data = OrderedDict((k, data[k]) for k in key_order)
         # Force CUDA primary context creation on worker threads.
         torch.cuda.set_device(device)
-        with self._lock:
+        with cast(Any, self._lock):
             return self.model(data)

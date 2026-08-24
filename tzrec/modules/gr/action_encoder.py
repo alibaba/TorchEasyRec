@@ -197,7 +197,7 @@ def create_action_encoder(
     else:
         assert len(action_encoder_cfg) == 1, (
             f"action_encoder_cfg should be {{action_encoder_type: action_encoder_kwargs}}, "  # NOQA
-            f"but got {action_encoder_type}"
+            f"but got {action_encoder_cfg}"
         )
         action_encoder_type, config_dict = action_encoder_cfg.popitem()
 

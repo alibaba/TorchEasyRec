@@ -80,9 +80,10 @@ def apply_split_helper(
     current_device: torch.device,
     use_cpu: bool,
     feature_table_map: list[int],
+    # pyrefly: ignore[not-a-type]  # fbgemm's SplitState resolves to a NamedTuple fallback
     split: SplitState,
     prefix: str,
-    dtype: type[torch.dtype],
+    dtype: torch.dtype,
     enforce_hbm: bool = False,
     make_dev_param: bool = False,
     dev_reshape: Optional[tuple[int, ...]] = None,
@@ -121,7 +122,6 @@ def apply_split_helper(
             torch.zeros(
                 split.dev_size,
                 device=current_device,
-                # pyre-fixme[6]
                 dtype=dtype,
             )
             if not use_init_value
@@ -129,7 +129,6 @@ def apply_split_helper(
                 (split.dev_size,),
                 init_value,
                 device=current_device,
-                # pyre-fixme[6]
                 dtype=dtype,
             )
         )
@@ -137,7 +136,6 @@ def apply_split_helper(
             dev_buffer.view(*dev_reshape) if dev_reshape is not None else dev_buffer
         )
     else:
-        # pyre-fixme[6]
         dev_buffer = torch.empty(0, device=current_device, dtype=dtype)
     if make_dev_param:
         set_attr_fn(f"{prefix}_dev", nn.Parameter(dev_buffer))
@@ -173,8 +171,6 @@ def apply_split_helper(
                 torch.zeros(
                     split.host_size,
                     device=current_device,
-                    # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]` for
-                    #  3rd param but got `Type[Type[torch._dtype]]`.
                     dtype=dtype,
                 )
                 if not use_init_value
@@ -182,8 +178,6 @@ def apply_split_helper(
                     (split.host_size,),
                     init_value,
                     device=current_device,
-                    # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]` for
-                    #  3rd param but got `Type[Type[torch._dtype]]`.
                     dtype=dtype,
                 )
             )
@@ -201,7 +195,6 @@ def apply_split_helper(
     else:
         persistent_state_fn(
             f"{prefix}_host",
-            # pyre-fixme[6]: For 3rd param expected `dtype` but got `Type[dtype]`.
             torch.empty(0, device=current_device, dtype=dtype),
         )
     if split.uvm_size > 0:
@@ -213,8 +206,6 @@ def apply_split_helper(
                 torch.zeros(
                     split.uvm_size,
                     device=current_device,
-                    # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]` for
-                    #  3rd param but got `Type[Type[torch._dtype]]`.
                     dtype=dtype,
                 )
                 if not use_init_value
@@ -222,8 +213,6 @@ def apply_split_helper(
                     (split.uvm_size,),
                     init_value,
                     device=current_device,
-                    # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]` for
-                    #  3rd param but got `Type[Type[torch._dtype]]`.
                     dtype=dtype,
                 ),
             )
@@ -233,7 +222,6 @@ def apply_split_helper(
                 torch.zeros(
                     (split.uvm_size,),
                     out=torch.ops.fbgemm.new_unified_tensor(
-                        # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]`
                         #  for 3rd param but got `Type[Type[torch._dtype]]`.
                         torch.zeros(1, device=current_device, dtype=dtype)
                         if not use_init_value
@@ -250,9 +238,11 @@ def apply_split_helper(
     else:
         persistent_state_fn(
             f"{prefix}_uvm",
-            # pyre-fixme[6]: For 3rd param expected `dtype` but got `Type[dtype]`.
             torch.empty(0, device=current_device, dtype=dtype),
         )
 
 
+# fbgemm annotates its own dtype parameter as `type[torch.dtype]`, but callers pass a
+# dtype instance; this replacement keeps the accurate annotation.
+# pyrefly: ignore[bad-assignment]
 split_table_batched_embeddings_ops_training.apply_split_helper = apply_split_helper

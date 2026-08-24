@@ -127,8 +127,8 @@ class SidRqvae(BaseSidModel):
         ``embedding_group`` / ``_input_dim``.
         """
         cfg = self._model_config
-        self._pair_feature_group = None
-        self._pair_flag_feature_group = None
+        self._pair_feature_group: Optional[str] = None
+        self._pair_flag_feature_group: Optional[str] = None
         self._use_contrastive = cfg.HasField("contrastive_config")
         has_contrastive_obj = any(
             lc.WhichOneof("sid_loss") == "contrastive_loss"
@@ -234,6 +234,8 @@ class SidRqvae(BaseSidModel):
         Args:
             grouped (dict): the EmbeddingGroup output (group name -> tensor).
         """
+        assert self._pair_feature_group is not None
+        assert self._pair_flag_feature_group is not None
         embedding = grouped[self._feature_group]
         fea2 = grouped[self._pair_feature_group]
         is_pair_raw = grouped[self._pair_flag_feature_group]

@@ -226,6 +226,7 @@ class BuildProjectionTest(unittest.TestCase):
             ]
         )
         projection = _build_projection(src, self.DST)
+        assert projection is not None
         self.assertEqual(projection, [2, 3, 0])
         batch = pa.record_batch(
             [
@@ -281,6 +282,7 @@ class BuildProjectionTest(unittest.TestCase):
         dst = pa.schema([pa.field("raw_g", dst_type)])
         src = pa.schema([pa.field("raw_g", src_type)])
         projection = _build_projection(src, dst)
+        assert projection is not None
         self.assertEqual(projection, [0])
 
         value = [1.0, 2.0] if pa.types.is_list(dst_type) else [("k", 1)]

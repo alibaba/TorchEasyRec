@@ -152,6 +152,7 @@ class FeatureTest(unittest.TestCase):
         np.testing.assert_allclose(tag_data.values, np.array(expected_values))
         np.testing.assert_allclose(tag_data.lengths, np.array(expected_lengths))
         if is_weighted:
+            assert tag_data.weights is not None
             np.testing.assert_allclose(tag_data.weights, np.array(expected_weights))
 
     @parameterized.expand(
@@ -477,6 +478,7 @@ class FeatureTest(unittest.TestCase):
             },
         )
         if with_asset_dir:
+            assert asset_dir is not None
             self.assertTrue(os.path.exists(os.path.join(asset_dir, token_file)))
 
     @parameterized.expand([[False], [True]])
@@ -616,6 +618,7 @@ class FeatureTest(unittest.TestCase):
             },
         )
         if with_asset_dir:
+            assert asset_dir is not None
             self.assertTrue(os.path.exists(os.path.join(asset_dir, token_file)))
 
     @parameterized.expand([[False], [True]])
@@ -637,6 +640,7 @@ class FeatureTest(unittest.TestCase):
         )
 
         if with_asset_dir:
+            assert asset_dir is not None
             feature_cfgs[6].tokenize_feature.vocab_file = token_file
             feature_cfgs[6].tokenize_feature.asset_dir = asset_dir
             feature_cfgs[7].sequence_id_feature.vocab_file = vocab_file

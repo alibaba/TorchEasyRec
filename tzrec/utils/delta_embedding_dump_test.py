@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import Any, Dict, List, cast
 from unittest import mock
 
 import numpy as np
@@ -1517,7 +1517,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         ]
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._table_shard_infos = {}
-        dumper._tracker = SimpleNamespace(
+        dumper._tracker = cast(Any, SimpleNamespace)(
             tracked_modules={
                 "model.ebc": ebc_module,
                 "model.ec": ec_module,
@@ -1550,7 +1550,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         sharded_module._lookups = [torch.nn.Identity()]
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._table_shard_infos = {}
-        dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": sharded_module})
+        dumper._tracker = cast(Any, SimpleNamespace)(
+            tracked_modules={"model.ebc": sharded_module}
+        )
 
         with self.assertRaisesRegex(TypeError, "Unsupported embedding lookup"):
             dumper._collect_table_weights()
@@ -1578,7 +1580,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         ebc_dynamic_module = SimpleNamespace(table_names=["shared"])
         ec_dynamic_module = SimpleNamespace(table_names=["shared"])
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._tracker = SimpleNamespace(
+        dumper._tracker = cast(Any, SimpleNamespace)(
             tracked_modules={
                 "model.ebc": ebc_module,
                 "model.ec": ec_module,
@@ -1687,7 +1689,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         tracker.curr_compact_index = -1
         tracker.per_consumer_batch_idx = {"consumer": -1}
         appended = []
-        tracker.store = SimpleNamespace(
+        tracker.store = cast(Any, SimpleNamespace)(
             append=lambda batch_idx, fqn, ids, states: appended.append(fqn),
             compact=lambda start_idx, end_idx: appended.append("compact"),
         )
@@ -1750,7 +1752,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         owner_module.module_sharding_plan = {}
         owner_module._lookups = [grouped_lookup]
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": owner_module})
+        dumper._tracker = cast(Any, SimpleNamespace)(
+            tracked_modules={"model.ebc": owner_module}
+        )
         with mock.patch(
             "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
             side_effect=lambda module_fqn, _module, table_name: (
@@ -1796,7 +1800,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         sharded_module._lookups = []
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._rank = 0
-        dumper._tracker = SimpleNamespace(tracked_modules={"model.ebc": sharded_module})
+        dumper._tracker = cast(Any, SimpleNamespace)(
+            tracked_modules={"model.ebc": sharded_module}
+        )
         table_fqn = "model.ebc.adgroup_id_emb"
         with mock.patch(
             "tzrec.utils.delta_embedding_dump._embedding_table_fqn",
@@ -1926,7 +1932,9 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         ).reshape(zch_size, _SHARED_EBC_EMBEDDING_DIM)
         table_fqn = "model.mc_ebc._embedding_module.embedding_bags.zch_tbl"
         dumper._zch_modules = {table_fqn: mch}
-        dumper._tracker = SimpleNamespace(fqn_to_feature_names={table_fqn: ["feat"]})
+        dumper._tracker = cast(Any, SimpleNamespace)(
+            fqn_to_feature_names={table_fqn: ["feat"]}
+        )
         table_weights = {
             table_fqn: _TableWeight(
                 tensor=weight,
@@ -2004,7 +2012,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         tracker.pause_depth = 0
         tracker.curr_batch_idx = 0
         appended = []
-        tracker.store = SimpleNamespace(
+        tracker.store = cast(Any, SimpleNamespace)(
             append=lambda batch_idx, fqn, ids, states: appended.append(
                 (batch_idx, fqn, sorted(ids.tolist()))
             )

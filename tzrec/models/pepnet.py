@@ -176,7 +176,8 @@ class PEPNet(MultiTaskRank):
     def _select_domain_task_output(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        new_predictions = defaultdict(list)
+        domain_predictions = defaultdict(list)
+        new_predictions: Dict[str, torch.Tensor] = {}
         if self._domain_input_name:
             for (
                 tower_domain_loss_predict_name,
@@ -185,11 +186,14 @@ class PEPNet(MultiTaskRank):
                 tower_loss_name, domain_index = tower_domain_loss_predict_name.rsplit(
                     "_", 1
                 )
-                new_predictions[tower_loss_name].append(
+                domain_predictions[tower_loss_name].append(
                     (int(domain_index), tower_domain_loss_predict_value)
                 )
             domain_index = batch.labels[self._domain_input_name]
-            for tower_loss_name, tower_loss_predict_values in new_predictions.items():
+            for (
+                tower_loss_name,
+                tower_loss_predict_values,
+            ) in domain_predictions.items():
                 tower_loss_domain_predict = torch.stack(
                     [
                         v[1]

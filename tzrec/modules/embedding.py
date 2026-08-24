@@ -403,7 +403,9 @@ class EmbeddingGroup(nn.Module):
         else:
             dims = self.emb_impls[impl_key].group_dims(group_name)
             if group_name in self._group_name_to_seq_encoders:
-                for seq_encoder in self._group_name_to_seq_encoders[group_name]:
+                for seq_encoder in cast(
+                    nn.ModuleList, self._group_name_to_seq_encoders[group_name]
+                ):
                     dims.append(seq_encoder.output_dim())
             return dims
 
@@ -530,7 +532,7 @@ class EmbeddingGroup(nn.Module):
         seq_feature_dict = {}
         for group_name, seq_encoders in self._group_name_to_seq_encoders.items():
             new_feature = []
-            for seq_encoder in seq_encoders:
+            for seq_encoder in cast(nn.ModuleList, seq_encoders):
                 new_feature.append(seq_encoder(result))
             seq_feature_dict[group_name] = torch.cat(new_feature, dim=-1)
         return _update_dict_tensor(result, seq_feature_dict)

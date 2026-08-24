@@ -402,7 +402,7 @@ def create_feature_store_view(settings: FeatureStoreUploadSettings) -> Any:
         ) from exc
 
     credential = CredClient().get_credential()
-    kwargs = {
+    kwargs: Dict[str, Any] = {
         "access_key_id": credential.access_key_id,
         "access_key_secret": credential.access_key_secret,
         "region": settings.region or None,

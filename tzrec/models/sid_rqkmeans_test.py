@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import unittest
+from typing import cast
 from unittest import mock
 
 import torch
@@ -19,6 +20,7 @@ from torchrec import KeyedTensor
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
 from tzrec.models.sid_rqkmeans import SidRqkmeans
+from tzrec.modules.sid.kmeans_quantize import KMeansQuantizeLayer
 from tzrec.protos import feature_pb2, model_pb2
 from tzrec.protos.models import sid_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
@@ -222,6 +224,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self._fit(model, B, input_dim)
 
         for k, layer in zip(codebook, model._quantizer.layers):
+            layer = cast(KMeansQuantizeLayer, layer)
             self.assertTrue(bool(layer._is_initialized.item()))
             self.assertEqual(layer.centroids.shape[0], k)
 

@@ -10,10 +10,12 @@
 # limitations under the License.
 
 import unittest
+from typing import cast
 
 import torch
 from parameterized import parameterized
 
+from tzrec.modules.sid.kmeans_quantize import KMeansQuantizeLayer
 from tzrec.modules.sid.residual_kmeans_quantizer import (
     ResidualKMeansQuantizer,
 )
@@ -32,7 +34,13 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
     def test_non_uniform_codebook_supported(self) -> None:
         rkq = ResidualKMeansQuantizer(embed_dim=4, n_layers=3, n_embed=[8, 4, 16])
         self.assertEqual(rkq.n_embed_list, [8, 4, 16])
-        self.assertEqual([layer.centroids.shape[0] for layer in rkq.layers], [8, 4, 16])
+        self.assertEqual(
+            [
+                cast(KMeansQuantizeLayer, layer).centroids.shape[0]
+                for layer in rkq.layers
+            ],
+            [8, 4, 16],
+        )
 
     @parameterized.expand(
         [

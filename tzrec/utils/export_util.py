@@ -202,7 +202,7 @@ def _move_quantized_modules_to_device(model: nn.Module, device: torch.device) ->
     for m in model.modules():
         if not hasattr(m, "_emb_modules"):
             continue
-        for emb in m._emb_modules:
+        for emb in cast(List[nn.Module], m._emb_modules):
             if (
                 isinstance(emb, IntNBitTableBatchedEmbeddingBagsCodegen)
                 and emb.current_device != device
@@ -414,7 +414,7 @@ def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
         model: torch.nn.Module,
         path: str,
         leaf_module_names: Set[str],
-    ) -> bool:
+    ) -> None:
         if isinstance(model, ShardedModule):
             leaf_module_names.add(path)
         else:
@@ -531,7 +531,7 @@ def _is_fx_node(value: Any) -> bool:
 def _get_rtp_feature_to_embedding_info(
     model: nn.Module,
 ) -> Dict[str, BaseEmbeddingConfig]:
-    feature_to_embedding_info = dict()
+    feature_to_embedding_info: Dict[str, BaseEmbeddingConfig] = dict()
     feature_to_module_path = dict()
     emb_name_to_module_path = dict()
     q = Queue()
@@ -1153,7 +1153,7 @@ def export_rtp_model(
                 )
                 with graph.inserting_before(node):
                     new_node = graph.call_function(
-                        FBGEMM_RTP_TORCH_OP_MAPPING[node.target],
+                        FBGEMM_RTP_TORCH_OP_MAPPING[cast(Any, node.target)],
                         args=node.args,
                         kwargs=node.kwargs,
                     )
@@ -1622,7 +1622,7 @@ def export_distributed_embedding(
                     },
                 )
                 dense_graph_config[name] = [
-                    k + "__ebc" for k in new_node.kwargs["keys"]
+                    k + "__ebc" for k in cast(List[str], new_node.kwargs["keys"])
                 ]
                 node_kt.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
@@ -1888,7 +1888,7 @@ def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
             tables = None
         if tables is not None:
             for table in tables:
-                weight = table.weight
+                weight = cast(torch.Tensor, table.weight)
                 # zeros, not empty: if the model is already materialized,
                 # init_parameters skips it and uninitialized memory would
                 # flow through the warm-up and sanity forwards.
@@ -2062,7 +2062,7 @@ def build_dense_graph_module(
                     },
                 )
                 dense_graph_config[name] = [
-                    k + "__ebc" for k in new_node.kwargs["keys"]
+                    k + "__ebc" for k in cast(List[str], new_node.kwargs["keys"])
                 ]
                 node_kt.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
@@ -2279,8 +2279,8 @@ def _get_sparse_table_to_embedding_info(
     model: nn.Module,
 ) -> Tuple[Dict[str, BaseEmbeddingConfig], Dict[str, BaseEmbeddingConfig]]:
     """Collect sparse embedding configs keyed by state-dict-style table FQN."""
-    table_to_embedding_bag_info = dict()
-    table_to_embedding_info = dict()
+    table_to_embedding_bag_info: Dict[str, BaseEmbeddingConfig] = dict()
+    table_to_embedding_info: Dict[str, BaseEmbeddingConfig] = dict()
     q = Queue()
     q.put(("", model))
     while not q.empty():
@@ -2749,7 +2749,7 @@ def _get_sparse_embedding_tensor(
             continue
         export_meta = emb_name_to_export_meta[emb_name]
         is_dynamic = emb_name in dynamic_emb_names
-        t_meta = {
+        t_meta: Dict[str, Any] = {
             "feat_name_impl": feat_name_impl_list,
             "dense": False,
             "is_dynamic": is_dynamic,

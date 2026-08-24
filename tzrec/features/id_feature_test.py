@@ -309,6 +309,7 @@ class IdFeatureTest(unittest.TestCase):
         self.assertEqual(repr(id_feat.emb_bag_config), repr(expected_emb_bag_config))
         fg_default = id_feat.fg_encoded_default_value()
         if expected_fg_default:
+            assert fg_default is not None
             np.testing.assert_allclose(fg_default, expected_fg_default)
         else:
             self.assertEqual(fg_default, expected_fg_default)

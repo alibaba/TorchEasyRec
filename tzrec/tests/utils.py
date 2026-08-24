@@ -617,7 +617,7 @@ def create_mock_hard_negative(
     user_path: str,
     src_data: Dict[str, List],  # {user_id: user_t, item_id: item_t}
     num_rows: int = 10240,
-) -> Tuple[str]:
+) -> Tuple[str, str]:
     """Create hard negative mock data."""
     idx_1 = np.random.choice(
         np.arange(len(src_data["user_id"])), num_rows, replace=False
@@ -649,7 +649,7 @@ def build_mock_input_fg_encoded(
     features: List[BaseFeature], user_id: str = "", item_id: str = ""
 ) -> Dict[str, MockInput]:
     """Build fg encoded mock input instance list from features."""
-    inputs = {}
+    inputs: Dict[str, MockInput] = {}
     single_id_fields = {user_id, item_id}
     for feature in features:
         if feature.is_sequence:
@@ -708,7 +708,7 @@ def build_mock_input_with_fg(
     features: List[BaseFeature],
     user_id: str = "",
     item_id: str = "",
-) -> Dict[str, MockInput]:
+) -> Tuple[Dict[str, MockInput], Dict[str, MockInput]]:
     """Build mock input instance list with fg from features."""
     inputs = defaultdict(dict)
     single_id_fields = {user_id, item_id}
@@ -870,6 +870,8 @@ def load_config_for_test(
 
     data_config.num_workers = 2
     num_parts = data_config.num_workers * 2
+    user_t = None
+    item_t = None
     if data_config.fg_mode == FgMode.FG_NONE:
         inputs = build_mock_input_fg_encoded(features, user_id, item_id)
         item_inputs = inputs
@@ -936,6 +938,7 @@ def load_config_for_test(
         sampler_config = getattr(data_config, sampler_type)
     if sampler_type is not None:
         if sampler_type == "tdm_sampler":
+            assert item_t is not None
             all_attr_fields = item_t.column_names
             attr_fields = []
             raw_attr_fields = []
@@ -1001,6 +1004,7 @@ def load_config_for_test(
                 num_rows=data_config.batch_size * num_parts * 4,
             )
 
+            assert user_t is not None and item_t is not None
             hard_neg_edge_path, hard_neg_user_path = create_mock_hard_negative(
                 os.path.join(test_dir, "hard_neg_edge"),
                 os.path.join(test_dir, "hard_neg_user"),

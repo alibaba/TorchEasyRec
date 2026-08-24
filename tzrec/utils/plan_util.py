@@ -943,7 +943,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         global_constraints: Optional[ParameterConstraints] = None,
     ) -> None:
         if not estimator:
-            estimator: List[ShardEstimator] = [
+            estimator = [
                 EmbeddingPerfEstimator(topology=topology, constraints=constraints),
                 EmbeddingStorageEstimator(topology=topology, constraints=constraints),
             ]

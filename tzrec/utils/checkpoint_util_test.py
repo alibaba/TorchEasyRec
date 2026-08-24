@@ -15,6 +15,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from typing import cast
 from unittest import mock
 
 import torch
@@ -510,8 +511,8 @@ class CheckpointUtilTest(unittest.TestCase):
         model = Model()
         dense_ema = DenseEMA(
             {
-                "dense.weight": model.dense.weight,
-                "dense.bias": model.dense.bias,
+                "dense.weight": cast(nn.Parameter, model.dense.weight),
+                "dense.bias": cast(nn.Parameter, model.dense.bias),
             },
             decay=0.5,
         )
@@ -570,8 +571,8 @@ class CheckpointUtilTest(unittest.TestCase):
             resumed_model = Model()
             resumed_ema = DenseEMA(
                 {
-                    "dense.weight": resumed_model.dense.weight,
-                    "dense.bias": resumed_model.dense.bias,
+                    "dense.weight": cast(nn.Parameter, resumed_model.dense.weight),
+                    "dense.bias": cast(nn.Parameter, resumed_model.dense.bias),
                 },
                 decay=0.5,
             )
@@ -594,8 +595,8 @@ class CheckpointUtilTest(unittest.TestCase):
         model = nn.Linear(2, 1)
         dense_ema = DenseEMA(
             {
-                "weight": model.weight,
-                "bias": model.bias,
+                "weight": cast(nn.Parameter, model.weight),
+                "bias": cast(nn.Parameter, model.bias),
             },
             decay=0.5,
         )
@@ -627,7 +628,7 @@ class CheckpointUtilTest(unittest.TestCase):
         with torch.no_grad():
             model.weight.fill_(2.0)
             model.bias.fill_(3.0)
-        dense_ema = DenseEMA({"weight": model.weight}, decay=0.5)
+        dense_ema = DenseEMA({"weight": cast(nn.Parameter, model.weight)}, decay=0.5)
         dense_ema.update()
         with torch.no_grad():
             model.weight.fill_(4.0)
@@ -642,8 +643,8 @@ class CheckpointUtilTest(unittest.TestCase):
             resumed_model = nn.Linear(2, 1)
             resumed_ema = DenseEMA(
                 {
-                    "weight": resumed_model.weight,
-                    "bias": resumed_model.bias,
+                    "weight": cast(nn.Parameter, resumed_model.weight),
+                    "bias": cast(nn.Parameter, resumed_model.bias),
                 },
                 decay=0.5,
             )

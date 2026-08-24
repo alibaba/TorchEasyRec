@@ -226,6 +226,7 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         if self._is_inference:
             if self._features_scalar is None:
                 self._build_scalar_features()
+            assert self._features_scalar is not None
             return self._features_scalar
         return self._features
 
@@ -235,6 +236,7 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         if self._is_inference:
             if self._feature_groups_scalar is None:
                 self._build_scalar_features()
+            assert self._feature_groups_scalar is not None
             return self._feature_groups_scalar
         return self._feature_groups
 

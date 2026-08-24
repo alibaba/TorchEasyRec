@@ -48,7 +48,9 @@ class LookupFeatureTest(unittest.TestCase):
         lookup_feat = lookup_feature_lib.LookupFeature(lookup_feat_cfg)
 
         if fg_encoded_default is None:
-            np.testing.assert_allclose(lookup_feat.fg_encoded_default_value(), [0])
+            fg_default = lookup_feat.fg_encoded_default_value()
+            assert fg_default is not None
+            np.testing.assert_allclose(fg_default, [0])
         self.assertEqual(lookup_feat.output_dim, 16)
         self.assertEqual(lookup_feat.is_sparse, True)
         self.assertEqual(lookup_feat.inputs, ["lookup_feat"])
@@ -82,7 +84,9 @@ class LookupFeatureTest(unittest.TestCase):
         lookup_feat = lookup_feature_lib.LookupFeature(lookup_feat_cfg)
 
         if fg_encoded_default is None:
-            np.testing.assert_allclose(lookup_feat.fg_encoded_default_value(), [0, 0])
+            fg_default = lookup_feat.fg_encoded_default_value()
+            assert fg_default is not None
+            np.testing.assert_allclose(fg_default, [0, 0])
         self.assertEqual(lookup_feat.output_dim, 2)
         self.assertEqual(lookup_feat.is_sparse, False)
         self.assertEqual(lookup_feat.inputs, ["lookup_feat"])

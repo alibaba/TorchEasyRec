@@ -26,16 +26,16 @@ class DecayAUC(Metric):
 
     def __init__(self, thresholds: int = 200, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        thresholds = torch.linspace(0, 1, thresholds)
-        self.register_buffer("thresholds", thresholds, persistent=False)
+        threshold_values = torch.linspace(0, 1, thresholds)
+        self.register_buffer("thresholds", threshold_values, persistent=False)
         self.add_state(
             "confmat",
-            default=torch.zeros(len(thresholds), 2, 2, dtype=torch.long),
+            default=torch.zeros(len(threshold_values), 2, 2, dtype=torch.long),
             dist_reduce_fx="sum",
         )
         self.add_state(
             "buffer_confmat",
-            default=torch.zeros(len(thresholds), 2, 2, dtype=torch.long),
+            default=torch.zeros(len(threshold_values), 2, 2, dtype=torch.long),
             dist_reduce_fx="sum",
         )
 

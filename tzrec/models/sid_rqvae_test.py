@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import unittest
+from typing import Optional
 
 import torch
 from parameterized import parameterized
@@ -26,7 +27,10 @@ from tzrec.utils.state_dict_util import init_parameters
 
 
 def _features_and_groups(
-    input_dim: int, use_contrastive: bool = False, pair_emb_dim: int = None, flag_dim=1
+    input_dim: int,
+    use_contrastive: bool = False,
+    pair_emb_dim: Optional[int] = None,
+    flag_dim=1,
 ):
     """Real raw features + feature groups for a SID model.
 

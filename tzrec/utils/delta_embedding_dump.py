@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
+    Any,
     Dict,
     Iterable,
     Iterator,
@@ -22,6 +23,7 @@ from typing import (
     Set,
     Tuple,
     Union,
+    cast,
 )
 
 import pyarrow as pa
@@ -1113,14 +1115,14 @@ class DeltaEmbeddingDumper:
             if flushed_module_ids is not None:
                 flushed_module_ids.add(id(dynamic_module))
         table_name = fqn.rsplit(".", maxsplit=1)[-1]
-        table_id = dynamic_module.table_names.index(table_name)
+        table_id = cast(List[str], dynamic_module.table_names).index(table_name)
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         ids = ids.to(device=device, dtype=torch.int64)
         table_ids = torch.full_like(ids, table_id, dtype=torch.int64)
         _, _, _, _, _, founds, _, values = dynamic_module.tables.find(
             ids, table_ids, CopyMode.EMBEDDING
         )
-        emb_dim = dynamic_module._dynamicemb_options[table_id].dim
+        emb_dim = cast(Any, dynamic_module._dynamicemb_options)[table_id].dim
         founds = founds.to(dtype=torch.bool)
         if not bool(founds.all().item()):
             logger.warning(
@@ -1203,7 +1205,7 @@ class DeltaEmbeddingDumper:
         modules: Dict[str, nn.Module] = {}
         for module_fqn, module in self._tracker.tracked_modules.items():
             for dynamic_module in get_dynamic_emb_module(module):
-                for table_name in dynamic_module.table_names:
+                for table_name in cast(List[str], dynamic_module.table_names):
                     table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
                     modules[table_fqn] = dynamic_module
         return modules

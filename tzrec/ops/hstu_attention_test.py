@@ -738,9 +738,13 @@ def test_sla_attn(
     )
 
     if test_backward:
+        # pyrefly: ignore[unbound-name]
         real_out.backward(dout.detach().clone())
+        # pyrefly: ignore[unbound-name]
         torch.testing.assert_close(ref_dq, q2.grad, atol=atol or 5e-2, rtol=0.1)
+        # pyrefly: ignore[unbound-name]
         torch.testing.assert_close(ref_dk, k2.grad, atol=atol or 5e-2, rtol=0.1)
+        # pyrefly: ignore[unbound-name]
         torch.testing.assert_close(ref_dv, v2.grad, atol=atol or 5e-2, rtol=0.1)
 
     gc.collect()
