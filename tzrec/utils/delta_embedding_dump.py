@@ -72,6 +72,9 @@ _CONSUMER = "delta_embedding_dump"
 # Rows per tombstone chunk: chunks alias one zero buffer of this size so an
 # eviction drain never materializes a single huge zero matrix.
 _TOMBSTONE_CHUNK_ROWS = 65536
+# Rows per merged-lookup batch: caps the find's [batch, dim] GPU values
+# buffer, which would otherwise grow with the dump interval's eviction volume.
+_FIND_BATCH_ROWS = 65536
 _ShardedEmbeddingModule = Union[
     ShardedEmbeddingCollection, ShardedEmbeddingBagCollection
 ]
@@ -1199,10 +1202,13 @@ class DeltaEmbeddingDumper:
     ) -> int:
         """Append one merged lookup's real rows and tombstones for a table.
 
-        The tracker ids and this dump's evicted keys are merged into a
-        single ``find`` so each key publishes exactly one row: its current
-        embedding when present, a zero tombstone when absent but evicted,
-        and nothing (with a warning) when it was never admitted.
+        The tracker ids and this dump's evicted keys are merged and
+        deduplicated on host, then resolved by a post-flush ``find`` batched
+        in ``_FIND_BATCH_ROWS`` slices so the GPU values buffer stays capped
+        regardless of eviction volume. Each key publishes exactly one row:
+        its current embedding when present, a zero tombstone when absent
+        but evicted, and nothing (with a warning) when it was never
+        admitted.
 
         Args:
             table_chunks: List to append the per-table parquet chunks to.
@@ -1231,58 +1237,62 @@ class DeltaEmbeddingDumper:
         if id(dynamic_module) not in flushed_module_ids:
             dynamic_module.flush()
             flushed_module_ids.add(id(dynamic_module))
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        ids = tracker_ids.to(device=device, dtype=torch.int64)
+        table_id = dynamic_module.table_names.index(table_name)
+        # pyre-ignore [29]
+        emb_dim = dynamic_module._dynamicemb_options[table_id].dim
+        ids = tracker_ids.cpu().to(torch.int64)
         evicted_ids: Optional[torch.Tensor] = None
         if dump_evicted_tombstones:
             evicted = self._pop_evicted_key_ids(fqn, dynamic_module, table_name)
             if evicted is not None and evicted.numel() > 0:
-                evicted_ids = evicted.to(device=device, dtype=torch.int64)
+                evicted_ids = evicted.cpu().to(torch.int64)
                 ids = torch.cat([ids, evicted_ids])
         ids = ids.unique(sorted=True)
         if ids.numel() == 0:
             return 0
-        table_id = dynamic_module.table_names.index(table_name)
-        table_ids = torch.full_like(ids, table_id, dtype=torch.int64)
-        _, _, _, _, _, founds, _, values = dynamic_module.tables.find(
-            ids, table_ids, CopyMode.EMBEDDING
-        )
-        # pyre-ignore [29]
-        emb_dim = dynamic_module._dynamicemb_options[table_id].dim
-        founds = founds.to(dtype=torch.bool)
-        missing = ~founds
-        if evicted_ids is not None:
-            evicted_mask = torch.isin(ids, evicted_ids)
-            tombstone_ids = ids[missing & evicted_mask]
-            never_admitted = missing & ~evicted_mask
-        else:
-            tombstone_ids = ids[torch.zeros_like(founds)]
-            never_admitted = missing
-        if bool(never_admitted.any().item()):
-            logger.warning(
-                "Skip %s missing dynamic embedding ids for table %s.",
-                int(never_admitted.sum().item()),
-                fqn,
-            )
+        evicted_mask = torch.isin(ids, evicted_ids) if evicted_ids is not None else None
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
         feature_name = _feature_name(self._tracker.fqn_to_feature_names.get(fqn, []))
         num_rows = 0
-        if bool(founds.any().item()):
+        num_never_admitted = 0
+        for start in range(0, ids.numel(), _FIND_BATCH_ROWS):
+            batch_ids = ids[start : start + _FIND_BATCH_ROWS]
+            gpu_ids = batch_ids.to(device=device)
+            table_ids = torch.full_like(gpu_ids, table_id, dtype=torch.int64)
+            _, _, _, _, _, founds, _, values = dynamic_module.tables.find(
+                gpu_ids, table_ids, CopyMode.EMBEDDING
+            )
+            founds = founds.to(dtype=torch.bool)
+            missing = ~founds
+            if evicted_mask is not None:
+                batch_evicted = evicted_mask[start : start + _FIND_BATCH_ROWS]
+                tombstone_ids = gpu_ids[missing & batch_evicted]
+                num_never_admitted += int((missing & ~batch_evicted).sum().item())
+            else:
+                tombstone_ids = gpu_ids.new_empty(0)
+                num_never_admitted += int(missing.sum().item())
             num_rows += self._append_table_chunk(
                 table_chunks,
                 global_step=global_step,
                 feature_name=feature_name,
                 table_fqn=fqn,
-                key_ids=ids[founds],
+                key_ids=gpu_ids[founds],
                 embeddings=values[founds, :emb_dim].detach(),
                 source="model_delta_tracker",
             )
-        num_rows += self._append_tombstone_chunks(
-            table_chunks,
-            global_step=global_step,
-            fqn=fqn,
-            tombstone_ids=tombstone_ids,
-            emb_dim=emb_dim,
-        )
+            num_rows += self._append_tombstone_chunks(
+                table_chunks,
+                global_step=global_step,
+                fqn=fqn,
+                tombstone_ids=tombstone_ids,
+                emb_dim=emb_dim,
+            )
+        if num_never_admitted > 0:
+            logger.warning(
+                "Skip %s missing dynamic embedding ids for table %s.",
+                num_never_admitted,
+                fqn,
+            )
         return num_rows
 
     def _warn_no_retain_table_once(self, table_fqn: str, reason: str) -> None:

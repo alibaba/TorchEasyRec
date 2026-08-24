@@ -189,10 +189,12 @@ class _SharedTableECAndEBCModel(nn.Module):
 
 
 class _FakeDynamicTables:
-    def __init__(self, founds=None, values=None) -> None:
+    def __init__(self, founds=None, values=None, rows=None) -> None:
         self.ids = None
         self.table_ids = None
         self.copy_mode = None
+        self.call_count = 0
+        self._rows = rows
         self._founds = founds if founds is not None else [True, False, True]
         self._values = (
             values
@@ -201,9 +203,26 @@ class _FakeDynamicTables:
         )
 
     def find(self, ids, table_ids, copy_mode):
-        self.ids = ids.detach().clone()
-        self.table_ids = table_ids.detach().clone()
+        self.call_count += 1
+        ids = ids.detach().clone()
+        self.ids = ids if self.ids is None else torch.cat([self.ids, ids])
+        table_ids = table_ids.detach().clone()
+        self.table_ids = (
+            table_ids
+            if self.table_ids is None
+            else torch.cat([self.table_ids, table_ids])
+        )
         self.copy_mode = copy_mode
+        if self._rows is not None:
+            dim = len(next(iter(self._rows.values())))
+            founds = torch.tensor(
+                [int(key.item()) in self._rows for key in ids], device=ids.device
+            )
+            values = torch.tensor(
+                [self._rows.get(int(key.item()), [0.0] * dim) for key in ids],
+                device=ids.device,
+            )
+            return None, None, None, None, None, founds, None, values
         founds = torch.tensor(self._founds, device=ids.device)
         values = torch.tensor(self._values, device=ids.device)
         return None, None, None, None, None, founds, None, values
@@ -2230,12 +2249,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._warned_no_retain_tables = set()
         return dumper
 
-    def _eviction_module(self, evicted_keys, founds, values):
+    def _eviction_module(self, evicted_keys, founds=None, values=None, rows=None):
         table_name = self._DYN_TABLE_FQN.rsplit(".", maxsplit=1)[-1]
         return SimpleNamespace(
             table_names=[table_name],
             _dynamicemb_options=[SimpleNamespace(dim=2)],
-            tables=_FakeDynamicTables(founds=founds, values=values),
+            tables=_FakeDynamicTables(founds=founds, values=values, rows=rows),
             flush=mock.MagicMock(),
             pop_evicted_keys=mock.MagicMock(
                 return_value={table_name: torch.tensor(evicted_keys, dtype=torch.int64)}
@@ -2346,6 +2365,49 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             table["source"].to_pylist(),
             ["model_delta_tracker", "model_delta_tracker", "dynamicemb_evicted"],
         )
+
+    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
+    @mark_ci_scope("gpu")
+    def test_append_dynamic_rows_batches_merged_lookup(self):
+        # Merged set [101, 102, 103, 200] looked up 2 ids per batch: 102 was
+        # tracked then evicted (tombstone), 103 was tracked but never admitted
+        # (one warning across both batches), 200 was evicted then reinserted and
+        # publishes its fresh row from the second batch.
+        torch.cuda.set_device(0)
+        dumper = self._eviction_dumper()
+        dynamic_module = self._eviction_module(
+            [102, 200], rows={101: [1.0, 2.0, 0.0], 200: [5.0, 6.0, 0.0]}
+        )
+        table_chunks = []
+
+        with mock.patch("tzrec.utils.delta_embedding_dump._FIND_BATCH_ROWS", 2):
+            with mock.patch("tzrec.utils.delta_embedding_dump.logger") as log:
+                num_rows = dumper._append_dynamic_rows(
+                    table_chunks,
+                    global_step=5,
+                    fqn=self._DYN_TABLE_FQN,
+                    dynamic_module=dynamic_module,
+                    tracker_ids=torch.tensor([101, 102, 103]),
+                    flushed_module_ids=set(),
+                    dump_evicted_tombstones=True,
+                )
+
+        self.assertEqual(dynamic_module.tables.call_count, 2)
+        torch.testing.assert_close(
+            dynamic_module.tables.ids.cpu(), torch.tensor([101, 102, 103, 200])
+        )
+        self.assertEqual(num_rows, 3)
+        table = pa.concat_tables(table_chunks)
+        self.assertEqual(table["key_id"].to_pylist(), [101, 102, 200])
+        self.assertEqual(
+            table["embedding"].to_pylist(), [[1.0, 2.0], [0.0, 0.0], [5.0, 6.0]]
+        )
+        self.assertEqual(
+            table["source"].to_pylist(),
+            ["model_delta_tracker", "dynamicemb_evicted", "model_delta_tracker"],
+        )
+        self.assertEqual(log.warning.call_count, 1)
 
     def test_pop_evicted_key_ids_warns_on_discard_and_old_builds(self):
         dumper = self._eviction_dumper()
