@@ -379,6 +379,16 @@ feature_configs {
 
 - **value_dim**: 默认值是0，value_dim=0时支持多值ID输出
 
+- **fg_value_type**: 表达式的计算与输出类型，默认是`float`，可选`double` / `int32` / `int64`。
+  需要精确的整数输出（如0/1的Mask）时配置为`int64`。注意`int`类型不能与`boundaries`或
+  `hash_bucket_size`同时使用（FG会先把值截断成整数，分桶结果不符合预期），配置了会报错
+
+- **num_buckets**: 表达式输出为整数ID时的ID数目，ID取值范围为\[0, num_buckets)，配置后
+  `fg_value_type`默认为`int64`
+
+- **hash_bucket_size**: 对表达式输出做Hash分桶的桶数目，Hash基于字符串值计算，
+  故只能与浮点类型的`fg_value_type`一起使用
+
 - **内置函数**: 详见[表达式文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/built-in-feature-operator?#1d09c2da3aajb)
 
   | 函数名      | 参数数量 | 解释                                                                    |
@@ -478,6 +488,41 @@ feature_configs {
   | \_e    | Euler's number.      | 2.718281828459045235360287 |
 
 - 其余配置同RawFeature
+
+- **序列Mask用法**: 表达式特征可以作为序列的Mask，配合下文的BoolMaskFeature
+  筛选出序列中符合条件的元素，如只保留与目标物品同类目的点击序列。Mask特征只作为FG的中间结果，
+  需配置`stub_type: true`，并用`fg_value_type: "int64"`输出0/1
+
+  ```
+  feature_configs {
+      sequence_feature {
+          sequence_name: "click_seq"
+          sequence_length: 50
+          features {
+              expr_feature {
+                  feature_name: "is_same_cate"
+                  variables: ["item:cate", "item:tgt_cate"]
+                  sequence_fields: ["cate"]
+                  expression: "cate == tgt_cate"
+                  fg_value_type: "int64"
+                  stub_type: true
+              }
+          }
+          features {
+              bool_mask_feature {
+                  feature_name: "masked_iid"
+                  expression: ["item:iid", "feature:click_seq__is_same_cate"]
+                  embedding_dim: 16
+                  num_buckets: 1000
+              }
+          }
+      }
+  }
+  ```
+
+  其中`sequence_fields`指定表达式中的哪些字段是序列字段，未指定的item侧字段（如目标物品的
+  `tgt_cate`）为单值。BoolMaskFeature通过`feature:<sequence_name>__<feature_name>`
+  引用Mask特征。该用法需要`data_config.fg_mode`为`FG_DAG`
 
 ## OverlapFeature: 重合匹配特征
 

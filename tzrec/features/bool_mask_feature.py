@@ -56,6 +56,7 @@ class BoolMaskFeature(IdFeature):
             "feature_name": self.config.feature_name,
             "default_value": self.default_value,
             "expression": list(self.config.expression),
+            "value_type": "string",
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
@@ -74,10 +75,7 @@ class BoolMaskFeature(IdFeature):
             fg_cfg["default_bucketize_value"] = self.default_bucketize_value
         elif self.config.HasField("num_buckets"):
             fg_cfg["num_buckets"] = self.config.num_buckets
-        if self.config.HasField("value_dim"):
-            fg_cfg["value_dim"] = self.config.value_dim
-        else:
-            fg_cfg["value_dim"] = 0
+        fg_cfg["value_dim"] = self.value_dim
         if self.config.HasField("fg_value_type"):
             fg_cfg["value_type"] = self.config.fg_value_type
         if self.config.HasField("stub_type"):
