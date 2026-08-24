@@ -17,7 +17,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 
 from tzrec.features.feature import BaseFeature, FgMode, create_features
 from tzrec.prompt.assembler import PromptAssembler
-from tzrec.prompt.plan import CompiledPrompt
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import feature_pb2
 
 

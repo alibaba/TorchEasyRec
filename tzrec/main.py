@@ -74,7 +74,7 @@ from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.persist import check_prompt_assets, copy_prompt_assets
-from tzrec.prompt.plan import CompiledPrompt
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import export_pb2
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig

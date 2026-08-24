@@ -64,7 +64,7 @@ class PromptStackIntegrationTest(unittest.TestCase):
 
     def _model(self):
         model_config = ModelConfig()
-        qwen = model_config.prompt_generative_qwen
+        qwen = model_config.genrec_causal_lm_model
         qwen.hf_model_name_or_path = self.backbone
         qwen.common.beam_widths.extend([2, 2, 2])
         qwen.common.num_return_sequences = 2

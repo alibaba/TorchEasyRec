@@ -1,11 +1,11 @@
 syntax = "proto2";
 package tzrec.protos;
 
-// Prompt-native generative recommendation models. Everything about the prompt
+// Generative recommendation models. Everything about the prompt
 // itself -- template, slots, SID space, tokenizer -- lives in prompt_config;
 // these messages carry only what belongs to the LM.
 
-message PromptModelConfig {
+message GenrecModelConfig {
     // Nested so it does not collide with another model's dtype enum: proto2
     // enum values are siblings of their enclosing scope.
     enum ParamDtype {
@@ -30,9 +30,10 @@ message PromptModelConfig {
     optional ParamDtype lm_parameter_dtype = 5 [default = FP32];
 }
 
-// Qwen family (Qwen2.5, Qwen3, ...).
-message PromptGenerativeQwen {
-    optional PromptModelConfig common = 1;
+// Decoder-only HF causal LM. hf_model_name_or_path names the family; only
+// Qwen2.5/Qwen3 are covered by CI.
+message GenrecCausalLMModel {
+    optional GenrecModelConfig common = 1;
 
     // HF hub id or local path. Names the architecture used for every model build
     // and the weights loaded by init_from_pretrained at cold start; the vocabulary

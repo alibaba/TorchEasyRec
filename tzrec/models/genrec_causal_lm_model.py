@@ -9,15 +9,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Decoder-only forward and decode over a Qwen backbone.
+"""Decoder-only forward and decode over an HF causal LM.
 
-Shared causal-LM plumbing is in ``BasePromptGenerativeModel``. This subclass
+Shared causal-LM plumbing is in ``BaseGenrecModel``. This subclass
 reaches past ``lm(...)`` into ``lm.model`` and ``lm.lm_head`` so logits are
 materialized for a suffix window only, and it decodes by prefilling once and
 stepping a self-attention cache.
 
-This implementation targets the Qwen HuggingFace module and cache interfaces;
-other causal-LM families need their own compatibility verification.
+The required HF interfaces are checked in ``init_backbone``; a backbone on the
+legacy tuple cache is not supported, and Qwen2.5/Qwen3 are what CI covers.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,7 +26,7 @@ import torch
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.prompt_generative_model import BasePromptGenerativeModel
+from tzrec.models.genrec_model import BaseGenrecModel
 from tzrec.modules.dynamic_beam import _capped_beam_widths, dynamic_beam_search
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS,
@@ -34,13 +34,13 @@ from tzrec.prompt.assembler import (
     PROMPT_MAX_SEQLEN,
     PROMPT_RESPONSE_LENGTHS,
 )
-from tzrec.prompt.plan import CompiledPrompt
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models.prompt_model_pb2 import PromptModelConfig
+from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
 
 
-class PromptGenerativeQwen(BasePromptGenerativeModel):
-    """Qwen family (Qwen2.5, Qwen3, ...) driven by a compiled prompt.
+class GenrecCausalLMModel(BaseGenrecModel):
+    """An HF causal LM driven by a compiled prompt.
 
     Args:
         model_config: the model oneof.
@@ -72,7 +72,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
         self._generated_sids_key = common.generated_sids_key
         self._read_beam_config(common)
 
-    def _read_beam_config(self, common: PromptModelConfig) -> None:
+    def _read_beam_config(self, common: GenrecModelConfig) -> None:
         """Parse the decode knobs; the schedule must match the codebook.
 
         Args:
@@ -227,7 +227,7 @@ class PromptGenerativeQwen(BasePromptGenerativeModel):
 
 @torch.fx.wrap
 def _fx_wrapped_loss(
-    model: "PromptGenerativeQwen", embeds: torch.Tensor, batch: Batch
+    model: "GenrecCausalLMModel", embeds: torch.Tensor, batch: Batch
 ) -> Dict[str, torch.Tensor]:
     """Hide the padded forward from FX.
 
@@ -248,7 +248,7 @@ def _fx_wrapped_loss(
 
 @torch.fx.wrap
 def _fx_wrapped_generate(
-    model: "PromptGenerativeQwen", embeds: torch.Tensor, batch: Batch
+    model: "GenrecCausalLMModel", embeds: torch.Tensor, batch: Batch
 ) -> torch.Tensor:
     """Hide the decode loop from FX.
 

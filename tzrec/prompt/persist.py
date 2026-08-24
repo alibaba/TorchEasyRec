@@ -24,7 +24,7 @@ import shutil
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from tzrec.prompt.plan import CompiledPrompt
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.utils.logging_util import logger
 
 PROMPT_DIR = "prompt"

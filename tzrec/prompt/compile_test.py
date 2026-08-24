@@ -18,7 +18,7 @@ from tokenizers import Tokenizer
 
 from tzrec.features.feature import FgMode, create_features
 from tzrec.prompt.compile import compile_prompt
-from tzrec.prompt.plan import FillMode, SlotSeg, Static, WidthKind
+from tzrec.prompt.types import FillMode, SlotSeg, Static, WidthKind
 from tzrec.protos import feature_pb2
 from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.tests.prompt_test_util import (

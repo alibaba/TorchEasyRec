@@ -9,14 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared causal-LM plumbing for prompt-native generative models.
+"""Shared causal-LM plumbing for generative recommendation models.
 
 This layer builds an empty causal LM, resizes its vocabulary, wires slot
 projections, converts SID coordinate systems and implements checkpoint hooks.
 A family subclass owns its forward and decode path.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torchmetrics
@@ -33,19 +33,29 @@ from tzrec.prompt.assembler import (
     PROMPT_INPUT_IDS,
 )
 from tzrec.prompt.persist import save_prompt_assets
-from tzrec.prompt.plan import CompiledPrompt
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models.prompt_model_pb2 import PromptModelConfig
+from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
 from tzrec.utils.logging_util import logger
 
 _PARAM_DTYPE: Dict[int, torch.dtype] = {
-    PromptModelConfig.FP32: torch.float32,
-    PromptModelConfig.BF16: torch.bfloat16,
-    PromptModelConfig.FP16: torch.float16,
+    GenrecModelConfig.FP32: torch.float32,
+    GenrecModelConfig.BF16: torch.bfloat16,
+    GenrecModelConfig.FP16: torch.float16,
 }
 
+# The forward and the banded decode reach past lm(...) into these directly, so a
+# backbone missing any of them fails deep in HF rather than at build time.
+_REQUIRED_LM_ATTRS: Tuple[str, ...] = (
+    "model",
+    "lm_head",
+    "loss_function",
+    "get_input_embeddings",
+    "resize_token_embeddings",
+)
 
-class BasePromptGenerativeModel(BaseModel):
+
+class BaseGenrecModel(BaseModel):
     """An HF backbone driven by a compiled prompt.
 
     Args:
@@ -80,9 +90,8 @@ class BasePromptGenerativeModel(BaseModel):
         self._prompt = compiled_prompt
         cfg = self._model_config
 
-        self.lm = self._build_backbone(
-            cfg.hf_model_name_or_path, cfg.common.lm_parameter_dtype
-        )
+        self.lm: nn.Module
+        self.init_backbone(cfg.hf_model_name_or_path, cfg.common.lm_parameter_dtype)
         # Every run replaces this initialization from pretrained or DCP weights.
         self.lm.resize_token_embeddings(
             compiled_prompt.sid_space.target_vocab_size, mean_resizing=False
@@ -101,26 +110,47 @@ class BasePromptGenerativeModel(BaseModel):
         self.embedding_group = EmbeddingGroup(
             self._features, list(self._prompt.projection_plan.feature_groups)
         )
-        self._build_projections()
+        self.init_projections()
 
-    def _build_backbone(
+    def init_backbone(
         self, hf_model_name_or_path: str, lm_parameter_dtype: int
-    ) -> nn.Module:
-        """Build the LM from config, so HF weights load only on cold start.
+    ) -> None:
+        """Assign ``self.lm`` from config, so HF weights load only on cold start.
 
         Args:
             hf_model_name_or_path: hub id or local directory naming the
                 architecture and cold-start weights.
             lm_parameter_dtype: dtype of the LM parameters.
-
-        Returns:
-            A randomly initialized backbone with the requested parameter dtype.
         """
         config = AutoConfig.from_pretrained(hf_model_name_or_path)
         model = AutoModelForCausalLM.from_config(config)
-        return model.to(_PARAM_DTYPE[lm_parameter_dtype])
+        self.lm = model.to(_PARAM_DTYPE[lm_parameter_dtype])
+        self._check_backbone_interfaces(hf_model_name_or_path)
 
-    def _build_projections(self) -> None:
+    def _check_backbone_interfaces(self, hf_model_name_or_path: str) -> None:
+        """Reject a backbone this model cannot drive.
+
+        Args:
+            hf_model_name_or_path: what named the architecture, for the message.
+
+        Raises:
+            ValueError: the backbone lacks an interface the forward or the
+                banded decode reaches for.
+        """
+        missing = [name for name in _REQUIRED_LM_ATTRS if not hasattr(self.lm, name)]
+        for name in ("vocab_size", "hidden_size"):
+            if not hasattr(self.lm.config, name):
+                missing.append(f"config.{name}")
+        if missing:
+            raise ValueError(
+                f"{type(self).__name__}: {hf_model_name_or_path} builds "
+                f"{type(self.lm).__name__}, which is missing {sorted(missing)}. "
+                f"This model drives the decoder-only layout directly -- see "
+                f"tzrec/modules/dynamic_beam.py -- so a backbone without these "
+                f"cannot be used."
+            )
+
+    def init_projections(self) -> None:
         """One module per resolved id, aligned with ``prompt_plan.projected_slots``.
 
         Slots sharing a ``projection_name`` share a module by reference, so

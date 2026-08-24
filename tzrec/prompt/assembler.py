@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from tzrec.prompt.plan import (
+from tzrec.prompt.types import (
     FillMode,
     PromptPlan,
     ResolvedSidSpace,

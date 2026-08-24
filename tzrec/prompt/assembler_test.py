@@ -14,7 +14,7 @@ import unittest
 import numpy as np
 
 from tzrec.prompt.assembler import PromptAssembler
-from tzrec.prompt.plan import (
+from tzrec.prompt.types import (
     FillMode,
     PromptPlan,
     ResolvedSidSpace,
@@ -202,7 +202,7 @@ class PromptAssemblerTest(unittest.TestCase):
 
     def test_column_shaped_values_are_flattened(self) -> None:
         # the data parser emits (total, value_dim) for a dense sequence feature
-        from tzrec.prompt.plan import CompiledPrompt, ProjectionPlan
+        from tzrec.prompt.types import CompiledPrompt, ProjectionPlan
 
         plan = _plan((_slot("hist", FillMode.INLINE),))
         compiled_prompt = CompiledPrompt(

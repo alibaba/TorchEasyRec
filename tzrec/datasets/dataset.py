@@ -42,7 +42,7 @@ from tzrec.datasets.utils import (
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.prompt.assembler import PromptAssembler
-from tzrec.prompt.plan import CompiledPrompt, SlotSeg
+from tzrec.prompt.types import CompiledPrompt, SlotSeg
 from tzrec.protos import data_pb2
 from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta

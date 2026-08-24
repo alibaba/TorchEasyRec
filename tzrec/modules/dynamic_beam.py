@@ -44,7 +44,8 @@ def dynamic_beam_search(
     """Decode SID answers with a caller-supplied per-level beam width.
 
     Args:
-        model: an HF causal LM exposing ``.model`` / ``.lm_head`` (Qwen layout).
+        model: an HF causal LM exposing ``.model`` / ``.lm_head`` and the modern
+            ``Cache`` protocol; a legacy tuple cache is not supported.
         prompt_embeds: left-padded prompt embeddings ``(B, P, D)``. Embeddings
             rather than ids, because a projected slot has no vocabulary id.
         attention_mask: prompt mask ``(B, P)``.

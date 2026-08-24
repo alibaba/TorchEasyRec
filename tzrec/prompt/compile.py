@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from tokenizers import Tokenizer
 
 from tzrec.features.feature import BaseFeature
-from tzrec.prompt.plan import (
+from tzrec.prompt.types import (
     CompiledPrompt,
     FillMode,
     ProjectionPlan,

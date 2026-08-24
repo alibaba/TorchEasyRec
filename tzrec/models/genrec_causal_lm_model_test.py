@@ -14,7 +14,7 @@ import unittest
 import torch
 
 from tzrec.datasets.utils import Batch
-from tzrec.models.prompt_generative_qwen import PromptGenerativeQwen
+from tzrec.models.genrec_causal_lm_model import GenrecCausalLMModel
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS,
     PROMPT_INPUT_IDS,
@@ -40,7 +40,7 @@ class LeftPadPackedInputsTest(unittest.TestCase):
                 PROMPT_RESPONSE_LENGTHS: response_lengths,
             }
         )
-        model = PromptGenerativeQwen.__new__(PromptGenerativeQwen)
+        model = GenrecCausalLMModel.__new__(GenrecCausalLMModel)
         torch.nn.Module.__init__(model)
         model._ignore_index = ignore
 

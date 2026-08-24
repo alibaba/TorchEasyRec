@@ -21,14 +21,14 @@ from transformers import AutoModelForCausalLM
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.main import _create_model
-from tzrec.models.prompt_generative_model import _PARAM_DTYPE
+from tzrec.models.genrec_model import _PARAM_DTYPE
 from tzrec.prompt.assembler import (
     PROMPT_HOLE_POSITIONS,
     PROMPT_INPUT_IDS,
 )
 from tzrec.prompt.compile import compile_prompt
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models.prompt_model_pb2 import PromptModelConfig
+from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.tests.prompt_test_util import (
     assemble_into,
@@ -58,8 +58,8 @@ def _projected(name: str, dim: int) -> str:
     )
 
 
-class BasePromptGenerativeModelTest(unittest.TestCase):
-    """Shared causal-LM behavior, reached through its concrete Qwen subclass."""
+class BaseGenrecModelTest(unittest.TestCase):
+    """Shared causal-LM behavior, reached through its concrete subclass."""
 
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
@@ -87,14 +87,15 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         beam_widths=(2, 2, 2),
         num_return_sequences=2,
         lm_parameter_dtype=None,
+        hf_model_name_or_path=None,
     ):
         model_config = ModelConfig()
-        qwen = model_config.prompt_generative_qwen
-        qwen.hf_model_name_or_path = self.backbone
-        qwen.common.beam_widths.extend(beam_widths)
-        qwen.common.num_return_sequences = num_return_sequences
+        lm_cfg = model_config.genrec_causal_lm_model
+        lm_cfg.hf_model_name_or_path = hf_model_name_or_path or self.backbone
+        lm_cfg.common.beam_widths.extend(beam_widths)
+        lm_cfg.common.num_return_sequences = num_return_sequences
         if lm_parameter_dtype is not None:
-            qwen.common.lm_parameter_dtype = lm_parameter_dtype
+            lm_cfg.common.lm_parameter_dtype = lm_parameter_dtype
         return _create_model(
             model_config,
             self.features if features is None else features,
@@ -140,6 +141,17 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "declares no sid_space"):
             self._model(compiled_prompt=compiled_prompt)
+
+    def test_rejects_a_backbone_without_the_decoder_only_layout(self) -> None:
+        from transformers import GPT2Config, GPT2LMHeadModel
+
+        backbone = os.path.join(self.test_dir, "gpt2")
+        GPT2LMHeadModel(
+            GPT2Config(n_layer=1, n_head=2, n_embd=32, vocab_size=64)
+        ).save_pretrained(backbone)
+
+        with self.assertRaisesRegex(ValueError, r"missing \['model'\]"):
+            self._model(hf_model_name_or_path=backbone)
 
     def test_shared_projection_name_requires_matching_widths(self) -> None:
         features = [
@@ -208,7 +220,7 @@ class BasePromptGenerativeModelTest(unittest.TestCase):
         self.assertIsNotNone(proj.head.weight.grad)
 
     @parameterized.expand(
-        [[PromptModelConfig.BF16], [PromptModelConfig.FP16]],
+        [[GenrecModelConfig.BF16], [GenrecModelConfig.FP16]],
         name_func=parameterized_name_func,
     )
     def test_projected_slot_follows_a_narrow_lm_dtype(self, lm_parameter_dtype) -> None:
