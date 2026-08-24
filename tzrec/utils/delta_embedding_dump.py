@@ -1250,8 +1250,12 @@ class DeltaEmbeddingDumper:
         ids = ids.unique(sorted=True)
         if ids.numel() == 0:
             return 0
-        evicted_mask = torch.isin(ids, evicted_ids) if evicted_ids is not None else None
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        # find() returns its founds on the lookup device, so keep the mask
+        # there too; a CPU mask & CUDA founds would raise a device mismatch.
+        evicted_mask = (
+            torch.isin(ids, evicted_ids).to(device) if evicted_ids is not None else None
+        )
         feature_name = _feature_name(self._tracker.fqn_to_feature_names.get(fqn, []))
         num_rows = 0
         num_never_admitted = 0
