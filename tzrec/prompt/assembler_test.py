@@ -13,7 +13,13 @@ import unittest
 
 import numpy as np
 
-from tzrec.prompt.assembler import PromptAssembler
+from tzrec.prompt.assembler import (
+    PROMPT_CU_SEQLENS,
+    PROMPT_HOLE_POSITIONS,
+    PROMPT_INPUT_IDS,
+    PROMPT_RESPONSE_LENGTHS,
+    PromptAssembler,
+)
 from tzrec.prompt.types import (
     FillMode,
     PromptPlan,
@@ -94,15 +100,33 @@ def _plan(segments, response=(), max_length=0) -> PromptPlan:
     )
 
 
+def _parsed(inline=None, projected=None) -> dict:
+    """Build parsed features the way DataParser emits them.
+
+    Args:
+        inline: INLINE slot name to its per-sample value arrays.
+        projected: PROJECTED slot name to its per-sample position counts.
+    """
+    out = {}
+    for name, rows in (inline or {}).items():
+        out[f"{name}.values"] = (
+            np.concatenate(rows) if rows else np.zeros(0, dtype=np.int64)
+        )
+        out[f"{name}.lengths"] = np.asarray([len(row) for row in rows])
+    for name, lengths in (projected or {}).items():
+        out[f"{name}.lengths"] = np.asarray(lengths)
+    return out
+
+
 class PromptAssemblerTest(unittest.TestCase):
     def test_inline_sid_gets_the_base_vocab_shift(self) -> None:
         plan = _plan((Static((7, 8)), _slot("hist", FillMode.INLINE)))
         asm = PromptAssembler(plan, _sid_space())
         # offset codes for one item: level 0 -> 1, level 1 -> 4+2, level 2 -> 8+3
-        out = asm.assemble({"hist": [np.array([1, 6, 11])]})
+        out = asm.assemble(_parsed({"hist": [np.array([1, 6, 11])]}))
 
         self.assertEqual(
-            out.input_ids.tolist(),
+            out[PROMPT_INPUT_IDS].tolist(),
             [
                 7,
                 8,
@@ -111,22 +135,22 @@ class PromptAssemblerTest(unittest.TestCase):
                 _BASE_VOCAB_SIZE + 11,
             ],
         )
-        self.assertEqual(out.cu_seqlens.tolist(), [0, 5])
-        self.assertEqual(out.hole_positions.size, 0)
+        self.assertEqual(out[PROMPT_CU_SEQLENS].tolist(), [0, 5])
+        self.assertEqual(out[PROMPT_HOLE_POSITIONS].size, 0)
 
     def test_projected_emits_sentinels_and_records_holes(self) -> None:
         plan = _plan((Static((7,)), _slot("prof", FillMode.PROJECTED, 4)))
         asm = PromptAssembler(plan, _sid_space())
-        out = asm.assemble({}, {"prof": np.array([2, 3])}, batch_size=2)
+        out = asm.assemble(_parsed(projected={"prof": [2, 3]}))
 
         # sample 0: [7, S, S]   sample 1: [7, S, S, S]
         self.assertEqual(
-            out.input_ids.tolist(),
+            out[PROMPT_INPUT_IDS].tolist(),
             [7, _SENTINEL, _SENTINEL, 7, _SENTINEL, _SENTINEL, _SENTINEL],
         )
-        self.assertEqual(out.cu_seqlens.tolist(), [0, 3, 7])
+        self.assertEqual(out[PROMPT_CU_SEQLENS].tolist(), [0, 3, 7])
         # absolute indices into the flat buffer, which is what index_copy needs
-        self.assertEqual(out.hole_positions.tolist(), [1, 2, 4, 5, 6])
+        self.assertEqual(out[PROMPT_HOLE_POSITIONS].tolist(), [1, 2, 4, 5, 6])
 
     def test_holes_are_grouped_by_projected_occurrence_then_sample(self) -> None:
         plan = _plan(
@@ -138,67 +162,73 @@ class PromptAssemblerTest(unittest.TestCase):
             )
         )
         asm = PromptAssembler(plan, _sid_space())
-        out = asm.assemble(
-            {},
-            {"a": np.array([1, 2]), "b": np.array([2, 1])},
-            batch_size=2,
-        )
+        out = asm.assemble(_parsed(projected={"a": [1, 2], "b": [2, 1]}))
 
-        self.assertEqual(out.cu_seqlens.tolist(), [0, 5, 11])
-        self.assertEqual(out.hole_positions.tolist(), [0, 5, 6, 2, 3, 8, 4, 9, 10])
+        self.assertEqual(out[PROMPT_CU_SEQLENS].tolist(), [0, 5, 11])
+        self.assertEqual(
+            out[PROMPT_HOLE_POSITIONS].tolist(), [0, 5, 6, 2, 3, 8, 4, 9, 10]
+        )
 
     def test_response_is_optional_and_its_length_is_recorded(self) -> None:
         plan = _plan(
-            (Static((7, 8)),),
+            (Static((7,)), _slot("hist", FillMode.INLINE)),
             response=(Static((9,)), _slot("answer", FillMode.INLINE)),
         )
-        asm = PromptAssembler(plan, _sid_space())
-        out = asm.assemble({"answer": [np.array([0, 4, 8])]})
+        parsed = _parsed(
+            {"hist": [np.array([1, 6, 11])], "answer": [np.array([0, 4, 8])]}
+        )
+        out = PromptAssembler(plan, _sid_space()).assemble(parsed)
 
         self.assertEqual(
-            out.input_ids.tolist(),
+            out[PROMPT_INPUT_IDS].tolist(),
             [
                 7,
-                8,
+                _BASE_VOCAB_SIZE + 1,
+                _BASE_VOCAB_SIZE + 6,
+                _BASE_VOCAB_SIZE + 11,
                 9,
                 _BASE_VOCAB_SIZE,
                 _BASE_VOCAB_SIZE + 4,
                 _BASE_VOCAB_SIZE + 8,
             ],
         )
-        self.assertEqual(out.response_lengths.tolist(), [4])
+        self.assertEqual(out[PROMPT_RESPONSE_LENGTHS].tolist(), [4])
 
+        # at predict the response is dropped, and with it the answer column
         prompt_only = PromptAssembler(
             plan, _sid_space(), include_response=False
-        ).assemble({}, batch_size=1)
-        self.assertEqual(prompt_only.input_ids.tolist(), [7, 8])
-        self.assertEqual(prompt_only.response_lengths.tolist(), [0])
+        ).assemble(_parsed({"hist": [np.array([1, 6, 11])]}))
+        self.assertEqual(
+            prompt_only[PROMPT_INPUT_IDS].tolist(),
+            [7, _BASE_VOCAB_SIZE + 1, _BASE_VOCAB_SIZE + 6, _BASE_VOCAB_SIZE + 11],
+        )
+        self.assertEqual(prompt_only[PROMPT_RESPONSE_LENGTHS].tolist(), [0])
 
     def test_rejects_raw_codes_that_carry_no_offset(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
         asm = PromptAssembler(plan, _sid_space())
         # [1, 2, 3] is a valid raw SID but level 1 and 2 are below their bands
         with self.assertRaisesRegex(ValueError, "offset_codebook column"):
-            asm.assemble({"hist": [np.array([1, 2, 3])]})
+            asm.assemble(_parsed({"hist": [np.array([1, 2, 3])]}))
 
     def test_rejects_a_partial_item(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
         asm = PromptAssembler(plan, _sid_space())
         with self.assertRaisesRegex(ValueError, "whole number of 3-level items"):
-            asm.assemble({"hist": [np.array([1, 6])]})
+            asm.assemble(_parsed({"hist": [np.array([1, 6])]}))
 
     def test_rejects_an_out_of_band_code(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
         asm = PromptAssembler(plan, _sid_space())
         # level 2 admits [8, 12); 12 is the first value past it
         with self.assertRaisesRegex(ValueError, "offset_codebook column"):
-            asm.assemble({"hist": [np.array([1, 6, 12])]})
+            asm.assemble(_parsed({"hist": [np.array([1, 6, 12])]}))
 
     def test_over_long_row_is_an_error_not_a_truncation(self) -> None:
         plan = _plan((Static((7, 8, 9)), _slot("hist", FillMode.INLINE)), max_length=4)
         asm = PromptAssembler(plan, _sid_space())
         with self.assertRaisesRegex(ValueError, "never truncated"):
-            asm.assemble({"hist": [np.array([1, 6, 11])]})
+            asm.assemble(_parsed({"hist": [np.array([1, 6, 11])]}))
 
     def test_inline_without_a_sid_space_is_rejected_at_construction(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
@@ -243,7 +273,7 @@ class PromptAssemblerTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, r"prompt slot \[answer\] has 2 samples, expected 1"
         ):
-            asm.assemble_batch(parsed)
+            asm.assemble(parsed)
 
     def test_rejects_mismatched_projected_member_lengths(self) -> None:
         plan = _plan(
@@ -266,7 +296,7 @@ class PromptAssemblerTest(unittest.TestCase):
             ValueError,
             r"PROJECTED features \[age\] and \[country\] have different",
         ):
-            asm.assemble_batch(parsed)
+            asm.assemble(parsed)
 
     def test_deep_projected_members_emit_one_hole_per_sample(self) -> None:
         plan = _plan(
@@ -280,7 +310,7 @@ class PromptAssemblerTest(unittest.TestCase):
             )
         )
         asm = PromptAssembler(plan, _sid_space())
-        out = asm.assemble_batch(
+        out = asm.assemble(
             {
                 "dense.values": np.array([[1.0, 2.0], [3.0, 4.0]]),
                 "sparse.values": np.array([5, 6, 7]),

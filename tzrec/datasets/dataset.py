@@ -403,9 +403,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             batch.additional_infos.update(
                 {
                     k: torch.from_numpy(np.asarray(v))
-                    for k, v in self._prompt_assembler.assemble_batch(
-                        output_data
-                    ).items()
+                    for k, v in self._prompt_assembler.assemble(output_data).items()
                 }
             )
 

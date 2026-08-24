@@ -17,7 +17,7 @@ same walk is portable to an online C++/Java processor.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -63,6 +63,19 @@ class AssembledPrompt:
         return int(np.max(np.diff(self.cu_seqlens)))
 
 
+def _run_positions(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Absolute positions of concatenated variable-length runs.
+
+    Run i occupies ``lengths[i]`` positions from ``starts[i]``; the result is
+    every position, runs back to back.
+    """
+    total = int(lengths.sum())
+    within = np.arange(total, dtype=np.int64) - np.repeat(
+        np.cumsum(lengths) - lengths, lengths
+    )
+    return np.repeat(starts, lengths) + within
+
+
 class PromptAssembler:
     """Walks a ``PromptPlan`` to build token streams.
 
@@ -100,7 +113,11 @@ class PromptAssembler:
             )
 
     def _inline_tokens(
-        self, name: str, values: np.ndarray, exact_width: Optional[int] = None
+        self,
+        name: str,
+        flat: np.ndarray,
+        lengths: np.ndarray,
+        exact_width: Optional[int] = None,
     ) -> np.ndarray:
         """Validate offset SID codes against their bands and shift to token ids.
 
@@ -109,24 +126,32 @@ class PromptAssembler:
 
         Args:
             name: the slot, for the message.
-            values: the slot's offset SID codes for one sample.
-            exact_width: required position count, for a slot whose width is
-                fixed at compile time; any whole number of items otherwise.
+            flat: the slot's offset SID codes for the whole batch.
+            lengths: per-sample position counts into ``flat``.
+            exact_width: required position count, for the response; any whole
+                number of items otherwise.
         """
         assert self._sid_space is not None
         levels = self._sid_space.num_levels
-        if values.size % levels:
+        partial = np.nonzero(lengths % levels)[0]
+        if partial.size:
+            sample = int(partial[0])
             raise ValueError(
-                f"prompt slot [{name}]: {values.size} values is not a whole "
-                f"number of {levels}-level items."
+                f"prompt slot [{name}]: sample {sample} has "
+                f"{int(lengths[sample])} values, not a whole number of "
+                f"{levels}-level items."
             )
-        if exact_width is not None and values.size != exact_width:
-            raise ValueError(
-                f"prompt slot [{name}]: {values.size} values, but the compiled "
-                f"width is {exact_width}. The loss window is sized from that "
-                f"width, so a wider row would be supervised only in part."
-            )
-        by_level = values.reshape(-1, levels)
+        if exact_width is not None:
+            wrong = np.nonzero(lengths != exact_width)[0]
+            if wrong.size:
+                sample = int(wrong[0])
+                raise ValueError(
+                    f"prompt slot [{name}]: sample {sample} has "
+                    f"{int(lengths[sample])} values, but the compiled width is "
+                    f"{exact_width}. The loss window is sized from that width, "
+                    f"so a wider row would be supervised only in part."
+                )
+        by_level = flat.reshape(-1, levels)
         if np.any(by_level < self._flat_lo) or np.any(by_level >= self._flat_hi):
             raise ValueError(
                 f"prompt slot [{name}]: SID values must already carry their "
@@ -134,133 +159,97 @@ class PromptAssembler:
                 f"[level_offsets[l], level_offsets[l] + codebook[l]). Read the "
                 f"offset_codebook column, not codebook or origin_codebook."
             )
-        return values.astype(np.int64, copy=False) + self._sid_space.base_vocab_size
+        return flat.astype(np.int64, copy=False) + self._sid_space.base_vocab_size
 
-    def _emit_sample(
+    def _pack(
         self,
-        segments: Sequence[object],
-        sample_index: int,
-        inline_values: Dict[str, List[np.ndarray]],
+        inline_flat: Dict[str, np.ndarray],
+        inline_lengths: Dict[str, np.ndarray],
         projected_lengths: Dict[str, np.ndarray],
-        out: List[int],
-        holes_by_occurrence: List[List[int]],
-        projected_occurrence_index: int,
-        sample_start: int,
-        exact_widths: bool = False,
-    ) -> int:
-        """Append one sample's tokens for one segment list, recording holes.
-
-        ``exact_widths`` holds the response to its compiled width: the loss
-        window is sized from it, so a wider row would be supervised in part.
-        """
-        for seg in segments:
-            if isinstance(seg, Static):
-                out.extend(seg.token_ids)
-                continue
-            assert isinstance(seg, SlotSeg)
-            if seg.fill is FillMode.INLINE:
-                out.extend(
-                    self._inline_tokens(
-                        seg.name,
-                        inline_values[seg.name][sample_index],
-                        exact_width=(seg.width.num_positions if exact_widths else None),
-                    )
-                )
-            else:
-                assert self._sid_space is not None
-                width = int(projected_lengths[seg.name][sample_index])
-                holes_by_occurrence[projected_occurrence_index].extend(
-                    range(
-                        sample_start + len(out),
-                        sample_start + len(out) + width,
-                    )
-                )
-                projected_occurrence_index += 1
-                out.extend([self._sid_space.sentinel_token_id] * width)
-        return projected_occurrence_index
-
-    def assemble(
-        self,
-        inline_values: Dict[str, List[np.ndarray]],
-        projected_lengths: Optional[Dict[str, np.ndarray]] = None,
-        batch_size: Optional[int] = None,
+        batch_size: int,
     ) -> AssembledPrompt:
-        """Assemble one batch.
+        """Pack every sample in one pass over the compiled segments.
+
+        The loop is over segments, which the plan fixes, never over the batch:
+        each segment writes its whole column of the flat buffer at once.
 
         Args:
-            inline_values: INLINE slot name to its per-sample value arrays.
-            projected_lengths: PROJECTED slot name to its per-sample position count.
-            batch_size: sample count; inferred from ``inline_values`` when omitted.
+            inline_flat: INLINE slot name to its batch-wide value stream.
+            inline_lengths: INLINE slot name to its per-sample position counts.
+            projected_lengths: PROJECTED slot name to its per-sample counts.
+            batch_size: sample count.
 
         Returns:
             The packed streams.
         """
-        projected_lengths = projected_lengths or {}
-        if batch_size is None:
-            if not inline_values:
-                raise ValueError("batch_size is required when no INLINE slot exists.")
-            first_inline_values = next(iter(inline_values.values()))
-            batch_size = len(first_inline_values)
+        segments = self._prompt_plan.segments + self._response_segments
+        body_count = len(self._prompt_plan.segments)
 
-        jagged_token_ids: List[int] = []
-        response_lengths: List[int] = []
-        holes_by_occurrence = [
-            []
-            for seg in self._prompt_plan.segments + self._response_segments
-            if isinstance(seg, SlotSeg) and seg.fill is FillMode.PROJECTED
-        ]
-        cu_seqlens = [0]
-        for sample_index in range(batch_size):
-            sample_token_ids: List[int] = []
-            projected_occurrence_index = self._emit_sample(
-                self._prompt_plan.segments,
-                sample_index,
-                inline_values,
-                projected_lengths,
-                sample_token_ids,
-                holes_by_occurrence,
-                0,
-                len(jagged_token_ids),
-            )
-            prompt_len = len(sample_token_ids)
-            self._emit_sample(
-                self._response_segments,
-                sample_index,
-                inline_values,
-                projected_lengths,
-                sample_token_ids,
-                holes_by_occurrence,
-                projected_occurrence_index,
-                len(jagged_token_ids),
-                exact_widths=True,
-            )
-            response_lengths.append(len(sample_token_ids) - prompt_len)
-            if (
-                self._prompt_plan.max_length
-                and len(sample_token_ids) > self._prompt_plan.max_length
-            ):
+        seg_lengths = np.empty((len(segments), batch_size), dtype=np.int64)
+        for index, seg in enumerate(segments):
+            if isinstance(seg, Static):
+                seg_lengths[index] = len(seg.token_ids)
+            elif seg.fill is FillMode.INLINE:
+                seg_lengths[index] = inline_lengths[seg.name]
+            else:
+                seg_lengths[index] = projected_lengths[seg.name]
+
+        row_lengths = seg_lengths.sum(axis=0)
+        cu_seqlens = np.concatenate(([0], np.cumsum(row_lengths))).astype(np.int64)
+        max_length = self._prompt_plan.max_length
+        if max_length:
+            over = np.nonzero(row_lengths > max_length)[0]
+            if over.size:
+                sample = int(over[0])
                 raise ValueError(
-                    f"assembled sample {sample_index} is "
-                    f"{len(sample_token_ids)} tokens, over "
-                    f"max_length {self._prompt_plan.max_length}. Samples are "
-                    f"never truncated: cap the source features instead."
+                    f"assembled sample {sample} is {int(row_lengths[sample])} "
+                    f"tokens, over max_length {max_length}. Samples are never "
+                    f"truncated: cap the source features instead."
                 )
-            jagged_token_ids.extend(sample_token_ids)
-            cu_seqlens.append(len(jagged_token_ids))
 
-        holes = [
-            position
-            for occurrence_positions in holes_by_occurrence
-            for position in occurrence_positions
-        ]
+        # row start plus the exclusive prefix sum down the segment axis
+        seg_starts = cu_seqlens[:-1] + (np.cumsum(seg_lengths, axis=0) - seg_lengths)
+
+        input_ids = np.empty(int(cu_seqlens[-1]), dtype=np.int64)
+        holes: List[np.ndarray] = []
+        for index, seg in enumerate(segments):
+            lengths = seg_lengths[index]
+            destinations = _run_positions(seg_starts[index], lengths)
+            if isinstance(seg, Static):
+                input_ids[destinations] = np.tile(
+                    np.asarray(seg.token_ids, dtype=np.int64), batch_size
+                )
+            elif seg.fill is FillMode.INLINE:
+                input_ids[destinations] = self._inline_tokens(
+                    seg.name,
+                    inline_flat[seg.name],
+                    lengths,
+                    exact_width=(
+                        seg.width.num_positions if index >= body_count else None
+                    ),
+                )
+            else:
+                assert self._sid_space is not None
+                input_ids[destinations] = self._sid_space.sentinel_token_id
+                holes.append(destinations)
+
+        response_lengths = (
+            seg_lengths[body_count:].sum(axis=0)
+            if body_count < len(segments)
+            else np.zeros(batch_size, dtype=np.int64)
+        )
         return AssembledPrompt(
-            input_ids=np.asarray(jagged_token_ids, dtype=np.int64),
-            cu_seqlens=np.asarray(cu_seqlens, dtype=np.int64),
-            hole_positions=np.asarray(holes, dtype=np.int64),
-            response_lengths=np.asarray(response_lengths, dtype=np.int64),
+            input_ids=input_ids,
+            cu_seqlens=cu_seqlens,
+            # occurrence-major then sample-major: the model concatenates the
+            # projected embeddings in projected_slots order
+            hole_positions=(
+                np.concatenate(holes) if holes else np.empty(0, dtype=np.int64)
+            ),
+            response_lengths=response_lengths.astype(np.int64),
         )
 
-    def assemble_batch(
+    def assemble(
         self, parsed_features: Dict[str, "np.ndarray"]
     ) -> Dict[str, np.ndarray]:
         """Reshape one parsed batch, assemble it, and key it for the batch.
@@ -272,7 +261,8 @@ class PromptAssembler:
         Returns:
             The five streams, keyed as ``additional_infos`` expects them.
         """
-        inline_values: Dict[str, List[np.ndarray]] = {}
+        inline_flat: Dict[str, np.ndarray] = {}
+        inline_lengths: Dict[str, np.ndarray] = {}
         projected_lengths: Dict[str, np.ndarray] = {}
         batch_size: Optional[int] = None
         for seg in self._prompt_plan.segments + self._response_segments:
@@ -306,11 +296,10 @@ class PromptAssembler:
                 source, lengths = member_lengths[0]
                 # a dense sequence feature emits (total, value_dim); the stream
                 # is one code per position, so value_dim is always 1 here
-                flat = np.asarray(parsed_features[f"{source}.values"]).reshape(-1)
-                bounds = np.concatenate(([0], np.cumsum(lengths)))
-                inline_values[seg.name] = [
-                    flat[bounds[i] : bounds[i + 1]] for i in range(lengths.size)
-                ]
+                inline_flat[seg.name] = np.asarray(
+                    parsed_features[f"{source}.values"]
+                ).reshape(-1)
+                inline_lengths[seg.name] = np.asarray(lengths, dtype=np.int64)
             elif seg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
                 source, lengths = member_lengths[0]
                 for other_source, other_lengths in member_lengths[1:]:
@@ -325,10 +314,11 @@ class PromptAssembler:
                 assert batch_size is not None
                 projected_lengths[seg.name] = np.ones(batch_size, dtype=np.int64)
 
-        out = self.assemble(
-            inline_values,
+        out = self._pack(
+            inline_flat,
+            inline_lengths,
             projected_lengths,
-            batch_size=batch_size if batch_size is not None else 0,
+            batch_size if batch_size is not None else 0,
         )
         return {
             PROMPT_INPUT_IDS: out.input_ids,

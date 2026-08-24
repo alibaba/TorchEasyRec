@@ -85,4 +85,4 @@ def assemble_into(
     """
     return PromptAssembler(
         compiled_prompt.prompt_plan, compiled_prompt.sid_space
-    ).assemble_batch(parsed_features)
+    ).assemble(parsed_features)
