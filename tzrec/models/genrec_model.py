@@ -87,6 +87,12 @@ class BaseGenrecModel(BaseModel):
                 f"{type(self).__name__}: prompt_config declares no sid_space, "
                 f"so there is no SID vocabulary to extend or decode."
             )
+        if compiled_prompt.prompt_plan.logits_suffix_len is None:
+            raise ValueError(
+                f"{type(self).__name__}: the response is unbounded, so the "
+                f"supervised window cannot be sized and predict would retain a "
+                f"full (batch, length, vocab) logits tensor."
+            )
         self._prompt = compiled_prompt
         cfg = self._model_config
 
@@ -232,22 +238,29 @@ class BaseGenrecModel(BaseModel):
         return codes.view(batch_size, -1, space.num_levels)
 
     def init_loss(self) -> None:
-        """No-op: an LM computes its own CE inside ``predict``."""
+        """No-op: the backbone owns the causal-LM loss."""
         return
 
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        """Surface the CE already computed in ``predict``.
+        """Score the response window with the backbone's own causal-LM loss.
 
         Args:
-            predictions: what ``predict`` returned.
+            predictions: the response-window logits and labels.
             batch: the batch, unused.
 
         Returns:
             The named loss.
         """
-        return {"ce_loss": predictions["loss"]}
+        return {
+            "ce_loss": self.lm.loss_function(
+                logits=predictions["logits"],
+                labels=predictions["labels"],
+                vocab_size=self.lm.config.vocab_size,
+                ignore_index=self._ignore_index,
+            )
+        }
 
     def init_metric(self) -> None:
         """Register a mean-CE metric for the eval loop."""
@@ -262,11 +275,12 @@ class BaseGenrecModel(BaseModel):
         """Update the mean-CE metric with this batch's loss.
 
         Args:
-            predictions: what ``predict`` returned.
+            predictions: what ``predict`` returned, unused.
             batch: the batch, unused.
-            losses: the named losses, unused.
+            losses: the named losses the eval loop already computed.
         """
-        self._metric_modules["ce_loss"].update(predictions["loss"].detach())
+        if losses is not None:
+            self._metric_modules["ce_loss"].update(losses["ce_loss"].detach())
 
     def update_train_metric(
         self, predictions: Dict[str, torch.Tensor], batch: Batch

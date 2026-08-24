@@ -18,6 +18,7 @@ import torch.fx
 
 from tzrec.datasets.utils import Batch
 from tzrec.main import _create_model
+from tzrec.models.model import TrainWrapper
 from tzrec.prompt.compile import compile_prompt
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
@@ -98,7 +99,8 @@ class PromptStackIntegrationTest(unittest.TestCase):
     def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
         model = self._model()
         batch = self._batch([0, 1, 2, 3, 0, 1], [1, 2, 3])
-        loss = model.predict(batch)["loss"]
+        predictions = model.predict(batch)
+        loss = model.loss(predictions, batch)["ce_loss"]
         self.assertTrue(bool(torch.isfinite(loss)))
         loss.backward()
 
@@ -108,19 +110,12 @@ class PromptStackIntegrationTest(unittest.TestCase):
 
     def test_training_forward_survives_fx_tracing(self) -> None:
         # TrainPipelineSparseDist symbolically traces the model whenever a
-        # sharded module exists, and the padded forward reads the collator's
-        # width as a host int
+        # sharded module exists. Trace TrainWrapper itself, not predict alone:
+        # it iterates predictions and losses, which a leaf returning a bare
+        # Proxy cannot survive.
         model = self._model()
 
-        class _Wrapper(torch.nn.Module):
-            def __init__(self, inner):
-                super().__init__()
-                self.inner = inner
-
-            def forward(self, batch):
-                return self.inner.predict(batch)
-
-        torch.fx.symbolic_trace(_Wrapper(model))
+        torch.fx.symbolic_trace(TrainWrapper(model))
 
 
 if __name__ == "__main__":

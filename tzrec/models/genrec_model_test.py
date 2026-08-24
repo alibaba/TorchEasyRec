@@ -262,7 +262,8 @@ class BaseGenrecModelTest(unittest.TestCase):
         embeds = model.build_input(batch)
         self.assertIs(embeds.dtype, _PARAM_DTYPE[lm_parameter_dtype])
 
-        loss = model.predict(batch)["loss"]
+        predictions = model.predict(batch)
+        loss = model.loss(predictions, batch)["ce_loss"]
         self.assertTrue(bool(torch.isfinite(loss)))
         loss.backward()
         # the projection keeps fp32 masters, so only the spliced values convert
@@ -281,7 +282,7 @@ class BaseGenrecModelTest(unittest.TestCase):
         model = self._model()
         model.init_metric()
         for value in (1.0, 3.0):
-            model.update_metric({"loss": torch.tensor(value)}, Batch())
+            model.update_metric({}, Batch(), {"ce_loss": torch.tensor(value)})
 
         self.assertAlmostEqual(
             model._metric_modules["ce_loss"].compute().item(), 2.0, places=5

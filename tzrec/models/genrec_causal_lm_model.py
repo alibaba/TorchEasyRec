@@ -117,18 +117,22 @@ class GenrecCausalLMModel(BaseGenrecModel):
             batch: carries the packed prompt in ``additional_infos``.
 
         Returns:
-            The loss when training, the decoded SIDs otherwise.
+            The response-window logits and labels when training, the decoded
+            SIDs otherwise.
         """
         # outside the leaf on both paths, so the pipeline can prefetch it
         embeds = self.build_input(batch)
         if self.is_inference:
             return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
-        return _fx_wrapped_loss(self, embeds, batch)
+        # the leaf returns a tuple: FX cannot iterate a Proxy, and TrainWrapper
+        # iterates whatever predict returns
+        logits, labels = _fx_wrapped_forward(self, embeds, batch)
+        return {"logits": logits, "labels": labels}
 
-    def _forward_loss(
+    def _forward_window(
         self, embeds: torch.Tensor, batch: Batch
-    ) -> Dict[str, torch.Tensor]:
-        """Run the LM over the assembled embeddings and score the response.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the LM over the assembled embeddings and cut the response window.
 
         Body and head are called separately so logits cover the supervised
         window only: a full (batch, length, vocab) upcast does not fit.
@@ -138,23 +142,17 @@ class GenrecCausalLMModel(BaseGenrecModel):
             batch: carries the row boundaries and the collator's width.
 
         Returns:
-            The loss.
+            Logits and labels over the same window, so the shift ``loss``
+            applies lands on the pairs the window was sized for.
         """
         padded, mask, labels = self._left_pad_packed_inputs(
             embeds, batch, build_labels=True
         )
         outputs = self.lm.model(inputs_embeds=padded, attention_mask=mask)
 
-        suffix = self._prompt.prompt_plan.logits_suffix_len
-        window = slice(-suffix, None) if suffix else slice(None)
+        window = slice(-self._prompt.prompt_plan.logits_suffix_len, None)
         logits = self.lm.lm_head(outputs.last_hidden_state[:, window, :])
-        loss = self.lm.loss_function(
-            logits=logits,
-            labels=labels[:, window],
-            vocab_size=self.lm.config.vocab_size,
-            ignore_index=self._ignore_index,
-        )
-        return {"loss": loss}
+        return logits, labels[:, window]
 
     def _generate(self, embeds: torch.Tensor, batch: Batch) -> torch.Tensor:
         """Beam-search the SID answer.
@@ -226,9 +224,9 @@ class GenrecCausalLMModel(BaseGenrecModel):
 
 
 @torch.fx.wrap
-def _fx_wrapped_loss(
+def _fx_wrapped_forward(
     model: "GenrecCausalLMModel", embeds: torch.Tensor, batch: Batch
-) -> Dict[str, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Hide the padded forward from FX.
 
     ``TrainPipelineSparseDist`` symbolically traces the model whenever a
@@ -236,14 +234,14 @@ def _fx_wrapped_loss(
     ``max_seqlen`` as a host int.
 
     Args:
-        model: the model whose loss to compute.
+        model: the model whose response window to compute.
         embeds: the assembled prompt embeddings, packed.
         batch: the batch being scored.
 
     Returns:
-        The loss.
+        The response-window logits and labels.
     """
-    return model._forward_loss(embeds, batch)
+    return model._forward_window(embeds, batch)
 
 
 @torch.fx.wrap
