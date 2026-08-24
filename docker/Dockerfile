@@ -42,6 +42,9 @@ RUN case ${DEVICE} in \
                  rm -f /usr/local/cuda && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
+# torch_tensorrt comes from PyPI, not the pytorch-wheels index: the +cu130 build
+# there ships no C++ runtime, so TorchTensorRTModule falls back to a Python engine
+# object that torch.jit.trace cannot pass to tensorrt::execute_engine.
 RUN case ${DEVICE} in \
         "cu126") pip install torch==2.13.0 -f https://${PIP_MIRROR}/pytorch-wheels/${DEVICE}/ --no-deps && \
                  pip install torch==2.13.0 && \
@@ -57,7 +60,7 @@ RUN case ${DEVICE} in \
                  sed -i -E '/^Requires-Dist: (cuda-toolkit|nvidia-)/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.13.0+cu130.dist-info/METADATA && \
                  pip install fbgemm-gpu==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu130/repo.html && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torch_tensorrt==2.13.0 -f https://${PIP_MIRROR}/pytorch-wheels/cu130/ && \
+                 pip install torch_tensorrt==2.13.0 && \
                  rm -f /opt/conda/lib/python${PYTHON_VERSION}/site-packages/tensorrt_libs/libnvinfer_builder_resource_win_*.so.* && \
                  pip install torchrec==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
