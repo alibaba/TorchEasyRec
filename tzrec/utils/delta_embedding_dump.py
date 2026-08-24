@@ -1251,11 +1251,10 @@ class DeltaEmbeddingDumper:
         if ids.numel() == 0:
             return 0
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        # find() returns its founds on the lookup device, so keep the mask
-        # there too; a CPU mask & CUDA founds would raise a device mismatch.
-        evicted_mask = (
-            torch.isin(ids, evicted_ids).to(device) if evicted_ids is not None else None
-        )
+        # The evicted mask stays on CPU: per-batch tombstone and never-admitted
+        # selections reuse the CPU batch ids, so only the found mask and the
+        # embedding values cross the device boundary.
+        evicted_mask = torch.isin(ids, evicted_ids) if evicted_ids is not None else None
         feature_name = _feature_name(self._tracker.fqn_to_feature_names.get(fqn, []))
         num_rows = 0
         num_never_admitted = 0
@@ -1267,20 +1266,23 @@ class DeltaEmbeddingDumper:
                 gpu_ids, table_ids, CopyMode.EMBEDDING
             )
             founds = founds.to(dtype=torch.bool)
-            missing = ~founds
+            # Only the compact found mask moves D2H; found and tombstone key
+            # ids reuse the CPU batch ids instead of round-tripping GPU ids.
+            founds_cpu = founds.cpu()
+            missing_cpu = ~founds_cpu
             if evicted_mask is not None:
                 batch_evicted = evicted_mask[start : start + _FIND_BATCH_ROWS]
-                tombstone_ids = gpu_ids[missing & batch_evicted]
-                num_never_admitted += int((missing & ~batch_evicted).sum().item())
+                tombstone_ids = batch_ids[missing_cpu & batch_evicted]
+                num_never_admitted += int((missing_cpu & ~batch_evicted).sum())
             else:
-                tombstone_ids = gpu_ids.new_empty(0)
-                num_never_admitted += int(missing.sum().item())
+                tombstone_ids = batch_ids.new_empty(0)
+                num_never_admitted += int(missing_cpu.sum())
             num_rows += self._append_table_chunk(
                 table_chunks,
                 global_step=global_step,
                 feature_name=feature_name,
                 table_fqn=fqn,
-                key_ids=gpu_ids[founds],
+                key_ids=batch_ids[founds_cpu],
                 embeddings=values[founds, :emb_dim].detach(),
                 source="model_delta_tracker",
             )
