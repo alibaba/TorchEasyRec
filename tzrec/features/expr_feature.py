@@ -39,6 +39,28 @@ class ExprFeature(RawFeature):
         self._is_neg = value
         self._data_group = CROSS_NEG_DATA_GROUP
 
+    @property
+    def is_sparse(self) -> bool:
+        """Feature is sparse or dense."""
+        if self._is_sparse is None:
+            self._is_sparse = (
+                self.config.HasField("hash_bucket_size")
+                or self.config.HasField("num_buckets")
+                or len(self.config.boundaries) > 0
+            )
+        return self._is_sparse
+
+    @property
+    def num_embeddings(self) -> int:
+        """Get embedding row count."""
+        if self.config.HasField("hash_bucket_size"):
+            num_embeddings = self.config.hash_bucket_size
+        elif self.config.HasField("num_buckets"):
+            num_embeddings = self.config.num_buckets
+        else:
+            num_embeddings = len(self.config.boundaries) + 1
+        return num_embeddings
+
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
         if len(self.config.variables) > 0:
@@ -60,10 +82,28 @@ class ExprFeature(RawFeature):
             fg_cfg["separator"] = self.config.separator
         if self.config.HasField("fill_missing"):
             fg_cfg["fill_missing"] = self.config.fill_missing
-        if len(self.config.boundaries) > 0:
+        if self.config.HasField("hash_bucket_size"):
+            fg_cfg["hash_bucket_size"] = self.config.hash_bucket_size
+        elif self.config.HasField("num_buckets"):
+            fg_cfg["num_buckets"] = self.config.num_buckets
+            fg_cfg["value_type"] = "int64"
+        elif len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
         if self.config.HasField("value_dim"):
             fg_cfg["value_dim"] = self.config.value_dim
+        elif self.is_sequence:
+            # pyfg requires an explicit value_dim for sequence sub-features
+            # consumed by bool_mask_feature.
+            fg_cfg["value_dim"] = self.value_dim
+        if self.config.HasField("fg_value_type"):
+            assert not self.config.fg_value_type.startswith("int") or (
+                len(self.config.boundaries) == 0
+                and not self.config.HasField("hash_bucket_size")
+            ), (
+                f"expr feature[{self.name}]: int fg_value_type is not supported "
+                "with boundaries or hash_bucket_size."
+            )
+            fg_cfg["value_type"] = self.config.fg_value_type
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
 
