@@ -17,7 +17,6 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import Any, cast
 from unittest import mock
 
 import numpy as np
@@ -26,7 +25,6 @@ from torch import distributed as dist
 from torchrec import KeyedJaggedTensor, KeyedTensor
 from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.modules.embedding_configs import (
-    BaseEmbeddingConfig,
     EmbeddingBagConfig,
     EmbeddingConfig,
 )
@@ -95,11 +93,6 @@ def _dequant_quint8_rowwise_f16(values: np.ndarray, emb_dim: int) -> np.ndarray:
     dequant = q * scale.astype(np.float32).reshape(-1, 1)
     dequant += offset.astype(np.float32).reshape(-1, 1)
     return dequant.astype(np.float16).astype(np.float32)
-
-
-def _fake_table_config(**kwargs: Any) -> BaseEmbeddingConfig:
-    """Structural stand-in for a table config, matching only the fields read."""
-    return cast(BaseEmbeddingConfig, SimpleNamespace(**kwargs))
 
 
 class ExportUtilTest(unittest.TestCase):
@@ -521,7 +514,7 @@ class ExportUtilTest(unittest.TestCase):
                 "embedding_bags.user_id_emb"
             )
             embedding_bag_info = {
-                table_fqn: _fake_table_config(
+                table_fqn: SimpleNamespace(
                     name="user_id_emb",
                     embedding_dim=2,
                     feature_names=["user_id"],
@@ -606,7 +599,7 @@ class ExportUtilTest(unittest.TestCase):
                 "embedding_bags.user_id_emb"
             )
             embedding_bag_info = {
-                table_fqn: _fake_table_config(
+                table_fqn: SimpleNamespace(
                     name="user_id_emb",
                     embedding_dim=2,
                     feature_names=["user_id"],
@@ -694,9 +687,9 @@ class ExportUtilTest(unittest.TestCase):
                     [user_id_config],
                 ),
             )
-            cast(Any, mc_ebc._embedding_module).embedding_bags[
-                "user_id_emb"
-            ].weight.data.copy_(mc_ebc_weight)
+            mc_ebc._embedding_module.embedding_bags["user_id_emb"].weight.data.copy_(
+                mc_ebc_weight
+            )
             _set_mch_state(
                 mc_ebc._managed_collision_collection._managed_collision_modules[
                     "user_id_emb"
@@ -723,7 +716,7 @@ class ExportUtilTest(unittest.TestCase):
                 {"seq_emb": _make_mch(3, DistanceLFU_EvictionPolicy())}, [seq_config]
             ),
         )
-        cast(Any, mc_ec._embedding_module).embeddings["seq_emb"].weight.data.copy_(
+        mc_ec._embedding_module.embeddings["seq_emb"].weight.data.copy_(
             torch.tensor([[4.0, 4.1], [5.0, 5.1], [6.0, 6.1]])
         )
         _set_mch_state(
@@ -758,26 +751,26 @@ class ExportUtilTest(unittest.TestCase):
                     model,
                     tmp,
                     {
-                        zch_ec_fqn: _fake_table_config(
+                        zch_ec_fqn: SimpleNamespace(
                             name="seq_emb",
                             embedding_dim=2,
                             feature_names=["click_seq__cate"],
                         )
                     },
                     {
-                        zch_ebc_fqn: _fake_table_config(
+                        zch_ebc_fqn: SimpleNamespace(
                             name="user_id_emb",
                             embedding_dim=2,
                             feature_names=["user_id"],
                             pooling="SUM",
                         ),
-                        zch_ebc_user_fqn: _fake_table_config(
+                        zch_ebc_user_fqn: SimpleNamespace(
                             name="user_id_emb",
                             embedding_dim=2,
                             feature_names=["user_id"],
                             pooling="SUM",
                         ),
-                        plain_fqn: _fake_table_config(
+                        plain_fqn: SimpleNamespace(
                             name="plain_emb",
                             embedding_dim=2,
                             feature_names=["plain_id"],
@@ -890,9 +883,7 @@ class ExportUtilTest(unittest.TestCase):
                 [mc_ebc_config],
             ),
         )
-        cast(Any, mc_ebc._embedding_module).embedding_bags[
-            "user_id_emb"
-        ].weight.data.copy_(weight)
+        mc_ebc._embedding_module.embedding_bags["user_id_emb"].weight.data.copy_(weight)
         mch = mc_ebc._managed_collision_collection._managed_collision_modules[
             "user_id_emb"
         ]
@@ -920,7 +911,7 @@ class ExportUtilTest(unittest.TestCase):
                 tmp,
                 {},
                 {
-                    table_fqn: _fake_table_config(
+                    table_fqn: SimpleNamespace(
                         name="user_id_emb",
                         embedding_dim=2,
                         feature_names=["user_id"],
@@ -971,9 +962,7 @@ class ExportUtilTest(unittest.TestCase):
                 [mc_ebc_config],
             ),
         )
-        cast(Any, mc_ebc._embedding_module).embedding_bags[
-            "user_id_emb"
-        ].weight.data.copy_(weight)
+        mc_ebc._embedding_module.embedding_bags["user_id_emb"].weight.data.copy_(weight)
         mch = mc_ebc._managed_collision_collection._managed_collision_modules[
             "user_id_emb"
         ]
@@ -1003,7 +992,7 @@ class ExportUtilTest(unittest.TestCase):
                 tmp,
                 {},
                 {
-                    table_fqn: _fake_table_config(
+                    table_fqn: SimpleNamespace(
                         name="user_id_emb",
                         embedding_dim=2,
                         feature_names=["user_id"],
@@ -1073,20 +1062,20 @@ class ExportUtilTest(unittest.TestCase):
                 SparseCollisionModel(),
                 tmp,
                 {
-                    ec_fqn: _fake_table_config(
+                    ec_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["seq_feat"],
                     )
                 },
                 {
-                    ebc_fqn: _fake_table_config(
+                    ebc_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["id_feat"],
                         pooling="SUM",
                     ),
-                    ebc_user_fqn: _fake_table_config(
+                    ebc_user_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["user_feat"],
@@ -1165,20 +1154,20 @@ class ExportUtilTest(unittest.TestCase):
                 SparseCollisionModel(),
                 tmp,
                 {
-                    ec_fqn: _fake_table_config(
+                    ec_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["seq_feat"],
                     )
                 },
                 {
-                    ebc_fqn: _fake_table_config(
+                    ebc_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["id_feat"],
                         pooling="SUM",
                     ),
-                    ebc_user_fqn: _fake_table_config(
+                    ebc_user_fqn: SimpleNamespace(
                         name="shared_emb",
                         embedding_dim=2,
                         feature_names=["user_feat"],
@@ -1243,7 +1232,7 @@ class ExportUtilTest(unittest.TestCase):
                     tmp,
                     {},
                     {
-                        table_fqn: _fake_table_config(
+                        table_fqn: SimpleNamespace(
                             name="user_id_emb",
                             embedding_dim=3,
                             feature_names=["user_id"],
@@ -1846,7 +1835,7 @@ class ExportUtilTest(unittest.TestCase):
         self.assertTrue(ebc.embedding_bags["huge_emb"].weight.is_meta)
         self.assertEqual(ec.embeddings["seq_emb"].weight.shape, (1, 8))
         self.assertEqual(
-            cast(Any, mc_ebc._embedding_module).embedding_bags["zch_emb"].weight.shape,
+            mc_ebc._embedding_module.embedding_bags["zch_emb"].weight.shape,
             (1, 8),
         )
         self.assertEqual(mch._zch_size, 1)
@@ -2124,7 +2113,7 @@ class ExportUtilTest(unittest.TestCase):
                         tables = list(sub.embeddings.values())
                     for table in tables or []:
                         self.assertEqual(
-                            cast(torch.Tensor, table.weight).shape[0],
+                            table.weight.shape[0],
                             1,
                             "sparse table not shrunk before materialization",
                         )

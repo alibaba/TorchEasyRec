@@ -20,7 +20,7 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, cast
+from typing import Any, Callable, Dict, List
 from unittest import mock
 
 import torch
@@ -550,12 +550,12 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     # close() must drain inside the patch: after the fake
                     # releases, the worker still picks up the pending task.
                     with mock.patch.object(mgr, "_run_task", side_effect=fake_run_task):
-                        mgr._enqueue(1, 1.0, cast(Dict[str, torch.Tensor], {"m": "a"}))
+                        mgr._enqueue(1, 1.0, {"m": "a"})
                         self.assertTrue(started.wait(timeout=10))
                         # pending, not yet started
-                        mgr._enqueue(2, 2.0, cast(Dict[str, torch.Tensor], {"m": "b"}))
+                        mgr._enqueue(2, 2.0, {"m": "b"})
                         # supersedes b
-                        mgr._enqueue(3, 3.0, cast(Dict[str, torch.Tensor], {"m": "c"}))
+                        mgr._enqueue(3, 3.0, {"m": "c"})
                         proceed.set()
                         mgr.close()
                 finally:
@@ -751,7 +751,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         def fake_build(self: OnlineDenseExportManager, model: nn.Module) -> List:
             gm = _TinyModel()
             box["gm"] = gm
-            self._gm = cast(torch.fx.GraphModule, gm)
+            self._gm = gm
             self._twin_model = mock.Mock()
             self._full_graph = mock.Mock()
             self._warmup_data = {}

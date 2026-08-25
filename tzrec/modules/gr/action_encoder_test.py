@@ -11,7 +11,6 @@
 
 
 import unittest
-from typing import Any, cast
 
 import torch
 from parameterized import parameterized
@@ -101,7 +100,7 @@ class ActionEncoderTest(unittest.TestCase):
                         if atype in enabled_actions[j - b_start + u_start]:
                             torch.testing.assert_close(
                                 embedding[atype],
-                                cast(Any, encoder._action_embedding_table)[atype],
+                                encoder._action_embedding_table[atype],
                             )
                         else:
                             torch.testing.assert_close(

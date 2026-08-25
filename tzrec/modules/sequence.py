@@ -10,7 +10,7 @@
 # limitations under the License.
 
 
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -296,6 +296,9 @@ class MultiWindowDINEncoder(SequenceEncoder):
         attn_mlp (dict): target attention MLP module parameters.
     """
 
+    windows_len: torch.Tensor
+    cumsum_windows_len: torch.Tensor
+
     def __init__(
         self,
         sequence_dim: int,
@@ -354,11 +357,9 @@ class MultiWindowDINEncoder(SequenceEncoder):
             pad_att_sequences, reduce="sum", lengths=self.windows_len, axis=0
         ).transpose(0, 1)  # [B, L, C]
 
-        windows_len = cast(torch.Tensor, self.windows_len)
-        cumsum_windows_len = cast(torch.Tensor, self.cumsum_windows_len)
         segment_length = torch.min(
-            sequence_length.unsqueeze(1) - cumsum_windows_len.unsqueeze(0),
-            windows_len,
+            sequence_length.unsqueeze(1) - self.cumsum_windows_len.unsqueeze(0),
+            self.windows_len,
         )
         result = result / torch.max(
             segment_length, torch.ones_like(segment_length)

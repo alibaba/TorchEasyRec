@@ -528,6 +528,10 @@ class UnifiedAOTIModelWrapper(nn.Module):
         model (nn.Module): unified AOTInductor compiled model.
     """
 
+    # Set through object.__setattr__, so declare the types here. _lock cannot be
+    # declared: torch.jit.script rejects a threading.Lock annotation.
+    _key_order: Optional[List[str]]
+
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
@@ -554,9 +558,10 @@ class UnifiedAOTIModelWrapper(nn.Module):
         Return:
             predictions (dict): a dict of predicted result.
         """
-        if self._key_order is None:
-            object.__setattr__(self, "_key_order", sorted(data.keys()))
-        key_order = cast(List[str], self._key_order)
+        key_order = self._key_order
+        if key_order is None:
+            key_order = sorted(data.keys())
+            object.__setattr__(self, "_key_order", key_order)
         data = OrderedDict((k, data[k]) for k in key_order)
         # Force CUDA primary context creation on worker threads.
         torch.cuda.set_device(device)

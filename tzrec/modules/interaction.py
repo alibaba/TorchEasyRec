@@ -10,7 +10,7 @@
 # limitations under the License.
 
 
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List
 
 import torch
 from torch import nn
@@ -61,6 +61,8 @@ class InteractionArch(nn.Module):
         feature_num (int): feature_num
     """
 
+    triu_indices: torch.Tensor
+
     def __init__(self, feature_num: int) -> None:
         super().__init__()
         self.feature_num: int = feature_num
@@ -86,8 +88,7 @@ class InteractionArch(nn.Module):
         interactions = torch.bmm(
             features, torch.transpose(features, 1, 2)
         )  # B X (N) X (N)
-        triu_indices = cast(torch.Tensor, self.triu_indices)
-        interactions_flat = interactions[:, triu_indices[0], triu_indices[1]]
+        interactions_flat = interactions[:, self.triu_indices[0], self.triu_indices[1]]
 
         return interactions_flat
 

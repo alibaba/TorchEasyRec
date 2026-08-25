@@ -43,3 +43,21 @@ errors.missing-attribute = false
 errors.bad-argument-type = false
 errors.not-callable = false
 errors.unsupported-operation = false
+
+# Tests stand structural doubles in for real types on purpose: SimpleNamespace for a
+# tracker, a bare Module where a ManagedCollisionModule is declared, a plain Tensor
+# where a Parameter is. Asserting each of those with cast() is ceremony, so the codes
+# that only fire on them are off for test code; every other check stays on.
+[[sub-config]]
+matches = "tzrec/**/*_test.py"
+[sub-config.errors]
+bad-assignment = false
+bad-index = false
+not-iterable = false
+
+[[sub-config]]
+matches = "tzrec/tests/**"
+[sub-config.errors]
+bad-assignment = false
+bad-index = false
+not-iterable = false

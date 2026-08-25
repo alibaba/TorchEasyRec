@@ -17,7 +17,6 @@ import sys
 import time
 import unittest
 import warnings
-from typing import Iterable, cast
 from unittest.runner import TextTestRunner
 from unittest.signals import registerResult
 
@@ -72,7 +71,7 @@ def _gather_test_cases(args):
         test_dir, pattern=args.pattern, top_level_dir=None
     )
     for suite_discovered in discover:
-        for test_case in cast(Iterable[unittest.TestCase], suite_discovered):
+        for test_case in suite_discovered:
             if args.scope is not None:
                 test_case = _filter_in_scope(test_case, args.scope)
                 if test_case.countTestCases() == 0:
@@ -89,7 +88,7 @@ def _gather_test_cases(args):
                 test_suite_subproc.addTest(test_case)
 
             if hasattr(test_case, "__iter__"):
-                for subcase in cast(Iterable[unittest.TestCase], test_case):
+                for subcase in test_case:
                     if args.list_tests:
                         print(subcase)
             else:

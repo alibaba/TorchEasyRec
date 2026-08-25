@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import unittest
-from typing import cast
 
 import torch
 from torch import nn
@@ -27,7 +26,6 @@ from torchrec.modules.mc_embedding_modules import (
 from torchrec.modules.mc_modules import (
     LFU_EvictionPolicy,
     ManagedCollisionCollection,
-    ManagedCollisionModule,
     MCHManagedCollisionModule,
 )
 
@@ -56,9 +54,7 @@ def _build_pooled_zch_model(mch: nn.Module) -> nn.Module:
     model = nn.Module()
     model.mc_ebc = ManagedCollisionEmbeddingBagCollection(
         EmbeddingBagCollection(tables=[table], device=torch.device("meta")),
-        ManagedCollisionCollection(
-            {"user_emb": cast(ManagedCollisionModule, mch)}, [table]
-        ),
+        ManagedCollisionCollection({"user_emb": mch}, [table]),
     )
     return model
 
@@ -75,9 +71,7 @@ def _build_sequence_zch_model(mch: nn.Module) -> nn.Module:
         {
             str(_EMBEDDING_DIM): ManagedCollisionEmbeddingCollection(
                 EmbeddingCollection(tables=[table], device=torch.device("meta")),
-                ManagedCollisionCollection(
-                    {"item_emb": cast(ManagedCollisionModule, mch)}, [table]
-                ),
+                ManagedCollisionCollection({"item_emb": mch}, [table]),
             )
         }
     )
