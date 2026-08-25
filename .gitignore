@@ -46,7 +46,7 @@ docs/source/proto.html
 data/test/kuairand-1k*
 data/test/kuairand-mot-1k*
 
-# graphlearn glog output from tests
+# Test logs of graphlearn sampler
 graphlearn.INFO
 graphlearn.WARNING
 graphlearn.ERROR

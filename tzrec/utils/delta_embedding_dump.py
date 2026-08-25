@@ -14,7 +14,6 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
-    Any,
     Dict,
     Iterable,
     Iterator,
@@ -71,6 +70,12 @@ from tzrec.utils.zch_util import (
 )
 
 _CONSUMER = "delta_embedding_dump"
+# Rows per tombstone chunk: chunks alias one zero buffer of this size so an
+# eviction drain never materializes a single huge zero matrix.
+_TOMBSTONE_CHUNK_ROWS = 65536
+# Rows per merged-lookup batch: caps the find's [batch, dim] GPU values
+# buffer, which would otherwise grow with the dump interval's eviction volume.
+_FIND_BATCH_ROWS = 65536
 _ShardedEmbeddingModule = Union[
     ShardedEmbeddingCollection, ShardedEmbeddingBagCollection
 ]
@@ -162,6 +167,22 @@ def _feature_name(feature_names: Iterable[str]) -> str:
     if len(names) == 1:
         return names[0]
     return ",".join(names)
+
+
+def _dynamicemb_pop_evicted_keys_supported() -> bool:
+    """Return whether dynamicemb tables can report their evicted keys.
+
+    Only used to skip tombstone test coverage on dynamicemb builds without
+    eviction retention; ``dump`` itself degrades to a warning there instead
+    of failing fast, because the tombstone switch defaults to on.
+    """
+    try:
+        from dynamicemb.batched_dynamicemb_tables import (
+            BatchedDynamicEmbeddingTablesV2,
+        )
+    except ImportError:
+        return False
+    return hasattr(BatchedDynamicEmbeddingTablesV2, "pop_evicted_keys")
 
 
 def _metadata_shard_info(metadata: Optional[ShardMetadata]) -> _TableShardInfo:
@@ -663,6 +684,7 @@ class DeltaEmbeddingDumper:
         self._model = model
         self._config = config
         self._quant_type = config.quant_type
+        self._dump_evicted_tombstones = bool(config.dump_evicted_tombstones)
         self._schema = (
             _DELTA_DUMP_QUANT_SCHEMA
             if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
@@ -694,6 +716,7 @@ class DeltaEmbeddingDumper:
             auto_compact=True,
         )
         self._zch_modules = self._tracker.zch_modules
+        self._warned_no_retain_tables: Set[str] = set()
         self._table_shard_infos = self._collect_table_shard_infos()
         self._validate_supported_table_sharding(self._table_shard_infos)
         if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
@@ -763,12 +786,23 @@ class DeltaEmbeddingDumper:
     def clear(self) -> None:
         """Clear tracked sparse ids, usually after restore-time dummy steps.
 
-        The restored model state is the baseline the serving side already
-        holds, so admit/evict events recorded during the dummy forwards are
-        dropped together with the tracked ids; the next dump then reports
-        only the delta against the restored state.
+        The restored state is the baseline the serving side already holds, so
+        events recorded during the dummy forwards must not show up in the next
+        dump; retained evicted keys are popped and discarded for the same
+        reason.
         """
         self._tracker.clear(_CONSUMER)
+        if not self._dump_evicted_tombstones:
+            return
+        popped_module_ids: Set[int] = set()
+        for dynamic_module in self._collect_dynamic_modules().values():
+            # One module hosts several tables; a single pop drains them all.
+            if id(dynamic_module) in popped_module_ids:
+                continue
+            popped_module_ids.add(id(dynamic_module))
+            pop_fn = getattr(dynamic_module, "pop_evicted_keys", None)
+            if pop_fn is not None:
+                pop_fn()
 
     @contextmanager
     def pause_tracking(self) -> Iterator[None]:
@@ -918,6 +952,7 @@ class DeltaEmbeddingDumper:
             global_step=global_step,
             table_weights=table_weights,
             dynamic_modules=dynamic_modules,
+            dump_evicted_tombstones=self._dump_evicted_tombstones,
         )
         output_path: Optional[str] = None
         if write_local and (num_rows > 0 or self._world_size > 1):
@@ -967,31 +1002,71 @@ class DeltaEmbeddingDumper:
         global_step: int,
         table_weights: Dict[str, _TableWeight],
         dynamic_modules: Dict[str, nn.Module],
+        flushed_module_ids: Optional[Set[int]] = None,
+        dump_evicted_tombstones: bool = False,
     ) -> int:
+        """Append real rows for touched ids and tombstones for evicted keys.
+
+        Dynamic tables merge the tracker's ids with this dump's evicted
+        keys into one post-flush lookup: found keys publish their current
+        embeddings, missing keys from the evicted set publish zero
+        tombstones, and missing keys that were never admitted are skipped
+        with a warning. One lookup resolves both orderings within a dump
+        interval -- an evicted-then-reinserted key publishes exactly its
+        fresh row, an insert-then-evict key exactly one tombstone. Row-wise
+        sharding keeps rank-local shards disjoint, so no cross-rank
+        collective is needed.
+
+        Args:
+            table_chunks: List to append the per-table parquet chunks to.
+            global_step: Current training step.
+            table_weights: Local weight shards keyed by table FQN.
+            dynamic_modules: Dynamic embedding modules keyed by table FQN.
+            flushed_module_ids: Modules already flushed this dump; created
+                locally when None so direct callers keep working.
+            dump_evicted_tombstones: When True, dynamic tables drain their
+                evicted-key buffers and publish tombstones; tables without
+                tracker rows are still visited so the buffers are drained.
+
+        Returns:
+            Number of rows appended.
+        """
         num_rows = 0
-        # A dynamic module hosting multiple tables is shared across their FQN
-        # keys; flush() flushes the whole module, so track which
-        # modules were already flushed this dump and skip the redundant repeats.
-        flushed_module_ids: Set[int] = set()
-        for fqn, unique_rows in self._tracker.get_unique(_CONSUMER).items():
-            ids = unique_rows.ids
-            if ids.numel() == 0:
+        if flushed_module_ids is None:
+            flushed_module_ids = set()
+        unique_rows_by_fqn = self._tracker.get_unique(_CONSUMER)
+        fqns = list(unique_rows_by_fqn)
+        if dump_evicted_tombstones:
+            fqns += [fqn for fqn in dynamic_modules if fqn not in unique_rows_by_fqn]
+        for fqn in fqns:
+            unique_rows = unique_rows_by_fqn.get(fqn)
+            dynamic_module = dynamic_modules.get(fqn)
+            if dynamic_module is not None:
+                tracker_ids = (
+                    unique_rows.ids
+                    if unique_rows is not None
+                    else torch.empty(0, dtype=torch.int64)
+                )
+                num_rows += self._append_dynamic_rows(
+                    table_chunks,
+                    global_step=global_step,
+                    fqn=fqn,
+                    dynamic_module=dynamic_module,
+                    tracker_ids=tracker_ids,
+                    flushed_module_ids=flushed_module_ids,
+                    dump_evicted_tombstones=dump_evicted_tombstones,
+                )
                 continue
-            ids = ids.unique(sorted=True)
-            embeddings, key_ids = self._lookup_embeddings(
-                fqn,
-                ids,
-                table_weights=table_weights,
-                dynamic_modules=dynamic_modules,
-                flushed_module_ids=flushed_module_ids,
-            )
-            feature_name = _feature_name(
-                self._tracker.fqn_to_feature_names.get(fqn, [])
-            )
+            if unique_rows is None or unique_rows.ids.numel() == 0:
+                continue
+            ids = unique_rows.ids.unique(sorted=True)
+            embeddings, key_ids = self._lookup_embeddings(fqn, ids, table_weights)
             num_rows += self._append_table_chunk(
                 table_chunks,
                 global_step=global_step,
-                feature_name=feature_name,
+                feature_name=_feature_name(
+                    self._tracker.fqn_to_feature_names.get(fqn, [])
+                ),
                 table_fqn=fqn,
                 key_ids=key_ids,
                 embeddings=embeddings,
@@ -1004,14 +1079,7 @@ class DeltaEmbeddingDumper:
         fqn: str,
         ids: torch.Tensor,
         table_weights: Dict[str, _TableWeight],
-        dynamic_modules: Dict[str, nn.Module],
-        flushed_module_ids: Optional[Set[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        dynamic_module = dynamic_modules.get(fqn)
-        if dynamic_module is not None:
-            return self._lookup_dynamic_embeddings(
-                dynamic_module, fqn, ids, flushed_module_ids
-            )
         if fqn not in table_weights:
             raise KeyError(f"Embedding table {fqn} not found in sharded model.")
         table_weight = table_weights[fqn]
@@ -1095,42 +1163,225 @@ class DeltaEmbeddingDumper:
         embeddings[held_mask] = weight[rows].detach()
         return embeddings, raw_ids
 
-    def _lookup_dynamic_embeddings(
+    def _pop_evicted_key_ids(
+        self, fqn: str, dynamic_module: nn.Module, table_name: str
+    ) -> Optional[torch.Tensor]:
+        """Pop this dump's evicted keys for one dynamic table.
+
+        Args:
+            fqn: Dynamic table FQN, for warnings.
+            dynamic_module: Dynamic embedding module hosting the table.
+            table_name: Table name within the module.
+
+        Returns:
+            The evicted key ids (read-and-clear semantics), or None when
+            the build or the table cannot retain evicted keys.
+        """
+        pop_fn = getattr(dynamic_module, "pop_evicted_keys", None)
+        if pop_fn is None:
+            self._warn_no_retain_table_once(
+                fqn, "this dynamicemb build has no pop_evicted_keys"
+            )
+            return None
+        evicted = pop_fn([table_name]).get(table_name)
+        if evicted is None:
+            self._warn_no_retain_table_once(
+                fqn, "the table does not retain evicted keys (DISCARD mode)"
+            )
+            return None
+        return evicted.detach()
+
+    def _append_dynamic_rows(
         self,
-        dynamic_module: nn.Module,
+        table_chunks: List[pa.Table],
+        global_step: int,
         fqn: str,
-        ids: torch.Tensor,
-        flushed_module_ids: Optional[Set[int]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        dynamic_module: nn.Module,
+        tracker_ids: torch.Tensor,
+        flushed_module_ids: Set[int],
+        dump_evicted_tombstones: bool,
+    ) -> int:
+        """Append one merged lookup's real rows and tombstones for a table.
+
+        The tracker ids and this dump's evicted keys are merged and
+        deduplicated on host, then resolved by a post-flush ``find`` batched
+        in ``_FIND_BATCH_ROWS`` slices so the GPU values buffer stays capped
+        regardless of eviction volume. Each key publishes exactly one row:
+        its current embedding when present, a zero tombstone when absent
+        but evicted, and nothing (with a warning) when it was never
+        admitted.
+
+        Args:
+            table_chunks: List to append the per-table parquet chunks to.
+            global_step: Current training step.
+            fqn: Dynamic table FQN.
+            dynamic_module: Dynamic embedding module hosting the table.
+            tracker_ids: Touched ids recorded by the tracker for this table.
+            flushed_module_ids: Modules already flushed this dump; a module
+                hosting several tables flushes once, not once per table.
+            dump_evicted_tombstones: Whether to drain this table's evicted
+                keys and publish tombstones for the missing ones.
+
+        Returns:
+            Number of rows appended.
+        """
         try:
             from dynamicemb.types import CopyMode
         except ImportError as exc:
             raise RuntimeError(
                 "dynamicemb is required to dump dynamic embedding values."
             ) from exc
-        # flush() flushes the whole module; only the first table of a
-        # multi-table module needs it within a dump.
-        if flushed_module_ids is None or id(dynamic_module) not in flushed_module_ids:
-            dynamic_module.flush()
-            if flushed_module_ids is not None:
-                flushed_module_ids.add(id(dynamic_module))
         table_name = fqn.rsplit(".", maxsplit=1)[-1]
+        # flush() both syncs the caching store for the lookup and can evict
+        # backing-store rows; flush before the pop and the find so both see
+        # the post-flush state.
+        if id(dynamic_module) not in flushed_module_ids:
+            dynamic_module.flush()
+            flushed_module_ids.add(id(dynamic_module))
         table_id = cast(List[str], dynamic_module.table_names).index(table_name)
+        # pyre-ignore [29]
+        emb_dim = dynamic_module._dynamicemb_options[table_id].dim
+        ids = tracker_ids.cpu().to(torch.int64)
+        evicted_ids: Optional[torch.Tensor] = None
+        if dump_evicted_tombstones:
+            evicted = self._pop_evicted_key_ids(fqn, dynamic_module, table_name)
+            if evicted is not None and evicted.numel() > 0:
+                evicted_ids = evicted.cpu().to(torch.int64)
+                ids = torch.cat([ids, evicted_ids])
+        ids = ids.unique(sorted=True)
+        if ids.numel() == 0:
+            return 0
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        ids = ids.to(device=device, dtype=torch.int64)
-        table_ids = torch.full_like(ids, table_id, dtype=torch.int64)
-        _, _, _, _, _, founds, _, values = dynamic_module.tables.find(
-            ids, table_ids, CopyMode.EMBEDDING
-        )
-        emb_dim = cast(Any, dynamic_module._dynamicemb_options)[table_id].dim
-        founds = founds.to(dtype=torch.bool)
-        if not bool(founds.all().item()):
+        # The evicted mask stays on CPU: per-batch tombstone and never-admitted
+        # selections reuse the CPU batch ids, so only the found mask and the
+        # embedding values cross the device boundary.
+        evicted_mask = torch.isin(ids, evicted_ids) if evicted_ids is not None else None
+        feature_name = _feature_name(self._tracker.fqn_to_feature_names.get(fqn, []))
+        num_rows = 0
+        num_never_admitted = 0
+        for start in range(0, ids.numel(), _FIND_BATCH_ROWS):
+            batch_ids = ids[start : start + _FIND_BATCH_ROWS]
+            gpu_ids = batch_ids.to(device=device)
+            table_ids = torch.full_like(gpu_ids, table_id, dtype=torch.int64)
+            _, _, _, _, _, founds, _, values = dynamic_module.tables.find(
+                gpu_ids, table_ids, CopyMode.EMBEDDING
+            )
+            founds = founds.to(dtype=torch.bool)
+            # Only the compact found mask moves D2H; found and tombstone key
+            # ids reuse the CPU batch ids instead of round-tripping GPU ids.
+            founds_cpu = founds.cpu()
+            missing_cpu = ~founds_cpu
+            if evicted_mask is not None:
+                batch_evicted = evicted_mask[start : start + _FIND_BATCH_ROWS]
+                tombstone_ids = batch_ids[missing_cpu & batch_evicted]
+                num_never_admitted += int((missing_cpu & ~batch_evicted).sum())
+            else:
+                tombstone_ids = batch_ids.new_empty(0)
+                num_never_admitted += int(missing_cpu.sum())
+            num_rows += self._append_table_chunk(
+                table_chunks,
+                global_step=global_step,
+                feature_name=feature_name,
+                table_fqn=fqn,
+                key_ids=batch_ids[founds_cpu],
+                embeddings=values[founds, :emb_dim].detach(),
+                source="model_delta_tracker",
+            )
+            num_rows += self._append_tombstone_chunks(
+                table_chunks,
+                global_step=global_step,
+                fqn=fqn,
+                tombstone_ids=tombstone_ids,
+                emb_dim=emb_dim,
+            )
+        if num_never_admitted > 0:
             logger.warning(
                 "Skip %s missing dynamic embedding ids for table %s.",
-                int((~founds).sum().item()),
+                num_never_admitted,
                 fqn,
             )
-        return values[founds, :emb_dim].detach(), ids[founds]
+        return num_rows
+
+    def _warn_no_retain_table_once(self, table_fqn: str, reason: str) -> None:
+        """Warn once per table why its evicted keys cannot be tombstoned."""
+        if table_fqn in self._warned_no_retain_tables:
+            return
+        self._warned_no_retain_tables.add(table_fqn)
+        logger.warning(
+            "Delta embedding dump cannot tombstone evicted keys for table "
+            f"{table_fqn}: {reason}; stale FeatureStore rows for its evicted "
+            "keys will never be reclaimed."
+        )
+
+    def _append_tombstone_chunks(
+        self,
+        table_chunks: List[pa.Table],
+        global_step: int,
+        fqn: str,
+        tombstone_ids: torch.Tensor,
+        emb_dim: int,
+    ) -> int:
+        """Append zero-row tombstones for evicted keys in bounded chunks.
+
+        One zero buffer backs every chunk: _append_table_chunk wraps
+        row-slice views zero-copy, so Arrow chunks share this storage and
+        retained tombstone zeros stay one chunk-sized buffer regardless of
+        eviction volume. Under INT8 quantization the zero buffer is
+        quantized once up front and shared the same way, because
+        quantizing per chunk would allocate a separate buffer per chunk.
+
+        Args:
+            table_chunks: List to append the per-table parquet chunks to.
+            global_step: Current training step.
+            fqn: Dynamic table FQN.
+            tombstone_ids: Evicted key ids to tombstone.
+            emb_dim: The table's embedding dimension.
+
+        Returns:
+            Number of tombstone rows appended.
+        """
+        if tombstone_ids.numel() == 0:
+            return 0
+        feature_name = _feature_name(self._tracker.fqn_to_feature_names.get(fqn, []))
+        chunk_rows = min(_TOMBSTONE_CHUNK_ROWS, tombstone_ids.numel())
+        zero_rows: torch.Tensor = torch.zeros(
+            (chunk_rows, emb_dim), dtype=torch.float32
+        )
+        pre_quantized = False
+        if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
+            try:
+                quantized_zero = distributed_quantize_embeddings(
+                    zero_rows,
+                    emb_dim,
+                    feature_name,
+                    DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
+                )
+            except ValueError as e:
+                # quant_util errors address the distributed-export DIST_QUANT
+                # switch; delta dump quantization is toggled by quant_type.
+                raise ValueError(
+                    "Delta embedding dump INT8 quantization failed for "
+                    f"feature '{feature_name}' (table '{fqn}'): {e}. "
+                    "Disable delta dump quantization by setting "
+                    "delta_embedding_dump_config.quant_type to "
+                    "DELTA_EMBEDDING_QUANT_NONE."
+                ) from e
+            zero_rows = torch.from_numpy(quantized_zero)
+            pre_quantized = True
+        num_rows = 0
+        for start in range(0, tombstone_ids.numel(), chunk_rows):
+            key_chunk = tombstone_ids[start : start + chunk_rows]
+            num_rows += self._append_table_chunk(
+                table_chunks,
+                global_step=global_step,
+                feature_name=feature_name,
+                table_fqn=fqn,
+                key_ids=key_chunk,
+                embeddings=zero_rows[: key_chunk.numel()],
+                source="dynamicemb_evicted",
+                pre_quantized=pre_quantized,
+            )
+        return num_rows
 
     def _collect_table_shard_infos(self) -> Dict[str, _TableShardInfo]:
         table_shard_infos: Dict[str, _TableShardInfo] = {}
@@ -1219,9 +1470,13 @@ class DeltaEmbeddingDumper:
         key_ids: torch.Tensor,
         embeddings: torch.Tensor,
         source: str,
+        pre_quantized: bool = False,
     ) -> int:
         key_ids_cpu = key_ids.detach().cpu().to(torch.int64).contiguous()
-        embeddings_cpu = embeddings.detach().cpu().to(torch.float32).contiguous()
+        if pre_quantized:
+            embeddings_cpu = embeddings.detach().cpu().contiguous()
+        else:
+            embeddings_cpu = embeddings.detach().cpu().to(torch.float32).contiguous()
         if embeddings_cpu.dim() != 2:
             raise ValueError(
                 "delta embedding dump expects a 2-D embedding tensor, "
@@ -1236,25 +1491,27 @@ class DeltaEmbeddingDumper:
                 f"key_ids={num_rows}, embeddings={embeddings_cpu.size(0)}."
             )
         if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8:
-            emb_dim = embeddings_cpu.size(1)
-            try:
-                quantized = distributed_quantize_embeddings(
-                    embeddings_cpu,
-                    emb_dim,
-                    feature_name,
-                    DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
-                )
-            except ValueError as e:
-                # quant_util errors address the distributed-export DIST_QUANT
-                # switch; delta dump quantization is toggled by quant_type.
-                raise ValueError(
-                    "Delta embedding dump INT8 quantization failed for "
-                    f"feature '{feature_name}' (table '{table_fqn}'): {e}. "
-                    "Disable delta dump quantization by setting "
-                    "delta_embedding_dump_config.quant_type to "
-                    "DELTA_EMBEDDING_QUANT_NONE."
-                ) from e
-            embeddings_cpu = torch.from_numpy(quantized)
+            if not pre_quantized:
+                emb_dim = embeddings_cpu.size(1)
+                try:
+                    quantized = distributed_quantize_embeddings(
+                        embeddings_cpu,
+                        emb_dim,
+                        feature_name,
+                        DISTRIBUTED_SPARSE_SUPPORTED_QUANT_FORMATS[0],
+                    )
+                except ValueError as e:
+                    # quant_util errors address the distributed-export
+                    # DIST_QUANT switch; delta dump quantization is
+                    # toggled by quant_type.
+                    raise ValueError(
+                        "Delta embedding dump INT8 quantization failed for "
+                        f"feature '{feature_name}' (table '{table_fqn}'): {e}. "
+                        "Disable delta dump quantization by setting "
+                        "delta_embedding_dump_config.quant_type to "
+                        "DELTA_EMBEDDING_QUANT_NONE."
+                    ) from e
+                embeddings_cpu = torch.from_numpy(quantized)
             value_type = pa.uint8()
         else:
             value_type = pa.float32()
