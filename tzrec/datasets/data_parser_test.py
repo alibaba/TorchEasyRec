@@ -15,7 +15,7 @@ import unittest
 
 import pyarrow as pa
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec.sparse.jagged_tensor import (
     JaggedTensor,
     KeyedJaggedTensor,
@@ -27,6 +27,7 @@ from torchrec.sparse.jagged_tensor import (
 from tzrec.datasets.data_parser import DataParser
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import feature_pb2
+from tzrec.utils.test_util import parameterized_name_func
 
 
 class DataParserTest(unittest.TestCase):
@@ -901,7 +902,14 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
-    def test_fg_seq_bool_mask_with_expr_mask(self):
+    @parameterized.expand(
+        [
+            param("fg_dag", fg_mode=FgMode.FG_DAG),
+            param("fg_bucketize", fg_mode=FgMode.FG_BUCKETIZE),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_fg_seq_bool_mask_with_expr_mask(self, _, fg_mode):
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 sequence_feature=feature_pb2.SequenceFeature(
@@ -933,21 +941,28 @@ class DataParserTest(unittest.TestCase):
                 )
             )
         ]
-        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        features = create_features(feature_cfgs, fg_mode=fg_mode)
         data_parser = DataParser(features=features)
-        self.assertEqual(
-            sorted(list(data_parser.feature_input_names)),
-            ["click_seq__cate", "click_seq__iid", "tgt_cate"],
-        )
         self.assertEqual(data_parser.sparse_keys["__BASE__"], ["click_seq__masked_iid"])
-
-        data = data_parser.parse(
-            input_data={
+        if fg_mode == FgMode.FG_DAG:
+            expected_input_names = ["click_seq__cate", "click_seq__iid", "tgt_cate"]
+            input_data = {
                 "click_seq__cate": pa.array(["1;2;3;2", "1;1", "2"]),
                 "click_seq__iid": pa.array(["11;12;13;14", "21;22", "31"]),
                 "tgt_cate": pa.array([2, 1, 2]),
             }
+        else:
+            # fg does not output the mask, it is a dag intermediate result, we
+            # only need the masked ids before bucketize.
+            expected_input_names = ["click_seq__masked_iid"]
+            input_data = {
+                "click_seq__masked_iid": pa.array([["12", "14"], ["21", "22"], ["31"]])
+            }
+        self.assertEqual(
+            sorted(list(data_parser.feature_input_names)), expected_input_names
         )
+
+        data = data_parser.parse(input_data=input_data)
         batch = data_parser.to_batch(data)
 
         expected_sparse_feat = KeyedJaggedTensor.from_lengths_sync(
