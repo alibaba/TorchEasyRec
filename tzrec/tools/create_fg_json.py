@@ -71,7 +71,7 @@ if __name__ == "__main__":
         "--remove_bucketizer",
         action="store_true",
         default=False,
-        help="remove bucktizer params in fg json.",
+        help="remove bucketizer params in fg json.",
     )
     parser.add_argument(
         "--debug",
