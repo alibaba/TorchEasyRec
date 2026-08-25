@@ -222,7 +222,6 @@ def apply_split_helper(
                 torch.zeros(
                     (split.uvm_size,),
                     out=torch.ops.fbgemm.new_unified_tensor(
-                        #  for 3rd param but got `Type[Type[torch._dtype]]`.
                         torch.zeros(1, device=current_device, dtype=dtype)
                         if not use_init_value
                         else torch.full(

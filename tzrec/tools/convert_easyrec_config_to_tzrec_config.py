@@ -414,7 +414,11 @@ class ConvertConfig(object):
             feature_type = cfg.feature_type
 
             # TODO(hongsheng.jhs): the sub-sequence and not-in-fg.json branches below
-            # leave fg_json bound to the previous iteration's feature.
+            # never assign fg_json. On the first feature that takes one of them the
+            # later uses raise UnboundLocalError; afterwards they silently read the
+            # previous feature's fg_json and emit a wrong expression. Fixing it needs
+            # a decision on what those branches should do (skip the feature or fail),
+            # so it is left alone here.
             if feature_name in self.feature_to_fg:
                 fg_json = self.feature_to_fg[feature_name]
             elif feature_name in self.sub_sequence_to_group:

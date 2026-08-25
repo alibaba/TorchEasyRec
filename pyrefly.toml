@@ -35,10 +35,13 @@ permissive-ignores = true
 
 # torch's `nn.Module.__getattr__` is typed as `Tensor | Module`, so every attribute
 # access on a submodule degrades to that union. These four codes are almost entirely
-# that gap plus un-narrowed `Optional`s; the previous pyre setup filtered the same
-# errors out by text match.
-# TODO(hongsheng.jhs): re-enable per subtree via [[sub-config]] as the un-narrowed
-# `Optional` accesses are cleaned up.
+# that gap plus un-narrowed `Optional`s. Pyre suppressed the same errors, but by
+# matching message substrings rather than by code, so turning the codes off project-wide
+# is the broader relaxation: a genuinely wrong argument type in plain Python used to fail
+# and now passes.
+# TODO(hongsheng.jhs): narrow this back down per subtree via [[sub-config]] -- starting
+# with `bad-argument-type`, which has the least to do with the torch union -- as the
+# un-narrowed `Optional` accesses are cleaned up.
 errors.missing-attribute = false
 errors.bad-argument-type = false
 errors.not-callable = false

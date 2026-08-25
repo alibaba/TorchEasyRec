@@ -1157,7 +1157,7 @@ class TDMPredictSampler(BaseSampler):
             input_data (dict): input data with item_id.
 
         Returns:
-            Positive and negative sampled feature dict.
+            Sampled feature dict of positive (child) nodes.
         """
         ids = _pa_ids_to_npy(input_data[self._item_id_field]).reshape(-1, 1)
 
