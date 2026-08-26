@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import torch
 from torch import nn
@@ -48,14 +48,14 @@ class MMoE(nn.Module):
             self.gate_mlps = nn.ModuleList(
                 [MLP(in_features=in_features, **gate_mlp) for _ in range(num_task)]
             )
-            gate_final_in = self.gate_mlps[0].hidden_units[-1]
+            gate_final_in = cast(MLP, self.gate_mlps[0]).hidden_units[-1]
         self.gate_finals = nn.ModuleList(
             [nn.Linear(gate_final_in, num_expert) for _ in range(num_task)]
         )
 
     def output_dim(self) -> int:
         """Output dimension of the module."""
-        return self.expert_mlps[0].hidden_units[-1]
+        return cast(MLP, self.expert_mlps[0]).hidden_units[-1]
 
     def forward(self, input: torch.Tensor) -> List[torch.Tensor]:
         """Forward the module."""

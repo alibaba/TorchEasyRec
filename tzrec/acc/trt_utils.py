@@ -34,7 +34,7 @@ except Exception:
 
 def trt_convert(
     exp_program: torch.export.ExportedProgram,
-    inputs: Optional[Sequence[Sequence[Any]]],
+    inputs: Sequence[Sequence[Any]],
 ) -> torch.fx.GraphModule:
     """Convert model use trt.
 

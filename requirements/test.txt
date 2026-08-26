@@ -2,4 +2,4 @@ alibabacloud-alikafka20190916
 hypothesis
 parameterized
 pre-commit
-pyre-check==0.9.25
+pyrefly==1.2.0

@@ -65,8 +65,13 @@ def save_message(message: Message, filepath: str) -> None:
 
 def config_to_kwargs(config: Message) -> Dict[str, Any]:
     """Convert a message to a config dict."""
+    # NOTE: typeshed ships protobuf 5.x stubs, where this argument was renamed to
+    # always_print_fields_with_no_presence; we pin protobuf 4.x via grpcio-tools.
     return json_format.MessageToDict(
-        config, including_default_value_fields=True, preserving_proto_field_name=True
+        config,
+        # pyrefly: ignore[unexpected-keyword]
+        including_default_value_fields=True,
+        preserving_proto_field_name=True,
     )
 
 
@@ -141,7 +146,6 @@ def _get_basic_types() -> List[Type]:
         np.float16,
         np.float32,
         np.float64,
-        np.char,
         np.byte,
         np.uint8,
         np.int8,

@@ -324,9 +324,11 @@ def tdm_retrieval(
     )
     model.eval()
 
+    plogger = None
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Predicting", miniters=10)
 
+    prof = None
     if is_profiling:
         if is_rank_zero:
             logger.info(str(model))
@@ -526,9 +528,9 @@ def tdm_retrieval(
                     )
                     write_t.start()
                     pipeline_t_list.append(write_t)
-                if is_local_rank_zero:
+                if plogger is not None:
                     plogger.log(i_step)
-                if is_profiling:
+                if prof is not None:
                     prof.step()
                 i_step += 1
             except StopIteration:
@@ -563,7 +565,7 @@ def tdm_retrieval(
             all_queues,
             cancel_event,
         )
-        if is_profiling:
+        if prof is not None:
             # nothing here may raise, or this rank skips the commit rendezvous.
             try:
                 prof.stop()

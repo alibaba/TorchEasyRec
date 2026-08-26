@@ -89,6 +89,45 @@ class TreeSearchtest(unittest.TestCase):
         self.assertEqual(len(serving_tree), 14)
         self.assertEqual(len(node_feat_table), 13)
 
+    def test_tree_search_null_raw_attr(self) -> None:
+        """A null raw attr is written as "0" instead of breaking the join."""
+        null_file = tempfile.NamedTemporaryFile(
+            dir=self.test_dir, mode="w", delete=False, newline="", suffix=".csv"
+        )
+        writer = csv.writer(null_file)
+        writer.writerow(["item_id", "int_a", "float_b", "str_c", "item_emb"])
+        for i in range(6):
+            # the third item has no float_b, so its raw attr arrives as null
+            writer.writerow([i, i, "" if i == 2 else 0.1 * i, f"我们{i}", [i] * 4])
+        null_file.close()
+
+        cluster = TreeCluster(
+            item_input_path=null_file.name,
+            item_id_field="item_id",
+            attr_fields="int_a,str_c",
+            raw_attr_fields="float_b",
+            output_dir=None,
+            embedding_field="item_emb",
+            parallel=1,
+            n_cluster=2,
+        )
+        output_dir = os.path.join(self.test_dir, "null_raw_attr")
+        search = TreeSearch(output_file=output_dir, root=cluster.train(save_tree=False))
+        search.save(attr_delimiter=",")
+
+        # feature is level,item_id,int_a,str_c,float_b
+        raw_attr_by_id = {}
+        with open(os.path.join(output_dir, "node_table.txt")) as f:
+            next(f)
+            for line in f:
+                node_id, _, feature = line.rstrip("\n").split("\t")
+                fields = feature.split(",")
+                if len(fields) == 5:
+                    raw_attr_by_id[node_id] = fields[4]
+        # the null attr falls back to "0", while a real 0.0 stays distinguishable
+        self.assertEqual(raw_attr_by_id["2"], "0")
+        self.assertEqual(raw_attr_by_id["0"], "0.0")
+
 
 if __name__ == "__main__":
     unittest.main()

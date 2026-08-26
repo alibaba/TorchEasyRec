@@ -368,7 +368,7 @@ def _code_rows_in_range(
     code_array: np.ndarray, codebook_array: np.ndarray
 ) -> np.ndarray:
     """Return a range mask for already validated code and codebook arrays."""
-    return ((code_array >= 0) & (code_array < codebook_array)).all(axis=1)
+    return np.asarray(((code_array >= 0) & (code_array < codebook_array)).all(axis=1))
 
 
 def _compute_layer_metrics(layer: int, histogram: np.ndarray) -> SidLayerQualityMetrics:

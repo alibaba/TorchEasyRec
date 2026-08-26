@@ -226,7 +226,7 @@ class ParquetReader(BaseReader):
                 ):
                     parquet_metas_per_rank[k] = v
             if self._pg is not None:
-                parquet_metas_list = [None] * world_size
+                parquet_metas_list: List[Any] = [None] * world_size
                 dist.all_gather_object(parquet_metas_list, parquet_metas_per_rank)
                 for v in parquet_metas_list:
                     self._parquet_metas.update(v)

@@ -439,7 +439,9 @@ if has_dynamicemb:
             compute_kernels += [EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value]
         return compute_kernels
 
+    # pyrefly: ignore[unbound-name]
     DynamicEmbeddingBagCollectionSharder.compute_kernels = _ebc_compute_kernels
+    # pyrefly: ignore[unbound-name]
     DynamicEmbeddingCollectionSharder.compute_kernels = _ec_compute_kernels
 
     def _round_up(a: int, b: int) -> int:

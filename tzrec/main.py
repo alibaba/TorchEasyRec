@@ -423,6 +423,7 @@ def _train_and_evaluate(
 
     eval_result_filename = os.path.join(model_dir, eval_result_filename)
 
+    prof = None
     if train_config.is_profiling:
         if is_rank_zero:
             logger.info(str(model))
@@ -579,7 +580,7 @@ def _train_and_evaluate(
                 online_dense_exporter.maybe_export(
                     i_step, data_timestamp, model, dense_ema=export_dense_ema
                 )
-                if train_config.is_profiling:
+                if prof is not None:
                     prof.step()
 
             if ckpt_manager.maybe_save(
@@ -626,7 +627,7 @@ def _train_and_evaluate(
         )
         if summary_writer is not None:
             summary_writer.close()
-        if train_config.is_profiling:
+        if prof is not None:
             prof.stop()
         if ckpt_manager.maybe_save(
             i_step,
@@ -1317,21 +1318,21 @@ def predict(
     )
 
     if is_aot:
-        model: aot_utils.CombinedModelWrapper = aot_utils.load_model_aot(
-            scripted_model_path, device=device
-        )
+        model = aot_utils.load_model_aot(scripted_model_path, device=device)
     else:
         # disable jit compile， as it compile too slow now.
         if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
             os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-        model: torch.jit.ScriptModule = torch.jit.load(
+        model = torch.jit.load(
             os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
         )
         model.eval()
 
+    plogger = None
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Predicting", miniters=10)
 
+    prof = None
     if is_profiling:
         if is_rank_zero:
             logger.info(str(model))
@@ -1458,9 +1459,9 @@ def predict(
                     )
                     input_batches += 1
 
-                if is_local_rank_zero:
+                if plogger is not None:
                     plogger.log(i_step)
-                if is_profiling:
+                if prof is not None:
                     prof.step()
                 i_step += 1
                 if predict_steps is not None and i_step >= predict_steps:
@@ -1491,7 +1492,7 @@ def predict(
         if write_t is not None:
             pipeline_threads.append(write_t)
         predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
-        if is_profiling:
+        if prof is not None:
             # nothing here may raise, or this rank skips the commit rendezvous.
             try:
                 prof.stop()

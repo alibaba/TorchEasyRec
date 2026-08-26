@@ -11,13 +11,14 @@
 
 
 import os
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union, cast
 
 import torch
 import torch._inductor.codecache  # noqa: F401 -- populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti can read it on PPU torch (host torch auto-imports it; PPU's tzrec-test:1.1-ppu image does not).
 from torch import nn
 
 from tzrec.acc.utils import is_autotune_with_sample_inputs, is_unified_aot_predict
+from tzrec.features.feature import BaseFeature
 from tzrec.models.model import (
     CombinedModelWrapper,
     CudaAutocastWrapper,
@@ -458,7 +459,8 @@ def export_unified_model_aot(
 
     # Pad any 0-size non-sequence sparse .values tensors so torch.export
     # doesn't specialize on the empty size (which conflicts with dynamic Dims).
-    seq_feat_names = {f.name for f in model.features if f.is_sequence}
+    features = cast(List[BaseFeature], model.features)
+    seq_feat_names = {f.name for f in features if f.is_sequence}
     data = _pad_empty_sparse_values(data, seq_feat_names)
 
     # Build dynamic shapes using feature metadata for correct Dim grouping

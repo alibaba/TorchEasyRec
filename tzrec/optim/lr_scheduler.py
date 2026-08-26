@@ -26,6 +26,10 @@ _meta_cls = get_register_class_meta(_LR_CLASS_MAP)
 class BaseLR(LRScheduler, metaclass=_meta_cls):
     """LearningRate Scheduler base class."""
 
+    # torch types this as list[Tensor | float]; every scheduler here stores floats.
+    # pyrefly: ignore[bad-override-mutable-attribute]
+    base_lrs: List[float]
+
     def __init__(self, optimizer: Optimizer, by_epoch: bool = False) -> None:
         self._by_epoch = by_epoch
         super().__init__(optimizer)

@@ -51,7 +51,7 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from queue import Queue
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple, cast
 
 import numpy as np
 import torch
@@ -389,7 +389,9 @@ def _load_dcp_subset(
         load(target_sd, storage_reader=reader, no_dist=True)
 
     return {
-        suffix: (target_sd[meta_fqn] if suffix in suffix_to_meta_fqn else None)
+        suffix: (
+            target_sd[cast(str, meta_fqn)] if suffix in suffix_to_meta_fqn else None
+        )
         for suffix, meta_fqn in (
             (s, suffix_to_meta_fqn.get(s)) for s in requested_suffixes
         )

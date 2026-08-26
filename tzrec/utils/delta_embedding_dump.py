@@ -22,6 +22,7 @@ from typing import (
     Set,
     Tuple,
     Union,
+    cast,
 )
 
 import pyarrow as pa
@@ -1237,7 +1238,7 @@ class DeltaEmbeddingDumper:
         if id(dynamic_module) not in flushed_module_ids:
             dynamic_module.flush()
             flushed_module_ids.add(id(dynamic_module))
-        table_id = dynamic_module.table_names.index(table_name)
+        table_id = cast(List[str], dynamic_module.table_names).index(table_name)
         # pyre-ignore [29]
         emb_dim = dynamic_module._dynamicemb_options[table_id].dim
         ids = tracker_ids.cpu().to(torch.int64)
@@ -1455,7 +1456,7 @@ class DeltaEmbeddingDumper:
         modules: Dict[str, nn.Module] = {}
         for module_fqn, module in self._tracker.tracked_modules.items():
             for dynamic_module in get_dynamic_emb_module(module):
-                for table_name in dynamic_module.table_names:
+                for table_name in cast(List[str], dynamic_module.table_names):
                     table_fqn = _embedding_table_fqn(module_fqn, module, table_name)
                     modules[table_fqn] = dynamic_module
         return modules

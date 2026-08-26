@@ -42,7 +42,7 @@ class TrainMetricWrapper(nn.Module):
     def update(self, preds: Tensor, target: Tensor) -> None:
         """Update metric module."""
         self._metric_module.update(preds, target)
-        self._step_cnt += 1
+        self._step_cnt.add_(1)
         if self._step_cnt % self._decay_step == 0:
             if isinstance(self._metric_module, DecayAUC):
                 self._metric_module.decay(self._decay_rate)

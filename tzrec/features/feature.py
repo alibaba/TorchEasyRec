@@ -418,16 +418,16 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._side_inputs = None
         self._vocab_list = None
         self._vocab_dict = None
-        self._default_value = None
+        self._default_value: Optional[str] = None
         self._is_sequence = is_sequence
         self._is_grouped_seq = False
 
         # for sequence feature
         self._underline = "_" if env_util.use_rtp() else "__"
-        self.sequence_name = None
-        self.sequence_delim = None
-        self.sequence_length = None
-        self.sequence_pk = None
+        self.sequence_name: Optional[str] = None
+        self.sequence_delim: Optional[str] = None
+        self.sequence_length: Optional[int] = None
+        self.sequence_pk: Optional[str] = None
         if is_sequence:
             if sequence_name is None:
                 self.sequence_delim = self.config.sequence_delim
@@ -548,17 +548,19 @@ class BaseFeature(object, metaclass=_meta_cls):
     @property
     def default_value(self) -> str:
         """Effective default value for the feature."""
-        if self._default_value is None:
+        default_value = self._default_value
+        if default_value is None:
             val = self.config.default_value
             if self.is_sequence and not val:
                 logger.warning(
                     f"Sequence{self.__class__.__name__}[{self.name}] "
                     "not support empty default value now. reset to zero."
                 )
-                self._default_value = "0"
+                default_value = "0"
             else:
-                self._default_value = val
-        return self._default_value
+                default_value = val
+            self._default_value = default_value
+        return default_value
 
     @property
     def is_grouped_sequence(self) -> bool:
@@ -1138,7 +1140,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             else:
                 return len(vocab_dict)
         else:
-            return ""
+            return 0
 
     @property
     def default_bucketize_value(self) -> int:

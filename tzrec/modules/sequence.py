@@ -296,6 +296,9 @@ class MultiWindowDINEncoder(SequenceEncoder):
         attn_mlp (dict): target attention MLP module parameters.
     """
 
+    windows_len: torch.Tensor
+    cumsum_windows_len: torch.Tensor
+
     def __init__(
         self,
         sequence_dim: int,

@@ -22,4 +22,4 @@ jobs:
           cd run_${{ github.run_id }}
           pip install -r requirements-gpu.txt
           bash scripts/gen_proto.sh
-          python scripts/pyre_check.py
+          pyrefly check

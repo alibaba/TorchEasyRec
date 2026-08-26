@@ -93,8 +93,11 @@ class JRCLoss(_Loss):
         # next, we calculate neg sample loss in during the session.
         neg_mask_index = torch.where(labels == 0.0)[0]
         neg_diag_label = torch.index_select(diag_index, 0, neg_mask_index)
+        # neg_num is a 0-d integer tensor, which tile accepts via __index__.
+        # pyrefly: ignore[no-matching-overload]
         logits_neg = logits_neg.unsqueeze(0).tile([neg_num, 1])
         neg_session_mask = torch.index_select(mask, 0, neg_mask_index)
+        # pyrefly: ignore[no-matching-overload]
         y_neg = (1 - labels).unsqueeze(0).tile([neg_num, 1])
         diag_neg = torch.index_select(diag, 0, neg_mask_index)
         # we mask not in the same session, is diagonal and is negative.

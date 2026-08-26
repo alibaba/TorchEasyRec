@@ -9,6 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The easy_rec protos are downloaded at runtime and injected into globals(), so they
+# cannot be resolved statically.
+# pyrefly: ignore-errors[unknown-name]
+
 import argparse
 import io
 import json
@@ -409,6 +413,12 @@ class ConvertConfig(object):
             input_names = cfg.input_names
             feature_type = cfg.feature_type
 
+            # TODO(hongsheng.jhs): the sub-sequence and not-in-fg.json branches below
+            # never assign fg_json. On the first feature that takes one of them the
+            # later uses raise UnboundLocalError; afterwards they silently read the
+            # previous feature's fg_json and emit a wrong expression. Fixing it needs
+            # a decision on what those branches should do (skip the feature or fail),
+            # so it is left alone here.
             if feature_name in self.feature_to_fg:
                 fg_json = self.feature_to_fg[feature_name]
             elif feature_name in self.sub_sequence_to_group:
@@ -423,6 +433,7 @@ class ConvertConfig(object):
                 feature_config = tzrec_feature_pb2.FeatureConfig()
                 feature = tzrec_feature_pb2.IdFeature()
                 feature.feature_name = feature_name
+                # pyrefly: ignore[unbound-name]
                 feature.expression = fg_json["expression"]
                 feature.embedding_dim = cfg.embedding_dim
                 feature.hash_bucket_size = cfg.hash_bucket_size
@@ -432,6 +443,7 @@ class ConvertConfig(object):
                 feature_config = tzrec_feature_pb2.FeatureConfig()
                 feature = tzrec_feature_pb2.IdFeature()
                 feature.feature_name = feature_name
+                # pyrefly: ignore[unbound-name]
                 feature.expression = fg_json["expression"]
                 feature.embedding_dim = cfg.embedding_dim
                 feature.hash_bucket_size = cfg.hash_bucket_size
@@ -474,6 +486,7 @@ class ConvertConfig(object):
                     logger.error(f"sequences feature: {feature_name} can't converted")
             elif feature_type == easyrec_feature_config.RawFeature:
                 feature_config = tzrec_feature_pb2.FeatureConfig()
+                # pyrefly: ignore[unbound-name]
                 if fg_json["feature_type"] == "lookup_feature":
                     feature = tzrec_feature_pb2.LookupFeature()
                     feature.feature_name = feature_name
