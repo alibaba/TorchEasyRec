@@ -122,7 +122,7 @@ class VariationalDropoutFS:
             columns=["feature_name", "mean_drop_p"],
             data=[list(kv) for kv in feature_importance.items()],
         )
-        df.to_csv(csv_path, index=None)
+        df.to_csv(csv_path, index=False)
 
     def _visualize_feature_importance(
         self, feature_importance: Dict[str, float], group_name: str

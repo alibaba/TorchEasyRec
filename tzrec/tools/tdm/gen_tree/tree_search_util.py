@@ -12,7 +12,7 @@
 import os
 import pickle
 from collections import OrderedDict
-from typing import Any, Callable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Iterator, List, Optional, Tuple, cast
 
 import pyarrow as pa
 from anytree.importer.dictimporter import DictImporter
@@ -100,7 +100,7 @@ class TreeSearch(object):
         logger.info("Begin load tree.")
         with open(path, "rb") as f:
             data = pickle.load(f)
-        self.root = DictImporter().import_(data)
+        self.root = cast(TDMTreeNode, DictImporter().import_(data))
 
     def _get_nodes(self) -> None:
         """Get node info."""
@@ -145,7 +145,7 @@ class TreeSearch(object):
                         fea.append(
                             attr_delimiter.join(
                                 map(
-                                    lambda x: str(x) if x.is_valid else 0,
+                                    lambda x: str(x) if x.is_valid else "0",
                                     node.raw_attrs,
                                 )
                             )
@@ -216,7 +216,7 @@ class TreeSearch(object):
                             fea.append(
                                 attr_delimiter.join(
                                     map(
-                                        lambda x: str(x) if x.is_valid else 0,
+                                        lambda x: str(x) if x.is_valid else "0",
                                         node.raw_attrs,
                                     )
                                 )

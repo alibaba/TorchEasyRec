@@ -17,8 +17,6 @@ import torch
 from torch.nn import functional as F
 from torch.nn.modules.loss import _Loss
 
-from tzrec.modules.utils import div_no_nan
-
 
 class SidReconLoss(_Loss):
     """Reconstruction loss for RQ-VAE: per-row distance reduced to a scalar.
@@ -56,13 +54,14 @@ class SidReconLoss(_Loss):
     ) -> torch.Tensor:
         """Mean over the masked-in rows (all rows if ``mask`` is None).
 
-        The masked mean divides by the valid-row count (``div_no_nan`` keeps an
-        empty mask at 0). No data-dependent branching -> ``torch.compile``-friendly.
+        The masked mean divides by the valid-row count. Clamping the denominator
+        keeps an empty mask at 0 in both forward and backward. No data-dependent
+        branching -> ``torch.compile``-friendly.
         """
         if mask is None:
             return per_sample.mean()
         mask = mask.float()
-        return div_no_nan((per_sample * mask).sum(), mask.sum())
+        return (per_sample * mask).sum() / mask.sum().clamp(min=1)
 
     def forward(
         self,

@@ -199,6 +199,7 @@ class DAT(MatchModel):
         )
 
         if self.training:
+            assert user_augment is not None and item_augment is not None
             return {
                 "similarity": ui_sim,
                 "user_augment": user_augment,

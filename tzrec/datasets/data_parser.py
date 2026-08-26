@@ -924,7 +924,7 @@ class DataParser:
             result.append(" | ".join([f"{k}:{v}" for k, v in feature_rows[i].items()]))
         return pa.array(result)
 
-    def _build_fg_name_mapping(self) -> str:
+    def _build_fg_name_mapping(self) -> None:
         """Build fg name mapping for RTP FG Compatible."""
         self._rtpfg_to_pyfg_feat_name = {}
         self._rtpfg_to_pyfg_input_name = {}

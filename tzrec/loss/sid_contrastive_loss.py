@@ -161,6 +161,7 @@ class SidContrastiveLoss(_Loss):
         col_mask = (~pair_mask_all).unsqueeze(0)  # (1, B_global)
 
         labels = self.labels
+        assert labels is not None
         fallback = pair_mask.long().argmax()  # first pair sample index
         safe_labels = torch.where(pair_mask, labels, fallback.expand_as(labels))
         pair_mask_f = pair_mask.float()

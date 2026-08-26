@@ -124,7 +124,7 @@ class DLRM(RankModel):
         # interaction
         all_feat = self.interaction(feat)
         # final mlp
-        if self.dense_mlp:
+        if dense_feat is not None:
             all_feat = torch.cat([all_feat, dense_feat], dim=-1)
         if self._model_config.arch_with_sparse:
             all_feat = torch.cat([all_feat, sparse_group_feat], dim=-1)

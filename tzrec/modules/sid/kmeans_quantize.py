@@ -176,6 +176,8 @@ class KMeansQuantizeLayer(QuantizeLayer):
         embed_dim (int): feature dimension.
     """
 
+    centroids: torch.Tensor
+
     def __init__(self, n_embed: int, embed_dim: int) -> None:
         super().__init__(n_embed, embed_dim)
         self.register_buffer("centroids", torch.zeros(n_embed, embed_dim))

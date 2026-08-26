@@ -16,6 +16,8 @@ repos:
     hooks:
       - id: trailing-whitespace
       - id: check-yaml
+      - id: check-json
+      - id: check-toml
       - id: end-of-file-fixer
       - id: requirements-txt-fixer
       - id: check-merge-conflict

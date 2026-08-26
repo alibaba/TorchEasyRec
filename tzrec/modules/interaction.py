@@ -10,7 +10,7 @@
 # limitations under the License.
 
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 from torch import nn
@@ -60,6 +60,8 @@ class InteractionArch(nn.Module):
     Args:
         feature_num (int): feature_num
     """
+
+    triu_indices: torch.Tensor
 
     def __init__(self, feature_num: int) -> None:
         super().__init__()
@@ -281,7 +283,7 @@ class FactorizationMachineBlock(nn.Module):
         feature_num_in: int,
         feature_num_out: int,
         compressed_feature_num: int,
-        feature_num_mlp: Optional[Dict[str, Any]] = None,
+        feature_num_mlp: Dict[str, Any],
     ) -> None:
         super().__init__()
         self.feature_num_in = feature_num_in
@@ -340,7 +342,7 @@ class WuKongLayer(nn.Module):
         lcb_feature_num: int,
         fmb_feature_num: int,
         compressed_feature_num: int,
-        feature_num_mlp: Optional[Dict[str, Any]] = None,
+        feature_num_mlp: Dict[str, Any],
     ):
         super().__init__()
         self.lcb_feature_num = lcb_feature_num

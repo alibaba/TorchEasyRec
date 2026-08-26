@@ -2,7 +2,7 @@
 
 ## 代码风格
 
-我们采用 [PEP8](https://www.python.org/dev/peps/pep-0008/) 作为首选代码风格。使用 [ruff](https://github.com/astral-sh/ruff/) 工具进行 美化纠错 和格式化。使用 [pyre](https://pyre-check.org/) 工具进行类型静态检查。
+我们采用 [PEP8](https://www.python.org/dev/peps/pep-0008/) 作为首选代码风格。使用 [ruff](https://github.com/astral-sh/ruff/) 工具进行 美化纠错 和格式化。使用 [pyrefly](https://pyrefly.org/) 工具进行类型静态检查。
 
 我们在每次提交时都会自动使用 [pre-commit hook](https://pre-commit.com/) , 来检查和格式化 `ruff`、`trailing whitespaces`、修复 `end-of-files`问题，对 `requirements.txt` 进行排序。
 
@@ -10,7 +10,7 @@ ruff 的样式配置可以在[.ruff.toml](../../.ruff.toml) 中找到。
 
 pre-commit hook 的配置存储在 [.pre-commit-config](../../.pre-commit-config.yaml) 中。
 
-pyre 的配置存储在 [.pyre_configuration](../../.pyre_configuration) 中。
+pyrefly 的配置存储在 [pyrefly.toml](../../pyrefly.toml) 中。
 
 在克隆git仓库后，您需要安装初始化pre-commit:
 
@@ -22,14 +22,14 @@ pre-commit install
 在此之后，每次提交检查代码 linters 和格式化程序将被强制执行。类型静态检查需要手动执行。
 
 ```bash
-python scripts/pyre_check.py
+pyrefly check
 ```
 
 如果您只想格式化和整理代码，则可以运行
 
 ```bash
 pre-commit run -a
-python scripts/pyre_check.py
+pyrefly check
 ```
 
 ## 测试

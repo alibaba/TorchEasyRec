@@ -165,7 +165,7 @@ class TokenizeFeature(IdFeature):
                 if len(self.config.sequence_fields) > 0:
                     fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
             else:
-                fg_cfg["sequence_fields"] = [norm_fg_name]
+                fg_cfg["sequence_fields"] = [norm_fg_cfg["feature_name"]]
 
         fg_cfgs.append(fg_cfg)
         return fg_cfgs

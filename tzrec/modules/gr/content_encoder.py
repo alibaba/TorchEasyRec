@@ -206,7 +206,7 @@ class PadContentEncoder(ContentEncoder):
         return content_embeddings
 
 
-class MLPContentEncoder(BaseModule):
+class MLPContentEncoder(ContentEncoder):
     """MLP Content encoder for HSTU.
 
     Args:
@@ -293,7 +293,7 @@ def create_content_encoder(
     else:
         assert len(content_encoder_cfg) == 1, (
             f"content_encoder_cfg should be {{content_encoder_type: content_encoder_kwargs}}, "  # NOQA
-            f"but got {content_encoder_type}"
+            f"but got {content_encoder_cfg}"
         )
         content_encoder_type, config_dict = content_encoder_cfg.popitem()
 

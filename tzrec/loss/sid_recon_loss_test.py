@@ -61,11 +61,13 @@ class SidReconLossTest(unittest.TestCase):
             SidReconLoss._masked_mean(x, mask), torch.tensor(2.0)
         )  # (1+3)/2
 
-    def test_empty_mask_is_zero_not_nan(self) -> None:
-        out = SidReconLoss._masked_mean(
-            torch.tensor([1.0, 2.0, 3.0]), torch.zeros(3, dtype=torch.bool)
-        )
+    def test_empty_mask_has_zero_finite_gradient(self) -> None:
+        per_sample = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+        out = SidReconLoss._masked_mean(per_sample, torch.zeros(3, dtype=torch.bool))
         self.assertEqual(out.item(), 0.0)
+        out.backward()
+        self.assertTrue(torch.isfinite(per_sample.grad).all())
+        torch.testing.assert_close(per_sample.grad, torch.zeros_like(per_sample))
 
     def test_forward_applies_mask(self) -> None:
         # l1 per-row of [[1,1],[2,2],[3,3],[4,4]] vs 0 is [1,2,3,4]; mask keeps 0,2.
