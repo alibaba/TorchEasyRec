@@ -36,6 +36,7 @@ def create_prompt_tokenizer(path: str, words: Sequence[str]) -> str:
             vocab={word: i for i, word in enumerate(words)}, unk_token="<unk>"
         )
     )
+    # pyrefly: ignore[read-only]
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
     tokenizer.save(path)
     return path

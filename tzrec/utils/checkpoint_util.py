@@ -357,6 +357,8 @@ def unwrap_to(model: nn.Module, attr: str) -> Optional[nn.Module]:
             inner = inner.model
         else:
             return None
+    # hasattr cannot narrow the walk, though every link in it is a Module
+    # pyrefly: ignore[bad-return]
     return inner
 
 

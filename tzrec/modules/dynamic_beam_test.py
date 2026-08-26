@@ -139,7 +139,7 @@ class DynamicBeamSearchTest(unittest.TestCase):
         self.assertTrue(
             all(scores[i] >= scores[i + 1] - 1e-4 for i in range(len(scores) - 1))
         )
-        self.assertEqual(got[0], max(ref, key=ref.get))
+        self.assertEqual(got[0], max(ref, key=lambda combo: ref[combo]))
 
 
 if __name__ == "__main__":
