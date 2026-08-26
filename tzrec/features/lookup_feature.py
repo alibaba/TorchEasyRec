@@ -144,6 +144,8 @@ class LookupFeature(BaseFeature):
                 raw_fg_cfg["normalizer"] = self.config.normalizer
             if len(self.config.boundaries) > 0:
                 raw_fg_cfg["boundaries"] = list(self.config.boundaries)
+            if self.config.HasField("stub_type"):
+                raw_fg_cfg["stub_type"] = self.config.stub_type
         else:
             if self.config.separator != "\x1d":
                 fg_cfg["separator"] = self.config.separator
