@@ -81,6 +81,8 @@ message ModelConfig {
         // SID generation models
         SidRqvae sid_rqvae = 600;
         SidRqkmeans sid_rqkmeans = 601;
+
+        DlrmHSTUOneRank dlrm_hstu_onerank = 602;
     }
 
     optional uint32 num_class = 2 [default = 1];
