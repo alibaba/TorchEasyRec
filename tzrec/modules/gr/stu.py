@@ -14,7 +14,7 @@
 # thanks to their public work.
 
 import abc
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, cast
 
 import torch
 from torch.autograd.profiler import record_function
@@ -699,7 +699,9 @@ class STUStack(BaseModule):
             ):
                 prev_sig: Optional[str] = None
             else:
-                prev_sig = self._stu_layers[i - 1].attn_func_static_sig
+                prev_sig = cast(
+                    Optional[str], self._stu_layers[i - 1].attn_func_static_sig
+                )
             self._prev_attn_func_sig_per_layer.append(prev_sig)
 
     def forward(

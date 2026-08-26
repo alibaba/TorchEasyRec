@@ -13,7 +13,7 @@ import copy
 import os
 from datetime import timedelta
 from queue import Queue
-from typing import Callable, Iterator, List, Optional, Tuple, Type
+from typing import Callable, Iterator, List, Optional, Tuple, Type, cast
 
 import torch
 from torch import distributed as dist
@@ -84,7 +84,10 @@ def get_dist_object_pg(world_size: Optional[int] = None) -> Optional[dist.Proces
         if dist.is_initialized() and dist.GroupMember.WORLD.size() == world_size:
             pg = dist.GroupMember.WORLD
         else:
-            pg = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+            pg = cast(
+                Optional[dist.ProcessGroup],
+                dist.new_group(ranks=list(range(world_size)), backend="gloo"),
+            )
     return pg
 
 

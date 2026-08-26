@@ -20,7 +20,7 @@ import tempfile
 import threading
 import weakref
 from dataclasses import replace
-from typing import Any, Container, Dict, List, Optional, Set, Tuple
+from typing import Any, Container, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 import torch.distributed as dist
@@ -487,7 +487,9 @@ class CheckpointManager:
         self._ts_targets = ts_targets
         self._ts_quorum = ts_quorum
         if self.needs_worker_timestamps() and dist.is_initialized():
-            self._ts_group = dist.new_group(backend="gloo")
+            self._ts_group = cast(
+                Optional[dist.ProcessGroup], dist.new_group(backend="gloo")
+            )
 
     def needs_worker_timestamps(self) -> bool:
         """Return whether the policy needs per-worker event-times gathered."""

@@ -46,6 +46,13 @@ docs/source/proto.html
 data/test/kuairand-1k*
 data/test/kuairand-mot-1k*
 
+# Test logs of graphlearn sampler
+graphlearn.INFO
+graphlearn.WARNING
+graphlearn.ERROR
+graphlearn.FATAL
+graphlearn.*.log.*
+
 # Other temp files
 .hypothesis/
 .config/

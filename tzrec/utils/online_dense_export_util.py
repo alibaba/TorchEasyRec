@@ -49,7 +49,7 @@ import tempfile
 import time
 import weakref
 from threading import Condition, Event, Thread
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
 import torch.distributed as dist
@@ -332,7 +332,9 @@ class OnlineDenseExportManager:
                 )
         if dist.is_initialized() and dist.get_world_size() > 1:
             # collective; ONLINE_DENSE_EXPORT is job-uniform so all ranks enter
-            self._group = dist.new_group(backend="gloo")
+            self._group = cast(
+                Optional[dist.ProcessGroup], dist.new_group(backend="gloo")
+            )
 
         state_pairs: List[Tuple[str, str]] = []
         if self._rank == 0:

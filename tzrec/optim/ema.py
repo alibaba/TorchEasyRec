@@ -54,7 +54,7 @@ class DenseEMA:
 
     def state_dict(self) -> "OrderedDict[str, torch.Tensor]":
         """Return the distributed-checkpoint state for this EMA."""
-        state = OrderedDict(
+        state: "OrderedDict[str, torch.Tensor]" = OrderedDict(
             zip(
                 self._names,
                 self._averaged_model.module.parameters(),

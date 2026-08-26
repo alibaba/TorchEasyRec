@@ -120,6 +120,7 @@ class TZRecTestRunner(TextTestRunner):
     def _makeResult(self):
         return self.resultclass(self.stream, self.descriptions, self.verbosity)
 
+    # pyrefly: ignore[bad-override]
     def run(self, main_test, subproc_test):
         """Run the given test case or test suite."""
         result = self._makeResult()

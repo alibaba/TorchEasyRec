@@ -174,9 +174,9 @@ class RawFeatureTest(unittest.TestCase):
             )
         )
         raw_feat = raw_feature_lib.RawFeature(raw_feat_cfg, fg_mode=FgMode.FG_NORMAL)
-        np.testing.assert_allclose(
-            raw_feat.fg_encoded_default_value(), expected_fg_default
-        )
+        fg_default = raw_feat.fg_encoded_default_value()
+        assert fg_default is not None
+        np.testing.assert_allclose(fg_default, expected_fg_default)
         self.assertEqual(raw_feat.output_dim, value_dim)
         self.assertEqual(raw_feat.is_sparse, False)
         self.assertEqual(raw_feat.inputs, ["raw_input"])
@@ -245,6 +245,7 @@ class RawFeatureTest(unittest.TestCase):
         raw_feat = raw_feature_lib.RawFeature(raw_feat_cfg, fg_mode=FgMode.FG_NORMAL)
         fg_default = raw_feat.fg_encoded_default_value()
         if expected_fg_default:
+            assert fg_default is not None
             np.testing.assert_allclose(fg_default, expected_fg_default)
         else:
             self.assertEqual(fg_default, expected_fg_default)

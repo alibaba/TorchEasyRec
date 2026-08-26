@@ -574,6 +574,8 @@ message ExprFeature {
     optional string separator = 7 [default = "\x1d"];
     // fill value when vector length mismatch, default is NaN.
     optional float fill_missing = 8;
+    // number of hash size for sparse expr value
+    optional uint64 hash_bucket_size = 9;
     // embedding pooling type, available is {sum | mean}
     optional string pooling = 10 [default = "sum"];
     // fg default value
@@ -584,11 +586,16 @@ message ExprFeature {
     optional bool use_mask =  13;
     // if value_dim = 0, it supports multi-value
     optional uint32 value_dim = 14 [default = 0];
+    // number of id enumerators for sparse expr value
+    optional uint64 num_buckets = 15;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
     // when use own fg and data contain null value, you can set the param for fill null
     optional string fg_encoded_default_value = 30;
+    // value_type after fg before bucketize, you can specify it for better performance.
+    // e.g. fg_value_type = int64 when use num_buckets
+    optional string fg_value_type = 32;
     // embedding param trainable or not
     optional bool trainable = 33 [default = true];
     // only used as fg dag intermediate result or not

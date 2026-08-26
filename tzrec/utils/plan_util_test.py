@@ -510,7 +510,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         self.assertEqual(caching_modes, [False, True])
         load_factors = sorted(
             {
-                round(so.cache_load_factor, 4)
+                round(so.cache_load_factor or 0.0, 4)
                 for so in search_space
                 if getattr(so, "use_dynamicemb", False)
             }

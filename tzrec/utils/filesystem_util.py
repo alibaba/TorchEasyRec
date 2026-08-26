@@ -9,6 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# apply_monkeypatch() replaces stdlib file helpers with fsspec-backed ones that
+# accept the same call shapes but not the exact stdlib overload sets
+# (os.PathLike, int file descriptors).
+# pyrefly: ignore-errors[bad-assignment]
+
 import builtins
 import glob as glob_module
 import os

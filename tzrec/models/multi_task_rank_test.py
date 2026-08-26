@@ -160,6 +160,7 @@ class MultiTaskRankTest(unittest.TestCase):
             )
             if graph_type == TestGraphType.NORMAL:
                 torch.testing.assert_close(
+                    # pyrefly: ignore[unbound-name]
                     metric_result[f"auc_{tower_name}"],
                     expected_metrics[f"auc_{tower_name}"],
                     rtol=1e-4,

@@ -552,8 +552,10 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     with mock.patch.object(mgr, "_run_task", side_effect=fake_run_task):
                         mgr._enqueue(1, 1.0, {"m": "a"})
                         self.assertTrue(started.wait(timeout=10))
-                        mgr._enqueue(2, 2.0, {"m": "b"})  # pending, not yet started
-                        mgr._enqueue(3, 3.0, {"m": "c"})  # supersedes b
+                        # pending, not yet started
+                        mgr._enqueue(2, 2.0, {"m": "b"})
+                        # supersedes b
+                        mgr._enqueue(3, 3.0, {"m": "c"})
                         proceed.set()
                         mgr.close()
                 finally:

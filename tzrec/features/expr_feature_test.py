@@ -246,6 +246,91 @@ class ExprFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
+    @parameterized.expand(
+        [
+            [{"num_buckets": 100}, "int64", [10, 20, 30, 0]],
+            [{"hash_bucket_size": 100}, "float", [39, 63, 46, 0]],
+        ]
+    )
+    def test_expr_feature_with_id_bucketizer(
+        self, bucketizer, expected_value_type, expected_values
+    ):
+        expr_feat_cfg = feature_pb2.FeatureConfig(
+            expr_feature=feature_pb2.ExprFeature(
+                feature_name="expr_feat",
+                embedding_dim=16,
+                expression="a*10",
+                variables=["user:a"],
+                default_value="0",
+                **bucketizer,
+            )
+        )
+        expr_feat = expr_feature_lib.ExprFeature(
+            expr_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
+        self.assertEqual(expr_feat.output_dim, 16)
+        self.assertEqual(expr_feat.is_sparse, True)
+        self.assertEqual(expr_feat.inputs, ["a"])
+        self.assertEqual(expr_feat.fg_json()[0]["value_type"], expected_value_type)
+        expected_emb_bag_config = EmbeddingBagConfig(
+            num_embeddings=100,
+            embedding_dim=16,
+            name="expr_feat_emb",
+            feature_names=["expr_feat"],
+            pooling=PoolingType.SUM,
+        )
+        self.assertEqual(repr(expr_feat.emb_bag_config), repr(expected_emb_bag_config))
+
+        input_data = {"a": pa.array([1.0, 2.0, 3.0, None])}
+        parsed_feat = expr_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "expr_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 1, 1]))
+
+    def test_expr_feature_with_int_value_type(self):
+        expr_feat_cfg = feature_pb2.FeatureConfig(
+            expr_feature=feature_pb2.ExprFeature(
+                feature_name="expr_feat",
+                expression="a==b",
+                variables=["user:a", "item:b"],
+                fg_value_type="int64",
+                value_dim=4,
+                default_value="0",
+            )
+        )
+        expr_feat = expr_feature_lib.ExprFeature(
+            expr_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
+        self.assertEqual(expr_feat.output_dim, 4)
+        self.assertEqual(expr_feat.is_sparse, False)
+        self.assertEqual(expr_feat.fg_json()[0]["value_type"], "int64")
+
+        input_data = {
+            "a": pa.array(["1\x1d2\x1d3\x1d2", "1\x1d1\x1d1\x1d1"]),
+            "b": pa.array([2, 1]),
+        }
+        parsed_feat = expr_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "expr_feat")
+        np.testing.assert_allclose(
+            parsed_feat.values, np.array([[0, 1, 0, 1], [1, 1, 1, 1]])
+        )
+
+    def test_expr_feature_int_value_type_with_boundaries(self):
+        expr_feat_cfg = feature_pb2.FeatureConfig(
+            expr_feature=feature_pb2.ExprFeature(
+                feature_name="expr_feat",
+                embedding_dim=16,
+                boundaries=[0.5],
+                expression="a==b",
+                variables=["user:a", "item:b"],
+                fg_value_type="int64",
+            )
+        )
+        with self.assertRaises(AssertionError):
+            expr_feature_lib.ExprFeature(
+                expr_feat_cfg, fg_mode=FgMode.FG_NORMAL
+            ).fg_json()
+
 
 if __name__ == "__main__":
     unittest.main()

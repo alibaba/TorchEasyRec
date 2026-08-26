@@ -25,7 +25,7 @@ Use the gitignored `experiments/` directory at the repo root for scratch scripts
 
 ## Linting and Type Checking
 
-- Before committing: run `pre-commit run -a` (ruff lint+format at line 88, license header insertion, codespell, mdformat, LF endings) and fix everything it reports; type-check with `python scripts/pyre_check.py` (Pyre strict; proto-generated files and tests are excluded).
+- Before committing: run `pre-commit run -a` (ruff lint+format at line 88, license header insertion, codespell, mdformat, LF endings) and fix everything it reports; type-check with `pyrefly check` (config in `pyrefly.toml`; proto-generated files and `tzrec/ops/_triton/` are excluded).
 - Never `# noqa` a line-length violation; let ruff-format decide layout and do not fight it.
 
 ## Commits and Pull Requests

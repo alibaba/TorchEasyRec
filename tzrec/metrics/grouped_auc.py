@@ -68,7 +68,7 @@ class GroupedAUC(Metric):
             works = []
             for input_t in [input_preds_t, input_target_t, input_grouping_key_t]:
                 output_t = torch.empty(
-                    output_splits.sum().item(),
+                    int(output_splits.sum().item()),
                     dtype=input_t.dtype,
                     device=input_t.device,
                 )

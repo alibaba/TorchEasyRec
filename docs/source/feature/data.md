@@ -302,6 +302,11 @@ pipeline.global-job-parameters: |
 
   ```
 
+- 注意：特征输入中`feature`side的输入(如`feature:xxx`)读到的是被引用特征**Bucketize之后**的值，因此被引用的特征需要满足以下条件之一，否则`--remove_bucketizer`会改变离线FG的计算结果，`create_fg_json`时会报错
+
+  - 被引用的特征配置`stub_type: true`，即该特征只作为FG DAG的中间结果，不输出到表中。`--remove_bucketizer`会保留`stub_type: true`特征的Bucketize配置，如果该特征使用了`vocab_file`，该文件同样需要上传至资源中
+  - 被引用的特征不配置Bucketize参数，如果模型需要Bucketize后的该特征，可以另外增加一个带Bucketize配置的特征来引用它
+
 ### fg_threads
 
 - 每个dataloader worker上fg的运行线程数，默认为1，`nproc-per-node * num_workers * fg_threads`建议小于单机CPU核数

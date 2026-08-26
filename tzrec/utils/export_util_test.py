@@ -24,7 +24,10 @@ import torch
 from torch import distributed as dist
 from torchrec import KeyedJaggedTensor, KeyedTensor
 from torchrec.distributed.train_pipeline.utils import Tracer
-from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+from torchrec.modules.embedding_configs import (
+    EmbeddingBagConfig,
+    EmbeddingConfig,
+)
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
@@ -1832,7 +1835,8 @@ class ExportUtilTest(unittest.TestCase):
         self.assertTrue(ebc.embedding_bags["huge_emb"].weight.is_meta)
         self.assertEqual(ec.embeddings["seq_emb"].weight.shape, (1, 8))
         self.assertEqual(
-            mc_ebc._embedding_module.embedding_bags["zch_emb"].weight.shape, (1, 8)
+            mc_ebc._embedding_module.embedding_bags["zch_emb"].weight.shape,
+            (1, 8),
         )
         self.assertEqual(mch._zch_size, 1)
         for name in mch_buffer_names:

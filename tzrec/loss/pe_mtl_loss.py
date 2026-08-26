@@ -27,7 +27,7 @@ class ParetoEfficientMultiTaskLoss(torch.nn.Module):
         )
         self._c = np.array(min_c).reshape([-1, 1])
 
-    def _pareto_step(self, W: np.ndarray, C: np.ndarray, G: torch.Tensor) -> np.array:
+    def _pareto_step(self, W: np.ndarray, C: np.ndarray, G: torch.Tensor) -> np.ndarray:
         """Ref:http://ofey.me/papers/Pareto.pdf.
 
         Args:
@@ -50,7 +50,7 @@ class ParetoEfficientMultiTaskLoss(torch.nn.Module):
         new_w = self._asm(hat_w, c)
         return new_w
 
-    def _asm(self, hat_w: np.array, c: np.array) -> np.array:
+    def _asm(self, hat_w: np.ndarray, c: np.ndarray) -> np.ndarray:
         """Ref: http://ofey.me/papers/Pareto.pdf.
 
         Args:
@@ -106,5 +106,4 @@ class ParetoEfficientMultiTaskLoss(torch.nn.Module):
         new_loss = []
         for i, loss in enumerate(losses.values()):
             new_loss.append(loss * new_w[i])
-        losses = torch.stack(new_loss).sum()
-        return losses
+        return torch.stack(new_loss).sum()

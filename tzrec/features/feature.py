@@ -15,7 +15,7 @@ import shutil
 from collections import OrderedDict
 from copy import copy
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -418,16 +418,16 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._side_inputs = None
         self._vocab_list = None
         self._vocab_dict = None
-        self._default_value = None
+        self._default_value: Optional[str] = None
         self._is_sequence = is_sequence
         self._is_grouped_seq = False
 
         # for sequence feature
         self._underline = "_" if env_util.use_rtp() else "__"
-        self.sequence_name = None
-        self.sequence_delim = None
-        self.sequence_length = None
-        self.sequence_pk = None
+        self.sequence_name: Optional[str] = None
+        self.sequence_delim: Optional[str] = None
+        self.sequence_length: Optional[int] = None
+        self.sequence_pk: Optional[str] = None
         if is_sequence:
             if sequence_name is None:
                 self.sequence_delim = self.config.sequence_delim
@@ -548,17 +548,19 @@ class BaseFeature(object, metaclass=_meta_cls):
     @property
     def default_value(self) -> str:
         """Effective default value for the feature."""
-        if self._default_value is None:
+        default_value = self._default_value
+        if default_value is None:
             val = self.config.default_value
             if self.is_sequence and not val:
                 logger.warning(
                     f"Sequence{self.__class__.__name__}[{self.name}] "
                     "not support empty default value now. reset to zero."
                 )
-                self._default_value = "0"
+                default_value = "0"
             else:
-                self._default_value = val
-        return self._default_value
+                default_value = val
+            self._default_value = default_value
+        return default_value
 
     @property
     def is_grouped_sequence(self) -> bool:
@@ -1138,7 +1140,7 @@ class BaseFeature(object, metaclass=_meta_cls):
             else:
                 return len(vocab_dict)
         else:
-            return ""
+            return 0
 
     @property
     def default_bucketize_value(self) -> int:
@@ -1310,9 +1312,43 @@ def _remove_one_feature_bucketizer(fg_json: Dict[str, Any]) -> Dict[str, Any]:
     fg_json.pop("vocab_list", None)
     fg_json.pop("boundaries", None)
     fg_json.pop("num_buckets", None)
-    if fg_json["feature_type"] != "tokenize_feature":
+    if not fg_json["feature_type"].endswith("tokenize_feature"):
         fg_json.pop("vocab_file", None)
     return fg_json
+
+
+def _remove_bucketizer(
+    feature: BaseFeature,
+    fg_jsons: List[Dict[str, Any]],
+    referenced_names: Set[str],
+) -> List[Dict[str, Any]]:
+    """Remove bucketizer params in fg jsons of one feature.
+
+    Bucketizer params of fg dag intermediates are kept, and a feature used by
+    other features as `feature:xxx` can not have a bucketizer.
+    """
+    is_referenced = feature.name in referenced_names
+    results = []
+    for fg_json in fg_jsons:
+        # a stub feature and the intermediate fg jsons of a feature, e.g. the
+        # lookup of a multi-value LookupFeature, are not output as columns, and
+        # downstream features consume their bucketized value.
+        if feature.stub_type or fg_json.get("stub_type", False):
+            results.append(fg_json)
+            continue
+        no_bucketizer_fg_json = _remove_one_feature_bucketizer(dict(fg_json))
+        if is_referenced and no_bucketizer_fg_json != fg_json:
+            raise ValueError(
+                f"feature[{feature.name}] is used by other features as "
+                f"feature:{feature.name} and has a bucketizer, which is not "
+                "supported when remove bucketizer, because the value used by "
+                "downstream features is bucketized. Please set stub_type=true "
+                f"on [{feature.name}] if it is only a fg dag intermediate "
+                "result, or add another feature with the bucketizer for the "
+                "model to use."
+            )
+        results.append(no_bucketizer_fg_json)
+    return results
 
 
 def create_fg_json(
@@ -1321,6 +1357,16 @@ def create_fg_json(
     remove_bucketizer: bool = False,
 ) -> Dict[str, Any]:
     """Create feature generate config for features."""
+    referenced_names = set()
+    if remove_bucketizer:
+        for feature in features:
+            try:
+                referenced_names |= {
+                    name for side, name in feature.side_inputs if side == "feature"
+                }
+            except InvalidFgInputError:
+                pass
+
     results = []
     seq_to_idx = {}
     for feature in features:
@@ -1340,13 +1386,13 @@ def create_fg_json(
                 seq_to_idx[feature.sequence_name] = len(results) - 1
             fg_json = feature.fg_json()
             if remove_bucketizer:
-                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
+                fg_json = _remove_bucketizer(feature, fg_json, referenced_names)
             idx = seq_to_idx[feature.sequence_name]
             results[idx]["features"].extend(fg_json)
         else:
             fg_json = feature.fg_json()
             if remove_bucketizer:
-                fg_json = [_remove_one_feature_bucketizer(x) for x in fg_json]
+                fg_json = _remove_bucketizer(feature, fg_json, referenced_names)
             results.extend(fg_json)
     return {"features": results}
 

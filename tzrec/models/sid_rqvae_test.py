@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import unittest
+from typing import Optional
 
 import torch
 from parameterized import parameterized
@@ -26,7 +27,10 @@ from tzrec.utils.state_dict_util import init_parameters
 
 
 def _features_and_groups(
-    input_dim: int, use_contrastive: bool = False, pair_emb_dim: int = None, flag_dim=1
+    input_dim: int,
+    use_contrastive: bool = False,
+    pair_emb_dim: Optional[int] = None,
+    flag_dim=1,
 ):
     """Real raw features + feature groups for a SID model.
 
@@ -316,6 +320,39 @@ class SidRqvaeTest(unittest.TestCase):
         total_loss.backward()
         self._assert_has_grad(model)
 
+    def test_mixed_losses_weighted_by_is_pair_ratio(self) -> None:
+        """Conditional recon/contrastive means are weighted by row ratios."""
+        B, input_dim = 10, 32
+        model = self._create_model(input_dim=input_dim, use_contrastive=True)
+        model.train()
+        model.init_loss()
+
+        is_pair = torch.zeros(B, 1)
+        is_pair[3:] = 1.0  # 3/10 recon rows and 7/10 pair rows
+        batch = self._contrastive_batch(B, input_dim, is_pair)
+        predictions = model.predict(batch)
+
+        raw_recon = model._loss_modules["recon_loss"](
+            predictions["x_hat"],
+            predictions["recon_target"],
+            predictions["recon_mask"],
+        )
+        raw_commitment = model._loss_modules["commitment_loss"](
+            predictions["encoder_out"], predictions["latents"]
+        )
+        raw_contrastive = model._loss_modules["contrastive_loss"](
+            predictions["embed_a"],
+            predictions["embed_b"],
+            predictions["embed_a_ori"],
+            predictions["embed_b_ori"],
+            predictions["pair_mask"],
+        )
+
+        losses = model.loss(predictions, batch)
+        torch.testing.assert_close(losses["recon_loss"], raw_recon * 0.3)
+        torch.testing.assert_close(losses["contrastive_loss"], raw_contrastive * 0.7)
+        torch.testing.assert_close(losses["commitment_loss"], raw_commitment)
+
     def test_rqvae_contrastive_all_recon(self) -> None:
         """Mixed mode, all-recon batch: contrastive term 0, recon term > 0."""
         B, input_dim = 4, 32
@@ -339,6 +376,10 @@ class SidRqvaeTest(unittest.TestCase):
         losses = model.loss(model.predict(batch), batch)
         self.assertEqual(losses["recon_loss"].item(), 0.0)
         self.assertGreater(losses["contrastive_loss"].item(), 0.0)
+        sum(losses.values()).backward()
+        for param in model.parameters():
+            if param.grad is not None:
+                self.assertTrue(torch.isfinite(param.grad).all())
 
     def test_rqvae_backward(self) -> None:
         """Test that backward pass works without errors."""

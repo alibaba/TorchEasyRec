@@ -149,7 +149,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             sampler_type=self.sampler_type,
         )
 
-        self._input_fields = None
+        self._input_fields: Optional[List[pa.Field]] = None
         self._selected_input_names = set()
         self._selected_input_names |= self._data_parser.feature_input_names
         if self._mode == Mode.PREDICT:
@@ -198,8 +198,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                         "grouped sequence; only grouped sequence sub-features "
                         "are supported as item_id_field."
                     )
-                self._sampler_seq_delim = feature.sequence_delim
-                self._sampler_seq_prefix = feature.grouped_sequence_prefix
+                self._sampler_seq_delim = feature.sequence_delim or ""
+                self._sampler_seq_prefix = feature.grouped_sequence_prefix or ""
                 break
 
         self._fg_mode = data_config.fg_mode
@@ -286,6 +286,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         """Input fields info, overwrote by subclass for auto infer the info."""
         if self._input_fields is None:
             self._init_input_fields()
+        assert self._input_fields is not None
         return self._input_fields
 
     def get_worker_info(self) -> Tuple[int, int]:

@@ -302,6 +302,7 @@ def main(  # noqa: C901
         if report_flops:
             return all_flops / ms / 1e9
         else:
+            # pyrefly: ignore[bad-return]
             return ms
 
     df = _bench_hstu_attention.run(
@@ -312,6 +313,7 @@ def main(  # noqa: C901
     )
 
     if return_result:
+        # pyrefly: ignore[bad-return]
         return configs, df
 
 

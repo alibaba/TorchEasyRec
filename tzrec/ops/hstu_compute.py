@@ -179,6 +179,7 @@ def hstu_compute_uqvk(
     ru = recompute_uvqk_in_backward and use_remat
 
     if rn and ru:
+        # pyrefly: ignore[bad-return]
         return torch.utils.checkpoint.checkpoint(
             _hstu_compute_uqvk_impl,
             x,
@@ -212,6 +213,7 @@ def hstu_compute_uqvk(
         normed_x = layer_norm(
             x, weight=norm_weight, bias=norm_bias, eps=norm_eps, kernel=kernel
         )
+        # pyrefly: ignore[bad-return]
         return torch.utils.checkpoint.checkpoint(
             _addmm_split_silu,
             normed_x,

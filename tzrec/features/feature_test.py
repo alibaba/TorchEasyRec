@@ -17,7 +17,7 @@ from collections import OrderedDict
 
 import numpy as np
 import pyarrow as pa
-from parameterized import parameterized
+from parameterized import param, parameterized
 
 from tzrec.features import (
     combo_feature,
@@ -29,7 +29,7 @@ from tzrec.features import (
 from tzrec.features import feature as feature_lib
 from tzrec.features.feature import FgMode
 from tzrec.protos import feature_pb2
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
 class FeatureTest(unittest.TestCase):
@@ -152,6 +152,7 @@ class FeatureTest(unittest.TestCase):
         np.testing.assert_allclose(tag_data.values, np.array(expected_values))
         np.testing.assert_allclose(tag_data.lengths, np.array(expected_lengths))
         if is_weighted:
+            assert tag_data.weights is not None
             np.testing.assert_allclose(tag_data.weights, np.array(expected_weights))
 
     @parameterized.expand(
@@ -477,6 +478,7 @@ class FeatureTest(unittest.TestCase):
             },
         )
         if with_asset_dir:
+            assert asset_dir is not None
             self.assertTrue(os.path.exists(os.path.join(asset_dir, token_file)))
 
     @parameterized.expand([[False], [True]])
@@ -616,7 +618,163 @@ class FeatureTest(unittest.TestCase):
             },
         )
         if with_asset_dir:
+            assert asset_dir is not None
             self.assertTrue(os.path.exists(os.path.join(asset_dir, token_file)))
+
+    def _create_test_dag_feature_cfgs(self, grouped, stub_type):
+        cat_a = feature_pb2.IdFeature(
+            feature_name="cat_a",
+            expression="item:cat_a",
+            embedding_dim=16,
+            num_buckets=100,
+        )
+        if stub_type:
+            cat_a.stub_type = True
+        combo_b = feature_pb2.ComboFeature(
+            feature_name="combo_b",
+            expression=[
+                "feature:click_seq__cat_a" if grouped else "feature:cat_a",
+                "item:cat_b",
+            ],
+            embedding_dim=16,
+            hash_bucket_size=1000,
+        )
+        if grouped:
+            return [
+                feature_pb2.FeatureConfig(
+                    sequence_feature=feature_pb2.SequenceFeature(
+                        sequence_name="click_seq",
+                        sequence_length=50,
+                        sequence_delim=";",
+                        features=[
+                            feature_pb2.SeqFeatureConfig(id_feature=cat_a),
+                            feature_pb2.SeqFeatureConfig(combo_feature=combo_b),
+                        ],
+                    )
+                )
+            ]
+        return [
+            feature_pb2.FeatureConfig(id_feature=cat_a),
+            feature_pb2.FeatureConfig(combo_feature=combo_b),
+        ]
+
+    @parameterized.expand(
+        [
+            param("flat", grouped=False),
+            param("grouped_sequence", grouped=True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_create_fg_json_remove_bucketizer_with_stub_feature(self, _, grouped):
+        feature_cfgs = self._create_test_dag_feature_cfgs(grouped, stub_type=True)
+        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        fg_json = feature_lib.create_fg_json(features, remove_bucketizer=True)
+
+        fg_cfgs = fg_json["features"]
+        if grouped:
+            fg_cfgs = fg_cfgs[0]["features"]
+        self.assertEqual(fg_cfgs[0]["num_buckets"], 100)
+        self.assertEqual(fg_cfgs[0]["stub_type"], True)
+        self.assertNotIn("hash_bucket_size", fg_cfgs[1])
+
+    @parameterized.expand(
+        [
+            param("flat", grouped=False),
+            param("grouped_sequence", grouped=True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_create_fg_json_remove_bucketizer_with_referenced_feature(self, _, grouped):
+        feature_cfgs = self._create_test_dag_feature_cfgs(grouped, stub_type=False)
+        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        with self.assertRaisesRegex(ValueError, "is used by other features"):
+            feature_lib.create_fg_json(features, remove_bucketizer=True)
+
+        fg_json = feature_lib.create_fg_json(features)
+        fg_cfgs = fg_json["features"]
+        if grouped:
+            fg_cfgs = fg_cfgs[0]["features"]
+        self.assertEqual(fg_cfgs[0]["num_buckets"], 100)
+
+    def test_create_fg_json_remove_bucketizer_without_bucketizer(self):
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="raw_a", expression="item:raw_a"
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                combo_feature=feature_pb2.ComboFeature(
+                    feature_name="combo_b",
+                    expression=["feature:raw_a", "item:cat_b"],
+                    embedding_dim=16,
+                    hash_bucket_size=1000,
+                )
+            ),
+        ]
+        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        fg_json = feature_lib.create_fg_json(features, remove_bucketizer=True)
+
+        fg_cfgs = fg_json["features"]
+        self.assertEqual(fg_cfgs[0]["feature_name"], "raw_a")
+        self.assertNotIn("hash_bucket_size", fg_cfgs[1])
+
+    def test_create_fg_json_remove_bucketizer_with_stub_mulval_lookup(self):
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                lookup_feature=feature_pb2.LookupFeature(
+                    feature_name="lookup_a",
+                    map="user:map_a",
+                    key="item:key_a",
+                    embedding_dim=16,
+                    value_dim=2,
+                    boundaries=[1.0, 2.0],
+                    stub_type=True,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                expr_feature=feature_pb2.ExprFeature(
+                    feature_name="expr_b",
+                    expression="lookup_a*10",
+                    variables=["feature:lookup_a"],
+                )
+            ),
+        ]
+        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        fg_json = feature_lib.create_fg_json(features, remove_bucketizer=True)
+
+        fg_cfgs = fg_json["features"]
+        self.assertEqual(fg_cfgs[1]["feature_name"], "lookup_a")
+        self.assertEqual(fg_cfgs[1]["boundaries"], [1.0, 2.0])
+
+    def test_create_fg_json_remove_bucketizer_with_sequence_tokenize(self):
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                sequence_tokenize_feature=feature_pb2.TokenizeFeature(
+                    feature_name="token_a",
+                    expression="item:txt_a",
+                    embedding_dim=16,
+                    vocab_file="data/test/tokenizer.json",
+                    sequence_length=50,
+                    sequence_delim=";",
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                combo_feature=feature_pb2.ComboFeature(
+                    feature_name="combo_b",
+                    expression=["feature:token_a", "item:cat_b"],
+                    embedding_dim=16,
+                    hash_bucket_size=1000,
+                )
+            ),
+        ]
+        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        fg_json = feature_lib.create_fg_json(features, remove_bucketizer=True)
+
+        fg_cfgs = fg_json["features"]
+        self.assertEqual(fg_cfgs[0]["feature_type"], "sequence_tokenize_feature")
+        self.assertEqual(fg_cfgs[0]["vocab_file"], "data/test/tokenizer.json")
+        self.assertNotIn("hash_bucket_size", fg_cfgs[1])
 
     @parameterized.expand([[False], [True]])
     def test_create_feauture_configs(self, with_asset_dir=False):
@@ -637,6 +795,7 @@ class FeatureTest(unittest.TestCase):
         )
 
         if with_asset_dir:
+            assert asset_dir is not None
             feature_cfgs[6].tokenize_feature.vocab_file = token_file
             feature_cfgs[6].tokenize_feature.asset_dir = asset_dir
             feature_cfgs[7].sequence_id_feature.vocab_file = vocab_file
