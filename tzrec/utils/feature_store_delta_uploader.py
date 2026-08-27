@@ -757,11 +757,11 @@ class FeatureStoreDeltaUploader:
                 raise RuntimeError(
                     "DynamicEmbedding FeatureView embedding type mismatch: "
                     f"existing view {self._settings.feature_view_name!r} reports "
-                    "no embedding_field_type (a legacy float view, or "
-                    "feature_store_py older than 2.2.8), but the current delta "
-                    f"dump requires {self._embedding_field_type!r}; keep "
-                    "delta_embedding_dump_config.quant_type as NONE, or "
-                    "recreate the feature view with feature_store_py >= 2.2.8"
+                    "no embedding_field_type (a legacy float view, or a "
+                    "feature_store_py without typed-embedding support), but the "
+                    f"current delta dump requires {self._embedding_field_type!r}; "
+                    "keep delta_embedding_dump_config.quant_type as NONE, or "
+                    "recreate the feature view with feature_store_py >= 2.2.10"
                 )
         elif actual_field_type != self._embedding_field_type:
             raise RuntimeError(
@@ -858,7 +858,7 @@ class FeatureStoreDeltaUploader:
                 raise RuntimeError(
                     "failed to create configured DynamicEmbedding FeatureView: "
                     "the installed feature_store_py does not accept "
-                    "embedding_field_type; upgrade to feature_store_py >= 2.2.8 "
+                    "embedding_field_type; upgrade to feature_store_py >= 2.2.10 "
                     "as pinned in requirements/runtime.txt"
                 ) from exc
             except Exception as exc:
