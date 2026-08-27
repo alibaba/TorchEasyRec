@@ -64,6 +64,7 @@ feature_configs {
         embedding_dim: 32
         vocab_dict: [{key:"a" value:2}, {key:"b" value:3}, {key:"c" value:2}]
     }
+}
 feature_configs {
     id_feature {
         feature_name: "cate"
@@ -702,7 +703,9 @@ feature_configs {
 
 - operator_name: 特征算子注册的名字，建议与实现的类名保持一致
 
-- operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
+- operator_lib_file: 指定特征算子动态库文件的路径，必须以.so结尾，需使用`_GLIBCXX_USE_CXX11_ABI=1`编译。如果是`pyfg/lib/`开头的路径，则为pyfg官方自定义so
+
+- operator_lib_cxx11abi0_file: 可选，指定使用`_GLIBCXX_USE_CXX11_ABI=0`编译的特征算子动态库文件的路径，仅在生成MaxCompute FG的fg json（`tzrec.tools.create_fg_json`）时使用，会作为MaxCompute资源上传，生成的fg json中的参数名仍为`operator_lib_file`。使用自定义算子跑MaxCompute FG时必须配置该参数；`pyfg/lib/`开头的官方算子so由MaxCompute FG自行提供并上传，无需配置该参数
 
 - expression: 特征FG所依赖组合字段的来源
 
@@ -767,18 +770,6 @@ feature_configs {
             }
         }
         features {
-            custom_feature {
-                feature_name: "seq_expr"
-                operator_name: "SeqExpr"
-                operator_lib_file: "pyfg/lib/libseq_expr.so"
-                expression: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
-                operator_params {
-                    key: "formula"
-                    string_value: "spherical_distance"
-                }
-            }
-        }
-        features {
             lookup_feature {
                 feature_name: "user_cate_cnt"
                 map: "user:kv_cate_cnt"
@@ -805,6 +796,29 @@ feature_configs {
                 num_buckets: 10
                 combiner: "sum"
                 value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
+            }
+        }
+        features {
+            expr_feature {
+                feature_name: "user_item_dist"
+                variables: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
+                expression: "sphere_dist(ulng, ulat, ilng, ilat)"
+            }
+        }
+        features {
+            custom_feature {
+                feature_name: "seq_expr"
+                operator_name: "SeqExpr"
+                operator_lib_file: "pyfg/lib/libseq_expr.so"
+                expression: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
+                operator_params {
+                    fields {
+                        key: "formula"
+                        value {
+                            string_value: "spherical_distance"
+                        }
+                    }
+                }
             }
         }
     }
@@ -858,6 +872,25 @@ feature_configs {
     }
 }
 feature_configs {
+    sequence_combine_feature {
+        feature_name: "event_list"
+        expression: "user:event"
+        embedding_dim: 16
+        num_buckets: 10
+        combiner: "sum"
+        value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
+        sequence_length: 50
+        sequence_delim: ";"
+    }
+}
+feature_configs {
+    sequence_expr_feature {
+        feature_name: "seq_expr_2"
+        variables: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
+        expression: "sphere_dist(ulng, ulat, ilng, ilat)"
+    }
+}
+feature_configs {
     sequence_custom_feature {
         feature_name: "seq_expr_1"
         operator_name: "SeqExpr"
@@ -871,34 +904,6 @@ feature_configs {
                 }
             }
         }
-    }
-}
-feature_configs {
-    sequence_custom_feature {
-        feature_name: "seq_expr_2"
-        operator_name: "SeqExpr"
-        operator_lib_file: "pyfg/lib/libseq_expr.so"
-        expression: ["user:ulng", "user:ulat", "item:ilng", "item:ilat"]
-        operator_params {
-            fields {
-                key: "formula"
-                value {
-                    string_value: "spherical_distance"
-                }
-            }
-        }
-    }
-}
-feature_configs {
-    sequence_combine_feature {
-        feature_name: "event_list"
-        expression: "user:event"
-        embedding_dim: 16
-        num_buckets: 10
-        combiner: "sum"
-        value_map: [{key:"click" value:1.0}, {key:"buy" value:2.0}]
-        sequence_length: 50
-        sequence_delim: ";"
     }
 }
 ```
