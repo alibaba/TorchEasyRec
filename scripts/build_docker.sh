@@ -4,7 +4,7 @@ set -eo pipefail
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 REPO_NAME=tzrec-test
 DOCKER_TAG=1.4
-DOCKER_TAG_SUFFIX=-u3
+DOCKER_TAG_SUFFIX=-u4
 
 rm -rf docker/requirements*
 cp -r requirements*.txt docker/
