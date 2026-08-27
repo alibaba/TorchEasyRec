@@ -1044,6 +1044,7 @@ def test_train_eval(
     num_rows: Optional[int] = None,
     learnable_label: Optional[str] = None,
     num_epochs: Optional[int] = None,
+    pythonpath: str = ".",
 ) -> bool:
     """Run train_eval integration test."""
     pipeline_config = load_config_for_test(
@@ -1061,7 +1062,7 @@ def test_train_eval(
     config_util.save_message(pipeline_config, test_config_path)
     log_dir = os.path.join(test_dir, "log_train_eval")
     cmd_str = (
-        f"PYTHONPATH=. torchrun {_standalone()} "
+        f"PYTHONPATH={pythonpath} torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/train_eval.py "
         f"--pipeline_config_path {test_config_path} {args_str}"
@@ -1077,11 +1078,12 @@ def test_eval(
     pipeline_config_path: str,
     test_dir: str,
     env_str: str = "",
+    pythonpath: str = ".",
 ) -> bool:
     """Run evaluate integration test."""
     log_dir = os.path.join(test_dir, "log_eval")
     cmd_str = (
-        f"PYTHONPATH=. torchrun {_standalone()} "
+        f"PYTHONPATH={pythonpath} torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/eval.py "
         f"--pipeline_config_path {pipeline_config_path}"
@@ -1101,12 +1103,13 @@ def test_export(
     env_str: str = "",
     additional_export_config: str = "",
     item_input_path: str = "",
+    pythonpath: str = ".",
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
     export_dir = export_dir or f"{test_dir}/export"
     cmd_str = (
-        f"PYTHONPATH=. torchrun {_standalone()} "
+        f"PYTHONPATH={pythonpath} torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/export.py "
         f"--pipeline_config_path {pipeline_config_path} "

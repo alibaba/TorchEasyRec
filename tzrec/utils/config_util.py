@@ -14,11 +14,12 @@ import re
 from typing import Any, Dict, List, Optional, Type, Union
 
 import numpy as np
-from google.protobuf import json_format, text_format
+from google.protobuf import any_pb2, json_format, symbol_database, text_format
 from google.protobuf.message import Message
 
 from tzrec.protos import data_pb2, eval_pb2, export_pb2, pipeline_pb2, train_pb2
 from tzrec.protos.data_pb2 import FgMode
+from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import logger
 
 
@@ -35,16 +36,65 @@ def load_pipeline_config(
     Return:
         a object of pipeline_pb2.EasyRecConfig.
     """
-    config = pipeline_pb2.EasyRecConfig()
     with open(pipeline_config_path) as f:
-        if pipeline_config_path.endswith(".json"):
-            json_format.Parse(
-                f.read(), config, ignore_unknown_fields=allow_unknown_field
-            )
-        else:
-            text_format.Merge(f.read(), config, allow_unknown_field=allow_unknown_field)
+        content = f.read()
+    is_json = pipeline_config_path.endswith(".json")
+    _preload_custom_model(content, is_json)
+
+    config = pipeline_pb2.EasyRecConfig()
+    if is_json:
+        json_format.Parse(content, config, ignore_unknown_fields=allow_unknown_field)
+    else:
+        text_format.Merge(content, config, allow_unknown_field=allow_unknown_field)
     # compatible for fg_encoded
     config.data_config.fg_mode = _get_compatible_fg_mode(config.data_config)
+    return config
+
+
+def _preload_custom_model(content: str, is_json: bool) -> None:
+    """Import the custom model module before the pipeline config is parsed.
+
+    A custom model config is embedded in a google.protobuf.Any, whose type must
+    be registered in the default descriptor pool before parsing. Read class_path
+    with a pre-parse that tolerates the not-yet-registered Any, and import the
+    module defining the model, which registers the descriptor on the way.
+
+    Args:
+        content (str): raw content of a pipeline config.
+        is_json (bool): whether the content is in json format.
+    """
+    preload = pipeline_pb2.PreloadConfig()
+    if is_json:
+        json_format.Parse(content, preload, ignore_unknown_fields=True)
+    else:
+        text_format.Merge(content, preload, allow_unknown_field=True)
+    class_path = preload.model_config.custom_model.class_path
+    if class_path:
+        import_class(class_path)
+
+
+def unpack_any(any_config: any_pb2.Any) -> Optional[Message]:
+    """Unpack a google.protobuf.Any into its concrete message.
+
+    Args:
+        any_config (Any): a google.protobuf.Any message.
+
+    Return:
+        the packed message, or None when the Any is not set.
+    """
+    type_name = any_config.TypeName()
+    if not type_name:
+        return None
+    try:
+        config_cls = symbol_database.Default().GetSymbol(type_name)
+    except KeyError as e:
+        raise ValueError(
+            f"config type [{type_name}] is not registered, please make sure the "
+            "module defining the model imports its generated *_pb2 module."
+        ) from e
+    config = config_cls()
+    if not any_config.Unpack(config):
+        raise ValueError(f"failed to unpack config of type [{type_name}].")
     return config
 
 

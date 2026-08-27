@@ -32,6 +32,7 @@ from tzrec.loss.pe_mtl_loss import ParetoEfficientMultiTaskLoss
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
+from tzrec.utils import config_util
 from tzrec.utils.load_class import get_register_class_meta
 
 _MODEL_CLASS_MAP = {}
@@ -62,9 +63,14 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         self._features = features
         self._feature_groups = list(model_config.feature_groups)
         self._labels = labels
-        self._model_config = (
-            getattr(model_config, self._model_type) if self._model_type else None
-        )
+        if self._model_type == "custom_model":
+            self._model_config = config_util.unpack_any(
+                model_config.custom_model.config
+            )
+        elif self._model_type:
+            self._model_config = getattr(model_config, self._model_type)
+        else:
+            self._model_config = None
         self._metric_modules = nn.ModuleDict()
         self._loss_modules = nn.ModuleDict()
 

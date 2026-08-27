@@ -13,10 +13,25 @@ import unittest
 
 import torch
 
-from tzrec.utils.load_class import load_by_path
+from tzrec.utils.load_class import import_class, load_by_path
 
 
 class LoadClassTest(unittest.TestCase):
+    def test_import_class(self):
+        self.assertEqual(import_class("torch.nn.ReLU"), torch.nn.ReLU)
+
+    def test_import_class_propagates_import_error(self):
+        with self.assertRaises(ModuleNotFoundError):
+            import_class("tzrec.no_such_module.MyModel")
+
+    def test_import_class_missing_attribute(self):
+        with self.assertRaisesRegex(ValueError, "is not found in module"):
+            import_class("torch.nn.MyReLU")
+
+    def test_import_class_without_module(self):
+        with self.assertRaisesRegex(ValueError, "is not a full class path"):
+            import_class("MyModel")
+
     def test_load_by_path(self):
         loaded_cls = load_by_path("nn.ReLU")
         self.assertEqual(loaded_cls, torch.nn.ReLU)

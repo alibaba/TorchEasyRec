@@ -50,6 +50,49 @@ class CustomFeatureTest(unittest.TestCase):
         self.assertEqual(parsed_feat.name, "custom_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array([[3]]))
 
+    def _create_custom_feat(self, operator_lib_file, operator_lib_cxx11abi0_file=None):
+        custom_feat_cfg = feature_pb2.CustomFeature(
+            feature_name="custom_feat",
+            operator_name="MyOp",
+            operator_lib_file=operator_lib_file,
+            expression=["user:query", "item:title"],
+        )
+        if operator_lib_cxx11abi0_file:
+            custom_feat_cfg.operator_lib_cxx11abi0_file = operator_lib_cxx11abi0_file
+        return custom_feature_lib.CustomFeature(
+            feature_pb2.FeatureConfig(custom_feature=custom_feat_cfg),
+            fg_mode=FgMode.FG_NORMAL,
+        )
+
+    def test_odps_official_operator_lib(self):
+        custom_feat = self._create_custom_feat("pyfg/lib/libedit_distance.so")
+        # odps fg ships and uploads the official operator lib itself.
+        self.assertEqual(custom_feat.odps_assets(), {})
+        self.assertEqual(
+            custom_feat.odps_fg_json()[0]["operator_lib_file"],
+            "pyfg/lib/libedit_distance.so",
+        )
+        self.assertTrue(
+            custom_feat.fg_json()[0]["operator_lib_file"].endswith(
+                "pyfg/lib/libedit_distance.so"
+            )
+        )
+
+    def test_odps_custom_operator_lib(self):
+        custom_feat = self._create_custom_feat("libcustom.so", "libcustom_abi0.so")
+        self.assertEqual(
+            custom_feat.odps_assets(), {"operator_lib_file": "libcustom_abi0.so"}
+        )
+        self.assertEqual(custom_feat.assets(), {"operator_lib_file": "libcustom.so"})
+        self.assertEqual(
+            custom_feat.odps_fg_json()[0]["operator_lib_file"], "libcustom.so"
+        )
+
+    def test_odps_custom_operator_lib_without_cxx11abi0_file(self):
+        custom_feat = self._create_custom_feat("libcustom.so")
+        with self.assertRaisesRegex(ValueError, "operator_lib_cxx11abi0_file"):
+            custom_feat.odps_assets()
+
     def test_edit_distance_with_boundary(self):
         custom_feat_cfg = feature_pb2.FeatureConfig(
             custom_feature=feature_pb2.CustomFeature(

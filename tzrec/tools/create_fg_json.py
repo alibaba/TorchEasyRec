@@ -96,7 +96,10 @@ if __name__ == "__main__":
 
     tmp_dir = tempfile.mkdtemp(prefix="tzrec_")
     fg_json = create_fg_json(
-        features, asset_dir=tmp_dir, remove_bucketizer=args.remove_bucketizer
+        features,
+        asset_dir=tmp_dir,
+        remove_bucketizer=args.remove_bucketizer,
+        for_odps=True,
     )
 
     if args.reserves is not None:
@@ -144,6 +147,4 @@ if __name__ == "__main__":
                 logger.info(f"uploading resource [{fname}].")
                 resource = o.create_resource(fname, "file", file_obj=open(fpath, "rb"))
 
-    if tmp_dir is None:
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir)
+    shutil.rmtree(tmp_dir)
