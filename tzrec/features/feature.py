@@ -83,6 +83,7 @@ def _parse_fg_encoded_sparse_feature_impl(
     multival_sep: str = chr(3),
     default_value: Optional[List[int]] = None,
     is_weighted: bool = False,
+    use_weight: bool = False,
 ) -> SparseData:
     """Parse fg encoded sparse feature.
 
@@ -92,6 +93,7 @@ def _parse_fg_encoded_sparse_feature_impl(
         multival_sep (str): string separator for multi-val data.
         default_value (list): default value.
         is_weighted (bool): input feature is weighted or not.
+        use_weight (bool): output weight of the weighted feature or not.
 
     Returns:
         an instance of SparseData.
@@ -127,12 +129,16 @@ def _parse_fg_encoded_sparse_feature_impl(
                 )
         else:
             # dtype = map<int,float> or others can cast to map<int,float>
-            weight = pa.ListArray.from_arrays(
-                feat.offsets, feat.items, mask=feat.is_null()
-            )
+            if is_weighted:
+                weight = pa.ListArray.from_arrays(
+                    feat.offsets, feat.items, mask=feat.is_null()
+                )
             feat = pa.ListArray.from_arrays(
                 feat.offsets, feat.keys, mask=feat.is_null()
             )
+
+        if not use_weight:
+            weight = None
 
         feat = feat.cast(pa.list_(pa.int64()), safe=False)
         if weight is not None:
@@ -412,6 +418,8 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._is_neg = False
         self._is_sparse = None
         self._is_weighted = False
+        self._use_weight = False
+        self._in_weighted_group = False
         self._is_user_feat = None
         self._data_group = BASE_DATA_GROUP
         self._inputs = None
@@ -578,6 +586,11 @@ class BaseFeature(object, metaclass=_meta_cls):
         return self._is_weighted
 
     @property
+    def use_weight(self) -> bool:
+        """Weight of the weighted id feature is used in embedding or not."""
+        return self._use_weight
+
+    @property
     def has_embedding(self) -> bool:
         """Feature has embedding or not."""
         if self.is_sparse:
@@ -618,21 +631,42 @@ class BaseFeature(object, metaclass=_meta_cls):
             init_fn = None
             if self.config.HasField("init_fn"):
                 init_fn = init_util.create_init_fn(self.config.init_fn)
+            pooling = self.pooling_type
+            need_weight = self._use_weight
+            if self._in_weighted_group and pooling == PoolingType.MEAN:
+                # DataParser normalizes the per-sample weights of a mean pooled
+                # feature to sum to one per bag, so mean is done by sum pooling
+                # over them. eager EmbeddingBag does not support per_sample_weights
+                # with mean, and the mean divisor of the training and the inference
+                # kernel differ, so keeping mean would make them disagree.
+                pooling = PoolingType.SUM
+                need_weight = True
+            use_dynamicemb = hasattr(
+                self.config, "dynamicemb"
+            ) and self.config.HasField("dynamicemb")
+            if self._in_weighted_group and use_dynamicemb:
+                # dynamicemb reuses the kjt weights to carry frequency counters
+                # and does not support per_sample_weights in pooling.
+                raise ValueError(
+                    f"{self.__class__.__name__}[{self.name}] with dynamicemb cannot"
+                    " be in the same data group with a weighted id feature, please"
+                    " set use_weight = false on the weighted feature."
+                )
             emb_bag_config = EmbeddingBagConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
                 name=embedding_name,
                 feature_names=[self.name],
-                pooling=self.pooling_type,
+                pooling=pooling,
                 init_fn=init_fn,
                 data_type=_dtype_str_to_data_type(self.config.data_type),
             )
             # pyre-ignore [16]
             emb_bag_config.trainable = self.config.trainable
             # pyre-ignore [16]
-            emb_bag_config.use_dynamicemb = hasattr(
-                self.config, "dynamicemb"
-            ) and self.config.HasField("dynamicemb")
+            emb_bag_config.use_dynamicemb = use_dynamicemb
+            # pyre-ignore [16]
+            emb_bag_config.is_weighted = need_weight
             return emb_bag_config
         else:
             return None
@@ -931,6 +965,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                         self.name,
                         feat,
                         is_weighted=self._is_weighted,
+                        use_weight=self._use_weight,
                         **self._fg_encoded_kwargs,
                     )
                 else:
@@ -961,7 +996,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                         name=self.name,
                         values=feat_data.np_values,
                         lengths=feat_data.np_lengths,
-                        weights=feat_data.np_weights if self._is_weighted else None,
+                        weights=feat_data.np_weights if self._use_weight else None,
                     )
                 else:
                     parsed_feat = DenseData(
@@ -1228,6 +1263,10 @@ def create_features(
                     break
         except InvalidFgInputError:
             pass
+
+    weighted_data_groups = {x.data_group for x in features if x.use_weight}
+    for feature in features:
+        feature._in_weighted_group = feature.data_group in weighted_data_groups
 
     if has_dag:
         fg_json = create_fg_json(features)

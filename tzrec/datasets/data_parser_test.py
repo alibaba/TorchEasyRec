@@ -162,6 +162,7 @@ class DataParserTest(unittest.TestCase):
                     embedding_dim=16,
                     num_buckets=100,
                     weighted=True,
+                    use_weight=True,
                 )
             ),
             feature_pb2.FeatureConfig(
@@ -170,6 +171,7 @@ class DataParserTest(unittest.TestCase):
                     embedding_dim=16,
                     num_buckets=100,
                     weighted=True,
+                    use_weight=True,
                     fg_encoded_default_value="0",
                 )
             ),
@@ -179,6 +181,7 @@ class DataParserTest(unittest.TestCase):
                     embedding_dim=8,
                     num_buckets=1000,
                     weighted=True,
+                    use_weight=True,
                 )
             ),
             feature_pb2.FeatureConfig(
@@ -187,6 +190,7 @@ class DataParserTest(unittest.TestCase):
                     embedding_dim=8,
                     num_buckets=1000,
                     weighted=True,
+                    use_weight=True,
                     fg_encoded_default_value="0",
                 )
             ),
@@ -353,6 +357,7 @@ class DataParserTest(unittest.TestCase):
         tag_b_seq=False,
         with_const=False,
         with_stub_feat=False,
+        tag_b_use_weight=True,
     ):
         seq_sub_feas = [
             feature_pb2.SeqFeatureConfig(
@@ -407,6 +412,7 @@ class DataParserTest(unittest.TestCase):
                     embedding_dim=8,
                     num_buckets=1000,
                     weighted=tag_b_weighted,
+                    use_weight=tag_b_use_weight,
                 )
             ),
             feature_pb2.FeatureConfig(
@@ -702,6 +708,110 @@ class DataParserTest(unittest.TestCase):
             )
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
+
+    def test_fg_encoded_weighted_id_mean_pooling(self):
+        # mean pooling in a weighted data group is carried by the per-sample
+        # weights, normalized to sum to one per bag, so that pooling stays a
+        # plain weighted sum in every lookup kernel.
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="tag_a",
+                    embedding_dim=8,
+                    num_buckets=100,
+                    weighted=True,
+                    use_weight=True,
+                    pooling="mean",
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="tag_b",
+                    embedding_dim=8,
+                    num_buckets=100,
+                    pooling="mean",
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="tag_c",
+                    embedding_dim=8,
+                    num_buckets=100,
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        data_parser = DataParser(features=features)
+        data = data_parser.parse(
+            input_data={
+                "tag_a": pa.array(["1:1.0\x032:3.0", "", "3:2.0"]),
+                "tag_b": pa.array(["1\x032", "", "3"]),
+                "tag_c": pa.array(["1\x032", "", "3"]),
+            }
+        )
+        # raw weights are kept in the parsed inputs, normalization is in to_batch
+        torch.testing.assert_close(data["tag_a.weights"], torch.tensor([1.0, 3.0, 2.0]))
+
+        batch = data_parser.to_batch(data)
+        weights = batch.sparse_features["__BASE__"].weights()
+        # tag_a: weighted mean -> w / sum(w); tag_b: plain mean -> 1 / length;
+        # tag_c: sum pooling -> untouched ones
+        torch.testing.assert_close(
+            weights,
+            torch.tensor(
+                [0.25, 0.75, 1.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0],
+            ),
+        )
+
+    @parameterized.expand(
+        [
+            param("fg_normal", fg_mode=FgMode.FG_NORMAL),
+            param("fg_dag", fg_mode=FgMode.FG_DAG),
+            param("fg_none", fg_mode=FgMode.FG_NONE),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_fg_weighted_id_without_use_weight(self, name, fg_mode):
+        feature_cfgs = self._create_test_fg_feature_cfgs(
+            tag_b_weighted=True, tag_b_use_weight=False
+        )
+        features = create_features(feature_cfgs, fg_mode=fg_mode)
+        data_parser = DataParser(features=features)
+        self.assertEqual(len(data_parser.has_weight_keys["__BASE__"]), 0)
+
+        if fg_mode == FgMode.FG_NONE:
+            input_data = {
+                "f_cat_a": pa.array(["1", "2", "3"]),
+                "f_tag_b": pa.array(["4:0.1\x035:0.2", "", "6:0.3"]),
+                "f_int_a": pa.array([7, 8, 9], pa.float32()),
+                "f_int_b": pa.array(["27\x0337", "28\x0338", "29\x0339"]),
+                "f_lookup_a": pa.array([0.1, 0.0, 0.2], pa.float32()),
+                "click_seq__f_cat_a": pa.array(["10;11;12", "13", ""]),
+                "click_seq__f_int_a": pa.array(["14;15;16", "17", ""]),
+            }
+        else:
+            input_data = {
+                "cat_a": pa.array([1, 2, 3]),
+                "tag_b": pa.array(["4:0.1\x1d5:0.2", "", "6:0.3"]),
+                "int_a": pa.array([7, 8, 9], pa.float32()),
+                "int_b": pa.array(["27\x1d37", "28\x1d38", "29\x1d39"]),
+                "map_a": pa.array(["1:0.1\x1d3:0.2", "", "1:0.1\x1d3:0.2"]),
+                "click_seq__cat_a": pa.array(["10;11;12", "13", ""]),
+                "click_seq__int_a": pa.array(["14;15;16", "17", ""]),
+            }
+
+        data = data_parser.parse(input_data=input_data)
+        self.assertNotIn("f_tag_b.weights", data)
+        torch.testing.assert_close(
+            data["f_tag_b.lengths"], torch.tensor([2, 0, 1], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            torch.sort(data["f_tag_b.values"][:2]).values,
+            torch.tensor([4, 5], dtype=torch.int64),
+        )
+
+        batch = data_parser.to_batch(data)
+        self.assertIsNone(batch.sparse_features["__BASE__"].weights_or_none())
 
     def test_fg_with_const(self):
         feature_cfgs = self._create_test_fg_feature_cfgs(

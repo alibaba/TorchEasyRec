@@ -19,6 +19,7 @@ import torch
 from parameterized import param, parameterized
 from torch import nn
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
+from torchrec.modules.embedding_configs import PoolingType
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
@@ -254,6 +255,239 @@ class EmbeddingGroupTest(unittest.TestCase):
 
         self.assertEqual(result["wide"].size(), (2, 8))
         self.assertEqual(result["deep"].size(), (2, 25))
+
+    @parameterized.expand(
+        [
+            param("use_weight", use_weight=True),
+            param("wo_use_weight", use_weight=False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_embedding_group_impl_weighted(self, name, use_weight) -> None:
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_a",
+                    embedding_dim=16,
+                    num_buckets=100,
+                    weighted=True,
+                    use_weight=use_weight,
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["cat_a"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        embedding_group = EmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertEqual(embedding_group.ebc.is_weighted(), use_weight)
+
+        values = torch.tensor([1, 2, 3])
+        weights = torch.tensor([0.5, 2.0, 1.0])
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["cat_a"],
+            values=values,
+            lengths=torch.tensor([2, 1]),
+            weights=weights,
+        )
+        result = embedding_group(sparse_feature, None, EMPTY_KJT)
+
+        emb = next(iter(embedding_group.ebc.embedding_bags.values())).weight
+        if use_weight:
+            expected = torch.stack(
+                [
+                    emb[1] * weights[0] + emb[2] * weights[1],
+                    emb[3] * weights[2],
+                ]
+            )
+        else:
+            expected = torch.stack([emb[1] + emb[2], emb[3]])
+        torch.testing.assert_close(result["deep"], expected)
+
+    def test_embedding_group_impl_weighted_with_mean_pooling(self) -> None:
+        # mean pooling of a weighted group is done by sum pooling over the
+        # per-sample weights that DataParser normalizes to sum to one per bag.
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_a",
+                    embedding_dim=16,
+                    num_buckets=100,
+                    weighted=True,
+                    use_weight=True,
+                    pooling="mean",
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_b",
+                    embedding_dim=8,
+                    num_buckets=1000,
+                    pooling="mean",
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["cat_a", "cat_b"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        embedding_group = EmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertTrue(embedding_group.ebc.is_weighted())
+        for emb_bag_config in embedding_group.ebc.embedding_bag_configs():
+            self.assertEqual(emb_bag_config.pooling, PoolingType.SUM)
+
+        # weights as DataParser normalizes them: cat_a raw [1, 3], cat_b plain mean
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["cat_a", "cat_b"],
+            values=torch.tensor([1, 2, 3, 4]),
+            lengths=torch.tensor([2, 2]),
+            weights=torch.tensor([0.25, 0.75, 0.5, 0.5]),
+        )
+        result = embedding_group(sparse_feature, None, EMPTY_KJT)
+
+        emb_a = embedding_group.ebc.embedding_bags["cat_a_emb"].weight
+        emb_b = embedding_group.ebc.embedding_bags["cat_b_emb"].weight
+        expected = torch.cat(
+            [
+                (0.25 * emb_a[1] + 0.75 * emb_a[2]).unsqueeze(0),
+                (0.5 * emb_b[3] + 0.5 * emb_b[4]).unsqueeze(0),
+            ],
+            dim=1,
+        )
+        torch.testing.assert_close(result["deep"], expected)
+
+    @parameterized.expand(
+        [
+            param("sum_neighbor", neighbor_pooling="sum", expected_ebc_weighted=False),
+            param("mean_neighbor", neighbor_pooling="mean", expected_ebc_weighted=True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_embedding_group_impl_weighted_per_collection(
+        self, name, neighbor_pooling, expected_ebc_weighted
+    ) -> None:
+        # is_weighted is per EmbeddingBagCollection: the weighted feature lives in
+        # the zch collection, so the plain one only needs weights when it holds a
+        # mean pooled table, whose mean is carried by the normalized weights.
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_a",
+                    embedding_dim=16,
+                    zch=feature_pb2.ZeroCollisionHash(
+                        zch_size=100, lfu=feature_pb2.LFU_EvictionPolicy()
+                    ),
+                    weighted=True,
+                    use_weight=True,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_b",
+                    embedding_dim=8,
+                    num_buckets=1000,
+                    pooling=neighbor_pooling,
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["cat_a", "cat_b"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        embedding_group = EmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertEqual(embedding_group.ebc.is_weighted(), expected_ebc_weighted)
+        self.assertTrue(embedding_group.mc_ebc._embedding_bag_collection.is_weighted())
+
+    @parameterized.expand(
+        [
+            param("weighted_first", weighted_first=True),
+            param("weighted_second", weighted_first=False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_embedding_group_impl_weighted_shared_table(self, name, weighted_first):
+        # a shared table is weighted when any of its features needs weight,
+        # whichever of them is merged into the config dict first.
+        weighted = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="cat_a",
+                embedding_dim=8,
+                num_buckets=100,
+                embedding_name="shared_emb",
+                weighted=True,
+                use_weight=True,
+            )
+        )
+        plain = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="cat_b",
+                embedding_dim=8,
+                num_buckets=100,
+                embedding_name="shared_emb",
+            )
+        )
+        feature_cfgs = [weighted, plain] if weighted_first else [plain, weighted]
+        names = ["cat_a", "cat_b"] if weighted_first else ["cat_b", "cat_a"]
+        features = create_features(feature_cfgs)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=names,
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        embedding_group = EmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertTrue(embedding_group.ebc.is_weighted())
+
+    def test_embedding_group_impl_weighted_with_dynamicemb(self) -> None:
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_a",
+                    embedding_dim=16,
+                    num_buckets=100,
+                    weighted=True,
+                    use_weight=True,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_b",
+                    embedding_dim=8,
+                    dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=1024),
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["cat_a", "cat_b"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        with self.assertRaises(ValueError):
+            EmbeddingGroupImpl(features, feature_groups, device=torch.device("cpu"))
 
     @parameterized.expand(
         [

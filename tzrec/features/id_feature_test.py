@@ -18,7 +18,7 @@ import numpy as np
 import pyarrow as pa
 import pyfg
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torch import nn
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
@@ -174,6 +174,7 @@ class IdFeatureTest(unittest.TestCase):
                 embedding_dim=16,
                 expression="item:cate",
                 weighted=True,
+                use_weight=True,
             )
         )
         id_feat = id_feature_lib.IdFeature(id_feat_cfg)
@@ -186,6 +187,51 @@ class IdFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
         np.testing.assert_allclose(parsed_feat.weights, np.array(expected_weights))
+
+    @parameterized.expand(
+        [
+            param(
+                "str",
+                inputs=pa.array(["1:1.0", "2:1.5\x033:2.0", "4:2.5"]),
+                weighted=True,
+            ),
+            param(
+                "map",
+                inputs=pa.array(
+                    [{1: 1.0}, {2: 1.5, 3: 2.0}, {4: 2.5}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                ),
+                weighted=True,
+            ),
+            param(
+                "map_wo_weighted",
+                inputs=pa.array(
+                    [{1: 1.0}, {2: 1.5, 3: 2.0}, {4: 2.5}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                ),
+                weighted=False,
+            ),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_fg_encoded_without_use_weight(self, name, inputs, weighted):
+        # use_weight defaults to false, weight is parsed off the value and dropped
+        id_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="cate",
+                hash_bucket_size=10,
+                embedding_dim=16,
+                expression="item:cate",
+                weighted=weighted,
+            )
+        )
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg)
+        self.assertFalse(id_feat.use_weight)
+
+        parsed_feat = id_feat.parse({"cate": inputs})
+        np.testing.assert_allclose(parsed_feat.values, np.array([1, 2, 3, 4]))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 2, 1]))
+        self.assertIsNone(parsed_feat.weights)
 
     def test_fg_encoded_id_feature_with_mask(self):
         id_feat_cfg = feature_pb2.FeatureConfig(
@@ -231,6 +277,7 @@ class IdFeatureTest(unittest.TestCase):
                 embedding_dim=16,
                 expression="item:cate",
                 weighted=True,
+                use_weight=True,
             )
         )
         id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
@@ -249,6 +296,29 @@ class IdFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_values, np.array([123, 1391, 12, 123]))
         np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 0, 2, 0]))
         self.assertTrue(np.allclose(parsed_weights, np.array([0.5, 0.3, 0.9, 0.21])))
+
+    def test_id_feature_with_weighted_without_use_weight(self):
+        id_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="cate",
+                num_buckets=100000,
+                embedding_dim=16,
+                expression="item:cate",
+                weighted=True,
+            )
+        )
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
+        self.assertFalse(id_feat.use_weight)
+
+        parsed_feat = id_feat.parse(
+            {"cate": pa.array(["123:0.5", "1391:0.3", None, "12:0.9\035123:0.21", ""])}
+        )
+        parsed_values = np.concatenate(
+            [parsed_feat.values[:2], np.sort(parsed_feat.values[2:])]
+        )
+        np.testing.assert_allclose(parsed_values, np.array([123, 1391, 12, 123]))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 0, 2, 0]))
+        self.assertIsNone(parsed_feat.weights)
 
     @parameterized.expand(
         [

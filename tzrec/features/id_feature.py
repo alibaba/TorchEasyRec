@@ -33,10 +33,9 @@ class IdFeature(BaseFeature):
     ) -> None:
         super().__init__(feature_config, **kwargs)
 
-        if isinstance(self.config, feature_pb2.IdFeature) and self.config.HasField(
-            "weighted"
-        ):
+        if isinstance(self.config, feature_pb2.IdFeature):
             self._is_weighted = self.config.weighted
+            self._use_weight = self.config.weighted and self.config.use_weight
 
     @property
     def value_dim(self) -> int:
