@@ -148,7 +148,8 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT --nnodes=$WORLD_S
     --security_group_id=${SG_ID} \
     --priority=1 \
     --workers=1 \
-    --worker_image=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION} \
+    --worker_image=dsw-registry-vpc.{REGION}.cr.aliyuncs.com/pai/torcheasyrec:1.4.0-pytorch2.13.0-gpu-py311-cu126-ubuntu22.04 \
+    --driver=535.161.08 \
     --worker_spec=ecs.gn6v-c10g1.20xlarge
 ```
 
