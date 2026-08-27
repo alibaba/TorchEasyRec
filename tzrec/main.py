@@ -348,6 +348,7 @@ def _train_and_evaluate(
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
+    restore_from_model_dir: bool = False,
     dataloader_state: Optional[Dict[str, Any]] = None,
     delta_embedding_dumper: Optional[DeltaEmbeddingDumper] = None,
     pipeline_config_path: Optional[str] = None,
@@ -526,6 +527,10 @@ def _train_and_evaluate(
                         train_config.fine_tune_ckpt_param_map,
                         dense_ema=dense_ema,
                     )
+                if not restore_from_model_dir:
+                    # a fine-tune checkpoint's train metric describes the source
+                    # model, not the model this job is training.
+                    _model.reset_train_metric()
                 if delta_embedding_dumper is not None:
                     delta_embedding_dumper.clear()
 
@@ -933,6 +938,7 @@ def train_and_evaluate(
         ckpt_path=ckpt_path,
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
+        restore_from_model_dir=restore_from_model_dir,
         dataloader_state=dataloader_state,
         delta_embedding_dumper=delta_embedding_dumper,
         pipeline_config_path=os.path.join(pipeline_config.model_dir, "pipeline.config"),
