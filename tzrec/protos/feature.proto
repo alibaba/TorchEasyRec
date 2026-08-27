@@ -878,6 +878,9 @@ message CustomFeature {
     optional string asset_dir = 23;
     // dynamic embedding
     optional DynamicEmbedding dynamicemb = 24;
+    // custom operator lib file compiled with _GLIBCXX_USE_CXX11_ABI=0,
+    // only used when create fg json for odps fg.
+    optional string operator_lib_cxx11abi0_file = 25;
 
     // default value when fg_mode = FG_NONE,
     // when use pai-fg, you do not need to set the param.
