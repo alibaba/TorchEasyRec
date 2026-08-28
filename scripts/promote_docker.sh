@@ -8,8 +8,8 @@ set -e
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 SRC_REPO=tzrec-test
 DST_REPO=tzrec-devel
-DOCKER_TAG=1.3
-DOCKER_TAG_SUFFIX=-u3
+DOCKER_TAG=1.4
+DOCKER_TAG_SUFFIX=-u4
 
 for DEVICE in cpu cu126 cu129 cu130
 do
