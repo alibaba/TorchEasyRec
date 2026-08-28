@@ -483,7 +483,10 @@ class ExportUtilTest(unittest.TestCase):
         runtime order makes the serving processor reject every hot dense
         update with dense_meta_mismatch. The fake sharded EBC below outputs
         keys rotated to (f_b, f_c, f_a) whereas its ``_embedding_bag_configs``
-        order is (f_a, f_b, f_c).
+        order is (f_a, f_b, f_c). The INPUT_TILE=3 user side is also covered:
+        its marked KeyedTensor carries kwargs-sourced keys and tiled values,
+        while the sparse extraction captures the raw batch=1 values, so the
+        smoke-run permute must handle the pre-tile layout.
         """
         tables = [
             EmbeddingBagConfig(
@@ -496,25 +499,40 @@ class ExportUtilTest(unittest.TestCase):
                 name="t_c", embedding_dim=4, num_embeddings=10, feature_names=["f_c"]
             ),
         ]
+        user_tables = [
+            EmbeddingBagConfig(
+                name="t_ua", embedding_dim=4, num_embeddings=10, feature_names=["u_a"]
+            ),
+            EmbeddingBagConfig(
+                name="t_ub", embedding_dim=8, num_embeddings=10, feature_names=["u_b"]
+            ),
+        ]
 
         class FakeShardedEBC(ShardedModule):
-            def __init__(self, tables):  # type: ignore[no-untyped-def]
+            def __init__(self, tables, keys, fills):  # type: ignore[no-untyped-def]
                 super().__init__()
                 self._embedding_bag_configs = tables
+                dims = {
+                    f: cfg.embedding_dim for cfg in tables for f in cfg.feature_names
+                }
+                self._runtime_keys = keys
+                self._runtime_length_per_key = [dims[k] for k in keys]
+                self._runtime_fills = fills
 
             def forward(self, features):  # type: ignore[no-untyped-def]
                 batch_size = features.size(0)
                 values = torch.cat(
                     [
-                        torch.full((batch_size, 8), 2.0),
-                        torch.full((batch_size, 4), 3.0),
-                        torch.full((batch_size, 4), 1.0),
+                        torch.full((batch_size, dim), fill)
+                        for dim, fill in zip(
+                            self._runtime_length_per_key, self._runtime_fills
+                        )
                     ],
                     dim=1,
                 )
                 return KeyedTensor(
-                    keys=["f_b", "f_c", "f_a"],
-                    length_per_key=[8, 4, 4],
+                    keys=self._runtime_keys,
+                    length_per_key=self._runtime_length_per_key,
                     values=values,
                 )
 
@@ -538,7 +556,10 @@ class ExportUtilTest(unittest.TestCase):
             def __init__(self):  # type: ignore[no-untyped-def]
                 super().__init__()
                 self.features = []
-                self.ebc = FakeShardedEBC(tables)
+                self.ebc = FakeShardedEBC(
+                    tables, ["f_b", "f_c", "f_a"], [2.0, 3.0, 1.0]
+                )
+                self.ebc_user = FakeShardedEBC(user_tables, ["u_b", "u_a"], [5.0, 4.0])
 
             def set_is_inference(self, is_inference):  # type: ignore[no-untyped-def]
                 self.is_inference = is_inference
@@ -546,17 +567,33 @@ class ExportUtilTest(unittest.TestCase):
             def forward(self, data, device=None):  # type: ignore[no-untyped-def]
                 kt = self.ebc(data["x"])
                 fx_mark_keyed_tensor("grp__ebc", kt)
+                # mirror EmbeddingGroupImpl's INPUT_TILE=3 user side: raw
+                # batch=1 lookup, kwargs from the raw KT, tiled values
+                kt_user_raw = self.ebc_user(data["x_user"])
+                kt_user = KeyedTensor(
+                    keys=kt_user_raw.keys(),
+                    length_per_key=kt_user_raw.length_per_key(),
+                    values=kt_user_raw.values().tile(2, 1),
+                )
+                fx_mark_keyed_tensor("grp__ebc_user", kt_user)
                 grouped = KeyedTensor.regroup_as_dict(
-                    [kt], [["f_a"], ["f_b", "f_c"]], ["y_a", "y_bc"]
+                    [kt, kt_user],
+                    [["f_a"], ["f_b", "f_c"], ["u_a", "u_b"]],
+                    ["y_a", "y_bc", "y_u"],
                 )
                 return {
                     "y_a": grouped["y_a"].sum(dim=1),
                     "y_bc": grouped["y_bc"].sum(dim=1),
+                    "y_u": grouped["y_u"].sum(dim=1),
                 }
 
         # the same dict flows through warm-up, sparse run and the dense
-        # smoke run, so it exposes the permuted smoke-run input afterwards
-        data = {"x": torch.ones(2, 3)}
+        # smoke run, so it exposes the permuted smoke-run inputs afterwards
+        data = {
+            "x": torch.ones(2, 3),
+            "x_user": torch.ones(1, 3),
+            "batch_size": torch.tensor(2),
+        }
 
         class FakeBatch:
             def to(self, device):  # type: ignore[no-untyped-def]
@@ -658,18 +695,25 @@ class ExportUtilTest(unittest.TestCase):
             self.assertEqual(
                 dense_meta["grp__ebc"], ["f_a__ebc", "f_b__ebc", "f_c__ebc"]
             )
+            self.assertEqual(dense_meta["grp__ebc_user"], ["u_a__ebc", "u_b__ebc"])
             self.assertEqual(dense_meta["sequence__ec"], [])
 
             # the dense graph bakes the canonical keys/length_per_key
             gm = captured["gm"]
-            kt_nodes = [
-                node
+            kt_nodes = {
+                tuple(node.kwargs["keys"]): node
                 for node in gm.graph.nodes
                 if node.op == "call_function" and node.target is KeyedTensor
-            ]
-            self.assertEqual(len(kt_nodes), 1)
-            self.assertEqual(kt_nodes[0].kwargs["keys"], ["f_a", "f_b", "f_c"])
-            self.assertEqual(kt_nodes[0].kwargs["length_per_key"], [4, 8, 4])
+            }
+            self.assertEqual(len(kt_nodes), 2)
+            self.assertEqual(
+                kt_nodes[("f_a", "f_b", "f_c")].kwargs["length_per_key"], [4, 8, 4]
+            )
+            user_node = kt_nodes[("u_a", "u_b")]
+            self.assertEqual(user_node.kwargs["length_per_key"], [4, 8])
+            # the user-side reconstruction tiles the raw batch=1 values itself
+            self.assertEqual(user_node.kwargs["values"].op, "call_method")
+            self.assertEqual(user_node.kwargs["values"].target, "tile")
 
             # the smoke-run input was permuted from the runtime layout
             # (f_b=2.0 x8, f_c=3.0 x4, f_a=1.0 x4) to the canonical layout
@@ -682,12 +726,26 @@ class ExportUtilTest(unittest.TestCase):
                 dim=1,
             )
             torch.testing.assert_close(data["grp__ebc"], canonical_values)
+            # the raw batch=1 user values were permuted pre-tile from
+            # (u_b=5.0 x8, u_a=4.0 x4) to the canonical (u_a, u_b) layout
+            canonical_user_values = torch.cat(
+                [torch.full((1, 4), 4.0), torch.full((1, 8), 5.0)], dim=1
+            )
+            torch.testing.assert_close(data["grp__ebc_user"], canonical_user_values)
 
-            # the exported dense graph regroups a canonical-layout input by
-            # key name into the right slices
-            out = gm({"grp__ebc": canonical_values.clone()}, torch.device("cpu"))
+            # the exported dense graph regroups canonical-layout inputs by
+            # key name into the right slices, tiling the user side itself
+            out = gm(
+                {
+                    "grp__ebc": canonical_values.clone(),
+                    "grp__ebc_user": canonical_user_values.clone(),
+                    "batch_size": torch.tensor(2),
+                },
+                torch.device("cpu"),
+            )
             torch.testing.assert_close(out["y_a"], torch.full((2,), 4.0))
             torch.testing.assert_close(out["y_bc"], torch.full((2,), 28.0))
+            torch.testing.assert_close(out["y_u"], torch.full((2,), 56.0))
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
