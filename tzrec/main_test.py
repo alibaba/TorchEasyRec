@@ -24,7 +24,13 @@ from google.protobuf import text_format
 from parameterized import parameterized
 
 from tzrec.datasets.utils import RecordBatchTensor
-from tzrec.main import _train_and_evaluate, export, predict, predict_checkpoint
+from tzrec.main import (
+    _compile_prompt,
+    _train_and_evaluate,
+    export,
+    predict,
+    predict_checkpoint,
+)
 from tzrec.optim.ema import DenseEMA
 from tzrec.protos.data_pb2 import DataConfig
 from tzrec.protos.eval_pb2 import EvalConfig
@@ -37,6 +43,49 @@ from tzrec.utils.test_util import parameterized_name_func
 
 class MainTest(unittest.TestCase):
     """Tests for tzrec.main orchestration."""
+
+    def test_compile_prompt_has_one_distributed_writer(self) -> None:
+        config = EasyRecConfig(model_dir="model")
+        config.prompt_config.SetInParent()
+        compiled_prompt = mock.sentinel.compiled_prompt
+
+        for rank, should_write in ((0, True), (1, False)):
+            with (
+                self.subTest(rank=rank),
+                mock.patch("tzrec.main.dist.is_available", return_value=True),
+                mock.patch("tzrec.main.dist.is_initialized", return_value=True),
+                mock.patch("tzrec.main.dist.get_rank", return_value=rank),
+                mock.patch("tzrec.main.dist.barrier") as barrier,
+                mock.patch(
+                    "tzrec.main.compile_prompt", return_value=compiled_prompt
+                ) as compile_prompt,
+            ):
+                result = _compile_prompt(config, [])
+
+            self.assertIs(result, compiled_prompt)
+            self.assertEqual(
+                compile_prompt.call_args.kwargs["write_tokenizer"], should_write
+            )
+            barrier.assert_called_once_with()
+
+    def test_compile_prompt_writes_without_distributed_runtime(self) -> None:
+        config = EasyRecConfig(model_dir="model")
+        config.prompt_config.SetInParent()
+        compiled_prompt = mock.sentinel.compiled_prompt
+
+        with (
+            mock.patch("tzrec.main.dist.is_available", return_value=True),
+            mock.patch("tzrec.main.dist.is_initialized", return_value=False),
+            mock.patch("tzrec.main.dist.barrier") as barrier,
+            mock.patch(
+                "tzrec.main.compile_prompt", return_value=compiled_prompt
+            ) as compile_prompt,
+        ):
+            result = _compile_prompt(config, [])
+
+        self.assertIs(result, compiled_prompt)
+        self.assertTrue(compile_prompt.call_args.kwargs["write_tokenizer"])
+        barrier.assert_not_called()
 
     def test_train_and_evaluate_closes_exporter_and_ckpt_on_exception(self) -> None:
         """A training exception must still drain the exporter and ckpt manager.

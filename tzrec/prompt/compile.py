@@ -241,6 +241,7 @@ def compile_prompt(
     label_fields: Sequence[str] = (),
     model_dir: Optional[str] = None,
     tokenizer_dir: Optional[str] = None,
+    write_tokenizer: bool = True,
 ) -> CompiledPrompt:
     """Compile a prompt config into its plan, module and vocabulary artifacts.
 
@@ -252,6 +253,7 @@ def compile_prompt(
             ``prompt/tokenizer``; skipped when None.
         tokenizer_dir: write the extended tokenizer here instead, flat, which
             is what an exported HuggingFace directory loads.
+        write_tokenizer: whether to persist the extended tokenizer artifact.
 
     Returns:
         The compiled prompt.
@@ -333,7 +335,7 @@ def compile_prompt(
     out_dir = tokenizer_dir or (
         os.path.join(model_dir, "prompt", "tokenizer") if model_dir else ""
     )
-    if out_dir:
+    if out_dir and write_tokenizer:
         os.makedirs(out_dir, exist_ok=True)
         tok.save(os.path.join(out_dir, "tokenizer.json"))
 

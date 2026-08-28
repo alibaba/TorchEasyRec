@@ -79,6 +79,23 @@ class CompilePromptTest(unittest.TestCase):
         self.assertIsNone(space.sentinel_token_id)
         self.assertEqual(space.target_vocab_size % 128, 0)
 
+    def test_skip_tokenizer_write_preserves_output_directory(self) -> None:
+        cfg = self._config(prompt="History : {{hist}}")
+        cfg.sid_space.codebook.extend([4])
+        output_dir = os.path.join(self.test_dir, "model")
+
+        compiled = compile_prompt(
+            cfg,
+            [create_prompt_feature(_HIST)],
+            ["answer"],
+            model_dir=output_dir,
+            write_tokenizer=False,
+        )
+
+        expected_dir = os.path.join(output_dir, "prompt", "tokenizer")
+        self.assertEqual(compiled.tokenizer_dir, expected_dir)
+        self.assertFalse(os.path.exists(expected_dir))
+
     def test_inline_needs_no_group_projected_gets_one(self) -> None:
         cfg = self._config(prompt="History : {{hist}} . Profile : {{prof}}")
         cfg.sid_space.codebook.extend([4, 4, 4])

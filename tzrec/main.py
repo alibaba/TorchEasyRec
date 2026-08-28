@@ -134,12 +134,17 @@ def _compile_prompt(
     """Compile prompt_config for entry points that build prompt-aware objects."""
     if not pipeline_config.HasField("prompt_config"):
         return None
-    return compile_prompt(
+    is_distributed = dist.is_available() and dist.is_initialized()
+    compiled_prompt = compile_prompt(
         pipeline_config.prompt_config,
         features,
         list(pipeline_config.data_config.label_fields),
         model_dir=pipeline_config.model_dir,
+        write_tokenizer=not is_distributed or dist.get_rank() == 0,
     )
+    if is_distributed:
+        dist.barrier()
+    return compiled_prompt
 
 
 def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
