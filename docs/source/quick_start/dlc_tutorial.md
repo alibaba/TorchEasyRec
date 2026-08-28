@@ -33,7 +33,7 @@ pip index versions tzrec -f https://tzrec.oss-accelerate.aliyuncs.com/release/ni
 
 进入[PAI控制台](https://pai.console.aliyun.com)，并选择需要使用的工作空间，点击 **模型开发与训练-分布式训练(DLC)**，点击创建任务。
 
-**节点镜像** 选择官方镜像`torcheasyrec:1.3.0-pytorch2.12.1-gpu-py311-cu129-ubuntu22.04`
+**节点镜像** 选择官方镜像`torcheasyrec:1.4.0-pytorch2.13.0-gpu-py311-cu126-ubuntu22.04`
 
 **数据集配置** 选择刚新建的NAS数据集。如果选择的是OSS数据集，注意在高级配置中设置{"mountType":"ossfs"}，以使用ossfs方式进行挂载。
 
@@ -53,7 +53,7 @@ tar xf taobao_data_train.tar.gz
 tar xf taobao_data_eval.tar.gz
 cd -
 # 安装tzrec并启动训练
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.train_eval \
@@ -71,7 +71,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 #### 评估
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.eval \
@@ -86,7 +86,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 #### 导出
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.export \
@@ -101,7 +101,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 #### 预测
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.predict \
@@ -122,7 +122,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 设置`ODPS_ENDPOINT`的环境变量，并新建任务时，「角色信息」选择**PAI默认角色**，可以直读MaxCompute表。配置文件的data_config.dataset_type需设置为OdpsDataset。注意训练数据和评估数据必须同时来自MaxCompute表。
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
@@ -139,7 +139,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 ```bash
 dlc submit pytorchjob \
     --name=${JOB_NAME} \
-    --command='pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+    --command='pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK -m tzrec.train_eval --pipeline_config_path /mnt/data/multi_tower_din_taobao_dlc.config --train_input_path /mnt/data/data/taobao_data_train/\*.parquet --eval_input_path /mnt/data/taobao_data_eval/\*.parquet --model_dir /mnt/data/multi_tower_din_taobao_dlc' \
     --data_sources=${DATA_SOURCE} \
     --workspace_id=${WORKSPACE_ID} \
@@ -148,7 +148,8 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT --nnodes=$WORLD_S
     --security_group_id=${SG_ID} \
     --priority=1 \
     --workers=1 \
-    --worker_image=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION} \
+    --worker_image=dsw-registry-vpc.{REGION}.cr.aliyuncs.com/pai/torcheasyrec:1.4.0-pytorch2.13.0-gpu-py311-cu126-ubuntu22.04 \
+    --driver=535.161.08 \
     --worker_spec=ecs.gn6v-c10g1.20xlarge
 ```
 

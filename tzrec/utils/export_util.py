@@ -691,7 +691,7 @@ def _rewrite_dense_serving_graph(
 
     graph.output(dict(zip(output_keys, output_values)))
     gm = torch.fx.GraphModule(root, graph)
-    gm.graph.eliminate_dead_code()
+    _eliminate_dense_dead_code(gm.graph)
     gm = _prune_unused_param_and_buffer(gm)
 
     init_parameters(gm, device)
@@ -761,6 +761,24 @@ def _add_module_by_dotted_path(
             parent.add_module(p, nn.Module())  # create empty container
         parent = getattr(parent, p)
     parent.add_module(parts[-1], module)
+
+
+def _eliminate_dense_dead_code(graph: torch.fx.Graph) -> None:
+    """Drop every node the dense graph's output does not depend on.
+
+    A dense graph is a pruned view of the full traced graph: the marked sparse
+    outputs are rewired to read the sparse model's output dict, which leaves the
+    original lookup subtree unreachable. Plain ``eliminate_dead_code`` no longer
+    removes it, because torch>=2.13 resolves an ``OpOverloadPacket`` target to
+    its default overload when deciding purity, so the zero-user
+    ``fbgemm.bounds_check_indices`` left behind by a quantized lookup now counts
+    as impure and pins the whole subtree -- which then reads raw feature keys
+    that exist only in the sparse model's input. The sparse half runs in the
+    sparse model, so here only placeholders and the output are anchors.
+    """
+    graph.eliminate_dead_code(
+        is_impure_node=lambda node: node.op in ("placeholder", "output")
+    )
 
 
 def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -1338,7 +1356,7 @@ def export_rtp_model(
                 raise RuntimeError(f"{node.target} op is not supported by rtp")
     graph.output(tuple(output_values))
     gm = torch.fx.GraphModule(unwrap_model, graph)
-    gm.graph.eliminate_dead_code()
+    _eliminate_dense_dead_code(gm.graph)
     gm = _prune_unused_param_and_buffer(gm)
     init_parameters(gm, device)
     gm.to(device)
@@ -1541,7 +1559,7 @@ def split_model(
 
             node_t.replace_all_uses_with(get_node)
     dense_gm = torch.fx.GraphModule(model, graph)
-    dense_gm.graph.eliminate_dead_code()
+    _eliminate_dense_dead_code(dense_gm.graph)
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
     seq_share_groups = _compute_seq_share_groups(
