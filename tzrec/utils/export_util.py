@@ -555,8 +555,11 @@ def _canonicalize_keyed_tensor_attrs(
         runtime_length_per_key: length_per_key captured from the runtime.
 
     Returns:
-        Tuple of (keys, length_per_key) in canonical config order; falls back
-        to the runtime order when static inference is unsupported.
+        Tuple of (keys, length_per_key) in canonical config order.
+
+    Raises:
+        RuntimeError: if static inference is unsupported for the source
+            module, or the inferred attrs disagree with the runtime output.
     """
     inferred = (
         _infer_keyed_tensor_attrs_from_module(source_module)
@@ -564,12 +567,11 @@ def _canonicalize_keyed_tensor_attrs(
         else None
     )
     if inferred is None:
-        logger.warning(
-            f"cannot statically infer KeyedTensor attrs for [{name}]; falling "
-            "back to the sharded runtime key order, which may not match the "
-            "online dense export order."
+        raise RuntimeError(
+            f"cannot statically infer KeyedTensor attrs for [{name}]; the "
+            "dense export must not bake the plan-dependent sharded runtime "
+            "key order, which would mismatch the online dense export."
         )
-        return runtime_keys, runtime_length_per_key
     keys, length_per_key = inferred
     if sorted(zip(keys, length_per_key)) != sorted(
         zip(runtime_keys, runtime_length_per_key)

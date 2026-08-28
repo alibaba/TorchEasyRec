@@ -1675,12 +1675,16 @@ class ExportUtilTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "disagree"):
             _canonicalize_keyed_tensor_attrs(ebc, "grp__ebc", ["f_b", "f_c"], [8, 4])
 
-    def test_canonicalize_keyed_tensor_attrs_falls_back_without_module(self) -> None:
-        keys, length_per_key = _canonicalize_keyed_tensor_attrs(
-            None, "grp__ebc", ["f_b", "f_c", "f_a"], [8, 4, 4]
-        )
-        self.assertEqual(keys, ["f_b", "f_c", "f_a"])
-        self.assertEqual(length_per_key, [8, 4, 4])
+    def test_canonicalize_keyed_tensor_attrs_raises_without_module(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "statically infer"):
+            _canonicalize_keyed_tensor_attrs(
+                None, "grp__ebc", ["f_b", "f_c", "f_a"], [8, 4, 4]
+            )
+        # a resolved module without embedding bag configs must also fail fast
+        with self.assertRaisesRegex(RuntimeError, "statically infer"):
+            _canonicalize_keyed_tensor_attrs(
+                torch.nn.Linear(2, 2), "grp__ebc", ["f_b", "f_c", "f_a"], [8, 4, 4]
+            )
 
     def test_permute_keyed_tensor_values_reorders_dim1_blocks(self) -> None:
         values = torch.arange(2 * 16, dtype=torch.float32).reshape(2, 16)
