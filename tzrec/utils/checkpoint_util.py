@@ -237,6 +237,23 @@ def _get_checkpoint_step(ckpt_path: str) -> int:
     return ckpt_step
 
 
+def _find_checkpoint_by_step(model_dir: str, step: int) -> Optional[str]:
+    """Find the checkpoint directory of a step, whatever name it carries.
+
+    Args:
+        model_dir: model directory.
+        step: step of the wanted checkpoint.
+
+    Return:
+        the checkpoint path, or None when no checkpoint has that step.
+    """
+    for ckpt_path in glob.glob(os.path.join(model_dir, "model.ckpt-*" + os.path.sep)):
+        ckpt_path = ckpt_path.rstrip(os.path.sep)
+        if _get_checkpoint_step(ckpt_path) == step:
+            return ckpt_path
+    return None
+
+
 def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
     """Find latest checkpoint under a directory.
 
@@ -318,14 +335,14 @@ def best_checkpoint(
                 step_metric.items(), key=lambda x: x[1], reverse=False
             )
         max_metric_step = sorted_mertic[0][0]
-        best_ckpt_path = os.path.join(model_dir, f"model.ckpt-{max_metric_step}")
-        if os.path.exists(best_ckpt_path):
+        best_ckpt_path = _find_checkpoint_by_step(model_dir, max_metric_step)
+        if best_ckpt_path is not None:
             logger.info(f"find best checkpoint is {best_ckpt_path}")
             return best_ckpt_path, max_metric_step
         else:
             raise ValueError(
                 f"find best metric is {max_metric_step} step,"
-                f"but not find {best_ckpt_path}."
+                f" but not find its checkpoint in {model_dir}."
             )
     else:
         logger.info(f"not find {eval_result_filename}, will search latest checkpoint")

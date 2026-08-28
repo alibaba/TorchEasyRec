@@ -224,6 +224,27 @@ class CheckpointUtilTest(unittest.TestCase):
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-0"))
         self.assertEqual(step, 0)
 
+    def test_best_checkpoint_tagged_dir(self):
+        """The best checkpoint is found by step, not by rebuilding its name."""
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-d1-0"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-d1-10"))
+        with open(os.path.join(self.test_dir, TRAIN_EVAL_RESULT_FILENAME), "w+") as f:
+            f.write('{"global_step":0, "auc": 0.633}\n')
+            f.write('{"global_step":10, "auc": 0.640}\n')
+        config = ExportConfig(exporter_type="best", best_exporter_metric="auc")
+        ckpt_path, step = checkpoint_util.best_checkpoint(self.test_dir, config)
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-d1-10"))
+        self.assertEqual(step, 10)
+
+    def test_best_checkpoint_missing_step(self):
+        """A metric step with no checkpoint on disk is an error."""
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-0"))
+        with open(os.path.join(self.test_dir, TRAIN_EVAL_RESULT_FILENAME), "w+") as f:
+            f.write('{"global_step":10, "auc": 0.640}\n')
+        config = ExportConfig(exporter_type="best", best_exporter_metric="auc")
+        with self.assertRaisesRegex(ValueError, "not find its checkpoint"):
+            checkpoint_util.best_checkpoint(self.test_dir, config)
+
     def test_latest_checkpoint_with_custom_dir(self):
         os.makedirs(os.path.join(self.test_dir, "custom/model"))
         ckpt_path, step = checkpoint_util.latest_checkpoint(
