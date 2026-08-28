@@ -25,6 +25,22 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
+- CHECKPOINT_TAG: 给checkpoint打一个自定义标记，记录在`meta`中（见下面的checkpoint信息），便于外部调度识别是哪一次调度产出的checkpoint。默认为空，不做任何限制
+
+## Checkpoint信息与完成标记
+
+checkpoint目录下的`meta`记录该checkpoint的信息：
+
+- `step`: 步数
+- `data_ts`: 已消费数据的事件时间（秒），数据源不带timestamp时（如ParquetDataset）不写该字段
+- `tag`: `CHECKPOINT_TAG`的值，未设置时不写该字段
+
+`_SUCCESS`是最后生成的空文件，外部调度看到它即表示该checkpoint的所有文件都已写完：
+
+```bash
+test -e ${MODEL_DIR}/model.ckpt-1000/_SUCCESS && cat ${MODEL_DIR}/model.ckpt-1000/meta
+# {"step": 1000, "data_ts": 1755000000.0, "tag": "20260828"}
+```
 
 ## 训练配置
 
@@ -66,7 +82,6 @@ LR策略可以支持按epoch更新或者按step更新
 - save_checkpoints_timestamp_interval: 按数据时间（如Kafka消息的timestamp）保存模型的间隔秒数，每当已消费数据的事件时间跨过一个间隔边界时保存一次。默认0表示关闭。仅对带timestamp的数据源（如KafkaDataset）生效
 - save_checkpoints_timestamps: 按数据时间保存模型的绝对时间点列表（单位为秒的 Unix 时间戳），已消费数据的事件时间每跨过一个时间点保存一次，默认为空表示关闭
 - save_checkpoints_timestamp_quorum: 分布式训练下各rank消费的分区不同，事件时间也不同；当至少该比例（取值(0,1\]，默认0.5）的rank已消费越过边界/时间点时才触发保存。1.0表示所有rank都越过才保存（最保守），越小越激进（最小可仅需一个rank）；默认值对单个异常/超前的timestamp具有鲁棒性
-- save_checkpoints_timestamp_quorum还决定了checkpoint中记录的数据时间水位：每次保存checkpoint时，各rank已消费数据的事件时间会按该比例对齐成一个全局值，写入checkpoint目录下的`dataloader_state.json`，key为`__data_ts_watermark__`。按步数或Epoch保存时同样会记录，数据源不带timestamp时（如ParquetDataset）不写该字段。外部调度可以据此判断一个checkpoint覆盖到了哪个时间点的数据
 - keep_checkpoint_max: 最多保留的最近checkpoint数量，超出后会异步删除最旧的checkpoint，默认0表示全部保留；当exporter_type为best时，会额外保留指标最优的checkpoint
 - fine_tune_checkpoint: 增量训练的checkpoint路径，也可以设置checkpoint目录，将会使用目录下最新的checkpoint
 - fine_tune_ckpt_var_map: 需要restore的参数列表文件路径，文件的每一行是{variable_name in current model}\\t{variable name in old model ckpt}

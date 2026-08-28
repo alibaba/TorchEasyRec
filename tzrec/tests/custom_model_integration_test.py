@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import glob
+import json
 import os
 import shutil
 import subprocess
@@ -200,7 +201,10 @@ class CustomModelIntegrationTest(unittest.TestCase):
         pythonpath = f".:{project_dir}"
 
         self.success = utils.test_train_eval(
-            config_path, self.test_dir, pythonpath=pythonpath
+            config_path,
+            self.test_dir,
+            pythonpath=pythonpath,
+            env_str="CHECKPOINT_TAG=ci-tag",
         )
         self.assertTrue(self.success)
 
@@ -212,11 +216,18 @@ class CustomModelIntegrationTest(unittest.TestCase):
         ckpt_dirs = glob.glob(os.path.join(self.test_dir, "train", "model.ckpt-*"))
         self.assertTrue(ckpt_dirs)
         for ckpt_dir in ckpt_dirs:
-            self.assertTrue(
-                os.path.exists(
-                    os.path.join(ckpt_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
-                )
+            # the marker is empty and written last, so its presence means the
+            # meta beside it is complete
+            marker_path = os.path.join(ckpt_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
+            self.assertTrue(os.path.exists(marker_path))
+            self.assertEqual(os.path.getsize(marker_path), 0)
+            meta_path = os.path.join(ckpt_dir, checkpoint_util.CKPT_META_FILENAME)
+            with open(meta_path) as f:
+                meta = json.load(f)
+            self.assertEqual(
+                meta["step"], checkpoint_util._get_checkpoint_step(ckpt_dir)
             )
+            self.assertEqual(meta["tag"], "ci-tag")
         self.success = utils.test_eval(
             saved_config_path, self.test_dir, pythonpath=pythonpath
         )

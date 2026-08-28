@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import json
 import multiprocessing as mp
 import os
 import shutil
@@ -724,8 +725,58 @@ class DataloaderCheckpointTest(unittest.TestCase):
         restored_state = checkpoint_util.restore_dataloader_state(self.test_dir)
         self.assertEqual(restored_state, checkpoint_state)
 
+    def _read_meta(self, ckpt_dir):
+        with open(os.path.join(ckpt_dir, checkpoint_util.CKPT_META_FILENAME)) as f:
+            return json.load(f)
+
+    def test_save_meta(self):
+        """A checkpoint records which step it is."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            checkpoint_util.save_meta(self.test_dir, 300)
+
+        self.assertEqual(self._read_meta(self.test_dir), {"step": 300})
+
+    def test_save_meta_data_ts(self):
+        """The consumed event-time is recorded when the source has one."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            checkpoint_util.save_meta(self.test_dir, 300, data_ts=1755000000.0)
+
+        self.assertEqual(
+            self._read_meta(self.test_dir), {"step": 300, "data_ts": 1755000000.0}
+        )
+
+    def test_save_meta_tag(self):
+        """CHECKPOINT_TAG labels the checkpoint for an external scheduler."""
+        with mock.patch.dict(os.environ, {"CHECKPOINT_TAG": "20260828"}):
+            checkpoint_util.save_meta(self.test_dir, 300)
+
+        self.assertEqual(
+            self._read_meta(self.test_dir), {"step": 300, "tag": "20260828"}
+        )
+
+    def test_save_meta_non_zero_rank_skips(self):
+        """Only rank 0 writes the meta."""
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            checkpoint_util.save_meta(self.test_dir, 300)
+
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.test_dir, checkpoint_util.CKPT_META_FILENAME)
+            )
+        )
+
+    def test_save_meta_keeps_restore_defaults(self):
+        """The recorded info leaves the restore-relevant keys at their defaults."""
+        with mock.patch.dict(os.environ, {"CHECKPOINT_TAG": "t"}):
+            checkpoint_util.save_meta(self.test_dir, 300, data_ts=1.0)
+
+        meta = self._read_meta(self.test_dir)
+        self.assertTrue(meta.get("load_model", True))
+        self.assertTrue(meta.get("load_optim", True))
+        self.assertIsNone(meta.get("dynamicemb_load_table_names", None))
+
     def test_save_success_marker(self):
-        """A completed checkpoint is marked so schedulers can poll for it."""
+        """The marker is empty; its presence is the whole signal."""
         checkpoint_util.save_success_marker(self.test_dir)
 
         marker_path = os.path.join(self.test_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
@@ -1019,8 +1070,8 @@ class DataloaderCheckpointTest(unittest.TestCase):
         saved_state = mgr.save.call_args.args[3]
         self.assertEqual(saved_state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
 
-    def test_maybe_save_stamps_watermark_on_step_trigger(self):
-        """A step-triggered save records the watermark, triggers off."""
+    def test_maybe_save_reports_event_time_on_step_trigger(self):
+        """A step-triggered save reports its event-time, with triggers off."""
         mgr = self._policy_manager(save_steps=10)
         state = {"topic:0": 5}
         self.assertTrue(
@@ -1028,12 +1079,14 @@ class DataloaderCheckpointTest(unittest.TestCase):
                 10, model=None, dataloader_state=state, data_timestamp=3600.0
             )
         )
-        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, state)
+        # the trigger is off, so no resume watermark is stamped
         saved_state = mgr.save.call_args.args[3]
-        self.assertEqual(saved_state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
+        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, saved_state)
+        # but the checkpoint still reports which data it covers
+        self.assertEqual(mgr.save.call_args.args[5], 3600.0)
 
-    def test_maybe_save_no_watermark_without_event_time(self):
-        """A source without event-times leaves the watermark out entirely."""
+    def test_maybe_save_no_event_time_reports_none(self):
+        """A source without event-times reports nothing to the marker."""
         mgr = self._policy_manager(save_steps=10)
         state = {"file:0": 5}
         self.assertTrue(
@@ -1041,6 +1094,7 @@ class DataloaderCheckpointTest(unittest.TestCase):
         )
         saved_state = mgr.save.call_args.args[3]
         self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, saved_state)
+        self.assertIsNone(mgr.save.call_args.args[5])
 
     def test_set_save_policy_rejects_bad_quorum_without_triggers(self):
         """The quorum is used by every save now, so it is always validated."""

@@ -43,6 +43,7 @@ from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.optim.ema import DenseEMA
 from tzrec.protos import export_pb2
+from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -389,12 +390,15 @@ class CheckpointManager:
         optimizer: Optional[optim.Optimizer] = None,
         dataloader_state: Optional[Dict[str, Any]] = None,
         dense_ema: Optional[DenseEMA] = None,
+        data_ts: Optional[float] = None,
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer, dense_ema)
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
+        save_meta(ckpt_dir, step, data_ts)
+        # last, so its presence means every file above is complete
         save_success_marker(ckpt_dir)
         self._last_ckpt_dir = ckpt_dir
         self.prune()
@@ -517,6 +521,11 @@ class CheckpointManager:
             True if a checkpoint was saved.
         """
         data_ts = self._reconcile_event_time(data_timestamp)
+        # copy so the watermark isn't leaked back into the train loop's state
+        if dataloader_state is not None:
+            dataloader_state = dict(dataloader_state)
+            if data_ts is not None:
+                dataloader_state[DATA_TS_WATERMARK] = data_ts
 
         want = final
         if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:
@@ -540,20 +549,6 @@ class CheckpointManager:
         if not want:
             return False
 
-        # A step/epoch/final save records the watermark too, so a consumer can
-        # tell what data a checkpoint covers without the timestamp triggers being
-        # on. Gathering here rather than above keeps it one collective per saved
-        # checkpoint, and the save decision is identical on every rank so the
-        # gather stays in lockstep. It cannot affect the trigger, which was
-        # already decided.
-        if data_ts is None:
-            data_ts = self._reconcile_event_time(data_timestamp, force=True)
-        # copy so the watermark isn't leaked back into the train loop's state
-        if dataloader_state is not None:
-            dataloader_state = dict(dataloader_state)
-            if data_ts is not None:
-                dataloader_state[DATA_TS_WATERMARK] = data_ts
-
         if step == self._last_ckpt_step:
             # a boundary save dedup'd against an already-saved step: refresh
             # that checkpoint's state so the cleared + bumped bookkeeping is
@@ -571,7 +566,14 @@ class CheckpointManager:
         if data_ts is not None:
             # advance the watermark on every save so resume is exact
             self._last_data_ts = data_ts
-        self.save(step, model, optimizer, dataloader_state, dense_ema)
+        # The marker reports what data the checkpoint covers whether or not the
+        # event-time triggers are on. Reconciling here rather than above keeps it
+        # one collective per saved checkpoint, and the save decision is identical
+        # on every rank so the gather stays in lockstep.
+        report_ts = data_ts
+        if report_ts is None:
+            report_ts = self._reconcile_event_time(data_timestamp, force=True)
+        self.save(step, model, optimizer, dataloader_state, dense_ema, report_ts)
         return True
 
     def prune(self) -> None:
@@ -986,7 +988,7 @@ def restore_model(
     if not os.path.exists(checkpoint_dir):
         raise RuntimeError(f"checkpoint_dir[{checkpoint_dir}] not exists.")
 
-    meta_path = os.path.join(checkpoint_dir, "meta")
+    meta_path = os.path.join(checkpoint_dir, CKPT_META_FILENAME)
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
     dense_ema_ckpt_path = os.path.join(checkpoint_dir, "dense_ema")
@@ -1178,6 +1180,7 @@ def save_model(
 
 DATALOADER_CKPT_FILENAME = "dataloader_state.json"
 CKPT_SUCCESS_FILENAME = "_SUCCESS"
+CKPT_META_FILENAME = "meta"
 # reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
 # no ":" so per-source consumers skip it.
 DATA_TS_WATERMARK = "__data_ts_watermark__"
@@ -1186,12 +1189,42 @@ DATA_TS_WATERMARK = "__data_ts_watermark__"
 EPOCHS_COMPLETED = "__epochs_completed__"
 
 
+def save_meta(
+    checkpoint_dir: str,
+    step: int,
+    data_ts: Optional[float] = None,
+) -> None:
+    """Describe a checkpoint in its meta file.
+
+    Records the step, the consumed event-time when the data source has one, and
+    the CHECKPOINT_TAG label when set, alongside whatever restore-relevant keys
+    a converted checkpoint already carries.
+
+    Args:
+        checkpoint_dir: directory of the checkpoint.
+        step: step of the checkpoint.
+        data_ts: quorum event-time (seconds) of the consumed data, if any.
+    """
+    if int(os.environ.get("RANK", 0)) == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        meta: Dict[str, Any] = {"step": step}
+        if data_ts is not None:
+            meta["data_ts"] = data_ts
+        tag = env_util.checkpoint_tag()
+        if tag:
+            meta["tag"] = tag
+        with open(os.path.join(checkpoint_dir, CKPT_META_FILENAME), "w") as f:
+            json.dump(meta, f)
+
+
 def save_success_marker(checkpoint_dir: str) -> None:
     """Mark a checkpoint as completely written.
 
     Schedulers that poll a model directory need to tell a finished checkpoint
-    from one still being written. Write the marker only after every rank has
-    finished writing its shards.
+    from one still being written. The marker is empty and written last, after
+    every rank has finished its shards and after every other file in the
+    checkpoint, so its presence alone means the whole checkpoint is readable --
+    do not write anything into it, and do not move this call earlier.
 
     Args:
         checkpoint_dir: directory of the checkpoint to mark.
