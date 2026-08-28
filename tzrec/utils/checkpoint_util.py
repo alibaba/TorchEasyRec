@@ -43,6 +43,7 @@ from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.optim.ema import DenseEMA
 from tzrec.protos import export_pb2
+from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -216,6 +217,23 @@ class PartialLoadPlanner(DefaultLoadPlanner):
         return plan
 
 
+def _validate_checkpoint_tag(tag: str) -> str:
+    """Check a checkpoint tag renders into a name whose step is still parseable.
+
+    Args:
+        tag: raw tag, may contain the {data_ts} placeholder.
+
+    Return:
+        the tag, unchanged.
+    """
+    if tag and not re.fullmatch(r"[A-Za-z0-9_-]*", tag.replace(CKPT_TAG_DATA_TS, "")):
+        raise ValueError(
+            f"CHECKPOINT_TAG [{tag}] may only contain letters, digits, '_', '-' "
+            f"and {CKPT_TAG_DATA_TS}. A '.' makes the checkpoint step unparsable."
+        )
+    return tag
+
+
 def _get_checkpoint_step(ckpt_path: str) -> int:
     """Get checkpoint step from ckpt_path.
 
@@ -366,6 +384,9 @@ class CheckpointManager:
             (by eval metric) is always retained even if older than the kept window.
         eval_result_filename: eval result file (relative to ``model_dir``) used to
             locate the best checkpoint.
+
+    The ``CHECKPOINT_TAG`` environment variable names checkpoints
+    ``model.ckpt-<tag>-<step>``; the step stays last so it remains parseable.
     """
 
     def __init__(
@@ -376,6 +397,7 @@ class CheckpointManager:
         eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     ) -> None:
         self._model_dir = model_dir
+        self._checkpoint_tag = _validate_checkpoint_tag(env_util.checkpoint_tag())
         self._keep_checkpoint_max = keep_checkpoint_max
         self._export_config = export_config
         self._eval_result_filename = eval_result_filename
@@ -399,6 +421,20 @@ class CheckpointManager:
         self._last_ckpt_dir: Optional[str] = None
         self._last_data_ts: Optional[float] = None
 
+    def _render_checkpoint_tag(self, data_ts: Optional[float]) -> str:
+        """Substitute the consumed event-time into the configured tag.
+
+        Args:
+            data_ts: quorum event-time (seconds), None when the data source
+                carries no event-time.
+
+        Return:
+            the rendered tag, empty when no tag is configured.
+        """
+        return self._checkpoint_tag.replace(
+            CKPT_TAG_DATA_TS, str(int(data_ts)) if data_ts is not None else "0"
+        )
+
     def save(
         self,
         step: int,
@@ -406,9 +442,13 @@ class CheckpointManager:
         optimizer: Optional[optim.Optimizer] = None,
         dataloader_state: Optional[Dict[str, Any]] = None,
         dense_ema: Optional[DenseEMA] = None,
+        data_ts: Optional[float] = None,
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
-        ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
+        tag = self._render_checkpoint_tag(data_ts)
+        # the step stays last so _get_checkpoint_step keeps working
+        ckpt_name = f"model.ckpt-{tag}-{step}" if tag else f"model.ckpt-{step}"
+        ckpt_dir = os.path.join(self._model_dir, ckpt_name)
         save_model(ckpt_dir, model, optimizer, dense_ema)
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
@@ -588,7 +628,7 @@ class CheckpointManager:
         if data_ts is not None:
             # advance the watermark on every save so resume is exact
             self._last_data_ts = data_ts
-        self.save(step, model, optimizer, dataloader_state, dense_ema)
+        self.save(step, model, optimizer, dataloader_state, dense_ema, data_ts)
         return True
 
     def prune(self) -> None:
@@ -1195,6 +1235,8 @@ def save_model(
 
 DATALOADER_CKPT_FILENAME = "dataloader_state.json"
 CKPT_SUCCESS_FILENAME = "_SUCCESS"
+# placeholder in CHECKPOINT_TAG, replaced by the consumed event-time (seconds).
+CKPT_TAG_DATA_TS = "{data_ts}"
 # reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
 # no ":" so per-source consumers skip it.
 DATA_TS_WATERMARK = "__data_ts_watermark__"

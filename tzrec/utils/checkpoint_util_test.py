@@ -224,6 +224,53 @@ class CheckpointUtilTest(unittest.TestCase):
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-0"))
         self.assertEqual(step, 0)
 
+    def test_checkpoint_tag_name(self):
+        """A tag is inserted before the step, which stays parseable."""
+        with mock.patch.dict(os.environ, {"CHECKPOINT_TAG": "20260828"}):
+            mgr = checkpoint_util.CheckpointManager(self.test_dir)
+        self.assertEqual(mgr._render_checkpoint_tag(None), "20260828")
+        name = f"model.ckpt-{mgr._render_checkpoint_tag(None)}-300"
+        self.assertEqual(name, "model.ckpt-20260828-300")
+        self.assertEqual(
+            checkpoint_util._get_checkpoint_step(os.path.join("d", name)), 300
+        )
+
+    def test_checkpoint_tag_unset_keeps_name(self):
+        """No tag leaves the name exactly as before."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            mgr = checkpoint_util.CheckpointManager(self.test_dir)
+        self.assertEqual(mgr._render_checkpoint_tag(1755000000.0), "")
+
+    def test_checkpoint_tag_data_ts(self):
+        """{data_ts} carries the event-time; 0 when the source has none."""
+        with mock.patch.dict(os.environ, {"CHECKPOINT_TAG": "d-{data_ts}"}):
+            mgr = checkpoint_util.CheckpointManager(self.test_dir)
+        self.assertEqual(mgr._render_checkpoint_tag(1755000000.0), "d-1755000000")
+        self.assertEqual(mgr._render_checkpoint_tag(None), "d-0")
+        name = f"model.ckpt-{mgr._render_checkpoint_tag(1755000000.0)}-300"
+        self.assertEqual(
+            checkpoint_util._get_checkpoint_step(os.path.join("d", name)), 300
+        )
+
+    def test_checkpoint_tag_validation(self):
+        """A tag that would break step parsing is rejected at construction."""
+        for tag in ["v1.2", "1.4.0", "a/b", "a b"]:
+            with mock.patch.dict(os.environ, {"CHECKPOINT_TAG": tag}):
+                with self.assertRaisesRegex(ValueError, "CHECKPOINT_TAG"):
+                    checkpoint_util.CheckpointManager(self.test_dir)
+        for tag in ["20260828", "2026-08-28", "v1_2", "d-{data_ts}"]:
+            with mock.patch.dict(os.environ, {"CHECKPOINT_TAG": tag}):
+                checkpoint_util.CheckpointManager(self.test_dir)
+
+    def test_latest_checkpoint_mixed_tagged_and_untagged(self):
+        """Tagged and untagged checkpoints coexist and order by step."""
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-5"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-d1-10"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-d1-2"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-d1-10"))
+        self.assertEqual(step, 10)
+
     def test_best_checkpoint_tagged_dir(self):
         """The best checkpoint is found by step, not by rebuilding its name."""
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-d1-0"))
@@ -297,6 +344,29 @@ class CheckpointUtilTest(unittest.TestCase):
             manager.prune()
             manager.close()  # drains the async worker -> deterministic
         self.assertEqual(self._remaining_ckpt_steps(), expected_steps)
+
+    def test_checkpoint_manager_prune_tagged(self):
+        """Pruning tagged checkpoints keeps the newest by step, and the best."""
+        for step in [0, 10, 20, 30]:
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-d1-{step}"))
+        with open(os.path.join(self.test_dir, TRAIN_EVAL_RESULT_FILENAME), "w") as f:
+            f.write('{"global_step":0, "auc":0.50}\n')
+            f.write('{"global_step":10, "auc":0.99}\n')  # best, outside recent-2
+            f.write('{"global_step":20, "auc":0.60}\n')
+            f.write('{"global_step":30, "auc":0.70}\n')
+        manager = checkpoint_util.CheckpointManager(
+            self.test_dir,
+            keep_checkpoint_max=2,
+            export_config=ExportConfig(
+                exporter_type="best",
+                best_exporter_metric="auc",
+                metric_larger_is_better=True,
+            ),
+        )
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            manager.prune()
+            manager.close()
+        self.assertEqual(self._remaining_ckpt_steps(), [10, 20, 30])
 
     def test_checkpoint_manager_prune_non_rank_zero(self):
         for step in [0, 10, 20, 30]:

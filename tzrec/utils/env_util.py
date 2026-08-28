@@ -16,6 +16,15 @@ import torch
 from tzrec.utils.logging_util import logger
 
 
+def checkpoint_tag() -> str:
+    """Tag put into the checkpoint dir name, as model.ckpt-<tag>-<step>.
+
+    Supports the {data_ts} placeholder, replaced by the event-time of the data
+    the checkpoint covers.
+    """
+    return os.environ.get("CHECKPOINT_TAG", "")
+
+
 def use_hash_node_id() -> bool:
     """Use hash node id or not."""
     return os.environ.get("USE_HASH_NODE_ID", "0") == "1"

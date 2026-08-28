@@ -200,7 +200,10 @@ class CustomModelIntegrationTest(unittest.TestCase):
         pythonpath = f".:{project_dir}"
 
         self.success = utils.test_train_eval(
-            config_path, self.test_dir, pythonpath=pythonpath
+            config_path,
+            self.test_dir,
+            pythonpath=pythonpath,
+            env_str="CHECKPOINT_TAG=ci-{data_ts}",
         )
         self.assertTrue(self.success)
 
@@ -208,8 +211,10 @@ class CustomModelIntegrationTest(unittest.TestCase):
         # process, class_path alone has to resolve the model there
         saved_config_path = os.path.join(self.test_dir, "train/pipeline.config")
         self.assertTrue(os.path.exists(saved_config_path))
-        # every saved checkpoint is marked complete for external schedulers
-        ckpt_dirs = glob.glob(os.path.join(self.test_dir, "train", "model.ckpt-*"))
+        # CHECKPOINT_TAG names the checkpoints, and every one is marked complete
+        # for external schedulers. The parquet source carries no event-time, so
+        # {data_ts} renders 0.
+        ckpt_dirs = glob.glob(os.path.join(self.test_dir, "train", "model.ckpt-ci-0-*"))
         self.assertTrue(ckpt_dirs)
         for ckpt_dir in ckpt_dirs:
             self.assertTrue(
