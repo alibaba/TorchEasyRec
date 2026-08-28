@@ -34,7 +34,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 进入[PAI控制台](https://pai.console.aliyun.com)，并选择需要使用的工作空间，点击 **模型开发与训练-分布式训练(DLC)**，点击创建任务。
 
-**节点镜像** 选择官方镜像`torcheasyrec:1.3.0-pytorch2.12.1-gpu-py311-cu129-ubuntu22.04`
+**节点镜像** 选择官方镜像`torcheasyrec:1.4.0-pytorch2.13.0-gpu-py311-cu126-ubuntu22.04`
 
 **数据集配置** 选择刚新建的NAS数据集
 
@@ -52,7 +52,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 cd /mnt/data
 wget https://tzrec.oss-accelerate.aliyuncs.com/config/quick_start/multi_tower_din_taobao_dlc_mc.config
 # 安装tzrec并启动训练
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
@@ -78,7 +78,7 @@ nproc-per-node: 如果是cpu训练，则设置为固定值1
 完成模型训练后，进行模型评估：
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
@@ -96,7 +96,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 导出训练好的模型：
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
@@ -114,7 +114,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 使用导出的模型进行预测：
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu126]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ODPS_ENDPOINT=http://service.{region}-vpc.maxcompute.aliyun-inc.com/api \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \

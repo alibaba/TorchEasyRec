@@ -2,11 +2,11 @@
 
 DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`hash_bucket_size`的方式能避免hash冲突，相比设置`vocab_dict`和`vocab_list`的方式能更灵活动态地进行id的准入和驱逐。DynamicEmbedding 常用于user id，item id，combo feature等超大id枚举数的特征配置中。DynamicEmbedding 相比 ZCH 能外接PS，支撑十亿百亿甚至更多的Id枚举数，Id准入和淘汰无需攒Batch，可以更加及时。
 
-使用 DynamicEmbedding 前需安装如下whl包
+cu126/cu129/cu130 镜像已预装 dynamicemb，其它环境需先安装如下whl包
 
 ```bash
 # DEVICE 可选: cu126/cu129/cu130 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb==0.1.0+20260814.6b94bbf.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+pip install dynamicemb==0.1.0+20260824.6b94bbf.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
 ```
 
 注：同一个 FeatureGroup 中若存在多个配置了 DynamicEmbedding 的特征，底层 dynamicemb 会自动将这些表融合到同一份存储里（table fusion），共享 cache/admission counter，降低显存占用并减少内存碎片，无需额外配置。
