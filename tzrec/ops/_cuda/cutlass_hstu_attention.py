@@ -93,7 +93,7 @@ def cutlass_hstu_mha(
         raise RuntimeError(
             "fbgemm_gpu_hstu wheel is not installed; cannot run CUTLASS "
             "HSTU attention. Install via -f https://tzrec.oss-accelerate."
-            "aliyuncs.com/third_party/hstu/${DEVICE}/repo.html (cu126/cu130)."
+            "aliyuncs.com/third_party/hstu/${DEVICE}/repo.html (cu126/cu129/cu130)."
         )
     if q.shape[2] != v.shape[2]:
         raise ValueError(
