@@ -21,7 +21,10 @@ from tzrec.utils.logging_util import logger
 try:
     import hstu.hstu_ops_gpu  # noqa: F401
     from hstu import hstu_attn_varlen_func
-except ImportError as e:
+except Exception as e:
+    # Not just ImportError: hstu/library.py skips loading its .so when
+    # torch.cuda.is_available() is false, and hstu_ops_gpu.py then registers
+    # fakes for ops that were never registered, raising RuntimeError.
     logger.debug("fbgemm_gpu_hstu not available: %s", e)
     hstu_attn_varlen_func = None  # type: ignore[assignment]
 
