@@ -492,12 +492,21 @@ def _resolve_keyed_tensor_source_module(
 
 
 def _get_embedding_bag_configs(module: torch.nn.Module) -> Optional[List[Any]]:
-    """Get EmbeddingBag configs from EBC or MC_EBC modules by duck typing."""
+    """Get EmbeddingBag configs from EBC or MC_EBC modules by duck typing.
+
+    Handles unsharded and sharded modules: torchrec's
+    ``ShardedEmbeddingBagCollection`` keeps the original-order configs only in
+    the private ``_embedding_bag_configs`` attribute, and (sharded) MC-EBC
+    modules nest their embedding module under ``_embedding_module``.
+    """
     if hasattr(module, "embedding_bag_configs"):
         return list(module.embedding_bag_configs())
+    configs = getattr(module, "_embedding_bag_configs", None)
+    if configs is not None:
+        return list(configs)
     inner = getattr(module, "_embedding_module", None)
-    if inner is not None and hasattr(inner, "embedding_bag_configs"):
-        return list(inner.embedding_bag_configs())
+    if inner is not None:
+        return _get_embedding_bag_configs(inner)
     return None
 
 
@@ -521,6 +530,67 @@ def _infer_keyed_tensor_attrs_from_module(
         keys.extend(embedding_names)
         length_per_key.extend([config.embedding_dim] * len(embedding_names))
     return keys, length_per_key
+
+
+def _canonicalize_keyed_tensor_attrs(
+    source_module: Optional[torch.nn.Module],
+    name: str,
+    runtime_keys: List[str],
+    runtime_length_per_key: List[int],
+) -> Tuple[List[str], List[int]]:
+    """Return canonical config-order keys/length_per_key for a marked KeyedTensor.
+
+    A sharded EmbeddingBagCollection emits its output KeyedTensor grouped by
+    sharding type / compute kernel, so the runtime key order depends on the
+    sharding plan (e.g. dynamicemb tables get regrouped to the tail). The
+    exported dense graph and dense_meta.json must instead use the
+    plan-independent config order that the online dense export derives
+    statically, otherwise the serving processor rejects hot dense updates
+    with dense_meta_mismatch.
+
+    Args:
+        source_module: embedding module that produced the KeyedTensor.
+        name: fx-marked KeyedTensor name, for diagnostics.
+        runtime_keys: keys captured from the sharded runtime output.
+        runtime_length_per_key: length_per_key captured from the runtime.
+
+    Returns:
+        Tuple of (keys, length_per_key) in canonical config order; falls back
+        to the runtime order when static inference is unsupported.
+    """
+    inferred = (
+        _infer_keyed_tensor_attrs_from_module(source_module)
+        if source_module is not None
+        else None
+    )
+    if inferred is None:
+        logger.warning(
+            f"cannot statically infer KeyedTensor attrs for [{name}]; falling "
+            "back to the sharded runtime key order, which may not match the "
+            "online dense export order."
+        )
+        return runtime_keys, runtime_length_per_key
+    keys, length_per_key = inferred
+    if sorted(zip(keys, length_per_key)) != sorted(
+        zip(runtime_keys, runtime_length_per_key)
+    ):
+        raise RuntimeError(
+            f"statically inferred KeyedTensor attrs for [{name}] disagree with "
+            f"the runtime output: inferred={list(zip(keys, length_per_key))} "
+            f"runtime={list(zip(runtime_keys, runtime_length_per_key))}"
+        )
+    return keys, length_per_key
+
+
+def _permute_keyed_tensor_values(
+    values: torch.Tensor,
+    src_keys: List[str],
+    src_length_per_key: List[int],
+    dst_keys: List[str],
+) -> torch.Tensor:
+    """Reorder pooled KeyedTensor values along dim 1 from src to dst key order."""
+    chunks = dict(zip(src_keys, torch.split(values, src_length_per_key, dim=1)))
+    return torch.cat([chunks[k] for k in dst_keys], dim=1)
 
 
 def _is_fx_node(value: Any) -> bool:
@@ -1613,17 +1683,34 @@ def export_distributed_embedding(
                     values_node = graph.call_method(
                         "tile", args=(getitem_node, tile_size_node, 1)
                     )
+                runtime_keys = cast(List[str], sparse_attrs[name + "__keys"])
+                runtime_length_per_key = cast(
+                    List[int], sparse_attrs[name + "__length_per_key"]
+                )
+                keys, length_per_key = _canonicalize_keyed_tensor_attrs(
+                    _resolve_keyed_tensor_source_module(unwrap_model, node_kt),
+                    name,
+                    runtime_keys,
+                    runtime_length_per_key,
+                )
+                if keys != runtime_keys:
+                    # keep the rank-zero smoke-run inputs aligned with the
+                    # canonical layout baked into the dense graph
+                    sparse_output[name] = _permute_keyed_tensor_values(
+                        sparse_output[name],
+                        runtime_keys,
+                        runtime_length_per_key,
+                        keys,
+                    )
                 new_node = graph.call_function(
                     KeyedTensor,
                     kwargs={
-                        "keys": sparse_attrs[name + "__keys"],
-                        "length_per_key": sparse_attrs[name + "__length_per_key"],
+                        "keys": keys,
+                        "length_per_key": length_per_key,
                         "values": values_node,
                     },
                 )
-                dense_graph_config[name] = [
-                    k + "__ebc" for k in cast(List[str], new_node.kwargs["keys"])
-                ]
+                dense_graph_config[name] = [k + "__ebc" for k in keys]
                 node_kt.replace_all_uses_with(new_node)
         elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
             name = node.args[0]
