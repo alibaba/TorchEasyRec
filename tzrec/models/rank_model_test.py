@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 
 import torch
 from parameterized import parameterized
-from torchrec import KeyedJaggedTensor, KeyedTensor
+from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
@@ -145,6 +145,54 @@ class RankModelTest(unittest.TestCase):
             )
             torch.testing.assert_close(
                 metric_result["accuracy"], expected_acc, rtol=1e-4, atol=1e-4
+            )
+
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+        ]
+    )
+    def test_binary_classification_model_with_jagged_label(self, graph_type):
+        """A label stored as a list column is used like an ordinary label."""
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy())
+            ],
+            metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
+        )
+        model = _TestClassficationModel(
+            model_config=model_config, features=[], labels=["label"]
+        )
+        model = TrainWrapper(model)
+        model = create_test_model(model, graph_type)
+
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={},
+            jagged_labels={
+                "label": JaggedTensor(
+                    values=torch.tensor([0, 1]), lengths=torch.tensor([1, 1])
+                )
+            },
+        )
+        total_loss, (losses, predictions, batch) = model(batch)
+
+        torch.testing.assert_close(
+            total_loss, torch.tensor(0.6762), rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            predictions["probs"], torch.tensor([0.5498, 0.5744]), rtol=1e-4, atol=1e-4
+        )
+
+        if graph_type == TestGraphType.NORMAL:
+            model.model.update_metric(predictions, batch)
+            metric_result = model.model.compute_metric()
+            torch.testing.assert_close(
+                metric_result["auc"], torch.tensor(1.0), rtol=1e-4, atol=1e-4
             )
 
     @parameterized.expand(

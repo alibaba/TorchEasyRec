@@ -320,6 +320,11 @@ pipeline.global-job-parameters: |
     label_fields: "buy"
   ```
 
+- label列的类型是数组时（例如上游表的类型为`array<bigint>`），会被解析成jagged label。
+  模型侧统一用`BaseModel.get_label`读取label，会自动取出其中的values，因此这类label
+  可以和普通label一样使用。自定义模型中读取label时也应使用`self.get_label(batch, label_name)`
+  而不是`batch.labels[label_name]`。
+
 ### sample_weight_fields
 
 - 训练样本的样本权重列名

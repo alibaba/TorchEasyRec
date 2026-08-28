@@ -47,6 +47,18 @@ def symbolic_trace(
 
 
 @torch.fx.wrap
+def fx_get_label(
+    labels: Dict[str, torch.Tensor],
+    jagged_labels: Dict[str, JaggedTensor],
+    label_name: str,
+) -> torch.Tensor:
+    """Fx trace wrapper for reading a label that may be stored as a list column."""
+    if label_name in labels:
+        return labels[label_name]
+    return jagged_labels[label_name].values()
+
+
+@torch.fx.wrap
 def fx_arange(len: int, device: torch.device) -> torch.Tensor:
     """Fx trace wrapper for arange."""
     return torch.arange(len, device=device)
