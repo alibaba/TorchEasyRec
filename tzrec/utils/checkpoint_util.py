@@ -395,6 +395,7 @@ class CheckpointManager:
         save_model(ckpt_dir, model, optimizer, dense_ema)
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
+        save_success_marker(ckpt_dir)
         self._last_ckpt_dir = ckpt_dir
         self.prune()
         return ckpt_dir
@@ -1161,12 +1162,33 @@ def save_model(
 
 
 DATALOADER_CKPT_FILENAME = "dataloader_state.json"
+CKPT_SUCCESS_FILENAME = "_SUCCESS"
 # reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
 # no ":" so per-source consumers skip it.
 DATA_TS_WATERMARK = "__data_ts_watermark__"
 # reserved dataloader_state key: number of completed data passes; resume
 # continues the epoch budget from here. no ":" so per-source consumers skip it.
 EPOCHS_COMPLETED = "__epochs_completed__"
+
+
+def save_success_marker(checkpoint_dir: str) -> None:
+    """Mark a checkpoint as completely written.
+
+    Schedulers that poll a model directory need to tell a finished checkpoint
+    from one still being written. Write the marker only after every rank has
+    finished writing its shards.
+
+    Args:
+        checkpoint_dir: directory of the checkpoint to mark.
+    """
+    if dist.is_initialized():
+        dist.barrier()
+    if int(os.environ.get("RANK", 0)) == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        marker_path = os.path.join(checkpoint_dir, CKPT_SUCCESS_FILENAME)
+        with open(marker_path, "w"):
+            pass
+        logger.info(f"Saved checkpoint success marker to {marker_path}")
 
 
 def save_dataloader_state(

@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import os
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ import unittest
 
 import tzrec
 from tzrec.tests import utils
+from tzrec.utils import checkpoint_util
 from tzrec.utils.test_util import make_test_dir
 
 _PROTO = """syntax = "proto2";
@@ -206,6 +208,15 @@ class CustomModelIntegrationTest(unittest.TestCase):
         # process, class_path alone has to resolve the model there
         saved_config_path = os.path.join(self.test_dir, "train/pipeline.config")
         self.assertTrue(os.path.exists(saved_config_path))
+        # every saved checkpoint is marked complete for external schedulers
+        ckpt_dirs = glob.glob(os.path.join(self.test_dir, "train", "model.ckpt-*"))
+        self.assertTrue(ckpt_dirs)
+        for ckpt_dir in ckpt_dirs:
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(ckpt_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
+                )
+            )
         self.success = utils.test_eval(
             saved_config_path, self.test_dir, pythonpath=pythonpath
         )

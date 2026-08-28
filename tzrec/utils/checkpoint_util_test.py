@@ -724,6 +724,36 @@ class DataloaderCheckpointTest(unittest.TestCase):
         restored_state = checkpoint_util.restore_dataloader_state(self.test_dir)
         self.assertEqual(restored_state, checkpoint_state)
 
+    def test_save_success_marker(self):
+        """A completed checkpoint is marked so schedulers can poll for it."""
+        checkpoint_util.save_success_marker(self.test_dir)
+
+        marker_path = os.path.join(self.test_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
+        self.assertTrue(os.path.exists(marker_path))
+        self.assertEqual(os.path.getsize(marker_path), 0)
+
+    def test_save_success_marker_creates_dir(self):
+        """The marker can be written before the directory exists."""
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-10")
+        checkpoint_util.save_success_marker(ckpt_dir)
+
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(ckpt_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
+            )
+        )
+
+    def test_save_success_marker_non_zero_rank_skips(self):
+        """Only rank 0 writes the marker."""
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            checkpoint_util.save_success_marker(self.test_dir)
+
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.test_dir, checkpoint_util.CKPT_SUCCESS_FILENAME)
+            )
+        )
+
     def test_restore_dataloader_state_not_found(self):
         """Test restore returns None when no checkpoint exists."""
         restored_state = checkpoint_util.restore_dataloader_state(self.test_dir)
