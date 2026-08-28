@@ -423,9 +423,10 @@ class CheckpointManager:
         """Configure when ``maybe_save`` fires (train path only).
 
         Sets cadence config only (never the ``_last_*`` state), so a watermark
-        seeded on resume survives. When timestamp triggers are active under a
-        distributed run, also creates the dedicated CPU (gloo) group used for the
-        per-step event-time gather -- a collective, so all ranks must call this.
+        seeded on resume survives. Under a distributed run, also creates the
+        dedicated CPU (gloo) group used to gather event-times -- a collective, so
+        all ranks must call this. The group is created even when the timestamp
+        triggers are off, because a save still records the event-time watermark.
 
         Args:
             save_steps: step interval; 0 disables the step trigger.
@@ -434,7 +435,7 @@ class CheckpointManager:
             ts_targets: absolute event-time targets (Unix-epoch seconds).
             ts_quorum: fraction of workers (0, 1] past a boundary to trigger a save.
         """
-        if (ts_interval_s > 0 or len(ts_targets) > 0) and not (0.0 < ts_quorum <= 1.0):
+        if not (0.0 < ts_quorum <= 1.0):
             raise ValueError(
                 f"save_checkpoints_timestamp_quorum must be in (0, 1], got {ts_quorum}."
             )
@@ -443,7 +444,7 @@ class CheckpointManager:
         self._ts_interval = ts_interval_s
         self._ts_targets = ts_targets
         self._ts_quorum = ts_quorum
-        if self.needs_worker_timestamps() and dist.is_initialized():
+        if dist.is_initialized():
             self._ts_group = cast(
                 Optional[dist.ProcessGroup], dist.new_group(backend="gloo")
             )
@@ -452,7 +453,9 @@ class CheckpointManager:
         """Return whether the policy needs per-worker event-times gathered."""
         return self._ts_interval > 0 or len(self._ts_targets) > 0
 
-    def _reconcile_event_time(self, data_timestamp: float) -> Optional[float]:
+    def _reconcile_event_time(
+        self, data_timestamp: float, force: bool = False
+    ) -> Optional[float]:
         """Quorum-reconcile this rank's event-time across workers.
 
         Gathers over the CPU group from ``set_save_policy``. Each worker without a
@@ -462,11 +465,13 @@ class CheckpointManager:
 
         Args:
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none.
+            force: gather even when the timestamp triggers are off. Only safe once
+                the save decision is made, which is identical on every rank.
 
         Returns:
             The quorum event-time (seconds), or None.
         """
-        if not self.needs_worker_timestamps():
+        if not force and not self.needs_worker_timestamps():
             return None
         if dist.is_initialized():
             worker_ts: List[float] = [0.0] * dist.get_world_size(self._ts_group)
@@ -512,11 +517,6 @@ class CheckpointManager:
             True if a checkpoint was saved.
         """
         data_ts = self._reconcile_event_time(data_timestamp)
-        # copy so the watermark isn't leaked back into the train loop's state
-        if dataloader_state is not None:
-            dataloader_state = dict(dataloader_state)
-            if data_ts is not None:
-                dataloader_state[DATA_TS_WATERMARK] = data_ts
 
         want = final
         if self._save_steps > 0 and step > 0 and step % self._save_steps == 0:
@@ -539,6 +539,21 @@ class CheckpointManager:
 
         if not want:
             return False
+
+        # A step/epoch/final save records the watermark too, so a consumer can
+        # tell what data a checkpoint covers without the timestamp triggers being
+        # on. Gathering here rather than above keeps it one collective per saved
+        # checkpoint, and the save decision is identical on every rank so the
+        # gather stays in lockstep. It cannot affect the trigger, which was
+        # already decided.
+        if data_ts is None:
+            data_ts = self._reconcile_event_time(data_timestamp, force=True)
+        # copy so the watermark isn't leaked back into the train loop's state
+        if dataloader_state is not None:
+            dataloader_state = dict(dataloader_state)
+            if data_ts is not None:
+                dataloader_state[DATA_TS_WATERMARK] = data_ts
+
         if step == self._last_ckpt_step:
             # a boundary save dedup'd against an already-saved step: refresh
             # that checkpoint's state so the cleared + bumped bookkeeping is

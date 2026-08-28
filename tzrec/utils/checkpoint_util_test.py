@@ -1019,6 +1019,41 @@ class DataloaderCheckpointTest(unittest.TestCase):
         saved_state = mgr.save.call_args.args[3]
         self.assertEqual(saved_state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
 
+    def test_maybe_save_stamps_watermark_on_step_trigger(self):
+        """A step-triggered save records the watermark, triggers off."""
+        mgr = self._policy_manager(save_steps=10)
+        state = {"topic:0": 5}
+        self.assertTrue(
+            mgr.maybe_save(
+                10, model=None, dataloader_state=state, data_timestamp=3600.0
+            )
+        )
+        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, state)
+        saved_state = mgr.save.call_args.args[3]
+        self.assertEqual(saved_state[checkpoint_util.DATA_TS_WATERMARK], 3600.0)
+
+    def test_maybe_save_no_watermark_without_event_time(self):
+        """A source without event-times leaves the watermark out entirely."""
+        mgr = self._policy_manager(save_steps=10)
+        state = {"file:0": 5}
+        self.assertTrue(
+            mgr.maybe_save(10, model=None, dataloader_state=state, data_timestamp=-1.0)
+        )
+        saved_state = mgr.save.call_args.args[3]
+        self.assertNotIn(checkpoint_util.DATA_TS_WATERMARK, saved_state)
+
+    def test_set_save_policy_rejects_bad_quorum_without_triggers(self):
+        """The quorum is used by every save now, so it is always validated."""
+        mgr = checkpoint_util.CheckpointManager(self.test_dir)
+        with self.assertRaisesRegex(ValueError, "must be in"):
+            mgr.set_save_policy(
+                save_steps=10,
+                save_epochs=0,
+                ts_interval_s=0,
+                ts_targets=[],
+                ts_quorum=0,
+            )
+
     def test_reconcile_event_time_single_process(self):
         # not distributed: this rank's value passes through (quorum of one); -1.0
         # (no timestamp) -> None; disabled policy -> None
