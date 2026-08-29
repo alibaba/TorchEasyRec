@@ -220,7 +220,7 @@ class RocketLaunching(RankModel):
                     self._loss_impl(
                         predictions,
                         batch,
-                        batch.labels[self._label_name],
+                        self.get_label(batch, self._label_name),
                         loss_weight,
                         loss_cfg,
                         num_class=self._num_class,
@@ -231,7 +231,7 @@ class RocketLaunching(RankModel):
                 self._loss_impl(
                     predictions,
                     batch,
-                    batch.labels[self._label_name],
+                    self.get_label(batch, self._label_name),
                     loss_weight,
                     loss_cfg,
                     num_class=self._num_class,
@@ -262,7 +262,7 @@ class RocketLaunching(RankModel):
                 self._update_metric_impl(
                     predictions,
                     batch,
-                    batch.labels[self._label_name],
+                    self.get_label(batch, self._label_name),
                     metric_cfg,
                     num_class=self._num_class,
                     suffix="_booster",
@@ -270,7 +270,7 @@ class RocketLaunching(RankModel):
             self._update_metric_impl(
                 predictions,
                 batch,
-                batch.labels[self._label_name],
+                self.get_label(batch, self._label_name),
                 metric_cfg,
                 num_class=self._num_class,
                 suffix="_light",
@@ -281,14 +281,14 @@ class RocketLaunching(RankModel):
                     self._update_loss_metric_impl(
                         losses,
                         batch,
-                        batch.labels[self._label_name],
+                        self.get_label(batch, self._label_name),
                         loss_cfg,
                         suffix="_booster",
                     )
                 self._update_loss_metric_impl(
                     losses,
                     batch,
-                    batch.labels[self._label_name],
+                    self.get_label(batch, self._label_name),
                     loss_cfg,
                     suffix="_light",
                 )
@@ -308,7 +308,7 @@ class RocketLaunching(RankModel):
             self._update_train_metric_impl(
                 predictions,
                 batch,
-                batch.labels[self._label_name],
+                self.get_label(batch, self._label_name),
                 metric_cfg,
                 num_class=self._num_class,
                 suffix="_booster",
@@ -316,7 +316,7 @@ class RocketLaunching(RankModel):
             self._update_train_metric_impl(
                 predictions,
                 batch,
-                batch.labels[self._label_name],
+                self.get_label(batch, self._label_name),
                 metric_cfg,
                 num_class=self._num_class,
                 suffix="_light",
