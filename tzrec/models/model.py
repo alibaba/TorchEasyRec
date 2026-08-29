@@ -156,6 +156,11 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
             metric_results[metric_name] = metric.compute()
         return metric_results
 
+    def reset_train_metric(self) -> None:
+        """Reset train metric state."""
+        for metric in self._train_metric_modules.values():
+            metric.reset()
+
     def on_train_end(self) -> None:
         """Hook fired once after the train_eval loop exits.
 
