@@ -639,7 +639,7 @@ def _rewrite_dense_serving_graph(
     dense_graph_config["sequence__ec"] = []
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
-            name = node.args[0]
+            name = cast(str, node.args[0])
             if node.kwargs.get("is_dense", False):
                 continue
             node_kt = node.args[1]
