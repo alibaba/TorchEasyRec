@@ -43,6 +43,7 @@ from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.optim.ema import DenseEMA
 from tzrec.protos import export_pb2
+from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -389,12 +390,16 @@ class CheckpointManager:
         optimizer: Optional[optim.Optimizer] = None,
         dataloader_state: Optional[Dict[str, Any]] = None,
         dense_ema: Optional[DenseEMA] = None,
+        data_ts: Optional[float] = None,
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer, dense_ema)
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
+        save_meta(ckpt_dir, step, data_ts)
+        # last, so its presence means every file above is complete
+        save_success_marker(ckpt_dir)
         self._last_ckpt_dir = ckpt_dir
         self.prune()
         return ckpt_dir
@@ -422,9 +427,10 @@ class CheckpointManager:
         """Configure when ``maybe_save`` fires (train path only).
 
         Sets cadence config only (never the ``_last_*`` state), so a watermark
-        seeded on resume survives. When timestamp triggers are active under a
-        distributed run, also creates the dedicated CPU (gloo) group used for the
-        per-step event-time gather -- a collective, so all ranks must call this.
+        seeded on resume survives. Under a distributed run, also creates the
+        dedicated CPU (gloo) group used to gather event-times -- a collective, so
+        all ranks must call this. The group is created even when the timestamp
+        triggers are off, because a save still records the event-time watermark.
 
         Args:
             save_steps: step interval; 0 disables the step trigger.
@@ -433,7 +439,7 @@ class CheckpointManager:
             ts_targets: absolute event-time targets (Unix-epoch seconds).
             ts_quorum: fraction of workers (0, 1] past a boundary to trigger a save.
         """
-        if (ts_interval_s > 0 or len(ts_targets) > 0) and not (0.0 < ts_quorum <= 1.0):
+        if not (0.0 < ts_quorum <= 1.0):
             raise ValueError(
                 f"save_checkpoints_timestamp_quorum must be in (0, 1], got {ts_quorum}."
             )
@@ -442,7 +448,7 @@ class CheckpointManager:
         self._ts_interval = ts_interval_s
         self._ts_targets = ts_targets
         self._ts_quorum = ts_quorum
-        if self.needs_worker_timestamps() and dist.is_initialized():
+        if dist.is_initialized():
             self._ts_group = cast(
                 Optional[dist.ProcessGroup], dist.new_group(backend="gloo")
             )
@@ -451,7 +457,9 @@ class CheckpointManager:
         """Return whether the policy needs per-worker event-times gathered."""
         return self._ts_interval > 0 or len(self._ts_targets) > 0
 
-    def _reconcile_event_time(self, data_timestamp: float) -> Optional[float]:
+    def _reconcile_event_time(
+        self, data_timestamp: float, force: bool = False
+    ) -> Optional[float]:
         """Quorum-reconcile this rank's event-time across workers.
 
         Gathers over the CPU group from ``set_save_policy``. Each worker without a
@@ -461,11 +469,13 @@ class CheckpointManager:
 
         Args:
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none.
+            force: gather even when the timestamp triggers are off. Only safe once
+                the save decision is made, which is identical on every rank.
 
         Returns:
             The quorum event-time (seconds), or None.
         """
-        if not self.needs_worker_timestamps():
+        if not force and not self.needs_worker_timestamps():
             return None
         if dist.is_initialized():
             worker_ts: List[float] = [0.0] * dist.get_world_size(self._ts_group)
@@ -538,6 +548,7 @@ class CheckpointManager:
 
         if not want:
             return False
+
         if step == self._last_ckpt_step:
             # a boundary save dedup'd against an already-saved step: refresh
             # that checkpoint's state so the cleared + bumped bookkeeping is
@@ -555,7 +566,16 @@ class CheckpointManager:
         if data_ts is not None:
             # advance the watermark on every save so resume is exact
             self._last_data_ts = data_ts
-        self.save(step, model, optimizer, dataloader_state, dense_ema)
+        # The checkpoint records what data it covers whether or not the event-time
+        # triggers are on. With the triggers on the gather above already produced
+        # that value, and repeating it would return the same result, so gather
+        # only when they are off: at most one gather per saved checkpoint, none
+        # per step. Doing it after the save decision is safe because that
+        # decision is identical on every rank, so the gather stays in lockstep.
+        report_ts = data_ts
+        if report_ts is None and not self.needs_worker_timestamps():
+            report_ts = self._reconcile_event_time(data_timestamp, force=True)
+        self.save(step, model, optimizer, dataloader_state, dense_ema, report_ts)
         return True
 
     def prune(self) -> None:
@@ -970,7 +990,7 @@ def restore_model(
     if not os.path.exists(checkpoint_dir):
         raise RuntimeError(f"checkpoint_dir[{checkpoint_dir}] not exists.")
 
-    meta_path = os.path.join(checkpoint_dir, "meta")
+    meta_path = os.path.join(checkpoint_dir, CKPT_META_FILENAME)
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")
     dense_ema_ckpt_path = os.path.join(checkpoint_dir, "dense_ema")
@@ -1161,12 +1181,64 @@ def save_model(
 
 
 DATALOADER_CKPT_FILENAME = "dataloader_state.json"
+CKPT_SUCCESS_FILENAME = "_SUCCESS"
+CKPT_META_FILENAME = "meta"
 # reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
 # no ":" so per-source consumers skip it.
 DATA_TS_WATERMARK = "__data_ts_watermark__"
 # reserved dataloader_state key: number of completed data passes; resume
 # continues the epoch budget from here. no ":" so per-source consumers skip it.
 EPOCHS_COMPLETED = "__epochs_completed__"
+
+
+def save_meta(
+    checkpoint_dir: str,
+    step: int,
+    data_ts: Optional[float] = None,
+) -> None:
+    """Describe a checkpoint in its meta file.
+
+    Records the step, the consumed event-time when the data source has one, and
+    the CHECKPOINT_TAG label when set, alongside whatever restore-relevant keys
+    a converted checkpoint already carries.
+
+    Args:
+        checkpoint_dir: directory of the checkpoint.
+        step: step of the checkpoint.
+        data_ts: quorum event-time (seconds) of the consumed data, if any.
+    """
+    if int(os.environ.get("RANK", 0)) == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        meta: Dict[str, Any] = {"step": step}
+        if data_ts is not None:
+            meta["data_ts"] = data_ts
+        tag = env_util.checkpoint_tag()
+        if tag:
+            meta["tag"] = tag
+        with open(os.path.join(checkpoint_dir, CKPT_META_FILENAME), "w") as f:
+            json.dump(meta, f)
+
+
+def save_success_marker(checkpoint_dir: str) -> None:
+    """Mark a checkpoint as completely written.
+
+    Schedulers that poll a model directory need to tell a finished checkpoint
+    from one still being written. The marker is empty and written last, after
+    every rank has finished its shards and after every other file in the
+    checkpoint, so its presence alone means the whole checkpoint is readable --
+    do not write anything into it, and do not move this call earlier.
+
+    Args:
+        checkpoint_dir: directory of the checkpoint to mark.
+    """
+    if dist.is_initialized():
+        dist.barrier()
+    if int(os.environ.get("RANK", 0)) == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        marker_path = os.path.join(checkpoint_dir, CKPT_SUCCESS_FILENAME)
+        with open(marker_path, "w"):
+            pass
+        logger.info(f"Saved checkpoint success marker to {marker_path}")
 
 
 def save_dataloader_state(

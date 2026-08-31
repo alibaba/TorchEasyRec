@@ -142,6 +142,9 @@ python -m grpc_tools.protoc -I . -I "${TZREC_PATH}" \
 
 **模型模块必须在顶层 `import` 自己的 `*_pb2`。**
 
+读取 label 时使用 `self.get_label(batch, label_name)`，不要直接用 `batch.labels[label_name]`，
+否则数组类型的 label 会取不到。
+
 以排序模型为例
 
 ```python

@@ -25,6 +25,22 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
+- CHECKPOINT_TAG: 给checkpoint打一个自定义标记，记录在`meta`中（见下面的checkpoint信息），便于外部调度识别是哪一次调度产出的checkpoint。默认为空，不做任何限制
+
+## Checkpoint信息与完成标记
+
+checkpoint目录下的`meta`记录该checkpoint的信息：
+
+- `step`: 步数
+- `data_ts`: 已消费数据的事件时间（秒），数据源不带timestamp时（如ParquetDataset）不写该字段
+- `tag`: `CHECKPOINT_TAG`的值，未设置时不写该字段
+
+`_SUCCESS`是最后生成的空文件，外部调度看到它即表示该checkpoint的所有文件都已写完：
+
+```bash
+test -e ${MODEL_DIR}/model.ckpt-1000/_SUCCESS && cat ${MODEL_DIR}/model.ckpt-1000/meta
+# {"step": 1000, "data_ts": 1755000000.0, "tag": "20260828"}
+```
 
 ## 训练配置
 

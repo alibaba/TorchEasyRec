@@ -277,7 +277,7 @@ class RankModel(BaseModel):
                 self._loss_impl(
                     predictions,
                     batch,
-                    batch.labels[self._label_name],
+                    self.get_label(batch, self._label_name),
                     loss_weight,
                     loss_cfg,
                     num_class=self._num_class,
@@ -492,14 +492,14 @@ class RankModel(BaseModel):
             self._update_metric_impl(
                 predictions,
                 batch,
-                batch.labels[self._label_name],
+                self.get_label(batch, self._label_name),
                 metric_cfg,
                 num_class=self._num_class,
             )
         if losses is not None:
             for loss_cfg in self._base_model_config.losses:
                 self._update_loss_metric_impl(
-                    losses, batch, batch.labels[self._label_name], loss_cfg
+                    losses, batch, self.get_label(batch, self._label_name), loss_cfg
                 )
 
     def update_train_metric(
@@ -517,7 +517,7 @@ class RankModel(BaseModel):
             self._update_train_metric_impl(
                 predictions,
                 batch,
-                batch.labels[self._label_name],
+                self.get_label(batch, self._label_name),
                 metric_cfg,
                 num_class=self._num_class,
             )
