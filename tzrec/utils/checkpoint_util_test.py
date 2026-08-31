@@ -266,6 +266,25 @@ class CheckpointUtilTest(unittest.TestCase):
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "custom"))
         self.assertEqual(step, 0)
 
+    def test_latest_checkpoint_with_unsuffixed_ckpt(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt"))
+        self.assertEqual(step, 0)
+
+    def test_latest_checkpoint_prefers_stepped_over_unsuffixed(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-10/model"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-10"))
+        self.assertEqual(step, 10)
+
+    def test_latest_checkpoint_without_any_ckpt(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertIsNone(ckpt_path)
+        self.assertEqual(step, -1)
+
     def _remaining_ckpt_steps(self):
         return sorted(
             int(p.rsplit("-", 1)[1])
