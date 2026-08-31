@@ -148,6 +148,39 @@ def _save_restore_worker(test_dir, rank, world_size, port):
     checkpoint_util.restore_model(test_dir, model, optimizer)
 
 
+def _report_ts_worker(
+    test_dir, rank, world_size, port, data_timestamp, ts_interval_s, ts_quorum
+):
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="gloo")
+
+    gathers = []
+    orig_all_gather_object = dist.all_gather_object
+
+    def _counting_all_gather_object(obj_list, obj, group=None):
+        gathers.append(1)
+        return orig_all_gather_object(obj_list, obj, group=group)
+
+    checkpoint_util.dist.all_gather_object = _counting_all_gather_object
+
+    mgr = checkpoint_util.CheckpointManager(test_dir)
+    mgr.set_save_policy(
+        save_steps=10,
+        save_epochs=0,
+        ts_interval_s=ts_interval_s,
+        ts_targets=[],
+        ts_quorum=ts_quorum,
+    )
+    # save is mocked, so the only gathers are the event-time reconciles
+    mgr.save = mock.MagicMock(return_value="ckpt")
+    mgr.maybe_save(10, model=None, data_timestamp=data_timestamp)
+    with open(os.path.join(test_dir, f"report_ts.{rank}"), "w") as f:
+        f.write(f"{mgr.save.call_args.args[5]!r} {len(gathers)}")
+
+
 def _partial_restore_worker(test_dir, rank, world_size, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -360,6 +393,65 @@ class CheckpointUtilTest(unittest.TestCase):
             checkpoint_util.best_checkpoint(self.test_dir, export_config),
         )
         self.assertEqual(manager.best_checkpoint()[1], 10)
+
+    def test_dist_report_ts_agrees_across_ranks(self):
+        """Ranks at different event-times record the same one on the checkpoint.
+
+        The directory a checkpoint is written to, and the event-time recorded in
+        its meta, have to be identical on every rank; the save is collective, so
+        a rank-local event-time would split one checkpoint across directories.
+        """
+        # triggers off: the reconcile happens once, only because a save fired
+        reported = self._run_report_ts_workers(
+            data_timestamps=[3600.0, 3660.0], ts_interval_s=0, ts_quorum=0.5
+        )
+        self.assertEqual(reported[0], reported[1])
+        # quorum 0.5 over [3600, 3660]: largest T with at least 1 value >= T
+        self.assertEqual(reported[0], f"{3660.0!r} 1")
+
+    def test_dist_report_ts_reuses_the_trigger_gather(self):
+        """With the triggers on, reporting must not gather a second time.
+
+        The trigger already reconciled this step; repeating it returns the same
+        value, so a second all_gather_object is pure waste. Quorum 1.0 with one
+        rank lacking a timestamp leaves the trigger unmet, which is the path
+        where the redundant gather used to happen.
+        """
+        reported = self._run_report_ts_workers(
+            data_timestamps=[3600.0, -1.0], ts_interval_s=3600, ts_quorum=1.0
+        )
+        self.assertEqual(reported[0], reported[1])
+        # quorum unmet -> nothing to report, and exactly one gather
+        self.assertEqual(reported[0], "None 1")
+
+    def _run_report_ts_workers(self, data_timestamps, ts_interval_s, ts_quorum):
+        port = misc_util.get_free_port()
+        procs = []
+        ctx = mp.get_context("spawn")
+        for i, data_timestamp in enumerate(data_timestamps):
+            p = ctx.Process(
+                target=_report_ts_worker,
+                args=(
+                    self.test_dir,
+                    i,
+                    len(data_timestamps),
+                    port,
+                    data_timestamp,
+                    ts_interval_s,
+                    ts_quorum,
+                ),
+            )
+            p.start()
+            procs.append(p)
+        for i, p in enumerate(procs):
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"worker-{i} failed.")
+        reported = []
+        for i in range(len(data_timestamps)):
+            with open(os.path.join(self.test_dir, f"report_ts.{i}")) as f:
+                reported.append(f.read())
+        return reported
 
     def test_dist_save_restore_model(self):
         port = misc_util.get_free_port()

@@ -566,12 +566,14 @@ class CheckpointManager:
         if data_ts is not None:
             # advance the watermark on every save so resume is exact
             self._last_data_ts = data_ts
-        # The marker reports what data the checkpoint covers whether or not the
-        # event-time triggers are on. Reconciling here rather than above keeps it
-        # one collective per saved checkpoint, and the save decision is identical
-        # on every rank so the gather stays in lockstep.
+        # The checkpoint records what data it covers whether or not the event-time
+        # triggers are on. With the triggers on the gather above already produced
+        # that value, and repeating it would return the same result, so gather
+        # only when they are off: at most one gather per saved checkpoint, none
+        # per step. Doing it after the save decision is safe because that
+        # decision is identical on every rank, so the gather stays in lockstep.
         report_ts = data_ts
-        if report_ts is None:
+        if report_ts is None and not self.needs_worker_timestamps():
             report_ts = self._reconcile_event_time(data_timestamp, force=True)
         self.save(step, model, optimizer, dataloader_state, dense_ema, report_ts)
         return True
