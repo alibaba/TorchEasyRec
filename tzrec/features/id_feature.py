@@ -36,6 +36,14 @@ class IdFeature(BaseFeature):
         if isinstance(self.config, feature_pb2.IdFeature):
             self._is_weighted = self.config.weighted
             self._use_weight = self.config.weighted and self.config.use_weight
+            if self._is_weighted and self.is_sequence:
+                # fg does not parse weight for a sequence feature and
+                # SequenceSparseData has no weight, so the weight of a sequence
+                # feature would never reach the model.
+                raise ValueError(
+                    f"{self.__class__.__name__}[{self.name}] does not support "
+                    "weighted sequence feature."
+                )
 
     @property
     def value_dim(self) -> int:

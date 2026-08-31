@@ -33,6 +33,7 @@ from tzrec.utils.test_util import parameterized_name_func
 class DataParserTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("INPUT_TILE", None)
+        os.environ.pop("INPUT_TILE_3_ONLINE", None)
 
     def test_nofg(self):
         feature_cfgs = [
@@ -358,6 +359,7 @@ class DataParserTest(unittest.TestCase):
         with_const=False,
         with_stub_feat=False,
         tag_b_use_weight=True,
+        tag_b_pooling="sum",
     ):
         seq_sub_feas = [
             feature_pb2.SeqFeatureConfig(
@@ -413,6 +415,7 @@ class DataParserTest(unittest.TestCase):
                     num_buckets=1000,
                     weighted=tag_b_weighted,
                     use_weight=tag_b_use_weight,
+                    pooling=tag_b_pooling,
                 )
             ),
             feature_pb2.FeatureConfig(
@@ -744,13 +747,17 @@ class DataParserTest(unittest.TestCase):
         data_parser = DataParser(features=features)
         data = data_parser.parse(
             input_data={
-                "tag_a": pa.array(["1:1.0\x032:3.0", "", "3:2.0"]),
-                "tag_b": pa.array(["1\x032", "", "3"]),
-                "tag_c": pa.array(["1\x032", "", "3"]),
+                # the last row has an all-zero weight bag, its weight sum is
+                # guarded to one so that normalization does not divide by zero
+                "tag_a": pa.array(["1:1.0\x032:3.0", "", "3:2.0", "4:0.0\x035:0.0"]),
+                "tag_b": pa.array(["1\x032", "", "3", "4"]),
+                "tag_c": pa.array(["1\x032", "", "3", "4"]),
             }
         )
         # raw weights are kept in the parsed inputs, normalization is in to_batch
-        torch.testing.assert_close(data["tag_a.weights"], torch.tensor([1.0, 3.0, 2.0]))
+        torch.testing.assert_close(
+            data["tag_a.weights"], torch.tensor([1.0, 3.0, 2.0, 0.0, 0.0])
+        )
 
         batch = data_parser.to_batch(data)
         weights = batch.sparse_features["__BASE__"].weights()
@@ -759,8 +766,127 @@ class DataParserTest(unittest.TestCase):
         torch.testing.assert_close(
             weights,
             torch.tensor(
-                [0.25, 0.75, 1.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0],
+                # fmt: off
+                [
+                    0.25,
+                    0.75,
+                    1.0,
+                    0.0,
+                    0.0,  # tag_a  w / sum(w), 0/0 -> 0
+                    0.5,
+                    0.5,
+                    1.0,
+                    1.0,  # tag_b  1 / length
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,  # tag_c  untouched ones
+                ],
+                # fmt: on
             ),
+        )
+
+    def _weighted_input_tile_features(self):
+        """A weighted mean, a plain mean and a sum feature, user/user/item side."""
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="u_w",
+                    expression="user:u_w",
+                    embedding_dim=8,
+                    num_buckets=100,
+                    weighted=True,
+                    use_weight=True,
+                    pooling="mean",
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="u_m",
+                    expression="user:u_m",
+                    embedding_dim=8,
+                    num_buckets=100,
+                    pooling="mean",
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="i_s",
+                    expression="item:i_s",
+                    embedding_dim=8,
+                    num_buckets=100,
+                )
+            ),
+        ]
+        return create_features(feature_cfgs)
+
+    @staticmethod
+    def _weighted_input_tile_input_data():
+        # the same user in every row, so tiling row 0 is equivalent to the batch
+        return {
+            "u_w": pa.array(["4:1.0\x035:3.0"] * 3),
+            "u_m": pa.array(["1\x032\x033"] * 3),
+            "i_s": pa.array(["7", "8", "9"]),
+        }
+
+    def test_weighted_id_mean_pooling_input_tile(self):
+        # INPUT_TILE=2: user weights are normalized on the untiled bag and only
+        # then tiled, so each tiled copy keeps weights summing to one.
+        os.environ["INPUT_TILE"] = "2"
+        os.environ["INPUT_TILE_3_ONLINE"] = "1"
+        data_parser = DataParser(features=self._weighted_input_tile_features())
+        data = data_parser.parse(input_data=self._weighted_input_tile_input_data())
+        batch = data_parser.to_batch(data)
+
+        sparse_feature = batch.sparse_features["__BASE__"]
+        self.assertEqual(sparse_feature.keys(), ["u_w", "u_m", "i_s"])
+        torch.testing.assert_close(
+            sparse_feature.weights(),
+            torch.tensor(
+                # fmt: off
+                [
+                    0.25,
+                    0.75,
+                    0.25,
+                    0.75,
+                    0.25,
+                    0.75,  # u_w  w / sum(w), tiled
+                    1 / 3,
+                    1 / 3,
+                    1 / 3,
+                    1 / 3,
+                    1 / 3,
+                    1 / 3,
+                    1 / 3,
+                    1 / 3,
+                    1 / 3,  # u_m  1 / length, tiled
+                    1.0,
+                    1.0,
+                    1.0,  # i_s  untouched ones
+                ],
+                # fmt: on
+            ),
+        )
+
+    def test_weighted_id_mean_pooling_input_tile_emb(self):
+        # INPUT_TILE=3: user features stay at batch_size=1 in their own kjt, the
+        # weights are split across the user and the item collection.
+        os.environ["INPUT_TILE"] = "3"
+        os.environ["INPUT_TILE_3_ONLINE"] = "1"
+        data_parser = DataParser(features=self._weighted_input_tile_features())
+        data = data_parser.parse(input_data=self._weighted_input_tile_input_data())
+        batch = data_parser.to_batch(data)
+
+        user_feature = batch.sparse_features["__BASE___user"]
+        self.assertEqual(user_feature.keys(), ["u_w", "u_m"])
+        torch.testing.assert_close(
+            user_feature.weights(),
+            torch.tensor([0.25, 0.75, 1 / 3, 1 / 3, 1 / 3]),
+        )
+        item_feature = batch.sparse_features["__BASE__"]
+        self.assertEqual(item_feature.keys(), ["i_s"])
+        torch.testing.assert_close(
+            item_feature.weights(), torch.tensor([1.0, 1.0, 1.0])
         )
 
     @parameterized.expand(

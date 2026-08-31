@@ -459,6 +459,104 @@ class EmbeddingGroupTest(unittest.TestCase):
         )
         self.assertTrue(embedding_group.ebc.is_weighted())
 
+    def test_embedding_group_impl_weighted_input_tile_emb(self) -> None:
+        # under INPUT_TILE=3 the user side gets its own collections, so the
+        # weighted flag has to be resolved per collection there as well.
+        os.environ["INPUT_TILE"] = "3"
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="u_w",
+                    expression="user:u_w",
+                    embedding_dim=16,
+                    num_buckets=100,
+                    weighted=True,
+                    use_weight=True,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="u_z",
+                    expression="user:u_z",
+                    embedding_dim=8,
+                    zch=feature_pb2.ZeroCollisionHash(
+                        zch_size=100, lfu=feature_pb2.LFU_EvictionPolicy()
+                    ),
+                    pooling="mean",
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="i_s",
+                    expression="item:i_s",
+                    embedding_dim=8,
+                    num_buckets=100,
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["u_w", "u_z", "i_s"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        embedding_group = EmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        # u_w carries its own weight, u_z is mean pooled in a weighted data group
+        # so its mean rides on the normalized weights
+        self.assertTrue(embedding_group.ebc_user.is_weighted())
+        mc_ebc_user = embedding_group.mc_ebc_user._embedding_bag_collection
+        self.assertTrue(mc_ebc_user.is_weighted())
+        for emb_bag_config in mc_ebc_user.embedding_bag_configs():
+            self.assertEqual(emb_bag_config.pooling, PoolingType.SUM)
+        # the item side holds only an unweighted sum table
+        self.assertFalse(embedding_group.ebc.is_weighted())
+
+    def test_embedding_group_impl_weighted_stub_feature(self) -> None:
+        # DataParser skips stub features when collecting weight keys, so a stub
+        # must not mark its data group weighted either, otherwise the group's
+        # mean tables would be rewritten to sum against a kjt with no weights.
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="stub_w",
+                    expression="user:stub_w",
+                    embedding_dim=8,
+                    num_buckets=100,
+                    weighted=True,
+                    use_weight=True,
+                    stub_type=True,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_m",
+                    expression="item:cat_m",
+                    embedding_dim=8,
+                    num_buckets=100,
+                    pooling="mean",
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["cat_m"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+        ]
+        embedding_group = EmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertFalse(embedding_group.ebc.is_weighted())
+        self.assertEqual(
+            embedding_group.ebc.embedding_bag_configs()[0].pooling, PoolingType.MEAN
+        )
+
     def test_embedding_group_impl_weighted_with_dynamicemb(self) -> None:
         feature_cfgs = [
             feature_pb2.FeatureConfig(

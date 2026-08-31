@@ -1272,7 +1272,9 @@ def create_features(
         except InvalidFgInputError:
             pass
 
-    weighted_data_groups = {x.data_group for x in features if x.use_weight}
+    weighted_data_groups = {
+        x.data_group for x in features if x.use_weight and not x.stub_type
+    }
     for feature in features:
         feature._in_weighted_group = feature.data_group in weighted_data_groups
 

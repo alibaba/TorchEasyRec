@@ -233,6 +233,21 @@ class IdFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 2, 1]))
         self.assertIsNone(parsed_feat.weights)
 
+    def test_weighted_sequence_id_feature_raises(self):
+        # fg ignores weighted on a sequence feature and SequenceSparseData has no
+        # weight, so this used to blow up as a KeyError in a dataloader worker.
+        id_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="cate",
+                expression="item:cate",
+                embedding_dim=16,
+                num_buckets=100,
+                weighted=True,
+            )
+        )
+        with self.assertRaises(ValueError):
+            id_feature_lib.IdFeature(id_feat_cfg, is_sequence=True)
+
     def test_fg_encoded_id_feature_with_mask(self):
         id_feat_cfg = feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
