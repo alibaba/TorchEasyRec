@@ -68,10 +68,13 @@
 # If auth goes stale, re-run `codex login --device-auth` on the runner.
 # If the runner lacks direct OpenAI egress, set HTTPS_PROXY for the runner service.
 #
-# Trust model: the collaborator-added label gates every run (review before labeling).
-# Model commands run in a no-network sandbox; only the gh pr view/diff/comment
-# allowlist (scripts/ci/codex_review.rules) runs outside it — as with the claude
-# job's --allowedTools, a PR comment is the only exfil path for injected content.
+# Trust model: the collaborator-added label gates every run (review before labeling);
+# adding a label needs triage permission, so non-collaborators cannot trigger either job.
+# Codex confines model commands to a no-network sandbox, with only the gh pr
+# view/diff/comment allowlist (scripts/ci/codex_review.rules) running outside it. The
+# claude job reaches the same allowlist via --permission-mode manual, which is what makes
+# --allowedTools binding. A PR comment is the only exfil path out of either job, and
+# --add-dir / leaves everything readable on the runner reachable from that path.
 # ---- End Codex Setup ----
 
 name: Code Review
@@ -89,7 +92,7 @@ jobs:
   review:
     if: github.event.label.name == 'claude-review'
     runs-on: tzrec-codereview-runner
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
       pull-requests: write
@@ -145,9 +148,14 @@ jobs:
 
           MCP_CONFIG="{\"mcpServers\":{\"github_inline_comment\":{\"command\":\"${BUN_PATH}\",\"args\":[\"run\",\"/opt/claude-code-action/src/mcp/github-inline-comment-server.ts\"]}}}"
 
+          # --permission-mode manual makes --allowedTools binding; without it the
+          # runner's stored settings apply and every Bash command is permitted.
+          # --add-dir / keeps the cross-repo reads the reviewers depend on.
           claude -p \
             --output-format stream-json \
             --verbose \
+            --permission-mode manual \
+            --add-dir / \
             --settings '{"disableRemoteControl": true}' \
             --mcp-config "$MCP_CONFIG" \
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob,Agent" \
