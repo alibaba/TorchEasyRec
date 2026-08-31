@@ -18,6 +18,11 @@ one logit per ``(candidate, task)`` pair::
     z_k = CrossTask({ SD_k(s, {r^i_k}) })          request level, per task
     s^i_k = z_k . r^i_k / sqrt(D) + b_k            candidate level
 
+The inner product is the paper default; ``scorer_type`` offers a
+bilinear (per-task, identity-init ``W_k``) and an MLP variant because
+the rank-1 inner product can sit on the constant-prediction plateau
+for most of a single-epoch run (see ONERANK_OVERVIEW.md §5).
+
 Both stages are optional (paper ablations V5 and V3).  With neither, ``z_k``
 degenerates to the mean of ``{r^i_k}`` over the request's candidates, which
 still discriminates candidates through ``r^i_k``.
@@ -57,6 +62,12 @@ class OneRankPredictionHead(BaseModule):
         cross_task_head (Dict, optional): kwargs of
             :class:`~tzrec.modules.gr.onerank_cross_task.OneRankCrossTaskAttention`;
             ``None`` scores the per-task vectors directly (ablation V3).
+        scorer_type (str): ``"dot_product"`` (paper default),
+            ``"bilinear"`` (per-task identity-init ``W_k``) or ``"mlp"``
+            (per-task two-layer MLP over ``[z_k; r^i_k]``).
+        scorer_hidden_dim (int): hidden dim of the MLP scorer.
+        task_bias_init (Sequence[float], optional): per-task initial
+            logits in ``task_names`` order; ``None`` keeps zeros.
         is_inference (bool): whether to run in inference mode.
     """
 
@@ -67,6 +78,9 @@ class OneRankPredictionHead(BaseModule):
         contextual_feature_dim: int = 0,
         situation_discernment: Optional[Dict[str, Any]] = None,
         cross_task_head: Optional[Dict[str, Any]] = None,
+        scorer_type: str = "dot_product",
+        scorer_hidden_dim: int = 256,
+        task_bias_init: Optional[Sequence[float]] = None,
         is_inference: bool = False,
     ) -> None:
         super().__init__(is_inference=is_inference)
@@ -96,6 +110,41 @@ class OneRankPredictionHead(BaseModule):
                 is_inference=is_inference,
                 **cross_task_head,
             )
+        self._scorer_type: str = scorer_type
+        if scorer_type not in ("dot_product", "bilinear", "mlp"):
+            raise ValueError(f"unknown scorer_type: {scorer_type!r}")
+        if scorer_hidden_dim <= 0:
+            raise ValueError("scorer_hidden_dim must be > 0")
+        if task_bias_init is not None and len(task_bias_init) != num_tasks:
+            raise ValueError(
+                f"task_bias_init has {len(task_bias_init)} entries, "
+                f"expected {num_tasks} (= len(task_names))"
+            )
+        # BILINEAR starts exactly where DOT_PRODUCT would (identity W_k);
+        # what changes is the ability to leave the rank-1 subspace, not the
+        # starting point, so the two are directly comparable at step 0.
+        self._bilinear_weight: Optional[torch.nn.Parameter] = None
+        if scorer_type == "bilinear":
+            weight = torch.eye(embedding_dim).repeat(num_tasks, 1, 1)
+            self._bilinear_weight = torch.nn.Parameter(weight)
+        # MLP scorer: per-task, two layers, SiLU in between.  The random
+        # init already discriminates candidates, which is exactly what
+        # keeps the run out of the constant-prediction plateau.
+        self._task_mlps: Optional[torch.nn.ModuleList] = None
+        if scorer_type == "mlp":
+            self._task_mlps = torch.nn.ModuleList(
+                torch.nn.Sequential(
+                    torch.nn.Linear(2 * embedding_dim, scorer_hidden_dim),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(scorer_hidden_dim, 1),
+                )
+                for _ in range(num_tasks)
+            )
+        if task_bias_init is not None:
+            with torch.no_grad():
+                self._task_bias.copy_(
+                    torch.as_tensor(task_bias_init, dtype=self._task_bias.dtype)
+                )
 
     @property
     def num_tasks(self) -> int:
@@ -162,5 +211,27 @@ class OneRankPredictionHead(BaseModule):
         # Back to candidate granularity; repeat_interleave with a tensor of
         # repeats keeps this a single fused op instead of gather-by-index.
         broadcast = torch.repeat_interleave(request_vectors, num_candidates, dim=0)
-        scores = (broadcast * task_embeddings).sum(dim=-1) * self._logit_scale
+        if self._scorer_type == "dot_product":
+            scores = (broadcast * task_embeddings).sum(dim=-1) * self._logit_scale
+        elif self._scorer_type == "bilinear":
+            # s = z . (W_k r); one einsum fuses the K per-task matmuls.
+            scores = (
+                torch.einsum(
+                    "ikd,kde,ike->ik",
+                    broadcast,
+                    self._bilinear_weight,
+                    task_embeddings,
+                )
+                * self._logit_scale
+            )
+        else:
+            # (total, K, 2D) -> per-task MLP -> (total, K)
+            concat = torch.cat([broadcast, task_embeddings], dim=-1)
+            scores = torch.stack(
+                [
+                    mlp(concat[:, k, :]).squeeze(-1)
+                    for k, mlp in enumerate(self._task_mlps)
+                ],
+                dim=1,
+            )
         return scores + self._task_bias.to(scores.dtype)

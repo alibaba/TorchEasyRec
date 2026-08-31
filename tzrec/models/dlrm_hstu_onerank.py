@@ -170,12 +170,22 @@ class DlrmHSTUOneRank(DlrmHSTU):
         cross_task_head = None
         if onerank.HasField("cross_task_head"):
             cross_task_head = config_to_kwargs(onerank.cross_task_head)
+        # proto enum -> the head's scorer_type string; config_to_kwargs
+        # does not translate enums or repeated fields, so these three are
+        # wired by hand.
+        scorer_type = multi_task_rank_pb2.OneRankScorerType.Name(
+            onerank.scorer_type
+        ).removeprefix("ONERANK_SCORER_").lower()
+        task_bias_init = list(onerank.task_bias_init) or None
         self._onerank_head: torch.nn.Module = OneRankPredictionHead(
             embedding_dim=stu_embedding_dim,
             task_names=[task_cfg.task_name for task_cfg in self._task_configs],
             contextual_feature_dim=self._contextual_token_dim(),
             situation_discernment=situation_discernment,
             cross_task_head=cross_task_head,
+            scorer_type=scorer_type,
+            scorer_hidden_dim=onerank.scorer_hidden_dim,
+            task_bias_init=task_bias_init,
         )
 
     def init_loss(self) -> None:

@@ -156,6 +156,24 @@ message OneRankListwiseLoss {
     optional bool learnable_temperature = 4 [default = true];
 }
 
+// Scoring function for s^i_k (paper 2.4 uses the inner product).  The
+// alternatives exist because a rank-1 scorer ranks a request's candidates
+// by their projection onto a single direction, and combined with flat
+// candidate representations it can sit on the "predict the global CTR"
+// plateau for most of a single-epoch run (ONERANK_OVERVIEW.md §5).
+enum OneRankScorerType {
+    // s^i_k = z_k . r^i_k / sqrt(D) + b_k   (paper default)
+    ONERANK_SCORER_DOT_PRODUCT = 0;
+    // s^i_k = z_k . (W_k r^i_k) / sqrt(D) + b_k with a per-task W_k
+    // initialised to the identity: the run starts exactly where the dot
+    // product would, and training can raise the rank off 1.
+    ONERANK_SCORER_BILINEAR = 1;
+    // s^i_k = MLP_k([z_k; r^i_k]) + b_k, a per-task two-layer MLP.  The
+    // random init already discriminates candidates, so the run never
+    // enters the constant-prediction plateau.
+    ONERANK_SCORER_MLP = 2;
+}
+
 message OneRankConfig {
     // Upper bound on candidates per request.  Used only to pin the
     // attention-output scaling divisor of the inflated sequence, so that
@@ -165,6 +183,15 @@ message OneRankConfig {
     optional OneRankCrossTaskHead cross_task_head = 3;
     // Tasks not listed here are trained with their point-wise losses only.
     repeated OneRankListwiseLoss listwise_losses = 4;
+    // scoring function of the head; see OneRankScorerType
+    optional OneRankScorerType scorer_type = 5 [default = ONERANK_SCORER_DOT_PRODUCT];
+    // hidden dim of the MLP scorer (ONERANK_SCORER_MLP only)
+    optional uint32 scorer_hidden_dim = 6 [default = 256];
+    // per-task initial logits b_k, in task_configs order; empty keeps the
+    // zeros of previous runs.  logit(CTR_k) skips the descent onto the
+    // constant-prediction start, which is cheap either way (the descent
+    // takes ~100 steps, the plateau escape takes 900+).
+    repeated double task_bias_init = 7;
 }
 
 message DlrmHSTUOneRank {
