@@ -60,6 +60,8 @@ model_config {
   - decay_rate: 默认为0.9，历史指标的衰减率。
   - decay_step: 默认为100，历史指标每训练多少step会进行一次衰减，配置需要可以被train_config.log_step_count_steps整除。
 
+训练时指标会保存在checkpoint中，使用--continue_train续跑时会一并恢复。从fine_tune_checkpoint恢复时则会重置，避免继承上一个模型的指标，重置后在第一个decay_step之前打印为0。
+
 ______________________________________________________________________
 
 ## 指标详情

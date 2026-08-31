@@ -27,3 +27,20 @@ message EasyRecConfig {
 
     optional ModelConfig model_config = 9;
 }
+
+// Minimal mirror of EasyRecConfig used to read custom_model.class_path before the
+// full config is parsed, so that the module defining the custom model registers
+// its protobuf descriptors first. Only the fields on the path to class_path are
+// declared, the rest of the config, including the not-yet-registered Any, is
+// skipped as unknown field. Keep the field names in sync with EasyRecConfig.
+message PreloadCustomModel {
+    optional string class_path = 1;
+}
+
+message PreloadModelConfig {
+    optional PreloadCustomModel custom_model = 1;
+}
+
+message PreloadConfig {
+    optional PreloadModelConfig model_config = 1;
+}

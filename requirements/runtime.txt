@@ -2,8 +2,8 @@ alibabacloud_credentials<2.0.0,>=1.0.2
 anytree
 common_io @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/common_io-0.4.1%2Btunnel-py2.py3-none-any.whl
 confluent-kafka
-fbgemm-gpu==1.7.0
-feature_store_py @ https://feature-store-py.oss-cn-beijing.aliyuncs.com/package/feature_store_py-2.2.8-py3-none-any.whl
+fbgemm-gpu==1.8.0
+feature_store_py @ https://feature-store-py.oss-accelerate.aliyuncs.com/package/feature_store_py-2.2.10-py3-none-any.whl
 fsspec
 graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn/graphlearn-1.3.9-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
 graphlearn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn/graphlearn-1.3.9-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
@@ -13,13 +13,13 @@ numpy
 packaging
 pandas
 psutil
-pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-1.0.5-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
-pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-1.0.5-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
-pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-1.0.5-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
+pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-1.0.6-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
+pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-1.0.6-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
+pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-1.0.6-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
 pyodps>=0.13.1
 safetensors
 scikit-learn
 tensorboard
-torch==2.12.1
+torch==2.13.0
 torchmetrics==1.0.3
-torchrec==1.7.0
+torchrec==1.8.0

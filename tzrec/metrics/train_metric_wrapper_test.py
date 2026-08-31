@@ -48,6 +48,33 @@ class TrainMetricWrapperTest(unittest.TestCase):
         value = metric_wrapper.compute()
         torch.testing.assert_close(value, torch.tensor(0.11))
 
+    def test_state_restore_and_reset(self):
+        metric_wrapper = TrainMetricWrapper(
+            torchmetrics.MeanAbsoluteError(), decay_rate=0.9, decay_step=1
+        )
+        preds = torch.tensor([0.1, 0.2])
+        metric_wrapper.update(preds, torch.tensor([0.6, 0.7]))
+        torch.testing.assert_close(metric_wrapper.compute(), torch.tensor(0.5))
+        self.assertEqual(
+            list(metric_wrapper.state_dict().keys()), ["_value", "_step_cnt"]
+        )
+        self.assertEqual(list(metric_wrapper.parameters()), [])
+
+        # continue train restores the running metric of the interrupted job.
+        restored = TrainMetricWrapper(
+            torchmetrics.MeanAbsoluteError(), decay_rate=0.9, decay_step=1
+        )
+        restored.load_state_dict(metric_wrapper.state_dict())
+        torch.testing.assert_close(restored.compute(), torch.tensor(0.5))
+        restored.update(preds, torch.tensor([0.2, 0.3]))
+        torch.testing.assert_close(restored.compute(), torch.tensor(0.46))
+
+        # fine tune resets it, so the next value is not blended with the old one.
+        restored.reset()
+        torch.testing.assert_close(restored.compute(), torch.tensor(0.0))
+        restored.update(preds, torch.tensor([0.2, 0.3]))
+        torch.testing.assert_close(restored.compute(), torch.tensor(0.1))
+
 
 if __name__ == "__main__":
     unittest.main()

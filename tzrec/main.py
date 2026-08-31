@@ -97,6 +97,7 @@ from tzrec.utils.export_util import (
     export_model,
 )
 from tzrec.utils.filesystem_util import url_to_fs
+from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
 from tzrec.utils.plan_util import create_planner, get_default_sharders
@@ -154,9 +155,15 @@ def _create_model(
     Return:
         model: a EasyRec Model.
     """
-    model_cls_name = config_util.which_msg(model_config, "model")
-    # pyre-ignore [16]
-    model_cls = BaseModel.create_class(model_cls_name)
+    if model_config.WhichOneof("model") == "custom_model":
+        class_path = model_config.custom_model.class_path
+        model_cls = import_class(class_path)
+        if not isinstance(model_cls, type) or not issubclass(model_cls, BaseModel):
+            raise ValueError(f"Custom model class {class_path} must inherit BaseModel.")
+    else:
+        model_cls_name = config_util.which_msg(model_config, "model")
+        # pyre-ignore [16]
+        model_cls = BaseModel.create_class(model_cls_name)
 
     model: BaseModel = model_cls(
         model_config,
@@ -341,6 +348,7 @@ def _train_and_evaluate(
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
+    restore_from_model_dir: bool = False,
     dataloader_state: Optional[Dict[str, Any]] = None,
     delta_embedding_dumper: Optional[DeltaEmbeddingDumper] = None,
     pipeline_config_path: Optional[str] = None,
@@ -519,6 +527,10 @@ def _train_and_evaluate(
                         train_config.fine_tune_ckpt_param_map,
                         dense_ema=dense_ema,
                     )
+                if not restore_from_model_dir:
+                    # a fine-tune checkpoint's train metric describes the source
+                    # model, not the model this job is training.
+                    _model.reset_train_metric()
                 if delta_embedding_dumper is not None:
                     delta_embedding_dumper.clear()
 
@@ -926,6 +938,7 @@ def train_and_evaluate(
         ckpt_path=ckpt_path,
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
+        restore_from_model_dir=restore_from_model_dir,
         dataloader_state=dataloader_state,
         delta_embedding_dumper=delta_embedding_dumper,
         pipeline_config_path=os.path.join(pipeline_config.model_dir, "pipeline.config"),

@@ -1189,6 +1189,14 @@ class BaseFeature(object, metaclass=_meta_cls):
         """Asset file paths."""
         return {}
 
+    def odps_assets(self) -> Dict[str, str]:
+        """Asset file paths for odps fg."""
+        return self.assets()
+
+    def odps_fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config for odps fg."""
+        return self.fg_json()
+
     def __del__(self) -> None:
         # pyre-ignore [16]
         if self._fg_op and isinstance(self._fg_op, pyfg.FgArrowHandler):
@@ -1322,14 +1330,16 @@ def _copy_assets(
     feature: BaseFeature,
     asset_dir: Optional[str] = None,
     use_relative_asset_dir: bool = False,
+    for_odps: bool = False,
 ) -> BaseFeature:
-    if asset_dir and len(feature.assets()) > 0:
+    assets = feature.odps_assets() if for_odps else feature.assets()
+    if asset_dir and len(assets) > 0:
         # deepcopy feature config
         feature_config = type(feature.feature_config)()
         feature_config.CopyFrom(feature.feature_config)
         feature = copy(feature)
         feature.feature_config = feature_config
-        for k, v in feature.assets().items():
+        for k, v in assets.items():
             with open(v, "rb") as f:
                 fhash = hashlib.md5(f.read()).hexdigest()
             fprefix, fext = os.path.splitext(os.path.basename(v))
@@ -1394,8 +1404,20 @@ def create_fg_json(
     features: List[BaseFeature],
     asset_dir: Optional[str] = None,
     remove_bucketizer: bool = False,
+    for_odps: bool = False,
 ) -> Dict[str, Any]:
-    """Create feature generate config for features."""
+    """Create feature generate config for features.
+
+    Args:
+        features (list): list of features.
+        asset_dir (str, optional): directory to copy asset files into.
+        remove_bucketizer (bool): remove bucketizer params in fg json or not.
+        for_odps (bool): create fg json for odps fg or not. official pyfg operator
+            libs are supplied by odps fg, we neither copy nor rename them.
+
+    Return:
+        fg json config.
+    """
     referenced_names = set()
     if remove_bucketizer:
         for feature in features:
@@ -1409,7 +1431,12 @@ def create_fg_json(
     results = []
     seq_to_idx = {}
     for feature in features:
-        feature = _copy_assets(feature, asset_dir, use_relative_asset_dir=True)
+        feature = _copy_assets(
+            feature, asset_dir, use_relative_asset_dir=True, for_odps=for_odps
+        )
+        fg_json = feature.odps_fg_json() if for_odps else feature.fg_json()
+        if remove_bucketizer:
+            fg_json = _remove_bucketizer(feature, fg_json, referenced_names)
         if feature.is_grouped_sequence:
             # pyre-ignore [16]
             if feature.sequence_name not in seq_to_idx:
@@ -1423,15 +1450,9 @@ def create_fg_json(
                     }
                 )
                 seq_to_idx[feature.sequence_name] = len(results) - 1
-            fg_json = feature.fg_json()
-            if remove_bucketizer:
-                fg_json = _remove_bucketizer(feature, fg_json, referenced_names)
             idx = seq_to_idx[feature.sequence_name]
             results[idx]["features"].extend(fg_json)
         else:
-            fg_json = feature.fg_json()
-            if remove_bucketizer:
-                fg_json = _remove_bucketizer(feature, fg_json, referenced_names)
             results.extend(fg_json)
     return {"features": results}
 

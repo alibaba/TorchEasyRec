@@ -1,6 +1,7 @@
 syntax = "proto2";
 package tzrec.protos;
 
+import "google/protobuf/any.proto";
 import "tzrec/protos/models/rank_model.proto";
 import "tzrec/protos/models/multi_task_rank.proto";
 import "tzrec/protos/models/match_model.proto";
@@ -43,6 +44,11 @@ enum Kernel {
     CUTLASS = 2;
 }
 
+message CustomModel {
+    required string class_path = 1;
+    optional google.protobuf.Any config = 2;
+}
+
 message ModelConfig {
 
     repeated FeatureGroupConfig feature_groups = 1;
@@ -81,6 +87,8 @@ message ModelConfig {
         // SID generation models
         SidRqvae sid_rqvae = 600;
         SidRqkmeans sid_rqkmeans = 601;
+
+        CustomModel custom_model = 1000;
     }
 
     optional uint32 num_class = 2 [default = 1];

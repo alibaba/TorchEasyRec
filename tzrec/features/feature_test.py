@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import hashlib
 import os
 import shutil
 import unittest
@@ -30,6 +31,9 @@ from tzrec.features import feature as feature_lib
 from tzrec.features.feature import FgMode
 from tzrec.protos import feature_pb2
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
+
+_VOCAB_CONTENT = "a 1\nb 2\n"
+_VOCAB_ASSET_NAME = f"custom_vocab_{hashlib.md5(_VOCAB_CONTENT.encode()).hexdigest()}"
 
 
 class FeatureTest(unittest.TestCase):
@@ -961,6 +965,85 @@ class FeatureTest(unittest.TestCase):
                 by_name["click_seq__lookup_c"].sequence_input_names,
                 ["click_seq__cat_key"],
             )
+
+    def _create_custom_features(self, with_cxx11abi0_file=True):
+        """An official operator lib and a user compiled one written into test_dir."""
+        self.test_dir = test_dir = make_test_dir()
+        lib_file = os.path.join(test_dir, "libcustom.so")
+        with open(lib_file, "wb") as f:
+            f.write(b"custom operator lib")
+        abi0_lib_file = os.path.join(test_dir, "libcustom_abi0.so")
+        with open(abi0_lib_file, "wb") as f:
+            f.write(b"custom operator lib cxx11abi0")
+        vocab_file = os.path.join(test_dir, "custom_vocab")
+        with open(vocab_file, "w") as f:
+            f.write(_VOCAB_CONTENT)
+        custom_cfg = feature_pb2.CustomFeature(
+            feature_name="custom_b",
+            operator_name="MyOp",
+            operator_lib_file=lib_file,
+            expression=["user:query"],
+        )
+        if with_cxx11abi0_file:
+            custom_cfg.operator_lib_cxx11abi0_file = abi0_lib_file
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                custom_feature=feature_pb2.CustomFeature(
+                    feature_name="custom_a",
+                    operator_name="EditDistance",
+                    operator_lib_file="pyfg/lib/libedit_distance.so",
+                    expression=["user:query", "item:title"],
+                    vocab_file=vocab_file,
+                    default_bucketize_value=1,
+                )
+            ),
+            feature_pb2.FeatureConfig(custom_feature=custom_cfg),
+        ]
+        features = feature_lib.create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        asset_dir = os.path.join(test_dir, "fg_output")
+        os.makedirs(asset_dir)
+        return features, asset_dir
+
+    def test_create_fg_json_with_custom_feature(self):
+        features, asset_dir = self._create_custom_features()
+        fg_feats = feature_lib.create_fg_json(features, asset_dir=asset_dir)["features"]
+        official_lib = fg_feats[0]["operator_lib_file"]
+        custom_lib = fg_feats[1]["operator_lib_file"]
+        self.assertTrue(official_lib.startswith("libedit_distance_"))
+        self.assertEqual(
+            custom_lib,
+            f"libcustom_{hashlib.md5(b'custom operator lib').hexdigest()}.so",
+        )
+        self.assertEqual(fg_feats[0]["vocab_file"], _VOCAB_ASSET_NAME)
+        self.assertEqual(
+            sorted(os.listdir(asset_dir)),
+            sorted([official_lib, custom_lib, _VOCAB_ASSET_NAME]),
+        )
+
+    def test_create_fg_json_for_odps(self):
+        features, asset_dir = self._create_custom_features()
+        fg_feats = feature_lib.create_fg_json(
+            features, asset_dir=asset_dir, for_odps=True
+        )["features"]
+        # odps fg ships the official operator lib itself, keep its path as is.
+        self.assertEqual(
+            fg_feats[0]["operator_lib_file"], "pyfg/lib/libedit_distance.so"
+        )
+        abi0_hash = hashlib.md5(b"custom operator lib cxx11abi0").hexdigest()
+        self.assertEqual(
+            fg_feats[1]["operator_lib_file"], f"libcustom_abi0_{abi0_hash}.so"
+        )
+        # the vocab file of an official operator feature is still uploaded.
+        self.assertEqual(fg_feats[0]["vocab_file"], _VOCAB_ASSET_NAME)
+        self.assertEqual(
+            sorted(os.listdir(asset_dir)),
+            sorted([f"libcustom_abi0_{abi0_hash}.so", _VOCAB_ASSET_NAME]),
+        )
+
+    def test_create_fg_json_for_odps_without_cxx11abi0_file(self):
+        features, asset_dir = self._create_custom_features(with_cxx11abi0_file=False)
+        with self.assertRaisesRegex(ValueError, "operator_lib_cxx11abi0_file"):
+            feature_lib.create_fg_json(features, asset_dir=asset_dir, for_odps=True)
 
 
 class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):

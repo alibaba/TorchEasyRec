@@ -48,29 +48,32 @@ RUN case ${DEVICE} in \
                  rm -f /usr/local/cuda && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
+# torch_tensorrt comes from PyPI, not the pytorch-wheels index: the +cu130 build
+# there ships no C++ runtime, so TorchTensorRTModule falls back to a Python engine
+# object that torch.jit.trace cannot pass to tensorrt::execute_engine.
 RUN case ${DEVICE} in \
-        "cu126"|"cu129") pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/${DEVICE}/ --no-deps && \
-                 pip install torch==2.12.1 && \
-                 pip install fbgemm-gpu==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/${DEVICE}/repo.html && \
+        "cu126"|"cu129") pip install torch==2.13.0 -f https://${PIP_MIRROR}/pytorch-wheels/${DEVICE}/ --no-deps && \
+                 pip install torch==2.13.0 && \
+                 pip install fbgemm-gpu==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/${DEVICE}/repo.html && \
                  pip uninstall -y nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-cufile-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 && \
-                 sed -i -E '/^Requires-Dist: (cuda-toolkit|nvidia-)/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.12.1+${DEVICE}.dist-info/METADATA && \
+                 sed -i -E '/^Requires-Dist: (cuda-toolkit|nvidia-)/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.13.0+${DEVICE}.dist-info/METADATA && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torchrec==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
+                 pip install torchrec==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
-        "cu130") pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cu130/ --no-deps && \
-                 pip install torch==2.12.1 && \
+        "cu130") pip install torch==2.13.0 -f https://${PIP_MIRROR}/pytorch-wheels/cu130/ --no-deps && \
+                 pip install torch==2.13.0 && \
                  pip uninstall -y nvidia-cuda-runtime nvidia-cublas nvidia-cuda-cupti nvidia-cuda-nvrtc nvidia-cufft nvidia-cufile nvidia-curand nvidia-cusolver nvidia-cusparse nvidia-nvjitlink nvidia-nvtx && \
-                 sed -i -E '/^Requires-Dist: (cuda-toolkit|nvidia-)/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.12.1+cu130.dist-info/METADATA && \
-                 pip install fbgemm-gpu==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu130/repo.html && \
+                 sed -i -E '/^Requires-Dist: (cuda-toolkit|nvidia-)/d' /opt/conda/lib/python${PYTHON_VERSION}/site-packages/torch-2.13.0+cu130.dist-info/METADATA && \
+                 pip install fbgemm-gpu==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu130/repo.html && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torch_tensorrt==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cu130/ && \
+                 pip install torch_tensorrt==2.13.0 && \
                  rm -f /opt/conda/lib/python${PYTHON_VERSION}/site-packages/tensorrt_libs/libnvinfer_builder_resource_win_*.so.* && \
-                 pip install torchrec==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
+                 pip install torchrec==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
-        * )      pip install torch==2.12.1 -f https://${PIP_MIRROR}/pytorch-wheels/cpu/ && \
-                 pip install fbgemm-gpu==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cpu/repo.html && \
+        * )      pip install torch==2.13.0 -f https://${PIP_MIRROR}/pytorch-wheels/cpu/ && \
+                 pip install fbgemm-gpu==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cpu/repo.html && \
                  pip install torchmetrics==1.0.3 tensordict && \
-                 pip install torchrec==1.7.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
+                 pip install torchrec==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
                  pip cache purge ;; \
     esac && \
     case ${DEVICE} in \
