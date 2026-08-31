@@ -241,9 +241,10 @@ def _get_checkpoint_step(ckpt_path: str) -> int:
 def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
     """Find latest checkpoint under a directory.
 
-    Resolves, in order: the newest ``model.ckpt-<step>`` under the directory, the
-    directory itself when it is a checkpoint, and a ``model.ckpt`` inside it. The
-    last two carry no step, so they report 0.
+    A path that already names a checkpoint (contains ``model.ckpt-``) is returned
+    as given, without checking that it exists. Otherwise the directory is searched,
+    preferring the newest ``model.ckpt-<step>`` in it, then the directory itself,
+    then a ``model.ckpt`` in it. The last two carry no step, so they report 0.
 
     Args:
         model_dir: model directory
@@ -257,9 +258,7 @@ def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
         ckpt_metas = glob.glob(os.path.join(model_dir, "model.ckpt-*" + os.path.sep))
         ckpt_metas = list(map(lambda x: x.rstrip(os.path.sep), ckpt_metas))
         if len(ckpt_metas) == 0:
-            # no stepped checkpoint: the path may be a checkpoint itself, or hold
-            # a single one named without a step, as a producer of exactly one
-            # checkpoint tends to write.
+            # a producer of exactly one checkpoint tends to drop the -<step>
             for ckpt_dir in (model_dir, os.path.join(model_dir, "model.ckpt")):
                 model_ckpt_dir = os.path.join(ckpt_dir, "model")
                 optim_ckpt_dir = os.path.join(ckpt_dir, "optimizer")

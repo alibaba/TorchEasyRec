@@ -285,6 +285,21 @@ class CheckpointUtilTest(unittest.TestCase):
         self.assertIsNone(ckpt_path)
         self.assertEqual(step, -1)
 
+    def test_latest_checkpoint_prefers_dir_itself_over_unsuffixed(self):
+        os.makedirs(os.path.join(self.test_dir, "model"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertEqual(ckpt_path, self.test_dir)
+        self.assertEqual(step, 0)
+
+    def test_latest_checkpoint_on_unsuffixed_ckpt_path(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
+        ckpt_path, step = checkpoint_util.latest_checkpoint(
+            os.path.join(self.test_dir, "model.ckpt")
+        )
+        self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt"))
+        self.assertEqual(step, 0)
+
     def _remaining_ckpt_steps(self):
         return sorted(
             int(p.rsplit("-", 1)[1])
