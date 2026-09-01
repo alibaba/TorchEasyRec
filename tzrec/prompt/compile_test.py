@@ -55,7 +55,7 @@ class CompilePromptTest(unittest.TestCase):
         named = {f.name for f in features}
         if "{{answer}}" in cfg.response and "answer" not in named:
             features = list(features) + [create_prompt_feature(_ANSWER)]
-        return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
+        return compile_prompt(cfg, features, ["answer"])
 
     def test_sid_space_resolves_offsets_and_bands(self) -> None:
         cfg = self._config(prompt="History : {{hist}}")
@@ -78,23 +78,6 @@ class CompilePromptTest(unittest.TestCase):
         # no slot projects, so no sentinel is materialized
         self.assertIsNone(space.sentinel_token_id)
         self.assertEqual(space.target_vocab_size % 128, 0)
-
-    def test_skip_tokenizer_write_preserves_output_directory(self) -> None:
-        cfg = self._config(prompt="History : {{hist}}")
-        cfg.sid_space.codebook.extend([4])
-        output_dir = os.path.join(self.test_dir, "model")
-
-        compiled = compile_prompt(
-            cfg,
-            [create_prompt_feature(_HIST)],
-            ["answer"],
-            model_dir=output_dir,
-            write_tokenizer=False,
-        )
-
-        expected_dir = os.path.join(output_dir, "prompt", "tokenizer")
-        self.assertEqual(compiled.tokenizer_dir, expected_dir)
-        self.assertFalse(os.path.exists(expected_dir))
 
     def test_inline_needs_no_group_projected_gets_one(self) -> None:
         cfg = self._config(prompt="History : {{hist}} . Profile : {{prof}}")
@@ -203,11 +186,23 @@ class CompilePromptTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already in the base tokenizer"):
             self._compile(cfg, [create_prompt_feature(_HIST)])
 
+    def test_a_training_compile_persists_nothing(self) -> None:
+        cfg = self._config(prompt="History : {{hist}}")
+        cfg.sid_space.codebook.extend([4, 4])
+        before = sorted(os.listdir(self.test_dir))
+
+        compile_prompt(cfg, [create_prompt_feature(_HIST)], ["answer"])
+
+        self.assertEqual(sorted(os.listdir(self.test_dir)), before)
+
     def test_extended_tokenizer_is_written(self) -> None:
         cfg = self._config(prompt="History : {{hist}}")
         cfg.sid_space.codebook.extend([4, 4])
-        compiled = self._compile(cfg, [create_prompt_feature(_HIST)])
-        written = os.path.join(compiled.tokenizer_dir, "tokenizer.json")
+        out = os.path.join(self.test_dir, "export")
+        compile_prompt(
+            cfg, [create_prompt_feature(_HIST)], ["answer"], tokenizer_dir=out
+        )
+        written = os.path.join(out, "tokenizer.json")
         self.assertTrue(os.path.exists(written))
         # the SID tokens round-trip, which is what serving reloads
         reloaded = Tokenizer.from_file(written)
@@ -246,6 +241,15 @@ class CompilePromptTest(unittest.TestCase):
             self._compile(
                 cfg, [create_prompt_feature(_HIST), create_prompt_feature(_PROF)]
             )
+
+    def test_response_slot_takes_exactly_one_label_field(self) -> None:
+        cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        slot = cfg.slots.add(name="answer")
+        slot.feature_names.extend(["sid_a", "sid_b"])
+
+        with self.assertRaisesRegex(ValueError, "is one label field"):
+            compile_prompt(cfg, [create_prompt_feature(_HIST)], ["sid_a", "sid_b"])
 
     def test_response_slot_may_not_declare_a_projection(self) -> None:
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")

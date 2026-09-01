@@ -11,8 +11,8 @@
 
 """Compiles a ``PromptConfig`` into the artifacts the rest of the stack reads.
 
-Runs once, on the main process, and is the only tokenizer construction in an
-entry point. It resolves no physical dimension: the model does that at
+Runs on every rank and writes nothing unless an exporter asks for the extended
+tokenizer. It resolves no physical dimension: the model does that at
 ``__init__`` from ``group_total_dim``.
 """
 
@@ -239,9 +239,7 @@ def compile_prompt(
     cfg: PromptConfig,
     features: Sequence[BaseFeature],
     label_fields: Sequence[str] = (),
-    model_dir: Optional[str] = None,
     tokenizer_dir: Optional[str] = None,
-    write_tokenizer: bool = True,
 ) -> CompiledPrompt:
     """Compile a prompt config into its plan, module and vocabulary artifacts.
 
@@ -249,11 +247,9 @@ def compile_prompt(
         cfg: the prompt config to compile.
         features: every feature a body slot may reference, already created.
         label_fields: data_config.label_fields; a response slot names these.
-        model_dir: where to write the extended tokenizer, under
-            ``prompt/tokenizer``; skipped when None.
-        tokenizer_dir: write the extended tokenizer here instead, flat, which
-            is what an exported HuggingFace directory loads.
-        write_tokenizer: whether to persist the extended tokenizer artifact.
+        tokenizer_dir: where to write the extended tokenizer, flat, which is
+            what an exported HuggingFace directory loads; skipped when None.
+            Only export persists it -- nothing reads a training-time copy.
 
     Returns:
         The compiled prompt.
@@ -298,6 +294,12 @@ def compile_prompt(
             raise ValueError(
                 f"prompt slot [{name}] names {missing}, which are not in {declared_in}."
             )
+        if name in response_slot_names and len(slot.feature_names) != 1:
+            raise ValueError(
+                f"response slot [{name}] names {list(slot.feature_names)}; a "
+                f"response is one label field, because it compiles to one SID "
+                f"item and the loss window is sized from that."
+            )
         members[name] = (
             []
             if name in response_slot_names
@@ -332,13 +334,11 @@ def compile_prompt(
     )
     sid_space = _build_sid_space(cfg, tok, base_vocab_size, has_projection)
 
-    out_dir = tokenizer_dir or (
-        os.path.join(model_dir, "prompt", "tokenizer") if model_dir else ""
-    )
-    if out_dir and write_tokenizer:
-        os.makedirs(out_dir, exist_ok=True)
-        tok.save(os.path.join(out_dir, "tokenizer.json"))
+    if tokenizer_dir:
+        os.makedirs(tokenizer_dir, exist_ok=True)
+        tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
 
+    tokenizer_json = tok.to_str()
     slot_ids = {name: i for i, name in enumerate(resolved_slots_by_name)}
     segs: Dict[str, SlotSeg] = {}
     for name, slot in resolved_slots_by_name.items():
@@ -387,8 +387,7 @@ def compile_prompt(
         sid_space=sid_space,
         prompt_plan=plan,
         projection_plan=projection_plan,
-        tokenizer_dir=out_dir,
-        vocab_hash=_hash(sid_space, tok.to_str()),
+        vocab_hash=_hash(sid_space, tokenizer_json),
         plan_hash=_hash(
             sid_space,
             plan,
@@ -396,7 +395,7 @@ def compile_prompt(
             sorted(projection_plan.projections.items()),
             # routing too: matching bodies can still be wired to other slots
             sorted(projection_plan.slot_to_module.items()),
-            tok.to_str(),
+            tokenizer_json,
         ),
     )
 

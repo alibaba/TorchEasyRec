@@ -29,6 +29,7 @@ from tzrec.prompt.types import (
     Static,
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
+from tzrec.utils.sid.collision import concat_ranges
 
 PROMPT_INPUT_IDS = "prompt_input_ids"
 PROMPT_CU_SEQLENS = "prompt_cu_seqlens"
@@ -48,6 +49,7 @@ class AssembledPrompt:
             grouped by included projected occurrence in
             ``PromptPlan.projected_slots`` order, then by sample.
         response_lengths: number of response tokens in each sample.
+        max_seqlen: widest sample, on the host so the model never derives it.
     """
 
     input_ids: np.ndarray
@@ -55,25 +57,7 @@ class AssembledPrompt:
     hole_positions: np.ndarray
     response_lengths: np.ndarray
 
-    @property
-    def max_seqlen(self) -> int:
-        """Widest sample, computed on the host so the model never derives it."""
-        if self.cu_seqlens.size < 2:
-            return 0
-        return int(np.max(np.diff(self.cu_seqlens)))
-
-
-def _run_positions(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
-    """Absolute positions of concatenated variable-length runs.
-
-    Run i occupies ``lengths[i]`` positions from ``starts[i]``; the result is
-    every position, runs back to back.
-    """
-    total = int(lengths.sum())
-    within = np.arange(total, dtype=np.int64) - np.repeat(
-        np.cumsum(lengths) - lengths, lengths
-    )
-    return np.repeat(starts, lengths) + within
+    max_seqlen: int
 
 
 class PromptAssembler:
@@ -195,7 +179,7 @@ class PromptAssembler:
                 seg_lengths[index] = projected_lengths[seg.name]
 
         row_lengths = seg_lengths.sum(axis=0)
-        cu_seqlens = np.concatenate(([0], np.cumsum(row_lengths))).astype(np.int64)
+        cu_seqlens = np.concatenate(([0], np.cumsum(row_lengths)))
         max_length = self._prompt_plan.max_length
         if max_length:
             over = np.nonzero(row_lengths > max_length)[0]
@@ -214,7 +198,7 @@ class PromptAssembler:
         holes: List[np.ndarray] = []
         for index, seg in enumerate(segments):
             lengths = seg_lengths[index]
-            destinations = _run_positions(seg_starts[index], lengths)
+            destinations = concat_ranges(seg_starts[index], lengths)
             if isinstance(seg, Static):
                 input_ids[destinations] = np.tile(
                     np.asarray(seg.token_ids, dtype=np.int64), batch_size
@@ -233,11 +217,7 @@ class PromptAssembler:
                 input_ids[destinations] = self._sid_space.sentinel_token_id
                 holes.append(destinations)
 
-        response_lengths = (
-            seg_lengths[body_count:].sum(axis=0)
-            if body_count < len(segments)
-            else np.zeros(batch_size, dtype=np.int64)
-        )
+        response_lengths = seg_lengths[body_count:].sum(axis=0)
         return AssembledPrompt(
             input_ids=input_ids,
             cu_seqlens=cu_seqlens,
@@ -246,7 +226,8 @@ class PromptAssembler:
             hole_positions=(
                 np.concatenate(holes) if holes else np.empty(0, dtype=np.int64)
             ),
-            response_lengths=response_lengths.astype(np.int64),
+            response_lengths=response_lengths,
+            max_seqlen=int(row_lengths.max(initial=0)),
         )
 
     def forward(
@@ -255,8 +236,8 @@ class PromptAssembler:
         """Reshape one parsed batch, assemble it, and key it for the batch.
 
         Args:
-            parsed_features: ``{feature}.values`` / ``{feature}.lengths`` as
-                the data parser emits them.
+            parsed_features: ``{column}.values`` / ``{column}.lengths`` as the
+                data parser emits them, for features and label fields alike.
 
         Returns:
             The five streams, keyed as ``additional_infos`` expects them.
@@ -277,6 +258,13 @@ class PromptAssembler:
             for source in sources:
                 lengths_key = f"{source}.lengths"
                 if seg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
+                    if lengths_key not in parsed_features:
+                        raise ValueError(
+                            f"prompt slot [{seg.name}] reads [{source}], which "
+                            f"the parser emitted as a scalar: a slot renders a "
+                            f"sequence of SID codes, so the column must be "
+                            f"list<int64>."
+                        )
                     lengths = np.asarray(parsed_features[lengths_key])
                     slot_batch_size = int(lengths.size)
                     member_lengths.append((source, lengths))

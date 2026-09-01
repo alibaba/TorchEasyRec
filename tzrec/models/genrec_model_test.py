@@ -13,105 +13,37 @@ import dataclasses
 import os
 import unittest
 
-import numpy as np
 import torch
 from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
 from transformers import AutoModelForCausalLM
 
-from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
-from tzrec.main import _create_model
+from tzrec.datasets.utils import Batch
 from tzrec.models.genrec_model import _PARAM_DTYPE
 from tzrec.prompt.assembler import (
     PROMPT_HOLE_POSITIONS,
     PROMPT_INPUT_IDS,
 )
 from tzrec.prompt.compile import compile_prompt
-from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.tests.prompt_test_util import (
-    assemble_into,
+    _ANSWER,
+    _CODEBOOK,
+    _HIST,
+    GenrecModelTestBase,
     create_prompt_feature,
-    create_prompt_tokenizer,
     offset_sid_codes,
+    projected_feature,
 )
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
-    create_tiny_causal_lm,
-    make_test_dir,
     parameterized_name_func,
 )
 
-_CODEBOOK = [4, 4, 4]
-_WORDS = ["History", "Predict", ":", ".", "<unk>", "<|im_end|>"]
 
-
-_HIST = 'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }'
-_ANSWER = 'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }'
-
-
-def _projected(name: str, dim: int) -> str:
-    return (
-        f'sequence_id_feature {{ feature_name: "{name}" expression: "user:{name}" '
-        f"num_buckets: 32 embedding_dim: {dim} sequence_length: 2 }}"
-    )
-
-
-class BaseGenrecModelTest(unittest.TestCase):
+class BaseGenrecModelTest(GenrecModelTestBase):
     """Shared causal-LM behavior, reached through its concrete subclass."""
-
-    def setUp(self) -> None:
-        self.test_dir = make_test_dir()
-        self.backbone = os.path.join(self.test_dir, "backbone")
-        create_tiny_causal_lm(64).save_pretrained(self.backbone)
-        self.tok = create_prompt_tokenizer(
-            os.path.join(self.test_dir, "tok.json"), _WORDS
-        )
-        self.features = [
-            create_prompt_feature(_HIST),
-            create_prompt_feature(_ANSWER),
-        ]
-        self.compiled_prompt = self._compile(self.features)
-
-    def _compile(self, features, template="History : {{hist}} . Predict :", **kwargs):
-        kwargs.setdefault("response", "{{answer}}")
-        cfg = PromptConfig(tokenizer_path=self.tok, prompt=template, **kwargs)
-        cfg.sid_space.codebook.extend(_CODEBOOK)
-        return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
-
-    def _model(
-        self,
-        features=None,
-        compiled_prompt=-1,
-        beam_widths=(2, 2, 2),
-        num_return_sequences=2,
-        lm_parameter_dtype=None,
-        hf_model_name_or_path=None,
-    ):
-        model_config = ModelConfig()
-        lm_cfg = model_config.genrec_causal_lm_model
-        lm_cfg.hf_model_name_or_path = hf_model_name_or_path or self.backbone
-        lm_cfg.common.beam_widths.extend(beam_widths)
-        lm_cfg.common.num_return_sequences = num_return_sequences
-        if lm_parameter_dtype is not None:
-            lm_cfg.common.lm_parameter_dtype = lm_parameter_dtype
-        return _create_model(
-            model_config,
-            self.features if features is None else features,
-            ["answer"],
-            compiled_prompt=(
-                self.compiled_prompt if compiled_prompt == -1 else compiled_prompt
-            ),
-        )
-
-    def _batch(self, parsed, compiled_prompt=None, sparse=None):
-        streams = assemble_into(compiled_prompt or self.compiled_prompt, parsed)
-        batch = Batch(sparse_features={BASE_DATA_GROUP: sparse} if sparse else {})
-        batch.additional_infos.update(
-            {k: torch.from_numpy(np.asarray(v)) for k, v in streams.items()}
-        )
-        return batch
 
     def test_tokens_to_local_codes_undoes_shifts_and_groups_beams(self) -> None:
         model = self._model()
@@ -130,19 +62,6 @@ class BaseGenrecModelTest(unittest.TestCase):
         self.assertEqual(codes.shape, (2, 2, space.num_levels))
         self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1).tolist())
 
-    def test_written_digests_satisfy_the_restore_guard(self) -> None:
-        # write_hf_assets is the only writer and check_prompt_assets the only
-        # reader, so a round trip is what proves they agree on the location
-        from tzrec.prompt.persist import check_prompt_assets
-        from tzrec.utils.hf_export_util import write_hf_assets
-
-        model = self._model()
-        ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        write_hf_assets(model, ckpt)
-
-        check_prompt_assets(self.compiled_prompt, ckpt)
-        self.assertTrue(os.path.exists(os.path.join(ckpt, "hf_export_meta.json")))
-
     def test_rejects_a_model_built_without_a_prompt(self) -> None:
         with self.assertRaisesRegex(ValueError, "needs a compiled prompt"):
             self._model(compiled_prompt=None)
@@ -155,7 +74,7 @@ class BaseGenrecModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "declares no sid_space"):
             self._model(compiled_prompt=compiled_prompt)
 
-    def test_rejects_a_backbone_without_the_decoder_only_layout(self) -> None:
+    def test_rejects_a_backbone_that_cannot_narrow_its_logits(self) -> None:
         from transformers import GPT2Config, GPT2LMHeadModel
 
         backbone = os.path.join(self.test_dir, "gpt2")
@@ -163,15 +82,15 @@ class BaseGenrecModelTest(unittest.TestCase):
             GPT2Config(n_layer=1, n_head=2, n_embd=32, vocab_size=64)
         ).save_pretrained(backbone)
 
-        with self.assertRaisesRegex(ValueError, r"missing \['model'\]"):
+        with self.assertRaisesRegex(ValueError, "no.*logits_to_keep"):
             self._model(hf_model_name_or_path=backbone)
 
     def test_shared_projection_name_requires_matching_widths(self) -> None:
         features = [
             create_prompt_feature(_HIST),
             create_prompt_feature(_ANSWER),
-            create_prompt_feature(_projected("pa", 8)),
-            create_prompt_feature(_projected("pb", 16)),
+            create_prompt_feature(projected_feature("pa", 8)),
+            create_prompt_feature(projected_feature("pb", 16)),
         ]
         cfg = PromptConfig(
             tokenizer_path=self.tok,
@@ -182,9 +101,7 @@ class BaseGenrecModelTest(unittest.TestCase):
         for name in ("pa", "pb"):
             slot = cfg.slots.add(name=name, projection_name="shared")
             slot.feature_names.append(name)
-        compiled_prompt = compile_prompt(
-            cfg, features, ["answer"], model_dir=self.test_dir
-        )
+        compiled_prompt = compile_prompt(cfg, features, ["answer"])
 
         with self.assertRaisesRegex(ValueError, "cannot share a module"):
             self._model(features=features, compiled_prompt=compiled_prompt)
@@ -193,7 +110,7 @@ class BaseGenrecModelTest(unittest.TestCase):
         features = [
             create_prompt_feature(_HIST),
             create_prompt_feature(_ANSWER),
-            create_prompt_feature(_projected("prof", 8)),
+            create_prompt_feature(projected_feature("prof", 8)),
         ]
         compiled_prompt = self._compile(
             features,
@@ -242,7 +159,7 @@ class BaseGenrecModelTest(unittest.TestCase):
         features = [
             create_prompt_feature(_HIST),
             create_prompt_feature(_ANSWER),
-            create_prompt_feature(_projected("prof", 8)),
+            create_prompt_feature(projected_feature("prof", 8)),
         ]
         compiled_prompt = self._compile(
             features,
@@ -285,39 +202,6 @@ class BaseGenrecModelTest(unittest.TestCase):
         proj = next(iter(model.projections.values()))
         self.assertIs(proj.head.weight.dtype, torch.float32)
         self.assertGreater(float(proj.head.weight.grad.abs().sum()), 0.0)
-
-    @parameterized.expand(
-        [
-            # every request satisfiable -> the schedule is honoured verbatim
-            [[2, 3, 4], [2, 3, 4]],
-            # capped by band x surviving prefixes, not by what was asked
-            [[6, 12, 12], [4, 12, 12]],
-            # a flat schedule is just as valid
-            [[2, 2, 2], [2, 2, 2]],
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_beam_widths_are_capped_once_at_init(self, beam_widths, expected) -> None:
-        # the kernel takes these already capped, so the derivation lives here
-        model = self._model(beam_widths=beam_widths, num_return_sequences=1)
-        self.assertEqual(model._capped_widths, expected)
-        space = self.compiled_prompt.sid_space
-        self.assertEqual(model._bands, list(zip(space.band_lo, space.band_hi)))
-
-    def test_rejects_a_schedule_that_does_not_match_the_codebook(self) -> None:
-        with self.assertRaisesRegex(ValueError, "entries but the codebook has"):
-            self._model(beam_widths=(2, 2))
-
-    def test_rejects_a_non_positive_beam_width(self) -> None:
-        with self.assertRaisesRegex(ValueError, "must be >= 1"):
-            self._model(beam_widths=(2, 0, 2))
-
-    def test_beam_config_uses_final_capped_capacity(self) -> None:
-        with self.assertRaisesRegex(ValueError, "final capped beam width \\(4\\)"):
-            self._model(
-                beam_widths=(1, 1, 100),
-                num_return_sequences=5,
-            )
 
     def test_metric_averages_the_loss_across_batches(self) -> None:
         model = self._model()

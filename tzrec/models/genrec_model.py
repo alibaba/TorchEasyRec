@@ -12,10 +12,12 @@
 """Shared causal-LM plumbing for generative recommendation models.
 
 This layer builds an empty causal LM, resizes its vocabulary, wires slot
-projections, converts SID coordinate systems and implements checkpoint hooks.
-A family subclass owns its forward and decode path.
+projections, converts SID coordinate systems, scores the response window and
+supplies the digests a checkpoint records. A family subclass owns its forward
+and decode path.
 """
 
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -43,11 +45,7 @@ _PARAM_DTYPE: Dict[int, torch.dtype] = {
     GenrecModelConfig.FP16: torch.float16,
 }
 
-# The forward and the banded decode reach past lm(...) into these directly, so a
-# backbone missing any of them fails deep in HF rather than at build time.
 _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
-    "model",
-    "lm_head",
     "loss_function",
     "get_input_embeddings",
     "resize_token_embeddings",
@@ -95,6 +93,7 @@ class BaseGenrecModel(BaseModel):
         self._prompt = compiled_prompt
         cfg = self._model_config
 
+        self._ignore_index = int(cfg.common.ignore_index)
         self.lm: nn.Module
         self.init_backbone(cfg.hf_model_name_or_path, cfg.common.lm_parameter_dtype)
         # Every run replaces this initialization from pretrained or DCP weights.
@@ -140,7 +139,7 @@ class BaseGenrecModel(BaseModel):
 
         Raises:
             ValueError: the backbone lacks an interface the forward or the
-                banded decode reaches for.
+                banded decode needs.
         """
         missing = [name for name in _REQUIRED_LM_ATTRS if not hasattr(self.lm, name)]
         for name in ("vocab_size", "hidden_size"):
@@ -149,10 +148,17 @@ class BaseGenrecModel(BaseModel):
         if missing:
             raise ValueError(
                 f"{type(self).__name__}: {hf_model_name_or_path} builds "
-                f"{type(self.lm).__name__}, which is missing {sorted(missing)}. "
-                f"This model drives the decoder-only layout directly -- see "
-                f"tzrec/modules/dynamic_beam.py -- so a backbone without these "
-                f"cannot be used."
+                f"{type(self.lm).__name__}, which is missing {sorted(missing)}."
+            )
+        # both the forward and the decode ask for a narrow window of logits;
+        # without it the full (batch, length, vocab) tensor is unavoidable
+        if "logits_to_keep" not in inspect.signature(type(self.lm).forward).parameters:
+            raise ValueError(
+                f"{type(self).__name__}: {hf_model_name_or_path} builds "
+                f"{type(self.lm).__name__}, whose forward has no "
+                f"logits_to_keep, so logits cannot be narrowed to the response "
+                f"window. Use a backbone that accepts it, such as Qwen2.5 or "
+                f"Qwen3."
             )
 
     def init_projections(self) -> None:
@@ -217,7 +223,11 @@ class BaseGenrecModel(BaseModel):
         return embeds.index_copy(
             0,
             batch.additional_infos[PROMPT_HOLE_POSITIONS],
-            torch.cat(projected_embeddings).to(embeds.dtype),
+            (
+                projected_embeddings[0]
+                if len(projected_embeddings) == 1
+                else torch.cat(projected_embeddings)
+            ).to(embeds.dtype),
         )
 
     def _tokens_to_local_codes(

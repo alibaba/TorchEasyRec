@@ -16,17 +16,8 @@ from typing import Any, Dict, List, Tuple
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.dynamic_beam import dynamic_beam_search
+from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.utils.test_util import create_tiny_causal_lm, parameterized_name_func
-
-
-def _capped(widths, pairs):
-    """Cap each width the way the model does before calling the kernel."""
-    out, previous = [], 1
-    for requested, (lo, hi) in zip(widths, pairs):
-        out.append(min(requested, previous * (hi - lo + 1)))
-        previous = out[-1]
-    return out
 
 
 def _decode(lm, ids, pairs, width=8, beam_widths=None, attention_mask=None):
@@ -42,32 +33,31 @@ def _decode(lm, ids, pairs, width=8, beam_widths=None, attention_mask=None):
         lm,
         lm.get_input_embeddings()(ids),
         torch.ones_like(ids) if attention_mask is None else attention_mask,
-        capped_widths=_capped(beam_widths, pairs),
+        capped_widths=capped_beam_widths(beam_widths, pairs),
         bands=pairs,
     )
 
 
 class _RowSpy:
-    """Duck-typed backbone recording the row count of every ``.model`` call.
+    """Backbone wrapper recording the row count of every forward call.
 
-    The kernel touches only ``.model`` and ``.lm_head``, so the per-level beam
-    width -- otherwise a local inside the kernel -- becomes observable.
+    The kernel calls the model itself, so the per-level beam width -- otherwise
+    a local inside the kernel -- becomes observable.
     """
 
     def __init__(self, lm) -> None:
-        self.lm_head = lm.lm_head
         self.rows: List[int] = []
         self._lm = lm
 
     def get_input_embeddings(self):
         return self._lm.get_input_embeddings()
 
-    def model(self, **kwargs: Any) -> Any:
+    def __call__(self, **kwargs: Any) -> Any:
         first = kwargs.get("input_ids")
         if first is None:
             first = kwargs["inputs_embeds"]
         self.rows.append(first.shape[0])
-        return self._lm.model(**kwargs)
+        return self._lm(**kwargs)
 
 
 def _bruteforce_scores(lm, input_ids, attention_mask, pairs):

@@ -14,9 +14,9 @@ import os
 import unittest
 from unittest import mock
 
+from tzrec.constant import HF_EXPORT_META_FILENAME
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.persist import (
-    _HF_EXPORT_META_FILENAME,
     check_prompt_assets,
     read_prompt_digests,
 )
@@ -33,7 +33,7 @@ _WORDS = ["History", "Predict", ":", "<unk>", "<|im_end|>"]
 def _record(compiled_prompt, ckpt_dir: str) -> None:
     """Write the digests where write_hf_assets puts them."""
     os.makedirs(ckpt_dir, exist_ok=True)
-    with open(os.path.join(ckpt_dir, _HF_EXPORT_META_FILENAME), "w") as f:
+    with open(os.path.join(ckpt_dir, HF_EXPORT_META_FILENAME), "w") as f:
         json.dump(
             {
                 "backbone_state_dict_prefix": "lm.",
@@ -65,7 +65,7 @@ class PromptPersistTest(unittest.TestCase):
             tokenizer_path=self.tok_path, prompt=prompt, response="{{answer}}"
         )
         cfg.sid_space.codebook.extend(codebook)
-        return compile_prompt(cfg, self.features, ["answer"], model_dir=self.test_dir)
+        return compile_prompt(cfg, self.features, ["answer"])
 
     def test_a_changed_codebook_is_fatal(self) -> None:
         ckpt = os.path.join(self.test_dir, "model.ckpt-1")
@@ -92,7 +92,7 @@ class PromptPersistTest(unittest.TestCase):
                     "sequence_length: 2 }"
                 )
             ]
-            return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
+            return compile_prompt(cfg, features, ["answer"])
 
         ckpt = os.path.join(self.test_dir, "model.ckpt-proj")
         _record(compile_with([16]), ckpt)
@@ -125,7 +125,7 @@ class PromptPersistTest(unittest.TestCase):
                         "embedding_dim: 8 sequence_length: 2 }"
                     )
                 )
-            return compile_prompt(cfg, features, ["answer"], model_dir=self.test_dir)
+            return compile_prompt(cfg, features, ["answer"])
 
         ckpt = os.path.join(self.test_dir, "model.ckpt-route")
         _record(compile_with("X", "Y"), ckpt)
@@ -165,7 +165,7 @@ class PromptPersistTest(unittest.TestCase):
         # a non-prompt HF model writes the metadata file with no digests in it
         ckpt = os.path.join(self.test_dir, "model.ckpt-nodigest")
         os.makedirs(ckpt, exist_ok=True)
-        with open(os.path.join(ckpt, _HF_EXPORT_META_FILENAME), "w") as f:
+        with open(os.path.join(ckpt, HF_EXPORT_META_FILENAME), "w") as f:
             json.dump({"backbone_state_dict_prefix": "lm."}, f)
 
         self.assertIsNone(read_prompt_digests(ckpt))

@@ -12,6 +12,7 @@
 import unittest
 
 import numpy as np
+from parameterized import parameterized
 
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS,
@@ -31,6 +32,7 @@ from tzrec.prompt.types import (
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
 from tzrec.tests.prompt_test_util import assemble_into
+from tzrec.utils.test_util import parameterized_name_func
 
 _BASE_VOCAB_SIZE = 1000
 _SENTINEL = 1099
@@ -100,6 +102,14 @@ def _plan(segments, response=(), max_length=0) -> PromptPlan:
     )
 
 
+def _asm(segments, response=(), max_length=0, sid_space=None) -> PromptAssembler:
+    """An assembler over one ad-hoc plan."""
+    return PromptAssembler(
+        _plan(segments, response=response, max_length=max_length),
+        _sid_space() if sid_space is None else sid_space,
+    )
+
+
 def _parsed(inline=None, projected=None) -> dict:
     """Build parsed features the way DataParser emits them.
 
@@ -120,8 +130,7 @@ def _parsed(inline=None, projected=None) -> dict:
 
 class PromptAssemblerTest(unittest.TestCase):
     def test_inline_sid_gets_the_base_vocab_shift(self) -> None:
-        plan = _plan((Static((7, 8)), _slot("hist", FillMode.INLINE)))
-        asm = PromptAssembler(plan, _sid_space())
+        asm = _asm((Static((7, 8)), _slot("hist", FillMode.INLINE)))
         # offset codes for one item: level 0 -> 1, level 1 -> 4+2, level 2 -> 8+3
         out = asm.forward(_parsed({"hist": [np.array([1, 6, 11])]}))
 
@@ -139,8 +148,7 @@ class PromptAssemblerTest(unittest.TestCase):
         self.assertEqual(out[PROMPT_HOLE_POSITIONS].size, 0)
 
     def test_projected_emits_sentinels_and_records_holes(self) -> None:
-        plan = _plan((Static((7,)), _slot("prof", FillMode.PROJECTED, 4)))
-        asm = PromptAssembler(plan, _sid_space())
+        asm = _asm((Static((7,)), _slot("prof", FillMode.PROJECTED, 4)))
         out = asm.forward(_parsed(projected={"prof": [2, 3]}))
 
         # sample 0: [7, S, S]   sample 1: [7, S, S, S]
@@ -204,29 +212,33 @@ class PromptAssemblerTest(unittest.TestCase):
         )
         self.assertEqual(prompt_only[PROMPT_RESPONSE_LENGTHS].tolist(), [0])
 
-    def test_rejects_raw_codes_that_carry_no_offset(self) -> None:
-        plan = _plan((_slot("hist", FillMode.INLINE),))
-        asm = PromptAssembler(plan, _sid_space())
-        # [1, 2, 3] is a valid raw SID but level 1 and 2 are below their bands
+    def test_scalar_label_is_named_not_a_key_error(self) -> None:
+        asm = _asm((_slot("hist", FillMode.INLINE),))
+
+        with self.assertRaisesRegex(ValueError, "must be\\s+list<int64>"):
+            asm.forward({"hist.values": np.array([1, 6, 11])})
+
+    @parameterized.expand(
+        [
+            # a valid raw SID, but levels 1 and 2 sit below their bands
+            [[1, 2, 3]],
+            # level 2 admits [8, 12); 12 is the first value past it
+            [[1, 6, 12]],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_rejects_a_code_outside_its_band(self, values) -> None:
+        asm = _asm((_slot("hist", FillMode.INLINE),))
         with self.assertRaisesRegex(ValueError, "offset_codebook column"):
-            asm.forward(_parsed({"hist": [np.array([1, 2, 3])]}))
+            asm.forward(_parsed({"hist": [np.array(values)]}))
 
     def test_rejects_a_partial_item(self) -> None:
-        plan = _plan((_slot("hist", FillMode.INLINE),))
-        asm = PromptAssembler(plan, _sid_space())
+        asm = _asm((_slot("hist", FillMode.INLINE),))
         with self.assertRaisesRegex(ValueError, "whole number of 3-level items"):
             asm.forward(_parsed({"hist": [np.array([1, 6])]}))
 
-    def test_rejects_an_out_of_band_code(self) -> None:
-        plan = _plan((_slot("hist", FillMode.INLINE),))
-        asm = PromptAssembler(plan, _sid_space())
-        # level 2 admits [8, 12); 12 is the first value past it
-        with self.assertRaisesRegex(ValueError, "offset_codebook column"):
-            asm.forward(_parsed({"hist": [np.array([1, 6, 12])]}))
-
     def test_over_long_row_is_an_error_not_a_truncation(self) -> None:
-        plan = _plan((Static((7, 8, 9)), _slot("hist", FillMode.INLINE)), max_length=4)
-        asm = PromptAssembler(plan, _sid_space())
+        asm = _asm((Static((7, 8, 9)), _slot("hist", FillMode.INLINE)), max_length=4)
         with self.assertRaisesRegex(ValueError, "never truncated"):
             asm.forward(_parsed({"hist": [np.array([1, 6, 11])]}))
 
@@ -244,7 +256,6 @@ class PromptAssemblerTest(unittest.TestCase):
             sid_space=_sid_space(),
             prompt_plan=plan,
             projection_plan=ProjectionPlan(projections={}, slot_to_module={}),
-            tokenizer_dir="",
             vocab_hash="v",
             plan_hash="p",
         )

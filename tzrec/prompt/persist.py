@@ -19,15 +19,14 @@ import json
 import os
 from typing import Dict, Optional
 
+from tzrec.constant import HF_EXPORT_META_FILENAME
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.utils.logging_util import logger
-
-_HF_EXPORT_META_FILENAME = "hf_export_meta.json"
 
 
 def read_prompt_digests(source_dir: str) -> Optional[Dict[str, str]]:
     """Read the digests a checkpoint recorded, or None when it has none."""
-    path = os.path.join(source_dir, _HF_EXPORT_META_FILENAME)
+    path = os.path.join(source_dir, HF_EXPORT_META_FILENAME)
     if not os.path.exists(path):
         return None
     with open(path, "r") as f:

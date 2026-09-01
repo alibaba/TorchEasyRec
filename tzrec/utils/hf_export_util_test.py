@@ -20,9 +20,9 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
+from tzrec.constant import HF_EXPORT_META_FILENAME
 from tzrec.utils.checkpoint_util import save_model, unwrap_to
 from tzrec.utils.hf_export_util import (
-    _HF_EXPORT_META_FILENAME,
     dcp_to_hf,
     write_hf_assets,
 )
@@ -115,9 +115,9 @@ class HfExportUtilTest(unittest.TestCase):
         lm = _tied_lm()
         wrapped = _TrainWrapper(_GenRec(lm))
         ckpt_dir = self._save_ckpt(wrapped)
-        for name in ("config.json", "tokenizer.json", _HF_EXPORT_META_FILENAME):
+        for name in ("config.json", "tokenizer.json", HF_EXPORT_META_FILENAME):
             self.assertTrue(os.path.exists(os.path.join(ckpt_dir, name)), name)
-        with open(os.path.join(ckpt_dir, _HF_EXPORT_META_FILENAME)) as f:
+        with open(os.path.join(ckpt_dir, HF_EXPORT_META_FILENAME)) as f:
             prefix = json.load(f)["backbone_state_dict_prefix"]
         self.assertEqual(prefix, "model.lm.")
         # the prefix must reconstruct the exact FQNs save_model wrote

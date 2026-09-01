@@ -17,66 +17,21 @@ import torch
 import torch.fx
 
 from tzrec.datasets.utils import Batch
-from tzrec.main import _create_model
 from tzrec.models.model import TrainWrapper
-from tzrec.prompt.compile import compile_prompt
-from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.tests.prompt_test_util import (
+    GenrecModelTestBase,
     assemble_into,
-    create_prompt_feature,
-    create_prompt_tokenizer,
     offset_sid_codes,
 )
-from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
 _CODEBOOK = [4, 4, 4]
 _WORDS = ["History", "Predict", ":", ".", "<unk>", "<|im_end|>"]
 
 
-class PromptStackIntegrationTest(unittest.TestCase):
+class PromptStackIntegrationTest(GenrecModelTestBase):
     """compile -> assemble -> model, on the real code path."""
 
-    def setUp(self) -> None:
-        self.test_dir = make_test_dir()
-        self.backbone = os.path.join(self.test_dir, "backbone")
-        create_tiny_causal_lm(64).save_pretrained(self.backbone)
-        self.tok = create_prompt_tokenizer(
-            os.path.join(self.test_dir, "tok.json"), _WORDS
-        )
-        self.features = [
-            create_prompt_feature(text)
-            for text in (
-                'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }',
-                'sequence_raw_feature { feature_name: "answer" '
-                'expression: "item:answer" }',
-            )
-        ]
-
-        cfg = PromptConfig(
-            tokenizer_path=self.tok,
-            prompt="History : {{hist}} . Predict :",
-            response="{{answer}}",
-        )
-        cfg.sid_space.codebook.extend(_CODEBOOK)
-        self.compiled_prompt = compile_prompt(
-            cfg, self.features, ["answer"], model_dir=self.test_dir
-        )
-
-    def _model(self):
-        model_config = ModelConfig()
-        qwen = model_config.genrec_causal_lm_model
-        qwen.hf_model_name_or_path = self.backbone
-        qwen.common.beam_widths.extend([2, 2, 2])
-        qwen.common.num_return_sequences = 2
-        return _create_model(
-            model_config,
-            self.features,
-            ["answer"],
-            compiled_prompt=self.compiled_prompt,
-        )
-
-    def _batch(self, hist, answer):
+    def _batch_from_codes(self, hist, answer):
         parsed = {
             "hist.values": torch.tensor(offset_sid_codes(hist, _CODEBOOK)),
             "hist.lengths": torch.tensor([len(hist)]),
@@ -90,6 +45,19 @@ class PromptStackIntegrationTest(unittest.TestCase):
         )
         return batch
 
+    def test_written_digests_satisfy_the_restore_guard(self) -> None:
+        # write_hf_assets is the only writer and check_prompt_assets the only
+        # reader, so a round trip is what proves they agree on the location
+        from tzrec.prompt.persist import check_prompt_assets
+        from tzrec.utils.hf_export_util import write_hf_assets
+
+        model = self._model()
+        ckpt = os.path.join(self.test_dir, "model.ckpt-1")
+        write_hf_assets(model, ckpt)
+
+        check_prompt_assets(self.compiled_prompt, ckpt)
+        self.assertTrue(os.path.exists(os.path.join(ckpt, "hf_export_meta.json")))
+
     def test_model_resizes_to_target_vocab_size(self) -> None:
         model = self._model()
         rows = model.lm.get_input_embeddings().weight.shape[0]
@@ -98,7 +66,7 @@ class PromptStackIntegrationTest(unittest.TestCase):
 
     def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
         model = self._model()
-        batch = self._batch([0, 1, 2, 3, 0, 1], [1, 2, 3])
+        batch = self._batch_from_codes([0, 1, 2, 3, 0, 1], [1, 2, 3])
         predictions = model.predict(batch)
         loss = model.loss(predictions, batch)["ce_loss"]
         self.assertTrue(bool(torch.isfinite(loss)))

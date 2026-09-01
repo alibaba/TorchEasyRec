@@ -52,6 +52,7 @@ from tzrec.features.feature import (
     BaseFeature,
     create_features,
 )
+from tzrec.models.genrec_model import BaseGenrecModel
 from tzrec.models.match_model import (
     MatchModel,
     MatchTower,
@@ -134,17 +135,11 @@ def _compile_prompt(
     """Compile prompt_config for entry points that build prompt-aware objects."""
     if not pipeline_config.HasField("prompt_config"):
         return None
-    is_distributed = dist.is_available() and dist.is_initialized()
-    compiled_prompt = compile_prompt(
+    return compile_prompt(
         pipeline_config.prompt_config,
         features,
         list(pipeline_config.data_config.label_fields),
-        model_dir=pipeline_config.model_dir,
-        write_tokenizer=not is_distributed or dist.get_rank() == 0,
     )
-    if is_distributed:
-        dist.barrier()
-    return compiled_prompt
 
 
 def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
@@ -1141,10 +1136,13 @@ def export(
         else:
             checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
-    # A prompt-native model converts the checkpoint dir directly -- no model
-    # build, no DCP restore -- because its input is an assembled token stream
-    # that an export-time dummy batch cannot supply.
-    if pipeline_config.HasField("prompt_config"):
+    # The model chooses its exporter: a generative one converts the checkpoint
+    # dir directly -- no model build, no DCP restore -- because its input is an
+    # assembled token stream an export-time dummy batch cannot supply.
+    model_cls = BaseModel.create_class(
+        config_util.which_msg(pipeline_config.model_config, "model")
+    )
+    if issubclass(model_cls, BaseGenrecModel):
         if config_util.use_dense_ema(
             pipeline_config.export_config, pipeline_config.train_config
         ):
@@ -1173,6 +1171,7 @@ def export(
             features,
             list(pipeline_config.data_config.label_fields),
         )
+        check_prompt_assets(compiled_prompt, checkpoint_path)
         if compiled_prompt.prompt_plan.projected_slots:
             raise ValueError(
                 "HF export drops projected-slot state: dcp_to_hf keeps only "

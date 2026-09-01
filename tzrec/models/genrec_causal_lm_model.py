@@ -11,13 +11,13 @@
 
 """Decoder-only forward and decode over an HF causal LM.
 
-Shared causal-LM plumbing is in ``BaseGenrecModel``. This subclass
-reaches past ``lm(...)`` into ``lm.model`` and ``lm.lm_head`` so logits are
-materialized for a suffix window only, and it decodes by prefilling once and
-stepping a self-attention cache.
+This subclass asks the backbone's own forward for a suffix window of logits, so
+a full (batch, length, vocab) tensor is never materialized, and it decodes by
+prefilling once and stepping a self-attention cache.
 
-The required HF interfaces are checked in ``init_backbone``; a backbone on the
-legacy tuple cache is not supported, and Qwen2.5/Qwen3 are what CI covers.
+``init_backbone`` checks the interfaces both paths need. A backbone whose
+forward has no ``logits_to_keep``, or which returns a legacy tuple cache, is
+not supported; Qwen2.5/Qwen3 are what CI covers.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,7 +27,7 @@ import torch
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.genrec_model import BaseGenrecModel
-from tzrec.modules.dynamic_beam import dynamic_beam_search
+from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS,
     PROMPT_INPUT_IDS,
@@ -68,7 +68,6 @@ class GenrecCausalLMModel(BaseGenrecModel):
             **kwargs,
         )
         common = self._model_config.common
-        self._ignore_index = int(common.ignore_index)
         self._generated_sids_key = common.generated_sids_key
         self._read_beam_config(common)
 
@@ -80,38 +79,30 @@ class GenrecCausalLMModel(BaseGenrecModel):
         """
         space = self._prompt.sid_space
         self._num_return_sequences = int(common.num_return_sequences)
-        self._beam_widths: List[int] = list(common.beam_widths)
-        if not self._beam_widths:
+        beam_widths = list(common.beam_widths)
+        if not beam_widths:
             raise ValueError(
                 f"{type(self).__name__}: beam_widths is required; give one "
                 f"width per SID level, e.g. [50, 50, 50] or [100, 200, 400]."
             )
-        if len(self._beam_widths) != space.num_levels:
+        if len(beam_widths) != space.num_levels:
             raise ValueError(
                 f"{type(self).__name__}: beam_widths has "
-                f"{len(self._beam_widths)} entries but the codebook has "
+                f"{len(beam_widths)} entries but the codebook has "
                 f"{space.num_levels} levels; give one width per level."
             )
-        if any(width < 1 for width in self._beam_widths):
+        if any(width < 1 for width in beam_widths):
             raise ValueError(
-                f"{type(self).__name__}: beam_widths must be >= 1, got "
-                f"{self._beam_widths}."
+                f"{type(self).__name__}: beam_widths must be >= 1, got {beam_widths}."
             )
         if self._num_return_sequences < 1:
             raise ValueError(
                 f"{type(self).__name__}: num_return_sequences must be >= 1, got "
                 f"{self._num_return_sequences}."
             )
-        # bands, not codebook: the kernel slices by band and does not assume
-        # the bands are contiguous
+        # bands, not codebook: the kernel does not assume they are contiguous
         self._bands: List[Tuple[int, int]] = list(zip(space.band_lo, space.band_hi))
-        self._capped_widths: List[int] = []
-        previous_width = 1
-        for requested, (band_lo, band_hi) in zip(self._beam_widths, self._bands):
-            self._capped_widths.append(
-                min(requested, previous_width * (band_hi - band_lo + 1))
-            )
-            previous_width = self._capped_widths[-1]
+        self._capped_widths = capped_beam_widths(beam_widths, self._bands)
 
         final_width = self._capped_widths[-1]
         if self._num_return_sequences > final_width:
@@ -135,8 +126,7 @@ class GenrecCausalLMModel(BaseGenrecModel):
         embeds = self.build_input(batch)
         if self.is_inference:
             return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
-        # the leaf returns a tuple: FX cannot iterate a Proxy, and TrainWrapper
-        # iterates whatever predict returns
+        # a tuple, not a dict: TrainWrapper iterates what predict returns
         logits, labels = _fx_wrapped_forward(self, embeds, batch)
         return {"logits": logits, "labels": labels}
 
@@ -159,11 +149,14 @@ class GenrecCausalLMModel(BaseGenrecModel):
         padded, mask, labels = self._left_pad_packed_inputs(
             embeds, batch, build_labels=True
         )
-        outputs = self.lm.model(inputs_embeds=padded, attention_mask=mask)
-
-        window = slice(-self._prompt.prompt_plan.logits_suffix_len, None)
-        logits = self.lm.lm_head(outputs.last_hidden_state[:, window, :])
-        return logits, labels[:, window]
+        suffix = self._prompt.prompt_plan.logits_suffix_len
+        outputs = self.lm(
+            inputs_embeds=padded,
+            attention_mask=mask,
+            use_cache=False,
+            logits_to_keep=suffix,
+        )
+        return outputs.logits, labels[:, -suffix:]
 
     def _generate(self, embeds: torch.Tensor, batch: Batch) -> torch.Tensor:
         """Beam-search the SID answer.

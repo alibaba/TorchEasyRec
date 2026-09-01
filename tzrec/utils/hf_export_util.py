@@ -24,6 +24,7 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
+from tzrec.constant import HF_EXPORT_META_FILENAME
 from tzrec.utils import checkpoint_util
 from tzrec.utils.logging_util import logger
 
@@ -37,8 +38,6 @@ _HF_ASSET_FILES = (
     "added_tokens.json",
     "special_tokens_map.json",
 )
-
-_HF_EXPORT_META_FILENAME = "hf_export_meta.json"
 
 
 def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
@@ -76,7 +75,7 @@ def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
     digests = getattr(inner, "prompt_digests", None)
     if digests is not None:
         meta.update(digests())
-    with open(os.path.join(save_dir, _HF_EXPORT_META_FILENAME), "w") as f:
+    with open(os.path.join(save_dir, HF_EXPORT_META_FILENAME), "w") as f:
         json.dump(meta, f, indent=2)
 
 
@@ -100,7 +99,7 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str) -> None:
         checkpoint_id=model_ckpt_path
     )
 
-    meta_path = os.path.join(ckpt_dir, _HF_EXPORT_META_FILENAME)
+    meta_path = os.path.join(ckpt_dir, HF_EXPORT_META_FILENAME)
     prefix: Optional[str] = None
     if os.path.exists(meta_path):
         with open(meta_path, "r") as f:
