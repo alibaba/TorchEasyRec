@@ -3,7 +3,9 @@ allowed-tools: Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)
 description: Review a pull request
 ---
 
-Fetch the PR context with `gh pr view` and the changes with `gh pr diff`.
+Fetch the PR context with `gh pr view`. The PR's full unified diff is
+already saved as `pr.diff` at the root of the working directory — read it
+from there instead of fetching it again.
 Review statically — do not run tests or builds.
 
 Perform a comprehensive code review using subagents for key areas:
@@ -13,6 +15,12 @@ Perform a comprehensive code review using subagents for key areas:
 - test-coverage-reviewer
 - documentation-accuracy-reviewer
 - security-code-reviewer
+
+Give every subagent the path to `pr.diff` and tell it to read that file
+first. Subagents start with an empty context and have only Glob/Grep/Read —
+no shell, no `gh`, and no git history to diff against — so that file is
+their only view of what changed. Do not paraphrase the change or paste diff
+text in its place, and never name a tool an agent does not have.
 
 Instruct each to only provide noteworthy feedback. Once they finish, review
 the feedback and post only the feedback that you also deem noteworthy.
