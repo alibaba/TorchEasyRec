@@ -378,3 +378,16 @@ pip install -U "pyodps>=0.13.1"
 | `STORAGE_API_SDK_RETRY_TIMES`      | 5              | SDK内部重试次数（仅对连接错误生效）                                     |
 | `STORAGE_API_SESSION_POLL_TIMEOUT` | 600（秒）      | 等待read session离开INIT状态的超时时间                                  |
 | `STORAGE_API_COMPRESSION`          | `LZ4_FRAME`    | 传输压缩方式，可选`ZSTD`/`UNCOMPRESSED`                                 |
+
+**Q18: 如何复现实验**
+
+**解决方法：** TorchEasyRec通过环境变量控制随机性，不需要在模型或启动脚本里自己调用`torch.manual_seed`：
+
+```bash
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTHON_RANDOM_SEED=100007
+export NUMPY_MANUAL_SEED=100007
+export TORCH_MANUAL_SEED=100007          # 同时会设置所有CUDA设备的种子
+export USE_DETERMINISTIC_ALGORITHMS=1    # 已包含cudnn的确定性行为
+```

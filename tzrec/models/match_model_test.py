@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 
 import torch
 from parameterized import parameterized
-from torchrec import KeyedTensor
+from torchrec import JaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, NEG_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
@@ -125,6 +125,63 @@ class MatchModelTest(unittest.TestCase):
                 expected_recall,
                 rtol=1e-4,
                 atol=1e-4,
+            )
+
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+        ]
+    )
+    def test_match_model_with_jagged_label(self, graph_type):
+        """A label stored as a list column is used like an ordinary label."""
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(
+                    softmax_cross_entropy=loss_pb2.SoftmaxCrossEntropy()
+                )
+            ],
+            metrics=[
+                metric_pb2.MetricConfig(recall_at_k=metric_pb2.RecallAtK(top_k=2))
+            ],
+        )
+        model = _TestMatchModel(
+            model_config=model_config,
+            features=[],
+            labels=["label"],
+            sampler_type="negative_sampler",
+        )
+        model = TrainWrapper(model)
+        model = create_test_model(model, graph_type)
+
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        dense_feature_neg = KeyedTensor.from_tensor_list(
+            keys=["int_b"], tensors=[torch.tensor([[0.2], [0.3], [0.4]])]
+        )
+        batch = Batch(
+            dense_features={
+                BASE_DATA_GROUP: dense_feature,
+                NEG_DATA_GROUP: dense_feature_neg,
+            },
+            sparse_features={},
+            jagged_labels={
+                "label": JaggedTensor(
+                    values=torch.tensor([1, 1]), lengths=torch.tensor([1, 1])
+                )
+            },
+        )
+        total_loss, (losses, predictions, batch) = model(batch)
+
+        torch.testing.assert_close(
+            total_loss, torch.tensor(0.71080), rtol=1e-4, atol=1e-4
+        )
+        if graph_type == TestGraphType.NORMAL:
+            model.model.update_metric(predictions, batch)
+            metric_result = model.model.compute_metric()
+            torch.testing.assert_close(
+                metric_result["recall@2"], torch.tensor(1.0), rtol=1e-4, atol=1e-4
             )
 
 

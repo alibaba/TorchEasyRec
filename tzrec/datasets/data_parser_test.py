@@ -155,6 +155,37 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
+    def test_list_label(self):
+        """A label stored as a list column is parsed into a jagged label."""
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="cat_a", embedding_dim=16, num_buckets=100
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs)
+
+        data_parser = DataParser(features=features, labels=["label", "list_label"])
+
+        data = data_parser.parse(
+            input_data={
+                "cat_a": pa.array([1, 2, 3]),
+                "label": pa.array([0, 0, 1], pa.int32()),
+                "list_label": pa.array([[4], [5], [6]], pa.list_(pa.int32())),
+            }
+        )
+        batch = data_parser.to_batch(data)
+
+        torch.testing.assert_close(
+            batch.labels["label"], torch.tensor([0, 0, 1], dtype=torch.int64)
+        )
+        self.assertNotIn("list_label", batch.labels)
+        torch.testing.assert_close(
+            batch.jagged_labels["list_label"].values(),
+            torch.tensor([4, 5, 6], dtype=torch.int64),
+        )
+
     def test_fg_encoded_id_with_weight(self):
         feature_cfgs = [
             feature_pb2.FeatureConfig(

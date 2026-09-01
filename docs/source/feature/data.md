@@ -320,6 +320,9 @@ pipeline.global-job-parameters: |
     label_fields: "buy"
   ```
 
+- label列的类型是数组时（例如上游表的类型为`array<bigint>`），会被解析成jagged label，
+  取其中的values后和普通label一样使用，无需额外配置
+
 ### sample_weight_fields
 
 - 训练样本的样本权重列名
