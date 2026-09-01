@@ -123,7 +123,7 @@ class PromptAssemblerTest(unittest.TestCase):
         plan = _plan((Static((7, 8)), _slot("hist", FillMode.INLINE)))
         asm = PromptAssembler(plan, _sid_space())
         # offset codes for one item: level 0 -> 1, level 1 -> 4+2, level 2 -> 8+3
-        out = asm.assemble(_parsed({"hist": [np.array([1, 6, 11])]}))
+        out = asm.forward(_parsed({"hist": [np.array([1, 6, 11])]}))
 
         self.assertEqual(
             out[PROMPT_INPUT_IDS].tolist(),
@@ -141,7 +141,7 @@ class PromptAssemblerTest(unittest.TestCase):
     def test_projected_emits_sentinels_and_records_holes(self) -> None:
         plan = _plan((Static((7,)), _slot("prof", FillMode.PROJECTED, 4)))
         asm = PromptAssembler(plan, _sid_space())
-        out = asm.assemble(_parsed(projected={"prof": [2, 3]}))
+        out = asm.forward(_parsed(projected={"prof": [2, 3]}))
 
         # sample 0: [7, S, S]   sample 1: [7, S, S, S]
         self.assertEqual(
@@ -162,7 +162,7 @@ class PromptAssemblerTest(unittest.TestCase):
             )
         )
         asm = PromptAssembler(plan, _sid_space())
-        out = asm.assemble(_parsed(projected={"a": [1, 2], "b": [2, 1]}))
+        out = asm.forward(_parsed(projected={"a": [1, 2], "b": [2, 1]}))
 
         self.assertEqual(out[PROMPT_CU_SEQLENS].tolist(), [0, 5, 11])
         self.assertEqual(
@@ -177,7 +177,7 @@ class PromptAssemblerTest(unittest.TestCase):
         parsed = _parsed(
             {"hist": [np.array([1, 6, 11])], "answer": [np.array([0, 4, 8])]}
         )
-        out = PromptAssembler(plan, _sid_space()).assemble(parsed)
+        out = PromptAssembler(plan, _sid_space()).forward(parsed)
 
         self.assertEqual(
             out[PROMPT_INPUT_IDS].tolist(),
@@ -197,7 +197,7 @@ class PromptAssemblerTest(unittest.TestCase):
         # at predict the response is dropped, and with it the answer column
         prompt_only = PromptAssembler(
             plan, _sid_space(), include_response=False
-        ).assemble(_parsed({"hist": [np.array([1, 6, 11])]}))
+        ).forward(_parsed({"hist": [np.array([1, 6, 11])]}))
         self.assertEqual(
             prompt_only[PROMPT_INPUT_IDS].tolist(),
             [7, _BASE_VOCAB_SIZE + 1, _BASE_VOCAB_SIZE + 6, _BASE_VOCAB_SIZE + 11],
@@ -209,26 +209,26 @@ class PromptAssemblerTest(unittest.TestCase):
         asm = PromptAssembler(plan, _sid_space())
         # [1, 2, 3] is a valid raw SID but level 1 and 2 are below their bands
         with self.assertRaisesRegex(ValueError, "offset_codebook column"):
-            asm.assemble(_parsed({"hist": [np.array([1, 2, 3])]}))
+            asm.forward(_parsed({"hist": [np.array([1, 2, 3])]}))
 
     def test_rejects_a_partial_item(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
         asm = PromptAssembler(plan, _sid_space())
         with self.assertRaisesRegex(ValueError, "whole number of 3-level items"):
-            asm.assemble(_parsed({"hist": [np.array([1, 6])]}))
+            asm.forward(_parsed({"hist": [np.array([1, 6])]}))
 
     def test_rejects_an_out_of_band_code(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
         asm = PromptAssembler(plan, _sid_space())
         # level 2 admits [8, 12); 12 is the first value past it
         with self.assertRaisesRegex(ValueError, "offset_codebook column"):
-            asm.assemble(_parsed({"hist": [np.array([1, 6, 12])]}))
+            asm.forward(_parsed({"hist": [np.array([1, 6, 12])]}))
 
     def test_over_long_row_is_an_error_not_a_truncation(self) -> None:
         plan = _plan((Static((7, 8, 9)), _slot("hist", FillMode.INLINE)), max_length=4)
         asm = PromptAssembler(plan, _sid_space())
         with self.assertRaisesRegex(ValueError, "never truncated"):
-            asm.assemble(_parsed({"hist": [np.array([1, 6, 11])]}))
+            asm.forward(_parsed({"hist": [np.array([1, 6, 11])]}))
 
     def test_inline_without_a_sid_space_is_rejected_at_construction(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
@@ -273,7 +273,7 @@ class PromptAssemblerTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, r"prompt slot \[answer\] has 2 samples, expected 1"
         ):
-            asm.assemble(parsed)
+            asm.forward(parsed)
 
     def test_rejects_mismatched_projected_member_lengths(self) -> None:
         plan = _plan(
@@ -296,7 +296,7 @@ class PromptAssemblerTest(unittest.TestCase):
             ValueError,
             r"PROJECTED features \[age\] and \[country\] have different",
         ):
-            asm.assemble(parsed)
+            asm.forward(parsed)
 
     def test_deep_projected_members_emit_one_hole_per_sample(self) -> None:
         plan = _plan(
@@ -310,7 +310,7 @@ class PromptAssemblerTest(unittest.TestCase):
             )
         )
         asm = PromptAssembler(plan, _sid_space())
-        out = asm.assemble(
+        out = asm.forward(
             {
                 "dense.values": np.array([[1.0, 2.0], [3.0, 4.0]]),
                 "sparse.values": np.array([5, 6, 7]),

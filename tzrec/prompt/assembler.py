@@ -249,7 +249,7 @@ class PromptAssembler:
             response_lengths=response_lengths.astype(np.int64),
         )
 
-    def assemble(
+    def forward(
         self, parsed_features: Dict[str, "np.ndarray"]
     ) -> Dict[str, np.ndarray]:
         """Reshape one parsed batch, assemble it, and key it for the batch.
