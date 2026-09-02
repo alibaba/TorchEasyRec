@@ -7,7 +7,11 @@ Fetch the PR context with `gh pr view`. The change itself is already on
 disk: `.pr-review/stat` lists every changed file, `.pr-review/files/<path>.diff`
 holds one file's diff, and `.pr-review/diff` is the whole change. Read it from
 there instead of fetching it again.
-Review statically — do not run tests or builds.
+Review statically — do not run tests or builds. Installed dependency sources,
+when the runner has any, are listed in `.pr-review/env`. `WebFetch` and the
+web-search tool are available to you and to the subagents: use them to check an
+upstream API or an advisory for a changed dependency, not for anything the
+checkout already answers.
 
 Perform a comprehensive code review using subagents for key areas:
 

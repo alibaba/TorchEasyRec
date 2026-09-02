@@ -71,10 +71,21 @@
 # Trust model: the collaborator-added label gates every run (review before labeling);
 # adding a label needs triage permission, so non-collaborators cannot trigger either job.
 # Codex confines model commands to a no-network sandbox, with only the gh pr
-# view/diff/comment allowlist (scripts/ci/codex_review.rules) running outside it. The
-# claude job reaches the same allowlist via --permission-mode manual, which is what makes
-# --allowedTools binding. A PR comment is the only exfil path out of either job, and
-# --add-dir / leaves everything readable on the runner reachable from that path.
+# view/diff/comment allowlist (scripts/ci/codex_review.rules) running outside it.
+#
+# The claude job is contained differently, and --allowedTools is NOT a command allowlist
+# for it: measured on claude 2.1.257, read-only commands (ls, grep, sed -n, git log) are
+# auto-approved whether or not they are listed, while writes and redirections are refused
+# and file access is confined to the working directories. So --add-dir is the boundary
+# that matters, and it is scoped to the conda root the reviewers read dependency sources
+# from (see .pr-review/env), never the whole runner.
+#
+# The claude job is also granted WebFetch and a web-search MCP tool, for the dispatcher and
+# all five reviewers, so it can check an API or an advisory against upstream. That is a
+# deliberate trade: unlike a PR comment, a fetch is silent, so exfil from this job is no
+# longer visible or auditable, and the collaborator label gate is the control. The codex
+# job has no web access -- its per-run CODEX_HOME drops any [tools] block -- so the two
+# jobs deliberately differ in capability.
 # ---- End Codex Setup ----
 
 name: Code Review
@@ -151,6 +162,15 @@ jobs:
           mkdir -p "$(dirname "$EXCLUDE")"
           echo '.pr-review/' >> "$EXCLUDE"
 
+          # ~/.bashrc is never sourced in a step, so conda's PATH block never runs --
+          # same trap as the bun path below. The manifest tells the reviewers where
+          # installed dependencies are; its root is all they are given to read.
+          CONDA="$(which conda 2>/dev/null || echo "$HOME/conda/bin/conda")"
+          ENV_ROOT="$(python3 \
+            "${GITHUB_WORKSPACE}/trusted-claude/scripts/ci/write_cr_env.py" \
+            --conda "$CONDA" --out .pr-review/env)"
+          echo "REVIEW_ENV_ROOT=$ENV_ROOT" >> "$GITHUB_ENV"
+
       - name: RunCodeReview
         working-directory: pr-code
         env:
@@ -170,17 +190,18 @@ jobs:
 
           MCP_CONFIG="{\"mcpServers\":{\"github_inline_comment\":{\"command\":\"${BUN_PATH}\",\"args\":[\"run\",\"/opt/claude-code-action/src/mcp/github-inline-comment-server.ts\"]}}}"
 
-          # --permission-mode manual makes --allowedTools binding; without it the
-          # runner's stored settings apply and every Bash command is permitted.
-          # --add-dir / keeps the cross-repo reads the reviewers depend on.
+          # Read access is scoped to the checkout plus the conda root resolved above,
+          # so the runner's $HOME -- which holds the stored OAuth credentials -- is not
+          # readable. It falls back to the working directory, which is already
+          # allowed, when the runner has no conda environment.
           claude -p \
             --output-format stream-json \
             --verbose \
             --permission-mode manual \
-            --add-dir / \
+            --add-dir "${REVIEW_ENV_ROOT:-$PWD}" \
             --settings '{"disableRemoteControl": true}' \
             --mcp-config "$MCP_CONFIG" \
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob,Agent" \
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob,Agent,WebFetch,mcp__dashscope-search__web_search" \
             -- "/review-pr REPO: ${{ github.repository }} PR_NUMBER: ${PR_NUMBER}"
 
   codex-review:
@@ -249,6 +270,11 @@ jobs:
           EXCLUDE="$(git rev-parse --git-path info/exclude)"
           mkdir -p "$(dirname "$EXCLUDE")"
           echo '.pr-review/' >> "$EXCLUDE"
+
+          # Same manifest for the codex reviewers; this job has no --add-dir to scope.
+          CONDA="$(which conda 2>/dev/null || echo "$HOME/conda/bin/conda")"
+          python3 "${GITHUB_WORKSPACE}/trusted-claude/scripts/ci/write_cr_env.py" \
+            --conda "$CONDA" --out .pr-review/env > /dev/null
 
       - name: RunCodexReview
         working-directory: pr-code
