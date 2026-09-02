@@ -17,7 +17,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from queue import Queue
 from threading import Event, Thread
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import pyarrow as pa
 import torch
@@ -155,6 +155,27 @@ def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
     return sampler_type
 
 
+def _get_model_class(model_config: ModelConfig) -> Type[BaseModel]:
+    """Resolve the configured model class.
+
+    Args:
+        model_config (ModelConfig): easyrec model config.
+
+    Returns:
+        Type[BaseModel]: configured model class.
+    """
+    if model_config.WhichOneof("model") == "custom_model":
+        class_path = model_config.custom_model.class_path
+        model_cls = import_class(class_path)
+        if not isinstance(model_cls, type) or not issubclass(model_cls, BaseModel):
+            raise ValueError(f"Custom model class {class_path} must inherit BaseModel.")
+        return model_cls
+
+    model_cls_name = config_util.which_msg(model_config, "model")
+    # pyre-ignore [16]
+    return BaseModel.create_class(model_cls_name)
+
+
 def _create_model(
     model_config: ModelConfig,
     features: List[BaseFeature],
@@ -176,15 +197,7 @@ def _create_model(
     Return:
         model: a EasyRec Model.
     """
-    if model_config.WhichOneof("model") == "custom_model":
-        class_path = model_config.custom_model.class_path
-        model_cls = import_class(class_path)
-        if not isinstance(model_cls, type) or not issubclass(model_cls, BaseModel):
-            raise ValueError(f"Custom model class {class_path} must inherit BaseModel.")
-    else:
-        model_cls_name = config_util.which_msg(model_config, "model")
-        # pyre-ignore [16]
-        model_cls = BaseModel.create_class(model_cls_name)
+    model_cls = _get_model_class(model_config)
 
     model: BaseModel = model_cls(
         model_config,
@@ -1149,9 +1162,7 @@ def export(
         else:
             checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
-    model_cls = BaseModel.create_class(
-        config_util.which_msg(pipeline_config.model_config, "model")
-    )
+    model_cls = _get_model_class(pipeline_config.model_config)
     if issubclass(model_cls, BaseGenrecModel):
         if config_util.use_dense_ema(
             pipeline_config.export_config, pipeline_config.train_config
