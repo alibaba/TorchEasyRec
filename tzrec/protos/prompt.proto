@@ -13,7 +13,7 @@ message PromptConfig {
     // Static text between {{name}} placeholders is the prefix and suffix of
     // the surrounding slots; there are no per-slot text fields.
     required string prompt = 2;
-    // Supervised answer. Defines the loss span; absent at inference.
+    // Supervised answer. Must be declared in every mode; inference assembly omits it.
     optional string response = 3;
 
     // A placeholder resolves to a slot with that name, else to an implicit

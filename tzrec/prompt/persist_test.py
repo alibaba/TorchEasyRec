@@ -150,7 +150,6 @@ class PromptPersistTest(unittest.TestCase):
         warning.assert_called_once()
 
     def test_a_checkpoint_without_assets_is_fatal(self) -> None:
-        # save() swallows asset-write failures, so a bare checkpoint must fail
         bare = os.path.join(self.test_dir, "model.ckpt-bare")
         os.makedirs(bare, exist_ok=True)
         self.assertIsNone(read_prompt_digests(bare))

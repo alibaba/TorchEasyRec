@@ -439,14 +439,17 @@ class CheckpointManager:
         # Local import avoids a circular import (hf_export_util imports us).
         from tzrec.utils.hf_export_util import write_hf_assets
 
-        # a raise here skips save_dataloader_state's all_gather and hangs other ranks.
+        asset_error: Optional[str] = None
         try:
             write_hf_assets(model, ckpt_dir)
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"write_hf_assets failed for {ckpt_dir}: {e} -- checkpoint "
-                f"weights are saved; skipping HF assets."
-            )
+            asset_error = f"{type(e).__name__}: {e}"
+        if dist.is_initialized():
+            error_box = [asset_error]
+            dist.broadcast_object_list(error_box, src=0)
+            asset_error = error_box[0]
+        if asset_error is not None:
+            raise RuntimeError(f"write_hf_assets failed for {ckpt_dir}: {asset_error}")
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
         save_meta(ckpt_dir, step, data_ts)
