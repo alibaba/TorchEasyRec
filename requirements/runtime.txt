@@ -23,4 +23,4 @@ tensorboard
 torch==2.13.0
 torchmetrics==1.0.3
 torchrec==1.8.0
-transformers @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/transformers/transformers-4.51.2-py3-none-any.whl
+transformers
