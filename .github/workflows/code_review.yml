@@ -129,18 +129,27 @@ jobs:
       - name: Use trusted agent files
         run: bash trusted-claude/scripts/ci/use_trusted_agent_files.sh trusted-claude pr-code
 
-      # The reviewers read the diff from a file because nothing else can hand it
-      # to them: the subagents have Read but no shell, fetch-depth: 1 leaves no
-      # merge base for git diff, and --permission-mode manual lets the model
-      # neither redirect nor Write the file for itself.
+      # The reviewers read the change from files because nothing else can hand
+      # it to them: the subagents have Read but no shell, fetch-depth: 1 leaves
+      # no merge base for git diff, and --permission-mode manual lets the model
+      # neither redirect nor Write a file for itself. Split per file because
+      # Read caps what it returns, so one combined diff reaches a reviewer
+      # truncated at its tail once a PR is large.
       - name: Save PR diff for the reviewers
         working-directory: pr-code
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # rm before mkdir: a PR can commit .pr-review as a symlink, and
+          # writing through one would escape the checkout
+          rm -rf .pr-review && mkdir .pr-review
           gh pr diff ${{ github.event.pull_request.number }} \
-            --repo ${{ github.repository }} > pr.diff
-          wc -l pr.diff
+            --repo ${{ github.repository }} > .pr-review/diff
+          python3 "${GITHUB_WORKSPACE}/trusted-claude/scripts/ci/split_pr_diff.py" \
+            --diff .pr-review/diff --out-dir .pr-review
+          EXCLUDE="$(git rev-parse --git-path info/exclude)"
+          mkdir -p "$(dirname "$EXCLUDE")"
+          echo '.pr-review/' >> "$EXCLUDE"
 
       - name: RunCodeReview
         working-directory: pr-code
@@ -223,16 +232,23 @@ jobs:
           bash trusted-claude/scripts/ci/use_trusted_agent_files.sh \
             trusted-claude pr-code "${{ runner.temp }}/codex-gen"
 
-      # Same file, same reason: the subagent sandboxes are read-only and offline,
-      # so `gh pr diff` is unreachable from inside a review.
+      # Same files, same reason: the subagent sandboxes are read-only and
+      # offline, so `gh pr diff` is unreachable from inside a review.
       - name: Save PR diff for the reviewers
         working-directory: pr-code
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # rm before mkdir: a PR can commit .pr-review as a symlink, and
+          # writing through one would escape the checkout
+          rm -rf .pr-review && mkdir .pr-review
           gh pr diff ${{ github.event.pull_request.number }} \
-            --repo ${{ github.repository }} > pr.diff
-          wc -l pr.diff
+            --repo ${{ github.repository }} > .pr-review/diff
+          python3 "${GITHUB_WORKSPACE}/trusted-claude/scripts/ci/split_pr_diff.py" \
+            --diff .pr-review/diff --out-dir .pr-review
+          EXCLUDE="$(git rev-parse --git-path info/exclude)"
+          mkdir -p "$(dirname "$EXCLUDE")"
+          echo '.pr-review/' >> "$EXCLUDE"
 
       - name: RunCodexReview
         working-directory: pr-code
