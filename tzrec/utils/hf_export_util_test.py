@@ -150,6 +150,7 @@ class HfExportUtilTest(unittest.TestCase):
         with open(cfg_path) as f:
             cfg = json.load(f)
         cfg["num_hidden_layers"] = 4
+        cfg.pop("layer_types", None)
         with open(cfg_path, "w") as f:
             json.dump(cfg, f)
         with self.assertRaisesRegex(RuntimeError, "Refusing to write"):
