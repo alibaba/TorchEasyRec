@@ -12,6 +12,7 @@
 import dataclasses
 import os
 import unittest
+from unittest import mock
 
 import torch
 from parameterized import parameterized
@@ -74,15 +75,24 @@ class BaseGenrecModelTest(GenrecModelTestBase):
             self._model(compiled_prompt=compiled_prompt)
 
     def test_rejects_a_backbone_that_cannot_narrow_its_logits(self) -> None:
-        from transformers import GPT2Config, GPT2LMHeadModel
+        from transformers import GPT2Config
 
         backbone = os.path.join(self.test_dir, "gpt2")
-        GPT2LMHeadModel(
-            GPT2Config(n_layer=1, n_head=2, n_embd=32, vocab_size=64)
-        ).save_pretrained(backbone)
+        config = GPT2Config(n_layer=1, n_head=2, n_embd=32, vocab_size=64)
+        config.save_pretrained(backbone)
+        stand_in = torch.nn.Module()
+        stand_in.config = config
+        stand_in.loss_function = mock.Mock()
+        stand_in.get_input_embeddings = mock.Mock()
+        stand_in.resize_token_embeddings = mock.Mock()
 
-        with self.assertRaisesRegex(
-            ValueError, r"missing \['forward\(logits_to_keep\)'\]"
+        with (
+            mock.patch.object(
+                AutoModelForCausalLM, "from_config", return_value=stand_in
+            ),
+            self.assertRaisesRegex(
+                ValueError, r"missing \['forward\(logits_to_keep\)'\]"
+            ),
         ):
             self._model(hf_model_name_or_path=backbone)
 
