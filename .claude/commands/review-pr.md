@@ -25,10 +25,9 @@ Give each subagent the files its area owns and the
 `.pr-review/files/<path>.diff` path for each, and split the files between the
 areas rather than pointing all five at the whole change — say they may read
 another file's diff when a finding needs it. Subagents start with an empty
-context and have only Glob/Grep/Read — no shell, no `gh`, and no git history
-to diff against — so those files are their only view of what changed. Do not
-paraphrase the change or paste diff text in its place, and never name a tool
-an agent does not have.
+context and have no shell, no `gh`, and no git history to diff against — so
+those files are their only view of what changed. Do not paraphrase the change
+or paste diff text in its place, and never name a tool an agent does not have.
 
 Instruct each to only provide noteworthy feedback. Once they finish, review
 the feedback and post only the feedback that you also deem noteworthy.

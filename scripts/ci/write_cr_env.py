@@ -34,12 +34,16 @@ def conda_base(conda: Path) -> Optional[Path]:
         conda (Path): path to the conda executable, which may not exist.
 
     Returns:
-        The installation root, or None when `conda` is not there.
+        The installation root, or None when `conda` is not there or what it
+        resolves to is not a conda installation.
     """
     if not conda.exists():
         return None
-    # <base>/bin/conda and <base>/condabin/conda both resolve this way.
-    return conda.parent.parent
+    # resolve() first: `which conda` can be a cross-root symlink such as
+    # /usr/bin/conda -> /opt/conda/bin/conda, and a lexical parent.parent would
+    # hand /usr to --add-dir. <base>/bin and <base>/condabin both resolve here.
+    base = conda.resolve().parent.parent
+    return base if (base / "conda-meta").is_dir() else None
 
 
 def env_prefixes(base: Path) -> List[Path]:

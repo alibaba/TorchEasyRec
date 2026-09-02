@@ -20,19 +20,32 @@ reviewer read its own area whole. Used by .github/workflows/code_review.yml.
 
 import argparse
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List, Tuple
 
 _FILE_START = re.compile(rb"(?m)^diff --git ")
-# In fallback order: a rename names the new path, and only the header survives
-# for a binary, mode-only or pure-rename entry that carries no hunks.
-_RENAME_TO = re.compile(rb"(?m)^rename to (.+)$")
-_NEW_PATH = re.compile(rb"(?m)^\+\+\+ b/(.+)$")
-_OLD_PATH = re.compile(rb"(?m)^--- a/(.+)$")
+# Where an entry's header ends and its body begins. Everything after this is
+# attacker-authored: an added line reading "++ b/x" renders as "+++ b/x", so a
+# path must never be taken from it.
+_BODY_START = re.compile(rb"(?m)^(?:@@ |Binary files |GIT binary patch)")
+# In fallback order: a rename names the new path, and only the `diff --git`
+# line survives for a binary or mode-only entry. Each shape has a plain and a
+# C-quoted spelling -- git always quotes a path holding a control character,
+# whatever core.quotePath says.
+_PATH_PATTERNS = (
+    re.compile(rb'(?m)^rename to (?:"(.+)"|(.+))$'),
+    re.compile(rb'(?m)^\+\+\+ (?:"b/(.+)"|b/(.+))$'),
+    re.compile(rb'(?m)^--- (?:"a/(.+)"|a/(.+))$'),
+)
+_GIT_LINE = re.compile(rb'(?m)^diff --git (?:"a/.+" "b/(.+)"|a/.+ b/(.+))$')
 
 
 def chunk_path(chunk: bytes) -> str:
     """Return the post-change path a single-file diff chunk describes.
+
+    A C-quoted name keeps git's quoted spelling rather than being decoded:
+    decoding would put real tabs and newlines into filenames and into the
+    change map, whose one-entry-per-line format a newline would break.
 
     Args:
         chunk (bytes): one `diff --git` entry, header included.
@@ -41,13 +54,17 @@ def chunk_path(chunk: bytes) -> str:
         The path as it exists in the head tree, or the pre-change path for a
         deletion.
     """
-    for pattern in (_RENAME_TO, _NEW_PATH, _OLD_PATH):
-        match = pattern.search(chunk)
+    body = _BODY_START.search(chunk)
+    header = chunk[: body.start()] if body else chunk
+    for pattern in (*_PATH_PATTERNS, _GIT_LINE):
+        match = pattern.search(header)
         if match:
-            return match.group(1).decode()
-    header = chunk.split(b"\n", 1)[0][len(b"diff --git ") :].decode()
-    _, _, new_path = header.partition(" b/")
-    return new_path or header
+            quoted, plain = match.groups()
+            # An unquoted path holding a space is ambiguous on the `diff --git`
+            # line; git has the same ambiguity and only binary and mode-only
+            # entries reach it.
+            return (quoted or plain).decode()
+    return chunk.split(b"\n", 1)[0][len(b"diff --git ") :].decode()
 
 
 def split_diff(diff: bytes) -> List[Tuple[str, bytes]]:
@@ -70,8 +87,6 @@ def split_diff(diff: bytes) -> List[Tuple[str, bytes]]:
         raise ValueError("the diff has content before its first 'diff --git'")
     bounds = starts + [len(diff)]
     chunks = [diff[bounds[i] : bounds[i + 1]] for i in range(len(starts))]
-    if b"".join(chunks) != diff:
-        raise ValueError("splitting lost bytes; the chunks do not rebuild the diff")
     return [(chunk_path(chunk), chunk) for chunk in chunks]
 
 
@@ -84,11 +99,20 @@ def write_review_inputs(diff: bytes, out_dir: Path) -> List[Tuple[str, bytes]]:
 
     Returns:
         The (path, chunk) list that was written.
+
+    Raises:
+        ValueError: a path would be written outside `out_dir`.
     """
     entries = split_diff(diff)
     for path, chunk in entries:
+        if not path or path.startswith("/") or ".." in PurePosixPath(path).parts:
+            raise ValueError(f"refusing to write outside the review inputs: {path!r}")
         target = out_dir / "files" / f"{path}.diff"
         target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
+            # The parents were just created here, so the leaf is the only place
+            # a PR-committed symlink could redirect the write.
+            raise ValueError(f"refusing to write through a symlink: {target}")
         target.write_bytes(chunk)
 
     lines = [f"{len(diff.splitlines())} lines, {len(entries)} files", ""]

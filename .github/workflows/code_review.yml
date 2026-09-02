@@ -37,6 +37,13 @@
 #   }
 #   EOF
 #
+#   # The web-search tool the reviewers are granted
+#   # (mcp__dashscope-search__web_search) is NOT provisioned here: it comes from
+#   # this user's own ~/.claude/mcp.json at user scope, which merges because
+#   # --strict-mcp-config is deliberately not passed. Re-add it when rebuilding
+#   # the runner, or the tool named in --allowedTools and in every agent roster
+#   # silently resolves to nothing.
+#
 #   # Login (stores OAuth credentials for headless use)
 #   claude /login
 #
