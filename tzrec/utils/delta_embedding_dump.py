@@ -720,9 +720,7 @@ class DeltaEmbeddingDumper:
                 torch.distributed.new_group(backend="gloo"),
             )
         self._feature_store_enabled = config.HasField("feature_store_config")
-        self._retain_local_dump = self._feature_store_enabled and bool(
-            config.feature_store_config.retain_local_dump
-        )
+        self._retain_local_dump = config.retain_local_dump
         os.makedirs(self._output_dir, exist_ok=True)
 
         self._tracker = ModelDeltaTracker(

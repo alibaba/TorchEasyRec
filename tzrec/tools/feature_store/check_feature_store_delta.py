@@ -16,7 +16,7 @@ step, samples keys from its shard set, and queries the configured explicit
 FeatureDB version through ``DynamicEmbeddingFeatureView.get_online_features``.
 
 Local parquet files are only produced alongside FeatureStore uploads when
-``feature_store_config.retain_local_dump`` is enabled.
+``delta_embedding_dump_config.retain_local_dump`` is enabled.
 
 Example::
 
@@ -454,12 +454,12 @@ def run_check(args: argparse.Namespace) -> int:
         raise ValueError(
             "pipeline config delta_embedding_dump_config has no feature_store_config"
         )
-    feature_store_config = dump_config.feature_store_config
-    if not feature_store_config.retain_local_dump:
+    if not dump_config.retain_local_dump:
         raise ValueError(
-            "feature_store_config.retain_local_dump must be enabled so the "
-            "training job keeps local delta parquet files for readback"
+            "delta_embedding_dump_config.retain_local_dump must be enabled so "
+            "the training job keeps local delta parquet files for readback"
         )
+    feature_store_config = dump_config.feature_store_config
     settings = FeatureStoreUploadSettings.from_proto(feature_store_config)
     output_dir = resolve_output_dir(
         args.pipeline_config,

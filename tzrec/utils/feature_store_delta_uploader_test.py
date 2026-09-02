@@ -321,7 +321,6 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "feature_view_ttl_secs",
             "feature_view_shard_count",
             "feature_view_replication_count",
-            "retain_local_dump",
             "upload_format",
         ]
         fields = list(FeatureStoreConfig.DESCRIPTOR.fields)
