@@ -50,9 +50,14 @@ def export_online_dense_model(
     """Export and publish one online-learning dense model version.
 
     Offline / manual companion to the in-process online export
-    (tzrec.utils.online_dense_export_util.OnlineDenseExportManager): builds
-    the dense model from a checkpoint on disk instead of from the live
-    training state, then publishes it to the same serving tree.
+    (tzrec.utils.online_dense_export_util.OnlineDenseExportManager) for
+    bootstrapping the serving tree: builds the dense model from a checkpoint
+    on disk instead of from the live training state. Unlike the in-process
+    exporter it flips current.json directly, without waiting on a sparse
+    upload watermark: the bootstrap precondition is that the FeatureStore
+    full load and the checkpoint come from the same source, so
+    ``sparse_step`` mirrors ``checkpoint_step`` and ``sparse_probes`` is
+    empty, which tells the processor to skip probe verification.
 
     Args:
         pipeline_config_path: pipeline config the model is rebuilt from.
@@ -129,12 +134,17 @@ def export_online_dense_model(
             shutil.rmtree(tmp_dir)
         raise
 
+    # Manifest v2 for bootstrap: the FeatureStore full load and this
+    # checkpoint are same-source, so sparse_step mirrors checkpoint_step and
+    # the empty probe list tells the processor to skip verification.
     current_payload: Dict[str, Any] = {
         "version": version,
         "checkpoint_path": os.path.abspath(checkpoint_path),
         "checkpoint_step": checkpoint_step,
+        "sparse_step": checkpoint_step,
         "data_timestamp": data_timestamp,
         "created_at": _utc_now(),
+        "sparse_probes": [],
     }
 
     # Keep the service-facing pointer beside the immutable dense export versions.

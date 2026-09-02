@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
+    Any,
     Dict,
     Iterable,
     Iterator,
@@ -698,11 +699,26 @@ class DeltaEmbeddingDumper:
             self._interval_steps = int(config.dump_interval_steps)
         self._next_dump_time: Optional[float] = None
         self._last_dump_step: Optional[int] = None
+        self._local_completed_step = 0
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
         self._file_prefix = config.file_prefix or "delta_embedding"
         self._rank, self._world_size = _distributed_rank_world_size()
+        self._decision_group: Optional[torch.distributed.ProcessGroup] = None
+        if self._interval_secs is not None and self._world_size > 1:
+            if not (
+                torch.distributed.is_available() and torch.distributed.is_initialized()
+            ):
+                raise RuntimeError(
+                    "delta_embedding_dump_config.dump_interval_minutes requires "
+                    "an initialized torch.distributed process group when "
+                    "world_size > 1 to broadcast the rank-zero dump decision."
+                )
+            self._decision_group = cast(
+                Optional[torch.distributed.ProcessGroup],
+                torch.distributed.new_group(backend="gloo"),
+            )
         self._feature_store_enabled = config.HasField("feature_store_config")
         self._retain_local_dump = self._feature_store_enabled and bool(
             config.feature_store_config.retain_local_dump
@@ -816,17 +832,33 @@ class DeltaEmbeddingDumper:
         The rank-zero view rendezvous (create the DynamicEmbedding view,
         barrier, then non-primary ranks open it) lives in
         :meth:`FeatureStoreDeltaUploader.start`; this method only delegates and
-        arms the timed cadence.
+        arms the timed cadence. Under the multi-rank timed cadence only rank
+        zero arms a deadline, because it alone evaluates the clock and
+        broadcasts the per-step dump decision to the other ranks.
         """
         if self._uploader is not None:
             self._uploader.start()
-        if self._interval_secs is not None:
+        if self._interval_secs is not None and (
+            self._decision_group is None or self._rank == 0
+        ):
             self._next_dump_time = time.monotonic() + self._interval_secs
 
     def close(self, raise_on_error: bool = True, drain: bool = True) -> None:
         """Close this rank's uploader; abnormal shutdown can skip draining."""
         if self._uploader is not None:
             self._uploader.close(raise_on_error=raise_on_error, drain=drain)
+
+    def completed_upload_state(self) -> Tuple[int, List[Dict[str, Any]]]:
+        """Snapshot this rank's completed sparse publication watermark.
+
+        Returns:
+            The last FIFO-completed submitted step and its sampled probe rows
+            when the FeatureStore uploader is enabled; in local-file mode, the
+            last locally dumped step and an empty probe list.
+        """
+        if self._uploader is not None:
+            return self._uploader.completed_upload()
+        return self._local_completed_step, []
 
     def _feature_store_upload_error(self) -> Optional[BaseException]:
         """Collect this rank's uploader error without changing control flow."""
@@ -845,25 +877,54 @@ class DeltaEmbeddingDumper:
         if error is not None:
             raise error.with_traceback(error.__traceback__)
 
-    def maybe_dump(self, global_step: int) -> None:
+    def maybe_dump(self, global_step: int) -> bool:
         """Dump on the configured step or time interval and advance tracker state.
 
         Args:
             global_step: Current training step.
+
+        Returns:
+            Whether a dump fired this step; identical on all ranks, so the
+            caller can drive the same-step dense export from it.
         """
         self._check_feature_store_upload_error()
-        if self._local_dump_decision(global_step):
+        dumped = self._dump_decision(global_step)
+        if dumped:
             self.dump(global_step)
             self._last_dump_step = global_step
             if self._interval_secs is not None and self._next_dump_time is not None:
-                # Fixed-rate rescheduling keeps every rank's deadline sequence
-                # identical, so timed dumps stay step-aligned across ranks up to
-                # clock skew exactly astride a step boundary; missed deadlines
-                # are skipped instead of fired as a burst.
+                # Fixed-rate rescheduling: only rank zero owns the deadline
+                # sequence (other ranks follow its broadcast decision); missed
+                # deadlines are skipped instead of fired as a burst.
                 now = time.monotonic()
                 while self._next_dump_time <= now:
                     self._next_dump_time += self._interval_secs
         self._tracker.step()
+        return dumped
+
+    def _dump_decision(self, global_step: int) -> bool:
+        """Return the rank-uniform decision on whether this step dumps.
+
+        The steps cadence and the single-rank timed cadence are decided
+        locally. The multi-rank timed cadence broadcasts rank zero's clock
+        decision over the gloo decision group so a deadline landing astride
+        a step boundary can never split ranks. The per-step broadcast assumes
+        lockstep stepping, i.e. streaming inputs for the timed cadence.
+
+        Args:
+            global_step: Current training step.
+
+        Returns:
+            Whether this step dumps; identical on all ranks.
+        """
+        if self._decision_group is None:
+            return self._local_dump_decision(global_step)
+        decision = torch.tensor(
+            [1 if self._rank == 0 and self._local_dump_decision(global_step) else 0],
+            dtype=torch.uint8,
+        )
+        torch.distributed.broadcast(decision, src=0, group=self._decision_group)
+        return bool(decision.item())
 
     def _local_dump_decision(self, global_step: int) -> bool:
         """Return whether this step triggers a delta dump."""
@@ -873,18 +934,21 @@ class DeltaEmbeddingDumper:
             return time.monotonic() >= self._next_dump_time
         return False
 
-    def final_dump(self, global_step: int) -> Optional[str]:
+    def final_dump(self, global_step: int) -> Optional[int]:
         """Flush the trailing partial interval at the end of training.
 
         Boundary steps were already written by ``maybe_dump`` and have no
         remaining delta; re-dumping them would overwrite their shards with an
-        empty file under multi-GPU, so skip them here.
+        empty file under multi-GPU, so skip them here. Every skip/dump
+        decision is a function of rank-uniform values (the synced step, the
+        interval config, and ``_last_dump_step``), so all ranks agree on the
+        returned step and the caller can pair the final dense export with it.
 
         Args:
             global_step: Current training step.
 
         Returns:
-            Path to the dumped parquet file, or None if skipped.
+            The rank-synced step that was dumped, or None if skipped.
         """
         if global_step <= 0:
             logger.info("Skipping delta embedding dump at step %s.", global_step)
@@ -905,7 +969,8 @@ class DeltaEmbeddingDumper:
             # A timed dump can land on any step. Avoid replacing that step's full
             # delta with an empty final shard when training ends immediately after.
             return None
-        return self.dump(global_step)
+        self.dump(global_step)
+        return global_step
 
     def _sync_final_step(self, global_step: int) -> int:
         """Align the final step across ranks before the trailing flush.
@@ -960,8 +1025,15 @@ class DeltaEmbeddingDumper:
             # per-step file consumers never observe a partial set.
             output_path = self._output_path(global_step)
             self._write_table_chunks(table_chunks, output_path)
-        if uploader is not None and num_rows > 0:
-            uploader.submit(global_step, pa.concat_tables(table_chunks))
+        if uploader is not None:
+            # Empty intervals must still advance the upload watermark or the
+            # joint publish gate stalls.
+            uploader.submit(
+                global_step,
+                pa.concat_tables(table_chunks)
+                if table_chunks
+                else self._schema.empty_table(),
+            )
         if num_rows == 0:
             if output_path is None:
                 logger.debug("No delta embedding rows to dump at step %s.", global_step)
@@ -979,6 +1051,8 @@ class DeltaEmbeddingDumper:
             )
         else:
             logger.debug("Dumped %s delta embedding rows to %s.", num_rows, output_path)
+        if self._uploader is None:
+            self._local_completed_step = global_step
         return output_path
 
     def _output_path(self, global_step: int) -> str:

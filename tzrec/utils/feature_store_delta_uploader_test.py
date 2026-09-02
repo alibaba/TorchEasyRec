@@ -12,8 +12,10 @@
 import os
 import sys
 import threading
+import time
 import types
 import unittest
+import zlib
 from unittest import mock
 
 import numpy as np
@@ -78,6 +80,15 @@ def _delta_table(rows) -> pa.Table:
     if rows:
         return pa.Table.from_pylist(rows, schema=_DELTA_DUMP_SCHEMA)
     return _DELTA_DUMP_SCHEMA.empty_table()
+
+
+def _wait_for_completed_step(uploader, step, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if uploader.completed_upload()[0] >= step:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"upload watermark did not reach step {step}")
 
 
 class _FakeView:
@@ -1220,6 +1231,237 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             )
         )
         self.assertEqual(view.closed, [True])
+
+    def test_completed_upload_advances_only_after_successful_upload(self):
+        view = _BlockingView()
+        uploader = self._uploader(
+            client_factory=_FakeClientFactory(view),
+            clock_ms=lambda: 100,
+        )
+        uploader.start()
+        self.assertEqual(uploader.completed_upload(), (0, []))
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        uploader.submit(20, _delta_table([_row(20, 0, 2, [3.0, 4.0])]))
+        self.assertTrue(view.flush_started.wait(timeout=5))
+        # Step 10 is mid-flight (writes issued, flush blocked): no completion.
+        self.assertEqual(uploader.completed_upload(), (0, []))
+        view.release_flush.set()
+        uploader.close()
+
+        step, probes = uploader.completed_upload()
+        self.assertEqual(step, 20)
+        self.assertEqual([probe["sk"] for probe in probes], [2])
+
+    def test_completed_upload_watermark_and_probes_follow_fifo_steps(self):
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        _wait_for_completed_step(uploader, 10)
+        step, probes = uploader.completed_upload()
+        self.assertEqual(step, 10)
+        self.assertEqual([probe["sk"] for probe in probes], [1])
+
+        uploader.submit(20, _delta_table([_row(20, 0, 2, [3.0, 4.0])]))
+        uploader.close()
+        step, probes = uploader.completed_upload()
+        self.assertEqual(step, 20)
+        self.assertEqual([probe["sk"] for probe in probes], [2])
+
+    def test_watermark_advances_after_retry_succeeds(self):
+        failed_summary = {
+            "total_batches": 1,
+            "failed_batches": 1,
+            "total_records": 1,
+            "success_records": 0,
+            "failed_records": 1,
+        }
+        first_view = _FakeView([failed_summary])
+        second_view = _FakeView()
+        factory = _SequencedClientFactory([first_view, second_view])
+        uploader = self._uploader(
+            _feature_store_config(max_retries=2),
+            client_factory=factory,
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        uploader.close()
+
+        step, probes = uploader.completed_upload()
+        self.assertEqual(step, 10)
+        self.assertEqual([probe["sk"] for probe in probes], [1])
+
+    def test_failed_upload_does_not_advance_watermark(self):
+        failed_summary = {
+            "total_batches": 1,
+            "failed_batches": 1,
+            "total_records": 1,
+            "success_records": 0,
+            "failed_records": 1,
+        }
+        view = _FakeView([failed_summary])
+        uploader = self._uploader(
+            _feature_store_config(max_retries=1),
+            client_factory=_FakeClientFactory(view),
+        )
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        with self.assertRaises(FeatureStoreUploadError):
+            uploader.close()
+
+        self.assertEqual(uploader.completed_upload(), (0, []))
+
+    def test_empty_table_advances_watermark_without_view_writes(self):
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        uploader.start()
+        uploader.submit(10, _delta_table([]))
+        uploader.close()
+
+        self.assertEqual(uploader.completed_upload(), (10, []))
+        self.assertEqual(view.calls, [])
+        self.assertEqual(view.flush_calls, [])
+
+    def test_empty_table_keeps_prior_probes(self):
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 7, [1.0, 2.0])]))
+        uploader.submit(20, _delta_table([]))
+        uploader.close()
+
+        step, probes = uploader.completed_upload()
+        self.assertEqual(step, 20)
+        self.assertEqual([probe["sk"] for probe in probes], [7])
+        self.assertEqual(len(view.calls), 1)
+
+    def test_probes_match_wire_keys_and_crc32_fp32(self):
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        uploader.start()
+        uploader.submit(
+            10,
+            _delta_table([_row(10, 0, 1, [1.0, 2.0]), _row(10, 0, 2, [3.0, 4.0])]),
+        )
+        uploader.close()
+
+        _, probes = uploader.completed_upload()
+        self.assertEqual(len(probes), 2)
+        uploaded = {
+            (item["embedding_name"], item["key_id"]): item["embedding"]
+            for call in view.calls
+            for item in call["data"]
+        }
+        for probe in probes:
+            self.assertEqual(probe["encoding"], "fp32")
+            wire_bytes = uploaded[(probe["pk"], probe["sk"])].tobytes()
+            self.assertEqual(probe["crc32"], "%08x" % zlib.crc32(wire_bytes))
+
+    def test_probes_uint8_encoding_and_crc32(self):
+        view = _FakeView(embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8)
+        uploader = self._uploader(
+            client_factory=_FakeClientFactory(view),
+            embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8,
+            embedding_dimensions={"model.ebc.embedding_bags.user_emb": 6},
+        )
+        table = pa.Table.from_pylist(
+            [_row(10, 0, 7, [1, 2, 3, 250, 251, 252])],
+            schema=_DELTA_DUMP_QUANT_SCHEMA,
+        )
+        uploader.start()
+        uploader.submit(10, table)
+        uploader.close()
+
+        _, probes = uploader.completed_upload()
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0]["pk"], "model.ebc.embedding_bags.user_emb")
+        self.assertEqual(probes[0]["sk"], 7)
+        self.assertEqual(probes[0]["encoding"], "int8")
+        expected_bytes = np.array([1, 2, 3, 250, 251, 252], dtype=np.uint8).tobytes()
+        self.assertEqual(probes[0]["crc32"], "%08x" % zlib.crc32(expected_bytes))
+
+    def test_probes_capped_at_four_first_qualifying_rows(self):
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        uploader.start()
+        uploader.submit(
+            10,
+            _delta_table([_row(10, 0, key, [1.0, 2.0]) for key in range(1, 7)]),
+        )
+        uploader.close()
+
+        _, probes = uploader.completed_upload()
+        self.assertEqual([probe["sk"] for probe in probes], [1, 2, 3, 4])
+
+    def test_probes_skip_tombstone_rows_but_still_upload_them(self):
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        tombstone = _row(10, 0, 1, [0.0, 0.0])
+        tombstone["source"] = "dynamicemb_evicted"
+        uploader.start()
+        uploader.submit(10, _delta_table([tombstone, _row(10, 0, 2, [1.0, 2.0])]))
+        uploader.close()
+
+        _, probes = uploader.completed_upload()
+        self.assertEqual([probe["sk"] for probe in probes], [2])
+        uploaded_keys = [item["key_id"] for call in view.calls for item in call["data"]]
+        self.assertEqual(uploaded_keys, [1, 2])
+
+    def test_probes_prefer_distinct_pks(self):
+        view = _FakeView()
+        uploader = self._uploader(
+            _feature_store_config(upload_batch_size=1000),
+            client_factory=_FakeClientFactory(view),
+            embedding_dimensions={
+                "model.ebc.embedding_bags.user_emb": 2,
+                "model.ebc.embedding_bags.item_emb": 2,
+            },
+        )
+        rows = [_row(10, 0, key, [1.0, 2.0]) for key in range(1, 6)]
+        rows.append(_row(10, 0, 6, [3.0, 4.0], name="item_emb"))
+        uploader.start()
+        uploader.submit(10, _delta_table(rows))
+        uploader.close()
+
+        _, probes = uploader.completed_upload()
+        self.assertEqual([probe["sk"] for probe in probes], [1, 2, 3, 6])
+        self.assertEqual(
+            [probe["pk"] for probe in probes],
+            ["model.ebc.embedding_bags.user_emb"] * 3
+            + ["model.ebc.embedding_bags.item_emb"],
+        )
+
+    def test_probes_tolerate_wire_only_batches_without_source_column(self):
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        table = pa.table(
+            {
+                "table_fqn": pa.array(
+                    ["model.ebc.embedding_bags.user_emb"], type=pa.string()
+                ),
+                "key_id": pa.array([5], type=pa.int64()),
+                "embedding": pa.array([[1.0, 2.0]], type=pa.list_(pa.float32())),
+            }
+        )
+        uploader.start()
+        uploader.submit(10, table)
+        uploader.close()
+
+        step, probes = uploader.completed_upload()
+        self.assertEqual(step, 10)
+        self.assertEqual([probe["sk"] for probe in probes], [5])
+
+    def test_completed_upload_returns_copied_probe_list(self):
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+        uploader.start()
+        uploader.submit(10, _delta_table([_row(10, 0, 1, [1.0, 2.0])]))
+        uploader.close()
+
+        _, probes = uploader.completed_upload()
+        probes.clear()
+        _, fresh = uploader.completed_upload()
+        self.assertEqual([probe["sk"] for probe in fresh], [1])
 
 
 if __name__ == "__main__":
