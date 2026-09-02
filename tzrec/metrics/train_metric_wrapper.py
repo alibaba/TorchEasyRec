@@ -26,6 +26,9 @@ class TrainMetricWrapper(nn.Module):
         decay_step (int): decay step for decay,
     """
 
+    _value: Tensor
+    _step_cnt: Tensor
+
     def __init__(
         self, metric_module: Metric, decay_rate: float = 0.5, decay_step: int = 100
     ) -> None:
@@ -33,11 +36,8 @@ class TrainMetricWrapper(nn.Module):
         self._decay_rate = decay_rate
         self._decay_step = decay_step
         self._metric_module = metric_module
-        self._value = nn.Parameter(torch.tensor(0.0), requires_grad=False)
-        self._step_total_value = nn.Parameter(torch.tensor(0.0), requires_grad=False)
-        self._step_cnt = nn.Parameter(
-            torch.tensor(0, dtype=torch.int), requires_grad=False
-        )
+        self.register_buffer("_value", torch.tensor(0.0))
+        self.register_buffer("_step_cnt", torch.tensor(0, dtype=torch.int))
 
     def update(self, preds: Tensor, target: Tensor) -> None:
         """Update metric module."""
@@ -60,3 +60,9 @@ class TrainMetricWrapper(nn.Module):
     def compute(self) -> Tensor:
         """Get metric value."""
         return self._value.data
+
+    def reset(self) -> None:
+        """Reset metric state."""
+        self._metric_module.reset()
+        self._value.zero_()
+        self._step_cnt.zero_()

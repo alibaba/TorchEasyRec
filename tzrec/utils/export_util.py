@@ -492,12 +492,21 @@ def _resolve_keyed_tensor_source_module(
 
 
 def _get_embedding_bag_configs(module: torch.nn.Module) -> Optional[List[Any]]:
-    """Get EmbeddingBag configs from EBC or MC_EBC modules by duck typing."""
+    """Get EmbeddingBag configs from EBC or MC_EBC modules by duck typing.
+
+    Handles unsharded and sharded modules: torchrec's
+    ``ShardedEmbeddingBagCollection`` keeps the original-order configs only in
+    the private ``_embedding_bag_configs`` attribute, and (sharded) MC-EBC
+    modules nest their embedding module under ``_embedding_module``.
+    """
     if hasattr(module, "embedding_bag_configs"):
         return list(module.embedding_bag_configs())
+    configs = getattr(module, "_embedding_bag_configs", None)
+    if configs is not None:
+        return list(configs)
     inner = getattr(module, "_embedding_module", None)
-    if inner is not None and hasattr(inner, "embedding_bag_configs"):
-        return list(inner.embedding_bag_configs())
+    if inner is not None:
+        return _get_embedding_bag_configs(inner)
     return None
 
 
@@ -521,6 +530,173 @@ def _infer_keyed_tensor_attrs_from_module(
         keys.extend(embedding_names)
         length_per_key.extend([config.embedding_dim] * len(embedding_names))
     return keys, length_per_key
+
+
+def _canonicalize_keyed_tensor_attrs(
+    source_module: Optional[torch.nn.Module],
+    name: str,
+    runtime_keys: List[str],
+    runtime_length_per_key: List[int],
+) -> Tuple[List[str], List[int]]:
+    """Return canonical config-order keys/length_per_key for a marked KeyedTensor.
+
+    A sharded EmbeddingBagCollection emits its output KeyedTensor grouped by
+    sharding type / compute kernel, so the runtime key order depends on the
+    sharding plan (e.g. dynamicemb tables get regrouped to the tail). The
+    exported dense graph and dense_meta.json must instead use the
+    plan-independent config order that the online dense export derives
+    statically, otherwise the serving processor rejects hot dense updates
+    with dense_meta_mismatch.
+
+    Args:
+        source_module: embedding module that produced the KeyedTensor.
+        name: fx-marked KeyedTensor name, for diagnostics.
+        runtime_keys: keys captured from the sharded runtime output.
+        runtime_length_per_key: length_per_key captured from the runtime.
+
+    Returns:
+        Tuple of (keys, length_per_key) in canonical config order.
+
+    Raises:
+        RuntimeError: if static inference is unsupported for the source
+            module, or the inferred attrs disagree with the runtime output.
+    """
+    inferred = (
+        _infer_keyed_tensor_attrs_from_module(source_module)
+        if source_module is not None
+        else None
+    )
+    if inferred is None:
+        raise RuntimeError(
+            f"cannot statically infer KeyedTensor attrs for [{name}]; the "
+            "dense export must not bake the plan-dependent sharded runtime "
+            "key order, which would mismatch the online dense export."
+        )
+    keys, length_per_key = inferred
+    if sorted(zip(keys, length_per_key)) != sorted(
+        zip(runtime_keys, runtime_length_per_key)
+    ):
+        raise RuntimeError(
+            f"statically inferred KeyedTensor attrs for [{name}] disagree with "
+            f"the runtime output: inferred={list(zip(keys, length_per_key))} "
+            f"runtime={list(zip(runtime_keys, runtime_length_per_key))}"
+        )
+    return keys, length_per_key
+
+
+def _permute_keyed_tensor_values(
+    values: torch.Tensor,
+    src_keys: List[str],
+    src_length_per_key: List[int],
+    dst_keys: List[str],
+) -> torch.Tensor:
+    """Reorder pooled KeyedTensor values along dim 1 from src to dst key order."""
+    chunks = dict(zip(src_keys, torch.split(values, src_length_per_key, dim=1)))
+    return torch.cat([chunks[k] for k in dst_keys], dim=1)
+
+
+def _rewrite_dense_serving_graph(
+    full_graph: torch.fx.Graph,
+    root: torch.nn.Module,
+    sparse_attrs: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[torch.fx.GraphModule, Dict[str, Any]]:
+    """Rewrite a traced full graph into the serving-style dense graph module.
+
+    Replaces every fx-marked sparse KeyedTensor / sequence JaggedTensor with a
+    reconstruction from serving-fed input placeholders using the provided
+    keys/length_per_key attrs, prunes the now-unused embedding parameters, and
+    freshly initializes the module on ``device``; the caller loads the real
+    weights. Shared by the distributed-embedding export and the CPU dense
+    export so their dense graphs and dense_meta cannot drift apart.
+
+    Args:
+        full_graph: pre-surgery traced graph; deep-copied, not modified.
+        root: module owning the traced submodules and parameters.
+        sparse_attrs: ``<name>__keys`` / ``<name>__length_per_key`` attrs to
+            bake into the reconstructed KeyedTensor per marked name.
+        device: device the rewritten graph module lives on.
+
+    Returns:
+        Tuple of (gm, dense_graph_config): the rewritten dense graph module
+        and the dense_meta config mapping placeholder names to serving
+        embedding names.
+    """
+    graph = copy.deepcopy(full_graph)
+    output_keys = []
+    output_values = []
+    dense_graph_config = defaultdict()
+    for node in graph.nodes:
+        if node.op == "output":
+            for k, v in sorted(node.args[0].items()):
+                if k == TARGET_REPEAT_INTERLEAVE_KEY:
+                    continue
+                output_keys.append(k)
+                output_values.append(v)
+            graph.erase_node(node)
+    input_node = next(node for node in graph.nodes if node.op == "placeholder")
+
+    dense_graph_config["sequence__ec"] = []
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
+            name = cast(str, node.args[0])
+            if node.kwargs.get("is_dense", False):
+                continue
+            node_kt = node.args[1]
+            with graph.inserting_before(node_kt):
+                getitem_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                values_node = getitem_node
+                if _is_input_tile_user_keyed_tensor(name):
+                    batch_size_node = graph.call_function(
+                        operator.getitem, args=(input_node, "batch_size")
+                    )
+                    tile_size_node = graph.call_function(
+                        _tile_size, args=(batch_size_node,)
+                    )
+                    values_node = graph.call_method(
+                        "tile", args=(getitem_node, tile_size_node, 1)
+                    )
+                new_node = graph.call_function(
+                    KeyedTensor,
+                    kwargs={
+                        "keys": sparse_attrs[name + "__keys"],
+                        "length_per_key": sparse_attrs[name + "__length_per_key"],
+                        "values": values_node,
+                    },
+                )
+                dense_graph_config[name] = [
+                    k + "__ebc" for k in cast(List[str], new_node.kwargs["keys"])
+                ]
+                node_kt.replace_all_uses_with(new_node)
+        elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
+            name = node.args[0]
+            node_jt = node.args[1]
+            with graph.inserting_before(node_jt):
+                getitem_node = graph.call_function(
+                    operator.getitem, args=(input_node, name)
+                )
+                getitem_lengths = graph.call_function(
+                    operator.getitem, args=(input_node, name + "__lengths")
+                )
+                new_node = graph.call_function(
+                    JaggedTensor,
+                    kwargs={"values": getitem_node, "lengths": getitem_lengths},
+                )
+            node_jt.replace_all_uses_with(new_node)
+            emb_name = name + "__ec"
+            dense_graph_config["sequence__ec"].append(emb_name)
+            dense_graph_config["sequence__ec"].append(name + "__lengths")
+
+    graph.output(dict(zip(output_keys, output_values)))
+    gm = torch.fx.GraphModule(root, graph)
+    _eliminate_dense_dead_code(gm.graph)
+    gm = _prune_unused_param_and_buffer(gm)
+
+    init_parameters(gm, device)
+    gm.to(device)
+    return gm, dense_graph_config
 
 
 def _is_fx_node(value: Any) -> bool:
@@ -585,6 +761,24 @@ def _add_module_by_dotted_path(
             parent.add_module(p, nn.Module())  # create empty container
         parent = getattr(parent, p)
     parent.add_module(parts[-1], module)
+
+
+def _eliminate_dense_dead_code(graph: torch.fx.Graph) -> None:
+    """Drop every node the dense graph's output does not depend on.
+
+    A dense graph is a pruned view of the full traced graph: the marked sparse
+    outputs are rewired to read the sparse model's output dict, which leaves the
+    original lookup subtree unreachable. Plain ``eliminate_dead_code`` no longer
+    removes it, because torch>=2.13 resolves an ``OpOverloadPacket`` target to
+    its default overload when deciding purity, so the zero-user
+    ``fbgemm.bounds_check_indices`` left behind by a quantized lookup now counts
+    as impure and pins the whole subtree -- which then reads raw feature keys
+    that exist only in the sparse model's input. The sparse half runs in the
+    sparse model, so here only placeholders and the output are anchors.
+    """
+    graph.eliminate_dead_code(
+        is_impure_node=lambda node: node.op in ("placeholder", "output")
+    )
 
 
 def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -1162,7 +1356,7 @@ def export_rtp_model(
                 raise RuntimeError(f"{node.target} op is not supported by rtp")
     graph.output(tuple(output_values))
     gm = torch.fx.GraphModule(unwrap_model, graph)
-    gm.graph.eliminate_dead_code()
+    _eliminate_dense_dead_code(gm.graph)
     gm = _prune_unused_param_and_buffer(gm)
     init_parameters(gm, device)
     gm.to(device)
@@ -1365,7 +1559,7 @@ def split_model(
 
             node_t.replace_all_uses_with(get_node)
     dense_gm = torch.fx.GraphModule(model, graph)
-    dense_gm.graph.eliminate_dead_code()
+    _eliminate_dense_dead_code(dense_gm.graph)
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
     seq_share_groups = _compute_seq_share_groups(
@@ -1577,84 +1771,34 @@ def export_distributed_embedding(
 
     # Extract Dense Model
     logger.info("exporting dense model...")
-    graph = copy.deepcopy(full_graph)
-    output_keys = []
-    output_values = []
-    dense_graph_config = defaultdict()
-    for node in graph.nodes:
-        if node.op == "output":
-            for k, v in sorted(node.args[0].items()):
-                if k == TARGET_REPEAT_INTERLEAVE_KEY:
-                    continue
-                output_keys.append(k)
-                output_values.append(v)
-            graph.erase_node(node)
-    input_node = next(node for node in graph.nodes if node.op == "placeholder")
+    for node in full_graph.nodes:
+        if node.op != "call_function" or node.target != fx_mark_keyed_tensor:
+            continue
+        name = node.args[0]
+        if node.kwargs.get("is_dense", False):
+            continue
+        runtime_keys = cast(List[str], sparse_attrs[name + "__keys"])
+        runtime_length_per_key = cast(
+            List[int], sparse_attrs[name + "__length_per_key"]
+        )
+        keys, length_per_key = _canonicalize_keyed_tensor_attrs(
+            _resolve_keyed_tensor_source_module(unwrap_model, node.args[1]),
+            name,
+            runtime_keys,
+            runtime_length_per_key,
+        )
+        if keys != runtime_keys:
+            # keep the rank-zero smoke-run inputs aligned with the
+            # canonical layout baked into the dense graph
+            sparse_output[name] = _permute_keyed_tensor_values(
+                sparse_output[name], runtime_keys, runtime_length_per_key, keys
+            )
+        sparse_attrs[name + "__keys"] = keys
+        sparse_attrs[name + "__length_per_key"] = length_per_key
 
-    dense_graph_config["sequence__ec"] = []
-    for node in list(graph.nodes):
-        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
-            name = node.args[0]
-            if node.kwargs.get("is_dense", False):
-                continue
-            node_kt = node.args[1]
-            with graph.inserting_before(node_kt):
-                getitem_node = graph.call_function(
-                    operator.getitem, args=(input_node, name)
-                )
-                values_node = getitem_node
-                if _is_input_tile_user_keyed_tensor(name):
-                    batch_size_node = graph.call_function(
-                        operator.getitem, args=(input_node, "batch_size")
-                    )
-                    tile_size_node = graph.call_function(
-                        _tile_size, args=(batch_size_node,)
-                    )
-                    values_node = graph.call_method(
-                        "tile", args=(getitem_node, tile_size_node, 1)
-                    )
-                new_node = graph.call_function(
-                    KeyedTensor,
-                    kwargs={
-                        "keys": sparse_attrs[name + "__keys"],
-                        "length_per_key": sparse_attrs[name + "__length_per_key"],
-                        "values": values_node,
-                    },
-                )
-                dense_graph_config[name] = [
-                    k + "__ebc" for k in cast(List[str], new_node.kwargs["keys"])
-                ]
-                node_kt.replace_all_uses_with(new_node)
-        elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
-            name = node.args[0]
-            node_jt = node.args[1]
-
-            with graph.inserting_before(node_jt):
-                getitem_node = graph.call_function(
-                    operator.getitem, args=(input_node, name)
-                )
-                getitem_lengths = graph.call_function(
-                    operator.getitem, args=(input_node, name + "__lengths")
-                )
-                new_node = graph.call_function(
-                    JaggedTensor,
-                    kwargs={
-                        "values": getitem_node,
-                        "lengths": getitem_lengths,
-                    },
-                )
-            node_jt.replace_all_uses_with(new_node)
-            emb_name = name + "__ec"
-            dense_graph_config["sequence__ec"].append(emb_name)
-            dense_graph_config["sequence__ec"].append(name + "__lengths")
-
-    graph.output(dict(zip(output_keys, output_values)))
-    gm = torch.fx.GraphModule(unwrap_model, graph)
-    gm.graph.eliminate_dead_code()
-    gm = _prune_unused_param_and_buffer(gm)
-
-    init_parameters(gm, device)
-    gm.to(device)
+    gm, dense_graph_config = _rewrite_dense_serving_graph(
+        full_graph, unwrap_model, sparse_attrs, device
+    )
     checkpoint_util.restore_model(
         checkpoint_path,
         gm,
@@ -2017,80 +2161,9 @@ def build_dense_graph_module(
         sparse_attrs[name + "__length_per_key"] = length_per_key
 
     logger.info("exporting dense model on CPU...")
-    graph = copy.deepcopy(full_graph)
-    output_keys = []
-    output_values = []
-    dense_graph_config = defaultdict()
-    for node in graph.nodes:
-        if node.op == "output":
-            for k, v in sorted(node.args[0].items()):
-                if k == TARGET_REPEAT_INTERLEAVE_KEY:
-                    continue
-                output_keys.append(k)
-                output_values.append(v)
-            graph.erase_node(node)
-    input_node = next(node for node in graph.nodes if node.op == "placeholder")
-
-    dense_graph_config["sequence__ec"] = []
-    for node in list(graph.nodes):
-        if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
-            name = node.args[0]
-            if node.kwargs.get("is_dense", False):
-                continue
-            node_kt = node.args[1]
-            with graph.inserting_before(node_kt):
-                getitem_node = graph.call_function(
-                    operator.getitem, args=(input_node, name)
-                )
-                values_node = getitem_node
-                if _is_input_tile_user_keyed_tensor(name):
-                    batch_size_node = graph.call_function(
-                        operator.getitem, args=(input_node, "batch_size")
-                    )
-                    tile_size_node = graph.call_function(
-                        _tile_size, args=(batch_size_node,)
-                    )
-                    values_node = graph.call_method(
-                        "tile", args=(getitem_node, tile_size_node, 1)
-                    )
-                new_node = graph.call_function(
-                    KeyedTensor,
-                    kwargs={
-                        "keys": sparse_attrs[name + "__keys"],
-                        "length_per_key": sparse_attrs[name + "__length_per_key"],
-                        "values": values_node,
-                    },
-                )
-                dense_graph_config[name] = [
-                    k + "__ebc" for k in cast(List[str], new_node.kwargs["keys"])
-                ]
-                node_kt.replace_all_uses_with(new_node)
-        elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
-            name = node.args[0]
-            node_jt = node.args[1]
-            with graph.inserting_before(node_jt):
-                getitem_node = graph.call_function(
-                    operator.getitem, args=(input_node, name)
-                )
-                getitem_lengths = graph.call_function(
-                    operator.getitem, args=(input_node, name + "__lengths")
-                )
-                new_node = graph.call_function(
-                    JaggedTensor,
-                    kwargs={"values": getitem_node, "lengths": getitem_lengths},
-                )
-            node_jt.replace_all_uses_with(new_node)
-            emb_name = name + "__ec"
-            dense_graph_config["sequence__ec"].append(emb_name)
-            dense_graph_config["sequence__ec"].append(name + "__lengths")
-
-    graph.output(dict(zip(output_keys, output_values)))
-    gm = torch.fx.GraphModule(model, graph)
-    gm.graph.eliminate_dead_code()
-    gm = _prune_unused_param_and_buffer(gm)
-
-    init_parameters(gm, device)
-    gm.to(device)
+    gm, dense_graph_config = _rewrite_dense_serving_graph(
+        full_graph, model, sparse_attrs, device
+    )
     return gm, full_graph, dense_graph_config
 
 

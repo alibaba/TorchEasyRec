@@ -101,7 +101,6 @@ def assemble_into(
 _CODEBOOK = [4, 4, 4]
 _WORDS = ["History", "Predict", ":", ".", "<unk>", "<|im_end|>"]
 _HIST = 'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }'
-_ANSWER = 'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }'
 
 
 def projected_feature(name: str, dim: int) -> str:
@@ -123,10 +122,7 @@ class GenrecModelTestBase(unittest.TestCase):
         self.tok = create_prompt_tokenizer(
             os.path.join(self.test_dir, "tok.json"), _WORDS
         )
-        self.features = [
-            create_prompt_feature(_HIST),
-            create_prompt_feature(_ANSWER),
-        ]
+        self.features = [create_prompt_feature(_HIST)]
         self.compiled_prompt = self._compile(self.features)
 
     def _compile(self, features, template="History : {{hist}} . Predict :", **kwargs):

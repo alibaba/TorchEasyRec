@@ -625,7 +625,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         )
         uploader = self._uploader(client_factory=factory)
 
-        with self.assertRaisesRegex(RuntimeError, "feature_store_py.*2.2.8") as ctx:
+        with self.assertRaisesRegex(RuntimeError, "feature_store_py.*2.2.10") as ctx:
             uploader.start()
 
         self.assertIsInstance(ctx.exception.__cause__, TypeError)

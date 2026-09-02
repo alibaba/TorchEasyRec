@@ -77,7 +77,6 @@ def _slot(
         if group_type == FeatureGroupType.JAGGED_SEQUENCE
         else "",
         fill=fill,
-        # a response slot compiles to STATIC(num_levels); _NUM_LEVELS mirrors it
         width=Width(WidthKind.BOUNDED, width_n)
         if width_n
         else Width(WidthKind.STATIC, _NUM_LEVELS),
@@ -202,7 +201,6 @@ class PromptAssemblerTest(unittest.TestCase):
         )
         self.assertEqual(out[PROMPT_RESPONSE_LENGTHS].tolist(), [4])
 
-        # at predict the response is dropped, and with it the answer column
         prompt_only = PromptAssembler(
             plan, _sid_space(), include_response=False
         ).forward(_parsed({"hist": [np.array([1, 6, 11])]}))
@@ -220,9 +218,7 @@ class PromptAssemblerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # a valid raw SID, but levels 1 and 2 sit below their bands
             [[1, 2, 3]],
-            # level 2 admits [8, 12); 12 is the first value past it
             [[1, 6, 12]],
         ],
         name_func=parameterized_name_func,

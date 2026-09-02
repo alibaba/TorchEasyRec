@@ -77,17 +77,13 @@ class GenrecCausalLMModelTest(GenrecModelTestBase):
 
     @parameterized.expand(
         [
-            # every request satisfiable -> the schedule is honoured verbatim
             [[2, 3, 4], [2, 3, 4]],
-            # capped by band x surviving prefixes, not by what was asked
             [[6, 12, 12], [4, 12, 12]],
-            # a flat schedule is just as valid
             [[2, 2, 2], [2, 2, 2]],
         ],
         name_func=parameterized_name_func,
     )
     def test_beam_widths_are_capped_once_at_init(self, beam_widths, expected) -> None:
-        # the kernel takes these already capped, so the derivation lives here
         model = self._model(beam_widths=beam_widths, num_return_sequences=1)
         self.assertEqual(model._capped_widths, expected)
         space = self.compiled_prompt.sid_space

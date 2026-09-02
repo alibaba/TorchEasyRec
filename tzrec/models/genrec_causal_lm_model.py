@@ -100,16 +100,14 @@ class GenrecCausalLMModel(BaseGenrecModel):
                 f"{type(self).__name__}: num_return_sequences must be >= 1, got "
                 f"{self._num_return_sequences}."
             )
-        # bands, not codebook: the kernel does not assume they are contiguous
         self._bands: List[Tuple[int, int]] = list(zip(space.band_lo, space.band_hi))
         self._capped_widths = capped_beam_widths(beam_widths, self._bands)
 
-        final_width = self._capped_widths[-1]
-        if self._num_return_sequences > final_width:
+        if self._num_return_sequences > self._capped_widths[-1]:
             raise ValueError(
                 f"{type(self).__name__}: num_return_sequences "
                 f"({self._num_return_sequences}) must not exceed the final capped "
-                f"beam width ({final_width})."
+                f"beam width ({self._capped_widths[-1]})."
             )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -126,11 +124,10 @@ class GenrecCausalLMModel(BaseGenrecModel):
         embeds = self.build_input(batch)
         if self.is_inference:
             return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
-        # a tuple, not a dict: TrainWrapper iterates what predict returns
         logits, labels = _fx_wrapped_forward(self, embeds, batch)
         return {"logits": logits, "labels": labels}
 
-    def _forward_window(
+    def _forward(
         self, embeds: torch.Tensor, batch: Batch
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the LM over the assembled embeddings and cut the response window.
@@ -240,7 +237,7 @@ def _fx_wrapped_forward(
     Returns:
         The response-window logits and labels.
     """
-    return model._forward_window(embeds, batch)
+    return model._forward(embeds, batch)
 
 
 @torch.fx.wrap

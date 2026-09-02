@@ -145,14 +145,14 @@ class PromptAssembler:
             )
         return flat.astype(np.int64, copy=False) + self._sid_space.base_vocab_size
 
-    def _pack(
+    def _build_packed_prompt(
         self,
         inline_flat: Dict[str, np.ndarray],
         inline_lengths: Dict[str, np.ndarray],
         projected_lengths: Dict[str, np.ndarray],
         batch_size: int,
     ) -> AssembledPrompt:
-        """Pack every sample in one pass over the compiled segments.
+        """Build the packed prompt in one pass over the compiled segments.
 
         The loop is over segments, which the plan fixes, never over the batch:
         each segment writes its whole column of the flat buffer at once.
@@ -191,7 +191,6 @@ class PromptAssembler:
                     f"truncated: cap the source features instead."
                 )
 
-        # row start plus the exclusive prefix sum down the segment axis
         seg_starts = cu_seqlens[:-1] + (np.cumsum(seg_lengths, axis=0) - seg_lengths)
 
         input_ids = np.empty(int(cu_seqlens[-1]), dtype=np.int64)
@@ -221,8 +220,6 @@ class PromptAssembler:
         return AssembledPrompt(
             input_ids=input_ids,
             cu_seqlens=cu_seqlens,
-            # occurrence-major then sample-major: the model concatenates the
-            # projected embeddings in projected_slots order
             hole_positions=(
                 np.concatenate(holes) if holes else np.empty(0, dtype=np.int64)
             ),
@@ -302,7 +299,7 @@ class PromptAssembler:
                 assert batch_size is not None
                 projected_lengths[seg.name] = np.ones(batch_size, dtype=np.int64)
 
-        out = self._pack(
+        out = self._build_packed_prompt(
             inline_flat,
             inline_lengths,
             projected_lengths,

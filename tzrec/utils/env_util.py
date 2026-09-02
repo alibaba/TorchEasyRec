@@ -16,6 +16,11 @@ import torch
 from tzrec.utils.logging_util import logger
 
 
+def checkpoint_tag() -> str:
+    """Label recorded in each checkpoint's success marker, empty when unset."""
+    return os.environ.get("CHECKPOINT_TAG", "")
+
+
 def use_hash_node_id() -> bool:
     """Use hash node id or not."""
     return os.environ.get("USE_HASH_NODE_ID", "0") == "1"

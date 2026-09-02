@@ -28,7 +28,6 @@ from tzrec.prompt.compile import compile_prompt
 from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.tests.prompt_test_util import (
-    _ANSWER,
     _CODEBOOK,
     _HIST,
     GenrecModelTestBase,
@@ -82,13 +81,14 @@ class BaseGenrecModelTest(GenrecModelTestBase):
             GPT2Config(n_layer=1, n_head=2, n_embd=32, vocab_size=64)
         ).save_pretrained(backbone)
 
-        with self.assertRaisesRegex(ValueError, "no.*logits_to_keep"):
+        with self.assertRaisesRegex(
+            ValueError, r"missing \['forward\(logits_to_keep\)'\]"
+        ):
             self._model(hf_model_name_or_path=backbone)
 
     def test_shared_projection_name_requires_matching_widths(self) -> None:
         features = [
             create_prompt_feature(_HIST),
-            create_prompt_feature(_ANSWER),
             create_prompt_feature(projected_feature("pa", 8)),
             create_prompt_feature(projected_feature("pb", 16)),
         ]
@@ -109,7 +109,6 @@ class BaseGenrecModelTest(GenrecModelTestBase):
     def test_projected_slot_overwrites_sentinels_and_backpropagates(self) -> None:
         features = [
             create_prompt_feature(_HIST),
-            create_prompt_feature(_ANSWER),
             create_prompt_feature(projected_feature("prof", 8)),
         ]
         compiled_prompt = self._compile(
@@ -158,7 +157,6 @@ class BaseGenrecModelTest(GenrecModelTestBase):
     def test_projected_slot_follows_a_narrow_lm_dtype(self, lm_parameter_dtype) -> None:
         features = [
             create_prompt_feature(_HIST),
-            create_prompt_feature(_ANSWER),
             create_prompt_feature(projected_feature("prof", 8)),
         ]
         compiled_prompt = self._compile(

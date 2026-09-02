@@ -107,7 +107,8 @@ class HfExportUtilTest(unittest.TestCase):
 
     def _save_ckpt(self, wrapped):
         ckpt_dir = os.path.join(self.test_dir, "model.ckpt-1")
-        save_model(ckpt_dir, wrapped)
+        with mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False):
+            save_model(ckpt_dir, wrapped)
         write_hf_assets(wrapped, ckpt_dir)
         return ckpt_dir
 

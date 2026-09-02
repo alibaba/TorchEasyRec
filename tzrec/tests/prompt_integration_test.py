@@ -46,8 +46,6 @@ class PromptStackIntegrationTest(GenrecModelTestBase):
         return batch
 
     def test_written_digests_satisfy_the_restore_guard(self) -> None:
-        # write_hf_assets is the only writer and check_prompt_assets the only
-        # reader, so a round trip is what proves they agree on the location
         from tzrec.prompt.persist import check_prompt_assets
         from tzrec.utils.hf_export_util import write_hf_assets
 
@@ -77,10 +75,6 @@ class PromptStackIntegrationTest(GenrecModelTestBase):
         self.assertTrue(bool((grad.abs().sum() > 0)))
 
     def test_training_forward_survives_fx_tracing(self) -> None:
-        # TrainPipelineSparseDist symbolically traces the model whenever a
-        # sharded module exists. Trace TrainWrapper itself, not predict alone:
-        # it iterates predictions and losses, which a leaf returning a bare
-        # Proxy cannot survive.
         model = self._model()
 
         torch.fx.symbolic_trace(TrainWrapper(model))

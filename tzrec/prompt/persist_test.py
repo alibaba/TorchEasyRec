@@ -54,10 +54,6 @@ class PromptPersistTest(unittest.TestCase):
             create_prompt_feature(
                 'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }'
             ),
-            create_prompt_feature(
-                'sequence_raw_feature { feature_name: "answer" '
-                'expression: "item:answer" }'
-            ),
         ]
 
     def _compile(self, codebook=(4, 4, 4), prompt="History : {{hist}}"):
@@ -162,7 +158,6 @@ class PromptPersistTest(unittest.TestCase):
             check_prompt_assets(self._compile(), bare)
 
     def test_hf_metadata_without_digests_is_fatal(self) -> None:
-        # a non-prompt HF model writes the metadata file with no digests in it
         ckpt = os.path.join(self.test_dir, "model.ckpt-nodigest")
         os.makedirs(ckpt, exist_ok=True)
         with open(os.path.join(ckpt, HF_EXPORT_META_FILENAME), "w") as f:

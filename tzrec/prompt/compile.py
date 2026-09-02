@@ -276,9 +276,6 @@ def compile_prompt(
 
     members: Dict[str, List[BaseFeature]] = {}
     for name, slot in resolved_slots_by_name.items():
-        # the answer is the supervised target, so it is declared as a label; it
-        # is deliberately not a feature, which is what lets it be absent at
-        # inference without the parser demanding its column
         source = label_field_names if name in response_slot_names else features_by_name
         missing = [
             source_name
@@ -310,8 +307,6 @@ def compile_prompt(
     fill_modes_by_slot_name: Dict[str, FillMode] = {}
     for name, slot_members in members.items():
         if name in response_slot_names:
-            # a label carries no schema, so the layout is fixed rather than
-            # derived: the LM emits the answer as vocabulary tokens
             group_type, fill_mode = FeatureGroupType.JAGGED_SEQUENCE, FillMode.INLINE
         else:
             group_type, fill_mode = _derive_slot_layout(name, slot_members)
@@ -354,7 +349,6 @@ def compile_prompt(
             ),
             fill=fill_mode,
             width=(
-                # exactly one SID item, so the codebook depth sizes it
                 Width(WidthKind.STATIC, sid_space.num_levels)
                 if name in response_slot_names
                 else _slot_width(members[name], group_type)

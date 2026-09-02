@@ -300,7 +300,7 @@ torch.AcceleratorError: CUDA error: an illegal memory access was encountered
 
 **原因：** Triton 3.7.1 自带的 ptxas 12.8.93 在 Hopper（如 H20，sm_90）上会误编译 HSTU 的 WGMMA kernel：`_hstu_attn_bwd` 内核在 autotuning 阶段的共享内存访问越界（约 246 KiB，超出 H20 的 228 KiB 上限），触发非法内存访问（compute-sanitizer 下可见 `Invalid __shared__ read`）。该问题由 Triton `release/3.7` 分支的 commit `6c96454f2f` 将内置 ptxas 从 12.9.86 降级到 12.8.93 引入；换用 ptxas 12.9.86 即可修复（与 MMA v3 代码生成、triton-lang/triton#9514 均无关——经 H20 实测单独打入 #9514 仍报越界）。
 
-**解决方法：** 1.3.0 镜像已内置修复——将官方 triton 3.7.1 wheel 中的 `backends/nvidia/bin/ptxas` 替换为 12.9.86 后重新打包，默认即生效，无需 `DISABLE_MMA_V3`，也不损失 Hopper v3 性能。如需在其它环境手动安装该修复版 wheel：
+**解决方法：** 1.4.0 镜像已内置修复——将官方 triton 3.7.1 wheel 中的 `backends/nvidia/bin/ptxas` 替换为 12.9.86 后重新打包，默认即生效，无需 `DISABLE_MMA_V3`，也不损失 Hopper v3 性能。如需在其它环境手动安装该修复版 wheel：
 
 ```bash
 pip install --force-reinstall --no-deps \
@@ -341,3 +341,53 @@ model_config {
 ```
 
 具体余量需大于`max_contextual_seq_len + 1`（`max_contextual_seq_len` = contextual feature group的特征数）。
+
+______________________________________________________________________
+
+**Q17: MaxCompute Storage API读表失败**
+
+**报错信息：** 图采样（负采样/TDM）加载图数据时报错，最终sampler server退出，训练任务失败：
+
+```
+E0824 16:36:02.523523 163241 storage_api_file_system.cc:309] Fail to create read session:
+E0824 16:36:02.523869 163241 edge_loader.cc:99] Try to read next edge file failed, Internal:Failed to create read session.
+E0824 16:36:06.686076 163234 storage_api_file_system.cc:309] Fail to create read session: Read error
+E0824 16:36:04.137389 163237 storage_api_file_system.cc:372] Reach the end of OdpsTable
+F0824 16:36:33.027580 163127 server_impl.cc:172] Server load data failed: Internal:Failed to create read session.
+```
+
+**原因：** graphlearn 1.3.8及以前版本和pyodps 0.12.x的storage api读表实现有缺陷：session创建的瞬时失败不重试，读流中断还会被当作读完，导致数据静默截断。
+
+**解决方法：** 升级依赖graphlearn>=1.3.9、pyodps>=0.13.1，TorchEasyRec 1.3.19之后的版本已默认包含。已有环境可手动升级（`cp311`需替换为实际的python版本）：
+
+```bash
+pip install --force-reinstall --no-deps \
+  https://tzrec.oss-accelerate.aliyuncs.com/third_party/graphlearn/graphlearn-1.3.9-cp311-cp311-linux_x86_64.whl
+pip install -U "pyodps>=0.13.1"
+```
+
+**排查与调优：** graphlearn>=1.3.9新增了以下环境变量，默认值一般无需修改。如果升级后读表仍然失败，优先设置`STORAGE_API_LOG_LEVEL=DEBUG`，SDK默认只按ERROR级别打日志，看不到失败请求的HTTP状态码和响应体，DEBUG可以打印出来（输出到stdout）。
+
+| 环境变量                           | 默认值         | 作用                                                                    |
+| ---------------------------------- | -------------- | ----------------------------------------------------------------------- |
+| `STORAGE_API_LOG_LEVEL`            | SDK默认(ERROR) | 设为`DEBUG`打印失败请求的HTTP状态码与响应体，可选`DEBUG`/`INFO`/`ERROR` |
+| `STORAGE_API_CONNECT_TIMEOUT`      | 180（秒）      | socket连接超时                                                          |
+| `STORAGE_API_SOCKET_TIMEOUT`       | 300（秒）      | socket读写超时                                                          |
+| `STORAGE_API_RETRY_TIMES`          | 5              | create read session的重试次数（指数退避+抖动）                          |
+| `STORAGE_API_READ_RETRY_TIMES`     | 5              | 读流中断后从首个未消费行续读的重试次数                                  |
+| `STORAGE_API_SDK_RETRY_TIMES`      | 5              | SDK内部重试次数（仅对连接错误生效）                                     |
+| `STORAGE_API_SESSION_POLL_TIMEOUT` | 600（秒）      | 等待read session离开INIT状态的超时时间                                  |
+| `STORAGE_API_COMPRESSION`          | `LZ4_FRAME`    | 传输压缩方式，可选`ZSTD`/`UNCOMPRESSED`                                 |
+
+**Q18: 如何复现实验**
+
+**解决方法：** TorchEasyRec通过环境变量控制随机性，不需要在模型或启动脚本里自己调用`torch.manual_seed`：
+
+```bash
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTHON_RANDOM_SEED=100007
+export NUMPY_MANUAL_SEED=100007
+export TORCH_MANUAL_SEED=100007          # 同时会设置所有CUDA设备的种子
+export USE_DETERMINISTIC_ALGORITHMS=1    # 已包含cudnn的确定性行为
+```

@@ -9,13 +9,113 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import unittest
+from unittest import mock
 
+from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util
+from tzrec.utils.test_util import make_test_dir
 
 
 class ConfigUtilTest(unittest.TestCase):
+    _UNREGISTERED_MODEL_CONFIG = """
+        train_input_path: "odps://train"
+        feature_configs {
+          id_feature { feature_name: "f1" embedding_dim: 16 }
+        }
+        model_config {
+          feature_groups {
+            group_name: "g1"
+            feature_names: "f1"
+            group_type: DEEP
+          }
+          custom_model {
+            config {
+              [type.googleapis.com/my_models.protos.CustomRankModelConfig] {
+                mlp { hidden_units: 128 }
+              }
+            }
+            class_path: "my_models.models.rank.MyRankModel"
+          }
+        }
+        """
+
+    def test_preload_custom_model(self):
+        with mock.patch("tzrec.utils.config_util.import_class") as import_class:
+            config_util._preload_custom_model(
+                self._UNREGISTERED_MODEL_CONFIG, is_json=False
+            )
+        import_class.assert_called_once_with("my_models.models.rank.MyRankModel")
+
+    def test_preload_custom_model_json(self):
+        content = json.dumps(
+            {
+                "trainInputPath": "odps://train",
+                "modelConfig": {
+                    "customModel": {
+                        "config": {
+                            "@type": (
+                                "type.googleapis.com/"
+                                "my_models.protos.CustomRankModelConfig"
+                            ),
+                            "mlp": {"hiddenUnits": [128]},
+                        },
+                        "classPath": "my_models.models.rank.MyRankModel",
+                    }
+                },
+            }
+        )
+        with mock.patch("tzrec.utils.config_util.import_class") as import_class:
+            config_util._preload_custom_model(content, is_json=True)
+        import_class.assert_called_once_with("my_models.models.rank.MyRankModel")
+
+    def test_preload_custom_model_without_custom_model(self):
+        with mock.patch("tzrec.utils.config_util.import_class") as import_class:
+            config_util._preload_custom_model('train_input_path: "a"', is_json=False)
+        import_class.assert_not_called()
+
+    def test_load_custom_model_any_config(self):
+        config_path = os.path.join(make_test_dir(), "custom_model.config")
+        with open(config_path, "w") as f:
+            f.write(
+                """
+                model_config {
+                  custom_model {
+                    class_path: "tzrec.models.model.BaseModel"
+                    config {
+                      [type.googleapis.com/tzrec.protos.MLP] {
+                        hidden_units: 32
+                        hidden_units: 16
+                      }
+                    }
+                  }
+                }
+                """
+            )
+
+        pipeline_config = config_util.load_pipeline_config(config_path)
+        mlp_config = config_util.unpack_any(
+            pipeline_config.model_config.custom_model.config
+        )
+        self.assertEqual(list(mlp_config.hidden_units), [32, 16])
+
+    def test_unpack_any_not_set(self):
+        self.assertIsNone(
+            config_util.unpack_any(EasyRecConfig().model_config.custom_model.config)
+        )
+
+    def test_unpack_any_unregistered_type(self):
+        model_config = EasyRecConfig().model_config
+        model_config.custom_model.config.Pack(MLP(hidden_units=[8]))
+        model_config.custom_model.config.type_url = (
+            "type.googleapis.com/my_models.protos.NotRegistered"
+        )
+        with self.assertRaisesRegex(ValueError, "is not registered"):
+            config_util.unpack_any(model_config.custom_model.config)
+
     def test_get_inference_batch_size(self):
         pipeline_config = EasyRecConfig()
         pipeline_config.data_config.batch_size = 16

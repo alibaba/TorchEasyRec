@@ -31,7 +31,6 @@ _WORDS = ["History", "Profile", "Predict", ":", ".", "Histor0", "<unk>", "<|im_e
 
 
 _HIST = 'sequence_raw_feature { feature_name: "hist" expression: "user:hist" }'
-_ANSWER = 'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }'
 _PROF = (
     'sequence_id_feature { feature_name: "prof" expression: "user:prof" '
     "num_buckets: 768 embedding_dim: 16 sequence_length: 4 }"
@@ -52,9 +51,6 @@ class CompilePromptTest(unittest.TestCase):
         return cfg
 
     def _compile(self, cfg, features):
-        named = {f.name for f in features}
-        if "{{answer}}" in cfg.response and "answer" not in named:
-            features = list(features) + [create_prompt_feature(_ANSWER)]
         return compile_prompt(cfg, features, ["answer"])
 
     def test_sid_space_resolves_offsets_and_bands(self) -> None:
@@ -212,10 +208,7 @@ class CompilePromptTest(unittest.TestCase):
     def test_answer_width_comes_from_the_codebook(self) -> None:
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
-        answer = create_prompt_feature(
-            'sequence_raw_feature { feature_name: "answer" expression: "item:answer" }'
-        )
-        compiled = self._compile(cfg, [create_prompt_feature(_HIST), answer])
+        compiled = self._compile(cfg, [create_prompt_feature(_HIST)])
 
         seg = next(
             s for s in compiled.prompt_plan.response_segments if isinstance(s, SlotSeg)
@@ -228,8 +221,6 @@ class CompilePromptTest(unittest.TestCase):
         self.assertEqual(compiled.prompt_plan.logits_suffix_len, 4)
 
     def test_response_must_name_a_label_field(self) -> None:
-        # the answer is the supervised target, so it is declared in
-        # label_fields; naming a feature instead is the common mistake
         cfg = self._config(prompt="History : {{hist}}", response="{{prof}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
 

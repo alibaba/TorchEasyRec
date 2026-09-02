@@ -24,6 +24,8 @@ from tzrec.features.feature import (
 )
 from tzrec.protos.feature_pb2 import FeatureConfig
 
+_OFFICIAL_OP_LIB_PREFIX = "pyfg/lib/"
+
 
 class CustomFeature(BaseFeature):
     """CustomFeature class.
@@ -173,11 +175,11 @@ class CustomFeature(BaseFeature):
         """Operator library file path."""
         if self.config.HasField("operator_lib_file"):
             operator_lib_file = self.config.operator_lib_file
-            if operator_lib_file.startswith("pyfg/lib/"):
+            if operator_lib_file.startswith(_OFFICIAL_OP_LIB_PREFIX):
                 # official lib
                 pyfg_dir, _ = os.path.split(pyfg.__file__)
                 operator_lib_file = os.path.join(
-                    pyfg_dir, operator_lib_file.replace("pyfg/lib/", "lib/")
+                    pyfg_dir, operator_lib_file.replace(_OFFICIAL_OP_LIB_PREFIX, "lib/")
                 )
             if self.config.HasField("asset_dir"):
                 operator_lib_file = os.path.join(
@@ -191,4 +193,35 @@ class CustomFeature(BaseFeature):
         """Asset file paths."""
         assets = {}
         assets["operator_lib_file"] = self.operator_lib_file
+        if len(self.vocab_file) > 0:
+            assets["vocab_file"] = self.vocab_file
         return assets
+
+    def odps_assets(self) -> Dict[str, str]:
+        """Asset file paths for odps fg."""
+        assets = {}
+        if not self.config.operator_lib_file.startswith(_OFFICIAL_OP_LIB_PREFIX):
+            # odps fg ships and uploads official operator libs itself, an user
+            # compiled one should be built with _GLIBCXX_USE_CXX11_ABI=0.
+            if not self.config.HasField("operator_lib_cxx11abi0_file"):
+                raise ValueError(
+                    f"feature[{self.name}] should set operator_lib_cxx11abi0_file "
+                    "to the operator lib compiled with _GLIBCXX_USE_CXX11_ABI=0, "
+                    "which is required by odps fg."
+                )
+            operator_lib_file = self.config.operator_lib_cxx11abi0_file
+            if self.config.HasField("asset_dir"):
+                operator_lib_file = os.path.join(
+                    self.config.asset_dir, operator_lib_file
+                )
+            assets["operator_lib_file"] = operator_lib_file
+        if len(self.vocab_file) > 0:
+            assets["vocab_file"] = self.vocab_file
+        return assets
+
+    def odps_fg_json(self) -> List[Dict[str, Any]]:
+        """Get fg json config for odps fg."""
+        fg_cfgs = self.fg_json()
+        if self.config.operator_lib_file.startswith(_OFFICIAL_OP_LIB_PREFIX):
+            fg_cfgs[0]["operator_lib_file"] = self.config.operator_lib_file
+        return fg_cfgs

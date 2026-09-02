@@ -108,12 +108,13 @@ class MultiTaskRank(RankModel):
                     loss_weight = batch.sample_weights[sample_weight]
                 else:
                     loss_weight = torch.Tensor([1.0]).to(
-                        batch.labels[label_name].device
+                        self.get_label(batch, label_name).device
                     )
 
                 if task_tower_cfg.HasField("task_space_indicator_label"):
                     in_task_space = (
-                        batch.labels[task_tower_cfg.task_space_indicator_label] > 0
+                        self.get_label(batch, task_tower_cfg.task_space_indicator_label)
+                        > 0
                     ).float()
                     loss_weight = loss_weight * (
                         task_tower_cfg.in_task_space_weight * in_task_space
@@ -131,7 +132,7 @@ class MultiTaskRank(RankModel):
                     self._loss_impl(
                         predictions,
                         batch,
-                        batch.labels[label_name],
+                        self.get_label(batch, label_name),
                         loss_weight,
                         loss_cfg,
                         num_class=task_tower_cfg.num_class,
@@ -180,7 +181,7 @@ class MultiTaskRank(RankModel):
                 self._update_metric_impl(
                     predictions,
                     batch,
-                    batch.labels[label_name],
+                    self.get_label(batch, label_name),
                     metric_cfg,
                     num_class=task_tower_cfg.num_class,
                     suffix=f"_{tower_name}",
@@ -190,7 +191,7 @@ class MultiTaskRank(RankModel):
                     self._update_loss_metric_impl(
                         losses,
                         batch,
-                        batch.labels[label_name],
+                        self.get_label(batch, label_name),
                         loss_cfg,
                         suffix=f"_{tower_name}",
                     )
@@ -213,7 +214,7 @@ class MultiTaskRank(RankModel):
                 self._update_train_metric_impl(
                     predictions,
                     batch,
-                    batch.labels[label_name],
+                    self.get_label(batch, label_name),
                     metric_cfg,
                     num_class=task_tower_cfg.num_class,
                     suffix=f"_{tower_name}",

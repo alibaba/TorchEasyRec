@@ -145,20 +145,12 @@ class BaseGenrecModel(BaseModel):
         for name in ("vocab_size", "hidden_size"):
             if not hasattr(self.lm.config, name):
                 missing.append(f"config.{name}")
+        if "logits_to_keep" not in inspect.signature(type(self.lm).forward).parameters:
+            missing.append("forward(logits_to_keep)")
         if missing:
             raise ValueError(
                 f"{type(self).__name__}: {hf_model_name_or_path} builds "
                 f"{type(self.lm).__name__}, which is missing {sorted(missing)}."
-            )
-        # both the forward and the decode ask for a narrow window of logits;
-        # without it the full (batch, length, vocab) tensor is unavoidable
-        if "logits_to_keep" not in inspect.signature(type(self.lm).forward).parameters:
-            raise ValueError(
-                f"{type(self).__name__}: {hf_model_name_or_path} builds "
-                f"{type(self.lm).__name__}, whose forward has no "
-                f"logits_to_keep, so logits cannot be narrowed to the response "
-                f"window. Use a backbone that accepts it, such as Qwen2.5 or "
-                f"Qwen3."
             )
 
     def init_projections(self) -> None:
