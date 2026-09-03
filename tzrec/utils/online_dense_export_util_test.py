@@ -825,16 +825,23 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         self.assertEqual(payload["sparse_probes"], probes[:64])
 
     def test_latest_wins_publishes_only_newest_ready_version(self) -> None:
-        """Of two ready versions only the newest flips, once its step is covered."""
+        """Only the newest ready version flips; the superseded one is removed."""
         state = {"model.w": torch.zeros(2)}
         with tempfile.TemporaryDirectory() as tmp_dir:
             with self._tiny_manager(tmp_dir, state) as mgr:
                 mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
                 self.assertTrue(_wait_for(lambda: (mgr._ready or {}).get("step") == 5))
+                superseded_version = mgr._ready["version"]
                 mgr.maybe_export(7, 43.0, _mock_model(state), force=True)
                 self.assertTrue(_wait_for(lambda: (mgr._ready or {}).get("step") == 7))
+                # the superseded step-5 version was never published and is
+                # removed, so it cannot pile up or count against retention
+                self.assertFalse(
+                    os.path.exists(
+                        os.path.join(_versions_root(tmp_dir), superseded_version)
+                    )
+                )
                 current_path = _current_path(tmp_dir)
-                # the superseded step-5 version never publishes on its own
                 mgr.poll_publish((5, []))
                 self.assertFalse(os.path.exists(current_path))
                 mgr.poll_publish((7, []))
@@ -842,9 +849,8 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     payload = json.load(f)
                 self.assertEqual(payload["checkpoint_step"], 7)
                 self.assertEqual(payload["data_timestamp"], 43.0)
-                versions = sorted(os.listdir(_versions_root(tmp_dir)))
-                self.assertEqual(len(versions), 2)
-                self.assertEqual(payload["version"], versions[-1])
+                versions = os.listdir(_versions_root(tmp_dir))
+                self.assertEqual(versions, [payload["version"]])
                 # nothing left to publish: a later poll leaves the pointer alone
                 mgr.poll_publish((9, []))
                 with open(current_path) as f:

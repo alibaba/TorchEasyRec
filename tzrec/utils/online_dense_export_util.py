@@ -54,7 +54,8 @@ current.json (manifest v2):
   64 in total, may be empty); the processor verifies each (pk, sk, crc32)
   through its serving read path before hot-swapping the dense model, and an
   empty list (offline bootstrap) skips verification.
-- The processor reads only the version named by ``current.json``.
+- The processor reads only the version named by ``current.json``; a version
+  superseded by a newer build before it was published is removed.
 """
 
 import datetime
@@ -794,7 +795,10 @@ class OnlineDenseExportManager:
         Builds the immutable version directory (READY marker + atomic
         rename) but does not flip current.json: the finished version is
         recorded as the newest ready one and published only when the sparse
-        upload watermark covers its step.
+        upload watermark covers its step. A previously ready but still
+        unpublished version is superseded and its directory removed, so
+        unpublished builds neither pile up while the watermark lags nor eat
+        into the newest-K retention quota of published versions.
         """
         version = task["version"]
         versions_root = os.path.join(self._export_root, VERSIONS_DIR)
@@ -841,14 +845,24 @@ class OnlineDenseExportManager:
             raise
 
         with self._publish_lock:
-            if self._ready is not None:
+            superseded = self._ready
+            if superseded is not None:
+                # Never named by current.json, so nothing can reference it.
+                superseded_dir = os.path.join(versions_root, superseded["version"])
                 logger.info(
                     "online dense export version %s (step %s) superseded by %s "
-                    "before publish",
-                    self._ready["version"],
-                    self._ready["step"],
+                    "before publish; removing %s",
+                    superseded["version"],
+                    superseded["step"],
                     version,
+                    superseded_dir,
                 )
+                try:
+                    shutil.rmtree(superseded_dir)
+                except OSError as e:
+                    logger.warning(
+                        "failed to remove superseded version %s: %s", superseded_dir, e
+                    )
             self._ready = {
                 "step": task["step"],
                 "version": version,

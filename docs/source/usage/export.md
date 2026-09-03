@@ -104,7 +104,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 - 仅 rank 0 执行建图与发布；启动时会对整条建图 + script 链路做一次试运行，任何 trace/script 失败会在训练开始前就暴露（fail-fast）。
 - 启动时还会校验 dense 图的每个参数都能在训练模型 state dict 中找到来源（INPUT_TILE=3 的 user 侧孪生模块自动回落到非 user 侧权重），校验失败训练不会启动。
 - 导出在后台线程执行，dense 版本构建失败（日志中 `online dense export task failed`）只跳过该版本、不翻转 `current.json`，训练继续，由后续版本取代；FeatureStore 上传失败则会使训练报错退出，指针同样不翻转。两种失败下推理侧都停留在上一个自洽版本。
-- 两次导出间隔小于单次导出耗时时，排队中的旧任务被最新版本顶替（latest-wins），不产生积压；水位到达后也只发布最新的就绪版本。
+- 两次导出间隔小于单次导出耗时时，排队中的旧任务被最新版本顶替（latest-wins），不产生积压；水位到达后也只发布最新的就绪版本，被顶替的未发布版本目录会被直接删除，不占用 `ONLINE_DENSE_EXPORT_KEEP_VERSIONS` 的保留配额。
 - 新鲜度预算：dump/发布间隔必须大于单次增量上传耗时的 p99（可通过监控上传耗时占发布间隔的比例确认），否则全局水位持续落后于配对步，`current.json` 长期不翻转。
 - 建议周期性做全量再基线（anti-entropy）：停训后用离线全量导出 + FeatureStore 全量导入，再用下述 bootstrap 命令发布配对的 dense 版本，以清理 crash 重启死时间线残留的旧值、僵尸 tombstone 等漂移。全量导入必须以重启式切换进行，不能在增量流写入的同时在线叠写。
 - MatchModel（向量召回）与 TDM 模型的完整导出按 user/item（或按模块）分目录，与单体 dense 热导出的布局不兼容，启用会直接报错，请使用完整的 `tzrec.export`。
