@@ -205,8 +205,6 @@ train_config {
 1. `global_embedding_constraints`
 1. 框架默认，即不限制
 
-某张表命中更高优先级的约束后，`global_embedding_constraints`对它完全失效，两者不做字段级合并。这也是配置了`global_embedding_constraints`却未生效的首要排查方向，训练日志中会打印最终的sharding plan，可以逐表确认实际的分片方式和计算内核
-
 **Note**: 分片为`data_parallel`的Embedding表只能使用`dense`计算内核，没有fused TBE，因此它不由sparse_optimizer管理
 
 - 该表由dense_optimizer更新，sparse_optimizer中配置的优化器类型和LR策略对它不生效，它跟随dense_optimizer的LR策略
