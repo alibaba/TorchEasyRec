@@ -112,6 +112,9 @@ LR策略可以支持按epoch更新或者按step更新
 - tensorboard_summaries: 设置需要在tensorboard中展示的数据， 只在use_tensorboard为true时生效。 可选值为["loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"], 默认值是["loss", "learning_rate"]。 在训练数据量大， 训练时长较长时， 酌情开启"parameter"、 "gradient"、"gradient_norm", 避免出现性能问题。
 - cudnn_allow_tf32: cudnn是否打开tf32精度训练，默认为true
 - cuda_matmul_allow_tf32: cuda matmul 及 tzrec中的triton op是否打开tf32精度训练，默认为false，设置为true可加速训练
+- global_embedding_constraints: **全局Embedding分片约束**，限制planner可选的分片方式和计算内核，默认不配置，即planner自由寻优，详见[Embedding分片约束](#embedding-sharding-constraints)
+  - sharding_types: 允许的分片方式列表
+  - compute_kernels: 允许的计算内核列表
 - mixed_precision: **混合精度训练**，默认不开启，可以配置'BF16'或'FP16'
 - grad_scaler: 梯度动态缩放配置，使用FP16的情况下建议配置，参考[GradScaler](https://docs.pytorch.org/docs/stable/notes/amp_examples.html#typical-mixed-precision-training)
 
@@ -177,3 +180,35 @@ export CROSS_NODE_BANDWIDTH=$(awk 'BEGIN {printf("%f", 3 * 1024 * 1024 * 1024 / 
 ```bash
 export STORAGE_RESERVE_PERCENT=0.5
 ```
+
+(embedding-sharding-constraints)=
+
+### Embedding分片约束
+
+如果需要人为收窄planner的寻优空间，可以配置`train_config.global_embedding_constraints`，它对所有Embedding表生效。不配置时planner在全部分片方式和计算内核中自由寻优
+
+- sharding_types: 允许的分片方式列表，可选值为`data_parallel`、`table_wise`、`column_wise`、`row_wise`、`table_row_wise`、`table_column_wise`、`grid_shard`，为空表示不限制
+- compute_kernels: 允许的计算内核列表，可选值为`dense`、`fused`、`fused_uvm`、`fused_uvm_caching`、`key_value`，为空表示不限制
+
+```
+train_config {
+    global_embedding_constraints {
+        sharding_types: ['table_wise', 'row_wise']
+    }
+}
+```
+
+约束以表为单位生效，优先级从高到低为：
+
+1. 单个特征上配置的`embedding_constraints`，配置了dynamicemb的特征会自动带上`row_wise`约束
+1. checkpoint的plan中记录的分片方式：增量训练/续训时，plan中为`data_parallel`的表会被固定为`data_parallel`，因为`data_parallel`的优化器state在checkpoint中的key命名与`row_wise`、`table_wise`不同，无法直接切换；设置环境变量`FORCE_LOAD_SHARDING_PLAN=1`时，plan中所有表的分片方式都会被固定
+1. `global_embedding_constraints`
+1. 框架默认，即不限制
+
+某张表命中更高优先级的约束后，`global_embedding_constraints`对它完全失效，两者不做字段级合并。这也是配置了`global_embedding_constraints`却未生效的首要排查方向，训练日志中会打印最终的sharding plan，可以逐表确认实际的分片方式和计算内核
+
+**Note**: 分片为`data_parallel`的Embedding表只能使用`dense`计算内核，没有fused TBE，因此它不由sparse_optimizer管理
+
+- 该表由dense_optimizer更新，sparse_optimizer中配置的优化器类型和LR策略对它不生效，它跟随dense_optimizer的LR策略
+- 该表的参数会参与`dense_optimizer.part_optimizers`的`regex_pattern`匹配，也会被`dense_optimizer.ema`纳入
+- 如需让所有Embedding都由sparse_optimizer管理，可以在`sharding_types`中排除`data_parallel`
