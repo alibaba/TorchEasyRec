@@ -1868,7 +1868,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
         self.assertIsNone(output_path)
 
-    def test_completed_upload_state_local_mode_advances_after_empty_dump(self):
+    def test_completed_upload_state_is_none_in_local_mode(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dumper = object.__new__(DeltaEmbeddingDumper)
             dumper._output_dir = tmp_dir
@@ -1881,16 +1881,15 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
             dumper._schema = _DELTA_DUMP_SCHEMA
             dumper._dump_evicted_tombstones = False
-            dumper._local_completed_step = 0
-            self.assertEqual(dumper.completed_upload_state(), (0, []))
+            self.assertIsNone(dumper.completed_upload_state())
             with (
                 mock.patch.object(dumper, "_collect_table_weights", return_value={}),
                 mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
                 mock.patch.object(dumper, "_append_model_delta_rows", return_value=0),
             ):
                 self.assertIsNone(dumper.dump(50))
-        # Even an empty local dump advances the watermark, with no probes.
-        self.assertEqual(dumper.completed_upload_state(), (50, []))
+        # A local write is not an upload: no watermark can gate a dense publish.
+        self.assertIsNone(dumper.completed_upload_state())
 
     def test_completed_upload_state_delegates_to_uploader(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -1919,7 +1918,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
             dumper._schema = _DELTA_DUMP_SCHEMA
             dumper._dump_evicted_tombstones = False
-            dumper._local_completed_step = 0
             with (
                 mock.patch.object(dumper, "_collect_table_weights", return_value={}),
                 mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
@@ -1931,8 +1929,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(step, 50)
         self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
         self.assertEqual(table.num_rows, 0)
-        # The uploader's completion watermark, not the local one, tracks this.
-        self.assertEqual(dumper._local_completed_step, 0)
 
     def test_dump_submits_concatenated_rows_to_uploader(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1947,7 +1943,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
             dumper._schema = _DELTA_DUMP_SCHEMA
             dumper._dump_evicted_tombstones = False
-            dumper._local_completed_step = 0
 
             def append_rows(table_chunks, **kwargs):
                 return dumper._append_table_chunk(
@@ -1973,7 +1968,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(step, 50)
         self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
         self.assertEqual(table["key_id"].to_pylist(), [7])
-        self.assertEqual(dumper._local_completed_step, 0)
 
     def test_pause_tracking_suppresses_post_lookup_recording(self):
         tracker = object.__new__(ModelDeltaTracker)

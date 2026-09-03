@@ -33,7 +33,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.protos.train_pb2 import TrainConfig
+from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, TrainConfig
 from tzrec.utils import predict_util
 from tzrec.utils.test_util import parameterized_name_func
 
@@ -196,6 +196,55 @@ class MainTest(unittest.TestCase):
         self.assertTrue(model.module.model.on_train_end.called)
         for call in exporter.maybe_export.call_args_list:
             self.assertIsNone(call.kwargs["dense_ema"])
+
+    @parameterized.expand(
+        [
+            ["no_dumper", None, False],
+            ["local_dump_only", DeltaEmbeddingDumpConfig(dump_interval_steps=1), True],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_online_dense_export_requires_feature_store_upload(
+        self,
+        _name: str,
+        dump_config: DeltaEmbeddingDumpConfig,
+        has_dumper: bool,
+    ) -> None:
+        """Enabled export must fail fast unless the sparse delta is uploaded.
+
+        Without a FeatureStore uploader there is no upload watermark to gate
+        current.json on, so a local-only dump would publish dense ahead of the
+        serving-side sparse state.
+        """
+        exporter = mock.Mock()
+        exporter.enabled = True
+        train_config = TrainConfig(
+            num_steps=1,
+            num_epochs=0,
+            save_checkpoints_steps=0,
+            use_tensorboard=False,
+            dense_optimizer=DenseOptimizer(),
+        )
+        if dump_config is not None:
+            train_config.delta_embedding_dump_config.CopyFrom(dump_config)
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "feature_store_config"):
+                _train_and_evaluate(
+                    model=mock.Mock(),
+                    optimizer=mock.Mock(),
+                    train_dataloader=mock.Mock(),
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir="unused",
+                    train_config=train_config,
+                    eval_config=EvalConfig(),
+                    ckpt_manager=mock.Mock(),
+                    delta_embedding_dumper=mock.Mock() if has_dumper else None,
+                )
 
 
 class PredictionLifecycleTest(unittest.TestCase):

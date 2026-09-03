@@ -53,7 +53,7 @@ current.json (manifest v2):
 - ``sparse_probes`` samples keys from the completed sparse uploads (capped at
   64 in total, may be empty); the processor verifies each (pk, sk, crc32)
   through its serving read path before hot-swapping the dense model, and an
-  empty list (local dump mode, offline bootstrap) skips verification.
+  empty list (offline bootstrap) skips verification.
 - The processor reads only the version named by ``current.json``.
 """
 

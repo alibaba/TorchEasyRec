@@ -498,10 +498,15 @@ def _train_and_evaluate(
         model,
         publish_interval_minutes=publish_interval_minutes,
     )
-    if online_dense_exporter.enabled and delta_embedding_dumper is None:
+    if online_dense_exporter.enabled and (
+        delta_embedding_dumper is None
+        or not train_config.delta_embedding_dump_config.HasField("feature_store_config")
+    ):
         raise RuntimeError(
-            "ONLINE_DENSE_EXPORT=1 requires train_config.delta_embedding_dump_config: "
-            "the delta dump decision is the only dense export trigger."
+            "ONLINE_DENSE_EXPORT=1 requires train_config.delta_embedding_dump_config "
+            "with feature_store_config: the delta dump decision is the only dense "
+            "export trigger and the FeatureStore upload watermark is the only "
+            "publish gate."
         )
 
     # this rank's last consumed event-time, reused by the epoch / final saves

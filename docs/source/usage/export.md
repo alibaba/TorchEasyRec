@@ -66,7 +66,7 @@ dense 导出触发与增量 embedding dump 统一：每个 dump 边界（`dump_i
 
 ### 启用方式
 
-训练配置中必须开启增量 embedding dump（dense 导出节奏完全由它决定，详见 [DeltaEmbeddingDumpConfig](../proto.html#tzrec.protos.DeltaEmbeddingDumpConfig)）：
+训练配置中必须开启增量 embedding dump 并配置 FeatureStore 上传（dense 导出节奏完全由 dump 决定，发布水位来自上传完成进度，详见 [DeltaEmbeddingDumpConfig](../proto.html#tzrec.protos.DeltaEmbeddingDumpConfig)）：
 
 ```
 train_config {
@@ -94,7 +94,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 ### 环境变量
 
 - ONLINE_DENSE_EXPORT: 开启训练内在线 dense 导出，默认关闭
-  - **ONLINE_DENSE_EXPORT=1**：启用（要求同时设置 `USE_DISTRIBUTED_EMBEDDING=1`，并在 `train_config` 中配置 `delta_embedding_dump_config`，缺少任一项训练启动即报错）
+  - **ONLINE_DENSE_EXPORT=1**：启用（要求同时设置 `USE_DISTRIBUTED_EMBEDDING=1`，并在 `train_config` 中配置带 `feature_store_config` 的 `delta_embedding_dump_config`；仅本地落盘的 dump 没有上传水位可供门控，缺少任一项训练启动即报错）
 - ONLINE_DENSE_EXPORT_DIR: 在线服务读取的根目录（必填）。导出产物发布在 `<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export` 下，必须为本地路径（发布依赖 `os.rename` 原子换版）；`model_dir` 可以是远端（如 OSS）
 - ONLINE_DENSE_EXPORT_KEEP_VERSIONS: 保留的历史版本数，默认 0（不删除任何已导出的版本）。大于 0 时保留最新 K 个版本，且 K 最小为 3（serving 需要当前版本 + 上一版本用于原子切换）。`current.json` 指向的版本永远不被清理
 - ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 的等待上限

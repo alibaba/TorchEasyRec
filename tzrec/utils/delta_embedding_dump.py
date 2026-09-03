@@ -699,7 +699,6 @@ class DeltaEmbeddingDumper:
             self._interval_steps = int(config.dump_interval_steps)
         self._next_dump_time: Optional[float] = None
         self._last_dump_step: Optional[int] = None
-        self._local_completed_step = 0
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
         )
@@ -846,17 +845,17 @@ class DeltaEmbeddingDumper:
         if self._uploader is not None:
             self._uploader.close(raise_on_error=raise_on_error, drain=drain)
 
-    def completed_upload_state(self) -> Tuple[int, List[Dict[str, Any]]]:
-        """Snapshot this rank's completed sparse publication watermark.
+    def completed_upload_state(self) -> Optional[Tuple[int, List[Dict[str, Any]]]]:
+        """Snapshot this rank's completed FeatureStore upload watermark.
 
         Returns:
-            The last FIFO-completed submitted step and its sampled probe rows
-            when the FeatureStore uploader is enabled; in local-file mode, the
-            last locally dumped step and an empty probe list.
+            The last FIFO-completed submitted step and its sampled probe rows,
+            or None in local-file mode, where nothing is uploaded and so no
+            sparse publication watermark exists.
         """
-        if self._uploader is not None:
-            return self._uploader.completed_upload()
-        return self._local_completed_step, []
+        if self._uploader is None:
+            return None
+        return self._uploader.completed_upload()
 
     def _feature_store_upload_error(self) -> Optional[BaseException]:
         """Collect this rank's uploader error without changing control flow."""
@@ -1049,8 +1048,6 @@ class DeltaEmbeddingDumper:
             )
         else:
             logger.debug("Dumped %s delta embedding rows to %s.", num_rows, output_path)
-        if self._uploader is None:
-            self._local_completed_step = global_step
         return output_path
 
     def _output_path(self, global_step: int) -> str:
