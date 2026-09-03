@@ -185,7 +185,7 @@ export STORAGE_RESERVE_PERCENT=0.5
 
 ### Embedding分片约束
 
-如果需要人为收窄planner的寻优空间，可以配置`train_config.global_embedding_constraints`，它对所有Embedding表生效。不配置时planner在全部分片方式和计算内核中自由寻优
+如果需要人为收窄planner的寻优空间，可以配置`train_config.global_embedding_constraints`，它对所有Embedding表生效。不配置时planner在全部`sharding_type`和`compute_kernel`中自由寻优
 
 - sharding_types: 允许的分片方式列表，可选值为`data_parallel`、`table_wise`、`column_wise`、`row_wise`、`table_row_wise`、`table_column_wise`、`grid_shard`，为空表示不限制
 - compute_kernels: 允许的计算内核列表，可选值为`dense`、`fused`、`fused_uvm`、`fused_uvm_caching`、`key_value`，为空表示不限制
