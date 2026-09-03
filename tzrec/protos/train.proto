@@ -84,14 +84,8 @@ enum DeltaEmbeddingQuantType {
 }
 
 message DeltaEmbeddingDumpConfig {
-    // ZCH features publish raw feature ids: every id touched, admitted or
-    // evicted, each with the row the model now serves for it -- its trained row
-    // while the table holds it, the shared fallback row once it does not
-    // (FeatureStore has no delete, so a stale vector must be overwritten).
-    // Dump touched ids and their latest embedding every N training steps. Do not
-    // set this together with dump_interval_minutes.
-    // Larger intervals retain a longer id window in memory; auto compaction reduces
-    // per-batch tensor buildup but unique ids still scale with the interval.
+    // Dump every touched feature id with the row the model now serves.
+    // Dump interval in training steps; exclusive with dump_interval_minutes.
     optional uint32 dump_interval_steps = 1 [default = 1000];
     // output directory. default is ${model_dir}/delta_embedding_dump
     optional string output_dir = 2;
@@ -99,29 +93,14 @@ message DeltaEmbeddingDumpConfig {
     optional string file_prefix = 3 [default = "delta_embedding"];
     // Presence enables best-effort per-rank background upload to FeatureStore.
     optional FeatureStoreConfig feature_store_config = 4;
-    // Dump after this many elapsed minutes. The timer starts when training starts.
-    // Do not set this together with dump_interval_steps.
+    // Dump after this many elapsed minutes since training start; do not set with dump_interval_steps.
     optional uint32 dump_interval_minutes = 5;
-    // Quantization format for dumped embeddings. INT8 applies rowwise uint8
-    // quantization (QUint8RowwiseF16: uint8 values + fp16 scale/offset, 4 extra
-    // bytes per row) using the same format as distributed sparse export. Requires
-    // even embedding_dim.
+    // Quantization format for dumped embeddings; INT8 uses rowwise QUint8RowwiseF16 and requires even embedding_dim.
     optional DeltaEmbeddingQuantType quant_type = 6
         [default = DELTA_EMBEDDING_QUANT_NONE];
-    // Publish all-zero tombstone rows for dynamicemb keys evicted since the
-    // last dump; the polling processor detects them and deletes the key from
-    // NvEmbeddings, reclaiming its memory (FeatureStore has no delete). While
-    // enabled, delta dump mode also arms dynamicemb's evicted-key recording
-    // (evicted_item_mode=RETAIN_KEY) automatically; the retained keys live in
-    // per-rank GPU memory and grow with eviction volume until each dump
-    // drains them, so keep the dump interval short on high-churn tables.
-    // Requires a dynamicemb build with EvictedItemMode; older builds degrade
-    // to a warning.
+    // Publish all-zero tombstones for evicted keys so the polling processor deletes them from NvEmbeddings.
     optional bool dump_evicted_tombstones = 7 [default = true];
-    // Also write the local per-rank delta parquet files while uploading to
-    // FeatureStore (e.g. for the offline readback checker); by default the
-    // delta is handed to the uploader in memory and never touches disk.
-    // Without feature_store_config, local files are always written anyway.
+    // Also write local per-rank delta parquet files while uploading to FeatureStore.
     optional bool retain_local_dump = 8 [default = false];
 }
 
