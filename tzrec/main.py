@@ -17,7 +17,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from queue import Queue
 from threading import Event, Thread
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import pyarrow as pa
 import torch
@@ -52,6 +52,7 @@ from tzrec.features.feature import (
     BaseFeature,
     create_features,
 )
+from tzrec.models.genrec_model import BaseGenrecModel
 from tzrec.models.match_model import (
     MatchModel,
     MatchTower,
@@ -72,12 +73,16 @@ from tzrec.optim import optimizer_builder
 from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
+from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.persist import check_prompt_assets
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import (
     checkpoint_util,
@@ -125,6 +130,19 @@ def _create_features(
     return features
 
 
+def _compile_prompt(
+    pipeline_config: EasyRecConfig, features: List[BaseFeature]
+) -> Optional[CompiledPrompt]:
+    """Compile prompt_config for entry points that build prompt-aware objects."""
+    if not pipeline_config.HasField("prompt_config"):
+        return None
+    return compile_prompt(
+        pipeline_config.prompt_config,
+        features,
+        list(pipeline_config.data_config.label_fields),
+    )
+
+
 def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
     try:
         sampler_type = (
@@ -137,12 +155,34 @@ def _get_sampler_type(data_config: DataConfig) -> Optional[str]:
     return sampler_type
 
 
+def _get_model_class(model_config: ModelConfig) -> Type[BaseModel]:
+    """Resolve the configured model class.
+
+    Args:
+        model_config (ModelConfig): easyrec model config.
+
+    Returns:
+        Type[BaseModel]: configured model class.
+    """
+    if model_config.WhichOneof("model") == "custom_model":
+        class_path = model_config.custom_model.class_path
+        model_cls = import_class(class_path)
+        if not isinstance(model_cls, type) or not issubclass(model_cls, BaseModel):
+            raise ValueError(f"Custom model class {class_path} must inherit BaseModel.")
+        return model_cls
+
+    model_cls_name = config_util.which_msg(model_config, "model")
+    # pyre-ignore [16]
+    return BaseModel.create_class(model_cls_name)
+
+
 def _create_model(
     model_config: ModelConfig,
     features: List[BaseFeature],
     labels: List[str],
     sample_weights: Optional[List[str]] = None,
     sampler_type: Optional[str] = None,
+    compiled_prompt: Optional[CompiledPrompt] = None,
 ) -> BaseModel:
     """Build model.
 
@@ -152,18 +192,12 @@ def _create_model(
         labels (list): list of label names.
         sample_weights (list): list of sample weight names.
         sampler_type (str): negative sampler type
+        compiled_prompt (CompiledPrompt, optional): forwarded to prompt-native models.
+
     Return:
         model: a EasyRec Model.
     """
-    if model_config.WhichOneof("model") == "custom_model":
-        class_path = model_config.custom_model.class_path
-        model_cls = import_class(class_path)
-        if not isinstance(model_cls, type) or not issubclass(model_cls, BaseModel):
-            raise ValueError(f"Custom model class {class_path} must inherit BaseModel.")
-    else:
-        model_cls_name = config_util.which_msg(model_config, "model")
-        # pyre-ignore [16]
-        model_cls = BaseModel.create_class(model_cls_name)
+    model_cls = _get_model_class(model_config)
 
     model: BaseModel = model_cls(
         model_config,
@@ -171,6 +205,7 @@ def _create_model(
         labels,
         sample_weights=sample_weights,
         sampler_type=sampler_type,
+        compiled_prompt=compiled_prompt,
     )
 
     kernel = Kernel[KernelProto.Name(model_config.kernel)]
@@ -756,6 +791,7 @@ def train_and_evaluate(
     data_config = pipeline_config.data_config
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+    compiled_prompt = _compile_prompt(pipeline_config, features)
 
     ckpt_manager = checkpoint_util.CheckpointManager(
         pipeline_config.model_dir,
@@ -794,6 +830,8 @@ def train_and_evaluate(
 
     # Restore dataloader state before create_dataloader starts its workers
     dataloader_state: Optional[Dict[str, Any]] = None
+    if ckpt_path:
+        check_prompt_assets(compiled_prompt, ckpt_path)
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
         if dataloader_state and not restore_from_model_dir:
@@ -806,6 +844,7 @@ def train_and_evaluate(
         features,
         pipeline_config.train_input_path,
         mode=Mode.TRAIN,
+        compiled_prompt=compiled_prompt,
         checkpoint_state=dataloader_state,
     )
     eval_dataloader = None
@@ -817,6 +856,7 @@ def train_and_evaluate(
             features,
             pipeline_config.eval_input_path,
             mode=Mode.EVAL,
+            compiled_prompt=compiled_prompt,
             gl_cluster=gl_cluster,
         )
 
@@ -829,7 +869,11 @@ def train_and_evaluate(
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
+        compiled_prompt=compiled_prompt,
     )
+    # Cold start only; a resumed or fine-tuned run gets its weights from DCP.
+    if ckpt_path is None:
+        model.init_from_pretrained()
     model = TrainWrapper(
         model, device=device, mixed_precision=train_config.mixed_precision
     )
@@ -1021,12 +1065,14 @@ def evaluate(
     data_config = pipeline_config.data_config
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+    compiled_prompt = _compile_prompt(pipeline_config, features)
 
     eval_dataloader = create_dataloader(
         data_config,
         features,
         eval_input_path or pipeline_config.eval_input_path,
         mode=Mode.EVAL,
+        compiled_prompt=compiled_prompt,
     )
 
     sampler_type = _get_sampler_type(data_config)
@@ -1038,6 +1084,7 @@ def evaluate(
         list(data_config.label_fields),
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
+        compiled_prompt=compiled_prompt,
     )
     model = TrainWrapper(
         model, device=device, mixed_precision=train_config.mixed_precision
@@ -1069,6 +1116,7 @@ def evaluate(
     )
 
     if checkpoint_path:
+        check_prompt_assets(compiled_prompt, checkpoint_path)
         ckpt_manager.restore(
             checkpoint_path,
             model,
@@ -1141,6 +1189,65 @@ def export(
     if asset_files:
         assets = asset_files.split(",")
 
+    ckpt_manager = checkpoint_util.CheckpointManager(
+        pipeline_config.model_dir, export_config=pipeline_config.export_config
+    )
+    if not checkpoint_path:
+        if (
+            pipeline_config.HasField("export_config")
+            and pipeline_config.export_config.exporter_type == "best"
+        ):
+            checkpoint_path, _ = ckpt_manager.best_checkpoint()
+        else:
+            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
+
+    model_cls = _get_model_class(pipeline_config.model_config)
+    if issubclass(model_cls, BaseGenrecModel):
+        if config_util.use_dense_ema(
+            pipeline_config.export_config, pipeline_config.train_config
+        ):
+            raise ValueError(
+                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
+                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
+                "false to export the raw weights."
+            )
+        if not checkpoint_path:
+            raise ValueError("HF export: no checkpoint found to convert.")
+        if not os.path.exists(os.path.join(checkpoint_path, "config.json")):
+            raise ValueError(
+                f"HF export: {checkpoint_path} has no co-located HF assets; it "
+                f"was not written by an HF-backed model."
+            )
+        if assets:
+            logger.warning(f"HF export ignores asset_files: {assets}.")
+        features = _create_features(
+            list(pipeline_config.feature_configs), pipeline_config.data_config
+        )
+        compiled_prompt = compile_prompt(
+            pipeline_config.prompt_config,
+            features,
+            list(pipeline_config.data_config.label_fields),
+        )
+        check_prompt_assets(compiled_prompt, checkpoint_path)
+        if compiled_prompt.prompt_plan.projected_slots:
+            raise ValueError(
+                "HF export drops projected-slot state: dcp_to_hf keeps only "
+                "backbone keys, so embedding_group and projections would be "
+                "absent and the artifact could not reproduce checkpoint "
+                "inference."
+            )
+        if is_rank_zero:
+            from tzrec.utils.hf_export_util import dcp_to_hf
+
+            dcp_to_hf(checkpoint_path, export_dir)
+            compile_prompt(
+                pipeline_config.prompt_config,
+                features,
+                list(pipeline_config.data_config.label_fields),
+                tokenizer_dir=export_dir,
+            )
+        return
+
     data_config = pipeline_config.data_config
 
     # Build feature
@@ -1159,18 +1266,6 @@ def export(
     # is snapshot from the scalar view.
     model.set_is_inference(True)
     model = InferWrapper(model)
-
-    if not checkpoint_path:
-        ckpt_manager = checkpoint_util.CheckpointManager(
-            pipeline_config.model_dir, export_config=pipeline_config.export_config
-        )
-        if (
-            pipeline_config.HasField("export_config")
-            and pipeline_config.export_config.exporter_type == "best"
-        ):
-            checkpoint_path, _ = ckpt_manager.best_checkpoint()
-        else:
-            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():
@@ -1348,6 +1443,7 @@ def predict(
     data_config.drop_remainder = False
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+    compiled_prompt = _compile_prompt(pipeline_config, features)
 
     infer_dataloader = create_dataloader(
         data_config,
@@ -1355,6 +1451,7 @@ def predict(
         predict_input_path,
         reserved_columns=reserved_cols,
         mode=Mode.PREDICT,
+        compiled_prompt=compiled_prompt,
         debug_level=debug_level,
     )
     infer_iterator = infer_dataloader.get_iterator()  # pyre-ignore[16]
@@ -1621,6 +1718,7 @@ def predict_checkpoint(
     data_config = pipeline_config.data_config
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+    compiled_prompt = _compile_prompt(pipeline_config, features)
 
     # Build dataloader
     predict_dataloader = create_dataloader(
@@ -1629,6 +1727,7 @@ def predict_checkpoint(
         predict_input_path,
         reserved_columns=reserved_cols,
         mode=Mode.PREDICT,
+        compiled_prompt=compiled_prompt,
         debug_level=debug_level,
     )
 
@@ -1648,6 +1747,7 @@ def predict_checkpoint(
         pipeline_config.model_config,
         features,
         [],
+        compiled_prompt=compiled_prompt,
     )
     model.set_is_inference(True)
     model = PredictWrapper(
@@ -1683,6 +1783,7 @@ def predict_checkpoint(
     model.eval()
 
     if checkpoint_path:
+        check_prompt_assets(compiled_prompt, checkpoint_path)
         ckpt_manager.restore(
             checkpoint_path,
             model,
