@@ -108,7 +108,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 - 新鲜度预算：dump/发布间隔必须大于单次增量上传耗时的 p99（可通过监控上传耗时占发布间隔的比例确认），否则全局水位持续落后于配对步，`current.json` 长期不翻转。
 - 建议周期性做全量再基线（anti-entropy）：停训后用离线全量导出 + FeatureStore 全量导入，再用下述 bootstrap 命令发布配对的 dense 版本，以清理 crash 重启死时间线残留的旧值、僵尸 tombstone 等漂移。全量导入必须以重启式切换进行，不能在增量流写入的同时在线叠写。
 - MatchModel（向量召回）与 TDM 模型的完整导出按 user/item（或按模块）分目录，与单体 dense 热导出的布局不兼容，启用会直接报错，请使用完整的 `tzrec.export`。
-- 手动/离线从某个 checkpoint 导出一个版本（bootstrap，与训练内导出发布到同一目录结构）。该命令不经过水位门控、直接翻转 `current.json`，manifest 中 `sparse_step` 等于 `checkpoint_step`、`sparse_probes` 为空（Processor 跳过探针验证），前提是 FeatureStore 中的全量 embedding 与该 checkpoint 同源：
+- 手动/离线从某个 checkpoint 导出一个版本（bootstrap，与训练内导出发布到同一目录结构）。该命令不经过水位门控、直接翻转 `current.json`，manifest 中 `sparse_step` 等于 `checkpoint_step`（`--checkpoint_step` 省略时从 `model.ckpt-<step>` 路径解析）、`sparse_probes` 为空（Processor 跳过探针验证），前提是 FeatureStore 中的全量 embedding 与该 checkpoint 同源：
 
 ```bash
 USE_DISTRIBUTED_EMBEDDING=1 ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \

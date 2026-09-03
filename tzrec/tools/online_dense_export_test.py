@@ -85,7 +85,6 @@ class OnlineDenseExportTest(unittest.TestCase):
                     checkpoint_path=checkpoint_path,
                     model_dir=tmp_dir,
                     version="20260623174703",
-                    checkpoint_step=10,
                     data_timestamp=42.0,
                 )
 
@@ -119,6 +118,7 @@ class OnlineDenseExportTest(unittest.TestCase):
             self.assertEqual(
                 current["checkpoint_path"], os.path.abspath(checkpoint_path)
             )
+            # checkpoint_step defaults to the step parsed from model.ckpt-10
             self.assertEqual(current["checkpoint_step"], 10)
             # bootstrap pairing: FS full load and checkpoint are same-source
             self.assertEqual(current["sparse_step"], 10)

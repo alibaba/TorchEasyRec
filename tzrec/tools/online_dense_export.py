@@ -23,6 +23,7 @@ from tzrec.models.match_model import MatchModel
 from tzrec.models.model import ScriptWrapper
 from tzrec.models.tdm import TDM
 from tzrec.utils import config_util
+from tzrec.utils.checkpoint_util import _get_checkpoint_step
 from tzrec.utils.export_util import (
     ensure_input_tile_for_distributed_embedding,
     export_dense_model_cpu,
@@ -65,7 +66,9 @@ def export_online_dense_model(
         model_dir: training model dir (fallback publish root when
             ONLINE_DENSE_EXPORT_DIR is unset).
         version: explicit version name; a monotonic timestamp when unset.
-        checkpoint_step: checkpoint step recorded in current.json.
+        checkpoint_step: checkpoint step recorded in current.json; parsed from
+            a ``model.ckpt-<step>`` checkpoint_path when unset (0 when the path
+            carries no step), so the manifest watermark is never null.
         data_timestamp: consumed event-time recorded in current.json.
 
     Returns:
@@ -77,6 +80,8 @@ def export_online_dense_model(
     ensure_input_tile_for_distributed_embedding()
 
     version = version or make_version()
+    if checkpoint_step is None:
+        checkpoint_step = _get_checkpoint_step(checkpoint_path)
     export_root = resolve_dense_export_root(model_dir)
     versions_root = os.path.join(export_root, VERSIONS_DIR)
     version_dir = os.path.join(versions_root, version)
