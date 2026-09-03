@@ -190,7 +190,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             pq.write_table(
                 pa.table(
                     {
-                        "embedding_name": ["table_a", "table_a", "table_b"],
+                        "table_fqn": ["table_a", "table_a", "table_b"],
                         "key_id": pa.array([1, 2, 3], type=pa.int64()),
                         "embedding": pa.array(
                             [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
@@ -212,6 +212,35 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             [("table_a", 1), ("table_a", 2)],
         )
         np.testing.assert_array_equal(samples[0].embedding, [1.0, 2.0])
+
+    def test_sample_local_records_remaps_user_twin_fqns(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            path = os.path.join(output_dir, "delta__fs_target_step_20.parquet")
+            pq.write_table(
+                pa.table(
+                    {
+                        "table_fqn": [
+                            "model.ebc_user.embedding_bags.user_f",
+                            "model.ebc.embedding_bags.user_f",
+                        ],
+                        "key_id": pa.array([1, 2], type=pa.int64()),
+                        "embedding": pa.array(
+                            [[1.0, 2.0], [3.0, 4.0]], type=pa.list_(pa.float32())
+                        ),
+                    }
+                ),
+                path,
+            )
+
+            samples = sample_local_records([path], 2)
+
+        self.assertEqual(
+            [(sample.embedding_name, sample.key_id) for sample in samples],
+            [
+                ("model.ebc.embedding_bags.user_f", 1),
+                ("model.ebc.embedding_bags.user_f", 2),
+            ],
+        )
 
     def test_verify_samples_separates_presence_from_value_match(self):
         samples = [
@@ -250,7 +279,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             pq.write_table(
                 pa.table(
                     {
-                        "embedding_name": ["table_a"],
+                        "table_fqn": ["table_a"],
                         "key_id": pa.array([1], type=pa.int64()),
                         "embedding": pa.array(
                             [[1, 2, 3, 250, 251, 252]], type=pa.list_(pa.uint8())
@@ -263,7 +292,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             pq.write_table(
                 pa.table(
                     {
-                        "embedding_name": ["table_a"],
+                        "table_fqn": ["table_a"],
                         "key_id": pa.array([2], type=pa.int64()),
                         "embedding": pa.array(
                             [[1.0, 2.0]], type=pa.list_(pa.float32())

@@ -46,6 +46,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tzrec.utils import config_util
+from tzrec.utils.checkpoint_util import remap_input_tile_user_key
 from tzrec.utils.feature_store_delta_uploader import (
     FEATURE_STORE_PK_FIELD,
     FEATURE_STORE_SK_FIELD,
@@ -212,7 +213,7 @@ def sample_local_records(
         raise ValueError("sample_count must be > 0")
 
     columns = [
-        FEATURE_STORE_PK_FIELD,
+        "table_fqn",
         FEATURE_STORE_SK_FIELD,
         FEATURE_STORE_VALUE_FIELD,
     ]
@@ -232,11 +233,13 @@ def sample_local_records(
         for batch in parquet_file.iter_batches(batch_size=1024, columns=columns):
             values = batch.to_pydict()
             for name, key_id, vector in zip(
-                values[FEATURE_STORE_PK_FIELD],
+                values["table_fqn"],
                 values[FEATURE_STORE_SK_FIELD],
                 values[FEATURE_STORE_VALUE_FIELD],
             ):
-                name = str(name)
+                # The dump keeps the native table_fqn; the uploader remaps it
+                # to the FeatureStore embedding_name before upload.
+                name = remap_input_tile_user_key(str(name))
                 if embedding_name is not None and name != embedding_name:
                     continue
                 identity = (name, int(key_id))
