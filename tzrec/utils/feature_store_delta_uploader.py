@@ -109,6 +109,7 @@ class FeatureStoreUploadSettings:
     max_pending_steps: int
     poll_interval_secs: int
     upload_format: str
+    test_mode: bool
 
     @classmethod
     def from_proto(cls, config: FeatureStoreConfig) -> "FeatureStoreUploadSettings":
@@ -193,6 +194,7 @@ class FeatureStoreUploadSettings:
             max_pending_steps=positive_values["max_pending_steps"],
             poll_interval_secs=positive_values["poll_interval_secs"],
             upload_format=upload_format,
+            test_mode=bool(config.test_mode),
         )
 
 
@@ -839,6 +841,7 @@ class FeatureStoreDeltaUploader:
             security_token=credential.security_token or None,
             featuredb_username=os.environ.get("FEATUREDB_USERNAME") or None,
             featuredb_password=os.environ.get("FEATUREDB_PASSWORD") or None,
+            test_mode=self._settings.test_mode,
         )
 
     def _get_view(self) -> Any:

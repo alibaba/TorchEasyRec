@@ -322,6 +322,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "feature_view_shard_count",
             "feature_view_replication_count",
             "upload_format",
+            "test_mode",
         ]
         fields = list(FeatureStoreConfig.DESCRIPTOR.fields)
 
@@ -342,7 +343,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         )
         self.assertEqual(
             [field.number for field in fields],
-            [1, 2, 3] + list(range(5, 16)) + [17, 18],
+            [1, 2, 3] + list(range(5, 16)) + [18, 19],
         )
         for field_name in required_fields:
             with self.subTest(field_name=field_name):
@@ -422,9 +423,9 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                 "security_token",
                 "featuredb_username",
                 "featuredb_password",
+                "test_mode",
             },
         )
-        self.assertNotIn("test_mode", recorded)
 
     def test_start_creates_missing_dynamic_embedding_feature_view(self):
         created_view = _FakeView()

@@ -72,6 +72,10 @@ message FeatureStoreConfig {
     // dict construction and embedding deep-copy; "JSON" keeps the legacy
     // write_features() per-row payload. Both paths use MERGE write_mode.
     optional string upload_format = 18 [default = "ARROW"];
+    // Local/dev testing outside the VPC: the FeatureStore SDK prefers the
+    // FeatureDB public endpoint for the data plane, which stays reachable
+    // when the default VPC endpoint is not.
+    optional bool test_mode = 19 [default = false];
 }
 
 enum DeltaEmbeddingQuantType {
