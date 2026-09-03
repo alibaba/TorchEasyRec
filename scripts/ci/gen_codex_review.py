@@ -61,7 +61,8 @@ def gen_agent_toml(agent_md: Path, agents_dir: Path) -> None:
     lines = [
         f"name = {toml_str(name)}",
         f"description = {toml_str(fields.get('description', ''))}",
-        # Claude agents are read-only (tools: Glob, Grep, Read).
+        # Codex subagents stay offline and read-only whatever the Claude roster
+        # grants: this job's containment is the sandbox, not a tool list.
         'sandbox_mode = "read-only"',
         f"developer_instructions = {toml_str(body)}",
     ]
