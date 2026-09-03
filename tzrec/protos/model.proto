@@ -6,6 +6,7 @@ import "tzrec/protos/models/rank_model.proto";
 import "tzrec/protos/models/multi_task_rank.proto";
 import "tzrec/protos/models/match_model.proto";
 import "tzrec/protos/models/general_rank_model.proto";
+import "tzrec/protos/models/genrec_model.proto";
 import "tzrec/protos/models/sid_model.proto";
 import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
@@ -88,6 +89,7 @@ message ModelConfig {
         SidRqvae sid_rqvae = 600;
         SidRqkmeans sid_rqkmeans = 601;
 
+        GenrecCausalLMModel genrec_causal_lm_model = 701;
         CustomModel custom_model = 1000;
     }
 
