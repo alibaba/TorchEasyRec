@@ -33,6 +33,7 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import predict_util
 from tzrec.utils.test_util import parameterized_name_func
 
@@ -80,6 +81,7 @@ class MainTest(unittest.TestCase):
         ckpt_manager = mock.Mock()
         ckpt_manager.maybe_save.return_value = False
         exporter = mock.Mock()
+        exporter.enabled = False
         model = mock.Mock()
         optimizer = mock.Mock()
         train_dataloader = mock.Mock()
@@ -88,14 +90,14 @@ class MainTest(unittest.TestCase):
         pipeline = mock.Mock()
         pipeline.progress.side_effect = RuntimeError("boom")
 
-        train_config = SimpleNamespace(
+        train_config = TrainConfig(
             num_steps=1,
             num_epochs=0,
             save_checkpoints_steps=0,
             save_checkpoints_epochs=0,
             save_checkpoints_timestamp_interval=0,
             save_checkpoints_timestamps=[],
-            save_checkpoints_timestamp_quorum=0,
+            save_checkpoints_timestamp_quorum=0.0,
             use_tensorboard=False,
             tensorboard_summaries=[],
             is_profiling=False,
@@ -151,14 +153,15 @@ class MainTest(unittest.TestCase):
         ckpt_manager = mock.Mock()
         ckpt_manager.maybe_save.side_effect = [True, False, False]
         exporter = mock.Mock()
-        train_config = SimpleNamespace(
+        exporter.enabled = False
+        train_config = TrainConfig(
             num_steps=1,
             num_epochs=0,
             save_checkpoints_steps=1,
             save_checkpoints_epochs=0,
             save_checkpoints_timestamp_interval=0,
             save_checkpoints_timestamps=[],
-            save_checkpoints_timestamp_quorum=0,
+            save_checkpoints_timestamp_quorum=0.0,
             use_tensorboard=False,
             tensorboard_summaries=[],
             is_profiling=False,
