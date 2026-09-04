@@ -981,7 +981,10 @@ class DeltaEmbeddingDumper:
         locally. The multi-rank timed cadence broadcasts rank zero's clock
         decision over the gloo decision group so a deadline landing astride
         a step boundary can never split ranks. The per-step broadcast assumes
-        lockstep stepping, i.e. streaming inputs for the timed cadence.
+        lockstep stepping, i.e. streaming inputs for the timed cadence, and
+        that no rank drops out mid-step: ``maybe_dump`` surfaces a rank-local
+        upload failure before entering it, so the failing rank raises while
+        the others block here until the process group is torn down.
 
         Args:
             global_step: Current training step.
