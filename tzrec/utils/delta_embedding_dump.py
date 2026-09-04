@@ -13,6 +13,7 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import (
     Any,
     Dict,
@@ -71,6 +72,22 @@ from tzrec.utils.zch_util import (
 )
 
 _CONSUMER = "delta_embedding_dump"
+
+
+class DumpDecision(IntEnum):
+    """Rank-uniform per-step dump decision returned by ``maybe_dump``.
+
+    The int values travel through the timed-cadence uint8 broadcast, so they
+    are part of the multi-rank contract.
+    """
+
+    NONE = 0
+    # Delta dump + FeatureStore upload only (sparse_dump_interval_* cadence).
+    SPARSE_ONLY = 1
+    # Delta dump + upload + same-step dense export (paired_dump_interval_*).
+    PAIRED = 2
+
+
 # Rows per tombstone chunk: chunks alias one zero buffer of this size so an
 # eviction drain never materializes a single huge zero matrix.
 _TOMBSTONE_CHUNK_ROWS = 65536
@@ -149,18 +166,41 @@ def validate_delta_embedding_dump_config(
             "delta_embedding_dump_config only supports CUDA training, "
             f"but got device={device}."
         )
-    if config.HasField("dump_interval_minutes"):
-        if config.HasField("dump_interval_steps"):
+    paired_minutes = config.HasField("paired_dump_interval_minutes")
+    paired_steps = config.HasField("paired_dump_interval_steps")
+    if paired_minutes == paired_steps:
+        raise ValueError(
+            "delta_embedding_dump_config must configure exactly one of "
+            "paired_dump_interval_steps and paired_dump_interval_minutes."
+        )
+    if paired_minutes and config.paired_dump_interval_minutes <= 0:
+        raise ValueError(
+            "delta_embedding_dump_config.paired_dump_interval_minutes must be > 0."
+        )
+    if paired_steps and config.paired_dump_interval_steps <= 0:
+        raise ValueError(
+            "delta_embedding_dump_config.paired_dump_interval_steps must be > 0."
+        )
+    # The fine cadence must share the paired cadence's dimension and be
+    # strictly faster, so a sparse-only dump always lands between paired ones.
+    for unit, paired in (("steps", paired_steps), ("minutes", paired_minutes)):
+        sparse_field = f"sparse_dump_interval_{unit}"
+        if not config.HasField(sparse_field):
+            continue
+        if not paired:
             raise ValueError(
-                "delta_embedding_dump_config must configure only one of "
-                "dump_interval_steps and dump_interval_minutes."
+                f"delta_embedding_dump_config.{sparse_field} requires "
+                f"paired_dump_interval_{unit}; do not mix steps and minutes "
+                "cadences."
             )
-        if config.dump_interval_minutes <= 0:
+        paired_value = getattr(config, f"paired_dump_interval_{unit}")
+        sparse_value = getattr(config, sparse_field)
+        if not 0 < sparse_value < paired_value:
             raise ValueError(
-                "delta_embedding_dump_config.dump_interval_minutes must be > 0."
+                f"delta_embedding_dump_config.{sparse_field} must be > 0 and "
+                f"< paired_dump_interval_{unit} ({paired_value}), but got "
+                f"{sparse_value}."
             )
-    elif config.dump_interval_steps <= 0:
-        raise ValueError("delta_embedding_dump_config.dump_interval_steps must be > 0.")
 
 
 def _feature_name(feature_names: Iterable[str]) -> str:
@@ -691,13 +731,22 @@ class DeltaEmbeddingDumper:
             if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
             else _DELTA_DUMP_SCHEMA
         )
-        self._interval_steps: Optional[int] = None
-        self._interval_secs: Optional[float] = None
-        if config.HasField("dump_interval_minutes"):
-            self._interval_secs = float(config.dump_interval_minutes * 60)
+        self._paired_interval_steps: Optional[int] = None
+        self._paired_interval_secs: Optional[float] = None
+        self._sparse_interval_steps: Optional[int] = None
+        self._sparse_interval_secs: Optional[float] = None
+        if config.HasField("paired_dump_interval_minutes"):
+            self._paired_interval_secs = float(config.paired_dump_interval_minutes * 60)
+            if config.HasField("sparse_dump_interval_minutes"):
+                self._sparse_interval_secs = float(
+                    config.sparse_dump_interval_minutes * 60
+                )
         else:
-            self._interval_steps = int(config.dump_interval_steps)
-        self._next_dump_time: Optional[float] = None
+            self._paired_interval_steps = int(config.paired_dump_interval_steps)
+            if config.HasField("sparse_dump_interval_steps"):
+                self._sparse_interval_steps = int(config.sparse_dump_interval_steps)
+        self._next_paired_time: Optional[float] = None
+        self._next_sparse_time: Optional[float] = None
         self._last_dump_step: Optional[int] = None
         self._output_dir = config.output_dir or os.path.join(
             model_dir, "delta_embedding_dump"
@@ -705,14 +754,15 @@ class DeltaEmbeddingDumper:
         self._file_prefix = config.file_prefix or "delta_embedding"
         self._rank, self._world_size = _distributed_rank_world_size()
         self._decision_group: Optional[torch.distributed.ProcessGroup] = None
-        if self._interval_secs is not None and self._world_size > 1:
+        if self._paired_interval_secs is not None and self._world_size > 1:
             if not (
                 torch.distributed.is_available() and torch.distributed.is_initialized()
             ):
                 raise RuntimeError(
-                    "delta_embedding_dump_config.dump_interval_minutes requires "
-                    "an initialized torch.distributed process group when "
-                    "world_size > 1 to broadcast the rank-zero dump decision."
+                    "delta_embedding_dump_config.paired_dump_interval_minutes "
+                    "requires an initialized torch.distributed process group "
+                    "when world_size > 1 to broadcast the rank-zero dump "
+                    "decision."
                 )
             self._decision_group = cast(
                 Optional[torch.distributed.ProcessGroup],
@@ -777,17 +827,24 @@ class DeltaEmbeddingDumper:
                 world_size=self._world_size,
                 manage_remote_view=self._rank == 0,
             )
-        interval_name = "minutes" if self._interval_secs is not None else "steps"
-        interval_value = (
-            config.dump_interval_minutes
-            if self._interval_secs is not None
-            else self._interval_steps
+        unit = "minutes" if self._paired_interval_secs is not None else "steps"
+        paired_value = (
+            config.paired_dump_interval_minutes
+            if unit == "minutes"
+            else config.paired_dump_interval_steps
+        )
+        sparse_field = f"sparse_dump_interval_{unit}"
+        sparse_value = (
+            getattr(config, sparse_field) if config.HasField(sparse_field) else None
         )
         logger.info(
-            "Delta embedding dump enabled: interval_%s=%s output_dir=%s "
+            "Delta embedding dump enabled: paired_interval_%s=%s "
+            "sparse_interval_%s=%s output_dir=%s "
             "rank=%s/%s tables=%s feature_store_upload=%s quant_type=%s",
-            interval_name,
-            interval_value,
+            unit,
+            paired_value,
+            unit,
+            sparse_value,
             self._output_dir,
             self._rank,
             self._world_size,
@@ -835,10 +892,13 @@ class DeltaEmbeddingDumper:
         """
         if self._uploader is not None:
             self._uploader.start()
-        if self._interval_secs is not None and (
+        if self._paired_interval_secs is not None and (
             self._decision_group is None or self._rank == 0
         ):
-            self._next_dump_time = time.monotonic() + self._interval_secs
+            now = time.monotonic()
+            self._next_paired_time = now + self._paired_interval_secs
+            if self._sparse_interval_secs is not None:
+                self._next_sparse_time = now + self._sparse_interval_secs
 
     def close(self, raise_on_error: bool = True, drain: bool = True) -> None:
         """Close this rank's uploader; abnormal shutdown can skip draining."""
@@ -874,33 +934,48 @@ class DeltaEmbeddingDumper:
         if error is not None:
             raise error.with_traceback(error.__traceback__)
 
-    def maybe_dump(self, global_step: int) -> bool:
+    def maybe_dump(self, global_step: int) -> DumpDecision:
         """Dump on the configured step or time interval and advance tracker state.
 
         Args:
             global_step: Current training step.
 
         Returns:
-            Whether a dump fired this step; identical on all ranks, so the
-            caller can drive the same-step dense export from it.
+            This step's rank-uniform decision level; the caller drives the
+            same-step dense export from ``DumpDecision.PAIRED``.
         """
         self._check_feature_store_upload_error()
-        dumped = self._dump_decision(global_step)
-        if dumped:
+        decision = self._dump_decision(global_step)
+        if decision != DumpDecision.NONE:
             self.dump(global_step)
             self._last_dump_step = global_step
-            if self._interval_secs is not None and self._next_dump_time is not None:
-                # Fixed-rate rescheduling: only rank zero owns the deadline
-                # sequence (other ranks follow its broadcast decision); missed
-                # deadlines are skipped instead of fired as a burst.
+            if self._paired_interval_secs is not None and (
+                self._next_paired_time is not None or self._next_sparse_time is not None
+            ):
+                # Fixed-rate rescheduling of each clock that has come due:
+                # only rank zero owns the deadline sequence (other ranks
+                # follow its broadcast decision); missed deadlines are skipped
+                # instead of fired as a burst. A paired firing also retires a
+                # due sparse deadline so the two grids never double-dump.
                 now = time.monotonic()
-                while self._next_dump_time <= now:
-                    self._next_dump_time += self._interval_secs
+                if (
+                    decision == DumpDecision.PAIRED
+                    and self._next_paired_time is not None
+                    and self._paired_interval_secs is not None
+                ):
+                    while self._next_paired_time <= now:
+                        self._next_paired_time += self._paired_interval_secs
+                if (
+                    self._next_sparse_time is not None
+                    and self._sparse_interval_secs is not None
+                ):
+                    while self._next_sparse_time <= now:
+                        self._next_sparse_time += self._sparse_interval_secs
         self._tracker.step()
-        return dumped
+        return decision
 
-    def _dump_decision(self, global_step: int) -> bool:
-        """Return the rank-uniform decision on whether this step dumps.
+    def _dump_decision(self, global_step: int) -> DumpDecision:
+        """Return the rank-uniform decision on what this step dumps.
 
         The steps cadence and the single-rank timed cadence are decided
         locally. The multi-rank timed cadence broadcasts rank zero's clock
@@ -912,46 +987,72 @@ class DeltaEmbeddingDumper:
             global_step: Current training step.
 
         Returns:
-            Whether this step dumps; identical on all ranks.
+            This step's decision level; identical on all ranks.
         """
         if self._decision_group is None:
             return self._local_dump_decision(global_step)
         decision = torch.tensor(
-            [1 if self._rank == 0 and self._local_dump_decision(global_step) else 0],
+            [
+                int(self._local_dump_decision(global_step))
+                if self._rank == 0
+                else DumpDecision.NONE
+            ],
             dtype=torch.uint8,
         )
         torch.distributed.broadcast(decision, src=0, group=self._decision_group)
-        return bool(decision.item())
+        return DumpDecision(int(decision.item()))
 
-    def _local_dump_decision(self, global_step: int) -> bool:
-        """Return whether this step triggers a delta dump."""
-        if self._interval_steps is not None:
-            return global_step > 0 and global_step % self._interval_steps == 0
-        if self._interval_secs is not None and self._next_dump_time is not None:
-            return time.monotonic() >= self._next_dump_time
-        return False
+    def _local_dump_decision(self, global_step: int) -> DumpDecision:
+        """Return this step's decision level; the paired cadence wins ties."""
+        if self._paired_interval_steps is not None:
+            if global_step <= 0:
+                return DumpDecision.NONE
+            if global_step % self._paired_interval_steps == 0:
+                return DumpDecision.PAIRED
+            if (
+                self._sparse_interval_steps is not None
+                and global_step % self._sparse_interval_steps == 0
+            ):
+                return DumpDecision.SPARSE_ONLY
+            return DumpDecision.NONE
+        now = time.monotonic()
+        if self._next_paired_time is not None and now >= self._next_paired_time:
+            return DumpDecision.PAIRED
+        if self._next_sparse_time is not None and now >= self._next_sparse_time:
+            return DumpDecision.SPARSE_ONLY
+        return DumpDecision.NONE
 
     def final_dump(self, global_step: int) -> Optional[int]:
         """Flush the trailing partial interval at the end of training.
 
-        Boundary steps were already written by ``maybe_dump`` and have no
+        Steps already written by ``maybe_dump`` (any cadence boundary) have no
         remaining delta; re-dumping them would overwrite their shards with an
-        empty file under multi-GPU, so skip them here. Every skip/dump
+        empty file under multi-GPU, so skip the dump there. Every skip/dump
         decision is a function of rank-uniform values (the synced step, the
-        interval config, and ``_last_dump_step``), so all ranks agree on the
-        returned step and the caller can pair the final dense export with it.
+        interval config, and -- timed cadence only, which steps in lockstep --
+        ``_last_dump_step``), so all ranks agree on the returned step.
 
         Args:
             global_step: Current training step.
 
         Returns:
-            The rank-synced step that was dumped, or None if skipped.
+            The rank-synced step whose delta is on record -- flushed here or
+            already dumped by ``maybe_dump`` -- for the caller to pair the
+            final dense export with; the exporter's per-step dedupe skips a
+            paired boundary that already exported. None when there is no
+            positive step to publish.
         """
         if global_step <= 0:
             logger.info("Skipping delta embedding dump at step %s.", global_step)
             return None
         global_step = self._sync_final_step(global_step)
-        if self._interval_steps is not None and global_step % self._interval_steps == 0:
+        if self._paired_interval_steps is not None and (
+            global_step % self._paired_interval_steps == 0
+            or (
+                self._sparse_interval_steps is not None
+                and global_step % self._sparse_interval_steps == 0
+            )
+        ):
             # Boundary steps were already written (with full delta) by
             # ``maybe_dump``. Re-dumping here has no new delta to flush -- every
             # rank's consumer cursor has already advanced past the boundary's
@@ -960,12 +1061,17 @@ class DeltaEmbeddingDumper:
             # ``get_unique`` raises ``torch.cat(): expected a non-empty list of
             # Tensors`` on the empty consumer window. Re-dumping would also
             # overwrite the already-written boundary shards (with an empty file
-            # under multi-GPU), so skip.
-            return None
-        if self._interval_secs is not None and global_step == self._last_dump_step:
+            # under multi-GPU), so skip. A sparse-only boundary still returns
+            # its step: its delta is on record but no dense export paired with
+            # it yet, so the caller owes the final export.
+            return global_step
+        if (
+            self._paired_interval_secs is not None
+            and global_step == self._last_dump_step
+        ):
             # A timed dump can land on any step. Avoid replacing that step's full
             # delta with an empty final shard when training ends immediately after.
-            return None
+            return global_step
         self.dump(global_step)
         return global_step
 

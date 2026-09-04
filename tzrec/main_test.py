@@ -207,7 +207,11 @@ class MainTest(unittest.TestCase):
     @parameterized.expand(
         [
             ["no_dumper", None, False],
-            ["local_dump_only", DeltaEmbeddingDumpConfig(dump_interval_steps=1), True],
+            [
+                "local_dump_only",
+                DeltaEmbeddingDumpConfig(paired_dump_interval_steps=1),
+                True,
+            ],
         ],
         name_func=parameterized_name_func,
     )

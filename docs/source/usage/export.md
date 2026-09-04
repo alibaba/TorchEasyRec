@@ -62,7 +62,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 在 `USE_DISTRIBUTED_EMBEDDING=1` 的在线学习场景下，sparse embedding 通过增量 embedding dump（`train_config.delta_embedding_dump_config`）持续上传 FeatureStore，训练进程可以在训练过程中同步导出 dense 图，供推理 Processor 热切换。该能力**不依赖 checkpoint**：rank 0 在训练启动时一次性构建 serving 侧 dense 图，之后每次触发时全体 rank 从内存中的 DMP 模型收集 dense 权重（仅收集 dense 图实际携带的参数，不涉及 sparse/dynamicemb/MCH 状态），rank 0 在后台线程热替换权重、script 并构建新版本目录，训练主流程不阻塞在导出上。
 
-dense 导出触发与增量 embedding dump 统一：每个 dump 边界（`dump_interval_steps` 或 `dump_interval_minutes`）触发一次 dense 导出，同一训练步的 (dense, sparse) 严格成对；训练正常结束时若存在尾部增量，也会成对补一次最终导出。dense 版本构建完成后**不会立即生效**：`current.json` 仅在该步的 sparse 增量在所有 rank 上都完成 FeatureStore 上传后才原子翻转（联合发布），保证推理侧绝不出现 dense 领先 sparse——sparse 领先 dense 是唯一允许的偏斜方向。
+dense 导出触发与增量 embedding dump 的粗粒度边界统一：每个 `paired_dump_interval_steps` / `paired_dump_interval_minutes` 边界执行一次 delta dump 并触发一次 dense 导出，同一训练步的 (dense, sparse) 严格成对。粗粒度参数为**必选**（steps 与 minutes 二选一）。在此基础上可选配置更细粒度的 `sparse_dump_interval_steps` / `sparse_dump_interval_minutes`（维度必须与粗粒度一致且数值严格更小）：细粒度边界只执行 delta dump 与 FeatureStore 上传、不导出 dense，让线上 embedding 以更高频率更新，而 dense 版本仍按粗粒度节奏发布；两个边界落在同一训练步时粗粒度优先，只 dump 一次。训练正常结束时若存在尾部增量，也会成对补一次最终导出（尾部若恰好落在某个 dump 边界上，则不重复 dump，最终导出与该步配对）。dense 版本构建完成后**不会立即生效**：`current.json` 仅在该步的 sparse 增量在所有 rank 上都完成 FeatureStore 上传后才原子翻转（联合发布），保证推理侧绝不出现 dense 领先 sparse——sparse 领先 dense 是唯一允许的偏斜方向。
 
 ### 启用方式
 
@@ -72,7 +72,9 @@ dense 导出触发与增量 embedding dump 统一：每个 dump 边界（`dump_i
 train_config {
   ...
   delta_embedding_dump_config {
-    dump_interval_minutes: 10
+    paired_dump_interval_minutes: 10
+    # 可选：每 2 分钟只做 delta dump + 上传，不导 dense
+    sparse_dump_interval_minutes: 2
     feature_store_config {
       ...
     }

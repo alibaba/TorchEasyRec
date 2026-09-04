@@ -85,16 +85,18 @@ enum DeltaEmbeddingQuantType {
 
 message DeltaEmbeddingDumpConfig {
     // Dump every touched feature id with the row the model now serves.
-    // Dump interval in training steps; exclusive with dump_interval_minutes.
-    optional uint32 dump_interval_steps = 1 [default = 1000];
+    // Paired cadence in training steps: delta dump plus same-step dense export
+    // when online dense export is enabled. Configure exactly one of
+    // paired_dump_interval_steps / paired_dump_interval_minutes.
+    optional uint32 paired_dump_interval_steps = 1;
     // output directory. default is ${model_dir}/delta_embedding_dump
     optional string output_dir = 2;
     // parquet file prefix
     optional string file_prefix = 3 [default = "delta_embedding"];
     // Presence enables best-effort per-rank background upload to FeatureStore.
     optional FeatureStoreConfig feature_store_config = 4;
-    // Dump after this many elapsed minutes since training start; do not set with dump_interval_steps.
-    optional uint32 dump_interval_minutes = 5;
+    // Paired cadence in elapsed minutes since training start; do not set with paired_dump_interval_steps.
+    optional uint32 paired_dump_interval_minutes = 5;
     // Quantization format for dumped embeddings; INT8 uses rowwise QUint8RowwiseF16 and requires even embedding_dim.
     optional DeltaEmbeddingQuantType quant_type = 6
         [default = DELTA_EMBEDDING_QUANT_NONE];
@@ -102,6 +104,13 @@ message DeltaEmbeddingDumpConfig {
     optional bool dump_evicted_tombstones = 7 [default = true];
     // Also write local per-rank delta parquet files while uploading to FeatureStore.
     optional bool retain_local_dump = 8 [default = false];
+    // Fine cadence in training steps: delta dump and FeatureStore upload only,
+    // no dense export. Requires paired_dump_interval_steps and must be strictly
+    // smaller than it; unset keeps dumps locked to the paired cadence.
+    optional uint32 sparse_dump_interval_steps = 9;
+    // Fine cadence in elapsed minutes; requires paired_dump_interval_minutes
+    // and must be strictly smaller than it. Do not mix with the steps fields.
+    optional uint32 sparse_dump_interval_minutes = 10;
 }
 
 message TrainConfig {

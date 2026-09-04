@@ -90,7 +90,7 @@ from tzrec.utils import (
     dynamicemb_util,
     predict_util,
 )
-from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper
+from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -523,9 +523,11 @@ def _train_and_evaluate(
     publish_interval_minutes = None
     if train_config.HasField(
         "delta_embedding_dump_config"
-    ) and train_config.delta_embedding_dump_config.HasField("dump_interval_minutes"):
+    ) and train_config.delta_embedding_dump_config.HasField(
+        "paired_dump_interval_minutes"
+    ):
         publish_interval_minutes = (
-            train_config.delta_embedding_dump_config.dump_interval_minutes
+            train_config.delta_embedding_dump_config.paired_dump_interval_minutes
         )
     online_dense_exporter = OnlineDenseExportManager(
         model_dir,
@@ -539,8 +541,8 @@ def _train_and_evaluate(
     ):
         raise RuntimeError(
             "ONLINE_DENSE_EXPORT=1 requires train_config.delta_embedding_dump_config "
-            "with feature_store_config: the delta dump decision is the only dense "
-            "export trigger and the FeatureStore upload watermark is the only "
+            "with feature_store_config: the paired delta-dump decision is the only "
+            "dense export trigger and the FeatureStore upload watermark is the only "
             "publish gate."
         )
 
@@ -615,9 +617,9 @@ def _train_and_evaluate(
                         if not lr.by_epoch:
                             lr.step()
 
-                    dumped = False
+                    dump_decision = DumpDecision.NONE
                     if delta_embedding_dumper is not None:
-                        dumped = delta_embedding_dumper.maybe_dump(i_step)
+                        dump_decision = delta_embedding_dumper.maybe_dump(i_step)
                 except StopIteration:
                     # pass completed: later saves should record positions
                     # within the next pass, on top of the completed-pass count.
@@ -642,13 +644,14 @@ def _train_and_evaluate(
                     data_timestamp=data_timestamp,
                 ):
                     run_eval(i_step, i_epoch)
-                # Lockstep: the rank-uniform dump decision is the only export
-                # trigger, and the publish poll is an every-step collective.
+                # Lockstep: the rank-uniform paired dump decision is the only
+                # export trigger, and the publish poll is an every-step
+                # collective.
                 online_dense_exporter.maybe_export(
                     i_step,
                     data_timestamp,
                     model,
-                    force=dumped,
+                    force=dump_decision == DumpDecision.PAIRED,
                     dense_ema=export_dense_ema,
                 )
                 online_dense_exporter.poll_publish(
@@ -685,9 +688,11 @@ def _train_and_evaluate(
         final_dump_step = None
         if delta_embedding_dumper is not None:
             # Flush the trailing partial interval before the final checkpoint.
-            # final_dump skips dump-boundary steps already written by maybe_dump
-            # (all ranks run the same step count, so every rank participated in
-            # those dumps and reaches the same final step).
+            # final_dump does not re-dump boundary steps already written by
+            # maybe_dump (all ranks run the same step count, so every rank
+            # participated in those dumps and reaches the same final step) but
+            # still returns the step so the final export can pair with a
+            # sparse-only boundary.
             final_dump_step = delta_embedding_dumper.final_dump(i_step)
 
         _log_train(
@@ -715,7 +720,8 @@ def _train_and_evaluate(
             run_eval(i_step, i_epoch)
         if final_dump_step is not None:
             # Publish only paired versions: the final dense export uses the
-            # step the trailing delta was actually dumped at.
+            # step the trailing delta was actually dumped at; the exporter's
+            # per-step dedupe skips a paired boundary that already exported.
             online_dense_exporter.maybe_export(
                 final_dump_step,
                 data_timestamp,
