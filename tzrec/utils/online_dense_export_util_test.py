@@ -731,10 +731,13 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         with self._tiny_manager(tmp_dir, state) as mgr:
             box["gm"] = mgr._gm
             mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
-            # watermark already past the step: the worker flips on finish
-            mgr.poll_publish((9, []))
             current_path = _current_path(tmp_dir)
-            self.assertTrue(_wait_for(lambda: os.path.exists(current_path)))
+            # the worker only records the version as ready; the next poll
+            # with a watermark past the step is what flips the pointer
+            self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+            self.assertFalse(os.path.exists(current_path))
+            mgr.poll_publish((9, []))
+            self.assertTrue(os.path.exists(current_path))
         with open(current_path) as f:
             payload = json.load(f)
         box["payload"] = payload
@@ -872,6 +875,172 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 # the finally-block close after finalize stays idempotent
                 mgr.close()
 
+    def test_publish_clears_ready_before_prune(self) -> None:
+        """A prune failure after the flip must not leave the live version 'ready'.
+
+        Otherwise the next build would treat the published version as
+        superseded and remove the directory current.json points at.
+        """
+        state = {"model.w": torch.zeros(2)}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self._tiny_manager(tmp_dir, state) as mgr:
+                mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+                with mock.patch(
+                    _BUILD_PATCHES.format("_prune_old_dense_versions"),
+                    side_effect=OSError("boom"),
+                ):
+                    with self.assertRaises(OSError):
+                        mgr.poll_publish((5, []))
+                with open(_current_path(tmp_dir)) as f:
+                    published = json.load(f)["version"]
+                self.assertIsNone(mgr._ready)
+                mgr.maybe_export(7, 43.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: (mgr._ready or {}).get("step") == 7))
+                self.assertTrue(
+                    os.path.isdir(os.path.join(_versions_root(tmp_dir), published))
+                )
+
+    # --- multi-rank publish gate (two simulated ranks over the module dist) ---
+
+    def test_poll_publish_multi_rank_gates_on_min_watermark(self) -> None:
+        """The lagging rank holds the flip; probes are gathered only at the flip.
+
+        Simulates rank one through the module-level ``dist`` so the
+        world-size > 1 branch runs: the per-step tensor gather carries
+        (completed step, rank-zero ready step), the minimum completed step is
+        the watermark, and the object gather of probes happens once, when
+        that watermark covers the ready version.
+        """
+        state = {"model.w": torch.zeros(2)}
+        other = {"step": 0}
+        own_probes = [
+            {"pk": "emb.t", "sk": i, "crc32": "aa" * 4, "encoding": "fp32"}
+            for i in range(40)
+        ]
+        other_probes = [
+            {"pk": "emb.t", "sk": 100 + i, "crc32": "bb" * 4, "encoding": "fp32"}
+            for i in range(40)
+        ]
+
+        def fake_all_gather(gathered: List[Any], local: Any, group: Any = None) -> None:
+            gathered[0].copy_(local)
+            gathered[1].copy_(torch.tensor([other["step"], -1], dtype=torch.int64))
+
+        def fake_all_gather_object(box: List[Any], obj: Any, group: Any = None) -> None:
+            box[0] = obj
+            box[1] = other_probes
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                self._tiny_manager(tmp_dir, state) as mgr,
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.get_world_size"), return_value=2
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.all_gather"),
+                    side_effect=fake_all_gather,
+                ) as all_gather,
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.all_gather_object"),
+                    side_effect=fake_all_gather_object,
+                ) as gather_probes,
+            ):
+                mgr._group = mock.Mock()
+                current_path = _current_path(tmp_dir)
+                # nothing ready: the cheap tensor gather still runs on every
+                # step, the probe object gather does not
+                mgr.poll_publish((5, own_probes))
+                torch.testing.assert_close(
+                    all_gather.call_args.args[1], torch.tensor([5, -1])
+                )
+                gather_probes.assert_not_called()
+
+                mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+                # own rank covers step 5 but rank one lags: min() holds the flip
+                other["step"] = 4
+                mgr.poll_publish((5, own_probes))
+                torch.testing.assert_close(
+                    all_gather.call_args.args[1], torch.tensor([5, 5])
+                )
+                self.assertFalse(os.path.exists(current_path))
+                gather_probes.assert_not_called()
+
+                other["step"] = 6
+                mgr.poll_publish((5, own_probes))
+                self.assertEqual(all_gather.call_count, 3)
+                gather_probes.assert_called_once()
+                with open(current_path) as f:
+                    payload = json.load(f)
+                self.assertEqual(payload["checkpoint_step"], 5)
+                self.assertEqual(payload["sparse_step"], 5)
+                self.assertEqual(
+                    payload["sparse_probes"], (own_probes + other_probes)[:64]
+                )
+                # published: later polls gather nothing more
+                mgr.poll_publish((7, own_probes))
+                gather_probes.assert_called_once()
+
+    def test_poll_publish_non_zero_rank_joins_collectives_without_publishing(
+        self,
+    ) -> None:
+        """A non-zero rank enters both gathers in lockstep but never flips."""
+        probe = {"pk": "emb.t", "sk": 1, "crc32": "aa" * 4, "encoding": "fp32"}
+
+        def fake_all_gather(gathered: List[Any], local: Any, group: Any = None) -> None:
+            # rank zero: completed step 7, ready version at step 5
+            gathered[0].copy_(torch.tensor([7, 5], dtype=torch.int64))
+            gathered[1].copy_(local)
+
+        def fake_all_gather_object(box: List[Any], obj: Any, group: Any = None) -> None:
+            box[0] = []
+            box[1] = obj
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    _base_env(tmp_dir, RANK="1", LOCAL_RANK="1"),
+                    clear=True,
+                ),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.get_world_size"), return_value=2
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.all_gather"),
+                    side_effect=fake_all_gather,
+                ) as all_gather,
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.all_gather_object"),
+                    side_effect=fake_all_gather_object,
+                ) as gather_probes,
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model({}),
+                )
+                self.assertIsNone(mgr._worker)
+                mgr._group = mock.Mock()
+                current_path = _current_path(tmp_dir)
+                mgr.poll_publish((6, [probe]))
+                torch.testing.assert_close(
+                    all_gather.call_args.args[1], torch.tensor([6, -1])
+                )
+                # rank zero's ready step 5 <= min(7, 6): this rank must join
+                # the probe gather too, yet only rank zero writes the pointer
+                gather_probes.assert_called_once()
+                self.assertEqual(gather_probes.call_args.args[1], [probe])
+                self.assertFalse(os.path.exists(current_path))
+                mgr.finalize_publish((6, [probe]))
+                self.assertEqual(all_gather.call_count, 2)
+                self.assertFalse(os.path.exists(current_path))
+                mgr.close()
+
     def test_gather_uses_ema_parameters_and_live_buffers(self) -> None:
         manager = OnlineDenseExportManager.__new__(OnlineDenseExportManager)
         manager._rank = 0
@@ -969,9 +1138,9 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     # return as the cached traced module
                     self.assertIs(mgr._dense_model_traced, sentinel)
                     mgr.maybe_export(5, 42.0, _mock_model({}), force=True)
+                    self.assertTrue(_wait_for(lambda: mgr._ready is not None))
                     mgr.poll_publish((5, []))
-                    current_path = _current_path(tmp_dir)
-                    self.assertTrue(_wait_for(lambda: os.path.exists(current_path)))
+                    self.assertTrue(os.path.exists(_current_path(tmp_dir)))
                 finally:
                     mgr.close()
             # one construction call (no cached module) then one worker call

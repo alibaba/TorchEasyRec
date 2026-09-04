@@ -263,9 +263,12 @@ class OnlineDenseExportManager:
 
     Every collective the manager enters (group creation, the startup
     key-list broadcast, the per-export weight gather, the per-step publish
-    poll) is called identically on all ranks: the export trigger is the
-    rank-synchronized dump decision passed in as ``force``, and
-    ``poll_publish`` is called unconditionally on every step.
+    poll and its flip-time probe gather) is called identically on all ranks:
+    the export trigger is the rank-synchronized dump decision passed in as
+    ``force``, and ``poll_publish`` is called unconditionally on every step.
+    Like the pipeline's own per-step collectives this assumes lockstep
+    stepping; a rank that stops stepping early (ragged dataloader exhaustion
+    with ``check_all_workers_data_status=False``) desyncs the poll.
     """
 
     def __init__(
@@ -292,12 +295,10 @@ class OnlineDenseExportManager:
         self._last_export_step = -1
         self._group: Optional[dist.ProcessGroup] = None
         # rank-zero publish gating state, guarded by _publish_lock: the newest
-        # ready-but-unpublished version plus the cached sparse upload watermark
-        # and probes from the latest poll_publish gather.
+        # ready-but-unpublished version, written by the export worker and
+        # published by the training thread's poll_publish.
         self._publish_lock = Lock()
         self._ready: Optional[Dict[str, Any]] = None
-        self._sparse_watermark = 0
-        self._sparse_probes: List[Dict[str, Any]] = []
         # (gm state key, DMP state_dict source key) pairs, sorted; identical
         # on all ranks after the startup broadcast. The gather iterates them
         # in this order on every rank so collectives stay in lockstep.
@@ -568,14 +569,16 @@ class OnlineDenseExportManager:
     ) -> None:
         """Reconcile the sparse upload watermark and flip current.json if covered.
 
-        The train loop calls this on every step on all ranks. When enabled
-        with world size > 1 it is a gloo collective -- an
-        ``all_gather_object`` of each rank's ``(completed upload step,
-        probes)`` snapshot -- replacing the removed per-step event-time
-        reconcile with the same per-step cost pattern. Rank zero takes the
-        minimum completed step across ranks as the global watermark, caches
-        the concatenated probes (capped at 64), and publishes the newest
-        ready dense version once its pairing step is covered.
+        The train loop calls this on every step on all ranks; it is the only
+        publisher of ``current.json``. When enabled with world size > 1 the
+        per-step cost is one gloo ``all_gather`` of a two-int64 tensor: each
+        rank's completed upload step plus rank zero's ready-version step
+        (-1 when nothing is ready). The pickled probe dicts are only
+        object-gathered when that gather shows the watermark covers the
+        ready version, i.e. once per flip rather than per step. Rank zero
+        takes the minimum completed step across ranks as the global
+        watermark and publishes the ready version with the concatenated
+        probes (capped at 64).
 
         Args:
             sparse_state: this rank's ``(last completed upload step, probes)``
@@ -583,24 +586,29 @@ class OnlineDenseExportManager:
         """
         if not self._enabled:
             return
-        state = sparse_state or (0, [])
-        if self._group is not None:
-            states: List[Tuple[int, List[Dict[str, Any]]]] = [
-                (0, [])
-            ] * dist.get_world_size(self._group)
-            dist.all_gather_object(states, state, group=self._group)
+        step, probes = sparse_state or (0, [])
+        if self._group is None:
+            watermark = step
         else:
-            states = [state]
+            # Only rank zero's ready slot is ever set; its step travels in the
+            # second slot so every rank takes the same probe-gather decision.
+            with self._publish_lock:
+                ready_step = self._ready["step"] if self._ready is not None else -1
+            world_size = dist.get_world_size(self._group)
+            local = torch.tensor([step, ready_step], dtype=torch.int64)
+            gathered = [torch.empty(2, dtype=torch.int64) for _ in range(world_size)]
+            dist.all_gather(gathered, local, group=self._group)
+            watermark = min(int(state[0]) for state in gathered)
+            ready_step = int(gathered[0][1])
+            if ready_step < 0 or ready_step > watermark:
+                return
+            rank_probes: List[List[Dict[str, Any]]] = [[] for _ in range(world_size)]
+            dist.all_gather_object(rank_probes, probes, group=self._group)
+            probes = [probe for one_rank in rank_probes for probe in one_rank]
         if self._rank != 0:
             return
-        watermark = min(rank_step for rank_step, _ in states)
-        probes: List[Dict[str, Any]] = []
-        for _, rank_probes in states:
-            probes.extend(rank_probes)
         with self._publish_lock:
-            self._sparse_watermark = watermark
-            self._sparse_probes = probes[:64]
-            self._maybe_publish_locked()
+            self._publish_locked(watermark, probes[:64])
 
     def finalize_publish(
         self, sparse_state: Optional[Tuple[int, List[Dict[str, Any]]]]
@@ -794,11 +802,12 @@ class OnlineDenseExportManager:
 
         Builds the immutable version directory (READY marker + atomic
         rename) but does not flip current.json: the finished version is
-        recorded as the newest ready one and published only when the sparse
-        upload watermark covers its step. A previously ready but still
-        unpublished version is superseded and its directory removed, so
-        unpublished builds neither pile up while the watermark lags nor eat
-        into the newest-K retention quota of published versions.
+        recorded as the newest ready one and the training thread's next
+        ``poll_publish`` publishes it once the sparse upload watermark covers
+        its step. A previously ready but still unpublished version is
+        superseded and its directory removed, so unpublished builds neither
+        pile up while the watermark lags nor eat into the newest-K retention
+        quota of published versions.
         """
         version = task["version"]
         versions_root = os.path.join(self._export_root, VERSIONS_DIR)
@@ -868,7 +877,6 @@ class OnlineDenseExportManager:
                 "version": version,
                 "data_timestamp": task["data_timestamp"],
             }
-            self._maybe_publish_locked()
         elapsed = time.monotonic() - start_time
         if elapsed > self._export_timeout:
             logger.warning(
@@ -885,38 +893,47 @@ class OnlineDenseExportManager:
             elapsed,
         )
 
-    def _maybe_publish_locked(self) -> None:
+    def _publish_locked(
+        self, sparse_watermark: int, sparse_probes: List[Dict[str, Any]]
+    ) -> None:
         """Flip current.json if the sparse watermark covers the ready version.
 
         Caller must hold ``_publish_lock``. Publishes the newest ready dense
         version only when its pairing step is <= the cross-rank sparse upload
         watermark, so the flipped manifest always satisfies
         ``sparse_step >= checkpoint_step`` and sparse-ahead-of-dense stays the
-        only allowed skew.
+        only allowed skew. The ready slot is cleared as soon as the pointer
+        has flipped, before the best-effort prune: a prune failure must not
+        leave the published version marked ready, or the next build would
+        "supersede" it and remove the directory current.json points at.
+
+        Args:
+            sparse_watermark: minimum completed upload step across ranks.
+            sparse_probes: gathered probe rows to record in the manifest.
         """
         ready = self._ready
-        if ready is None or ready["step"] > self._sparse_watermark:
+        if ready is None or ready["step"] > sparse_watermark:
             return
         payload: Dict[str, Any] = {
             "version": ready["version"],
             "checkpoint_step": ready["step"],
-            "sparse_step": self._sparse_watermark,
+            "sparse_step": sparse_watermark,
             "data_timestamp": ready["data_timestamp"],
             "created_at": _utc_now(),
-            "sparse_probes": self._sparse_probes[:64],
+            "sparse_probes": sparse_probes,
         }
         if self._publish_interval_minutes is not None:
             payload["publish_interval_minutes"] = self._publish_interval_minutes
         # Keep the service-facing pointer beside the immutable dense versions.
         _publish_current(os.path.join(self._export_root, CURRENT_JSON), payload)
-        _prune_old_dense_versions(
-            self._export_root, os.path.join(self._export_root, VERSIONS_DIR)
-        )
         self._ready = None
         logger.info(
             "published online dense export version %s (checkpoint_step %s, "
             "sparse_step %s)",
             ready["version"],
             ready["step"],
-            self._sparse_watermark,
+            sparse_watermark,
+        )
+        _prune_old_dense_versions(
+            self._export_root, os.path.join(self._export_root, VERSIONS_DIR)
         )
