@@ -98,6 +98,128 @@ message UltraHSTU {
     optional bool concat_contextual_features = 7 [default = false];
 }
 
+// Cross-task attention mask A of the OneRank prediction head (paper 2.4).
+// Task order follows the order of fusion_mtl_tower.task_configs.
+enum OneRankCrossTaskMask {
+    // A[k][j] = 1 iff j <= k.  Default, because the duration bitmask only
+    // ever takes the values {0,1,3,7,15,31} == 2^k-1, i.e. the labels are
+    // strictly cumulative and form a single nesting chain.
+    ONERANK_MASK_CASCADE = 0;
+    // A = I; every task head reads only itself.
+    ONERANK_MASK_PARALLEL = 1;
+    // A = all ones; every task head reads every other task.
+    ONERANK_MASK_FULL = 2;
+    // Cascade among the tasks listed in `hybrid_chain_task_names`,
+    // identity for everything else.
+    ONERANK_MASK_HYBRID = 3;
+}
+
+// Situation Discernment (paper 2.3): per-task query built from the
+// contextual token, cross-candidate aggregation via softmax MHCA.
+// Absent == the module is skipped and the per-task request-level vector
+// degenerates to a mean over candidates (ablation V5).
+message OneRankSituationDiscernment {
+    // heads of the cross-candidate multi-head cross attention
+    optional uint32 num_heads = 1 [default = 4];
+    // attention dropout ratio
+    optional float dropout_ratio = 2 [default = 0.0];
+}
+
+// Cross-task prediction head (paper 2.4).  Absent == skipped, the
+// per-task vectors go straight to the inner-product scorer (ablation V3).
+message OneRankCrossTaskHead {
+    optional OneRankCrossTaskMask mask_type = 1 [default = ONERANK_MASK_CASCADE];
+    // Strategic Gradient Detachment: keep gradients only on the diagonal so
+    // the off-diagonal cross-task attention acts as a read-only memory.
+    optional bool gradient_detachment = 2 [default = true];
+    optional uint32 num_heads = 3 [default = 4];
+    // position-wise FFN hidden dim; 0 == 4x the stu embedding dim
+    optional uint32 ffn_hidden_dim = 4 [default = 0];
+    optional float dropout_ratio = 5 [default = 0.0];
+    // task names forming the cascade chain when mask_type is
+    // ONERANK_MASK_HYBRID; ignored otherwise
+    repeated string hybrid_chain_task_names = 6;
+}
+
+// One list-wise InfoNCE term (paper 2.5).  The negatives of a candidate
+// are the other candidates of the same request, so no cross-rank gather
+// is needed.  Only worth enabling for tasks whose per-request positive
+// coverage is close to 100%.
+message OneRankListwiseLoss {
+    // must match a fusion_mtl_tower.task_configs entry
+    required string task_name = 1;
+    // weight of this term in the total loss
+    optional float alpha = 2 [default = 1.0];
+    // initial softmax temperature
+    optional float temperature_init = 3 [default = 0.07];
+    // learn the temperature (clamped, see OneRankListwiseLoss module)
+    optional bool learnable_temperature = 4 [default = true];
+}
+
+// Scoring function for s^i_k (paper 2.4 uses the inner product).  The
+// alternatives exist because a rank-1 scorer ranks a request's candidates
+// by their projection onto a single direction, and combined with flat
+// candidate representations it can sit on the "predict the global CTR"
+// plateau for most of a single-epoch run (ONERANK_OVERVIEW.md §5).
+enum OneRankScorerType {
+    // s^i_k = z_k . r^i_k / sqrt(D) + b_k   (paper default)
+    ONERANK_SCORER_DOT_PRODUCT = 0;
+    // s^i_k = z_k . (W_k r^i_k) / sqrt(D) + b_k with a per-task W_k
+    // initialised to the identity: the run starts exactly where the dot
+    // product would, and training can raise the rank off 1.
+    ONERANK_SCORER_BILINEAR = 1;
+    // s^i_k = MLP_k([z_k; r^i_k]) + b_k, a per-task two-layer MLP.  The
+    // random init already discriminates candidates, so the run never
+    // enters the constant-prediction plateau.
+    ONERANK_SCORER_MLP = 2;
+}
+
+message OneRankConfig {
+    // Upper bound on candidates per request.  Used only to pin the
+    // attention-output scaling divisor of the inflated sequence, so that
+    // attention magnitudes stay comparable with the DlrmHSTU baseline.
+    required uint32 max_num_candidates = 1;
+    optional OneRankSituationDiscernment situation_discernment = 2;
+    optional OneRankCrossTaskHead cross_task_head = 3;
+    // Tasks not listed here are trained with their point-wise losses only.
+    repeated OneRankListwiseLoss listwise_losses = 4;
+    // scoring function of the head; see OneRankScorerType
+    optional OneRankScorerType scorer_type = 5 [default = ONERANK_SCORER_DOT_PRODUCT];
+    // hidden dim of the MLP scorer (ONERANK_SCORER_MLP only)
+    optional uint32 scorer_hidden_dim = 6 [default = 256];
+    // per-task initial logits b_k, in task_configs order; empty keeps the
+    // zeros of previous runs.  logit(CTR_k) skips the descent onto the
+    // constant-prediction start, which is cheap either way (the descent
+    // takes ~100 steps, the plateau escape takes 900+).
+    repeated double task_bias_init = 7;
+}
+
+message DlrmHSTUOneRank {
+    // Fields 1-7 mirror DlrmHSTU so an existing dlrm_hstu block can be
+    // reused verbatim.
+    // hstu config
+    required HSTU hstu = 1;
+    // multi task tower config; OneRank reads `task_configs` (task names,
+    // labels, bitmasks, losses, metrics) but replaces the fused tower
+    // itself with per-task inner-product scoring, so `mlp` is ignored.
+    required FusionMTLTower fusion_mtl_tower = 2;
+    // max sequence length, before the candidate-group inflation
+    required uint32 max_seq_len = 3;
+    // item embedding mlp hidden dimension
+    optional uint32 item_embedding_hidden_dim = 4 [default = 512];
+    // enables loss averaging computation globally across all ranks (total rank)
+    // instead of locally (local rank).
+    optional bool enable_global_average_loss = 5 [default = true];
+    // timestamp of sequence is ascending or descending
+    optional bool sequence_timestamp_is_ascending = 6 [default = true];
+    // concat all contextual features on channel dim as one token
+    optional bool concat_contextual_features = 7 [default = false];
+
+    // OneRank-specific configuration.  The number of task tokens K is
+    // implied by len(fusion_mtl_tower.task_configs).
+    required OneRankConfig onerank = 8;
+}
+
 message PEPNet {
     // epnet hidden units
     optional uint32 epnet_hidden_unit = 1;

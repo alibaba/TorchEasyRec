@@ -151,7 +151,15 @@ class DlrmHSTU(RankModel):
         )
 
         # item embeddings
-        stu_embedding_dim = self._stu_embedding_dim()
+        self._build_output_modules(self._stu_embedding_dim())
+
+    def _build_output_modules(self, stu_embedding_dim: int) -> None:
+        """Subclass hook: modules turning STU output into per-task logits.
+
+        Kept separate from the rest of ``_init`` so a subclass that scores
+        differently does not have to register these parameters -- DDP
+        errors out on parameters that never receive a gradient.
+        """
         self._item_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(
                 in_features=self.embedding_group.group_total_dim("candidate"),
