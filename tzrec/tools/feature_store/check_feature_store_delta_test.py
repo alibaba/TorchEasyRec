@@ -19,6 +19,7 @@ from unittest import mock
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from parameterized import parameterized
 
 from tzrec.tools.feature_store.check_feature_store_delta import (
     LocalSample,
@@ -29,6 +30,7 @@ from tzrec.tools.feature_store.check_feature_store_delta import (
     sample_local_records,
     verify_samples,
 )
+from tzrec.utils.test_util import parameterized_name_func
 
 
 class _FakeView:
@@ -43,7 +45,11 @@ class _FakeView:
 
 
 class CheckFeatureStoreDeltaTest(unittest.TestCase):
-    def test_create_feature_store_view_uses_public_endpoint_when_supported(self):
+    @parameterized.expand(
+        [["public_endpoint", True], ["vpc_endpoint", False]],
+        name_func=parameterized_name_func,
+    )
+    def test_create_feature_store_view_honors_test_mode(self, _name, test_mode):
         captured_kwargs = {}
         view = SimpleNamespace(
             pk_field="embedding_name",
@@ -73,6 +79,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             endpoint="",
             project_name="project",
             feature_view_name="view",
+            test_mode=test_mode,
         )
         feature_store_module = SimpleNamespace(
             FeatureStoreClient=FakeFeatureStoreClient
@@ -90,7 +97,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             actual = create_feature_store_view(settings)
 
         self.assertIs(actual, view)
-        self.assertTrue(captured_kwargs["test_mode"])
+        self.assertEqual(captured_kwargs["test_mode"], test_mode)
 
     def test_parse_args_does_not_accept_credentials(self):
         args = parse_args(["--pipeline_config", "pipeline.config"])

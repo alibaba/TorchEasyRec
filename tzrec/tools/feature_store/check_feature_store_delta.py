@@ -419,7 +419,9 @@ def create_feature_store_view(settings: FeatureStoreUploadSettings) -> Any:
     except (TypeError, ValueError):
         parameters = {}
     if "test_mode" in parameters:
-        kwargs["test_mode"] = True
+        # Same data-plane routing as the training-time uploader, so a config
+        # that uploads from a given network location also reads back from it.
+        kwargs["test_mode"] = settings.test_mode
 
     client = FeatureStoreClient(**kwargs)
     project = client.get_project(settings.project_name)
