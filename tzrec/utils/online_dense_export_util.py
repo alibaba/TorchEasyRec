@@ -349,9 +349,17 @@ class OnlineDenseExportManager:
                     f"ONLINE_DENSE_EXPORT requires a local {label}, got remote: {path}"
                 )
         if dist.is_initialized() and dist.get_world_size() > 1:
-            # collective; ONLINE_DENSE_EXPORT is job-uniform so all ranks enter
+            # collective; ONLINE_DENSE_EXPORT is job-uniform so all ranks enter.
+            # finalize_publish drains the export worker on rank zero (up to
+            # _close_timeout) before its gather while the other ranks already
+            # wait inside it, so the group timeout must cover that drain
+            # instead of the 30-minute gloo default.
             self._group = cast(
-                Optional[dist.ProcessGroup], dist.new_group(backend="gloo")
+                Optional[dist.ProcessGroup],
+                dist.new_group(
+                    backend="gloo",
+                    timeout=datetime.timedelta(seconds=self._close_timeout),
+                ),
             )
 
         state_pairs: List[Tuple[str, str]] = []
