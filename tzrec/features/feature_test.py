@@ -152,12 +152,66 @@ class FeatureTest(unittest.TestCase):
             default_value=default_value,
             multival_sep=";",
             is_weighted=is_weighted,
+            use_weight=bool(is_weighted),
         )
         np.testing.assert_allclose(tag_data.values, np.array(expected_values))
         np.testing.assert_allclose(tag_data.lengths, np.array(expected_lengths))
         if is_weighted:
             assert tag_data.weights is not None
             np.testing.assert_allclose(tag_data.weights, np.array(expected_weights))
+
+    @parameterized.expand(
+        [
+            param(
+                "str",
+                input_feat=pa.array(["1:0.1;2:0.2;3:0.3", "", None, "4:0.4"]),
+                expected_values=[1, 2, 3, 4],
+                expected_lengths=[3, 0, 0, 1],
+                is_weighted=True,
+            ),
+            param(
+                "list",
+                input_feat=pa.array([["1:0.1", "2:0.2", "3:0.3"], [], None, ["4:0.4"]]),
+                expected_values=[1, 2, 3, 4],
+                expected_lengths=[3, 0, 0, 1],
+                is_weighted=True,
+            ),
+            param(
+                "map",
+                input_feat=pa.array(
+                    [{1: 0.1}, {2: 0.2}, None, {4: 0.4}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                ),
+                expected_values=[1, 2, 4],
+                expected_lengths=[1, 1, 0, 1],
+                is_weighted=True,
+            ),
+            param(
+                "map_wo_weighted",
+                input_feat=pa.array(
+                    [{1: 0.1}, {2: 0.2}, None, {4: 0.4}],
+                    type=pa.map_(pa.int64(), pa.float32()),
+                ),
+                expected_values=[1, 2, 4],
+                expected_lengths=[1, 1, 0, 1],
+                is_weighted=False,
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_parse_fg_encoded_sparse_feature_impl_wo_weight(
+        self, name, input_feat, expected_values, expected_lengths, is_weighted
+    ):
+        tag_data = feature_lib._parse_fg_encoded_sparse_feature_impl(
+            "tag",
+            input_feat,
+            multival_sep=";",
+            is_weighted=is_weighted,
+            use_weight=False,
+        )
+        np.testing.assert_allclose(tag_data.values, np.array(expected_values))
+        np.testing.assert_allclose(tag_data.lengths, np.array(expected_lengths))
+        self.assertIsNone(tag_data.weights)
 
     @parameterized.expand(
         [

@@ -171,6 +171,8 @@ message IdFeature {
     optional bool stub_type = 34 [default = false];
     // embedding data type
     optional string data_type = 35 [default = 'FP32'];
+    // use weight in embedding pooling or not, only take effect when weighted = true
+    optional bool use_weight = 36 [default = false];
 
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
