@@ -401,11 +401,17 @@ class OnlineDenseExportManager:
     def _build_export_graph(self, model: nn.Module) -> List[Tuple[str, str]]:
         """Build the resident dense export graph once, before training starts.
 
-        Runs inside a scoped ``INPUT_TILE=3`` env window: the export-side
-        model has user-side twin modules the training process never builds,
-        and INPUT_TILE is read at model construction and batch-parse time.
-        The training model and its dataloader workers are already constructed
-        by the time this runs, so the window cannot affect them.
+        Runs inside a scoped ``INPUT_TILE=3`` / ``WORLD_SIZE=1`` env window:
+        the export-side model has user-side twin modules the training process
+        never builds, and INPUT_TILE is read at model construction and
+        batch-parse time. WORLD_SIZE gives the warm-up dataloader the same
+        single-rank view the full export runs under: the Parquet and ODPS
+        readers run startup collectives (file-metadata all-gather, scan
+        session broadcast) on the default process group when WORLD_SIZE > 1,
+        and this rank-zero-only build has no peer to join, which would
+        deadlock the collective. The training model and its dataloader
+        workers are already constructed by the time this runs, so the window
+        cannot affect them.
 
         Fails fast (before training) on any trace/script error via a dry-run
         finalize, and on any dense-graph state key with no gatherable source
@@ -426,7 +432,9 @@ class OnlineDenseExportManager:
 
         device = torch.device("cpu")
         prev_input_tile = os.environ.get("INPUT_TILE")
+        prev_world_size = os.environ.get("WORLD_SIZE")
         os.environ["INPUT_TILE"] = "3"
+        os.environ["WORLD_SIZE"] = "1"
         try:
             pipeline_config = config_util.load_pipeline_config(
                 self._pipeline_config_path
@@ -478,6 +486,10 @@ class OnlineDenseExportManager:
                 os.environ.pop("INPUT_TILE", None)
             else:
                 os.environ["INPUT_TILE"] = prev_input_tile
+            if prev_world_size is None:
+                os.environ.pop("WORLD_SIZE", None)
+            else:
+                os.environ["WORLD_SIZE"] = prev_world_size
 
         source_keys = model.state_dict()
         pairs: List[Tuple[str, str]] = []

@@ -206,9 +206,13 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
 
     # --- one-time build phase ---
 
-    def test_build_scopes_input_tile_env_and_restores_it(self) -> None:
-        """INPUT_TILE=3 holds only during the twin build, even on failure."""
+    def test_build_scopes_export_env_and_restores_it(self) -> None:
+        """INPUT_TILE/WORLD_SIZE hold only during the twin build, even on failure."""
         seen: Dict[str, Any] = {}
+
+        def fake_warmup(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+            seen["world_size"] = os.environ.get("WORLD_SIZE")
+            return {}
 
         def fake_finalize(*args: Any, **kwargs: Any) -> None:
             seen["input_tile"] = os.environ.get("INPUT_TILE")
@@ -216,7 +220,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         fake_gm = mock.Mock()
         fake_gm.state_dict.return_value = {}
         with tempfile.TemporaryDirectory() as tmp_dir:
-            env = _base_env(tmp_dir)
+            env = _base_env(tmp_dir, WORLD_SIZE="4")
             with mock.patch.dict(os.environ, env, clear=True):
                 with (
                     mock.patch(
@@ -231,7 +235,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     ),
                     mock.patch(
                         _BUILD_PATCHES.format("create_dense_export_warmup_data"),
-                        return_value={},
+                        side_effect=fake_warmup,
                     ),
                     mock.patch(
                         _BUILD_PATCHES.format("build_dense_graph_module"),
@@ -249,7 +253,9 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     )
                     mgr.close()
                 self.assertEqual(seen["input_tile"], "3")
+                self.assertEqual(seen["world_size"], "1")
                 self.assertNotIn("INPUT_TILE", os.environ)
+                self.assertEqual(os.environ["WORLD_SIZE"], "4")
 
                 # a failing build must also restore the env
                 with (
@@ -267,6 +273,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                             model=_mock_model({}),
                         )
                 self.assertNotIn("INPUT_TILE", os.environ)
+                self.assertEqual(os.environ["WORLD_SIZE"], "4")
 
     def test_build_maps_user_twin_keys_to_non_user_sources(self) -> None:
         """INPUT_TILE=3 user-side keys resolve to their non-user training twins."""
