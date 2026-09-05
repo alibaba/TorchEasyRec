@@ -23,6 +23,7 @@ from tzrec.models.match_model import MatchModel
 from tzrec.models.model import ScriptWrapper
 from tzrec.models.tdm import TDM
 from tzrec.utils import config_util
+from tzrec.utils.checkpoint_util import _get_checkpoint_step
 from tzrec.utils.export_util import (
     ensure_input_tile_for_distributed_embedding,
     export_dense_model_cpu,
@@ -50,9 +51,14 @@ def export_online_dense_model(
     """Export and publish one online-learning dense model version.
 
     Offline / manual companion to the in-process online export
-    (tzrec.utils.online_dense_export_util.OnlineDenseExportManager): builds
-    the dense model from a checkpoint on disk instead of from the live
-    training state, then publishes it to the same serving tree.
+    (tzrec.utils.online_dense_export_util.OnlineDenseExportManager) for
+    bootstrapping the serving tree: builds the dense model from a checkpoint
+    on disk instead of from the live training state. Unlike the in-process
+    exporter it flips current.json directly, without waiting on a sparse
+    upload watermark: the bootstrap precondition is that the FeatureStore
+    full load and the checkpoint come from the same source, so
+    ``sparse_step`` mirrors ``checkpoint_step`` and ``sparse_probes`` is
+    empty, which tells the processor to skip probe verification.
 
     Args:
         pipeline_config_path: pipeline config the model is rebuilt from.
@@ -60,7 +66,9 @@ def export_online_dense_model(
         model_dir: training model dir (fallback publish root when
             ONLINE_DENSE_EXPORT_DIR is unset).
         version: explicit version name; a monotonic timestamp when unset.
-        checkpoint_step: checkpoint step recorded in current.json.
+        checkpoint_step: checkpoint step recorded in current.json; parsed from
+            a ``model.ckpt-<step>`` checkpoint_path when unset (0 when the path
+            carries no step), so the manifest watermark is never null.
         data_timestamp: consumed event-time recorded in current.json.
 
     Returns:
@@ -72,6 +80,8 @@ def export_online_dense_model(
     ensure_input_tile_for_distributed_embedding()
 
     version = version or make_version()
+    if checkpoint_step is None:
+        checkpoint_step = _get_checkpoint_step(checkpoint_path)
     export_root = resolve_dense_export_root(model_dir)
     versions_root = os.path.join(export_root, VERSIONS_DIR)
     version_dir = os.path.join(versions_root, version)
@@ -129,12 +139,17 @@ def export_online_dense_model(
             shutil.rmtree(tmp_dir)
         raise
 
+    # Manifest v2 for bootstrap: the FeatureStore full load and this
+    # checkpoint are same-source, so sparse_step mirrors checkpoint_step and
+    # the empty probe list tells the processor to skip verification.
     current_payload: Dict[str, Any] = {
         "version": version,
         "checkpoint_path": os.path.abspath(checkpoint_path),
         "checkpoint_step": checkpoint_step,
+        "sparse_step": checkpoint_step,
         "data_timestamp": data_timestamp,
         "created_at": _utc_now(),
+        "sparse_probes": [],
     }
 
     # Keep the service-facing pointer beside the immutable dense export versions.

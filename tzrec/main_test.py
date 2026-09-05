@@ -40,7 +40,9 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, TrainConfig
 from tzrec.utils import predict_util
+from tzrec.utils.delta_embedding_dump import DumpDecision
 from tzrec.utils.test_util import parameterized_name_func
 
 
@@ -87,6 +89,7 @@ class MainTest(unittest.TestCase):
         ckpt_manager = mock.Mock()
         ckpt_manager.maybe_save.return_value = False
         exporter = mock.Mock()
+        exporter.enabled = False
         model = mock.Mock()
         optimizer = mock.Mock()
         train_dataloader = mock.Mock()
@@ -95,14 +98,14 @@ class MainTest(unittest.TestCase):
         pipeline = mock.Mock()
         pipeline.progress.side_effect = RuntimeError("boom")
 
-        train_config = SimpleNamespace(
+        train_config = TrainConfig(
             num_steps=1,
             num_epochs=0,
             save_checkpoints_steps=0,
             save_checkpoints_epochs=0,
             save_checkpoints_timestamp_interval=0,
             save_checkpoints_timestamps=[],
-            save_checkpoints_timestamp_quorum=0,
+            save_checkpoints_timestamp_quorum=0.0,
             use_tensorboard=False,
             tensorboard_summaries=[],
             is_profiling=False,
@@ -133,6 +136,8 @@ class MainTest(unittest.TestCase):
                     )
         self.assertTrue(exporter.close.called)
         self.assertTrue(ckpt_manager.close.called)
+        # a collective; missing ranks would hang it on exception paths
+        exporter.finalize_publish.assert_not_called()
 
     def test_train_eval_uses_ema_and_restores_training_parameters(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([2.0]))
@@ -158,14 +163,15 @@ class MainTest(unittest.TestCase):
         ckpt_manager = mock.Mock()
         ckpt_manager.maybe_save.side_effect = [True, False, False]
         exporter = mock.Mock()
-        train_config = SimpleNamespace(
+        exporter.enabled = False
+        train_config = TrainConfig(
             num_steps=1,
             num_epochs=0,
             save_checkpoints_steps=1,
             save_checkpoints_epochs=0,
             save_checkpoints_timestamp_interval=0,
             save_checkpoints_timestamps=[],
-            save_checkpoints_timestamp_quorum=0,
+            save_checkpoints_timestamp_quorum=0.0,
             use_tensorboard=False,
             tensorboard_summaries=[],
             is_profiling=False,
@@ -200,6 +206,165 @@ class MainTest(unittest.TestCase):
         self.assertTrue(model.module.model.on_train_end.called)
         for call in exporter.maybe_export.call_args_list:
             self.assertIsNone(call.kwargs["dense_ema"])
+
+    @parameterized.expand(
+        [
+            ["no_dumper", None, False],
+            [
+                "local_dump_only",
+                DeltaEmbeddingDumpConfig(paired_dump_interval_steps=1),
+                True,
+            ],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_online_dense_export_requires_feature_store_upload(
+        self,
+        _name: str,
+        dump_config: DeltaEmbeddingDumpConfig,
+        has_dumper: bool,
+    ) -> None:
+        """Enabled export must fail fast unless the sparse delta is uploaded.
+
+        Without a FeatureStore uploader there is no upload watermark to gate
+        current.json on, so a local-only dump would publish dense ahead of the
+        serving-side sparse state.
+        """
+        exporter = mock.Mock()
+        exporter.enabled = True
+        train_config = TrainConfig(
+            num_steps=1,
+            num_epochs=0,
+            save_checkpoints_steps=0,
+            use_tensorboard=False,
+            dense_optimizer=DenseOptimizer(),
+        )
+        if dump_config is not None:
+            train_config.delta_embedding_dump_config.CopyFrom(dump_config)
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "feature_store_config"):
+                _train_and_evaluate(
+                    model=mock.Mock(),
+                    optimizer=mock.Mock(),
+                    train_dataloader=mock.Mock(),
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir="unused",
+                    train_config=train_config,
+                    eval_config=EvalConfig(),
+                    ckpt_manager=mock.Mock(),
+                    delta_embedding_dumper=mock.Mock() if has_dumper else None,
+                )
+
+    def test_train_loop_pairs_dense_export_with_delta_dump(self) -> None:
+        """The dump decision drives the export; the poll and final publish follow.
+
+        Pins the per-step order maybe_dump -> maybe_export(force=PAIRED) ->
+        poll_publish(fresh upload state), the final export at the step
+        final_dump returns, and dumper.close() draining before the
+        finalize_publish collective so the final watermark covers the final
+        dump.
+        """
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()] * 3)
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=17.0)
+        pipeline = mock.Mock()
+        pipeline.progress.return_value = ({"loss": torch.tensor(1.0)}, {}, batch)
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        probe = {"pk": "emb.t", "sk": 1, "crc32": "aa" * 4, "encoding": "fp32"}
+        upload_states = [(0, []), (0, []), (1, [probe]), (2, [probe])]
+        dumper = mock.Mock()
+        dumper.maybe_dump.side_effect = [
+            DumpDecision.NONE,
+            DumpDecision.PAIRED,
+            DumpDecision.SPARSE_ONLY,
+        ]
+        dumper.completed_upload_state.side_effect = list(upload_states)
+        dumper.final_dump.return_value = 2
+        exporter = mock.Mock()
+        exporter.enabled = True
+        parent = mock.Mock()
+        parent.attach_mock(dumper, "dumper")
+        parent.attach_mock(exporter, "exporter")
+        train_config = TrainConfig(
+            num_steps=3,
+            num_epochs=0,
+            save_checkpoints_steps=0,
+            use_tensorboard=False,
+            log_step_count_steps=10,
+            dense_optimizer=DenseOptimizer(),
+        )
+        train_config.delta_embedding_dump_config.paired_dump_interval_steps = 1
+        train_config.delta_embedding_dump_config.feature_store_config.project_name = (
+            "project"
+        )
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            _train_and_evaluate(
+                model=model,
+                optimizer=optimizer,
+                train_dataloader=train_dataloader,
+                eval_dataloader=None,
+                lr_scheduler=[],
+                model_dir="unused",
+                train_config=train_config,
+                eval_config=EvalConfig(),
+                ckpt_manager=ckpt_manager,
+                delta_embedding_dumper=dumper,
+            )
+
+        self.assertEqual(
+            dumper.maybe_dump.call_args_list, [mock.call(0), mock.call(1), mock.call(2)]
+        )
+        self.assertEqual(
+            exporter.maybe_export.call_args_list,
+            [
+                mock.call(0, 17.0, model, force=False, dense_ema=None),
+                mock.call(1, 17.0, model, force=True, dense_ema=None),
+                mock.call(2, 17.0, model, force=False, dense_ema=None),
+                mock.call(2, 17.0, model, final=True, dense_ema=None),
+            ],
+        )
+        self.assertEqual(
+            exporter.poll_publish.call_args_list,
+            [mock.call(state) for state in upload_states[:3]],
+        )
+        dumper.final_dump.assert_called_once_with(2)
+        exporter.finalize_publish.assert_called_once_with(upload_states[3])
+        tracked = {
+            "dumper.maybe_dump",
+            "exporter.maybe_export",
+            "exporter.poll_publish",
+            "dumper.final_dump",
+            "dumper.close",
+            "exporter.finalize_publish",
+            "exporter.close",
+        }
+        self.assertEqual(
+            [name for name, _, _ in parent.mock_calls if name in tracked],
+            ["dumper.maybe_dump", "exporter.maybe_export", "exporter.poll_publish"] * 3
+            + [
+                "dumper.final_dump",
+                "exporter.maybe_export",
+                "dumper.close",
+                "exporter.finalize_publish",
+                "exporter.close",
+            ],
+        )
 
     def test_hf_export_rejects_dense_ema(self) -> None:
         # dcp_to_hf reads <ckpt>/model unconditionally, so it would silently

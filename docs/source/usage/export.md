@@ -60,16 +60,33 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 ## 在线学习 dense 模型热导出
 
-在 `USE_DISTRIBUTED_EMBEDDING=1` 的在线学习场景下，sparse embedding 由分布式 embedding 服务独立更新，训练进程可以在训练过程中按分钟级（或自定义节奏）持续导出 dense 图，供推理 Processor 热切换。该能力**不依赖 checkpoint**：rank 0 在训练启动时一次性构建 serving 侧 dense 图，之后每次触发时全体 rank 从内存中的 DMP 模型收集 dense 权重（仅收集 dense 图实际携带的参数，不涉及 sparse/dynamicemb/MCH 状态），rank 0 在后台线程热替换权重、script 并原子发布新版本，训练主流程不阻塞在导出上。
+在 `USE_DISTRIBUTED_EMBEDDING=1` 的在线学习场景下，sparse embedding 通过增量 embedding dump（`train_config.delta_embedding_dump_config`）持续上传 FeatureStore，训练进程可以在训练过程中同步导出 dense 图，供推理 Processor 热切换。该能力**不依赖 checkpoint**：rank 0 在训练启动时一次性构建 serving 侧 dense 图，之后每次触发时全体 rank 从内存中的 DMP 模型收集 dense 权重（仅收集 dense 图实际携带的参数，不涉及 sparse/dynamicemb/MCH 状态），rank 0 在后台线程热替换权重、script 并构建新版本目录，训练主流程不阻塞在导出上。
+
+dense 导出触发与增量 embedding dump 的粗粒度边界统一：每个 `paired_dump_interval_steps` / `paired_dump_interval_minutes` 边界执行一次 delta dump 并触发一次 dense 导出，同一训练步的 (dense, sparse) 严格成对。粗粒度参数为**必选**（steps 与 minutes 二选一）。在此基础上可选配置更细粒度的 `sparse_dump_interval_steps` / `sparse_dump_interval_minutes`（维度必须与粗粒度一致且数值严格更小）：细粒度边界只执行 delta dump 与 FeatureStore 上传、不导出 dense，让线上 embedding 以更高频率更新，而 dense 版本仍按粗粒度节奏发布；两个边界落在同一训练步时粗粒度优先，只 dump 一次。训练正常结束时若存在尾部增量，也会成对补一次最终导出（尾部若恰好落在某个 dump 边界上，则不重复 dump，最终导出与该步配对）。dense 版本构建完成后**不会立即生效**：`current.json` 仅在该步的 sparse 增量在所有 rank 上都完成 FeatureStore 上传后才原子翻转（联合发布），保证推理侧绝不出现 dense 领先 sparse——sparse 领先 dense 是唯一允许的偏斜方向。
 
 ### 启用方式
 
-训练命令前加上以下环境变量即可（`ONLINE_DENSE_EXPORT_DIR` 与 `ONLINE_DENSE_EXPORT_STEPS` / `ONLINE_DENSE_EXPORT_INTERVAL` 至少一项为必填）：
+训练配置中必须开启增量 embedding dump 并配置 FeatureStore 上传（dense 导出节奏完全由 dump 决定，发布水位来自上传完成进度，详见 [DeltaEmbeddingDumpConfig](../proto.html#tzrec.protos.DeltaEmbeddingDumpConfig)）：
+
+```
+train_config {
+  ...
+  delta_embedding_dump_config {
+    paired_dump_interval_minutes: 10
+    # 可选：每 2 分钟只做 delta dump + 上传，不导 dense
+    sparse_dump_interval_minutes: 2
+    feature_store_config {
+      ...
+    }
+  }
+}
+```
+
+训练命令前加上以下环境变量即可（`ONLINE_DENSE_EXPORT_DIR` 为必填）：
 
 ```bash
 ONLINE_DENSE_EXPORT=1 \
 ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \
-ONLINE_DENSE_EXPORT_INTERVAL=60 \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.train_eval \
@@ -79,24 +96,21 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 ### 环境变量
 
 - ONLINE_DENSE_EXPORT: 开启训练内在线 dense 导出，默认关闭
-  - **ONLINE_DENSE_EXPORT=1**：启用（要求同时设置 `USE_DISTRIBUTED_EMBEDDING=1`）
+  - **ONLINE_DENSE_EXPORT=1**：启用（要求同时设置 `USE_DISTRIBUTED_EMBEDDING=1`，并在 `train_config` 中配置带 `feature_store_config` 的 `delta_embedding_dump_config`；仅本地落盘的 dump 没有上传水位可供门控，缺少任一项训练启动即报错）
 - ONLINE_DENSE_EXPORT_DIR: 在线服务读取的根目录（必填）。导出产物发布在 `<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export` 下，必须为本地路径（发布依赖 `os.rename` 原子换版）；`model_dir` 可以是远端（如 OSS）
-- ONLINE_DENSE_EXPORT_STEPS: 按训练步数间隔触发导出（如 `300` 表示每 300 步导出一次），0 表示关闭
-- ONLINE_DENSE_EXPORT_INTERVAL: 按数据事件时间（`Batch.data_timestamp`，Unix 秒）间隔触发导出（如 `60` 表示每消费过 60 秒事件时间、且跨过整分边界时导出一次），0 表示关闭。事件时间触发会在各 rank 间做 quorum 对齐，与 checkpoint 的时间触发机制一致
-- ONLINE_DENSE_EXPORT_QUORUM: 事件时间触发的 worker 越界比例阈值，取值 (0, 1\]，默认 0.5
 - ONLINE_DENSE_EXPORT_KEEP_VERSIONS: 保留的历史版本数，默认 0（不删除任何已导出的版本）。大于 0 时保留最新 K 个版本，且 K 最小为 3（serving 需要当前版本 + 上一版本用于原子切换）。`current.json` 指向的版本永远不被清理
 - ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 的等待上限
-
-`ONLINE_DENSE_EXPORT_STEPS` 与 `ONLINE_DENSE_EXPORT_INTERVAL` 至少要设置一个；训练结束时还会强制导出一次最终状态。导出频率与 checkpoint 频率完全独立，checkpoint 仍按原有配置保存、用于训练恢复。
 
 ### 运行与排障说明
 
 - 仅 rank 0 执行建图与发布；启动时会对整条建图 + script 链路做一次试运行，任何 trace/script 失败会在训练开始前就暴露（fail-fast）。
 - 启动时还会校验 dense 图的每个参数都能在训练模型 state dict 中找到来源（INPUT_TILE=3 的 user 侧孪生模块自动回落到非 user 侧权重），校验失败训练不会启动。
-- 导出在后台线程执行，失败（日志中 `online dense export task failed`）只跳过该版本、不影响训练，也不改变 `current.json` 指向。
-- 两次导出间隔小于单次导出耗时时，排队中的旧任务被最新版本顶替（latest-wins），不产生积压。
+- 导出在后台线程执行，dense 版本构建失败（日志中 `online dense export task failed`）只跳过该版本、不翻转 `current.json`，训练继续，由后续版本取代；FeatureStore 上传失败则会使训练报错退出，指针同样不翻转。两种失败下推理侧都停留在上一个自洽版本。
+- 两次导出间隔小于单次导出耗时时，排队中的旧任务被最新版本顶替（latest-wins），不产生积压；水位到达后也只发布最新的就绪版本，被顶替的未发布版本目录会被直接删除，不占用 `ONLINE_DENSE_EXPORT_KEEP_VERSIONS` 的保留配额。
+- 新鲜度预算：dump/发布间隔必须大于单次增量上传耗时的 p99（可通过监控上传耗时占发布间隔的比例确认），否则全局水位持续落后于配对步，`current.json` 长期不翻转。
+- 建议周期性做全量再基线（anti-entropy）：停训后用离线全量导出 + FeatureStore 全量导入，再用下述 bootstrap 命令发布配对的 dense 版本，以清理 crash 重启死时间线残留的旧值、僵尸 tombstone 等漂移。全量导入必须以重启式切换进行，不能在增量流写入的同时在线叠写。
 - MatchModel（向量召回）与 TDM 模型的完整导出按 user/item（或按模块）分目录，与单体 dense 热导出的布局不兼容，启用会直接报错，请使用完整的 `tzrec.export`。
-- 手动/离线从某个 checkpoint 导出一个版本（与训练内导出发布到同一目录结构）：
+- 手动/离线从某个 checkpoint 导出一个版本（bootstrap，与训练内导出发布到同一目录结构）。该命令不经过水位门控、直接翻转 `current.json`，manifest 中 `sparse_step` 等于 `checkpoint_step`（`--checkpoint_step` 省略时从 `model.ckpt-<step>` 路径解析）、`sparse_probes` 为空（Processor 跳过探针验证），前提是 FeatureStore 中的全量 embedding 与该 checkpoint 同源：
 
 ```bash
 USE_DISTRIBUTED_EMBEDDING=1 ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \

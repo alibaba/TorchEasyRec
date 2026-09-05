@@ -19,6 +19,7 @@ latest checkpoint and pending deltas are discarded.
 import os
 import threading
 import time
+import zlib
 from collections import deque
 from dataclasses import dataclass
 from typing import (
@@ -62,6 +63,7 @@ FEATURE_STORE_DEFAULT_ENTITY_NAME = "default_dynemb_entity"
 FEATURE_STORE_DEFAULT_ENTITY_JOIN_ID = "default_dynemb_join_id"
 
 _FEATURE_STORE_PROGRESS_LOG_INTERVAL_BATCHES = 100
+_PROBE_SAMPLE_COUNT = 4
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,7 @@ class FeatureStoreUploadSettings:
     max_pending_steps: int
     poll_interval_secs: int
     upload_format: str
+    test_mode: bool
 
     @classmethod
     def from_proto(cls, config: FeatureStoreConfig) -> "FeatureStoreUploadSettings":
@@ -191,6 +194,7 @@ class FeatureStoreUploadSettings:
             max_pending_steps=positive_values["max_pending_steps"],
             poll_interval_secs=positive_values["poll_interval_secs"],
             upload_format=upload_format,
+            test_mode=bool(config.test_mode),
         )
 
 
@@ -207,6 +211,12 @@ class FeatureStoreDeltaUploader:
     data-parallel replicas issue identical idempotent MERGE writes. Publish
     timestamps are allocated per rank and only need per-rank monotonicity,
     because a key's owner rank is fixed for the lifetime of the process.
+
+    For the joint dense/sparse publish gate the worker keeps a FIFO completion
+    watermark: ``completed_upload()`` snapshots the last fully completed
+    submitted step (0-row steps advance it without any upload) plus up to
+    ``_PROBE_SAMPLE_COUNT`` probe rows (exact wire pk/sk, crc32 of the uploaded
+    value bytes, encoding) that verify read-side visibility downstream.
     """
 
     def __init__(
@@ -247,6 +257,8 @@ class FeatureStoreDeltaUploader:
         self._worker: Optional[threading.Thread] = None
         self._error: Optional[FeatureStoreUploadError] = None
         self._last_publish_ts: int = 0
+        self._completed_step: int = 0
+        self._completed_probes: List[Dict[str, Any]] = []
 
     def start(self) -> None:
         """Start the worker after the rank-zero view rendezvous.
@@ -325,6 +337,17 @@ class FeatureStoreDeltaUploader:
         with self._condition:
             self._raise_if_failed_locked()
 
+    def completed_upload(self) -> Tuple[int, List[Dict[str, Any]]]:
+        """Snapshot the FIFO upload watermark for the joint publish gate.
+
+        Returns:
+            Tuple of (last FIFO-completed submitted global_step, probe dicts
+            sampled during the freshest non-empty completed upload); (0, [])
+            before any submitted step completes.
+        """
+        with self._condition:
+            return self._completed_step, list(self._completed_probes)
+
     def close(self, raise_on_error: bool = True, drain: bool = True) -> None:
         """Close the worker, draining only during a normal training shutdown."""
         with self._condition:
@@ -371,9 +394,22 @@ class FeatureStoreDeltaUploader:
                         continue
                     current_step, table = self._pending[0]
 
-                self._upload_with_retries(current_step, table)
+                if table.num_rows == 0:
+                    # Joint dense/sparse publish gate stalls if empty intervals
+                    # never advance the watermark; skip the upload entirely and
+                    # keep the previous probes as the freshest evidence.
+                    with self._condition:
+                        self._completed_step = current_step
+                        self._pending.popleft()
+                        self._condition.notify_all()
+                    current_step = None
+                    continue
+
+                probes = self._upload_with_retries(current_step, table)
 
                 with self._condition:
+                    self._completed_step = current_step
+                    self._completed_probes = probes
                     self._pending.popleft()
                     self._condition.notify_all()
                 current_step = None
@@ -408,12 +444,14 @@ class FeatureStoreDeltaUploader:
             if self._aborting:
                 raise _UploadAborted()
 
-    def _upload_with_retries(self, global_step: int, table: pa.Table) -> None:
+    def _upload_with_retries(
+        self, global_step: int, table: pa.Table
+    ) -> List[Dict[str, Any]]:
+        """Upload one step with bounded retries; return its sampled probes."""
         for attempt in range(1, self._settings.max_retries + 1):
             self._raise_if_aborting()
             try:
-                self._stream_upload(global_step, table)
-                return
+                return self._stream_upload(global_step, table)
             except _UploadAborted:
                 raise
             except BaseException as exc:
@@ -445,8 +483,13 @@ class FeatureStoreDeltaUploader:
         self._last_publish_ts = range_end
         return range_start, range_end
 
-    def _stream_upload(self, global_step: int, table: pa.Table) -> None:
-        """Stream the in-memory delta table directly to the FeatureStore SDK."""
+    def _stream_upload(self, global_step: int, table: pa.Table) -> List[Dict[str, Any]]:
+        """Stream the in-memory delta table directly to the FeatureStore SDK.
+
+        Returns:
+            Probe rows sampled from the uploaded batches, capped at
+            ``_PROBE_SAMPLE_COUNT``.
+        """
         view = self._get_view()
         max_in_flight = int(getattr(view, "_max_workers", 1))
 
@@ -477,9 +520,12 @@ class FeatureStoreDeltaUploader:
             ts_range[1],
         )
 
+        probes: List[Dict[str, Any]] = []
         try:
             for batch in batches:
                 self._raise_if_aborting()
+                if len(probes) < _PROBE_SAMPLE_COUNT:
+                    self._collect_probes(batch, probes)
                 num_rows = self._submit_one_batch(
                     view, batch, range_start + completed_batches
                 )
@@ -539,6 +585,73 @@ class FeatureStoreDeltaUploader:
             completed_batches,
             time.monotonic() - started_at,
         )
+        return probes
+
+    def _collect_probes(
+        self, batch: pa.RecordBatch, probes: List[Dict[str, Any]]
+    ) -> None:
+        """Sample probe rows from one delta batch about to be uploaded.
+
+        Probes are read-side visibility evidence for the joint dense/sparse
+        publish gate, so they are collected after validation/remap: pk/sk equal
+        the exact wire key and the crc32 covers the exact uploaded value bytes.
+        Rows whose source is a dynamicemb_evicted tombstone are skipped,
+        distinct pks are preferred, and selection is deterministic (first
+        qualifying rows). Re-validates at most the first few batches (until
+        ``probes`` reaches ``_PROBE_SAMPLE_COUNT``), which is bounded.
+
+        Args:
+            batch: One delta RecordBatch from the in-memory delta table.
+            probes: Probe accumulator extended in place, capped at
+                ``_PROBE_SAMPLE_COUNT`` across batches.
+        """
+        delta = self._validate_delta_batch(batch)
+        if delta.num_rows == 0:
+            return
+        # Wire-only pk/sk/embedding batches carry no delta dump source column.
+        sources = (
+            batch.column("source").to_pylist()
+            if "source" in batch.schema.names
+            else None
+        )
+        qualifying = [
+            i
+            for i in range(delta.num_rows)
+            if sources is None or sources[i] != "dynamicemb_evicted"
+        ]
+        seen_pks = {probe["pk"] for probe in probes}
+        chosen: List[int] = []
+        for i in qualifying:
+            if len(probes) + len(chosen) >= _PROBE_SAMPLE_COUNT:
+                break
+            pk = delta.remapped_fqns[i]
+            if pk in seen_pks:
+                continue
+            seen_pks.add(pk)
+            chosen.append(i)
+        taken = set(chosen)
+        for i in qualifying:
+            if len(probes) + len(chosen) >= _PROBE_SAMPLE_COUNT:
+                break
+            if i not in taken:
+                chosen.append(i)
+        encoding = (
+            "int8"
+            if self._embedding_field_type == FEATURE_STORE_EMBEDDING_TYPE_UINT8
+            else "fp32"
+        )
+        for i in sorted(chosen):
+            value_bytes = delta.flat_embeddings[
+                int(delta.offsets[i]) : int(delta.offsets[i + 1])
+            ].tobytes()
+            probes.append(
+                {
+                    "pk": delta.remapped_fqns[i],
+                    "sk": int(delta.key_ids[i]),
+                    "crc32": "%08x" % zlib.crc32(value_bytes),
+                    "encoding": encoding,
+                }
+            )
 
     def _submit_one_batch(self, view: Any, batch: pa.RecordBatch, ts: int) -> int:
         """Validate, build, and submit one batch; return submitted rows (0 skip).
@@ -728,6 +841,7 @@ class FeatureStoreDeltaUploader:
             security_token=credential.security_token or None,
             featuredb_username=os.environ.get("FEATUREDB_USERNAME") or None,
             featuredb_password=os.environ.get("FEATUREDB_PASSWORD") or None,
+            test_mode=self._settings.test_mode,
         )
 
     def _get_view(self) -> Any:

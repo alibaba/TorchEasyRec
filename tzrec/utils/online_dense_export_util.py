@@ -25,20 +25,37 @@ Serving publish contract:
         ├── graph/                # Graph dump for debugging
         └── READY                 # Completion marker written before the switch
 
-current.json:
+current.json (manifest v2):
 {
+  "version": "20260724052000",
   "checkpoint_step": 1200,
-  "created_at": "2026-07-24T05:20:00.000000+00:00",
+  "sparse_step": 1250,
   "data_timestamp": 1782365432.0,
-  "version": "20260724052000"
+  "created_at": "2026-07-24T05:20:00.000000+00:00",
+  "publish_interval_minutes": 10,
+  "sparse_probes": [
+    {"pk": "<remapped_table_fqn>", "sk": 123456,
+     "crc32": "9a3e17b0", "encoding": "int8"}
+  ]
 }
 
 - Build each version under a temporary directory, write ``READY``, then rename
   it atomically into place.
-- Only after the rename, atomically replace ``current.json`` with ``version``,
-  ``checkpoint_step``, ``data_timestamp``, and ``created_at``.
-- The processor reads only the version named by ``current.json``; step/timestamp
-  align dense and sparse state.
+- ``current.json`` flips only when the version's dense pairing step
+  (``checkpoint_step``) is <= the cross-rank sparse upload watermark, and
+  ``sparse_step`` records that watermark at flip time, so
+  ``sparse_step >= checkpoint_step`` always holds: sparse ahead of dense is
+  the only allowed skew, and the processor never serves a dense version whose
+  paired embeddings have not finished uploading.
+- ``created_at`` is the flip time; ``publish_interval_minutes`` is present
+  only when a timed publish cadence is configured, and the processor derives
+  its "no new version" alert threshold from it.
+- ``sparse_probes`` samples keys from the completed sparse uploads (capped at
+  64 in total, may be empty); the processor verifies each (pk, sk, crc32)
+  through its serving read path before hot-swapping the dense model, and an
+  empty list (offline bootstrap) skips verification.
+- The processor reads only the version named by ``current.json``; a version
+  superseded by a newer build before it was published is removed.
 """
 
 import datetime
@@ -48,7 +65,7 @@ import shutil
 import tempfile
 import time
 import weakref
-from threading import Condition, Event, Thread
+from threading import Condition, Event, Lock, Thread
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
@@ -60,11 +77,7 @@ from torch.distributed._tensor import DTensor
 from tzrec.acc import utils as acc_utils
 from tzrec.optim.ema import DenseEMA
 from tzrec.utils import config_util
-from tzrec.utils.checkpoint_util import (
-    quorum_event_time,
-    remap_input_tile_user_key,
-    should_save_on_timestamp,
-)
+from tzrec.utils.checkpoint_util import remap_input_tile_user_key
 from tzrec.utils.export_util import (
     build_dense_graph_module,
     create_dense_export_warmup_data,
@@ -139,9 +152,13 @@ def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
     restart can publish an older timestamp, and deleting it would leave the
     serving pointer referencing a missing directory. Stale ``*.tmp.<pid>``
     dirs and current.json.tmp.<pid> files left by crashed exports are swept
-    so they don't accumulate under the serving-facing tree.
+    so they don't accumulate under the serving-facing tree; this process's
+    own ``.tmp.<pid>`` artifacts are spared because the flip-time prune runs
+    on the training thread while the export worker may be building the next
+    version's tmp directory.
     """
     max_versions = _max_kept_versions()
+    own_tmp_suffix = f".tmp.{os.getpid()}"
     for base in (versions_root, export_root):
         try:
             entries = os.listdir(base)
@@ -149,6 +166,8 @@ def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
             continue
         for name in entries:
             if ".tmp." not in name and not name.endswith(".tmp"):
+                continue
+            if name.endswith(own_tmp_suffix):
                 continue
             path = os.path.join(base, name)
             try:
@@ -169,7 +188,9 @@ def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
     version_dirs = sorted(
         os.path.join(versions_root, name)
         for name in entries
-        if os.path.isdir(os.path.join(versions_root, name))
+        # tmp build dirs are the sweep's business; the spared own-pid one may
+        # be an in-flight build and must never be retention-pruned.
+        if os.path.isdir(os.path.join(versions_root, name)) and ".tmp." not in name
     )
     for path in version_dirs[:-max_versions]:
         if os.path.basename(path) == current_version:
@@ -231,18 +252,23 @@ class OnlineDenseExportManager:
     """In-process online-learning dense model export.
 
     Rank zero builds the serving dense graph once at construction time. On
-    each trigger (independent of checkpoint saving) all ranks gather the DMP
-    model's dense weights in memory -- scoped to exactly the state keys the
-    dense graph carries, so sparse / dynamicemb / MCH state is never
-    materialized -- and rank zero hot-swaps them into the resident graph from
-    a background thread, then publishes a version. No checkpoint write is
-    needed per export.
+    each trigger (the train loop's delta-dump boundary decision) all ranks
+    gather the DMP model's dense weights in memory -- scoped to exactly the
+    state keys the dense graph carries, so sparse / dynamicemb / MCH state is
+    never materialized -- and rank zero hot-swaps them into the resident
+    graph from a background thread. The finished version is held as "ready"
+    and ``current.json`` flips only once ``poll_publish`` observes a
+    cross-rank sparse upload watermark covering its pairing step, so serving
+    never sees dense ahead of sparse.
 
-    Every collective the manager enters (group creation, the per-step
-    event-time reconcile, the startup key-list broadcast, the per-export
-    gather) is called identically on all ranks: the trigger decision is a
-    deterministic function of job-uniform env config, the step counter and
-    the quorum-reconciled event-time, mirroring CheckpointManager.maybe_save.
+    Every collective the manager enters (group creation, the startup
+    key-list broadcast, the per-export weight gather, the per-step publish
+    poll and its flip-time probe gather) is called identically on all ranks:
+    the export trigger is the rank-synchronized dump decision passed in as
+    ``force``, and ``poll_publish`` is called unconditionally on every step.
+    Like the pipeline's own per-step collectives this assumes lockstep
+    stepping; a rank that stops stepping early (ragged dataloader exhaustion
+    with ``check_all_workers_data_status=False``) desyncs the poll.
     """
 
     def __init__(
@@ -250,6 +276,7 @@ class OnlineDenseExportManager:
         model_dir: str,
         pipeline_config_path: str,
         model: nn.Module,
+        publish_interval_minutes: Optional[int] = None,
     ) -> None:
         self._enabled = _online_dense_export_enabled()
         self._rank = int(os.environ.get("RANK", 0))
@@ -264,14 +291,14 @@ class OnlineDenseExportManager:
         )
         # Covers an in-flight plus one pending task timeout during close() drain.
         self._close_timeout = 2 * self._export_timeout + 120.0
-        # trigger config; identical on all ranks (env is job-uniform), so the
-        # trigger decision needs no consensus beyond the event-time reconcile
-        self._export_steps = int(os.environ.get("ONLINE_DENSE_EXPORT_STEPS", "0"))
-        self._ts_interval = int(os.environ.get("ONLINE_DENSE_EXPORT_INTERVAL", "0"))
-        self._ts_quorum = float(os.environ.get("ONLINE_DENSE_EXPORT_QUORUM", "0.5"))
+        self._publish_interval_minutes = publish_interval_minutes
         self._last_export_step = -1
-        self._last_data_ts: Optional[float] = None
         self._group: Optional[dist.ProcessGroup] = None
+        # rank-zero publish gating state, guarded by _publish_lock: the newest
+        # ready-but-unpublished version, written by the export worker and
+        # published by the training thread's poll_publish.
+        self._publish_lock = Lock()
+        self._ready: Optional[Dict[str, Any]] = None
         # (gm state key, DMP state_dict source key) pairs, sorted; identical
         # on all ranks after the startup broadcast. The gather iterates them
         # in this order on every rank so collectives stay in lockstep.
@@ -305,15 +332,6 @@ class OnlineDenseExportManager:
             raise RuntimeError(
                 "ONLINE_DENSE_EXPORT=1 requires USE_DISTRIBUTED_EMBEDDING=1."
             )
-        if self._export_steps <= 0 and self._ts_interval <= 0:
-            raise RuntimeError(
-                "ONLINE_DENSE_EXPORT=1 requires ONLINE_DENSE_EXPORT_STEPS or "
-                "ONLINE_DENSE_EXPORT_INTERVAL to configure the export cadence."
-            )
-        if self._ts_interval > 0 and not (0.0 < self._ts_quorum <= 1.0):
-            raise RuntimeError(
-                f"ONLINE_DENSE_EXPORT_QUORUM must be in (0, 1], got {self._ts_quorum}."
-            )
         # fail fast on a misconfigured retention K instead of at prune time,
         # where the worker's exception guard would swallow it and silently
         # disable retention.
@@ -331,9 +349,17 @@ class OnlineDenseExportManager:
                     f"ONLINE_DENSE_EXPORT requires a local {label}, got remote: {path}"
                 )
         if dist.is_initialized() and dist.get_world_size() > 1:
-            # collective; ONLINE_DENSE_EXPORT is job-uniform so all ranks enter
+            # collective; ONLINE_DENSE_EXPORT is job-uniform so all ranks enter.
+            # finalize_publish drains the export worker on rank zero (up to
+            # _close_timeout) before its gather while the other ranks already
+            # wait inside it, so the group timeout must cover that drain
+            # instead of the 30-minute gloo default.
             self._group = cast(
-                Optional[dist.ProcessGroup], dist.new_group(backend="gloo")
+                Optional[dist.ProcessGroup],
+                dist.new_group(
+                    backend="gloo",
+                    timeout=datetime.timedelta(seconds=self._close_timeout),
+                ),
             )
 
         state_pairs: List[Tuple[str, str]] = []
@@ -367,14 +393,25 @@ class OnlineDenseExportManager:
                 self._export_root,
             )
 
+    @property
+    def enabled(self) -> bool:
+        """Whether ONLINE_DENSE_EXPORT is enabled for this process."""
+        return self._enabled
+
     def _build_export_graph(self, model: nn.Module) -> List[Tuple[str, str]]:
         """Build the resident dense export graph once, before training starts.
 
-        Runs inside a scoped ``INPUT_TILE=3`` env window: the export-side
-        model has user-side twin modules the training process never builds,
-        and INPUT_TILE is read at model construction and batch-parse time.
-        The training model and its dataloader workers are already constructed
-        by the time this runs, so the window cannot affect them.
+        Runs inside a scoped ``INPUT_TILE=3`` / ``WORLD_SIZE=1`` env window:
+        the export-side model has user-side twin modules the training process
+        never builds, and INPUT_TILE is read at model construction and
+        batch-parse time. WORLD_SIZE gives the warm-up dataloader the same
+        single-rank view the full export runs under: the Parquet and ODPS
+        readers run startup collectives (file-metadata all-gather, scan
+        session broadcast) on the default process group when WORLD_SIZE > 1,
+        and this rank-zero-only build has no peer to join, which would
+        deadlock the collective. The training model and its dataloader
+        workers are already constructed by the time this runs, so the window
+        cannot affect them.
 
         Fails fast (before training) on any trace/script error via a dry-run
         finalize, and on any dense-graph state key with no gatherable source
@@ -395,7 +432,9 @@ class OnlineDenseExportManager:
 
         device = torch.device("cpu")
         prev_input_tile = os.environ.get("INPUT_TILE")
+        prev_world_size = os.environ.get("WORLD_SIZE")
         os.environ["INPUT_TILE"] = "3"
+        os.environ["WORLD_SIZE"] = "1"
         try:
             pipeline_config = config_util.load_pipeline_config(
                 self._pipeline_config_path
@@ -447,6 +486,10 @@ class OnlineDenseExportManager:
                 os.environ.pop("INPUT_TILE", None)
             else:
                 os.environ["INPUT_TILE"] = prev_input_tile
+            if prev_world_size is None:
+                os.environ.pop("WORLD_SIZE", None)
+            else:
+                os.environ["WORLD_SIZE"] = prev_world_size
 
         source_keys = model.state_dict()
         pairs: List[Tuple[str, str]] = []
@@ -507,70 +550,107 @@ class OnlineDenseExportManager:
                 + ", ".join(sorted(set(missing)))
             )
 
-    def _reconcile_event_time(self, data_timestamp: float) -> Optional[float]:
-        """Quorum-reconcile this rank's event-time across workers.
-
-        A collective over the exporter's gloo group; every rank calls it on
-        the same steps (on every maybe_export call when the event-time
-        trigger is configured). Workers without a timestamp contribute the
-        -1.0 sentinel, which sorts low and counts as "not past".
-        """
-        if self._ts_interval <= 0:
-            return None
-        if self._group is not None:
-            worker_ts: List[float] = [0.0] * dist.get_world_size(self._group)
-            dist.all_gather_object(worker_ts, data_timestamp, group=self._group)
-        else:
-            worker_ts = [data_timestamp]
-        data_ts = quorum_event_time(worker_ts, self._ts_quorum)
-        return data_ts if data_ts is not None and data_ts >= 0 else None
-
     def maybe_export(
         self,
         step: int,
         data_timestamp: float,
         model: nn.Module,
+        force: bool = False,
         final: bool = False,
         dense_ema: Optional[DenseEMA] = None,
     ) -> None:
-        """Export a dense version now if a configured trigger fires.
+        """Export a dense version now if the delta-dump boundary fired.
 
-        All ranks must call this in lockstep from the train loop (it is
-        invoked unconditionally, not gated on a checkpoint save): the trigger
-        decision is deterministic and identical across ranks, and a firing
-        decision enters the collective weight gather on every rank.
+        All ranks must call this in lockstep from the train loop: the trigger
+        is the delta-dump boundary decision passed in as ``force``, which the
+        dumper already synchronizes across ranks, so a firing decision enters
+        the collective weight gather on every rank.
 
         Args:
             step: current global step.
             data_timestamp: this rank's consumed event-time (seconds), -1.0
-                if none; quorum-reconciled across workers for the event-time
-                trigger.
+                if none; recorded in the published manifest.
             model: the live DMP training model to gather weights from.
-            final: force an export (still subject to the per-step dedupe),
-                e.g. at train end.
+            force: the rank-synchronized delta-dump decision; True pairs a
+                dense version with the sparse delta dumped at this step.
+            final: force an export at train end (still subject to the
+                per-step dedupe).
             dense_ema: Dense EMA state to use for exported parameters.
         """
         if not self._enabled:
             return
-        want = final
-        if self._export_steps > 0 and step > 0 and step % self._export_steps == 0:
-            want = True
-        data_ts = self._reconcile_event_time(data_timestamp)
-        if data_ts is not None:
-            if self._last_data_ts is None:
-                # first event-time seen: set the reference, do not export
-                self._last_data_ts = data_ts
-            elif should_save_on_timestamp(
-                data_ts, self._last_data_ts, self._ts_interval, []
-            ):
-                want = True
-        if not want or step == self._last_export_step:
+        if not (force or final) or step == self._last_export_step:
             return
         self._last_export_step = step
-        if data_ts is not None:
-            # advance the watermark on every export
-            self._last_data_ts = data_ts
         self._gather_and_submit(step, data_timestamp, model, dense_ema)
+
+    def poll_publish(
+        self, sparse_state: Optional[Tuple[int, List[Dict[str, Any]]]]
+    ) -> None:
+        """Reconcile the sparse upload watermark and flip current.json if covered.
+
+        The train loop calls this on every step on all ranks; it is the only
+        publisher of ``current.json``. When enabled with world size > 1 the
+        per-step cost is one gloo ``all_gather`` of a two-int64 tensor: each
+        rank's completed upload step plus rank zero's ready-version step
+        (-1 when nothing is ready). The pickled probe dicts are only
+        object-gathered when that gather shows the watermark covers the
+        ready version, i.e. once per flip rather than per step. Rank zero
+        takes the minimum completed step across ranks as the global
+        watermark and publishes the ready version with the concatenated
+        probes (capped at 64).
+
+        Args:
+            sparse_state: this rank's ``(last completed upload step, probes)``
+                snapshot, or None when unavailable (treated as ``(0, [])``).
+        """
+        if not self._enabled:
+            return
+        step, probes = sparse_state or (0, [])
+        if self._group is None:
+            watermark = step
+        else:
+            # Only rank zero's ready slot is ever set; its step travels in the
+            # second slot so every rank takes the same probe-gather decision.
+            with self._publish_lock:
+                ready_step = self._ready["step"] if self._ready is not None else -1
+            world_size = dist.get_world_size(self._group)
+            local = torch.tensor([step, ready_step], dtype=torch.int64)
+            gathered = [torch.empty(2, dtype=torch.int64) for _ in range(world_size)]
+            dist.all_gather(gathered, local, group=self._group)
+            watermark = min(int(state[0]) for state in gathered)
+            ready_step = int(gathered[0][1])
+            if ready_step < 0 or ready_step > watermark:
+                return
+            rank_probes: List[List[Dict[str, Any]]] = [[] for _ in range(world_size)]
+            dist.all_gather_object(rank_probes, probes, group=self._group)
+            probes = [probe for one_rank in rank_probes for probe in one_rank]
+        if self._rank != 0:
+            return
+        with self._publish_lock:
+            self._publish_locked(watermark, probes[:64])
+
+    def finalize_publish(
+        self, sparse_state: Optional[Tuple[int, List[Dict[str, Any]]]]
+    ) -> None:
+        """Drain the export worker and run one final gated publish.
+
+        A collective: all ranks must call it, and only on the normal shutdown
+        path after the delta uploads have drained -- never from exception
+        paths, where missing ranks would hang the gather. Rank zero first
+        drains the export worker via close() so the final dense version is
+        recorded as ready (instant on other ranks, and idempotent for the
+        finally-block close()); then all ranks gather the final upload state
+        and rank zero flips current.json if the pairing is complete.
+
+        Args:
+            sparse_state: this rank's final ``(completed upload step, probes)``
+                snapshot, or None when unavailable (treated as ``(0, [])``).
+        """
+        if not self._enabled:
+            return
+        self.close()
+        self.poll_publish(sparse_state)
 
     def _gather_and_submit(
         self,
@@ -738,7 +818,17 @@ class OnlineDenseExportManager:
                 logger.exception("online dense export task failed; continuing")
 
     def _run_task(self, task: Dict[str, Any]) -> None:
-        """Load the snapshot into the resident graph, script it and publish."""
+        """Load the snapshot into the resident graph, script it, mark it ready.
+
+        Builds the immutable version directory (READY marker + atomic
+        rename) but does not flip current.json: the finished version is
+        recorded as the newest ready one and the training thread's next
+        ``poll_publish`` publishes it once the sparse upload watermark covers
+        its step. A previously ready but still unpublished version is
+        superseded and its directory removed, so unpublished builds neither
+        pile up while the watermark lags nor eat into the newest-K retention
+        quota of published versions.
+        """
         version = task["version"]
         versions_root = os.path.join(self._export_root, VERSIONS_DIR)
         version_dir = os.path.join(versions_root, version)
@@ -783,15 +873,30 @@ class OnlineDenseExportManager:
                 shutil.rmtree(tmp_dir)
             raise
 
-        payload: Dict[str, Any] = {
-            "version": version,
-            "checkpoint_step": task["step"],
-            "data_timestamp": task["data_timestamp"],
-            "created_at": _utc_now(),
-        }
-        # Keep the service-facing pointer beside the immutable dense versions.
-        _publish_current(os.path.join(self._export_root, CURRENT_JSON), payload)
-        _prune_old_dense_versions(self._export_root, versions_root)
+        with self._publish_lock:
+            superseded = self._ready
+            if superseded is not None:
+                # Never named by current.json, so nothing can reference it.
+                superseded_dir = os.path.join(versions_root, superseded["version"])
+                logger.info(
+                    "online dense export version %s (step %s) superseded by %s "
+                    "before publish; removing %s",
+                    superseded["version"],
+                    superseded["step"],
+                    version,
+                    superseded_dir,
+                )
+                try:
+                    shutil.rmtree(superseded_dir)
+                except OSError as e:
+                    logger.warning(
+                        "failed to remove superseded version %s: %s", superseded_dir, e
+                    )
+            self._ready = {
+                "step": task["step"],
+                "version": version,
+                "data_timestamp": task["data_timestamp"],
+            }
         elapsed = time.monotonic() - start_time
         if elapsed > self._export_timeout:
             logger.warning(
@@ -802,8 +907,53 @@ class OnlineDenseExportManager:
                 self._export_timeout,
             )
         logger.info(
-            "published online dense export version %s to %s (%.1fs)",
+            "built online dense export version %s at %s (%.1fs)",
             version,
             version_dir,
             elapsed,
+        )
+
+    def _publish_locked(
+        self, sparse_watermark: int, sparse_probes: List[Dict[str, Any]]
+    ) -> None:
+        """Flip current.json if the sparse watermark covers the ready version.
+
+        Caller must hold ``_publish_lock``. Publishes the newest ready dense
+        version only when its pairing step is <= the cross-rank sparse upload
+        watermark, so the flipped manifest always satisfies
+        ``sparse_step >= checkpoint_step`` and sparse-ahead-of-dense stays the
+        only allowed skew. The ready slot is cleared as soon as the pointer
+        has flipped, before the best-effort prune: a prune failure must not
+        leave the published version marked ready, or the next build would
+        "supersede" it and remove the directory current.json points at.
+
+        Args:
+            sparse_watermark: minimum completed upload step across ranks.
+            sparse_probes: gathered probe rows to record in the manifest.
+        """
+        ready = self._ready
+        if ready is None or ready["step"] > sparse_watermark:
+            return
+        payload: Dict[str, Any] = {
+            "version": ready["version"],
+            "checkpoint_step": ready["step"],
+            "sparse_step": sparse_watermark,
+            "data_timestamp": ready["data_timestamp"],
+            "created_at": _utc_now(),
+            "sparse_probes": sparse_probes,
+        }
+        if self._publish_interval_minutes is not None:
+            payload["publish_interval_minutes"] = self._publish_interval_minutes
+        # Keep the service-facing pointer beside the immutable dense versions.
+        _publish_current(os.path.join(self._export_root, CURRENT_JSON), payload)
+        self._ready = None
+        logger.info(
+            "published online dense export version %s (checkpoint_step %s, "
+            "sparse_step %s)",
+            ready["version"],
+            ready["step"],
+            sparse_watermark,
+        )
+        _prune_old_dense_versions(
+            self._export_root, os.path.join(self._export_root, VERSIONS_DIR)
         )
