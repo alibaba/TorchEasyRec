@@ -117,7 +117,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             PromptAssembler(
                 compiled_prompt.prompt_plan,
                 compiled_prompt.sid_space,
-                plan_hash=compiled_prompt.plan_hash,
                 include_response=mode != Mode.PREDICT,
             )
             if compiled_prompt is not None

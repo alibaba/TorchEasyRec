@@ -19,23 +19,17 @@ construction and what remains is jagged integer arithmetic -- ``cumsum``,
 which is what lets ``torch.jit.script`` carry the same module into a runtime
 that has no tzrec source. Serving therefore never reimplements this walk.
 
-``hole_keys`` is computed at both call sites and discarded by training. It is
-integer end to end: ``int64`` addition is associative and commutative and wraps
-deterministically, so the fold cannot depend on the order ``index_add_``
-happens to reduce in, on the device, or on how the batch was split. A float
-accumulator would satisfy "do not fold the projected vector" in letter and
-reintroduce the variance in spirit.
+The walk is prompt structure only. The prefix-cache identity of each hole,
+``hole_keys``, is a serving concern that ``hole_keys.py`` folds beside it.
 """
 
-import hashlib
-from typing import Dict, Final, List, Optional, Tuple
+from typing import Dict, Final, List, Tuple
 
 import torch
 from torch import nn
 
 from tzrec.prompt.types import (
     FillMode,
-    FoldConstants,
     PromptPlan,
     ResolvedSidSpace,
     SlotSeg,
@@ -46,7 +40,6 @@ from tzrec.protos.model_pb2 import FeatureGroupType
 INPUT_IDS = "input_ids"
 CU_SEQLENS = "cu_seqlens"
 HOLE_POSITIONS = "hole_positions"
-HOLE_KEYS = "hole_keys"
 HOLE_SLOT_COUNTS = "hole_slot_counts"
 RESPONSE_LENGTHS = "response_lengths"
 MAX_SEQLEN = "max_seqlen"
@@ -56,7 +49,6 @@ OUTPUT_KEYS = (
     INPUT_IDS,
     CU_SEQLENS,
     HOLE_POSITIONS,
-    HOLE_KEYS,
     HOLE_SLOT_COUNTS,
     RESPONSE_LENGTHS,
     MAX_SEQLEN,
@@ -67,24 +59,9 @@ PROMPT_INFO_PREFIX = "prompt_"
 PROMPT_INPUT_IDS = PROMPT_INFO_PREFIX + INPUT_IDS
 PROMPT_CU_SEQLENS = PROMPT_INFO_PREFIX + CU_SEQLENS
 PROMPT_HOLE_POSITIONS = PROMPT_INFO_PREFIX + HOLE_POSITIONS
-PROMPT_HOLE_KEYS = PROMPT_INFO_PREFIX + HOLE_KEYS
 PROMPT_HOLE_SLOT_COUNTS = PROMPT_INFO_PREFIX + HOLE_SLOT_COUNTS
 PROMPT_MAX_SEQLEN = PROMPT_INFO_PREFIX + MAX_SEQLEN
 PROMPT_RESPONSE_LENGTHS = PROMPT_INFO_PREFIX + RESPONSE_LENGTHS
-
-
-@torch.jit.script
-def mix64(z: torch.Tensor) -> torch.Tensor:
-    """A SplitMix64-shaped avalanche over int64, wrapping.
-
-    torch's right shift on a signed integer is arithmetic, so every shift the
-    mixer wants as logical is masked back. Getting that wrong is not a weaker
-    hash, it is a different function on negative inputs.
-    """
-    z = z * (-7046029254386353131)
-    z = (z ^ ((z >> 30) & 0x3FFFFFFFF)) * (-4658895280553007687)
-    z = (z ^ ((z >> 27) & 0x1FFFFFFFFF)) * (-7723592293110705685)
-    return z ^ ((z >> 31) & 0x1FFFFFFFF)
 
 
 @torch.jit.script
@@ -126,30 +103,6 @@ def _destinations(seg_start: torch.Tensor, seg_len: torch.Tensor) -> torch.Tenso
     return torch.repeat_interleave(seg_start, seg_len) + _within_row_index(seg_len)
 
 
-def _wrap64(value: int) -> int:
-    """Reduce a Python int into the signed 64-bit range, wrapping.
-
-    Every constant the fold mixes is built on the host and handed to torch as a
-    scalar, and torch refuses a scalar outside the tensor's dtype. Wrapping here
-    is what makes "the fold wraps" true at the boundary as well as inside it.
-    """
-    value &= (1 << 64) - 1
-    return value - (1 << 64) if value >= 1 << 63 else value
-
-
-def _plan_salt(fold: FoldConstants, plan_hash: str) -> int:
-    """A 64-bit digest of ``plan_hash``, as a signed multiple of the plan constant."""
-    if not plan_hash:
-        return 0
-    digest = hashlib.sha256(plan_hash.encode("utf-8")).digest()[:8]
-    return _wrap64(int.from_bytes(digest, "little") * fold.plan)
-
-
-def host_lengths_key(feature_name: str) -> str:
-    """The per-row item count a host lookup stage emits beside its rows."""
-    return feature_name + "__lengths"
-
-
 class PromptAssembler(nn.Module):
     """Walks a compiled plan to build one batch's packed token stream.
 
@@ -160,10 +113,7 @@ class PromptAssembler(nn.Module):
 
     Args:
         prompt_plan: the compiled walk order and its constants.
-        sid_space: resolved SID token space; required when a slot renders SID
-            codes or is projected.
-        plan_hash: the compiled plan's hash; its low bits salt every key, so
-            two plans cannot cross-match in a shared prefix cache.
+        sid_space: the resolved SID token space.
         include_response: whether to read and emit the supervised tail.
     """
 
@@ -172,9 +122,6 @@ class PromptAssembler(nn.Module):
     KIND_STATIC: Final[int] = 0
     KIND_INLINE: Final[int] = 1
     KIND_PROJECTED: Final[int] = 2
-    # member index and position within a hole packed into one integer, wide
-    # enough that a position cannot carry into the member index
-    MEMBER_STRIDE: Final[int] = 1 << 32
 
     kinds: List[int]
     names: List[str]
@@ -182,7 +129,6 @@ class PromptAssembler(nn.Module):
     exact_widths: List[int]
     hole_slots: List[int]
     is_sequences: List[bool]
-    salts: List[int]
     member_names: List[List[str]]
     level_lo: List[int]
     level_hi: List[int]
@@ -190,8 +136,7 @@ class PromptAssembler(nn.Module):
     def __init__(
         self,
         prompt_plan: PromptPlan,
-        sid_space: Optional[ResolvedSidSpace] = None,
-        plan_hash: str = "",
+        sid_space: ResolvedSidSpace,
         include_response: bool = True,
     ) -> None:
         super().__init__()
@@ -200,30 +145,17 @@ class PromptAssembler(nn.Module):
         if include_response:
             segments = segments + tuple(prompt_plan.response_segments)
 
-        inline = [
-            s.name
-            for s in segments
-            if isinstance(s, SlotSeg) and s.fill is FillMode.INLINE
-        ]
-        if inline and sid_space is None:
-            raise ValueError(
-                f"prompt slots {inline} render INLINE, which means SID codes, but "
-                f"no sid_space was compiled."
-            )
+        # compile reserves a sentinel whenever a slot is PROJECTED, so -1 is
+        # never written
         self.sentinel = -1
-        self.id_shift = 0
-        self.num_levels = 1
-        self.level_lo = []
-        self.level_hi = []
-        if sid_space is not None:
-            if sid_space.sentinel_token_id is not None:
-                self.sentinel = int(sid_space.sentinel_token_id)
-            self.id_shift = int(sid_space.base_vocab_size)
-            self.num_levels = int(sid_space.num_levels)
-            self.level_lo = [int(o) for o in sid_space.level_offsets]
-            self.level_hi = [
-                int(o + c) for o, c in zip(sid_space.level_offsets, sid_space.codebook)
-            ]
+        if sid_space.sentinel_token_id is not None:
+            self.sentinel = int(sid_space.sentinel_token_id)
+        self.id_shift = int(sid_space.base_vocab_size)
+        self.num_levels = int(sid_space.num_levels)
+        self.level_lo = [int(o) for o in sid_space.level_offsets]
+        self.level_hi = [
+            int(o + c) for o, c in zip(sid_space.level_offsets, sid_space.codebook)
+        ]
         self.max_length = int(prompt_plan.max_length)
 
         self.kinds = []
@@ -233,9 +165,9 @@ class PromptAssembler(nn.Module):
         self.hole_slots = []
         self.is_sequences = []
         self.member_names = []
-        slot_ids: List[int] = []
         # holes are grouped by projected occurrence in emission order, which is
-        # the order of ``projected_slots`` and of the front-end's projections
+        # the order of ``projected_slots``, of the front-end's projections and
+        # of ``hole_keys``
         occurrences = 0
         for index, seg in enumerate(segments):
             if isinstance(seg, Static):
@@ -248,7 +180,6 @@ class PromptAssembler(nn.Module):
                     False,
                     [],
                 )
-                slot_ids.append(-1)
                 continue
             assert isinstance(seg, SlotSeg)
             is_sequence = seg.group_type == FeatureGroupType.JAGGED_SEQUENCE
@@ -267,11 +198,6 @@ class PromptAssembler(nn.Module):
                     [seg.feature_names[0]],
                 )
             else:
-                if self.sentinel < 0:
-                    raise ValueError(
-                        f"prompt slot [{seg.name}] is PROJECTED but no sentinel token "
-                        f"was compiled; a hole would be indistinguishable from content."
-                    )
                 self._append(
                     self.KIND_PROJECTED,
                     seg.name,
@@ -282,15 +208,9 @@ class PromptAssembler(nn.Module):
                     list(seg.feature_names),
                 )
                 occurrences += 1
-            slot_ids.append(int(seg.slot_id))
 
         self.num_segments = len(self.kinds)
         self.num_hole_slots = occurrences
-        fold = prompt_plan.fold
-        self.fold_value = int(fold.value)
-        self.fold_index = int(fold.index)
-        plan_salt = _plan_salt(fold, plan_hash)
-        self.salts = [_wrap64(fold.slot * slot_id + plan_salt) for slot_id in slot_ids]
 
     def _append(
         self,
@@ -314,21 +234,19 @@ class PromptAssembler(nn.Module):
     def _lengths(
         self, batch: Dict[str, torch.Tensor], slot: str, member: str, is_sequence: bool
     ) -> torch.Tensor:
-        """Per-row item count, from the parsed dict or from a host lookup stage."""
+        """Per-row item count of one member, as the data parser emits it."""
         key = member + ".lengths"
         if key in batch:
             return batch[key].to(torch.int64)
-        host_key = host_lengths_key(member)
-        if host_key in batch:
-            return batch[host_key].to(torch.int64)
         if is_sequence:
             raise ValueError(
                 "prompt slot ["
                 + slot
-                + "] reads ["
-                + member
-                + "], which the parser emitted as a scalar: a slot renders a "
-                + "sequence of SID codes, so the column must be list<int64>."
+                + "] renders a sequence but the batch has no ["
+                + key
+                + "]: the column must be list<int64>, and under distributed "
+                + "embedding the processor must pass the raw parsed features "
+                + "through beside the looked-up embeddings."
             )
         # a dense member has one row per sample and no lengths
         return torch.ones(
@@ -488,87 +406,6 @@ class PromptAssembler(nn.Module):
             (total,), self.sentinel, dtype=torch.int64, device=seg_len.device
         )
 
-    def _fold_segment(
-        self,
-        batch: Dict[str, torch.Tensor],
-        index: int,
-        batch_size: int,
-        hole_base: int,
-        keys: torch.Tensor,
-    ) -> None:
-        """Mix one projected segment's input values into ``keys``.
-
-        Every member value that produces a hole contributes, discriminated by
-        slot, by member and by its index inside the hole. Without the last two
-        a two-member slot with values ``(a, b)`` would match one with
-        ``(b, a)``, and a permuted multi-value item would match itself
-        reordered -- both plausible, both wrong, and both silent.
-        """
-        salt = self.salts[index]
-        name = self.names[index]
-        members = self.member_names[index]
-        is_sequence = self.is_sequences[index]
-        for member_index in range(len(members)):
-            member = members[member_index]
-            raw = batch[member + ".values"]
-            lengths = self._lengths(batch, name, member, is_sequence)
-            key_length_key = member + ".key_lengths"
-
-            if not is_sequence:
-                # one hole per row; a dense member contributes its float32 bit
-                # pattern verbatim, which is the parsed input and not a
-                # computed reduction, so it is stable for a given request
-                if raw.is_floating_point():
-                    width = raw.size(1)
-                    values = (
-                        raw.to(torch.float32)
-                        .contiguous()
-                        .view(torch.int32)
-                        .to(torch.int64)
-                        .reshape(-1)
-                        & 0xFFFFFFFF
-                    )
-                    hole = torch.repeat_interleave(
-                        torch.arange(batch_size, dtype=torch.int64, device=raw.device),
-                        torch.full(
-                            (batch_size,), width, dtype=torch.int64, device=raw.device
-                        ),
-                    )
-                    local = (
-                        torch.arange(width, dtype=torch.int64, device=raw.device)
-                        .unsqueeze(0)
-                        .expand(batch_size, width)
-                        .reshape(-1)
-                    )
-                else:
-                    values = raw.to(torch.int64).reshape(-1)
-                    hole = _row_ids(lengths)
-                    local = _within_row_index(lengths)
-            else:
-                if raw.is_floating_point():
-                    raise ValueError(
-                        "prompt slot ["
-                        + name
-                        + "] member ["
-                        + member
-                        + "] is a dense sequence; the fold has no per-item boundary "
-                        + "for it."
-                    )
-                values = raw.to(torch.int64).reshape(-1)
-                if key_length_key in batch:
-                    key_lengths = batch[key_length_key].to(torch.int64).reshape(-1)
-                    hole = _row_ids(key_lengths)
-                    local = _within_row_index(key_lengths)
-                else:
-                    hole = torch.arange(
-                        values.numel(), dtype=torch.int64, device=values.device
-                    )
-                    local = torch.zeros_like(hole)
-
-            local = local + member_index * self.MEMBER_STRIDE
-            mixed = mix64(values * self.fold_value + local * self.fold_index + salt)
-            keys.index_add_(0, hole + hole_base, mixed)
-
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Assemble one batch.
 
@@ -577,11 +414,11 @@ class PromptAssembler(nn.Module):
                 ``.lengths`` / ``.key_lengths`` as the data parser emits it.
 
         Returns:
-            ``input_ids``, ``cu_seqlens``, ``hole_positions``, ``hole_keys``,
-            ``hole_slot_counts``, ``response_lengths`` and ``max_seqlen``. The
-            two hole-indexed streams are row-aligned: entry ``k`` of each
-            describes the same hole, grouped by projected occurrence in
-            emission order, then by sample.
+            ``input_ids``, ``cu_seqlens``, ``hole_positions``,
+            ``hole_slot_counts``, ``response_lengths`` and ``max_seqlen``. Holes
+            are grouped by projected occurrence in emission order, then by
+            sample; the front-end's ``slot_embeds`` and ``hole_keys`` follow the
+            same order.
         """
         batch_size = self._batch_size(batch)
         device = batch_device(batch)
@@ -639,13 +476,6 @@ class PromptAssembler(nn.Module):
         slot_counts = torch.zeros(self.num_hole_slots, dtype=torch.int64, device=device)
         for slot in range(self.num_hole_slots):
             slot_counts[slot] = hole_parts[slot + 1].numel()
-        keys = torch.zeros(hole_positions.numel(), dtype=torch.int64, device=device)
-        hole_base = 0
-        for slot in range(self.num_hole_slots):
-            for i in range(self.num_segments):
-                if self.hole_slots[i] == slot:
-                    self._fold_segment(batch, i, batch_size, hole_base, keys)
-                    hole_base = hole_base + hole_parts[slot + 1].numel()
 
         cu_seqlens = torch.cat(
             [
@@ -663,7 +493,6 @@ class PromptAssembler(nn.Module):
             "input_ids": out,
             "cu_seqlens": cu_seqlens.to(torch.int32),
             "hole_positions": hole_positions,
-            "hole_keys": keys,
             "hole_slot_counts": slot_counts,
             "response_lengths": response_lengths,
             "max_seqlen": max_seqlen,

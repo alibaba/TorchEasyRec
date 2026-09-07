@@ -16,7 +16,7 @@ This namespace disambiguates ``plan.ResolvedSidSpace``, the resolved token space
 physical dimension: the model resolves those at ``__init__``.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Optional, Tuple, Union
 
@@ -141,36 +141,6 @@ Segment = Union[Static, SlotSeg]
 
 
 @dataclass(frozen=True)
-class FoldConstants:
-    """Odd multipliers mixed into ``hole_keys``.
-
-    Written as signed int64 so torch takes them verbatim: the fold wraps, and a
-    host that had to convert them would be a second place to get it wrong.
-
-    They live in the plan rather than in the host so the artifact, not the
-    machine that runs it, decides the keys. Each closes a collision that would
-    otherwise produce a correct-looking prefix-cache hit: two slots holding the
-    same id, two members of one slot exchanging values, or a multi-value item
-    permuted.
-
-    Args:
-        slot: multiplies ``slot_id`` into the per-hole salt.
-        plan: multiplies the low 64 bits of ``plan_hash``, so keys are
-            artifact-specific and a rolling upgrade cannot cross-match.
-        value: multiplies each contributing value.
-        index: multiplies the member-and-position index within a hole.
-        position: multiplies the hole index in the per-item outer fold, without
-            which a permuted history collides.
-    """
-
-    slot: int = -7046029254386353131
-    plan: int = -4417276706812531889
-    value: int = -49064778989728563
-    index: int = -2960836687051489901
-    position: int = -6752110988234923001
-
-
-@dataclass(frozen=True)
 class PromptPlan:
     """The walk order the assembler follows, plus the ceilings derived from it.
 
@@ -185,7 +155,6 @@ class PromptPlan:
         projected_slots: PROJECTED occurrences in emission order, which is also
             ascending hole position; nothing may reorder them by slot id or by
             shared module, because the serving scatter is positional.
-        fold: the constants ``hole_keys`` mixes in.
     """
 
     segments: Tuple[Segment, ...]
@@ -196,7 +165,6 @@ class PromptPlan:
     logits_suffix_len: Optional[int]
     static_prefix_len: int
     projected_slots: Tuple[SlotSeg, ...]
-    fold: FoldConstants = field(default_factory=FoldConstants)
 
 
 @dataclass(frozen=True)
@@ -229,7 +197,7 @@ class CompiledPrompt:
         plan_hash: over all four parts; warns on mismatch.
     """
 
-    sid_space: Optional[ResolvedSidSpace]
+    sid_space: ResolvedSidSpace
     prompt_plan: PromptPlan
     projection_plan: ProjectionPlan
     vocab_hash: str

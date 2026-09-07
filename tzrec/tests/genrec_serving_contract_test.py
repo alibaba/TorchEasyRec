@@ -27,8 +27,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 
-from tzrec.prompt.assembler import mix64
-from tzrec.prompt.types import FoldConstants
+from tzrec.prompt.hole_keys import mix64
 from tzrec.tests.prompt_test_util import export_tiny_genrec
 from tzrec.utils.test_util import make_test_dir
 
@@ -127,8 +126,7 @@ class GenrecServingContractTest(unittest.TestCase):
         self.assertEqual(out["hole_keys"].dtype, torch.int64)
 
     def test_host_item_hash_refolds_hole_keys(self) -> None:
-        """The per-item outer fold on the host uses the plan's position constant."""
-        self.assertEqual(FoldConstants().position, _C_POSITION)
+        """The host's per-item outer fold reuses the front-end's mixer."""
         for value in (0, 1, -1, 123456789, -(2**40)):
             signed = _mix64_host(value & _MASK64)
             signed = signed - (1 << 64) if signed >= 1 << 63 else signed

@@ -23,11 +23,11 @@ from tzrec.datasets.utils import Batch
 from tzrec.models.model import TrainWrapper
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
-    HOLE_KEYS,
     HOLE_POSITIONS,
     INPUT_IDS,
     PromptAssembler,
 )
+from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
 from tzrec.tests.prompt_test_util import (
     GenrecModelTestBase,
     assemble_into,
@@ -113,21 +113,23 @@ class GenrecExportIntegrationTest(unittest.TestCase):
             )
         self.assertFalse(os.path.exists(os.path.join(exported.export_dir, "sparse")))
 
-        # the exported artifact and the collator are two call sites of one walk
+        # the exported artifact and the collator are two call sites of one walk;
+        # only the artifact folds hole keys
         data = exported.sample_data
         compiled = exported.compiled_prompt
         collator = PromptAssembler(
-            compiled.prompt_plan,
-            compiled.sid_space,
-            plan_hash=compiled.plan_hash,
-            include_response=False,
+            compiled.prompt_plan, compiled.sid_space, include_response=False
         )(data)
         front_end = torch.jit.load(
             os.path.join(exported.export_dir, "scripted_model.pt")
         )
         out = front_end(data, torch.device("cpu"))
-        for key in (INPUT_IDS, CU_SEQLENS, HOLE_POSITIONS, HOLE_KEYS):
+        for key in (INPUT_IDS, CU_SEQLENS, HOLE_POSITIONS):
             self.assertTrue(torch.equal(out[key], collator[key]), key)
+        self.assertTrue(
+            torch.equal(out[HOLE_KEYS], HoleKeyBuilder(compiled.prompt_plan)(data))
+        )
+        self.assertNotIn(HOLE_KEYS, collator)
         self.assertEqual(
             tuple(out["slot_embeds"].shape), (int(out[HOLE_POSITIONS].numel()), 32)
         )

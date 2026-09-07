@@ -31,6 +31,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.loss.pe_mtl_loss import ParetoEfficientMultiTaskLoss
 from tzrec.modules.utils import BaseModule
 from tzrec.prompt.assembler import OUTPUT_KEYS, PROMPT_INFO_PREFIX, PromptAssembler
+from tzrec.prompt.hole_keys import PROMPT_HOLE_KEYS, HoleKeyBuilder
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.utils import config_util
@@ -392,7 +393,8 @@ class ScriptWrapper(BaseModule):
 
     A module that exposes ``compiled_prompt`` gets its prompt assembled here,
     from the parsed dict, exactly as the training collator does: one walk, two
-    call sites.
+    call sites. Serving alone also folds the prefix-cache ``hole_keys`` here,
+    which training never computes.
     """
 
     def __init__(self, module: nn.Module) -> None:
@@ -407,13 +409,13 @@ class ScriptWrapper(BaseModule):
         prompt = getattr(module, "compiled_prompt", None)
         self._prompt_assembler = (
             PromptAssembler(
-                prompt.prompt_plan,
-                prompt.sid_space,
-                plan_hash=prompt.plan_hash,
-                include_response=False,
+                prompt.prompt_plan, prompt.sid_space, include_response=False
             )
             if prompt is not None
             else None
+        )
+        self._hole_keys = (
+            HoleKeyBuilder(prompt.prompt_plan) if prompt is not None else None
         )
 
     @property
@@ -439,6 +441,8 @@ class ScriptWrapper(BaseModule):
             batch.additional_infos.update(
                 {PROMPT_INFO_PREFIX + k: streams[k] for k in OUTPUT_KEYS}
             )
+        if self._hole_keys is not None:
+            batch.additional_infos[PROMPT_HOLE_KEYS] = self._hole_keys(data)
         batch = batch.to(device, non_blocking=True)
         return batch
 

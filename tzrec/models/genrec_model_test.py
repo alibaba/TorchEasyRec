@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dataclasses
 import json
 import os
 import shutil
@@ -29,7 +28,6 @@ from tzrec.models.genrec_model import (
 )
 from tzrec.models.model import ScriptWrapper
 from tzrec.prompt.assembler import (
-    HOLE_KEYS,
     HOLE_POSITIONS,
     INPUT_IDS,
     PROMPT_HOLE_POSITIONS,
@@ -37,6 +35,7 @@ from tzrec.prompt.assembler import (
     PromptAssembler,
 )
 from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
 from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
@@ -79,14 +78,6 @@ class BaseGenrecModelTest(GenrecModelTestBase):
     def test_rejects_a_model_built_without_a_prompt(self) -> None:
         with self.assertRaisesRegex(ValueError, "needs a compiled prompt"):
             self._model(compiled_prompt=None)
-
-    def test_rejects_a_prompt_that_declares_no_sid_space(self) -> None:
-        # compile_prompt refuses this config, so the model precondition is
-        # reachable only by constructing a prompt directly
-        compiled_prompt = dataclasses.replace(self.compiled_prompt, sid_space=None)
-
-        with self.assertRaisesRegex(ValueError, "declares no sid_space"):
-            self._model(compiled_prompt=compiled_prompt)
 
     def test_shared_projection_name_requires_matching_widths(self) -> None:
         features = [
@@ -263,13 +254,13 @@ class GenrecFrontEndTest(GenrecModelTestBase):
         out = self.wrapped(self.data)
         compiled = self.compiled_prompt
         walk = PromptAssembler(
-            compiled.prompt_plan,
-            compiled.sid_space,
-            plan_hash=compiled.plan_hash,
-            include_response=False,
+            compiled.prompt_plan, compiled.sid_space, include_response=False
         )(self.data)
-        for key in (INPUT_IDS, HOLE_POSITIONS, HOLE_KEYS):
+        for key in (INPUT_IDS, HOLE_POSITIONS):
             self.assertTrue(torch.equal(out[key], walk[key]), key)
+        self.assertTrue(
+            torch.equal(out[HOLE_KEYS], HoleKeyBuilder(compiled.prompt_plan)(self.data))
+        )
         batch = self.wrapped.get_batch(self.data)
         expected = project_slots(
             self.model.embedding_group,

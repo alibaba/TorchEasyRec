@@ -18,7 +18,7 @@ from torchrec.fx import symbolic_trace as _symbolic_trace
 # Modules whose forward FX cannot record -- they branch on tensor values or
 # turn them into Python ints -- so tracing keeps them opaque and TorchScript
 # compiles them whole. Matched by class name.
-UNTRACEABLE_MODULES = ["ComputeJTDictToKJT", "PromptAssembler"]
+UNTRACEABLE_MODULES = ["ComputeJTDictToKJT", "PromptAssembler", "HoleKeyBuilder"]
 
 
 def symbolic_trace(

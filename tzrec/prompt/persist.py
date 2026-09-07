@@ -48,16 +48,9 @@ def write_serving_contract(compiled_prompt: CompiledPrompt, export_dir: str) -> 
     out = os.path.join(export_dir, PROMPT_DIR)
     os.makedirs(out, exist_ok=True)
     path = os.path.join(out, PROMPT_CONTRACT_FILENAME)
-    sid_space = compiled_prompt.sid_space
     with open(path, "w") as f:
         json.dump(
-            {
-                "sid_space": dataclasses.asdict(sid_space)
-                if sid_space is not None
-                else None
-            },
-            f,
-            indent=2,
+            {"sid_space": dataclasses.asdict(compiled_prompt.sid_space)}, f, indent=2
         )
     return path
 

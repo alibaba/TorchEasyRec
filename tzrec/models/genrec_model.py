@@ -39,17 +39,16 @@ from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.prompt_projection import PromptProjection
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
-    HOLE_KEYS,
     HOLE_POSITIONS,
     HOLE_SLOT_COUNTS,
     INPUT_IDS,
     PROMPT_CU_SEQLENS,
-    PROMPT_HOLE_KEYS,
     PROMPT_HOLE_POSITIONS,
     PROMPT_HOLE_SLOT_COUNTS,
     PROMPT_INPUT_IDS,
 )
 from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.hole_keys import HOLE_KEYS, PROMPT_HOLE_KEYS
 from tzrec.prompt.persist import PROMPT_DIR, TOKENIZER_DIR, write_serving_contract
 from tzrec.prompt.types import CompiledPrompt, PromptPlan
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
@@ -100,11 +99,6 @@ class BaseGenrecModel(BaseModel):
                 f"{type(self).__name__} needs a compiled prompt; call "
                 f"compile_prompt(pipeline_config.prompt_config, features) and "
                 f"pass it to _create_model."
-            )
-        if compiled_prompt.sid_space is None:
-            raise ValueError(
-                f"{type(self).__name__}: prompt_config declares no sid_space, "
-                f"so there is no SID vocabulary to extend or decode."
             )
         if compiled_prompt.prompt_plan.logits_suffix_len is None:
             raise ValueError(
@@ -367,6 +361,11 @@ class GenrecFrontEnd(nn.Module):
     never loaded at export. ``predict`` returns the assembled prompt and the
     projected slot embeddings; an LLM engine gathers the LM's own table, scatters
     ``slot_embeds`` at ``hole_positions`` and decodes.
+
+    The walk and the ``hole_keys`` fold both read the parsed feature dict, so
+    under distributed embedding the dense stage must still receive every slot
+    member's raw ``.values`` / ``.lengths`` / ``.key_lengths`` beside the
+    looked-up embeddings.
 
     Args:
         model: the genrec model to serve.

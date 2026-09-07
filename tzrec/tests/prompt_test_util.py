@@ -100,11 +100,9 @@ def assemble_into(
         The assembled streams keyed for ``additional_infos``.
     """
     batch = {k: torch.as_tensor(np.asarray(v)) for k, v in parsed_features.items()}
-    streams = PromptAssembler(
-        compiled_prompt.prompt_plan,
-        compiled_prompt.sid_space,
-        plan_hash=compiled_prompt.plan_hash,
-    )(batch)
+    streams = PromptAssembler(compiled_prompt.prompt_plan, compiled_prompt.sid_space)(
+        batch
+    )
     return {PROMPT_INFO_PREFIX + k: v for k, v in streams.items()}
 
 
