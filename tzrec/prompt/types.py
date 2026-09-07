@@ -185,7 +185,6 @@ class PromptPlan:
         projected_slots: PROJECTED occurrences in emission order, which is also
             ascending hole position; nothing may reorder them by slot id or by
             shared module, because the serving scatter is positional.
-        slot_index: slot name to its index in ``projected_slots``.
         fold: the constants ``hole_keys`` mixes in.
     """
 
@@ -197,7 +196,6 @@ class PromptPlan:
     logits_suffix_len: Optional[int]
     static_prefix_len: int
     projected_slots: Tuple[SlotSeg, ...]
-    slot_index: Mapping[str, int] = field(default_factory=dict)
     fold: FoldConstants = field(default_factory=FoldConstants)
 
 

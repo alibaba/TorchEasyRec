@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 
-from tzrec.prompt.frontend import mix64
+from tzrec.prompt.assembler import mix64
 from tzrec.prompt.types import FoldConstants
 from tzrec.tests.prompt_test_util import export_tiny_genrec, offset_sid_codes
 from tzrec.utils.test_util import make_test_dir

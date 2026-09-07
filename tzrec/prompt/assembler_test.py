@@ -12,14 +12,20 @@
 import unittest
 
 import numpy as np
+import torch
 from parameterized import parameterized
 
+from tzrec.prompt import assembler
 from tzrec.prompt.assembler import (
-    PROMPT_CU_SEQLENS,
-    PROMPT_HOLE_POSITIONS,
-    PROMPT_INPUT_IDS,
-    PROMPT_RESPONSE_LENGTHS,
+    CU_SEQLENS,
+    HOLE_KEYS,
+    HOLE_POSITIONS,
+    HOLE_SLOT_COUNTS,
+    INPUT_IDS,
+    MAX_SEQLEN,
+    RESPONSE_LENGTHS,
     PromptAssembler,
+    mix64,
 )
 from tzrec.prompt.types import (
     FillMode,
@@ -67,9 +73,10 @@ def _slot(
     width_n=None,
     feature_names=None,
     group_type=FeatureGroupType.JAGGED_SEQUENCE,
+    slot_id=0,
 ) -> SlotSeg:
     return SlotSeg(
-        slot_id=0,
+        slot_id=slot_id,
         name=name,
         feature_names=tuple(feature_names) if feature_names is not None else (name,),
         group_type=group_type,
@@ -118,23 +125,27 @@ def _parsed(inline=None, projected=None) -> dict:
     """
     out = {}
     for name, rows in (inline or {}).items():
-        out[f"{name}.values"] = (
+        out[f"{name}.values"] = torch.as_tensor(
             np.concatenate(rows) if rows else np.zeros(0, dtype=np.int64)
         )
-        out[f"{name}.lengths"] = np.asarray([len(row) for row in rows])
+        out[f"{name}.lengths"] = torch.tensor([len(row) for row in rows])
     for name, lengths in (projected or {}).items():
-        out[f"{name}.lengths"] = np.asarray(lengths)
+        out[f"{name}.lengths"] = torch.tensor(lengths)
     return out
+
+
+def _tensors(raw):
+    return {key: torch.as_tensor(np.asarray(value)) for key, value in raw.items()}
 
 
 class PromptAssemblerTest(unittest.TestCase):
     def test_inline_sid_gets_the_base_vocab_shift(self) -> None:
         asm = _asm((Static((7, 8)), _slot("hist", FillMode.INLINE)))
         # offset codes for one item: level 0 -> 1, level 1 -> 4+2, level 2 -> 8+3
-        out = asm.forward(_parsed({"hist": [np.array([1, 6, 11])]}))
+        out = asm(_parsed({"hist": [np.array([1, 6, 11])]}))
 
         self.assertEqual(
-            out[PROMPT_INPUT_IDS].tolist(),
+            out[INPUT_IDS].tolist(),
             [
                 7,
                 8,
@@ -143,21 +154,30 @@ class PromptAssemblerTest(unittest.TestCase):
                 _BASE_VOCAB_SIZE + 11,
             ],
         )
-        self.assertEqual(out[PROMPT_CU_SEQLENS].tolist(), [0, 5])
-        self.assertEqual(out[PROMPT_HOLE_POSITIONS].size, 0)
+        self.assertEqual(out[CU_SEQLENS].tolist(), [0, 5])
+        self.assertEqual(out[HOLE_POSITIONS].numel(), 0)
+        self.assertEqual(int(out[MAX_SEQLEN]), 5)
 
     def test_projected_emits_sentinels_and_records_holes(self) -> None:
         asm = _asm((Static((7,)), _slot("prof", FillMode.PROJECTED, 4)))
-        out = asm.forward(_parsed(projected={"prof": [2, 3]}))
+        out = asm(
+            _parsed(projected={"prof": [2, 3]})
+            | {"prof.values": torch.tensor([1, 2, 3, 4, 5])}
+        )
 
         # sample 0: [7, S, S]   sample 1: [7, S, S, S]
         self.assertEqual(
-            out[PROMPT_INPUT_IDS].tolist(),
+            out[INPUT_IDS].tolist(),
             [7, _SENTINEL, _SENTINEL, 7, _SENTINEL, _SENTINEL, _SENTINEL],
         )
-        self.assertEqual(out[PROMPT_CU_SEQLENS].tolist(), [0, 3, 7])
+        self.assertEqual(out[CU_SEQLENS].tolist(), [0, 3, 7])
         # absolute indices into the flat buffer, which is what index_copy needs
-        self.assertEqual(out[PROMPT_HOLE_POSITIONS].tolist(), [1, 2, 4, 5, 6])
+        self.assertEqual(out[HOLE_POSITIONS].tolist(), [1, 2, 4, 5, 6])
+        self.assertEqual(out[HOLE_SLOT_COUNTS].tolist(), [5])
+        holes = out[HOLE_POSITIONS]
+        self.assertTrue(bool(torch.all(out[INPUT_IDS][holes] == _SENTINEL)))
+        self.assertEqual(int(torch.sum(out[INPUT_IDS] == _SENTINEL)), 5)
+        self.assertEqual(int(out[MAX_SEQLEN]), 4)
 
     def test_holes_are_grouped_by_projected_occurrence_then_sample(self) -> None:
         plan = _plan(
@@ -169,12 +189,14 @@ class PromptAssemblerTest(unittest.TestCase):
             )
         )
         asm = PromptAssembler(plan, _sid_space())
-        out = asm.forward(_parsed(projected={"a": [1, 2], "b": [2, 1]}))
-
-        self.assertEqual(out[PROMPT_CU_SEQLENS].tolist(), [0, 5, 11])
-        self.assertEqual(
-            out[PROMPT_HOLE_POSITIONS].tolist(), [0, 5, 6, 2, 3, 8, 4, 9, 10]
+        out = asm(
+            _parsed(projected={"a": [1, 2], "b": [2, 1]})
+            | {"a.values": torch.tensor([1, 2, 3]), "b.values": torch.tensor([4, 5, 6])}
         )
+
+        self.assertEqual(out[CU_SEQLENS].tolist(), [0, 5, 11])
+        self.assertEqual(out[HOLE_POSITIONS].tolist(), [0, 5, 6, 2, 3, 8, 4, 9, 10])
+        self.assertEqual(out[HOLE_SLOT_COUNTS].tolist(), [3, 3, 3])
 
     def test_response_is_optional_and_its_length_is_recorded(self) -> None:
         plan = _plan(
@@ -184,10 +206,10 @@ class PromptAssemblerTest(unittest.TestCase):
         parsed = _parsed(
             {"hist": [np.array([1, 6, 11])], "answer": [np.array([0, 4, 8])]}
         )
-        out = PromptAssembler(plan, _sid_space()).forward(parsed)
+        out = PromptAssembler(plan, _sid_space())(parsed)
 
         self.assertEqual(
-            out[PROMPT_INPUT_IDS].tolist(),
+            out[INPUT_IDS].tolist(),
             [
                 7,
                 _BASE_VOCAB_SIZE + 1,
@@ -199,22 +221,54 @@ class PromptAssemblerTest(unittest.TestCase):
                 _BASE_VOCAB_SIZE + 8,
             ],
         )
-        self.assertEqual(out[PROMPT_RESPONSE_LENGTHS].tolist(), [4])
+        self.assertEqual(out[RESPONSE_LENGTHS].tolist(), [4])
 
-        prompt_only = PromptAssembler(
-            plan, _sid_space(), include_response=False
-        ).forward(_parsed({"hist": [np.array([1, 6, 11])]}))
+        prompt_only = PromptAssembler(plan, _sid_space(), include_response=False)(
+            _parsed({"hist": [np.array([1, 6, 11])]})
+        )
         self.assertEqual(
-            prompt_only[PROMPT_INPUT_IDS].tolist(),
+            prompt_only[INPUT_IDS].tolist(),
             [7, _BASE_VOCAB_SIZE + 1, _BASE_VOCAB_SIZE + 6, _BASE_VOCAB_SIZE + 11],
         )
-        self.assertEqual(prompt_only[PROMPT_RESPONSE_LENGTHS].tolist(), [0])
+        self.assertEqual(prompt_only[RESPONSE_LENGTHS].tolist(), [0])
+
+    def test_rejects_a_response_of_the_wrong_width(self) -> None:
+        plan = _plan(
+            (_slot("hist", FillMode.INLINE),),
+            response=(_slot("answer", FillMode.INLINE),),
+        )
+        asm = PromptAssembler(plan, _sid_space())
+        with self.assertRaisesRegex(ValueError, "compiled width is 3"):
+            asm(
+                _parsed(
+                    {
+                        "hist": [np.array([1, 6, 11])],
+                        "answer": [np.array([0, 4, 8, 1, 5, 9])],
+                    }
+                )
+            )
+
+    def test_a_multi_value_history_walks_like_the_flat_layout(self) -> None:
+        """Items with key_lengths and one code per position are one stream."""
+        asm = _asm((Static((7,)), _slot("hist", FillMode.INLINE)))
+        flat = asm(
+            _parsed({"hist": [np.array([1, 6, 11, 2, 7, 10]), np.array([0, 4, 8])]})
+        )
+        items = asm(
+            {
+                "hist.values": torch.tensor([1, 6, 11, 2, 7, 10, 0, 4, 8]),
+                "hist.lengths": torch.tensor([2, 1]),
+                "hist.key_lengths": torch.tensor([3, 3, 3]),
+            }
+        )
+        for key in (INPUT_IDS, CU_SEQLENS, HOLE_POSITIONS, MAX_SEQLEN):
+            self.assertTrue(torch.equal(flat[key], items[key]), key)
 
     def test_scalar_label_is_named_not_a_key_error(self) -> None:
         asm = _asm((_slot("hist", FillMode.INLINE),))
 
         with self.assertRaisesRegex(ValueError, "must be\\s+list<int64>"):
-            asm.forward({"hist.values": np.array([1, 6, 11])})
+            asm({"hist.values": torch.tensor([1, 6, 11])})
 
     @parameterized.expand(
         [
@@ -226,17 +280,17 @@ class PromptAssemblerTest(unittest.TestCase):
     def test_rejects_a_code_outside_its_band(self, values) -> None:
         asm = _asm((_slot("hist", FillMode.INLINE),))
         with self.assertRaisesRegex(ValueError, "offset_codebook column"):
-            asm.forward(_parsed({"hist": [np.array(values)]}))
+            asm(_parsed({"hist": [np.array(values)]}))
 
     def test_rejects_a_partial_item(self) -> None:
         asm = _asm((_slot("hist", FillMode.INLINE),))
         with self.assertRaisesRegex(ValueError, "whole number of 3-level items"):
-            asm.forward(_parsed({"hist": [np.array([1, 6])]}))
+            asm(_parsed({"hist": [np.array([1, 6])]}))
 
     def test_over_long_row_is_an_error_not_a_truncation(self) -> None:
         asm = _asm((Static((7, 8, 9)), _slot("hist", FillMode.INLINE)), max_length=4)
         with self.assertRaisesRegex(ValueError, "never truncated"):
-            asm.forward(_parsed({"hist": [np.array([1, 6, 11])]}))
+            asm(_parsed({"hist": [np.array([1, 6, 11])]}))
 
     def test_inline_without_a_sid_space_is_rejected_at_construction(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
@@ -262,6 +316,7 @@ class PromptAssemblerTest(unittest.TestCase):
         out = assemble_into(compiled_prompt, parsed)
         self.assertEqual(out["prompt_cu_seqlens"].tolist(), [0, 3, 6])
         self.assertEqual(out["prompt_input_ids"].tolist()[0], _BASE_VOCAB_SIZE + 1)
+        self.assertEqual(int(out["prompt_max_seqlen"]), 3)
 
     def test_rejects_inconsistent_slot_batch_sizes(self) -> None:
         plan = _plan(
@@ -272,15 +327,15 @@ class PromptAssemblerTest(unittest.TestCase):
         )
         asm = PromptAssembler(plan, _sid_space())
         parsed = {
-            "hist.values": np.array([1, 6, 11]),
-            "hist.lengths": np.array([3]),
-            "answer.values": np.array([0, 4, 8, 1, 6, 11]),
-            "answer.lengths": np.array([3, 3]),
+            "hist.values": torch.tensor([1, 6, 11]),
+            "hist.lengths": torch.tensor([3]),
+            "answer.values": torch.tensor([0, 4, 8, 1, 6, 11]),
+            "answer.lengths": torch.tensor([3, 3]),
         }
         with self.assertRaisesRegex(
             ValueError, r"prompt slot \[answer\] has 2 samples, expected 1"
         ):
-            asm.forward(parsed)
+            asm(parsed)
 
     def test_rejects_mismatched_projected_member_lengths(self) -> None:
         plan = _plan(
@@ -295,15 +350,15 @@ class PromptAssemblerTest(unittest.TestCase):
         )
         asm = PromptAssembler(plan, _sid_space())
         parsed = {
-            "age.lengths": np.array([2, 1]),
-            "country.lengths": np.array([2, 2]),
+            "age.lengths": torch.tensor([2, 1]),
+            "country.lengths": torch.tensor([2, 2]),
         }
 
         with self.assertRaisesRegex(
             ValueError,
             r"PROJECTED features \[age\] and \[country\] have different",
         ):
-            asm.forward(parsed)
+            asm(parsed)
 
     def test_deep_projected_members_emit_one_hole_per_sample(self) -> None:
         plan = _plan(
@@ -317,17 +372,203 @@ class PromptAssemblerTest(unittest.TestCase):
             )
         )
         asm = PromptAssembler(plan, _sid_space())
-        out = asm.forward(
+        out = asm(
             {
-                "dense.values": np.array([[1.0, 2.0], [3.0, 4.0]]),
-                "sparse.values": np.array([5, 6, 7]),
-                "sparse.lengths": np.array([2, 1]),
+                "dense.values": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                "sparse.values": torch.tensor([5, 6, 7]),
+                "sparse.lengths": torch.tensor([2, 1]),
             }
         )
 
-        self.assertEqual(out["prompt_input_ids"].tolist(), [_SENTINEL, _SENTINEL])
-        self.assertEqual(out["prompt_cu_seqlens"].tolist(), [0, 1, 2])
-        self.assertEqual(out["prompt_hole_positions"].tolist(), [0, 1])
+        self.assertEqual(out[INPUT_IDS].tolist(), [_SENTINEL, _SENTINEL])
+        self.assertEqual(out[CU_SEQLENS].tolist(), [0, 1, 2])
+        self.assertEqual(out[HOLE_POSITIONS].tolist(), [0, 1])
+
+    def test_output_keys_match_the_module_constants(self) -> None:
+        """``forward`` writes literals; they must equal the exported names."""
+        module = PromptAssembler(_plan((Static((7,)),)))
+        out = module({"batch_size": torch.tensor(2)})
+        self.assertEqual(
+            set(out.keys()),
+            {
+                INPUT_IDS,
+                CU_SEQLENS,
+                HOLE_POSITIONS,
+                HOLE_KEYS,
+                HOLE_SLOT_COUNTS,
+                RESPONSE_LENGTHS,
+                MAX_SEQLEN,
+            },
+        )
+        self.assertEqual(out[INPUT_IDS].tolist(), [7, 7])
+        self.assertEqual(assembler.PROMPT_INPUT_IDS, "prompt_" + INPUT_IDS)
+
+    def test_scripting_preserves_every_output(self) -> None:
+        """The artifact and the collator's module are the same function."""
+        plan = _plan(
+            (
+                Static((7,)),
+                _slot("hist", FillMode.INLINE),
+                _slot("beh", FillMode.PROJECTED, 4),
+            ),
+            response=(_slot("answer", FillMode.INLINE),),
+        )
+        module = PromptAssembler(plan, _sid_space(), plan_hash="a1b2c3d4e5f60718")
+        batch = {
+            "hist.values": torch.tensor([1, 6, 11, 2, 7, 10]),
+            "hist.lengths": torch.tensor([1, 1]),
+            "hist.key_lengths": torch.tensor([3, 3]),
+            "beh.values": torch.tensor([7, 8, 9, 21, 22]),
+            "beh.lengths": torch.tensor([3, 2]),
+            "answer.values": torch.tensor([3, 7, 11, 0, 4, 8]),
+            "answer.lengths": torch.tensor([3, 3]),
+        }
+        eager = module(batch)
+        scripted = torch.jit.script(module)
+        for key, value in scripted(batch).items():
+            self.assertTrue(torch.equal(eager[key], value), key)
+
+    def test_a_scripted_walk_reports_its_validation(self) -> None:
+        """The exported artifact refuses a bad request with the same message."""
+        scripted = torch.jit.script(
+            _asm((Static((7, 8, 9)), _slot("hist", FillMode.INLINE)), max_length=4)
+        )
+        with self.assertRaisesRegex(torch.jit.Error, "never truncated"):
+            scripted(_parsed({"hist": [np.array([1, 6, 11])]}))
+
+
+class MixTest(unittest.TestCase):
+    def test_mix64_matches_a_host_reference(self) -> None:
+        """The mixer's masked shifts must reproduce SplitMix64 on negatives."""
+
+        def reference(value: int) -> int:
+            mask = (1 << 64) - 1
+            z = (value * 0x9E3779B97F4A7C15) & mask
+            z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
+            z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
+            z = z ^ (z >> 31)
+            return z - (1 << 64) if z >= 1 << 63 else z
+
+        values = [0, 1, -1, 2**31, -(2**31), 123456789, -987654321]
+        got = mix64(torch.tensor(values, dtype=torch.int64)).tolist()
+        self.assertEqual(got, [reference(v) for v in values])
+
+
+class FoldTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.beh = _slot("beh", FillMode.PROJECTED, 30)
+        self.plan = _plan((self.beh,))
+        self.module = PromptAssembler(
+            self.plan, _sid_space(), plan_hash="a1b2c3d4e5f60718"
+        )
+
+    def _keys(self, values, lengths):
+        return self.module(
+            _tensors(
+                {
+                    "beh.values": np.array(values, dtype=np.int64),
+                    "beh.lengths": np.array(lengths, dtype=np.int64),
+                }
+            )
+        )[HOLE_KEYS]
+
+    def test_equal_content_folds_equal(self) -> None:
+        """A key is a function of the hole's inputs and nothing else."""
+        self.assertTrue(
+            torch.equal(self._keys([5, 6, 7], [3]), self._keys([5, 6, 7], [3]))
+        )
+
+    def test_different_content_folds_apart(self) -> None:
+        """The whole point: a changed input must not reuse the cached KV."""
+        first = self._keys([5, 6, 7], [3])
+        second = self._keys([5, 6, 8], [3])
+        self.assertEqual(first[:2].tolist(), second[:2].tolist())
+        self.assertNotEqual(int(first[2]), int(second[2]))
+
+    def test_the_plan_hash_salts_the_keys(self) -> None:
+        """Two plans must not cross-match in a shared prefix cache."""
+        other = PromptAssembler(self.plan, _sid_space(), plan_hash="ffffffffffffffff")
+        batch = _tensors(
+            {
+                "beh.values": np.array([5, 6, 7], dtype=np.int64),
+                "beh.lengths": np.array([3], dtype=np.int64),
+            }
+        )
+        self.assertFalse(
+            torch.equal(self.module(batch)[HOLE_KEYS], other(batch)[HOLE_KEYS])
+        )
+
+    def test_a_permuted_multi_value_item_does_not_collide(self) -> None:
+        """``[a, b, c]`` and ``[c, b, a]`` are different items, in different bands."""
+
+        def keys(values):
+            return self.module(
+                _tensors(
+                    {
+                        "beh.values": np.array(values, dtype=np.int64),
+                        "beh.lengths": np.array([1], dtype=np.int64),
+                        "beh.key_lengths": np.array([3], dtype=np.int64),
+                    }
+                )
+            )[HOLE_KEYS]
+
+        self.assertNotEqual(keys([1, 5, 9]).tolist(), keys([9, 5, 1]).tolist())
+
+    def test_two_members_exchanging_values_do_not_collide(self) -> None:
+        """Without the member index a two-member slot is order-blind."""
+        slot = _slot("pair", FillMode.PROJECTED, 30, feature_names=("a", "b"))
+        module = PromptAssembler(
+            _plan((slot,)), _sid_space(), plan_hash="a1b2c3d4e5f60718"
+        )
+
+        def keys(first, second):
+            return module(
+                _tensors(
+                    {
+                        "a.values": np.array(first, dtype=np.int64),
+                        "a.lengths": np.array([1], dtype=np.int64),
+                        "b.values": np.array(second, dtype=np.int64),
+                        "b.lengths": np.array([1], dtype=np.int64),
+                    }
+                )
+            )[HOLE_KEYS]
+
+        self.assertNotEqual(keys([3], [9]).tolist(), keys([9], [3]).tolist())
+
+    def test_a_dense_member_folds_its_bit_pattern(self) -> None:
+        """A float member contributes the parsed input verbatim, so it is stable."""
+        slot = _slot("vec", FillMode.PROJECTED, group_type=FeatureGroupType.DEEP)
+        module = PromptAssembler(_plan((slot,)), _sid_space(), plan_hash="a1b2")
+
+        def keys(rows):
+            return module({"vec.values": torch.tensor(rows, dtype=torch.float32)})[
+                HOLE_KEYS
+            ]
+
+        self.assertEqual(keys([[0.5, 1.0]]).tolist(), keys([[0.5, 1.0]]).tolist())
+        self.assertNotEqual(keys([[0.5, 1.0]]).tolist(), keys([[1.0, 0.5]]).tolist())
+
+    def test_a_dense_sequence_member_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no per-item boundary"):
+            self.module(
+                {
+                    "beh.values": torch.tensor([[0.5], [1.0]]),
+                    "beh.lengths": torch.tensor([2]),
+                }
+            )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "no GPU")
+    def test_the_fold_is_bit_identical_across_devices(self) -> None:
+        """Integer addition cannot depend on the order a device reduces in."""
+        batch = _tensors(
+            {
+                "beh.values": np.arange(64, dtype=np.int64),
+                "beh.lengths": np.array([32, 32], dtype=np.int64),
+            }
+        )
+        on_cpu = self.module(batch)[HOLE_KEYS]
+        on_gpu = self.module({k: v.cuda() for k, v in batch.items()})[HOLE_KEYS]
+        self.assertTrue(torch.equal(on_cpu, on_gpu.cpu()))
 
 
 if __name__ == "__main__":

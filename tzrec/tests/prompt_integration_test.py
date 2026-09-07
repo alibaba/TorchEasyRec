@@ -21,7 +21,13 @@ import torch.fx
 from tzrec.datasets.utils import Batch
 from tzrec.main import export
 from tzrec.models.model import TrainWrapper
-from tzrec.prompt.assembler import PromptAssembler
+from tzrec.prompt.assembler import (
+    CU_SEQLENS,
+    HOLE_KEYS,
+    HOLE_POSITIONS,
+    INPUT_IDS,
+    PromptAssembler,
+)
 from tzrec.tests.prompt_test_util import (
     GenrecModelTestBase,
     assemble_into,
@@ -44,11 +50,8 @@ class PromptStackIntegrationTest(GenrecModelTestBase):
             "answer.values": torch.tensor(offset_sid_codes(answer, _CODEBOOK)),
             "answer.lengths": torch.tensor([len(answer)]),
         }
-        streams = assemble_into(self.compiled_prompt, parsed)
         batch = Batch()
-        batch.additional_infos.update(
-            {k: torch.from_numpy(np.asarray(v)) for k, v in streams.items()}
-        )
+        batch.additional_infos.update(assemble_into(self.compiled_prompt, parsed))
         return batch
 
     def test_written_digests_satisfy_the_restore_guard(self) -> None:
@@ -122,25 +125,21 @@ class GenrecExportIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(exported.export_dir, "frontend/sparse"))
         )
 
-        # the collator and the scripted front-end are two call sites of one walk
+        # the collator and the exported artifact are two call sites of one walk
         batch = _serving_batch()
         compiled = exported.compiled_prompt
         collator = PromptAssembler(
-            compiled.prompt_plan, compiled.sid_space, include_response=False
-        ).forward({k: v.numpy() for k, v in batch.items()})
+            compiled.prompt_plan,
+            compiled.sid_space,
+            plan_hash=compiled.plan_hash,
+            include_response=False,
+        )(batch)
         front_end = torch.jit.load(
             os.path.join(exported.export_dir, "frontend", "scripted_model.pt")
         )
         out = front_end(batch, torch.device("cpu"))
-        self.assertEqual(
-            out["input_ids"].tolist(), collator["prompt_input_ids"].tolist()
-        )
-        self.assertEqual(
-            out["cu_seqlens"].tolist(), collator["prompt_cu_seqlens"].tolist()
-        )
-        self.assertEqual(
-            out["hole_positions"].tolist(), collator["prompt_hole_positions"].tolist()
-        )
+        for key in (INPUT_IDS, CU_SEQLENS, HOLE_POSITIONS, HOLE_KEYS):
+            self.assertTrue(torch.equal(out[key], collator[key]), key)
         self.assertEqual(tuple(out["slot_embeds"].shape), (2, 32))
 
     def test_distributed_embedding_export_writes_the_processor_shape(self) -> None:

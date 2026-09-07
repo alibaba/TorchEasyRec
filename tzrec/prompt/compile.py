@@ -403,7 +403,6 @@ def compile_prompt(
         logits_suffix_len=_suffix_keep(response),
         static_prefix_len=_static_prefix_len(body),
         projected_slots=projected,
-        slot_index={seg.name: index for index, seg in enumerate(projected)},
     )
     _validate(plan)
 

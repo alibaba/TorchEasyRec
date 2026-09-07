@@ -46,19 +46,18 @@ from torchrec.modules.mc_embedding_modules import (
 
 from tzrec.acc import utils as acc_utils
 from tzrec.features.feature import BaseFeature, create_feature_configs, create_fg_json
-from tzrec.prompt.frontend import (
-    OUT_CU_SEQLENS,
-    OUT_HOLE_KEYS,
-    OUT_HOLE_POSITIONS,
-    OUT_HOLE_SLOT_COUNTS,
-    OUT_INPUT_IDS,
-    OUT_RESPONSE_LENGTHS,
-    OUT_SLOT_EMBEDS,
+from tzrec.prompt.assembler import (
+    CU_SEQLENS,
+    HOLE_KEYS,
+    HOLE_POSITIONS,
+    HOLE_SLOT_COUNTS,
+    INPUT_IDS,
+    MAX_SEQLEN,
+    RESPONSE_LENGTHS,
     PromptAssembler,
-    PromptFrontEnd,
-    SlotTable,
     host_lengths_key,
 )
+from tzrec.prompt.frontend import SLOT_EMBEDS, PromptFrontEnd, SlotTable
 from tzrec.prompt.types import CompiledPrompt, FillMode, SlotSeg
 from tzrec.protos.model_pb2 import FeatureGroupType
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -294,8 +293,6 @@ def build_front_end(
     assembler = PromptAssembler(
         plan,
         sid_space,
-        features_are_dense={f.name: not f.is_sparse for f in features},
-        features_are_multi_valued={f.name: _is_multi_valued(f) for f in features},
         plan_hash=compiled_prompt.plan_hash,
         # serving has no answer to assemble; the LM generates it
         include_response=False,
@@ -327,13 +324,14 @@ def build_front_end(
         "lookup": lookup,
         "inputs": _frontend_inputs(compiled_prompt, features, lookup, embed_keys),
         "outputs": [
-            OUT_INPUT_IDS,
-            OUT_CU_SEQLENS,
-            OUT_HOLE_POSITIONS,
-            OUT_HOLE_KEYS,
-            OUT_HOLE_SLOT_COUNTS,
-            OUT_SLOT_EMBEDS,
-            OUT_RESPONSE_LENGTHS,
+            INPUT_IDS,
+            CU_SEQLENS,
+            HOLE_POSITIONS,
+            HOLE_KEYS,
+            HOLE_SLOT_COUNTS,
+            SLOT_EMBEDS,
+            RESPONSE_LENGTHS,
+            MAX_SEQLEN,
         ],
     }
     return front_end, meta, dense_meta

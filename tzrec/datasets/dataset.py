@@ -18,7 +18,6 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
-import torch
 from torch import distributed as dist
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
@@ -41,7 +40,7 @@ from tzrec.datasets.utils import (
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
-from tzrec.prompt.assembler import PromptAssembler
+from tzrec.prompt.assembler import PROMPT_INFO_PREFIX, PromptAssembler
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import data_pb2
 from tzrec.utils import config_util
@@ -118,6 +117,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             PromptAssembler(
                 compiled_prompt.prompt_plan,
                 compiled_prompt.sid_space,
+                plan_hash=compiled_prompt.plan_hash,
                 include_response=mode != Mode.PREDICT,
             )
             if compiled_prompt is not None
@@ -403,8 +403,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._prompt_assembler is not None:
             batch.additional_infos.update(
                 {
-                    k: torch.from_numpy(np.asarray(v))
-                    for k, v in self._prompt_assembler.forward(output_data).items()
+                    PROMPT_INFO_PREFIX + k: v
+                    for k, v in self._prompt_assembler(output_data).items()
                 }
             )
 

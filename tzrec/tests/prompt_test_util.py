@@ -24,7 +24,7 @@ from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature, FgMode, create_features
 from tzrec.main import _create_features, _create_model, export
 from tzrec.models.model import TrainWrapper
-from tzrec.prompt.assembler import PromptAssembler
+from tzrec.prompt.assembler import PROMPT_INFO_PREFIX, PromptAssembler
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import feature_pb2
@@ -86,22 +86,25 @@ def offset_sid_codes(codes: Sequence[Any], codebook: Sequence[int]) -> np.ndarra
 
 
 def assemble_into(
-    compiled_prompt: CompiledPrompt,
-    parsed_features: Dict[str, "np.ndarray"],
-) -> Dict[str, np.ndarray]:
-    """Assemble one parsed batch with a temporary assembler.
+    compiled_prompt: CompiledPrompt, parsed_features: Dict[str, Any]
+) -> Dict[str, torch.Tensor]:
+    """Assemble one parsed batch the way the collator does.
 
     Args:
         compiled_prompt: the compiled prompt.
         parsed_features: ``{column}.values`` / ``{column}.lengths`` as the data
-            parser emits them.
+            parser emits them, as tensors or arrays.
 
     Returns:
         The assembled streams keyed for ``additional_infos``.
     """
-    return PromptAssembler(
-        compiled_prompt.prompt_plan, compiled_prompt.sid_space
-    ).forward(parsed_features)
+    batch = {k: torch.as_tensor(np.asarray(v)) for k, v in parsed_features.items()}
+    streams = PromptAssembler(
+        compiled_prompt.prompt_plan,
+        compiled_prompt.sid_space,
+        plan_hash=compiled_prompt.plan_hash,
+    )(batch)
+    return {PROMPT_INFO_PREFIX + k: v for k, v in streams.items()}
 
 
 _CODEBOOK = [4, 4, 4]
@@ -165,9 +168,7 @@ class GenrecModelTestBase(unittest.TestCase):
     def _batch(self, parsed, compiled_prompt=None, sparse=None):
         streams = assemble_into(compiled_prompt or self.compiled_prompt, parsed)
         batch = Batch(sparse_features={BASE_DATA_GROUP: sparse} if sparse else {})
-        batch.additional_infos.update(
-            {k: torch.from_numpy(np.asarray(v)) for k, v in streams.items()}
-        )
+        batch.additional_infos.update(streams)
         return batch
 
 
