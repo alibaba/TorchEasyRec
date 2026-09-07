@@ -279,12 +279,26 @@ class PromptAssembler:
                     )
             if seg.fill is FillMode.INLINE:
                 source, lengths = member_lengths[0]
-                # a dense sequence feature emits (total, value_dim); the stream
-                # is one code per position, so value_dim is always 1 here
+                lengths = np.asarray(lengths, dtype=np.int64)
                 inline_flat[seg.name] = np.asarray(
                     parsed_features[f"{source}.values"]
                 ).reshape(-1)
-                inline_lengths[seg.name] = np.asarray(lengths, dtype=np.int64)
+                # a multi-value sequence holds `lengths` items per sample and
+                # `key_lengths` codes per item, so a sample's position count is
+                # a segmented sum rather than its item count
+                key_lengths_key = f"{source}.key_lengths"
+                if key_lengths_key in parsed_features:
+                    key_lengths = np.asarray(
+                        parsed_features[key_lengths_key], dtype=np.int64
+                    ).reshape(-1)
+                    per_sample = np.zeros(lengths.size, dtype=np.int64)
+                    np.add.at(
+                        per_sample,
+                        np.repeat(np.arange(lengths.size), lengths),
+                        key_lengths,
+                    )
+                    lengths = per_sample
+                inline_lengths[seg.name] = lengths
             elif seg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
                 source, lengths = member_lengths[0]
                 for other_source, other_lengths in member_lengths[1:]:

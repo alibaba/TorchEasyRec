@@ -134,12 +134,13 @@ def _render_sid_tokens(sid_space: SidSpace) -> List[str]:
     return [fmt.replace("{i}", str(i)) for i in range(sum(sid_space.codebook))]
 
 
-def _read_manifest_codebook(path: str) -> List[int]:
-    """Read ``codebook`` from a SID manifest."""
+def _read_manifest(path: str) -> Tuple[List[int], str]:
+    """Read ``codebook`` and the bundle identity from a SID manifest."""
     if not os.path.exists(path):
         raise ValueError(f"sid_space.manifest_path [{path}] does not exist.")
     with open(path, "r") as f:
-        return [int(c) for c in json.load(f)["codebook"]]
+        manifest = json.load(f)
+    return [int(c) for c in manifest["codebook"]], str(manifest.get("bundle_uuid", ""))
 
 
 def _build_sid_space(
@@ -159,8 +160,15 @@ def _build_sid_space(
     if any(c <= 0 for c in codebook):
         raise ValueError(f"every codebook size must be positive, got {codebook}.")
 
+    bundle_uuid = ""
     if space.HasField("manifest_path"):
-        declared = _read_manifest_codebook(space.manifest_path)
+        declared, bundle_uuid = _read_manifest(space.manifest_path)
+        if not bundle_uuid:
+            logger.warning(
+                f"the SID manifest at [{space.manifest_path}] carries no "
+                f"bundle_uuid, so serving cannot verify that a catalog belongs "
+                f"to this bundle by identity rather than by path."
+            )
         if declared != codebook:
             raise ValueError(
                 f"sid_space.codebook {codebook} does not match the manifest at "
@@ -212,7 +220,29 @@ def _build_sid_space(
         sentinel_token_id=sentinel_id,
         eos_token_id=_special_id(tok, ("<|im_end|>", "<|endoftext|>")),
         pad_token_id=_special_id(tok, ("<|endoftext|>", "<|im_end|>")),
+        bundle_uuid=bundle_uuid,
     )
+
+
+def _save_tokenizer_dir(
+    tok: Tokenizer, sid_space: ResolvedSidSpace, tokenizer_dir: str
+) -> None:
+    """Write the extended tokenizer as a directory ``AutoTokenizer`` loads.
+
+    ``tokenizer.json`` carries the vocabulary and the added SID atoms; the
+    minimal ``tokenizer_config.json`` beside it names the tokenizer class and
+    the two special ids the prompt resolved, which is all a serving runtime
+    needs to decode a generated SID atom through ``--tokenizer-path``.
+    """
+    os.makedirs(tokenizer_dir, exist_ok=True)
+    tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
+    config = {
+        "tokenizer_class": "PreTrainedTokenizerFast",
+        "eos_token": tok.id_to_token(sid_space.eos_token_id),
+        "pad_token": tok.id_to_token(sid_space.pad_token_id),
+    }
+    with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
+        json.dump(config, f, indent=2)
 
 
 def _special_id(tok: Tokenizer, candidates: Sequence[str]) -> int:
@@ -247,9 +277,9 @@ def compile_prompt(
         cfg: the prompt config to compile.
         features: every feature a body slot may reference, already created.
         label_fields: data_config.label_fields; a response slot names these.
-        tokenizer_dir: where to write the extended tokenizer, flat, which is
-            what an exported HuggingFace directory loads; skipped when None.
-            Only export persists it -- nothing reads a training-time copy.
+        tokenizer_dir: where to write the extended tokenizer as a directory
+            ``AutoTokenizer`` loads; skipped when None. Only export persists
+            it -- nothing reads a training-time copy.
 
     Returns:
         The compiled prompt.
@@ -330,8 +360,7 @@ def compile_prompt(
     sid_space = _build_sid_space(cfg, tok, base_vocab_size, has_projection)
 
     if tokenizer_dir:
-        os.makedirs(tokenizer_dir, exist_ok=True)
-        tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
+        _save_tokenizer_dir(tok, sid_space, tokenizer_dir)
 
     tokenizer_json = tok.to_str()
     slot_ids = {name: i for i, name in enumerate(resolved_slots_by_name)}
@@ -374,6 +403,7 @@ def compile_prompt(
         logits_suffix_len=_suffix_keep(response),
         static_prefix_len=_static_prefix_len(body),
         projected_slots=projected,
+        slot_index={seg.name: index for index, seg in enumerate(projected)},
     )
     _validate(plan)
 

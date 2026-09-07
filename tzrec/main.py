@@ -74,7 +74,12 @@ from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.prompt.compile import compile_prompt
-from tzrec.prompt.persist import check_prompt_assets
+from tzrec.prompt.persist import (
+    PROMPT_DIR,
+    TOKENIZER_DIR,
+    check_prompt_assets,
+    write_serving_contract,
+)
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
@@ -1155,6 +1160,52 @@ def evaluate(
         logger.info("Evaluate Finished.")
 
 
+def _export_prompt_serving_assets(
+    pipeline_config: EasyRecConfig,
+    features: List[BaseFeature],
+    compiled_prompt: CompiledPrompt,
+    checkpoint_path: str,
+    export_dir: str,
+) -> None:
+    """Write the composite config, the front-end and the serving contract.
+
+    The model is rebuilt and restored on CPU so the front-end carries the
+    trained projections and slot tables by reference, the same way the
+    TorchScript export restores a checkpoint before scripting it.
+    """
+    from tzrec.prompt.export import (
+        build_front_end,
+        export_sparse_tables,
+        write_composite_config,
+        write_front_end_dir,
+    )
+    from tzrec.utils.state_dict_util import init_parameters
+
+    write_composite_config(export_dir)
+
+    model = _create_model(
+        pipeline_config.model_config,
+        features,
+        list(pipeline_config.data_config.label_fields),
+        compiled_prompt=compiled_prompt,
+    )
+    model.set_is_inference(True)
+    wrapped_model = ScriptWrapper(model)
+    init_parameters(wrapped_model, torch.device("cpu"))
+    checkpoint_util.restore_model(checkpoint_path, wrapped_model)
+
+    carry_tables = not acc_utils.use_distributed_embedding()
+    front_end, frontend_meta, dense_meta = build_front_end(
+        model, compiled_prompt, features, carry_tables
+    )
+    frontend_dir = write_front_end_dir(
+        front_end, pipeline_config, features, export_dir, dense_meta
+    )
+    if not carry_tables:
+        export_sparse_tables(wrapped_model, checkpoint_path, frontend_dir)
+    write_serving_contract(compiled_prompt, export_dir, frontend_meta)
+
+
 def export(
     pipeline_config_path: str,
     export_dir: str,
@@ -1233,24 +1284,17 @@ def export(
             pipeline_config.prompt_config,
             features,
             list(pipeline_config.data_config.label_fields),
+            tokenizer_dir=os.path.join(export_dir, PROMPT_DIR, TOKENIZER_DIR)
+            if is_rank_zero
+            else None,
         )
         check_prompt_assets(compiled_prompt, checkpoint_path)
-        if compiled_prompt.prompt_plan.projected_slots:
-            raise ValueError(
-                "HF export drops projected-slot state: dcp_to_hf keeps only "
-                "backbone keys, so embedding_group and projections would be "
-                "absent and the artifact could not reproduce checkpoint "
-                "inference."
-            )
         if is_rank_zero:
             from tzrec.utils.hf_export_util import dcp_to_hf
 
             dcp_to_hf(checkpoint_path, export_dir)
-            compile_prompt(
-                pipeline_config.prompt_config,
-                features,
-                list(pipeline_config.data_config.label_fields),
-                tokenizer_dir=export_dir,
+            _export_prompt_serving_assets(
+                pipeline_config, features, compiled_prompt, checkpoint_path, export_dir
             )
         return
 

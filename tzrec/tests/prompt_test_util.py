@@ -9,9 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
+import json
 import os
 import unittest
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -20,13 +22,17 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature, FgMode, create_features
-from tzrec.main import _create_model
+from tzrec.main import _create_features, _create_model, export
+from tzrec.models.model import TrainWrapper
 from tzrec.prompt.assembler import PromptAssembler
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
+from tzrec.utils.hf_export_util import write_hf_assets
+from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
 
@@ -163,3 +169,133 @@ class GenrecModelTestBase(unittest.TestCase):
             {k: torch.from_numpy(np.asarray(v)) for k, v in streams.items()}
         )
         return batch
+
+
+def write_genrec_checkpoint(model: torch.nn.Module, ckpt_dir: str) -> str:
+    """Save a model the way a training run does, minus the dynamic-table dump.
+
+    Args:
+        model: the bare genrec model; wrapped and initialized here.
+        ckpt_dir: the ``model.ckpt-N`` directory to write.
+
+    Returns:
+        ``ckpt_dir``.
+    """
+    from torch.distributed.checkpoint import save
+
+    wrapped = TrainWrapper(model)
+    init_parameters(wrapped, torch.device("cpu"))
+    save(wrapped.state_dict(), checkpoint_id=os.path.join(ckpt_dir, "model"))
+    write_hf_assets(wrapped, ckpt_dir)
+    return ckpt_dir
+
+
+@dataclasses.dataclass
+class ExportedGenrec:
+    """A tiny genrec model, its checkpoint and its HF export.
+
+    Args:
+        config: the pipeline config the export ran on.
+        config_path: where it was written.
+        features: the created features.
+        compiled_prompt: the prompt as the export compiled it.
+        checkpoint_dir: the checkpoint the export converted.
+        export_dir: the export directory.
+    """
+
+    config: EasyRecConfig
+    config_path: str
+    features: List[BaseFeature]
+    compiled_prompt: CompiledPrompt
+    checkpoint_dir: str
+    export_dir: str
+
+
+def export_tiny_genrec(
+    test_dir: str,
+    projected: bool = True,
+    bundle_uuid: Optional[str] = None,
+    hidden_size: int = 32,
+) -> ExportedGenrec:
+    """Train nothing, save a checkpoint of a tiny genrec model, and export it.
+
+    The prompt carries an INLINE SID history and, when ``projected``, one
+    PROJECTED behaviour slot, which is what makes the export write a front-end
+    with tables and a projection.
+
+    Args:
+        test_dir: scratch directory.
+        projected: whether to add the projected slot.
+        bundle_uuid: when given, a SID manifest carrying it is written and
+            referenced, so the export records a bundle identity.
+        hidden_size: the tiny backbone's hidden size.
+
+    Returns:
+        Everything a test needs to read the export back.
+    """
+    backbone = os.path.join(test_dir, "backbone")
+    create_tiny_causal_lm(64).save_pretrained(backbone)
+    tok = create_prompt_tokenizer(os.path.join(test_dir, "tok.json"), _WORDS)
+    manifest = ""
+    if bundle_uuid is not None:
+        manifest = os.path.join(test_dir, "manifest.json")
+        with open(manifest, "w") as f:
+            json.dump({"codebook": _CODEBOOK, "bundle_uuid": bundle_uuid}, f)
+
+    config = EasyRecConfig()
+    text_format.Merge(
+        f'''
+train_input_path: "" eval_input_path: "" model_dir: "{test_dir}/train"
+train_config {{
+  sparse_optimizer {{ adagrad_optimizer {{ lr: 0.0 }} constant_learning_rate {{}} }}
+  dense_optimizer {{ adam_optimizer {{ lr: 0.0001 }} constant_learning_rate {{}} }}
+  num_epochs: 1
+}}
+data_config {{
+  batch_size: 4 dataset_type: ParquetDataset fg_mode: FG_NONE
+  label_fields: "answer" num_workers: 1
+}}
+feature_configs {{ {_HIST} }}
+{"feature_configs { " + projected_feature("beh", 8) + " }" if projected else ""}
+prompt_config {{
+  tokenizer_path: "{tok}"
+  prompt: "History : {{{{hist}}}} .{" {{beh}}" if projected else ""} Predict :"
+  response: "{{{{answer}}}}"
+  sid_space {{
+    codebook: 4 codebook: 4 codebook: 4
+    {f'manifest_path: "{manifest}"' if manifest else ""}
+  }}
+  max_length: 64
+}}
+model_config {{
+  genrec_causal_lm_model {{
+    hf_model_name_or_path: "{backbone}"
+    common {{ beam_widths: 2 beam_widths: 2 beam_widths: 2 num_return_sequences: 2 }}
+  }}
+}}
+''',
+        config,
+    )
+    os.makedirs(config.model_dir)
+    config_path = os.path.join(test_dir, "pipeline.config")
+    with open(config_path, "w") as f:
+        f.write(text_format.MessageToString(config))
+
+    features = _create_features(list(config.feature_configs), config.data_config)
+    compiled_prompt = compile_prompt(config.prompt_config, features, ["answer"])
+    model = _create_model(
+        config.model_config, features, ["answer"], compiled_prompt=compiled_prompt
+    )
+    checkpoint_dir = write_genrec_checkpoint(
+        model, os.path.join(config.model_dir, "model.ckpt-1")
+    )
+    export_dir = os.path.join(test_dir, "export")
+    export(config_path, export_dir, checkpoint_path=checkpoint_dir)
+    return ExportedGenrec(
+        config=config,
+        config_path=config_path,
+        features=features,
+        compiled_prompt=compiled_prompt,
+        checkpoint_dir=checkpoint_dir,
+        export_dir=export_dir,
+    )
