@@ -19,8 +19,9 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, Iterator, List, Optional
 from unittest import mock
 
 import torch
@@ -52,7 +53,6 @@ def _base_env(tmp_dir: str, **extra: str) -> Dict[str, str]:
         "ONLINE_DENSE_EXPORT": "1",
         "USE_DISTRIBUTED_EMBEDDING": "1",
         "ONLINE_DENSE_EXPORT_DIR": os.path.join(tmp_dir, "serving_root"),
-        "ONLINE_DENSE_EXPORT_STEPS": "5",
         "RANK": "0",
         "LOCAL_RANK": "0",
         "WORLD_SIZE": "1",
@@ -60,6 +60,14 @@ def _base_env(tmp_dir: str, **extra: str) -> Dict[str, str]:
     }
     env.update(extra)
     return env
+
+
+def _current_path(tmp_dir: str) -> str:
+    return os.path.join(tmp_dir, "serving_root", "dense_hot_export", "current.json")
+
+
+def _versions_root(tmp_dir: str) -> str:
+    return os.path.join(tmp_dir, "serving_root", "dense_hot_export", "versions")
 
 
 def _mock_model(state: Dict[str, Any]) -> mock.Mock:
@@ -151,37 +159,6 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                         model=_mock_model({}),
                     )
 
-    def test_init_requires_trigger_config_when_enabled(self) -> None:
-        """Without STEPS or INTERVAL the cadence is undefined: fail fast."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            env = _base_env(tmp_dir)
-            del env["ONLINE_DENSE_EXPORT_STEPS"]
-            with mock.patch.dict(os.environ, env, clear=True):
-                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_STEPS"):
-                    OnlineDenseExportManager(
-                        model_dir=tmp_dir,
-                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                        model=_mock_model({}),
-                    )
-
-    def test_init_rejects_bad_quorum(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            env = _base_env(
-                tmp_dir,
-                **{
-                    "ONLINE_DENSE_EXPORT_STEPS": "0",
-                    "ONLINE_DENSE_EXPORT_INTERVAL": "60",
-                    "ONLINE_DENSE_EXPORT_QUORUM": "1.5",
-                },
-            )
-            with mock.patch.dict(os.environ, env, clear=True):
-                with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT_QUORUM"):
-                    OnlineDenseExportManager(
-                        model_dir=tmp_dir,
-                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                        model=_mock_model({}),
-                    )
-
     def test_init_rejects_remote_export_root_and_pipeline_config(self) -> None:
         """With the dir set, remote export_root/pipeline_config fail fast."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -229,9 +206,13 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
 
     # --- one-time build phase ---
 
-    def test_build_scopes_input_tile_env_and_restores_it(self) -> None:
-        """INPUT_TILE=3 holds only during the twin build, even on failure."""
+    def test_build_scopes_export_env_and_restores_it(self) -> None:
+        """INPUT_TILE/WORLD_SIZE hold only during the twin build, even on failure."""
         seen: Dict[str, Any] = {}
+
+        def fake_warmup(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+            seen["world_size"] = os.environ.get("WORLD_SIZE")
+            return {}
 
         def fake_finalize(*args: Any, **kwargs: Any) -> None:
             seen["input_tile"] = os.environ.get("INPUT_TILE")
@@ -239,7 +220,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         fake_gm = mock.Mock()
         fake_gm.state_dict.return_value = {}
         with tempfile.TemporaryDirectory() as tmp_dir:
-            env = _base_env(tmp_dir)
+            env = _base_env(tmp_dir, WORLD_SIZE="4")
             with mock.patch.dict(os.environ, env, clear=True):
                 with (
                     mock.patch(
@@ -254,7 +235,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     ),
                     mock.patch(
                         _BUILD_PATCHES.format("create_dense_export_warmup_data"),
-                        return_value={},
+                        side_effect=fake_warmup,
                     ),
                     mock.patch(
                         _BUILD_PATCHES.format("build_dense_graph_module"),
@@ -272,7 +253,9 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     )
                     mgr.close()
                 self.assertEqual(seen["input_tile"], "3")
+                self.assertEqual(seen["world_size"], "1")
                 self.assertNotIn("INPUT_TILE", os.environ)
+                self.assertEqual(os.environ["WORLD_SIZE"], "4")
 
                 # a failing build must also restore the env
                 with (
@@ -290,6 +273,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                             model=_mock_model({}),
                         )
                 self.assertNotIn("INPUT_TILE", os.environ)
+                self.assertEqual(os.environ["WORLD_SIZE"], "4")
 
     def test_build_maps_user_twin_keys_to_non_user_sources(self) -> None:
         """INPUT_TILE=3 user-side keys resolve to their non-user training twins."""
@@ -642,7 +626,8 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
 
     # --- trigger decisions ---
 
-    def test_maybe_export_fires_on_step_interval_and_dedupes(self) -> None:
+    def test_maybe_export_fires_on_force_and_dedupes(self) -> None:
+        """Only the delta-dump decision (force) or final fires; steps dedupe."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             with (
                 mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
@@ -656,57 +641,21 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     model=_mock_model({}),
                 )
                 try:
+                    self.assertTrue(mgr.enabled)
                     model = _mock_model({})
                     with mock.patch.object(mgr, "_gather_and_submit") as gather:
-                        for step in (0, 1, 4):
+                        for step in (0, 1, 4, 5):
                             mgr.maybe_export(step, -1.0, model)
                         gather.assert_not_called()
-                        mgr.maybe_export(5, -1.0, model)
+                        mgr.maybe_export(5, -1.0, model, force=True)
                         gather.assert_called_once_with(5, -1.0, model, None)
-                        # same step (even forced) is deduped
+                        # same step (even forced/final) is deduped
+                        mgr.maybe_export(5, -1.0, model, force=True)
                         mgr.maybe_export(5, -1.0, model, final=True)
                         gather.assert_called_once()
                         mgr.maybe_export(6, -1.0, model)
                         gather.assert_called_once()
-                        mgr.maybe_export(10, -1.0, model)
-                        self.assertEqual(gather.call_count, 2)
-                finally:
-                    mgr.close()
-
-    def test_maybe_export_fires_on_event_time_interval(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            env = _base_env(
-                tmp_dir,
-                **{
-                    "ONLINE_DENSE_EXPORT_STEPS": "0",
-                    "ONLINE_DENSE_EXPORT_INTERVAL": "60",
-                },
-            )
-            with (
-                mock.patch.dict(os.environ, env, clear=True),
-                mock.patch.object(
-                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
-                ),
-            ):
-                mgr = OnlineDenseExportManager(
-                    model_dir=tmp_dir,
-                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
-                    model=_mock_model({}),
-                )
-                try:
-                    model = _mock_model({})
-                    with mock.patch.object(mgr, "_gather_and_submit") as gather:
-                        # first event-time seen only sets the reference
-                        mgr.maybe_export(1, 1000.0, model)
-                        gather.assert_not_called()
-                        # 1000/60 -> 16, 1050/60 -> 17: boundary crossed
-                        mgr.maybe_export(2, 1050.0, model)
-                        gather.assert_called_once()
-                        # still bucket 17: no fire
-                        mgr.maybe_export(3, 1070.0, model)
-                        gather.assert_called_once()
-                        # 1120/60 -> 18: fires
-                        mgr.maybe_export(4, 1120.0, model)
+                        mgr.maybe_export(7, -1.0, model, final=True)
                         self.assertEqual(gather.call_count, 2)
                 finally:
                     mgr.close()
@@ -737,26 +686,32 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
                     model=_mock_model({}),
                 )
-                self.assertFalse(mgr._enabled)
-                # no gather state at all; must be a pure no-op
+                self.assertFalse(mgr.enabled)
+                # no gather/publish state at all; all must be pure no-ops
                 mgr.maybe_export(1, -1.0, _mock_model({}), final=True)
+                mgr.poll_publish((1, []))
+                mgr.poll_publish(None)
+                mgr.finalize_publish(None)
                 mgr.close()
 
     # --- gather + publish, with the real worker ---
 
-    def _run_one_export(self, tmp_dir: str, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Build a manager over a tiny gm, fire one export, return the payload."""
-        box: Dict[str, Any] = {}
+    @contextmanager
+    def _tiny_manager(
+        self,
+        tmp_dir: str,
+        state: Dict[str, Any],
+        publish_interval_minutes: Optional[int] = None,
+    ) -> Iterator[OnlineDenseExportManager]:
+        """Manager over a tiny gm with the heavy graph build patched out."""
 
-        def fake_build(self: OnlineDenseExportManager, model: nn.Module) -> List:
-            gm = _TinyModel()
-            box["gm"] = gm
-            self._gm = gm
-            self._twin_model = mock.Mock()
-            self._full_graph = mock.Mock()
-            self._warmup_data = {}
-            self._dense_graph_config = {}
-            self._dense_model_traced = mock.Mock()
+        def fake_build(self_: OnlineDenseExportManager, model: nn.Module) -> List[Any]:
+            self_._gm = _TinyModel()
+            self_._twin_model = mock.Mock()
+            self_._full_graph = mock.Mock()
+            self_._warmup_data = {}
+            self_._dense_graph_config = {}
+            self_._dense_model_traced = mock.Mock()
             return [("w", "model.w")]
 
         with (
@@ -770,15 +725,26 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 model_dir=tmp_dir,
                 pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
                 model=_mock_model(state),
+                publish_interval_minutes=publish_interval_minutes,
             )
             try:
-                mgr.maybe_export(5, 42.0, _mock_model(state))
-                current_path = os.path.join(
-                    tmp_dir, "serving_root", "dense_hot_export", "current.json"
-                )
-                self.assertTrue(_wait_for(lambda: os.path.exists(current_path)))
+                yield mgr
             finally:
                 mgr.close()
+
+    def _run_one_export(self, tmp_dir: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Fire one forced export, flip via poll_publish, return gm and payload."""
+        box: Dict[str, Any] = {}
+        with self._tiny_manager(tmp_dir, state) as mgr:
+            box["gm"] = mgr._gm
+            mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+            current_path = _current_path(tmp_dir)
+            # the worker only records the version as ready; the next poll
+            # with a watermark past the step is what flips the pointer
+            self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+            self.assertFalse(os.path.exists(current_path))
+            mgr.poll_publish((9, []))
+            self.assertTrue(os.path.exists(current_path))
         with open(current_path) as f:
             payload = json.load(f)
         box["payload"] = payload
@@ -791,19 +757,296 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             payload = box["payload"]
             self.assertEqual(
                 set(payload.keys()),
-                {"version", "checkpoint_step", "data_timestamp", "created_at"},
+                {
+                    "version",
+                    "checkpoint_step",
+                    "sparse_step",
+                    "data_timestamp",
+                    "created_at",
+                    "sparse_probes",
+                },
             )
             self.assertEqual(payload["checkpoint_step"], 5)
+            self.assertEqual(payload["sparse_step"], 9)
+            self.assertGreaterEqual(payload["sparse_step"], payload["checkpoint_step"])
             self.assertEqual(payload["data_timestamp"], 42.0)
+            self.assertEqual(payload["sparse_probes"], [])
             self.assertTrue(payload["version"])
-            versions_root = os.path.join(
-                tmp_dir, "serving_root", "dense_hot_export", "versions"
-            )
+            versions_root = _versions_root(tmp_dir)
             self.assertEqual(os.listdir(versions_root), [payload["version"]])
             self.assertTrue(
                 os.path.exists(os.path.join(versions_root, payload["version"], "READY"))
             )
         torch.testing.assert_close(box["gm"].w, torch.full((2,), 7.0))
+
+    def test_ready_version_not_published_until_watermark(self) -> None:
+        """A finished dense version must not flip current.json ahead of sparse."""
+        state = {"model.w": torch.zeros(2)}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self._tiny_manager(tmp_dir, state) as mgr:
+                mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+                current_path = _current_path(tmp_dir)
+                # the version dir is ready on disk, but the pointer stays put
+                self.assertEqual(len(os.listdir(_versions_root(tmp_dir))), 1)
+                self.assertFalse(os.path.exists(current_path))
+                mgr.poll_publish(None)
+                self.assertFalse(os.path.exists(current_path))
+                mgr.poll_publish((4, []))
+                self.assertFalse(os.path.exists(current_path))
+                mgr.poll_publish((5, []))
+                self.assertTrue(os.path.exists(current_path))
+                with open(current_path) as f:
+                    payload = json.load(f)
+                self.assertEqual(payload["checkpoint_step"], 5)
+                self.assertEqual(payload["sparse_step"], 5)
+
+    def test_poll_publish_payload_carries_v2_fields(self) -> None:
+        """The flip carries capped probes and publish_interval_minutes."""
+        probes = [
+            {"pk": "emb.t", "sk": i, "crc32": "0a" * 4, "encoding": "fp32"}
+            for i in range(70)
+        ]
+        state = {"model.w": torch.zeros(2)}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self._tiny_manager(tmp_dir, state, publish_interval_minutes=10) as mgr:
+                mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+                mgr.poll_publish((6, probes))
+                with open(_current_path(tmp_dir)) as f:
+                    payload = json.load(f)
+        self.assertEqual(
+            set(payload.keys()),
+            {
+                "version",
+                "checkpoint_step",
+                "sparse_step",
+                "data_timestamp",
+                "created_at",
+                "publish_interval_minutes",
+                "sparse_probes",
+            },
+        )
+        self.assertEqual(payload["publish_interval_minutes"], 10)
+        self.assertEqual(payload["checkpoint_step"], 5)
+        self.assertEqual(payload["sparse_step"], 6)
+        self.assertGreaterEqual(payload["sparse_step"], payload["checkpoint_step"])
+        self.assertEqual(len(payload["sparse_probes"]), 64)
+        self.assertEqual(payload["sparse_probes"], probes[:64])
+
+    def test_latest_wins_publishes_only_newest_ready_version(self) -> None:
+        """Only the newest ready version flips; the superseded one is removed."""
+        state = {"model.w": torch.zeros(2)}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self._tiny_manager(tmp_dir, state) as mgr:
+                mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: (mgr._ready or {}).get("step") == 5))
+                superseded_version = mgr._ready["version"]
+                mgr.maybe_export(7, 43.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: (mgr._ready or {}).get("step") == 7))
+                # the superseded step-5 version was never published and is
+                # removed, so it cannot pile up or count against retention
+                self.assertFalse(
+                    os.path.exists(
+                        os.path.join(_versions_root(tmp_dir), superseded_version)
+                    )
+                )
+                current_path = _current_path(tmp_dir)
+                mgr.poll_publish((5, []))
+                self.assertFalse(os.path.exists(current_path))
+                mgr.poll_publish((7, []))
+                with open(current_path) as f:
+                    payload = json.load(f)
+                self.assertEqual(payload["checkpoint_step"], 7)
+                self.assertEqual(payload["data_timestamp"], 43.0)
+                versions = os.listdir(_versions_root(tmp_dir))
+                self.assertEqual(versions, [payload["version"]])
+                # nothing left to publish: a later poll leaves the pointer alone
+                mgr.poll_publish((9, []))
+                with open(current_path) as f:
+                    self.assertEqual(json.load(f), payload)
+
+    def test_finalize_publish_drains_worker_and_flips(self) -> None:
+        """finalize_publish drains the in-flight build, then publishes."""
+        state = {"model.w": torch.zeros(2)}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self._tiny_manager(tmp_dir, state) as mgr:
+                mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+                # no wait: finalize must drain the in-flight build itself
+                mgr.finalize_publish((5, []))
+                self.assertFalse(mgr._worker.is_alive())
+                with open(_current_path(tmp_dir)) as f:
+                    payload = json.load(f)
+                self.assertEqual(payload["checkpoint_step"], 5)
+                self.assertEqual(payload["sparse_step"], 5)
+                # the finally-block close after finalize stays idempotent
+                mgr.close()
+
+    def test_publish_clears_ready_before_prune(self) -> None:
+        """A prune failure after the flip must not leave the live version 'ready'.
+
+        Otherwise the next build would treat the published version as
+        superseded and remove the directory current.json points at.
+        """
+        state = {"model.w": torch.zeros(2)}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self._tiny_manager(tmp_dir, state) as mgr:
+                mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+                with mock.patch(
+                    _BUILD_PATCHES.format("_prune_old_dense_versions"),
+                    side_effect=OSError("boom"),
+                ):
+                    with self.assertRaises(OSError):
+                        mgr.poll_publish((5, []))
+                with open(_current_path(tmp_dir)) as f:
+                    published = json.load(f)["version"]
+                self.assertIsNone(mgr._ready)
+                mgr.maybe_export(7, 43.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: (mgr._ready or {}).get("step") == 7))
+                self.assertTrue(
+                    os.path.isdir(os.path.join(_versions_root(tmp_dir), published))
+                )
+
+    # --- multi-rank publish gate (two simulated ranks over the module dist) ---
+
+    def test_poll_publish_multi_rank_gates_on_min_watermark(self) -> None:
+        """The lagging rank holds the flip; probes are gathered only at the flip.
+
+        Simulates rank one through the module-level ``dist`` so the
+        world-size > 1 branch runs: the per-step tensor gather carries
+        (completed step, rank-zero ready step), the minimum completed step is
+        the watermark, and the object gather of probes happens once, when
+        that watermark covers the ready version.
+        """
+        state = {"model.w": torch.zeros(2)}
+        other = {"step": 0}
+        own_probes = [
+            {"pk": "emb.t", "sk": i, "crc32": "aa" * 4, "encoding": "fp32"}
+            for i in range(40)
+        ]
+        other_probes = [
+            {"pk": "emb.t", "sk": 100 + i, "crc32": "bb" * 4, "encoding": "fp32"}
+            for i in range(40)
+        ]
+
+        def fake_all_gather(gathered: List[Any], local: Any, group: Any = None) -> None:
+            gathered[0].copy_(local)
+            gathered[1].copy_(torch.tensor([other["step"], -1], dtype=torch.int64))
+
+        def fake_all_gather_object(box: List[Any], obj: Any, group: Any = None) -> None:
+            box[0] = obj
+            box[1] = other_probes
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                self._tiny_manager(tmp_dir, state) as mgr,
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.get_world_size"), return_value=2
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.all_gather"),
+                    side_effect=fake_all_gather,
+                ) as all_gather,
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.all_gather_object"),
+                    side_effect=fake_all_gather_object,
+                ) as gather_probes,
+            ):
+                mgr._group = mock.Mock()
+                current_path = _current_path(tmp_dir)
+                # nothing ready: the cheap tensor gather still runs on every
+                # step, the probe object gather does not
+                mgr.poll_publish((5, own_probes))
+                torch.testing.assert_close(
+                    all_gather.call_args.args[1], torch.tensor([5, -1])
+                )
+                gather_probes.assert_not_called()
+
+                mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+                self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+                # own rank covers step 5 but rank one lags: min() holds the flip
+                other["step"] = 4
+                mgr.poll_publish((5, own_probes))
+                torch.testing.assert_close(
+                    all_gather.call_args.args[1], torch.tensor([5, 5])
+                )
+                self.assertFalse(os.path.exists(current_path))
+                gather_probes.assert_not_called()
+
+                other["step"] = 6
+                mgr.poll_publish((5, own_probes))
+                self.assertEqual(all_gather.call_count, 3)
+                gather_probes.assert_called_once()
+                with open(current_path) as f:
+                    payload = json.load(f)
+                self.assertEqual(payload["checkpoint_step"], 5)
+                self.assertEqual(payload["sparse_step"], 5)
+                self.assertEqual(
+                    payload["sparse_probes"], (own_probes + other_probes)[:64]
+                )
+                # published: later polls gather nothing more
+                mgr.poll_publish((7, own_probes))
+                gather_probes.assert_called_once()
+
+    def test_poll_publish_non_zero_rank_joins_collectives_without_publishing(
+        self,
+    ) -> None:
+        """A non-zero rank enters both gathers in lockstep but never flips."""
+        probe = {"pk": "emb.t", "sk": 1, "crc32": "aa" * 4, "encoding": "fp32"}
+
+        def fake_all_gather(gathered: List[Any], local: Any, group: Any = None) -> None:
+            # rank zero: completed step 7, ready version at step 5
+            gathered[0].copy_(torch.tensor([7, 5], dtype=torch.int64))
+            gathered[1].copy_(local)
+
+        def fake_all_gather_object(box: List[Any], obj: Any, group: Any = None) -> None:
+            box[0] = []
+            box[1] = obj
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    _base_env(tmp_dir, RANK="1", LOCAL_RANK="1"),
+                    clear=True,
+                ),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.get_world_size"), return_value=2
+                ),
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.all_gather"),
+                    side_effect=fake_all_gather,
+                ) as all_gather,
+                mock.patch(
+                    _BUILD_PATCHES.format("dist.all_gather_object"),
+                    side_effect=fake_all_gather_object,
+                ) as gather_probes,
+            ):
+                mgr = OnlineDenseExportManager(
+                    model_dir=tmp_dir,
+                    pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                    model=_mock_model({}),
+                )
+                self.assertIsNone(mgr._worker)
+                mgr._group = mock.Mock()
+                current_path = _current_path(tmp_dir)
+                mgr.poll_publish((6, [probe]))
+                torch.testing.assert_close(
+                    all_gather.call_args.args[1], torch.tensor([6, -1])
+                )
+                # rank zero's ready step 5 <= min(7, 6): this rank must join
+                # the probe gather too, yet only rank zero writes the pointer
+                gather_probes.assert_called_once()
+                self.assertEqual(gather_probes.call_args.args[1], [probe])
+                self.assertFalse(os.path.exists(current_path))
+                mgr.finalize_publish((6, [probe]))
+                self.assertEqual(all_gather.call_count, 2)
+                self.assertFalse(os.path.exists(current_path))
+                mgr.close()
 
     def test_gather_uses_ema_parameters_and_live_buffers(self) -> None:
         manager = OnlineDenseExportManager.__new__(OnlineDenseExportManager)
@@ -901,11 +1144,10 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     # the real build stored the construction-time finalize
                     # return as the cached traced module
                     self.assertIs(mgr._dense_model_traced, sentinel)
-                    mgr.maybe_export(5, 42.0, _mock_model({}))
-                    current_path = os.path.join(
-                        tmp_dir, "serving_root", "dense_hot_export", "current.json"
-                    )
-                    self.assertTrue(_wait_for(lambda: os.path.exists(current_path)))
+                    mgr.maybe_export(5, 42.0, _mock_model({}), force=True)
+                    self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+                    mgr.poll_publish((5, []))
+                    self.assertTrue(os.path.exists(_current_path(tmp_dir)))
                 finally:
                     mgr.close()
             # one construction call (no cached module) then one worker call

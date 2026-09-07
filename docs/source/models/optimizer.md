@@ -50,6 +50,8 @@ train_config {
   - optimizer: 优化器类型，具体见sparse optimize的[配置文档](../reference.md)
   - learning_rate: sparse_optimizer的学习率计划器,具体见sparse_optimizer中的learning_rate的[配置文档](../reference.md)
 
+  **Note**: 被分片为`data_parallel`的Embedding表不受sparse_optimizer管理，实际由dense_optimizer更新，并跟随dense_optimizer的LR策略，详见[训练文档](../usage/train.md)的Embedding分片约束章节
+
 - dense_optimizer
 
   - optimizer: 优化器类型，具体见dense optimize的[配置文档](../reference.md)

@@ -20,6 +20,7 @@ message SparseOptimizer {
         ManualStepLR manual_step_learning_rate = 103;
         CosineAnnealingLR cosine_annealing_learning_rate = 104;
         CosineAnnealingWarmRestartsLR cosine_annealing_warm_restarts_learning_rate = 105;
+        LinearDecayLR linear_decay_learning_rate = 106;
     }
 }
 
@@ -43,6 +44,7 @@ message DenseOptimizer {
         ManualStepLR manual_step_learning_rate = 103;
         CosineAnnealingLR cosine_annealing_learning_rate = 104;
         CosineAnnealingWarmRestartsLR cosine_annealing_warm_restarts_learning_rate = 105;
+        LinearDecayLR linear_decay_learning_rate = 106;
     }
     repeated PartOptimizer part_optimizers = 201;
     optional EMAConfig ema = 202;
@@ -64,6 +66,7 @@ message PartOptimizer {
         ManualStepLR manual_step_learning_rate = 103;
         CosineAnnealingLR cosine_annealing_learning_rate = 104;
         CosineAnnealingWarmRestartsLR cosine_annealing_warm_restarts_learning_rate = 105;
+        LinearDecayLR linear_decay_learning_rate = 106;
     }
 }
 
@@ -237,6 +240,17 @@ message ManualStepLR {
     optional bool warmup = 3 [default = false];
     // schedule by epoch or by step.
     optional bool by_epoch = 4 [default = false];
+}
+
+message LinearDecayLR {
+    // length of the whole run, measured from step 0 and INCLUDING warmup_size
+    // -- HF Trainer's `num_training_steps`, not the post-warmup horizon that
+    // decay_size/T_max above measure. Must be > 0 when this scheduler is selected.
+    optional uint32 num_training_steps = 1;
+    optional float min_learning_rate = 2 [default = 0.0];
+    optional float warmup_learning_rate = 3 [default = 0.0];
+    optional uint32 warmup_size = 4 [default = 0];
+    optional bool by_epoch = 5 [default = false];
 }
 
 message CosineAnnealingLR {

@@ -1,0 +1,36 @@
+syntax = "proto2";
+package tzrec.protos;
+
+message GenrecModelConfig {
+    // Nested so it does not collide with another model's dtype enum: proto2
+    // enum values are siblings of their enclosing scope.
+    enum ParamDtype {
+        FP32 = 0;
+        BF16 = 1;
+        FP16 = 2;
+    }
+
+    // Label value outside the supervised span.
+    optional int32 ignore_index = 1 [default = -100];
+
+    // REQUIRED. Beam width per SID level, one entry per level; [100, 200, 400]
+    // is the escalating beam. Each entry is capped to what its band supplies.
+    repeated uint32 beam_widths = 2;
+    // Must not exceed the final width after per-level candidate capping.
+    required uint32 num_return_sequences = 3;
+
+    optional string generated_sids_key = 4 [default = "generated_sids"];
+
+    // LM parameters. FP32 avoids bf16-ULP underflow of Adam's small updates;
+    // bf16 compute comes from mixed_precision, not from this.
+    optional ParamDtype lm_parameter_dtype = 5 [default = FP32];
+}
+
+message GenrecCausalLMModel {
+    optional GenrecModelConfig common = 1;
+
+    // HF hub id or local path. Names the architecture used for every model build
+    // and the weights loaded by init_from_pretrained at cold start; the vocabulary
+    // is prompt_config's.
+    optional string hf_model_name_or_path = 2 [default = "Qwen/Qwen2.5-0.5B"];
+}

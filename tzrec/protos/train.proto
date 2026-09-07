@@ -65,17 +65,17 @@ message FeatureStoreConfig {
     optional uint32 feature_view_ttl_secs = 13 [default = 1296000];
     optional uint32 feature_view_shard_count = 14 [default = 20];
     optional uint32 feature_view_replication_count = 15 [default = 1];
-    reserved 4, 16;
-    reserved "feature_entity_name", "allow_custom_endpoint";
-    // Also write the local per-rank delta parquet files while uploading to
-    // FeatureStore (e.g. for the offline readback checker); by default the
-    // delta is handed to the uploader in memory and never touches disk.
-    optional bool retain_local_dump = 17 [default = false];
+    reserved 4, 16, 17;
+    reserved "feature_entity_name", "allow_custom_endpoint", "retain_local_dump";
     // Wire format for delta upload. "ARROW" (default) streams a columnar Arrow
     // IPC batch through write_features_arrow(), avoiding the JSON path's per-row
     // dict construction and embedding deep-copy; "JSON" keeps the legacy
     // write_features() per-row payload. Both paths use MERGE write_mode.
     optional string upload_format = 18 [default = "ARROW"];
+    // Local/dev testing outside the VPC: the FeatureStore SDK prefers the
+    // FeatureDB public endpoint for the data plane, which stays reachable
+    // when the default VPC endpoint is not.
+    optional bool test_mode = 19 [default = false];
 }
 
 enum DeltaEmbeddingQuantType {
@@ -88,20 +88,23 @@ message DeltaEmbeddingDumpConfig {
     // evicted, each with the row the model now serves for it -- its trained row
     // while the table holds it, the shared fallback row once it does not
     // (FeatureStore has no delete, so a stale vector must be overwritten).
-    // Dump touched ids and their latest embedding every N training steps. Do not
-    // set this together with dump_interval_minutes.
-    // Larger intervals retain a longer id window in memory; auto compaction reduces
-    // per-batch tensor buildup but unique ids still scale with the interval.
-    optional uint32 dump_interval_steps = 1 [default = 1000];
+    // Paired cadence in training steps: dump touched ids and their latest
+    // embedding every N steps, plus a same-step dense export when online dense
+    // export is enabled. Configure exactly one of paired_dump_interval_steps /
+    // paired_dump_interval_minutes.
+    // Larger intervals retain a longer id window in memory; auto compaction
+    // reduces per-batch tensor buildup but unique ids still scale with the
+    // interval.
+    optional uint32 paired_dump_interval_steps = 1;
     // output directory. default is ${model_dir}/delta_embedding_dump
     optional string output_dir = 2;
     // parquet file prefix
     optional string file_prefix = 3 [default = "delta_embedding"];
     // Presence enables best-effort per-rank background upload to FeatureStore.
     optional FeatureStoreConfig feature_store_config = 4;
-    // Dump after this many elapsed minutes. The timer starts when training starts.
-    // Do not set this together with dump_interval_steps.
-    optional uint32 dump_interval_minutes = 5;
+    // Paired cadence in elapsed minutes. The timer starts when training starts.
+    // Do not set this together with paired_dump_interval_steps.
+    optional uint32 paired_dump_interval_minutes = 5;
     // Quantization format for dumped embeddings. INT8 applies rowwise uint8
     // quantization (QUint8RowwiseF16: uint8 values + fp16 scale/offset, 4 extra
     // bytes per row) using the same format as distributed sparse export. Requires
@@ -118,6 +121,17 @@ message DeltaEmbeddingDumpConfig {
     // Requires a dynamicemb build with EvictedItemMode; older builds degrade
     // to a warning.
     optional bool dump_evicted_tombstones = 7 [default = true];
+    // Also write the local per-rank delta parquet files while uploading to
+    // FeatureStore (e.g. for the offline readback checker); by default the
+    // delta is handed to the uploader in memory and never touches disk.
+    optional bool retain_local_dump = 8 [default = false];
+    // Fine cadence in training steps: delta dump and FeatureStore upload only,
+    // no dense export. Requires paired_dump_interval_steps and must be strictly
+    // smaller than it; unset keeps dumps locked to the paired cadence.
+    optional uint32 sparse_dump_interval_steps = 9;
+    // Fine cadence in elapsed minutes; requires paired_dump_interval_minutes
+    // and must be strictly smaller than it. Do not mix with the steps fields.
+    optional uint32 sparse_dump_interval_minutes = 10;
 }
 
 message TrainConfig {

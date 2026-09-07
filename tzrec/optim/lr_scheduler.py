@@ -163,6 +163,67 @@ class ManualStepLR(BaseLR):
         return lr
 
 
+class LinearDecayLR(BaseLR):
+    """Linear Decay LearningRate Scheduler.
+
+    Decays the learning rate linearly from base_lr to min_learning_rate,
+    with optional linear warmup. Mirrors HuggingFace Trainer's
+    ``lr_scheduler_type: linear``.
+
+    Args:
+        optimizer (Optimizer): an instance of Optimizer.
+        num_training_steps (int): length of the whole run in steps or epochs,
+            INCLUDING warmup_size (unlike decay_size/T_max, which measure only
+            the post-warmup horizon).
+        min_learning_rate (float): minimum learning rate.
+        warmup_learning_rate (float): warmup start learning rate.
+        warmup_size (int): warmup steps or epochs.
+        by_epoch (bool): schedule by epoch or by step.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        num_training_steps: int,
+        min_learning_rate: float = 0.0,
+        warmup_learning_rate: float = 0.0,
+        warmup_size: int = 0,
+        by_epoch: bool = False,
+    ) -> None:
+        if num_training_steps <= 0:
+            raise ValueError(
+                f"num_training_steps must be positive, got {num_training_steps}"
+            )
+        if warmup_size >= num_training_steps:
+            raise ValueError(
+                f"warmup_size ({warmup_size}) must be smaller than "
+                f"num_training_steps ({num_training_steps})"
+            )
+        self._num_training_steps = num_training_steps
+        self._min_learning_rate = min_learning_rate
+        self._warmup_learning_rate = warmup_learning_rate
+        self._warmup_size = warmup_size
+        super().__init__(optimizer, by_epoch=by_epoch)
+
+    def _get_lr(self) -> List[float]:
+        """Calculates the learning rate."""
+        step_count = max(self._step_count - 1, 0)
+        if step_count < self._warmup_size:
+            scale = step_count / self._warmup_size
+            return [
+                (base_lr - self._warmup_learning_rate) * scale
+                + self._warmup_learning_rate
+                for base_lr in self.base_lrs
+            ]
+        decay_steps = self._num_training_steps - self._warmup_size
+        t = min(step_count - self._warmup_size, decay_steps)
+        decay_scale = 1.0 - t / decay_steps
+        return [
+            self._min_learning_rate + (base_lr - self._min_learning_rate) * decay_scale
+            for base_lr in self.base_lrs
+        ]
+
+
 class CosineAnnealingLR(BaseLR):
     """Cosine Annealing LearningRate Scheduler.
 

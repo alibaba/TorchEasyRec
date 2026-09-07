@@ -118,6 +118,14 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         """
         raise NotImplementedError
 
+    def init_from_pretrained(self) -> None:
+        """Load pretrained weights at cold start (no checkpoint to restore).
+
+        The training pipeline calls this hook before distributed wrapping when
+        no checkpoint was selected. The default is a no-op; models backed by an
+        external pretrained source, such as an HF backbone, override it.
+        """
+
     def init_loss(self) -> None:
         """Initialize loss modules."""
         raise NotImplementedError
