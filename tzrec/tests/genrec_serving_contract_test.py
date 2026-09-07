@@ -29,7 +29,7 @@ from safetensors.torch import load_file
 
 from tzrec.prompt.assembler import mix64
 from tzrec.prompt.types import FoldConstants
-from tzrec.tests.prompt_test_util import export_tiny_genrec, offset_sid_codes
+from tzrec.tests.prompt_test_util import export_tiny_genrec
 from tzrec.utils.test_util import make_test_dir
 
 # sglang's multimodal/processors/prompt_genrec.py folds a slot's per-hole keys
@@ -63,20 +63,14 @@ class GenrecServingContractTest(unittest.TestCase):
         ) as f:
             cls.contract = json.load(f)
         cls.front_end = torch.jit.load(
-            os.path.join(cls.exported.export_dir, "frontend", "scripted_model.pt")
+            os.path.join(cls.exported.export_dir, "scripted_model.pt")
         )
 
     def _payload(self):
         """A request as the in-process processor receives it: an npz blob."""
         buffer = io.BytesIO()
         np.savez_compressed(
-            buffer,
-            **{
-                "hist.values": offset_sid_codes([0, 1, 2, 3, 0, 1], [4, 4, 4]),
-                "hist.lengths": np.array([6], dtype=np.int64),
-                "beh.values": np.array([3, 9], dtype=np.int64),
-                "beh.lengths": np.array([2], dtype=np.int64),
-            },
+            buffer, **{k: v.numpy() for k, v in self.exported.sample_data.items()}
         )
         buffer.seek(0)
         with np.load(buffer, allow_pickle=False) as data:
@@ -107,7 +101,10 @@ class GenrecServingContractTest(unittest.TestCase):
         self.assertIn("model.embed_tokens.weight", exported)
 
     def test_front_end_output_feeds_the_processor(self) -> None:
+        # sglang calls it with the batch alone; the processor adds a device
         out = self.front_end(self._payload())
+        with_device = self.front_end(self._payload(), torch.device("cpu"))
+        self.assertTrue(torch.equal(with_device["hole_keys"], out["hole_keys"]))
         for key in (
             "input_ids",
             "hole_positions",
@@ -152,12 +149,12 @@ class GenrecServingContractTest(unittest.TestCase):
         self.assertEqual(
             self.contract["vocab_hash"], self.exported.compiled_prompt.vocab_hash
         )
-        self.assertEqual(self.contract["frontend"]["dir"], "frontend")
         self.assertEqual(self.contract["frontend"]["model"], "scripted_model.pt")
-        # the artifact pairs with the contract by identity, not by path
-        self.assertEqual(self.front_end.vocab_hash, self.contract["vocab_hash"])
-        self.assertEqual(self.front_end.plan_hash, self.contract["plan_hash"])
-        self.assertEqual(self.front_end.bundle_uuid, "bundle-test")
+        self.assertEqual(self.contract["frontend"]["lookup"], "artifact")
+        self.assertIn("beh.values", self.contract["frontend"]["inputs"])
+        self.assertEqual(
+            self.contract["plan_hash"], self.exported.compiled_prompt.plan_hash
+        )
 
     def test_tokenizer_dir_decodes_a_sid_atom(self) -> None:
         from transformers import AutoTokenizer

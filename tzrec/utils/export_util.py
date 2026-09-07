@@ -72,6 +72,7 @@ from tzrec.utils import checkpoint_util, config_util, env_util, npz_util, quant_
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
+    UNTRACEABLE_MODULES,
     fx_mark_keyed_tensor,
     fx_mark_seq_ec_jt,
     fx_mark_seq_len,
@@ -375,6 +376,24 @@ def export_model_normal(
         if assets is not None:
             for asset in assets:
                 shutil.copy(asset, save_dir)
+        _export_extra_assets(model, pipeline_config, checkpoint_path, save_dir)
+
+
+def _export_extra_assets(
+    model: nn.Module,
+    pipeline_config: EasyRecConfig,
+    checkpoint_path: str,
+    save_dir: str,
+) -> None:
+    """Let a served module write what its runtime reads beside the scripted model.
+
+    Discovered by duck typing through the inference wrappers, the way
+    checkpointing finds ``hf_backbone``; runs inside the export's own save dir
+    so a remote export dir is uploaded together with the scripted model.
+    """
+    served = checkpoint_util.unwrap_to(model, "export_assets")
+    if served is not None:
+        served.export_assets(pipeline_config, checkpoint_path, save_dir)
 
 
 def _prepare_single_rank_distributed_embedding_export() -> bool:
@@ -432,6 +451,15 @@ def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
         leaf_module_names,
     )
     return list(leaf_module_names)
+
+
+def _get_untraceable_leaf_module_names(model: torch.nn.Module) -> List[str]:
+    """Paths of the modules FX cannot trace, for a tracer that matches by path."""
+    return [
+        path
+        for path, module in model.named_modules()
+        if type(module).__name__ in UNTRACEABLE_MODULES
+    ]
 
 
 def _get_dense_embedding_leaf_module_names(model: torch.nn.Module) -> List[str]:
@@ -1666,7 +1694,10 @@ def export_distributed_embedding(
         torch.cuda.empty_cache()
 
     unwrap_model = dmp_model.module
-    tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
+    tracer = Tracer(
+        leaf_modules=_get_sharded_leaf_module_names(unwrap_model)
+        + _get_untraceable_leaf_module_names(unwrap_model)
+    )
     full_graph = tracer.trace(unwrap_model)
 
     if is_rank_zero:
@@ -1871,6 +1902,7 @@ def export_distributed_embedding(
         merged_emb_json = _merge_sharded_embedding_json(emb_json_files)
         with open(os.path.join(save_dir_sparse, "sparse_embedding.json"), "w") as f:
             json.dump(merged_emb_json, f, indent=4)
+        _export_extra_assets(model, pipeline_config, checkpoint_path, save_dir)
 
 
 class _SparseMarkCapture(Interpreter):

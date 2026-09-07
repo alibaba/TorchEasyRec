@@ -20,14 +20,12 @@ from unittest import mock
 
 import pyarrow as pa
 import torch
-from google.protobuf import text_format
 from parameterized import parameterized
 
 from tzrec.datasets.utils import RecordBatchTensor
 from tzrec.main import (
     _create_model,
     _train_and_evaluate,
-    export,
     predict,
     predict_checkpoint,
 )
@@ -369,19 +367,11 @@ class MainTest(unittest.TestCase):
     def test_hf_export_rejects_dense_ema(self) -> None:
         # dcp_to_hf reads <ckpt>/model unconditionally, so it would silently
         # ship raw weights where TorchScript export ships the EMA ones.
+        from tzrec.tests.prompt_test_util import export_tiny_genrec
+
         with tempfile.TemporaryDirectory() as test_dir:
-            config = EasyRecConfig()
-            config.train_input_path = "unused"
-            config.eval_input_path = "unused"
-            config.model_dir = os.path.join(test_dir, "train")
-            os.makedirs(config.model_dir)
-            config.train_config.dense_optimizer.ema.CopyFrom(EMAConfig())
-            config.model_config.genrec_causal_lm_model.SetInParent()
-            config_path = os.path.join(test_dir, "pipeline.config")
-            with open(config_path, "w") as f:
-                f.write(text_format.MessageToString(config))
             with self.assertRaisesRegex(ValueError, "Dense EMA"):
-                export(config_path, os.path.join(test_dir, "export"))
+                export_tiny_genrec(test_dir, use_dense_ema=True)
 
 
 class PredictionLifecycleTest(unittest.TestCase):

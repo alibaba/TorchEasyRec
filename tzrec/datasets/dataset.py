@@ -40,7 +40,7 @@ from tzrec.datasets.utils import (
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
-from tzrec.prompt.assembler import PROMPT_INFO_PREFIX, PromptAssembler
+from tzrec.prompt.assembler import OUTPUT_KEYS, PROMPT_INFO_PREFIX, PromptAssembler
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import data_pb2
 from tzrec.utils import config_util
@@ -401,11 +401,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             batch = self._data_parser.to_batch(output_data)
 
         if self._prompt_assembler is not None:
+            streams = self._prompt_assembler(output_data)
             batch.additional_infos.update(
-                {
-                    PROMPT_INFO_PREFIX + k: v
-                    for k, v in self._prompt_assembler(output_data).items()
-                }
+                {PROMPT_INFO_PREFIX + k: streams[k] for k in OUTPUT_KEYS}
             )
 
         # Set checkpoint info on batch

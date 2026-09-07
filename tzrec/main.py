@@ -52,7 +52,7 @@ from tzrec.features.feature import (
     BaseFeature,
     create_features,
 )
-from tzrec.models.genrec_model import BaseGenrecModel
+from tzrec.models.genrec_model import BaseGenrecModel, GenrecFrontEnd
 from tzrec.models.match_model import (
     MatchModel,
     MatchTower,
@@ -74,12 +74,7 @@ from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.prompt.compile import compile_prompt
-from tzrec.prompt.persist import (
-    PROMPT_DIR,
-    TOKENIZER_DIR,
-    check_prompt_assets,
-    write_serving_contract,
-)
+from tzrec.prompt.persist import check_prompt_assets
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
@@ -1160,52 +1155,6 @@ def evaluate(
         logger.info("Evaluate Finished.")
 
 
-def _export_prompt_serving_assets(
-    pipeline_config: EasyRecConfig,
-    features: List[BaseFeature],
-    compiled_prompt: CompiledPrompt,
-    checkpoint_path: str,
-    export_dir: str,
-) -> None:
-    """Write the composite config, the front-end and the serving contract.
-
-    The model is rebuilt and restored on CPU so the front-end carries the
-    trained projections and slot tables by reference, the same way the
-    TorchScript export restores a checkpoint before scripting it.
-    """
-    from tzrec.prompt.export import (
-        build_front_end,
-        export_sparse_tables,
-        write_composite_config,
-        write_front_end_dir,
-    )
-    from tzrec.utils.state_dict_util import init_parameters
-
-    write_composite_config(export_dir)
-
-    model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(pipeline_config.data_config.label_fields),
-        compiled_prompt=compiled_prompt,
-    )
-    model.set_is_inference(True)
-    wrapped_model = ScriptWrapper(model)
-    init_parameters(wrapped_model, torch.device("cpu"))
-    checkpoint_util.restore_model(checkpoint_path, wrapped_model)
-
-    carry_tables = not acc_utils.use_distributed_embedding()
-    front_end, frontend_meta, dense_meta = build_front_end(
-        model, compiled_prompt, features, carry_tables
-    )
-    frontend_dir = write_front_end_dir(
-        front_end, pipeline_config, features, export_dir, dense_meta
-    )
-    if not carry_tables:
-        export_sparse_tables(wrapped_model, checkpoint_path, frontend_dir)
-    write_serving_contract(compiled_prompt, export_dir, frontend_meta)
-
-
 def export(
     pipeline_config_path: str,
     export_dir: str,
@@ -1258,50 +1207,14 @@ def export(
         else:
             checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
-    model_cls = _get_model_class(pipeline_config.model_config)
-    if issubclass(model_cls, BaseGenrecModel):
-        if config_util.use_dense_ema(
-            pipeline_config.export_config, pipeline_config.train_config
-        ):
-            raise ValueError(
-                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
-                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
-                "false to export the raw weights."
-            )
-        if not checkpoint_path:
-            raise ValueError("HF export: no checkpoint found to convert.")
-        if not os.path.exists(os.path.join(checkpoint_path, "config.json")):
-            raise ValueError(
-                f"HF export: {checkpoint_path} has no co-located HF assets; it "
-                f"was not written by an HF-backed model."
-            )
-        if assets:
-            logger.warning(f"HF export ignores asset_files: {assets}.")
-        features = _create_features(
-            list(pipeline_config.feature_configs), pipeline_config.data_config
-        )
-        compiled_prompt = compile_prompt(
-            pipeline_config.prompt_config,
-            features,
-            list(pipeline_config.data_config.label_fields),
-            tokenizer_dir=os.path.join(export_dir, PROMPT_DIR, TOKENIZER_DIR)
-            if is_rank_zero
-            else None,
-        )
-        check_prompt_assets(compiled_prompt, checkpoint_path)
-        if is_rank_zero:
-            from tzrec.utils.hf_export_util import dcp_to_hf
-
-            dcp_to_hf(checkpoint_path, export_dir)
-            _export_prompt_serving_assets(
-                pipeline_config, features, compiled_prompt, checkpoint_path, export_dir
-            )
-        return
-
     data_config = pipeline_config.data_config
 
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+
+    compiled_prompt = _compile_prompt(pipeline_config, features)
+    if checkpoint_path:
+        check_prompt_assets(compiled_prompt, checkpoint_path)
 
     # Build model
     model = _create_model(
@@ -1309,6 +1222,7 @@ def export(
         features,
         list(data_config.label_fields),
         sampler_type=None,
+        compiled_prompt=compiled_prompt,
     )
     InferWrapper = ScriptWrapper
     # Flip to inference *before* wrapping so view-dependent state
@@ -1355,6 +1269,17 @@ def export(
             checkpoint_path,
             os.path.join(export_dir, "model"),
             assets=assets,
+        )
+    elif isinstance(model.model, BaseGenrecModel):
+        # tzrec serves the prompt front-end; the LM rides beside it as
+        # HuggingFace weights for the engine that decodes
+        export_model(
+            ori_pipeline_config,
+            InferWrapper(GenrecFrontEnd(model.model)),
+            checkpoint_path,
+            export_dir,
+            assets=assets,
+            additional_export_config=additional_export_config,
         )
     else:
         export_model(

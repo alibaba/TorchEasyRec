@@ -15,29 +15,54 @@ This layer builds an empty causal LM, resizes its vocabulary, wires slot
 projections, converts SID coordinate systems, scores the response window and
 supplies the digests a checkpoint records. A family subclass owns its forward
 and decode path.
+
+``GenrecFrontEnd`` is the half of the model tzrec serves: the assembled prompt
+and the projected slots, everything before the LM's embedding gather. It is
+exported like any tzrec model; the LM itself is handed to an LLM engine as the
+HuggingFace weights beside it.
 """
 
 import inspect
-from typing import Any, Dict, List, Optional, Tuple
+import os
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torchmetrics
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from tzrec.acc import utils as acc_utils
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.prompt_projection import PromptProjection
 from tzrec.prompt.assembler import (
+    CU_SEQLENS,
+    HOLE_KEYS,
+    HOLE_POSITIONS,
+    HOLE_SLOT_COUNTS,
+    INPUT_IDS,
+    PROMPT_CU_SEQLENS,
+    PROMPT_HOLE_KEYS,
     PROMPT_HOLE_POSITIONS,
+    PROMPT_HOLE_SLOT_COUNTS,
     PROMPT_INPUT_IDS,
 )
-from tzrec.prompt.types import CompiledPrompt
-from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.persist import PROMPT_DIR, TOKENIZER_DIR, write_serving_contract
+from tzrec.prompt.types import CompiledPrompt, FillMode, PromptPlan, SlotSeg
+from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.utils import config_util, env_util
+from tzrec.utils.hf_export_util import dcp_to_hf, write_composite_config
 from tzrec.utils.logging_util import logger
+
+SLOT_EMBEDS = "slot_embeds"
+SCRIPTED_MODEL_FILENAME = "scripted_model.pt"
+LOOKUP_ARTIFACT = "artifact"
+LOOKUP_HOST = "host"
 
 _PARAM_DTYPE: Dict[int, torch.dtype] = {
     GenrecModelConfig.FP32: torch.float32,
@@ -188,6 +213,11 @@ class BaseGenrecModel(BaseModel):
         """The HF module export and checkpointing reach for."""
         return self.lm
 
+    @property
+    def compiled_prompt(self) -> CompiledPrompt:
+        """The prompt this model was built against."""
+        return self._prompt
+
     def build_input(self, batch: Batch) -> torch.Tensor:
         """Build packed LM input embeddings and fill projected positions.
 
@@ -199,27 +229,18 @@ class BaseGenrecModel(BaseModel):
         """
         ids = batch.additional_infos[PROMPT_INPUT_IDS]
         embeds = self.lm.get_input_embeddings()(ids)
-
-        prompt_plan = self._prompt.prompt_plan
-        if not prompt_plan.projected_slots:
+        if not self._prompt.prompt_plan.projected_slots:
             return embeds
-
-        grouped = self.embedding_group(batch)
-        hidden_size = embeds.shape[-1]
-        projected_embeddings = [
-            proj(grouped[seg.name + seg.output_key]).reshape(-1, hidden_size)
-            for seg, proj in zip(prompt_plan.projected_slots, self._slot_projections)
-        ]
-        # The assembler records holes in this projected-occurrence-major order.
+        projected = project_slots(
+            self.embedding_group,
+            self._prompt.prompt_plan,
+            self._slot_projections,
+            batch,
+            embeds.shape[-1],
+        )
         # out of place: embeds carries grad from the embedding lookup
         return embeds.index_copy(
-            0,
-            batch.additional_infos[PROMPT_HOLE_POSITIONS],
-            (
-                projected_embeddings[0]
-                if len(projected_embeddings) == 1
-                else torch.cat(projected_embeddings)
-            ).to(embeds.dtype),
+            0, batch.additional_infos[PROMPT_HOLE_POSITIONS], projected.to(embeds.dtype)
         )
 
     def _tokens_to_local_codes(
@@ -311,3 +332,174 @@ class BaseGenrecModel(BaseModel):
         )
         self.lm.load_state_dict(pretrained.state_dict())
         del pretrained
+
+
+def project_slots(
+    embedding_group: EmbeddingGroup,
+    prompt_plan: PromptPlan,
+    slot_projections: Sequence[nn.Module],
+    batch: Batch,
+    hidden_size: int,
+) -> torch.Tensor:
+    """Look every projected slot up and project it into the LM input space.
+
+    Args:
+        embedding_group: the model's prompt groups.
+        prompt_plan: fixes the slot order.
+        slot_projections: one module per projected slot, in the same order.
+        batch: the batch to look up.
+        hidden_size: the LM hidden size.
+
+    Returns:
+        ``(total_holes, hidden_size)`` in the order the assembler records holes:
+        projected occurrence first, then sample.
+    """
+    grouped = embedding_group(batch)
+    parts = [
+        proj(grouped[seg.name + seg.output_key]).reshape(-1, hidden_size)
+        for seg, proj in zip(prompt_plan.projected_slots, slot_projections)
+    ]
+    return parts[0] if len(parts) == 1 else torch.cat(parts)
+
+
+class GenrecFrontEnd(nn.Module):
+    """The served half of a genrec model, exported like any tzrec model.
+
+    It shares the model's embedding group and projections, so under the
+    inference wrapper their state-dict names are the checkpoint's and the LM is
+    never loaded at export. ``predict`` returns the assembled prompt and the
+    projected slot embeddings; an LLM engine gathers the LM's own table, scatters
+    ``slot_embeds`` at ``hole_positions`` and decodes.
+
+    Args:
+        model: the genrec model to serve.
+    """
+
+    def __init__(self, model: BaseGenrecModel) -> None:
+        super().__init__()
+        if acc_utils.is_aot() or acc_utils.is_trt() or env_util.use_rtp():
+            raise ValueError(
+                "the genrec front-end is exported with TorchScript only: its "
+                "prompt walk has data-dependent shapes, which AOT, TRT and RTP "
+                "export cannot capture. Unset ENABLE_AOT / ENABLE_TRT / USE_RTP."
+            )
+        self.embedding_group = model.embedding_group
+        self.projections = model.projections
+        self._slot_projections = list(model._slot_projections)
+        self._prompt = model.compiled_prompt
+        self._features = list(model.features)
+        self._hidden_size = int(model.lm.config.hidden_size)
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """The features the served prompt reads."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[FeatureGroupConfig]:
+        """The groups derived for the projected slots."""
+        return list(self._prompt.projection_plan.feature_groups)
+
+    @property
+    def compiled_prompt(self) -> CompiledPrompt:
+        """The prompt the inference wrapper assembles before ``predict``."""
+        return self._prompt
+
+    def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """Return the assembled streams and the projected slot embeddings.
+
+        Args:
+            batch: carries the assembled prompt in ``additional_infos``.
+
+        Returns:
+            The serving contract's outputs.
+        """
+        infos = batch.additional_infos
+        out = {
+            INPUT_IDS: infos[PROMPT_INPUT_IDS],
+            CU_SEQLENS: infos[PROMPT_CU_SEQLENS],
+            HOLE_POSITIONS: infos[PROMPT_HOLE_POSITIONS],
+            HOLE_KEYS: infos[PROMPT_HOLE_KEYS],
+            HOLE_SLOT_COUNTS: infos[PROMPT_HOLE_SLOT_COUNTS],
+        }
+        if self._prompt.prompt_plan.projected_slots:
+            out[SLOT_EMBEDS] = project_slots(
+                self.embedding_group,
+                self._prompt.prompt_plan,
+                self._slot_projections,
+                batch,
+                self._hidden_size,
+            )
+        else:
+            out[SLOT_EMBEDS] = torch.zeros(
+                0, 0, dtype=torch.float32, device=infos[PROMPT_INPUT_IDS].device
+            )
+        return out
+
+    def _serving_contract(self) -> Dict[str, Any]:
+        """What the exported module reads and writes, for ``prompt.json``."""
+        by_name = {feature.name: feature for feature in self._features}
+        inputs: List[str] = []
+        plan = self._prompt.prompt_plan
+        for seg in plan.segments:
+            if not isinstance(seg, SlotSeg):
+                continue
+            members = (
+                seg.feature_names[:1]
+                if seg.fill is FillMode.INLINE
+                else seg.feature_names
+            )
+            for name in members:
+                feature = by_name[name]
+                inputs.extend([f"{name}.values", f"{name}.lengths"])
+                if feature.is_sequence and feature.value_dim != 1:
+                    inputs.append(f"{name}.key_lengths")
+        return {
+            "model": SCRIPTED_MODEL_FILENAME,
+            "lookup": (
+                LOOKUP_HOST
+                if acc_utils.use_distributed_embedding()
+                else LOOKUP_ARTIFACT
+            ),
+            "inputs": list(dict.fromkeys(inputs)),
+            "outputs": [
+                INPUT_IDS,
+                CU_SEQLENS,
+                HOLE_POSITIONS,
+                HOLE_KEYS,
+                HOLE_SLOT_COUNTS,
+                SLOT_EMBEDS,
+            ],
+        }
+
+    def export_assets(
+        self, pipeline_config: EasyRecConfig, checkpoint_path: str, save_dir: str
+    ) -> None:
+        """Write what an LLM engine reads beside the scripted front-end.
+
+        The HuggingFace weights and composite config, the extended tokenizer and
+        the serving contract. Called by the export on rank 0, inside its save
+        dir.
+
+        Args:
+            pipeline_config: the pipeline being exported.
+            checkpoint_path: the checkpoint the weights come from.
+            save_dir: the export directory.
+        """
+        if config_util.use_dense_ema(
+            pipeline_config.export_config, pipeline_config.train_config
+        ):
+            raise ValueError(
+                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
+                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
+                "false to export the raw weights."
+            )
+        dcp_to_hf(checkpoint_path, save_dir)
+        write_composite_config(save_dir)
+        compile_prompt(
+            pipeline_config.prompt_config,
+            self._features,
+            list(pipeline_config.data_config.label_fields),
+            tokenizer_dir=os.path.join(save_dir, PROMPT_DIR, TOKENIZER_DIR),
+        )
+        write_serving_contract(self._prompt, save_dir, self._serving_contract())

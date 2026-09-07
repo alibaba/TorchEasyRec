@@ -50,12 +50,25 @@ HOLE_KEYS = "hole_keys"
 HOLE_SLOT_COUNTS = "hole_slot_counts"
 RESPONSE_LENGTHS = "response_lengths"
 MAX_SEQLEN = "max_seqlen"
+# every stream the walk emits; a caller under FX tracing indexes these rather
+# than iterating the result, which is one opaque proxy there
+OUTPUT_KEYS = (
+    INPUT_IDS,
+    CU_SEQLENS,
+    HOLE_POSITIONS,
+    HOLE_KEYS,
+    HOLE_SLOT_COUNTS,
+    RESPONSE_LENGTHS,
+    MAX_SEQLEN,
+)
 
 # where the collator stores the streams on the batch
 PROMPT_INFO_PREFIX = "prompt_"
 PROMPT_INPUT_IDS = PROMPT_INFO_PREFIX + INPUT_IDS
 PROMPT_CU_SEQLENS = PROMPT_INFO_PREFIX + CU_SEQLENS
 PROMPT_HOLE_POSITIONS = PROMPT_INFO_PREFIX + HOLE_POSITIONS
+PROMPT_HOLE_KEYS = PROMPT_INFO_PREFIX + HOLE_KEYS
+PROMPT_HOLE_SLOT_COUNTS = PROMPT_INFO_PREFIX + HOLE_SLOT_COUNTS
 PROMPT_MAX_SEQLEN = PROMPT_INFO_PREFIX + MAX_SEQLEN
 PROMPT_RESPONSE_LENGTHS = PROMPT_INFO_PREFIX + RESPONSE_LENGTHS
 

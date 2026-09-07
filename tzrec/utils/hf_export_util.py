@@ -18,7 +18,7 @@ circular import.
 import json
 import os
 import shutil
-from typing import Dict, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 import torch
 from safetensors.torch import save_file
@@ -27,6 +27,9 @@ from torch import nn
 from tzrec.constant import HF_EXPORT_META_FILENAME
 from tzrec.utils import checkpoint_util
 from tzrec.utils.logging_util import logger
+
+SERVING_ARCH = "PromptGenRecForCausalLM"
+SERVING_MODEL_TYPE = "prompt_genrec"
 
 _HF_ASSET_FILES = (
     "config.json",
@@ -73,6 +76,39 @@ def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
         meta.update(digests())
     with open(os.path.join(save_dir, HF_EXPORT_META_FILENAME), "w") as f:
         json.dump(meta, f, indent=2)
+
+
+def write_composite_config(export_dir: str) -> None:
+    """Rewrite ``config.json`` so the backbone sits under ``text_config``.
+
+    That is what names the backbone to a serving runtime that composes an
+    arbitrary causal LM behind one registered architecture, and what makes it
+    treat the model as carrying a second modality, which is what a projected
+    prompt slot is.
+
+    Args:
+        export_dir: the HuggingFace export directory.
+    """
+    path = os.path.join(export_dir, "config.json")
+    with open(path, "r") as f:
+        backbone: Dict[str, Any] = json.load(f)
+    if backbone.get("model_type") == SERVING_MODEL_TYPE:
+        return
+    composite: Dict[str, Any] = {
+        "architectures": [SERVING_ARCH],
+        "model_type": SERVING_MODEL_TYPE,
+        "text_config": backbone,
+    }
+    # a runtime that reads only the outer config still needs to size its cache
+    for key in ("vocab_size", "hidden_size", "num_hidden_layers", "torch_dtype"):
+        if key in backbone:
+            composite[key] = backbone[key]
+    with open(path, "w") as f:
+        json.dump(composite, f, indent=2)
+    logger.info(
+        f"wrote a composite config naming backbone "
+        f"{backbone.get('architectures', ['?'])[0]} under {SERVING_ARCH}."
+    )
 
 
 def dcp_to_hf(ckpt_dir: str, out_dir: str) -> None:
