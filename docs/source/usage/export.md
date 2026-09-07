@@ -221,28 +221,3 @@ eascmd -i ${ACCESS_KEY_ID} -k ${ACCESS_KEY_SECRET} -e ${ENDPOINT} create aot_exp
 ```
 
 任务运行结束后，`--export_dir` 指向的目录即为导出好的模型，将其作为在线服务的模型路径部署即可（部署方式参见 [模型服务](serving.md)）。
-
-(genrec-export)=
-
-## 生成式推荐模型（genrec）导出
-
-`genrec_causal_lm_model` 与其他模型一样通过 `tzrec.export` 导出：tzrec 侧导出的是 **prompt 前端**（特征 -> 拼接后的 token 流与 PROJECTED slot 的投影向量），量化、`INPUT_TILE`、`USE_DISTRIBUTED_EMBEDDING` 等环境变量与普通模型一致；LLM 骨干网络则以 HuggingFace 权重的形式放在同一目录下，交给 SGLang 等 LLM 推理引擎解码：
-
-```
-export_dir/
-  scripted_model.pt           # prompt 前端：特征 -> input_ids / hole_positions / slot_embeds / hole_keys / hole_slot_counts
-  fg.json  pipeline.config  model_acc.json
-  dense_meta.json  sparse/    # 仅 USE_DISTRIBUTED_EMBEDDING=1 时，与普通模型的分布式 embedding 导出一致
-  config.json                 # 复合结构：architectures 为 PromptGenRecForCausalLM，骨干网络配置位于 text_config
-  model.safetensors           # 骨干网络权重，参数名与骨干网络一致
-  generation_config.json
-  prompt/
-    prompt.json               # 服务契约：sid_space（band、base_vocab_size、bundle_uuid）、decode 调度、vocab_hash/plan_hash、frontend 输入输出
-    tokenizer/                # 扩展了 SID token 的 tokenizer，可由 AutoTokenizer 加载（对应 SGLang 的 --tokenizer-path）
-```
-
-- TorchEasyRec Processor 以 `export_dir` 作为 `model_path` 加载前端；SGLang 以 `--model-path export_dir` 加载骨干网络，并通过 `SGLANG_PROMPT_FRONTEND_PATH=export_dir/scripted_model.pt` 加载前端。
-- 默认导出下前端内置 PROJECTED slot 的 embedding 表，输入为 FG 输出的原始 id（`{feature}.values` / `.lengths` / `.key_lengths`）。设置 `USE_DISTRIBUTED_EMBEDDING=1` 时，前端改为读取 Processor 分布式 embedding 阶段查表后的向量（命名由 `dense_meta.json` 描述），embedding 表以 `sparse/*.npz` 导出。此时前端仍需要 INLINE slot 与 PROJECTED 成员的原始 id（用于计算 `hole_keys`），`prompt.json` 的 `frontend.inputs` 列出了全部输入 key。
-- 前端仅支持 TorchScript 导出：prompt 拼接的形状随请求变化，`ENABLE_AOT` / `ENABLE_TRT` / `USE_RTP` 不适用。
-- 约束解码索引不由 tzrec 生成：推理侧根据 `prompt/prompt.json` 与 SID bundle 的 `sid_to_items` 构建（SGLang 侧 `python -m sglang.srt.beam_search.build_constraint_csr`），并以 `bundle_uuid` 校验索引与模型是否来自同一 bundle。
-- genrec 导出不支持 `export_config.use_dense_ema=true`。

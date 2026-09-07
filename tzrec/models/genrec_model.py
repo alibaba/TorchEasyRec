@@ -51,7 +51,7 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.persist import PROMPT_DIR, TOKENIZER_DIR, write_serving_contract
-from tzrec.prompt.types import CompiledPrompt, FillMode, PromptPlan, SlotSeg
+from tzrec.prompt.types import CompiledPrompt, PromptPlan
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -60,9 +60,6 @@ from tzrec.utils.hf_export_util import dcp_to_hf, write_composite_config
 from tzrec.utils.logging_util import logger
 
 SLOT_EMBEDS = "slot_embeds"
-SCRIPTED_MODEL_FILENAME = "scripted_model.pt"
-LOOKUP_ARTIFACT = "artifact"
-LOOKUP_HOST = "host"
 
 _PARAM_DTYPE: Dict[int, torch.dtype] = {
     GenrecModelConfig.FP32: torch.float32,
@@ -436,50 +433,13 @@ class GenrecFrontEnd(nn.Module):
             )
         return out
 
-    def _serving_contract(self) -> Dict[str, Any]:
-        """What the exported module reads and writes, for ``prompt.json``."""
-        by_name = {feature.name: feature for feature in self._features}
-        inputs: List[str] = []
-        plan = self._prompt.prompt_plan
-        for seg in plan.segments:
-            if not isinstance(seg, SlotSeg):
-                continue
-            members = (
-                seg.feature_names[:1]
-                if seg.fill is FillMode.INLINE
-                else seg.feature_names
-            )
-            for name in members:
-                feature = by_name[name]
-                inputs.extend([f"{name}.values", f"{name}.lengths"])
-                if feature.is_sequence and feature.value_dim != 1:
-                    inputs.append(f"{name}.key_lengths")
-        return {
-            "model": SCRIPTED_MODEL_FILENAME,
-            "lookup": (
-                LOOKUP_HOST
-                if acc_utils.use_distributed_embedding()
-                else LOOKUP_ARTIFACT
-            ),
-            "inputs": list(dict.fromkeys(inputs)),
-            "outputs": [
-                INPUT_IDS,
-                CU_SEQLENS,
-                HOLE_POSITIONS,
-                HOLE_KEYS,
-                HOLE_SLOT_COUNTS,
-                SLOT_EMBEDS,
-            ],
-        }
-
     def export_assets(
         self, pipeline_config: EasyRecConfig, checkpoint_path: str, save_dir: str
     ) -> None:
         """Write what an LLM engine reads beside the scripted front-end.
 
         The HuggingFace weights and composite config, the extended tokenizer and
-        the serving contract. Called by the export on rank 0, inside its save
-        dir.
+        the SID space. Called by the export on rank 0, inside its save dir.
 
         Args:
             pipeline_config: the pipeline being exported.
@@ -502,4 +462,4 @@ class GenrecFrontEnd(nn.Module):
             list(pipeline_config.data_config.label_fields),
             tokenizer_dir=os.path.join(save_dir, PROMPT_DIR, TOKENIZER_DIR),
         )
-        write_serving_contract(self._prompt, save_dir, self._serving_contract())
+        write_serving_contract(self._prompt, save_dir)

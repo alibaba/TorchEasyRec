@@ -9,23 +9,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checks a checkpoint's prompt contract on restore, and publishes it on export.
+"""Checks a checkpoint's prompt contract on restore, and publishes the SID space.
 
 The digests ride in the HF export metadata the checkpoint already carries, so
 there is no second file that can drift from the weights beside it. Export
-additionally writes ``prompt/prompt.json``: what a serving runtime reads, and
-only that. The plan itself is deliberately not published there -- it reaches
-serving compiled into the front-end artifact, and a copy a runtime could
-interpret would invite the second assembler this design exists to prevent.
+additionally writes ``prompt/prompt.json`` with the resolved SID space: the
+token base, the per-level bands and the bundle identity a serving side needs
+to build its constraint index and to refuse one built from another bundle.
+The plan itself is deliberately not published -- it reaches serving compiled
+into the front-end, and a copy a runtime could interpret would invite the
+second assembler this design exists to prevent.
 """
 
 import dataclasses
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Dict, Optional
 
 from tzrec.constant import HF_EXPORT_META_FILENAME
-from tzrec.prompt.types import CompiledPrompt, SlotSeg, Static
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.utils.logging_util import logger
 
 PROMPT_DIR = "prompt"
@@ -33,62 +35,26 @@ PROMPT_CONTRACT_FILENAME = "prompt.json"
 TOKENIZER_DIR = "tokenizer"
 
 
-def _decode_schedule(compiled_prompt: CompiledPrompt) -> List[Dict[str, int]]:
-    """One entry per response position: a forced token or the band it is masked to.
-
-    Derived from the response segments, so a runtime gets the schedule without
-    gaining the ability to interpret a plan.
-    """
-    sid_space = compiled_prompt.sid_space
-    schedule: List[Dict[str, int]] = []
-    for seg in compiled_prompt.prompt_plan.response_segments:
-        if isinstance(seg, Static):
-            schedule.extend({"token_id": int(t)} for t in seg.token_ids)
-            continue
-        assert isinstance(seg, SlotSeg) and sid_space is not None
-        width = seg.width.num_positions or 0
-        for index in range(width):
-            level = index % sid_space.num_levels
-            schedule.append(
-                {
-                    "level": level,
-                    "band_lo": sid_space.band_lo[level],
-                    "band_hi": sid_space.band_hi[level],
-                }
-            )
-    return schedule
-
-
-def write_serving_contract(
-    compiled_prompt: CompiledPrompt, export_dir: str, frontend: Dict[str, Any]
-) -> str:
-    """Write ``prompt/prompt.json``, everything a serving runtime reads.
+def write_serving_contract(compiled_prompt: CompiledPrompt, export_dir: str) -> str:
+    """Write ``prompt/prompt.json``: the resolved SID space.
 
     Args:
         compiled_prompt: the compiled prompt.
-        export_dir: the HuggingFace export directory.
-        frontend: how the exported front-end is laid out and what it reads.
+        export_dir: the export directory.
 
     Returns:
         The path written.
     """
-    plan = compiled_prompt.prompt_plan
     out = os.path.join(export_dir, PROMPT_DIR)
     os.makedirs(out, exist_ok=True)
     path = os.path.join(out, PROMPT_CONTRACT_FILENAME)
+    sid_space = compiled_prompt.sid_space
     with open(path, "w") as f:
         json.dump(
             {
-                "sid_space": dataclasses.asdict(compiled_prompt.sid_space)
-                if compiled_prompt.sid_space is not None
-                else None,
-                "decode": _decode_schedule(compiled_prompt),
-                "static_prefix_len": plan.static_prefix_len,
-                "max_length": plan.max_length,
-                "max_total_length": plan.max_total_length,
-                "vocab_hash": compiled_prompt.vocab_hash,
-                "plan_hash": compiled_prompt.plan_hash,
-                "frontend": frontend,
+                "sid_space": dataclasses.asdict(sid_space)
+                if sid_space is not None
+                else None
             },
             f,
             indent=2,

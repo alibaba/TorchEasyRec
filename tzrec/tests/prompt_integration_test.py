@@ -183,8 +183,6 @@ class GenrecExportIntegrationTest(unittest.TestCase):
         with open(os.path.join(dist_dir, "dense_meta.json"), "r") as f:
             dense_meta = json.load(f)
         self.assertEqual(dense_meta["sequence__ec"], ["beh__ec", "beh__lengths"])
-        with open(os.path.join(dist_dir, "prompt", "prompt.json"), "r") as f:
-            self.assertEqual(json.load(f)["frontend"]["lookup"], "host")
 
         # a processor simulator: one request is one user, looked up in the
         # exported tables the way the distributed-embedding stage does, then

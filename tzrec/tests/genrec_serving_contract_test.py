@@ -138,6 +138,7 @@ class GenrecServingContractTest(unittest.TestCase):
         self.assertNotEqual(_item_hash(keys), _item_hash(keys.flip(0)))
 
     def test_prompt_json_carries_the_index_builder_inputs(self) -> None:
+        self.assertEqual(list(self.contract), ["sid_space"])
         space = self.contract["sid_space"]
         compiled = self.exported.compiled_prompt.sid_space
         self.assertEqual(space["base_vocab_size"], compiled.base_vocab_size)
@@ -145,16 +146,6 @@ class GenrecServingContractTest(unittest.TestCase):
         self.assertEqual(space["band_lo"], list(compiled.band_lo))
         self.assertEqual(space["band_hi"], list(compiled.band_hi))
         self.assertEqual(space["bundle_uuid"], "bundle-test")
-        self.assertEqual(len(self.contract["decode"]), 3)
-        self.assertEqual(
-            self.contract["vocab_hash"], self.exported.compiled_prompt.vocab_hash
-        )
-        self.assertEqual(self.contract["frontend"]["model"], "scripted_model.pt")
-        self.assertEqual(self.contract["frontend"]["lookup"], "artifact")
-        self.assertIn("beh.values", self.contract["frontend"]["inputs"])
-        self.assertEqual(
-            self.contract["plan_hash"], self.exported.compiled_prompt.plan_hash
-        )
 
     def test_tokenizer_dir_decodes_a_sid_atom(self) -> None:
         from transformers import AutoTokenizer
