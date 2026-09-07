@@ -16,11 +16,10 @@ tokenizer. It resolves no physical dimension: the model does that at
 ``__init__`` from ``group_total_dim``.
 """
 
-import hashlib
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from tokenizers import Tokenizer
 
@@ -257,14 +256,6 @@ def _special_id(tok: Tokenizer, candidates: Sequence[str]) -> int:
     )
 
 
-def _hash(*parts: Any) -> str:
-    """Stable sha256 over the given parts."""
-    digest = hashlib.sha256()
-    for part in parts:
-        digest.update(repr(part).encode("utf-8"))
-    return digest.hexdigest()
-
-
 def compile_prompt(
     cfg: PromptConfig,
     features: Sequence[BaseFeature],
@@ -362,7 +353,6 @@ def compile_prompt(
     if tokenizer_dir:
         _save_tokenizer_dir(tok, sid_space, tokenizer_dir)
 
-    tokenizer_json = tok.to_str()
     slot_ids = {name: i for i, name in enumerate(resolved_slots_by_name)}
     segs: Dict[str, SlotSeg] = {}
     for name, slot in resolved_slots_by_name.items():
@@ -407,19 +397,7 @@ def compile_prompt(
     _validate(plan)
 
     return CompiledPrompt(
-        sid_space=sid_space,
-        prompt_plan=plan,
-        projection_plan=projection_plan,
-        vocab_hash=_hash(sid_space, tokenizer_json),
-        plan_hash=_hash(
-            sid_space,
-            plan,
-            # items(), not the bare dict: iterating one yields only its keys
-            sorted(projection_plan.projections.items()),
-            # routing too: matching bodies can still be wired to other slots
-            sorted(projection_plan.slot_to_module.items()),
-            tokenizer_json,
-        ),
+        sid_space=sid_space, prompt_plan=plan, projection_plan=projection_plan
     )
 
 

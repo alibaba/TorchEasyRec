@@ -54,17 +54,6 @@ class PromptStackIntegrationTest(GenrecModelTestBase):
         batch.additional_infos.update(assemble_into(self.compiled_prompt, parsed))
         return batch
 
-    def test_written_digests_satisfy_the_restore_guard(self) -> None:
-        from tzrec.prompt.persist import check_prompt_assets
-        from tzrec.utils.hf_export_util import write_hf_assets
-
-        model = self._model()
-        ckpt = os.path.join(self.test_dir, "model.ckpt-1")
-        write_hf_assets(model, ckpt)
-
-        check_prompt_assets(self.compiled_prompt, ckpt)
-        self.assertTrue(os.path.exists(os.path.join(ckpt, "hf_export_meta.json")))
-
     def test_model_resizes_to_target_vocab_size(self) -> None:
         model = self._model()
         rows = model.lm.get_input_embeddings().weight.shape[0]

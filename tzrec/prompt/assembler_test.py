@@ -295,8 +295,6 @@ class PromptAssemblerTest(unittest.TestCase):
             sid_space=_sid_space(),
             prompt_plan=plan,
             projection_plan=ProjectionPlan(projections={}, slot_to_module={}),
-            vocab_hash="v",
-            plan_hash="p",
         )
         parsed = {
             "hist.values": np.array([[1], [6], [11], [0], [4], [8]]),

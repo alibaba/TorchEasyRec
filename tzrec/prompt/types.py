@@ -193,12 +193,8 @@ class CompiledPrompt:
         sid_space: the resolved SID token space.
         prompt_plan: assembler walk order and ceilings.
         projection_plan: projection topology.
-        vocab_hash: over sid_space and tokenizer.json; fatal on mismatch.
-        plan_hash: over all four parts; warns on mismatch.
     """
 
     sid_space: ResolvedSidSpace
     prompt_plan: PromptPlan
     projection_plan: ProjectionPlan
-    vocab_hash: str
-    plan_hash: str

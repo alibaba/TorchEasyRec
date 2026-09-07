@@ -306,13 +306,6 @@ class BaseGenrecModel(BaseModel):
         """
         return
 
-    def prompt_digests(self) -> Dict[str, str]:
-        """The contract digests the checkpoint records, for restore checking."""
-        return {
-            "vocab_hash": self._prompt.vocab_hash,
-            "plan_hash": self._prompt.plan_hash,
-        }
-
     def init_from_pretrained(self) -> None:
         """Load HF weights once, on a cold start only."""
         source = self._model_config.hf_model_name_or_path

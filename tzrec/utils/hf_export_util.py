@@ -71,9 +71,6 @@ def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
     )
     prefix = checkpoint_util._strip_dmp_prefix(raw_prefix)
     meta = {"backbone_state_dict_prefix": prefix + ("." if prefix else "")}
-    digests = getattr(inner, "prompt_digests", None)
-    if digests is not None:
-        meta.update(digests())
     with open(os.path.join(save_dir, HF_EXPORT_META_FILENAME), "w") as f:
         json.dump(meta, f, indent=2)
 
