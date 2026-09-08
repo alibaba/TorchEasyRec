@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
 
 import torch
@@ -17,7 +18,8 @@ from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
 from transformers import AutoModelForCausalLM
 
-from tzrec.datasets.utils import Batch
+from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
+from tzrec.main import _create_model
 from tzrec.models.genrec_model import (
     _PARAM_DTYPE,
     SLOT_EMBEDS,
@@ -25,36 +27,79 @@ from tzrec.models.genrec_model import (
     project_slots,
 )
 from tzrec.models.model import ScriptWrapper, TrainWrapper
-from tzrec.prompt.assembler import (
-    HOLE_POSITIONS,
-    INPUT_IDS,
-    PromptAssembler,
-)
-from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.assembler import HOLE_POSITIONS, INPUT_IDS, PromptAssembler
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
+from tzrec.protos import feature_pb2
+from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
-from tzrec.protos.prompt_pb2 import PromptConfig
-from tzrec.tests.prompt_test_util import (
-    _CODEBOOK,
-    _HIST,
-    GenRecModelTestBase,
-    assemble_into,
-    create_prompt_feature,
-    offset_sid_codes,
-    projected_feature,
-)
+from tzrec.protos.prompt_pb2 import PromptSlot
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
+    create_genrec_test_model,
+    make_test_dir,
     parameterized_name_func,
 )
 
+# offset SID codes for the (4, 4, 4) codebook: level_offsets[l] + code
+_HIST_CODES = [0, 5, 10]
+_LONG_HIST_CODES = [0, 5, 10, 3, 4, 9]
+_ANSWER_CODES = [1, 6, 11]
 
-class BaseGenRecModelTest(GenRecModelTestBase):
+
+def _hist() -> feature_pb2.FeatureConfig:
+    return feature_pb2.FeatureConfig(
+        sequence_raw_feature=feature_pb2.RawFeature(
+            feature_name="hist", expression="user:hist"
+        )
+    )
+
+
+def _projected(name: str, dim: int) -> feature_pb2.FeatureConfig:
+    return feature_pb2.FeatureConfig(
+        sequence_id_feature=feature_pb2.IdFeature(
+            feature_name=name,
+            expression=f"user:{name}",
+            num_buckets=32,
+            embedding_dim=dim,
+            sequence_length=2,
+        )
+    )
+
+
+def _batch(compiled_prompt, parsed, sparse=None) -> Batch:
+    batch = Batch(sparse_features={BASE_DATA_GROUP: sparse} if sparse else {})
+    batch.additional_infos.update(
+        PromptAssembler(compiled_prompt.prompt_plan, compiled_prompt.sid_space)(parsed)
+    )
+    return batch
+
+
+def _projected_batch(compiled_prompt) -> Batch:
+    return _batch(
+        compiled_prompt,
+        {
+            "hist.values": torch.tensor(_HIST_CODES).reshape(-1, 1),
+            "hist.lengths": torch.tensor([3]),
+            "answer.values": torch.tensor(_ANSWER_CODES),
+            "answer.lengths": torch.tensor([3]),
+            "prof.values": torch.tensor([5, 9]),
+            "prof.lengths": torch.tensor([2]),
+        },
+        sparse=KeyedJaggedTensor.from_lengths_sync(
+            keys=["prof"], values=torch.tensor([5, 9]), lengths=torch.tensor([2])
+        ),
+    )
+
+
+class BaseGenRecModelTest(unittest.TestCase):
     """Shared causal-LM behavior, reached through its concrete subclass."""
 
+    def setUp(self) -> None:
+        self.test_dir = make_test_dir()
+        self.model, self.compiled_prompt = create_genrec_test_model(self.test_dir)
+
     def test_tokens_to_local_codes_undoes_shifts_and_groups_beams(self) -> None:
-        model = self._model()
         space = self.compiled_prompt.sid_space
         local_codes = torch.tensor(
             [
@@ -65,66 +110,44 @@ class BaseGenRecModelTest(GenRecModelTestBase):
             ]
         )
         tokens = local_codes + torch.tensor(space.level_offsets) + space.base_vocab_size
-        codes = model._tokens_to_local_codes(tokens, batch_size=2)
+        codes = self.model._tokens_to_local_codes(tokens, batch_size=2)
 
         self.assertEqual(codes.shape, (2, 2, space.num_levels))
         self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1).tolist())
 
     def test_rejects_a_model_built_without_a_prompt(self) -> None:
+        model_config = ModelConfig()
+        model_config.genrec_causal_lm_model.hf_model_name_or_path = os.path.join(
+            self.test_dir, "backbone"
+        )
         with self.assertRaisesRegex(ValueError, "needs a compiled prompt"):
-            self._model(compiled_prompt=None)
+            _create_model(model_config, [], ["answer"], compiled_prompt=None)
 
     def test_shared_projection_name_requires_matching_widths(self) -> None:
-        features = [
-            create_prompt_feature(_HIST),
-            create_prompt_feature(projected_feature("pa", 8)),
-            create_prompt_feature(projected_feature("pb", 16)),
-        ]
-        cfg = PromptConfig(
-            tokenizer_path=self.tok,
-            prompt="History : {{hist}} . {{pa}} {{pb}} Predict :",
-            response="{{answer}}",
-        )
-        cfg.sid_space.codebook.extend(_CODEBOOK)
-        for name in ("pa", "pb"):
-            slot = cfg.slots.add(name=name, projection_name="shared")
-            slot.feature_names.append(name)
-        compiled_prompt = compile_prompt(cfg, features, ["answer"])
-
         with self.assertRaisesRegex(ValueError, "cannot share a module"):
-            self._model(features=features, compiled_prompt=compiled_prompt)
+            create_genrec_test_model(
+                self.test_dir,
+                feature_configs=[_hist(), _projected("pa", 8), _projected("pb", 16)],
+                prompt="History : {{hist}} . {{pa}} {{pb}} Predict :",
+                slots=[
+                    PromptSlot(
+                        name="pa", feature_names=["pa"], projection_name="shared"
+                    ),
+                    PromptSlot(
+                        name="pb", feature_names=["pb"], projection_name="shared"
+                    ),
+                ],
+            )
 
     def test_projected_slot_overwrites_sentinels_and_backpropagates(self) -> None:
-        features = [
-            create_prompt_feature(_HIST),
-            create_prompt_feature(projected_feature("prof", 8)),
-        ]
-        compiled_prompt = self._compile(
-            features,
-            template="History : {{hist}} . Predict {{prof}} :",
-            response="{{answer}}",
+        model, compiled_prompt = create_genrec_test_model(
+            self.test_dir,
+            feature_configs=[_hist(), _projected("prof", 8)],
+            prompt="History : {{hist}} . Predict {{prof}} :",
         )
-        model = self._model(features=features, compiled_prompt=compiled_prompt)
         # the embedding table is built on meta until something materializes it
         init_parameters(model, device=torch.device("cpu"))
-        batch = self._batch(
-            {
-                "hist.values": torch.tensor(
-                    offset_sid_codes([0, 1, 2], _CODEBOOK)
-                ).reshape(-1, 1),
-                "hist.lengths": torch.tensor([3]),
-                "answer.values": torch.tensor(offset_sid_codes([1, 2, 3], _CODEBOOK)),
-                "answer.lengths": torch.tensor([3]),
-                "prof.values": torch.tensor([5, 9]),
-                "prof.lengths": torch.tensor([2]),
-            },
-            compiled_prompt=compiled_prompt,
-            sparse=KeyedJaggedTensor.from_lengths_sync(
-                keys=["prof"],
-                values=torch.tensor([5, 9]),
-                lengths=torch.tensor([2]),
-            ),
-        )
+        batch = _projected_batch(compiled_prompt)
 
         embeds = model.build_input(batch)
         raw = model.lm.get_input_embeddings()(batch.additional_infos[INPUT_IDS])
@@ -143,39 +166,14 @@ class BaseGenRecModelTest(GenRecModelTestBase):
         name_func=parameterized_name_func,
     )
     def test_projected_slot_follows_a_narrow_lm_dtype(self, lm_parameter_dtype) -> None:
-        features = [
-            create_prompt_feature(_HIST),
-            create_prompt_feature(projected_feature("prof", 8)),
-        ]
-        compiled_prompt = self._compile(
-            features,
-            template="History : {{hist}} . Predict {{prof}} :",
-            response="{{answer}}",
-        )
-        model = self._model(
-            features=features,
-            compiled_prompt=compiled_prompt,
+        model, compiled_prompt = create_genrec_test_model(
+            self.test_dir,
+            feature_configs=[_hist(), _projected("prof", 8)],
+            prompt="History : {{hist}} . Predict {{prof}} :",
             lm_parameter_dtype=lm_parameter_dtype,
         )
         init_parameters(model, device=torch.device("cpu"))
-        batch = self._batch(
-            {
-                "hist.values": torch.tensor(
-                    offset_sid_codes([0, 1, 2], _CODEBOOK)
-                ).reshape(-1, 1),
-                "hist.lengths": torch.tensor([3]),
-                "answer.values": torch.tensor(offset_sid_codes([1, 2, 3], _CODEBOOK)),
-                "answer.lengths": torch.tensor([3]),
-                "prof.values": torch.tensor([5, 9]),
-                "prof.lengths": torch.tensor([2]),
-            },
-            compiled_prompt=compiled_prompt,
-            sparse=KeyedJaggedTensor.from_lengths_sync(
-                keys=["prof"],
-                values=torch.tensor([5, 9]),
-                lengths=torch.tensor([2]),
-            ),
-        )
+        batch = _projected_batch(compiled_prompt)
 
         embeds = model.build_input(batch)
         self.assertIs(embeds.dtype, _PARAM_DTYPE[lm_parameter_dtype])
@@ -190,89 +188,74 @@ class BaseGenRecModelTest(GenRecModelTestBase):
         self.assertGreater(float(proj.head.weight.grad.abs().sum()), 0.0)
 
     def test_metric_averages_the_loss_across_batches(self) -> None:
-        model = self._model()
-        model.init_metric()
+        self.model.init_metric()
         for value in (1.0, 3.0):
-            model.update_metric({}, Batch(), {"ce_loss": torch.tensor(value)})
+            self.model.update_metric({}, Batch(), {"ce_loss": torch.tensor(value)})
 
         self.assertAlmostEqual(
-            model._metric_modules["ce_loss"].compute().item(), 2.0, places=5
+            self.model._metric_modules["ce_loss"].compute().item(), 2.0, places=5
         )
 
     def test_init_from_pretrained_replaces_the_empty_weights(self) -> None:
-        model = self._model()
         base_vocab_size = self.compiled_prompt.sid_space.base_vocab_size
-        before = model.lm.get_input_embeddings().weight[:base_vocab_size].clone()
-        model.init_from_pretrained()
-        after = model.lm.get_input_embeddings().weight[:base_vocab_size]
+        embeddings = self.model.lm.get_input_embeddings()
+        before = embeddings.weight[:base_vocab_size].clone()
+        self.model.init_from_pretrained()
+        after = embeddings.weight[:base_vocab_size]
 
         # the checkpoint rows land verbatim; only the appended SID rows are new
-        reference = AutoModelForCausalLM.from_pretrained(self.backbone)
+        reference = AutoModelForCausalLM.from_pretrained(
+            os.path.join(self.test_dir, "backbone")
+        )
         expected = reference.get_input_embeddings().weight[:base_vocab_size]
         self.assertFalse(torch.allclose(before, expected))
         torch.testing.assert_close(after, expected)
 
-    def _batch_from_codes(self, hist, answer):
-        parsed = {
-            "hist.values": torch.tensor(offset_sid_codes(hist, _CODEBOOK)),
-            "hist.lengths": torch.tensor([len(hist)]),
-            "answer.values": torch.tensor(offset_sid_codes(answer, _CODEBOOK)),
-            "answer.lengths": torch.tensor([len(answer)]),
-        }
-        batch = Batch()
-        batch.additional_infos.update(assemble_into(self.compiled_prompt, parsed))
-        return batch
-
     def test_model_resizes_to_target_vocab_size(self) -> None:
-        model = self._model()
-        rows = model.lm.get_input_embeddings().weight.shape[0]
+        rows = self.model.lm.get_input_embeddings().weight.shape[0]
         self.assertEqual(rows, self.compiled_prompt.sid_space.target_vocab_size)
         self.assertGreater(rows, self.compiled_prompt.sid_space.band_hi[-1])
 
     def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
-        model = self._model()
-        batch = self._batch_from_codes([0, 1, 2, 3, 0, 1], [1, 2, 3])
-        predictions = model.predict(batch)
-        loss = model.loss(predictions, batch)["ce_loss"]
+        batch = _batch(
+            self.compiled_prompt,
+            {
+                "hist.values": torch.tensor(_LONG_HIST_CODES),
+                "hist.lengths": torch.tensor([6]),
+                "answer.values": torch.tensor(_ANSWER_CODES),
+                "answer.lengths": torch.tensor([3]),
+            },
+        )
+        predictions = self.model.predict(batch)
+        loss = self.model.loss(predictions, batch)["ce_loss"]
         self.assertTrue(bool(torch.isfinite(loss)))
         loss.backward()
 
-        grad = model.lm.get_input_embeddings().weight.grad
+        grad = self.model.lm.get_input_embeddings().weight.grad
         self.assertIsNotNone(grad)
         self.assertTrue(bool((grad.abs().sum() > 0)))
 
     def test_training_forward_survives_fx_tracing(self) -> None:
-        model = self._model()
-
-        torch.fx.symbolic_trace(TrainWrapper(model))
+        torch.fx.symbolic_trace(TrainWrapper(self.model))
 
 
-class GenRecFrontEndTest(GenRecModelTestBase):
+class GenRecFrontEndTest(unittest.TestCase):
     """The served half of the model, under the same wrapper every export uses."""
 
     def setUp(self) -> None:
-        super().setUp()
-        self.features = [
-            create_prompt_feature(_HIST),
-            create_prompt_feature(projected_feature("beh", 8)),
-        ]
-        self.prompt_config = PromptConfig(
-            tokenizer_path=self.tok,
+        self.test_dir = make_test_dir()
+        self.model, self.compiled_prompt = create_genrec_test_model(
+            self.test_dir,
+            feature_configs=[_hist(), _projected("beh", 8)],
             prompt="History : {{hist}} . {{beh}} Predict :",
-            response="{{answer}}",
         )
-        self.prompt_config.sid_space.codebook.extend(_CODEBOOK)
-        self.compiled_prompt = compile_prompt(
-            self.prompt_config, self.features, ["answer"]
-        )
-        self.model = self._model()
         init_parameters(self.model, device=torch.device("cpu"))
         # the parsed dict as the data parser emits it: a dense sequence of codes
         # and a sparse behaviour sequence
         self.data = {
-            "hist.values": torch.tensor(
-                offset_sid_codes([0, 1, 2, 3, 0, 1], _CODEBOOK), dtype=torch.float32
-            ).reshape(-1, 1),
+            "hist.values": torch.tensor(_LONG_HIST_CODES, dtype=torch.float32).reshape(
+                -1, 1
+            ),
             "hist.lengths": torch.tensor([6]),
             "beh.values": torch.tensor([3, 9]),
             "beh.lengths": torch.tensor([2]),

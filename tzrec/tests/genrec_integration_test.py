@@ -32,14 +32,9 @@ from tzrec.prompt.assembler import (
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
 from tzrec.tests import utils
-from tzrec.tests.prompt_test_util import (
-    _CODEBOOK,
-    _WORDS,
-    create_prompt_tokenizer,
-    projected_feature,
-)
 from tzrec.utils import config_util
 from tzrec.utils.test_util import (
+    create_genrec_test_tokenizer,
     create_tiny_causal_lm,
     gpu_unavailable,
     make_test_dir,
@@ -48,6 +43,11 @@ from tzrec.utils.test_util import (
 
 _MOCK_CONFIG = "tzrec/tests/configs/genrec_causal_lm_model_mock.config"
 _BUNDLE_UUID = "bundle-test"
+_CODEBOOK = [4, 4, 4]
+_BEH = (
+    'sequence_id_feature { feature_name: "beh" expression: "user:beh" '
+    "num_buckets: 32 embedding_dim: 8 sequence_length: 2 }"
+)
 
 
 class GenRecIntegrationTest(unittest.TestCase):
@@ -69,8 +69,8 @@ class GenRecIntegrationTest(unittest.TestCase):
         """Write the tiny backbone, tokenizer, manifest and data; return the config."""
         backbone = os.path.join(self.test_dir, "backbone")
         create_tiny_causal_lm(64).save_pretrained(backbone)
-        tokenizer = create_prompt_tokenizer(
-            os.path.join(self.test_dir, "tok.json"), _WORDS
+        tokenizer = create_genrec_test_tokenizer(
+            os.path.join(self.test_dir, "tok.json")
         )
         manifest = os.path.join(self.test_dir, "manifest.json")
         with open(manifest, "w") as f:
@@ -86,7 +86,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         config.prompt_config.tokenizer_path = tokenizer
         config.prompt_config.sid_space.manifest_path = manifest
         if projected:
-            text_format.Merge(projected_feature("beh", 8), config.feature_configs.add())
+            text_format.Merge(_BEH, config.feature_configs.add())
             config.prompt_config.prompt = "History : {{hist}} . {{beh}} Predict :"
         config_path = os.path.join(self.test_dir, "genrec.config")
         config_util.save_message(config, config_path)

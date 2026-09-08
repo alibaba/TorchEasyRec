@@ -21,11 +21,7 @@ from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.types import FillMode, SlotSeg, Static, WidthKind
 from tzrec.protos import feature_pb2
 from tzrec.protos.prompt_pb2 import PromptConfig
-from tzrec.tests.prompt_test_util import (
-    create_prompt_feature,
-    create_prompt_tokenizer,
-)
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import create_genrec_test_tokenizer, make_test_dir
 
 _WORDS = ["History", "Profile", "Predict", ":", ".", "Histor0", "<unk>", "<|im_end|>"]
 
@@ -38,10 +34,16 @@ _PROF = (
 _AGE = 'id_feature { feature_name: "age" expression: "user:age" num_buckets: 8 }'
 
 
+def _feature(text: str):
+    config = feature_pb2.FeatureConfig()
+    text_format.Merge(text, config)
+    return create_features([config], fg_mode=FgMode.FG_NONE)[0]
+
+
 class CompilePromptTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
-        self.tok_path = create_prompt_tokenizer(
+        self.tok_path = create_genrec_test_tokenizer(
             os.path.join(self.test_dir, "tok.json"), _WORDS
         )
 
@@ -56,7 +58,7 @@ class CompilePromptTest(unittest.TestCase):
     def test_sid_space_resolves_offsets_and_bands(self) -> None:
         cfg = self._config(prompt="History : {{hist}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
-        compiled = self._compile(cfg, [create_prompt_feature(_HIST)])
+        compiled = self._compile(cfg, [_feature(_HIST)])
         space = compiled.sid_space
 
         base_vocab_size = space.base_vocab_size
@@ -78,9 +80,7 @@ class CompilePromptTest(unittest.TestCase):
     def test_inline_needs_no_group_projected_gets_one(self) -> None:
         cfg = self._config(prompt="History : {{hist}} . Profile : {{prof}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
-        compiled = self._compile(
-            cfg, [create_prompt_feature(_HIST), create_prompt_feature(_PROF)]
-        )
+        compiled = self._compile(cfg, [_feature(_HIST), _feature(_PROF)])
 
         by_name = {
             s.name: s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg)
@@ -100,7 +100,7 @@ class CompilePromptTest(unittest.TestCase):
     def test_static_runs_are_woven_between_slots(self) -> None:
         cfg = self._config(prompt="History : {{hist}} . Predict :")
         cfg.sid_space.codebook.extend([4])
-        compiled = self._compile(cfg, [create_prompt_feature(_HIST)])
+        compiled = self._compile(cfg, [_feature(_HIST)])
         kinds = [
             "static" if isinstance(s, Static) else s.name
             for s in compiled.prompt_plan.segments
@@ -112,7 +112,7 @@ class CompilePromptTest(unittest.TestCase):
     def test_scalar_slot_is_one_deep_position(self) -> None:
         cfg = self._config(prompt="Profile : {{age}}")
         cfg.sid_space.codebook.extend([4])
-        compiled = self._compile(cfg, [create_prompt_feature(_AGE)])
+        compiled = self._compile(cfg, [_feature(_AGE)])
         seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
         self.assertIs(seg.fill, FillMode.PROJECTED)
         self.assertEqual(seg.output_key, "")
@@ -127,7 +127,7 @@ class CompilePromptTest(unittest.TestCase):
         cfg.sid_space.codebook.extend([4, 4, 4])
         cfg.sid_space.manifest_path = manifest
         with self.assertRaisesRegex(ValueError, "does not match the manifest"):
-            self._compile(cfg, [create_prompt_feature(_HIST)])
+            self._compile(cfg, [_feature(_HIST)])
 
     def test_manifest_match_compiles(self) -> None:
         manifest = os.path.join(self.test_dir, "manifest.json")
@@ -137,7 +137,7 @@ class CompilePromptTest(unittest.TestCase):
         cfg.sid_space.codebook.extend([4, 4, 4])
         cfg.sid_space.manifest_path = manifest
         self.assertEqual(
-            self._compile(cfg, [create_prompt_feature(_HIST)]).sid_space.num_levels,
+            self._compile(cfg, [_feature(_HIST)]).sid_space.num_levels,
             3,
         )
 
@@ -147,9 +147,7 @@ class CompilePromptTest(unittest.TestCase):
         slot = cfg.slots.add(name="both")
         slot.feature_names.extend(["hist", "age"])
         with self.assertRaisesRegex(ValueError, "mixes sequence and scalar"):
-            self._compile(
-                cfg, [create_prompt_feature(_HIST), create_prompt_feature(_AGE)]
-            )
+            self._compile(cfg, [_feature(_HIST), _feature(_AGE)])
 
     def test_rejects_unknown_feature_and_unreferenced_slot(self) -> None:
         cfg = self._config(prompt="X : {{hist}}")
@@ -157,13 +155,13 @@ class CompilePromptTest(unittest.TestCase):
         slot = cfg.slots.add(name="hist")
         slot.feature_names.append("nope")
         with self.assertRaisesRegex(ValueError, "not in\n?\\s*feature_configs"):
-            self._compile(cfg, [create_prompt_feature(_HIST)])
+            self._compile(cfg, [_feature(_HIST)])
 
         cfg2 = self._config(prompt="X : {{hist}}")
         cfg2.sid_space.codebook.extend([4])
         cfg2.slots.add(name="ghost").feature_names.append("hist")
         with self.assertRaisesRegex(ValueError, "never referenced"):
-            self._compile(cfg2, [create_prompt_feature(_HIST)])
+            self._compile(cfg2, [_feature(_HIST)])
 
     def test_rejects_a_projection_on_an_inline_slot(self) -> None:
         cfg = self._config(prompt="X : {{hist}}")
@@ -172,7 +170,7 @@ class CompilePromptTest(unittest.TestCase):
         slot.feature_names.append("hist")
         slot.projection.bias = True
         with self.assertRaisesRegex(ValueError, "is INLINE"):
-            self._compile(cfg, [create_prompt_feature(_HIST)])
+            self._compile(cfg, [_feature(_HIST)])
 
     def test_sid_tokens_absent_from_the_base_tokenizer(self) -> None:
         cfg = self._config(prompt="X : {{hist}}")
@@ -180,14 +178,14 @@ class CompilePromptTest(unittest.TestCase):
         # renders Histor0..Histor3, and Histor0 is already in the base vocab
         cfg.sid_space.token_format = "Histor{i}"
         with self.assertRaisesRegex(ValueError, "already in the base tokenizer"):
-            self._compile(cfg, [create_prompt_feature(_HIST)])
+            self._compile(cfg, [_feature(_HIST)])
 
     def test_a_training_compile_persists_nothing(self) -> None:
         cfg = self._config(prompt="History : {{hist}}")
         cfg.sid_space.codebook.extend([4, 4])
         before = sorted(os.listdir(self.test_dir))
 
-        compile_prompt(cfg, [create_prompt_feature(_HIST)], ["answer"])
+        compile_prompt(cfg, [_feature(_HIST)], ["answer"])
 
         self.assertEqual(sorted(os.listdir(self.test_dir)), before)
 
@@ -195,9 +193,7 @@ class CompilePromptTest(unittest.TestCase):
         cfg = self._config(prompt="History : {{hist}}")
         cfg.sid_space.codebook.extend([4, 4])
         out = os.path.join(self.test_dir, "export")
-        compile_prompt(
-            cfg, [create_prompt_feature(_HIST)], ["answer"], tokenizer_dir=out
-        )
+        compile_prompt(cfg, [_feature(_HIST)], ["answer"], tokenizer_dir=out)
         written = os.path.join(out, "tokenizer.json")
         self.assertTrue(os.path.exists(written))
         # the SID tokens round-trip, which is what serving reloads
@@ -208,7 +204,7 @@ class CompilePromptTest(unittest.TestCase):
     def test_answer_width_comes_from_the_codebook(self) -> None:
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
-        compiled = self._compile(cfg, [create_prompt_feature(_HIST)])
+        compiled = self._compile(cfg, [_feature(_HIST)])
 
         seg = next(
             s for s in compiled.prompt_plan.response_segments if isinstance(s, SlotSeg)
@@ -229,9 +225,7 @@ class CompilePromptTest(unittest.TestCase):
             r"\[prof\] names \['prof'\], which are not in "
             r"data_config.label_fields",
         ):
-            self._compile(
-                cfg, [create_prompt_feature(_HIST), create_prompt_feature(_PROF)]
-            )
+            self._compile(cfg, [_feature(_HIST), _feature(_PROF)])
 
     def test_response_slot_takes_exactly_one_label_field(self) -> None:
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
@@ -240,7 +234,7 @@ class CompilePromptTest(unittest.TestCase):
         slot.feature_names.extend(["sid_a", "sid_b"])
 
         with self.assertRaisesRegex(ValueError, "is one label field"):
-            compile_prompt(cfg, [create_prompt_feature(_HIST)], ["sid_a", "sid_b"])
+            compile_prompt(cfg, [_feature(_HIST)], ["sid_a", "sid_b"])
 
     def test_response_slot_may_not_declare_a_projection(self) -> None:
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
@@ -250,14 +244,14 @@ class CompilePromptTest(unittest.TestCase):
         slot.projection.SetInParent()
 
         with self.assertRaisesRegex(ValueError, "drop its projection"):
-            self._compile(cfg, [create_prompt_feature(_HIST)])
+            self._compile(cfg, [_feature(_HIST)])
 
     def test_missing_sid_space_is_rejected(self) -> None:
         # the response width is codebook-derived, so sid_space must exist
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
         cfg.ClearField("sid_space")
         with self.assertRaisesRegex(ValueError, "sid_space is required"):
-            self._compile(cfg, [create_prompt_feature(_HIST)])
+            self._compile(cfg, [_feature(_HIST)])
 
     def test_token_format_without_a_placeholder_is_rejected(self) -> None:
         # without {i} every token renders alike: one row, not sum(codebook)
@@ -265,13 +259,13 @@ class CompilePromptTest(unittest.TestCase):
         cfg.sid_space.codebook.extend([4, 4, 4])
         cfg.sid_space.token_format = "<|sid|>"
         with self.assertRaisesRegex(ValueError, "has no '{i}' placeholder"):
-            self._compile(cfg, [create_prompt_feature(_HIST)])
+            self._compile(cfg, [_feature(_HIST)])
 
     def test_a_custom_token_format_with_a_placeholder_compiles(self) -> None:
         cfg = self._config(prompt="History : {{hist}}", response="{{answer}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
         cfg.sid_space.token_format = "C{i}"
-        compiled = self._compile(cfg, [create_prompt_feature(_HIST)])
+        compiled = self._compile(cfg, [_feature(_HIST)])
 
         space = compiled.sid_space
         self.assertEqual(space.band_hi[-1] - space.band_lo[0] + 1, 12)
@@ -282,7 +276,7 @@ class CompilePromptTest(unittest.TestCase):
         cfg.sid_space.codebook.extend([4, 4, 4])
         cfg.ClearField("response")
         with self.assertRaisesRegex(ValueError, "response is required"):
-            self._compile(cfg, [create_prompt_feature(_HIST)])
+            self._compile(cfg, [_feature(_HIST)])
 
     def test_a_grouped_feature_inherits_the_group_cap(self) -> None:
         # a SequenceFeature member never sets its own sequence_length; the cap

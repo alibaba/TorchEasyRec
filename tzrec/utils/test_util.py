@@ -14,7 +14,7 @@ import importlib.util
 import os
 import tempfile
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -25,7 +25,11 @@ from torch import nn
 from torch.fx import GraphModule
 
 from tzrec.acc.aot_utils import export_model_aot, load_model_aot
-from tzrec.models.model import ScriptWrapper
+from tzrec.models.model import BaseModel, ScriptWrapper
+from tzrec.prompt.types import CompiledPrompt
+from tzrec.protos import feature_pb2
+from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+from tzrec.protos.prompt_pb2 import PromptSlot
 from tzrec.utils.export_util import split_model
 from tzrec.utils.fx_util import symbolic_trace
 
@@ -350,3 +354,98 @@ def reference_stu_truncation(
         chunks.append(torch.cat([prefix, uih_kept, targets], dim=0))
         new_lens.append(contextual_seq_len + new_uih + T)
     return torch.cat(chunks, dim=0), new_lens
+
+
+def create_genrec_test_tokenizer(
+    path: str,
+    words: Sequence[str] = ("History", "Predict", ":", ".", "<unk>", "<|im_end|>"),
+) -> str:
+    """Write a word-level tokenizer for the genrec tests.
+
+    Args:
+        path (str): destination JSON path.
+        words (Sequence[str]): vocabulary entries in token-id order.
+
+    Returns:
+        str: the destination path.
+    """
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    tokenizer = Tokenizer(
+        models.WordLevel(
+            vocab={word: i for i, word in enumerate(words)}, unk_token="<unk>"
+        )
+    )
+    # pyrefly: ignore[read-only]
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.save(path)
+    return path
+
+
+def create_genrec_test_model(
+    test_dir: str,
+    feature_configs: Optional[List[feature_pb2.FeatureConfig]] = None,
+    prompt: str = "History : {{hist}} . Predict :",
+    response: str = "{{answer}}",
+    slots: Sequence[PromptSlot] = (),
+    beam_widths: Sequence[int] = (2, 2, 2),
+    num_return_sequences: int = 2,
+    lm_parameter_dtype: Optional["GenRecModelConfig.ParamDtype"] = None,
+) -> Tuple[BaseModel, CompiledPrompt]:
+    """Build a GenRecCausalLMModel over a tiny backbone and a compiled prompt.
+
+    The backbone and the tokenizer are written under ``test_dir``. The default
+    features are one ``hist`` raw sequence and the codebook is ``(4, 4, 4)``, so
+    an offset SID code is ``level_offsets[l] + code`` with offsets ``(0, 4, 8)``.
+
+    Args:
+        test_dir (str): scratch directory.
+        feature_configs (list, optional): feature configs; the ``hist`` raw
+            sequence when None.
+        prompt (str): the prompt template.
+        response (str): the response template.
+        slots (Sequence[PromptSlot]): explicit slot declarations.
+        beam_widths (Sequence[int]): per-level beam widths.
+        num_return_sequences (int): sequences returned per sample.
+        lm_parameter_dtype (optional): ``GenRecModelConfig.ParamDtype`` value.
+
+    Returns:
+        Tuple[BaseModel, CompiledPrompt]: the model and the prompt it was built on.
+    """
+    from tzrec.features.feature import FgMode, create_features
+    from tzrec.main import _create_model
+    from tzrec.prompt.compile import compile_prompt
+    from tzrec.protos.model_pb2 import ModelConfig
+    from tzrec.protos.prompt_pb2 import PromptConfig
+
+    backbone = os.path.join(test_dir, "backbone")
+    create_tiny_causal_lm(64).save_pretrained(backbone)
+    if feature_configs is None:
+        feature_configs = [
+            feature_pb2.FeatureConfig(
+                sequence_raw_feature=feature_pb2.RawFeature(
+                    feature_name="hist", expression="user:hist"
+                )
+            )
+        ]
+    features = create_features(feature_configs, fg_mode=FgMode.FG_NONE)
+    prompt_config = PromptConfig(
+        tokenizer_path=create_genrec_test_tokenizer(os.path.join(test_dir, "tok.json")),
+        prompt=prompt,
+        response=response,
+    )
+    prompt_config.sid_space.codebook.extend([4, 4, 4])
+    prompt_config.slots.extend(slots)
+    compiled_prompt = compile_prompt(prompt_config, features, ["answer"])
+
+    model_config = ModelConfig()
+    lm_config = model_config.genrec_causal_lm_model
+    lm_config.hf_model_name_or_path = backbone
+    lm_config.common.beam_widths.extend(beam_widths)
+    lm_config.common.num_return_sequences = num_return_sequences
+    if lm_parameter_dtype is not None:
+        lm_config.common.lm_parameter_dtype = lm_parameter_dtype
+    model = _create_model(
+        model_config, features, ["answer"], compiled_prompt=compiled_prompt
+    )
+    return model, compiled_prompt
