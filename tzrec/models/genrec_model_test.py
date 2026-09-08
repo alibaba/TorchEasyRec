@@ -27,7 +27,12 @@ from tzrec.models.genrec_model import (
     project_slots,
 )
 from tzrec.models.model import ScriptWrapper, TrainWrapper
-from tzrec.prompt.assembler import HOLE_POSITIONS, INPUT_IDS, PromptAssembler
+from tzrec.prompt.assembler import (
+    HOLE_POSITIONS,
+    HOLE_SLOT_COUNTS,
+    INPUT_IDS,
+    PromptAssembler,
+)
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
 from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import ModelConfig
@@ -284,6 +289,30 @@ class GenRecFrontEndTest(unittest.TestCase):
         self.assertTrue(torch.allclose(out[SLOT_EMBEDS], expected))
         self.assertEqual(tuple(out[SLOT_EMBEDS].shape), (2, 32))
 
+    def test_front_end_joins_several_projected_slots_in_order(self) -> None:
+        """Two slots: ``slot_embeds`` is their projections, occurrence by occurrence."""
+        model, compiled = create_genrec_test_model(
+            self.test_dir,
+            feature_configs=[_hist(), _projected("beh", 8), _projected("ctx", 8)],
+            prompt="History : {{hist}} . {{beh}} then {{ctx}} Predict :",
+        )
+        init_parameters(model, device=torch.device("cpu"))
+        wrapped = ScriptWrapper(GenRecFrontEnd(model))
+        data = dict(self.data)
+        data["ctx.values"] = torch.tensor([1, 4, 7])
+        data["ctx.lengths"] = torch.tensor([3])
+
+        out = wrapped(data)
+        counts = out[HOLE_SLOT_COUNTS]
+        self.assertEqual(counts.tolist(), [2, 3])
+        grouped = model.embedding_group(wrapped.get_batch(data))
+        spans = torch.split(out[SLOT_EMBEDS], counts.tolist())
+        for seg, proj, span in zip(
+            compiled.prompt_plan.projected_slots, model._slot_projections, spans
+        ):
+            expected = proj(grouped[seg.name + seg.output_key]).reshape(-1, 32)
+            self.assertTrue(torch.allclose(span, expected), seg.name)
+
     def test_front_end_shares_the_checkpoint_names_and_not_the_lm(self) -> None:
         names = set(self.wrapped.state_dict())
         self.assertTrue(any(n.startswith("model.embedding_group.") for n in names))
@@ -296,7 +325,10 @@ class GenRecFrontEndTest(unittest.TestCase):
         scripted = torch.jit.script(symbolic_trace(self.wrapped))
         out = scripted(self.data)
         for key, value in eager.items():
-            self.assertTrue(torch.allclose(out[key].float(), value.float()), key)
+            if value.is_floating_point():
+                self.assertTrue(torch.allclose(out[key], value), key)
+            else:
+                self.assertTrue(torch.equal(out[key], value), key)
 
 
 if __name__ == "__main__":

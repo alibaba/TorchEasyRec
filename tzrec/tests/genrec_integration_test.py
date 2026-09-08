@@ -65,7 +65,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         if self.success and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
-    def _prepare_config(self, projected: bool) -> str:
+    def _prepare_config(self) -> str:
         """Write the tiny backbone, tokenizer, manifest and data; return the config."""
         backbone = os.path.join(self.test_dir, "backbone")
         create_tiny_causal_lm(64).save_pretrained(backbone)
@@ -76,7 +76,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         with open(manifest, "w") as f:
             json.dump({"codebook": _CODEBOOK, "bundle_uuid": _BUNDLE_UUID}, f)
         self.data_glob = utils.create_mock_prompt_data(
-            os.path.join(self.test_dir, "data"), _CODEBOOK, projected=projected
+            os.path.join(self.test_dir, "data"), _CODEBOOK
         )
 
         config = config_util.load_pipeline_config(_MOCK_CONFIG)
@@ -85,16 +85,15 @@ class GenRecIntegrationTest(unittest.TestCase):
         config.model_config.genrec_causal_lm_model.hf_model_name_or_path = backbone
         config.prompt_config.tokenizer_path = tokenizer
         config.prompt_config.sid_space.manifest_path = manifest
-        if projected:
-            text_format.Merge(_BEH, config.feature_configs.add())
-            config.prompt_config.prompt = "History : {{hist}} . {{beh}} Predict :"
+        text_format.Merge(_BEH, config.feature_configs.add())
+        config.prompt_config.prompt = "History : {{hist}} . {{beh}} Predict :"
         config_path = os.path.join(self.test_dir, "genrec.config")
         config_util.save_message(config, config_path)
         return config_path
 
-    def _train_eval_export(self, projected: bool) -> str:
+    def _train_eval_export(self) -> str:
         """Run the pipeline; return the trained ``pipeline.config`` path."""
-        config_path = self._prepare_config(projected)
+        config_path = self._prepare_config()
         self.success = utils.test_train_eval(config_path, self.test_dir)
         trained = os.path.join(self.test_dir, "pipeline.config")
         if self.success:
@@ -122,7 +121,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         return out
 
     def test_genrec_train_eval_export(self):
-        trained = self._train_eval_export(projected=True)
+        trained = self._train_eval_export()
         export_dir = os.path.join(self.test_dir, "export")
         for name in (
             "scripted_model.pt",
@@ -198,7 +197,7 @@ class GenRecIntegrationTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")
     def test_genrec_export_distributed_embedding(self):
-        trained = self._train_eval_export(projected=True)
+        trained = self._train_eval_export()
         dist_dir = os.path.join(self.test_dir, "export_dist")
         self.success = utils.test_export(
             trained,

@@ -535,7 +535,7 @@ def create_mock_data(
 
 
 def create_mock_prompt_data(
-    path: str, codebook: Sequence[int], projected: bool, num_rows: int = 8
+    path: str, codebook: Sequence[int], num_rows: int = 8
 ) -> str:
     """Write a parquet of SID histories for the prompt-native tests.
 
@@ -545,7 +545,6 @@ def create_mock_prompt_data(
     Args:
         path: directory to write into.
         codebook: per-level SID vocabulary sizes.
-        projected: whether to add the ``beh`` column.
         num_rows: samples to write.
 
     Returns:
@@ -561,9 +560,8 @@ def create_mock_prompt_data(
     columns = {
         "hist": [codes(2) for _ in range(num_rows)],
         "answer": [codes(1) for _ in range(num_rows)],
+        "beh": [rng.integers(0, 32, size=2).tolist() for _ in range(num_rows)],
     }
-    if projected:
-        columns["beh"] = [rng.integers(0, 32, size=2).tolist() for _ in range(num_rows)]
     os.makedirs(path, exist_ok=True)
     pq.write_table(
         pa.table(
