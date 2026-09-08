@@ -29,10 +29,10 @@ from tzrec.features.feature import BaseFeature
 from tzrec.models.genrec_model import BaseGenRecModel
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.prompt.assembler import (
-    PROMPT_CU_SEQLENS,
-    PROMPT_INPUT_IDS,
-    PROMPT_MAX_SEQLEN,
-    PROMPT_RESPONSE_LENGTHS,
+    CU_SEQLENS,
+    INPUT_IDS,
+    MAX_SEQLEN,
+    RESPONSE_LENGTHS,
 )
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.model_pb2 import ModelConfig
@@ -189,8 +189,8 @@ class GenRecCausalLMModel(BaseGenRecModel):
             Padded embeddings, attention mask and optional labels.
         """
         infos = batch.additional_infos
-        cu_seqlens = infos[PROMPT_CU_SEQLENS]
-        max_seqlen = int(infos[PROMPT_MAX_SEQLEN])
+        cu_seqlens = infos[CU_SEQLENS]
+        max_seqlen = int(infos[MAX_SEQLEN])
         starts = cu_seqlens[:-1]
         lengths = cu_seqlens[1:] - starts
         batch_size = lengths.numel()
@@ -205,8 +205,8 @@ class GenRecCausalLMModel(BaseGenRecModel):
         if not build_labels:
             return padded, mask.long(), None
 
-        input_ids = infos[PROMPT_INPUT_IDS]
-        response_lengths = infos[PROMPT_RESPONSE_LENGTHS]
+        input_ids = infos[INPUT_IDS]
+        response_lengths = infos[RESPONSE_LENGTHS]
         labels = torch.full(
             (batch_size, max_seqlen),
             self._ignore_index,

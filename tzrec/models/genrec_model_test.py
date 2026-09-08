@@ -28,8 +28,6 @@ from tzrec.models.model import ScriptWrapper, TrainWrapper
 from tzrec.prompt.assembler import (
     HOLE_POSITIONS,
     INPUT_IDS,
-    PROMPT_HOLE_POSITIONS,
-    PROMPT_INPUT_IDS,
     PromptAssembler,
 )
 from tzrec.prompt.compile import compile_prompt
@@ -129,8 +127,8 @@ class BaseGenRecModelTest(GenRecModelTestBase):
         )
 
         embeds = model.build_input(batch)
-        raw = model.lm.get_input_embeddings()(batch.additional_infos[PROMPT_INPUT_IDS])
-        holes = batch.additional_infos[PROMPT_HOLE_POSITIONS]
+        raw = model.lm.get_input_embeddings()(batch.additional_infos[INPUT_IDS])
+        holes = batch.additional_infos[HOLE_POSITIONS]
         self.assertGreater(holes.numel(), 0)
 
         changed = ~torch.isclose(embeds, raw).all(dim=-1)

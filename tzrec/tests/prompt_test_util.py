@@ -21,7 +21,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature, FgMode, create_features
 from tzrec.main import _create_model
-from tzrec.prompt.assembler import PROMPT_INFO_PREFIX, PromptAssembler
+from tzrec.prompt.assembler import PromptAssembler
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import feature_pb2
@@ -93,10 +93,9 @@ def assemble_into(
         The assembled streams keyed for ``additional_infos``.
     """
     batch = {k: torch.as_tensor(np.asarray(v)) for k, v in parsed_features.items()}
-    streams = PromptAssembler(compiled_prompt.prompt_plan, compiled_prompt.sid_space)(
+    return PromptAssembler(compiled_prompt.prompt_plan, compiled_prompt.sid_space)(
         batch
     )
-    return {PROMPT_INFO_PREFIX + k: v for k, v in streams.items()}
 
 
 _CODEBOOK = [4, 4, 4]

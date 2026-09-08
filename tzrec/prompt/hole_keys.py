@@ -25,17 +25,11 @@ from typing import Dict, Final, List
 import torch
 from torch import nn
 
-from tzrec.prompt.assembler import (
-    PROMPT_INFO_PREFIX,
-    _row_ids,
-    _within_row_index,
-    batch_device,
-)
+from tzrec.prompt.assembler import _row_ids, _within_row_index, batch_device
 from tzrec.prompt.types import PromptPlan
 from tzrec.protos.model_pb2 import FeatureGroupType
 
 HOLE_KEYS = "hole_keys"
-PROMPT_HOLE_KEYS = PROMPT_INFO_PREFIX + HOLE_KEYS
 
 
 @torch.jit.script
@@ -71,7 +65,8 @@ class HoleKeyBuilder(nn.Module):
     slots holding the same id would match; without the last two, a two-member
     slot with values ``(a, b)`` would match one with ``(b, a)`` and a permuted
     multi-value item would match itself reordered -- all plausible, all wrong,
-    and all silent.
+    and all silent. A dense member contributes its float32 bit pattern per row,
+    which is the parsed input and not a computed reduction.
 
     Args:
         prompt_plan: the compiled plan; its ``projected_slots`` fix the hole
@@ -87,94 +82,66 @@ class HoleKeyBuilder(nn.Module):
     # enough that a position cannot carry into the member index
     MEMBER_STRIDE: Final[int] = 1 << 32
 
-    names: List[str]
     member_names: List[List[str]]
     is_sequences: List[bool]
     salts: List[int]
 
     def __init__(self, prompt_plan: PromptPlan) -> None:
         super().__init__()
-        self.names = []
         self.member_names = []
         self.is_sequences = []
         self.salts = []
         for seg in prompt_plan.projected_slots:
-            self.names.append(seg.name)
             self.member_names.append(list(seg.feature_names))
             self.is_sequences.append(seg.group_type == FeatureGroupType.JAGGED_SEQUENCE)
             self.salts.append(_wrap64(self.C_SLOT * int(seg.slot_id)))
-        self.num_slots = len(self.names)
-
-    def _lengths(self, batch: Dict[str, torch.Tensor], member: str) -> torch.Tensor:
-        """Per-row item count; a dense member has one row per sample and no lengths."""
-        key = member + ".lengths"
-        if key in batch:
-            return batch[key].to(torch.int64)
-        return torch.ones(
-            batch[member + ".values"].size(0),
-            dtype=torch.int64,
-            device=batch_device(batch),
-        )
+        self.num_slots = len(self.member_names)
 
     def _fold_slot(self, batch: Dict[str, torch.Tensor], index: int) -> torch.Tensor:
         """One projected occurrence's keys, one per hole, in sample order."""
         salt = self.salts[index]
-        name = self.names[index]
         members = self.member_names[index]
         is_sequence = self.is_sequences[index]
         # the assembler's hole count: one per item of a sequence slot, one per
-        # sample of a DEEP slot
-        first = self._lengths(batch, members[0])
-        num_holes = int(torch.sum(first)) if is_sequence else int(first.numel())
+        # sample of a DEEP slot; a dense member has one row per hole either way
+        first = batch[members[0] + ".values"]
+        if first.is_floating_point():
+            num_holes = int(first.size(0))
+        else:
+            lengths = batch[members[0] + ".lengths"].to(torch.int64)
+            num_holes = int(torch.sum(lengths)) if is_sequence else int(lengths.numel())
         keys = torch.zeros(num_holes, dtype=torch.int64, device=first.device)
         for member_index in range(len(members)):
             member = members[member_index]
             raw = batch[member + ".values"]
-            key_length_key = member + ".key_lengths"
-
-            if not is_sequence:
-                # a dense member contributes its float32 bit pattern verbatim,
-                # which is the parsed input and not a computed reduction, so
-                # it is stable for a given request
-                if raw.is_floating_point():
-                    width = raw.size(1)
-                    values = (
-                        raw.to(torch.float32)
-                        .contiguous()
-                        .view(torch.int32)
-                        .to(torch.int64)
-                        .reshape(-1)
-                        & 0xFFFFFFFF
-                    )
-                    hole = torch.repeat_interleave(
-                        torch.arange(num_holes, dtype=torch.int64, device=raw.device),
-                        torch.full(
-                            (num_holes,), width, dtype=torch.int64, device=raw.device
-                        ),
-                    )
-                    local = (
-                        torch.arange(width, dtype=torch.int64, device=raw.device)
-                        .unsqueeze(0)
-                        .expand(num_holes, width)
-                        .reshape(-1)
-                    )
-                else:
-                    lengths = self._lengths(batch, member)
-                    values = raw.to(torch.int64).reshape(-1)
+            if raw.is_floating_point():
+                rows = raw.size(0)
+                width = raw.size(1)
+                values = (
+                    raw.to(torch.float32)
+                    .contiguous()
+                    .view(torch.int32)
+                    .to(torch.int64)
+                    .reshape(-1)
+                    & 0xFFFFFFFF
+                )
+                hole = torch.arange(
+                    rows, dtype=torch.int64, device=raw.device
+                ).repeat_interleave(width)
+                local = (
+                    torch.arange(width, dtype=torch.int64, device=raw.device)
+                    .unsqueeze(0)
+                    .expand(rows, width)
+                    .reshape(-1)
+                )
+            else:
+                values = raw.to(torch.int64).reshape(-1)
+                key_length_key = member + ".key_lengths"
+                if not is_sequence:
+                    lengths = batch[member + ".lengths"].to(torch.int64)
                     hole = _row_ids(lengths)
                     local = _within_row_index(lengths)
-            else:
-                if raw.is_floating_point():
-                    raise ValueError(
-                        "prompt slot ["
-                        + name
-                        + "] member ["
-                        + member
-                        + "] is a dense sequence; the fold has no per-item boundary "
-                        + "for it."
-                    )
-                values = raw.to(torch.int64).reshape(-1)
-                if key_length_key in batch:
+                elif key_length_key in batch:
                     key_lengths = batch[key_length_key].to(torch.int64).reshape(-1)
                     hole = _row_ids(key_lengths)
                     local = _within_row_index(key_lengths)

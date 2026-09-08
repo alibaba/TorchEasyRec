@@ -37,12 +37,8 @@ from tzrec.prompt.assembler import (
     HOLE_POSITIONS,
     HOLE_SLOT_COUNTS,
     INPUT_IDS,
-    PROMPT_CU_SEQLENS,
-    PROMPT_HOLE_POSITIONS,
-    PROMPT_HOLE_SLOT_COUNTS,
-    PROMPT_INPUT_IDS,
 )
-from tzrec.prompt.hole_keys import HOLE_KEYS, PROMPT_HOLE_KEYS
+from tzrec.prompt.hole_keys import HOLE_KEYS
 from tzrec.prompt.types import CompiledPrompt, PromptPlan
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
@@ -209,7 +205,7 @@ class BaseGenRecModel(BaseModel):
         Returns:
             ``(total_tokens, hidden_size)``.
         """
-        ids = batch.additional_infos[PROMPT_INPUT_IDS]
+        ids = batch.additional_infos[INPUT_IDS]
         embeds = self.lm.get_input_embeddings()(ids)
         if not self._prompt.prompt_plan.projected_slots:
             return embeds
@@ -222,7 +218,7 @@ class BaseGenRecModel(BaseModel):
         )
         # out of place: embeds carries grad from the embedding lookup
         return embeds.index_copy(
-            0, batch.additional_infos[PROMPT_HOLE_POSITIONS], projected.to(embeds.dtype)
+            0, batch.additional_infos[HOLE_POSITIONS], projected.to(embeds.dtype)
         )
 
     def _tokens_to_local_codes(
@@ -396,11 +392,11 @@ class GenRecFrontEnd(nn.Module):
         """
         infos = batch.additional_infos
         out = {
-            INPUT_IDS: infos[PROMPT_INPUT_IDS],
-            CU_SEQLENS: infos[PROMPT_CU_SEQLENS],
-            HOLE_POSITIONS: infos[PROMPT_HOLE_POSITIONS],
-            HOLE_KEYS: infos[PROMPT_HOLE_KEYS],
-            HOLE_SLOT_COUNTS: infos[PROMPT_HOLE_SLOT_COUNTS],
+            INPUT_IDS: infos[INPUT_IDS],
+            CU_SEQLENS: infos[CU_SEQLENS],
+            HOLE_POSITIONS: infos[HOLE_POSITIONS],
+            HOLE_KEYS: infos[HOLE_KEYS],
+            HOLE_SLOT_COUNTS: infos[HOLE_SLOT_COUNTS],
         }
         if self._prompt.prompt_plan.projected_slots:
             out[SLOT_EMBEDS] = project_slots(
@@ -412,6 +408,6 @@ class GenRecFrontEnd(nn.Module):
             )
         else:
             out[SLOT_EMBEDS] = torch.zeros(
-                0, 0, dtype=torch.float32, device=infos[PROMPT_INPUT_IDS].device
+                0, 0, dtype=torch.float32, device=infos[INPUT_IDS].device
             )
         return out

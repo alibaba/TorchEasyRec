@@ -18,10 +18,10 @@ from parameterized import parameterized
 from tzrec.datasets.utils import Batch
 from tzrec.models.genrec_causal_lm_model import GenRecCausalLMModel
 from tzrec.prompt.assembler import (
-    PROMPT_CU_SEQLENS,
-    PROMPT_INPUT_IDS,
-    PROMPT_MAX_SEQLEN,
-    PROMPT_RESPONSE_LENGTHS,
+    CU_SEQLENS,
+    INPUT_IDS,
+    MAX_SEQLEN,
+    RESPONSE_LENGTHS,
 )
 from tzrec.tests.prompt_test_util import (
     _CODEBOOK,
@@ -42,10 +42,10 @@ class LeftPadPackedInputsTest(unittest.TestCase):
         ignore = -7
         batch = Batch(
             additional_infos={
-                PROMPT_CU_SEQLENS: cu,
-                PROMPT_INPUT_IDS: input_ids,
-                PROMPT_MAX_SEQLEN: torch.tensor(7),
-                PROMPT_RESPONSE_LENGTHS: response_lengths,
+                CU_SEQLENS: cu,
+                INPUT_IDS: input_ids,
+                MAX_SEQLEN: torch.tensor(7),
+                RESPONSE_LENGTHS: response_lengths,
             }
         )
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)

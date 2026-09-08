@@ -16,7 +16,7 @@ import torch
 from torch import nn
 
 from tzrec.prompt.assembler import HOLE_SLOT_COUNTS, PromptAssembler
-from tzrec.prompt.hole_keys import PROMPT_HOLE_KEYS, HoleKeyBuilder, mix64
+from tzrec.prompt.hole_keys import HoleKeyBuilder, mix64
 from tzrec.prompt.types import (
     FillMode,
     PromptPlan,
@@ -192,20 +192,24 @@ class HoleKeyBuilderTest(unittest.TestCase):
         self.assertNotEqual(keys([[0.5, 1.0]]).tolist(), keys([[1.0, 0.5]]).tolist())
         self.assertEqual(keys([[0.5, 1.0], [0.5, 1.0]]).numel(), 2)
 
-    def test_a_dense_sequence_member_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "no per-item boundary"):
-            self.module(
-                {
-                    "beh.values": torch.tensor([[0.5], [1.0]]),
-                    "beh.lengths": torch.tensor([2]),
-                }
+    def test_a_dense_sequence_member_folds_each_item(self) -> None:
+        """Every row of a dense sequence is one item, so one hole and one key."""
+
+        def keys(rows):
+            return self.module(
+                {"beh.values": torch.tensor(rows), "beh.lengths": torch.tensor([2])}
             )
+
+        self.assertEqual(keys([[0.5], [1.0]]).numel(), 2)
+        self.assertEqual(keys([[0.5], [1.0]]).tolist(), keys([[0.5], [1.0]]).tolist())
+        self.assertNotEqual(
+            keys([[0.5], [1.0]]).tolist(), keys([[1.0], [0.5]]).tolist()
+        )
 
     def test_no_projected_slot_folds_nothing(self) -> None:
         keys = HoleKeyBuilder(_plan((Static((7,)),)))({"batch_size": torch.tensor(2)})
         self.assertEqual(keys.numel(), 0)
         self.assertEqual(keys.dtype, torch.int64)
-        self.assertEqual(PROMPT_HOLE_KEYS, "prompt_hole_keys")
 
     def test_scripting_preserves_the_keys(self) -> None:
         """The exported front-end folds exactly what the eager module does."""
