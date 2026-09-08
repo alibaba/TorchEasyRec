@@ -2688,7 +2688,8 @@ def _get_sparse_embedding_tensor(
             continue
         table_fqn = name[: -len(".weight")]
         export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
-        # a dense weight beside the tables, such as a genrec backbone's
+        # a dense weight beside the tables, such as a genrec slot projection
+        # head, which the sparse export does not carry
         if export_emb_name not in emb_name_to_emb_dim:
             continue
         state_values_by_emb[export_emb_name] = values

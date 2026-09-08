@@ -26,8 +26,9 @@ message PromptConfig {
     // does not enforce required, so compile_prompt raises the actual error.
     required SidSpace sid_space = 5;
 
-    // Validation ceiling, not a truncation trigger: an over-long row is an
-    // error, never truncated.
+    // Compile-time ceiling, not a truncation trigger: compile_prompt refuses a
+    // plan whose proven maximum length exceeds it. Rows are neither measured
+    // nor truncated at runtime.
     optional uint32 max_length = 6 [default = 0];
 
     // Reserves a position filled by a projected slot. Materialized only when

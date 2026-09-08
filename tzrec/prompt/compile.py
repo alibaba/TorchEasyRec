@@ -222,7 +222,7 @@ def _save_tokenizer_dir(
 
     ``tokenizer.json`` carries the vocabulary and the added SID atoms; the
     minimal ``tokenizer_config.json`` beside it names the tokenizer class and
-    the two special ids the prompt resolved, which is all a serving runtime
+    the two special tokens the prompt resolved, which is all a serving runtime
     needs to decode a generated SID atom through ``--tokenizer-path``.
     """
     os.makedirs(tokenizer_dir, exist_ok=True)

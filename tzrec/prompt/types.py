@@ -142,7 +142,8 @@ class PromptPlan:
     Args:
         segments: prompt body, in emission order.
         response_segments: supervised tail, in emission order.
-        max_length: validation ceiling; an over-long row is an error.
+        max_length: compile-time ceiling; compile refuses a plan whose
+            proven maximum exceeds it. Rows are not measured at runtime.
         max_total_length: proven ceiling when every slot is bounded, else None.
         max_holes: per-row projected-position ceiling, not a runtime shape.
         logits_suffix_len: upper bound on the supervised logits window.
