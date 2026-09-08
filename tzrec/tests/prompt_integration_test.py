@@ -15,28 +15,47 @@ import unittest
 import numpy as np
 import torch
 import torch.fx
+from parameterized import parameterized
+from transformers import AutoConfig
 
 from tzrec.datasets.utils import Batch
 from tzrec.models.model import TrainWrapper
+from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
 from tzrec.tests.prompt_test_util import (
     GenrecModelTestBase,
     assemble_into,
     offset_sid_codes,
+)
+from tzrec.utils.test_util import (
+    mark_ci_scope,
+    nv_gpu_unavailable,
+    parameterized_name_func,
 )
 
 _CODEBOOK = [4, 4, 4]
 _WORDS = ["History", "Predict", ":", ".", "<unk>", "<|im_end|>"]
 
 
+@mark_ci_scope("gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
 class PromptStackIntegrationTest(GenrecModelTestBase):
     """compile -> assemble -> model, on the real code path."""
 
     def _batch_from_codes(self, hist, answer):
+        return self._batch_from_rows([hist], [answer])
+
+    def _batch_from_rows(self, hist_rows, answer_rows):
         parsed = {
-            "hist.values": torch.tensor(offset_sid_codes(hist, _CODEBOOK)),
-            "hist.lengths": torch.tensor([len(hist)]),
-            "answer.values": torch.tensor(offset_sid_codes(answer, _CODEBOOK)),
-            "answer.lengths": torch.tensor([len(answer)]),
+            "hist.values": torch.from_numpy(
+                np.concatenate([offset_sid_codes(row, _CODEBOOK) for row in hist_rows])
+            ),
+            "hist.lengths": torch.tensor([len(row) for row in hist_rows]),
+            "answer.values": torch.from_numpy(
+                np.concatenate(
+                    [offset_sid_codes(row, _CODEBOOK) for row in answer_rows]
+                )
+            ),
+            "answer.lengths": torch.tensor([len(row) for row in answer_rows]),
         }
         streams = assemble_into(self.compiled_prompt, parsed)
         batch = Batch()
@@ -62,17 +81,68 @@ class PromptStackIntegrationTest(GenrecModelTestBase):
         self.assertEqual(rows, self.compiled_prompt.sid_space.target_vocab_size)
         self.assertGreater(rows, self.compiled_prompt.sid_space.band_hi[-1])
 
-    def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
-        model = self._model()
-        batch = self._batch_from_codes([0, 1, 2, 3, 0, 1], [1, 2, 3])
-        predictions = model.predict(batch)
-        loss = model.loss(predictions, batch)["ce_loss"]
+    @parameterized.expand(
+        [["qwen2"], ["qwen3"]],
+        name_func=parameterized_name_func,
+    )
+    def test_packed_rows_match_solo_runs_and_backpropagate(
+        self, model_type: str
+    ) -> None:
+        device = torch.device("cuda")
+        backbone = os.path.join(self.test_dir, model_type)
+        AutoConfig.for_model(
+            model_type,
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            tie_word_embeddings=False,
+        ).save_pretrained(backbone)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            model = self._model(
+                lm_parameter_dtype=GenrecModelConfig.BF16,
+                hf_model_name_or_path=backbone,
+            ).to(device)
+        model.eval()
+        hist_rows = [[0, 1, 2], [3, 0, 1, 2, 3, 0]]
+        answer_rows = [[1, 2, 3], [2, 3, 0]]
+        packed_batch = self._batch_from_rows(hist_rows, answer_rows).to(device)
+
+        packed = model.predict(packed_batch)
+        with torch.no_grad():
+            solos = [
+                model.predict(self._batch_from_codes(hist, answer).to(device))
+                for hist, answer in zip(hist_rows, answer_rows)
+            ]
+            changed = model.predict(
+                self._batch_from_rows([[3, 3, 3], hist_rows[1]], answer_rows).to(device)
+            )
+
+        torch.testing.assert_close(
+            packed["logits"],
+            torch.cat([result["logits"] for result in solos]),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            packed["labels"], torch.cat([result["labels"] for result in solos])
+        )
+        torch.testing.assert_close(
+            packed["logits"][1], changed["logits"][1], atol=0, rtol=0
+        )
+
+        loss = model.loss(packed, packed_batch)["ce_loss"]
         self.assertTrue(bool(torch.isfinite(loss)))
         loss.backward()
-
         grad = model.lm.get_input_embeddings().weight.grad
         self.assertIsNotNone(grad)
-        self.assertTrue(bool((grad.abs().sum() > 0)))
+        self.assertTrue(bool(torch.isfinite(grad).all()))
+        self.assertGreater(float(grad.abs().sum()), 0)
 
     def test_training_forward_survives_fx_tracing(self) -> None:
         model = self._model()

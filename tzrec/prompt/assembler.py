@@ -179,6 +179,11 @@ class PromptAssembler:
                 seg_lengths[index] = projected_lengths[seg.name]
 
         row_lengths = seg_lengths.sum(axis=0)
+        body_lengths = seg_lengths[:body_count].sum(axis=0)
+        empty = np.flatnonzero(body_lengths == 0)
+        if empty.size:
+            sample = int(empty[0])
+            raise ValueError(f"assembled sample {sample} has an empty prompt body.")
         cu_seqlens = np.concatenate(([0], np.cumsum(row_lengths)))
         max_length = self._prompt_plan.max_length
         if max_length:

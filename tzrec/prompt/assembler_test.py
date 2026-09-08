@@ -238,6 +238,18 @@ class PromptAssemblerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "never truncated"):
             asm.forward(_parsed({"hist": [np.array([1, 6, 11])]}))
 
+    def test_empty_prompt_body_is_rejected(self) -> None:
+        asm = _asm(
+            (_slot("hist", FillMode.INLINE),),
+            response=(_slot("answer", FillMode.INLINE),),
+        )
+        parsed = _parsed(
+            {"hist": [np.array([], dtype=np.int64)], "answer": [np.array([1, 6, 11])]}
+        )
+
+        with self.assertRaisesRegex(ValueError, "sample 0 has an empty prompt body"):
+            asm.forward(parsed)
+
     def test_inline_without_a_sid_space_is_rejected_at_construction(self) -> None:
         plan = _plan((_slot("hist", FillMode.INLINE),))
         with self.assertRaisesRegex(ValueError, "no sid_space was compiled"):

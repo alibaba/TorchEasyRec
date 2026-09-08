@@ -127,8 +127,11 @@ class BaseGenrecModel(BaseModel):
             lm_parameter_dtype: dtype of the LM parameters.
         """
         config = AutoConfig.from_pretrained(hf_model_name_or_path)
-        model = AutoModelForCausalLM.from_config(config)
-        self.lm = model.to(_PARAM_DTYPE[lm_parameter_dtype])
+        self.lm = AutoModelForCausalLM.from_config(
+            config,
+            attn_implementation="flash_attention_2",
+            torch_dtype=_PARAM_DTYPE[lm_parameter_dtype],
+        )
         self._check_backbone_interfaces(hf_model_name_or_path)
 
     def _check_backbone_interfaces(self, hf_model_name_or_path: str) -> None:
