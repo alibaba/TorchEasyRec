@@ -28,22 +28,15 @@ from torch import nn
 from tzrec.constant import HF_EXPORT_META_FILENAME
 from tzrec.features.feature import BaseFeature
 from tzrec.prompt.compile import compile_prompt
-from tzrec.prompt.persist import (
-    PROMPT_DIR,
-    TOKENIZER_DIR,
-    read_bundle_uuid,
-    write_serving_contract,
-)
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.logging_util import logger
 
-SERVING_ARCH = "PromptGenRecForCausalLM"
-SERVING_MODEL_TYPE = "prompt_genrec"
+SERVING_ARCH = "GenRecForCausalLM"
+SERVING_MODEL_TYPE = "genrec"
 
 _HF_ASSET_FILES = (
-    "config.json",
     "generation_config.json",
     "tokenizer.json",
     "tokenizer_config.json",
@@ -86,44 +79,15 @@ def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
         json.dump(meta, f, indent=2)
 
 
-def write_composite_config(export_dir: str) -> None:
-    """Rewrite ``config.json`` so the backbone sits under ``text_config``.
-
-    That is what names the backbone to a serving runtime that composes an
-    arbitrary causal LM behind one registered architecture, and what makes it
-    treat the model as carrying a second modality, which is what a projected
-    prompt slot is.
-
-    Args:
-        export_dir: the HuggingFace export directory.
-    """
-    path = os.path.join(export_dir, "config.json")
-    with open(path, "r") as f:
-        backbone: Dict[str, Any] = json.load(f)
-    if backbone.get("model_type") == SERVING_MODEL_TYPE:
-        return
-    composite: Dict[str, Any] = {
-        "architectures": [SERVING_ARCH],
-        "model_type": SERVING_MODEL_TYPE,
-        "text_config": backbone,
-    }
-    # a runtime that reads only the outer config still needs to size its cache
-    for key in ("vocab_size", "hidden_size", "num_hidden_layers", "torch_dtype"):
-        if key in backbone:
-            composite[key] = backbone[key]
-    with open(path, "w") as f:
-        json.dump(composite, f, indent=2)
-    logger.info(
-        f"wrote a composite config naming backbone "
-        f"{backbone.get('architectures', ['?'])[0]} under {SERVING_ARCH}."
-    )
-
-
-def dcp_to_hf(ckpt_dir: str, out_dir: str) -> None:
+def dcp_to_hf(ckpt_dir: str, out_dir: str) -> Dict[str, Any]:
     """Convert a checkpoint with co-located HF assets to a ``from_pretrained`` dir.
 
     Keys that do not map 1:1 onto the co-located ``config.json`` raise rather
-    than write a partial model.
+    than write a partial model. The config itself is not written: the caller
+    composes the one ``config.json`` the export carries.
+
+    Returns:
+        The backbone config as ``config.json`` would hold it.
     """
     from torch.distributed.checkpoint.state_dict_loader import (
         _load_state_dict_from_keys,
@@ -203,6 +167,7 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str) -> None:
         src = os.path.join(ckpt_dir, fname)
         if os.path.exists(src):
             shutil.copy(src, os.path.join(out_dir, fname))
+    return json.loads(cfg.to_json_string())
 
 
 def export_hf_assets(
@@ -213,9 +178,12 @@ def export_hf_assets(
 ) -> None:
     """Write what an LLM engine reads beside the scripted front-end.
 
-    The HuggingFace weights and composite config, the extended tokenizer under
-    ``prompt/tokenizer`` and ``prompt/prompt.json``. A remote ``export_dir`` is
-    written locally and uploaded, as ``export_model`` does for its own files.
+    The HuggingFace weights, the extended tokenizer and one composite
+    ``config.json``: the backbone sits under ``text_config``, which names it to
+    a runtime that composes an arbitrary causal LM behind one registered
+    architecture and treats a projected prompt slot as a second modality. A
+    remote ``export_dir`` is written locally and uploaded, as ``export_model``
+    does for its own files.
 
     Args:
         pipeline_config: the pipeline being exported.
@@ -226,20 +194,26 @@ def export_hf_assets(
     fs, local_dir = url_to_fs(export_dir)
     if fs is not None:
         local_dir = tempfile.mkdtemp()
-    dcp_to_hf(checkpoint_path, local_dir)
-    write_composite_config(local_dir)
-    prompt_config = pipeline_config.prompt_config
+    backbone = dcp_to_hf(checkpoint_path, local_dir)
     compiled = compile_prompt(
-        prompt_config,
+        pipeline_config.prompt_config,
         features,
         list(pipeline_config.data_config.label_fields),
-        tokenizer_dir=os.path.join(local_dir, PROMPT_DIR, TOKENIZER_DIR),
+        tokenizer_dir=local_dir,
     )
-    write_serving_contract(
-        compiled.sid_space,
-        read_bundle_uuid(prompt_config.sid_space.manifest_path),
-        local_dir,
-    )
+    composite: Dict[str, Any] = {
+        "architectures": [SERVING_ARCH],
+        "model_type": SERVING_MODEL_TYPE,
+        "text_config": backbone,
+        "eos_token_id": compiled.sid_space.eos_token_id,
+        "pad_token_id": compiled.sid_space.pad_token_id,
+    }
+    # a runtime that reads only the outer config still needs to size its cache
+    for key in ("vocab_size", "hidden_size", "num_hidden_layers", "torch_dtype"):
+        if key in backbone:
+            composite[key] = backbone[key]
+    with open(os.path.join(local_dir, "config.json"), "w") as f:
+        json.dump(composite, f, indent=2)
     if fs is not None:
         fs.upload(local_dir, export_dir, recursive=True, file_thread_num=os.cpu_count())
         shutil.rmtree(local_dir)

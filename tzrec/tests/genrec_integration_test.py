@@ -131,9 +131,8 @@ class GenRecIntegrationTest(unittest.TestCase):
             "model_acc.json",
             "config.json",
             "model.safetensors",
-            "prompt/prompt.json",
-            "prompt/tokenizer/tokenizer.json",
-            "prompt/tokenizer/tokenizer_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
         ):
             self.assertTrue(os.path.exists(os.path.join(export_dir, name)), name)
         self.assertFalse(os.path.exists(os.path.join(export_dir, "sparse")))
@@ -171,26 +170,23 @@ class GenRecIntegrationTest(unittest.TestCase):
         # what the engine loads beside it
         with open(os.path.join(export_dir, "config.json"), "r") as f:
             hf_config = json.load(f)
-        self.assertEqual(hf_config["architectures"], ["PromptGenRecForCausalLM"])
-        self.assertEqual(hf_config["model_type"], "prompt_genrec")
+        self.assertEqual(hf_config["architectures"], ["GenRecForCausalLM"])
+        self.assertEqual(hf_config["model_type"], "genrec")
+        self.assertEqual(
+            hf_config["text_config"]["architectures"], ["Qwen2ForCausalLM"]
+        )
         self.assertEqual(hf_config["text_config"]["model_type"], "qwen2")
-        self.assertEqual(
-            hf_config["text_config"]["vocab_size"], compiled.sid_space.target_vocab_size
-        )
-        with open(os.path.join(export_dir, "prompt", "prompt.json"), "r") as f:
-            contract = json.load(f)
-        self.assertEqual(list(contract), ["sid_space", "bundle_uuid"])
-        self.assertEqual(contract["bundle_uuid"], _BUNDLE_UUID)
-        self.assertEqual(
-            contract["sid_space"]["band_lo"], list(compiled.sid_space.band_lo)
-        )
-        self.assertEqual(
-            contract["sid_space"]["band_hi"], list(compiled.sid_space.band_hi)
-        )
+        self.assertEqual(hf_config["vocab_size"], compiled.sid_space.target_vocab_size)
+        self.assertEqual(hf_config["eos_token_id"], compiled.sid_space.eos_token_id)
+        self.assertEqual(hf_config["pad_token_id"], compiled.sid_space.pad_token_id)
+        self.assertNotIn("sid_space", hf_config)
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            os.path.join(export_dir, "prompt", "tokenizer")
+        # the index builder derives the token base from the first SID token
+        tokenizer = AutoTokenizer.from_pretrained(export_dir)
+        self.assertEqual(
+            tokenizer.convert_tokens_to_ids("<|sid_0|>"),
+            compiled.sid_space.base_vocab_size,
         )
         self.assertEqual(tokenizer.decode([compiled.sid_space.band_lo[0]]), "<|sid_0|>")
         self.assertEqual(
@@ -218,7 +214,7 @@ class GenRecIntegrationTest(unittest.TestCase):
             "sparse_features.json",
         ):
             self.assertTrue(os.path.exists(os.path.join(sparse_dir, name)), name)
-        for name in ("config.json", "model.safetensors", "prompt/prompt.json"):
+        for name in ("config.json", "model.safetensors", "tokenizer.json"):
             self.assertTrue(os.path.exists(os.path.join(dist_dir, name)), name)
         with open(os.path.join(dist_dir, "model_acc.json"), "r") as f:
             self.assertEqual(json.load(f)["DISTRIBUTED_EMBEDDING"], "1")

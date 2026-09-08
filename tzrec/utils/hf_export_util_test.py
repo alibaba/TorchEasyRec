@@ -131,7 +131,11 @@ class HfExportUtilTest(unittest.TestCase):
         lm = _tied_lm()
         ckpt_dir = self._save_ckpt(_DmpLike(_TrainWrapper(_GenRec(lm))))
         out_dir = os.path.join(self.test_dir, "hf_out")
-        dcp_to_hf(ckpt_dir, out_dir)
+        config = dcp_to_hf(ckpt_dir, out_dir)
+        # the caller composes config.json; here the backbone's own is enough
+        self.assertEqual(config["model_type"], lm.config.model_type)
+        with open(os.path.join(out_dir, "config.json"), "w") as f:
+            json.dump(config, f)
 
         st = load_file(os.path.join(out_dir, "model.safetensors"))
         self.assertNotIn("lm_head.weight", st)
