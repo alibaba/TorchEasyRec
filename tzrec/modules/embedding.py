@@ -598,8 +598,23 @@ def _add_embedding_bag_config(
         for feature_name in emb_bag_config.feature_names:
             if feature_name not in existed_emb_bag_config.feature_names:
                 existed_emb_bag_config.feature_names.append(feature_name)
+        # a shared table is weighted when any of its features needs weight
+        # pyre-ignore [16]
+        existed_emb_bag_config.is_weighted |= emb_bag_config.is_weighted
     else:
         emb_bag_configs[emb_bag_config.name] = emb_bag_config
+
+
+def _is_weighted(emb_bag_configs: Dict[str, EmbeddingBagConfig]) -> bool:
+    """Any table of the embedding bag collection is looked up with weight or not.
+
+    Args:
+        emb_bag_configs(Dict[str, EmbeddingBagConfig]): a dict contains emb_bag_configs
+
+    Returns:
+        whether the EmbeddingBagCollection should be built as weighted.
+    """
+    return any(x.is_weighted for x in emb_bag_configs.values())
 
 
 def _add_embedding_config(
@@ -854,11 +869,17 @@ class EmbeddingGroupImpl(nn.Module):
             self._group_feature_output_dims[group_name] = feature_output_dims
         self._all_group_str = "__".join(self._group_to_feature_names.keys())
 
-        self.ebc = EmbeddingBagCollection(list(emb_bag_configs.values()), device=device)
+        self.ebc = EmbeddingBagCollection(
+            list(emb_bag_configs.values()),
+            is_weighted=_is_weighted(emb_bag_configs),
+            device=device,
+        )
         if self.has_mc_sparse:
             self.mc_ebc = ManagedCollisionEmbeddingBagCollection(
                 EmbeddingBagCollection(
-                    list(mc_emb_bag_configs.values()), device=device
+                    list(mc_emb_bag_configs.values()),
+                    is_weighted=_is_weighted(mc_emb_bag_configs),
+                    device=device,
                 ),
                 ManagedCollisionCollection(
                     mc_modules, list(mc_emb_bag_configs.values())
@@ -873,12 +894,16 @@ class EmbeddingGroupImpl(nn.Module):
 
         if need_input_tile_emb:
             self.ebc_user = EmbeddingBagCollection(
-                list(emb_bag_configs_user.values()), device=device
+                list(emb_bag_configs_user.values()),
+                is_weighted=_is_weighted(emb_bag_configs_user),
+                device=device,
             )
             if self.has_mc_sparse_user:
                 self.mc_ebc_user = ManagedCollisionEmbeddingBagCollection(
                     EmbeddingBagCollection(
-                        list(mc_emb_bag_configs_user.values()), device=device
+                        list(mc_emb_bag_configs_user.values()),
+                        is_weighted=_is_weighted(mc_emb_bag_configs_user),
+                        device=device,
                     ),
                     ManagedCollisionCollection(
                         mc_modules_user, list(mc_emb_bag_configs_user.values())

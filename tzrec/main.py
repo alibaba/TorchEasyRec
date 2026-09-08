@@ -90,7 +90,7 @@ from tzrec.utils import (
     dynamicemb_util,
     predict_util,
 )
-from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper
+from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -518,12 +518,33 @@ def _train_and_evaluate(
             model.train()
 
     # In-process online dense export: rank zero builds the serving graph once
-    # here and hot-swaps gathered weights per trigger; independent of saves.
+    # here and hot-swaps gathered weights per delta-dump trigger; independent
+    # of saves.
+    publish_interval_minutes = None
+    if train_config.HasField(
+        "delta_embedding_dump_config"
+    ) and train_config.delta_embedding_dump_config.HasField(
+        "paired_dump_interval_minutes"
+    ):
+        publish_interval_minutes = (
+            train_config.delta_embedding_dump_config.paired_dump_interval_minutes
+        )
     online_dense_exporter = OnlineDenseExportManager(
         model_dir,
         pipeline_config_path or os.path.join(model_dir, "pipeline.config"),
         model,
+        publish_interval_minutes=publish_interval_minutes,
     )
+    if online_dense_exporter.enabled and (
+        delta_embedding_dumper is None
+        or not train_config.delta_embedding_dump_config.HasField("feature_store_config")
+    ):
+        raise RuntimeError(
+            "ONLINE_DENSE_EXPORT=1 requires train_config.delta_embedding_dump_config "
+            "with feature_store_config: the paired delta-dump decision is the only "
+            "dense export trigger and the FeatureStore upload watermark is the only "
+            "publish gate."
+        )
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
@@ -596,8 +617,9 @@ def _train_and_evaluate(
                         if not lr.by_epoch:
                             lr.step()
 
+                    dump_decision = DumpDecision.NONE
                     if delta_embedding_dumper is not None:
-                        delta_embedding_dumper.maybe_dump(i_step)
+                        dump_decision = delta_embedding_dumper.maybe_dump(i_step)
                 except StopIteration:
                     # pass completed: later saves should record positions
                     # within the next pass, on top of the completed-pass count.
@@ -622,10 +644,20 @@ def _train_and_evaluate(
                     data_timestamp=data_timestamp,
                 ):
                     run_eval(i_step, i_epoch)
-                # Unconditional: the exporter decides its own (checkpoint-
-                # independent) cadence and enters its collective in lockstep.
+                # Lockstep: the rank-uniform paired dump decision is the only
+                # export trigger, and the publish poll is an every-step
+                # collective.
                 online_dense_exporter.maybe_export(
-                    i_step, data_timestamp, model, dense_ema=export_dense_ema
+                    i_step,
+                    data_timestamp,
+                    model,
+                    force=dump_decision == DumpDecision.PAIRED,
+                    dense_ema=export_dense_ema,
+                )
+                online_dense_exporter.poll_publish(
+                    delta_embedding_dumper.completed_upload_state()
+                    if delta_embedding_dumper is not None
+                    else None
                 )
                 if prof is not None:
                     prof.step()
@@ -640,9 +672,6 @@ def _train_and_evaluate(
                 data_timestamp=data_timestamp,
             ):
                 run_eval(i_step, i_epoch)
-            online_dense_exporter.maybe_export(
-                i_step, data_timestamp, model, dense_ema=export_dense_ema
-            )
 
             if use_step and i_step >= train_config.num_steps - 1:
                 break
@@ -656,12 +685,15 @@ def _train_and_evaluate(
         # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
         # the only checkpoint and persists whatever on_train_end produced.
         _model.on_train_end()
+        final_dump_step = None
         if delta_embedding_dumper is not None:
             # Flush the trailing partial interval before the final checkpoint.
-            # final_dump skips dump-boundary steps already written by maybe_dump
-            # (all ranks run the same step count, so every rank participated in
-            # those dumps and reaches the same final step).
-            delta_embedding_dumper.final_dump(i_step)
+            # final_dump does not re-dump boundary steps already written by
+            # maybe_dump (all ranks run the same step count, so every rank
+            # participated in those dumps and reaches the same final step) but
+            # still returns the step so the final export can pair with a
+            # sparse-only boundary.
+            final_dump_step = delta_embedding_dumper.final_dump(i_step)
 
         _log_train(
             i_step,
@@ -686,12 +718,25 @@ def _train_and_evaluate(
             final=True,
         ):
             run_eval(i_step, i_epoch)
-        online_dense_exporter.maybe_export(
-            i_step,
-            data_timestamp,
-            model,
-            final=True,
-            dense_ema=export_dense_ema,
+        if final_dump_step is not None:
+            # Publish only paired versions: the final dense export uses the
+            # step the trailing delta was actually dumped at; the exporter's
+            # per-step dedupe skips a paired boundary that already exported.
+            online_dense_exporter.maybe_export(
+                final_dump_step,
+                data_timestamp,
+                model,
+                final=True,
+                dense_ema=export_dense_ema,
+            )
+        if delta_embedding_dumper is not None:
+            # Drain uploads first so the final watermark covers the final dump.
+            delta_embedding_dumper.close()
+        # finalize_publish is a collective; it must not run on exception paths.
+        online_dense_exporter.finalize_publish(
+            delta_embedding_dumper.completed_upload_state()
+            if delta_embedding_dumper is not None
+            else None
         )
     finally:
         online_dense_exporter.close()

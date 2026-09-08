@@ -16,7 +16,7 @@ step, samples keys from its shard set, and queries the configured explicit
 FeatureDB version through ``DynamicEmbeddingFeatureView.get_online_features``.
 
 Local parquet files are only produced alongside FeatureStore uploads when
-``feature_store_config.retain_local_dump`` is enabled.
+``delta_embedding_dump_config.retain_local_dump`` is enabled.
 
 Example::
 
@@ -46,6 +46,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tzrec.utils import config_util
+from tzrec.utils.checkpoint_util import remap_input_tile_user_key
 from tzrec.utils.feature_store_delta_uploader import (
     FEATURE_STORE_PK_FIELD,
     FEATURE_STORE_SK_FIELD,
@@ -212,7 +213,7 @@ def sample_local_records(
         raise ValueError("sample_count must be > 0")
 
     columns = [
-        FEATURE_STORE_PK_FIELD,
+        "table_fqn",
         FEATURE_STORE_SK_FIELD,
         FEATURE_STORE_VALUE_FIELD,
     ]
@@ -232,11 +233,13 @@ def sample_local_records(
         for batch in parquet_file.iter_batches(batch_size=1024, columns=columns):
             values = batch.to_pydict()
             for name, key_id, vector in zip(
-                values[FEATURE_STORE_PK_FIELD],
+                values["table_fqn"],
                 values[FEATURE_STORE_SK_FIELD],
                 values[FEATURE_STORE_VALUE_FIELD],
             ):
-                name = str(name)
+                # The dump keeps the native table_fqn; the uploader remaps it
+                # to the FeatureStore embedding_name before upload.
+                name = remap_input_tile_user_key(str(name))
                 if embedding_name is not None and name != embedding_name:
                     continue
                 identity = (name, int(key_id))
@@ -416,7 +419,9 @@ def create_feature_store_view(settings: FeatureStoreUploadSettings) -> Any:
     except (TypeError, ValueError):
         parameters = {}
     if "test_mode" in parameters:
-        kwargs["test_mode"] = True
+        # Same data-plane routing as the training-time uploader, so a config
+        # that uploads from a given network location also reads back from it.
+        kwargs["test_mode"] = settings.test_mode
 
     client = FeatureStoreClient(**kwargs)
     project = client.get_project(settings.project_name)
@@ -454,12 +459,12 @@ def run_check(args: argparse.Namespace) -> int:
         raise ValueError(
             "pipeline config delta_embedding_dump_config has no feature_store_config"
         )
-    feature_store_config = dump_config.feature_store_config
-    if not feature_store_config.retain_local_dump:
+    if not dump_config.retain_local_dump:
         raise ValueError(
-            "feature_store_config.retain_local_dump must be enabled so the "
-            "training job keeps local delta parquet files for readback"
+            "delta_embedding_dump_config.retain_local_dump must be enabled so "
+            "the training job keeps local delta parquet files for readback"
         )
+    feature_store_config = dump_config.feature_store_config
     settings = FeatureStoreUploadSettings.from_proto(feature_store_config)
     output_dir = resolve_output_dir(
         args.pipeline_config,

@@ -92,6 +92,7 @@ from tzrec.utils.delta_embedding_dump import (
     _DELTA_DUMP_QUANT_SCHEMA,
     _DELTA_DUMP_SCHEMA,
     DeltaEmbeddingDumper,
+    DumpDecision,
     ModelDeltaTracker,
     _dynamicemb_pop_evicted_keys_supported,
     _local_table_weight,
@@ -343,7 +344,7 @@ def _run_sharded_delta_embedding_dump(rank: int, world_size: int, output_dir: st
         dumper = DeltaEmbeddingDumper(
             model,
             DeltaEmbeddingDumpConfig(
-                dump_interval_steps=1,
+                paired_dump_interval_steps=1,
                 output_dir=output_dir,
                 file_prefix="delta",
             ),
@@ -383,7 +384,7 @@ def _run_shared_table_fqn_delta_embedding_dump(
         dumper = DeltaEmbeddingDumper(
             sharded_model,
             DeltaEmbeddingDumpConfig(
-                dump_interval_steps=1,
+                paired_dump_interval_steps=1,
                 output_dir=output_dir,
                 file_prefix="delta",
             ),
@@ -533,7 +534,7 @@ def _run_zch_delta_embedding_dump(rank: int, world_size: int, output_dir: str):
         dumper = DeltaEmbeddingDumper(
             model,
             DeltaEmbeddingDumpConfig(
-                dump_interval_steps=10,
+                paired_dump_interval_steps=10,
                 output_dir=output_dir,
                 file_prefix="delta",
             ),
@@ -648,7 +649,7 @@ def _run_zch_lifecycle_delta_embedding_dump(
         dumper = DeltaEmbeddingDumper(
             model,
             DeltaEmbeddingDumpConfig(
-                dump_interval_steps=10,
+                paired_dump_interval_steps=10,
                 output_dir=output_dir,
                 file_prefix="delta",
             ),
@@ -712,33 +713,79 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             validate_delta_embedding_dump_config(None, torch.device("cpu"))
 
     def test_present_config_allows_multi_gpu_cuda_device(self):
-        config = DeltaEmbeddingDumpConfig(dump_interval_steps=10)
+        config = DeltaEmbeddingDumpConfig(paired_dump_interval_steps=10)
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
             validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
 
     def test_present_config_requires_cuda_device(self):
-        config = DeltaEmbeddingDumpConfig(dump_interval_steps=10)
+        config = DeltaEmbeddingDumpConfig(paired_dump_interval_steps=10)
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "1"}):
             with self.assertRaisesRegex(ValueError, "CUDA"):
                 validate_delta_embedding_dump_config(config, torch.device("cpu"))
 
     def test_present_config_requires_positive_interval(self):
-        config = DeltaEmbeddingDumpConfig(dump_interval_steps=0)
+        config = DeltaEmbeddingDumpConfig(paired_dump_interval_steps=0)
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "1"}):
-            with self.assertRaisesRegex(ValueError, "dump_interval_steps"):
+            with self.assertRaisesRegex(ValueError, "paired_dump_interval_steps"):
                 validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
 
     def test_present_config_accepts_minutes_interval(self):
-        config = DeltaEmbeddingDumpConfig(dump_interval_minutes=5)
+        config = DeltaEmbeddingDumpConfig(paired_dump_interval_minutes=5)
         validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
 
     def test_present_config_requires_positive_minutes_interval(self):
-        config = DeltaEmbeddingDumpConfig(dump_interval_minutes=0)
-        with self.assertRaisesRegex(ValueError, "dump_interval_minutes"):
+        config = DeltaEmbeddingDumpConfig(paired_dump_interval_minutes=0)
+        with self.assertRaisesRegex(ValueError, "paired_dump_interval_minutes"):
+            validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
+
+    def test_present_config_requires_explicit_paired_interval(self):
+        config = DeltaEmbeddingDumpConfig()
+        with self.assertRaisesRegex(ValueError, "exactly one of"):
+            validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
+
+    def test_sparse_interval_requires_same_dimension_paired_interval(self):
+        for config in (
+            DeltaEmbeddingDumpConfig(
+                paired_dump_interval_minutes=5, sparse_dump_interval_steps=10
+            ),
+            DeltaEmbeddingDumpConfig(
+                paired_dump_interval_steps=100, sparse_dump_interval_minutes=5
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "do not mix"):
+                validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
+
+    def test_sparse_interval_must_be_strictly_smaller_than_paired(self):
+        for config in (
+            DeltaEmbeddingDumpConfig(
+                paired_dump_interval_steps=10, sparse_dump_interval_steps=10
+            ),
+            DeltaEmbeddingDumpConfig(
+                paired_dump_interval_steps=10, sparse_dump_interval_steps=20
+            ),
+            DeltaEmbeddingDumpConfig(
+                paired_dump_interval_minutes=5, sparse_dump_interval_minutes=5
+            ),
+            DeltaEmbeddingDumpConfig(
+                paired_dump_interval_minutes=5, sparse_dump_interval_minutes=0
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "sparse_dump_interval"):
+                validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
+
+    def test_sparse_interval_smaller_than_paired_is_accepted(self):
+        for config in (
+            DeltaEmbeddingDumpConfig(
+                paired_dump_interval_steps=10, sparse_dump_interval_steps=4
+            ),
+            DeltaEmbeddingDumpConfig(
+                paired_dump_interval_minutes=5, sparse_dump_interval_minutes=1
+            ),
+        ):
             validate_delta_embedding_dump_config(config, torch.device("cuda:0"))
 
     def test_init_validates_cuda_device(self):
-        config = DeltaEmbeddingDumpConfig(dump_interval_steps=10)
+        config = DeltaEmbeddingDumpConfig(paired_dump_interval_steps=10)
         with tempfile.TemporaryDirectory() as tmp_dir:
             with self.assertRaisesRegex(ValueError, "CUDA"):
                 DeltaEmbeddingDumper(
@@ -791,7 +838,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     @staticmethod
     def _feature_store_delta_config(quant_type):
         return DeltaEmbeddingDumpConfig(
-            dump_interval_steps=10,
+            paired_dump_interval_steps=10,
             quant_type=quant_type,
             feature_store_config=FeatureStoreConfig(
                 region="cn-test",
@@ -1156,25 +1203,47 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def test_final_dump_skips_boundary_step_to_avoid_overwrite(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = 50
-        dumper._interval_secs = None
+        dumper._paired_interval_steps = 50
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = None
+        dumper._sparse_interval_secs = None
         dumper._last_dump_step = None
         dumper._world_size = 1
         with mock.patch.object(dumper, "dump") as dump_mock:
-            # Boundary steps were already written by maybe_dump; skip them so a
-            # trailing empty shard never overwrites the real one.
-            self.assertIsNone(dumper.final_dump(50))
-            self.assertIsNone(dumper.final_dump(100))
+            # Boundary steps were already written by maybe_dump; skip the dump
+            # so a trailing empty shard never overwrites the real one, but
+            # still report the step for the final export pairing.
+            self.assertEqual(dumper.final_dump(50), 50)
+            self.assertEqual(dumper.final_dump(100), 100)
             dump_mock.assert_not_called()
 
             # Step 0 is not publishable; final_dump returns early. A positive
-            # trailing partial interval must still be flushed.
+            # trailing partial interval must still be flushed, and final_dump
+            # reports the step it dumped so the caller can pair exports to it.
             self.assertIsNone(dumper.final_dump(0))
-            dumper.final_dump(73)
+            self.assertEqual(dumper.final_dump(73), 73)
             self.assertEqual(
                 [call.args[0] for call in dump_mock.call_args_list],
                 [73],
             )
+
+    def test_final_dump_skips_sparse_boundary_but_returns_step(self):
+        # A sparse-only boundary was dumped by maybe_dump without a dense
+        # export; final_dump must not re-dump it (empty-shard overwrite) but
+        # must return the step so the caller fires the final paired export.
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._paired_interval_steps = 50
+        dumper._sparse_interval_steps = 25
+        dumper._paired_interval_secs = None
+        dumper._sparse_interval_secs = None
+        dumper._last_dump_step = None
+        dumper._world_size = 1
+        with mock.patch.object(dumper, "dump") as dump_mock:
+            self.assertEqual(dumper.final_dump(25), 25)
+            self.assertEqual(dumper.final_dump(50), 50)
+            dump_mock.assert_not_called()
+            self.assertEqual(dumper.final_dump(63), 63)
+            dump_mock.assert_called_once_with(63)
 
     def test_final_dump_syncs_step_across_ranks_before_flush(self):
         # A lagging rank reaches final_dump at a boundary step (50) while the
@@ -1182,8 +1251,10 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         # skip and write no shard, leaving step_73/ ragged. The MAX all_reduce
         # lifts every rank to 73 so all take the same dump-into-step_73 path.
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = 50
-        dumper._interval_secs = None
+        dumper._paired_interval_steps = 50
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = None
+        dumper._sparse_interval_secs = None
         dumper._last_dump_step = None
         dumper._world_size = 2
 
@@ -1202,51 +1273,97 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             ),
             mock.patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
         ):
-            dumper.final_dump(50)
+            self.assertEqual(dumper.final_dump(50), 73)
         dump_mock.assert_called_once_with(73)
 
     def test_final_dump_skips_step_already_dumped_by_time_interval(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = None
-        dumper._interval_secs = 60.0
+        dumper._paired_interval_steps = None
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = 60.0
+        dumper._sparse_interval_secs = None
         dumper._last_dump_step = 73
         dumper._world_size = 1
         with mock.patch.object(dumper, "dump") as dump_mock:
-            self.assertIsNone(dumper.final_dump(73))
+            self.assertEqual(dumper.final_dump(73), 73)
         dump_mock.assert_not_called()
 
     def test_maybe_dump_uses_checkpoint_aligned_global_step(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = 50
-        dumper._interval_secs = None
+        dumper._paired_interval_steps = 50
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = None
+        dumper._sparse_interval_secs = None
         dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 1
+        dumper._decision_group = None
         dumper._feature_store_enabled = False
         dumper._uploader = None
         dumper._tracker = mock.MagicMock()
         with mock.patch.object(dumper, "dump") as dump_mock:
-            dumper.maybe_dump(49)
+            self.assertFalse(dumper.maybe_dump(49))
             dump_mock.assert_not_called()
-            dumper.maybe_dump(50)
+            self.assertTrue(dumper.maybe_dump(50))
             dump_mock.assert_called_once_with(50)
-            dumper.maybe_dump(99)
+            self.assertFalse(dumper.maybe_dump(99))
             dump_mock.assert_called_once_with(50)
-            dumper.maybe_dump(100)
+            self.assertTrue(dumper.maybe_dump(100))
             self.assertEqual(
                 [call.args[0] for call in dump_mock.call_args_list],
                 [50, 100],
             )
         self.assertEqual(dumper._tracker.step.call_count, 4)
 
-    def test_maybe_dump_uses_elapsed_time_with_fixed_rate_schedule(self):
+    def test_steps_cadence_sparse_only_between_paired_boundaries(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = None
-        dumper._interval_secs = 60.0
-        dumper._next_dump_time = 160.0
+        dumper._paired_interval_steps = 10
+        dumper._sparse_interval_steps = 4
+        dumper._paired_interval_secs = None
+        dumper._sparse_interval_secs = None
+        dumper._next_paired_time = None
+        dumper._next_sparse_time = None
         dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 1
+        dumper._decision_group = None
+        dumper._feature_store_enabled = False
+        dumper._uploader = None
+        dumper._tracker = mock.MagicMock()
+        expected = [
+            (0, DumpDecision.NONE),
+            (4, DumpDecision.SPARSE_ONLY),
+            (7, DumpDecision.NONE),
+            (8, DumpDecision.SPARSE_ONLY),
+            (10, DumpDecision.PAIRED),
+            (12, DumpDecision.SPARSE_ONLY),
+            # 20 hits both grids; the paired cadence wins the tie and the step
+            # dumps once.
+            (20, DumpDecision.PAIRED),
+        ]
+        with mock.patch.object(dumper, "dump") as dump_mock:
+            for step, level in expected:
+                self.assertEqual(dumper.maybe_dump(step), level, f"step={step}")
+                if level != DumpDecision.NONE:
+                    dump_mock.assert_called_with(step)
+        self.assertEqual(
+            [call.args[0] for call in dump_mock.call_args_list],
+            [step for step, level in expected if level != DumpDecision.NONE],
+        )
+        self.assertEqual(dumper._tracker.step.call_count, len(expected))
+
+    def test_maybe_dump_uses_elapsed_time_with_fixed_rate_schedule(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._paired_interval_steps = None
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = 60.0
+        dumper._sparse_interval_secs = None
+        dumper._next_paired_time = 160.0
+        dumper._next_sparse_time = None
+        dumper._last_dump_step = None
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._decision_group = None
         dumper._feature_store_enabled = False
         dumper._uploader = None
         dumper._tracker = mock.MagicMock()
@@ -1257,10 +1374,10 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 side_effect=[159.0, 160.0, 162.0, 221.0, 222.0, 223.0],
             ),
         ):
-            dumper.maybe_dump(10)
-            dumper.maybe_dump(11)
-            dumper.maybe_dump(12)
-            dumper.maybe_dump(13)
+            self.assertFalse(dumper.maybe_dump(10))
+            self.assertTrue(dumper.maybe_dump(11))
+            self.assertTrue(dumper.maybe_dump(12))
+            self.assertFalse(dumper.maybe_dump(13))
 
         self.assertEqual(
             [call.args[0] for call in dump_mock.call_args_list],
@@ -1268,18 +1385,22 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
         # Deadlines advance at a fixed rate from the armed schedule
         # (160 -> 220 -> 280), not from each dump's completion time.
-        self.assertEqual(dumper._next_dump_time, 280.0)
+        self.assertEqual(dumper._next_paired_time, 280.0)
         self.assertEqual(dumper._last_dump_step, 12)
         self.assertEqual(dumper._tracker.step.call_count, 4)
 
-    def test_timed_dump_decides_locally_without_collectives(self):
+    def test_timed_single_rank_dump_decides_locally_without_collectives(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = None
-        dumper._interval_secs = 60.0
-        dumper._next_dump_time = 160.0
+        dumper._paired_interval_steps = None
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = 60.0
+        dumper._sparse_interval_secs = None
+        dumper._next_paired_time = 160.0
+        dumper._next_sparse_time = None
         dumper._last_dump_step = None
-        dumper._rank = 1
-        dumper._world_size = 2
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._decision_group = None
         dumper._feature_store_enabled = False
         dumper._uploader = None
         dumper._tracker = mock.MagicMock()
@@ -1287,30 +1408,36 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mock.patch.object(
                 dumper, "dump", return_value="delta.parquet"
             ) as dump_mock,
+            mock.patch("torch.distributed.broadcast") as broadcast_mock,
             mock.patch("torch.distributed.all_reduce") as all_reduce_mock,
             mock.patch(
                 "tzrec.utils.delta_embedding_dump.time.monotonic",
                 side_effect=[159.0, 160.5, 161.0],
             ),
         ):
-            dumper.maybe_dump(10)
+            self.assertFalse(dumper.maybe_dump(10))
             dump_mock.assert_not_called()
-            dumper.maybe_dump(11)
+            self.assertTrue(dumper.maybe_dump(11))
 
+        broadcast_mock.assert_not_called()
         all_reduce_mock.assert_not_called()
         dump_mock.assert_called_once_with(11)
         self.assertEqual(dumper._last_dump_step, 11)
-        self.assertEqual(dumper._next_dump_time, 220.0)
+        self.assertEqual(dumper._next_paired_time, 220.0)
         self.assertEqual(dumper._tracker.step.call_count, 2)
 
     def test_timed_maybe_dump_propagates_local_dump_failure(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = None
-        dumper._interval_secs = 60.0
-        dumper._next_dump_time = 0.0
+        dumper._paired_interval_steps = None
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = 60.0
+        dumper._sparse_interval_secs = None
+        dumper._next_paired_time = 0.0
+        dumper._next_sparse_time = None
         dumper._last_dump_step = None
         dumper._rank = 0
-        dumper._world_size = 2
+        dumper._world_size = 1
+        dumper._decision_group = None
         dumper._feature_store_enabled = False
         dumper._uploader = None
         dumper._tracker = mock.MagicMock()
@@ -1331,12 +1458,16 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def test_timed_dump_skips_missed_deadlines_without_burst(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._interval_steps = None
-        dumper._interval_secs = 60.0
-        dumper._next_dump_time = 0.0
+        dumper._paired_interval_steps = None
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = 60.0
+        dumper._sparse_interval_secs = None
+        dumper._next_paired_time = 0.0
+        dumper._next_sparse_time = None
         dumper._last_dump_step = None
         dumper._rank = 0
         dumper._world_size = 2
+        dumper._decision_group = object()
         dumper._feature_store_enabled = False
         dumper._uploader = None
         dumper._tracker = mock.MagicMock()
@@ -1344,32 +1475,224 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             mock.patch.object(
                 dumper, "dump", return_value="delta.parquet"
             ) as dump_mock,
+            # A no-op broadcast leaves rank zero's own decision in the tensor.
+            mock.patch("torch.distributed.broadcast") as broadcast_mock,
             mock.patch(
                 "tzrec.utils.delta_embedding_dump.time.monotonic",
                 return_value=100.0,
             ),
         ):
-            dumper.maybe_dump(10)
-            dumper.maybe_dump(11)
-            dumper.maybe_dump(12)
+            self.assertTrue(dumper.maybe_dump(10))
+            self.assertFalse(dumper.maybe_dump(11))
+            self.assertFalse(dumper.maybe_dump(12))
 
         dump_mock.assert_called_once_with(10)
-        # Deadlines 0 and 60 already elapsed at the dump; skip past them
-        # instead of firing a burst of catch-up dumps.
-        self.assertEqual(dumper._next_dump_time, 120.0)
+        # Rank zero owns the deadline sequence; deadlines 0 and 60 already
+        # elapsed at the dump, so skip past them instead of firing a burst.
+        self.assertEqual(dumper._next_paired_time, 120.0)
+        self.assertEqual(broadcast_mock.call_count, 3)
         self.assertEqual(dumper._tracker.step.call_count, 3)
+
+    def test_timed_dual_clocks_fire_independently_at_fixed_rate(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._paired_interval_steps = None
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = 600.0
+        dumper._sparse_interval_secs = 180.0
+        dumper._next_paired_time = 1000.0
+        dumper._next_sparse_time = 820.0
+        dumper._last_dump_step = None
+        dumper._rank = 0
+        dumper._world_size = 1
+        dumper._decision_group = None
+        dumper._feature_store_enabled = False
+        dumper._uploader = None
+        dumper._tracker = mock.MagicMock()
+        with (
+            mock.patch.object(dumper, "dump") as dump_mock,
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.time.monotonic",
+                # decision/reschedule pairs: (819), (820, 821), (1001, 1002).
+                side_effect=[819.0, 820.0, 821.0, 1001.0, 1002.0],
+            ),
+        ):
+            self.assertEqual(dumper.maybe_dump(10), DumpDecision.NONE)
+            self.assertEqual(dumper.maybe_dump(11), DumpDecision.SPARSE_ONLY)
+            # Both grids are due at t=1001; paired wins and retires both.
+            self.assertEqual(dumper.maybe_dump(12), DumpDecision.PAIRED)
+        self.assertEqual([call.args[0] for call in dump_mock.call_args_list], [11, 12])
+        self.assertEqual(dumper._next_sparse_time, 1180.0)
+        self.assertEqual(dumper._next_paired_time, 1600.0)
 
     def test_start_initializes_minutes_interval_from_training_start(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._feature_store_enabled = False
         dumper._uploader = None
-        dumper._interval_secs = 120.0
-        dumper._next_dump_time = None
+        dumper._paired_interval_secs = 120.0
+        dumper._sparse_interval_secs = None
+        dumper._next_paired_time = None
+        dumper._next_sparse_time = None
+        dumper._decision_group = None
         with mock.patch(
             "tzrec.utils.delta_embedding_dump.time.monotonic", return_value=100.0
         ):
             dumper.start()
-        self.assertEqual(dumper._next_dump_time, 220.0)
+        self.assertEqual(dumper._next_paired_time, 220.0)
+
+    def test_start_arms_both_timed_deadlines_from_training_start(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._feature_store_enabled = False
+        dumper._uploader = None
+        dumper._paired_interval_secs = 600.0
+        dumper._sparse_interval_secs = 120.0
+        dumper._next_paired_time = None
+        dumper._next_sparse_time = None
+        dumper._decision_group = None
+        with mock.patch(
+            "tzrec.utils.delta_embedding_dump.time.monotonic", return_value=100.0
+        ):
+            dumper.start()
+        self.assertEqual(dumper._next_paired_time, 700.0)
+        self.assertEqual(dumper._next_sparse_time, 220.0)
+
+    def test_start_arms_timed_deadline_only_on_rank_zero_of_decision_group(self):
+        for rank, expected in ((0, 220.0), (1, None)):
+            dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._feature_store_enabled = False
+            dumper._uploader = None
+            dumper._paired_interval_secs = 120.0
+            dumper._sparse_interval_secs = None
+            dumper._next_paired_time = None
+            dumper._next_sparse_time = None
+            dumper._rank = rank
+            dumper._decision_group = object()
+            with mock.patch(
+                "tzrec.utils.delta_embedding_dump.time.monotonic", return_value=100.0
+            ):
+                dumper.start()
+            self.assertEqual(dumper._next_paired_time, expected)
+
+    def test_init_timed_multi_rank_requires_initialized_process_group(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch.dict(os.environ, {"RANK": "0", "WORLD_SIZE": "2"}),
+            mock.patch("torch.distributed.is_initialized", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "initialized"):
+                DeltaEmbeddingDumper(
+                    torch.nn.Module(),
+                    DeltaEmbeddingDumpConfig(paired_dump_interval_minutes=2),
+                    tmp_dir,
+                    torch.device("cuda"),
+                )
+
+    def test_init_timed_multi_rank_creates_gloo_decision_group(self):
+        tracker = mock.MagicMock()
+        tracker.fqn_to_feature_names = {}
+        tracker.tracked_modules = {}
+        decision_group = object()
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.ModelDeltaTracker",
+                return_value=tracker,
+            ),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_rank", return_value=0),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch(
+                "torch.distributed.new_group", return_value=decision_group
+            ) as new_group_mock,
+        ):
+            dumper = DeltaEmbeddingDumper(
+                torch.nn.Module(),
+                DeltaEmbeddingDumpConfig(paired_dump_interval_minutes=2),
+                tmp_dir,
+                torch.device("cuda"),
+            )
+        self.assertIs(dumper._decision_group, decision_group)
+        new_group_mock.assert_called_once_with(backend="gloo")
+
+    def test_init_steps_interval_skips_decision_group(self):
+        tracker = mock.MagicMock()
+        tracker.fqn_to_feature_names = {}
+        tracker.tracked_modules = {}
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch.dict(os.environ, {"RANK": "0", "WORLD_SIZE": "2"}),
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.ModelDeltaTracker",
+                return_value=tracker,
+            ),
+            mock.patch("torch.distributed.new_group") as new_group_mock,
+        ):
+            dumper = DeltaEmbeddingDumper(
+                torch.nn.Module(),
+                DeltaEmbeddingDumpConfig(paired_dump_interval_steps=10),
+                tmp_dir,
+                torch.device("cuda"),
+            )
+        self.assertIsNone(dumper._decision_group)
+        new_group_mock.assert_not_called()
+
+    def test_timed_multi_rank_decision_broadcasts_from_rank_zero(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._paired_interval_steps = None
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = 60.0
+        dumper._sparse_interval_secs = None
+        dumper._next_paired_time = 100.0
+        dumper._next_sparse_time = None
+        dumper._rank = 0
+        dumper._world_size = 2
+        decision_group = object()
+        dumper._decision_group = decision_group
+        broadcast_calls = []
+
+        def fake_broadcast(tensor, src=None, group=None):
+            broadcast_calls.append((tensor.clone(), src, group))
+
+        with (
+            mock.patch("torch.distributed.broadcast", side_effect=fake_broadcast),
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.time.monotonic",
+                side_effect=[99.0, 100.0],
+            ),
+        ):
+            self.assertFalse(dumper._dump_decision(10))
+            self.assertTrue(dumper._dump_decision(11))
+
+        self.assertEqual(len(broadcast_calls), 2)
+        for tensor, src, group in broadcast_calls:
+            self.assertEqual(tensor.dtype, torch.uint8)
+            self.assertEqual(tensor.numel(), 1)
+            self.assertEqual(tensor.device.type, "cpu")
+            self.assertEqual(src, 0)
+            self.assertIs(group, decision_group)
+        # NONE and PAIRED travel as their int levels over the uint8 broadcast.
+        self.assertEqual(
+            [int(t.item()) for t, _, _ in broadcast_calls],
+            [DumpDecision.NONE, DumpDecision.PAIRED],
+        )
+
+    def test_timed_multi_rank_nonzero_rank_follows_broadcast_decision(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._paired_interval_steps = None
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = 60.0
+        dumper._sparse_interval_secs = None
+        # Non-zero ranks never arm a deadline; the broadcast alone decides.
+        dumper._next_paired_time = None
+        dumper._next_sparse_time = None
+        dumper._rank = 1
+        dumper._world_size = 2
+        dumper._decision_group = object()
+
+        def fake_broadcast(tensor, src=None, group=None):
+            tensor.fill_(int(DumpDecision.SPARSE_ONLY))
+
+        with mock.patch("torch.distributed.broadcast", side_effect=fake_broadcast):
+            self.assertEqual(dumper._dump_decision(10), DumpDecision.SPARSE_ONLY)
 
     def test_tracker_uses_auto_compact(self):
         tracker = mock.MagicMock()
@@ -1384,7 +1707,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         ):
             DeltaEmbeddingDumper(
                 torch.nn.Module(),
-                DeltaEmbeddingDumpConfig(dump_interval_steps=10),
+                DeltaEmbeddingDumpConfig(paired_dump_interval_steps=10),
                 tmp_dir,
                 torch.device("cuda"),
             )
@@ -1404,13 +1727,46 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         ):
             dumper = DeltaEmbeddingDumper(
                 torch.nn.Module(),
-                DeltaEmbeddingDumpConfig(dump_interval_minutes=2),
+                DeltaEmbeddingDumpConfig(paired_dump_interval_minutes=2),
                 tmp_dir,
                 torch.device("cuda"),
             )
 
-        self.assertIsNone(dumper._interval_steps)
-        self.assertEqual(dumper._interval_secs, 120.0)
+        self.assertIsNone(dumper._paired_interval_steps)
+        self.assertEqual(dumper._paired_interval_secs, 120.0)
+
+    def test_sparse_intervals_are_read_from_matching_dimension(self):
+        tracker = mock.MagicMock()
+        tracker.fqn_to_feature_names = {}
+        tracker.tracked_modules = {}
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.ModelDeltaTracker",
+                return_value=tracker,
+            ),
+        ):
+            timed = DeltaEmbeddingDumper(
+                torch.nn.Module(),
+                DeltaEmbeddingDumpConfig(
+                    paired_dump_interval_minutes=10, sparse_dump_interval_minutes=2
+                ),
+                tmp_dir,
+                torch.device("cuda"),
+            )
+            stepped = DeltaEmbeddingDumper(
+                torch.nn.Module(),
+                DeltaEmbeddingDumpConfig(
+                    paired_dump_interval_steps=100, sparse_dump_interval_steps=25
+                ),
+                tmp_dir,
+                torch.device("cuda"),
+            )
+        self.assertEqual(timed._sparse_interval_secs, 120.0)
+        self.assertIsNone(timed._sparse_interval_steps)
+        self.assertEqual(stepped._sparse_interval_steps, 25)
+        self.assertIsNone(stepped._sparse_interval_secs)
+        self.assertIsNone(stepped._next_sparse_time)
 
     def test_model_delta_tracker_records_same_table_name_by_owner_fqn(self):
         tracker = object.__new__(ModelDeltaTracker)
@@ -1728,6 +2084,107 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 output_path = dumper.dump(50)
 
         self.assertIsNone(output_path)
+
+    def test_completed_upload_state_is_none_in_local_mode(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._output_dir = tmp_dir
+            dumper._file_prefix = "delta_embedding"
+            dumper._rank = 0
+            dumper._world_size = 1
+            dumper._feature_store_enabled = False
+            dumper._uploader = None
+            dumper._retain_local_dump = False
+            dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+            dumper._schema = _DELTA_DUMP_SCHEMA
+            dumper._dump_evicted_tombstones = False
+            self.assertIsNone(dumper.completed_upload_state())
+            with (
+                mock.patch.object(dumper, "_collect_table_weights", return_value={}),
+                mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
+                mock.patch.object(dumper, "_append_model_delta_rows", return_value=0),
+            ):
+                self.assertIsNone(dumper.dump(50))
+        # A local write is not an upload: no watermark can gate a dense publish.
+        self.assertIsNone(dumper.completed_upload_state())
+
+    def test_completed_upload_state_delegates_to_uploader(self):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        probe = {
+            "pk": "model.ebc.embedding_bags.user_emb",
+            "sk": 7,
+            "crc32": "0a1b2c3d",
+            "encoding": "fp32",
+        }
+        uploader = mock.MagicMock()
+        uploader.completed_upload.return_value = (42, [probe])
+        dumper._uploader = uploader
+        self.assertEqual(dumper.completed_upload_state(), (42, [probe]))
+        uploader.completed_upload.assert_called_once_with()
+
+    def test_dump_submits_empty_table_to_uploader_when_no_delta_rows(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._output_dir = tmp_dir
+            dumper._file_prefix = "delta_embedding"
+            dumper._rank = 0
+            dumper._world_size = 1
+            dumper._feature_store_enabled = True
+            dumper._uploader = mock.MagicMock()
+            dumper._retain_local_dump = False
+            dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+            dumper._schema = _DELTA_DUMP_SCHEMA
+            dumper._dump_evicted_tombstones = False
+            with (
+                mock.patch.object(dumper, "_collect_table_weights", return_value={}),
+                mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
+                mock.patch.object(dumper, "_append_model_delta_rows", return_value=0),
+            ):
+                self.assertIsNone(dumper.dump(50))
+        dumper._uploader.submit.assert_called_once()
+        step, table = dumper._uploader.submit.call_args.args
+        self.assertEqual(step, 50)
+        self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+        self.assertEqual(table.num_rows, 0)
+
+    def test_dump_submits_concatenated_rows_to_uploader(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._output_dir = tmp_dir
+            dumper._file_prefix = "delta_embedding"
+            dumper._rank = 0
+            dumper._world_size = 1
+            dumper._feature_store_enabled = True
+            dumper._uploader = mock.MagicMock()
+            dumper._retain_local_dump = False
+            dumper._quant_type = DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
+            dumper._schema = _DELTA_DUMP_SCHEMA
+            dumper._dump_evicted_tombstones = False
+
+            def append_rows(table_chunks, **kwargs):
+                return dumper._append_table_chunk(
+                    table_chunks,
+                    global_step=kwargs["global_step"],
+                    feature_name="user_id",
+                    table_fqn="model.ebc.embedding_bags.user_emb",
+                    key_ids=torch.tensor([7]),
+                    embeddings=torch.tensor([[1.0, 2.0]]),
+                    source="model_delta_tracker",
+                )
+
+            with (
+                mock.patch.object(dumper, "_collect_table_weights", return_value={}),
+                mock.patch.object(dumper, "_collect_dynamic_modules", return_value={}),
+                mock.patch.object(
+                    dumper, "_append_model_delta_rows", side_effect=append_rows
+                ),
+            ):
+                self.assertIsNone(dumper.dump(50))
+        dumper._uploader.submit.assert_called_once()
+        step, table = dumper._uploader.submit.call_args.args
+        self.assertEqual(step, 50)
+        self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
+        self.assertEqual(table["key_id"].to_pylist(), [7])
 
     def test_pause_tracking_suppresses_post_lookup_recording(self):
         tracker = object.__new__(ModelDeltaTracker)
@@ -2841,7 +3298,7 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
 
         dump_dir = os.path.abspath(os.path.join(self.test_dir, "delta_dump"))
         dump_cfg = pipeline_config.train_config.delta_embedding_dump_config
-        dump_cfg.dump_interval_steps = 1
+        dump_cfg.paired_dump_interval_steps = 1
         dump_cfg.output_dir = dump_dir
         dump_cfg.file_prefix = "delta_embedding"
         new_config_path = os.path.join(self.test_dir, "new_pipeline.config")
@@ -2945,7 +3402,7 @@ class DeltaEmbeddingDumpZchIntegrationTest(unittest.TestCase):
         )
         dump_dir = os.path.abspath(os.path.join(self.test_dir, "delta_dump"))
         dump_cfg = pipeline_config.train_config.delta_embedding_dump_config
-        dump_cfg.dump_interval_steps = 1
+        dump_cfg.paired_dump_interval_steps = 1
         dump_cfg.output_dir = dump_dir
         dump_cfg.file_prefix = "delta_embedding"
         new_config_path = os.path.join(self.test_dir, "new_pipeline.config")

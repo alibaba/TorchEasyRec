@@ -19,6 +19,7 @@ from unittest import mock
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from parameterized import parameterized
 
 from tzrec.tools.feature_store.check_feature_store_delta import (
     LocalSample,
@@ -29,6 +30,7 @@ from tzrec.tools.feature_store.check_feature_store_delta import (
     sample_local_records,
     verify_samples,
 )
+from tzrec.utils.test_util import parameterized_name_func
 
 
 class _FakeView:
@@ -43,7 +45,11 @@ class _FakeView:
 
 
 class CheckFeatureStoreDeltaTest(unittest.TestCase):
-    def test_create_feature_store_view_uses_public_endpoint_when_supported(self):
+    @parameterized.expand(
+        [["public_endpoint", True], ["vpc_endpoint", False]],
+        name_func=parameterized_name_func,
+    )
+    def test_create_feature_store_view_honors_test_mode(self, _name, test_mode):
         captured_kwargs = {}
         view = SimpleNamespace(
             pk_field="embedding_name",
@@ -73,6 +79,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             endpoint="",
             project_name="project",
             feature_view_name="view",
+            test_mode=test_mode,
         )
         feature_store_module = SimpleNamespace(
             FeatureStoreClient=FakeFeatureStoreClient
@@ -90,7 +97,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             actual = create_feature_store_view(settings)
 
         self.assertIs(actual, view)
-        self.assertTrue(captured_kwargs["test_mode"])
+        self.assertEqual(captured_kwargs["test_mode"], test_mode)
 
     def test_parse_args_does_not_accept_credentials(self):
         args = parse_args(["--pipeline_config", "pipeline.config"])
@@ -190,7 +197,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             pq.write_table(
                 pa.table(
                     {
-                        "embedding_name": ["table_a", "table_a", "table_b"],
+                        "table_fqn": ["table_a", "table_a", "table_b"],
                         "key_id": pa.array([1, 2, 3], type=pa.int64()),
                         "embedding": pa.array(
                             [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
@@ -212,6 +219,35 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             [("table_a", 1), ("table_a", 2)],
         )
         np.testing.assert_array_equal(samples[0].embedding, [1.0, 2.0])
+
+    def test_sample_local_records_remaps_user_twin_fqns(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            path = os.path.join(output_dir, "delta__fs_target_step_20.parquet")
+            pq.write_table(
+                pa.table(
+                    {
+                        "table_fqn": [
+                            "model.ebc_user.embedding_bags.user_f",
+                            "model.ebc.embedding_bags.user_f",
+                        ],
+                        "key_id": pa.array([1, 2], type=pa.int64()),
+                        "embedding": pa.array(
+                            [[1.0, 2.0], [3.0, 4.0]], type=pa.list_(pa.float32())
+                        ),
+                    }
+                ),
+                path,
+            )
+
+            samples = sample_local_records([path], 2)
+
+        self.assertEqual(
+            [(sample.embedding_name, sample.key_id) for sample in samples],
+            [
+                ("model.ebc.embedding_bags.user_f", 1),
+                ("model.ebc.embedding_bags.user_f", 2),
+            ],
+        )
 
     def test_verify_samples_separates_presence_from_value_match(self):
         samples = [
@@ -250,7 +286,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             pq.write_table(
                 pa.table(
                     {
-                        "embedding_name": ["table_a"],
+                        "table_fqn": ["table_a"],
                         "key_id": pa.array([1], type=pa.int64()),
                         "embedding": pa.array(
                             [[1, 2, 3, 250, 251, 252]], type=pa.list_(pa.uint8())
@@ -263,7 +299,7 @@ class CheckFeatureStoreDeltaTest(unittest.TestCase):
             pq.write_table(
                 pa.table(
                     {
-                        "embedding_name": ["table_a"],
+                        "table_fqn": ["table_a"],
                         "key_id": pa.array([2], type=pa.int64()),
                         "embedding": pa.array(
                             [[1.0, 2.0]], type=pa.list_(pa.float32())

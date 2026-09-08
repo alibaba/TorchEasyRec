@@ -85,7 +85,6 @@ class OnlineDenseExportTest(unittest.TestCase):
                     checkpoint_path=checkpoint_path,
                     model_dir=tmp_dir,
                     version="20260623174703",
-                    checkpoint_step=10,
                     data_timestamp=42.0,
                 )
 
@@ -110,6 +109,8 @@ class OnlineDenseExportTest(unittest.TestCase):
                     "checkpoint_step",
                     "created_at",
                     "data_timestamp",
+                    "sparse_probes",
+                    "sparse_step",
                     "version",
                 },
             )
@@ -117,21 +118,16 @@ class OnlineDenseExportTest(unittest.TestCase):
             self.assertEqual(
                 current["checkpoint_path"], os.path.abspath(checkpoint_path)
             )
+            # checkpoint_step defaults to the step parsed from model.ckpt-10
             self.assertEqual(current["checkpoint_step"], 10)
+            # bootstrap pairing: FS full load and checkpoint are same-source
+            self.assertEqual(current["sparse_step"], 10)
+            self.assertEqual(current["sparse_probes"], [])
             self.assertEqual(current["data_timestamp"], 42.0)
             self.assertTrue(current["created_at"])
             self.assertFalse(os.path.exists(os.path.join(tmp_dir, "dense_hot_update")))
 
-            self.assertEqual(
-                set(payload.keys()),
-                {
-                    "checkpoint_path",
-                    "checkpoint_step",
-                    "created_at",
-                    "data_timestamp",
-                    "version",
-                },
-            )
+            self.assertEqual(payload, current)
             self.assertEqual(payload["version"], "20260623174703")
 
     def test_prune_old_versions_and_stale_tmp(self) -> None:
@@ -155,9 +151,16 @@ class OnlineDenseExportTest(unittest.TestCase):
                 with open(os.path.join(vd, "READY"), "w") as f:
                     f.write("x")
             # stale per-PID tmp dir + current.json.tmp left by a crashed export
-            os.makedirs(os.path.join(versions_root, "20260101000001.tmp.9999"))
-            with open(os.path.join(export_root, "current.json.tmp.9999"), "w") as f:
+            stale_pid = os.getpid() + 1
+            os.makedirs(os.path.join(versions_root, f"20260101000001.tmp.{stale_pid}"))
+            with open(
+                os.path.join(export_root, f"current.json.tmp.{stale_pid}"), "w"
+            ) as f:
                 f.write("x")
+            # this process's own tmp dir mimics an in-flight worker build and
+            # must survive both the sweep and the newest-K retention
+            own_tmp = f"20260101000002.tmp.{os.getpid()}"
+            os.makedirs(os.path.join(versions_root, own_tmp))
 
             def fake_export_dense_model_cpu(**kwargs):
                 save_dir = kwargs["save_dir"]
@@ -215,13 +218,17 @@ class OnlineDenseExportTest(unittest.TestCase):
             remaining = sorted(os.listdir(versions_root))
             self.assertEqual(
                 remaining,
-                ["20260101000003", "20260101000004", "20260623174704"],
+                [own_tmp, "20260101000003", "20260101000004", "20260623174704"],
             )
             self.assertFalse(
-                os.path.exists(os.path.join(versions_root, "20260101000001.tmp.9999"))
+                os.path.exists(
+                    os.path.join(versions_root, f"20260101000001.tmp.{stale_pid}")
+                )
             )
             self.assertFalse(
-                os.path.exists(os.path.join(export_root, "current.json.tmp.9999"))
+                os.path.exists(
+                    os.path.join(export_root, f"current.json.tmp.{stale_pid}")
+                )
             )
 
     def test_prune_spare_current_version_when_oldest(self) -> None:
