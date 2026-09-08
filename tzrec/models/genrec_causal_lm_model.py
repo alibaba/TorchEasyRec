@@ -26,7 +26,7 @@ import torch
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.genrec_model import BaseGenrecModel
+from tzrec.models.genrec_model import BaseGenRecModel
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS,
@@ -36,10 +36,10 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
+from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 
 
-class GenrecCausalLMModel(BaseGenrecModel):
+class GenRecCausalLMModel(BaseGenRecModel):
     """An HF causal LM driven by a compiled prompt.
 
     Args:
@@ -71,7 +71,7 @@ class GenrecCausalLMModel(BaseGenrecModel):
         self._generated_sids_key = common.generated_sids_key
         self._read_beam_config(common)
 
-    def _read_beam_config(self, common: GenrecModelConfig) -> None:
+    def _read_beam_config(self, common: GenRecModelConfig) -> None:
         """Parse the decode knobs; the schedule must match the codebook.
 
         Args:
@@ -221,7 +221,7 @@ class GenrecCausalLMModel(BaseGenrecModel):
 
 @torch.fx.wrap
 def _fx_wrapped_forward(
-    model: "GenrecCausalLMModel", embeds: torch.Tensor, batch: Batch
+    model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Hide the padded forward from FX.
 
@@ -242,7 +242,7 @@ def _fx_wrapped_forward(
 
 @torch.fx.wrap
 def _fx_wrapped_generate(
-    model: "GenrecCausalLMModel", embeds: torch.Tensor, batch: Batch
+    model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
 ) -> torch.Tensor:
     """Hide the decode loop from FX.
 

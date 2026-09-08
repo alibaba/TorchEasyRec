@@ -16,7 +16,7 @@ projections, converts SID coordinate systems, scores the response window and
 supplies the digests a checkpoint records. A family subclass owns its forward
 and decode path.
 
-``GenrecFrontEnd`` is the half of the model tzrec serves: the assembled prompt
+``GenRecFrontEnd`` is the half of the model tzrec serves: the assembled prompt
 and the projected slots, everything before the LM's embedding gather. It is
 exported like any tzrec model; the LM itself is handed to an LLM engine as the
 HuggingFace weights beside it.
@@ -52,7 +52,7 @@ from tzrec.prompt.hole_keys import HOLE_KEYS, PROMPT_HOLE_KEYS
 from tzrec.prompt.persist import PROMPT_DIR, TOKENIZER_DIR, write_serving_contract
 from tzrec.prompt.types import CompiledPrompt, PromptPlan
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
-from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
+from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util, env_util
 from tzrec.utils.hf_export_util import dcp_to_hf, write_composite_config
@@ -61,9 +61,9 @@ from tzrec.utils.logging_util import logger
 SLOT_EMBEDS = "slot_embeds"
 
 _PARAM_DTYPE: Dict[int, torch.dtype] = {
-    GenrecModelConfig.FP32: torch.float32,
-    GenrecModelConfig.BF16: torch.bfloat16,
-    GenrecModelConfig.FP16: torch.float16,
+    GenRecModelConfig.FP32: torch.float32,
+    GenRecModelConfig.BF16: torch.bfloat16,
+    GenRecModelConfig.FP16: torch.float16,
 }
 
 _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
@@ -73,7 +73,7 @@ _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
 )
 
 
-class BaseGenrecModel(BaseModel):
+class BaseGenRecModel(BaseModel):
     """An HF backbone driven by a compiled prompt.
 
     Args:
@@ -346,7 +346,7 @@ def project_slots(
     return parts[0] if len(parts) == 1 else torch.cat(parts)
 
 
-class GenrecFrontEnd(nn.Module):
+class GenRecFrontEnd(nn.Module):
     """The served half of a genrec model, exported like any tzrec model.
 
     It shares the model's embedding group and projections, so under the
@@ -364,7 +364,7 @@ class GenrecFrontEnd(nn.Module):
         model: the genrec model to serve.
     """
 
-    def __init__(self, model: BaseGenrecModel) -> None:
+    def __init__(self, model: BaseGenRecModel) -> None:
         super().__init__()
         if acc_utils.is_aot() or acc_utils.is_trt() or env_util.use_rtp():
             raise ValueError(

@@ -29,7 +29,7 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
 from tzrec.tests.prompt_test_util import (
-    GenrecModelTestBase,
+    GenRecModelTestBase,
     assemble_into,
     export_tiny_genrec,
     offset_sid_codes,
@@ -40,7 +40,7 @@ _CODEBOOK = [4, 4, 4]
 _WORDS = ["History", "Predict", ":", ".", "<unk>", "<|im_end|>"]
 
 
-class PromptStackIntegrationTest(GenrecModelTestBase):
+class PromptStackIntegrationTest(GenRecModelTestBase):
     """compile -> assemble -> model, on the real code path."""
 
     def _batch_from_codes(self, hist, answer):
@@ -78,7 +78,7 @@ class PromptStackIntegrationTest(GenrecModelTestBase):
         torch.fx.symbolic_trace(TrainWrapper(model))
 
 
-class GenrecExportIntegrationTest(unittest.TestCase):
+class GenRecExportIntegrationTest(unittest.TestCase):
     """checkpoint -> export -> the artifacts an LLM engine and a processor load."""
 
     def setUp(self) -> None:

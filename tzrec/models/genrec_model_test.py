@@ -23,7 +23,7 @@ from tzrec.datasets.utils import Batch
 from tzrec.models.genrec_model import (
     _PARAM_DTYPE,
     SLOT_EMBEDS,
-    GenrecFrontEnd,
+    GenRecFrontEnd,
     project_slots,
 )
 from tzrec.models.model import ScriptWrapper
@@ -36,13 +36,13 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
-from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
+from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.tests.prompt_test_util import (
     _CODEBOOK,
     _HIST,
-    GenrecModelTestBase,
+    GenRecModelTestBase,
     create_prompt_feature,
     offset_sid_codes,
     projected_feature,
@@ -55,7 +55,7 @@ from tzrec.utils.test_util import (
 )
 
 
-class BaseGenrecModelTest(GenrecModelTestBase):
+class BaseGenRecModelTest(GenRecModelTestBase):
     """Shared causal-LM behavior, reached through its concrete subclass."""
 
     def test_tokens_to_local_codes_undoes_shifts_and_groups_beams(self) -> None:
@@ -144,7 +144,7 @@ class BaseGenrecModelTest(GenrecModelTestBase):
         self.assertIsNotNone(proj.head.weight.grad)
 
     @parameterized.expand(
-        [[GenrecModelConfig.BF16], [GenrecModelConfig.FP16]],
+        [[GenRecModelConfig.BF16], [GenRecModelConfig.FP16]],
         name_func=parameterized_name_func,
     )
     def test_projected_slot_follows_a_narrow_lm_dtype(self, lm_parameter_dtype) -> None:
@@ -218,7 +218,7 @@ class BaseGenrecModelTest(GenrecModelTestBase):
         torch.testing.assert_close(after, expected)
 
 
-class GenrecFrontEndTest(GenrecModelTestBase):
+class GenRecFrontEndTest(GenRecModelTestBase):
     """The served half of the model, under the same wrapper every export uses."""
 
     def setUp(self) -> None:
@@ -248,7 +248,7 @@ class GenrecFrontEndTest(GenrecModelTestBase):
             "beh.values": torch.tensor([3, 9]),
             "beh.lengths": torch.tensor([2]),
         }
-        self.wrapped = ScriptWrapper(GenrecFrontEnd(self.model))
+        self.wrapped = ScriptWrapper(GenRecFrontEnd(self.model))
 
     def test_front_end_returns_the_walk_and_the_projected_slots(self) -> None:
         out = self.wrapped(self.data)
@@ -294,7 +294,7 @@ class GenrecFrontEndTest(GenrecModelTestBase):
         out_dir = os.path.join(self.test_dir, "export")
         os.makedirs(out_dir)
         shutil.copy(os.path.join(ckpt, "config.json"), out_dir)
-        GenrecFrontEnd(self.model).export_assets(pipeline, ckpt, out_dir)
+        GenRecFrontEnd(self.model).export_assets(pipeline, ckpt, out_dir)
         with open(os.path.join(out_dir, "config.json"), "r") as f:
             self.assertEqual(json.load(f)["model_type"], "prompt_genrec")
         for name in (
@@ -306,7 +306,7 @@ class GenrecFrontEndTest(GenrecModelTestBase):
 
         pipeline.export_config.use_dense_ema = True
         with self.assertRaisesRegex(ValueError, "Dense EMA"):
-            GenrecFrontEnd(self.model).export_assets(pipeline, ckpt, out_dir)
+            GenRecFrontEnd(self.model).export_assets(pipeline, ckpt, out_dir)
 
 
 if __name__ == "__main__":

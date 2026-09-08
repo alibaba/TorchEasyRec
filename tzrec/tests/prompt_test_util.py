@@ -119,8 +119,8 @@ def projected_feature(name: str, dim: int) -> str:
     )
 
 
-class GenrecModelTestBase(unittest.TestCase):
-    """Builds a real GenrecCausalLMModel over a tiny backbone and prompt."""
+class GenRecModelTestBase(unittest.TestCase):
+    """Builds a real GenRecCausalLMModel over a tiny backbone and prompt."""
 
     def setUp(self) -> None:
         """Build the tiny backbone, tokenizer and compiled prompt."""
@@ -191,7 +191,7 @@ def write_genrec_checkpoint(model: torch.nn.Module, ckpt_dir: str) -> str:
 
 
 @dataclasses.dataclass
-class ExportedGenrec:
+class ExportedGenRec:
     """A tiny genrec model, its checkpoint and its export.
 
     Args:
@@ -252,7 +252,7 @@ def export_tiny_genrec(
     bundle_uuid: Optional[str] = None,
     use_dense_ema: bool = False,
     env: Optional[Dict[str, str]] = None,
-) -> ExportedGenrec:
+) -> ExportedGenRec:
     """Train nothing, save a checkpoint of a tiny genrec model, and export it.
 
     The prompt carries an INLINE SID history and, when ``projected``, one
@@ -365,7 +365,7 @@ model_config {{
         for k, v in batch.to_dict(sparse_dtype=torch.int64).items()
         if not k.startswith(PROMPT_INFO_PREFIX)
     }
-    return ExportedGenrec(
+    return ExportedGenRec(
         config=config,
         config_path=config_path,
         features=features,

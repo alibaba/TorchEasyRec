@@ -16,7 +16,7 @@ import torch
 from parameterized import parameterized
 
 from tzrec.datasets.utils import Batch
-from tzrec.models.genrec_causal_lm_model import GenrecCausalLMModel
+from tzrec.models.genrec_causal_lm_model import GenRecCausalLMModel
 from tzrec.prompt.assembler import (
     PROMPT_CU_SEQLENS,
     PROMPT_INPUT_IDS,
@@ -25,7 +25,7 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.tests.prompt_test_util import (
     _CODEBOOK,
-    GenrecModelTestBase,
+    GenRecModelTestBase,
     offset_sid_codes,
 )
 from tzrec.utils.test_util import parameterized_name_func
@@ -48,7 +48,7 @@ class LeftPadPackedInputsTest(unittest.TestCase):
                 PROMPT_RESPONSE_LENGTHS: response_lengths,
             }
         )
-        model = GenrecCausalLMModel.__new__(GenrecCausalLMModel)
+        model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         torch.nn.Module.__init__(model)
         model._ignore_index = ignore
 
@@ -72,7 +72,7 @@ class LeftPadPackedInputsTest(unittest.TestCase):
         )
 
 
-class GenrecCausalLMModelTest(GenrecModelTestBase):
+class GenRecCausalLMModelTest(GenRecModelTestBase):
     """The decode schedule and the training forward, both subclass-owned."""
 
     @parameterized.expand(

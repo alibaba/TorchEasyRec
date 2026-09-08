@@ -51,7 +51,7 @@ def _item_hash(keys) -> int:
     return total
 
 
-class GenrecServingContractTest(unittest.TestCase):
+class GenRecServingContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.exported = export_tiny_genrec(make_test_dir(), bundle_uuid="bundle-test")

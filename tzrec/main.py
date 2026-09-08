@@ -52,7 +52,7 @@ from tzrec.features.feature import (
     BaseFeature,
     create_features,
 )
-from tzrec.models.genrec_model import BaseGenrecModel, GenrecFrontEnd
+from tzrec.models.genrec_model import BaseGenRecModel, GenRecFrontEnd
 from tzrec.models.match_model import (
     MatchModel,
     MatchTower,
@@ -1264,12 +1264,12 @@ def export(
             os.path.join(export_dir, "model"),
             assets=assets,
         )
-    elif isinstance(model.model, BaseGenrecModel):
+    elif isinstance(model.model, BaseGenRecModel):
         # tzrec serves the prompt front-end; the LM rides beside it as
         # HuggingFace weights for the engine that decodes
         export_model(
             ori_pipeline_config,
-            InferWrapper(GenrecFrontEnd(model.model)),
+            InferWrapper(GenRecFrontEnd(model.model)),
             checkpoint_path,
             export_dir,
             assets=assets,
