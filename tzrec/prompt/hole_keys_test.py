@@ -28,6 +28,7 @@ from tzrec.prompt.types import (
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
 from tzrec.utils.fx_util import symbolic_trace
+from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 
 
 def _slot(
@@ -243,7 +244,8 @@ class HoleKeyBuilderTest(unittest.TestCase):
         )
         self.assertTrue(torch.equal(traced(batch), self.module(batch)))
 
-    @unittest.skipIf(not torch.cuda.is_available(), "no GPU")
+    @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_the_fold_is_bit_identical_across_devices(self) -> None:
         """Integer addition cannot depend on the order a device reduces in."""
         batch = _tensors(
