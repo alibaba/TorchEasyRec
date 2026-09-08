@@ -14,12 +14,13 @@ import math
 import os
 import random
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 import torch
 
 from tzrec.acc.utils import is_aot_predict, is_trt_predict
@@ -531,6 +532,46 @@ def create_mock_data(
     )
 
     return os.path.join(data_dir, f"*.{fmt}"), t
+
+
+def create_mock_prompt_data(
+    path: str, codebook: Sequence[int], projected: bool, num_rows: int = 8
+) -> str:
+    """Write a parquet of SID histories for the prompt-native tests.
+
+    ``hist`` and ``answer`` carry offset SID codes, ``level_offsets[l] + code``,
+    which is what a prompt reads; ``beh`` is an id sequence for a PROJECTED slot.
+
+    Args:
+        path: directory to write into.
+        codebook: per-level SID vocabulary sizes.
+        projected: whether to add the ``beh`` column.
+        num_rows: samples to write.
+
+    Returns:
+        The glob a data config points at.
+    """
+    rng = np.random.default_rng(0)
+    offsets = np.cumsum([0, *codebook[:-1]])
+
+    def codes(items: int) -> List[int]:
+        drawn = rng.integers(0, codebook, size=(items, len(codebook)))
+        return (drawn + offsets).reshape(-1).tolist()
+
+    columns = {
+        "hist": [codes(2) for _ in range(num_rows)],
+        "answer": [codes(1) for _ in range(num_rows)],
+    }
+    if projected:
+        columns["beh"] = [rng.integers(0, 32, size=2).tolist() for _ in range(num_rows)]
+    os.makedirs(path, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {k: pa.array(v, type=pa.list_(pa.int64())) for k, v in columns.items()}
+        ),
+        os.path.join(path, "part-0.parquet"),
+    )
+    return os.path.join(path, "*.parquet")
 
 
 def create_mock_join_data(

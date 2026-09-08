@@ -12,6 +12,7 @@
 import unittest
 
 import torch
+import torch.fx
 from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
 from transformers import AutoModelForCausalLM
@@ -23,7 +24,7 @@ from tzrec.models.genrec_model import (
     GenRecFrontEnd,
     project_slots,
 )
-from tzrec.models.model import ScriptWrapper
+from tzrec.models.model import ScriptWrapper, TrainWrapper
 from tzrec.prompt.assembler import (
     HOLE_POSITIONS,
     INPUT_IDS,
@@ -39,6 +40,7 @@ from tzrec.tests.prompt_test_util import (
     _CODEBOOK,
     _HIST,
     GenRecModelTestBase,
+    assemble_into,
     create_prompt_feature,
     offset_sid_codes,
     projected_feature,
@@ -211,6 +213,40 @@ class BaseGenRecModelTest(GenRecModelTestBase):
         expected = reference.get_input_embeddings().weight[:base_vocab_size]
         self.assertFalse(torch.allclose(before, expected))
         torch.testing.assert_close(after, expected)
+
+    def _batch_from_codes(self, hist, answer):
+        parsed = {
+            "hist.values": torch.tensor(offset_sid_codes(hist, _CODEBOOK)),
+            "hist.lengths": torch.tensor([len(hist)]),
+            "answer.values": torch.tensor(offset_sid_codes(answer, _CODEBOOK)),
+            "answer.lengths": torch.tensor([len(answer)]),
+        }
+        batch = Batch()
+        batch.additional_infos.update(assemble_into(self.compiled_prompt, parsed))
+        return batch
+
+    def test_model_resizes_to_target_vocab_size(self) -> None:
+        model = self._model()
+        rows = model.lm.get_input_embeddings().weight.shape[0]
+        self.assertEqual(rows, self.compiled_prompt.sid_space.target_vocab_size)
+        self.assertGreater(rows, self.compiled_prompt.sid_space.band_hi[-1])
+
+    def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
+        model = self._model()
+        batch = self._batch_from_codes([0, 1, 2, 3, 0, 1], [1, 2, 3])
+        predictions = model.predict(batch)
+        loss = model.loss(predictions, batch)["ce_loss"]
+        self.assertTrue(bool(torch.isfinite(loss)))
+        loss.backward()
+
+        grad = model.lm.get_input_embeddings().weight.grad
+        self.assertIsNotNone(grad)
+        self.assertTrue(bool((grad.abs().sum() > 0)))
+
+    def test_training_forward_survives_fx_tracing(self) -> None:
+        model = self._model()
+
+        torch.fx.symbolic_trace(TrainWrapper(model))
 
 
 class GenRecFrontEndTest(GenRecModelTestBase):

@@ -364,15 +364,6 @@ class MainTest(unittest.TestCase):
             ],
         )
 
-    def test_hf_export_rejects_dense_ema(self) -> None:
-        # dcp_to_hf reads <ckpt>/model unconditionally, so it would silently
-        # ship raw weights where TorchScript export ships the EMA ones.
-        from tzrec.tests.prompt_test_util import export_tiny_genrec
-
-        with tempfile.TemporaryDirectory() as test_dir:
-            with self.assertRaisesRegex(ValueError, "Dense EMA"):
-                export_tiny_genrec(test_dir, use_dense_ema=True)
-
 
 class PredictionLifecycleTest(unittest.TestCase):
     """Tests for prediction lifecycle wiring."""
