@@ -186,8 +186,13 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # Post inline comments as they are created. Left unset, the MCP server
+          # buffers them into /tmp for a post-step that only claude-code-action
+          # runs; these jobs drive the CLI directly, so nothing would post them.
+          CLASSIFY_INLINE_COMMENTS: "false"
           # No ANTHROPIC_API_KEY — uses stored OAuth from `claude /login` on the runner
-          # MCP server inherits env vars (GITHUB_TOKEN, REPO_OWNER, REPO_NAME, PR_NUMBER)
+          # MCP server inherits env vars (GITHUB_TOKEN, REPO_OWNER, REPO_NAME,
+          # PR_NUMBER, CLASSIFY_INLINE_COMMENTS)
         run: |
           set -euo pipefail
 
@@ -314,7 +319,9 @@ jobs:
           grep -q '^model *=' "$CODEX_HOME/config.toml" || {
             echo "::error::set model = \"...\" in the runner's ~/.codex/config.toml"; exit 1; }
 
-          # The MCP server gets its token here (config file, not argv or codex env)
+          # The MCP server gets its token here (config file, not argv or codex
+          # env), and this block is its whole environment, so the inline-comment
+          # buffer opt-out has to be repeated here
           cat >> "$CODEX_HOME/config.toml" << EOF
 
           [mcp_servers.github_inline_comment]
@@ -327,6 +334,7 @@ jobs:
           REPO_OWNER = "${REPO_OWNER}"
           REPO_NAME = "${REPO_NAME}"
           PR_NUMBER = "${PR_NUMBER}"
+          CLASSIFY_INLINE_COMMENTS = "false"
           EOF
           chmod 600 "$CODEX_HOME/config.toml"
 
