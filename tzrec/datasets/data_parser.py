@@ -20,6 +20,7 @@ import pyarrow.compute as pc
 import pyfg
 import torch
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
+from torchrec.modules.embedding_configs import PoolingType
 
 from tzrec.acc.utils import (
     is_cuda_export,
@@ -46,6 +47,26 @@ def _to_tensor(x: npt.NDArray) -> torch.Tensor:
     if not x.flags.writeable:
         x = np.array(x)
     return torch.from_numpy(x)
+
+
+def _normalize_weight(weight: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Normalize weight of each bag to sum to one.
+
+    Mean pooling of a weighted feature is expressed as a sum pooling over
+    weights normalized per bag, so that the pooled result does not depend on
+    whether the divisor of the underlying kernel is the bag length or the sum
+    of the weights.
+
+    Args:
+        weight (torch.Tensor): per value weight.
+        lengths (torch.Tensor): value count of each bag.
+
+    Returns:
+        per value weight normalized by the weight sum of its bag.
+    """
+    weight_sum = torch.segment_reduce(weight, "sum", lengths=lengths)
+    weight_sum = torch.where(weight_sum == 0, torch.ones_like(weight_sum), weight_sum)
+    return weight / torch.repeat_interleave(weight_sum, lengths.long())
 
 
 @torch.fx.wrap
@@ -104,6 +125,7 @@ class DataParser:
         self.sequence_mulval_sparse_keys = defaultdict(list)
         self.sequence_dense_keys = []
         self.has_weight_keys = defaultdict(list)
+        self.mean_pooling_keys = defaultdict(list)
 
         self.sampler_type = sampler_type
 
@@ -124,8 +146,14 @@ class DataParser:
             else:
                 self.dense_keys[feature.data_group].append(feature.name)
                 self.dense_length_per_key[feature.data_group].append(feature.value_dim)
-            if feature.is_weighted:
+            if feature.use_weight:
                 self.has_weight_keys[feature.data_group].append(feature.name)
+            if (
+                feature.is_sparse
+                and not feature.is_sequence
+                and feature.pooling_type == PoolingType.MEAN
+            ):
+                self.mean_pooling_keys[feature.data_group].append(feature.name)
 
         if self._fg_mode in [FgMode.FG_DAG, FgMode.FG_BUCKETIZE]:
             self._init_fg_hander()
@@ -386,7 +414,7 @@ class DataParser:
                             feat_lengths, (0, max_batch_size - len(feat_lengths))
                         )
                     output_data[f"{feat_name}.lengths"] = _to_tensor(feat_lengths)
-                    if feature.is_weighted:
+                    if feature.use_weight:
                         output_data[f"{feat_name}.weights"] = _to_tensor(
                             feat_data.np_weights
                         )
@@ -547,6 +575,7 @@ class DataParser:
             mulval_key_lengths = []
 
             dg_has_weight_keys = self.has_weight_keys[dg]
+            dg_mean_pooling_keys = self.mean_pooling_keys[dg]
             dg_sequence_mulval_sparse_keys = self.sequence_mulval_sparse_keys[dg]
             for key in keys:
                 values.append(input_data[f"{key}.values"])
@@ -565,13 +594,14 @@ class DataParser:
                 lengths.append(length)
                 if len(dg_has_weight_keys) > 0:
                     if key in dg_has_weight_keys:
-                        weights.append(input_data[f"{key}.weights"])
+                        weight = input_data[f"{key}.weights"]
                     else:
-                        weights.append(
-                            torch.ones_like(
-                                input_data[f"{key}.values"], dtype=torch.float32
-                            )
+                        weight = torch.ones_like(
+                            input_data[f"{key}.values"], dtype=torch.float32
                         )
+                    if key in dg_mean_pooling_keys:
+                        weight = _normalize_weight(weight, input_data[f"{key}.lengths"])
+                    weights.append(weight)
 
             sparse_feature = KeyedJaggedTensor(
                 keys=keys,
@@ -672,6 +702,7 @@ class DataParser:
             mulval_key_lengths = []
 
             dg_has_weight_keys = self.has_weight_keys[dg]
+            dg_mean_pooling_keys = self.mean_pooling_keys[dg]
             dg_sequence_mulval_sparse_keys = self.sequence_mulval_sparse_keys[dg]
 
             for key in keys:
@@ -704,6 +735,8 @@ class DataParser:
                         weight = torch.ones_like(
                             input_data[f"{key}.values"], dtype=torch.float32
                         )
+                    if key in dg_mean_pooling_keys:
+                        weight = _normalize_weight(weight, input_data[f"{key}.lengths"])
                     if key in self.user_feats:
                         weight = weight.tile(tile_size)
                     weights.append(weight)
@@ -767,6 +800,7 @@ class DataParser:
             mulval_key_lengths_user = []
 
             dg_has_weight_keys = self.has_weight_keys[dg]
+            dg_mean_pooling_keys = self.mean_pooling_keys[dg]
             dg_sequence_mulval_sparse_keys = self.sequence_mulval_sparse_keys[dg]
             for key in keys:
                 value = input_data[f"{key}.values"]
@@ -807,6 +841,8 @@ class DataParser:
                         weight = torch.ones_like(
                             input_data[f"{key}.values"], dtype=torch.float32
                         )
+                    if key in dg_mean_pooling_keys:
+                        weight = _normalize_weight(weight, input_data[f"{key}.lengths"])
                     if key in self.user_feats:
                         weights_user.append(weight)
                     else:
@@ -889,7 +925,7 @@ class DataParser:
                     lengths = input_data[f"{f.name}.lengths"]
                     values = input_data[f"{f.name}.values"].cpu().numpy().astype(str)
                     weights = None
-                    if f.is_weighted:
+                    if f.use_weight:
                         weights = (
                             input_data[f"{f.name}.weights"].cpu().numpy().astype(str)
                         )
