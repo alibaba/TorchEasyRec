@@ -133,13 +133,13 @@ def _render_sid_tokens(sid_space: SidSpace) -> List[str]:
     return [fmt.replace("{i}", str(i)) for i in range(sum(sid_space.codebook))]
 
 
-def _read_manifest(path: str) -> Tuple[List[int], str]:
-    """Read ``codebook`` and the bundle identity from a SID manifest."""
+def _read_manifest(path: str) -> List[int]:
+    """Read ``codebook`` from a SID manifest."""
     if not os.path.exists(path):
         raise ValueError(f"sid_space.manifest_path [{path}] does not exist.")
     with open(path, "r") as f:
         manifest = json.load(f)
-    return [int(c) for c in manifest["codebook"]], str(manifest.get("bundle_uuid", ""))
+    return [int(c) for c in manifest["codebook"]]
 
 
 def _build_sid_space(
@@ -159,15 +159,8 @@ def _build_sid_space(
     if any(c <= 0 for c in codebook):
         raise ValueError(f"every codebook size must be positive, got {codebook}.")
 
-    bundle_uuid = ""
     if space.HasField("manifest_path"):
-        declared, bundle_uuid = _read_manifest(space.manifest_path)
-        if not bundle_uuid:
-            logger.warning(
-                f"the SID manifest at [{space.manifest_path}] carries no "
-                f"bundle_uuid, so serving cannot verify that a catalog belongs "
-                f"to this bundle by identity rather than by path."
-            )
+        declared = _read_manifest(space.manifest_path)
         if declared != codebook:
             raise ValueError(
                 f"sid_space.codebook {codebook} does not match the manifest at "
@@ -219,7 +212,6 @@ def _build_sid_space(
         sentinel_token_id=sentinel_id,
         eos_token_id=_special_id(tok, ("<|im_end|>", "<|endoftext|>")),
         pad_token_id=_special_id(tok, ("<|endoftext|>", "<|im_end|>")),
-        bundle_uuid=bundle_uuid,
     )
 
 

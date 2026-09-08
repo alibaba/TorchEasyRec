@@ -9,9 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-import os
-import shutil
 import unittest
 
 import torch
@@ -37,7 +34,6 @@ from tzrec.prompt.assembler import (
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
-from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.tests.prompt_test_util import (
     _CODEBOOK,
@@ -46,7 +42,6 @@ from tzrec.tests.prompt_test_util import (
     create_prompt_feature,
     offset_sid_codes,
     projected_feature,
-    write_genrec_checkpoint,
 )
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.state_dict_util import init_parameters
@@ -285,28 +280,6 @@ class GenRecFrontEndTest(GenRecModelTestBase):
         out = scripted(self.data)
         for key, value in eager.items():
             self.assertTrue(torch.allclose(out[key].float(), value.float()), key)
-
-    def test_export_assets_write_the_engine_side(self) -> None:
-        ckpt = write_genrec_checkpoint(self.model, os.path.join(self.test_dir, "ckpt"))
-        pipeline = EasyRecConfig()
-        pipeline.prompt_config.CopyFrom(self.prompt_config)
-        pipeline.data_config.label_fields.append("answer")
-        out_dir = os.path.join(self.test_dir, "export")
-        os.makedirs(out_dir)
-        shutil.copy(os.path.join(ckpt, "config.json"), out_dir)
-        GenRecFrontEnd(self.model).export_assets(pipeline, ckpt, out_dir)
-        with open(os.path.join(out_dir, "config.json"), "r") as f:
-            self.assertEqual(json.load(f)["model_type"], "prompt_genrec")
-        for name in (
-            "model.safetensors",
-            "prompt/prompt.json",
-            "prompt/tokenizer/tokenizer.json",
-        ):
-            self.assertTrue(os.path.exists(os.path.join(out_dir, name)), name)
-
-        pipeline.export_config.use_dense_ema = True
-        with self.assertRaisesRegex(ValueError, "Dense EMA"):
-            GenRecFrontEnd(self.model).export_assets(pipeline, ckpt, out_dir)
 
 
 if __name__ == "__main__":

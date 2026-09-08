@@ -23,18 +23,38 @@ import dataclasses
 import json
 import os
 
-from tzrec.prompt.types import CompiledPrompt
+from tzrec.prompt.types import ResolvedSidSpace
 
 PROMPT_DIR = "prompt"
 PROMPT_CONTRACT_FILENAME = "prompt.json"
 TOKENIZER_DIR = "tokenizer"
 
 
-def write_serving_contract(compiled_prompt: CompiledPrompt, export_dir: str) -> str:
-    """Write ``prompt/prompt.json``: the resolved SID space.
+def read_bundle_uuid(manifest_path: str) -> str:
+    """The identity of the SID bundle a manifest describes, empty without one.
 
     Args:
-        compiled_prompt: the compiled prompt.
+        manifest_path: ``sid_space.manifest_path``, possibly unset.
+
+    Returns:
+        The manifest's ``bundle_uuid``, or ``""`` when there is no manifest or
+        it records none.
+    """
+    if not manifest_path:
+        return ""
+    with open(manifest_path, "r") as f:
+        return str(json.load(f).get("bundle_uuid", ""))
+
+
+def write_serving_contract(
+    sid_space: ResolvedSidSpace, bundle_uuid: str, export_dir: str
+) -> str:
+    """Write ``prompt/prompt.json``: the resolved SID space and the bundle identity.
+
+    Args:
+        sid_space: the resolved SID token space.
+        bundle_uuid: the bundle the codebook was read from, so an index builder
+            can refuse a catalog from another bundle; empty when unknown.
         export_dir: the export directory.
 
     Returns:
@@ -45,6 +65,8 @@ def write_serving_contract(compiled_prompt: CompiledPrompt, export_dir: str) -> 
     path = os.path.join(out, PROMPT_CONTRACT_FILENAME)
     with open(path, "w") as f:
         json.dump(
-            {"sid_space": dataclasses.asdict(compiled_prompt.sid_space)}, f, indent=2
+            {"sid_space": dataclasses.asdict(sid_space), "bundle_uuid": bundle_uuid},
+            f,
+            indent=2,
         )
     return path

@@ -136,14 +136,14 @@ class GenRecServingContractTest(unittest.TestCase):
         self.assertNotEqual(_item_hash(keys), _item_hash(keys.flip(0)))
 
     def test_prompt_json_carries_the_index_builder_inputs(self) -> None:
-        self.assertEqual(list(self.contract), ["sid_space"])
+        self.assertEqual(list(self.contract), ["sid_space", "bundle_uuid"])
         space = self.contract["sid_space"]
         compiled = self.exported.compiled_prompt.sid_space
         self.assertEqual(space["base_vocab_size"], compiled.base_vocab_size)
         self.assertEqual(space["num_levels"], 3)
         self.assertEqual(space["band_lo"], list(compiled.band_lo))
         self.assertEqual(space["band_hi"], list(compiled.band_hi))
-        self.assertEqual(space["bundle_uuid"], "bundle-test")
+        self.assertEqual(self.contract["bundle_uuid"], "bundle-test")
 
     def test_tokenizer_dir_decodes_a_sid_atom(self) -> None:
         from transformers import AutoTokenizer

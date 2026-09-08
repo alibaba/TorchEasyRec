@@ -18,14 +18,25 @@ circular import.
 import json
 import os
 import shutil
-from typing import Any, Dict, Optional, Set
+import tempfile
+from typing import Any, Dict, List, Optional, Set
 
 import torch
 from safetensors.torch import save_file
 from torch import nn
 
 from tzrec.constant import HF_EXPORT_META_FILENAME
+from tzrec.features.feature import BaseFeature
+from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.persist import (
+    PROMPT_DIR,
+    TOKENIZER_DIR,
+    read_bundle_uuid,
+    write_serving_contract,
+)
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util
+from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.logging_util import logger
 
 SERVING_ARCH = "PromptGenRecForCausalLM"
@@ -192,3 +203,43 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str) -> None:
         src = os.path.join(ckpt_dir, fname)
         if os.path.exists(src):
             shutil.copy(src, os.path.join(out_dir, fname))
+
+
+def export_hf_assets(
+    pipeline_config: EasyRecConfig,
+    features: List[BaseFeature],
+    checkpoint_path: str,
+    export_dir: str,
+) -> None:
+    """Write what an LLM engine reads beside the scripted front-end.
+
+    The HuggingFace weights and composite config, the extended tokenizer under
+    ``prompt/tokenizer`` and ``prompt/prompt.json``. A remote ``export_dir`` is
+    written locally and uploaded, as ``export_model`` does for its own files.
+
+    Args:
+        pipeline_config: the pipeline being exported.
+        features: the created features the prompt compiles against.
+        checkpoint_path: the checkpoint the weights come from.
+        export_dir: the export directory.
+    """
+    fs, local_dir = url_to_fs(export_dir)
+    if fs is not None:
+        local_dir = tempfile.mkdtemp()
+    dcp_to_hf(checkpoint_path, local_dir)
+    write_composite_config(local_dir)
+    prompt_config = pipeline_config.prompt_config
+    compiled = compile_prompt(
+        prompt_config,
+        features,
+        list(pipeline_config.data_config.label_fields),
+        tokenizer_dir=os.path.join(local_dir, PROMPT_DIR, TOKENIZER_DIR),
+    )
+    write_serving_contract(
+        compiled.sid_space,
+        read_bundle_uuid(prompt_config.sid_space.manifest_path),
+        local_dir,
+    )
+    if fs is not None:
+        fs.upload(local_dir, export_dir, recursive=True, file_thread_num=os.cpu_count())
+        shutil.rmtree(local_dir)

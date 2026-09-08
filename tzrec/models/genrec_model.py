@@ -12,9 +12,8 @@
 """Shared causal-LM plumbing for generative recommendation models.
 
 This layer builds an empty causal LM, resizes its vocabulary, wires slot
-projections, converts SID coordinate systems, scores the response window and
-supplies the digests a checkpoint records. A family subclass owns its forward
-and decode path.
+projections, converts SID coordinate systems and scores the response window.
+A family subclass owns its forward and decode path.
 
 ``GenRecFrontEnd`` is the half of the model tzrec serves: the assembled prompt
 and the projected slots, everything before the LM's embedding gather. It is
@@ -23,7 +22,6 @@ HuggingFace weights beside it.
 """
 
 import inspect
-import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -47,15 +45,11 @@ from tzrec.prompt.assembler import (
     PROMPT_HOLE_SLOT_COUNTS,
     PROMPT_INPUT_IDS,
 )
-from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.hole_keys import HOLE_KEYS, PROMPT_HOLE_KEYS
-from tzrec.prompt.persist import PROMPT_DIR, TOKENIZER_DIR, write_serving_contract
 from tzrec.prompt.types import CompiledPrompt, PromptPlan
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
-from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import config_util, env_util
-from tzrec.utils.hf_export_util import dcp_to_hf, write_composite_config
+from tzrec.utils import env_util
 from tzrec.utils.logging_util import logger
 
 SLOT_EMBEDS = "slot_embeds"
@@ -424,34 +418,3 @@ class GenRecFrontEnd(nn.Module):
                 0, 0, dtype=torch.float32, device=infos[PROMPT_INPUT_IDS].device
             )
         return out
-
-    def export_assets(
-        self, pipeline_config: EasyRecConfig, checkpoint_path: str, save_dir: str
-    ) -> None:
-        """Write what an LLM engine reads beside the scripted front-end.
-
-        The HuggingFace weights and composite config, the extended tokenizer and
-        the SID space. Called by the export on rank 0, inside its save dir.
-
-        Args:
-            pipeline_config: the pipeline being exported.
-            checkpoint_path: the checkpoint the weights come from.
-            save_dir: the export directory.
-        """
-        if config_util.use_dense_ema(
-            pipeline_config.export_config, pipeline_config.train_config
-        ):
-            raise ValueError(
-                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
-                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
-                "false to export the raw weights."
-            )
-        dcp_to_hf(checkpoint_path, save_dir)
-        write_composite_config(save_dir)
-        compile_prompt(
-            pipeline_config.prompt_config,
-            self._features,
-            list(pipeline_config.data_config.label_fields),
-            tokenizer_dir=os.path.join(save_dir, PROMPT_DIR, TOKENIZER_DIR),
-        )
-        write_serving_contract(self._prompt, save_dir)

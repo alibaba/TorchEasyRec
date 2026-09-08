@@ -101,6 +101,7 @@ from tzrec.utils.export_util import (
     export_model,
 )
 from tzrec.utils.filesystem_util import url_to_fs
+from tzrec.utils.hf_export_util import export_hf_assets
 from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
@@ -1267,6 +1268,16 @@ def export(
     elif isinstance(model.model, BaseGenRecModel):
         # tzrec serves the prompt front-end; the LM rides beside it as
         # HuggingFace weights for the engine that decodes
+        if config_util.use_dense_ema(
+            pipeline_config.export_config, pipeline_config.train_config
+        ):
+            raise ValueError(
+                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
+                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
+                "false to export the raw weights."
+            )
+        if not checkpoint_path:
+            raise ValueError("HF export: no checkpoint found to convert.")
         export_model(
             ori_pipeline_config,
             InferWrapper(GenRecFrontEnd(model.model)),
@@ -1275,6 +1286,8 @@ def export(
             assets=assets,
             additional_export_config=additional_export_config,
         )
+        if is_rank_zero:
+            export_hf_assets(pipeline_config, features, checkpoint_path, export_dir)
     else:
         export_model(
             ori_pipeline_config,

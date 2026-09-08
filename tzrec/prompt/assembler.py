@@ -461,14 +461,16 @@ class PromptAssembler(nn.Module):
             hole_parts.append(torch.zeros(0, dtype=torch.int64, device=device))
 
         response_lengths = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        dests: List[torch.Tensor] = []
         for i in range(self.num_segments):
             dest = _destinations(row_start + seg_offsets[i], seg_lens[i])
-            out.index_copy_(0, dest, seg_values[i])
+            dests.append(dest)
             slot = self.hole_slots[i]
             if slot >= 0:
                 hole_parts[slot + 1] = dest
             if i >= self.num_body:
                 response_lengths = response_lengths + seg_lens[i]
+        out.index_copy_(0, torch.cat(dests, dim=0), torch.cat(seg_values, dim=0))
 
         hole_positions = torch.cat(hole_parts, dim=0)
         # how many of those holes each projected occurrence owns, so a host can

@@ -376,24 +376,6 @@ def export_model_normal(
         if assets is not None:
             for asset in assets:
                 shutil.copy(asset, save_dir)
-        _export_extra_assets(model, pipeline_config, checkpoint_path, save_dir)
-
-
-def _export_extra_assets(
-    model: nn.Module,
-    pipeline_config: EasyRecConfig,
-    checkpoint_path: str,
-    save_dir: str,
-) -> None:
-    """Let a served module write what its runtime reads beside the scripted model.
-
-    Discovered by duck typing through the inference wrappers, the way
-    checkpointing finds ``hf_backbone``; runs inside the export's own save dir
-    so a remote export dir is uploaded together with the scripted model.
-    """
-    served = checkpoint_util.unwrap_to(model, "export_assets")
-    if served is not None:
-        served.export_assets(pipeline_config, checkpoint_path, save_dir)
 
 
 def _prepare_single_rank_distributed_embedding_export() -> bool:
@@ -1902,7 +1884,6 @@ def export_distributed_embedding(
         merged_emb_json = _merge_sharded_embedding_json(emb_json_files)
         with open(os.path.join(save_dir_sparse, "sparse_embedding.json"), "w") as f:
             json.dump(merged_emb_json, f, indent=4)
-        _export_extra_assets(model, pipeline_config, checkpoint_path, save_dir)
 
 
 class _SparseMarkCapture(Interpreter):

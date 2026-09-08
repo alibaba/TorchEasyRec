@@ -84,10 +84,6 @@ class ResolvedSidSpace:
             slot is projected.
         eos_token_id: end-of-sequence id of the extended tokenizer.
         pad_token_id: padding id of the extended tokenizer.
-        bundle_uuid: identity of the SID bundle this space was compiled
-            against, empty when no manifest was read. Serving refuses a
-            catalog whose bundle differs: a copied artifact's path proves
-            nothing.
     """
 
     codebook: Tuple[int, ...]
@@ -100,7 +96,6 @@ class ResolvedSidSpace:
     sentinel_token_id: Optional[int]
     eos_token_id: int
     pad_token_id: int
-    bundle_uuid: str = ""
 
 
 @dataclass(frozen=True)
