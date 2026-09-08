@@ -89,7 +89,7 @@ message ModelConfig {
         SidRqvae sid_rqvae = 600;
         SidRqkmeans sid_rqkmeans = 601;
 
-        GenrecCausalLMModel genrec_causal_lm_model = 701;
+        GenRecCausalLMModel genrec_causal_lm_model = 701;
         CustomModel custom_model = 1000;
     }
 

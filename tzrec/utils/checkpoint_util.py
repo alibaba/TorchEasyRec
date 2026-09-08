@@ -431,8 +431,7 @@ class CheckpointManager:
         """Save a checkpoint at the given step, then request an async prune.
 
         For HF-backed models, writes the config, optional tokenizer, and the
-        state dict metadata and contract digests HF conversion and restore
-        checking read.
+        state dict metadata HF conversion reads.
         """
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer, dense_ema)

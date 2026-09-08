@@ -142,12 +142,15 @@ class PromptPlan:
     Args:
         segments: prompt body, in emission order.
         response_segments: supervised tail, in emission order.
-        max_length: validation ceiling; an over-long row is an error.
+        max_length: compile-time ceiling; compile refuses a plan whose
+            proven maximum exceeds it. Rows are not measured at runtime.
         max_total_length: proven ceiling when every slot is bounded, else None.
         max_holes: per-row projected-position ceiling, not a runtime shape.
         logits_suffix_len: upper bound on the supervised logits window.
         static_prefix_len: leading positions that are request-invariant.
-        projected_slots: PROJECTED occurrences in emission order.
+        projected_slots: PROJECTED occurrences in emission order, which is also
+            ascending hole position; nothing may reorder them by slot id or by
+            shared module, because the serving scatter is positional.
     """
 
     segments: Tuple[Segment, ...]
@@ -186,12 +189,8 @@ class CompiledPrompt:
         sid_space: the resolved SID token space.
         prompt_plan: assembler walk order and ceilings.
         projection_plan: projection topology.
-        vocab_hash: over sid_space and tokenizer.json; fatal on mismatch.
-        plan_hash: over all four parts; warns on mismatch.
     """
 
-    sid_space: Optional[ResolvedSidSpace]
+    sid_space: ResolvedSidSpace
     prompt_plan: PromptPlan
     projection_plan: ProjectionPlan
-    vocab_hash: str
-    plan_hash: str

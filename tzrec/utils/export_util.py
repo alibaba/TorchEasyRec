@@ -72,6 +72,7 @@ from tzrec.utils import checkpoint_util, config_util, env_util, npz_util, quant_
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
+    UNTRACEABLE_MODULES,
     fx_mark_keyed_tensor,
     fx_mark_seq_ec_jt,
     fx_mark_seq_len,
@@ -432,6 +433,15 @@ def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
         leaf_module_names,
     )
     return list(leaf_module_names)
+
+
+def _get_untraceable_leaf_module_names(model: torch.nn.Module) -> List[str]:
+    """Paths of the modules FX cannot trace, for a tracer that matches by path."""
+    return [
+        path
+        for path, module in model.named_modules()
+        if type(module).__name__ in UNTRACEABLE_MODULES
+    ]
 
 
 def _get_dense_embedding_leaf_module_names(model: torch.nn.Module) -> List[str]:
@@ -1666,7 +1676,10 @@ def export_distributed_embedding(
         torch.cuda.empty_cache()
 
     unwrap_model = dmp_model.module
-    tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
+    tracer = Tracer(
+        leaf_modules=_get_sharded_leaf_module_names(unwrap_model)
+        + _get_untraceable_leaf_module_names(unwrap_model)
+    )
     full_graph = tracer.trace(unwrap_model)
 
     if is_rank_zero:
@@ -2675,6 +2688,10 @@ def _get_sparse_embedding_tensor(
             continue
         table_fqn = name[: -len(".weight")]
         export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
+        # a dense weight beside the tables, such as a genrec slot projection
+        # head, which the sparse export does not carry
+        if export_emb_name not in emb_name_to_emb_dim:
+            continue
         state_values_by_emb[export_emb_name] = values
 
     for export_emb_name, values in state_values_by_emb.items():

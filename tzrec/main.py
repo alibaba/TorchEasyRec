@@ -52,7 +52,7 @@ from tzrec.features.feature import (
     BaseFeature,
     create_features,
 )
-from tzrec.models.genrec_model import BaseGenrecModel
+from tzrec.models.genrec_model import BaseGenRecModel, GenRecFrontEnd
 from tzrec.models.match_model import (
     MatchModel,
     MatchTower,
@@ -74,7 +74,6 @@ from tzrec.optim.ema import DenseEMA, EMAOptimizer
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
 from tzrec.prompt.compile import compile_prompt
-from tzrec.prompt.persist import check_prompt_assets
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
@@ -102,6 +101,7 @@ from tzrec.utils.export_util import (
     export_model,
 )
 from tzrec.utils.filesystem_util import url_to_fs
+from tzrec.utils.hf_export_util import export_hf_assets
 from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
@@ -836,8 +836,6 @@ def train_and_evaluate(
 
     # Restore dataloader state before create_dataloader starts its workers
     dataloader_state: Optional[Dict[str, Any]] = None
-    if ckpt_path:
-        check_prompt_assets(compiled_prompt, ckpt_path)
     if ckpt_path and continue_train:
         dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
         if dataloader_state and not restore_from_model_dir:
@@ -1122,7 +1120,6 @@ def evaluate(
     )
 
     if checkpoint_path:
-        check_prompt_assets(compiled_prompt, checkpoint_path)
         ckpt_manager.restore(
             checkpoint_path,
             model,
@@ -1207,57 +1204,12 @@ def export(
         else:
             checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
-    model_cls = _get_model_class(pipeline_config.model_config)
-    if issubclass(model_cls, BaseGenrecModel):
-        if config_util.use_dense_ema(
-            pipeline_config.export_config, pipeline_config.train_config
-        ):
-            raise ValueError(
-                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
-                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
-                "false to export the raw weights."
-            )
-        if not checkpoint_path:
-            raise ValueError("HF export: no checkpoint found to convert.")
-        if not os.path.exists(os.path.join(checkpoint_path, "config.json")):
-            raise ValueError(
-                f"HF export: {checkpoint_path} has no co-located HF assets; it "
-                f"was not written by an HF-backed model."
-            )
-        if assets:
-            logger.warning(f"HF export ignores asset_files: {assets}.")
-        features = _create_features(
-            list(pipeline_config.feature_configs), pipeline_config.data_config
-        )
-        compiled_prompt = compile_prompt(
-            pipeline_config.prompt_config,
-            features,
-            list(pipeline_config.data_config.label_fields),
-        )
-        check_prompt_assets(compiled_prompt, checkpoint_path)
-        if compiled_prompt.prompt_plan.projected_slots:
-            raise ValueError(
-                "HF export drops projected-slot state: dcp_to_hf keeps only "
-                "backbone keys, so embedding_group and projections would be "
-                "absent and the artifact could not reproduce checkpoint "
-                "inference."
-            )
-        if is_rank_zero:
-            from tzrec.utils.hf_export_util import dcp_to_hf
-
-            dcp_to_hf(checkpoint_path, export_dir)
-            compile_prompt(
-                pipeline_config.prompt_config,
-                features,
-                list(pipeline_config.data_config.label_fields),
-                tokenizer_dir=export_dir,
-            )
-        return
-
     data_config = pipeline_config.data_config
 
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
+
+    compiled_prompt = _compile_prompt(pipeline_config, features)
 
     # Build model
     model = _create_model(
@@ -1265,6 +1217,7 @@ def export(
         features,
         list(data_config.label_fields),
         sampler_type=None,
+        compiled_prompt=compiled_prompt,
     )
     InferWrapper = ScriptWrapper
     # Flip to inference *before* wrapping so view-dependent state
@@ -1312,6 +1265,33 @@ def export(
             os.path.join(export_dir, "model"),
             assets=assets,
         )
+    elif isinstance(model.model, BaseGenRecModel):
+        # tzrec serves the prompt front-end; the LM rides beside it as
+        # HuggingFace weights for the engine that decodes
+        if config_util.use_dense_ema(
+            pipeline_config.export_config, pipeline_config.train_config
+        ):
+            raise ValueError(
+                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
+                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
+                "false to export the raw weights."
+            )
+        if not checkpoint_path:
+            raise ValueError("HF export: no checkpoint found to convert.")
+        front_end = InferWrapper(GenRecFrontEnd(model.model))
+        # the front-end carries no backbone: the engine serves the LM from the
+        # HuggingFace weights, so the copy built here is dead weight on every rank
+        del model.model.lm
+        export_model(
+            ori_pipeline_config,
+            front_end,
+            checkpoint_path,
+            export_dir,
+            assets=assets,
+            additional_export_config=additional_export_config,
+        )
+        if is_rank_zero:
+            export_hf_assets(pipeline_config, features, checkpoint_path, export_dir)
     else:
         export_model(
             ori_pipeline_config,
@@ -1789,7 +1769,6 @@ def predict_checkpoint(
     model.eval()
 
     if checkpoint_path:
-        check_prompt_assets(compiled_prompt, checkpoint_path)
         ckpt_manager.restore(
             checkpoint_path,
             model,

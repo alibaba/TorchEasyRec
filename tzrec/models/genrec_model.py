@@ -11,38 +11,46 @@
 
 """Shared causal-LM plumbing for generative recommendation models.
 
-This layer builds an empty causal LM, resizes its vocabulary, wires slot
-projections, converts SID coordinate systems, scores the response window and
-supplies the digests a checkpoint records. A family subclass owns its forward
-and decode path.
+Builds the causal LM, resizes its vocabulary, wires slot projections, converts
+SID coordinates and scores the response window; a family subclass owns its
+forward and decode path. ``GenRecFrontEnd`` is the served half, the assembled
+prompt and the projected slots, exported like any tzrec model beside the LM's
+HuggingFace weights.
 """
 
 import inspect
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torchmetrics
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from tzrec.acc import utils as acc_utils
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.prompt_projection import PromptProjection
 from tzrec.prompt.assembler import (
-    PROMPT_HOLE_POSITIONS,
-    PROMPT_INPUT_IDS,
+    CU_SEQLENS,
+    HOLE_POSITIONS,
+    HOLE_SLOT_COUNTS,
+    INPUT_IDS,
 )
-from tzrec.prompt.types import CompiledPrompt
-from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
+from tzrec.prompt.hole_keys import HOLE_KEYS
+from tzrec.prompt.types import CompiledPrompt, PromptPlan
+from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
+from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+from tzrec.utils import env_util
 from tzrec.utils.logging_util import logger
 
+SLOT_EMBEDS = "slot_embeds"
+
 _PARAM_DTYPE: Dict[int, torch.dtype] = {
-    GenrecModelConfig.FP32: torch.float32,
-    GenrecModelConfig.BF16: torch.bfloat16,
-    GenrecModelConfig.FP16: torch.float16,
+    GenRecModelConfig.FP32: torch.float32,
+    GenRecModelConfig.BF16: torch.bfloat16,
+    GenRecModelConfig.FP16: torch.float16,
 }
 
 _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
@@ -52,7 +60,7 @@ _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
 )
 
 
-class BaseGenrecModel(BaseModel):
+class BaseGenRecModel(BaseModel):
     """An HF backbone driven by a compiled prompt.
 
     Args:
@@ -78,11 +86,6 @@ class BaseGenrecModel(BaseModel):
                 f"{type(self).__name__} needs a compiled prompt; call "
                 f"compile_prompt(pipeline_config.prompt_config, features) and "
                 f"pass it to _create_model."
-            )
-        if compiled_prompt.sid_space is None:
-            raise ValueError(
-                f"{type(self).__name__}: prompt_config declares no sid_space, "
-                f"so there is no SID vocabulary to extend or decode."
             )
         if compiled_prompt.prompt_plan.logits_suffix_len is None:
             raise ValueError(
@@ -197,29 +200,20 @@ class BaseGenrecModel(BaseModel):
         Returns:
             ``(total_tokens, hidden_size)``.
         """
-        ids = batch.additional_infos[PROMPT_INPUT_IDS]
+        ids = batch.additional_infos[INPUT_IDS]
         embeds = self.lm.get_input_embeddings()(ids)
-
-        prompt_plan = self._prompt.prompt_plan
-        if not prompt_plan.projected_slots:
+        if not self._prompt.prompt_plan.projected_slots:
             return embeds
-
-        grouped = self.embedding_group(batch)
-        hidden_size = embeds.shape[-1]
-        projected_embeddings = [
-            proj(grouped[seg.name + seg.output_key]).reshape(-1, hidden_size)
-            for seg, proj in zip(prompt_plan.projected_slots, self._slot_projections)
-        ]
-        # The assembler records holes in this projected-occurrence-major order.
+        projected = project_slots(
+            self.embedding_group,
+            self._prompt.prompt_plan,
+            self._slot_projections,
+            batch,
+            embeds.shape[-1],
+        )
         # out of place: embeds carries grad from the embedding lookup
         return embeds.index_copy(
-            0,
-            batch.additional_infos[PROMPT_HOLE_POSITIONS],
-            (
-                projected_embeddings[0]
-                if len(projected_embeddings) == 1
-                else torch.cat(projected_embeddings)
-            ).to(embeds.dtype),
+            0, batch.additional_infos[HOLE_POSITIONS], projected.to(embeds.dtype)
         )
 
     def _tokens_to_local_codes(
@@ -294,13 +288,6 @@ class BaseGenrecModel(BaseModel):
         """
         return
 
-    def prompt_digests(self) -> Dict[str, str]:
-        """The contract digests the checkpoint records, for restore checking."""
-        return {
-            "vocab_hash": self._prompt.vocab_hash,
-            "plan_hash": self._prompt.plan_hash,
-        }
-
     def init_from_pretrained(self) -> None:
         """Load HF weights once, on a cold start only."""
         source = self._model_config.hf_model_name_or_path
@@ -311,3 +298,111 @@ class BaseGenrecModel(BaseModel):
         )
         self.lm.load_state_dict(pretrained.state_dict())
         del pretrained
+
+
+def project_slots(
+    embedding_group: EmbeddingGroup,
+    prompt_plan: PromptPlan,
+    slot_projections: Sequence[nn.Module],
+    batch: Batch,
+    hidden_size: int,
+) -> torch.Tensor:
+    """Look every projected slot up and project it into the LM input space.
+
+    Args:
+        embedding_group: the model's prompt groups.
+        prompt_plan: fixes the slot order.
+        slot_projections: one module per projected slot, in the same order.
+        batch: the batch to look up.
+        hidden_size: the LM hidden size.
+
+    Returns:
+        ``(total_holes, hidden_size)`` in the order the assembler records holes:
+        projected occurrence first, then sample.
+    """
+    grouped = embedding_group(batch)
+    parts = [
+        proj(grouped[seg.name + seg.output_key]).reshape(-1, hidden_size)
+        for seg, proj in zip(prompt_plan.projected_slots, slot_projections)
+    ]
+    return parts[0] if len(parts) == 1 else torch.cat(parts)
+
+
+class GenRecFrontEnd(nn.Module):
+    """The served half of a genrec model, exported like any tzrec model.
+
+    It shares the model's embedding group and projections, so under the
+    inference wrapper their state-dict names are the checkpoint's and the LM is
+    never loaded at export. ``predict`` returns the assembled prompt and the
+    projected slot embeddings; an LLM engine gathers the LM's own table, scatters
+    ``slot_embeds`` at ``hole_positions`` and decodes.
+
+    The walk and the ``hole_keys`` fold both read the parsed feature dict, so
+    under distributed embedding the dense stage must still receive every slot
+    member's raw ``.values`` / ``.lengths`` / ``.key_lengths`` beside the
+    looked-up embeddings.
+
+    Args:
+        model: the genrec model to serve.
+    """
+
+    def __init__(self, model: BaseGenRecModel) -> None:
+        super().__init__()
+        if acc_utils.is_aot() or acc_utils.is_trt() or env_util.use_rtp():
+            raise ValueError(
+                "the genrec front-end is exported with TorchScript only: its "
+                "prompt walk has data-dependent shapes, which AOT, TRT and RTP "
+                "export cannot capture. Unset ENABLE_AOT / ENABLE_TRT / USE_RTP."
+            )
+        self.embedding_group = model.embedding_group
+        self.projections = model.projections
+        self._slot_projections = list(model._slot_projections)
+        self._prompt = model._prompt
+        self._features = list(model.features)
+        self._hidden_size = int(model.lm.config.hidden_size)
+
+    @property
+    def features(self) -> List[BaseFeature]:
+        """The features the served prompt reads."""
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[FeatureGroupConfig]:
+        """The groups derived for the projected slots."""
+        return list(self._prompt.projection_plan.feature_groups)
+
+    @property
+    def compiled_prompt(self) -> CompiledPrompt:
+        """The prompt the inference wrapper assembles before ``predict``."""
+        return self._prompt
+
+    def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """Return the assembled streams and the projected slot embeddings.
+
+        Args:
+            batch: carries the assembled prompt in ``additional_infos``.
+
+        Returns:
+            The serving contract's outputs.
+        """
+        infos = batch.additional_infos
+        out = {
+            INPUT_IDS: infos[INPUT_IDS],
+            CU_SEQLENS: infos[CU_SEQLENS],
+            HOLE_POSITIONS: infos[HOLE_POSITIONS],
+            HOLE_KEYS: infos[HOLE_KEYS],
+            HOLE_SLOT_COUNTS: infos[HOLE_SLOT_COUNTS],
+        }
+        if self._prompt.prompt_plan.projected_slots:
+            out[SLOT_EMBEDS] = project_slots(
+                self.embedding_group,
+                self._prompt.prompt_plan,
+                self._slot_projections,
+                batch,
+                self._hidden_size,
+            )
+        else:
+            out[SLOT_EMBEDS] = torch.zeros(
+                0, 0, dtype=torch.float32, device=infos[INPUT_IDS].device
+            )
+        return out

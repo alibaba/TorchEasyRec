@@ -9,17 +9,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Builds the packed token stream a compiled prompt describes.
+"""The prompt assembler: one scripted walk with two call sites.
 
-Runs in the dataloader worker, after the features are parsed and outside any
-feature's ``_parse``. Pure integer arithmetic with no FG dependency, so the
-same walk is portable to an online C++/Java processor.
+The collator runs it after parsing and the exported front-end runs the same
+module at serving. ``PromptPlan`` unrolls into constant lists at construction,
+leaving jagged integer arithmetic with no data-dependent control flow, which
+is what ``torch.jit.script`` can carry into a runtime without tzrec source.
+The walk is prompt structure only; ``hole_keys.py`` folds the prefix-cache
+identity of each hole beside it.
 """
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Final, List, Tuple
 
-import numpy as np
+import torch
+from torch import nn
 
 from tzrec.prompt.types import (
     FillMode,
@@ -29,286 +32,307 @@ from tzrec.prompt.types import (
     Static,
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
-from tzrec.utils.sid.collision import concat_ranges
 
-PROMPT_INPUT_IDS = "prompt_input_ids"
-PROMPT_CU_SEQLENS = "prompt_cu_seqlens"
-PROMPT_HOLE_POSITIONS = "prompt_hole_positions"
-PROMPT_MAX_SEQLEN = "prompt_max_seqlen"
-PROMPT_RESPONSE_LENGTHS = "prompt_response_lengths"
+INPUT_IDS = "input_ids"
+CU_SEQLENS = "cu_seqlens"
+HOLE_POSITIONS = "hole_positions"
+HOLE_SLOT_COUNTS = "hole_slot_counts"
+RESPONSE_LENGTHS = "response_lengths"
+MAX_SEQLEN = "max_seqlen"
+# every stream the walk emits; a caller under FX tracing indexes these rather
+# than iterating the result, which is one opaque proxy there
+OUTPUT_KEYS = (
+    INPUT_IDS,
+    CU_SEQLENS,
+    HOLE_POSITIONS,
+    HOLE_SLOT_COUNTS,
+    RESPONSE_LENGTHS,
+    MAX_SEQLEN,
+)
 
 
-@dataclass
-class AssembledPrompt:
-    """One batch of assembled prompts, in packed varlen form.
+@torch.jit.script
+def _exclusive_cumsum(values: torch.Tensor) -> torch.Tensor:
+    """Exclusive prefix sum along dim 0."""
+    return torch.cumsum(values, dim=0) - values
+
+
+@torch.jit.script
+def _row_ids(lengths: torch.Tensor) -> torch.Tensor:
+    """Row index of every element in a jagged buffer described by lengths."""
+    return torch.repeat_interleave(
+        torch.arange(lengths.numel(), dtype=torch.int64, device=lengths.device),
+        lengths,
+    )
+
+
+@torch.jit.script
+def _within_row_index(lengths: torch.Tensor) -> torch.Tensor:
+    """Position of every element inside its own row."""
+    total = int(torch.sum(lengths))
+    starts = _exclusive_cumsum(lengths)
+    return torch.arange(
+        total, dtype=torch.int64, device=lengths.device
+    ) - torch.repeat_interleave(starts, lengths)
+
+
+@torch.jit.script
+def batch_device(batch: Dict[str, torch.Tensor]) -> torch.device:
+    """Device the batch already lives on, so nothing is built on the wrong one."""
+    for value in batch.values():
+        return value.device
+    return torch.device("cpu")
+
+
+@torch.jit.script
+def _destinations(seg_start: torch.Tensor, seg_len: torch.Tensor) -> torch.Tensor:
+    """Absolute index of every value of one segment in the packed stream."""
+    return torch.repeat_interleave(seg_start, seg_len) + _within_row_index(seg_len)
+
+
+class PromptAssembler(nn.Module):
+    """Walks a compiled plan to build one batch's packed token stream.
+
+    The collator calls it eagerly on the host; export scripts the same module
+    into the serving front-end. It trusts the parsed batch as every scripted
+    module does: the data contract belongs to the parser and to the request.
 
     Args:
-        input_ids: every sample's tokens concatenated, ``(total_tokens,)``.
-        cu_seqlens: sample boundaries into ``input_ids``, ``(batch_size + 1,)``.
-        hole_positions: absolute indices the projected embeddings overwrite,
-            grouped by included projected occurrence in
-            ``PromptPlan.projected_slots`` order, then by sample.
-        response_lengths: number of response tokens in each sample.
-        max_seqlen: widest sample, on the host so the model never derives it.
+        prompt_plan: the compiled walk order and its constants.
+        sid_space: the resolved SID token space.
+        include_response: whether to read and emit the supervised tail.
     """
 
-    input_ids: np.ndarray
-    cu_seqlens: np.ndarray
-    hole_positions: np.ndarray
-    response_lengths: np.ndarray
+    # TorchScript resolves a Final class attribute as a constant; a
+    # module-level one it cannot see at all
+    KIND_STATIC: Final[int] = 0
+    KIND_INLINE: Final[int] = 1
+    KIND_PROJECTED: Final[int] = 2
 
-    max_seqlen: int
-
-
-class PromptAssembler:
-    """Walks a ``PromptPlan`` to build token streams.
-
-    Args:
-        prompt_plan: the compiled walk order.
-        sid_space: resolved SID token space; required when a slot renders SIDs.
-        include_response: whether to read and emit the supervised response.
-    """
+    kinds: List[int]
+    static_tokens: List[List[int]]
+    hole_slots: List[int]
+    is_sequences: List[bool]
+    member_names: List[List[str]]
 
     def __init__(
         self,
         prompt_plan: PromptPlan,
-        sid_space: Optional[ResolvedSidSpace] = None,
+        sid_space: ResolvedSidSpace,
         include_response: bool = True,
     ) -> None:
-        self._prompt_plan = prompt_plan
-        self._sid_space = sid_space
-        self._response_segments = (
-            prompt_plan.response_segments if include_response else ()
-        )
-        if sid_space is not None:
-            self._flat_lo = np.asarray(sid_space.level_offsets, dtype=np.int64)
-            self._flat_hi = self._flat_lo + np.asarray(
-                sid_space.codebook, dtype=np.int64
-            )
-        inline = [
-            s
-            for s in prompt_plan.segments + self._response_segments
-            if isinstance(s, SlotSeg) and s.fill is FillMode.INLINE
-        ]
-        if inline and sid_space is None:
-            raise ValueError(
-                f"prompt slots {[s.name for s in inline]} render INLINE, which "
-                f"means SID codes, but no sid_space was compiled."
-            )
+        super().__init__()
+        segments = tuple(prompt_plan.segments)
+        self.num_body = len(segments)
+        if include_response:
+            segments = segments + tuple(prompt_plan.response_segments)
 
-    def _inline_tokens(
-        self,
-        name: str,
-        flat: np.ndarray,
-        lengths: np.ndarray,
-        exact_width: Optional[int] = None,
-    ) -> np.ndarray:
-        """Validate offset SID codes against their bands and shift to token ids.
+        # compile reserves a sentinel whenever a slot is PROJECTED, so -1 is
+        # never written
+        self.sentinel = -1
+        if sid_space.sentinel_token_id is not None:
+            self.sentinel = int(sid_space.sentinel_token_id)
+        self.id_shift = int(sid_space.base_vocab_size)
 
-        The data carries ``level_offsets[l] + code``; the LM vocabulary needs
-        one further uniform shift by ``base_vocab_size``.
-
-        Args:
-            name: the slot, for the message.
-            flat: the slot's offset SID codes for the whole batch.
-            lengths: per-sample position counts into ``flat``.
-            exact_width: required position count, for the response; any whole
-                number of items otherwise.
-        """
-        assert self._sid_space is not None
-        levels = self._sid_space.num_levels
-        partial = np.nonzero(lengths % levels)[0]
-        if partial.size:
-            sample = int(partial[0])
-            raise ValueError(
-                f"prompt slot [{name}]: sample {sample} has "
-                f"{int(lengths[sample])} values, not a whole number of "
-                f"{levels}-level items."
-            )
-        if exact_width is not None:
-            wrong = np.nonzero(lengths != exact_width)[0]
-            if wrong.size:
-                sample = int(wrong[0])
-                raise ValueError(
-                    f"prompt slot [{name}]: sample {sample} has "
-                    f"{int(lengths[sample])} values, but the compiled width is "
-                    f"{exact_width}. The loss window is sized from that width, "
-                    f"so a wider row would be supervised only in part."
-                )
-        by_level = flat.reshape(-1, levels)
-        if np.any(by_level < self._flat_lo) or np.any(by_level >= self._flat_hi):
-            raise ValueError(
-                f"prompt slot [{name}]: SID values must already carry their "
-                f"level offset, so level l lies in "
-                f"[level_offsets[l], level_offsets[l] + codebook[l]). Read the "
-                f"offset_codebook column, not codebook or origin_codebook."
-            )
-        return flat.astype(np.int64, copy=False) + self._sid_space.base_vocab_size
-
-    def _build_packed_prompt(
-        self,
-        inline_flat: Dict[str, np.ndarray],
-        inline_lengths: Dict[str, np.ndarray],
-        projected_lengths: Dict[str, np.ndarray],
-        batch_size: int,
-    ) -> AssembledPrompt:
-        """Build the packed prompt in one pass over the compiled segments.
-
-        The loop is over segments, which the plan fixes, never over the batch:
-        each segment writes its whole column of the flat buffer at once.
-
-        Args:
-            inline_flat: INLINE slot name to its batch-wide value stream.
-            inline_lengths: INLINE slot name to its per-sample position counts.
-            projected_lengths: PROJECTED slot name to its per-sample counts.
-            batch_size: sample count.
-
-        Returns:
-            The packed streams.
-        """
-        segments = self._prompt_plan.segments + self._response_segments
-        body_count = len(self._prompt_plan.segments)
-
-        seg_lengths = np.empty((len(segments), batch_size), dtype=np.int64)
-        for index, seg in enumerate(segments):
+        self.kinds = []
+        self.static_tokens = []
+        self.hole_slots = []
+        self.is_sequences = []
+        self.member_names = []
+        # the first slot member sizes the batch; an all-static plan reads the
+        # batch_size the parser passes along
+        self.anchor = ""
+        # holes are grouped by projected occurrence in emission order, which is
+        # the order of ``projected_slots``, of the front-end's projections and
+        # of ``hole_keys``
+        occurrences = 0
+        for seg in segments:
             if isinstance(seg, Static):
-                seg_lengths[index] = len(seg.token_ids)
-            elif seg.fill is FillMode.INLINE:
-                seg_lengths[index] = inline_lengths[seg.name]
-            else:
-                seg_lengths[index] = projected_lengths[seg.name]
-
-        row_lengths = seg_lengths.sum(axis=0)
-        cu_seqlens = np.concatenate(([0], np.cumsum(row_lengths)))
-        max_length = self._prompt_plan.max_length
-        if max_length:
-            over = np.nonzero(row_lengths > max_length)[0]
-            if over.size:
-                sample = int(over[0])
-                raise ValueError(
-                    f"assembled sample {sample} is {int(row_lengths[sample])} "
-                    f"tokens, over max_length {max_length}. Samples are never "
-                    f"truncated: cap the source features instead."
+                self._append(
+                    self.KIND_STATIC, [int(t) for t in seg.token_ids], -1, False, []
                 )
-
-        seg_starts = cu_seqlens[:-1] + (np.cumsum(seg_lengths, axis=0) - seg_lengths)
-
-        input_ids = np.empty(int(cu_seqlens[-1]), dtype=np.int64)
-        holes: List[np.ndarray] = []
-        for index, seg in enumerate(segments):
-            lengths = seg_lengths[index]
-            destinations = concat_ranges(seg_starts[index], lengths)
-            if isinstance(seg, Static):
-                input_ids[destinations] = np.tile(
-                    np.asarray(seg.token_ids, dtype=np.int64), batch_size
-                )
-            elif seg.fill is FillMode.INLINE:
-                input_ids[destinations] = self._inline_tokens(
-                    seg.name,
-                    inline_flat[seg.name],
-                    lengths,
-                    exact_width=(
-                        seg.width.num_positions if index >= body_count else None
-                    ),
-                )
-            else:
-                assert self._sid_space is not None
-                input_ids[destinations] = self._sid_space.sentinel_token_id
-                holes.append(destinations)
-
-        response_lengths = seg_lengths[body_count:].sum(axis=0)
-        return AssembledPrompt(
-            input_ids=input_ids,
-            cu_seqlens=cu_seqlens,
-            hole_positions=(
-                np.concatenate(holes) if holes else np.empty(0, dtype=np.int64)
-            ),
-            response_lengths=response_lengths,
-            max_seqlen=int(row_lengths.max(initial=0)),
-        )
-
-    def forward(
-        self, parsed_features: Dict[str, "np.ndarray"]
-    ) -> Dict[str, np.ndarray]:
-        """Reshape one parsed batch, assemble it, and key it for the batch.
-
-        Args:
-            parsed_features: ``{column}.values`` / ``{column}.lengths`` as the
-                data parser emits them, for features and label fields alike.
-
-        Returns:
-            The five streams, keyed as ``additional_infos`` expects them.
-        """
-        inline_flat: Dict[str, np.ndarray] = {}
-        inline_lengths: Dict[str, np.ndarray] = {}
-        projected_lengths: Dict[str, np.ndarray] = {}
-        batch_size: Optional[int] = None
-        for seg in self._prompt_plan.segments + self._response_segments:
-            if not isinstance(seg, SlotSeg):
                 continue
-            sources = (
-                seg.feature_names
-                if seg.fill is FillMode.PROJECTED
-                else seg.feature_names[:1]
-            )
-            member_lengths: List[tuple[str, np.ndarray]] = []
-            for source in sources:
-                lengths_key = f"{source}.lengths"
-                if seg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
-                    if lengths_key not in parsed_features:
-                        raise ValueError(
-                            f"prompt slot [{seg.name}] reads [{source}], which "
-                            f"the parser emitted as a scalar: a slot renders a "
-                            f"sequence of SID codes, so the column must be "
-                            f"list<int64>."
-                        )
-                    lengths = np.asarray(parsed_features[lengths_key])
-                    slot_batch_size = int(lengths.size)
-                    member_lengths.append((source, lengths))
-                elif lengths_key in parsed_features:
-                    slot_batch_size = int(np.asarray(parsed_features[lengths_key]).size)
-                else:
-                    values = np.asarray(parsed_features[f"{source}.values"])
-                    slot_batch_size = int(values.shape[0])
-                if batch_size is None:
-                    batch_size = slot_batch_size
-                elif slot_batch_size != batch_size:
-                    raise ValueError(
-                        f"prompt slot [{seg.name}] has {slot_batch_size} samples, "
-                        f"expected {batch_size}."
-                    )
+            assert isinstance(seg, SlotSeg)
+            if not self.anchor:
+                self.anchor = seg.feature_names[0]
+            is_sequence = seg.group_type == FeatureGroupType.JAGGED_SEQUENCE
             if seg.fill is FillMode.INLINE:
-                source, lengths = member_lengths[0]
-                # a dense sequence feature emits (total, value_dim); the stream
-                # is one code per position, so value_dim is always 1 here
-                inline_flat[seg.name] = np.asarray(
-                    parsed_features[f"{source}.values"]
-                ).reshape(-1)
-                inline_lengths[seg.name] = np.asarray(lengths, dtype=np.int64)
-            elif seg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
-                source, lengths = member_lengths[0]
-                for other_source, other_lengths in member_lengths[1:]:
-                    if not np.array_equal(lengths, other_lengths):
-                        raise ValueError(
-                            f"prompt slot [{seg.name}] PROJECTED features "
-                            f"[{source}] and [{other_source}] have different "
-                            "per-sample lengths."
-                        )
-                projected_lengths[seg.name] = lengths
+                self._append(
+                    self.KIND_INLINE, [], -1, is_sequence, [seg.feature_names[0]]
+                )
             else:
-                assert batch_size is not None
-                projected_lengths[seg.name] = np.ones(batch_size, dtype=np.int64)
+                self._append(
+                    self.KIND_PROJECTED,
+                    [],
+                    occurrences,
+                    is_sequence,
+                    list(seg.feature_names),
+                )
+                occurrences += 1
 
-        out = self._build_packed_prompt(
-            inline_flat,
-            inline_lengths,
-            projected_lengths,
-            batch_size if batch_size is not None else 0,
+        self.num_segments = len(self.kinds)
+        self.num_hole_slots = occurrences
+
+    def _append(
+        self,
+        kind: int,
+        tokens: List[int],
+        hole_slot: int,
+        is_sequence: bool,
+        members: List[str],
+    ) -> None:
+        """Record one unrolled segment's constants."""
+        self.kinds.append(kind)
+        self.static_tokens.append(tokens)
+        self.hole_slots.append(hole_slot)
+        self.is_sequences.append(is_sequence)
+        self.member_names.append(members)
+
+    def _batch_size(self, batch: Dict[str, torch.Tensor]) -> int:
+        """Row count, from the anchor member.
+
+        A sequence or a multi-value member carries ``lengths``, one per row; a
+        dense member has one row per sample and no lengths.
+        """
+        if self.anchor == "":
+            if "batch_size" in batch:
+                return int(batch["batch_size"])
+            return 0
+        key = self.anchor + ".lengths"
+        if key in batch:
+            return int(batch[key].numel())
+        return int(batch[self.anchor + ".values"].size(0))
+
+    def _inline_counts(
+        self, batch: Dict[str, torch.Tensor], index: int, batch_size: int
+    ) -> torch.Tensor:
+        """Token count each row contributes for one INLINE segment.
+
+        For a multi-value sequence -- which is what a SID history is -- the row
+        holds ``lengths`` items and each item holds ``key_lengths`` codes, so the
+        count is a segmented sum rather than ``lengths`` itself.
+        """
+        member = self.member_names[index][0]
+        lengths = batch[member + ".lengths"].to(torch.int64)
+        key = member + ".key_lengths"
+        if key in batch:
+            key_lengths = batch[key].to(torch.int64).reshape(-1)
+            counts = torch.zeros(batch_size, dtype=torch.int64, device=lengths.device)
+            lengths = counts.index_add_(0, _row_ids(lengths), key_lengths)
+        return lengths
+
+    def _segment(
+        self,
+        batch: Dict[str, torch.Tensor],
+        index: int,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-row length and row-major values of one segment."""
+        kind = self.kinds[index]
+
+        if kind == self.KIND_STATIC:
+            run = torch.tensor(
+                self.static_tokens[index], dtype=torch.int64, device=device
+            )
+            width = run.numel()
+            seg_len = torch.full((batch_size,), width, dtype=torch.int64, device=device)
+            return seg_len, run.unsqueeze(0).expand(batch_size, width).reshape(-1)
+
+        member = self.member_names[index][0]
+        if kind == self.KIND_INLINE:
+            # the data carries ``level_offsets[l] + code``; the LM vocabulary
+            # needs one further uniform shift by ``base_vocab_size``
+            counts = self._inline_counts(batch, index, batch_size)
+            values = batch[member + ".values"].to(torch.int64).reshape(-1)
+            return counts, values + self.id_shift
+
+        if self.is_sequences[index]:
+            seg_len = batch[member + ".lengths"].to(torch.int64)
+        else:
+            seg_len = torch.ones(batch_size, dtype=torch.int64, device=device)
+        total = int(torch.sum(seg_len))
+        return seg_len, torch.full(
+            (total,), self.sentinel, dtype=torch.int64, device=seg_len.device
         )
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Assemble one batch.
+
+        Args:
+            batch: the parsed feature dict, keyed ``{feature}.values`` /
+                ``.lengths`` / ``.key_lengths`` as the data parser emits it.
+
+        Returns:
+            ``input_ids``, ``cu_seqlens``, ``hole_positions``,
+            ``hole_slot_counts``, ``response_lengths`` and ``max_seqlen``. Holes
+            are grouped by projected occurrence in emission order, then by
+            sample; the front-end's ``slot_embeds`` and ``hole_keys`` follow the
+            same order.
+        """
+        batch_size = self._batch_size(batch)
+        device = batch_device(batch)
+
+        seg_lens: List[torch.Tensor] = []
+        seg_values: List[torch.Tensor] = []
+        for i in range(self.num_segments):
+            length, values = self._segment(batch, i, batch_size, device)
+            seg_lens.append(length)
+            seg_values.append(values)
+
+        stacked = torch.stack(seg_lens, dim=0)
+        row_total = torch.sum(stacked, dim=0)
+        row_start = _exclusive_cumsum(row_total)
+        seg_offsets = torch.cumsum(stacked, dim=0) - stacked
+
+        total_tokens = int(torch.sum(row_total))
+        out = torch.zeros(total_tokens, dtype=torch.int64, device=device)
+
+        # one entry per projected occurrence, and an empty stream under
+        # Pattern I, where the concatenation below would otherwise have
+        # nothing to join
+        hole_parts: List[torch.Tensor] = [
+            torch.zeros(0, dtype=torch.int64, device=device)
+        ]
+        for _ in range(self.num_hole_slots):
+            hole_parts.append(torch.zeros(0, dtype=torch.int64, device=device))
+
+        response_lengths = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        dests: List[torch.Tensor] = []
+        for i in range(self.num_segments):
+            dest = _destinations(row_start + seg_offsets[i], seg_lens[i])
+            dests.append(dest)
+            slot = self.hole_slots[i]
+            if slot >= 0:
+                hole_parts[slot + 1] = dest
+            if i >= self.num_body:
+                response_lengths = response_lengths + seg_lens[i]
+        out.index_copy_(0, torch.cat(dests, dim=0), torch.cat(seg_values, dim=0))
+
+        hole_positions = torch.cat(hole_parts, dim=0)
+        # how many of those holes each projected occurrence owns, so a host can
+        # cut the flat streams back into per-slot spans without the plan
+        slot_counts = torch.zeros(self.num_hole_slots, dtype=torch.int64, device=device)
+        for slot in range(self.num_hole_slots):
+            slot_counts[slot] = hole_parts[slot + 1].numel()
+
+        cu_seqlens = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=device),
+                torch.cumsum(row_total, dim=0),
+            ]
+        )
+        if batch_size > 0:
+            max_seqlen = torch.max(row_total)
+        else:
+            max_seqlen = torch.zeros((), dtype=torch.int64, device=device)
+        # literals rather than the module constants above: TorchScript cannot
+        # see a module-level global. ``assembler_test`` pins the two together.
         return {
-            PROMPT_INPUT_IDS: out.input_ids,
-            PROMPT_CU_SEQLENS: out.cu_seqlens,
-            PROMPT_HOLE_POSITIONS: out.hole_positions,
-            PROMPT_MAX_SEQLEN: np.asarray(out.max_seqlen, dtype=np.int64),
-            PROMPT_RESPONSE_LENGTHS: out.response_lengths,
+            "input_ids": out,
+            "cu_seqlens": cu_seqlens.to(torch.int32),
+            "hole_positions": hole_positions,
+            "hole_slot_counts": slot_counts,
+            "response_lengths": response_lengths,
+            "max_seqlen": max_seqlen,
         }

@@ -18,7 +18,6 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
-import torch
 from torch import distributed as dist
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
@@ -41,7 +40,7 @@ from tzrec.datasets.utils import (
     remove_nullable,
 )
 from tzrec.features.feature import BaseFeature
-from tzrec.prompt.assembler import PromptAssembler
+from tzrec.prompt.assembler import OUTPUT_KEYS, PromptAssembler
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import data_pb2
 from tzrec.utils import config_util
@@ -401,12 +400,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             batch = self._data_parser.to_batch(output_data)
 
         if self._prompt_assembler is not None:
-            batch.additional_infos.update(
-                {
-                    k: torch.from_numpy(np.asarray(v))
-                    for k, v in self._prompt_assembler.forward(output_data).items()
-                }
-            )
+            streams = self._prompt_assembler(output_data)
+            batch.additional_infos.update({k: streams[k] for k in OUTPUT_KEYS})
 
         # Set checkpoint info on batch
         batch.checkpoint_info = checkpoint_info
