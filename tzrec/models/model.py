@@ -391,10 +391,10 @@ class PredictWrapper(BaseModule):
 class ScriptWrapper(BaseModule):
     """Model inference wrapper for jit.script.
 
-    A module that exposes ``compiled_prompt`` gets its prompt assembled here,
-    from the parsed dict, exactly as the training collator does: one walk, two
-    call sites. Serving alone also folds the prefix-cache ``hole_keys`` here,
-    which training never computes.
+    A module that exposes ``compiled_prompt`` -- the genrec front-end -- gets
+    its prompt assembled here from the parsed dict, exactly as the training
+    collator does: one walk, two call sites. Serving alone also folds the
+    prefix-cache ``hole_keys`` here, which training never computes.
     """
 
     def __init__(self, module: nn.Module) -> None:

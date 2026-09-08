@@ -191,11 +191,6 @@ class BaseGenRecModel(BaseModel):
         """The HF module export and checkpointing reach for."""
         return self.lm
 
-    @property
-    def compiled_prompt(self) -> CompiledPrompt:
-        """The prompt this model was built against."""
-        return self._prompt
-
     def build_input(self, batch: Batch) -> torch.Tensor:
         """Build packed LM input embeddings and fill projected positions.
 
@@ -362,7 +357,7 @@ class GenRecFrontEnd(nn.Module):
         self.embedding_group = model.embedding_group
         self.projections = model.projections
         self._slot_projections = list(model._slot_projections)
-        self._prompt = model.compiled_prompt
+        self._prompt = model._prompt
         self._features = list(model.features)
         self._hidden_size = int(model.lm.config.hidden_size)
 
