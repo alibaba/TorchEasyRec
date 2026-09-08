@@ -11,16 +11,12 @@
 
 """The prompt assembler: one scripted walk with two call sites.
 
-It runs in the dataloader worker after the features are parsed, and again
-inside the exported front-end at serving. ``PromptPlan`` is a compile-time
-constant, so the segment loop unrolls into parallel constant lists at
-construction and what remains is jagged integer arithmetic -- ``cumsum``,
-``repeat_interleave``, ``index_copy_`` -- with no data-dependent control flow,
-which is what lets ``torch.jit.script`` carry the same module into a runtime
-that has no tzrec source. Serving therefore never reimplements this walk.
-
-The walk is prompt structure only. The prefix-cache identity of each hole,
-``hole_keys``, is a serving concern that ``hole_keys.py`` folds beside it.
+The collator runs it after parsing and the exported front-end runs the same
+module at serving. ``PromptPlan`` unrolls into constant lists at construction,
+leaving jagged integer arithmetic with no data-dependent control flow, which
+is what ``torch.jit.script`` can carry into a runtime without tzrec source.
+The walk is prompt structure only; ``hole_keys.py`` folds the prefix-cache
+identity of each hole beside it.
 """
 
 from typing import Dict, Final, List, Tuple

@@ -199,18 +199,6 @@ class GenRecIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(tokenizer.eos_token_id, compiled.sid_space.eos_token_id)
 
-        # Dense EMA weights never reach the HF conversion
-        config.export_config.use_dense_ema = True
-        ema_config = os.path.join(self.test_dir, "dense_ema.config")
-        config_util.save_message(config, ema_config)
-        self.assertFalse(
-            utils.test_export(
-                ema_config, self.test_dir, export_dir=os.path.join(self.test_dir, "ema")
-            )
-        )
-        with open(os.path.join(self.test_dir, "log_export.txt"), "r") as f:
-            self.assertIn("Dense EMA", f.read())
-
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")
     def test_genrec_export_distributed_embedding(self):

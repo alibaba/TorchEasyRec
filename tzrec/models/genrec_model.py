@@ -11,14 +11,11 @@
 
 """Shared causal-LM plumbing for generative recommendation models.
 
-This layer builds an empty causal LM, resizes its vocabulary, wires slot
-projections, converts SID coordinate systems and scores the response window.
-A family subclass owns its forward and decode path.
-
-``GenRecFrontEnd`` is the half of the model tzrec serves: the assembled prompt
-and the projected slots, everything before the LM's embedding gather. It is
-exported like any tzrec model; the LM itself is handed to an LLM engine as the
-HuggingFace weights beside it.
+Builds the causal LM, resizes its vocabulary, wires slot projections, converts
+SID coordinates and scores the response window; a family subclass owns its
+forward and decode path. ``GenRecFrontEnd`` is the served half, the assembled
+prompt and the projected slots, exported like any tzrec model beside the LM's
+HuggingFace weights.
 """
 
 import inspect

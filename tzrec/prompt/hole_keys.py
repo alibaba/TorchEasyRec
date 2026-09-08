@@ -11,24 +11,13 @@
 
 """The ``hole_keys`` fold: a serving-only prefix-cache identity per hole.
 
-An LLM engine keys its prefix cache on token ids, and a PROJECTED slot writes
-the same sentinel at the same position for every request, so the engine needs
-a per-hole identity to match on instead. ``HoleKeyBuilder`` folds each hole's
-*input* values -- never the projected vector -- into one ``int64`` key per
-hole, row-aligned with the assembler's ``hole_positions``: the projected
-occurrences in emission order, then the samples. Only the serving wrapper
-composes it; training never computes a key it would discard.
-
-The fold is integer end to end: ``int64`` addition is associative and
-commutative and wraps deterministically, so a key cannot depend on the order
-``index_add_`` happens to reduce in, on the device, or on how the batch was
-split. A float accumulator would satisfy "do not fold the projected vector" in
-letter and reintroduce the variance in spirit.
-
-No plan or model identity enters a key. A cache shared across model versions
-already matches their static tokens alike, so only the engine can namespace
-it, and the engine folds the keys it receives with a position constant of its
-own. Nothing outside the scripted front-end reads the constants below.
+A PROJECTED slot writes the same sentinel at the same position for every
+request, so an engine keying its prefix cache on token ids needs a per-hole
+identity instead. ``HoleKeyBuilder`` folds each hole's input values, never the
+projected vector, into one ``int64`` key per hole, row-aligned with the
+assembler's ``hole_positions``. The fold is integer end to end, so a key cannot
+depend on reduction order, device or batch split. No plan or model identity
+enters a key: only the engine can namespace a shared cache.
 """
 
 from typing import Dict, Final, List
