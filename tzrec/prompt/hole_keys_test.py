@@ -145,6 +145,24 @@ class HoleKeyBuilderTest(unittest.TestCase):
         other = HoleKeyBuilder(_plan((_slot("beh", slot_id=1),)))
         self.assertFalse(torch.equal(self.module(batch), other(batch)))
 
+    def test_two_empty_holes_do_not_collide(self) -> None:
+        """A hole no value reaches still carries its slot: the salt seeds it."""
+        batch = _tensors(
+            {
+                "beh.values": np.array([], dtype=np.int64),
+                "beh.lengths": np.array([0], dtype=np.int64),
+            }
+        )
+        deep = HoleKeyBuilder(
+            _plan((_slot("beh", group_type=FeatureGroupType.DEEP, slot_id=0),))
+        )
+        other = HoleKeyBuilder(
+            _plan((_slot("beh", group_type=FeatureGroupType.DEEP, slot_id=1),))
+        )
+        self.assertEqual(deep(batch).numel(), 1)
+        self.assertNotEqual(int(deep(batch)[0]), 0)
+        self.assertNotEqual(int(deep(batch)[0]), int(other(batch)[0]))
+
     def test_a_permuted_multi_value_item_does_not_collide(self) -> None:
         """``[a, b, c]`` and ``[c, b, a]`` are different items, in different bands."""
 

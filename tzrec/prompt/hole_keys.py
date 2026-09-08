@@ -68,6 +68,10 @@ class HoleKeyBuilder(nn.Module):
     and all silent. A dense member contributes its float32 bit pattern per row,
     which is the parsed input and not a computed reduction.
 
+    Body and response slots are walked together, which the assembler's holes
+    match because compile gives every response slot ``FillMode.INLINE``: a
+    response slot is never PROJECTED and so never reaches ``projected_slots``.
+
     Args:
         prompt_plan: the compiled plan; its ``projected_slots`` fix the hole
             order.
@@ -94,7 +98,9 @@ class HoleKeyBuilder(nn.Module):
         for seg in prompt_plan.projected_slots:
             self.member_names.append(list(seg.feature_names))
             self.is_sequences.append(seg.group_type == FeatureGroupType.JAGGED_SEQUENCE)
-            self.salts.append(_wrap64(self.C_SLOT * int(seg.slot_id)))
+            # 1-based: slot 0 must not salt to zero, or its empty hole
+            # would fold to zero as an unsalted accumulator did
+            self.salts.append(_wrap64(self.C_SLOT * (int(seg.slot_id) + 1)))
         self.num_slots = len(self.member_names)
 
     def _fold_slot(self, batch: Dict[str, torch.Tensor], index: int) -> torch.Tensor:
@@ -110,7 +116,9 @@ class HoleKeyBuilder(nn.Module):
         else:
             lengths = batch[members[0] + ".lengths"].to(torch.int64)
             num_holes = int(torch.sum(lengths)) if is_sequence else int(lengths.numel())
-        keys = torch.zeros(num_holes, dtype=torch.int64, device=first.device)
+        # seeded with the salt, not zero: a hole no value reaches -- an empty
+        # DEEP member, a zero-length item -- is still that slot's hole
+        keys = torch.full((num_holes,), salt, dtype=torch.int64, device=first.device)
         for member_index in range(len(members)):
             member = members[member_index]
             raw = batch[member + ".values"]
