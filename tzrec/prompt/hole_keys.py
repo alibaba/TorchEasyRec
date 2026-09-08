@@ -60,17 +60,13 @@ def _wrap64(value: int) -> int:
 class HoleKeyBuilder(nn.Module):
     """Folds every projected slot's input values into one key per hole.
 
-    Every member value that produces a hole contributes, discriminated by
-    slot, by member and by its index inside the hole. Without the first, two
-    slots holding the same id would match; without the last two, a two-member
-    slot with values ``(a, b)`` would match one with ``(b, a)`` and a permuted
-    multi-value item would match itself reordered -- all plausible, all wrong,
-    and all silent. A dense member contributes its float32 bit pattern per row,
-    which is the parsed input and not a computed reduction.
-
-    Body and response slots are walked together, which the assembler's holes
-    match because compile gives every response slot ``FillMode.INLINE``: a
-    response slot is never PROJECTED and so never reaches ``projected_slots``.
+    Every value contributing to a hole is discriminated by slot, by member and
+    by its index inside the hole; without those, two slots holding the same id,
+    a two-member slot with ``(a, b)`` against ``(b, a)``, and a permuted
+    multi-value item would all match silently. A dense member contributes its
+    float32 bit pattern per row, the parsed input rather than a computed
+    reduction. Response slots compile INLINE, so ``projected_slots`` is
+    body-only and stays aligned with the assembler's holes.
 
     Args:
         prompt_plan: the compiled plan; its ``projected_slots`` fix the hole
