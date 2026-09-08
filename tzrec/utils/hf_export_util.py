@@ -91,17 +91,13 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str) -> Dict[str, Any]:
     """
     from torch.distributed.checkpoint.state_dict_loader import (
         _load_state_dict_from_keys,
+        _storage_setup,
     )
     from transformers import AutoConfig, AutoModelForCausalLM
 
     model_ckpt_path = os.path.join(ckpt_dir, "model")
     if not os.path.exists(model_ckpt_path):
         raise RuntimeError(f"dcp_to_hf: model DCP dir [{model_ckpt_path}] not exists.")
-
-    # No keys => load every key; non-distributed => full tensors locally.
-    raw_state: Dict[str, torch.Tensor] = _load_state_dict_from_keys(
-        checkpoint_id=model_ckpt_path
-    )
 
     meta_path = os.path.join(ckpt_dir, HF_EXPORT_META_FILENAME)
     prefix: Optional[str] = None
@@ -116,44 +112,51 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str) -> Dict[str, Any]:
     tied_keys: Set[str] = set(getattr(empty, "_tied_weights_keys", None) or [])
     del empty
 
-    def _strip_recorded_prefix(
-        state: Dict[str, torch.Tensor],
-    ) -> Optional[Dict[str, torch.Tensor]]:
+    # the mapping is decided on names alone, so the load below reads the
+    # backbone and not the sparse tables beside it
+    reader = _storage_setup(None, model_ckpt_path, reader=True)
+    ckpt_keys: Set[str] = set(reader.read_metadata().state_dict_metadata)
+
+    def _strip_recorded_prefix() -> Optional[Dict[str, str]]:
         """Strip the recorded prefix; None unless it yields an EXACT match."""
         if not prefix:
             return None
-        out = {k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)}
+        out = {k[len(prefix) :]: k for k in ckpt_keys if k.startswith(prefix)}
         return out if set(out) == target_keys else None
 
-    def _derive_by_suffix(
-        state: Dict[str, torch.Tensor],
-    ) -> Optional[Dict[str, torch.Tensor]]:
+    def _derive_by_suffix() -> Optional[Dict[str, str]]:
         """Each target key is a unique suffix of exactly one DCP key; None if not."""
-        out: Dict[str, torch.Tensor] = {}
+        out: Dict[str, str] = {}
         for tk in target_keys:
-            matches = [k for k in state if k == tk or k.endswith("." + tk)]
+            matches = [k for k in ckpt_keys if k == tk or k.endswith("." + tk)]
             if len(matches) != 1:
                 return None
-            out[tk] = state[matches[0]]
+            out[tk] = matches[0]
         return out
 
-    mapped = _strip_recorded_prefix(raw_state)
-    if mapped is None:
+    key_map = _strip_recorded_prefix()
+    if key_map is None:
         if prefix:
             logger.warning(
                 f"dcp_to_hf: recorded prefix [{prefix}] did not map exactly onto "
                 "the architecture; deriving the backbone prefix by suffix-matching."
             )
-        mapped = _derive_by_suffix(raw_state)
+        key_map = _derive_by_suffix()
 
-    if mapped is None:
+    if key_map is None:
         raise RuntimeError(
             "dcp_to_hf: cannot map the DCP state dict onto the backbone "
             f"architecture (recorded prefix={prefix!r}). Wanted "
             f"{len(target_keys)} keys like {sorted(target_keys)[:3]}; the "
-            f"checkpoint holds {len(raw_state)} like {sorted(raw_state)[:3]}. "
+            f"checkpoint holds {len(ckpt_keys)} like {sorted(ckpt_keys)[:3]}. "
             "Refusing to write a partially-loaded HF model."
         )
+
+    # non-distributed => full tensors locally
+    raw_state: Dict[str, torch.Tensor] = _load_state_dict_from_keys(
+        set(key_map.values()), checkpoint_id=model_ckpt_path
+    )
+    mapped = {tk: raw_state[ck] for tk, ck in key_map.items()}
 
     # from_pretrained re-ties them.
     if getattr(cfg, "tie_word_embeddings", False):
@@ -194,26 +197,32 @@ def export_hf_assets(
     fs, local_dir = url_to_fs(export_dir)
     if fs is not None:
         local_dir = tempfile.mkdtemp()
-    backbone = dcp_to_hf(checkpoint_path, local_dir)
-    compiled = compile_prompt(
-        pipeline_config.prompt_config,
-        features,
-        list(pipeline_config.data_config.label_fields),
-        tokenizer_dir=local_dir,
-    )
-    composite: Dict[str, Any] = {
-        "architectures": [SERVING_ARCH],
-        "model_type": SERVING_MODEL_TYPE,
-        "text_config": backbone,
-        "eos_token_id": compiled.sid_space.eos_token_id,
-        "pad_token_id": compiled.sid_space.pad_token_id,
-    }
-    # a runtime that reads only the outer config still needs to size its cache
-    for key in ("vocab_size", "hidden_size", "num_hidden_layers", "torch_dtype"):
-        if key in backbone:
-            composite[key] = backbone[key]
-    with open(os.path.join(local_dir, "config.json"), "w") as f:
-        json.dump(composite, f, indent=2)
-    if fs is not None:
-        fs.upload(local_dir, export_dir, recursive=True, file_thread_num=os.cpu_count())
-        shutil.rmtree(local_dir)
+    try:
+        backbone = dcp_to_hf(checkpoint_path, local_dir)
+        compiled = compile_prompt(
+            pipeline_config.prompt_config,
+            features,
+            list(pipeline_config.data_config.label_fields),
+            tokenizer_dir=local_dir,
+        )
+        composite: Dict[str, Any] = {
+            "architectures": [SERVING_ARCH],
+            "model_type": SERVING_MODEL_TYPE,
+            "text_config": backbone,
+            "eos_token_id": compiled.sid_space.eos_token_id,
+            "pad_token_id": compiled.sid_space.pad_token_id,
+        }
+        # a runtime that reads only the outer config still needs to size its cache
+        for key in ("vocab_size", "hidden_size", "num_hidden_layers", "torch_dtype"):
+            if key in backbone:
+                composite[key] = backbone[key]
+        with open(os.path.join(local_dir, "config.json"), "w") as f:
+            json.dump(composite, f, indent=2)
+        if fs is not None:
+            fs.upload(
+                local_dir, export_dir, recursive=True, file_thread_num=os.cpu_count()
+            )
+    finally:
+        # the staging dir holds the full LM weights; drop it however this ends
+        if fs is not None:
+            shutil.rmtree(local_dir, ignore_errors=True)

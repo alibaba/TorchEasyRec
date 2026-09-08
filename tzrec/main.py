@@ -1278,9 +1278,13 @@ def export(
             )
         if not checkpoint_path:
             raise ValueError("HF export: no checkpoint found to convert.")
+        front_end = InferWrapper(GenRecFrontEnd(model.model))
+        # the front-end carries no backbone: the engine serves the LM from the
+        # HuggingFace weights, so the copy built here is dead weight on every rank
+        del model.model.lm
         export_model(
             ori_pipeline_config,
-            InferWrapper(GenRecFrontEnd(model.model)),
+            front_end,
             checkpoint_path,
             export_dir,
             assets=assets,

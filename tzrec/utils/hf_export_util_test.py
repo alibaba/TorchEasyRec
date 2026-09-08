@@ -147,6 +147,24 @@ class HfExportUtilTest(unittest.TestCase):
         for k, v in lm.state_dict().items():
             self.assertTrue(torch.equal(back.state_dict()[k], v), k)
 
+    def test_dcp_to_hf_loads_only_the_backbone_keys(self) -> None:
+        """The rest of a genrec checkpoint is the sparse tables; never read them."""
+        from torch.distributed.checkpoint import state_dict_loader
+
+        ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(_tied_lm())))
+        original = state_dict_loader._load_state_dict_from_keys
+        requested = []
+
+        def _spy(keys=None, **kwargs):
+            requested.append(keys)
+            return original(keys, **kwargs)
+
+        with mock.patch.object(state_dict_loader, "_load_state_dict_from_keys", _spy):
+            dcp_to_hf(ckpt_dir, os.path.join(self.test_dir, "hf_out_keys"))
+        self.assertEqual(len(requested), 1)
+        self.assertIsNotNone(requested[0])
+        self.assertFalse([k for k in requested[0] if ".other." in k])
+
     def test_dcp_to_hf_refuses_a_mismatched_architecture(self) -> None:
         ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(_tied_lm())))
         # widen the recorded architecture so the checkpoint can no longer fill it
