@@ -401,17 +401,33 @@ class OneRankHSTUTransducer(HSTUTransducer):
         # for the `OneRankSTULayer` check to reject with a clear message.
         if stu.get("contextual_seq_len", -1) < 0:
             stu["contextual_seq_len"] = 0
+        # Rejected at construction rather than at the first training step:
+        # a reused `dlrm_hstu` block may carry truncation tuning, and the
+        # stack would otherwise only surface `OneRankSTULayer`'s
+        # NotImplementedError after torchrun, sharding and the data
+        # pipeline are fully up.
+        if (
+            kwargs.get("attn_truncation_split_layer", 0) != 0
+            or kwargs.get("attn_truncation_tail_len", 0) != 0
+        ):
+            raise ValueError(
+                "OneRank does not support mid-stack attention truncation: "
+                "the func tensor is cached across layers keyed on a static "
+                "signature, and truncation changes total_q and the prefix "
+                "boundary. Leave attn_truncation_split_layer / "
+                "attn_truncation_tail_len at 0."
+            )
         super().__init__(stu=stu, **kwargs)
         if self._return_full_embeddings:
             raise ValueError(
                 "OneRank does not return full sequence embeddings; the "
                 "expanded sequence is an internal layout."
             )
-        # `_enable_interleaving` doubles the candidate segment before this
-        # module sees it, which would break the fixed group stride. It is a
-        # private flag because `interleave_targets()` is train/eval
-        # dependent and we need a construction-time answer.
-        if getattr(self._input_preprocessor, "_enable_interleaving", False):
+        # Interleaving doubles the candidate segment before this module
+        # sees it, which would break the fixed group stride. Checked via
+        # the public construction-time accessor: `interleave_targets()` is
+        # train/eval dependent and would read False at construction.
+        if self._input_preprocessor.has_interleaving():
             raise ValueError(
                 "OneRank requires an input preprocessor without target "
                 "interleaving (use `contextual_preprocessor`, not "
