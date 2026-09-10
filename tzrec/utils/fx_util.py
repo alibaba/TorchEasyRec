@@ -99,6 +99,16 @@ def fx_numel(x: torch.Tensor) -> int:
 
 
 @torch.fx.wrap
+def fx_size0_max1(x: torch.Tensor) -> int:
+    """Fx trace wrapper for max(x.size(0), 1).
+
+    The inline ``max()`` compares a traced ``size()`` proxy in a bool context,
+    which raises ``TraceError`` under torchrec's train-pipeline FX rewrite.
+    """
+    return max(x.size(0), 1)
+
+
+@torch.fx.wrap
 def fx_flip_tensor_dict(
     tensor_dict: Dict[str, torch.Tensor],
 ) -> Dict[str, torch.Tensor]:
