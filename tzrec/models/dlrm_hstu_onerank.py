@@ -66,9 +66,10 @@ class DlrmHSTUOneRank(DlrmHSTU):
     -- is inherited unchanged, so the two models are directly comparable on
     the same ``fusion_mtl_tower.task_configs``.
 
-    Requires ``kernel: CUTLASS`` (or ``PYTORCH``) plus bf16/fp16 mixed
-    precision: the task-private mask is expressed as an NFUNC func tensor,
-    which the Triton attention kernel does not implement.
+    Requires ``kernel: CUTLASS`` (with bf16/fp16 mixed precision) or the
+    ``PYTORCH`` reference kernel (fp32-capable): the task-private mask is
+    expressed as an NFUNC func tensor, which the Triton attention kernel
+    does not implement, and the CUTLASS kernel only accepts fp16/bf16.
 
     Args:
         model_config (ModelConfig): an instance of ModelConfig.

@@ -10,7 +10,7 @@
 - **打分**：`s^i_k = z_k · r^i_k / sqrt(D) + b_k`，逐任务内积（另有 bilinear / MLP 变体）；
 - **listwise InfoNCE**：同一请求内其他候选互为负样本。
 
-损失、标签、bitmask 解码、指标全部继承自 `fusion_mtl_tower.task_configs`，与 DlrmHSTU 可在同一份配置下直接对比。
+损失、标签、bitmask 解码、指标全部继承自 `fusion_mtl_tower.task_configs`，与 DlrmHSTU 可在同一份配置下直接对比；唯一差异在 contextual token 的注意力模式：DlrmHSTU 把未显式设置的 `stu.contextual_seq_len` 解析为 contextual 特征数并给这些 token 一个双向注意力块，OneRank 固定为 0（普通 causal 前缀行）。做同配置 A/B 时注意这一基线差异也会计入指标差值。
 
 注意：
 
@@ -20,7 +20,7 @@
 
 ## 配置说明
 
-`dlrm_hstu_onerank` 的字段 1-7 与 `dlrm_hstu` 完全一致，现有 `dlrm_hstu` 配置块可直接复用；OneRank 会自动把 `stu.contextual_seq_len` 的 `-1` 哨兵值解析为 0。`fusion_mtl_tower.mlp` 与 `item_embedding_hidden_dim` 被本模型忽略（打分头替换了融合塔）。
+`dlrm_hstu_onerank` 的字段 1-7 与 `dlrm_hstu` 完全一致，现有 `dlrm_hstu` 配置块可直接复用；OneRank 会自动把 `stu.contextual_seq_len` 的 `-1` 哨兵值解析为 0。`fusion_mtl_tower.mlp` 与 `item_embedding_hidden_dim` 被本模型忽略（打分头替换了融合塔，`mlp` 为 optional 字段，可不配置）。
 
 `task_configs` 的字段与 DlrmHSTU 完全一致：标签须为 jagged 候选序列标签（如 `cand_seq___action_weight`，配合 `task_bitmask` 解码），损失和指标分别用 `losses` / `metrics` 重复字段表达，GAUC 为 `metrics { grouped_auc { grouping_key: "user_id" } }`。
 
@@ -98,7 +98,8 @@ model_config {
             }
         }
         fusion_mtl_tower {
-            # mlp 被 OneRank 忽略，但 FusionMTLTower 要求该字段存在
+            # mlp 被本模型忽略；可不配置（FusionMTLTower.mlp 为 optional，且
+            # DlrmHSTUOneRank 不会构造该塔），此处仅为兼容复用配置而保留
             mlp {
                 hidden_units: 256
                 activation: "nn.SiLU"
@@ -165,7 +166,7 @@ train_config {
 
 ### 不支持的配置
 
-以下组合会在**构造或首个 batch** 时报错（`ValueError` / `NotImplementedError`），为避免长训后失败，请在配置阶段避开：
+以下组合会在**构造、首个 batch 或 serving 调用**时报错（`ValueError` / `NotImplementedError`），为避免长训后失败，请在配置阶段避开：
 
 | 配置                                                                | 原因                                                          |
 | ------------------------------------------------------------------- | ------------------------------------------------------------- |
@@ -176,7 +177,9 @@ train_config {
 | `hstu.attn_truncation_split_layer` / `attn_truncation_tail_len` > 0 | 截断会破坏 func tensor 的静态签名缓存                         |
 | `input_preprocessor.contextual_interleave_preprocessor`             | 目标交织会破坏固定分组步长                                    |
 | `num_class > 1`                                                     | 任务 token 通道只支持二分类任务                               |
-| 模型导出 / KV-cache 增量推理（`OneRankSTULayer.cached_forward`）    | 膨胀序列是内部布局，增量推理未实现                            |
+| KV-cache 增量推理（`OneRankSTULayer.cached_forward`）               | 增量推理未实现，serving 侧调用时才抛 `NotImplementedError`；导出不受影响，见下文 |
+
+模型导出不受上表影响：`tzrec.export` 不会拒绝 `dlrm_hstu_onerank`，也不要求 `dlrm_hstu` / `ultra_hstu` 导出所必需的 `additional_export_config.cand_seq_pk`——那是 KV-cache 增量 serving 的契约键，OneRank 无此路径。导出产物按全量 forward 加载推理即可；上表的 `NotImplementedError` 只会在 serving 栈调用 `OneRankSTULayer.cached_forward` 时抛出，而非在导出时。
 
 ### 关键参数
 
@@ -185,7 +188,7 @@ train_config {
 | `max_num_candidates`            | 每请求候选数上界；膨胀后的序列长度为 `max_seq_len + max_num_candidates * 2K`。实际候选数超出上界的请求会在训练时被立即报错拒绝           |
 | `onerank.situation_discernment` | SD 模块；不配置时退化为候选表示的均值池化（论文 V5 显示这是最伤的消融）                                                                  |
 | `onerank.cross_task_head`       | 跨任务注意力；`mask_type` 默认 CASCADE（时长任务读点击任务），`gradient_detachment` 默认 true                                            |
-| `onerank.listwise_losses`       | 逐任务 listwise InfoNCE；对应任务须配置 `binary_cross_entropy` 或 `binary_focal_loss` 损失；只对每请求正样本覆盖率接近 100% 的任务有意义 |
+| `onerank.listwise_losses`       | 逐任务 listwise InfoNCE；对应任务须配置 `binary_cross_entropy` 或 `binary_focal_loss` 损失；每个请求需同时含至少一个正样本与一个负样本才计入该项损失，因此只对「几乎每个请求都含正样本」的任务值得开启（全正样本的请求同样被屏蔽：无负样本即无排序信号） |
 | `onerank.scorer_type`           | 打分函数；单 epoch 训练建议 MLP 或 BILINEAR 规避常数解平台期                                                                             |
 | `onerank.task_bias_init`        | 每任务初始 logit（`task_configs` 顺序，数量须等于 K）；设为 logit(全局 CTR) 可跳过向常数解的下降                                         |
 

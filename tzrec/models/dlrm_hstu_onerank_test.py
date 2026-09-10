@@ -28,6 +28,7 @@ from torchrec import JaggedTensor, KeyedJaggedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
+from tzrec.loss.onerank_listwise_loss import OneRankListwiseLoss
 from tzrec.models.dlrm_hstu_onerank import DlrmHSTUOneRank
 from tzrec.models.model import TrainWrapper
 from tzrec.models.rank_model import TARGET_REPEAT_INTERLEAVE_KEY
@@ -44,6 +45,7 @@ from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
+    cleanup_cuda_memory,
     create_test_model,
     cutlass_hstu_unavailable,
     gpu_unavailable,
@@ -115,6 +117,8 @@ def _model_config(
     scorer_type: Optional[int] = None,
     scorer_hidden_dim: Optional[int] = None,
     task_bias_init: Optional[List[float]] = None,
+    attn_truncation_split_layer: int = 0,
+    attn_truncation_tail_len: int = 0,
 ) -> model_pb2.ModelConfig:
     onerank = multi_task_rank_pb2.OneRankConfig(
         max_num_candidates=max_num_candidates,
@@ -179,6 +183,8 @@ def _model_config(
                 output_postprocessor=module_pb2.GROutputPostprocessor(
                     layernorm_postprocessor=module_pb2.GRLayerNormPostprocessor()
                 ),
+                attn_truncation_split_layer=attn_truncation_split_layer,
+                attn_truncation_tail_len=attn_truncation_tail_len,
             ),
             # `mlp` is ignored by OneRank but FusionMTLTower requires it.
             fusion_mtl_tower=tower_pb2.FusionMTLTower(
@@ -374,9 +380,91 @@ def _build_batch(device: torch.device) -> Batch:
     ).to(device)
 
 
+def _build_request_permuted_batch(device: torch.device) -> Batch:
+    """``_build_batch`` with the two requests swapped (r1 first, then r0).
+
+    Same two requests with identical per-request content -- user state,
+    histories, candidates, labels -- only the request order differs.  The
+    model is per-request independent, so predictions must come back as
+    the same request blocks in the swapped order; anything else means the
+    published logits no longer follow the batch's request order.
+    """
+    sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+        keys=[
+            "user_id",
+            "user_active_degree",
+            "uih_seq__video_id",
+            "cand_seq__item_video_id",
+            "uih_seq__video_cat",
+            "cand_seq__item_video_cat",
+        ],
+        # Key-major, request-major within each key: r1's block first.
+        values=torch.tensor(
+            [
+                1,
+                0,
+                3,
+                2,
+                6,
+                7,
+                8,
+                4,
+                5,
+                11,
+                12,
+                13,
+                14,
+                9,
+                10,
+                17,
+                18,
+                19,
+                15,
+                16,
+                22,
+                23,
+                24,
+                25,
+                20,
+                21,
+            ]
+        ),
+        lengths=torch.tensor([1, 1, 1, 1, 3, 2, 4, 2, 3, 2, 4, 2]),
+    )
+    sequence_dense_features = {
+        "uih_seq__action_timestamp": JaggedTensor(
+            values=torch.tensor([[3], [4], [5], [1], [2]]),
+            lengths=torch.tensor([3, 2]),
+        ),
+        "cand_seq__item_query_time": JaggedTensor(
+            values=torch.tensor([[8], [9], [10], [11], [6], [7]]),
+            lengths=torch.tensor([4, 2]),
+        ),
+        "uih_seq__action_weight": JaggedTensor(
+            values=torch.tensor([[0], [1], [0], [0], [1]]),
+            lengths=torch.tensor([3, 2]),
+        ),
+    }
+    jagged_labels = {
+        "item_action_weight": JaggedTensor(
+            values=torch.tensor([2, 5, 4, 0, 0, 1]),
+            lengths=torch.tensor([4, 2]),
+        ),
+    }
+    return Batch(
+        sequence_dense_features=sequence_dense_features,
+        sparse_features={BASE_DATA_GROUP: sparse_feature},
+        labels={},
+        jagged_labels=jagged_labels,
+    ).to(device)
+
+
 @mark_ci_scope("gpu")
 class DlrmHSTUOneRankTest(unittest.TestCase):
     """End-to-end tests of the OneRank model on the PYTORCH/CUTLASS kernels."""
+
+    def teardown_example(self, example):
+        cleanup_cuda_memory()
 
     @unittest.skipIf(*gpu_unavailable)
     @given(
@@ -559,6 +647,113 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             )
 
     @unittest.skipIf(*gpu_unavailable)
+    def test_listwise_loss_matches_hand_decoded_reference(self) -> None:
+        """The list-wise term must see decoded labels and its own logits.
+
+        A silent wiring regression -- feeding the raw jagged label values
+        instead of the bitmask-decoded ``_get_label`` output -- would count
+        every nonzero bitmask (2 == is_like, 4 == is_comment) as an
+        is_click positive and quietly train a different objective, while
+        every "finite / positive / alpha-scaled" assertion stays green.
+        The reference here decodes the label by hand and evaluates a bare
+        ``OneRankListwiseLoss`` on the published per-task logits and
+        ``num_targets``; only the exact wiring reproduces it, in both
+        timestamp directions.
+        """
+        device = torch.device("cuda")
+        for ascending in (True, False):
+            model = _build_model(
+                device=device,
+                sequence_timestamp_is_ascending=ascending,
+                listwise_losses=[
+                    multi_task_rank_pb2.OneRankListwiseLoss(
+                        task_name="is_click", alpha=1.0
+                    )
+                ],
+            )
+            model.set_kernel(Kernel.PYTORCH)
+            model.init_loss()
+            model.eval()
+            batch = _build_batch(device=device)
+            with torch.no_grad():
+                predictions = model.predict(batch)
+                losses = model.loss(predictions, batch)
+
+            # Hand-decoded is_click labels: (value & bitmask=1) > 0.
+            raw = batch.jagged_labels["item_action_weight"].values()
+            decoded = ((raw.to(torch.int64) & 1) > 0).to(torch.float32)
+            reference = OneRankListwiseLoss()
+            reference.load_state_dict(
+                model._loss_modules["listwise_infonce_is_click"].state_dict()
+            )
+            expected = reference(
+                predictions["logits_is_click"],
+                decoded,
+                predictions[TARGET_REPEAT_INTERLEAVE_KEY],
+            )
+            torch.testing.assert_close(
+                losses["listwise_infonce_is_click"],
+                expected,
+                msg=f"list-wise wiring wrong for ascending={ascending}",
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_predict_logits_stay_in_request_order(self) -> None:
+        """Published logits must follow the batch's request order.
+
+        ``test_predict_num_targets_order_is_deterministic`` pins the split
+        key; this pins the logits themselves.  Under
+        ``sequence_timestamp_is_ascending=False`` a regression of the
+        ``mt_preds`` flip-back would publish globally reversed logits
+        while ``num_targets`` stays ``[2, 4]`` -- whole request blocks
+        then pair with the wrong jagged labels in ``loss()`` with no
+        error anywhere.  The model is per-request independent, so feeding
+        the same two requests in swapped order must return the same
+        blocks, swapped.
+        """
+        device = torch.device("cuda")
+        first_request_len = _NUM_TARGETS[0]
+        for ascending in (True, False):
+            model = _build_model(
+                device=device,
+                sequence_timestamp_is_ascending=ascending,
+                listwise_losses=[
+                    multi_task_rank_pb2.OneRankListwiseLoss(
+                        task_name="is_click", alpha=1.0
+                    )
+                ],
+            )
+            model.set_kernel(Kernel.PYTORCH)
+            model.init_loss()
+            model.eval()
+            batch = _build_batch(device=device)
+            permuted_batch = _build_request_permuted_batch(device=device)
+            with torch.no_grad():
+                predictions = model.predict(batch)
+                permuted_predictions = model.predict(permuted_batch)
+                losses = model.loss(predictions, batch)
+                permuted_losses = model.loss(permuted_predictions, permuted_batch)
+
+            for task_name in _TASK_NAMES:
+                logits = predictions[f"logits_{task_name}"]
+                permuted_logits = permuted_predictions[f"logits_{task_name}"]
+                torch.testing.assert_close(
+                    permuted_logits,
+                    torch.cat([logits[first_request_len:], logits[:first_request_len]]),
+                    rtol=1e-5,
+                    atol=1e-6,
+                    msg=f"{task_name} logits not request-permuted for "
+                    f"ascending={ascending}",
+                )
+            torch.testing.assert_close(
+                permuted_losses["listwise_infonce_is_click"],
+                losses["listwise_infonce_is_click"],
+                rtol=1e-5,
+                atol=1e-6,
+                msg=f"list-wise loss not request-invariant for ascending={ascending}",
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
     def test_listwise_temperature_is_a_trainable_parameter(self) -> None:
         """The temperature must reach the optimizer.
 
@@ -635,6 +830,25 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             _build_model(device=torch.device("cpu"), task_configs=[])
         with self.assertRaisesRegex(ValueError, "max_num_candidates"):
             _build_model(device=torch.device("cpu"), max_num_candidates=0)
+
+    def test_truncation_tuning_is_rejected_at_construction(self) -> None:
+        """A reused ``dlrm_hstu`` block may carry truncation tuning.
+
+        Mid-stack attention truncation is incompatible with the group
+        layout; before the construction guard it only surfaced as
+        ``OneRankSTULayer.truncate_input``'s ``NotImplementedError`` on
+        the first training step, after torchrun, TorchRec sharding and
+        the data pipeline were fully up.
+        """
+        for truncation_kwargs in (
+            {"attn_truncation_split_layer": 2},
+            {"attn_truncation_tail_len": 64},
+        ):
+            with self.subTest(**truncation_kwargs):
+                with self.assertRaisesRegex(
+                    ValueError, "mid-stack attention truncation"
+                ):
+                    _build_model(device=torch.device("cpu"), **truncation_kwargs)
 
     def test_scorer_type_wiring(self) -> None:
         """The proto enum reaches the head as the documented string."""
@@ -763,6 +977,11 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         ):
             model.predict(batch)
 
+    # Method-level "h20" in addition to the class-level "gpu": these are
+    # the only end-to-end CUTLASS NFUNC checks, and the gpu lane lacks the
+    # fbgemm_gpu_hstu wheel -- without the h20 tag they would run on no
+    # per-PR lane at all (see rank_integration_test.py for the precedent).
+    @mark_ci_scope("h20", "gpu")
     @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_cutlass_matches_pytorch_kernel(self) -> None:
@@ -800,6 +1019,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
                 got, want, rtol=5e-2, atol=5e-2, msg=f"kernel mismatch on {task_name}"
             )
 
+    @mark_ci_scope("h20", "gpu")
     @unittest.skipIf(*cutlass_hstu_unavailable)
     @unittest.skipIf(*gpu_unavailable)
     def test_cutlass_backward_reaches_the_task_tokens(self) -> None:

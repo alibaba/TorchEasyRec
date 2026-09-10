@@ -39,7 +39,11 @@ from tzrec.modules.gr.onerank_cross_task import (
     build_cross_task_mask,
 )
 from tzrec.modules.gr.onerank_head import OneRankPredictionHead
-from tzrec.modules.gr.onerank_sd import JaggedCrossAttention
+from tzrec.modules.gr.onerank_jagged import jagged_softmax
+from tzrec.modules.gr.onerank_sd import (
+    JaggedCrossAttention,
+    OneRankSituationDiscernment,
+)
 from tzrec.ops import Kernel
 from tzrec.utils.test_util import (
     TestGraphType,
@@ -526,6 +530,165 @@ class JaggedCrossAttentionTest(unittest.TestCase):
 
         torch.testing.assert_close(out[0], bias)
         torch.testing.assert_close(out[1], pool.mean(dim=0) + bias)
+
+    def test_matches_dense_softmax_reference(self) -> None:
+        """Random projections, two heads, live scale: the full math.
+
+        The identity/zero-scale tests above never exercise the weighted
+        attention -- every logit is zero, so a wrong
+        ``(q_rows * k).sum(dim=-1)`` numerator, a head-order scramble in
+        the multi-head collapse, or a per-segment max-shift regression in
+        ``jagged_softmax`` would all pass them.  This compares against a
+        per-segment dense ``torch.softmax`` reference, ``num_heads=2``, so
+        both head slices and the head-major reshape are value-pinned.
+        """
+        torch.manual_seed(5)
+        module = JaggedCrossAttention(embedding_dim=self._DIM, num_heads=2)
+        module.eval()
+        lengths = torch.tensor([1, 3, 2])
+        pool = torch.randn(int(lengths.sum()), self._DIM)
+        query = torch.randn(lengths.size(0), self._DIM)
+
+        out = module(query, pool, lengths)
+
+        num_heads = module._num_heads
+        head_dim = module._head_dim
+        q = module._q_proj(query).view(-1, num_heads, head_dim)
+        k = module._k_proj(pool).view(-1, num_heads, head_dim)
+        v = module._v_proj(pool).view(-1, num_heads, head_dim)
+        contexts = []
+        offset = 0
+        for request_idx, num in enumerate(lengths.tolist()):
+            rows = slice(offset, offset + num)
+            logits = (
+                torch.einsum("hd,nhd->hn", q[request_idx], k[rows]) * module._attn_scale
+            )
+            attn = torch.softmax(logits, dim=-1)
+            # Head-major collapse, matching the module's
+            # ``(attn.unsqueeze(-1) * v).reshape(-1, num_heads * head_dim)``.
+            contexts.append(torch.einsum("hn,nhd->hd", attn, v[rows]).reshape(-1))
+            offset += num
+        expected = module._out_proj(torch.stack(contexts))
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
+
+
+class JaggedSoftmaxTest(unittest.TestCase):
+    """Direct value-level pin of ``jagged_softmax``.
+
+    Every other use in these tests flows through attention paths that
+    zero the logits first; non-uniform logits are what expose a
+    per-segment max-shift or denominator regression.
+    """
+
+    def test_normalizes_each_segment_and_column_independently(self) -> None:
+        torch.manual_seed(6)
+        lengths = torch.tensor([1, 3, 2])
+        # Two columns (heads) with independent random patterns, so a
+        # column mix-up or a cross-segment normalization both fail loudly.
+        logits = torch.randn(int(lengths.sum()), 2)
+
+        weights = jagged_softmax(logits, lengths)
+
+        offset = 0
+        for num in lengths.tolist():
+            rows = slice(offset, offset + num)
+            torch.testing.assert_close(
+                weights[rows], torch.softmax(logits[rows], dim=0)
+            )
+            offset += num
+
+
+class OneRankSituationDiscernmentTest(unittest.TestCase):
+    """Value-level pins of the per-task wiring in SD.
+
+    ``forward`` drives three parallel per-task lists (query projection,
+    pool channel, attention) with the same ``task_idx`` and stacks the
+    results in task order.  A permutation of any of the three leaves
+    every shape/finite assertion in the model-level tests green while
+    silently mis-ordering ``z_k`` against ``r^i_k`` in the scorer.  The
+    tests here pin the wiring with values: one hand-computable
+    (identity projections, uniform attention), one exhaustive over the
+    per-task modules.
+    """
+
+    _DIM = 6
+    _NUM_TASKS = 3
+
+    def _identity_sd(self) -> OneRankSituationDiscernment:
+        torch.manual_seed(0)
+        module = OneRankSituationDiscernment(
+            embedding_dim=self._DIM,
+            num_tasks=self._NUM_TASKS,
+            contextual_feature_dim=self._DIM,
+            num_heads=2,
+        )
+        for linear in module._query_projs:
+            torch.nn.init.eye_(linear.weight)
+            torch.nn.init.zeros_(linear.bias)
+        for attention in module._attentions:
+            for linear in (
+                attention._q_proj,
+                attention._k_proj,
+                attention._v_proj,
+                attention._out_proj,
+            ):
+                torch.nn.init.eye_(linear.weight)
+                torch.nn.init.zeros_(linear.bias)
+            # Zero logits: the expected pooling is the segment-local
+            # uniform mean, and the (LayerNorm-ed) query cannot matter.
+            attention._attn_scale = 0.0
+        # The default TRITON LayerNorm is CUDA-only; the reference
+        # math here is kernel-independent.
+        module.set_kernel(Kernel.PYTORCH)
+        module.eval()
+        return module
+
+    def test_output_channel_k_pools_task_channel_k(self) -> None:
+        """``forward(...)[:, k]`` is the mean of task channel ``k`` rows."""
+        module = self._identity_sd()
+        torch.manual_seed(7)
+        task_embeddings = torch.randn(_TOTAL, self._NUM_TASKS, self._DIM)
+        contextual = torch.randn(len(_NUM_CANDIDATES), self._DIM)
+
+        out = module(contextual, task_embeddings, torch.tensor(_NUM_CANDIDATES))
+
+        offset = 0
+        for request_idx, num in enumerate(_NUM_CANDIDATES):
+            rows = slice(offset, offset + num)
+            for task_idx in range(self._NUM_TASKS):
+                torch.testing.assert_close(
+                    out[request_idx, task_idx],
+                    task_embeddings[rows, task_idx].mean(dim=0),
+                )
+            offset += num
+
+    def test_per_task_modules_stay_paired(self) -> None:
+        """Query ``k``, pool channel ``k`` and attention ``k`` stay paired."""
+        torch.manual_seed(8)
+        module = OneRankSituationDiscernment(
+            embedding_dim=self._DIM,
+            num_tasks=self._NUM_TASKS,
+            contextual_feature_dim=self._DIM,
+            num_heads=2,
+        )
+        module.set_kernel(Kernel.PYTORCH)
+        module.eval()
+        torch.manual_seed(9)
+        task_embeddings = torch.randn(_TOTAL, self._NUM_TASKS, self._DIM)
+        contextual = torch.randn(len(_NUM_CANDIDATES), self._DIM)
+
+        out = module(contextual, task_embeddings, torch.tensor(_NUM_CANDIDATES))
+
+        for task_idx in range(self._NUM_TASKS):
+            query = module._query_norms[task_idx](
+                module._query_projs[task_idx](contextual)
+            )
+            expected = module._attentions[task_idx](
+                query=query,
+                pool=task_embeddings[:, task_idx, :].contiguous(),
+                lengths=torch.tensor(_NUM_CANDIDATES),
+            )
+            torch.testing.assert_close(out[:, task_idx, :], expected)
 
 
 if __name__ == "__main__":

@@ -145,8 +145,10 @@ message OneRankCrossTaskHead {
 
 // One list-wise InfoNCE term (paper 2.5).  The negatives of a candidate
 // are the other candidates of the same request, so no cross-rank gather
-// is needed.  Only worth enabling for tasks whose per-request positive
-// coverage is close to 100%.
+// is needed.  A request only contributes when it contains at least one
+// positive and at least one negative (an all-positive request carries no
+// ranking signal), so this is worth enabling only for tasks where nearly
+// every request contains a positive.
 message OneRankListwiseLoss {
     // must match a fusion_mtl_tower.task_configs entry that carries a
     // binary_cross_entropy or binary_focal_loss: the term scores the

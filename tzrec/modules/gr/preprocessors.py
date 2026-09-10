@@ -85,6 +85,14 @@ class InputPreprocessor(BaseModule):
         """Interleave targets or not."""
         return False
 
+    def has_interleaving(self) -> bool:
+        """Whether target interleaving is enabled in the config.
+
+        Unlike :meth:`interleave_targets`, this is a static, construction-
+        time answer that does not depend on train/eval mode.
+        """
+        return False
+
     def contextual_seq_len(self) -> int:
         """Contextual feature sequence length."""
         return 0
@@ -475,6 +483,10 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
     def interleave_targets(self) -> bool:
         """Interleave targets or not."""
         return self.is_train and self._enable_interleaving
+
+    def has_interleaving(self) -> bool:
+        """Whether target interleaving is enabled in the config."""
+        return self._enable_interleaving
 
     def contextual_seq_len(self) -> int:
         """Contextual feature sequence length."""
