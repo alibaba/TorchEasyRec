@@ -168,29 +168,29 @@ train_config {
 
 以下组合会在**构造、首个 batch 或 serving 调用**时报错（`ValueError` / `NotImplementedError`），为避免长训后失败，请在配置阶段避开：
 
-| 配置                                                                | 原因                                                          |
-| ------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `kernel: TRITON`                                                    | NFUNC func tensor 路径无 Triton 实现                          |
-| `stu.sla_k1` / `stu.sla_k2` > 0                                     | OneRank 自建 func mask，与 SLA 区间互斥                       |
-| `stu.max_attn_len` > 0                                              | 局部窗口需折叠进 func tensor 的两个区间，区间已被分组布局占用 |
-| 显式 `stu.contextual_seq_len` > 0                                   | 分组布局将两个列区间都用于 `prefix + own group`               |
-| `hstu.attn_truncation_split_layer` / `attn_truncation_tail_len` > 0 | 截断会破坏 func tensor 的静态签名缓存                         |
-| `input_preprocessor.contextual_interleave_preprocessor`             | 目标交织会破坏固定分组步长                                    |
-| `num_class > 1`                                                     | 任务 token 通道只支持二分类任务                               |
+| 配置                                                                | 原因                                                                             |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `kernel: TRITON`                                                    | NFUNC func tensor 路径无 Triton 实现                                             |
+| `stu.sla_k1` / `stu.sla_k2` > 0                                     | OneRank 自建 func mask，与 SLA 区间互斥                                          |
+| `stu.max_attn_len` > 0                                              | 局部窗口需折叠进 func tensor 的两个区间，区间已被分组布局占用                    |
+| 显式 `stu.contextual_seq_len` > 0                                   | 分组布局将两个列区间都用于 `prefix + own group`                                  |
+| `hstu.attn_truncation_split_layer` / `attn_truncation_tail_len` > 0 | 截断会破坏 func tensor 的静态签名缓存                                            |
+| `input_preprocessor.contextual_interleave_preprocessor`             | 目标交织会破坏固定分组步长                                                       |
+| `num_class > 1`                                                     | 任务 token 通道只支持二分类任务                                                  |
 | KV-cache 增量推理（`OneRankSTULayer.cached_forward`）               | 增量推理未实现，serving 侧调用时才抛 `NotImplementedError`；导出不受影响，见下文 |
 
 模型导出不受上表影响：`tzrec.export` 不会拒绝 `dlrm_hstu_onerank`，也不要求 `dlrm_hstu` / `ultra_hstu` 导出所必需的 `additional_export_config.cand_seq_pk`——那是 KV-cache 增量 serving 的契约键，OneRank 无此路径。导出产物按全量 forward 加载推理即可；上表的 `NotImplementedError` 只会在 serving 栈调用 `OneRankSTULayer.cached_forward` 时抛出，而非在导出时。
 
 ### 关键参数
 
-| 参数                            | 说明                                                                                                                                     |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `max_num_candidates`            | 每请求候选数上界；膨胀后的序列长度为 `max_seq_len + max_num_candidates * 2K`。实际候选数超出上界的请求会在训练时被立即报错拒绝           |
-| `onerank.situation_discernment` | SD 模块；不配置时退化为候选表示的均值池化（论文 V5 显示这是最伤的消融）                                                                  |
-| `onerank.cross_task_head`       | 跨任务注意力；`mask_type` 默认 CASCADE（时长任务读点击任务），`gradient_detachment` 默认 true                                            |
+| 参数                            | 说明                                                                                                                                                                                                                                                     |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_num_candidates`            | 每请求候选数上界；膨胀后的序列长度为 `max_seq_len + max_num_candidates * 2K`。实际候选数超出上界的请求会在训练时被立即报错拒绝                                                                                                                           |
+| `onerank.situation_discernment` | SD 模块；不配置时退化为候选表示的均值池化（论文 V5 显示这是最伤的消融）                                                                                                                                                                                  |
+| `onerank.cross_task_head`       | 跨任务注意力；`mask_type` 默认 CASCADE（时长任务读点击任务），`gradient_detachment` 默认 true                                                                                                                                                            |
 | `onerank.listwise_losses`       | 逐任务 listwise InfoNCE；对应任务须配置 `binary_cross_entropy` 或 `binary_focal_loss` 损失；每个请求需同时含至少一个正样本与一个负样本才计入该项损失，因此只对「几乎每个请求都含正样本」的任务值得开启（全正样本的请求同样被屏蔽：无负样本即无排序信号） |
-| `onerank.scorer_type`           | 打分函数；单 epoch 训练建议 MLP 或 BILINEAR 规避常数解平台期                                                                             |
-| `onerank.task_bias_init`        | 每任务初始 logit（`task_configs` 顺序，数量须等于 K）；设为 logit(全局 CTR) 可跳过向常数解的下降                                         |
+| `onerank.scorer_type`           | 打分函数；单 epoch 训练建议 MLP 或 BILINEAR 规避常数解平台期                                                                                                                                                                                             |
+| `onerank.task_bias_init`        | 每任务初始 logit（`task_configs` 顺序，数量须等于 K）；设为 logit(全局 CTR) 可跳过向常数解的下降                                                                                                                                                         |
 
 ## 训练动态：常数解平台期
 
