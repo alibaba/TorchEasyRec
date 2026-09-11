@@ -209,17 +209,7 @@ class DlrmHSTU(RankModel):
             # we should reverse all features
             grouped_features = fx_flip_tensor_dict(grouped_features)
 
-        with record_function("## item_forward ##"):
-            candidates_item_embeddings = self._item_embedding_mlp(
-                grouped_features["candidate.sequence"]
-            )
-
-        with record_function("## user_forward ##"):
-            candidates_user_embeddings, _ = self._hstu_transducer(grouped_features)
-        with record_function("## multitask_module ##"):
-            mt_preds = self._multitask_module(
-                candidates_user_embeddings, candidates_item_embeddings
-            )
+        mt_preds = self._score_targets(grouped_features)
 
         if not self._model_config.sequence_timestamp_is_ascending:
             # if timestamp of sequence is descending,
@@ -241,6 +231,29 @@ class DlrmHSTU(RankModel):
         predictions[TARGET_REPEAT_INTERLEAVE_KEY] = num_targets
 
         return predictions
+
+    def _score_targets(
+        self, grouped_features: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Turn grouped features into one prediction tensor per task.
+
+        The hook sees the features *after* the descending-timestamp flip
+        and must return its tensors in that same request order;
+        :meth:`predict` owns the flip bookkeeping and the prediction
+        publication, so a subclass that scores differently overrides
+        only this hook (see ``DlrmHSTUOneRank``).
+        """
+        with record_function("## item_forward ##"):
+            candidates_item_embeddings = self._item_embedding_mlp(
+                grouped_features["candidate.sequence"]
+            )
+
+        with record_function("## user_forward ##"):
+            candidates_user_embeddings, _ = self._hstu_transducer(grouped_features)
+        with record_function("## multitask_module ##"):
+            return self._multitask_module(
+                candidates_user_embeddings, candidates_item_embeddings
+            )
 
     def _get_label(self, batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
         label_name = task_cfg.label_name

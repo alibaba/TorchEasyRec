@@ -67,12 +67,27 @@ def jagged_segment_sum(
 
     Returns:
         torch.Tensor: ``(B, C)``; empty segments sum to zeros.
+
+    Reduced-precision inputs (fp16/bf16) accumulate in fp32 and cast
+    back: ``index_add_`` is not on autocast's promote list (unlike
+    ``sum``), so bf16 inputs would otherwise add through bf16 atomics
+    whose reorder noise sits at bf16 rounding scale -- and the pooled
+    result anchors every logit of its request in the no-SD pooling
+    path.  fp32/fp64 inputs accumulate natively, so fp32 is
+    bit-identical and fp64 keeps full precision.
+
+    ``promote_types`` keeps the dtype choice a graph node rather than
+    Python control flow on ``values.dtype``: fx symbolic tracing
+    inlines this body and rejects traced variables in control flow.
     """
-    return torch.zeros(
+    acc_dtype = torch.promote_types(values.dtype, torch.float32)
+    sums = torch.zeros(
         (lengths.size(0), values.size(-1)),
-        dtype=values.dtype,
+        dtype=acc_dtype,
         device=values.device,
-    ).index_add_(0, segment_ids, values)
+    )
+    sums.index_add_(0, segment_ids, values.to(acc_dtype))
+    return sums.to(values.dtype)
 
 
 def jagged_segment_max(
