@@ -29,11 +29,9 @@ from tzrec.ops.utils import set_static_max_seq_lens
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_flip_tensor_dict
 
 # `torch.fx.wrap` registers by name in the *calling* module's globals, so the
-# decorators in dlrm_hstu.py / fx_util.py do not cover the calls made from here.
-torch.fx.wrap(fx_flip_tensor_dict)
+# decorator on dlrm_hstu.py does not cover the call made from here.
 torch.fx.wrap(_fx_avg_batch_size)
 
 # Loss types whose `_output_to_prediction_impl` branch publishes a
@@ -276,27 +274,16 @@ class DlrmHSTUOneRank(DlrmHSTU):
             )
         return losses
 
-    def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Forward the model.
+    def _score_targets(
+        self, grouped_features: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Score every candidate of the (possibly time-flipped) request.
 
-        Args:
-            batch (Batch): input batch data.
-
-        Return:
-            predictions (dict): a dict of predicted result.
+        The head consumes the features in the same request order the
+        transducer does -- reversed when
+        ``sequence_timestamp_is_ascending`` is false; the flip /
+        un-flip bookkeeping stays in :meth:`DlrmHSTU.predict`.
         """
-        with record_function("## preprocess ##"):
-            grouped_features = self.build_input(batch)
-
-        # Capture num_targets before the descending-timestamp flip below, so the
-        # output split key stays in the original (un-flipped) request order.
-        num_targets = grouped_features["candidate.sequence_length"]
-
-        if not self._model_config.sequence_timestamp_is_ascending:
-            # if timestamp of sequence is descending,
-            # we should reverse all features
-            grouped_features = fx_flip_tensor_dict(grouped_features)
-
         with record_function("## user_forward ##"):
             task_embeddings, _ = self._hstu_transducer(grouped_features)
 
@@ -310,29 +297,9 @@ class DlrmHSTUOneRank(DlrmHSTU):
                 contextual_embeddings=grouped_features[self._contextual_group_name],
             )
 
-        mt_preds: Dict[str, torch.Tensor] = {}
-        for i, task_cfg in enumerate(self._task_configs):
-            # Keep the trailing class dim so `_output_to_prediction_impl`
-            # sees the same `(N, 1)` shape FusionMTLTower produces.
-            mt_preds[task_cfg.task_name] = scores[:, i : i + 1]
-
-        if not self._model_config.sequence_timestamp_is_ascending:
-            # if timestamp of sequence is descending,
-            # we should reverse predictions back to input order
-            mt_preds = fx_flip_tensor_dict(mt_preds)
-
-        predictions = {}
-        for task_cfg in self._task_configs:
-            task_name = task_cfg.task_name
-            for loss_cfg in task_cfg.losses:
-                predictions.update(
-                    self._output_to_prediction_impl(
-                        mt_preds[task_name],
-                        loss_cfg,
-                        num_class=task_cfg.num_class,
-                        suffix=f"_{task_name}",
-                    )
-                )
-        predictions[TARGET_REPEAT_INTERLEAVE_KEY] = num_targets
-
-        return predictions
+        # Keep the trailing class dim so `_output_to_prediction_impl`
+        # sees the same `(N, 1)` shape FusionMTLTower produces.
+        return {
+            task_cfg.task_name: scores[:, i : i + 1]
+            for i, task_cfg in enumerate(self._task_configs)
+        }
