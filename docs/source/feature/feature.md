@@ -117,7 +117,7 @@ feature_configs {
 
 - **weighted**: 是否为带权重的Id特征，输入形式为`k1:v1\x1dk2:v2`
 
-- **use_weight**: 默认值是false，仅在**weighted**=true时生效。默认情况下，权重仅用于从`k:v`格式的输入中解析出id，解析后即被丢弃，不参与模型计算，也不会传输给模型。设置为true时，权重会参与embedding pooling。注意：开启后，同一**数据组（data group）**内的所有特征都会带上权重（其余特征填充为1），会有一定的内存和计算开销；且同一数据组内不能有配置了**dynamicemb**的特征（dynamicemb目前不支持带权重的pooling）
+- **use_weight**: 默认值是false，仅在**weighted**=true时生效。默认情况下，权重仅用于从`k:v`格式的输入中解析出id，解析后即被丢弃，不参与模型计算，也不会传输给模型。设置为true时，权重会参与embedding pooling。注意：开启后，同一**数据组**（data group）内的所有特征都会带上权重（其余特征填充为1），会有一定的内存和计算开销
 
 - **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
 
