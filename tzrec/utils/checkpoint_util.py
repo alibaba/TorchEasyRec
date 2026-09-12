@@ -42,6 +42,7 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.optim.ema import DenseEMA
+from tzrec.optim.lr_scheduler import BaseLR, ConstantLR
 from tzrec.protos import export_pb2
 from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
@@ -427,6 +428,7 @@ class CheckpointManager:
         dataloader_state: Optional[Dict[str, Any]] = None,
         dense_ema: Optional[DenseEMA] = None,
         data_ts: Optional[float] = None,
+        lr_schedulers: Optional[List[BaseLR]] = None,
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune.
 
@@ -435,6 +437,8 @@ class CheckpointManager:
         """
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer, dense_ema)
+        if lr_schedulers is not None:
+            save_lr_schedulers(ckpt_dir, lr_schedulers)
         # Local import avoids a circular import (hf_export_util imports us).
         from tzrec.utils.hf_export_util import write_hf_assets
 
@@ -550,6 +554,7 @@ class CheckpointManager:
         epoch: Optional[int] = None,
         data_timestamp: float = -1.0,
         final: bool = False,
+        lr_schedulers: Optional[List[BaseLR]] = None,
     ) -> bool:
         """Save a checkpoint if a configured trigger fires; return whether it did.
 
@@ -570,6 +575,7 @@ class CheckpointManager:
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none;
                 reconciled across workers (quorum) for the event-time trigger.
             final: force a save (still subject to the dedupe), e.g. at train end.
+            lr_schedulers: learning rate schedulers to save on every rank.
 
         Returns:
             True if a checkpoint was saved.
@@ -614,6 +620,8 @@ class CheckpointManager:
                 and self._last_ckpt_dir is not None
             ):
                 save_dataloader_state(self._last_ckpt_dir, dataloader_state)
+                if lr_schedulers is not None:
+                    save_lr_schedulers(self._last_ckpt_dir, lr_schedulers)
             return False
 
         self._last_ckpt_step = step
@@ -629,7 +637,15 @@ class CheckpointManager:
         report_ts = data_ts
         if report_ts is None and not self.needs_worker_timestamps():
             report_ts = self._reconcile_event_time(data_timestamp, force=True)
-        self.save(step, model, optimizer, dataloader_state, dense_ema, report_ts)
+        self.save(
+            step,
+            model,
+            optimizer,
+            dataloader_state,
+            dense_ema,
+            report_ts,
+            lr_schedulers=lr_schedulers,
+        )
         return True
 
     def prune(self) -> None:
@@ -685,6 +701,7 @@ class CheckpointManager:
         ckpt_param_map_path: Optional[str] = None,
         dense_ema: Optional[DenseEMA] = None,
         use_dense_ema: bool = False,
+        lr_schedulers: Optional[List[BaseLR]] = None,
     ) -> None:
         """Restore model/optimizer state from a checkpoint dir."""
         restore_model(
@@ -695,6 +712,8 @@ class CheckpointManager:
             dense_ema=dense_ema,
             use_dense_ema=use_dense_ema,
         )
+        if lr_schedulers is not None:
+            restore_lr_schedulers(ckpt_path, lr_schedulers)
 
     def restore_dataloader_state(self, ckpt_path: str) -> Optional[Dict[str, Any]]:
         """Restore dataloader state saved alongside a checkpoint.
@@ -1243,6 +1262,88 @@ DATA_TS_WATERMARK = "__data_ts_watermark__"
 # reserved dataloader_state key: number of completed data passes; resume
 # continues the epoch budget from here. no ":" so per-source consumers skip it.
 EPOCHS_COMPLETED = "__epochs_completed__"
+LR_SCHEDULER_CKPT_FILENAME = "lr_scheduler.json"
+
+
+def save_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
+    """Save per-rank scheduler states, including rank-local parameter groups.
+
+    The JSON list is indexed by rank. Restoring requires the same world size,
+    scheduler types/order and local parameter-group counts. Atomic replacement
+    also supports refreshing an epoch boundary deduplicated against a step save.
+    """
+    local_state = [
+        {"type": type(scheduler).__name__, "state": scheduler.state_dict()}
+        for scheduler in schedulers
+    ]
+    states: List[Any] = [local_state]
+    if dist.is_initialized():
+        states = [None] * dist.get_world_size()
+        dist.all_gather_object(states, local_state)
+    if int(os.environ.get("RANK", 0)) == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        path = os.path.join(checkpoint_dir, LR_SCHEDULER_CKPT_FILENAME)
+        with open(path + ".tmp", "w") as f:
+            json.dump(states, f)
+        os.replace(path + ".tmp", path)
+
+
+def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
+    """Restore schedulers, or reconstruct legacy progress from unchanged config.
+
+    A stepped legacy checkpoint records a zero-based batch index. Epoch-based
+    schedules additionally require an explicit completed-epoch count; missing
+    progress is an error rather than silently restarting the learning rate.
+    """
+    path = os.path.join(checkpoint_dir, LR_SCHEDULER_CKPT_FILENAME)
+    if os.path.exists(path):
+        with open(path) as f:
+            states = json.load(f)
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if len(states) != world_size:
+            raise ValueError("Restored LR scheduler world size does not match.")
+        local_state = states[rank]
+        if [state["type"] for state in local_state] != [
+            type(scheduler).__name__ for scheduler in schedulers
+        ]:
+            raise ValueError("Restored LR scheduler types/order do not match.")
+        for scheduler, state in zip(schedulers, local_state):
+            scheduler.load_state_dict(state["state"])
+    else:
+        meta_path = os.path.join(checkpoint_dir, CKPT_META_FILENAME)
+        meta = {}
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+        step = meta.get("step")
+        if step is None:
+            match = re.search(r"model\.ckpt-(\d+)$", checkpoint_dir.rstrip("/"))
+            if match:
+                step = int(match.group(1))
+        dataloader_state = restore_dataloader_state(checkpoint_dir) or {}
+        counts = []
+        for scheduler in schedulers:
+            if isinstance(scheduler, ConstantLR):
+                count = 0
+            elif scheduler.by_epoch:
+                count = dataloader_state.get(EPOCHS_COMPLETED)
+            else:
+                count = step + 1 if step is not None else None
+            if count is None:
+                raise ValueError(
+                    "Cannot reconstruct legacy LR scheduler progress: checkpoint "
+                    "must record step / completed epochs. Omit --restore_lr_scheduler "
+                    "to keep the configured initial schedule."
+                )
+            counts.append(count)
+        logger.warning(
+            "Checkpoint has no LR scheduler state; reconstructing progress from "
+            "checkpoint metadata. The original LR configuration must be unchanged."
+        )
+        for scheduler, count in zip(schedulers, counts):
+            scheduler.set_step(count)
+    logger.info(f"Restored LR schedulers from {checkpoint_dir}.")
 
 
 def save_meta(

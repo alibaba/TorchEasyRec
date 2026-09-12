@@ -20,6 +20,11 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --fine_tune_checkpoint: 增量训练的checkpoint路径，如experiments/multi_tower_din_taobao_local/model.ckpt-0，如果不设置，增量训练使用model_dir下最近的检查点
 - --edit_config_json: 命令行以json的方式动态修改配置文件，如{"model_dir":"experiments/","feature_configs[0].raw_feature.boundaries":[4,5,6,7]}
 - --ignore_restore_optimizer: 加载checkpoint参数时，忽略加载优化器的参数
+- --restore_lr_scheduler: 从选中的checkpoint恢复学习率调度器，默认false，保持旧版本从头调度的行为。该参数独立于`--ignore_restore_optimizer`，后者仍只控制优化器状态的恢复。
+  - 续训时使用`--continue_train --restore_lr_scheduler`，恢复稀疏、稠密和part optimizer的调度进度及当前学习率；续训第一批即使用恢复后的学习率。新checkpoint会保存调度状态，恢复时要求world size、调度器类型/顺序及各rank参数组数量一致。
+  - 旧checkpoint没有调度状态时，按checkpoint步数（从0开始）或已完成epoch数重建，要求学习率配置与原训练一致。按epoch调度但缺少已完成epoch数等无法确定进度的情况会报错，不会静默从头调度。
+  - 不传此参数时，即使checkpoint中有调度状态，也不会加载；切换版本无需修改旧配置。按step调度仍以训练batch计数，不改变梯度累积下现有的调度口径。
+  - 此开关不写入`pipeline.config`，复现任务时需保留启动命令；恢复checkpoint时会在日志中记录优化器和调度器恢复开关。
 
 ### 环境变量
 
