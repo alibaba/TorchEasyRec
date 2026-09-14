@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import unittest
 
 import torch
@@ -20,7 +19,7 @@ from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 from tzrec.optim import optimizer_builder
 from tzrec.optim.optimizer import (
-    _SPARSE_INIT_ACC_ENV,
+    set_sparse_init_accumulator_value,
     sparse_init_accumulator_value,
 )
 from tzrec.protos import optimizer_pb2
@@ -29,7 +28,7 @@ from tzrec.utils.test_util import parameterized_name_func
 
 class OpimizerBuilderTest(unittest.TestCase):
     def tearDown(self):
-        os.environ.pop(_SPARSE_INIT_ACC_ENV, None)
+        set_sparse_init_accumulator_value(0.0)
 
     @parameterized.expand(
         [

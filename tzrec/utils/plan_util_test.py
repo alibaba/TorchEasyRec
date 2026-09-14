@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import random
 import unittest
 from types import SimpleNamespace
@@ -567,10 +566,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         from dynamicemb.planner import DynamicEmbParameterSharding
         from torchrec.distributed.planner import planners
 
-        from tzrec.optim.optimizer import (
-            _SPARSE_INIT_ACC_ENV,
-            set_sparse_init_accumulator_value,
-        )
+        from tzrec.optim.optimizer import set_sparse_init_accumulator_value
         from tzrec.utils.plan_util import (
             EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
         )
@@ -604,7 +600,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         try:
             plan = planners.to_sharding_plan([sharding_option], topology)
         finally:
-            os.environ.pop(_SPARSE_INIT_ACC_ENV, None)
+            set_sparse_init_accumulator_value(0.0)
 
         param_sharding = plan.plan[sharding_option.path][sharding_option.name]
         fused_params = param_sharding.get_additional_fused_params()

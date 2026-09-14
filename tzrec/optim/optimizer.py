@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-import os
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -72,17 +71,18 @@ class TZRecOptimizer(OptimizerWrapper):
 # `initial_accumulator_value`, with a default value of 0.1.
 # Here, we patch the fbgemm embedding optimizer state split helper
 # to support `momentum1` (Adagrad) with the specified initial value.
-_SPARSE_INIT_ACC_ENV = "FBGEMM_MOMENTUM1_STATE_INIT_VALUE"
+_sparse_init_accumulator_value = 0.0
 
 
 def set_sparse_init_accumulator_value(value: float) -> None:
     """Record the sparse Adagrad accumulator initial value for embedding kernels."""
-    os.environ[_SPARSE_INIT_ACC_ENV] = str(value)
+    global _sparse_init_accumulator_value
+    _sparse_init_accumulator_value = value
 
 
 def sparse_init_accumulator_value() -> float:
     """Sparse Adagrad accumulator initial value, 0.0 when not configured."""
-    return float(os.environ.get(_SPARSE_INIT_ACC_ENV, 0.0))
+    return _sparse_init_accumulator_value
 
 
 def apply_split_helper(
