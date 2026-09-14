@@ -22,6 +22,17 @@ from tzrec.utils.fx_util import fx_int_item
 
 torch.fx.wrap(fx_int_item)
 
+# ``HSTU_ARBITRARY_NFUNC`` the fbgemm_gpu_hstu wheel is compiled with (its
+# version carries the matching ``fn<N>`` tag).  The arbitrary-mask kernel reads
+# ``func`` as interleaved ``[max0, min0, max1, min1, ...]`` rows, exposing
+# ``(NFUNC + 1) // 2`` visible column intervals per query row, and hard-checks
+# ``func.size(-2) == NFUNC`` -- a mismatch is a TORCH_CHECK failure, so this
+# constant and the installed wheel must move together.
+HSTU_ARBITRARY_NFUNC = 5
+# The wheel only accepts odd values, and ``build_sla_func_tensor`` below needs
+# room for SLA's two intervals before it starts padding.
+assert HSTU_ARBITRARY_NFUNC % 2 == 1 and HSTU_ARBITRARY_NFUNC >= 3
+
 
 def build_sla_func_tensor(
     nheads: int,
@@ -33,15 +44,19 @@ def build_sla_func_tensor(
     contextual_seq_len: int = 0,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
-    """Build the NFUNC=3 func tensor for Semi-Local Attention (SLA).
+    """Build the arbitrary-mask func tensor for Semi-Local Attention (SLA).
 
     The HSTU CUTLASS kernel's arbitrary-mask path addresses the func tensor
     via ``func_ptr + cu_seqlens[b]``, requiring a jagged layout of shape
-    ``(nheads, 3, total_q)``.
+    ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)``.
 
-    NFUNC=3 encodes two disjoint column-intervals per query row:
+    SLA needs two disjoint column-intervals per query row:
       Interval 0: ``[0, col_max0)``
       Interval 1: ``[col_min0, col_max1)``
+
+    The remaining ``(NFUNC + 1) // 2 - 2`` intervals the compiled wheel expects
+    are padded empty (``min == max``); the kernel skips any interval whose
+    ``max <= min``, so they contribute no visible columns.
 
     For **history tokens** (position < seq_len - num_targets):
       SLA mask = causal ∩ (local-K1 ∪ global-prefix).
@@ -68,7 +83,7 @@ def build_sla_func_tensor(
         device: target device (inferred from seq_offsets if None).
 
     Returns:
-        func tensor of shape (nheads, 3, total_q), dtype int32, as a
+        func tensor of shape (nheads, HSTU_ARBITRARY_NFUNC, total_q), int32, as a
         strided view (stride 0 on the head dim).  The FX-leaf consumer
         ``cutlass_hstu_mha`` materializes it via ``.contiguous()`` at
         runtime.
@@ -123,12 +138,17 @@ def build_sla_func_tensor(
     col_min0 = torch.where(is_history, hist_col_min0, H_boundary)
     col_max1 = torch.where(is_history, hist_col_max1, H_boundary)
 
-    func_2d = torch.stack([col_max0, col_min0, col_max1], dim=0)  # (3, total_q)
+    # Rows beyond the first three pad the unused intervals empty: repeating
+    # col_max1 makes every later (min, max) pair satisfy max <= min.
+    pad_rows = [col_max1] * (HSTU_ARBITRARY_NFUNC - 3)
+    func_2d = torch.stack(
+        [col_max0, col_min0, col_max1] + pad_rows, dim=0
+    )  # (NFUNC, total_q)
     # Return the strided view; the FX-leaf consumer `cutlass_hstu_mha`
     # calls `.contiguous()` at runtime. Doing it here triggers
-    # `combine_contiguous_dims` -> `ModularIndexing(.., total_q, 3)`
+    # `combine_contiguous_dims` -> `ModularIndexing(.., total_q, NFUNC)`
     # -> sympy ZeroDivisionError under AOT compile.
-    return func_2d.unsqueeze(0).expand(nheads, 3, total_q)
+    return func_2d.unsqueeze(0).expand(nheads, HSTU_ARBITRARY_NFUNC, total_q)
 
 
 @dataclass(frozen=True)
