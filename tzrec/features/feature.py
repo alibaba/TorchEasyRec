@@ -641,17 +641,6 @@ class BaseFeature(object, metaclass=_meta_cls):
                 # kernel differ, so keeping mean would make them disagree.
                 pooling = PoolingType.SUM
                 need_weight = True
-            use_dynamicemb = hasattr(
-                self.config, "dynamicemb"
-            ) and self.config.HasField("dynamicemb")
-            if self._in_weighted_group and use_dynamicemb:
-                # dynamicemb reuses the kjt weights to carry frequency counters
-                # and does not support per_sample_weights in pooling.
-                raise ValueError(
-                    f"{self.__class__.__name__}[{self.name}] with dynamicemb cannot"
-                    " be in the same data group with a weighted id feature, please"
-                    " set use_weight = false on the weighted feature."
-                )
             emb_bag_config = EmbeddingBagConfig(
                 num_embeddings=self.num_embeddings,
                 embedding_dim=self._embedding_dim,
@@ -664,7 +653,9 @@ class BaseFeature(object, metaclass=_meta_cls):
             # pyre-ignore [16]
             emb_bag_config.trainable = self.config.trainable
             # pyre-ignore [16]
-            emb_bag_config.use_dynamicemb = use_dynamicemb
+            emb_bag_config.use_dynamicemb = hasattr(
+                self.config, "dynamicemb"
+            ) and self.config.HasField("dynamicemb")
             # pyre-ignore [16]
             emb_bag_config.is_weighted = need_weight
             return emb_bag_config
