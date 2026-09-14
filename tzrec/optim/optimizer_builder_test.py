@@ -9,18 +9,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
 
 import torch
+from parameterized import param, parameterized
 from torch import Tensor, nn
 from torch.optim import Optimizer
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 from tzrec.optim import optimizer_builder
+from tzrec.optim.optimizer import (
+    _SPARSE_INIT_ACC_ENV,
+    sparse_init_accumulator_value,
+)
 from tzrec.protos import optimizer_pb2
+from tzrec.utils.test_util import parameterized_name_func
 
 
 class OpimizerBuilderTest(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop(_SPARSE_INIT_ACC_ENV, None)
+
+    @parameterized.expand(
+        [
+            param(
+                "adagrad",
+                optimizer_config=optimizer_pb2.SparseOptimizer(
+                    adagrad_optimizer=optimizer_pb2.FusedAdagradOptimizer(
+                        lr=0.001, initial_accumulator_value=0.1
+                    ),
+                    constant_learning_rate=optimizer_pb2.ConstantLR(),
+                ),
+                expected=0.1,
+            ),
+            param(
+                "rowwise_adagrad",
+                optimizer_config=optimizer_pb2.SparseOptimizer(
+                    rowwise_adagrad_optimizer=(
+                        optimizer_pb2.FusedRowWiseAdagradOptimizer(
+                            lr=0.001, initial_accumulator_value=0.2
+                        )
+                    ),
+                    constant_learning_rate=optimizer_pb2.ConstantLR(),
+                ),
+                expected=0.2,
+            ),
+            param(
+                "adagrad_unset",
+                optimizer_config=optimizer_pb2.SparseOptimizer(
+                    adagrad_optimizer=optimizer_pb2.FusedAdagradOptimizer(lr=0.001),
+                    constant_learning_rate=optimizer_pb2.ConstantLR(),
+                ),
+                expected=0.0,
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_create_sparse_optimizer_init_accumulator_value(
+        self, name, optimizer_config, expected
+    ):
+        _, kwargs = optimizer_builder.create_sparse_optimizer(optimizer_config)
+        # FBGEMM TBE has no such kwarg, it must not reach the fused params.
+        self.assertNotIn("initial_accumulator_value", kwargs)
+        self.assertAlmostEqual(sparse_init_accumulator_value(), expected)
+
     def test_create_part_optimizer(self):
         pattern1 = "model.dbmtl.task(.*)"
         pattern2 = "model.dbmtl.mmoe(.*)"
