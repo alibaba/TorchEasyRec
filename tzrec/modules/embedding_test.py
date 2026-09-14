@@ -30,10 +30,12 @@ from tzrec.modules.embedding import (
     SequenceEmbeddingGroupImpl,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
+from tzrec.utils import dynamicemb_util
 from tzrec.utils.fx_util import fx_mark_seq_ec_jt, symbolic_trace
 from tzrec.utils.test_util import (
     TestGraphType,
     create_test_module,
+    mark_ci_scope,
     parameterized_name_func,
 )
 
@@ -564,6 +566,8 @@ class EmbeddingGroupTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
+    @unittest.skipIf(not dynamicemb_util.has_dynamicemb, "dynamicemb not available.")
+    @mark_ci_scope("gpu")
     def test_embedding_group_impl_weighted_with_dynamicemb(self, name, pooling) -> None:
         # dynamicemb only pools with weights in sum mode, and it reads the kjt
         # weights only when the collection is weighted, so both must hold for
