@@ -58,7 +58,7 @@ feature_configs {
 
 - **eval_initializer_args**: （可选）评估时的初始化方式，默认是 CONSTANT，value=0
 
-- **init_capacity_per_rank**: （可选）初始的每个Rank上的id数，默认等于max_capacity
+- **init_capacity_per_rank**: （可选）初始的每个Rank上的id数，默认等于max_capacity。如需显式配置，建议不小于单个Batch在每个Rank上的新增Id数，过小会导致首个Batch部分Id插入失败，其embedding未初始化，训练loss为nan
 
 - **admission_strategy**: (可选) 特征准入策略，默认不开启，目前只支持frequency_admission_strategy
 
