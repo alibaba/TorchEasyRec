@@ -31,11 +31,11 @@ class DlrmHSTUOneRank(DlrmHSTU):
 
     Differs from :class:`DlrmHSTU` in three places:
 
-    1. every candidate is expanded into ``2K`` tokens (a candidate replica
-       and a task token per task) and attention runs under a task-private
-       mask, so the trunk emits one representation ``r^i_k`` per
-       ``(candidate, task)`` pair rather than a single per-candidate vector
-       (paper 2.1 / 2.2, see
+    1. every candidate is expanded into a group of ``K + 1`` tokens (the
+       candidate token followed by the task tokens, paper 2.1 / 2.2) and
+       attention runs under a task-private mask, so the trunk emits one
+       representation ``r^i_k`` per ``(candidate, task)`` pair rather than
+       a single per-candidate vector (see
        :mod:`tzrec.modules.gr.onerank_tokenizer`);
     2. scoring is a per-task inner product instead of ``FusionMTLTower``'s
        shared MLP (paper 2.4, see
@@ -85,8 +85,8 @@ class DlrmHSTUOneRank(DlrmHSTU):
         # Same contract as DlrmHSTU: `max_seq_len` both buckets the
         # jagged-kernel autotune and scales the attention output.  For
         # OneRank it bounds the *inflated* sequence (each candidate
-        # becomes 2K tokens in the tokenizer), which the tokenizer guards
-        # at runtime.
+        # becomes K + 1 tokens in the tokenizer), which the tokenizer
+        # guards at runtime.
         set_static_max_seq_lens([self._model_config.max_seq_len])
 
     def _num_tasks(self) -> int:

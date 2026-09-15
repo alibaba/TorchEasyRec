@@ -120,9 +120,9 @@ def _model_config(
     concat_contextual_features: bool = False,
     with_situation_discernment: bool = True,
     with_cross_task_head: bool = True,
-    # 100 history tokens + 8 candidates * 2 * 3 tasks: the inflated
+    # 100 history tokens + 8 candidates * (1 + 3 tasks): the inflated
     # sequence bound the model is configured with by default.
-    max_seq_len: int = 148,
+    max_seq_len: int = 132,
     output_dropout_ratio: float = 0.0,
     scorer_type: Optional[str] = None,
     scorer_hidden_dim: Optional[int] = None,
@@ -578,9 +578,9 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
     def test_trunk_emits_one_vector_per_candidate_and_task(self) -> None:
         """The group layout must survive the transducer as ``(N, K, D)``.
 
-        A wiring slip that returned the replica slot instead of the task
-        slot, or collapsed K, would still give correctly shaped logits --
-        this is where that is caught.
+        A wiring slip that returned the candidate slot instead of the
+        task slots, or collapsed K, would still give correctly shaped
+        logits -- this is where that is caught.
         """
         device = torch.device("cuda")
         model = _build_model(device=device)
@@ -918,12 +918,12 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
 
         ``max_seq_len`` carries the *inflated* sequence bound, so the
         divisor and the autotune bucket follow it verbatim; the group
-        inflation factor (2K tokens per candidate) stays private to the
-        tokenizer.
+        inflation factor (K + 1 tokens per candidate) stays private to
+        the tokenizer.
         """
         model = _build_model(device=torch.device("cpu"))
         for layer in model._hstu_transducer._stu_module._stu_layers:
-            self.assertEqual(layer._scaling_seqlen, 148)
+            self.assertEqual(layer._scaling_seqlen, 132)
 
     def test_runtime_rejects_inflated_sequences_above_max_seq_len(self) -> None:
         """Requests whose inflated sequence exceeds ``max_seq_len`` fail loudly.
@@ -934,15 +934,15 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         """
         device = torch.device("cpu")
         # The batch carries requests of 2 and 4 candidates over 2 and 3
-        # history tokens; the largest inflated sequence is 3 + 4 * 2 * 3
-        # = 27, so a bound of 26 must reject it.
-        model = _build_model(device=device, max_seq_len=26)
+        # history tokens; the largest inflated sequence is 3 + 4 * (1 + 3)
+        # = 19, so a bound of 18 must reject it.
+        model = _build_model(device=device, max_seq_len=18)
         model.set_kernel(Kernel.PYTORCH)
         model.eval()
         batch = _build_batch(device=device)
         with (
             torch.no_grad(),
-            self.assertRaisesRegex(ValueError, r"more than max_seq_len \(26\)"),
+            self.assertRaisesRegex(ValueError, r"more than max_seq_len \(18\)"),
         ):
             model.predict(batch)
 

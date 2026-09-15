@@ -12,7 +12,7 @@
 """Unit tests for ``tzrec.modules.gr.onerank_tokenizer``.
 
 The core assertion is :meth:`OneRankFuncTensorTest.test_matches_reference_mask`:
-the NFUNC=3 func tensor, once decoded to a dense mask, must equal the mask
+the NFUNC=5 func tensor, once decoded to a dense mask, must equal the mask
 written out directly from the paper's group layout.  Everything downstream --
 task-token isolation, cross-candidate isolation, the causal prefix -- is a
 property of that mask, so it is the one place the whole tokenization scheme
@@ -42,14 +42,15 @@ from tzrec.utils.test_util import (
 
 _GRAPH_TYPES = [TestGraphType.NORMAL, TestGraphType.FX_TRACE]
 
-# (name, group_size, [(prefix_len, num_candidates), ...]) per batch sample.
+# (name, group_size = K + 1, [(prefix_len, num_candidates), ...]) per batch
+# sample.
 _LAYOUT_CASES = [
     ("single_task", 2, [(4, 1)]),
-    ("no_prefix", 4, [(0, 2)]),
-    ("seven_tasks", 14, [(5, 3)]),
-    ("no_candidates", 6, [(6, 0)]),
-    ("mixed_batch", 6, [(3, 2), (7, 1), (1, 4)]),
-    ("ragged_with_empty", 4, [(0, 0), (5, 2), (2, 1)]),
+    ("no_prefix", 3, [(0, 2)]),
+    ("seven_tasks", 8, [(5, 3)]),
+    ("no_candidates", 4, [(6, 0)]),
+    ("mixed_batch", 4, [(3, 2), (7, 1), (1, 4)]),
+    ("ragged_with_empty", 3, [(0, 0), (5, 2), (2, 1)]),
 ]
 
 
@@ -88,11 +89,11 @@ def _reference_mask(
     """Write out the paper's group layout as a dense mask, row by row.
 
     ``X = [prefix (H) | G_1 | ... | G_N]`` with
-    ``G_i = [c_i^(1), t_1, ..., c_i^(K), t_K]``:
+    ``G_i = [e^C_i, t_1, ..., t_K]``:
 
     * prefix rows are plain causal;
-    * a candidate replica sees the whole prefix plus itself;
-    * a task token sees the whole prefix plus its own replica and itself.
+    * the candidate token sees the whole prefix plus itself;
+    * a task token sees the whole prefix plus the candidate and itself.
 
     Returns:
         torch.Tensor: ``(B, padded_len, padded_len)`` bool.
@@ -103,13 +104,15 @@ def _reference_mask(
             mask[b, q, : q + 1] = True
         for i in range(num_candidates):
             base = prefix_len + i * group_size
-            for slot in range(group_size):
-                q = base + slot
+            # slot 0: the candidate token e^C_i.
+            mask[b, base, :prefix_len] = True
+            mask[b, base, base] = True
+            # slots 1..K: task tokens, paired with the candidate at slot 0.
+            for k in range(1, group_size):
+                q = base + k
                 mask[b, q, :prefix_len] = True
+                mask[b, q, base] = True
                 mask[b, q, q] = True
-                if slot % 2 == 1:
-                    # The replica this task token is paired with.
-                    mask[b, q, q - 1] = True
     return mask
 
 
@@ -143,7 +146,7 @@ def _build_func_tensor(
 
 @mark_ci_scope("h20", "gpu")
 class OneRankFuncTensorTest(unittest.TestCase):
-    """Verify the NFUNC=3 encoding of the OneRank group layout."""
+    """Verify the NFUNC=5 encoding of the OneRank group layout."""
 
     @parameterized.expand(_xprod(_LAYOUT_CASES))
     def test_matches_reference_mask(
@@ -162,7 +165,7 @@ class OneRankFuncTensorTest(unittest.TestCase):
         func, seq_offsets, padded_len = _build_func_tensor(
             layout, group_size, graph_type=graph_type
         )
-        self.assertEqual(tuple(func.shape), (1, 3, int(seq_offsets[-1])))
+        self.assertEqual(tuple(func.shape), (1, 5, int(seq_offsets[-1])))
         got = _decode_attn_func_to_mask(func, seq_offsets, padded_len)
         want = _reference_mask(layout, group_size, padded_len)
         torch.testing.assert_close(got[:, 0], want)
@@ -182,11 +185,12 @@ class OneRankFuncTensorTest(unittest.TestCase):
     def test_task_tokens_within_a_group_are_isolated(self) -> None:
         """``t_k`` never sees ``t_j`` for ``j != k``, nor another candidate.
 
-        This is the property the whole replica layout exists to buy: a task
-        token must not read another task's state, or the cross-task head in
-        the tower would be modelling an attention path that already leaked.
+        This is the property the three-interval encoding exists to buy: a
+        task token must not read another task's state, or the cross-task
+        head in the tower would be modelling an attention path that
+        already leaked.
         """
-        prefix_len, num_candidates, group_size = 3, 3, 8
+        prefix_len, num_candidates, group_size = 3, 3, 5
         func, seq_offsets, padded_len = _build_func_tensor(
             [(prefix_len, num_candidates)], group_size
         )
@@ -194,10 +198,10 @@ class OneRankFuncTensorTest(unittest.TestCase):
 
         for i in range(num_candidates):
             base = prefix_len + i * group_size
-            for k in range(group_size // 2):
-                q = base + 2 * k + 1  # a task token
+            for k in range(1, group_size):
+                q = base + k  # a task token
                 visible = mask[q].nonzero().flatten().tolist()
-                self.assertEqual(visible, list(range(prefix_len)) + [q - 1, q])
+                self.assertEqual(visible, list(range(prefix_len)) + [base, q])
 
         # Cross-group: no row of group 0 sees any column of group 1.
         g0 = slice(prefix_len, prefix_len + group_size)
@@ -233,10 +237,14 @@ class OneRankFuncTensorTest(unittest.TestCase):
         # still attends to at least itself.
         self.assertTrue(mask.any(dim=-1).all())
 
-    def test_odd_or_non_positive_group_size_raises(self) -> None:
-        """``group_size`` is ``2 * num_tasks``; anything else is a bug."""
+    def test_group_size_below_two_raises(self) -> None:
+        """``group_size`` is ``num_tasks + 1``.
+
+        Below 2 there is no room for even the candidate token plus one
+        task token.
+        """
         seq_offsets = torch.tensor([0, 4], dtype=torch.int32)
-        for bad in (0, -2, 3):
+        for bad in (0, 1, -2):
             with self.assertRaisesRegex(ValueError, "group_size"):
                 build_onerank_func_tensor(
                     nheads=1,
@@ -248,48 +256,59 @@ class OneRankFuncTensorTest(unittest.TestCase):
 
 
 class OneRankTokenizerTest(unittest.TestCase):
-    """Verify the interleaved ``[replica, task token] * K`` expansion."""
+    """Verify the ``[e^C_i, t_1, ..., t_K]`` group expansion."""
 
     def test_expansion_layout(self) -> None:
-        """Slot ``2k`` is the candidate, slot ``2k+1`` is task token ``k``.
+        """Slot 0 is the candidate, slot ``k`` is task token ``t_k``.
 
-        The func tensor's parity rule is hard-coded, so a layout that
-        alternates the other way round would mask correctly and mean the
-        wrong thing.
+        The func tensor's slot rule is hard-coded, so a layout that put
+        the task tokens first would mask correctly and mean the wrong
+        thing.
         """
         num_tasks, dim, total_targets = 3, 8, 4
         tokenizer = OneRankTokenizer(num_tasks=num_tasks, embedding_dim=dim)
         candidates = torch.randn(total_targets, dim)
 
         out = tokenizer(candidates)
-        self.assertEqual(tuple(out.shape), (total_targets * 2 * num_tasks, dim))
-        self.assertEqual(tokenizer.group_size, 2 * num_tasks)
+        self.assertEqual(tuple(out.shape), (total_targets * (num_tasks + 1), dim))
+        self.assertEqual(tokenizer.group_size, num_tasks + 1)
         for i in range(total_targets):
+            base = i * (num_tasks + 1)
+            torch.testing.assert_close(out[base], candidates[i])
             for k in range(num_tasks):
-                base = i * 2 * num_tasks + 2 * k
-                torch.testing.assert_close(out[base], candidates[i])
-                torch.testing.assert_close(out[base + 1], tokenizer._task_tokens[k])
+                torch.testing.assert_close(out[base + 1 + k], tokenizer._task_tokens[k])
 
-    def test_replica_gradients_sum_back_into_the_candidate(self) -> None:
-        """Replicas are an ``expand``, so K task channels share one input.
+    def test_gradients_follow_the_single_candidate_token(self) -> None:
+        """The candidate row appears once; task tokens repeat per group.
 
-        A ``repeat`` would give the same forward values and a K-times
-        smaller candidate gradient.
+        The candidate gradient must be exactly its single row's weight,
+        and each task token's gradient must sum over all candidate groups
+        -- the shared parameters see every group, not just one.
         """
         num_tasks, dim = 4, 5
         tokenizer = OneRankTokenizer(num_tasks=num_tasks, embedding_dim=dim)
         candidates = torch.randn(2, dim, requires_grad=True)
 
         out = tokenizer(candidates)
-        # Weight each replica distinctly so an averaging bug cannot cancel.
+        # Weight each expanded row distinctly so a mis-aggregated gradient
+        # cannot cancel.
         weights = torch.arange(1, out.size(0) + 1, dtype=out.dtype).unsqueeze(-1)
         (out * weights).sum().backward()
 
-        want = torch.zeros_like(candidates)
+        group = num_tasks + 1
+        # Candidate i lives at row i * group; its gradient is that row's
+        # weight, broadcast over dim.
+        want_candidates = torch.stack(
+            [weights[i * group, 0].expand(dim) for i in range(2)]
+        )
+        torch.testing.assert_close(candidates.grad, want_candidates)
+        # Task token k lives at slot k + 1 of every group; its gradient
+        # sums those rows' weights over both candidates.
+        want_tokens = torch.zeros_like(tokenizer._task_tokens)
         for i in range(2):
             for k in range(num_tasks):
-                want[i] += float(i * 2 * num_tasks + 2 * k + 1)
-        torch.testing.assert_close(candidates.grad, want)
+                want_tokens[k] += weights[i * group + 1 + k, 0]
+        torch.testing.assert_close(tokenizer._task_tokens.grad, want_tokens)
 
     def test_task_tokens_are_shared_across_candidates(self) -> None:
         """``K`` parameters total, not ``K`` per candidate."""
@@ -332,11 +351,11 @@ class OneRankSTULayerTest(unittest.TestCase):
         A collision with plain SLA in a mixed stack would silently reuse
         the wrong mask.
         """
-        layer = self._build(group_size=14, num_heads=4)
-        self.assertEqual(layer.attn_func_static_sig, "onerank:14:4")
+        layer = self._build(group_size=8, num_heads=4)
+        self.assertEqual(layer.attn_func_static_sig, "onerank:8:4")
         self.assertNotEqual(
             layer.attn_func_static_sig,
-            self._build(group_size=14, num_heads=2).attn_func_static_sig,
+            self._build(group_size=8, num_heads=2).attn_func_static_sig,
         )
 
     @parameterized.expand(
@@ -346,16 +365,19 @@ class OneRankSTULayerTest(unittest.TestCase):
             ("contextual", {"contextual_seq_len": 4}, "contextual_seq_len"),
             ("max_attn_len", {"max_attn_len": 8}, "max_attn_len"),
             ("non_causal", {"causal": False}, "causal"),
-            ("odd_group", {"group_size": 3}, "group_size"),
+            ("small_group", {"group_size": 1}, "group_size"),
         ]
     )
     def test_unsupported_options_are_rejected(
         self, _name: str, overrides: dict, message: str
     ) -> None:
-        """Each of these would need a third column interval in NFUNC=3.
+        """Most of these would need a fourth column interval in NFUNC=5.
 
-        Rejecting at construction time rather than producing a mask that
-        quietly drops one of the two requirements.
+        The paper layout spends all three intervals on ``prefix + own
+        group``, so SLA / a contextual block / a local window cannot also
+        apply; a group below two tokens is not a group at all.  Rejecting
+        at construction time rather than producing a mask that quietly
+        drops one of the requirements.
         """
         with self.assertRaisesRegex(ValueError, message):
             self._build(**overrides)
@@ -378,19 +400,19 @@ class OneRankSTULayerTest(unittest.TestCase):
 class OneRankComposeOutputTest(unittest.TestCase):
     """The transducer output must be the *task* slots of the groups.
 
-    ``_compose_output`` slices ``view(-1, K, 2, D)[:, :, 1, :]`` off the
-    expanded sequence.  A wiring slip taking the replica slot
-    ``[:, :, 0, :]`` still yields a correctly shaped output that differs
-    across K (every replica sits at a different position under a
+    ``_compose_output`` slices ``view(-1, K + 1, D)[:, 1:, :]`` off the
+    expanded sequence.  A wiring slip taking the candidate slot
+    ``[:, 0, :]`` still yields a correctly shaped output that differs
+    across K (every candidate token sits at a different position under a
     different mask), so shape/inequality assertions cannot catch it.
     Here every row of the (stubbed) STU output is stamped with its own
     position in the expanded sequence, and the returned tensor must
-    carry exactly the odd-slot stamps.
+    carry exactly the task-slot stamps.
     """
 
     def test_returns_the_task_slot_rows(self) -> None:
         K, D = 3, 4
-        group_size = 2 * K
+        group_size = K + 1
         prefix = [1, 1]
         candidates = [2, 4]
         num_targets = [c * group_size for c in candidates]
@@ -440,15 +462,15 @@ class OneRankComposeOutputTest(unittest.TestCase):
             num_targets=torch.tensor(num_targets),
         )
 
-        # Expected stamp of the odd row of candidate c, task k, request b:
-        # request start + prefix + c * 2K + (2k + 1).
+        # Expected stamp of the task-token row of candidate c, task k,
+        # request b: request start + prefix + c * (K + 1) + (k + 1).
         expected = []
         start = 0
         for b in range(2):
             for c in range(candidates[b]):
                 expected.append(
                     [
-                        float(start + prefix[b] + c * group_size + 2 * k + 1)
+                        float(start + prefix[b] + c * group_size + k + 1)
                         for k in range(K)
                     ]
                 )

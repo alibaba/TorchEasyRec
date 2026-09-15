@@ -11,27 +11,24 @@
 
 """OneRank structured tokenization (paper 2.1 / 2.2).
 
-Every candidate is expanded into a group of ``2K`` tokens that alternates a
-candidate replica with a task token::
+Every candidate is expanded into a group of ``K + 1`` tokens -- the
+candidate token followed by the task tokens::
 
     X   = [ prefix (contextual + UIH, length H) | G_1 | G_2 | ... | G_N ]
-    G_i = [ c_i^(1), t_1, c_i^(2), t_2, ..., c_i^(K), t_K ]      |G_i| = 2K
+    G_i = [ e^C_i, t_1, t_2, ..., t_K ]                        |G_i| = K + 1
 
 The task tokens ``t_1..t_K`` are ``K`` learned vectors shared by every
 candidate and every request; what makes ``t_k`` candidate-specific is the
 mask, not the content.
 
-Why replicas instead of the paper's ``[e^C_i, t_1, ..., t_K]``: HSTU's
-arbitrary-mask path encodes exactly **two** column intervals per query row
-(``NFUNC=3``, see ``build_sla_func_tensor``).  Under the paper layout a task
-token needs ``[0, H)`` + ``{e^C_i}`` + ``{itself}`` -- three intervals,
-because the mutually invisible ``t_1..t_{k-1}`` sit in between.  Pairing
-each task token with its own adjacent candidate replica collapses the last
-two into one interval, so the layout fits the existing kernels with no
-kernel change.  Semantically it is equivalent: the replicas carry identical
-content, so ``t_k`` still reads the same candidate the paper gives it.
+The mask gives ``t_k`` the visible set ``[0, H) u {e^C_i} u {t_k}`` --
+three column intervals, because the mutually invisible ``t_1..t_{k-1}``
+sit in between.  HSTU's arbitrary-mask path compiles with
+``HSTU_ARBITRARY_NFUNC = 5``, exposing exactly ``(NFUNC + 1) // 2 = 3``
+intervals per query row (see :func:`build_onerank_func_tensor`), so the
+paper layout encodes directly with no candidate replicas.
 
-The cost is ``N * 2K`` extra tokens per request, so ``N`` must stay in
+The cost is ``N * (K + 1)`` tokens per request, so ``N`` must stay in
 the few-candidates-per-request regime a rerank stage works in (a few to
 a few dozen); it does not scale to full-corpus candidate sets.
 """
@@ -81,7 +78,7 @@ torch.fx.wrap(_fx_check_max_seq_len)
 
 
 class OneRankTokenizer(BaseModule):
-    """Expands each candidate into its ``[replica, task token] * K`` group.
+    """Expands each candidate into its ``[candidate, t_1..t_K]`` group.
 
     Args:
         num_tasks (int): number of task tokens ``K``.
@@ -113,8 +110,8 @@ class OneRankTokenizer(BaseModule):
 
     @property
     def group_size(self) -> int:
-        """Tokens per candidate group, ``2K``."""
-        return 2 * self._num_tasks
+        """Tokens per candidate group, ``K + 1``."""
+        return self._num_tasks + 1
 
     def forward(self, target_embeddings: torch.Tensor) -> torch.Tensor:
         """Expand the candidate segment of a jagged sequence.
@@ -124,34 +121,33 @@ class OneRankTokenizer(BaseModule):
                 ``(total_targets, D)``, jagged and grouped by request.
 
         Returns:
-            torch.Tensor: ``(total_targets * 2K, D)``, each candidate
-                replaced in place by ``[c^(1), t_1, ..., c^(K), t_K]``.
+            torch.Tensor: ``(total_targets * (K + 1), D)``, each candidate
+                replaced in place by ``[e^C_i, t_1, ..., t_K]``.
         """
         dim = target_embeddings.size(-1)
-        # expand (not repeat): the K replicas are read-only views, so the
-        # backward pass sums their grads straight back into the candidate.
-        replicas = target_embeddings.unsqueeze(1).expand(-1, self._num_tasks, -1)
         tokens = self._task_tokens.to(target_embeddings.dtype)
         tokens = tokens.unsqueeze(0).expand(target_embeddings.size(0), -1, -1)
-        # (total_targets, K, 2, D) -> flatten preserves the alternating
-        # replica / task-token order the mask assumes.
-        return torch.stack([replicas, tokens], dim=2).reshape(-1, dim)
+        # (total_targets, K + 1, D) -> flatten preserves the
+        # candidate-then-task-token order the mask assumes.
+        return torch.cat([target_embeddings.unsqueeze(1), tokens], dim=1).reshape(
+            -1, dim
+        )
 
 
 class OneRankSTULayer(STULayer):
     """``STULayer`` masked with the OneRank group layout instead of SLA.
 
     Args:
-        group_size (int): tokens per candidate group, ``2 * num_tasks``.
+        group_size (int): tokens per candidate group, ``num_tasks + 1``.
         **kwargs: forwarded verbatim to :class:`STULayer`.
     """
 
     def __init__(self, group_size: int, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        if group_size <= 0 or group_size % 2 != 0:
+        if group_size < 2:
             raise ValueError(
-                f"group_size must be a positive even int (2 * num_tasks); "
-                f"got {group_size}"
+                f"group_size must be at least 2 (candidate token + one task "
+                f"token, i.e. num_tasks + 1); got {group_size}"
             )
         self._group_size: int = group_size
         if self._sla_k1 > 0 or self._sla_k2 > 0:
@@ -163,10 +159,11 @@ class OneRankSTULayer(STULayer):
         if self._contextual_seq_len != 0:
             raise ValueError(
                 f"OneRank requires stu.contextual_seq_len == 0, got "
-                f"{self._contextual_seq_len}. NFUNC=3 encodes two column "
-                f"intervals per query row and the group layout already spends "
-                f"both on `prefix + own group`; a bidirectional contextual "
-                f"block would need a third. With 0 the contextual tokens are "
+                f"{self._contextual_seq_len}. The NFUNC mask encodes "
+                f"(HSTU_ARBITRARY_NFUNC + 1) // 2 column intervals per query "
+                f"row and the group layout already spends all of them on "
+                f"`prefix + own group`; a bidirectional contextual block "
+                f"would need another. With 0 the contextual tokens are "
                 f"ordinary causal prefix; note this differs from the "
                 f"DlrmHSTU baseline, whose unset (-1) sentinel resolves to "
                 f"the number of contextual features and gives contextual "
@@ -176,8 +173,8 @@ class OneRankSTULayer(STULayer):
             raise ValueError(
                 f"OneRank does not support stu.max_attn_len (got "
                 f"{self._max_attn_len}); a local window would have to be "
-                f"folded into the func tensor's two intervals, which the "
-                f"group layout already uses up."
+                f"folded into the func tensor's intervals, which the group "
+                f"layout already uses up."
             )
         if not self._causal:
             raise ValueError("OneRank requires stu.causal = true.")
@@ -256,8 +253,8 @@ class OneRankHSTUTransducer(HSTUTransducer):
     stack by overriding :meth:`_preprocess`: the base implementation runs
     the input preprocessor plus positional encoding, and only then are the
     candidates replaced by their groups.  Task tokens therefore carry no
-    positional / time encoding (they are pure learned queries) while every
-    candidate replica keeps the encoding of the candidate it copies.
+    positional / time encoding (they are pure learned queries) while the
+    candidate token keeps the encoding of the candidate it heads.
 
     Output is ``(total_targets, K, D)`` -- the per-candidate per-task
     representation ``r^i_k`` of the paper -- instead of the baseline's
@@ -288,8 +285,8 @@ class OneRankHSTUTransducer(HSTUTransducer):
         stu = dict(kwargs.pop("stu"))
         # Routed through the stu dict because `_build_stu_layer` runs inside
         # `super().__init__()`, before subclass attributes exist.
-        stu["group_size"] = 2 * num_task_tokens
-        # The NFUNC=3 group layout spends both func-tensor column intervals
+        stu["group_size"] = num_task_tokens + 1
+        # The paper layout spends all three func-tensor column intervals
         # on `prefix + own group`, so contextual tokens must be ordinary
         # causal prefix. Resolve the `-1` sentinel ("inherit from the
         # preprocessor", which the base class would resolve to the number
@@ -320,7 +317,7 @@ class OneRankHSTUTransducer(HSTUTransducer):
                 "OneRank does not return full sequence embeddings; the "
                 "expanded sequence is an internal layout."
             )
-        # Interleaving doubles the candidate segment before this module
+        # Interleaving reorders the candidate segment before this module
         # sees it, which would break the fixed group stride. Checked via
         # the public construction-time accessor: `interleave_targets()` is
         # train/eval dependent and would read False at construction.
@@ -459,10 +456,10 @@ class OneRankHSTUTransducer(HSTUTransducer):
             total_targets=total_targets,
             num_targets=num_targets,
         )
-        # (total_targets * 2K, D) -> (total_targets, K, D): slot 1 of each
-        # (replica, task token) pair is the task token's output, r^i_k.
+        # (total_targets * (K + 1), D) -> (total_targets, K, D): slots
+        # 1..K of each group carry the task tokens' outputs, r^i_k.
         dim = group_embeddings.size(-1)
         return (
-            group_embeddings.view(-1, self._tokenizer.num_tasks, 2, dim)[:, :, 1, :],
+            group_embeddings.view(-1, self._tokenizer.group_size, dim)[:, 1:, :],
             full,
         )
