@@ -283,18 +283,18 @@ class BuildSlaFuncTensorTest(unittest.TestCase):
         The wheel bakes ``HSTU_ARBITRARY_NFUNC`` in and rejects any other
         width. SLA only needs the first two intervals, so every later
         ``[col_min, col_max)`` pair must satisfy ``max <= min`` -- the
-        condition under which the kernel skips an interval entirely.
+        condition under which the kernel skips an interval entirely. Only
+        that contract is asserted; any encoding meeting it is valid.
         """
         L, K1, K2 = 8, 4, 2
         func = self._build([L], sla_k1=K1, sla_k2=K2, graph_type=graph_type)
         self.assertEqual(func.shape[1], HSTU_ARBITRARY_NFUNC)
-        col_max1 = func[0, 2]
         for i in range(2, (HSTU_ARBITRARY_NFUNC + 1) // 2):
             col_min = func[0, 2 * i - 1]
             col_max = func[0, 2 * i]
-            torch.testing.assert_close(col_min, col_max1)
-            torch.testing.assert_close(col_max, col_max1)
-            self.assertTrue(bool(torch.all(col_max <= col_min)), f"interval {i}")
+            self.assertTrue(
+                bool(torch.all(col_max <= col_min)), f"interval {i} is not empty"
+            )
 
     @parameterized.expand([(gt,) for gt in _GRAPH_TYPES])
     def test_jagged_layout_across_batch(self, graph_type: TestGraphType) -> None:
