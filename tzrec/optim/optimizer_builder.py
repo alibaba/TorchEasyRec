@@ -47,13 +47,10 @@ def create_sparse_optimizer(
         optimizer_kwargs["weight_decay_mode"] = WeightDecayMode[
             optimizer_kwargs["weight_decay_mode"]
         ]
-    if "initial_accumulator_value" in optimizer_kwargs:
-        # FBGEMM TBE has no such kwarg, it is applied by the apply_split_helper patch
-        # in tzrec.optim.optimizer and forwarded to dynamicemb tables as a fused param
-        # in tzrec.utils.dynamicemb_util.
-        set_sparse_init_accumulator_value(
-            optimizer_kwargs.pop("initial_accumulator_value")
-        )
+    # FBGEMM TBE has no such kwarg; see set_sparse_init_accumulator_value.
+    set_sparse_init_accumulator_value(
+        optimizer_kwargs.pop("initial_accumulator_value", 0.0)
+    )
 
     if optimizer_type == "sgd_optimizer":
         return optimizers.SGD, optimizer_kwargs

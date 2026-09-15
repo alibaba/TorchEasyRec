@@ -52,7 +52,7 @@ train_config {
 
   **Note**: 被分片为`data_parallel`的Embedding表不受sparse_optimizer管理，实际由dense_optimizer更新，并跟随dense_optimizer的LR策略，详见[训练文档](../usage/train.md)的Embedding分片约束章节
 
-  **Note**: `adagrad_optimizer`和`rowwise_adagrad_optimizer`的`initial_accumulator_value`（对齐TensorFlow Adagrad的同名参数，默认0.0）对普通Embedding表和[dynamicemb](../feature/dynamicemb.md)表同时生效，新插入的key其accumulator会初始化为该值
+  **Note**: `adagrad_optimizer`和`rowwise_adagrad_optimizer`的`initial_accumulator_value`对齐TensorFlow Adagrad的同名参数（TF默认0.1，TorchEasyRec默认0.0），对普通Embedding表和[dynamicemb](../feature/dynamicemb.md)表同时生效：普通Embedding表在建表时把整个accumulator初始化为该值，dynamicemb表则在key首次写入时把该key的accumulator初始化为该值
 
 - dense_optimizer
 

@@ -75,7 +75,15 @@ _sparse_init_accumulator_value = 0.0
 
 
 def set_sparse_init_accumulator_value(value: float) -> None:
-    """Record the sparse Adagrad accumulator initial value for embedding kernels."""
+    """Record the Adagrad accumulator initial value for embedding tables built later.
+
+    Takes effect at table build time, in the ``apply_split_helper`` patch below and
+    in ``dynamicemb_util``'s plan-time fused params, so it must be set before
+    planning; FBGEMM TBE has no such kwarg, hence this module-level switch.
+
+    Args:
+        value: accumulator initial value, 0.0 for optimizers without one.
+    """
     global _sparse_init_accumulator_value
     _sparse_init_accumulator_value = value
 
