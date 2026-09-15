@@ -559,6 +559,56 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             proposal = proposer.propose()
         self.assertGreater(count, 0)
 
+    def test_sharding_plan_carries_initial_accumulator_value(self):
+        import inspect
+
+        from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+        from dynamicemb.planner import DynamicEmbParameterSharding
+        from torchrec.distributed.planner import planners
+
+        from tzrec.optim.optimizer import set_sparse_init_accumulator_value
+        from tzrec.utils.plan_util import (
+            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
+        )
+        from tzrec.utils.plan_util import (
+            get_default_sharders as _tzrec_get_default_sharders,
+        )
+
+        # The value travels as a plain kwarg of the dynamicemb table module.
+        self.assertIn(
+            "initial_accumulator_value",
+            inspect.signature(BatchedDynamicEmbeddingTablesV2.__init__).parameters,
+        )
+
+        model = self._build_model()
+        topology = Topology(world_size=2, compute_device="cuda")
+        enumerator = _TzrecEmbeddingEnumerator(
+            topology=topology,
+            batch_size=128,
+            fqn_constraints={"sparse.ebc.table_de": self._build_constraint()},
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=_tzrec_get_default_sharders()
+        )
+        sharding_option = next(
+            so for so in search_space if getattr(so, "use_dynamicemb", False)
+        )
+        for rank, shard in enumerate(sharding_option.shards):
+            shard.rank = rank
+
+        set_sparse_init_accumulator_value(0.1)
+        try:
+            plan = planners.to_sharding_plan([sharding_option], topology)
+        finally:
+            set_sparse_init_accumulator_value(0.0)
+
+        param_sharding = plan.plan[sharding_option.path][sharding_option.name]
+        fused_params = param_sharding.get_additional_fused_params()
+        self.assertAlmostEqual(fused_params["initial_accumulator_value"], 0.1)
+        # dynamicemb strips only its planner-only keys before the table module.
+        DynamicEmbParameterSharding.pop_additional_fused_params(fused_params)
+        self.assertIn("initial_accumulator_value", fused_params)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -139,6 +139,7 @@ message FusedRowWiseAdagradOptimizer {
     optional WeightDecayMode weight_decay_mode = 3 [default = NONE];
     optional bool gradient_clipping = 4 [default = false];
     optional float max_gradient = 5 [default = 1.0];
+    optional float initial_accumulator_value = 6 [default = 0.0];
 }
 
 message FusedAdadeltaOptimizer {

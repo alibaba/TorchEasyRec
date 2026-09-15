@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-import os
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -72,6 +71,28 @@ class TZRecOptimizer(OptimizerWrapper):
 # `initial_accumulator_value`, with a default value of 0.1.
 # Here, we patch the fbgemm embedding optimizer state split helper
 # to support `momentum1` (Adagrad) with the specified initial value.
+_sparse_init_accumulator_value = 0.0
+
+
+def set_sparse_init_accumulator_value(value: float) -> None:
+    """Record the Adagrad accumulator initial value for embedding tables built later.
+
+    Takes effect at table build time, in the ``apply_split_helper`` patch below and
+    in ``dynamicemb_util``'s plan-time fused params, so it must be set before
+    planning; FBGEMM TBE has no such kwarg, hence this module-level switch.
+
+    Args:
+        value: accumulator initial value, 0.0 for optimizers without one.
+    """
+    global _sparse_init_accumulator_value
+    _sparse_init_accumulator_value = value
+
+
+def sparse_init_accumulator_value() -> float:
+    """Sparse Adagrad accumulator initial value, 0.0 when not configured."""
+    return _sparse_init_accumulator_value
+
+
 def apply_split_helper(
     persistent_state_fn: Callable[[str, torch.Tensor], None],
     set_attr_fn: Callable[
@@ -93,16 +114,10 @@ def apply_split_helper(
     preallocated_host_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     """Patch for state split helper of FBGEMM SplitTableBatchedEmbeddingBagsCodegen."""
-    # Adagrad of tensorflow has param initial_accumulator_value with default value 0.1
-    momentum1_init_value_str = os.environ.get("FBGEMM_MOMENTUM1_STATE_INIT_VALUE", None)
-    init_value = 0.0
+    init_value = sparse_init_accumulator_value()
     use_init_value = (
-        momentum1_init_value_str is not None
-        and prefix == "momentum1"
-        and dtype.is_floating_point
+        init_value != 0.0 and prefix == "momentum1" and dtype.is_floating_point
     )
-    if use_init_value:
-        init_value = float(momentum1_init_value_str)
 
     set_attr_fn(f"{prefix}_physical_placements", split.placements)
     set_attr_fn(f"{prefix}_physical_offsets", split.offsets)
