@@ -28,7 +28,7 @@ from torchrec import JaggedTensor, KeyedJaggedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
-from tzrec.loss.onerank_listwise_loss import OneRankListwiseLoss
+from tzrec.loss.listwise_rank_loss import ListwiseRankLoss
 from tzrec.models.dlrm_hstu_onerank import DlrmHSTUOneRank
 from tzrec.models.model import TrainWrapper
 from tzrec.models.rank_model import TARGET_REPEAT_INTERLEAVE_KEY
@@ -61,10 +61,16 @@ _NUM_TARGETS = [2, 4]
 _TOTAL_TARGETS = sum(_NUM_TARGETS)
 
 
+def _listwise_loss_cfg(**kwargs) -> loss_pb2.LossConfig:
+    """A ``listwise_rank_loss`` entry, as carried inside a task's losses."""
+    return loss_pb2.LossConfig(listwise_rank_loss=loss_pb2.ListwiseRankLoss(**kwargs))
+
+
 def _task_configs(
     task_weight: float = 1.0,
     num_class: int = 1,
     click_loss: str = "binary_cross_entropy",
+    listwise_loss: Optional[loss_pb2.LossConfig] = None,
 ) -> List[tower_pb2.FusionSubTaskConfig]:
     if click_loss == "binary_cross_entropy":
         click_loss_cfg = loss_pb2.LossConfig(
@@ -72,13 +78,16 @@ def _task_configs(
         )
     else:
         click_loss_cfg = loss_pb2.LossConfig(l2_loss=loss_pb2.L2Loss())
+    click_losses = [click_loss_cfg] + (
+        [listwise_loss] if listwise_loss is not None else []
+    )
     return [
         tower_pb2.FusionSubTaskConfig(
             task_name="is_click",
             label_name="item_action_weight",
             task_bitmask=1,
             num_class=num_class,
-            losses=[click_loss_cfg],
+            losses=click_losses,
             metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
         ),
         tower_pb2.FusionSubTaskConfig(
@@ -111,19 +120,17 @@ def _model_config(
     concat_contextual_features: bool = False,
     with_situation_discernment: bool = True,
     with_cross_task_head: bool = True,
-    listwise_losses: Optional[List[multi_task_rank_pb2.OneRankListwiseLoss]] = None,
-    max_num_candidates: int = 8,
+    # 100 history tokens + 8 candidates * 2 * 3 tasks: the inflated
+    # sequence bound the model is configured with by default.
+    max_seq_len: int = 148,
     output_dropout_ratio: float = 0.0,
-    scorer_type: Optional[int] = None,
+    scorer_type: Optional[str] = None,
     scorer_hidden_dim: Optional[int] = None,
     task_bias_init: Optional[List[float]] = None,
     attn_truncation_split_layer: int = 0,
     attn_truncation_tail_len: int = 0,
 ) -> model_pb2.ModelConfig:
-    onerank = multi_task_rank_pb2.OneRankConfig(
-        max_num_candidates=max_num_candidates,
-        listwise_losses=listwise_losses or [],
-    )
+    onerank = multi_task_rank_pb2.OneRankConfig()
     if scorer_type is not None:
         onerank.scorer_type = scorer_type
     if scorer_hidden_dim is not None:
@@ -191,7 +198,7 @@ def _model_config(
                 mlp=module_pb2.MLP(hidden_units=[64], activation="nn.SiLU"),
                 task_configs=task_configs,
             ),
-            max_seq_len=100,
+            max_seq_len=max_seq_len,
             enable_global_average_loss=enable_global_average_loss,
             sequence_timestamp_is_ascending=sequence_timestamp_is_ascending,
             concat_contextual_features=concat_contextual_features,
@@ -320,8 +327,9 @@ def _build_model(
 ) -> DlrmHSTUOneRank:
     """Build a ``DlrmHSTUOneRank`` on ``device`` with initialized parameters."""
     task_configs = config_kwargs.pop("task_configs", None)
+    listwise_loss = config_kwargs.pop("listwise_loss", None)
     if task_configs is None:
-        task_configs = _task_configs()
+        task_configs = _task_configs(listwise_loss=listwise_loss)
     model_config = _model_config(task_configs, **config_kwargs)
     model = DlrmHSTUOneRank(
         model_config=model_config,
@@ -497,11 +505,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         ablation axes, so each has to stay independently runnable.
         """
         device = torch.device("cuda")
-        listwise_losses = (
-            [multi_task_rank_pb2.OneRankListwiseLoss(task_name="is_click", alpha=0.5)]
-            if with_listwise_loss
-            else None
-        )
+        listwise_loss = _listwise_loss_cfg(alpha=0.5) if with_listwise_loss else None
         model = _build_model(
             device=device,
             with_situation_discernment=with_situation_discernment,
@@ -510,7 +514,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             concat_contextual_features=concat_contextual_features,
             sequence_timestamp_is_ascending=sequence_timestamp_is_ascending,
             enable_global_average_loss=enable_global_average_loss,
-            listwise_losses=listwise_losses,
+            listwise_loss=listwise_loss,
         )
         model.set_kernel(Kernel.PYTORCH)
         batch = _build_batch(device=device)
@@ -523,7 +527,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             total_loss, (losses, predictions, batch) = wrapper(batch)
             self.assertTrue(torch.isfinite(total_loss))
             expected_listwise = (
-                ["listwise_infonce_is_click"] if with_listwise_loss else []
+                ["listwise_rank_loss_is_click"] if with_listwise_loss else []
             )
             self.assertEqual(
                 sorted(k for k in losses if k.startswith("listwise_")),
@@ -598,27 +602,22 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
 
     @unittest.skipIf(*gpu_unavailable)
     def test_listwise_loss_is_scaled_by_alpha(self) -> None:
-        """``alpha`` is the only knob multiplying the list-wise term.
+        """``alpha`` is the only knob scaling the list-wise term.
 
-        Task ``weight`` scales the point-wise loss instead, so the two must
-        not be conflated: the total is
-        ``sum_k alpha_k * L_list_k + sum_k weight_k * L_point_k``.
+        Task ``weight`` scales every loss of the task alike -- the EasyRec
+        convention -- so it cannot trade the list-wise term against the
+        point-wise ones; ``alpha`` is the knob that does, and the total is
+        ``sum_k weight_k * (alpha_k * L_list_k + L_point_k)``.
         """
         device = torch.device("cuda")
         alpha = 0.25
         base = _build_model(
             device=device,
-            listwise_losses=[
-                multi_task_rank_pb2.OneRankListwiseLoss(task_name="is_click", alpha=1.0)
-            ],
+            listwise_loss=_listwise_loss_cfg(alpha=1.0),
         )
         scaled = _build_model(
             device=device,
-            listwise_losses=[
-                multi_task_rank_pb2.OneRankListwiseLoss(
-                    task_name="is_click", alpha=alpha
-                )
-            ],
+            listwise_loss=_listwise_loss_cfg(alpha=alpha),
         )
         scaled.load_state_dict(base.state_dict())
         base.set_kernel(Kernel.PYTORCH)
@@ -634,7 +633,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             base_losses = base.loss(predictions, batch)
             scaled_losses = scaled.loss(predictions, batch)
 
-        key = "listwise_infonce_is_click"
+        key = "listwise_rank_loss_is_click"
         self.assertGreater(base_losses[key].item(), 0.0)
         torch.testing.assert_close(
             scaled_losses[key], base_losses[key] * alpha, rtol=1e-5, atol=1e-6
@@ -656,7 +655,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         is_click positive and quietly train a different objective, while
         every "finite / positive / alpha-scaled" assertion stays green.
         The reference here decodes the label by hand and evaluates a bare
-        ``OneRankListwiseLoss`` on the published per-task logits and
+        ``ListwiseRankLoss`` on the published per-task logits and
         ``num_targets``; only the exact wiring reproduces it, in both
         timestamp directions.
         """
@@ -665,11 +664,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             model = _build_model(
                 device=device,
                 sequence_timestamp_is_ascending=ascending,
-                listwise_losses=[
-                    multi_task_rank_pb2.OneRankListwiseLoss(
-                        task_name="is_click", alpha=1.0
-                    )
-                ],
+                listwise_loss=_listwise_loss_cfg(alpha=1.0),
             )
             model.set_kernel(Kernel.PYTORCH)
             model.init_loss()
@@ -682,9 +677,9 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             # Hand-decoded is_click labels: (value & bitmask=1) > 0.
             raw = batch.jagged_labels["item_action_weight"].values()
             decoded = ((raw.to(torch.int64) & 1) > 0).to(torch.float32)
-            reference = OneRankListwiseLoss()
+            reference = ListwiseRankLoss()
             reference.load_state_dict(
-                model._loss_modules["listwise_infonce_is_click"].state_dict()
+                model._loss_modules["listwise_rank_loss_is_click"].state_dict()
             )
             expected = reference(
                 predictions["logits_is_click"],
@@ -692,7 +687,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
                 predictions[TARGET_REPEAT_INTERLEAVE_KEY],
             )
             torch.testing.assert_close(
-                losses["listwise_infonce_is_click"],
+                losses["listwise_rank_loss_is_click"],
                 expected,
                 msg=f"list-wise wiring wrong for ascending={ascending}",
             )
@@ -717,11 +712,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             model = _build_model(
                 device=device,
                 sequence_timestamp_is_ascending=ascending,
-                listwise_losses=[
-                    multi_task_rank_pb2.OneRankListwiseLoss(
-                        task_name="is_click", alpha=1.0
-                    )
-                ],
+                listwise_loss=_listwise_loss_cfg(alpha=1.0),
             )
             model.set_kernel(Kernel.PYTORCH)
             model.init_loss()
@@ -746,8 +737,8 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
                     f"ascending={ascending}",
                 )
             torch.testing.assert_close(
-                permuted_losses["listwise_infonce_is_click"],
-                losses["listwise_infonce_is_click"],
+                permuted_losses["listwise_rank_loss_is_click"],
+                losses["listwise_rank_loss_is_click"],
                 rtol=1e-5,
                 atol=1e-6,
                 msg=f"list-wise loss not request-invariant for ascending={ascending}",
@@ -764,61 +755,48 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         device = torch.device("cuda")
         model = _build_model(
             device=device,
-            listwise_losses=[
-                multi_task_rank_pb2.OneRankListwiseLoss(
-                    task_name="is_click", learnable_temperature=True
-                )
-            ],
+            listwise_loss=_listwise_loss_cfg(learnable_temperature=True),
         )
         model.set_kernel(Kernel.PYTORCH)
         wrapper = TrainWrapper(model, device=device).to(device)
         names = [n for n, _ in wrapper.named_parameters()]
         self.assertIn(
-            "model._loss_modules.listwise_infonce_is_click.logit_scale", names
+            "model._loss_modules.listwise_rank_loss_is_click.logit_scale", names
         )
 
         total_loss, _ = wrapper(_build_batch(device=device))
         total_loss.backward()
-        scale = wrapper.model._loss_modules["listwise_infonce_is_click"].logit_scale
+        scale = wrapper.model._loss_modules["listwise_rank_loss_is_click"].logit_scale
         self.assertIsNotNone(scale.grad)
         self.assertTrue(torch.isfinite(scale.grad))
 
-    def test_listwise_loss_config_is_validated(self) -> None:
-        """Misconfiguration fails at ``init_loss()``, not at step 1.
+    def test_listwise_loss_requires_a_logit_sibling(self) -> None:
+        """A list-wise term without a sibling logit loss fails loudly.
 
-        All three of these would otherwise surface as a ``KeyError`` deep in
-        ``loss()`` after the first forward pass.
+        The term scores over the ``logits_<task>`` prediction that a logit
+        loss of the same task publishes; with none there, the failure
+        surfaces at ``loss()`` with a message naming the missing
+        prediction, not as a ``KeyError`` deep in the first step.
         """
         device = torch.device("cpu")
-        cases = [
-            (
-                [
-                    multi_task_rank_pb2.OneRankListwiseLoss(task_name="is_click"),
-                    multi_task_rank_pb2.OneRankListwiseLoss(task_name="is_click"),
-                ],
-                None,
-                "more than one entry",
-            ),
-            (
-                [multi_task_rank_pb2.OneRankListwiseLoss(task_name="nope")],
-                None,
-                "not in fusion_mtl_tower.task_configs",
-            ),
-            (
-                [multi_task_rank_pb2.OneRankListwiseLoss(task_name="is_click")],
-                _task_configs(click_loss="l2_loss"),
-                "needs that task to also carry",
-            ),
-        ]
-        for listwise_losses, task_configs, message in cases:
-            with self.subTest(message=message):
-                model = _build_model(
-                    device=device,
-                    listwise_losses=listwise_losses,
-                    task_configs=task_configs,
-                )
-                with self.assertRaisesRegex(ValueError, message):
-                    model.init_loss()
+        task_configs = _task_configs(
+            click_loss="l2_loss", listwise_loss=_listwise_loss_cfg()
+        )
+        # The l2 label path yields float values, and float labels cannot
+        # pass through task_bitmask (bitwise_and has no Float kernel);
+        # the bitmask is orthogonal to what this test pins, so drop it.
+        task_configs[0].ClearField("task_bitmask")
+        model = _build_model(
+            device=device,
+            task_configs=task_configs,
+        )
+        model.set_kernel(Kernel.PYTORCH)
+        model.init_loss()
+        batch = _build_batch(device=device)
+        with torch.no_grad():
+            predictions = model.predict(batch)
+            with self.assertRaisesRegex(ValueError, "needs the task to also carry"):
+                model.loss(predictions, batch)
 
     def test_unsupported_task_configs_are_rejected(self) -> None:
         """Inner-product scoring is single-logit and needs at least one task."""
@@ -828,8 +806,8 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "at least one"):
             _build_model(device=torch.device("cpu"), task_configs=[])
-        with self.assertRaisesRegex(ValueError, "max_num_candidates"):
-            _build_model(device=torch.device("cpu"), max_num_candidates=0)
+        with self.assertRaisesRegex(ValueError, "max_seq_len"):
+            _build_model(device=torch.device("cpu"), max_seq_len=0)
 
     def test_truncation_tuning_is_rejected_at_construction(self) -> None:
         """A reused ``dlrm_hstu`` block may carry truncation tuning.
@@ -851,15 +829,11 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
                     _build_model(device=torch.device("cpu"), **truncation_kwargs)
 
     def test_scorer_type_wiring(self) -> None:
-        """The proto enum reaches the head as the documented string."""
-        for enum_val, expected in (
-            (multi_task_rank_pb2.ONERANK_SCORER_DOT_PRODUCT, "dot_product"),
-            (multi_task_rank_pb2.ONERANK_SCORER_BILINEAR, "bilinear"),
-            (multi_task_rank_pb2.ONERANK_SCORER_MLP, "mlp"),
-        ):
-            with self.subTest(scorer=expected):
-                model = _build_model(device=torch.device("cpu"), scorer_type=enum_val)
-                self.assertEqual(model._onerank_head._scorer_type, expected)
+        """The proto string reaches the head verbatim."""
+        for scorer in ("dot_product", "bilinear", "mlp"):
+            with self.subTest(scorer=scorer):
+                model = _build_model(device=torch.device("cpu"), scorer_type=scorer)
+                self.assertEqual(model._onerank_head._scorer_type, scorer)
 
     def test_scorer_variants_build_exactly_their_parameters(self) -> None:
         """Each variant owns the parameters its docs promise, and no more.
@@ -875,7 +849,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
 
         bilinear = _build_model(
             device=device,
-            scorer_type=multi_task_rank_pb2.ONERANK_SCORER_BILINEAR,
+            scorer_type="bilinear",
         )
         weight = bilinear._onerank_head._bilinear_weight
         self.assertEqual(weight.shape, (len(_TASK_NAMES), 64, 64))
@@ -885,7 +859,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
 
         mlp = _build_model(
             device=device,
-            scorer_type=multi_task_rank_pb2.ONERANK_SCORER_MLP,
+            scorer_type="mlp",
             scorer_hidden_dim=32,
         )
         self.assertEqual(len(mlp._onerank_head._task_mlps), len(_TASK_NAMES))
@@ -911,19 +885,15 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         degrade to the dot product.
         """
         device = torch.device("cuda")
-        for enum_val in (
-            multi_task_rank_pb2.ONERANK_SCORER_BILINEAR,
-            multi_task_rank_pb2.ONERANK_SCORER_MLP,
+        for scorer in (
+            "bilinear",
+            "mlp",
         ):
-            with self.subTest(
-                scorer=multi_task_rank_pb2.OneRankScorerType.Name(enum_val)
-            ):
+            with self.subTest(scorer=scorer):
                 model = _build_model(
                     device=device,
-                    scorer_type=enum_val,
-                    listwise_losses=[
-                        multi_task_rank_pb2.OneRankListwiseLoss(task_name="is_click")
-                    ],
+                    scorer_type=scorer,
+                    listwise_loss=_listwise_loss_cfg(),
                 )
                 model.set_kernel(Kernel.PYTORCH)
                 wrapper = TrainWrapper(model, device=device).to(device)
@@ -933,7 +903,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
                 total_loss.backward()
 
                 head = wrapper.model._onerank_head
-                if enum_val == multi_task_rank_pb2.ONERANK_SCORER_BILINEAR:
+                if scorer == "bilinear":
                     grad = head._bilinear_weight.grad
                     self.assertIsNotNone(grad)
                     self.assertTrue(torch.isfinite(grad).all())
@@ -943,37 +913,36 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
                         self.assertIsNotNone(grad, msg=f"task {k} MLP has no grad")
                         self.assertTrue(torch.isfinite(grad).all())
 
-    def test_scaling_seqlen_tracks_the_inflated_sequence(self) -> None:
-        """The attention-output divisor must follow the group inflation.
+    def test_scaling_seqlen_is_the_configured_max_seq_len(self) -> None:
+        """The attention-output divisor is ``max_seq_len``, as in DlrmHSTU.
 
-        Leaving it at ``max_seq_len`` would silently change the
-        normalization scale relative to the DlrmHSTU baseline and make the
-        A/B comparison meaningless.
+        ``max_seq_len`` carries the *inflated* sequence bound, so the
+        divisor and the autotune bucket follow it verbatim; the group
+        inflation factor (2K tokens per candidate) stays private to the
+        tokenizer.
         """
-        model = _build_model(device=torch.device("cpu"), max_num_candidates=8)
-        # 100 + 8 candidates * 2 * 3 tasks
-        self.assertEqual(model._inflated_max_seq_len(), 100 + 8 * 2 * 3)
+        model = _build_model(device=torch.device("cpu"))
         for layer in model._hstu_transducer._stu_module._stu_layers:
-            self.assertEqual(layer._scaling_seqlen, 100 + 8 * 2 * 3)
+            self.assertEqual(layer._scaling_seqlen, 148)
 
-    def test_runtime_rejects_more_candidates_than_configured(self) -> None:
-        """Requests above ``onerank.max_num_candidates`` fail loudly.
+    def test_runtime_rejects_inflated_sequences_above_max_seq_len(self) -> None:
+        """Requests whose inflated sequence exceeds ``max_seq_len`` fail loudly.
 
         The static max sequence length -- and every jagged-kernel autotune
-        bucket derived from it -- is sized from ``max_num_candidates``;
-        a longer request used to overflow those bounds silently.
+        bucket derived from it -- is the bound the tokenizer guards at
+        runtime; a longer request used to overflow those bounds silently.
         """
         device = torch.device("cpu")
-        # The batch carries requests of 2 and 4 candidates.
-        model = _build_model(device=device, max_num_candidates=2)
+        # The batch carries requests of 2 and 4 candidates over 2 and 3
+        # history tokens; the largest inflated sequence is 3 + 4 * 2 * 3
+        # = 27, so a bound of 26 must reject it.
+        model = _build_model(device=device, max_seq_len=26)
         model.set_kernel(Kernel.PYTORCH)
         model.eval()
         batch = _build_batch(device=device)
         with (
             torch.no_grad(),
-            self.assertRaisesRegex(
-                ValueError, r"more than onerank\.max_num_candidates \(2\)"
-            ),
+            self.assertRaisesRegex(ValueError, r"more than max_seq_len \(26\)"),
         ):
             model.predict(batch)
 
@@ -1032,9 +1001,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         device = torch.device("cuda")
         model = _build_model(
             device=device,
-            listwise_losses=[
-                multi_task_rank_pb2.OneRankListwiseLoss(task_name="is_click")
-            ],
+            listwise_loss=_listwise_loss_cfg(),
         )
         model.set_kernel(Kernel.CUTLASS)
         # The CUTLASS kernel accepts fp16/bf16 only, so mixed precision must

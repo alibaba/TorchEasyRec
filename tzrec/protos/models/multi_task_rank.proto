@@ -143,60 +143,15 @@ message OneRankCrossTaskHead {
     repeated string hybrid_chain_task_names = 6;
 }
 
-// One list-wise InfoNCE term (paper 2.5).  The negatives of a candidate
-// are the other candidates of the same request, so no cross-rank gather
-// is needed.  A request only contributes when it contains at least one
-// positive and at least one negative (an all-positive request carries no
-// ranking signal), so this is worth enabling only for tasks where nearly
-// every request contains a positive.
-message OneRankListwiseLoss {
-    // must match a fusion_mtl_tower.task_configs entry that carries a
-    // binary_cross_entropy or binary_focal_loss: the term scores the
-    // task's `logits_<task>` prediction, which only those losses publish.
-    required string task_name = 1;
-    // weight of this term in the total loss
-    optional float alpha = 2 [default = 1.0];
-    // initial softmax temperature
-    optional float temperature_init = 3 [default = 0.07];
-    // learn the temperature (clamped, see OneRankListwiseLoss module)
-    optional bool learnable_temperature = 4 [default = true];
-}
-
-// Scoring function for s^i_k (paper 2.4 uses the inner product).  The
-// alternatives exist because a rank-1 scorer ranks a request's candidates
-// by their projection onto a single direction, and combined with flat
-// candidate representations it can sit on the "predict the global CTR"
-// plateau for most of a single-epoch run
-// (see docs/source/models/dlrm_hstu_onerank.md).
-enum OneRankScorerType {
-    // s^i_k = z_k . r^i_k / sqrt(D) + b_k   (paper default)
-    ONERANK_SCORER_DOT_PRODUCT = 0;
-    // s^i_k = z_k . (W_k r^i_k) / sqrt(D) + b_k with a per-task W_k
-    // initialised to the identity: the run starts exactly where the dot
-    // product would, and training can raise the rank off 1.
-    ONERANK_SCORER_BILINEAR = 1;
-    // s^i_k = MLP_k([z_k; r^i_k]) + b_k, a per-task two-layer MLP.  The
-    // random init already discriminates candidates, so the run never
-    // enters the constant-prediction plateau.
-    ONERANK_SCORER_MLP = 2;
-}
-
 message OneRankConfig {
-    // Upper bound on candidates per request.  Pins both the
-    // attention-output scaling divisor of the inflated sequence (so
-    // attention magnitudes stay comparable with the DlrmHSTU baseline)
-    // and the static max sequence length fed to `set_static_max_seq_lens`
-    // (which also re-buckets the jagged-kernel autotune).  A request that
-    // carries more candidates fails with a clear error rather than
-    // silently overflowing those bounds.
-    required uint32 max_num_candidates = 1;
     optional OneRankSituationDiscernment situation_discernment = 2;
     optional OneRankCrossTaskHead cross_task_head = 3;
-    // Tasks not listed here are trained with their point-wise losses only.
-    repeated OneRankListwiseLoss listwise_losses = 4;
-    // scoring function of the head; see OneRankScorerType
-    optional OneRankScorerType scorer_type = 5 [default = ONERANK_SCORER_DOT_PRODUCT];
-    // hidden dim of the MLP scorer.  Only ONERANK_SCORER_MLP reads it,
+    // scoring function of the head, one of "dot_product", "bilinear"
+    // or "mlp"; validated at head construction (see
+    // docs/source/models/dlrm_hstu_onerank.md for when to move off the
+    // paper default).
+    optional string scorer_type = 5 [default = "dot_product"];
+    // hidden dim of the MLP scorer.  Only scorer_type="mlp" reads it,
     // but the positivity check is unconditional so a config that flips
     // scorer_type to MLP later fails at build time, not mid-run.
     optional uint32 scorer_hidden_dim = 6 [default = 256];
@@ -219,7 +174,14 @@ message DlrmHSTUOneRank {
     // labels, bitmasks, losses, metrics) but replaces the fused tower
     // itself with per-task inner-product scoring, so `mlp` is ignored.
     required FusionMTLTower fusion_mtl_tower = 2;
-    // max sequence length, before the candidate-group inflation
+    // max sequence length of the sequence that enters the STU backbone,
+    // i.e. AFTER the candidate-group inflation (the tokenizer expands
+    // each candidate into 2K tokens).  Same contract as DlrmHSTU's
+    // max_seq_len -- it is both the attention-output scaling divisor and
+    // the static bucket fed to `set_static_max_seq_lens` -- but it bounds
+    // the inflated sequence, not the raw input.  A request whose inflated
+    // sequence exceeds it fails with a clear error at runtime (see
+    // OneRankHSTUTransducer).
     required uint32 max_seq_len = 3;
     // item embedding mlp hidden dimension.  IGNORED by this model (OneRank
     // builds no candidate-side `_item_embedding_mlp`; candidates reuse the

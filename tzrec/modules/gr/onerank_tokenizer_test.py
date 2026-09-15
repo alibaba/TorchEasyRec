@@ -30,10 +30,10 @@ from tzrec.modules.gr.onerank_tokenizer import (
     OneRankHSTUTransducer,
     OneRankSTULayer,
     OneRankTokenizer,
-    build_onerank_func_tensor,
 )
 from tzrec.ops import Kernel
 from tzrec.ops._pytorch.pt_hstu_attention import _decode_attn_func_to_mask
+from tzrec.ops.hstu_attention_utils import build_onerank_func_tensor
 from tzrec.utils.test_util import (
     TestGraphType,
     create_test_module,

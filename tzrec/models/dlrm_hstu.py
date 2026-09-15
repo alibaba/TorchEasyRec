@@ -13,7 +13,6 @@
 from typing import Any, Dict, List, Optional
 
 import torch
-from torch import distributed as dist
 from torch.autograd.profiler import record_function
 from torchrec import JaggedTensor
 
@@ -36,8 +35,14 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_flip_tensor_dict, fx_int_item, fx_numel
+from tzrec.utils.fx_util import (
+    fx_avg_batch_size,
+    fx_flip_tensor_dict,
+    fx_int_item,
+    fx_numel,
+)
 
+torch.fx.wrap(fx_avg_batch_size)
 torch.fx.wrap(fx_flip_tensor_dict)
 torch.fx.wrap(fx_int_item)
 torch.fx.wrap(fx_numel)
@@ -60,14 +65,6 @@ def _fx_construct_payload(
         results[k] = v.values()
     results.update(payload_features)
     return results
-
-
-@torch.fx.wrap
-def _fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
-    batch_size = torch.tensor(x.size(0), dtype=torch.float, device=x.device)
-    if dist.is_initialized():
-        dist.all_reduce(batch_size, op=dist.ReduceOp.AVG)
-    return batch_size
 
 
 class DlrmHSTU(RankModel):
@@ -209,7 +206,7 @@ class DlrmHSTU(RankModel):
             # we should reverse all features
             grouped_features = fx_flip_tensor_dict(grouped_features)
 
-        mt_preds = self._score_targets(grouped_features)
+        mt_preds = self._predict_impl(grouped_features)
 
         if not self._model_config.sequence_timestamp_is_ascending:
             # if timestamp of sequence is descending,
@@ -232,7 +229,7 @@ class DlrmHSTU(RankModel):
 
         return predictions
 
-    def _score_targets(
+    def _predict_impl(
         self, grouped_features: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
         """Turn grouped features into one prediction tensor per task.
@@ -291,7 +288,7 @@ class DlrmHSTU(RankModel):
             label = self._get_label(batch, task_cfg)
             loss_weight = None
             if self._model_config.enable_global_average_loss:
-                avg_batch_size = _fx_avg_batch_size(label)
+                avg_batch_size = fx_avg_batch_size(label)
                 loss_weight = label.size(0) / avg_batch_size
 
             for loss_cfg in task_cfg.losses:

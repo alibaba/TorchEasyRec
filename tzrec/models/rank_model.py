@@ -21,6 +21,7 @@ from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.focal_loss import BinaryFocalLoss
 from tzrec.loss.jrc_loss import JRCLoss
+from tzrec.loss.listwise_rank_loss import ListwiseRankLoss
 from tzrec.metrics.decay_auc import DecayAUC
 from tzrec.metrics.grouped_auc import GroupedAUC
 from tzrec.metrics.grouped_xauc import GroupedXAUC
@@ -35,6 +36,9 @@ from tzrec.protos import model_pb2
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.metric_pb2 import MetricConfig, TrainMetricConfig
 from tzrec.utils.config_util import config_to_kwargs
+from tzrec.utils.fx_util import fx_avg_batch_size
+
+torch.fx.wrap(fx_avg_batch_size)
 
 
 @torch.fx.wrap
@@ -162,6 +166,10 @@ class RankModel(BaseModel):
         elif loss_type == "l2_loss":
             output = torch.squeeze(output, dim=1)
             predictions["y" + suffix] = output
+        elif loss_type == "listwise_rank_loss":
+            # Consumes `logits_<task>` published by the task's point-wise
+            # logit loss; publishes no prediction of its own.
+            pass
         else:
             raise NotImplementedError
         return predictions
@@ -207,6 +215,13 @@ class RankModel(BaseModel):
             )
         elif loss_type == "l2_loss":
             self._loss_modules[loss_name] = nn.MSELoss(reduction=reduction)
+        elif loss_type == "listwise_rank_loss":
+            # The module averages over requests itself, so the per-sample
+            # `reduction` of the surrounding losses does not apply.
+            self._loss_modules[loss_name] = ListwiseRankLoss(
+                temperature_init=loss_cfg.listwise_rank_loss.temperature_init,
+                learnable_temperature=loss_cfg.listwise_rank_loss.learnable_temperature,
+            )
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
 
@@ -255,6 +270,38 @@ class RankModel(BaseModel):
         elif loss_type == "l2_loss":
             pred = predictions["y" + suffix]
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
+        elif loss_type == "listwise_rank_loss":
+            pred = predictions.get("logits" + suffix)
+            if pred is None:
+                raise ValueError(
+                    f"listwise_rank_loss{suffix} needs the task to also "
+                    "carry a logit loss (binary_cross_entropy / "
+                    "binary_focal_loss): the list-wise term scores over "
+                    "the `logits` prediction those losses publish."
+                )
+            lengths = predictions.get(TARGET_REPEAT_INTERLEAVE_KEY)
+            if lengths is None:
+                raise ValueError(
+                    "listwise_rank_loss needs per-request candidate counts "
+                    "(predictions[TARGET_REPEAT_INTERLEAVE_KEY]), which "
+                    "this model does not publish."
+                )
+            # The module averages over this rank's request count; rescale
+            # by the local/global request-count ratio so that DDP's
+            # cross-rank gradient average comes out as a global mean on a
+            # ragged batch.  Both denominators are total counts, so the
+            # average stays unbiased even when the masked-out fraction
+            # differs across ranks.  The caller's per-candidate loss_weight
+            # is deliberately not reused: it is sized off the candidate
+            # count, not the request count.
+            global_avg_weight = None
+            if getattr(self._base_model_config, "enable_global_average_loss", False):
+                global_avg_weight = lengths.size(0) / fx_avg_batch_size(lengths)
+            losses[loss_name] = (
+                self._loss_modules[loss_name](pred, label, lengths, global_avg_weight)
+                * loss_cfg.listwise_rank_loss.alpha
+            )
+            return losses
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
         if loss_weight is not None:

@@ -20,26 +20,190 @@ it to attend over that request's candidates::
 ``h_k`` is a request-level summary of "what this request looks like through
 task k's eyes", which the scorer then dots against each candidate.  Dropping
 this module is the most damaging ablation in the paper (V5), so the pooling
-fallback in :mod:`tzrec.modules.gr.onerank_head` is a floor, not a peer.
+fallback in :mod:`tzrec.modules.task_tower` is a floor, not a peer.
 
 The attention here is *not* HSTU attention.  ``hstu_mha`` computes
 ``silu(qk) / scaling * mask`` point-wise with no normalization over keys; a
-weighted average over a candidate pool needs weights that sum to one, so
-this is a plain softmax MHCA over the jagged pool.
+weighted average over a candidate pool needs weights that sum to one.  The
+single-query-per-segment special case maps directly onto
+``torch.nn.attention.varlen.varlen_attn`` (packed Q/K/V plus cumulative
+sequence bounds), so eligible CUDA batches take that kernel; everything
+else -- CPU or fp32 tensors, attention dropout, a request with an empty
+candidate list -- falls back to the reference math below, which is the
+historical implementation verbatim.
 """
 
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 
-from tzrec.modules.gr.onerank_jagged import (
-    jagged_segment_ids,
-    jagged_segment_sum,
-    jagged_softmax,
-)
 from tzrec.modules.norm import LayerNorm
 from tzrec.modules.utils import BaseModule
+
+
+def _jagged_segment_ids(
+    lengths: torch.Tensor, output_size: Optional[int] = None
+) -> torch.Tensor:
+    """Map each jagged row to its segment index.
+
+    ``output_size`` -- the statically known ``sum(lengths)`` -- avoids the
+    hidden device->host sync (and data-dependent graph break) that
+    ``repeat_interleave`` with tensor repeats otherwise performs.
+    """
+    return torch.repeat_interleave(
+        torch.arange(lengths.size(0), device=lengths.device),
+        lengths,
+        output_size=output_size,
+    )
+
+
+def _jagged_segment_sum(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    segment_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Sum a jagged ``(total, C)`` tensor within each segment; empties -> 0.
+
+    Reduced-precision inputs (fp16/bf16) accumulate in fp32 and cast back:
+    ``index_add_`` is not on autocast's promote list, so bf16 inputs would
+    otherwise add through bf16 atomics whose reorder noise sits at bf16
+    rounding scale.  ``promote_types`` keeps the dtype choice a graph node
+    rather than Python control flow, so fx tracing still inlines this.
+    """
+    acc_dtype = torch.promote_types(values.dtype, torch.float32)
+    sums = torch.zeros(
+        (lengths.size(0), values.size(-1)),
+        dtype=acc_dtype,
+        device=values.device,
+    )
+    sums.index_add_(0, segment_ids, values.to(acc_dtype))
+    return sums.to(values.dtype)
+
+
+def _jagged_segment_max(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    segment_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Max-reduce a jagged ``(total, C)`` tensor within each segment.
+
+    ``scatter_reduce_`` rather than the still-beta ``index_reduce_`` (which
+    warns on every call); it has no amax backward either, so callers using
+    the result as a shift constant must detach ``values``.  Empty segments
+    keep ``-inf``, which would make downstream broadcasts NaN under
+    torch.compile, so they are rewritten to 0 -- nothing reads them back.
+    """
+    maxes = torch.full(
+        (lengths.size(0), values.size(-1)),
+        float("-inf"),
+        dtype=values.dtype,
+        device=values.device,
+    ).scatter_reduce_(
+        0,
+        segment_ids.unsqueeze(-1).expand_as(values),
+        values,
+        "amax",
+        include_self=False,
+    )
+    return torch.nan_to_num(maxes, neginf=0.0)
+
+
+def _jagged_softmax(logits: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Softmax a jagged ``(total, C)`` tensor within each segment.
+
+    The max shift is per segment (a global max would underflow a
+    far-below-max segment to an all-zero row and a 0/0 denominator) and
+    detached, because it is a constant of the softmax identity.
+    """
+    segment_ids = _jagged_segment_ids(lengths, output_size=logits.size(0))
+    maxes = _jagged_segment_max(logits.detach(), lengths, segment_ids)
+    exp = torch.exp(logits - maxes.index_select(0, segment_ids))
+    denom = _jagged_segment_sum(exp, lengths, segment_ids)
+    return exp / torch.repeat_interleave(denom, lengths, dim=0, output_size=exp.size(0))
+
+
+def _varlen_single_query_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lengths: torch.Tensor,
+    attn_scale: float,
+) -> torch.Tensor:
+    """Packed-varlen attention, one query per segment.  fx leaf.
+
+    Maps the jagged layout onto
+    ``torch.nn.attention.varlen.varlen_attn``: the queries are already
+    packed (``B`` segments of exactly one query each), the keys/values are
+    the jagged pool rows, and the segment lengths become the cumulative
+    sequence bounds.  ``max_k`` is only a kernel-tile hint, so the static
+    total ``k.size(0)`` is a safe upper bound that avoids a
+    ``lengths.max()`` device->host sync.
+    """
+    from torch.nn.attention.varlen import varlen_attn
+
+    batch_size = q.size(0)
+    device = q.device
+    cu_seq_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
+    cu_seq_k = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
+    cu_seq_k[1:] = torch.cumsum(lengths.to(torch.int32), dim=0)
+    out = varlen_attn(
+        q,
+        k,
+        v,
+        cu_seq_q,
+        cu_seq_k,
+        max_q=1,
+        max_k=int(k.size(0)),
+        scale=attn_scale,
+    )
+    return out.reshape(batch_size, q.size(1) * q.size(2))
+
+
+torch.fx.wrap(_varlen_single_query_attn)
+
+
+def _jagged_single_query_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lengths: torch.Tensor,
+    dropout_ratio: float,
+    training: bool,
+    attn_scale: float,
+) -> torch.Tensor:
+    """Single-query-per-segment softmax attention.  fx leaf.
+
+    Dispatches to the varlen kernel only when the batch is eligible:
+    CUDA with fp16/bf16 tensors (the flash kernel's dtype contract), no
+    attention dropout (``varlen_attn`` takes none), and no empty segment
+    (an empty candidate list must keep the documented bias-only output
+    rather than depend on kernel-specific empty-KV behaviour).  The
+    emptiness probe is the one device->host sync this path pays;
+    everything else falls through to the reference math, which is the
+    historical implementation verbatim.
+    """
+    if (
+        q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and dropout_ratio == 0.0
+        and bool((lengths > 0).all())
+    ):
+        return _varlen_single_query_attn(q, k, v, lengths, attn_scale)
+    num_heads = q.size(1)
+    head_dim = q.size(2)
+    segment_ids = _jagged_segment_ids(lengths, output_size=k.size(0))
+    # Broadcast the query onto its own rows instead of padding the pool
+    # to a dense (B, N_max, D) block.
+    q_rows = q.index_select(0, segment_ids)
+    logits = (q_rows * k).sum(dim=-1) * attn_scale
+    attn = _jagged_softmax(logits, lengths)
+    attn = F.dropout(attn, p=dropout_ratio, training=training)
+    weighted = (attn.unsqueeze(-1) * v).reshape(-1, num_heads * head_dim)
+    return _jagged_segment_sum(weighted, lengths, segment_ids)
+
+
+torch.fx.wrap(_jagged_single_query_attn)
 
 
 class JaggedCrossAttention(BaseModule):
@@ -48,7 +212,11 @@ class JaggedCrossAttention(BaseModule):
     Query is ``(B, D)`` -- exactly one per request -- and the keys/values
     are the request's own jagged rows, so this is the single-query special
     case of MHCA and needs no attention mask: segment membership already
-    restricts what each query can see.
+    restricts what each query can see.  Eligible CUDA batches run through
+    ``torch.nn.attention.varlen.varlen_attn`` (see
+    :func:`_jagged_single_query_attn` for the eligibility rules); all
+    other batches run the reference math, and the two agree to kernel
+    rounding.
 
     Args:
         embedding_dim (int): query / key / value dim ``D``.
@@ -102,18 +270,18 @@ class JaggedCrossAttention(BaseModule):
         """
         num_heads = self._num_heads
         head_dim = self._head_dim
-        segment_ids = jagged_segment_ids(lengths, output_size=pool.size(0))
         q = self._q_proj(query).view(-1, num_heads, head_dim)
         k = self._k_proj(pool).view(-1, num_heads, head_dim)
         v = self._v_proj(pool).view(-1, num_heads, head_dim)
-        # Broadcast the query onto its own rows instead of padding the pool
-        # to a dense (B, N_max, D) block.
-        q_rows = q.index_select(0, segment_ids)
-        logits = (q_rows * k).sum(dim=-1) * self._attn_scale
-        attn = jagged_softmax(logits, lengths)
-        attn = F.dropout(attn, p=self._dropout_ratio, training=self.training)
-        weighted = (attn.unsqueeze(-1) * v).reshape(-1, num_heads * head_dim)
-        context = jagged_segment_sum(weighted, lengths, segment_ids)
+        context = _jagged_single_query_attn(
+            q,
+            k,
+            v,
+            lengths,
+            dropout_ratio=self._dropout_ratio,
+            training=self.training,
+            attn_scale=self._attn_scale,
+        )
         return self._out_proj(context)
 
 
@@ -203,9 +371,10 @@ class OneRankSituationDiscernment(BaseModule):
         )
         # The K per-task passes are kept as-is on purpose: the per-task
         # modules (query norm / projection and each JaggedCrossAttention's
-        # weights) are part of the checkpoint layout, and every hidden
-        # device->host sync inside JaggedCrossAttention is already removed
-        # via `output_size=`; batching the K passes into one grouped GEMM
+        # weights) are part of the checkpoint layout, and the attention
+        # leaf pays at most one device->host sync per pass (the varlen
+        # path's empty-segment probe; the reference path has none thanks
+        # to `output_size=`).  Batching the K passes into one grouped GEMM
         # would change that layout for a modest kernel-count win.
         outputs: List[torch.Tensor] = []
         for task_idx in range(self._num_tasks):

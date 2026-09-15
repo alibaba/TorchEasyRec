@@ -15,32 +15,15 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.autograd.profiler import record_function
 
-from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.loss.onerank_listwise_loss import OneRankListwiseLoss
-from tzrec.models.dlrm_hstu import (
-    DlrmHSTU,
-    _fx_avg_batch_size,
-)
-from tzrec.models.rank_model import TARGET_REPEAT_INTERLEAVE_KEY, RankModel
-from tzrec.modules.gr.onerank_head import OneRankPredictionHead
+from tzrec.models.dlrm_hstu import DlrmHSTU
+from tzrec.models.rank_model import RankModel
 from tzrec.modules.gr.onerank_tokenizer import OneRankHSTUTransducer
+from tzrec.modules.task_tower import OneRankPredictionHead
 from tzrec.ops.utils import set_static_max_seq_lens
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.config_util import config_to_kwargs
-
-# `torch.fx.wrap` registers by name in the *calling* module's globals, so the
-# decorator on dlrm_hstu.py does not cover the call made from here.
-torch.fx.wrap(_fx_avg_batch_size)
-
-# Loss types whose `_output_to_prediction_impl` branch publishes a
-# `logits_<task>` entry, which is what the list-wise term scores over.
-_LOGIT_LOSS_TYPES = ("binary_cross_entropy", "binary_focal_loss")
-
-
-def _listwise_loss_name(task_name: str) -> str:
-    return f"listwise_infonce_{task_name}"
 
 
 class DlrmHSTUOneRank(DlrmHSTU):
@@ -55,14 +38,16 @@ class DlrmHSTUOneRank(DlrmHSTU):
        (paper 2.1 / 2.2, see
        :mod:`tzrec.modules.gr.onerank_tokenizer`);
     2. scoring is a per-task inner product instead of ``FusionMTLTower``'s
-       shared MLP (paper 2.4, see :mod:`tzrec.modules.gr.onerank_head`);
+       shared MLP (paper 2.4, see
+       :class:`tzrec.modules.task_tower.OneRankPredictionHead`);
     3. the candidate-side ``_item_embedding_mlp`` is gone -- the candidate
        features already enter through the HSTU input preprocessor, and the
        task token's own channel replaces the fused ``user * item`` product.
 
-    Everything else -- labels, bitmask decoding, point-wise losses, metrics
-    -- is inherited unchanged, so the two models are directly comparable on
-    the same ``fusion_mtl_tower.task_configs``.
+    Everything else -- labels, bitmask decoding, losses (including the
+    optional ``LossConfig.listwise_rank_loss``), metrics -- is inherited
+    unchanged, so the two models are directly comparable on the same
+    ``fusion_mtl_tower.task_configs``.
 
     Requires ``kernel: CUTLASS`` (with bf16/fp16 mixed precision) or the
     ``PYTORCH`` reference kernel (fp32-capable): the task-private mask is
@@ -97,29 +82,16 @@ class DlrmHSTUOneRank(DlrmHSTU):
 
     def _init(self) -> None:
         super()._init()
-        # The group inflation makes the real sequence longer than
-        # `max_seq_len`, and `autotune_max_seq_len` falls back to the largest
-        # configured bucket once the runtime length exceeds all of them --
-        # silently autotuning every jagged kernel for a shorter sequence.
-        set_static_max_seq_lens([self._inflated_max_seq_len()])
+        # Same contract as DlrmHSTU: `max_seq_len` both buckets the
+        # jagged-kernel autotune and scales the attention output.  For
+        # OneRank it bounds the *inflated* sequence (each candidate
+        # becomes 2K tokens in the tokenizer), which the tokenizer guards
+        # at runtime.
+        set_static_max_seq_lens([self._model_config.max_seq_len])
 
     def _num_tasks(self) -> int:
         """Number of task tokens ``K``, one per task tower."""
         return len(self._task_configs)
-
-    def _inflated_max_seq_len(self) -> int:
-        """``max_seq_len`` after the candidate-group expansion.
-
-        Used as the attention-output scaling divisor.  Leaving it at the
-        un-inflated ``max_seq_len`` would quietly change the normalization
-        scale relative to the ``DlrmHSTU`` baseline and make attention
-        magnitudes incomparable.
-        """
-        onerank = self._model_config.onerank
-        return (
-            self._model_config.max_seq_len
-            + onerank.max_num_candidates * 2 * self._num_tasks()
-        )
 
     def _build_transducer(
         self, contextual_feature_dim: int, max_contextual_seq_len: int
@@ -138,17 +110,15 @@ class DlrmHSTUOneRank(DlrmHSTU):
                     f"product, so num_class > 1 is not supported; task "
                     f"'{task_cfg.task_name}' has num_class={task_cfg.num_class}."
                 )
-        if self._model_config.onerank.max_num_candidates == 0:
-            raise ValueError("onerank.max_num_candidates must be > 0.")
         return OneRankHSTUTransducer(
             num_task_tokens=num_tasks,
-            max_num_candidates=self._model_config.onerank.max_num_candidates,
+            max_seq_len=self._model_config.max_seq_len,
             uih_embedding_dim=self.embedding_group.group_total_dim("uih"),
             target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
             contextual_feature_dim=contextual_feature_dim,
             max_contextual_seq_len=max_contextual_seq_len,
             contextual_group_name=self._contextual_group_name,
-            scaling_seqlen=self._inflated_max_seq_len(),
+            scaling_seqlen=self._model_config.max_seq_len,
             **config_to_kwargs(self._model_config.hstu),
             return_full_embeddings=False,
         )
@@ -173,17 +143,10 @@ class DlrmHSTUOneRank(DlrmHSTU):
         # config_to_kwargs emits enums as name strings and repeated fields
         # as lists, so cross_task_head.mask_type and
         # hybrid_chain_task_names already arrive in the exact form
-        # build_cross_task_mask expects.  Two fields are wired by hand,
-        # each for its own reason: scorer_type needs the ONERANK_SCORER_*
-        # -> lowercase transform, and task_bias_init needs the
-        # empty-list -> None mapping.  Slicing instead of
-        # str.removeprefix keeps the file importable on Python 3.8
-        # (str.removeprefix needs 3.9+).
-        scorer_name = multi_task_rank_pb2.OneRankScorerType.Name(onerank.scorer_type)
-        scorer_prefix = "ONERANK_SCORER_"
-        if scorer_name.startswith(scorer_prefix):
-            scorer_name = scorer_name[len(scorer_prefix) :]
-        scorer_type = scorer_name.lower()
+        # build_cross_task_mask expects.  task_bias_init is wired by hand
+        # for the empty-list -> None mapping; scorer_type is a plain
+        # string in the proto, so it passes through verbatim and the head
+        # validates the value at construction.
         task_bias_init = list(onerank.task_bias_init) or None
         self._onerank_head: torch.nn.Module = OneRankPredictionHead(
             embedding_dim=stu_embedding_dim,
@@ -191,90 +154,12 @@ class DlrmHSTUOneRank(DlrmHSTU):
             contextual_feature_dim=self._contextual_token_dim(),
             situation_discernment=situation_discernment,
             cross_task_head=cross_task_head,
-            scorer_type=scorer_type,
+            scorer_type=onerank.scorer_type,
             scorer_hidden_dim=onerank.scorer_hidden_dim,
             task_bias_init=task_bias_init,
         )
 
-    def init_loss(self) -> None:
-        """Initialize loss modules.
-
-        Adds the list-wise InfoNCE terms on top of the inherited per-task
-        point-wise losses; the total is
-        ``sum_k alpha_k * L_list_k + sum_k weight_k * L_point_k``.
-        """
-        super().init_loss()
-        task_cfgs = {cfg.task_name: cfg for cfg in self._task_configs}
-        seen = set()
-        for listwise_cfg in self._model_config.onerank.listwise_losses:
-            task_name = listwise_cfg.task_name
-            if task_name in seen:
-                raise ValueError(
-                    f"onerank.listwise_losses has more than one entry for task "
-                    f"'{task_name}'."
-                )
-            seen.add(task_name)
-            task_cfg = task_cfgs.get(task_name)
-            if task_cfg is None:
-                raise ValueError(
-                    f"onerank.listwise_losses references task '{task_name}', "
-                    f"which is not in fusion_mtl_tower.task_configs "
-                    f"({sorted(task_cfgs)})."
-                )
-            if not any(
-                loss_cfg.WhichOneof("loss") in _LOGIT_LOSS_TYPES
-                for loss_cfg in task_cfg.losses
-            ):
-                raise ValueError(
-                    f"onerank.listwise_losses on task '{task_name}' needs that "
-                    f"task to also carry one of {_LOGIT_LOSS_TYPES}: the "
-                    f"list-wise term scores over the `logits_{task_name}` "
-                    f"prediction those losses publish."
-                )
-            self._loss_modules[_listwise_loss_name(task_name)] = OneRankListwiseLoss(
-                temperature_init=listwise_cfg.temperature_init,
-                learnable_temperature=listwise_cfg.learnable_temperature,
-            )
-
-    def loss(
-        self, predictions: Dict[str, torch.Tensor], batch: Batch
-    ) -> Dict[str, torch.Tensor]:
-        """Compute loss of the model."""
-        losses = super().loss(predictions, batch)
-        listwise_cfgs = self._model_config.onerank.listwise_losses
-        if len(listwise_cfgs) == 0:
-            return losses
-
-        task_cfgs = {cfg.task_name: cfg for cfg in self._task_configs}
-        # Un-flipped candidate counts, matching the request order of both
-        # `logits_<task>` (flipped back in `predict`) and the jagged labels.
-        lengths = predictions[TARGET_REPEAT_INTERLEAVE_KEY]
-        loss_weight = None
-        if self._model_config.enable_global_average_loss:
-            # The term is a mean over this rank's *total* request count
-            # (OneRankListwiseLoss divides by the total count, masked-out
-            # requests contribute 0); rescale by the local/global
-            # request-count ratio so that DDP's cross-rank gradient
-            # average comes out as a global mean on a ragged batch. Both
-            # denominators are total counts, so the average stays unbiased
-            # even when the masked-out fraction differs across ranks.
-            loss_weight = lengths.size(0) / _fx_avg_batch_size(lengths)
-
-        for listwise_cfg in listwise_cfgs:
-            task_name = listwise_cfg.task_name
-            loss_name = _listwise_loss_name(task_name)
-            losses[loss_name] = (
-                self._loss_modules[loss_name](
-                    predictions[f"logits_{task_name}"],
-                    self._get_label(batch, task_cfgs[task_name]),
-                    lengths,
-                    loss_weight,
-                )
-                * listwise_cfg.alpha
-            )
-        return losses
-
-    def _score_targets(
+    def _predict_impl(
         self, grouped_features: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
         """Score every candidate of the (possibly time-flipped) request.

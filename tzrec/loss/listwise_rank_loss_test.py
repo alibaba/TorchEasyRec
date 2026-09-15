@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for ``tzrec.loss.onerank_listwise_loss`` (CPU only)."""
+"""Unit tests for ``tzrec.loss.listwise_rank_loss`` (CPU only)."""
 
 import math
 import unittest
@@ -18,7 +18,7 @@ from typing import List
 import torch
 from parameterized import parameterized
 
-from tzrec.loss.onerank_listwise_loss import OneRankListwiseLoss
+from tzrec.loss.listwise_rank_loss import ListwiseRankLoss
 
 # (lengths, labels) pairs covering every masking branch of the loss.
 _CASES = [
@@ -43,7 +43,7 @@ def _reference_loss(
     Requests with no positive or no negative contribute 0; the surviving
     terms are summed and divided by the *total* request count, matching
     the `enable_global_average_loss` denominator the module must agree
-    with (see OneRankListwiseLoss.forward).
+    with (see ListwiseRankLoss.forward).
     """
     terms = []
     start = 0
@@ -61,7 +61,7 @@ def _reference_loss(
     return torch.stack(terms).sum() / len(lengths)
 
 
-class OneRankListwiseLossTest(unittest.TestCase):
+class ListwiseRankLossTest(unittest.TestCase):
     """Tests for the per-request list-wise InfoNCE term."""
 
     @parameterized.expand([(0.07, True), (1.0, True), (0.5, False)])
@@ -73,7 +73,7 @@ class OneRankListwiseLossTest(unittest.TestCase):
         The gradient half is the real assertion: it is what proves the
         detached per-segment max shift is exactly neutral.
         """
-        module = OneRankListwiseLoss(
+        module = ListwiseRankLoss(
             temperature_init=temperature, learnable_temperature=learnable
         )
         scale = module.logit_scale.detach().clamp(max=math.log(100)).exp().double()
@@ -133,7 +133,7 @@ class OneRankListwiseLossTest(unittest.TestCase):
         Both are masked, not skipped, so this is what verifies the mask
         actually zeroes their contribution rather than merely shrinking it.
         """
-        module = OneRankListwiseLoss(temperature_init=1.0, learnable_temperature=False)
+        module = ListwiseRankLoss(temperature_init=1.0, learnable_temperature=False)
         lengths = torch.tensor([3, 3, 3], dtype=torch.int64)
         # usable | all positive | all negative
         labels = torch.tensor([1.0, 0, 0, 1, 1, 1, 0, 0, 0])
@@ -154,7 +154,7 @@ class OneRankListwiseLossTest(unittest.TestCase):
 
     def test_all_dropped_batch_is_finite_zero(self) -> None:
         """A batch with nothing to learn from must be 0, not 0/0 -> NaN."""
-        module = OneRankListwiseLoss(temperature_init=1.0)
+        module = ListwiseRankLoss(temperature_init=1.0)
         lengths = torch.tensor([0, 2, 2], dtype=torch.int64)
         labels = torch.tensor([1.0, 1.0, 0.0, 0.0])
         logits = torch.randn(4, requires_grad=True)
@@ -173,7 +173,7 @@ class OneRankListwiseLossTest(unittest.TestCase):
         An empty rank feeds length-0 tensors; a NaN here would poison
         every parameter through the all-reduced DDP gradient.
         """
-        module = OneRankListwiseLoss(temperature_init=1.0)
+        module = ListwiseRankLoss(temperature_init=1.0)
         lengths = torch.tensor([], dtype=torch.int64)
         logits = torch.tensor([], requires_grad=True)
 
@@ -185,7 +185,7 @@ class OneRankListwiseLossTest(unittest.TestCase):
 
     def test_temperature_clamp_keeps_gradients_finite(self) -> None:
         """A runaway temperature must not overflow to +Inf -> NaN grad."""
-        module = OneRankListwiseLoss(temperature_init=0.07)
+        module = ListwiseRankLoss(temperature_init=0.07)
         with torch.no_grad():
             module.logit_scale.fill_(1e4)
         lengths = torch.tensor([4, 4], dtype=torch.int64)
@@ -205,7 +205,7 @@ class OneRankListwiseLossTest(unittest.TestCase):
         With a single batch-wide max shift its exponentials underflow to
         zero and the softmax denominator becomes 0/0.
         """
-        module = OneRankListwiseLoss(temperature_init=1.0, learnable_temperature=False)
+        module = ListwiseRankLoss(temperature_init=1.0, learnable_temperature=False)
         lengths = torch.tensor([3, 3], dtype=torch.int64)
         labels = torch.tensor([1.0, 0, 0, 1, 0, 0])
         logits = torch.tensor(
@@ -220,13 +220,13 @@ class OneRankListwiseLossTest(unittest.TestCase):
 
     def test_temperature_parameterization(self) -> None:
         """``learnable_temperature`` picks parameter vs buffer."""
-        learnable = OneRankListwiseLoss(temperature_init=0.07)
+        learnable = ListwiseRankLoss(temperature_init=0.07)
         self.assertEqual([n for n, _ in learnable.named_parameters()], ["logit_scale"])
         torch.testing.assert_close(
             learnable.logit_scale.detach(), torch.tensor(math.log(1 / 0.07))
         )
 
-        fixed = OneRankListwiseLoss(temperature_init=0.5, learnable_temperature=False)
+        fixed = ListwiseRankLoss(temperature_init=0.5, learnable_temperature=False)
         self.assertEqual(list(fixed.named_parameters()), [])
         self.assertEqual([n for n, _ in fixed.named_buffers()], ["logit_scale"])
 
@@ -234,11 +234,11 @@ class OneRankListwiseLossTest(unittest.TestCase):
         """``log(1 / T)`` is undefined for T <= 0, so reject it up front."""
         for bad in (0.0, -1.0):
             with self.assertRaisesRegex(ValueError, "temperature_init"):
-                OneRankListwiseLoss(temperature_init=bad)
+                ListwiseRankLoss(temperature_init=bad)
 
     def test_loss_weight_is_a_scalar_multiplier(self) -> None:
         """``loss_weight`` carries the global-average-loss rescaling."""
-        module = OneRankListwiseLoss(temperature_init=1.0, learnable_temperature=False)
+        module = ListwiseRankLoss(temperature_init=1.0, learnable_temperature=False)
         lengths = torch.tensor([3, 4], dtype=torch.int64)
         labels = torch.tensor([1.0, 0, 0, 0, 1, 0, 0])
         logits = torch.randn(7)
@@ -250,7 +250,7 @@ class OneRankListwiseLossTest(unittest.TestCase):
 
     def test_integer_labels_are_accepted(self) -> None:
         """Labels arrive as ints from the bitmask decode in some configs."""
-        module = OneRankListwiseLoss(temperature_init=1.0, learnable_temperature=False)
+        module = ListwiseRankLoss(temperature_init=1.0, learnable_temperature=False)
         lengths = torch.tensor([4], dtype=torch.int64)
         logits = torch.randn(4)
         torch.testing.assert_close(

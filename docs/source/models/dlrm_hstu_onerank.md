@@ -111,6 +111,17 @@ model_config {
                 losses {
                     binary_cross_entropy {}
                 }
+                # 同请求候选互为负样本的 listwise InfoNCE（通用
+                # LossConfig，配置在任务自己的 losses 里）；要求同
+                # 任务配置了 binary_cross_entropy 或
+                # binary_focal_loss
+                losses {
+                    listwise_rank_loss {
+                        alpha: 0.1
+                        temperature_init: 0.07
+                        learnable_temperature: true
+                    }
+                }
                 metrics {
                     auc {}
                 }
@@ -122,12 +133,13 @@ model_config {
             }
             # ... 其余任务同格式
         }
-        max_seq_len: 2048
+        # 膨胀后的序列长度上界：每个候选在 tokenizer 中扩展为 2K 个
+        # token（K 为任务数）。该值同时是注意力归一化除数与静态最大
+        # 序列长度（jagged 内核 autotune 分桶依据）；膨胀后超出该上界
+        # 的请求会在训练时被立即拒绝。例：历史 2048 + 候选 20 × 2 × 7
+        # 任务 = 2328
+        max_seq_len: 2328
         onerank {
-            # 每请求候选数上界：同时决定膨胀序列的注意力归一化除数
-            # 与静态最大序列长度；超出该上界的请求会在训练时被
-            # 立即拒绝（self-explanatory 报错）
-            max_num_candidates: 20
             situation_discernment {
                 num_heads: 4
             }
@@ -137,17 +149,8 @@ model_config {
                 # 任务 k 可「读」任务 j 的表示但不可「改写」
                 gradient_detachment: true
             }
-            # 同请求候选互为负样本的 listwise InfoNCE；
-            # 要求对应任务配置了 binary_cross_entropy 或
-            # binary_focal_loss 损失
-            listwise_losses {
-                task_name: "is_click"
-                alpha: 0.1
-                temperature_init: 0.07
-                learnable_temperature: true
-            }
-            # 打分函数：DOT_PRODUCT（默认）/ BILINEAR / MLP
-            scorer_type: ONERANK_SCORER_MLP
+            # 打分函数："dot_product"（默认）/ "bilinear" / "mlp"
+            scorer_type: "mlp"
             scorer_hidden_dim: 256
             # 可选：每任务初始 logit，数量须等于任务数 K
             # （按 task_configs 顺序），建议 logit(全局 CTR)
@@ -185,10 +188,10 @@ train_config {
 
 | 参数                            | 说明                                                                                                                                                                                                                                                     |
 | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `max_num_candidates`            | 每请求候选数上界；膨胀后的序列长度为 `max_seq_len + max_num_candidates * 2K`。实际候选数超出上界的请求会在训练时被立即报错拒绝                                                                                                                           |
+| `max_seq_len`                   | 膨胀后的序列长度上界（= 历史上界 + 每请求候选数上界 × 2K）；同时是注意力归一化除数与 jagged 内核 autotune 分桶依据。膨胀后超出该上界的请求会在训练时被立即报错拒绝                                                                                                                           |
 | `onerank.situation_discernment` | SD 模块；不配置时退化为候选表示的均值池化（论文 V5 显示这是最伤的消融）                                                                                                                                                                                  |
 | `onerank.cross_task_head`       | 跨任务注意力；`mask_type` 默认 CASCADE（时长任务读点击任务），`gradient_detachment` 默认 true                                                                                                                                                            |
-| `onerank.listwise_losses`       | 逐任务 listwise InfoNCE；对应任务须配置 `binary_cross_entropy` 或 `binary_focal_loss` 损失；每个请求需同时含至少一个正样本与一个负样本才计入该项损失，因此只对「几乎每个请求都含正样本」的任务值得开启（全正样本的请求同样被屏蔽：无负样本即无排序信号） |
+| `losses.listwise_rank_loss`     | 逐任务 listwise InfoNCE（通用 `LossConfig`，配置在 `task_configs` 的 `losses` 里，非 onerank 专属字段）；同任务须配置 `binary_cross_entropy` 或 `binary_focal_loss`；每个请求需同时含至少一个正样本与一个负样本才计入该项损失，因此只对「几乎每个请求都含正样本」的任务值得开启（全正样本的请求同样被屏蔽：无负样本即无排序信号） |
 | `onerank.scorer_type`           | 打分函数；单 epoch 训练建议 MLP 或 BILINEAR 规避常数解平台期                                                                                                                                                                                             |
 | `onerank.task_bias_init`        | 每任务初始 logit（`task_configs` 顺序，数量须等于 K）；设为 logit(全局 CTR) 可跳过向常数解的下降                                                                                                                                                         |
 
@@ -208,8 +211,8 @@ train_config {
 
 | 对策                                   | 作用                                                                                            |
 | -------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `scorer_type: ONERANK_SCORER_MLP`      | `MLP_k([z_k; r^i_k]) + b_k`；随机初始化即可判别候选，训练不进入平台期                           |
-| `scorer_type: ONERANK_SCORER_BILINEAR` | `z_k . (W_k r^i_k) / sqrt(D) + b_k`，`W_k` 单位阵初始化：起点与内积完全一致，训练中可把秩提离 1 |
+| `scorer_type: "mlp"`                | `MLP_k([z_k; r^i_k]) + b_k`；随机初始化即可判别候选，训练不进入平台期                           |
+| `scorer_type: "bilinear"`           | `z_k . (W_k r^i_k) / sqrt(D) + b_k`，`W_k` 单位阵初始化：起点与内积完全一致，训练中可把秩提离 1 |
 | `task_bias_init: logit(CTR_k)`         | 把 bias 直接放在平台期的*正确*位置：跳过向常数解的下降，缩短（但不消除）平台期                  |
 | 更多步数 / epoch                       | 每个运行最终都会逃逸；不改 `scorer_type` 则天花板仍是 rank-1                                    |
 | 重复多次取均值                         | 不修复任何东西，但让单 epoch 指标可信；发散本身就是逃逸时间彩票                                 |

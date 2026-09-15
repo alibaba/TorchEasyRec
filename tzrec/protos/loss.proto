@@ -8,6 +8,7 @@ message LossConfig {
         L2Loss l2_loss = 3;
         JRCLoss jrc_loss = 4;
         BinaryFocalLoss binary_focal_loss = 5;
+        ListwiseRankLoss listwise_rank_loss = 9;
     }
     // Losses for semantic-ID (SID) generation models (SidRqvae). A SID model
     // lists one LossConfig per term it trains on (a reconstruction loss, the
@@ -43,6 +44,22 @@ message SidContrastiveLoss {
 
 message BinaryCrossEntropy {
     optional float label_smoothing = 1 [default = 0.0];
+}
+
+// Per-request list-wise ranking loss: softmax cross-entropy over the
+// candidates of one request, where the negatives of a candidate are the
+// other candidates of the same request.  Requires the model to publish
+// per-request candidate counts and the task's `logits_<task_name>`
+// prediction (carry it next to a logit loss such as
+// binary_cross_entropy); currently the DlrmHSTU family satisfies both.
+message ListwiseRankLoss {
+    // weight of the list-wise term relative to the task's other losses.
+    optional float alpha = 1 [default = 0.1];
+    // initial softmax temperature; the logits are multiplied by
+    // 1 / temperature.
+    optional float temperature_init = 2 [default = 0.07];
+    // learn the temperature (clamped, see the loss module).
+    optional bool learnable_temperature = 3 [default = true];
 }
 
 message SoftmaxCrossEntropy {
