@@ -18,6 +18,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from tzrec.ops.hstu_attention_utils import HSTU_ARBITRARY_NFUNC
+
 
 @torch.fx.wrap
 def _get_valid_attn_mask(
@@ -122,12 +124,14 @@ def _decode_attn_func_to_mask(
     seq_offsets: torch.Tensor,
     N: int,
 ) -> torch.Tensor:
-    """Decode a CUTLASS-style NFUNC=3 mask tensor into a dense bool mask.
+    """Decode a CUTLASS-style NFUNC mask tensor into a dense bool mask.
 
     The NFUNC encoding (see ``build_sla_func_tensor``) has shape
-    ``(nheads, 3, total_q)`` where for each query position q the three
-    values are ``[col_max0, col_min0, col_max1]``.  Query q attends to key
-    positions in ``[0, col_max0) ∪ [col_min0, col_max1)``.
+    ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)`` where the rows interleave
+    ``[col_max0, col_min0, col_max1, col_min1, ...]``.  Query q attends to
+    key positions in ``[0, col_max0) ∪ [col_min0, col_max1) ∪ ...``, i.e.
+    ``(NFUNC + 1) // 2`` intervals; one with ``col_max <= col_min`` is empty
+    and contributes nothing, matching the kernel's own skip.
 
     This helper produces a per-sample dense ``(B, H, N, N)`` boolean mask
     consumable by the jagged-to-padded PyTorch reference path.  Columns
@@ -135,7 +139,8 @@ def _decode_attn_func_to_mask(
     never contribute to attention.
 
     Args:
-        attn_func: shape ``(H, 3, total_q)`` int32, jagged along ``total_q``.
+        attn_func: shape ``(H, HSTU_ARBITRARY_NFUNC, total_q)`` int32,
+            jagged along ``total_q``.
         seq_offsets: shape ``(B + 1,)`` int32 cumulative offsets matching
             ``attn_func``'s jagged layout.
         N: padded maximum sequence length.
@@ -143,28 +148,33 @@ def _decode_attn_func_to_mask(
     Returns:
         bool tensor of shape ``(B, H, N, N)``.
     """
-    H, three, total_q = attn_func.shape
-    torch._assert(three == 3, "attn_func must have shape (H, 3, total_q)")
-    # Fold (H, 3) into channels so we can use jagged_to_padded_dense with
+    n_func = HSTU_ARBITRARY_NFUNC
+    H, n_func_actual, total_q = attn_func.shape
+    torch._assert(
+        n_func_actual == n_func,
+        f"attn_func must have shape (H, {n_func}, total_q)",
+    )
+    # Fold (H, NFUNC) into channels so we can use jagged_to_padded_dense with
     # the (total_q, C) 2D layout; unfold after padding.
-    padded_flat = attn_func.permute(2, 0, 1).reshape(total_q, H * 3)
+    padded_flat = attn_func.permute(2, 0, 1).reshape(total_q, H * n_func)
     padded = torch.ops.fbgemm.jagged_to_padded_dense(
         values=padded_flat,
         offsets=[seq_offsets],
         max_lengths=[N],
         padding_value=0,
-    )  # (B, N, H * 3)
+    )  # (B, N, H * NFUNC)
     B = padded.size(0)
-    padded = padded.view(B, N, H, 3).permute(0, 2, 1, 3)  # (B, H, N, 3)
-    col_max0 = padded[..., 0:1]  # (B, H, N, 1)
-    col_min0 = padded[..., 1:2]
-    col_max1 = padded[..., 2:3]
+    padded = padded.view(B, N, H, n_func).permute(0, 2, 1, 3)  # (B, H, N, NFUNC)
     col_ids = torch.arange(N, device=attn_func.device, dtype=torch.int32).view(
         1, 1, 1, N
     )
-    in_0 = col_ids < col_max0
-    in_1 = (col_ids >= col_min0) & (col_ids < col_max1)
-    mask = in_0 | in_1  # (B, H, N, N) bool
+    # Interval 0 is [0, col_max0); interval i is [col_min_{i-1}, col_max_i),
+    # with col_max_i at row 2*i and col_min_i at row 2*i + 1.
+    mask = col_ids < padded[..., 0:1]  # (B, H, N, N) bool
+    for i in range(1, (n_func + 1) // 2):
+        col_min = padded[..., 2 * i - 1 : 2 * i]  # (B, H, N, 1)
+        col_max = padded[..., 2 * i : 2 * i + 1]
+        mask = mask | ((col_ids >= col_min) & (col_ids < col_max))
     seq_lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.int32).view(B, 1, 1, 1)
     col_valid = col_ids < seq_lengths
     return mask & col_valid
@@ -190,7 +200,7 @@ def pytorch_hstu_mha(
 ) -> torch.Tensor:
     """PyTorch reference HSTU attention.
 
-    When ``attn_func`` is provided the mask is decoded from the NFUNC=3
+    When ``attn_func`` is provided the mask is decoded from the NFUNC
     tensor (matching the CUTLASS kernel's arbitrary-mask path).  When
     ``attn_func`` is ``None`` the fixed-mask path uses ``causal`` /
     ``max_attn_len`` / ``contextual_seq_len`` / ``num_targets``.
