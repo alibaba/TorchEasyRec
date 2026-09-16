@@ -16,7 +16,7 @@ TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature�
 
 - **default_value**: 特征默认值。如果默认值为""，则没有默认值，后续模型中对于空特征的嵌入为零向量。注意: 该默认值为`bucketize`前的默认值。`bucketize`的配置包括`num_buckets`/`hash_bucket_size`/`vocab_list`/`vocab_dict`/`vocab_file`/`boundaries`
 
-- **separator**: FG在输入为string类型时的多值分隔符，默认为`\x1d`。更建议用数组（ARRAY）类型来表示多值，训练和推理性能更好
+- **separator**: FG在输入为string类型时的多值分隔符，默认为`\x1d`。注意配置后是**追加**而不是替换，即FG会同时按`\x1d`和配置的符号切分。更建议用数组（ARRAY）类型来表示多值，训练和推理性能更好
 
 - **fg_encoded_default_value**: FG编码后的数据的默认值，当fg_mode=FG_NONE并且不是用pai-fg编码数据时，可以设置该参数填充空值
 
@@ -94,7 +94,7 @@ feature_configs {
 
   - 如果需要跟tensorflow的hash保持一致，可以设置环境变量 USE_FARM_HASH_TO_BUCKETIZE=true
 
-- **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets
+- **num_buckets**: buckets数量, 仅仅当输入是integer类型时，可以使用num_buckets。输入为空或者不在\[0, num_buckets)范围内时，分箱结果为0，并打一条ERROR日志
 
 - **vocab_list**: 指定词表，适合取值比较少可以枚举的特征，如星期，月份，星座等
 
@@ -202,7 +202,7 @@ feature_configs {
 }
 ```
 
-- **boundaries**: 分箱/分桶的边界值，通过一个数组来设置。
+- **boundaries**: 分箱/分桶的边界值，通过一个数组来设置。分箱区间**左闭右开**，如`boundaries: [0.0, 1.0, 2.0]`分成`(-inf, 0.0)`、`[0.0, 1.0)`、`[1.0, 2.0)`、`[2.0, +inf)`四个桶。
 - **mlp**: 由一层MLP变换特征到`embedding_dim`维度
 - **autodis**: 由AutoDis模块变换特征到`embedding_dim`维度，详见[AutoDis文档](./autodis.md)
 
@@ -219,8 +219,8 @@ feature_configs {
 }
 ```
 
-- **separator**: FG多值分隔符，默认为`\x1d`
-- **value_dim**: 默认值为1， 指定Embedding特征的输入维度
+- **separator**: FG多值分隔符，默认为`\x1d`，只在`value_dim`大于1时生效
+- **value_dim**: 默认值为1， 指定Embedding特征的输入维度。注意输入按分隔符切分出来的值个数必须等于`value_dim`，否则FG会跳过该行并打一条WARNING日志，该行的输出是未初始化的内容
 
 ## ComboFeature: 组合特征
 
@@ -283,11 +283,11 @@ feature_configs {
 ```
 
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
-- **value_map**: 输入字符串值到浮点值的映射，可与`num_buckets`或`boundaries`配合使用
+- **value_map**: 输入字符串值到浮点值的映射，可与`num_buckets`或`boundaries`配合使用。不在映射表里的值会被**跳过**（不参与聚合，也不计入`mean`/`count`的个数），并打一条WARNING日志
 - **combiner**: 如果输入为多值，可以设置combiner来对值进行聚合，默认为`sum`，支持`sum`/`mean`(`avg`)/`min`/`max`/`count`/`gap_min`/`gap_max`
-- **num_buckets**: 离散化桶数量，设置后输出为离散整数值（value_type为int64），值范围为\[0, num_buckets)
+- **num_buckets**: 离散化桶数量，设置后输出为离散整数值（value_type为int64），值范围为\[0, num_buckets)。注意聚合结果会先转成整数再分箱，所以`mean`等非整数结果会被截断
 - **boundaries**: 分箱/分桶的边界值，通过一个数组来设置
-- **normalizer**: 连续值变换方式，支持`log10`/`zscore`/`minmax`/`expression`，用法同RawFeature
+- **normalizer**: 连续值变换方式，支持`log10`/`zscore`/`minmax`/`expression`。注意与RawFeature不同，这里的归一化作用在**聚合之后**的结果上，即`log10(sum(x))`而不是`sum(log10(x))`
 
 ## LookupFeature: 字典查询特征
 
@@ -312,8 +312,9 @@ feature_configs {
 - **map**: 特征FG所依赖map字段的来源
 - **key**: 特征FG所依赖key字段的来源
 - **combiner**: 如果key为多值，可以设置combiner来对查找的值进行聚合，默认为`sum`，支持`sum`/`mean`(`avg`)/`min`/`max`/`count`/`gap_min`/`gap_max`
+- **default_value**: 没查到时的取值，默认为`0`。注意配置为空字符串时FG会不输出任何值，离散特征在模型中的嵌入为零向量
 - **need_discrete**: 查到的值是否为离散值，默认为false
-- **need_key**: 查到的值是否拼接key作为前缀，默认为false
+- **need_key**: 查到的值是否拼接key作为前缀，默认为false。只在输出是字符串（即配置了`hash_bucket_size`/`vocab_list`/`vocab_dict`/`vocab_file`或`need_discrete=true`）时生效，否则FG会忽略它并打一条WARNING日志
 
 如果Map的值为离散值 或 `need_key=true`，可设置:
 
@@ -345,10 +346,10 @@ feature_configs {
 - **nested_map**: 特征FG所依赖nested_map字段的来源
 - **pkey**: 特征FG所依赖主键字段的来源。可以设置为ALL，将匹配所有pkey下面的指定的skey的值
 - **skey**: 特征FG所依赖子键字段的来源。可以设置为ALL，将指定pkey下面所有skey的值
-- **combiner**: 如果key为多值，可以设置combiner来对查找的值进行聚合，支持`sum`/`mean`/`min`/`max`
-- **need_discrete**: 查到的值是否为离散值，默认为false
+- **need_discrete**: 查到的值是否为离散值，默认为false。配置为true时输出必须是字符串，即必须同时配置`hash_bucket_size`/`vocab_list`/`vocab_dict`/`vocab_file`之一，否则FG会报错
 - **show_pkey**: 查到的值是否拼接pkey作为前缀，默认为false
-- **show_skey**: 查到的值是否拼接skey作为前缀，默认为false
+- **show_skey**: 查到的值是否拼接skey作为前缀，默认为false。`show_pkey`/`show_skey`只在`need_discrete=true`时生效；另外注意FG自身的默认值是“`match_type=hit`且`need_discrete=true`时为true”，从手写的FG json迁移过来时取值会变化
+- 离散输出的取值会自动加上`<feature_name>_`前缀（配置`num_buckets`时不加），多个match特征共享embedding时需要注意
 
 如果Map的值为离散值 或 `show_pkey=true` 或 `show_skey=true`，可设置:
 
@@ -382,9 +383,13 @@ feature_configs {
 
 - **value_dim**: 默认值是0，value_dim=0时支持多值ID输出
 
+- **default_value**: 表达式结果为NaN/Inf或输入为空时的取值，默认为`0`。注意配置为空字符串时FG会丢弃该值而不是输出默认值
+
+- **fill_missing**: 变量长度不一致时的填充值，默认为NaN。注意长度为1的变量会被广播成最长变量的长度，不走填充逻辑，即只有长度为0或者长度介于2和最大长度之间的变量才会被填充
+
 - **fg_value_type**: 表达式的计算与输出类型，默认是`float`，可选`double` / `int32` / `int64`。
   需要精确的整数输出（如0/1的Mask）时配置为`int64`。注意`int`类型不能与`boundaries`或
-  `hash_bucket_size`同时使用（FG会先把值截断成整数，分桶结果不符合预期），配置了会报错
+  `hash_bucket_size`同时使用（FG会先把值四舍五入成整数，分桶结果不符合预期），配置了会报错
 
 - **num_buckets**: 表达式输出为整数ID时的ID数目，ID取值范围为\[0, num_buckets)，配置后
   `fg_value_type`默认为`int64`
@@ -476,6 +481,9 @@ feature_configs {
   | \*     | multiplication            | 7      |
   | /      | division                  | 7      |
   | ^      | raise x to the power of y | 8      |
+  | %      | modulo                    | 7      |
+
+- 支持临时变量和逗号表达式，如`x=roundp(a),(a-x)*b`，其中`x`是临时变量，不需要配置在`variables`中
 
 - **内置三元操作符**
 
@@ -501,6 +509,7 @@ feature_configs {
       sequence_feature {
           sequence_name: "click_seq"
           sequence_length: 50
+          sequence_delim: ";"
           features {
               expr_feature {
                   feature_name: "is_same_cate"
@@ -529,7 +538,7 @@ feature_configs {
 
 ## OverlapFeature: 重合匹配特征
 
-`overlap_feature`会计算`query`和`title`两个字段字词重合比例，`query`和`title`中字词的分割符默认为`\x1d`，可以用多值分隔符由**separator**指定。
+`overlap_feature`会计算`query`和`title`两个字段字词重合比例，`query`和`title`中字词的分割符默认为`\x1d`，可以用多值分隔符由**separator**指定，注意配置后FG会同时按`\x1d`和配置的符号切分。
 
 ```
 feature_configs {
@@ -562,7 +571,8 @@ feature_configs {
   | proximity_max_dist  | 计算query term在title中的邻近度 (maximum pairwise distance) | 取值为[0, length(title)+1], length(title)+1表示没有匹配的term |
   | proximity_avg_dist  | 计算query term在title中的邻近度 (average pairwise distance) | 取值为[0, length(title)+1], length(title)+1表示没有匹配的term |
 
-- 其余配置同RawFeature
+- 其余配置同RawFeature，但不支持`default_value`、`value_dim`和`hash_bucket_size`等类别型分箱。
+  输入为空时的取值由FG决定：`index_of`为`-1`，其余method为`0`，配置`boundaries`时需要注意
 
 ## TokenizeFeature: 分词特征
 
@@ -652,7 +662,9 @@ feature_configs {
 
 - **kv_delimiter**: 可选项，指定输入特征中的kv对之间的分隔符，默认为 ":"，只能是单个符号
 
-- 其余配置同RawFeature
+- **normalizer**: 可选项，连续值变换方式，用法同RawFeature
+
+- 其余配置同RawFeature，但输出固定为单值（`value_dim`恒为1），也不支持`hash_bucket_size`等类别型分箱
 
 ## BoolMaskFeature：布尔值过滤
 
@@ -663,13 +675,17 @@ feature_configs {
     bool_mask_feature {
         feature_name: "query_doc_sim"
         expression: ["user:click_items", "item:is_valid"]
+        embedding_dim: 16
         separator: ","
     }
 }
 ```
 
 - **expression**:该feature所依赖的字段来源,第一个字段表示字段的取值, 第二个字段表示对第一个字段的取值进行Mask
-- 其余配置同IdFeature
+  - Mask为字符串类型时，只有空串和`false`表示False，其余取值（包括`"0"`）都是True；
+    需要用0/1做Mask时，输入要是整型数组而不是字符串
+- 其余配置同IdFeature，但`value_dim`只能是1：FG内部会把该特征当作序列特征处理，
+  `value_dim=0`时会被重置为1，每个元素只保留第一个值
 
 示例
 
@@ -718,6 +734,17 @@ feature_configs {
     - number_value: 值为数值
     - string_value: 值为字符串
     - bool_value: 值为布尔
+
+- **value_dim**: 默认值为1，即算子输出取单值；算子输出多值时需要显式配置为0，否则每个元素只保留第一个值
+
+- **normalizer**: 只在数值型输出时生效，配置了类别型分箱（`hash_bucket_size`/`vocab_list`等）时FG会忽略它
+
+- 算子的`value_type`由分箱配置决定：配置`num_buckets`时为`int64`，配置`hash_bucket_size`/`vocab_*`时为`string`，
+  否则为`float`。算子需要实现对应的`ProcessWith*`方法，否则运行时会报错
+
+- **is_op_thread_safe**: 默认为false，即每个线程持有一份算子实例；算子本身线程安全时可以配置为true
+
+- 算子参数中以`_file`结尾的资源文件不会被自动收集到导出目录，需要自行保证在线离线路径一致
 
 - 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
 

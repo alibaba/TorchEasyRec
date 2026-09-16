@@ -402,7 +402,8 @@ message LookupFeature {
     // lookup map value is sparse or numeric,
     // when need_discrete is true, combiner will be empty string
     optional bool need_discrete = 15 [default = false];
-    // lookup value need key as prefix or not.
+    // lookup value need key as prefix or not. it only takes effect when the
+    // lookup value is a string, fg ignores it otherwise
     optional bool need_key = 16 [default = false];
     // fg normalizer, e.g.
     // method=log10,threshold=1e-10,default=-10
@@ -496,12 +497,15 @@ message MatchFeature {
     optional string default_value = 13 [default = "0"];
     // fg multi-value separator
     optional string separator = 14 [default = "\x1d"];
-    // match map value is sparse or numeric,
-    // when need_discrete is true, combiner will be empty string
+    // match map value is sparse or numeric. when need_discrete is true, the
+    // match output must be a string, i.e. a hash/vocab bucketizer must be set,
+    // otherwise fg raises
     optional bool need_discrete = 15 [default = false];
-    // match value need pkey value as prefix or not.
+    // match value need pkey value as prefix or not, only takes effect when
+    // need_discrete is true. fg itself defaults it to true for a hit match
     optional bool show_pkey = 16 [default = false];
-    // match value need skey  valueas prefix or not.
+    // match value need skey value as prefix or not, only takes effect when
+    // need_discrete is true. fg itself defaults it to true for a hit match
     optional bool show_skey = 17 [default = false];
     // fg normalizer, e.g.
     // method=log10,threshold=1e-10,default=-10
@@ -574,7 +578,8 @@ message ExprFeature {
     repeated float boundaries = 6;
     // fg multi-value separator
     optional string separator = 7 [default = "\x1d"];
-    // fill value when vector length mismatch, default is NaN.
+    // fill value when vector length mismatch, default is NaN. a variable of
+    // length 1 is broadcast instead of filled
     optional float fill_missing = 8;
     // number of hash size for sparse expr value
     optional uint64 hash_bucket_size = 9;
@@ -868,7 +873,7 @@ message CustomFeature {
     optional string normalizer = 17;
     // embedding init function, e.g. "nn.init.uniform_,a=-0.01,b=0.01"
     optional string init_fn = 18;
-    // value dimensions
+    // value dimensions, default = 1, set 0 to keep multi-value operator output
     optional uint32 value_dim = 19;
     // mask value in training progress
     optional bool use_mask = 20;
@@ -933,8 +938,8 @@ message BoolMaskFeature {
     repeated string vocab_list = 7;
     // id vocabulary dict
     map<string, uint64> vocab_dict = 8;
-    // id value dimensions, default = 0, when use in seq, default = 1
-    // if value_dim = 0, it supports id with multi-value
+    // id value dimensions, fg handles bool mask as a sequence feature and
+    // rewrites value_dim 0 to 1, so multi-value input keeps its first value only
     optional uint32 value_dim = 9;
     // embedding pooling type, available is {sum | mean}
     optional string pooling = 10 [default = "sum"];
