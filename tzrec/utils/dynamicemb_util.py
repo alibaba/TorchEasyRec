@@ -45,6 +45,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
+from tzrec.optim.optimizer import sparse_init_accumulator_value
 from tzrec.protos import feature_pb2
 from tzrec.utils.logging_util import logger
 
@@ -251,6 +252,23 @@ try:
 
     # pyre-ignore [9]
     DynamicEmbeddingCollectionContext.__init__ = _demb_ctx_init_coerce_none
+
+    @dataclasses.dataclass
+    class TZRecDynamicEmbParameterSharding(DynamicEmbParameterSharding):
+        """DynamicEmbParameterSharding carrying the Adagrad accumulator init value.
+
+        The value is not a DynamicEmbTableOptions field, and FBGEMM TBE rejects it as
+        a kwarg, so it can only reach BatchedDynamicEmbeddingTables as a per-table
+        fused param of the customized kernel.
+        """
+
+        initial_accumulator_value: float = 0.0
+
+        def get_additional_fused_params(self) -> Dict[str, Any]:
+            """Extra fused params of the customized kernel."""
+            params = super().get_additional_fused_params()
+            params["initial_accumulator_value"] = self.initial_accumulator_value
+            return params
 
     has_dynamicemb = True
 except Exception:
@@ -569,7 +587,7 @@ if has_dynamicemb:
                 if dynamicemb_options.index_type is None:
                     dynamicemb_options.index_type = torch.int64
 
-                module_plan[sharding_option.name] = DynamicEmbParameterSharding(
+                module_plan[sharding_option.name] = TZRecDynamicEmbParameterSharding(
                     sharding_spec=sharding_spec,
                     sharding_type=ShardingType.ROW_WISE.value,
                     ranks=[i for i in range(world_size)],
@@ -577,6 +595,7 @@ if has_dynamicemb:
                     customized_compute_kernel=DynamicEmbKernel,
                     dist_type="roundrobin",
                     dynamicemb_options=dynamicemb_options,
+                    initial_accumulator_value=sparse_init_accumulator_value(),
                 )
                 _log_dynamicemb_table_plan(
                     fqn=f"{sharding_option.path}.{sharding_option.name}",

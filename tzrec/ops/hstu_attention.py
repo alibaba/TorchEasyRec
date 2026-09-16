@@ -80,9 +80,12 @@ def hstu_mha(
         kernel: backend kernel to use (PYTORCH, TRITON, CUTLASS).
         enable_tma: enable TMA (TRITON only).
         attn_func: pre-built arbitrary-mask func tensor of shape
-            ``(nheads, 3, total_q)``, int32 — selects the NFUNC mask
-            path.  Supported on ``Kernel.CUTLASS`` and ``Kernel.PYTORCH``;
-            rejected on ``Kernel.TRITON``.
+            ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)``, int32 — selects the
+            NFUNC mask path.  ``HSTU_ARBITRARY_NFUNC`` is defined in
+            ``tzrec.ops.hstu_attention_utils`` (currently 5) and must match
+            the ``fn<N>`` tag of the installed ``fbgemm_gpu_hstu`` wheel.
+            Supported on ``Kernel.CUTLASS`` and ``Kernel.PYTORCH``; rejected
+            on ``Kernel.TRITON``.
         scaling_seqlen: divisor used to scale the attention output inside
             the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
             the behavior matches the legacy code path.

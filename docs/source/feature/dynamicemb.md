@@ -6,7 +6,7 @@ cu126/cu129/cu130 镜像已预装 dynamicemb，其它环境需先安装如下whl
 
 ```bash
 # DEVICE 可选: cu126/cu129/cu130 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb==0.1.0+20260824.6b94bbf.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+pip install dynamicemb==0.1.0+20260911.5948173.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
 ```
 
 注：同一个 FeatureGroup 中若存在多个配置了 DynamicEmbedding 的特征，底层 dynamicemb 会自动将这些表融合到同一份存储里（table fusion），共享 cache/admission counter，降低显存占用并减少内存碎片，无需额外配置。
@@ -58,7 +58,7 @@ feature_configs {
 
 - **eval_initializer_args**: （可选）评估时的初始化方式，默认是 CONSTANT，value=0
 
-- **init_capacity_per_rank**: （可选）初始的每个Rank上的id数，默认等于max_capacity
+- **init_capacity_per_rank**: （可选）初始的每个Rank上的id数，默认等于max_capacity。如需显式配置，建议不小于单个Batch在每个Rank上的新增Id数，过小会导致首个Batch部分Id插入失败，其embedding未初始化，训练loss为nan
 
 - **admission_strategy**: (可选) 特征准入策略，默认不开启，目前只支持frequency_admission_strategy
 

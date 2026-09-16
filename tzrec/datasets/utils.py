@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -18,6 +19,7 @@ import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.compute as pc
 import torch
+from torch import distributed as dist
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Pipelineable
 
@@ -41,6 +43,40 @@ CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
 # transient event-time column (Unix-epoch seconds, -1 when unavailable); its
 # per-batch max is surfaced on Batch.data_timestamp.
 DATA_TIMESTAMP = "__data_timestamp__"  # float64 column, event-time (seconds)
+
+
+def list_input_files(
+    input_path: str, pg: Optional[dist.ProcessGroup] = None
+) -> List[str]:
+    """List input files of comma separated path patterns.
+
+    Args:
+        input_path (str): comma separated input path patterns.
+        pg (ProcessGroup): process group to check file list consistency on.
+
+    Returns:
+        input files, in an order identical on every rank.
+    """
+    input_files = []
+    for pattern in input_path.split(","):
+        # NOTE: sort as glob returns filesystem order, which may differ by rank.
+        input_files.extend(sorted(glob.glob(pattern)))
+    if pg is not None:
+        object_list = [input_files]
+        dist.broadcast_object_list(object_list, group=pg)
+        rank0_files = object_list[0]
+        if rank0_files != input_files:
+            missing = sorted(set(rank0_files) - set(input_files))
+            extra = sorted(set(input_files) - set(rank0_files))
+            diff = (
+                f"missing: {missing}, extra: {extra}"
+                if missing or extra
+                else "same files in a different order"
+            )
+            raise RuntimeError(
+                f"input files of {input_path} are inconsistent with rank 0, {diff}."
+            )
+    return input_files
 
 
 def inject_checkpoint_metadata(

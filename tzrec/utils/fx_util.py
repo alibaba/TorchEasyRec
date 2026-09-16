@@ -15,6 +15,11 @@ import torch
 from torchrec import JaggedTensor, KeyedTensor
 from torchrec.fx import symbolic_trace as _symbolic_trace
 
+# Modules whose forward FX cannot record -- they branch on tensor values or
+# turn them into Python ints -- so tracing keeps them opaque and TorchScript
+# compiles them whole. Matched by class name.
+UNTRACEABLE_MODULES = ["ComputeJTDictToKJT", "PromptAssembler", "HoleKeyBuilder"]
+
 
 def symbolic_trace(
     # pyre-ignore[24]
@@ -39,8 +44,7 @@ def symbolic_trace(
     Returns:
         GraphModule: a Module created from the recorded operations from ``root``.
     """
-    # ComputeJTDictToKJT could not be traced
-    _leaf_modules = ["ComputeJTDictToKJT"]
+    _leaf_modules = list(UNTRACEABLE_MODULES)
     if leaf_modules:
         _leaf_modules.extend(leaf_modules)
     return _symbolic_trace(root, concrete_args, _leaf_modules)

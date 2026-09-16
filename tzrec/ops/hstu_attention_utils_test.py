@@ -25,6 +25,7 @@ from torch import nn
 
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention_utils import (
+    HSTU_ARBITRARY_NFUNC,
     apply_stu_truncation_plan,
     build_sla_func_tensor,
     compute_stu_truncation_plan,
@@ -272,6 +273,28 @@ class BuildSlaFuncTensorTest(unittest.TestCase):
         func = self._build([6], sla_k1=3, sla_k2=2, nheads=4, graph_type=graph_type)
         for h in range(1, 4):
             torch.testing.assert_close(func[0], func[h])
+
+    @parameterized.expand([(gt,) for gt in _GRAPH_TYPES])
+    def test_width_matches_nfunc_and_extra_intervals_are_empty(
+        self, graph_type: TestGraphType
+    ) -> None:
+        """Pad rows must encode empty intervals for the compiled NFUNC.
+
+        The wheel bakes ``HSTU_ARBITRARY_NFUNC`` in and rejects any other
+        width. SLA only needs the first two intervals, so every later
+        ``[col_min, col_max)`` pair must satisfy ``max <= min`` -- the
+        condition under which the kernel skips an interval entirely. Only
+        that contract is asserted; any encoding meeting it is valid.
+        """
+        L, K1, K2 = 8, 4, 2
+        func = self._build([L], sla_k1=K1, sla_k2=K2, graph_type=graph_type)
+        self.assertEqual(func.shape[1], HSTU_ARBITRARY_NFUNC)
+        for i in range(2, (HSTU_ARBITRARY_NFUNC + 1) // 2):
+            col_min = func[0, 2 * i - 1]
+            col_max = func[0, 2 * i]
+            self.assertTrue(
+                bool(torch.all(col_max <= col_min)), f"interval {i} is not empty"
+            )
 
     @parameterized.expand([(gt,) for gt in _GRAPH_TYPES])
     def test_jagged_layout_across_batch(self, graph_type: TestGraphType) -> None:

@@ -630,6 +630,70 @@ class HSTUAttentionTest(unittest.TestCase):
         )
         torch.testing.assert_close(out_sla, out_fixed)
 
+    def test_decode_covers_all_nfunc_intervals(self) -> None:
+        """CPU coverage of every interval the compiled NFUNC exposes.
+
+        ``build_sla_func_tensor`` only ever fills the first two intervals,
+        so the rows past them are never exercised semantically -- a
+        row-index bug in the decode loop stays invisible because the
+        intervals it misreads are empty either way. Here the causal row
+        ``[0, q + 1)`` is partitioned into ``(NFUNC + 1) // 2`` adjacent
+        non-empty chunks, so their union is again plain causal attention
+        but every row of the func tensor carries a live boundary.
+        """
+        from tzrec.ops._pytorch.pt_hstu_attention import pytorch_hstu_mha
+        from tzrec.ops.hstu_attention_utils import HSTU_ARBITRARY_NFUNC
+
+        torch.manual_seed(0)
+        H, D = 2, 16
+        # Long enough that the last cut point lands strictly inside the row.
+        lengths = torch.tensor([7, 9], dtype=torch.int64)
+        seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+        L = int(seq_offsets[-1].item())
+        q = torch.randn(L, H, D)
+        k = torch.randn(L, H, D)
+        v = torch.randn(L, H, D)
+        N = int(lengths.max().item())
+        alpha = 1.0 / (D**0.5)
+
+        pos_local = torch.cat(
+            [torch.arange(int(n), dtype=torch.int32) for n in lengths]
+        )
+        # Rows interleave [max0, min0, max1, min1, ...]; adjacent chunks share
+        # a boundary, so each cut point is written twice.
+        n_intervals = (HSTU_ARBITRARY_NFUNC + 1) // 2
+        rows = []
+        for i in range(n_intervals - 1):
+            cut = torch.clamp(pos_local + 1, max=2 + 3 * i)
+            rows += [cut, cut]
+        rows.append(pos_local + 1)
+        attn_func = (
+            torch.stack(rows, dim=0)
+            .unsqueeze(0)
+            .expand(H, HSTU_ARBITRARY_NFUNC, L)
+            .contiguous()
+        )
+
+        out_fixed = pytorch_hstu_mha(
+            max_seq_len=N,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            causal=True,
+        )
+        out_partitioned = pytorch_hstu_mha(
+            max_seq_len=N,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            attn_func=attn_func,
+        )
+        torch.testing.assert_close(out_partitioned, out_fixed)
+
 
 def test_sla_attn(
     batch_size: int,

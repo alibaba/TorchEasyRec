@@ -26,20 +26,20 @@ import torch
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.genrec_model import BaseGenrecModel
+from tzrec.models.genrec_model import BaseGenRecModel
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.prompt.assembler import (
-    PROMPT_CU_SEQLENS,
-    PROMPT_INPUT_IDS,
-    PROMPT_MAX_SEQLEN,
-    PROMPT_RESPONSE_LENGTHS,
+    CU_SEQLENS,
+    INPUT_IDS,
+    MAX_SEQLEN,
+    RESPONSE_LENGTHS,
 )
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
+from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 
 
-class GenrecCausalLMModel(BaseGenrecModel):
+class GenRecCausalLMModel(BaseGenRecModel):
     """An HF causal LM driven by a compiled prompt.
 
     Args:
@@ -71,7 +71,7 @@ class GenrecCausalLMModel(BaseGenrecModel):
         self._generated_sids_key = common.generated_sids_key
         self._read_beam_config(common)
 
-    def _read_beam_config(self, common: GenrecModelConfig) -> None:
+    def _read_beam_config(self, common: GenRecModelConfig) -> None:
         """Parse the decode knobs; the schedule must match the codebook.
 
         Args:
@@ -144,7 +144,7 @@ class GenrecCausalLMModel(BaseGenrecModel):
             applies lands on the pairs the window was sized for.
         """
         infos = batch.additional_infos
-        cu_seqlens = infos[PROMPT_CU_SEQLENS]
+        cu_seqlens = infos[CU_SEQLENS]
         starts = cu_seqlens[:-1]
         lengths = torch.diff(cu_seqlens)
         row_starts = torch.repeat_interleave(
@@ -155,10 +155,24 @@ class GenrecCausalLMModel(BaseGenrecModel):
         ).unsqueeze(0)
 
         suffix = cast(int, self._prompt.prompt_plan.logits_suffix_len)
+        # the window walks back from each row's end, so a row shorter than
+        # it reads the row before it, and for row 0 wraps to the tail of the
+        # pack. The assembler is scripted for serving and cannot raise, so
+        # the packed forward owns the check.
+        if bool((lengths < suffix).any()):
+            raise ValueError(
+                f"{type(self).__name__}: every assembled sample must be at "
+                f"least logits_suffix_len ({suffix}) tokens long; a sample "
+                f"whose prompt body is empty is not. Drop the rows whose "
+                f"prompt features are all empty, or give the template "
+                f"static text."
+            )
         suffix_offsets = torch.arange(-suffix, 0, device=embeds.device)
         keep_indices = (cu_seqlens[1:, None] + suffix_offsets).reshape(-1)
+        # varlen flash-attention wants int32 boundaries; the assembler
+        # already emits them, so this is normally a no-op
         flash_cu_seqlens = cu_seqlens.to(dtype=torch.int32).contiguous()
-        max_seqlen = int(infos[PROMPT_MAX_SEQLEN])
+        max_seqlen = int(infos[MAX_SEQLEN])
         outputs = self.lm(
             inputs_embeds=embeds.unsqueeze(0),
             attention_mask=None,
@@ -172,12 +186,10 @@ class GenrecCausalLMModel(BaseGenrecModel):
         )
         logits = outputs.logits.reshape(lengths.numel(), suffix, -1)
 
-        window_ids = infos[PROMPT_INPUT_IDS][keep_indices].reshape(
-            lengths.numel(), suffix
-        )
+        window_ids = infos[INPUT_IDS][keep_indices].reshape(lengths.numel(), suffix)
         columns = torch.arange(suffix, device=embeds.device)
         labels = window_ids.masked_fill(
-            columns[None, :] < suffix - infos[PROMPT_RESPONSE_LENGTHS][:, None],
+            columns[None, :] < suffix - infos[RESPONSE_LENGTHS][:, None],
             self._ignore_index,
         )
         return logits, labels
@@ -214,8 +226,8 @@ class GenrecCausalLMModel(BaseGenrecModel):
             Padded embeddings and attention mask.
         """
         infos = batch.additional_infos
-        cu_seqlens = infos[PROMPT_CU_SEQLENS]
-        max_seqlen = int(infos[PROMPT_MAX_SEQLEN])
+        cu_seqlens = infos[CU_SEQLENS]
+        max_seqlen = int(infos[MAX_SEQLEN])
         starts = cu_seqlens[:-1]
         lengths = cu_seqlens[1:] - starts
         batch_size = lengths.numel()
@@ -232,7 +244,7 @@ class GenrecCausalLMModel(BaseGenrecModel):
 
 @torch.fx.wrap
 def _fx_wrapped_forward(
-    model: "GenrecCausalLMModel", embeds: torch.Tensor, batch: Batch
+    model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Hide the packed forward from FX.
 
@@ -252,7 +264,7 @@ def _fx_wrapped_forward(
 
 @torch.fx.wrap
 def _fx_wrapped_generate(
-    model: "GenrecCausalLMModel", embeds: torch.Tensor, batch: Batch
+    model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
 ) -> torch.Tensor:
     """Hide the decode loop from FX.
 

@@ -10,7 +10,6 @@
 # limitations under the License.
 
 
-import glob
 import os
 import sys
 import time
@@ -27,6 +26,7 @@ from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
 from tzrec.datasets.utils import (
     calc_slice_intervals,
     inject_checkpoint_metadata,
+    list_input_files,
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
@@ -192,9 +192,7 @@ class ParquetReader(BaseReader):
         self._rebalance = rebalance
 
         self._ordered_cols = None
-        self._input_files = []
-        for input_path in self._input_path.split(","):
-            self._input_files.extend(glob.glob(input_path))
+        self._input_files = list_input_files(self._input_path, self._pg)
         if len(self._input_files) == 0:
             raise RuntimeError(f"No parquet files exist in {self._input_path}.")
 

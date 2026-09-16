@@ -9,8 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from parameterized import parameterized
@@ -18,16 +20,58 @@ from torch import nn
 from transformers.loss.loss_utils import ForCausalLMLoss
 
 from tzrec.datasets.utils import Batch
-from tzrec.models.genrec_causal_lm_model import GenrecCausalLMModel
+from tzrec.features.feature import FgMode, create_features
+from tzrec.models.genrec_causal_lm_model import GenRecCausalLMModel
 from tzrec.prompt.assembler import (
-    PROMPT_CU_SEQLENS,
-    PROMPT_INPUT_IDS,
-    PROMPT_MAX_SEQLEN,
-    PROMPT_RESPONSE_LENGTHS,
+    CU_SEQLENS,
+    INPUT_IDS,
+    MAX_SEQLEN,
+    RESPONSE_LENGTHS,
+    PromptAssembler,
 )
-from tzrec.protos.models.genrec_model_pb2 import GenrecModelConfig
-from tzrec.tests.prompt_test_util import GenrecModelTestBase
-from tzrec.utils.test_util import parameterized_name_func
+from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.types import CompiledPrompt
+from tzrec.protos import feature_pb2
+from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+from tzrec.protos.prompt_pb2 import PromptConfig
+from tzrec.utils.test_util import (
+    create_genrec_test_model,
+    create_genrec_test_tokenizer,
+    make_test_dir,
+    parameterized_name_func,
+)
+
+
+def _compiled_prompt(test_dir: str) -> CompiledPrompt:
+    """Compile the genrec test prompt without building a backbone.
+
+    ``create_genrec_test_model`` also constructs the LM. The decode-schedule
+    tests only read the SID space, so they compile the prompt on its own and
+    keep ``_read_beam_config`` reachable without an HF backbone.
+
+    Args:
+        test_dir (str): scratch directory for the tokenizer.
+
+    Returns:
+        CompiledPrompt: the prompt over the ``(4, 4, 4)`` codebook.
+    """
+    features = create_features(
+        [
+            feature_pb2.FeatureConfig(
+                sequence_raw_feature=feature_pb2.RawFeature(
+                    feature_name="hist", expression="user:hist"
+                )
+            )
+        ],
+        fg_mode=FgMode.FG_NONE,
+    )
+    prompt_config = PromptConfig(
+        tokenizer_path=create_genrec_test_tokenizer(os.path.join(test_dir, "tok.json")),
+        prompt="History : {{hist}} . Predict :",
+        response="{{answer}}",
+    )
+    prompt_config.sid_space.codebook.extend([4, 4, 4])
+    return compile_prompt(prompt_config, features, ["answer"])
 
 
 class LeftPadPackedInputsTest(unittest.TestCase):
@@ -38,11 +82,11 @@ class LeftPadPackedInputsTest(unittest.TestCase):
         cu = torch.tensor([0, 4, 9])
         batch = Batch(
             additional_infos={
-                PROMPT_CU_SEQLENS: cu,
-                PROMPT_MAX_SEQLEN: torch.tensor(7),
+                CU_SEQLENS: cu,
+                MAX_SEQLEN: torch.tensor(7),
             }
         )
-        model = GenrecCausalLMModel.__new__(GenrecCausalLMModel)
+        model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         torch.nn.Module.__init__(model)
 
         padded, mask = model._left_pad_packed_inputs(embeds, batch)
@@ -89,7 +133,7 @@ class _DifferentiableLM(nn.Module):
 
 class PackedForwardTest(unittest.TestCase):
     def test_passes_varlen_metadata_and_builds_per_row_labels(self) -> None:
-        model = GenrecCausalLMModel.__new__(GenrecCausalLMModel)
+        model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model.lm = _CapturingLM()
         model._ignore_index = -7
@@ -100,10 +144,10 @@ class PackedForwardTest(unittest.TestCase):
         input_ids = torch.arange(100, 112)
         batch = Batch(
             additional_infos={
-                PROMPT_CU_SEQLENS: torch.tensor([0, 5, 12]),
-                PROMPT_INPUT_IDS: input_ids,
-                PROMPT_MAX_SEQLEN: torch.tensor(7),
-                PROMPT_RESPONSE_LENGTHS: torch.tensor([3, 2]),
+                CU_SEQLENS: torch.tensor([0, 5, 12]),
+                INPUT_IDS: input_ids,
+                MAX_SEQLEN: torch.tensor(7),
+                RESPONSE_LENGTHS: torch.tensor([3, 2]),
             }
         )
 
@@ -128,8 +172,29 @@ class PackedForwardTest(unittest.TestCase):
             [[-7, 102, 103, 104], [-7, -7, 110, 111]],
         )
 
+    def test_a_row_shorter_than_the_window_is_rejected(self) -> None:
+        """A row under ``logits_suffix_len`` would index into its neighbour."""
+        model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
+        nn.Module.__init__(model)
+        model.lm = _CapturingLM()
+        model._ignore_index = -7
+        model._prompt = SimpleNamespace(
+            prompt_plan=SimpleNamespace(logits_suffix_len=4)
+        )
+        batch = Batch(
+            additional_infos={
+                CU_SEQLENS: torch.tensor([0, 3, 12], dtype=torch.int32),
+                INPUT_IDS: torch.arange(100, 112),
+                MAX_SEQLEN: torch.tensor(9),
+                RESPONSE_LENGTHS: torch.tensor([3, 3]),
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "at least logits_suffix_len"):
+            model._forward(torch.zeros(12, 6), batch)
+
     def test_loss_and_gradients_cover_only_valid_response_pairs(self) -> None:
-        model = GenrecCausalLMModel.__new__(GenrecCausalLMModel)
+        model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model.lm = _DifferentiableLM(hidden_size=6, vocab_size=32)
         model._ignore_index = -7
@@ -142,10 +207,10 @@ class PackedForwardTest(unittest.TestCase):
         input_ids = torch.arange(4, 16)
         batch = Batch(
             additional_infos={
-                PROMPT_CU_SEQLENS: torch.tensor([0, 5, 12]),
-                PROMPT_INPUT_IDS: input_ids,
-                PROMPT_MAX_SEQLEN: torch.tensor(7),
-                PROMPT_RESPONSE_LENGTHS: torch.tensor([3, 2]),
+                CU_SEQLENS: torch.tensor([0, 5, 12]),
+                INPUT_IDS: input_ids,
+                MAX_SEQLEN: torch.tensor(7),
+                RESPONSE_LENGTHS: torch.tensor([3, 2]),
             }
         )
 
@@ -173,16 +238,20 @@ class PackedForwardTest(unittest.TestCase):
         self.assertGreater(float(weight_grad.abs().sum()), 0)
 
 
-class GenrecCausalLMModelTest(GenrecModelTestBase):
+class GenRecCausalLMModelTest(unittest.TestCase):
     """The decode schedule and the training forward, both subclass-owned."""
+
+    def setUp(self) -> None:
+        self.test_dir = make_test_dir()
+        self.compiled_prompt = _compiled_prompt(self.test_dir)
 
     def _beam_model(
         self, beam_widths=(2, 2, 2), num_return_sequences=2
-    ) -> GenrecCausalLMModel:
-        model = GenrecCausalLMModel.__new__(GenrecCausalLMModel)
+    ) -> GenRecCausalLMModel:
+        model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model._prompt = self.compiled_prompt
-        common = GenrecModelConfig(num_return_sequences=num_return_sequences)
+        common = GenRecModelConfig(num_return_sequences=num_return_sequences)
         common.beam_widths.extend(beam_widths)
         model._read_beam_config(common)
         return model
@@ -215,6 +284,27 @@ class GenrecCausalLMModelTest(GenrecModelTestBase):
                 beam_widths=(1, 1, 100),
                 num_return_sequences=5,
             )
+
+    def test_training_forward_builds_no_cache(self) -> None:
+        model, compiled_prompt = create_genrec_test_model(self.test_dir)
+        batch = Batch()
+        batch.additional_infos.update(
+            PromptAssembler(compiled_prompt.prompt_plan, compiled_prompt.sid_space)(
+                {
+                    # offset SID codes for the (4, 4, 4) codebook
+                    "hist.values": torch.tensor([0, 5, 10]),
+                    "hist.lengths": torch.tensor([3]),
+                    "answer.values": torch.tensor([1, 6, 11]),
+                    "answer.lengths": torch.tensor([3]),
+                }
+            )
+        )
+        inner = model.lm.model.forward
+
+        with mock.patch.object(model.lm.model, "forward", side_effect=inner) as spy:
+            model.predict(batch)
+
+        self.assertIs(spy.call_args.kwargs["use_cache"], False)
 
 
 if __name__ == "__main__":

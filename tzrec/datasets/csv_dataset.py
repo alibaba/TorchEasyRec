@@ -10,7 +10,6 @@
 # limitations under the License.
 
 
-import glob
 import os
 import random
 import time
@@ -23,9 +22,14 @@ from pyarrow import csv
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
-from tzrec.datasets.utils import FIELD_TYPE_TO_PA, get_input_fields_proto
+from tzrec.datasets.utils import (
+    FIELD_TYPE_TO_PA,
+    get_input_fields_proto,
+    list_input_files,
+)
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils import dist_util
 
 
 class CsvDataset(BaseDataset):
@@ -123,9 +127,9 @@ class CsvReader(BaseReader):
                 column_names=column_names, block_size=64 * 1024 * 1024
             ),
         )
-        self._input_files = []
-        for input_path in self._input_path.split(","):
-            self._input_files.extend(glob.glob(input_path))
+        self._input_files = list_input_files(
+            self._input_path, dist_util.get_dist_object_pg()
+        )
         if len(self._input_files) == 0:
             raise RuntimeError(f"No csv files exist in {self._input_path}.")
         dataset = ds.dataset(self._input_files[0], format=self._csv_fmt)

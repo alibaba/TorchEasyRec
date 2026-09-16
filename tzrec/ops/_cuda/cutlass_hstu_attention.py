@@ -13,6 +13,7 @@ from typing import Optional
 
 import torch
 
+from tzrec.ops.hstu_attention_utils import HSTU_ARBITRARY_NFUNC
 from tzrec.utils.logging_util import logger
 
 # Eager hstu import: registers fbgemm::hstu_varlen_fwd_{80,90} schema
@@ -54,8 +55,9 @@ def cutlass_hstu_mha(
       context/target masking driven by ``causal``, ``max_attn_len``,
       ``contextual_seq_len`` and ``num_targets``.
     - Arbitrary-mask NFUNC path (``attn_func`` provided): the kernel
-      interprets ``attn_func`` as a jagged ``(nheads, 3, total_q)`` int32
-      tensor encoding two disjoint column-intervals per query row. The
+      interprets ``attn_func`` as a jagged
+      ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)`` int32 tensor encoding
+      ``(NFUNC + 1) // 2`` disjoint column-intervals per query row. The
       caller is responsible for constructing it (see
       ``build_sla_func_tensor`` for the SLA case). In this mode the
       kernel forces ``window_size_left=-1, window_size_right=0`` so
@@ -79,9 +81,9 @@ def cutlass_hstu_mha(
             0 means unlimited).
         contextual_seq_len: number of contextual tokens per sequence.
         attn_func: pre-built arbitrary-mask func tensor of shape
-            ``(nheads, 3, total_q)``, int32. When provided, selects the
-            NFUNC mask path; ``causal`` and ``max_attn_len`` must be at
-            defaults.
+            ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)``, int32. When
+            provided, selects the NFUNC mask path; ``causal`` and
+            ``max_attn_len`` must be at defaults.
         scaling_seqlen: divisor used to scale the attention output inside
             the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
             the behavior matches the legacy code path.
@@ -128,9 +130,11 @@ def cutlass_hstu_mha(
         torch._assert(attn_func.dim() == 3, "attn_func must be 3-D")
         torch._assert(
             attn_func.shape[0] == q.shape[1]
-            and attn_func.shape[1] == 3
+            and attn_func.shape[1] == HSTU_ARBITRARY_NFUNC
             and attn_func.shape[2] == q.shape[0],
-            "attn_func must have shape (nheads, 3, total_q)",
+            f"attn_func must have shape (nheads, {HSTU_ARBITRARY_NFUNC}, total_q); "
+            "it must match the HSTU_ARBITRARY_NFUNC the installed "
+            "fbgemm_gpu_hstu wheel was built with (see its fn<N> version tag)",
         )
         torch._assert(
             attn_func.device == q.device,
