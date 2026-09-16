@@ -284,6 +284,36 @@ class CheckpointUtilTest(unittest.TestCase):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
+    def _lr_scheduler(self, num_groups):
+        params = [nn.Parameter(torch.zeros(1)) for _ in range(num_groups)]
+        optimizer = torch.optim.SGD([{"params": [p]} for p in params], lr=0.1)
+        return LinearDecayLR(optimizer, num_training_steps=100)
+
+    def test_restore_lr_schedulers_rebuilds_on_param_group_change(self):
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-40")
+        saved = self._lr_scheduler(2)
+        # a checkpoint named after batch index 40 has stepped 41 times
+        for _ in range(41):
+            saved.step()
+        checkpoint_util.save_lr_schedulers(ckpt_dir, [saved])
+        # a replanned restart holds a different number of parameter groups
+        restored = self._lr_scheduler(1)
+        checkpoint_util.restore_lr_schedulers(ckpt_dir, [restored])
+        self.assertEqual(restored.last_epoch, saved.last_epoch)
+        self.assertEqual(
+            restored.optimizer.param_groups[0]["lr"], saved.optimizer.param_groups[0]["lr"]
+        )
+
+    def test_restore_lr_schedulers_uses_saved_state(self):
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-40")
+        saved = self._lr_scheduler(2)
+        for _ in range(40):
+            saved.step()
+        checkpoint_util.save_lr_schedulers(ckpt_dir, [saved])
+        restored = self._lr_scheduler(2)
+        checkpoint_util.restore_lr_schedulers(ckpt_dir, [restored])
+        self.assertEqual(restored.state_dict(), saved.state_dict())
+
     def test_latest_checkpoint_with_model_dir(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-0"))
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-10"))

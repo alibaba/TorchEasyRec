@@ -1288,10 +1288,48 @@ def save_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
         os.replace(path + ".tmp", path)
 
 
-def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
-    """Restore schedulers, or reconstruct legacy progress from unchanged config.
+def _set_lr_schedulers_from_progress(
+    checkpoint_dir: str, schedulers: List[BaseLR]
+) -> None:
+    """Advance schedulers by the batch or epoch count the checkpoint records.
 
-    A stepped legacy checkpoint records a zero-based batch index. Epoch-based
+    The schedulers here derive their learning rate from that count alone, so
+    this reproduces the saved rates without the saved parameter groups.
+    """
+    meta_path = os.path.join(checkpoint_dir, CKPT_META_FILENAME)
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+    step = meta.get("step")
+    if step is None:
+        match = re.search(r"model\.ckpt-(\d+)$", checkpoint_dir.rstrip("/"))
+        if match:
+            step = int(match.group(1))
+    dataloader_state = restore_dataloader_state(checkpoint_dir) or {}
+    counts = []
+    for scheduler in schedulers:
+        if isinstance(scheduler, ConstantLR):
+            count = 0
+        elif scheduler.by_epoch:
+            count = dataloader_state.get(EPOCHS_COMPLETED)
+        else:
+            count = step + 1 if step is not None else None
+        if count is None:
+            raise ValueError(
+                "Cannot reconstruct LR scheduler progress: checkpoint "
+                "must record step / completed epochs. Omit --restore_lr_scheduler "
+                "to keep the configured initial schedule."
+            )
+        counts.append(count)
+    for scheduler, count in zip(schedulers, counts):
+        scheduler.set_step(count)
+
+
+def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
+    """Restore schedulers, or reconstruct their progress from unchanged config.
+
+    A stepped checkpoint records a zero-based batch index. Epoch-based
     schedules additionally require an explicit completed-epoch count; missing
     progress is an error rather than silently restarting the learning rate.
     """
@@ -1308,41 +1346,26 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
             type(scheduler).__name__ for scheduler in schedulers
         ]:
             raise ValueError("Restored LR scheduler types/order do not match.")
-        for scheduler, state in zip(schedulers, local_state):
-            scheduler.load_state_dict(state["state"])
+        try:
+            for scheduler, state in zip(schedulers, local_state):
+                scheduler.load_state_dict(state["state"])
+        except ValueError:
+            # A rank's fused-optimizer parameter groups follow its shards, so a
+            # replanned restart can hold a different number of them than the
+            # saved state. The step-based rebuild gives the same rates.
+            logger.warning(
+                "Saved LR scheduler state does not fit this rank's parameter "
+                f"groups ({[len(s.optimizer.param_groups) for s in schedulers]} "
+                f"groups vs saved {[len(s['state']['base_lrs']) for s in local_state]}); "
+                "rebuilding the schedule from the checkpoint step instead."
+            )
+            _set_lr_schedulers_from_progress(checkpoint_dir, schedulers)
     else:
-        meta_path = os.path.join(checkpoint_dir, CKPT_META_FILENAME)
-        meta = {}
-        if os.path.exists(meta_path):
-            with open(meta_path) as f:
-                meta = json.load(f)
-        step = meta.get("step")
-        if step is None:
-            match = re.search(r"model\.ckpt-(\d+)$", checkpoint_dir.rstrip("/"))
-            if match:
-                step = int(match.group(1))
-        dataloader_state = restore_dataloader_state(checkpoint_dir) or {}
-        counts = []
-        for scheduler in schedulers:
-            if isinstance(scheduler, ConstantLR):
-                count = 0
-            elif scheduler.by_epoch:
-                count = dataloader_state.get(EPOCHS_COMPLETED)
-            else:
-                count = step + 1 if step is not None else None
-            if count is None:
-                raise ValueError(
-                    "Cannot reconstruct legacy LR scheduler progress: checkpoint "
-                    "must record step / completed epochs. Omit --restore_lr_scheduler "
-                    "to keep the configured initial schedule."
-                )
-            counts.append(count)
         logger.warning(
             "Checkpoint has no LR scheduler state; reconstructing progress from "
             "checkpoint metadata. The original LR configuration must be unchanged."
         )
-        for scheduler, count in zip(schedulers, counts):
-            scheduler.set_step(count)
+        _set_lr_schedulers_from_progress(checkpoint_dir, schedulers)
     logger.info(f"Restored LR schedulers from {checkpoint_dir}.")
 
 
