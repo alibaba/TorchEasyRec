@@ -218,8 +218,10 @@ class BaseGenRecModelTest(unittest.TestCase):
             prompt="History : {{hist}} . Predict {{prof}} :",
             lm_parameter_dtype=lm_parameter_dtype,
         )
-        init_parameters(model, device=torch.device("cpu"))
-        batch = _projected_batch(compiled_prompt)
+        device = torch.device("cuda")
+        init_parameters(model, device=device)
+        model.to(device)
+        batch = _projected_batch(compiled_prompt).to(device)
 
         embeds = model.build_input(batch)
         self.assertIs(embeds.dtype, _PARAM_DTYPE[lm_parameter_dtype])
@@ -239,12 +241,12 @@ class BaseGenRecModelTest(unittest.TestCase):
             feature_configs=[_hist(), _projected("prof", 8)],
             prompt="History : {{hist}} . Predict {{prof}} :",
         )
-        init_parameters(model, device=torch.device("cpu"))
-        batch = _projected_batch(compiled_prompt)
+        device = torch.device("cuda")
+        init_parameters(model, device=device)
+        model.to(device)
+        batch = _projected_batch(compiled_prompt).to(device)
 
-        wrapper = TrainWrapper(
-            model, device=torch.device("cpu"), mixed_precision="BF16"
-        )
+        wrapper = TrainWrapper(model, device=device, mixed_precision="BF16")
         loss, _ = wrapper(batch)
         self.assertTrue(bool(torch.isfinite(loss)))
         loss.backward()
@@ -288,6 +290,8 @@ class BaseGenRecModelTest(unittest.TestCase):
         self.assertGreater(rows, self.compiled_prompt.sid_space.band_hi[-1])
 
     def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
+        device = torch.device("cuda")
+        self.model.to(device)
         batch = _batch(
             self.compiled_prompt,
             {
@@ -296,9 +300,10 @@ class BaseGenRecModelTest(unittest.TestCase):
                 "answer.values": torch.tensor(_ANSWER_CODES),
                 "answer.lengths": torch.tensor([3]),
             },
-        )
-        predictions = self.model.predict(batch)
-        loss = self.model.loss(predictions, batch)["ce_loss"]
+        ).to(device)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            predictions = self.model.predict(batch)
+            loss = self.model.loss(predictions, batch)["ce_loss"]
         self.assertTrue(bool(torch.isfinite(loss)))
         loss.backward()
 

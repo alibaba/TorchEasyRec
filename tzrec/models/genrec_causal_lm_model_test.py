@@ -290,7 +290,11 @@ class GenRecCausalLMModelTest(unittest.TestCase):
     @unittest.skipIf(*nv_gpu_unavailable)
     @mark_ci_scope("gpu")
     def test_training_forward_builds_no_cache(self) -> None:
-        model, compiled_prompt = create_genrec_test_model(self.test_dir)
+        model, compiled_prompt = create_genrec_test_model(
+            self.test_dir, lm_parameter_dtype=GenRecModelConfig.BF16
+        )
+        device = torch.device("cuda")
+        model.to(device)
         batch = Batch()
         batch.additional_infos.update(
             PromptAssembler(compiled_prompt.prompt_plan, compiled_prompt.sid_space)(
@@ -303,6 +307,7 @@ class GenRecCausalLMModelTest(unittest.TestCase):
                 }
             )
         )
+        batch = batch.to(device)
         inner = model.lm.model.forward
 
         with mock.patch.object(model.lm.model, "forward", side_effect=inner) as spy:
