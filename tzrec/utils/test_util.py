@@ -61,6 +61,10 @@ faiss_unavailable: Tuple[bool, str] = (
     importlib.util.find_spec("faiss") is None,
     "faiss is not installed (required for SID residual K-Means)",
 )
+flash_attn_unavailable: Tuple[bool, str] = (
+    importlib.util.find_spec("flash_attn") is None,
+    "flash_attn wheel is not installed (required for GenRec packed attention)",
+)
 
 
 def get_compare_tolerance(

@@ -20,6 +20,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.utils.test_util import (
     create_tiny_causal_lm,
+    flash_attn_unavailable,
     mark_ci_scope,
     nv_gpu_unavailable,
     parameterized_name_func,
@@ -140,6 +141,7 @@ class DynamicBeamSearchTest(unittest.TestCase):
 
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_unavailable)
 class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
     @parameterized.expand(
         [["qwen2"], ["qwen3"]],

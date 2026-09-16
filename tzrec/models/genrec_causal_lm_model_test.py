@@ -37,6 +37,7 @@ from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.utils.test_util import (
     create_genrec_test_model,
     create_genrec_test_tokenizer,
+    flash_attn_unavailable,
     make_test_dir,
     mark_ci_scope,
     nv_gpu_unavailable,
@@ -288,6 +289,7 @@ class GenRecCausalLMModelTest(unittest.TestCase):
             )
 
     @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skipIf(*flash_attn_unavailable)
     @mark_ci_scope("gpu")
     def test_training_forward_builds_no_cache(self) -> None:
         model, compiled_prompt = create_genrec_test_model(

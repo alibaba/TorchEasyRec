@@ -48,6 +48,7 @@ from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     create_genrec_test_model,
     create_genrec_test_tokenizer,
+    flash_attn_unavailable,
     make_test_dir,
     mark_ci_scope,
     nv_gpu_unavailable,
@@ -107,6 +108,7 @@ def _projected_batch(compiled_prompt) -> Batch:
 
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_unavailable)
 class BaseGenRecModelTest(unittest.TestCase):
     """Shared causal-LM behavior, reached through its concrete subclass."""
 
@@ -317,6 +319,7 @@ class BaseGenRecModelTest(unittest.TestCase):
 
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_unavailable)
 class GenRecFrontEndTest(unittest.TestCase):
     """The served half of the model, under the same wrapper every export uses."""
 
@@ -483,6 +486,7 @@ def _packed_flash_model(
 
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_unavailable)
 class PackedFlashAttentionTest(unittest.TestCase):
     """The packed varlen forward, against the same rows run one at a time."""
 
