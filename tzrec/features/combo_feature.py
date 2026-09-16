@@ -81,7 +81,7 @@ class ComboFeature(IdFeature):
             "expression": list(self.config.expression),
             "value_type": "string",
             "need_prefix": False,
-            "value_dim": self.config.value_dim,
+            "value_dim": self.value_dim,
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator

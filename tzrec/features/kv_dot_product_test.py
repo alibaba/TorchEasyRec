@@ -169,6 +169,44 @@ class KvDotProductTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
+    def test_kv_dot_product_with_kv_delimiter_and_normalizer(self):
+        kdp_feat_cfg = feature_pb2.FeatureConfig(
+            kv_dot_product=feature_pb2.KvDotProduct(
+                feature_name="kdp_feat",
+                query="user:q",
+                document="item:d",
+                default_value="0",
+                separator="|",
+                kv_delimiter="=",
+                normalizer="method=log10,threshold=1e-10,default=-10",
+            )
+        )
+        kdp_feat = kv_dot_product_lib.KvDotProduct(
+            kdp_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
+        fg_cfg = kdp_feat.fg_json()[0]
+        self.assertEqual(fg_cfg["kv_delimiter"], "=")
+        self.assertEqual(
+            fg_cfg["normalizer"], "method=log10,threshold=1e-10,default=-10"
+        )
+
+        input_data = {"q": pa.array(["a=2|b=3"]), "d": pa.array(["a=2|b=2"])}
+        parsed_feat = kdp_feat.parse(input_data)
+        np.testing.assert_allclose(parsed_feat.values, np.array([[1.0]]))
+
+    def test_kv_dot_product_with_invalid_kv_delimiter(self):
+        kdp_feat_cfg = feature_pb2.FeatureConfig(
+            kv_dot_product=feature_pb2.KvDotProduct(
+                feature_name="kdp_feat",
+                query="user:q",
+                document="item:d",
+                kv_delimiter="::",
+            )
+        )
+        kdp_feat = kv_dot_product_lib.KvDotProduct(kdp_feat_cfg)
+        with self.assertRaisesRegex(ValueError, "invalid kv_delimiter"):
+            kdp_feat.fg_json()
+
 
 if __name__ == "__main__":
     unittest.main()

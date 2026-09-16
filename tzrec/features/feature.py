@@ -69,6 +69,9 @@ _meta_cls = get_register_class_meta(_FEATURE_CLASS_MAP)
 
 
 MAX_HASH_BUCKET_SIZE = 2**63 - 1
+# combiners fg implements. gap_min/gap_max parse but are never accumulated,
+# and fg falls back to sum for any other value without warning.
+FG_COMBINERS = frozenset({"sum", "mean", "avg", "min", "max", "count"})
 SINGLE_INPUT_FEATURE_CLASSES = [
     "IdFeature",
     "RawFeature",
