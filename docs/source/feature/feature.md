@@ -1,6 +1,6 @@
 # 特征
 
-TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、CombineFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、KvDotProduct、BoolMaskFeature、CustomFeature、SequenceFeature。
+TorchEasyRec多种类型的特征，包括IdFeature、RawFeature、ComboFeature、CombineFeature、LookupFeature、MatchFeature、ExprFeature、OverlapFeature、TokenizeFeature、KvDotProduct、BoolMaskFeature、RegexReplaceFeature、CustomFeature、SequenceFeature。
 
 **共用配置**
 
@@ -576,7 +576,7 @@ feature_configs {
         vocab_file: "tokenizer.json"
         embedding_dim: 8
         text_normalizer {
-            norm_options: [TEXT_LOWER2UPPER, TEXT_SBC2DBC, TEXT_CHT2CHS, TEXT_FILTER]
+            norm_options: [TEXT_UPPER2LOWER, TEXT_SBC2DBC, TEXT_CHT2CHS, TEXT_FILTER]
         }
     }
 }
@@ -586,12 +586,16 @@ feature_configs {
 
 - **vocab_file**: 分词字典，完全兼容 https://github.com/mlc-ai/tokenizers-cpp 库的分词文件
 
-- **tokenizer_type**: 分词类型，支持bpe、sentencepiece，默认为bpe
+- **tokenizer_type**: 分词类型，默认为`bpe`。`bpe`表示用huggingface tokenizers的json词典，具体是BPE还是WordPiece等由`tokenizer.json`的内容决定；`sentencepiece`表示用sentencepiece模型
+
+- **default_value**: 输入为空时的默认值。注意该默认值是**文本**，会跟正常输入一样被分词。
+  序列特征（包括`tokens_as_sequence: true`）不支持空默认值，未配置时会被重置为`"0"`
 
 - **text_normalizer**: 可选，是否对文本进行归一化
 
-  - **stop_char_file**: 停用词表路径，默认为系统内置，详见[stop_char](https://tzrec.oss-accelerate.aliyuncs.com/third_party/stop_char)
-  - **norm_options**: 归一化选项，默认为TEXT_LOWER2UPPER, TEXT_SBC2DBC, TEXT_CHT2CHS, TEXT_FILTER
+  - **max_length**: 可选，默认不限制。输入长度超过该值时**跳过归一化，原样输出原始文本**（不是截断），并且每条超长记录都会打一条ERROR日志。长度按**GBK编码的字节数**计算，中文和全角字符算2字节，ASCII算1字节，即`max_length: 512`约等于512个英文字符或256个汉字
+  - **stop_char_file**: 特殊符号表路径，默认为系统内置，详见[stop_char](https://tzrec.oss-accelerate.aliyuncs.com/third_party/stop_char)。文件必须是**GBK编码**、每行一个字符，配置后会**替换**（而不是追加）内置的特殊符号表
+  - **norm_options**: 归一化选项，默认为TEXT_UPPER2LOWER, TEXT_SBC2DBC, TEXT_CHT2CHS, TEXT_FILTER。注意`TEXT_REMOVE_SPACE`不是归一化选项而是单独的开关，只配它等价于没有配置归一化选项，FG会按默认选项归一化，也就是说无法表达“只去空格、不做其他归一化”
 
   | 方式              | 描述                   |
   | ----------------- | ---------------------- |
@@ -599,7 +603,7 @@ feature_configs {
   | TEXT_UPPER2LOWER  | 大写转换成小写         |
   | TEXT_SBC2DBC      | 全角到半角             |
   | TEXT_CHT2CHS      | 繁体到简体             |
-  | TEXT_FILTER       | 去除特殊符号           |
+  | TEXT_FILTER       | 特殊符号替换成空格     |
   | TEXT_SPLITCHRS    | 中文拆成单字(空格分隔) |
   | TEXT_REMOVE_SPACE | 去除空格               |
 
@@ -680,6 +684,52 @@ feature_configs {
 | [1, 2, 3, 4]    | [1, 0, 1, 0]            | [1, 3]                |
 | [1, 2, 3, 4]    | "true,false,true,false" | [1, 3]                |
 
+## RegexReplaceFeature: 正则替换特征
+
+`regex_replace_feature`用正则表达式（[RE2语法](https://github.com/google/re2/wiki/Syntax)）替换输入文本中匹配的片段，可以配置多个pattern，匹配任一pattern的片段都会被替换。
+
+```
+feature_configs {
+    regex_replace_feature {
+        feature_name: "query_clean"
+        expression: "user:query"
+        regex_pattern: ["\\|", "#"]
+        replacement: " "
+        embedding_dim: 32
+        hash_bucket_size: 100000
+    }
+}
+```
+
+- **expression**: 特征FG所依赖字段的来源
+
+- **regex_pattern**: 必选项，正则表达式，`string`或`list<string>`类型，配置多个时取并集
+
+- **replacement**: 替换文本，可以用`\\1`引用pattern中的捕获组；为空时删除匹配的文本片段
+
+- **replace_all**: 是否全局替换，默认为true；设为false时只替换第一次匹配到的片段
+
+- **icase**: 匹配时是否忽略大小写，默认为false
+
+- **value_dim**: 输出值的维度，默认为1。为1时输出列的类型是单值`string`，为其他值时是`array<string>`，`tokenize_feature`等下游算子只接受单值输入。注意它不会截断输出，多值（array）输入的每个元素都会被替换，输出值的个数由输入决定
+
+- **default_value**: 输入为空时的默认值，默认值会**原样输出，不经过正则替换**；不配置时，输入为空则不输出任何值
+
+- 分箱支持`hash_bucket_size`/`vocab_list`/`vocab_dict`/`vocab_file`/`num_buckets`，其中`num_buckets`要求替换后的文本都能转成`[0, num_buckets)`的整数，非数字的文本会导致FG报错
+
+- 在分词前截断文本并追加EOS token的用法，见[FAQ](../faq.md)
+
+- **separator**: 只在序列场景下用来切分序列元素内的多值字符串，非序列的字符串输入不会按它切分
+
+- 其余配置同IdFeature
+
+示例
+
+| 输入               | regex_pattern               | replacement | 未进行bucketize的输出 |
+| ------------------ | --------------------------- | ----------- | --------------------- |
+| 中华\|人民\|共和国 | `["\\\|"]`                  | `" "`       | 中华 人民 共和国      |
+| a\|b#c(d)          | `["\\\|", "#", "\\(.*\\)"]` | `""`        | abc                   |
+
 ## CustomFeature: 自定义特征
 
 自定义特征，自定义方式参考[自定义算子文档](https://help.aliyun.com/zh/airec/what-is-pai-rec/user-guide/custom-feature-operator)
@@ -721,11 +771,11 @@ feature_configs {
 
 - 其余配置如果是类别型特征同IdFeature，如果是数值型特征同RawFeature
 
-| 算子名称     | 算子功能 | 算子动态库                   | 算子参数                                                                         |
-| ------------ | -------- | ---------------------------- | -------------------------------------------------------------------------------- |
-| EditDistance | 编辑距离 | pyfg/lib/libedit_distance.so | • encoding: 输入文本的编码，可选：utf-8, latin，默认值为latin                    |
-| RegexReplace | 正则替换 | pyfg/lib/libregex_replace.so | • regex_patten: 正则表达式，匹配的文本片段将会被替换 <br>• replacement: 替换文本 |
-|              |          |                              |                                                                                  |
+| 算子名称     | 算子功能                                | 算子动态库                   | 算子参数                                                                         |
+| ------------ | --------------------------------------- | ---------------------------- | -------------------------------------------------------------------------------- |
+| EditDistance | 编辑距离                                | pyfg/lib/libedit_distance.so | • encoding: 输入文本的编码，可选：utf-8, latin，默认值为latin                    |
+| RegexReplace | 正则替换，建议直接用RegexReplaceFeature | pyfg/lib/libregex_replace.so | • regex_patten: 正则表达式，匹配的文本片段将会被替换 <br>• replacement: 替换文本 |
+|              |                                         |                              |                                                                                  |
 
 ## SequenceFeature：序列特征
 
