@@ -143,6 +143,21 @@ class GenRecCausalLMModel(BaseGenRecModel):
             Logits and labels over the same window, so the shift ``loss``
             applies lands on the pairs the window was sized for.
         """
+        # fp32 masters are fine under autocast, so only the forward can tell
+        if (
+            embeds.is_cuda
+            and embeds.dtype == torch.float32
+            and not torch.is_autocast_enabled("cuda")
+        ):
+            raise ValueError(
+                f"{type(self).__name__}: flash_attention_2 needs bf16 or fp16 "
+                f"activations, but the backbone ran in fp32 with no autocast "
+                f"active. Set train_config.mixed_precision to BF16 or FP16 to "
+                f"keep fp32 master weights, or set "
+                f"the model's common.lm_parameter_dtype to BF16 or FP16 to "
+                f"narrow the parameters themselves."
+            )
+
         infos = batch.additional_infos
         cu_seqlens = infos[CU_SEQLENS]
         starts = cu_seqlens[:-1]
@@ -155,10 +170,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         ).unsqueeze(0)
 
         suffix = cast(int, self._prompt.prompt_plan.logits_suffix_len)
-        # the window walks back from each row's end, so a row shorter than
-        # it reads the row before it, and for row 0 wraps to the tail of the
-        # pack. The assembler is scripted for serving and cannot raise, so
-        # the packed forward owns the check.
+        # a row shorter than the window reads the row before it
         if bool((lengths < suffix).any()):
             raise ValueError(
                 f"{type(self).__name__}: every assembled sample must be at "

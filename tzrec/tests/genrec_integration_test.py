@@ -39,6 +39,7 @@ from tzrec.utils.test_util import (
     gpu_unavailable,
     make_test_dir,
     mark_ci_scope,
+    nv_gpu_unavailable,
 )
 
 _MOCK_CONFIG = "tzrec/tests/configs/genrec_causal_lm_model_mock.config"
@@ -120,6 +121,8 @@ class GenRecIntegrationTest(unittest.TestCase):
             out[column + ".lengths"] = torch.tensor([len(row) for row in lists])
         return out
 
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @mark_ci_scope("gpu")
     def test_genrec_train_eval_export(self):
         trained = self._train_eval_export()
         export_dir = os.path.join(self.test_dir, "export")

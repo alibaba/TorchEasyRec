@@ -105,6 +105,8 @@ def _projected_batch(compiled_prompt) -> Batch:
     )
 
 
+@mark_ci_scope("gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
 class BaseGenRecModelTest(unittest.TestCase):
     """Shared causal-LM behavior, reached through its concrete subclass."""
 
@@ -308,6 +310,8 @@ class BaseGenRecModelTest(unittest.TestCase):
         torch.fx.symbolic_trace(TrainWrapper(self.model))
 
 
+@mark_ci_scope("gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
 class GenRecFrontEndTest(unittest.TestCase):
     """The served half of the model, under the same wrapper every export uses."""
 
@@ -395,9 +399,7 @@ class GenRecFrontEndTest(unittest.TestCase):
                 self.assertTrue(torch.equal(out[key], value), key)
 
 
-# offset SID codes for the (4, 4, 4) codebook, beside the module's _HIST_CODES /
-# _LONG_HIST_CODES / _ANSWER_CODES: a second answer, and a rewrite of
-# _HIST_CODES that keeps its width so the row after it does not move
+# a second answer, and a rewrite of _HIST_CODES that keeps its width
 _OTHER_ANSWER_CODES = [2, 7, 8]
 _REWRITTEN_HIST_CODES = [3, 7, 11]
 
