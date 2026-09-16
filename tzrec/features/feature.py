@@ -875,17 +875,6 @@ class BaseFeature(object, metaclass=_meta_cls):
         """Build input field names with side."""
         return NotImplemented
 
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        raise NotImplementedError
-
     def parse(
         self, input_data: Dict[str, pa.Array], is_training: bool = False
     ) -> ParsedData:
