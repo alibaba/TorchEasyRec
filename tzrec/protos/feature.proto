@@ -338,7 +338,7 @@ message CombineFeature {
     optional string init_fn = 15;
     // mask value in training progress
     optional bool use_mask = 16;
-    // combine value combiner type, available is {sum | mean | min | max}
+    // combine value combiner type, available is {sum | mean | avg | min | max | count}
     // Controls FG-level multi-value aggregation before bucketization.
     optional string combiner = 22 [default = "sum"];
 
@@ -393,7 +393,8 @@ message LookupFeature {
     map<string, uint64> vocab_dict = 10;
     // embedding pooling type, available is {sum | mean}
     optional string pooling = 11 [default = "sum"];
-    // lookup value combiner type, available is {sum | mean | min | max | count}
+    // lookup value combiner type, available is {sum | mean | avg | min | max | count},
+    // an empty combiner outputs the matched values without aggregation
     optional string combiner = 12 [default = "sum"];
     // fg default value
     optional string default_value = 13 [default = "0"];
@@ -629,7 +630,9 @@ message OverlapFeature {
     required string query = 2;
     // title input name, e,g. item:title
     required string title = 3;
-    // overlap calculate method, available is {query_common_ratio | title_common_ratio | is_contain | is_equal}
+    // overlap calculate method, available is {is_equal | is_contain | index_of |
+    // query_common_ratio | title_common_ratio | proximity_min_dist |
+    // proximity_max_dist | proximity_avg_dist | proximity_min_cover}
     required string method = 4;
     // embedding name, feature with same embedding name will share embedding
     optional string embedding_name = 5;
@@ -860,8 +863,8 @@ message KvDotProduct {
     repeated float boundaries = 6;
     // fg multi-value separator
     optional string separator = 7 [default = "\x1d"];
-    // fg kv separator, default is :.
-    optional float kv_delimiter = 8;
+    // fg kv separator, only one char is allowed
+    optional string kv_delimiter = 8 [default = ":"];
     // fg normalizer, e.g.
     // method=log10,threshold=1e-10,default=-10
     // method=zscore,mean=0.0,standard_deviation=10.0

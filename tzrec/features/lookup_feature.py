@@ -15,6 +15,7 @@ from tzrec.datasets.utils import (
     CROSS_NEG_DATA_GROUP,
 )
 from tzrec.features.feature import (
+    FG_COMBINERS,
     MAX_HASH_BUCKET_SIZE,
     BaseFeature,
 )
@@ -191,6 +192,14 @@ class LookupFeature(BaseFeature):
                 fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
             if raw_fg_cfg is not None:
                 raw_fg_cfg["sequence_fields"] = [self.config.feature_name + "__lookup"]
+
+        # a discrete or multi-value lookup empties the combiner above, fg never
+        # sees the configured one, so we only validate what we emit
+        if fg_cfg["combiner"] and fg_cfg["combiner"] not in FG_COMBINERS:
+            raise ValueError(
+                f"{self.__class__.__name__}[{self.name}] has invalid combiner "
+                f"[{self.config.combiner}], available is {sorted(FG_COMBINERS)}."
+            )
 
         fg_cfgs = [fg_cfg]
         if raw_fg_cfg is not None:

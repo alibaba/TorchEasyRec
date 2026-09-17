@@ -243,6 +243,27 @@ class SequenceComboFeatureTest(unittest.TestCase):
             np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
         )
 
+    def test_sequence_combo_feature_default_value_dim(self):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            combo_feature=feature_pb2.ComboFeature(
+                feature_name="combo_feat",
+                hash_bucket_size=100,
+                embedding_dim=16,
+                expression=["user:id_str", "item:iid_str"],
+                default_value="0",
+            )
+        )
+        seq_feat = combo_feature_lib.ComboFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+        )
+        # fg would emit multi-value sequence steps the model does not reduce
+        self.assertEqual(seq_feat.value_dim, 1)
+        self.assertEqual(seq_feat.fg_json()[0]["value_dim"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

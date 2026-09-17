@@ -284,7 +284,7 @@ feature_configs {
 
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
 - **value_map**: 输入字符串值到浮点值的映射，可与`num_buckets`或`boundaries`配合使用
-- **combiner**: 如果输入为多值，可以设置combiner来对值进行聚合，默认为`sum`，支持`sum`/`mean`(`avg`)/`min`/`max`/`count`/`gap_min`/`gap_max`
+- **combiner**: 如果输入为多值，可以设置combiner来对值进行聚合，默认为`sum`，支持`sum`/`mean`(`avg`)/`min`/`max`/`count`
 - **num_buckets**: 离散化桶数量，设置后输出为离散整数值（value_type为int64），值范围为\[0, num_buckets)
 - **boundaries**: 分箱/分桶的边界值，通过一个数组来设置
 - **normalizer**: 连续值变换方式，支持`log10`/`zscore`/`minmax`/`expression`，用法同RawFeature
@@ -311,7 +311,7 @@ feature_configs {
 
 - **map**: 特征FG所依赖map字段的来源
 - **key**: 特征FG所依赖key字段的来源
-- **combiner**: 如果key为多值，可以设置combiner来对查找的值进行聚合，默认为`sum`，支持`sum`/`mean`(`avg`)/`min`/`max`/`count`/`gap_min`/`gap_max`
+- **combiner**: 如果key为多值，可以设置combiner来对查找的值进行聚合，默认为`sum`，支持`sum`/`mean`(`avg`)/`min`/`max`/`count`。配置为空字符串时不做聚合，直接输出查到的多个值（`need_discrete=true`时会自动置空）
 - **need_discrete**: 查到的值是否为离散值，默认为false
 - **need_key**: 查到的值是否拼接key作为前缀，默认为false
 

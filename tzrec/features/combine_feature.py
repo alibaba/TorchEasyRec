@@ -12,6 +12,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 from tzrec.features.feature import (
+    FG_COMBINERS,
     BaseFeature,
 )
 from tzrec.protos.feature_pb2 import FeatureConfig
@@ -78,6 +79,13 @@ class CombineFeature(BaseFeature):
 
     def _fg_json(self) -> List[Dict[str, Any]]:
         """Get fg json config impl."""
+        combiner = self.config.combiner.lower()
+        # fg falls back to sum for an empty combiner
+        if combiner and combiner not in FG_COMBINERS:
+            raise ValueError(
+                f"{self.__class__.__name__}[{self.name}] has invalid combiner "
+                f"[{self.config.combiner}], available is {sorted(FG_COMBINERS)}."
+            )
         fg_cfg = {
             "feature_type": "combine_feature",
             "feature_name": self.config.feature_name,
@@ -85,7 +93,7 @@ class CombineFeature(BaseFeature):
             "expression": self.config.expression,
             "value_type": "float",
             "need_prefix": False,
-            "combiner": self.config.combiner.lower(),
+            "combiner": combiner,
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
