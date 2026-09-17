@@ -33,80 +33,18 @@ candidate list -- falls back to the reference math below, which is the
 historical implementation verbatim.
 """
 
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.nn.functional as F
 
 from tzrec.modules.norm import LayerNorm
 from tzrec.modules.utils import BaseModule
-
-
-def _jagged_segment_ids(
-    lengths: torch.Tensor, output_size: Optional[int] = None
-) -> torch.Tensor:
-    """Map each jagged row to its segment index.
-
-    ``output_size`` -- the statically known ``sum(lengths)`` -- avoids the
-    hidden device->host sync (and data-dependent graph break) that
-    ``repeat_interleave`` with tensor repeats otherwise performs.
-    """
-    return torch.repeat_interleave(
-        torch.arange(lengths.size(0), device=lengths.device),
-        lengths,
-        output_size=output_size,
-    )
-
-
-def _jagged_segment_sum(
-    values: torch.Tensor,
-    lengths: torch.Tensor,
-    segment_ids: torch.Tensor,
-) -> torch.Tensor:
-    """Sum a jagged ``(total, C)`` tensor within each segment; empties -> 0.
-
-    Reduced-precision inputs (fp16/bf16) accumulate in fp32 and cast back:
-    ``index_add_`` is not on autocast's promote list, so bf16 inputs would
-    otherwise add through bf16 atomics whose reorder noise sits at bf16
-    rounding scale.  ``promote_types`` keeps the dtype choice a graph node
-    rather than Python control flow, so fx tracing still inlines this.
-    """
-    acc_dtype = torch.promote_types(values.dtype, torch.float32)
-    sums = torch.zeros(
-        (lengths.size(0), values.size(-1)),
-        dtype=acc_dtype,
-        device=values.device,
-    )
-    sums.index_add_(0, segment_ids, values.to(acc_dtype))
-    return sums.to(values.dtype)
-
-
-def _jagged_segment_max(
-    values: torch.Tensor,
-    lengths: torch.Tensor,
-    segment_ids: torch.Tensor,
-) -> torch.Tensor:
-    """Max-reduce a jagged ``(total, C)`` tensor within each segment.
-
-    ``scatter_reduce_`` rather than the still-beta ``index_reduce_`` (which
-    warns on every call); it has no amax backward either, so callers using
-    the result as a shift constant must detach ``values``.  Empty segments
-    keep ``-inf``, which would make downstream broadcasts NaN under
-    torch.compile, so they are rewritten to 0 -- nothing reads them back.
-    """
-    maxes = torch.full(
-        (lengths.size(0), values.size(-1)),
-        float("-inf"),
-        dtype=values.dtype,
-        device=values.device,
-    ).scatter_reduce_(
-        0,
-        segment_ids.unsqueeze(-1).expand_as(values),
-        values,
-        "amax",
-        include_self=False,
-    )
-    return torch.nan_to_num(maxes, neginf=0.0)
+from tzrec.ops.jagged_tensors import (
+    jagged_segment_ids,
+    jagged_segment_max,
+    jagged_segment_sum,
+)
 
 
 def _jagged_softmax(logits: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -116,10 +54,10 @@ def _jagged_softmax(logits: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor
     far-below-max segment to an all-zero row and a 0/0 denominator) and
     detached, because it is a constant of the softmax identity.
     """
-    segment_ids = _jagged_segment_ids(lengths, output_size=logits.size(0))
-    maxes = _jagged_segment_max(logits.detach(), lengths, segment_ids)
+    segment_ids = jagged_segment_ids(lengths, output_size=logits.size(0))
+    maxes = jagged_segment_max(logits.detach(), lengths, segment_ids)
     exp = torch.exp(logits - maxes.index_select(0, segment_ids))
-    denom = _jagged_segment_sum(exp, lengths, segment_ids)
+    denom = jagged_segment_sum(exp, lengths, segment_ids)
     return exp / torch.repeat_interleave(denom, lengths, dim=0, output_size=exp.size(0))
 
 
@@ -192,7 +130,7 @@ def _jagged_single_query_attn(
         return _varlen_single_query_attn(q, k, v, lengths, attn_scale)
     num_heads = q.size(1)
     head_dim = q.size(2)
-    segment_ids = _jagged_segment_ids(lengths, output_size=k.size(0))
+    segment_ids = jagged_segment_ids(lengths, output_size=k.size(0))
     # Broadcast the query onto its own rows instead of padding the pool
     # to a dense (B, N_max, D) block.
     q_rows = q.index_select(0, segment_ids)
@@ -200,7 +138,7 @@ def _jagged_single_query_attn(
     attn = _jagged_softmax(logits, lengths)
     attn = F.dropout(attn, p=dropout_ratio, training=training)
     weighted = (attn.unsqueeze(-1) * v).reshape(-1, num_heads * head_dim)
-    return _jagged_segment_sum(weighted, lengths, segment_ids)
+    return jagged_segment_sum(weighted, lengths, segment_ids)
 
 
 torch.fx.wrap(_jagged_single_query_attn)

@@ -20,6 +20,7 @@ from tzrec.modules.gr.onerank_cross_task import OneRankCrossTaskAttention
 from tzrec.modules.gr.onerank_sd import OneRankSituationDiscernment
 from tzrec.modules.mlp import MLP
 from tzrec.modules.utils import BaseModule
+from tzrec.ops.jagged_tensors import jagged_segment_ids, jagged_segment_sum
 
 
 class TaskTower(nn.Module):
@@ -97,45 +98,6 @@ class FusionMTLTower(nn.Module):
         return result_dict
 
 
-def _jagged_segment_ids(
-    lengths: torch.Tensor, output_size: Optional[int] = None
-) -> torch.Tensor:
-    """Map each jagged row to its segment index.
-
-    ``output_size`` -- the statically known ``sum(lengths)`` -- avoids the
-    hidden device->host sync (and data-dependent graph break) that
-    ``repeat_interleave`` with tensor repeats otherwise performs.
-    """
-    return torch.repeat_interleave(
-        torch.arange(lengths.size(0), device=lengths.device),
-        lengths,
-        output_size=output_size,
-    )
-
-
-def _jagged_segment_sum(
-    values: torch.Tensor,
-    lengths: torch.Tensor,
-    segment_ids: torch.Tensor,
-) -> torch.Tensor:
-    """Sum a jagged ``(total, C)`` tensor within each segment; empties -> 0.
-
-    Reduced-precision inputs (fp16/bf16) accumulate in fp32 and cast back:
-    ``index_add_`` is not on autocast's promote list, so bf16 inputs would
-    otherwise add through bf16 atomics whose reorder noise sits at bf16
-    rounding scale.  ``promote_types`` keeps the dtype choice a graph node
-    rather than Python control flow, so fx tracing still inlines this.
-    """
-    acc_dtype = torch.promote_types(values.dtype, torch.float32)
-    sums = torch.zeros(
-        (lengths.size(0), values.size(-1)),
-        dtype=acc_dtype,
-        device=values.device,
-    )
-    sums.index_add_(0, segment_ids, values.to(acc_dtype))
-    return sums.to(values.dtype)
-
-
 def _jagged_mean(values: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     """Mean-pool the segments of a jagged ``(total, K, D)`` tensor.
 
@@ -147,8 +109,8 @@ def _jagged_mean(values: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     num_tasks = values.size(1)
     dim = values.size(2)
     flat = values.reshape(values.size(0), num_tasks * dim)
-    sums = _jagged_segment_sum(
-        flat, lengths, _jagged_segment_ids(lengths, output_size=flat.size(0))
+    sums = jagged_segment_sum(
+        flat, lengths, jagged_segment_ids(lengths, output_size=flat.size(0))
     )
     denom = lengths.clamp(min=1).to(flat.dtype).unsqueeze(-1)
     return (sums / denom).reshape(batch_size, num_tasks, dim)

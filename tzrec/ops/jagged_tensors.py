@@ -170,3 +170,70 @@ def jagged_dense_bmm_broadcast_add(
             dense=dense,
             bias=bias,
         )
+
+
+def jagged_segment_ids(
+    lengths: torch.Tensor, output_size: Optional[int] = None
+) -> torch.Tensor:
+    """Map each jagged row to its segment index.
+
+    ``output_size`` -- the statically known ``sum(lengths)`` -- avoids the
+    hidden device->host sync (and data-dependent graph break) that
+    ``repeat_interleave`` with tensor repeats otherwise performs.
+    """
+    return torch.repeat_interleave(
+        torch.arange(lengths.size(0), device=lengths.device),
+        lengths,
+        output_size=output_size,
+    )
+
+
+def jagged_segment_sum(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    segment_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Sum a jagged ``(total, C)`` tensor within each segment; empties -> 0.
+
+    Reduced-precision inputs (fp16/bf16) accumulate in fp32 and cast back:
+    ``index_add_`` is not on autocast's promote list, so bf16 inputs would
+    otherwise add through bf16 atomics whose reorder noise sits at bf16
+    rounding scale.  ``promote_types`` keeps the dtype choice a graph node
+    rather than Python control flow, so fx tracing still inlines this.
+    """
+    acc_dtype = torch.promote_types(values.dtype, torch.float32)
+    sums = torch.zeros(
+        (lengths.size(0), values.size(-1)),
+        dtype=acc_dtype,
+        device=values.device,
+    )
+    sums.index_add_(0, segment_ids, values.to(acc_dtype))
+    return sums.to(values.dtype)
+
+
+def jagged_segment_max(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    segment_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Max-reduce a jagged ``(total, C)`` tensor within each segment.
+
+    ``scatter_reduce_`` rather than the still-beta ``index_reduce_`` (which
+    warns on every call); it has no amax backward either, so callers using
+    the result as a shift constant must detach ``values``.  Empty segments
+    keep ``-inf``, which would make downstream broadcasts NaN under
+    torch.compile, so they are rewritten to 0 -- nothing reads them back.
+    """
+    maxes = torch.full(
+        (lengths.size(0), values.size(-1)),
+        float("-inf"),
+        dtype=values.dtype,
+        device=values.device,
+    ).scatter_reduce_(
+        0,
+        segment_ids.unsqueeze(-1).expand_as(values),
+        values,
+        "amax",
+        include_self=False,
+    )
+    return torch.nan_to_num(maxes, neginf=0.0)
