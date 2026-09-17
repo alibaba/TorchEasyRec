@@ -435,6 +435,54 @@ class ExprFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.key_lengths, np.array([1, 1, 1, 1]))
         np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([2, 1, 1]))
 
+    @parameterized.expand(
+        [
+            param(
+                "item_side_seq",
+                variables=["user:request_time", "item:event_time"],
+                sequence_fields=[],
+            ),
+            param(
+                "user_side_seq",
+                variables=["user:request_time", "user:event_time"],
+                sequence_fields=["event_time"],
+            ),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_simple_sequence_expr_feature_dense(self, name, variables, sequence_fields):
+        expr_feat_cfg = feature_pb2.FeatureConfig(
+            sequence_expr_feature=feature_pb2.ExprFeature(
+                feature_name="click_50_seq_ts_diff",
+                sequence_delim="|",
+                sequence_length=50,
+                expression="request_time - event_time",
+                variables=variables,
+                sequence_fields=sequence_fields,
+                default_value="0",
+            )
+        )
+        expr_feat = expr_feature_lib.ExprFeature(
+            expr_feat_cfg, is_sequence=True, fg_mode=FgMode.FG_NORMAL
+        )
+        self.assertEqual(expr_feat.output_dim, 1)
+        self.assertEqual(expr_feat.is_sparse, False)
+        self.assertEqual(expr_feat.inputs, ["request_time", "event_time"])
+        self.assertEqual(expr_feat.sequence_input_names, ["event_time"])
+        self.assertEqual(expr_feat.emb_config, None)
+        self.assertEqual(
+            expr_feat.fg_json()[0].get("sequence_fields"), sequence_fields or None
+        )
+
+        input_data = {
+            "request_time": pa.array([10, None, 5]),
+            "event_time": pa.array(["2|3", "4", None]),
+        }
+        parsed_feat = expr_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq_ts_diff")
+        np.testing.assert_allclose(parsed_feat.values, np.array([[8], [7], [0], [0]]))
+        np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([2, 1, 1]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -991,5 +991,7 @@ feature_configs {
 ```
 
 - 配置同非序列版本，特征类型带`sequence_`前缀
+- 对于输入字段大于一个的特征算子（如: ExprFeature等），`input_side == item`的输入字段默认是序列类型，其余输入字段默认不是序列类型
+  - **sequence_fields**: (可选) 指定哪些输入字段是序列类型，指定后只有指定的字段认为是序列类型。如上述`seq_expr_2`中，若行为时间序列从user侧传递（如`variables: ["user:request_time", "user:event_time"]`），需配置`sequence_fields: ["event_time"]`
 - 其中当特征值为离散值时（如IdFeature，ComboFeature等），value_dim的默认值与非序列的版本不同
   - **value_dim**: 默认值是1，可以设置0，value_dim=0时支持多值ID输出
