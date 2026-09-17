@@ -187,11 +187,10 @@ class LookupFeature(BaseFeature):
             if self.config.HasField("stub_type"):
                 fg_cfg["stub_type"] = self.config.stub_type
 
-        if self.is_grouped_sequence:
-            if len(self.config.sequence_fields) > 0:
-                fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
-            if raw_fg_cfg is not None:
-                raw_fg_cfg["sequence_fields"] = [self.config.feature_name + "__lookup"]
+        if self.is_sequence and len(self.config.sequence_fields) > 0:
+            fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
+        if self.is_grouped_sequence and raw_fg_cfg is not None:
+            raw_fg_cfg["sequence_fields"] = [self.config.feature_name + "__lookup"]
 
         # a discrete or multi-value lookup empties the combiner above, fg never
         # sees the configured one, so we only validate what we emit

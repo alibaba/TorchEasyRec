@@ -14,7 +14,7 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
 
 from tzrec.features import match_feature as match_feature_lib
@@ -251,6 +251,63 @@ class MatchFeatureTest(unittest.TestCase):
         self.assertEqual(parsed_feat.name, "match_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+
+
+class SequenceMatchFeatureTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            param(
+                "item_side_seq",
+                pkey="item:cate",
+                skey="item:brand",
+                sequence_fields=[],
+            ),
+            param(
+                "user_side_seq",
+                pkey="user:cate",
+                skey="user:brand",
+                sequence_fields=["cate", "brand"],
+            ),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_simple_sequence_match_feature_dense(
+        self, name, pkey, skey, sequence_fields
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            sequence_match_feature=feature_pb2.MatchFeature(
+                feature_name="click_50_seq_match_feat",
+                sequence_delim=";",
+                sequence_length=50,
+                nested_map="user:match_cate_brand",
+                pkey=pkey,
+                skey=skey,
+                sequence_fields=sequence_fields,
+                default_value="0",
+            )
+        )
+        seq_feat = match_feature_lib.MatchFeature(
+            seq_feat_cfg, is_sequence=True, fg_mode=FgMode.FG_NORMAL
+        )
+        self.assertEqual(seq_feat.output_dim, 1)
+        self.assertEqual(seq_feat.is_sparse, False)
+        self.assertEqual(seq_feat.inputs, ["match_cate_brand", "cate", "brand"])
+        self.assertEqual(seq_feat.sequence_input_names, ["cate", "brand"])
+        self.assertEqual(
+            seq_feat.fg_json()[0].get("sequence_fields"), sequence_fields or None
+        )
+
+        input_data = {
+            "match_cate_brand": pa.array(
+                ["ca^ba:1,bb:2|cb^ba:3,bb:4", "ca^ba:1,bb:2|cb^ba:3,bb:4"]
+            ),
+            "cate": pa.array(["ca;cb", "ca"]),
+            "brand": pa.array(["ba;bb", "bb"]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq_match_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array([[1], [4], [2]]))
+        np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([2, 1]))
 
 
 if __name__ == "__main__":
