@@ -104,10 +104,9 @@ class LeftPadPackedInputsTest(unittest.TestCase):
 
 
 class _CapturingLM(nn.Module):
-    def __init__(self, attn_implementation: str = "sdpa") -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.kwargs = {}
-        self.config = SimpleNamespace(_attn_implementation=attn_implementation)
 
     def forward(self, **kwargs):
         self.kwargs = kwargs
@@ -123,9 +122,7 @@ class _CapturingLM(nn.Module):
 class _DifferentiableLM(nn.Module):
     def __init__(self, hidden_size: int, vocab_size: int) -> None:
         super().__init__()
-        self.config = SimpleNamespace(
-            vocab_size=vocab_size, _attn_implementation="sdpa"
-        )
+        self.config = SimpleNamespace(vocab_size=vocab_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.loss_function = ForCausalLMLoss
 
@@ -139,6 +136,7 @@ class PackedForwardTest(unittest.TestCase):
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model.lm = _CapturingLM()
+        model._attn_impl = "sdpa"
         model._ignore_index = -7
         model._prompt = SimpleNamespace(
             prompt_plan=SimpleNamespace(logits_suffix_len=4)
@@ -180,6 +178,7 @@ class PackedForwardTest(unittest.TestCase):
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model.lm = _CapturingLM()
+        model._attn_impl = "sdpa"
         model._ignore_index = -7
         model._prompt = SimpleNamespace(
             prompt_plan=SimpleNamespace(logits_suffix_len=4)
@@ -200,7 +199,8 @@ class PackedForwardTest(unittest.TestCase):
         """The flash kernel takes bf16/fp16 only; sdpa is happy in fp32."""
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
-        model.lm = _CapturingLM("flash_attention_2")
+        model.lm = _CapturingLM()
+        model._attn_impl = "flash_attention_2"
         model._ignore_index = -7
         model._prompt = SimpleNamespace(
             prompt_plan=SimpleNamespace(logits_suffix_len=4)
@@ -217,7 +217,7 @@ class PackedForwardTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "needs bf16 or fp16"):
             model._forward(torch.zeros(12, 6, dtype=torch.float32), batch)
 
-        model.lm = _CapturingLM("sdpa")
+        model._attn_impl = "sdpa"
         logits, _ = model._forward(torch.zeros(12, 6, dtype=torch.float32), batch)
         self.assertEqual(logits.shape, (2, 4, 5))
 
@@ -225,6 +225,7 @@ class PackedForwardTest(unittest.TestCase):
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model.lm = _DifferentiableLM(hidden_size=6, vocab_size=32)
+        model._attn_impl = "sdpa"
         model._ignore_index = -7
         model._prompt = SimpleNamespace(
             prompt_plan=SimpleNamespace(logits_suffix_len=4)

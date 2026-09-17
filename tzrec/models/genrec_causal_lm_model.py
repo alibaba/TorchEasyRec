@@ -144,9 +144,9 @@ class GenRecCausalLMModel(BaseGenRecModel):
             applies lands on the pairs the window was sized for.
         """
         # only the flash kernel rejects fp32, and fp32 masters are fine under
-        # autocast, so neither the config nor the dtype alone can tell
+        # autocast, so neither the kernel nor the dtype alone can tell
         if (
-            self.lm.config._attn_implementation == "flash_attention_2"
+            self._attn_impl == "flash_attention_2"
             and embeds.dtype == torch.float32
             and not torch.is_autocast_enabled("cuda")
         ):

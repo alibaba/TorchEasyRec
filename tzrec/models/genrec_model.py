@@ -104,6 +104,7 @@ class BaseGenRecModel(BaseModel):
 
         self._ignore_index = int(cfg.common.ignore_index)
         self.lm: nn.Module
+        self._attn_impl: str
         self.init_backbone(
             cfg.hf_model_name_or_path,
             cfg.common.lm_parameter_dtype,
@@ -148,6 +149,9 @@ class BaseGenRecModel(BaseModel):
                 absent, so the packed forward has no kernel to run on.
         """
         impl = _ATTN_IMPL[attn_implementation]
+        # the forward needs it too, and transformers exposes only the private
+        # config._attn_implementation
+        self._attn_impl = impl
         if impl == "flash_attention_2":
             if find_spec("flash_attn") is None:
                 raise ImportError(
