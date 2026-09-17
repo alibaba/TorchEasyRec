@@ -37,10 +37,7 @@ from tzrec.protos.prompt_pb2 import PromptConfig
 from tzrec.utils.test_util import (
     create_genrec_test_model,
     create_genrec_test_tokenizer,
-    flash_attn_unavailable,
     make_test_dir,
-    mark_ci_scope,
-    nv_gpu_unavailable,
     parameterized_name_func,
 )
 
@@ -316,15 +313,8 @@ class GenRecCausalLMModelTest(unittest.TestCase):
                 num_return_sequences=5,
             )
 
-    @unittest.skipIf(*nv_gpu_unavailable)
-    @unittest.skipIf(*flash_attn_unavailable)
-    @mark_ci_scope("gpu")
     def test_training_forward_builds_no_cache(self) -> None:
-        model, compiled_prompt = create_genrec_test_model(
-            self.test_dir, lm_parameter_dtype=GenRecModelConfig.BF16
-        )
-        device = torch.device("cuda")
-        model.to(device)
+        model, compiled_prompt = create_genrec_test_model(self.test_dir)
         batch = Batch()
         batch.additional_infos.update(
             PromptAssembler(compiled_prompt.prompt_plan, compiled_prompt.sid_space)(
@@ -337,7 +327,6 @@ class GenRecCausalLMModelTest(unittest.TestCase):
                 }
             )
         )
-        batch = batch.to(device)
         inner = model.lm.model.forward
 
         with mock.patch.object(model.lm.model, "forward", side_effect=inner) as spy:

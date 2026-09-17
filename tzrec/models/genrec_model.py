@@ -18,8 +18,8 @@ prompt and the projected slots, exported like any tzrec model beside the LM's
 HuggingFace weights.
 """
 
-import importlib.util
 import inspect
+from importlib.util import find_spec
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -149,7 +149,7 @@ class BaseGenRecModel(BaseModel):
         """
         impl = _ATTN_IMPL[attn_implementation]
         if impl == "flash_attention_2":
-            if importlib.util.find_spec("flash_attn") is None:
+            if find_spec("flash_attn") is None:
                 raise ImportError(
                     f"{type(self).__name__}: attn_implementation is "
                     f"FLASH_ATTENTION_2 but the flash_attn wheel is not "
