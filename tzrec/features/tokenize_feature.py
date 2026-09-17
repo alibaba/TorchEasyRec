@@ -136,7 +136,7 @@ class TokenizeFeature(IdFeature):
                 parameter = 0
                 for norm_option in norm_cfg.norm_options:
                     if norm_option in NORM_OPTION_MAPPING:
-                        parameter += NORM_OPTION_MAPPING[norm_option]
+                        parameter |= NORM_OPTION_MAPPING[norm_option]
                     if norm_option == TextNormalizeOption.TEXT_REMOVE_SPACE:
                         norm_fg_cfg["remove_space"] = True
                 norm_fg_cfg["parameter"] = parameter

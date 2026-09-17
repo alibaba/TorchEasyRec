@@ -192,6 +192,30 @@ class LookupFeatureTest(unittest.TestCase):
                 [[1, 2], [0, 0], [0, 0], [0, 0], [0, 0]],
                 [0, 0],
             ],
+            [
+                pa.array(["ca:1\x1dcb:3", "ca:1\x1dcb:3", ""]),
+                pa.array(["ca\x1dcb", "ca", "ca"]),
+                1,
+                "min",
+                [[1], [1], [0]],
+                0,
+            ],
+            [
+                pa.array(["ca:1\x1dcb:3", "ca:1\x1dcb:3", ""]),
+                pa.array(["ca\x1dcb", "ca", "ca"]),
+                1,
+                "max",
+                [[3], [1], [0]],
+                0,
+            ],
+            [
+                pa.array(["ca:1\x1dcb:3", "ca:1\x1dcb:3", ""]),
+                pa.array(["ca\x1dcb", "ca", "ca"]),
+                1,
+                "count",
+                [[2], [1], [0]],
+                0,
+            ],
         ],
         name_func=test_util.parameterized_name_func,
     )
@@ -582,6 +606,19 @@ class SequenceLookupFeatureTest(unittest.TestCase):
         self.assertTrue(
             np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
         )
+
+    def test_lookup_feature_with_invalid_combiner(self):
+        lookup_feat_cfg = feature_pb2.FeatureConfig(
+            lookup_feature=feature_pb2.LookupFeature(
+                feature_name="lookup_feat",
+                map="user:kv",
+                key="item:cate",
+                combiner="gap_max",
+            )
+        )
+        lookup_feat = lookup_feature_lib.LookupFeature(lookup_feat_cfg)
+        with self.assertRaisesRegex(ValueError, "invalid combiner"):
+            lookup_feat.fg_json()
 
 
 if __name__ == "__main__":

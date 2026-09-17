@@ -357,6 +357,18 @@ class CombineFeatureTest(unittest.TestCase):
             np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
         )
 
+    def test_combine_feature_with_invalid_combiner(self):
+        combine_feat_cfg = feature_pb2.FeatureConfig(
+            combine_feature=feature_pb2.CombineFeature(
+                feature_name="combine_feat",
+                expression="user:event",
+                combiner="gap_max",
+            )
+        )
+        combine_feat = combine_feature_lib.CombineFeature(combine_feat_cfg)
+        with self.assertRaisesRegex(ValueError, "invalid combiner"):
+            combine_feat.fg_json()
+
 
 if __name__ == "__main__":
     unittest.main()
