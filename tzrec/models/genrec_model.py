@@ -18,6 +18,7 @@ prompt and the projected slots, exported like any tzrec model beside the LM's
 HuggingFace weights.
 """
 
+import importlib.util
 import inspect
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -51,6 +52,11 @@ _PARAM_DTYPE: Dict[int, torch.dtype] = {
     GenRecModelConfig.FP32: torch.float32,
     GenRecModelConfig.BF16: torch.bfloat16,
     GenRecModelConfig.FP16: torch.float16,
+}
+
+_ATTN_IMPL: Dict[int, str] = {
+    GenRecModelConfig.SDPA: "sdpa",
+    GenRecModelConfig.FLASH_ATTENTION_2: "flash_attention_2",
 }
 
 _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
@@ -98,7 +104,11 @@ class BaseGenRecModel(BaseModel):
 
         self._ignore_index = int(cfg.common.ignore_index)
         self.lm: nn.Module
-        self.init_backbone(cfg.hf_model_name_or_path, cfg.common.lm_parameter_dtype)
+        self.init_backbone(
+            cfg.hf_model_name_or_path,
+            cfg.common.lm_parameter_dtype,
+            cfg.common.attn_implementation,
+        )
         # Every run replaces this initialization from pretrained or DCP weights.
         self.lm.resize_token_embeddings(
             compiled_prompt.sid_space.target_vocab_size, mean_resizing=False
@@ -120,7 +130,10 @@ class BaseGenRecModel(BaseModel):
         self.init_projections()
 
     def init_backbone(
-        self, hf_model_name_or_path: str, lm_parameter_dtype: int
+        self,
+        hf_model_name_or_path: str,
+        lm_parameter_dtype: int,
+        attn_implementation: int = GenRecModelConfig.SDPA,
     ) -> None:
         """Assign ``self.lm`` from config, so HF weights load only on cold start.
 
@@ -128,11 +141,31 @@ class BaseGenRecModel(BaseModel):
             hf_model_name_or_path: hub id or local directory naming the
                 architecture and cold-start weights.
             lm_parameter_dtype: dtype of the LM parameters.
+            attn_implementation: attention kernel to build the backbone with.
+
+        Raises:
+            ImportError: FLASH_ATTENTION_2 is configured but the wheel is
+                absent, so the packed forward has no kernel to run on.
         """
+        impl = _ATTN_IMPL[attn_implementation]
+        if impl == "flash_attention_2":
+            if importlib.util.find_spec("flash_attn") is None:
+                raise ImportError(
+                    f"{type(self).__name__}: attn_implementation is "
+                    f"FLASH_ATTENTION_2 but the flash_attn wheel is not "
+                    f"installed. Install it from "
+                    f"https://tzrec.oss-accelerate.aliyuncs.com/third_party/"
+                    f"flash_attn/${{DEVICE}}/ (cu126/cu129/cu130), or set "
+                    f"attn_implementation to SDPA."
+                )
+        elif torch.cuda.is_available():
+            # the packed mask makes CUDNN_ATTENTION eligible, and it returns
+            # NaN losses on this shape; the other sdpa backends are fine
+            torch.backends.cuda.enable_cudnn_sdp(False)
         config = AutoConfig.from_pretrained(hf_model_name_or_path)
         self.lm = AutoModelForCausalLM.from_config(
             config,
-            attn_implementation="flash_attention_2",
+            attn_implementation=impl,
             torch_dtype=_PARAM_DTYPE[lm_parameter_dtype],
         )
         self._check_backbone_interfaces(hf_model_name_or_path)

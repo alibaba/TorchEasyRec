@@ -140,7 +140,16 @@ class BaseGenRecModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "needs a compiled prompt"):
             _create_model(model_config, [], ["answer"], compiled_prompt=None)
 
-    def test_builds_backbone_with_flash_attention_2_and_target_dtype(self) -> None:
+    @parameterized.expand(
+        [
+            [GenRecModelConfig.SDPA, "sdpa"],
+            [GenRecModelConfig.FLASH_ATTENTION_2, "flash_attention_2"],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_builds_backbone_with_the_configured_kernel_and_dtype(
+        self, attn_implementation, expected_impl
+    ) -> None:
         # from_config is mocked, so this pins the kwargs init_backbone sends
         # without building a second backbone; setUp still builds a real one.
         stand_in = AutoModelForCausalLM.from_pretrained(
@@ -154,7 +163,9 @@ class BaseGenRecModelTest(unittest.TestCase):
             ) as from_config,
         ):
             model, _ = create_genrec_test_model(
-                self.test_dir, lm_parameter_dtype=GenRecModelConfig.BF16
+                self.test_dir,
+                lm_parameter_dtype=GenRecModelConfig.BF16,
+                attn_implementation=attn_implementation,
             )
 
         from_config.assert_called_once()
@@ -164,7 +175,7 @@ class BaseGenRecModelTest(unittest.TestCase):
         self.assertEqual(
             kwargs,
             {
-                "attn_implementation": "flash_attention_2",
+                "attn_implementation": expected_impl,
                 "torch_dtype": torch.bfloat16,
             },
         )
@@ -428,7 +439,7 @@ def _packed_batch(compiled_prompt, hist_rows, answer_rows) -> Batch:
 
 
 def _packed_flash_model(
-    test_dir: str, model_type: str
+    test_dir: str, model_type: str, attn_implementation: int
 ) -> Tuple[BaseModel, CompiledPrompt]:
     """Build a bf16 genrec model over a tiny ``model_type`` backbone.
 
@@ -441,6 +452,7 @@ def _packed_flash_model(
     Args:
         test_dir (str): scratch directory the backbone is written under.
         model_type (str): the hugging-face ``model_type`` of the backbone.
+        attn_implementation (int): ``GenRecModelConfig.AttnImpl`` to build with.
 
     Returns:
         Tuple[BaseModel, CompiledPrompt]: the model and the prompt it was
@@ -476,6 +488,7 @@ def _packed_flash_model(
     lm_config.common.num_return_sequences = 2
     # flash attention runs on fp16/bf16 only, and this arm carries no autocast
     lm_config.common.lm_parameter_dtype = GenRecModelConfig.BF16
+    lm_config.common.attn_implementation = attn_implementation
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(0)
         model = _create_model(
@@ -494,11 +507,16 @@ class PackedFlashAttentionTest(unittest.TestCase):
         self.test_dir = make_test_dir()
 
     @parameterized.expand(
-        [["qwen2"], ["qwen3"]],
+        [
+            ["qwen2", GenRecModelConfig.SDPA],
+            ["qwen3", GenRecModelConfig.SDPA],
+            ["qwen2", GenRecModelConfig.FLASH_ATTENTION_2],
+            ["qwen3", GenRecModelConfig.FLASH_ATTENTION_2],
+        ],
         name_func=parameterized_name_func,
     )
     def test_packed_rows_match_solo_runs_and_backpropagate(
-        self, model_type: str
+        self, model_type: str, attn_implementation: int
     ) -> None:
         """A packed batch reads as the rows do alone, and nothing crosses rows.
 
@@ -509,7 +527,9 @@ class PackedFlashAttentionTest(unittest.TestCase):
         identical.
         """
         device = torch.device("cuda")
-        model, compiled_prompt = _packed_flash_model(self.test_dir, model_type)
+        model, compiled_prompt = _packed_flash_model(
+            self.test_dir, model_type, attn_implementation
+        )
         model.to(device)
         model.eval()
         hist_rows = [_HIST_CODES, _LONG_HIST_CODES]

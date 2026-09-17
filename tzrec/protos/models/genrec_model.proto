@@ -24,6 +24,16 @@ message GenRecModelConfig {
     // LM parameters. FP32 avoids bf16-ULP underflow of Adam's small updates;
     // bf16 compute comes from mixed_precision, not from this.
     optional ParamDtype lm_parameter_dtype = 5 [default = FP32];
+
+    // Attention kernel the backbone is built with. FLASH_ATTENTION_2 packs the
+    // batch through the varlen kernel and is what training should use, but it
+    // needs the flash_attn wheel and a GPU; SDPA carries the same row
+    // boundaries through position_ids and runs anywhere.
+    enum AttnImpl {
+        SDPA = 0;
+        FLASH_ATTENTION_2 = 1;
+    }
+    optional AttnImpl attn_implementation = 6 [default = SDPA];
 }
 
 message GenRecCausalLMModel {

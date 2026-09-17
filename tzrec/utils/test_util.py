@@ -395,6 +395,7 @@ def create_genrec_test_model(
     beam_widths: Sequence[int] = (2, 2, 2),
     num_return_sequences: int = 2,
     lm_parameter_dtype: Optional["GenRecModelConfig.ParamDtype"] = None,
+    attn_implementation: Optional["GenRecModelConfig.AttnImpl"] = None,
 ) -> Tuple[BaseModel, CompiledPrompt]:
     """Build a GenRecCausalLMModel over a tiny backbone and a compiled prompt.
 
@@ -412,6 +413,7 @@ def create_genrec_test_model(
         beam_widths (Sequence[int]): per-level beam widths.
         num_return_sequences (int): sequences returned per sample.
         lm_parameter_dtype (optional): ``GenRecModelConfig.ParamDtype`` value.
+        attn_implementation (optional): ``GenRecModelConfig.AttnImpl`` value.
 
     Returns:
         Tuple[BaseModel, CompiledPrompt]: the model and the prompt it was built on.
@@ -449,6 +451,8 @@ def create_genrec_test_model(
     lm_config.common.num_return_sequences = num_return_sequences
     if lm_parameter_dtype is not None:
         lm_config.common.lm_parameter_dtype = lm_parameter_dtype
+    if attn_implementation is not None:
+        lm_config.common.attn_implementation = attn_implementation
     model = _create_model(
         model_config, features, ["answer"], compiled_prompt=compiled_prompt
     )

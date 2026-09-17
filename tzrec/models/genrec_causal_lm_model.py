@@ -143,9 +143,10 @@ class GenRecCausalLMModel(BaseGenRecModel):
             Logits and labels over the same window, so the shift ``loss``
             applies lands on the pairs the window was sized for.
         """
-        # fp32 masters are fine under autocast, so only the forward can tell
+        # only the flash kernel rejects fp32, and fp32 masters are fine under
+        # autocast, so neither the config nor the dtype alone can tell
         if (
-            embeds.is_cuda
+            self.lm.config._attn_implementation == "flash_attention_2"
             and embeds.dtype == torch.float32
             and not torch.is_autocast_enabled("cuda")
         ):

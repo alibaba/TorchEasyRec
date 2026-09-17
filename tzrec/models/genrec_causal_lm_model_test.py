@@ -107,9 +107,10 @@ class LeftPadPackedInputsTest(unittest.TestCase):
 
 
 class _CapturingLM(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, attn_implementation: str = "sdpa") -> None:
         super().__init__()
         self.kwargs = {}
+        self.config = SimpleNamespace(_attn_implementation=attn_implementation)
 
     def forward(self, **kwargs):
         self.kwargs = kwargs
@@ -125,7 +126,9 @@ class _CapturingLM(nn.Module):
 class _DifferentiableLM(nn.Module):
     def __init__(self, hidden_size: int, vocab_size: int) -> None:
         super().__init__()
-        self.config = SimpleNamespace(vocab_size=vocab_size)
+        self.config = SimpleNamespace(
+            vocab_size=vocab_size, _attn_implementation="sdpa"
+        )
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.loss_function = ForCausalLMLoss
 
@@ -195,6 +198,31 @@ class PackedForwardTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "at least logits_suffix_len"):
             model._forward(torch.zeros(12, 6), batch)
+
+    def test_fp32_without_autocast_is_rejected_on_the_flash_path(self) -> None:
+        """The flash kernel takes bf16/fp16 only; sdpa is happy in fp32."""
+        model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
+        nn.Module.__init__(model)
+        model.lm = _CapturingLM("flash_attention_2")
+        model._ignore_index = -7
+        model._prompt = SimpleNamespace(
+            prompt_plan=SimpleNamespace(logits_suffix_len=4)
+        )
+        batch = Batch(
+            additional_infos={
+                CU_SEQLENS: torch.tensor([0, 5, 12], dtype=torch.int32),
+                INPUT_IDS: torch.arange(100, 112),
+                MAX_SEQLEN: torch.tensor(7),
+                RESPONSE_LENGTHS: torch.tensor([3, 2]),
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "needs bf16 or fp16"):
+            model._forward(torch.zeros(12, 6, dtype=torch.float32), batch)
+
+        model.lm = _CapturingLM("sdpa")
+        logits, _ = model._forward(torch.zeros(12, 6, dtype=torch.float32), batch)
+        self.assertEqual(logits.shape, (2, 4, 5))
 
     def test_loss_and_gradients_cover_only_valid_response_pairs(self) -> None:
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
