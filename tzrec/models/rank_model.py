@@ -167,9 +167,13 @@ class RankModel(BaseModel):
             output = torch.squeeze(output, dim=1)
             predictions["y" + suffix] = output
         elif loss_type == "listwise_rank_loss":
-            # Consumes `logits_<task>` published by the task's point-wise
-            # logit loss; publishes no prediction of its own.
-            pass
+            # A valid standalone objective: publish the same logits/probs
+            # pair the point-wise logit losses would, so the task need not
+            # carry a BCE/focal sibling just to produce them.  A task that
+            # also configures one updates these keys with identical values.
+            output = torch.squeeze(output, dim=1)
+            predictions["logits" + suffix] = output
+            predictions["probs" + suffix] = torch.sigmoid(output)
         else:
             raise NotImplementedError
         return predictions
@@ -271,14 +275,7 @@ class RankModel(BaseModel):
             pred = predictions["y" + suffix]
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
         elif loss_type == "listwise_rank_loss":
-            pred = predictions.get("logits" + suffix)
-            if pred is None:
-                raise ValueError(
-                    f"listwise_rank_loss{suffix} needs the task to also "
-                    "carry a logit loss (binary_cross_entropy / "
-                    "binary_focal_loss): the list-wise term scores over "
-                    "the `logits` prediction those losses publish."
-                )
+            pred = predictions["logits" + suffix]
             lengths = predictions.get(TARGET_REPEAT_INTERLEAVE_KEY)
             if lengths is None:
                 raise ValueError(

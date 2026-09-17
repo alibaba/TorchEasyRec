@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Alibaba Group;
+# Copyright (c) 2026, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -770,13 +770,13 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         self.assertIsNotNone(scale.grad)
         self.assertTrue(torch.isfinite(scale.grad))
 
-    def test_listwise_loss_requires_a_logit_sibling(self) -> None:
-        """A list-wise term without a sibling logit loss fails loudly.
+    def test_listwise_loss_is_a_standalone_objective(self) -> None:
+        """A list-wise term without a point-wise sibling trains fine.
 
-        The term scores over the ``logits_<task>`` prediction that a logit
-        loss of the same task publishes; with none there, the failure
-        surfaces at ``loss()`` with a message naming the missing
-        prediction, not as a ``KeyError`` deep in the first step.
+        ``listwise_rank_loss`` publishes its own ``logits_<task>`` (and
+        ``probs_<task>``) in ``_output_to_prediction_impl``, so a task may
+        carry it as its only loss.  The term scores over those logits;
+        nothing requires a BCE/focal sibling to be present.
         """
         device = torch.device("cpu")
         task_configs = _task_configs(
@@ -793,10 +793,26 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         model.set_kernel(Kernel.PYTORCH)
         model.init_loss()
         batch = _build_batch(device=device)
-        with torch.no_grad():
-            predictions = model.predict(batch)
-            with self.assertRaisesRegex(ValueError, "needs the task to also carry"):
-                model.loss(predictions, batch)
+        # Grad-enabled: the backward pass below is part of the contract.
+        predictions = model.predict(batch)
+        self.assertIn("logits_is_click", predictions)
+        self.assertIn("probs_is_click", predictions)
+        losses = model.loss(predictions, batch)
+        self.assertIn("listwise_rank_loss_is_click", losses)
+        total = losses["listwise_rank_loss_is_click"]
+        self.assertTrue(torch.isfinite(total))
+        total.backward()
+        # The scorer's parameters must receive a gradient through the
+        # standalone list-wise term alone.
+        scored = False
+        for name, param in model.named_parameters():
+            if "_onerank_head." in name and param.grad is not None:
+                self.assertTrue(
+                    torch.isfinite(param.grad).all(),
+                    msg=f"{name} got a non-finite gradient",
+                )
+                scored = True
+        self.assertTrue(scored, "no prediction-head parameter received a gradient")
 
     def test_unsupported_task_configs_are_rejected(self) -> None:
         """Inner-product scoring is single-logit and needs at least one task."""

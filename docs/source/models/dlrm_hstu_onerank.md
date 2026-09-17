@@ -112,9 +112,8 @@ model_config {
                     binary_cross_entropy {}
                 }
                 # 同请求候选互为负样本的 listwise InfoNCE（通用
-                # LossConfig，配置在任务自己的 losses 里）；要求同
-                # 任务配置了 binary_cross_entropy 或
-                # binary_focal_loss
+                # LossConfig，配置在任务自己的 losses 里）；自发布
+                # logits/probs 预测，可独立也可与逐点损失搭配
                 losses {
                     listwise_rank_loss {
                         alpha: 0.1
@@ -186,14 +185,14 @@ train_config {
 
 ### 关键参数
 
-| 参数                            | 说明                                                                                                                                                                                                                                                                                                                              |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `max_seq_len`                   | 膨胀后的序列长度上界（= 历史上界 + 每请求候选数上界 × (K + 1)）；同时是注意力归一化除数与 jagged 内核 autotune 分桶依据。膨胀后超出该上界的请求会在训练时被立即报错拒绝                                                                                                                                                           |
-| `onerank.situation_discernment` | SD 模块；不配置时退化为候选表示的均值池化（论文 V5 显示这是最伤的消融）                                                                                                                                                                                                                                                           |
-| `onerank.cross_task_head`       | 跨任务注意力；`mask_type` 默认 CASCADE（时长任务读点击任务），`gradient_detachment` 默认 true                                                                                                                                                                                                                                     |
-| `losses.listwise_rank_loss`     | 逐任务 listwise InfoNCE（通用 `LossConfig`，配置在 `task_configs` 的 `losses` 里，非 onerank 专属字段）；同任务须配置 `binary_cross_entropy` 或 `binary_focal_loss`；每个请求需同时含至少一个正样本与一个负样本才计入该项损失，因此只对「几乎每个请求都含正样本」的任务值得开启（全正样本的请求同样被屏蔽：无负样本即无排序信号） |
-| `onerank.scorer_type`           | 打分函数；单 epoch 训练建议 MLP 或 BILINEAR 规避常数解平台期                                                                                                                                                                                                                                                                      |
-| `onerank.task_bias_init`        | 每任务初始 logit（`task_configs` 顺序，数量须等于 K）；设为 logit(全局 CTR) 可跳过向常数解的下降                                                                                                                                                                                                                                  |
+| 参数                            | 说明                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_seq_len`                   | 膨胀后的序列长度上界（= 历史上界 + 每请求候选数上界 × (K + 1)）；同时是注意力归一化除数与 jagged 内核 autotune 分桶依据。膨胀后超出该上界的请求会在训练时被立即报错拒绝                                                                                                                                                                                                               |
+| `onerank.situation_discernment` | SD 模块；不配置时退化为候选表示的均值池化（论文 V5 显示这是最伤的消融）                                                                                                                                                                                                                                                                                                               |
+| `onerank.cross_task_head`       | 跨任务注意力；`mask_type` 默认 CASCADE（时长任务读点击任务），`gradient_detachment` 默认 true                                                                                                                                                                                                                                                                                         |
+| `losses.listwise_rank_loss`     | 逐任务 listwise InfoNCE（通用 `LossConfig`，配置在 `task_configs` 的 `losses` 里，非 onerank 专属字段）；自发布 `logits`/`probs` 预测，可独立作为任务的唯一损失，也可与 `binary_cross_entropy`/`binary_focal_loss` 搭配；每个请求需同时含至少一个正样本与一个负样本才计入该项损失，因此只对「几乎每个请求都含正样本」的任务值得开启（全正样本的请求同样被屏蔽：无负样本即无排序信号） |
+| `onerank.scorer_type`           | 打分函数；单 epoch 训练建议 MLP 或 BILINEAR 规避常数解平台期                                                                                                                                                                                                                                                                                                                          |
+| `onerank.task_bias_init`        | 每任务初始 logit（`task_configs` 顺序，数量须等于 K）；设为 logit(全局 CTR) 可跳过向常数解的下降                                                                                                                                                                                                                                                                                      |
 
 ## 训练动态：常数解平台期
 

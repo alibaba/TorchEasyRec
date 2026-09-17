@@ -60,63 +60,68 @@ class TaskTowerTest(unittest.TestCase):
         self.assertEqual(list(output.size()), [4, 2])
 
 
-_GRAPH_TYPES = [TestGraphType.NORMAL, TestGraphType.FX_TRACE]
-_SCORER_TYPES = ["dot_product", "bilinear", "mlp"]
-
-_EMBEDDING_DIM = 16
-_NUM_HEADS = 2
-_TASK_NAMES = ["is_click", "is_like", "is_comment"]
-_NUM_TASKS = len(_TASK_NAMES)
-_CONTEXTUAL_DIM = 8
-# Ragged on purpose: two requests of 2 and 4 candidates.
-_NUM_CANDIDATES = [2, 4]
-_TOTAL = sum(_NUM_CANDIDATES)
-_TASK_BIAS = [0.25, -0.5, 1.0]
-
-
-def _inputs(seed: int = 7) -> tuple:
-    torch.manual_seed(seed)
-    task_embeddings = torch.randn(_TOTAL, _NUM_TASKS, _EMBEDDING_DIM)
-    contextual = torch.randn(len(_NUM_CANDIDATES), _CONTEXTUAL_DIM)
-    num_candidates = torch.tensor(_NUM_CANDIDATES)
-    return task_embeddings, num_candidates, contextual
-
-
-def _head(
-    scorer_type: str = "dot_product",
-    task_bias_init=None,
-    with_sd: bool = True,
-    with_cross_task: bool = True,
-) -> OneRankPredictionHead:
-    torch.manual_seed(11)
-    head = OneRankPredictionHead(
-        embedding_dim=_EMBEDDING_DIM,
-        task_names=_TASK_NAMES,
-        contextual_feature_dim=_CONTEXTUAL_DIM,
-        situation_discernment=({"num_heads": _NUM_HEADS} if with_sd else None),
-        cross_task_head=(
-            {"num_heads": _NUM_HEADS, "ffn_hidden_dim": 8} if with_cross_task else None
-        ),
-        scorer_type=scorer_type,
-        scorer_hidden_dim=12,
-        task_bias_init=task_bias_init,
-    )
-    # The default kernel (TRITON) is CUDA-only; these tests run on CPU.
-    head.set_kernel(Kernel.PYTORCH)
-    return head
-
-
 @mark_ci_scope("h20", "gpu")
 class OneRankPredictionHeadTest(unittest.TestCase):
     """Tests for the scorer variants and ``task_bias_init``."""
 
-    @parameterized.expand(
-        [
-            (f"{scorer}_{gt.name.lower()}", scorer, gt)
-            for gt in _GRAPH_TYPES
-            for scorer in _SCORER_TYPES
-        ]
-    )
+    _GRAPH_TYPES = [TestGraphType.NORMAL, TestGraphType.FX_TRACE]
+    _SCORER_TYPES = ["dot_product", "bilinear", "mlp"]
+
+    _EMBEDDING_DIM = 16
+    _NUM_HEADS = 2
+    _TASK_NAMES = ["is_click", "is_like", "is_comment"]
+    _NUM_TASKS = len(_TASK_NAMES)
+    _CONTEXTUAL_DIM = 8
+    # Ragged on purpose: two requests of 2 and 4 candidates.
+    _NUM_CANDIDATES = [2, 4]
+    _TOTAL = sum(_NUM_CANDIDATES)
+    _TASK_BIAS = [0.25, -0.5, 1.0]
+
+    # Built with an explicit loop (not a nested comprehension): the inner
+    # comprehension iterables cannot see the class scope, so ``_SCORER_TYPES``
+    # and friends are invisible where ``expand`` consumes them.
+    _SCORER_CASES = []
+    for _gt in _GRAPH_TYPES:
+        for _scorer in _SCORER_TYPES:
+            _SCORER_CASES.append((f"{_scorer}_{_gt.name.lower()}", _scorer, _gt))
+    del _gt, _scorer
+
+    @classmethod
+    def _inputs(cls, seed: int = 7) -> tuple:
+        torch.manual_seed(seed)
+        task_embeddings = torch.randn(cls._TOTAL, cls._NUM_TASKS, cls._EMBEDDING_DIM)
+        contextual = torch.randn(len(cls._NUM_CANDIDATES), cls._CONTEXTUAL_DIM)
+        num_candidates = torch.tensor(cls._NUM_CANDIDATES)
+        return task_embeddings, num_candidates, contextual
+
+    @classmethod
+    def _head(
+        cls,
+        scorer_type: str = "dot_product",
+        task_bias_init=None,
+        with_sd: bool = True,
+        with_cross_task: bool = True,
+    ) -> OneRankPredictionHead:
+        torch.manual_seed(11)
+        head = OneRankPredictionHead(
+            embedding_dim=cls._EMBEDDING_DIM,
+            task_names=cls._TASK_NAMES,
+            contextual_feature_dim=cls._CONTEXTUAL_DIM,
+            situation_discernment=({"num_heads": cls._NUM_HEADS} if with_sd else None),
+            cross_task_head=(
+                {"num_heads": cls._NUM_HEADS, "ffn_hidden_dim": 8}
+                if with_cross_task
+                else None
+            ),
+            scorer_type=scorer_type,
+            scorer_hidden_dim=12,
+            task_bias_init=task_bias_init,
+        )
+        # The default kernel (TRITON) is CUDA-only; these tests run on CPU.
+        head.set_kernel(Kernel.PYTORCH)
+        return head
+
+    @parameterized.expand(_SCORER_CASES)
     def test_scorer_variants_produce_discriminating_logits(
         self, name, scorer_type, graph_type
     ) -> None:
@@ -126,20 +131,20 @@ class OneRankPredictionHeadTest(unittest.TestCase):
         added to ``repeat_interleave`` keeps the broadcast sync-free, which
         only holds if the static size survives symbolic tracing.
         """
-        head = _head(scorer_type=scorer_type)
+        head = self._head(scorer_type=scorer_type)
         module = create_test_module(head, graph_type)
-        task_embeddings, num_candidates, contextual = _inputs()
+        task_embeddings, num_candidates, contextual = self._inputs()
 
         logits = module(task_embeddings, num_candidates, contextual)
 
-        self.assertEqual(logits.size(), (_TOTAL, _NUM_TASKS))
+        self.assertEqual(logits.size(), (self._TOTAL, self._NUM_TASKS))
         self.assertTrue(torch.isfinite(logits).all())
         # Candidates of one request must not tie under any scorer: the MLP
         # by construction, the rank-1 pair because two random projections
         # onto one direction tie with probability zero.
-        for k in range(_NUM_TASKS):
+        for k in range(self._NUM_TASKS):
             self.assertFalse(
-                torch.allclose(logits[: _NUM_CANDIDATES[0], k], logits[0, k]),
+                torch.allclose(logits[: self._NUM_CANDIDATES[0], k], logits[0, k]),
                 msg=f"{scorer_type} ties a request's candidates on task {k}",
             )
 
@@ -150,17 +155,17 @@ class OneRankPredictionHeadTest(unittest.TestCase):
         the *ability* to leave the rank-1 subspace changes, not the
         starting point.
         """
-        dot = _head(scorer_type="dot_product")
-        bilinear = _head(scorer_type="bilinear")
+        dot = self._head(scorer_type="dot_product")
+        bilinear = self._head(scorer_type="bilinear")
         # Shared submodules (SD, cross-task, bias) identical by copy, so
         # the only difference left is the scorer itself.
         bilinear.load_state_dict(dot.state_dict(), strict=False)
         torch.testing.assert_close(
             bilinear._bilinear_weight.detach(),
-            torch.eye(_EMBEDDING_DIM).repeat(_NUM_TASKS, 1, 1),
+            torch.eye(self._EMBEDDING_DIM).repeat(self._NUM_TASKS, 1, 1),
         )
 
-        task_embeddings, num_candidates, contextual = _inputs()
+        task_embeddings, num_candidates, contextual = self._inputs()
         torch.testing.assert_close(
             bilinear(task_embeddings, num_candidates, contextual),
             dot(task_embeddings, num_candidates, contextual),
@@ -172,8 +177,8 @@ class OneRankPredictionHeadTest(unittest.TestCase):
         The identity init is a starting point, not a frozen prior: if the
         gradient never reached ``W_k`` the variant would be a no-op.
         """
-        bilinear = _head(scorer_type="bilinear")
-        task_embeddings, num_candidates, contextual = _inputs()
+        bilinear = self._head(scorer_type="bilinear")
+        task_embeddings, num_candidates, contextual = self._inputs()
 
         bilinear(task_embeddings, num_candidates, contextual).sum().backward()
         self.assertIsNotNone(bilinear._bilinear_weight.grad)
@@ -181,11 +186,11 @@ class OneRankPredictionHeadTest(unittest.TestCase):
 
     def test_mlp_scorer_has_one_mlp_per_task(self) -> None:
         """Each task owns its whole MLP; nothing is shared between tasks."""
-        mlp = _head(scorer_type="mlp")
-        self.assertEqual(len(mlp._task_mlps), _NUM_TASKS)
+        mlp = self._head(scorer_type="mlp")
+        self.assertEqual(len(mlp._task_mlps), self._NUM_TASKS)
         # Different parameters per task -- the point of the per-task scorer.
         first = mlp._task_mlps[0][0].weight
-        for k in range(1, _NUM_TASKS):
+        for k in range(1, self._NUM_TASKS):
             self.assertFalse(
                 torch.allclose(first, mlp._task_mlps[k][0].weight),
                 msg=f"task {k} shares task 0's MLP weights",
@@ -200,36 +205,40 @@ class OneRankPredictionHeadTest(unittest.TestCase):
         the difference of the two heads is exactly ``b_k`` broadcast over
         the request's candidates.
         """
-        plain = _head(scorer_type="mlp")
-        biased = _head(scorer_type="mlp", task_bias_init=_TASK_BIAS)
+        plain = self._head(scorer_type="mlp")
+        biased = self._head(scorer_type="mlp", task_bias_init=self._TASK_BIAS)
         # Same-seed construction makes every shared parameter identical;
         # load_state_dict would also copy the *zero* bias over, so re-apply
         # the configured one after it.
         biased.load_state_dict(plain.state_dict(), strict=False)
         with torch.no_grad():
-            biased._task_bias.copy_(torch.tensor(_TASK_BIAS))
+            biased._task_bias.copy_(torch.tensor(self._TASK_BIAS))
 
-        task_embeddings, num_candidates, contextual = _inputs()
+        task_embeddings, num_candidates, contextual = self._inputs()
         # Broadcasting (total, K) + (K,) adds b_k to column k for every
         # candidate -- exactly the claimed semantics.
         torch.testing.assert_close(
             biased(task_embeddings, num_candidates, contextual),
             plain(task_embeddings, num_candidates, contextual)
-            + torch.tensor(_TASK_BIAS),
+            + torch.tensor(self._TASK_BIAS),
         )
-        torch.testing.assert_close(biased._task_bias.detach(), torch.tensor(_TASK_BIAS))
+        torch.testing.assert_close(
+            biased._task_bias.detach(), torch.tensor(self._TASK_BIAS)
+        )
 
     def test_task_bias_defaults_to_zero(self) -> None:
         """No ``task_bias_init`` keeps the zeros of previous runs."""
-        plain = _head()
-        torch.testing.assert_close(plain._task_bias.detach(), torch.zeros(_NUM_TASKS))
+        plain = self._head()
+        torch.testing.assert_close(
+            plain._task_bias.detach(), torch.zeros(self._NUM_TASKS)
+        )
 
     def test_bad_configs_are_rejected(self) -> None:
         """Config errors fail at construction, not at the first forward."""
         with self.assertRaisesRegex(ValueError, "unknown scorer_type"):
-            _head(scorer_type="nonsense")
+            self._head(scorer_type="nonsense")
         with self.assertRaisesRegex(ValueError, "task_bias_init has"):
-            _head(task_bias_init=[0.1, 0.2])
+            self._head(task_bias_init=[0.1, 0.2])
 
     def test_mean_pooling_fallback_matches_reference(self) -> None:
         """Without SD / cross-task the scorer is the plain mean pool.
@@ -238,14 +247,16 @@ class OneRankPredictionHeadTest(unittest.TestCase):
         sqrt(D)``: a straight transcription of paper 2.4's degenerate case
         (ablations V5 and V3 both off).
         """
-        head = _head(scorer_type="dot_product", with_sd=False, with_cross_task=False)
-        task_embeddings, num_candidates, _ = _inputs(seed=3)
+        head = self._head(
+            scorer_type="dot_product", with_sd=False, with_cross_task=False
+        )
+        task_embeddings, num_candidates, _ = self._inputs(seed=3)
 
         got = head(task_embeddings, num_candidates)
-        scale = 1.0 / math.sqrt(_EMBEDDING_DIM)
-        want = torch.zeros(_TOTAL, _NUM_TASKS)
+        scale = 1.0 / math.sqrt(self._EMBEDDING_DIM)
+        want = torch.zeros(self._TOTAL, self._NUM_TASKS)
         start = 0
-        for n in _NUM_CANDIDATES:
+        for n in self._NUM_CANDIDATES:
             segment = task_embeddings[start : start + n]
             z = segment.mean(dim=0)  # (K, D)
             want[start : start + n] = (z * segment).sum(dim=-1) * scale
@@ -254,8 +265,8 @@ class OneRankPredictionHeadTest(unittest.TestCase):
 
     def test_situation_discernment_requires_contextual(self) -> None:
         """SD configured but no contextual embeddings -> loud failure."""
-        head = _head()
-        task_embeddings, num_candidates, _ = _inputs()
+        head = self._head()
+        task_embeddings, num_candidates, _ = self._inputs()
         with self.assertRaisesRegex(ValueError, "contextual"):
             head(task_embeddings, num_candidates)
 

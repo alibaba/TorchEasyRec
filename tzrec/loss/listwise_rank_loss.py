@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Alibaba Group;
+# Copyright (c) 2026, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -119,8 +119,10 @@ class ListwiseRankLoss(_Loss):
     mean of the positives' log-probabilities.
 
     Consumed through ``LossConfig.listwise_rank_loss`` in a task's
-    ``losses`` (see ``RankModel._loss_impl``), next to the point-wise logit
-    loss whose ``logits_<task>`` prediction it scores over.
+    ``losses`` (see ``RankModel._loss_impl``); it scores over the task's
+    ``logits_<task>`` prediction, which ``_output_to_prediction_impl``
+    publishes for this loss itself, so it stands alone without a
+    point-wise sibling.
 
     Args:
         temperature_init (float): initial softmax temperature; the logits
