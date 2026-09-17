@@ -74,6 +74,7 @@ SINGLE_INPUT_FEATURE_CLASSES = [
     "RawFeature",
     "TokenizeFeature",
     "CombineFeature",
+    "RegexReplaceFeature",
 ]
 
 

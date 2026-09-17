@@ -252,6 +252,26 @@ class TokenizeFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
 
+    def test_text_norm_options_are_or_ed(self):
+        token_feat_cfg = feature_pb2.FeatureConfig(
+            tokenize_feature=feature_pb2.TokenizeFeature(
+                feature_name="token_feat",
+                vocab_file="data/test/tokenizer.json",
+                embedding_dim=16,
+                expression="user:token_input",
+                text_normalizer=feature_pb2.TextNormalizer(
+                    norm_options=[
+                        feature_pb2.TEXT_UPPER2LOWER,
+                        feature_pb2.TEXT_UPPER2LOWER,
+                        feature_pb2.TEXT_FILTER,
+                    ]
+                ),
+            )
+        )
+        token_feat = tokenize_feature_lib.TokenizeFeature(token_feat_cfg)
+        # summing the bits would give 4 + 4 + 32 = 40, which sets an unrelated bit
+        self.assertEqual(token_feat.fg_json()[0]["parameter"], 4 | 32)
+
 
 class SequenceTokenizeFeatureTest(unittest.TestCase):
     @parameterized.expand(
