@@ -23,6 +23,7 @@ keep:
 * MLP discriminates a request's candidates straight from random init.
 """
 
+import itertools
 import math
 import unittest
 
@@ -77,14 +78,15 @@ class OneRankPredictionHeadTest(unittest.TestCase):
     _TOTAL = sum(_NUM_CANDIDATES)
     _TASK_BIAS = [0.25, -0.5, 1.0]
 
-    # Built with an explicit loop (not a nested comprehension): the inner
-    # comprehension iterables cannot see the class scope, so ``_SCORER_TYPES``
-    # and friends are invisible where ``expand`` consumes them.
-    _SCORER_CASES = []
-    for _gt in _GRAPH_TYPES:
-        for _scorer in _SCORER_TYPES:
-            _SCORER_CASES.append((f"{_scorer}_{_gt.name.lower()}", _scorer, _gt))
-    del _gt, _scorer
+    # A comprehension over itertools.product (not a nested comprehension):
+    # the single ``for`` iterable is evaluated in the class scope -- nested
+    # comprehension iterables would not see ``_SCORER_TYPES`` and friends --
+    # while the loop variables stay comprehension-local, leaving no
+    # class-level leftovers to clean up.
+    _SCORER_CASES = [
+        (f"{scorer}_{gt.name.lower()}", scorer, gt)
+        for gt, scorer in itertools.product(_GRAPH_TYPES, _SCORER_TYPES)
+    ]
 
     @classmethod
     def _inputs(cls, seed: int = 7) -> tuple:
