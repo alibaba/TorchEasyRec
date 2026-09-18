@@ -12,7 +12,7 @@
 
 import bisect
 import math
-from typing import List
+from typing import Any, Dict, List
 
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
@@ -47,6 +47,25 @@ class BaseLR(LRScheduler, metaclass=_meta_cls):
     def _get_lr(self) -> List[float]:
         """Calculates the learning rate."""
         raise NotImplementedError
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Restore scheduler state and the optimizer's next learning rates."""
+        group_count = len(self.optimizer.param_groups)
+        if any(len(state_dict[key]) != group_count for key in ("base_lrs", "_last_lr")):
+            raise ValueError("Restored LR scheduler parameter groups do not match.")
+        super().load_state_dict(state_dict)
+        for group, lr in zip(self.optimizer.param_groups, self._last_lr):
+            group["lr"] = lr
+
+    def set_step(self, step: int) -> None:
+        """Rebuild a legacy scheduler after this many batch or epoch advances."""
+        if step < 0:
+            raise ValueError(f"LR scheduler step must be non-negative, got {step}.")
+        self.last_epoch = step
+        self._step_count = step + 1
+        self._last_lr = [float(lr) for lr in self.get_lr()]
+        for group, lr in zip(self.optimizer.param_groups, self._last_lr):
+            group["lr"] = lr
 
     @property
     def by_epoch(self) -> bool:

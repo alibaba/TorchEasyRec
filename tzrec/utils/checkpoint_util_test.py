@@ -38,9 +38,14 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.optim.ema import DenseEMA
+from tzrec.optim.lr_scheduler import (
+    ConstantLR,
+    ExponentialDecayLR,
+    LinearDecayLR,
+)
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.utils import checkpoint_util, misc_util
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
 def _create_test_model(large_table_cnt=2, small_table_cnt=2):
@@ -144,8 +149,24 @@ def _save_restore_worker(test_dir, rank, world_size, port):
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo")
     model, optimizer = _create_test_model()
+    for i, group in enumerate(optimizer.param_groups):
+        group["lr"] = 0.01 * (rank + 1) * (i + 1)
+    scheduler = LinearDecayLR(optimizer, num_training_steps=10)
+    scheduler.set_step(4)
+    expected = scheduler.get_last_lr()
     checkpoint_util.save_model(test_dir, model, optimizer)
+    checkpoint_util.save_lr_schedulers(test_dir, [scheduler])
+    dist.barrier()
     checkpoint_util.restore_model(test_dir, model, optimizer)
+    scheduler.set_step(0)
+    checkpoint_util.restore_lr_schedulers(test_dir, [scheduler])
+    torch.testing.assert_close(scheduler.get_last_lr(), expected)
+    torch.testing.assert_close(
+        [group["lr"] for group in optimizer.param_groups], expected
+    )
+    optimizer.step()
+    scheduler.step()
+    torch.testing.assert_close(scheduler.get_last_lr(), [lr * 5 / 6 for lr in expected])
 
 
 def _report_ts_worker(
@@ -891,6 +912,84 @@ class CheckpointUtilTest(unittest.TestCase):
         self.assertEqual(
             checkpoint_util.remap_input_tile_user_key(fqn, {target}), target
         )
+
+
+class LRSchedulerCheckpointTest(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+        env = mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _scheduler(self, by_epoch=False):
+        optimizer = KeyedOptimizerWrapper(
+            {"weight": nn.Parameter(torch.ones(1))},
+            lambda params: torch.optim.Adam(params, lr=0.01),
+        )
+        return ExponentialDecayLR(optimizer, 1, 0.5, by_epoch=by_epoch)
+
+    def test_round_trip(self):
+        original = [self._scheduler(), self._scheduler(by_epoch=True)]
+        for scheduler in original:
+            scheduler.set_step(4)
+        manager = checkpoint_util.CheckpointManager(self.test_dir)
+        self.addCleanup(manager.close)
+        with (
+            mock.patch("tzrec.utils.checkpoint_util.save_model"),
+            mock.patch("tzrec.utils.hf_export_util.write_hf_assets"),
+        ):
+            ckpt = manager.save(3, nn.Linear(1, 1), lr_schedulers=original)
+        resumed = [self._scheduler(), self._scheduler(by_epoch=True)]
+        with mock.patch("tzrec.utils.checkpoint_util.restore_model"):
+            manager.restore(ckpt, nn.Linear(1, 1), lr_schedulers=resumed)
+        for expected, actual in zip(original, resumed):
+            self.assertEqual(expected.state_dict(), actual.state_dict())
+            self.assertEqual(
+                actual.optimizer.param_groups[0]["lr"], expected.get_last_lr()[0]
+            )
+
+    @parameterized.expand(
+        [("meta", True), ("filename", False)], name_func=parameterized_name_func
+    )
+    def test_legacy_step(self, name, with_meta):
+        ckpt = os.path.join(self.test_dir, "model.ckpt-3")
+        os.makedirs(ckpt)
+        if with_meta:
+            checkpoint_util.save_meta(ckpt, 3)
+        scheduler = self._scheduler()
+        checkpoint_util.restore_lr_schedulers(ckpt, [scheduler])
+        self.assertEqual(scheduler.last_epoch, 4)
+        self.assertAlmostEqual(scheduler.optimizer.param_groups[0]["lr"], 0.000625)
+
+    def test_legacy_epoch(self):
+        checkpoint_util.save_dataloader_state(
+            self.test_dir, {checkpoint_util.EPOCHS_COMPLETED: 2}
+        )
+        scheduler = self._scheduler(by_epoch=True)
+        checkpoint_util.restore_lr_schedulers(self.test_dir, [scheduler])
+        self.assertEqual(scheduler.last_epoch, 2)
+        self.assertAlmostEqual(scheduler.optimizer.param_groups[0]["lr"], 0.0025)
+
+    @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
+    def test_legacy_missing_progress(self, by_epoch):
+        with self.assertRaisesRegex(ValueError, "Cannot reconstruct"):
+            checkpoint_util.restore_lr_schedulers(
+                self.test_dir, [self._scheduler(by_epoch=by_epoch)]
+            )
+
+    def test_legacy_constant_without_progress(self):
+        opt = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.01)
+        scheduler = ConstantLR(opt)
+        checkpoint_util.restore_lr_schedulers(self.test_dir, [scheduler])
+        self.assertEqual(opt.param_groups[0]["lr"], 0.01)
+
+    def test_scheduler_type_mismatch(self):
+        scheduler = self._scheduler()
+        schedulers = [scheduler, ConstantLR(scheduler.optimizer)]
+        checkpoint_util.save_lr_schedulers(self.test_dir, schedulers)
+        with self.assertRaisesRegex(ValueError, "types/order"):
+            checkpoint_util.restore_lr_schedulers(self.test_dir, schedulers[::-1])
 
 
 class DataloaderCheckpointTest(unittest.TestCase):

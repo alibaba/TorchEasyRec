@@ -389,6 +389,7 @@ def _train_and_evaluate(
     pipeline_config_path: Optional[str] = None,
     dense_ema: Optional[DenseEMA] = None,
     export_config: Optional[ExportConfig] = None,
+    restore_lr_scheduler: bool = False,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -562,6 +563,12 @@ def _train_and_evaluate(
 
             # Restore model and optimizer checkpoint
             if i_step == 0 and ckpt_path is not None:
+                if is_rank_zero:
+                    logger.info(
+                        "Checkpoint restore options: "
+                        f"ignore_restore_optimizer={ignore_restore_optimizer}, "
+                        f"restore_lr_scheduler={restore_lr_scheduler}."
+                    )
                 if ignore_restore_optimizer:
                     ckpt_manager.restore(
                         ckpt_path,
@@ -569,6 +576,7 @@ def _train_and_evaluate(
                         None,
                         train_config.fine_tune_ckpt_param_map,
                         dense_ema=dense_ema,
+                        lr_schedulers=lr_scheduler if restore_lr_scheduler else None,
                     )
                 else:
                     # optimizer state is lazy, so peek one batch to init it
@@ -582,6 +590,7 @@ def _train_and_evaluate(
                         optimizer,
                         train_config.fine_tune_ckpt_param_map,
                         dense_ema=dense_ema,
+                        lr_schedulers=lr_scheduler if restore_lr_scheduler else None,
                     )
                 if not restore_from_model_dir:
                     # a fine-tune checkpoint's train metric describes the source
@@ -642,6 +651,7 @@ def _train_and_evaluate(
                     dataloader_state,
                     dense_ema,
                     data_timestamp=data_timestamp,
+                    lr_schedulers=lr_scheduler,
                 ):
                     run_eval(i_step, i_epoch)
                 # Lockstep: the rank-uniform paired dump decision is the only
@@ -662,6 +672,11 @@ def _train_and_evaluate(
                 if prof is not None:
                     prof.step()
 
+            if not (use_step and i_step >= train_config.num_steps - 1):
+                for lr in lr_scheduler:
+                    if lr.by_epoch:
+                        lr.step()
+
             if ckpt_manager.maybe_save(
                 i_step,
                 model,
@@ -670,15 +685,12 @@ def _train_and_evaluate(
                 dense_ema,
                 epoch=i_epoch,
                 data_timestamp=data_timestamp,
+                lr_schedulers=lr_scheduler,
             ):
                 run_eval(i_step, i_epoch)
 
             if use_step and i_step >= train_config.num_steps - 1:
                 break
-
-            for lr in lr_scheduler:
-                if lr.by_epoch:
-                    lr.step()
 
         # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
         # codebook here). SID models run with periodic checkpointing disabled
@@ -716,6 +728,7 @@ def _train_and_evaluate(
             dense_ema,
             data_timestamp=data_timestamp,
             final=True,
+            lr_schedulers=lr_scheduler,
         ):
             run_eval(i_step, i_epoch)
         if final_dump_step is not None:
@@ -752,6 +765,7 @@ def train_and_evaluate(
     fine_tune_checkpoint: Optional[str] = None,
     edit_config_json: Optional[str] = None,
     ignore_restore_optimizer: bool = False,
+    restore_lr_scheduler: bool = False,
 ) -> None:
     """Train and evaluate a EasyRec model.
 
@@ -765,8 +779,10 @@ def train_and_evaluate(
         fine_tune_checkpoint (str, optional): path to an existing
             finetune checkpoint.
         edit_config_json (str, optional): edit pipeline config json str.
-        ignore_restore_optimizer (bool): whether to restore optimizer
+        ignore_restore_optimizer (bool): whether to skip restoring optimizer
             state from checkpoint.
+        restore_lr_scheduler (bool): whether to restore LR scheduler state
+            independently of optimizer state; defaults to a fresh schedule.
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     train_config = pipeline_config.train_config
@@ -1025,6 +1041,7 @@ def train_and_evaluate(
         ckpt_path=ckpt_path,
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
+        restore_lr_scheduler=restore_lr_scheduler,
         restore_from_model_dir=restore_from_model_dir,
         dataloader_state=dataloader_state,
         delta_embedding_dumper=delta_embedding_dumper,

@@ -14,11 +14,59 @@ import math
 import unittest
 
 import torch
+from parameterized import parameterized
 
 from tzrec.optim import lr_scheduler
+from tzrec.utils.test_util import parameterized_name_func
 
 
 class LRSchedulerTest(unittest.TestCase):
+    @parameterized.expand(
+        [(count, legacy) for count in [1, 4, 12] for legacy in [False, True]],
+        name_func=parameterized_name_func,
+    )
+    def test_restore_progress(self, count, legacy):
+        def build():
+            opt = torch.optim.SGD(
+                [
+                    {"params": [torch.nn.Parameter(torch.ones(1))], "lr": 0.01},
+                    {"params": [torch.nn.Parameter(torch.ones(1))], "lr": 0.0},
+                ]
+            )
+            return opt, lr_scheduler.LinearDecayLR(
+                opt, num_training_steps=10, warmup_size=2
+            )
+
+        optimizer, scheduler = build()
+        for _ in range(count):
+            optimizer.step()
+            scheduler.step()
+        resumed_optimizer, resumed = build()
+        if legacy:
+            resumed.set_step(count)
+        else:
+            resumed.load_state_dict(scheduler.state_dict())
+        for _ in range(2):
+            self.assertEqual(resumed.last_epoch, scheduler.last_epoch)
+            self.assertEqual(resumed._step_count, scheduler._step_count)
+            self.assertEqual(resumed.get_last_lr(), scheduler.get_last_lr())
+            self.assertEqual(
+                [group["lr"] for group in resumed_optimizer.param_groups],
+                [group["lr"] for group in optimizer.param_groups],
+            )
+            optimizer.step()
+            resumed_optimizer.step()
+            scheduler.step()
+            resumed.step()
+
+    def test_restore_rejects_different_parameter_groups(self):
+        optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=0.01)
+        scheduler = lr_scheduler.ConstantLR(optimizer)
+        state = scheduler.state_dict()
+        state["base_lrs"] = []
+        with self.assertRaisesRegex(ValueError, "parameter groups"):
+            scheduler.load_state_dict(state)
+
     def test_constant_lr(self) -> None:
         params = [torch.tensor([1.0, 2.0])]
         opt = torch.optim.Adam(params, lr=0.01)
