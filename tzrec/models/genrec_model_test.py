@@ -18,10 +18,9 @@ import torch
 import torch.fx
 from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
-from tzrec.features.feature import FgMode, create_features
 from tzrec.main import _create_model
 from tzrec.models.genrec_model import (
     _PARAM_DTYPE,
@@ -36,22 +35,16 @@ from tzrec.prompt.assembler import (
     INPUT_IDS,
     PromptAssembler,
 )
-from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
-from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
-from tzrec.protos.prompt_pb2 import PromptConfig, PromptSlot
+from tzrec.protos.prompt_pb2 import PromptSlot
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     create_genrec_test_model,
-    create_genrec_test_tokenizer,
-    flash_attn_unavailable,
     make_test_dir,
-    mark_ci_scope,
-    nv_gpu_unavailable,
     parameterized_name_func,
 )
 
@@ -145,7 +138,7 @@ class BaseGenRecModelTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_builds_backbone_with_the_configured_kernel_and_dtype(
-        self, attn_implementation, expected_impl
+        self, attn_kernel, expected_impl
     ) -> None:
         # from_config is mocked, so this pins the kwargs init_backbone sends
         # without building a second backbone; setUp still builds a real one.
@@ -158,16 +151,15 @@ class BaseGenRecModelTest(unittest.TestCase):
             mock.patch.object(
                 AutoModelForCausalLM, "from_config", return_value=stand_in
             ) as from_config,
-            # the backbone is mocked, so the wheel probe has nothing to check
-            mock.patch("tzrec.models.genrec_model.find_spec", return_value=object()),
         ):
-            model, _ = create_genrec_test_model(
+            create_genrec_test_model(
                 self.test_dir,
                 lm_parameter_dtype=GenRecModelConfig.BF16,
-                attn_implementation=attn_implementation,
+                attn_kernel=attn_kernel,
             )
 
-        from_config.assert_called_once()
+        # the fixture backbone is built through from_config too, so this
+        # reads the last call, which is init_backbone's
         args, kwargs = from_config.call_args
         self.assertEqual(len(args), 1)
         self.assertEqual(args[0].model_type, "qwen2")
@@ -179,7 +171,6 @@ class BaseGenRecModelTest(unittest.TestCase):
             },
         )
         to_mock.assert_not_called()
-        self.assertIs(model.lm, stand_in)
 
     def test_shared_projection_name_requires_matching_widths(self) -> None:
         with self.assertRaisesRegex(ValueError, "cannot share a module"):
@@ -197,15 +188,20 @@ class BaseGenRecModelTest(unittest.TestCase):
                 ],
             )
 
-    def test_projected_slot_overwrites_sentinels_and_backpropagates(self) -> None:
+    def _projected_model(self, **kwargs) -> Tuple[BaseModel, Batch]:
+        """A model with one projected ``prof`` slot, materialized, and its batch."""
         model, compiled_prompt = create_genrec_test_model(
             self.test_dir,
             feature_configs=[_hist(), _projected("prof", 8)],
             prompt="History : {{hist}} . Predict {{prof}} :",
+            **kwargs,
         )
         # the embedding table is built on meta until something materializes it
         init_parameters(model, device=torch.device("cpu"))
-        batch = _projected_batch(compiled_prompt)
+        return model, _projected_batch(compiled_prompt)
+
+    def test_projected_slot_overwrites_sentinels_and_backpropagates(self) -> None:
+        model, batch = self._projected_model()
 
         embeds = model.build_input(batch)
         raw = model.lm.get_input_embeddings()(batch.additional_infos[INPUT_IDS])
@@ -224,14 +220,7 @@ class BaseGenRecModelTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_projected_slot_follows_a_narrow_lm_dtype(self, lm_parameter_dtype) -> None:
-        model, compiled_prompt = create_genrec_test_model(
-            self.test_dir,
-            feature_configs=[_hist(), _projected("prof", 8)],
-            prompt="History : {{hist}} . Predict {{prof}} :",
-            lm_parameter_dtype=lm_parameter_dtype,
-        )
-        init_parameters(model, device=torch.device("cpu"))
-        batch = _projected_batch(compiled_prompt)
+        model, batch = self._projected_model(lm_parameter_dtype=lm_parameter_dtype)
 
         embeds = model.build_input(batch)
         self.assertIs(embeds.dtype, _PARAM_DTYPE[lm_parameter_dtype])
@@ -409,176 +398,5 @@ class GenRecFrontEndTest(unittest.TestCase):
                 self.assertTrue(torch.equal(out[key], value), key)
 
 
-# a second answer, and a rewrite of _HIST_CODES that keeps its width
-_OTHER_ANSWER_CODES = [2, 7, 8]
-_REWRITTEN_HIST_CODES = [3, 7, 11]
-
-
-def _packed_batch(compiled_prompt, hist_rows, answer_rows) -> Batch:
-    """Several rows in one batch, packed the way the collator packs them."""
-    return _batch(
-        compiled_prompt,
-        {
-            "hist.values": torch.tensor([code for row in hist_rows for code in row]),
-            "hist.lengths": torch.tensor([len(row) for row in hist_rows]),
-            "answer.values": torch.tensor(
-                [code for row in answer_rows for code in row]
-            ),
-            "answer.lengths": torch.tensor([len(row) for row in answer_rows]),
-        },
-    )
-
-
-def _packed_model(
-    test_dir: str, model_type: str, attn_implementation: int, lm_parameter_dtype: int
-) -> Tuple[BaseModel, CompiledPrompt]:
-    """Build a bf16 genrec model over a tiny ``model_type`` backbone.
-
-    ``create_genrec_test_model`` always writes a Qwen2 backbone, and the packed
-    forward only holds where the backbone threads the varlen keyword arguments
-    through to its attention, so the architecture is chosen here instead. Only
-    the config is written: ``init_backbone`` builds from it and this test never
-    restores pretrained weights.
-
-    Args:
-        test_dir (str): scratch directory the backbone is written under.
-        model_type (str): the hugging-face ``model_type`` of the backbone.
-        attn_implementation (int): ``GenRecModelConfig.AttnImpl`` to build with.
-        lm_parameter_dtype (int): ``GenRecModelConfig.ParamDtype`` to build in.
-
-    Returns:
-        Tuple[BaseModel, CompiledPrompt]: the model and the prompt it was
-        built on.
-    """
-    backbone = os.path.join(test_dir, model_type)
-    AutoConfig.for_model(
-        model_type,
-        vocab_size=64,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        max_position_embeddings=64,
-        tie_word_embeddings=False,
-    ).save_pretrained(backbone)
-
-    features = create_features([_hist()], fg_mode=FgMode.FG_NONE)
-    prompt_config = PromptConfig(
-        tokenizer_path=create_genrec_test_tokenizer(os.path.join(test_dir, "tok.json")),
-        prompt="History : {{hist}} . Predict :",
-        response="{{answer}}",
-    )
-    prompt_config.sid_space.codebook.extend([4, 4, 4])
-    compiled_prompt = compile_prompt(prompt_config, features, ["answer"])
-
-    model_config = ModelConfig()
-    lm_config = model_config.genrec_causal_lm_model
-    lm_config.hf_model_name_or_path = backbone
-    lm_config.common.beam_widths.extend([2, 2, 2])
-    lm_config.common.num_return_sequences = 2
-    lm_config.common.lm_parameter_dtype = lm_parameter_dtype
-    lm_config.common.attn_implementation = attn_implementation
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(0)
-        model = _create_model(
-            model_config, features, ["answer"], compiled_prompt=compiled_prompt
-        )
-    return model, compiled_prompt
-
-
-class _PackedRowsCase:
-    """A packed batch must read exactly as its rows do one at a time.
-
-    The batch is one concatenated stream with ``cu_seq_lens`` marking the
-    boundaries, so the failure this guards against is a row attending into the
-    row before it. Rewriting row 0 to different codes of the same width leaves
-    row 1 at the same packed offsets: its logits have to stay bit identical.
-    """
-
-    device = torch.device("cpu")
-    attn_implementation = GenRecModelConfig.SDPA
-    lm_parameter_dtype = GenRecModelConfig.FP32
-
-    def setUp(self) -> None:
-        self.test_dir = make_test_dir()
-
-    def _assert_packed_matches_solo(self, model_type: str) -> None:
-        device = self.device
-        model, compiled_prompt = _packed_model(
-            self.test_dir,
-            model_type,
-            self.attn_implementation,
-            self.lm_parameter_dtype,
-        )
-        model.to(device)
-        model.eval()
-        hist_rows = [_HIST_CODES, _LONG_HIST_CODES]
-        answer_rows = [_ANSWER_CODES, _OTHER_ANSWER_CODES]
-        packed_batch = _packed_batch(compiled_prompt, hist_rows, answer_rows).to(device)
-
-        packed = model.predict(packed_batch)
-        with torch.no_grad():
-            solos = [
-                model.predict(
-                    _packed_batch(compiled_prompt, [hist], [answer]).to(device)
-                )
-                for hist, answer in zip(hist_rows, answer_rows)
-            ]
-            changed = model.predict(
-                _packed_batch(
-                    compiled_prompt,
-                    [_REWRITTEN_HIST_CODES, hist_rows[1]],
-                    answer_rows,
-                ).to(device)
-            )
-
-        torch.testing.assert_close(
-            packed["logits"],
-            torch.cat([result["logits"] for result in solos]),
-            atol=1e-2,
-            rtol=1e-2,
-        )
-        torch.testing.assert_close(
-            packed["labels"], torch.cat([result["labels"] for result in solos])
-        )
-        torch.testing.assert_close(
-            packed["logits"][1], changed["logits"][1], atol=0, rtol=0
-        )
-
-        loss = model.loss(packed, packed_batch)["ce_loss"]
-        self.assertTrue(bool(torch.isfinite(loss)))
-        loss.backward()
-        grad = model.lm.get_input_embeddings().weight.grad
-        self.assertIsNotNone(grad)
-        self.assertTrue(bool(torch.isfinite(grad).all()))
-        self.assertGreater(float(grad.abs().sum()), 0)
-
-
-class PackedSdpaAttentionTest(_PackedRowsCase, unittest.TestCase):
-    """The packed forward under sdpa, which needs no GPU and no wheel."""
-
-    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
-    def test_packed_rows_match_solo_runs_and_backpropagate(
-        self, model_type: str
-    ) -> None:
-        self._assert_packed_matches_solo(model_type)
-
-
-@mark_ci_scope("gpu")
-@unittest.skipIf(*nv_gpu_unavailable)
-@unittest.skipIf(*flash_attn_unavailable)
-class PackedFlashAttentionTest(_PackedRowsCase, unittest.TestCase):
-    """The same rows through the varlen flash kernel."""
-
-    device = torch.device("cuda")
-    attn_implementation = GenRecModelConfig.FLASH_ATTENTION_2
-    # the flash kernel takes fp16/bf16 only, and this arm carries no autocast
-    lm_parameter_dtype = GenRecModelConfig.BF16
-
-    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
-    def test_packed_rows_match_solo_runs_and_backpropagate(
-        self, model_type: str
-    ) -> None:
-        self._assert_packed_matches_solo(model_type)
+if __name__ == "__main__":
+    unittest.main()

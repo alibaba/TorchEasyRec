@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 from parameterized import parameterized
-from transformers import AutoConfig, AutoModelForCausalLM
 
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.utils.test_util import (
@@ -149,26 +148,12 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
     )
     def test_ragged_batch_matches_solo_dynamic_cache(self, model_type: str) -> None:
         device = torch.device("cuda")
-        config = AutoConfig.for_model(
-            model_type,
-            vocab_size=30,
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            max_position_embeddings=64,
-            tie_word_embeddings=False,
-        )
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(0)
-            lm = AutoModelForCausalLM.from_config(
-                config,
-                attn_implementation="flash_attention_2",
-                torch_dtype=torch.bfloat16,
-            ).to(device)
-        lm.eval()
+        lm = create_tiny_causal_lm(
+            30,
+            model_type=model_type,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+        ).to(device)
         pairs = [(20, 21), (22, 24), (25, 28)]
         ids = torch.tensor(
             [[5, 6, 7, 8], [0, 9, 10, 11]],
