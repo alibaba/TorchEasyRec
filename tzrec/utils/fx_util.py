@@ -12,6 +12,7 @@
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
+import torch.distributed as dist
 from torchrec import JaggedTensor, KeyedTensor
 from torchrec.fx import symbolic_trace as _symbolic_trace
 
@@ -96,6 +97,29 @@ def fx_numel(x: torch.Tensor) -> int:
         torch._check(total_len >= 0)
         torch._check(total_len <= 2**31 - 1)
     return total_len
+
+
+@torch.fx.wrap
+def fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
+    """Fx trace wrapper for the DDP-averaged first dimension of ``x``.
+
+    Used to rescale a local-batch mean loss into a global-batch mean so
+    DDP's cross-rank gradient average stays unbiased on ragged batches.
+    """
+    batch_size = torch.tensor(x.size(0), dtype=torch.float, device=x.device)
+    if dist.is_initialized():
+        dist.all_reduce(batch_size, op=dist.ReduceOp.AVG)
+    return batch_size
+
+
+@torch.fx.wrap
+def fx_size0_max1(x: torch.Tensor) -> int:
+    """Fx trace wrapper for max(x.size(0), 1).
+
+    The inline ``max()`` compares a traced ``size()`` proxy in a bool context,
+    which raises ``TraceError`` under torchrec's train-pipeline FX rewrite.
+    """
+    return max(x.size(0), 1)
 
 
 @torch.fx.wrap

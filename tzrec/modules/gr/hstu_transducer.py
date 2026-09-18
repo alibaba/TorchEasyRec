@@ -24,7 +24,7 @@ from tzrec.modules.gr.postprocessors import (
     create_output_postprocessor,
 )
 from tzrec.modules.gr.preprocessors import InputPreprocessor, create_input_preprocessor
-from tzrec.modules.gr.stu import STULayer, STUStack
+from tzrec.modules.gr.stu import STU, STULayer, STUStack
 from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention_utils import (
@@ -97,7 +97,7 @@ class _HSTUPipelineBase(BaseModule):
         if stu.get("scaling_seqlen", -1) < 0:
             stu["scaling_seqlen"] = scaling_seqlen
         self._stu_module: STUStack = STUStack(
-            stu_list=[STULayer(**stu) for _ in range(attn_num_layers)],
+            stu_list=[self._build_stu_layer(stu) for _ in range(attn_num_layers)],
             truncate_split_layer=attn_truncation_split_layer,
             truncate_tail_len=attn_truncation_tail_len,
         )
@@ -109,6 +109,17 @@ class _HSTUPipelineBase(BaseModule):
                 **positional_encoder,
             )
         self._input_dropout_ratio: float = input_dropout_ratio
+
+    def _build_stu_layer(self, stu: Dict[str, Any]) -> STU:
+        """Subclass hook: build one STU layer from the resolved config.
+
+        ``stu`` already has the ``contextual_seq_len`` / ``scaling_seqlen``
+        sentinels replaced.  Called once per layer from ``__init__``, so
+        overrides must not depend on subclass attributes assigned after
+        ``super().__init__()`` -- pass extra kwargs through the ``stu``
+        dict instead.
+        """
+        return STULayer(**stu)
 
     def _preprocess(
         self, grouped_features

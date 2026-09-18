@@ -17,6 +17,11 @@ from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
+from tzrec.ops.jagged_tensors import (
+    jagged_segment_ids,
+    jagged_segment_max,
+    jagged_segment_sum,
+)
 from tzrec.utils.test_util import (
     cleanup_cuda_memory,
     generate_sparse_seq_len,
@@ -487,6 +492,48 @@ class JaggedTensorsTest(unittest.TestCase):
                 atol=atol,
                 rtol=rtol,
             )
+
+
+class JaggedSegmentOpsTest(unittest.TestCase):
+    """Value-level tests for the shared jagged segment reductions.
+
+    Deterministic CPU cases pinning the contracts the three consumers
+    (listwise loss, SD, task tower) rely on: empty segments sum to 0,
+    max empties are rewritten to 0 (not -inf), and reduced-precision
+    inputs round-trip through fp32 accumulation.
+    """
+
+    def test_segment_ids_maps_rows_and_skips_empties(self) -> None:
+        lengths = torch.tensor([2, 0, 3])
+        ids = jagged_segment_ids(lengths)
+        self.assertEqual(ids.tolist(), [0, 0, 2, 2, 2])
+
+    def test_segment_ids_honors_output_size(self) -> None:
+        lengths = torch.tensor([2, 0, 3])
+        ids = jagged_segment_ids(lengths, output_size=5)
+        self.assertEqual(ids.tolist(), [0, 0, 2, 2, 2])
+
+    def test_segment_sum_within_segments_empty_is_zero(self) -> None:
+        values = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
+        lengths = torch.tensor([2, 0, 3])
+        ids = jagged_segment_ids(lengths, output_size=5)
+        sums = jagged_segment_sum(values, lengths, ids)
+        self.assertEqual(sums.tolist(), [[3.0], [0.0], [12.0]])
+
+    def test_segment_sum_round_trips_reduced_precision(self) -> None:
+        values = torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.bfloat16)
+        lengths = torch.tensor([3])
+        ids = jagged_segment_ids(lengths, output_size=3)
+        sums = jagged_segment_sum(values, lengths, ids)
+        self.assertEqual(sums.dtype, torch.bfloat16)
+        self.assertEqual(sums.tolist(), [[6.0]])
+
+    def test_segment_max_rewrites_empty_segments_to_zero(self) -> None:
+        values = torch.tensor([[1.0], [5.0], [2.0], [7.0], [3.0]])
+        lengths = torch.tensor([2, 0, 3])
+        ids = jagged_segment_ids(lengths, output_size=5)
+        maxes = jagged_segment_max(values, lengths, ids)
+        self.assertEqual(maxes.tolist(), [[5.0], [0.0], [7.0]])
 
 
 if __name__ == "__main__":
