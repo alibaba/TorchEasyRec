@@ -332,6 +332,8 @@ class MatchModel(BaseModel):
             losses[loss_name] = div_no_nan(
                 torch.mean(losses[loss_name] * sample_weight), torch.mean(sample_weight)
             )
+        if loss_cfg.weight != 1.0:
+            losses[loss_name] = losses[loss_name] * loss_cfg.weight
 
         return losses
 

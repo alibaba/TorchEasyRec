@@ -78,10 +78,11 @@ def _make_batch(batch_size: int, input_dim: int) -> Batch:
     )
 
 
-def _recon_loss_cfg(recon_type: str = "l2") -> loss_pb2.LossConfig:
+def _recon_loss_cfg(recon_type: str = "l2", weight: float = 1.0) -> loss_pb2.LossConfig:
     """A LossConfig with a recon_loss term of the given recon_type."""
     lc = loss_pb2.LossConfig()
     lc.recon_loss.recon_type = recon_type
+    lc.weight = weight
     return lc
 
 
@@ -130,6 +131,7 @@ class SidRqvaeTest(unittest.TestCase):
         embed_dim=8,
         n_layers=2,
         recon="l2",
+        recon_weight=1.0,
         candidate_output=False,
     ):
         """Helper to create a SidRqvae model with config-driven losses."""
@@ -140,7 +142,7 @@ class SidRqvaeTest(unittest.TestCase):
             forward_mode="ste",
             kmeans_init=False,
         )
-        losses = [_recon_loss_cfg(recon), _commitment_cfg()]
+        losses = [_recon_loss_cfg(recon, recon_weight), _commitment_cfg()]
         if use_contrastive:
             sid_rqvae_cfg.contrastive_config.pair_feature_group = "pair"
             sid_rqvae_cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
@@ -204,6 +206,30 @@ class SidRqvaeTest(unittest.TestCase):
         metrics = model.compute_metric()
         self.assertIn("mse", metrics)
         self.assertIn("unique_sid_ratio", metrics)
+
+    def test_loss_weight_scales_only_its_own_term(self) -> None:
+        """``LossConfig.weight`` scales its own sid_loss term and no other."""
+        B, input_dim = 4, 32
+        recon_weight = 0.5
+        base = self._create_model(input_dim=input_dim)
+        scaled = self._create_model(input_dim=input_dim, recon_weight=recon_weight)
+        base.init_loss()
+        scaled.init_loss()
+
+        # The sid loss modules are stateless, so both configs can score the
+        # same predictions without matching the models' parameters.
+        batch = _make_batch(B, input_dim)
+        predictions = base.predict(batch)
+        base_losses = base.loss(predictions, batch)
+        scaled_losses = scaled.loss(predictions, batch)
+
+        self.assertGreater(base_losses["recon_loss"].item(), 0.0)
+        torch.testing.assert_close(
+            scaled_losses["recon_loss"], base_losses["recon_loss"] * recon_weight
+        )
+        torch.testing.assert_close(
+            scaled_losses["commitment_loss"], base_losses["commitment_loss"]
+        )
 
     def test_rqvae_eval_mode(self) -> None:
         """Test SidRqvae in eval mode: predict returns the recon fields."""

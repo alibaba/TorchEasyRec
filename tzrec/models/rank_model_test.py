@@ -13,7 +13,7 @@ import unittest
 from typing import Dict, List, Optional
 
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
@@ -22,7 +22,11 @@ from tzrec.models.model import TrainWrapper
 from tzrec.models.rank_model import RankModel
 from tzrec.protos import loss_pb2, metric_pb2, model_pb2
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.utils.test_util import TestGraphType, create_test_model
+from tzrec.utils.test_util import (
+    TestGraphType,
+    create_test_model,
+    parameterized_name_func,
+)
 
 
 class _TestClassficationModel(RankModel):
@@ -145,6 +149,74 @@ class RankModelTest(unittest.TestCase):
             )
             torch.testing.assert_close(
                 metric_result["accuracy"], expected_acc, rtol=1e-4, atol=1e-4
+            )
+
+    @parameterized.expand(
+        [
+            param("plain", graph_type=TestGraphType.NORMAL, weighted=False),
+            param("plain_fx", graph_type=TestGraphType.FX_TRACE, weighted=False),
+            param("sample_weighted", graph_type=TestGraphType.NORMAL, weighted=True),
+            param(
+                "sample_weighted_fx", graph_type=TestGraphType.FX_TRACE, weighted=True
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_loss_weight_scales_loss(self, _name, graph_type, weighted):
+        """``LossConfig.weight`` scales the loss after the sample-weight step.
+
+        Same batch and same expected values as
+        ``test_binary_classification_model``, so a weight folded into the
+        sample weights instead -- which would renormalize away -- would not
+        reproduce them.
+        """
+        loss_weight = 0.5
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(
+                    binary_cross_entropy=loss_pb2.BinaryCrossEntropy(),
+                    weight=loss_weight,
+                )
+            ],
+            metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
+        )
+        model = _TestClassficationModel(
+            model_config=model_config,
+            features=[],
+            labels=["label"],
+            sample_weights=["weight"] if weighted else None,
+        )
+        model = TrainWrapper(model)
+        model = create_test_model(model, graph_type)
+
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["id_a"], values=torch.tensor([1, 1]), lengths=torch.tensor([1, 1])
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={BASE_DATA_GROUP: sparse_feature},
+            labels={"label": torch.tensor([0, 1])},
+            sample_weights={"weight": torch.tensor([1.0, 2.0])},
+        )
+        total_loss, (losses, predictions, batch) = model(batch)
+
+        expected_loss = torch.tensor(0.6356 if weighted else 0.6762) * loss_weight
+        torch.testing.assert_close(total_loss, expected_loss, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(
+            losses["binary_cross_entropy"], expected_loss, rtol=1e-4, atol=1e-4
+        )
+
+        if graph_type == TestGraphType.NORMAL:
+            model.model.update_metric(predictions, batch, losses)
+            metric_result = model.model.compute_metric()
+            torch.testing.assert_close(
+                metric_result["binary_cross_entropy"],
+                expected_loss,
+                rtol=1e-4,
+                atol=1e-4,
             )
 
     @parameterized.expand(
