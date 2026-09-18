@@ -13,7 +13,7 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
@@ -226,6 +226,47 @@ class OverlapFeatureTest(unittest.TestCase):
         }
         parsed_feat = overlap_feat.parse(input_data)
         np.testing.assert_allclose(parsed_feat.values, np.array([[expected_value]]))
+
+
+class SequenceOverlapFeatureTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            param("item_side_seq", title="item:title", sequence_fields=[]),
+            param("user_side_seq", title="user:title", sequence_fields=["title"]),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_simple_sequence_overlap_feature_dense(self, name, title, sequence_fields):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            sequence_overlap_feature=feature_pb2.OverlapFeature(
+                feature_name="click_50_seq_overlap_feat",
+                sequence_delim=";",
+                sequence_length=50,
+                query="user:query",
+                title=title,
+                sequence_fields=sequence_fields,
+                method="query_common_ratio",
+            )
+        )
+        seq_feat = overlap_feature_lib.OverlapFeature(
+            seq_feat_cfg, is_sequence=True, fg_mode=FgMode.FG_NORMAL
+        )
+        self.assertEqual(seq_feat.output_dim, 1)
+        self.assertEqual(seq_feat.is_sparse, False)
+        self.assertEqual(seq_feat.inputs, ["query", "title"])
+        self.assertEqual(seq_feat.sequence_input_names, ["title"])
+        self.assertEqual(
+            seq_feat.fg_json()[0].get("sequence_fields"), sequence_fields or None
+        )
+
+        input_data = {
+            "query": pa.array(["abc\x1defg", "abc\x1defg"]),
+            "title": pa.array(["abc\x1drty;abc\x1defg", "qwe"]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq_overlap_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array([[0.5], [1.0], [0.0]]))
+        np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([2, 1]))
 
 
 if __name__ == "__main__":
