@@ -222,6 +222,35 @@ class PromptAssemblerTest(unittest.TestCase):
         )
         self.assertEqual(prompt_only[RESPONSE_LENGTHS].tolist(), [0])
 
+    def test_an_empty_prompt_body_leaves_only_the_response(self) -> None:
+        """The walk no longer measures rows, so its consumer must.
+
+        A row whose body assembles to nothing is shorter than the supervised
+        suffix window, and the packed forward's window would then reach back
+        into the sample before it. The assembler emits the row regardless --
+        it trusts the parsed batch -- so the guard belongs to the model; this
+        pins the shape that guard has to reject.
+        """
+        asm = _asm(
+            (_slot("hist", FillMode.INLINE),),
+            response=(_slot("answer", FillMode.INLINE),),
+        )
+        out = asm(
+            _parsed(
+                {
+                    "hist": [np.array([], dtype=np.int64)],
+                    "answer": [np.array([1, 6, 11])],
+                }
+            )
+        )
+
+        row_lengths = torch.diff(out[CU_SEQLENS])
+        self.assertEqual(row_lengths.tolist(), out[RESPONSE_LENGTHS].tolist())
+        self.assertEqual(
+            out[INPUT_IDS].tolist(),
+            [_BASE_VOCAB_SIZE + 1, _BASE_VOCAB_SIZE + 6, _BASE_VOCAB_SIZE + 11],
+        )
+
     def test_a_multi_value_history_walks_like_the_flat_layout(self) -> None:
         """Items with key_lengths and one code per position are one stream."""
         asm = _asm((Static((7,)), _slot("hist", FillMode.INLINE)))

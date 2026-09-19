@@ -20,9 +20,10 @@ forward has no ``logits_to_keep``, or which returns a legacy tuple cache, is
 not supported; Qwen2.5/Qwen3 are what CI covers.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -143,17 +144,103 @@ class GenRecCausalLMModel(BaseGenRecModel):
             Logits and labels over the same window, so the shift ``loss``
             applies lands on the pairs the window was sized for.
         """
-        padded, mask, labels = self._left_pad_packed_inputs(
-            embeds, batch, build_labels=True
+        infos = batch.additional_infos
+        cu_seqlens = infos[CU_SEQLENS]
+        lengths = torch.diff(cu_seqlens)
+        suffix = cast(int, self._prompt.prompt_plan.logits_suffix_len)
+        # a row shorter than the window reads the row before it
+        if bool((lengths < suffix).any()):
+            raise ValueError(
+                f"{type(self).__name__}: every assembled sample must be at "
+                f"least logits_suffix_len ({suffix}) tokens long. Drop the "
+                f"rows whose prompt features are all empty, or give the "
+                f"template static text."
+            )
+        suffix_offsets = torch.arange(-suffix, 0, device=embeds.device)
+        # (rows, suffix): the window each row is supervised over, the same
+        # absolute positions whichever layout the kernel is given
+        keep = cu_seqlens[1:, None] + suffix_offsets
+        labels = infos[INPUT_IDS][keep].masked_fill(
+            suffix_offsets[None, :] < -infos[RESPONSE_LENGTHS][:, None],
+            self._ignore_index,
         )
-        suffix = self._prompt.prompt_plan.logits_suffix_len
+        # CUDNN_ATTENTION is eligible for the packed mask and returns NaN
+        # losses on it; exclude it here rather than disabling it process-wide
+        with sdpa_kernel(
+            [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+        ):
+            if self._attn_kernel == GenRecModelConfig.FLASH_ATTENTION_2:
+                logits = self._packed_logits(embeds, batch, keep)
+            else:
+                logits = self._padded_logits(embeds, batch, suffix)
+        return logits, labels
+
+    def _packed_logits(
+        self, embeds: torch.Tensor, batch: Batch, keep: torch.Tensor
+    ) -> torch.Tensor:
+        """Score every row in one varlen call, with no padding at all.
+
+        Only the flash varlen kernel reads ``cu_seq_lens``; every other kernel
+        would rebuild the row boundaries as a dense ``(1, 1, T, T)`` mask and
+        pay ``(sum L)^2`` instead of ``sum L^2``.
+
+        Args:
+            embeds: the assembled prompt embeddings, packed.
+            batch: carries the row boundaries and the collator's width.
+            keep: ``(rows, suffix)`` absolute positions of the response window.
+
+        Returns:
+            ``(rows, suffix, vocab)`` logits over the response window.
+        """
+        infos = batch.additional_infos
+        cu_seqlens = infos[CU_SEQLENS]
+        row_starts = torch.repeat_interleave(
+            cu_seqlens[:-1], torch.diff(cu_seqlens), output_size=embeds.shape[0]
+        )
+        position_ids = (
+            torch.arange(embeds.shape[0], device=embeds.device) - row_starts
+        ).unsqueeze(0)
+        # varlen flash-attention wants int32 boundaries
+        flash_cu_seqlens = cu_seqlens.to(torch.int32)
+        max_seqlen = int(infos[MAX_SEQLEN])
+        outputs = self.lm(
+            inputs_embeds=embeds.unsqueeze(0),
+            attention_mask=None,
+            position_ids=position_ids,
+            use_cache=False,
+            logits_to_keep=keep.reshape(-1),
+            cu_seq_lens_q=flash_cu_seqlens,
+            cu_seq_lens_k=flash_cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+        )
+        return outputs.logits.reshape(keep.shape[0], keep.shape[1], -1)
+
+    def _padded_logits(
+        self, embeds: torch.Tensor, batch: Batch, suffix: int
+    ) -> torch.Tensor:
+        """Score left-padded rows, which every kernel can serve.
+
+        Args:
+            embeds: the assembled prompt embeddings, packed.
+            batch: carries the row boundaries and the collator's width.
+            suffix: width of the supervised window.
+
+        Returns:
+            ``(rows, suffix, vocab)`` logits over the response window.
+        """
+        padded, mask = self._left_pad_packed_inputs(embeds, batch)
         outputs = self.lm(
             inputs_embeds=padded,
             attention_mask=mask,
             use_cache=False,
             logits_to_keep=suffix,
         )
-        return outputs.logits, labels[:, -suffix:]
+        return outputs.logits
 
     def _generate(self, embeds: torch.Tensor, batch: Batch) -> torch.Tensor:
         """Beam-search the SID answer.
@@ -165,7 +252,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Returns:
             ``(B, num_return, num_levels)`` local codes, best first.
         """
-        padded, mask, _ = self._left_pad_packed_inputs(embeds, batch)
+        padded, mask = self._left_pad_packed_inputs(embeds, batch)
         tokens = dynamic_beam_search(
             self.lm, padded, mask, self._capped_widths, self._bands
         )
@@ -176,17 +263,15 @@ class GenRecCausalLMModel(BaseGenRecModel):
         self,
         embeds: torch.Tensor,
         batch: Batch,
-        build_labels: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Left-pad packed prompt embeddings for the causal LM.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Left-pad packed prompt embeddings for beam decode.
 
         Args:
             embeds: packed embeddings, ``(total_tokens, hidden)``.
             batch: carries the packed prompt metadata.
-            build_labels: whether to build response-only training labels.
 
         Returns:
-            Padded embeddings, attention mask and optional labels.
+            Padded embeddings and attention mask.
         """
         infos = batch.additional_infos
         cu_seqlens = infos[CU_SEQLENS]
@@ -202,32 +287,17 @@ class GenRecCausalLMModel(BaseGenRecModel):
         padded = embeds.new_zeros((batch_size, max_seqlen, hidden))
         # mask selects row-major, which is how embeds and input_ids are packed
         padded[mask] = embeds
-        if not build_labels:
-            return padded, mask.long(), None
-
-        input_ids = infos[INPUT_IDS]
-        response_lengths = infos[RESPONSE_LENGTHS]
-        labels = torch.full(
-            (batch_size, max_seqlen),
-            self._ignore_index,
-            dtype=input_ids.dtype,
-            device=embeds.device,
-        )
-        labels[mask] = input_ids
-        response_mask = columns[None, :] >= (max_seqlen - response_lengths)[:, None]
-        labels[~response_mask] = self._ignore_index
-        return padded, mask.long(), labels
+        return padded, mask.long()
 
 
 @torch.fx.wrap
 def _fx_wrapped_forward(
     model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Hide the padded forward from FX.
+    """Hide the packed forward from FX.
 
     ``TrainPipelineSparseDist`` symbolically traces the model whenever a
-    sharded module exists, and ``_left_pad_packed_inputs`` reads
-    ``max_seqlen`` as a host int.
+    sharded module exists, and the LM call reads ``max_seqlen`` as a host int.
 
     Args:
         model: the model whose response window to compute.
