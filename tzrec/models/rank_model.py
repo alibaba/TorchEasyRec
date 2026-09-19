@@ -288,21 +288,22 @@ class RankModel(BaseModel):
             # cross-rank gradient average comes out as a global mean on a
             # ragged batch.  Both denominators are total counts, so the
             # average stays unbiased even when the masked-out fraction
-            # differs across ranks.  The caller's per-candidate loss_weight
-            # is deliberately not reused: it is sized off the candidate
-            # count, not the request count.
+            # differs across ranks.
             global_avg_weight = None
             if getattr(self._base_model_config, "enable_global_average_loss", False):
                 global_avg_weight = lengths.size(0) / fx_avg_batch_size(lengths)
-            losses[loss_name] = (
-                self._loss_modules[loss_name](pred, label, lengths, global_avg_weight)
-                * loss_cfg.listwise_rank_loss.alpha
+            losses[loss_name] = self._loss_modules[loss_name](
+                pred, label, lengths, global_avg_weight
             )
-            return losses
+            # The caller's per-candidate loss_weight does not apply here: it
+            # is sized off the candidate count, not the request count.
+            loss_weight = None
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
         if loss_weight is not None:
             losses[loss_name] = torch.mean(losses[loss_name] * loss_weight)
+        if loss_cfg.weight != 1.0:
+            losses[loss_name] = losses[loss_name] * loss_cfg.weight
         return losses
 
     def loss(

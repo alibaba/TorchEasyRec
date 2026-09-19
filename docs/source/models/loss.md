@@ -2,7 +2,31 @@
 
 ## 简介
 
-不同类型的任务有不同的loss，也可以对于同一个任务配置多个损失函数。 目前TorchEasyRec支持binary_cross_entropy，softmax_cross_entropy，l2_loss，以及jrc_loss
+不同类型的任务有不同的loss，也可以对于同一个任务配置多个损失函数。 目前TorchEasyRec支持binary_cross_entropy，binary_focal_loss，softmax_cross_entropy，l2_loss，jrc_loss，以及listwise_rank_loss
+
+## 损失权重 weight
+
+`losses` 是 `LossConfig` 列表，每一项都支持 `weight` 字段，用于调节该损失项在总损失中的权重，默认值1.0。当一个任务配置了多个损失函数时，用 `weight` 平衡它们之间的相对大小
+
+配置如下
+
+```
+model_config {
+    losses {
+        binary_cross_entropy {}
+    }
+    losses {
+        listwise_rank_loss {}
+        weight: 0.1
+    }
+}
+```
+
+参数说明：
+
+1. weight: 该损失项的权重，默认值1.0。它与任务级的weight（`task_towers.weight` / `task_configs.weight`）相乘生效。任务级weight对该任务下的所有损失等比缩放，只有losses.weight才能调节同一个任务内各损失项的相对权重
+1. 训练日志和loss metric记录的都是加权后的值，因此各损失项之和即为total_loss
+1. 开启`use_pareto_loss_weight`时，pe_mtl_loss会在各损失项之上再动态求解一组权重，losses.weight会改变梯度尺度进而影响求解结果，建议不要同时调节二者
 
 ## binary_cross_entropy
 
@@ -104,6 +128,31 @@ DISTRIBUTE BY user_id
 SORT BY user_id asc,time_stamp asc
 ;
 ```
+
+## listwise_rank_loss
+
+请求粒度的listwise排序损失（InfoNCE），同一个请求内的其他候选互为负样本。该损失函数要求模型发布每个请求的候选数以及该任务的`logits_<task_name>`预测，目前只有DlrmHSTU系列满足，详见[dlrm_hstu_onerank](dlrm_hstu_onerank.md)。 一个请求需要同时含有至少一个正样本和一个负样本才会计入该项损失
+
+配置如下
+
+```
+model_config {
+    losses {
+        listwise_rank_loss {
+            temperature_init: 0.07
+            learnable_temperature: true
+        }
+        weight: 0.1
+    }
+}
+```
+
+参数说明：
+
+1. temperature_init: softmax温度初始值，logits会乘以 1 / temperature，默认值0.07
+1. learnable_temperature: 温度是否可学习（训练中会被clamp防止溢出），默认值true
+
+该损失通常与逐点损失（如binary_cross_entropy）搭配使用，用同级的`weight`调节相对权重，经验值0.1量级
 
 ## pe_mtl_loss
 
