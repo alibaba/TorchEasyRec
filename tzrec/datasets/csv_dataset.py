@@ -68,9 +68,10 @@ class CsvDataset(BaseDataset):
             input_path,
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
-            self._data_config.drop_remainder,
+            self._drop_remainder,
             shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
             shuffle_buffer_size=self._data_config.shuffle_buffer_size,
+            min_batch_size=self._min_batch_size,
             column_names=column_names,
             delimiter=self._data_config.delimiter,
             column_types=column_types,
@@ -119,6 +120,7 @@ class CsvReader(BaseReader):
             shuffle_buffer_size,
             sample_cost_field=sample_cost_field,
             batch_cost_size=batch_cost_size,
+            **kwargs,
         )
         self._csv_fmt = ds.CsvFileFormat(
             parse_options=pa.csv.ParseOptions(delimiter=delimiter),

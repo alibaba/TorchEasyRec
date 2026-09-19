@@ -208,6 +208,18 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             self._batch_size = config_util.get_inference_batch_size(data_config)
         else:
             self._batch_size = data_config.batch_size
+        # predict keeps every row: no tail dropping and no rank equalization
+        if mode == Mode.PREDICT:
+            self._drop_remainder = False
+            self._min_batch_size = 0
+        else:
+            self._drop_remainder = data_config.drop_remainder
+            self._min_batch_size = data_config.min_batch_size
+            if self._min_batch_size > self._batch_size:
+                raise ValueError(
+                    f"data_config.min_batch_size[{self._min_batch_size}] must not "
+                    f"exceed the batch size[{self._batch_size}]."
+                )
 
         self._sampler = None
         self._sampler_inited = False
@@ -533,11 +545,14 @@ class BaseReader(metaclass=_reader_meta_cls):
         input_path (str): data input path.
         batch_size (int): batch size.
         selected_cols (list): selection column names.
-        drop_remainder (bool): drop last batch.
+        drop_remainder (bool): drop last batch, same as min_batch_size=batch_size.
         shuffle (bool): shuffle data or not.
         shuffle_buffer_size (int): buffer size for shuffle.
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
+        min_batch_size (int): drop a final batch with fewer rows, 0 disables.
+        equalize_rank_steps (bool): make every rank yield the same batch sizes,
+            honored by readers that slice rows by count.
     """
 
     def __init__(
@@ -550,12 +565,16 @@ class BaseReader(metaclass=_reader_meta_cls):
         shuffle_buffer_size: int = 32,
         sample_cost_field: Optional[str] = None,
         batch_cost_size: Optional[int] = None,
+        min_batch_size: int = 0,
+        equalize_rank_steps: bool = False,
         **kwargs: Any,
     ) -> None:
         self._input_path = input_path
         self._batch_size = batch_size
         self._selected_cols = selected_cols
         self._drop_remainder = drop_remainder
+        self._min_batch_size = batch_size if drop_remainder else min_batch_size
+        self._equalize_rank_steps = equalize_rank_steps
         self._shuffle = shuffle
         self._shuffle_buffer_size = shuffle_buffer_size
         self._sample_cost_field = sample_cost_field
@@ -624,7 +643,7 @@ class BaseReader(metaclass=_reader_meta_cls):
                             [buff_data, pa.Table.from_batches([read_data])]
                         )
                 except StopIteration:
-                    if self._drop_remainder or buff_data is None:
+                    if buff_data is None or len(buff_data) < self._min_batch_size:
                         data = buff_data = None
                     else:
                         data, buff_data = self._slice_buff_data(buff_data)

@@ -23,13 +23,14 @@ from pyarrow import parquet
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 
+from tzrec.constant import Mode
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader, ParquetWriter
 from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils import misc_util
 from tzrec.utils.checkpoint_util import EPOCHS_COMPLETED, update_dataloder_state
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
 class ParquetDatasetTest(unittest.TestCase):
@@ -312,6 +313,78 @@ class ParquetDatasetTest(unittest.TestCase):
             self.assertEqual(num_meta_only_rows, num_total_rows)
             del dataloader3
 
+    @parameterized.expand(
+        [
+            # 8200 rows over 8 workers: one 8-row tail instead of eight 1-row tails
+            [0, [1024] * 8 + [8]],
+            [2, [1024] * 8 + [8]],
+            # drop_remainder drops the 8-row tail only
+            [1024, [1024] * 8],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_create_dataloader_tail_batches(self, min_batch_size, expected):
+        feature_cfgs = self._create_feature_cfgs()
+        features = create_features(feature_cfgs)
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_test_parquet_data(test_dir, num_rows=8200)
+            data_config = data_pb2.DataConfig(
+                batch_size=1024,
+                dataset_type=data_pb2.DatasetType.ParquetDataset,
+                fg_mode=data_pb2.FgMode.FG_NONE,
+                label_fields=["label"],
+                num_workers=8,
+                min_batch_size=min_batch_size,
+                drop_remainder=min_batch_size == 1024,
+            )
+            dataloader = create_dataloader(data_config, features, f"{test_dir}/*")
+            sizes = sorted(
+                (len(batch.labels["label"]) for batch in dataloader.get_iterator()),
+                reverse=True,
+            )
+            self.assertEqual(sizes, expected)
+
+    def test_create_dataloader_predict_keeps_every_row(self):
+        feature_cfgs = self._create_feature_cfgs()
+        features = create_features(feature_cfgs)
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_test_parquet_data(test_dir, num_rows=8201)
+            data_config = data_pb2.DataConfig(
+                batch_size=1024,
+                dataset_type=data_pb2.DatasetType.ParquetDataset,
+                fg_mode=data_pb2.FgMode.FG_NONE,
+                label_fields=["label"],
+                num_workers=8,
+                drop_remainder=True,
+                min_batch_size=2,
+            )
+            dataloader = create_dataloader(
+                data_config,
+                features,
+                f"{test_dir}/*",
+                reserved_columns=["label"],
+                mode=Mode.PREDICT,
+            )
+            num_rows = sum(
+                len(batch.reserves.get()) for batch in dataloader.get_iterator()
+            )
+            self.assertEqual(num_rows, 8201)
+
+    def test_min_batch_size_exceeds_batch_size(self):
+        feature_cfgs = self._create_feature_cfgs()
+        features = create_features(feature_cfgs)
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_test_parquet_data(test_dir, num_rows=10)
+            data_config = data_pb2.DataConfig(
+                batch_size=4,
+                dataset_type=data_pb2.DatasetType.ParquetDataset,
+                fg_mode=data_pb2.FgMode.FG_NONE,
+                label_fields=["label"],
+                min_batch_size=5,
+            )
+            with self.assertRaisesRegex(ValueError, "min_batch_size"):
+                ParquetDataset(data_config, features, f"{test_dir}/*")
+
     def test_create_dataloader_get_iterator_reuses_eager_iterator(self):
         """get_iterator() yields the eagerly prefetched iterator first.
 
@@ -435,6 +508,62 @@ class ParquetReaderTest(unittest.TestCase):
             p.join()
             if p.exitcode != 0:
                 raise RuntimeError(f"reader worker-{i} failed.")
+
+    @parameterized.expand(
+        [
+            # extra row would buy rank 0 a fifth step: dropped
+            [33, 4, 0, [4, 4], [[4] * 4, [4] * 4]],
+            # residue-1 tails stay when min_batch_size is 0
+            [35, 4, 0, [5, 5], [[4] * 4 + [2], [4] * 4 + [1]]],
+            # ... and go together with the extra row when min_batch_size=2
+            [35, 4, 2, [4, 4], [[4] * 4, [4] * 4]],
+            # 8200 rows over two ranks: 4100 each, 4-row tails
+            [8200, 1024, 2, [5, 5], [[1024] * 4 + [4], [1024] * 4 + [4]]],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_parquet_reader_equal_steps(
+        self, num_rows, batch_size, min_batch_size, steps, sizes
+    ):
+        def _reader_worker(rank, port, queue):
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(2)
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(port)
+            dist.init_process_group(backend="gloo")
+            reader = ParquetReader(
+                os.path.join(self.test_dir, "*.parquet"),
+                batch_size=batch_size,
+                min_batch_size=min_batch_size,
+                equalize_rank_steps=True,
+            )
+            queue.put((rank, [len(b["id_a"]) for b in reader.to_batches(rank, 2)]))
+
+        t = pa.Table.from_arrays(
+            [pa.array(["1"] * num_rows), pa.array([0] * num_rows)],
+            names=["id_a", "label"],
+        )
+        writer = parquet.ParquetWriter(
+            os.path.join(self.test_dir, "part-0.parquet"), schema=t.schema
+        )
+        writer.write_table(t)
+        writer.close()
+
+        port = misc_util.get_free_port()
+        queue = mp.Queue()
+        procs = [
+            mp.Process(target=_reader_worker, args=(rank, port, queue))
+            for rank in range(2)
+        ]
+        for p in procs:
+            p.start()
+        results = dict(queue.get() for _ in procs)
+        for i, p in enumerate(procs):
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"reader worker-{i} failed.")
+        self.assertEqual([len(results[r]) for r in range(2)], steps)
+        self.assertEqual([results[r] for r in range(2)], sizes)
 
 
 class ParquetWriterTest(unittest.TestCase):
