@@ -137,12 +137,13 @@ class ParquetDataset(BaseDataset):
             input_path,
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
-            self._data_config.drop_remainder,
+            self._drop_remainder,
             shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
             shuffle_buffer_size=self._data_config.shuffle_buffer_size,
-            drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
             sample_cost_field=self._data_config.sample_cost_field,
             batch_cost_size=self._data_config.batch_cost_size,
+            min_batch_size=self._min_batch_size,
+            equalize_rank_steps=self._mode != Mode.PREDICT,
         )
 
 
@@ -153,14 +154,14 @@ class ParquetReader(BaseReader):
         input_path (str): data input path.
         batch_size (int): batch size.
         selected_cols (list): selection column names.
-        drop_remainder (bool): drop last batch.
+        drop_remainder (bool): drop last batch, same as min_batch_size=batch_size.
         shuffle (bool): shuffle data or not.
         shuffle_buffer_size (int): buffer size for shuffle.
-        drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
-            equal one to prevent train_eval hung.
-        rebalance (bool): rebalance parquet rows to equal number for each worker.
+        rebalance (bool): rebalance parquet rows to equal number for each rank.
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
+        min_batch_size (int): drop a final batch with fewer rows, 0 disables.
+        equalize_rank_steps (bool): make every rank yield the same batch sizes.
     """
 
     def __init__(
@@ -171,7 +172,6 @@ class ParquetReader(BaseReader):
         drop_remainder: bool = False,
         shuffle: bool = False,
         shuffle_buffer_size: int = 32,
-        drop_redundant_bs_eq_one: bool = False,
         rebalance: bool = True,
         sample_cost_field: Optional[str] = None,
         batch_cost_size: Optional[int] = None,
@@ -186,9 +186,9 @@ class ParquetReader(BaseReader):
             shuffle_buffer_size,
             sample_cost_field=sample_cost_field,
             batch_cost_size=batch_cost_size,
+            **kwargs,
         )
         self._pg = dist_util.get_dist_object_pg()
-        self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
         self._rebalance = rebalance
 
         self._ordered_cols = None
@@ -248,18 +248,20 @@ class ParquetReader(BaseReader):
 
         worker_intervals = [(0, sys.maxsize)]
         if self._rebalance:
-            worker_intervals, _ = calc_slice_intervals(
-                sum(self._num_rows),
+            worker_intervals = calc_slice_intervals(
+                [(self._input_path, sum(self._num_rows))],
                 worker_id,
                 num_workers,
                 self._batch_size,
-                self._drop_redundant_bs_eq_one,
+                self._equalize_rank_steps,
+                self._min_batch_size,
                 checkpoint_state=self._checkpoint_state,
-                input_path=self._input_path,
-            )
+            )[self._input_path]
 
         def _combined_reader() -> Iterator[pa.RecordBatch]:
             for start, end in worker_intervals:
+                if start >= end:
+                    continue
                 yield from _reader_iter(
                     self._input_files
                     if self._rebalance

@@ -156,6 +156,10 @@ message DataConfig {
     // whether dataloader batches are returned in first-in, first-out order
     optional bool in_order = 28 [default = true];
 
+    // drop train/eval tail batches with fewer rows than this, 0 disables.
+    // drop_remainder=true is equivalent to min_batch_size=batch_size.
+    optional uint32 min_batch_size = 29 [default = 0];
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;
