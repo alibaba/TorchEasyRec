@@ -387,6 +387,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 is_orderby_partition=True,
                 odps_data_quota_name=self.test_quota,
+                min_batch_size=2,
             ),
             features=features,
             input_path=input_path,

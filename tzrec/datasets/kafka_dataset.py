@@ -257,7 +257,8 @@ class KafkaReader(BaseReader):
         input_path (str): kafka URI, e.g. kafka://broker:9092/topic?group.id=xxx
         batch_size (int): batch size.
         selected_cols (list): selection column names.
-        drop_remainder (bool): drop last batch.
+        drop_remainder (bool): inert, the consume loop never ends so no tail
+            batch is formed; min_batch_size is inert for the same reason.
         input_fields (list): list of pa.Field for schema definition.
     """
 
@@ -627,13 +628,14 @@ class KafkaReader(BaseReader):
                     logger.warning(f"consumer.close() failed: {e}")
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator.
 
         Args:
             worker_id: Worker ID
             num_workers: Total number of workers
+            world_size: Unused, partitions are split by global worker id
 
         Yields:
             Dict of column name to PyArrow Array

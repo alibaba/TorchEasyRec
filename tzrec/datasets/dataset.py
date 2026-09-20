@@ -208,6 +208,18 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             self._batch_size = config_util.get_inference_batch_size(data_config)
         else:
             self._batch_size = data_config.batch_size
+        # only training drops tail batches; eval and predict keep every row
+        if mode == Mode.TRAIN:
+            self._drop_remainder = data_config.drop_remainder
+            self._min_batch_size = data_config.min_batch_size
+            if self._min_batch_size > self._batch_size:
+                raise ValueError(
+                    f"data_config.min_batch_size[{self._min_batch_size}] must not "
+                    f"exceed the batch size[{self._batch_size}]."
+                )
+        else:
+            self._drop_remainder = False
+            self._min_batch_size = 0
 
         self._sampler = None
         self._sampler_inited = False
@@ -288,8 +300,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         assert self._input_fields is not None
         return self._input_fields
 
-    def get_worker_info(self) -> Tuple[int, int]:
-        """Get multiprocessing dataloader worker id and worker number."""
+    def get_worker_info(self) -> Tuple[int, int, int]:
+        """Get global dataloader worker id, worker number and world size."""
         worker_info = get_worker_info()
         if worker_info is None:
             worker_id = 0
@@ -305,7 +317,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             rank = 0
             world_size = 1
 
-        return rank * num_workers + worker_id, num_workers * world_size
+        return rank * num_workers + worker_id, num_workers * world_size, world_size
 
     def load_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
         """Set checkpoint state for resume.
@@ -320,8 +332,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._sampler is not None and not self._sampler_inited:
             self._sampler.init()
             self._sampler_inited = True
-        worker_id, num_workers = self.get_worker_info()
-        for input_data in self._reader.to_batches(worker_id, num_workers):
+        worker_id, num_workers, world_size = self.get_worker_info()
+        for input_data in self._reader.to_batches(worker_id, num_workers, world_size):
             yield self._build_batch(input_data)
         # pass complete: clear the resume state so later epochs do full passes
         self._reader.load_state_dict(None)
@@ -533,11 +545,15 @@ class BaseReader(metaclass=_reader_meta_cls):
         input_path (str): data input path.
         batch_size (int): batch size.
         selected_cols (list): selection column names.
-        drop_remainder (bool): drop last batch.
+        drop_remainder (bool): drop last batch, same as min_batch_size=batch_size.
         shuffle (bool): shuffle data or not.
         shuffle_buffer_size (int): buffer size for shuffle.
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
+        min_batch_size (int): drop a final batch with fewer rows, 0 disables.
+        equalize_rank_steps (bool): make every rank yield the same number of
+            batches; honored by readers that slice rows by count and not
+            guaranteed when batch_cost_size cuts batches by cost.
     """
 
     def __init__(
@@ -550,12 +566,16 @@ class BaseReader(metaclass=_reader_meta_cls):
         shuffle_buffer_size: int = 32,
         sample_cost_field: Optional[str] = None,
         batch_cost_size: Optional[int] = None,
+        min_batch_size: int = 0,
+        equalize_rank_steps: bool = False,
         **kwargs: Any,
     ) -> None:
         self._input_path = input_path
         self._batch_size = batch_size
         self._selected_cols = selected_cols
         self._drop_remainder = drop_remainder
+        self._min_batch_size = batch_size if drop_remainder else min_batch_size
+        self._equalize_rank_steps = equalize_rank_steps
         self._shuffle = shuffle
         self._shuffle_buffer_size = shuffle_buffer_size
         self._sample_cost_field = sample_cost_field
@@ -582,9 +602,17 @@ class BaseReader(metaclass=_reader_meta_cls):
         raise NotImplementedError
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
-        """Get batch iterator."""
+        """Get batch iterator of one of ``num_workers`` slices of the data.
+
+        Args:
+            worker_id (int): slice id.
+            num_workers (int): slice number; without ``world_size`` every slice
+                is an independent even share.
+            world_size (int, optional): set by the dataset when the slices are
+                the rank-major dataloader workers of ``world_size`` ranks.
+        """
         raise NotImplementedError
 
     def _slice_buff_data(
@@ -624,7 +652,7 @@ class BaseReader(metaclass=_reader_meta_cls):
                             [buff_data, pa.Table.from_batches([read_data])]
                         )
                 except StopIteration:
-                    if self._drop_remainder or buff_data is None:
+                    if buff_data is None or len(buff_data) < self._min_batch_size:
                         data = buff_data = None
                     else:
                         data, buff_data = self._slice_buff_data(buff_data)
