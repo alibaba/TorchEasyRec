@@ -844,10 +844,10 @@ def plan_rank_worker_intervals(
        ``min_batch_size`` is cut off the end of the stream, on every rank alike.
     3. Inside a rank the stream is cut into whole batches plus one tail and dealt
        to the workers source by source: the rows completing the open batch go to
-       its holder, whole batches are dealt as contiguous blocks to the least
-       loaded workers first, and the tail opens the next batch on the least
-       loaded worker. Only the holder ever buffers a partial batch, so a rank
-       ends a pass with at most one.
+       its holder, whole batches go to the least loaded workers first, and the
+       tail opens the next batch on the least loaded worker. Every worker reads
+       one contiguous chunk per source, and only the holder ever buffers a
+       partial batch, so a rank ends a pass with at most one.
 
     Dropped rows are never read.
 
@@ -862,8 +862,8 @@ def plan_rank_worker_intervals(
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
 
     Returns:
-        for every source, the (start, end) intervals this worker reads, in read
-        order; empty when the worker reads nothing from that source.
+        for every source, a list holding the (start, end) interval this worker
+        reads, empty when it reads nothing from that source.
     """
     assert 0 < num_workers and 0 <= worker_id < num_workers
     assert 0 < world_size and 0 <= rank < world_size
@@ -904,46 +904,28 @@ def plan_rank_worker_intervals(
     loads = [0] * num_workers
     holder, carry = 0, 0
     for start, rows in shares:
-        chunks: List[Tuple[int, int, int]] = []
-        pos = 0
-        topped = None
-        if carry and rows:
-            pos = min(batch_size - carry, rows)
-            chunks.append((holder, 0, pos))
-            loads[holder] += pos
-            carry = (carry + pos) % batch_size
-            topped = holder
-        full, tail = divmod(rows - pos, batch_size)
+        # a worker's buffer only cares how many rows it gets from a source, so
+        # every worker reads one contiguous chunk: its whole batches, plus the
+        # rows completing the open batch for its holder, plus the tail for the
+        # least loaded worker, which then holds the next open batch
+        need = min(batch_size - carry, rows) if carry else 0
+        loads[holder] += need
+        carry = (carry + need) % batch_size
+        full, tail = divmod(rows - need, batch_size)
         q, r = divmod(full, num_workers)
         order = sorted(range(num_workers), key=lambda w: (loads[w], w))
-        counts = {w: (q + 1 if i < r else q) * batch_size for i, w in enumerate(order)}
-        for w in order:
-            loads[w] += counts[w]
-        # the topped-up worker's block follows its carry chunk and the tail opens
-        # the next batch on the least loaded worker, whose block is laid out
-        # last, so that each of them reads one interval from this source
-        owner = min(range(num_workers), key=lambda w: (loads[w], w))
-        layout = [w for w in order if w != topped]
-        if topped is not None:
-            layout.insert(0, topped)
-        for w in layout:
-            if counts[w] and (w != owner or not tail):
-                chunks.append((w, pos, pos + counts[w]))
-                pos += counts[w]
+        chunk = [0] * num_workers
+        for i, w in enumerate(order):
+            chunk[w] = (q + 1 if i < r else q) * batch_size
+            loads[w] += chunk[w]
+        chunk[holder] += need
         if tail:
-            chunks.append((owner, pos, pos + counts[owner] + tail))
+            owner = min(range(num_workers), key=lambda w: (loads[w], w))
+            chunk[owner] += tail
             loads[owner] += tail
             holder, carry = owner, tail
-
-        mine: List[Tuple[int, int]] = []
-        for w, lo, hi in chunks:
-            if w != worker_id:
-                continue
-            if mine and mine[-1][1] == start + lo:
-                mine[-1] = (mine[-1][0], start + hi)
-            else:
-                mine.append((start + lo, start + hi))
-        result.append(mine)
+        pos = start + sum(chunk[:worker_id])
+        result.append([(pos, pos + chunk[worker_id])] if chunk[worker_id] else [])
     return result
 
 

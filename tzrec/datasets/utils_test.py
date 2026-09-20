@@ -187,8 +187,8 @@ class DatasetUtilsTest(unittest.TestCase):
     def test_calc_slice_intervals_two_ranks_two_workers(self):
         # 35 rows: rank 0 owns [0, 18) with the extra row, rank 1 owns [18, 35);
         # inside each rank the 4 full batches are dealt two per worker and the
-        # tail opens on worker 0, whose block is laid out last
-        expected = {0: [(8, 18)], 1: [(0, 8)], 2: [(26, 35)], 3: [(18, 26)]}
+        # tail opens on worker 0; chunks are laid out in worker order
+        expected = {0: [(0, 10)], 1: [(10, 18)], 2: [(18, 27)], 3: [(27, 35)]}
         for worker_id, intervals in expected.items():
             result = calc_slice_intervals(
                 [("/data/test.parquet", 35)],
