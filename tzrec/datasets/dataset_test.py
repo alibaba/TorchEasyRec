@@ -133,7 +133,7 @@ class _TestReader(BaseReader):
             )
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         yield from self._arrow_reader_iter(self._reader())
 

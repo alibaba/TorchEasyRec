@@ -68,9 +68,10 @@ class CsvDataset(BaseDataset):
             input_path,
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
-            self._data_config.drop_remainder,
+            self._drop_remainder,
             shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
             shuffle_buffer_size=self._data_config.shuffle_buffer_size,
+            min_batch_size=self._min_batch_size,
             column_names=column_names,
             delimiter=self._data_config.delimiter,
             column_types=column_types,
@@ -86,13 +87,14 @@ class CsvReader(BaseReader):
         input_path (str): data input path.
         batch_size (int): batch size.
         selected_cols (list): selection column names.
-        drop_remainder (bool): drop last batch.
+        drop_remainder (bool): drop last batch, same as min_batch_size=batch_size.
         shuffle (bool): shuffle data or not.
         shuffle_buffer_size (int): buffer size for shuffle.
         column_names (list): set column name if csv without header.
         delimiter (str): csv delimiter.
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
+        min_batch_size (int): drop a final batch with fewer rows, 0 disables.
     """
 
     def __init__(
@@ -119,6 +121,7 @@ class CsvReader(BaseReader):
             shuffle_buffer_size,
             sample_cost_field=sample_cost_field,
             batch_cost_size=batch_cost_size,
+            **kwargs,
         )
         self._csv_fmt = ds.CsvFileFormat(
             parse_options=pa.csv.ParseOptions(delimiter=delimiter),
@@ -152,7 +155,7 @@ class CsvReader(BaseReader):
         return self._schema
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         input_files = self._input_files[worker_id::num_workers]

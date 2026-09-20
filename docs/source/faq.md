@@ -546,3 +546,19 @@ ______________________________________________________________________
 - TorchEasyRec在需要稠密序列时会自己按batch内的最大长度padding，并保留每条样本真实的长度用于mask，在tokenizer里补齐反而会丢掉这个信息
 
 如果确实需要定长输出，注意TorchEasyRec生成的FG配置中`output_type`固定为`word_id`，因此只有`pad_id`生效：`pad_token`不会和`pad_id`做一致性校验，配错了不会报错；`pad_id`也不会校验是否在词表范围内，超出词表大小时训练会在embedding查表时越界。
+
+**Q21: 训练报 ValueError: Expected more than 1 value per channel when training**
+
+**报错信息：**
+
+```
+  File ".../torch/nn/functional.py", line ..., in batch_norm
+    _verify_batch_size(input.size())
+  File ".../torch/nn/functional.py", line ..., in _verify_batch_size
+    raise ValueError(
+ValueError: Expected more than 1 value per channel when training, got input size torch.Size([1, 1024])
+```
+
+**原因：** 样本表的行数恰好使得某一轮训练的最后一个batch只有1行。BatchNorm在训练模式下需要在batch内计算统计量，1行样本无法计算方差；batch内负采样、listwise loss等也要求batch内至少有2行样本。TorchEasyRec默认不丢弃任何样本，因此最后一个不足batch_size的batch会原样送入模型。
+
+**解决方法：** 在`data_config`中设置`min_batch_size: 2`，训练时行数小于2的最后一个batch会被丢弃，每个`proc`每轮最多丢弃1行样本；也可以设置`drop_remainder: true`丢弃所有不足batch_size的batch。两个参数都只在训练时生效，评估和预测不受影响。
