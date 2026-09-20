@@ -522,22 +522,19 @@ class OdpsReader(BaseReader):
                 else:
                     session_ids.append(None)
 
-            # a session's record count is an immutable snapshot: fetch it once
-            # here instead of in every dataloader worker
-            sess_infos = [(x, None) for x in session_ids]
-            if int(os.environ.get("RANK", 0)) == 0:
-                sess_reqs = [SessionRequest(session_id=x) for x in session_ids]
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    record_counts = executor.map(
+            if self._pg is not None:
+                dist.broadcast_object_list(session_ids, group=self._pg)
+            sess_reqs = [SessionRequest(session_id=x) for x in session_ids]
+            self._input_to_sess[input_path] = sess_reqs
+            # a session's record count is an immutable snapshot: every rank fetches
+            # it once here, outside any collective, instead of in every worker
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                record_counts = list(
+                    executor.map(
                         _get_session_record_count, [client] * len(sess_reqs), sess_reqs
                     )
-                sess_infos = list(zip(session_ids, record_counts))
-            if self._pg is not None:
-                dist.broadcast_object_list(sess_infos, group=self._pg)
-            self._input_to_sess[input_path] = [
-                SessionRequest(session_id=x) for x, _ in sess_infos
-            ]
-            self._sess_row_counts.update(dict(sess_infos))
+                )
+            self._sess_row_counts.update(zip(session_ids, record_counts))
         # refresh session
         if int(os.environ.get("RANK", 0)) == 0:
             t = threading.Thread(

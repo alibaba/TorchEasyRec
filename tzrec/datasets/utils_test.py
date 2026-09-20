@@ -73,6 +73,7 @@ class DatasetUtilsTest(unittest.TestCase):
                         total += end - start
                 num_read += total
                 worker_totals.append(total)
+                assert not 0 < total % batch_size < min_batch_size, total
                 # a worker's stream is whole batches plus at most one final tail
                 batches.extend([batch_size] * (total // batch_size))
                 if total % batch_size >= max(min_batch_size, 1):
@@ -106,8 +107,6 @@ class DatasetUtilsTest(unittest.TestCase):
                         f"bs={batch_size} min_bs={min_batch_size}"
                     )
                     for batches in per_rank:
-                        self.assertTrue(all(b <= batch_size for b in batches), msg)
-                        self.assertTrue(all(b >= min_batch_size for b in batches), msg)
                         # at most one partial batch per rank and pass
                         self.assertLessEqual(
                             sum(1 for b in batches if b != batch_size), 1, msg
@@ -308,36 +307,47 @@ class DatasetUtilsTest(unittest.TestCase):
         )[0]
         self.assertEqual(result, [(100, 500), (600, 1000)])
 
+    def _assert_tiles(self, slices, remaining):
+        """Slices are pairwise disjoint and their union is the remaining rows."""
+        rows = [r for s in slices for start, end in s for r in range(start, end)]
+        self.assertEqual(len(rows), len(set(rows)))
+        self.assertEqual(
+            sorted(rows), [r for start, end in remaining for r in range(start, end)]
+        )
+
     def test_calc_slice_intervals_two_workers(self):
-        """Test calc_slice_intervals among two workers."""
-        # Total remaining: 800 rows (400 + 400)
-        # Intervals: [(100, 500), (600, 1000)]
+        """Two even shares tile the remaining intervals without overlap."""
         checkpoint_state = {
             "/data/test.parquet:0": 99,
             "/data/test.parquet:500": 599,
         }
+        slices = [
+            calc_slice_intervals(
+                [("/data/test.parquet", 1000)],
+                worker_id=worker_id,
+                num_workers=2,
+                batch_size=1,
+                checkpoint_state=checkpoint_state,
+            )[0]
+            for worker_id in range(2)
+        ]
+        self._assert_tiles(slices, [(100, 500), (600, 1000)])
 
-        # Worker 0 gets first half of total rows
-        result_w0 = calc_slice_intervals(
-            [("/data/test.parquet", 1000)],
-            worker_id=0,
-            num_workers=2,
-            batch_size=1,
-            checkpoint_state=checkpoint_state,
-        )[0]
-        # Worker 1 gets second half
-        result_w1 = calc_slice_intervals(
-            [("/data/test.parquet", 1000)],
-            worker_id=1,
-            num_workers=2,
-            batch_size=1,
-            checkpoint_state=checkpoint_state,
-        )[0]
-
-        # Combined should cover all intervals
-        total_rows_w0 = sum(end - start for start, end in result_w0)
-        total_rows_w1 = sum(end - start for start, end in result_w1)
-        self.assertEqual(total_rows_w0 + total_rows_w1, 800)
+    def test_calc_slice_intervals_two_sources_resume(self):
+        """Even shares over two sources, the first partly consumed."""
+        sources = [("a", 1000), ("b", 500)]
+        slices = [
+            calc_slice_intervals(
+                sources,
+                worker_id=worker_id,
+                num_workers=2,
+                batch_size=128,
+                checkpoint_state={"a:0": 399},
+            )
+            for worker_id in range(2)
+        ]
+        self._assert_tiles([s[0] for s in slices], [(400, 1000)])
+        self._assert_tiles([s[1] for s in slices], [(0, 500)])
 
     def test_calc_slice_intervals_empty_intervals(self):
         """Test calc_slice_intervals with empty intervals (fully consumed)."""
@@ -353,30 +363,23 @@ class DatasetUtilsTest(unittest.TestCase):
         self.assertEqual(result, [])
 
     def test_calc_slice_intervals_topology_change(self):
-        """Test calc_slice_intervals when changing from 2 to 3 workers."""
-        # Original 2 workers, remaining intervals from their checkpoints
-        # Intervals: [(300, 500), (800, 1000)] = 400 rows total
+        """Resuming with 3 workers tiles what 2 workers left behind."""
         checkpoint_state = {
             "/data/test.parquet:0": 299,
             "/data/test.parquet:500": 799,
         }
-
-        # Now redistribute among 3 workers
-        total_rows = 0
-        for worker_id in range(3):
-            result = calc_slice_intervals(
+        slices = [
+            calc_slice_intervals(
                 [("/data/test.parquet", 1000)],
                 worker_id=worker_id,
                 num_workers=3,
                 batch_size=1,
                 checkpoint_state=checkpoint_state,
             )[0]
-            for start, end in result:
-                total_rows += end - start
+            for worker_id in range(3)
+        ]
+        self._assert_tiles(slices, [(300, 500), (800, 1000)])
 
-        self.assertEqual(total_rows, 400)  # All remaining rows accounted for
-
-    # Every case verifies output, input non-mutation, and dict identity.
     @parameterized.expand(
         [
             # (name, input_data, item_id_field, user_id_field,

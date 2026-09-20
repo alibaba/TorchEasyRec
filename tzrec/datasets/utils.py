@@ -906,21 +906,27 @@ def plan_rank_worker_intervals(
     for start, rows in shares:
         chunks: List[Tuple[int, int, int]] = []
         pos = 0
+        topped = None
         if carry and rows:
             pos = min(batch_size - carry, rows)
             chunks.append((holder, 0, pos))
             loads[holder] += pos
             carry = (carry + pos) % batch_size
+            topped = holder
         full, tail = divmod(rows - pos, batch_size)
         q, r = divmod(full, num_workers)
         order = sorted(range(num_workers), key=lambda w: (loads[w], w))
         counts = {w: (q + 1 if i < r else q) * batch_size for i, w in enumerate(order)}
         for w in order:
             loads[w] += counts[w]
-        # the tail opens the next batch on the least loaded worker, whose block
-        # is laid out last so that block and tail form one interval
+        # the topped-up worker's block follows its carry chunk and the tail opens
+        # the next batch on the least loaded worker, whose block is laid out
+        # last, so that each of them reads one interval from this source
         owner = min(range(num_workers), key=lambda w: (loads[w], w))
-        for w in order:
+        layout = [w for w in order if w != topped]
+        if topped is not None:
+            layout.insert(0, topped)
+        for w in layout:
             if counts[w] and (w != owner or not tail):
                 chunks.append((w, pos, pos + counts[w]))
                 pos += counts[w]
@@ -1006,8 +1012,14 @@ def calc_slice_intervals(
         local_workers = num_workers // world_size
         rank, local_worker_id = divmod(worker_id, local_workers)
 
+    # hand every source only its own checkpoint entries, in one pass over the keys
+    state_by_prefix: Dict[str, Dict[str, int]] = {}
+    for key, consumed in (checkpoint_state or {}).items():
+        prefix, sep, _ = key.rpartition(":")
+        if sep:
+            state_by_prefix.setdefault(prefix, {})[key] = consumed
     remaining = [
-        calc_remaining_intervals(checkpoint_state, prefix, total_rows)
+        calc_remaining_intervals(state_by_prefix.get(prefix), prefix, total_rows)
         for prefix, total_rows in sources
     ]
     plan = plan_rank_worker_intervals(
@@ -1028,13 +1040,6 @@ def calc_slice_intervals(
         ]
         for intervals, logical in zip(remaining, plan)
     ]
-    num_rows = sum(end - start for intervals in result for start, end in intervals)
-    if equalize_rank_steps and min_batch_size < 2 and num_rows % batch_size == 1:
-        logger.warning(
-            "The final training batch of this pass has a single row; set "
-            "data_config.min_batch_size >= 2 if the model needs more than one "
-            "row per batch, e.g. with BatchNorm."
-        )
     return result
 
 

@@ -33,8 +33,6 @@ data_config {
   - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
   - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
 
-- 注意: 训练和评估时，OdpsDataset会保证每个`proc`读取相同的步数以避免同步训练卡住，为此全部输入合计最多有`nproc - 1`行样本不会被读取；预测时不受影响
-
 - 运行训练/评估/导出/预测等命令时
 
   - **本地环境**：
@@ -76,8 +74,6 @@ data_config {
   - `${PATH_TO_DATA_DIR}/*.parquet`
 
 - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
-
-- 注意: 训练和评估时，ParquetDataset会保证每个`proc`读取相同的步数以避免同步训练卡住，为此全部输入合计最多有`nproc - 1`行样本不会被读取；预测时不受影响
 
 ## CsvDataset
 
@@ -334,11 +330,13 @@ pipeline.global-job-parameters: |
 ### drop_remainder
 
 - 是否丢弃掉最后一个不足batch_size的batch数据，默认为false
-- 仅在训练时生效，评估和预测时不会丢弃任何数据；等价于`min_batch_size`设置为`batch_size`
+- 仅在训练时生效；等价于`min_batch_size`设置为`batch_size`；评估和预测不会因最后一个batch不足而丢弃数据
 
 ### min_batch_size
 
-- 训练时，丢弃掉每个数据读取进程最后一个行数小于`min_batch_size`的batch，默认为0（不丢弃）；评估和预测时不生效
+- 训练时，丢弃掉最后一个行数小于`min_batch_size`的batch，默认为0（不丢弃）；评估和预测时不生效
+- OdpsDataset和ParquetDataset按`proc`（rank）规划数据，每个`proc`每轮最多丢弃`min_batch_size - 1`行；CsvDataset按数据读取进程丢弃
+- 须满足`min_batch_size <= batch_size`，否则训练时报错
 - 使用BatchNorm等要求batch内至少2行样本的模型时，建议设置为2，避免样本表行数恰好使最后一个batch只剩1行导致训练失败
 
 ### batch_cost_size

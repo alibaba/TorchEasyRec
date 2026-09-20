@@ -552,7 +552,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_cost_size (int): batch cost limit size.
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
         equalize_rank_steps (bool): make every rank yield the same number of
-            batches,            honored by readers that slice rows by count.
+            batches; honored by readers that slice rows by count and not
+            guaranteed when batch_cost_size cuts batches by cost.
     """
 
     def __init__(

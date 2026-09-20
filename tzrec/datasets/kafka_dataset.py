@@ -257,7 +257,8 @@ class KafkaReader(BaseReader):
         input_path (str): kafka URI, e.g. kafka://broker:9092/topic?group.id=xxx
         batch_size (int): batch size.
         selected_cols (list): selection column names.
-        drop_remainder (bool): drop last batch.
+        drop_remainder (bool): inert, the consume loop never ends so no tail
+            batch is formed; min_batch_size is inert for the same reason.
         input_fields (list): list of pa.Field for schema definition.
     """
 
@@ -376,7 +377,6 @@ class KafkaReader(BaseReader):
         Args:
             worker_id: Worker ID
             num_workers: Total number of workers
-            world_size: Unused, partitions are split by global worker id
 
         Yields:
             PyArrow RecordBatch

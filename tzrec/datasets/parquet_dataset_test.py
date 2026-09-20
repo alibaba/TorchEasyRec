@@ -316,14 +316,17 @@ class ParquetDatasetTest(unittest.TestCase):
     @parameterized.expand(
         [
             # 8200 rows over 8 workers: one 8-row tail instead of eight 1-row tails
-            [0, [1024] * 8 + [8]],
-            [2, [1024] * 8 + [8]],
-            # drop_remainder drops the 8-row tail only
-            [1024, [1024] * 8],
+            [0, False, [1024] * 8 + [8]],
+            [2, False, [1024] * 8 + [8]],
+            # drop_remainder alone, and min_batch_size=batch_size, drop the tail only
+            [0, True, [1024] * 8],
+            [1024, False, [1024] * 8],
         ],
         name_func=parameterized_name_func,
     )
-    def test_create_dataloader_tail_batches(self, min_batch_size, expected):
+    def test_create_dataloader_tail_batches(
+        self, min_batch_size, drop_remainder, expected
+    ):
         feature_cfgs = self._create_feature_cfgs()
         features = create_features(feature_cfgs)
         with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
@@ -335,7 +338,7 @@ class ParquetDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 num_workers=8,
                 min_batch_size=min_batch_size,
-                drop_remainder=min_batch_size == 1024,
+                drop_remainder=drop_remainder,
             )
             dataloader = create_dataloader(data_config, features, f"{test_dir}/*")
             sizes = sorted(
@@ -347,7 +350,9 @@ class ParquetDatasetTest(unittest.TestCase):
     @parameterized.expand(
         [[Mode.EVAL], [Mode.PREDICT]], name_func=parameterized_name_func
     )
-    def test_create_dataloader_eval_predict_keep_every_row(self, mode):
+    def test_create_dataloader_eval_predict_no_tail_drop(self, mode):
+        # single rank: the knobs are inert outside training; multi-rank eval may
+        # still skip rows for lockstep, see test_parquet_reader_equal_steps
         feature_cfgs = self._create_feature_cfgs()
         features = create_features(feature_cfgs)
         with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
