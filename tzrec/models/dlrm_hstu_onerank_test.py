@@ -61,9 +61,11 @@ _NUM_TARGETS = [2, 4]
 _TOTAL_TARGETS = sum(_NUM_TARGETS)
 
 
-def _listwise_loss_cfg(**kwargs) -> loss_pb2.LossConfig:
+def _listwise_loss_cfg(weight: float = 1.0, **kwargs) -> loss_pb2.LossConfig:
     """A ``listwise_rank_loss`` entry, as carried inside a task's losses."""
-    return loss_pb2.LossConfig(listwise_rank_loss=loss_pb2.ListwiseRankLoss(**kwargs))
+    return loss_pb2.LossConfig(
+        weight=weight, listwise_rank_loss=loss_pb2.ListwiseRankLoss(**kwargs)
+    )
 
 
 def _task_configs(
@@ -505,7 +507,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         ablation axes, so each has to stay independently runnable.
         """
         device = torch.device("cuda")
-        listwise_loss = _listwise_loss_cfg(alpha=0.5) if with_listwise_loss else None
+        listwise_loss = _listwise_loss_cfg(weight=0.5) if with_listwise_loss else None
         model = _build_model(
             device=device,
             with_situation_discernment=with_situation_discernment,
@@ -601,23 +603,24 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             )
 
     @unittest.skipIf(*gpu_unavailable)
-    def test_listwise_loss_is_scaled_by_alpha(self) -> None:
-        """``alpha`` is the only knob scaling the list-wise term.
+    def test_listwise_loss_is_scaled_by_loss_weight(self) -> None:
+        """``LossConfig.weight`` is the knob scaling the list-wise term.
 
-        Task ``weight`` scales every loss of the task alike -- the EasyRec
-        convention -- so it cannot trade the list-wise term against the
-        point-wise ones; ``alpha`` is the knob that does, and the total is
-        ``sum_k weight_k * (alpha_k * L_list_k + L_point_k)``.
+        The task ``weight`` scales every loss of the task alike -- the
+        EasyRec convention -- so it cannot trade the list-wise term against
+        the point-wise ones; the per-loss ``weight`` is the knob that does,
+        and the total is
+        ``sum_k task_weight_k * sum_l loss_weight_kl * L_kl``.
         """
         device = torch.device("cuda")
-        alpha = 0.25
+        weight = 0.25
         base = _build_model(
             device=device,
-            listwise_loss=_listwise_loss_cfg(alpha=1.0),
+            listwise_loss=_listwise_loss_cfg(),
         )
         scaled = _build_model(
             device=device,
-            listwise_loss=_listwise_loss_cfg(alpha=alpha),
+            listwise_loss=_listwise_loss_cfg(weight=weight),
         )
         scaled.load_state_dict(base.state_dict())
         base.set_kernel(Kernel.PYTORCH)
@@ -636,7 +639,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         key = "listwise_rank_loss_is_click"
         self.assertGreater(base_losses[key].item(), 0.0)
         torch.testing.assert_close(
-            scaled_losses[key], base_losses[key] * alpha, rtol=1e-5, atol=1e-6
+            scaled_losses[key], base_losses[key] * weight, rtol=1e-5, atol=1e-6
         )
         # Point-wise terms are untouched.
         for task_name in _TASK_NAMES:
@@ -653,7 +656,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         instead of the bitmask-decoded ``_get_label`` output -- would count
         every nonzero bitmask (2 == is_like, 4 == is_comment) as an
         is_click positive and quietly train a different objective, while
-        every "finite / positive / alpha-scaled" assertion stays green.
+        every "finite / positive / weight-scaled" assertion stays green.
         The reference here decodes the label by hand and evaluates a bare
         ``ListwiseRankLoss`` on the published per-task logits and
         ``num_targets``; only the exact wiring reproduces it, in both
@@ -664,7 +667,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             model = _build_model(
                 device=device,
                 sequence_timestamp_is_ascending=ascending,
-                listwise_loss=_listwise_loss_cfg(alpha=1.0),
+                listwise_loss=_listwise_loss_cfg(),
             )
             model.set_kernel(Kernel.PYTORCH)
             model.init_loss()
@@ -712,7 +715,7 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             model = _build_model(
                 device=device,
                 sequence_timestamp_is_ascending=ascending,
-                listwise_loss=_listwise_loss_cfg(alpha=1.0),
+                listwise_loss=_listwise_loss_cfg(),
             )
             model.set_kernel(Kernel.PYTORCH)
             model.init_loss()

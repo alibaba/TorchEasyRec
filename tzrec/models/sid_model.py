@@ -186,12 +186,10 @@ class BaseSidModel(BaseModel):
             recon_mask = predictions.get("recon_mask")
             if recon_mask is not None:
                 loss = loss * recon_mask.to(dtype=loss.dtype).mean()
-            return {"recon_loss": loss}
         elif loss_type == "commitment_loss":
             loss = self._loss_modules["commitment_loss"](
                 predictions["encoder_out"], predictions["latents"]
             )
-            return {"commitment_loss": loss}
         elif loss_type == "contrastive_loss":
             loss = self._loss_modules["contrastive_loss"](
                 predictions["embed_a"],
@@ -201,9 +199,11 @@ class BaseSidModel(BaseModel):
                 predictions["pair_mask"],
             )
             loss = loss * predictions["pair_mask"].to(dtype=loss.dtype).mean()
-            return {"contrastive_loss": loss}
         else:
             raise ValueError(f"unsupported sid_loss variant: {loss_type!r}")
+        if loss_cfg.weight != 1.0:
+            loss = loss * loss_cfg.weight
+        return {loss_type: loss}
 
     def init_metric(self) -> None:
         """Initialize the eval metrics shared by all SID models.

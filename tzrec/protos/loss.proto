@@ -18,6 +18,10 @@ message LossConfig {
         SidCommitmentLoss commitment_loss = 7;
         SidContrastiveLoss contrastive_loss = 8;
     }
+    // Weight of this loss term in the model's total loss. Composes
+    // multiplicatively with the task-level `weight`, which scales every loss
+    // of a task alike and so cannot trade one loss of a task against another.
+    optional float weight = 10 [default = 1.0];
 }
 
 // RQ-VAE reconstruction loss (input vs. decoder output).
@@ -53,8 +57,6 @@ message BinaryCrossEntropy {
 // prediction (carry it next to a logit loss such as
 // binary_cross_entropy); currently the DlrmHSTU family satisfies both.
 message ListwiseRankLoss {
-    // weight of the list-wise term relative to the task's other losses.
-    optional float alpha = 1 [default = 0.1];
     // initial softmax temperature; the logits are multiplied by
     // 1 / temperature.
     optional float temperature_init = 2 [default = 0.07];
