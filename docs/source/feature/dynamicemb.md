@@ -6,7 +6,7 @@ cu126/cu129/cu130 镜像已预装 dynamicemb，其它环境需先安装如下whl
 
 ```bash
 # DEVICE 可选: cu126/cu129/cu130 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb==0.1.0+20260911.5948173.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+pip install dynamicemb==0.1.0+20260920.9643985.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
 ```
 
 注：同一个 FeatureGroup 中若存在多个配置了 DynamicEmbedding 的特征，底层 dynamicemb 会自动将这些表融合到同一份存储里（table fusion），共享 cache/admission counter，降低显存占用并减少内存碎片，无需额外配置。
@@ -60,13 +60,16 @@ feature_configs {
 
 - **init_capacity_per_rank**: （可选）初始的每个Rank上的id数，默认等于max_capacity。如需显式配置，建议不小于单个Batch在每个Rank上的新增Id数，过小会导致首个Batch部分Id插入失败，其embedding未初始化，训练loss为nan
 
-- **admission_strategy**: (可选) 特征准入策略，默认不开启，目前只支持frequency_admission_strategy
+- **admission_strategy**: (可选) 特征准入策略，默认不开启，目前支持 frequency_admission_strategy 和 probabilistic_admission_strategy
 
-  - **frequency_admission_strategy**: 基于频次的特征准入策略
+  - **frequency_admission_strategy**: 基于频次的特征准入策略，频次统计Counter会额外占用显存
     - threshold: 准入频次
     - initializer_args: （可选）未准入的ID的初始化方式，默认是 CONSTANT，value=0
     - counter_capacity: （可选）频次统计Counter的最大id数，默认与max_capacity相等
     - counter_bucket_capacity: （可选）频次统计Counter的每个bucket的最大id数，默认为1024
+  - **probabilistic_admission_strategy**: 基于概率的特征准入策略，未准入的Id每次出现都独立抛一次硬币，平均出现 1/probability 次后准入。相比 frequency_admission_strategy 不需要频次统计Counter，不额外占用显存，也不会写入 checkpoint（保存/加载时的 `Counter table is none` warning 属正常现象）
+    - probability: 单次出现的准入概率，取值范围 [0, 1]
+    - initializer_args: （可选）未准入的ID的初始化方式，默认是 CONSTANT，value=0
 
 - **init_table**: （可选）初始化表的路径，支持Odps/Parquet/Csv格式，表的第一列为id值，第二列为embedding值。
 

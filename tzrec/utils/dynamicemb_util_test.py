@@ -9,13 +9,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
+import warnings
+from functools import partial
 from unittest import mock
 
-from parameterized import parameterized
+import torch
+from parameterized import param, parameterized
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.types import ShardingType
+from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
+from tzrec.protos import feature_pb2
 from tzrec.utils import dynamicemb_util
-from tzrec.utils.test_util import mark_ci_scope
+from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
 
 
 @unittest.skipUnless(
@@ -144,6 +152,191 @@ class StorageFormulaTest(unittest.TestCase):
                 cache_ratio=0.5, is_hbm=True, caching=caching, only_values=True
             )
             self.assertGreater(with_meta, without_meta)
+
+
+@unittest.skipUnless(
+    dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+)
+@mark_ci_scope("gpu")
+class AdmissionStrategyTest(unittest.TestCase):
+    """The admission oneof -> a dynamicemb strategy, and its counter's HBM cost."""
+
+    NUM_EMBEDDINGS = 1024
+    EMBEDDING_DIM = 8
+
+    def _options(self, **admission_strategy):
+        dynamicemb_cfg = feature_pb2.DynamicEmbedding(
+            max_capacity=self.NUM_EMBEDDINGS, **admission_strategy
+        )
+        constraints = dynamicemb_util.build_dynamicemb_constraints(
+            dynamicemb_cfg,
+            EmbeddingBagConfig(
+                name="dyn_table",
+                num_embeddings=self.NUM_EMBEDDINGS,
+                embedding_dim=self.EMBEDDING_DIM,
+                feature_names=["user_id"],
+            ),
+        )
+        return constraints.dynamicemb_options
+
+    def _shard_storages(self, dynamicemb_options):
+        return dynamicemb_util.dynamicemb_calculate_shard_storages(
+            sharder_data=None,
+            sharding_type=ShardingType.ROW_WISE.value,
+            tensor=torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM),
+            compute_device="cuda",
+            compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
+            shard_sizes=[[self.NUM_EMBEDDINGS // 2, self.EMBEDDING_DIM]] * 2,
+            batch_sizes=[16],
+            world_size=2,
+            local_world_size=2,
+            input_lengths=[1.0],
+            num_poolings=[1.0],
+            caching_ratio=1.0,
+            is_pooled=True,
+            input_data_type_size=4,
+            output_data_type_size=4,
+            dynamicemb_options=dynamicemb_options,
+        )
+
+    def test_frequency_strategy_owns_its_counter(self):
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
+            options = self._options(
+                frequency_admission_strategy=(
+                    feature_pb2.DynamicEmbFrequencyAdmissionStrategy(
+                        threshold=5,
+                        counter_capacity=2048,
+                        counter_bucket_capacity=512,
+                    )
+                )
+            )
+        admit_strategy = options.admit_strategy
+        self.assertIsInstance(
+            admit_strategy, dynamicemb_util.FrequencyAdmissionStrategy
+        )
+        self.assertEqual(admit_strategy.threshold, 5)
+        self.assertEqual(
+            admit_strategy.counter.capacity,
+            dynamicemb_util.align_to_table_size(1024),
+        )
+        self.assertEqual(admit_strategy.counter.bucket_capacity, 512)
+
+    def test_counter_capacity_defaults_to_num_embeddings(self):
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": "1"}):
+            options = self._options(
+                frequency_admission_strategy=(
+                    feature_pb2.DynamicEmbFrequencyAdmissionStrategy(threshold=1)
+                )
+            )
+        self.assertEqual(
+            options.admit_strategy.counter.capacity,
+            dynamicemb_util.align_to_table_size(self.NUM_EMBEDDINGS),
+        )
+
+    def test_deprecated_admission_counter_stays_unset(self):
+        # The counter now belongs to the strategy; setting the table option
+        # instead is deprecated upstream and raises DeprecationWarning.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            options = self._options(
+                frequency_admission_strategy=(
+                    feature_pb2.DynamicEmbFrequencyAdmissionStrategy(threshold=1)
+                )
+            )
+        self.assertIsNone(options.admission_counter)
+
+    def test_probabilistic_strategy_keeps_no_counter(self):
+        options = self._options(
+            probabilistic_admission_strategy=(
+                feature_pb2.DynamicEmbProbabilisticAdmissionStrategy(probability=0.25)
+            )
+        )
+        admit_strategy = options.admit_strategy
+        self.assertIsInstance(
+            admit_strategy, dynamicemb_util.ProbabilisticAdmissionStrategy
+        )
+        self.assertEqual(admit_strategy.probability, 0.25)
+        self.assertFalse(hasattr(admit_strategy, "counter"))
+
+    @parameterized.expand(
+        [
+            param(
+                "frequency",
+                field="frequency_admission_strategy",
+                strategy=partial(
+                    feature_pb2.DynamicEmbFrequencyAdmissionStrategy, threshold=1
+                ),
+            ),
+            param(
+                "probabilistic",
+                field="probabilistic_admission_strategy",
+                strategy=partial(
+                    feature_pb2.DynamicEmbProbabilisticAdmissionStrategy,
+                    probability=0.25,
+                ),
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_non_admitted_initializer(self, _name, field, strategy):
+        options = self._options(**{field: strategy()})
+        initializer_args = options.admit_strategy.initializer_args
+        self.assertEqual(
+            initializer_args.mode, dynamicemb_util.DynamicEmbInitializerMode.CONSTANT
+        )
+        self.assertEqual(initializer_args.value, 0.0)
+
+        options = self._options(
+            **{
+                field: strategy(
+                    initializer_args=feature_pb2.DynamicEmbInitializerArgs(
+                        mode="CONSTANT", value=0.5
+                    )
+                )
+            }
+        )
+        self.assertEqual(options.admit_strategy.initializer_args.value, 0.5)
+
+    def test_identical_configs_share_a_fused_table(self):
+        strategy = feature_pb2.DynamicEmbProbabilisticAdmissionStrategy(
+            probability=0.25
+        )
+        first = self._options(probabilistic_admission_strategy=strategy)
+        second = self._options(probabilistic_admission_strategy=strategy)
+        frequency = self._options(
+            frequency_admission_strategy=(
+                feature_pb2.DynamicEmbFrequencyAdmissionStrategy(threshold=1)
+            )
+        )
+        self.assertEqual(first.get_grouped_key(), second.get_grouped_key())
+        self.assertNotEqual(first.get_grouped_key(), frequency.get_grouped_key())
+
+    def test_counter_hbm_lands_only_for_frequency_admission(self):
+        no_admission = self._shard_storages(self._options())
+        probabilistic = self._shard_storages(
+            self._options(
+                probabilistic_admission_strategy=(
+                    feature_pb2.DynamicEmbProbabilisticAdmissionStrategy(
+                        probability=0.25
+                    )
+                )
+            )
+        )
+        frequency_options = self._options(
+            frequency_admission_strategy=(
+                feature_pb2.DynamicEmbFrequencyAdmissionStrategy(threshold=1)
+            )
+        )
+        frequency = self._shard_storages(frequency_options)
+        counter = frequency_options.admit_strategy.counter
+        counter_hbm = dynamicemb_util._calculate_dynamicemb_table_storage_specific_size(
+            [counter.capacity, 0],
+            element_size=0,
+            bucket_capacity=counter.bucket_capacity,
+        )
+        for base, prob, freq in zip(no_admission, probabilistic, frequency):
+            self.assertEqual(prob.hbm, base.hbm)
+            self.assertEqual(freq.hbm - base.hbm, counter_hbm)
 
 
 if __name__ == "__main__":
