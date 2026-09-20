@@ -42,6 +42,7 @@ from tzrec.utils.test_util import (
     parameterized_name_func,
 )
 
+# FX wrap registration is local to the caller's globals.
 torch.fx.wrap(_mcc_lazy_init_inplace)
 torch.fx.wrap(_permute_kjt)
 
@@ -92,14 +93,17 @@ import torch
 
 torch.set_num_threads(1)
 root = Path(importlib.util.find_spec("fbgemm_gpu").origin).parent
+print("Loading FBGEMM native operators", flush=True)
 torch.ops.load_library(str(root / "fbgemm_gpu_py.so"))
 assert "fbgemm_gpu" not in sys.modules
 assert "tzrec" not in sys.modules
 device = sys.argv[3]
+print(f"Loading TorchScript on {device}", flush=True)
 model = torch.jit.load(sys.argv[1], map_location=device)
 cases = torch.load(sys.argv[2], weights_only=True)
 with torch.no_grad():
-    for inputs, expected in cases:
+    for index, (inputs, expected) in enumerate(cases):
+        print(f"Running native case {index + 1}/{len(cases)}", flush=True)
         inputs = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
         actual = model(*inputs)
         assert len(actual) == len(expected)
@@ -152,19 +156,30 @@ class KJTPermutationTest(unittest.TestCase):
                     )
         cases_path = os.path.join(self.test_dir, "cases.pt")
         torch.save(cases, cases_path)
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                _NATIVE_SCRIPT_RUNNER,
-                model_path,
-                cases_path,
-                device,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _NATIVE_SCRIPT_RUNNER,
+                    model_path,
+                    cases_path,
+                    device,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as error:
+            diagnostics = []
+            for name, output in (("stdout", error.stdout), ("stderr", error.stderr)):
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                diagnostics.append(f"{name}:\n{output or ''}")
+            self.fail(
+                f"Native TorchScript timed out after {error.timeout}s\n"
+                + "\n".join(diagnostics)
+            )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
     def test_retrace_preserves_weights_guards(self) -> None:
@@ -182,6 +197,21 @@ class KJTPermutationTest(unittest.TestCase):
         actual = model(torch.arange(6), torch.ones(6, dtype=torch.int64))
         torch.testing.assert_close(actual[1], torch.tensor([0, 3, 4, 1, 2, 5]))
         self.assertIsNone(actual[3])
+
+    @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
+    def test_torch_export_preserves_optional_weights(self, weighted) -> None:
+        values = torch.arange(6)
+        lengths = torch.ones(6, dtype=torch.int64)
+        weights = values.float() + 0.25 if weighted else None
+        args = (values, lengths, weights)
+        model = _PermuteKJT(cached_order=True)
+        expected = model(*args)
+        gm = fx_util.symbolic_trace(model)
+        exported = torch.export.export(gm, args)
+        actual = exported.module()(*args)
+        self.assertEqual(actual[0], expected[0])
+        for result, reference in zip(actual[1:], expected[1:]):
+            torch.testing.assert_close(result, reference)
 
 
 class FxAvgBatchSizeTest(unittest.TestCase):

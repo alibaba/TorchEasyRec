@@ -15,8 +15,6 @@ import torch
 import torch.distributed as dist
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.fx import symbolic_trace as _symbolic_trace
-from torchrec.modules.mc_modules import _mcc_lazy_init_inplace
-from torchrec.quant.embedding_modules import _permute_kjt
 
 # Modules whose forward FX cannot record -- they branch on tensor values or
 # turn them into Python ints -- so tracing keeps them opaque and TorchScript
@@ -33,6 +31,9 @@ def _restore_unweighted_kjt(
     FBGEMM CUDA can return an undefined Tensor instead of None for absent
     weights. Python converts it to None, but native TorchScript retains it and
     fails when another permutation consumes it.
+
+    Mutates and returns ``permuted`` without copying it. ``source`` and
+    ``permuted`` may be the same object on identity-permutation paths.
     """
     if source.weights_or_none() is None:
         permuted._weights = None
@@ -53,6 +54,9 @@ def symbolic_trace(
     `concrete_args` allows you to partially specialize your function, whether it's to
     remove control flow or data structures.
 
+    Inserts absent-weight guards after FX-wrapped TorchRec KJT permutations.
+    This post-processing is idempotent when tracing an already guarded graph.
+
     Args:
         root (Union[torch.nn.Module, Callable]): Module or function to be traced and
             converted into a Graph representation.
@@ -62,10 +66,15 @@ def symbolic_trace(
     Returns:
         GraphModule: a Module created from the recorded operations from ``root``.
     """
+    # Resolve private TorchRec helpers only when tracing.
+    from torchrec.modules.mc_modules import _mcc_lazy_init_inplace
+    from torchrec.quant.embedding_modules import _permute_kjt
+
     _leaf_modules = list(UNTRACEABLE_MODULES)
     if leaf_modules:
         _leaf_modules.extend(leaf_modules)
     gm = _symbolic_trace(root, concrete_args, _leaf_modules)
+    inserted = False
     for node in list(gm.graph.nodes):
         if node.op != "call_function" or node.target not in (
             _mcc_lazy_init_inplace,
@@ -73,6 +82,7 @@ def symbolic_trace(
         ):
             continue
         source = node.args[0] if node.args else node.kwargs["features"]
+        # Split exporters can trace an already guarded graph again.
         if len(node.users) == 1:
             user = next(iter(node.users))
             if user.target == _restore_unweighted_kjt and user.args == (source, node):
@@ -81,11 +91,15 @@ def symbolic_trace(
             restored = gm.graph.call_function(
                 _restore_unweighted_kjt, args=(source, node)
             )
+        # Keep the guard opaque when FX traces the generated module again.
         restored.meta["is_wrapped"] = True
         node.replace_all_uses_with(restored)
+        # Replace-all also rewrites the guard's input; restore it to avoid a cycle.
         restored.args = (source, node)
-    gm.graph.lint()
-    gm.recompile()
+        inserted = True
+    if inserted:
+        gm.graph.lint()
+        gm.recompile()
     return gm
 
 
