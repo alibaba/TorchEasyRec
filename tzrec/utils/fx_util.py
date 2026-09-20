@@ -100,16 +100,31 @@ def fx_numel(x: torch.Tensor) -> int:
 
 
 @torch.fx.wrap
-def fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
-    """Fx trace wrapper for the DDP-averaged first dimension of ``x``.
+def fx_avg_counts(lengths: torch.Tensor) -> torch.Tensor:
+    """Fx trace wrapper for the DDP-averaged ``(requests, candidates)`` counts.
 
     Used to rescale a local-batch mean loss into a global-batch mean so
-    DDP's cross-rank gradient average stays unbiased on ragged batches.
+    DDP's cross-rank gradient average stays unbiased on ragged batches. A
+    loss that reduces over requests takes the first element and one that
+    reduces over candidates the second; both travel in one all-reduce
+    because a scalar collective costs a rank synchronization, not
+    bandwidth.
+
+    Args:
+        lengths (torch.Tensor): ``(B,)`` candidates per request.
+
+    Returns:
+        torch.Tensor: ``(2,)`` cross-rank mean of ``B`` and ``sum(lengths)``.
     """
-    batch_size = torch.tensor(x.size(0), dtype=torch.float, device=x.device)
+    counts = torch.stack(
+        [
+            torch.tensor(lengths.size(0), dtype=torch.float, device=lengths.device),
+            lengths.sum().to(torch.float),
+        ]
+    )
     if dist.is_initialized():
-        dist.all_reduce(batch_size, op=dist.ReduceOp.AVG)
-    return batch_size
+        dist.all_reduce(counts, op=dist.ReduceOp.AVG)
+    return counts
 
 
 @torch.fx.wrap
