@@ -208,11 +208,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             self._batch_size = config_util.get_inference_batch_size(data_config)
         else:
             self._batch_size = data_config.batch_size
-        # predict keeps every row: no tail dropping and no rank equalization
-        if mode == Mode.PREDICT:
-            self._drop_remainder = False
-            self._min_batch_size = 0
-        else:
+        # only training drops tail batches; eval and predict keep every row
+        if mode == Mode.TRAIN:
             self._drop_remainder = data_config.drop_remainder
             self._min_batch_size = data_config.min_batch_size
             if self._min_batch_size > self._batch_size:
@@ -220,6 +217,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
                     f"data_config.min_batch_size[{self._min_batch_size}] must not "
                     f"exceed the batch size[{self._batch_size}]."
                 )
+        else:
+            self._drop_remainder = False
+            self._min_batch_size = 0
 
         self._sampler = None
         self._sampler_inited = False

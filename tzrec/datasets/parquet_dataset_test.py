@@ -344,7 +344,10 @@ class ParquetDatasetTest(unittest.TestCase):
             )
             self.assertEqual(sizes, expected)
 
-    def test_create_dataloader_predict_keeps_every_row(self):
+    @parameterized.expand(
+        [[Mode.EVAL], [Mode.PREDICT]], name_func=parameterized_name_func
+    )
+    def test_create_dataloader_eval_predict_keep_every_row(self, mode):
         feature_cfgs = self._create_feature_cfgs()
         features = create_features(feature_cfgs)
         with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
@@ -363,10 +366,13 @@ class ParquetDatasetTest(unittest.TestCase):
                 features,
                 f"{test_dir}/*",
                 reserved_columns=["label"],
-                mode=Mode.PREDICT,
+                mode=mode,
             )
             num_rows = sum(
-                len(batch.reserves.get()) for batch in dataloader.get_iterator()
+                len(batch.reserves.get())
+                if mode == Mode.PREDICT
+                else len(batch.labels["label"])
+                for batch in dataloader.get_iterator()
             )
             self.assertEqual(num_rows, 8201)
 
@@ -383,7 +389,7 @@ class ParquetDatasetTest(unittest.TestCase):
                 min_batch_size=5,
             )
             with self.assertRaisesRegex(ValueError, "min_batch_size"):
-                ParquetDataset(data_config, features, f"{test_dir}/*")
+                ParquetDataset(data_config, features, f"{test_dir}/*", mode=Mode.TRAIN)
 
     def test_create_dataloader_get_iterator_reuses_eager_iterator(self):
         """get_iterator() yields the eagerly prefetched iterator first.

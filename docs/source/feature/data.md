@@ -330,11 +330,11 @@ pipeline.global-job-parameters: |
 ### drop_remainder
 
 - 是否丢弃掉最后一个不足batch_size的batch数据，默认为false
-- 仅在训练和评估时生效，预测时不会丢弃任何数据；等价于`min_batch_size`设置为`batch_size`
+- 仅在训练时生效，评估和预测时不会丢弃任何数据；等价于`min_batch_size`设置为`batch_size`
 
 ### min_batch_size
 
-- 训练和评估时，丢弃掉每个数据读取进程最后一个行数小于`min_batch_size`的batch，默认为0（不丢弃）
+- 训练时，丢弃掉每个数据读取进程最后一个行数小于`min_batch_size`的batch，默认为0（不丢弃）；评估和预测时不生效
 - 使用BatchNorm等要求batch内至少2行样本的模型时，建议设置为2，避免样本表行数恰好使最后一个batch只剩1行导致训练失败
 - 注：OdpsDataset和ParquetDataset按行切分数据时，会保证每个`proc`（rank）读取相同的步数，以避免同步训练时卡住；为此每张表（或每个分区）最多有`nproc - 1`行样本不会被读取，预测时不受影响
 
