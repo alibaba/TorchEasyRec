@@ -42,15 +42,19 @@ class DatasetUtilsTest(unittest.TestCase):
         batch_size: int,
         equalize: bool,
         min_batch_size: int,
-    ) -> Tuple[List[List[int]], int]:
-        """Simulate every worker's buffered stream; return per-rank sizes, rows read."""
+    ) -> Tuple[List[List[int]], int, List[int]]:
+        """Simulate every worker's buffered stream.
+
+        Returns per-rank batch sizes, rows read, and per-worker row totals.
+        """
         per_rank = []
+        worker_totals = []
         num_read = 0
         seen = [set() for _ in rows]
         for rank in range(world_size):
             batches = []
             for worker in range(num_workers):
-                ranges = plan_rank_worker_intervals(
+                intervals = plan_rank_worker_intervals(
                     rows,
                     rank,
                     world_size,
@@ -61,17 +65,20 @@ class DatasetUtilsTest(unittest.TestCase):
                     min_batch_size,
                 )
                 total = 0
-                for t, (start, end) in enumerate(ranges):
-                    assert 0 <= start <= end <= rows[t]
-                    assert seen[t].isdisjoint(range(start, end))
-                    seen[t].update(range(start, end))
-                    total += end - start
+                for t, source_intervals in enumerate(intervals):
+                    for start, end in source_intervals:
+                        assert 0 <= start < end <= rows[t]
+                        assert seen[t].isdisjoint(range(start, end))
+                        seen[t].update(range(start, end))
+                        total += end - start
                 num_read += total
+                worker_totals.append(total)
+                # a worker's stream is whole batches plus at most one final tail
                 batches.extend([batch_size] * (total // batch_size))
                 if total % batch_size >= max(min_batch_size, 1):
                     batches.append(total % batch_size)
-            per_rank.append(sorted(batches))
-        return per_rank, num_read
+            per_rank.append(batches)
+        return per_rank, num_read, worker_totals
 
     def test_plan_rank_worker_intervals_invariants(self):
         rng = random.Random(0)
@@ -81,12 +88,12 @@ class DatasetUtilsTest(unittest.TestCase):
             for min_batch_size in sorted({0, 1, min(2, batch_size), batch_size}):
                 cases = [
                     [rng.randrange(3 * batch_size * world_size + 5) for _ in range(n)]
-                    for n in (1, 2, 3)
-                    for _ in range(20)
+                    for n in (1, 2, 3, 5)
+                    for _ in range(15)
                 ]
                 cases += [[r] for r in range(4 * batch_size * world_size + 3)]
                 for rows in cases:
-                    per_rank, num_read = self._rank_batches(
+                    per_rank, num_read, _ = self._rank_batches(
                         rows,
                         world_size,
                         num_workers,
@@ -101,16 +108,28 @@ class DatasetUtilsTest(unittest.TestCase):
                     for batches in per_rank:
                         self.assertTrue(all(b <= batch_size for b in batches), msg)
                         self.assertTrue(all(b >= min_batch_size for b in batches), msg)
+                        # at most one partial batch per rank and pass
+                        self.assertLessEqual(
+                            sum(1 for b in batches if b != batch_size), 1, msg
+                        )
                     if equalize:
                         self.assertEqual(len({len(b) for b in per_rank}), 1, msg)
                     if not equalize and min_batch_size == 0:
                         self.assertEqual(num_read, sum(rows), msg)
                     else:
-                        max_drop = (world_size - 1) * len(rows)
-                        max_drop += (
-                            max(min_batch_size - 1, 0) * num_workers * world_size
-                        )
+                        # the extra rows of the pass, plus a short tail per rank
+                        max_drop = world_size - 1
+                        max_drop += max(min_batch_size - 1, 0) * world_size
                         self.assertLessEqual(sum(rows) - num_read, max_drop, msg)
+
+    def test_plan_rank_worker_intervals_uniform_sources_balance(self):
+        # dealing to the least loaded worker keeps the skew independent of the
+        # number of sources
+        for num_workers, num_sources in ((2, 2), (2, 40), (4, 4), (4, 40), (8, 40)):
+            _, _, worker_totals = self._rank_batches(
+                [13] * num_sources, 1, num_workers, 4, True, 0
+            )
+            self.assertLessEqual(max(worker_totals) - min(worker_totals), 2 * 4)
 
     @parameterized.expand(
         [
@@ -118,19 +137,26 @@ class DatasetUtilsTest(unittest.TestCase):
             [[8200], 1, 8, 1024, 0, 9, [8], 8200],
             [[8200], 1, 8, 1024, 2, 9, [8], 8200],
             [[8201], 1, 8, 1024, 2, 9, [9], 8201],
-            # extra row would buy a whole step on rank 0 -> drop it
+            # extra row would buy a whole step on one rank -> drop it
             [[33], 2, 4, 4, 0, 4, [], 32],
             # residue-1 tails are kept without min_batch_size
             [[34], 2, 4, 4, 0, 5, [1], 34],
             [[35], 2, 4, 4, 0, 5, [2], 35],
-            # ... and dropped together with the extras when min_batch_size=2
+            # ... and dropped together with the extra row when min_batch_size=2
             [[35], 2, 4, 4, 2, 4, [], 32],
             [[36], 2, 4, 4, 2, 5, [2], 36],
             # too few rows for one 2-row batch per rank -> empty pass
             [[3], 2, 4, 4, 2, 0, [], 0],
-            # tails of two sources (1000 + 25) sum to 1024 + 1 on one worker
+            # tails of two sources carry across the boundary: 2049 = 2 * 1024 + 1
             [[1000, 1049], 1, 1, 1024, 0, 3, [1], 2049],
             [[1000, 1049], 1, 1, 1024, 2, 2, [], 2048],
+            # sources are one stream: 300 rows are exactly three batches
+            [[150, 150], 1, 4, 100, 0, 3, [], 300],
+            [[6, 7], 1, 3, 4, 0, 4, [1], 13],
+            [[13, 13], 1, 2, 4, 0, 7, [2], 26],
+            # ranks split the stream too: 80 rows over 8 ranks lose nothing
+            [[33, 47], 8, 1, 10, 0, 1, [], 80],
+            [[33, 47], 8, 2, 10, 2, 1, [], 80],
             # drop_remainder: no partial batch at all
             [[8200], 1, 8, 1024, 1024, 8, [], 8192],
         ],
@@ -147,7 +173,7 @@ class DatasetUtilsTest(unittest.TestCase):
         rank0_tails,
         num_read,
     ):
-        per_rank, actual_read = self._rank_batches(
+        per_rank, actual_read, _ = self._rank_batches(
             rows, world_size, num_workers, batch_size, True, min_batch_size
         )
         self.assertEqual([len(b) for b in per_rank], [steps] * world_size)
@@ -155,9 +181,44 @@ class DatasetUtilsTest(unittest.TestCase):
         self.assertEqual(actual_read, num_read)
 
     def test_plan_rank_worker_intervals_predict_keeps_rows(self):
-        per_rank, num_read = self._rank_batches([35], 2, 4, 4, False, 0)
+        per_rank, num_read, _ = self._rank_batches([35], 2, 4, 4, False, 0)
         self.assertEqual([len(b) for b in per_rank], [5, 5])
         self.assertEqual(num_read, 35)
+
+    def test_calc_slice_intervals_two_ranks_two_workers(self):
+        # 35 rows: rank 0 owns [0, 18) with the extra row, rank 1 owns [18, 35);
+        # inside each rank the 4 full batches are dealt two per worker and the
+        # tail opens on worker 0, whose block is laid out last
+        expected = {0: [(8, 18)], 1: [(0, 8)], 2: [(26, 35)], 3: [(18, 26)]}
+        for worker_id, intervals in expected.items():
+            result = calc_slice_intervals(
+                [("/data/test.parquet", 35)],
+                worker_id=worker_id,
+                num_workers=4,
+                batch_size=4,
+                equalize_rank_steps=True,
+                world_size=2,
+            )
+            self.assertEqual(result, [intervals])
+
+    def test_calc_slice_intervals_two_ranks_resume(self):
+        # remaining [(100, 500), (600, 1000)] = 800 rows, 400 per rank; rank 1's
+        # share [400, 800) spans the gap between the two remaining intervals
+        checkpoint_state = {
+            "/data/test.parquet:0": 99,
+            "/data/test.parquet:500": 599,
+        }
+        result = calc_slice_intervals(
+            [("/data/test.parquet", 1000)],
+            worker_id=2,
+            num_workers=4,
+            batch_size=128,
+            equalize_rank_steps=True,
+            checkpoint_state=checkpoint_state,
+            world_size=2,
+        )
+        # rank 1, worker 0 gets two full batches -> logical [400, 656)
+        self.assertEqual(result, [[(600, 856)]])
 
     def test_calc_remaining_intervals_no_checkpoint(self):
         """Test remaining intervals when no checkpoint exists."""
@@ -244,7 +305,7 @@ class DatasetUtilsTest(unittest.TestCase):
             num_workers=1,
             batch_size=1,
             checkpoint_state=checkpoint_state,
-        )["/data/test.parquet"]
+        )[0]
         self.assertEqual(result, [(100, 500), (600, 1000)])
 
     def test_calc_slice_intervals_two_workers(self):
@@ -263,7 +324,7 @@ class DatasetUtilsTest(unittest.TestCase):
             num_workers=2,
             batch_size=1,
             checkpoint_state=checkpoint_state,
-        )["/data/test.parquet"]
+        )[0]
         # Worker 1 gets second half
         result_w1 = calc_slice_intervals(
             [("/data/test.parquet", 1000)],
@@ -271,7 +332,7 @@ class DatasetUtilsTest(unittest.TestCase):
             num_workers=2,
             batch_size=1,
             checkpoint_state=checkpoint_state,
-        )["/data/test.parquet"]
+        )[0]
 
         # Combined should cover all intervals
         total_rows_w0 = sum(end - start for start, end in result_w0)
@@ -288,7 +349,7 @@ class DatasetUtilsTest(unittest.TestCase):
             num_workers=2,
             batch_size=1,
             checkpoint_state=checkpoint_state,
-        )["/data/test.parquet"]
+        )[0]
         self.assertEqual(result, [])
 
     def test_calc_slice_intervals_topology_change(self):
@@ -309,7 +370,7 @@ class DatasetUtilsTest(unittest.TestCase):
                 num_workers=3,
                 batch_size=1,
                 checkpoint_state=checkpoint_state,
-            )["/data/test.parquet"]
+            )[0]
             for start, end in result:
                 total_rows += end - start
 

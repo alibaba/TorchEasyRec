@@ -517,21 +517,23 @@ class ParquetReaderTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # extra row would buy rank 0 a fifth step: dropped
-            [33, 4, 0, [4, 4], [[4] * 4, [4] * 4]],
-            # residue-1 tails stay when min_batch_size is 0
-            [35, 4, 0, [5, 5], [[4] * 4 + [2], [4] * 4 + [1]]],
+            # one worker per rank; extra row would buy one rank a fifth step: dropped
+            [33, 4, 0, 1, [[4] * 4, [4] * 4]],
+            # residue-1 tails stay when min_batch_size is 0 (rank 0 holds the extra)
+            [35, 4, 0, 1, [[4] * 4 + [2], [4] * 4 + [1]]],
             # ... and go together with the extra row when min_batch_size=2
-            [35, 4, 2, [4, 4], [[4] * 4, [4] * 4]],
+            [35, 4, 2, 1, [[4] * 4, [4] * 4]],
             # 8200 rows over two ranks: 4100 each, 4-row tails
-            [8200, 1024, 2, [5, 5], [[1024] * 4 + [4], [1024] * 4 + [4]]],
+            [8200, 1024, 2, 1, [[1024] * 4 + [4], [1024] * 4 + [4]]],
+            # two workers per rank: full batches dealt two per worker, tail last
+            [35, 4, 0, 2, [[4] * 4 + [2], [4] * 4 + [1]]],
         ],
         name_func=parameterized_name_func,
     )
     def test_parquet_reader_equal_steps(
-        self, num_rows, batch_size, min_batch_size, steps, sizes
+        self, num_rows, batch_size, min_batch_size, local_workers, sizes
     ):
-        def _reader_worker(rank, port, queue):
+        def _reader_worker(rank, port):
             os.environ["RANK"] = str(rank)
             os.environ["WORLD_SIZE"] = str(2)
             os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -543,11 +545,18 @@ class ParquetReaderTest(unittest.TestCase):
                 min_batch_size=min_batch_size,
                 equalize_rank_steps=True,
             )
-            sizes = [len(b["id_a"]) for b in reader.to_batches(rank, 2, world_size=2)]
+            rank_sizes = []
+            for w in range(local_workers):
+                rank_sizes += [
+                    len(b["id_a"])
+                    for b in reader.to_batches(
+                        rank * local_workers + w, 2 * local_workers, world_size=2
+                    )
+                ]
+            assert sorted(rank_sizes, reverse=True) == sizes[rank], rank_sizes
             # a tool slicing on its own terms, e.g. faiss_util.build_faiss_index,
             # still reads the whole table on every rank
             assert sum(len(b["id_a"]) for b in reader.to_batches()) == num_rows
-            queue.put((rank, sizes))
 
         t = pa.Table.from_arrays(
             [pa.array(["1"] * num_rows), pa.array([0] * num_rows)],
@@ -560,20 +569,15 @@ class ParquetReaderTest(unittest.TestCase):
         writer.close()
 
         port = misc_util.get_free_port()
-        queue = mp.Queue()
         procs = [
-            mp.Process(target=_reader_worker, args=(rank, port, queue))
-            for rank in range(2)
+            mp.Process(target=_reader_worker, args=(rank, port)) for rank in range(2)
         ]
         for p in procs:
             p.start()
-        results = dict(queue.get() for _ in procs)
         for i, p in enumerate(procs):
             p.join()
             if p.exitcode != 0:
                 raise RuntimeError(f"reader worker-{i} failed.")
-        self.assertEqual([len(results[r]) for r in range(2)], steps)
-        self.assertEqual([results[r] for r in range(2)], sizes)
 
 
 class ParquetWriterTest(unittest.TestCase):

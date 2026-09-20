@@ -551,8 +551,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
-        equalize_rank_steps (bool): make every rank yield the same batch sizes,
-            honored by readers that slice rows by count.
+        equalize_rank_steps (bool): make every rank yield the same number of
+            batches,            honored by readers that slice rows by count.
     """
 
     def __init__(

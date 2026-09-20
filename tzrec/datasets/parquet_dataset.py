@@ -161,7 +161,7 @@ class ParquetReader(BaseReader):
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
-        equalize_rank_steps (bool): make every rank yield the same batch sizes.
+        equalize_rank_steps (bool): make every rank yield the same number of batches.
     """
 
     def __init__(
@@ -257,7 +257,7 @@ class ParquetReader(BaseReader):
                 self._min_batch_size,
                 checkpoint_state=self._checkpoint_state,
                 world_size=world_size,
-            )[self._input_path]
+            )[0]
 
         def _combined_reader() -> Iterator[pa.RecordBatch]:
             for start, end in worker_intervals:

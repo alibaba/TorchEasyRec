@@ -87,13 +87,14 @@ class CsvReader(BaseReader):
         input_path (str): data input path.
         batch_size (int): batch size.
         selected_cols (list): selection column names.
-        drop_remainder (bool): drop last batch.
+        drop_remainder (bool): drop last batch, same as min_batch_size=batch_size.
         shuffle (bool): shuffle data or not.
         shuffle_buffer_size (int): buffer size for shuffle.
         column_names (list): set column name if csv without header.
         delimiter (str): csv delimiter.
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
+        min_batch_size (int): drop a final batch with fewer rows, 0 disables.
     """
 
     def __init__(

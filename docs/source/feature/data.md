@@ -33,6 +33,8 @@ data_config {
   - `odps://{project}/tables/{table_name}/{partition}`，多表按逗号分隔
   - 如果单表需要设置多个分区，可以用`&`简写，来分隔多个分区，`odps://{project}/tables/{table_name}/{partition1}&{partition2}`
 
+- 注意: 训练和评估时，OdpsDataset会保证每个`proc`读取相同的步数以避免同步训练卡住，为此全部输入合计最多有`nproc - 1`行样本不会被读取；预测时不受影响
+
 - 运行训练/评估/导出/预测等命令时
 
   - **本地环境**：
@@ -74,6 +76,8 @@ data_config {
   - `${PATH_TO_DATA_DIR}/*.parquet`
 
 - 注意: 如果每个parquet文件中的数据量不相等或文件数据小于worker数，ParquetDataset会自动重分配数据，来保证每个worker读取的数据量相等。但仍建议parquet文件数是 `nproc-per-node * nnodes * num_workers`的倍数，并且每个parquet文件的数据量基本相等，减少数据自动重分配的IO开销。
+
+- 注意: 训练和评估时，ParquetDataset会保证每个`proc`读取相同的步数以避免同步训练卡住，为此全部输入合计最多有`nproc - 1`行样本不会被读取；预测时不受影响
 
 ## CsvDataset
 
@@ -336,7 +340,6 @@ pipeline.global-job-parameters: |
 
 - 训练时，丢弃掉每个数据读取进程最后一个行数小于`min_batch_size`的batch，默认为0（不丢弃）；评估和预测时不生效
 - 使用BatchNorm等要求batch内至少2行样本的模型时，建议设置为2，避免样本表行数恰好使最后一个batch只剩1行导致训练失败
-- 注：OdpsDataset和ParquetDataset按行切分数据时，会保证每个`proc`（rank）读取相同的步数，以避免同步训练时卡住；为此每张表（或每个分区）最多有`nproc - 1`行样本不会被读取，预测时不受影响
 
 ### batch_cost_size
 

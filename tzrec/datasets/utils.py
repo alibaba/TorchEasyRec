@@ -826,24 +826,28 @@ def plan_rank_worker_intervals(
     batch_size: int,
     equalize_rank_steps: bool = False,
     min_batch_size: int = 0,
-) -> List[Tuple[int, int]]:
-    """Plan the row range one dataloader worker reads from every source.
+) -> List[List[Tuple[int, int]]]:
+    """Plan the row intervals one dataloader worker reads from every source.
 
     Sources (tables, sessions, or remaining checkpoint intervals) are consumed in
-    order by a single buffered reader per worker, so a worker's partial batches
-    are decided by its cumulative row count over all sources. The plan is
-    computed identically on every rank:
+    order by a single buffered reader per worker, so they are planned as one
+    stream, identically on every rank:
 
-    1. Every rank takes ``rows // world_size`` rows of each source, laid out
-       contiguously; the ``rows % world_size`` extra rows are read one each by
-       the lowest ranks.
-    2. Inside a rank, whole batches are spread over its workers (rotating the
-       first worker across sources) and the partial tail goes to the worker laid
-       out last, so a worker never manufactures a partial batch of its own.
-    3. A cumulative tail smaller than ``min_batch_size`` is dropped.
-    4. With ``equalize_rank_steps`` every rank yields the same batch-size list:
-       the extra rows landing on a worker are kept only when they cannot push
-       its last batch past ``batch_size``.
+    1. Ranks split the stream as if its rows were dealt round-robin: of the
+       first ``S`` rows rank ``r`` owns ``(S + W - 1 - r) // W``, laid out
+       contiguously inside every source, so every source stays spread over all
+       ranks (partition order is kept) while the rank totals are ``R // W`` or
+       ``R // W + 1``.
+    2. With ``equalize_rank_steps`` every rank yields the same number of batches:
+       a rank drops its extra row only when it would buy a step, that is when
+       ``(R // W) % batch_size == 0``. A final batch shorter than
+       ``min_batch_size`` is cut off the end of the stream, on every rank alike.
+    3. Inside a rank the stream is cut into whole batches plus one tail and dealt
+       to the workers source by source: the rows completing the open batch go to
+       its holder, whole batches are dealt as contiguous blocks to the least
+       loaded workers first, and the tail opens the next batch on the least
+       loaded worker. Only the holder ever buffers a partial batch, so a rank
+       ends a pass with at most one.
 
     Dropped rows are never read.
 
@@ -854,79 +858,86 @@ def plan_rank_worker_intervals(
         worker_id (int): dataloader worker id within the rank.
         num_workers (int): dataloader workers per rank.
         batch_size (int): batch size.
-        equalize_rank_steps (bool): make every rank yield the same batch sizes.
+        equalize_rank_steps (bool): make every rank yield the same number of batches.
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
 
     Returns:
-        (start, end) per source for this rank and worker, ``start == end`` when
-        the worker reads nothing from that source.
+        for every source, the (start, end) intervals this worker reads, in read
+        order; empty when the worker reads nothing from that source.
     """
     assert 0 < num_workers and 0 <= worker_id < num_workers
     assert 0 < world_size and 0 <= rank < world_size
     assert 0 <= min_batch_size <= batch_size
 
-    # chunk layout of each source inside a rank: (worker, rows) in layout order
-    layouts: List[List[Tuple[int, int]]] = []
-    last_workers: List[int] = []
-    cursor = 0
+    def _rows_before(num_rows: int, r: int) -> int:
+        # rows of ranks < r among the first num_rows rows of the stream
+        return num_rows // world_size * r + min(num_rows % world_size, r)
+
+    # this rank's (start, rows) in every source
+    shares: List[Tuple[int, int]] = []
+    prefix = 0
     for rows in source_rows:
-        full, tail = divmod(rows // world_size, batch_size)
-        order = [(cursor + i) % num_workers for i in range(num_workers)]
-        q, r = divmod(full, num_workers)
-        layout = [
-            (w, (q + 1 if i < r else q) * batch_size) for i, w in enumerate(order)
-        ]
-        layout[-1] = (order[-1], layout[-1][1] + tail)
-        layouts.append(layout)
-        last_workers.append(order[-1])
-        cursor = (cursor + full + (1 if tail else 0)) % num_workers
+        lo = _rows_before(prefix + rows, rank) - _rows_before(prefix, rank)
+        hi = _rows_before(prefix + rows, rank + 1) - _rows_before(prefix, rank + 1)
+        shares.append((lo, hi - lo))
+        prefix += rows
+    total = sum(rows for _, rows in shares)
+    base = prefix // world_size
 
-    totals = [0] * num_workers
-    for layout in layouts:
-        for w, cnt in layout:
-            totals[w] += cnt
-
-    # drop a cumulative tail shorter than min_batch_size from the end of the
-    # worker's stream, walking its chunks backwards
-    shrink: Dict[Tuple[int, int], int] = {}
-    for w in range(num_workers):
-        remain = totals[w] % batch_size
-        if 0 < remain < min_batch_size:
-            totals[w] -= remain
-            for t in reversed(range(len(source_rows))):
-                cnt = dict(layouts[t])[w]
-                take = min(cnt, remain)
-                if take:
-                    shrink[(t, w)] = take
-                    remain -= take
-                if remain == 0:
-                    break
-
-    extras = [rows % world_size for rows in source_rows]
+    cut = 0
     if equalize_rank_steps:
-        landing = [0] * num_workers
-        for t, e in enumerate(extras):
-            if e:
-                landing[last_workers[t]] += 1
-        for t, e in enumerate(extras):
-            w = last_workers[t]
-            remain = totals[w] % batch_size
-            if e and (remain == 0 or remain + landing[w] > batch_size):
-                extras[t] = 0
+        if base % batch_size == 0:
+            cut = total - base
+        elif base % batch_size < min_batch_size:
+            cut = total - base + base % batch_size
+    elif 0 < total % batch_size < min_batch_size:
+        cut = total % batch_size
+    for t in range(len(shares) - 1, -1, -1):
+        if cut == 0:
+            break
+        start, rows = shares[t]
+        take = min(rows, cut)
+        shares[t] = (start, rows - take)
+        cut -= take
 
-    result = []
-    for t, rows in enumerate(source_rows):
-        n = rows // world_size
-        pos = rank * n + min(rank, extras[t])
-        start = end = pos
-        for i, (w, cnt) in enumerate(layouts[t]):
-            if i == num_workers - 1 and rank < extras[t]:
-                cnt += 1
-            if w == worker_id:
-                start = pos
-                end = pos + cnt - shrink.get((t, w), 0)
-            pos += cnt
-        result.append((start, end))
+    result: List[List[Tuple[int, int]]] = []
+    loads = [0] * num_workers
+    holder, carry = 0, 0
+    for start, rows in shares:
+        chunks: List[Tuple[int, int, int]] = []
+        pos = 0
+        if carry and rows:
+            pos = min(batch_size - carry, rows)
+            chunks.append((holder, 0, pos))
+            loads[holder] += pos
+            carry = (carry + pos) % batch_size
+        full, tail = divmod(rows - pos, batch_size)
+        q, r = divmod(full, num_workers)
+        order = sorted(range(num_workers), key=lambda w: (loads[w], w))
+        counts = {w: (q + 1 if i < r else q) * batch_size for i, w in enumerate(order)}
+        for w in order:
+            loads[w] += counts[w]
+        # the tail opens the next batch on the least loaded worker, whose block
+        # is laid out last so that block and tail form one interval
+        owner = min(range(num_workers), key=lambda w: (loads[w], w))
+        for w in order:
+            if counts[w] and (w != owner or not tail):
+                chunks.append((w, pos, pos + counts[w]))
+                pos += counts[w]
+        if tail:
+            chunks.append((owner, pos, pos + counts[owner] + tail))
+            loads[owner] += tail
+            holder, carry = owner, tail
+
+        mine: List[Tuple[int, int]] = []
+        for w, lo, hi in chunks:
+            if w != worker_id:
+                continue
+            if mine and mine[-1][1] == start + lo:
+                mine[-1] = (mine[-1][0], start + hi)
+            else:
+                mine.append((start + lo, start + hi))
+        result.append(mine)
     return result
 
 
@@ -962,7 +973,7 @@ def calc_slice_intervals(
     min_batch_size: int = 0,
     checkpoint_state: Optional[Dict[str, int]] = None,
     world_size: Optional[int] = None,
-) -> Dict[str, List[Tuple[int, int]]]:
+) -> List[List[Tuple[int, int]]]:
     """Assign the row intervals of every source to one of ``num_workers`` slices.
 
     Without ``world_size`` every slice is an independent even share of the rows.
@@ -977,13 +988,14 @@ def calc_slice_intervals(
         worker_id (int): slice id.
         num_workers (int): slice number.
         batch_size (int): batch size.
-        equalize_rank_steps (bool): make every rank yield the same batch sizes.
+        equalize_rank_steps (bool): make every rank yield the same number of batches.
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
         checkpoint_state (dict): dict mapping source_id to max consumed row index.
         world_size (int, optional): number of ranks the slices are grouped into.
 
     Returns:
-        dict mapping source_id_prefix to the (start, end) intervals of this slice.
+        for every source, in the order of ``sources``, the (start, end) intervals
+        of this slice.
     """
     if world_size is None:
         rank, world_size, local_worker_id, local_workers = worker_id, num_workers, 0, 1
@@ -1008,10 +1020,22 @@ def calc_slice_intervals(
         equalize_rank_steps,
         min_batch_size,
     )
-    return {
-        prefix: _map_logical_range(intervals, start, end)
-        for (prefix, _), intervals, (start, end) in zip(sources, remaining, plan)
-    }
+    result = [
+        [
+            physical
+            for start, end in logical
+            for physical in _map_logical_range(intervals, start, end)
+        ]
+        for intervals, logical in zip(remaining, plan)
+    ]
+    num_rows = sum(end - start for intervals in result for start, end in intervals)
+    if equalize_rank_steps and min_batch_size < 2 and num_rows % batch_size == 1:
+        logger.warning(
+            "The final training batch of this pass has a single row; set "
+            "data_config.min_batch_size >= 2 if the model needs more than one "
+            "row per batch, e.g. with BatchNorm."
+        )
+    return result
 
 
 def remove_nullable(field_type: pa.DataType) -> pa.DataType:

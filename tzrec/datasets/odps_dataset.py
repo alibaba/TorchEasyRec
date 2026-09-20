@@ -15,6 +15,7 @@ import random
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import pyarrow as pa
@@ -414,7 +415,7 @@ class OdpsReader(BaseReader):
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
-        equalize_rank_steps (bool): make every rank yield the same batch sizes.
+        equalize_rank_steps (bool): make every rank yield the same number of batches.
     """
 
     def __init__(
@@ -453,6 +454,7 @@ class OdpsReader(BaseReader):
         self._proj_to_o = {}
         self._table_to_cli = {}
         self._input_to_sess = {}
+        self._sess_row_counts: Dict[str, int] = {}
         self._init_client()
 
         fields = []
@@ -520,11 +522,22 @@ class OdpsReader(BaseReader):
                 else:
                     session_ids.append(None)
 
+            # a session's record count is an immutable snapshot: fetch it once
+            # here instead of in every dataloader worker
+            sess_infos = [(x, None) for x in session_ids]
+            if int(os.environ.get("RANK", 0)) == 0:
+                sess_reqs = [SessionRequest(session_id=x) for x in session_ids]
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    record_counts = executor.map(
+                        _get_session_record_count, [client] * len(sess_reqs), sess_reqs
+                    )
+                sess_infos = list(zip(session_ids, record_counts))
             if self._pg is not None:
-                dist.broadcast_object_list(session_ids, group=self._pg)
+                dist.broadcast_object_list(sess_infos, group=self._pg)
             self._input_to_sess[input_path] = [
-                SessionRequest(session_id=x) for x in session_ids
+                SessionRequest(session_id=x) for x, _ in sess_infos
             ]
+            self._sess_row_counts.update(dict(sess_infos))
         # refresh session
         if int(os.environ.get("RANK", 0)) == 0:
             t = threading.Thread(
@@ -586,6 +599,7 @@ class OdpsReader(BaseReader):
                             " Please restart training from scratch."
                         )
                     restored_sess_reqs.append(sess_req)
+                    self._sess_row_counts[session_id] = resp.record_count
                 except ODPSError as e:
                     raise RuntimeError(
                         f"Cannot resume from checkpoint: ODPS session {session_id} "
@@ -629,12 +643,12 @@ class OdpsReader(BaseReader):
                 sources.append(
                     (
                         f"{input_path}#{sess_req.session_id}",
-                        _get_session_record_count(client, sess_req),
+                        self._sess_row_counts[sess_req.session_id],
                         client,
                         sess_req,
                     )
                 )
-        intervals = calc_slice_intervals(
+        plan = calc_slice_intervals(
             [(prefix, record_count) for prefix, record_count, _, _ in sources],
             worker_id,
             num_workers,
@@ -646,8 +660,8 @@ class OdpsReader(BaseReader):
         )
 
         def _combined_reader() -> Iterator[pa.RecordBatch]:
-            for prefix, _, client, sess_req in sources:
-                for start, end in intervals[prefix]:
+            for (prefix, _, client, sess_req), intervals in zip(sources, plan):
+                for start, end in intervals:
                     if start >= end:
                         continue
                     yield from _reader_iter(
