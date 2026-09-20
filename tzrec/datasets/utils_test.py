@@ -66,6 +66,8 @@ class DatasetUtilsTest(unittest.TestCase):
                 )
                 total = 0
                 for t, source_intervals in enumerate(intervals):
+                    # one contiguous chunk per worker and source
+                    assert len(source_intervals) <= 1, source_intervals
                     for start, end in source_intervals:
                         assert 0 <= start < end <= rows[t]
                         assert seen[t].isdisjoint(range(start, end))
@@ -278,6 +280,16 @@ class DatasetUtilsTest(unittest.TestCase):
         # No remaining intervals
         self.assertEqual(result, [])
 
+    def test_calc_remaining_intervals_unstarted_leading_range(self):
+        """A range with no key yet was never read, even before the first key."""
+        checkpoint_state = {"/data/test.parquet:4": 7}
+        result = calc_remaining_intervals(
+            checkpoint_state=checkpoint_state,
+            input_path="/data/test.parquet",
+            total_rows=8,
+        )
+        self.assertEqual(result, [(0, 4)])
+
     def test_calc_remaining_intervals_unrelated_path(self):
         """Test remaining intervals when checkpoint is for different path."""
         checkpoint_state = {"/data/other.parquet:0": 499}
@@ -348,6 +360,30 @@ class DatasetUtilsTest(unittest.TestCase):
         ]
         self._assert_tiles([s[0] for s in slices], [(400, 1000)])
         self._assert_tiles([s[1] for s in slices], [(0, 500)])
+
+    def test_calc_slice_intervals_worker_ahead_in_next_source(self):
+        """Rows of a source chunk nobody has started yet survive a resume.
+
+        Sources [12, 8], 2 workers, batch 4: worker 1 has one batch in source 0
+        and reaches source 1 first, so the checkpoint keys source1:4 but not
+        source1:0.
+        """
+        sources = [("source0", 12), ("source1", 8)]
+        checkpoint_state = {"source0:0": 7, "source0:8": 11, "source1:4": 7}
+        slices = [
+            calc_slice_intervals(
+                sources,
+                worker_id=worker_id,
+                num_workers=2,
+                batch_size=4,
+                equalize_rank_steps=True,
+                checkpoint_state=checkpoint_state,
+                world_size=1,
+            )
+            for worker_id in range(2)
+        ]
+        self._assert_tiles([s[0] for s in slices], [])
+        self._assert_tiles([s[1] for s in slices], [(0, 4)])
 
     def test_calc_slice_intervals_empty_intervals(self):
         """Test calc_slice_intervals with empty intervals (fully consumed)."""

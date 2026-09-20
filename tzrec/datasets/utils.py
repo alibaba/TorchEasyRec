@@ -800,8 +800,11 @@ def calc_remaining_intervals(
     # Sort by start to infer original ranges
     entries.sort(key=lambda x: x[0])
 
-    # Calculate remaining intervals
+    # Calculate remaining intervals; rows before the first keyed range were
+    # never read, a consumed range always leaves its own key
     remaining = []
+    if entries[0][0] > 0:
+        remaining.append((0, entries[0][0]))
     num_entries = len(entries)
     for i, (_, consumed) in enumerate(entries):
         # Infer the end of this worker's range
