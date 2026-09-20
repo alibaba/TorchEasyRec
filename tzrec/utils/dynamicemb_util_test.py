@@ -12,10 +12,13 @@
 import unittest
 from unittest import mock
 
-from parameterized import parameterized
+import torch
+from parameterized import param, parameterized
+from torchrec.optim import optimizers, rowwise_adagrad
 
+from tzrec.optim.optimizer import FTRL
 from tzrec.utils import dynamicemb_util
-from tzrec.utils.test_util import mark_ci_scope
+from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
 
 
 @unittest.skipUnless(
@@ -144,6 +147,32 @@ class StorageFormulaTest(unittest.TestCase):
                 cache_ratio=0.5, is_hbm=True, caching=caching, only_values=True
             )
             self.assertGreater(with_meta, without_meta)
+
+
+class OptimizerMultiplerTest(unittest.TestCase):
+    """Per-element optimizer state width used to size dynamicemb values."""
+
+    @parameterized.expand(
+        [
+            param("untrained", optimizer_class=None, expected=0.0),
+            param("sgd", optimizer_class=optimizers.SGD, expected=0),
+            param("adam", optimizer_class=optimizers.Adam, expected=2),
+            param(
+                "rowwise_adagrad",
+                optimizer_class=rowwise_adagrad.RowWiseAdagrad,
+                expected=1 / 16,
+            ),
+            param("ftrl", optimizer_class=FTRL, expected=2.0),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_multipler(self, _name, optimizer_class, expected):
+        self.assertAlmostEqual(
+            dynamicemb_util._get_optimizer_multipler(
+                optimizer_class, torch.Size([1024, 16])
+            ),
+            expected,
+        )
 
 
 if __name__ == "__main__":

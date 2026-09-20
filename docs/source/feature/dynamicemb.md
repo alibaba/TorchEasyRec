@@ -6,12 +6,14 @@ cu126/cu129/cu130 镜像已预装 dynamicemb，其它环境需先安装如下whl
 
 ```bash
 # DEVICE 可选: cu126/cu129/cu130 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb==0.1.0+20260911.5948173.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+pip install dynamicemb==0.1.0+20260920.9643985.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
 ```
 
 注：同一个 FeatureGroup 中若存在多个配置了 DynamicEmbedding 的特征，底层 dynamicemb 会自动将这些表融合到同一份存储里（table fusion），共享 cache/admission counter，降低显存占用并减少内存碎片，无需额外配置。
 
 注：配置了 DynamicEmbedding 的模型导出时需设置环境变量 `USE_DISTRIBUTED_EMBEDDING=1`，使用分布式 embedding 导出模式，详见[模型导出](../usage/export.md)的环境变量章节。
+
+注：DynamicEmbedding 表额外支持 `ftrl_optimizer`（普通 Embedding 表不支持），配置方式见[优化器](../models/optimizer.md)文档。
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
 

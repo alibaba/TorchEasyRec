@@ -45,7 +45,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
-from tzrec.optim.optimizer import sparse_init_accumulator_value
+from tzrec.optim.optimizer import FTRL, sparse_init_accumulator_value
 from tzrec.protos import feature_pb2
 from tzrec.utils.logging_util import logger
 
@@ -205,6 +205,28 @@ def _log_dynamicemb_table_plan(
         f"local_hbm={hbm_gib:.3f}GiB "
         f"local_dram={dram_gib:.3f}GiB"
     )
+
+
+def _get_optimizer_multipler(
+    optimizer_class: Optional[Type[torch.optim.Optimizer]], shape: torch.Size
+) -> float:
+    """Optimizer state size per embedding element, including dynamicemb's FTRL.
+
+    torchrec's table maps any class it does not know to 1, and FTRL keeps a
+    linear and an accumulator term per element, so its rows are ``2 * dim`` wide
+    like Adam's.
+
+    Args:
+        optimizer_class (type, optional): in-backward optimizer class of the
+            table, None when the table is not trained.
+        shape (torch.Size): unsharded table shape, used by row-wise optimizers.
+
+    Returns:
+        the multiplier applied to the embedding width.
+    """
+    if optimizer_class is FTRL:
+        return 2.0
+    return shard_estimators._get_optimizer_multipler(optimizer_class, shape)
 
 
 has_dynamicemb = False
@@ -559,7 +581,7 @@ if has_dynamicemb:
                 # calc local_hbm_for_values
                 tensor = sharding_option.tensor
                 optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
-                optimizer_multipler = shard_estimators._get_optimizer_multipler(
+                optimizer_multipler = _get_optimizer_multipler(
                     optimizer_class, tensor.shape
                 )
                 dynamicemb_options.training = optimizer_class is not None
@@ -605,6 +627,23 @@ if has_dynamicemb:
                     ddr_bytes=int(shards[0].storage.ddr),
                 )
             else:
+                # A data_parallel table gets the dense kernel, which ignores the
+                # fused params and is updated by the dense optimizer, so only a
+                # fused TBE actually has to honor the sparse optimizer.
+                if (
+                    getattr(sharding_option.tensor, "_optimizer_classes", [None])[0]
+                    is FTRL
+                    and sharding_option.compute_kernel
+                    != EmbeddingComputeKernel.DENSE.value
+                ):
+                    raise ValueError(
+                        "sparse ftrl_optimizer only supports dynamicemb embedding "
+                        "tables, but table["
+                        f"{sharding_option.path}.{sharding_option.name}] is planned "
+                        f"with compute_kernel[{sharding_option.compute_kernel}]. "
+                        "Set `dynamicemb { }` on every sparse feature, or use "
+                        "another sparse optimizer."
+                    )
                 module_plan[sharding_option.name] = ParameterSharding(
                     sharding_spec=sharding_spec,
                     sharding_type=sharding_type,
@@ -727,7 +766,7 @@ if has_dynamicemb:
         optimizer_multipler = 0.0
         optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
         if not is_inference:
-            optimizer_multipler = shard_estimators._get_optimizer_multipler(
+            optimizer_multipler = _get_optimizer_multipler(
                 optimizer_class, tensor.shape
             )
 
