@@ -617,7 +617,7 @@ class OdpsReader(BaseReader):
             self._restore_sessions(state)
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         # (source_id_prefix, record_count, client, session) in read order
@@ -642,6 +642,7 @@ class OdpsReader(BaseReader):
             self._equalize_rank_steps,
             self._min_batch_size,
             checkpoint_state=self._checkpoint_state,
+            world_size=world_size,
         )
 
         def _combined_reader() -> Iterator[pa.RecordBatch]:

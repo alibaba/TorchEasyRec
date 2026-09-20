@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import glob
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -818,12 +817,6 @@ def calc_remaining_intervals(
     return remaining if remaining else []
 
 
-def _get_world_size() -> int:
-    if dist.is_initialized():
-        return dist.get_world_size()
-    return int(os.environ.get("WORLD_SIZE", 1))
-
-
 def plan_rank_worker_intervals(
     source_rows: List[int],
     rank: int,
@@ -968,32 +961,38 @@ def calc_slice_intervals(
     equalize_rank_steps: bool = False,
     min_batch_size: int = 0,
     checkpoint_state: Optional[Dict[str, int]] = None,
+    world_size: Optional[int] = None,
 ) -> Dict[str, List[Tuple[int, int]]]:
-    """Assign the row intervals of every source to one global dataloader worker.
+    """Assign the row intervals of every source to one of ``num_workers`` slices.
 
-    ``worker_id`` and ``num_workers`` are the rank-major global ids from
-    ``BaseDataset.get_worker_info``. The rows each source still has after the
-    checkpoint state is applied are planned per rank and worker by
-    ``plan_rank_worker_intervals`` and mapped back onto the remaining intervals.
+    Without ``world_size`` every slice is an independent even share of the rows.
+    With ``world_size`` the slices are the rank-major dataloader workers of
+    ``BaseDataset.get_worker_info``, ``num_workers // world_size`` per rank, and
+    the rows each source still has after the checkpoint state is applied are
+    planned per rank and worker by ``plan_rank_worker_intervals`` and mapped back
+    onto the remaining intervals.
 
     Args:
         sources (list): (source_id_prefix, total_rows) in read order.
-        worker_id (int): global worker id.
-        num_workers (int): total worker number over all ranks.
+        worker_id (int): slice id.
+        num_workers (int): slice number.
         batch_size (int): batch size.
         equalize_rank_steps (bool): make every rank yield the same batch sizes.
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
         checkpoint_state (dict): dict mapping source_id to max consumed row index.
+        world_size (int, optional): number of ranks the slices are grouped into.
 
     Returns:
-        dict mapping source_id_prefix to the (start, end) intervals of this worker.
+        dict mapping source_id_prefix to the (start, end) intervals of this slice.
     """
-    world_size = _get_world_size()
-    assert num_workers % world_size == 0, (
-        f"num_workers[{num_workers}] must be a multiple of world_size[{world_size}]"
-    )
-    local_workers = num_workers // world_size
-    rank, local_worker_id = divmod(worker_id, local_workers)
+    if world_size is None:
+        rank, world_size, local_worker_id, local_workers = worker_id, num_workers, 0, 1
+    else:
+        assert num_workers % world_size == 0, (
+            f"num_workers[{num_workers}] must be a multiple of world_size[{world_size}]"
+        )
+        local_workers = num_workers // world_size
+        rank, local_worker_id = divmod(worker_id, local_workers)
 
     remaining = [
         calc_remaining_intervals(checkpoint_state, prefix, total_rows)

@@ -537,7 +537,11 @@ class ParquetReaderTest(unittest.TestCase):
                 min_batch_size=min_batch_size,
                 equalize_rank_steps=True,
             )
-            queue.put((rank, [len(b["id_a"]) for b in reader.to_batches(rank, 2)]))
+            sizes = [len(b["id_a"]) for b in reader.to_batches(rank, 2, world_size=2)]
+            # a tool slicing on its own terms, e.g. faiss_util.build_faiss_index,
+            # still reads the whole table on every rank
+            assert sum(len(b["id_a"]) for b in reader.to_batches()) == num_rows
+            queue.put((rank, sizes))
 
         t = pa.Table.from_arrays(
             [pa.array(["1"] * num_rows), pa.array([0] * num_rows)],

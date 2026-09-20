@@ -154,7 +154,7 @@ class CsvReader(BaseReader):
         return self._schema
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         input_files = self._input_files[worker_id::num_workers]

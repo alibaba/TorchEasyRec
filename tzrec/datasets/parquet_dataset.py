@@ -240,7 +240,7 @@ class ParquetReader(BaseReader):
         return self._schema
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         if len(self._input_files) == 0:
@@ -256,6 +256,7 @@ class ParquetReader(BaseReader):
                 self._equalize_rank_steps,
                 self._min_batch_size,
                 checkpoint_state=self._checkpoint_state,
+                world_size=world_size,
             )[self._input_path]
 
         def _combined_reader() -> Iterator[pa.RecordBatch]:

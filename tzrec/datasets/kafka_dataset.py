@@ -376,6 +376,7 @@ class KafkaReader(BaseReader):
         Args:
             worker_id: Worker ID
             num_workers: Total number of workers
+            world_size: Unused, partitions are split by global worker id
 
         Yields:
             PyArrow RecordBatch
@@ -627,13 +628,14 @@ class KafkaReader(BaseReader):
                     logger.warning(f"consumer.close() failed: {e}")
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator.
 
         Args:
             worker_id: Worker ID
             num_workers: Total number of workers
+            world_size: Unused, partitions are split by global worker id
 
         Yields:
             Dict of column name to PyArrow Array

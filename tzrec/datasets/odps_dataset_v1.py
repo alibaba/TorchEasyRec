@@ -176,7 +176,7 @@ class OdpsReaderV1(BaseReader):
             yield data
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         for input_path in self._input_path.split(","):

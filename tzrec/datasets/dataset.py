@@ -300,8 +300,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         assert self._input_fields is not None
         return self._input_fields
 
-    def get_worker_info(self) -> Tuple[int, int]:
-        """Get multiprocessing dataloader worker id and worker number."""
+    def get_worker_info(self) -> Tuple[int, int, int]:
+        """Get global dataloader worker id, worker number and world size."""
         worker_info = get_worker_info()
         if worker_info is None:
             worker_id = 0
@@ -317,7 +317,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             rank = 0
             world_size = 1
 
-        return rank * num_workers + worker_id, num_workers * world_size
+        return rank * num_workers + worker_id, num_workers * world_size, world_size
 
     def load_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
         """Set checkpoint state for resume.
@@ -332,8 +332,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._sampler is not None and not self._sampler_inited:
             self._sampler.init()
             self._sampler_inited = True
-        worker_id, num_workers = self.get_worker_info()
-        for input_data in self._reader.to_batches(worker_id, num_workers):
+        worker_id, num_workers, world_size = self.get_worker_info()
+        for input_data in self._reader.to_batches(worker_id, num_workers, world_size):
             yield self._build_batch(input_data)
         # pass complete: clear the resume state so later epochs do full passes
         self._reader.load_state_dict(None)
@@ -601,9 +601,17 @@ class BaseReader(metaclass=_reader_meta_cls):
         raise NotImplementedError
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
-        """Get batch iterator."""
+        """Get batch iterator of one of ``num_workers`` slices of the data.
+
+        Args:
+            worker_id (int): slice id.
+            num_workers (int): slice number; without ``world_size`` every slice
+                is an independent even share.
+            world_size (int, optional): set by the dataset when the slices are
+                the rank-major dataloader workers of ``world_size`` ranks.
+        """
         raise NotImplementedError
 
     def _slice_buff_data(
