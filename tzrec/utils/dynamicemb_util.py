@@ -238,6 +238,7 @@ try:
         DynamicEmbScoreStrategy,
         FrequencyAdmissionStrategy,
         KVCounter,
+        ProbabilisticAdmissionStrategy,
         align_to_table_size,
     )
     from dynamicemb.dynamicemb_config import DynamicEmbKernel
@@ -380,30 +381,35 @@ def build_dynamicemb_constraints(
     if dynamicemb_cfg.HasField("init_capacity_per_rank"):
         init_capacity = align_to_table_size(dynamicemb_cfg.init_capacity_per_rank)
 
-    admission_counter = None
     admit_strategy = None
     admission_strategy_type = dynamicemb_cfg.WhichOneof("admission_strategy")
     if admission_strategy_type is not None:
+        admission_strategy_cfg = getattr(dynamicemb_cfg, admission_strategy_type)
+        non_admitted_initializer_args = _build_dynamicemb_initializer(
+            admission_strategy_cfg.initializer_args,
+            num_embeddings,
+            embedding_dim,
+            is_eval=True,
+        )
         if admission_strategy_type == "frequency_admission_strategy":
-            admission_strategy_cfg = getattr(dynamicemb_cfg, admission_strategy_type)
             counter_capacity = (
                 admission_strategy_cfg.counter_capacity
                 if admission_strategy_cfg.HasField("counter_capacity")
                 else num_embeddings
             )
             world_size = int(os.environ.get("WORLD_SIZE", 1))
-            admission_counter = KVCounter(
-                capacity=align_to_table_size(int(counter_capacity / world_size)),
-                bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
-            )
             admit_strategy = FrequencyAdmissionStrategy(
                 threshold=admission_strategy_cfg.threshold,
-                initializer_args=_build_dynamicemb_initializer(
-                    admission_strategy_cfg.initializer_args,
-                    num_embeddings,
-                    embedding_dim,
-                    is_eval=True,
+                counter=KVCounter(
+                    capacity=align_to_table_size(int(counter_capacity / world_size)),
+                    bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
                 ),
+                initializer_args=non_admitted_initializer_args,
+            )
+        elif admission_strategy_type == "probabilistic_admission_strategy":
+            admit_strategy = ProbabilisticAdmissionStrategy(
+                probability=admission_strategy_cfg.probability,
+                initializer_args=non_admitted_initializer_args,
             )
         else:
             raise ValueError(f"Unknown AdmissionStrategy: {admission_strategy_type}")
@@ -429,7 +435,6 @@ def build_dynamicemb_constraints(
         ),
         score_strategy=score_strategy,
         admit_strategy=admit_strategy,
-        admission_counter=admission_counter,
         **demb_opt_kwargs,
     )
 
@@ -884,17 +889,18 @@ if has_dynamicemb:
                 caching=bool(getattr(dynamicemb_options, "caching", False)),
             )
         )
+        # The counter belongs to the strategy that counts with it; a
+        # probabilistic admitter keeps no state, so it costs nothing.
         counter_hbm_specific_size = 0
-        if dynamicemb_options.admission_counter is not None:
-            counter = dynamicemb_options.admission_counter
-            if isinstance(counter, KVCounter):
-                counter_hbm_specific_size = (
-                    _calculate_dynamicemb_table_storage_specific_size(
-                        [counter.capacity, 0],
-                        element_size=0,  # counter does not contain embedding value
-                        bucket_capacity=counter.bucket_capacity,
-                    )
+        if isinstance(dynamicemb_options.admit_strategy, FrequencyAdmissionStrategy):
+            counter = dynamicemb_options.admit_strategy.counter
+            counter_hbm_specific_size = (
+                _calculate_dynamicemb_table_storage_specific_size(
+                    [counter.capacity, 0],
+                    element_size=0,  # counter does not contain embedding value
+                    bucket_capacity=counter.bucket_capacity,
                 )
+            )
 
         hbm_sizes: List[int] = [
             (

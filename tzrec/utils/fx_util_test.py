@@ -11,10 +11,10 @@
 
 """Unit tests for ``tzrec.utils.fx_util``.
 
-``fx_avg_batch_size`` was promoted here from a ``DlrmHSTU`` private helper
-when ``listwise_rank_loss`` was generalized to ``RankModel``, so every rank
-model now consumes it.  Its distributed branch (``dist.all_reduce``) is
-unreachable from single-process unittests, so it is pinned through the same
+``fx_avg_counts`` carries the local/global rescaling factors behind
+``enable_global_average_loss``, and ``DlrmHSTU.loss`` is its only caller.
+Its distributed branch (``dist.all_reduce``) is unreachable from
+single-process unittests, so it is pinned through the same
 ``mock.patch.object`` pattern as ``tzrec.utils.predict_util_test``.
 """
 
@@ -34,7 +34,7 @@ from torchrec.modules.mc_modules import _mcc_lazy_init_inplace
 from torchrec.quant.embedding_modules import _permute_kjt
 
 from tzrec.utils import fx_util
-from tzrec.utils.fx_util import fx_avg_batch_size
+from tzrec.utils.fx_util import fx_avg_counts
 from tzrec.utils.test_util import (
     gpu_unavailable,
     make_test_dir,
@@ -214,44 +214,45 @@ class KJTPermutationTest(unittest.TestCase):
             torch.testing.assert_close(result, reference)
 
 
-class FxAvgBatchSizeTest(unittest.TestCase):
-    """The local/global rescaling factor of ``enable_global_average_loss``."""
+class FxAvgCountsTest(unittest.TestCase):
+    """The local/global rescaling factors of ``enable_global_average_loss``."""
 
-    def test_single_process_returns_local_size(self) -> None:
-        """Without an initialized process group the local size is the answer."""
+    def test_single_process_returns_local_counts(self) -> None:
+        """Without an initialized process group the local counts are the answer."""
         if dist.is_initialized():
             self.skipTest("dist already initialized in this process")
-        x = torch.zeros(7)
-        out = fx_avg_batch_size(x)
-        self.assertEqual(out.item(), 7.0)
+        lengths = torch.tensor([3, 0, 4], dtype=torch.int64)
+        out = fx_avg_counts(lengths)
+        self.assertEqual(out.tolist(), [3.0, 7.0])
         self.assertEqual(out.dtype, torch.float32)
-        self.assertEqual(out.device, x.device)
+        self.assertEqual(out.device, lengths.device)
 
     def test_empty_shard_is_reported_verbatim(self) -> None:
-        """A rank with an empty shard contributes 0 to the average."""
-        out = fx_avg_batch_size(torch.zeros(0))
-        self.assertEqual(out.item(), 0.0)
+        """A rank with an empty shard contributes 0 to both averages."""
+        out = fx_avg_counts(torch.zeros(0, dtype=torch.int64))
+        self.assertEqual(out.tolist(), [0.0, 0.0])
 
-    def test_dist_branch_averages_across_ranks(self) -> None:
-        """The distributed branch must reduce with AVG semantics.
+    def test_dist_branch_averages_both_axes_in_one_reduction(self) -> None:
+        """The distributed branch must reduce both counts with AVG semantics.
 
-        Two ranks with ragged shard sizes 3 and 5 must both read 4.0 as
-        the global average; a SUM reduction would read 8.0 and double the
-        ``local / global`` loss rescaling factor -- silently, because the
-        loss stays finite and the sign stays correct.
+        Two ranks holding (3 requests, 10 candidates) and (5, 30) must read
+        (4.0, 20.0). A SUM reduction would read double and halve the
+        ``local / global`` loss rescaling factors -- silently, because the
+        loss stays finite and the sign stays correct. The two axes share one
+        collective, so a per-axis reduction would show up as a second call.
         """
-        x = torch.zeros(3)
+        lengths = torch.tensor([4, 6], dtype=torch.int64)
+        peer = torch.tensor([5.0, 30.0])
         with mock.patch.object(fx_util, "dist") as dist_mock:
             dist_mock.is_initialized.return_value = True
             # Hand the mock the real enum so the recorded call is assertable.
             dist_mock.ReduceOp.AVG = dist.ReduceOp.AVG
-            # Emulate ReduceOp.AVG against a peer that owns 5 rows.
-            dist_mock.all_reduce.side_effect = lambda outcome, op: outcome.fill_(
-                (outcome.item() + 5) / 2
+            dist_mock.all_reduce.side_effect = lambda outcome, op: outcome.copy_(
+                (outcome + peer) / 2
             )
-            out = fx_avg_batch_size(x)
+            out = fx_avg_counts(lengths)
 
-        self.assertEqual(out.item(), 4.0)
+        self.assertEqual(out.tolist(), [3.5, 20.0])
         dist_mock.all_reduce.assert_called_once()
         self.assertIs(dist_mock.all_reduce.call_args.kwargs["op"], dist.ReduceOp.AVG)
         # The reduced buffer is the returned tensor itself (in place).

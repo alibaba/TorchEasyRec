@@ -12,7 +12,6 @@
 """Per-request list-wise InfoNCE over a jagged candidate list (paper 2.5)."""
 
 import math
-from typing import Optional
 
 import torch
 from torch import nn
@@ -88,7 +87,6 @@ class ListwiseRankLoss(_Loss):
         logits: torch.Tensor,
         labels: torch.Tensor,
         lengths: torch.Tensor,
-        loss_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute the list-wise InfoNCE term.
 
@@ -102,8 +100,6 @@ class ListwiseRankLoss(_Loss):
                 non-zero value counts as a positive.
             lengths (torch.Tensor): ``(B,)`` candidates per request,
                 summing to ``total``.
-            loss_weight (torch.Tensor, optional): scalar multiplier, used
-                to turn the local-batch mean into a global-batch mean.
 
         Returns:
             torch.Tensor: scalar loss -- the mean of per-request losses over
@@ -138,14 +134,11 @@ class ListwiseRankLoss(_Loss):
         per_request = torch.nan_to_num(per_request, nan=0.0)
 
         # Divide by the *total* request count, not the valid count: the
-        # `enable_global_average_loss` rescale in ``RankModel._loss_impl``
+        # `enable_global_average_loss` rescale in ``DlrmHSTU.loss``
         # divides by the total count too, so the two denominators agree
         # and DDP's cross-rank gradient average stays an unbiased global
         # mean even when the masked-out fraction differs across ranks.
         # The max() keeps an empty (zero-request) batch at 0 instead of
         # the NaN of 0/0, which would poison every parameter through the
         # all-reduced gradient.
-        loss = (per_request * valid).sum() / fx_size0_max1(lengths)
-        if loss_weight is not None:
-            loss = loss * loss_weight
-        return loss
+        return (per_request * valid).sum() / fx_size0_max1(lengths)

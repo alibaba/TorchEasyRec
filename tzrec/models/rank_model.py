@@ -36,9 +36,6 @@ from tzrec.protos import model_pb2
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.metric_pb2 import MetricConfig, TrainMetricConfig
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_avg_batch_size
-
-torch.fx.wrap(fx_avg_batch_size)
 
 
 @torch.fx.wrap
@@ -283,21 +280,10 @@ class RankModel(BaseModel):
                     "(predictions[TARGET_REPEAT_INTERLEAVE_KEY]), which "
                     "this model does not publish."
                 )
-            # The module averages over this rank's request count; rescale
-            # by the local/global request-count ratio so that DDP's
-            # cross-rank gradient average comes out as a global mean on a
-            # ragged batch.  Both denominators are total counts, so the
-            # average stays unbiased even when the masked-out fraction
-            # differs across ranks.
-            global_avg_weight = None
-            if getattr(self._base_model_config, "enable_global_average_loss", False):
-                global_avg_weight = lengths.size(0) / fx_avg_batch_size(lengths)
-            losses[loss_name] = self._loss_modules[loss_name](
-                pred, label, lengths, global_avg_weight
-            )
-            # The caller's per-candidate loss_weight does not apply here: it
-            # is sized off the candidate count, not the request count.
-            loss_weight = None
+            # NOTE: this loss is a mean over requests, so a loss_weight
+            # reaching the tail below must be request-level too, not the
+            # per-candidate weight the sibling losses take.
+            losses[loss_name] = self._loss_modules[loss_name](pred, label, lengths)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
         if loss_weight is not None:

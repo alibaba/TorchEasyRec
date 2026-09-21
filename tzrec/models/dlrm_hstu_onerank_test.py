@@ -20,8 +20,10 @@ as the reference.
 
 import unittest
 from typing import List, Optional
+from unittest import mock
 
 import torch
+import torch.distributed as dist
 from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 from torchrec import JaggedTensor, KeyedJaggedTensor
@@ -42,6 +44,7 @@ from tzrec.protos import (
     tower_pb2,
 )
 from tzrec.protos.models import multi_task_rank_pb2
+from tzrec.utils import fx_util
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
@@ -646,6 +649,70 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             torch.testing.assert_close(
                 scaled_losses[f"binary_cross_entropy_{task_name}"],
                 base_losses[f"binary_cross_entropy_{task_name}"],
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_global_average_loss_rescales_each_term_by_its_own_denominator(
+        self,
+    ) -> None:
+        """Each loss family takes its own global-average-loss factor.
+
+        The list-wise term is a mean over requests and the point-wise terms
+        are means over candidates, so each must be rescaled by the ratio of
+        the count it divided by -- mixing them up leaves the loss finite and
+        the sign correct, so only a numeric check catches it.  Both counts
+        are ragged across ranks under cost-based batching.
+        """
+        device = torch.device("cuda")
+        base = _build_model(device=device, listwise_loss=_listwise_loss_cfg())
+        scaled = _build_model(
+            device=device,
+            listwise_loss=_listwise_loss_cfg(),
+            enable_global_average_loss=True,
+        )
+        scaled.load_state_dict(base.state_dict())
+        for model in (base, scaled):
+            model.set_kernel(Kernel.PYTORCH)
+            model.init_loss()
+            model.eval()
+
+        batch = _build_batch(device=device)
+        with torch.no_grad():
+            predictions = base.predict(batch)
+            base_losses = base.loss(predictions, batch)
+            # Emulate one peer rank holding 6 requests / 2 candidates against
+            # this rank's 2 / 6, so the two ratios differ and neither is 1.0.
+            peer = torch.tensor([6.0, 2.0], device=device)
+            with mock.patch.object(fx_util, "dist") as dist_mock:
+                dist_mock.is_initialized.return_value = True
+                dist_mock.ReduceOp.AVG = dist.ReduceOp.AVG
+                dist_mock.all_reduce.side_effect = lambda outcome, op: outcome.copy_(
+                    (outcome + peer) / 2
+                )
+                scaled_losses = scaled.loss(predictions, batch)
+                # The flag-off model must take no factor even with a live
+                # process group, which pins the `global_average` gate: every
+                # single-process factor is 1.0, so nothing else would catch
+                # the gate being dropped.
+                gated_losses = base.loss(predictions, batch)
+
+        # Both axes travel in one reduction, whatever the task or loss count.
+        self.assertEqual(dist_mock.all_reduce.call_count, 1)
+
+        request_ratio = len(_NUM_TARGETS) / ((len(_NUM_TARGETS) + 6.0) / 2)
+        candidate_ratio = _TOTAL_TARGETS / ((_TOTAL_TARGETS + 2.0) / 2)
+        self.assertNotAlmostEqual(request_ratio, candidate_ratio)
+
+        for name, value in base_losses.items():
+            torch.testing.assert_close(gated_losses[name], value, msg=name)
+
+        key = "listwise_rank_loss_is_click"
+        self.assertGreater(base_losses[key].item(), 0.0)
+        torch.testing.assert_close(scaled_losses[key], base_losses[key] * request_ratio)
+        for task_name in _TASK_NAMES:
+            pointwise = f"binary_cross_entropy_{task_name}"
+            torch.testing.assert_close(
+                scaled_losses[pointwise], base_losses[pointwise] * candidate_ratio
             )
 
     @unittest.skipIf(*gpu_unavailable)
