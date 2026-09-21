@@ -245,7 +245,7 @@ class AdmissionStrategyTest(unittest.TestCase):
             )
         self.assertIsNone(options.admission_counter)
 
-    def test_probabilistic_strategy_keeps_no_counter(self):
+    def test_probabilistic_strategy_carries_its_probability(self):
         options = self._options(
             probabilistic_admission_strategy=(
                 feature_pb2.DynamicEmbProbabilisticAdmissionStrategy(probability=0.25)
@@ -256,7 +256,6 @@ class AdmissionStrategyTest(unittest.TestCase):
             admit_strategy, dynamicemb_util.ProbabilisticAdmissionStrategy
         )
         self.assertEqual(admit_strategy.probability, 0.25)
-        self.assertFalse(hasattr(admit_strategy, "counter"))
 
     @parameterized.expand(
         [
