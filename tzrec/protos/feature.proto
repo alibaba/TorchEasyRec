@@ -87,6 +87,14 @@ message DynamicEmbFrequencyAdmissionStrategy {
     optional uint64 counter_bucket_capacity = 4 [default = 1024];
 }
 
+message DynamicEmbProbabilisticAdmissionStrategy {
+    // probability in [0, 1] that one appearance of a not-admitted id admits it,
+    // so an id needs 1 / probability appearances on average to be admitted.
+    required float probability = 1;
+    // determine how to initialize the embedding if the key is not admitted.
+    optional DynamicEmbInitializerArgs initializer_args = 2;
+}
+
 message DynamicEmbedding {
     // arguments for initializing dynamic embedding vector values.
     // default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / embedding_dim).
@@ -110,6 +118,7 @@ message DynamicEmbedding {
     optional uint64 bucket_capacity = 9;
     oneof admission_strategy {
         DynamicEmbFrequencyAdmissionStrategy frequency_admission_strategy = 100;
+        DynamicEmbProbabilisticAdmissionStrategy probabilistic_admission_strategy = 101;
     }
 }
 
