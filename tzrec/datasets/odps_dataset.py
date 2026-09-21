@@ -15,6 +15,7 @@ import random
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import pyarrow as pa
@@ -387,13 +388,14 @@ class OdpsDataset(BaseDataset):
             input_path,
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
-            self._data_config.drop_remainder,
+            self._drop_remainder,
             is_orderby_partition=self._data_config.is_orderby_partition,
             quota_name=self._data_config.odps_data_quota_name,
-            drop_redundant_bs_eq_one=self._mode != Mode.PREDICT,
             compression=self._data_config.odps_data_compression,
             sample_cost_field=self._data_config.sample_cost_field,
             batch_cost_size=self._data_config.batch_cost_size,
+            min_batch_size=self._min_batch_size,
+            equalize_rank_steps=self._mode != Mode.PREDICT,
         )
 
 
@@ -404,16 +406,16 @@ class OdpsReader(BaseReader):
         input_path (str): data input path.
         batch_size (int): batch size.
         selected_cols (list): selection column names.
-        drop_remainder (bool): drop last batch less than batch_size.
+        drop_remainder (bool): drop last batch, same as min_batch_size=batch_size.
         shuffle (bool): shuffle data or not.
         shuffle_buffer_size (int): buffer size for shuffle.
         is_orderby_partition (bool): read data order by table partitions or not.
         quota_name (str): storage api quota name.
-        drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
-            equal one to prevent train_eval hung.
         compression (str):  storage api data compression name.
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
+        min_batch_size (int): drop a final batch with fewer rows, 0 disables.
+        equalize_rank_steps (bool): make every rank yield the same number of batches.
     """
 
     def __init__(
@@ -426,7 +428,6 @@ class OdpsReader(BaseReader):
         shuffle_buffer_size: int = 32,
         is_orderby_partition: bool = False,
         quota_name: str = "pay-as-you-go",
-        drop_redundant_bs_eq_one: bool = False,
         compression: str = "LZ4_FRAME",
         sample_cost_field: Optional[str] = None,
         batch_cost_size: Optional[int] = None,
@@ -441,18 +442,19 @@ class OdpsReader(BaseReader):
             shuffle_buffer_size,
             sample_cost_field=sample_cost_field,
             batch_cost_size=batch_cost_size,
+            **kwargs,
         )
         self._pg = dist_util.get_dist_object_pg()
         self._is_orderby_partition = is_orderby_partition
         self._quota_name = quota_name
         self._compression = _get_compression_type(compression)
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
-        self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
 
         self._account, self._odps_endpoint = _create_odps_account()
         self._proj_to_o = {}
         self._table_to_cli = {}
         self._input_to_sess = {}
+        self._sess_row_counts: Dict[str, int] = {}
         self._init_client()
 
         fields = []
@@ -522,9 +524,17 @@ class OdpsReader(BaseReader):
 
             if self._pg is not None:
                 dist.broadcast_object_list(session_ids, group=self._pg)
-            self._input_to_sess[input_path] = [
-                SessionRequest(session_id=x) for x in session_ids
-            ]
+            sess_reqs = [SessionRequest(session_id=x) for x in session_ids]
+            self._input_to_sess[input_path] = sess_reqs
+            # a session's record count is an immutable snapshot: every rank fetches
+            # it once here, outside any collective, instead of in every worker
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                record_counts = list(
+                    executor.map(
+                        _get_session_record_count, [client] * len(sess_reqs), sess_reqs
+                    )
+                )
+            self._sess_row_counts.update(zip(session_ids, record_counts))
         # refresh session
         if int(os.environ.get("RANK", 0)) == 0:
             t = threading.Thread(
@@ -537,34 +547,34 @@ class OdpsReader(BaseReader):
     def _restore_sessions(self, checkpoint_state: Dict[str, int]) -> None:
         """Restore ODPS sessions from checkpoint state.
 
-        Parses session_ids from checkpoint keys and validates they are still active.
-        Raises RuntimeError if any session is expired/invalid.
+        Parses session ids and their positions from checkpoint keys, validates the
+        sessions are still active and puts each one back at its own position, so
+        partitions that never produced a key (e.g. empty ones) keep the freshly
+        created session at their own index. Keys of unknown input paths are skipped
+        with a warning. Raises RuntimeError if a key of a current input path has no
+        session index (written by an older version), if an index exceeds the current
+        number of partition sessions, or if any session is expired/invalid.
 
-        Checkpoint key format: "{input_path}#{session_id}:{start}"
+        Checkpoint key format: "{input_path}#{sess_idx}#{session_id}:{start}"
 
         Args:
             checkpoint_state: Checkpoint state dict mapping source_key to row index.
         """
-        # Parse unique session_ids from checkpoint keys
-        session_ids_by_input: Dict[str, List[str]] = {}  # {input_path: [session_ids]}
+        sess_by_input: Dict[str, Dict[int, str]] = {}  # {input_path: {idx: sess_id}}
         for key in checkpoint_state.keys():
-            # Parse: "{input_path}#{session_id}:{start}"
-            last_colon = key.rfind(":")
-            if last_colon == -1:
+            prefix, sep, _ = key.rpartition(":")
+            if not sep:
                 continue
-            prefix = key[:last_colon]  # "{input_path}#{session_id}"
-            hash_idx = prefix.rfind("#")
-            if hash_idx == -1:
+            input_and_idx, sep, session_id = prefix.rpartition("#")
+            if not sep:
                 continue
-            input_path = prefix[:hash_idx]
-            session_id = prefix[hash_idx + 1 :]
-            if input_path not in session_ids_by_input:
-                session_ids_by_input[input_path] = []
-            if session_id not in session_ids_by_input[input_path]:
-                session_ids_by_input[input_path].append(session_id)
+            input_path, sep, sess_idx = input_and_idx.rpartition("#")
+            if not sep or not sess_idx.isdigit():
+                # "{input_path}#{session_id}" key of an older version
+                input_path, sess_idx = input_and_idx, "-1"
+            sess_by_input.setdefault(input_path, {})[int(sess_idx)] = session_id
 
-        # Restore sessions for each input_path
-        for input_path, session_ids in session_ids_by_input.items():
+        for input_path, idx_to_sess in sess_by_input.items():
             if input_path not in self._input_to_sess:
                 logger.warning(
                     f"Checkpoint contains unknown input_path: {input_path}. "
@@ -573,9 +583,23 @@ class OdpsReader(BaseReader):
                 continue
             _, table_name, _, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
+            sess_reqs = list(self._input_to_sess[input_path])
 
-            restored_sess_reqs = []
-            for session_id in session_ids:
+            for sess_idx, session_id in idx_to_sess.items():
+                if sess_idx < 0:
+                    raise RuntimeError(
+                        f"Cannot resume from checkpoint: ODPS session {session_id} "
+                        f"for {input_path} has no session index, the checkpoint was "
+                        "written by an older TorchEasyRec version. "
+                        "Please restart training from scratch."
+                    )
+                if sess_idx >= len(sess_reqs):
+                    raise RuntimeError(
+                        f"Cannot resume from checkpoint: ODPS session {session_id} "
+                        f"for {input_path} has index {sess_idx} but only "
+                        f"{len(sess_reqs)} partition sessions exist now. "
+                        "Please restart training from scratch."
+                    )
                 sess_req = SessionRequest(session_id=session_id)
                 try:
                     resp = client.get_read_session(sess_req)
@@ -585,26 +609,15 @@ class OdpsReader(BaseReader):
                             f"for {input_path} has expired. Row order may have changed."
                             " Please restart training from scratch."
                         )
-                    restored_sess_reqs.append(sess_req)
+                    sess_reqs[sess_idx] = sess_req
+                    self._sess_row_counts[session_id] = resp.record_count
                 except ODPSError as e:
                     raise RuntimeError(
                         f"Cannot resume from checkpoint: ODPS session {session_id} "
                         f"for {input_path} is invalid. Error: {e}. "
                         "Please restart training from scratch."
                     ) from e
-
-            # When orderby partition, partitions are consumed in order.
-            # Checkpoint only contains consumed partition sessions.
-            # Merge: restored sessions + unconsumed partition sessions (newly created)
-            current_sessions = self._input_to_sess.get(input_path, [])
-            n_restored = len(restored_sess_reqs)
-            if n_restored < len(current_sessions):
-                # Keep sessions for unconsumed partitions
-                self._input_to_sess[input_path] = (
-                    restored_sess_reqs + current_sessions[n_restored:]
-                )
-            else:
-                self._input_to_sess[input_path] = restored_sess_reqs
+            self._input_to_sess[input_path] = sess_reqs
 
     def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
         """Set checkpoint state and restore sessions.
@@ -617,63 +630,48 @@ class OdpsReader(BaseReader):
             self._restore_sessions(state)
 
     def to_batches(
-        self, worker_id: int = 0, num_workers: int = 1
+        self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
-        input_paths = self._input_path.split(",")
-        num_tables = len(input_paths)
+        # (source_id_prefix, record_count, client, session) in read order
+        sources = []
+        for input_path in self._input_path.split(","):
+            _, table_name, _, _ = _parse_table_path(input_path)
+            client = self._table_to_cli[table_name]
+            for sess_idx, sess_req in enumerate(self._input_to_sess[input_path]):
+                sources.append(
+                    (
+                        f"{input_path}#{sess_idx}#{sess_req.session_id}",
+                        self._sess_row_counts[sess_req.session_id],
+                        client,
+                        sess_req,
+                    )
+                )
+        plan = calc_slice_intervals(
+            [(prefix, record_count) for prefix, record_count, _, _ in sources],
+            worker_id,
+            num_workers,
+            self._batch_size,
+            self._equalize_rank_steps,
+            self._min_batch_size,
+            checkpoint_state=self._checkpoint_state,
+            world_size=world_size,
+        )
 
         def _combined_reader() -> Iterator[pa.RecordBatch]:
-            remain_row_count = 0
-
-            for table_idx, input_path in enumerate(input_paths):
-                is_last_table = table_idx == num_tables - 1
-                _, table_name, _, _ = _parse_table_path(input_path)
-                client = self._table_to_cli[table_name]
-                sess_reqs = self._input_to_sess[input_path]
-                num_sess = len(sess_reqs)
-
-                for sess_idx, sess_req in enumerate(sess_reqs):
-                    is_last_session = sess_idx == num_sess - 1
-                    # Only drop redundant on the very last session of the very
-                    # last table
-                    should_drop_redundant = (
-                        self._drop_redundant_bs_eq_one
-                        and is_last_table
-                        and is_last_session
-                    )
-
-                    # Get session record count
-                    record_count = _get_session_record_count(client, sess_req)
-
-                    # Generate source_id with session_id for unique identification
-                    source_id_prefix = f"{input_path}#{sess_req.session_id}"
-
-                    # Calculate intervals (similar to parquet pattern)
-                    worker_intervals, remain_row_count = calc_slice_intervals(
-                        record_count,
-                        worker_id,
-                        num_workers,
+            for (prefix, _, client, sess_req), intervals in zip(sources, plan):
+                for start, end in intervals:
+                    if start >= end:
+                        continue
+                    yield from _reader_iter(
+                        client,
+                        sess_req,
                         self._batch_size,
-                        should_drop_redundant,
-                        pre_total_remain=remain_row_count,
-                        checkpoint_state=self._checkpoint_state,
-                        input_path=source_id_prefix,
+                        self._compression,
+                        start,
+                        end,
+                        f"{prefix}:{start}",
                     )
-
-                    for start, end in worker_intervals:
-                        if start >= end:
-                            continue
-                        source_id = f"{source_id_prefix}:{start}"
-                        yield from _reader_iter(
-                            client,
-                            sess_req,
-                            self._batch_size,
-                            self._compression,
-                            start,
-                            end,
-                            source_id,
-                        )
 
         yield from self._arrow_reader_iter(_combined_reader())
 

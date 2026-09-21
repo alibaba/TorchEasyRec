@@ -12,13 +12,32 @@
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-from torchrec import JaggedTensor, KeyedTensor
+import torch.distributed as dist
+from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.fx import symbolic_trace as _symbolic_trace
 
 # Modules whose forward FX cannot record -- they branch on tensor values or
 # turn them into Python ints -- so tracing keeps them opaque and TorchScript
 # compiles them whole. Matched by class name.
 UNTRACEABLE_MODULES = ["ComputeJTDictToKJT", "PromptAssembler", "HoleKeyBuilder"]
+
+
+@torch.fx.wrap
+def _restore_unweighted_kjt(
+    source: KeyedJaggedTensor, permuted: KeyedJaggedTensor
+) -> KeyedJaggedTensor:
+    """Preserve absent weights after a TorchRec feature permutation.
+
+    FBGEMM CUDA can return an undefined Tensor instead of None for absent
+    weights. Python converts it to None, but native TorchScript retains it and
+    fails when another permutation consumes it.
+
+    Mutates and returns ``permuted`` without copying it. ``source`` and
+    ``permuted`` may be the same object on identity-permutation paths.
+    """
+    if source.weights_or_none() is None:
+        permuted._weights = None
+    return permuted
 
 
 def symbolic_trace(
@@ -35,6 +54,9 @@ def symbolic_trace(
     `concrete_args` allows you to partially specialize your function, whether it's to
     remove control flow or data structures.
 
+    Inserts absent-weight guards after FX-wrapped TorchRec KJT permutations.
+    This post-processing is idempotent when tracing an already guarded graph.
+
     Args:
         root (Union[torch.nn.Module, Callable]): Module or function to be traced and
             converted into a Graph representation.
@@ -44,10 +66,41 @@ def symbolic_trace(
     Returns:
         GraphModule: a Module created from the recorded operations from ``root``.
     """
+    # Resolve private TorchRec helpers only when tracing.
+    from torchrec.modules.mc_modules import _mcc_lazy_init_inplace
+    from torchrec.quant.embedding_modules import _permute_kjt
+
     _leaf_modules = list(UNTRACEABLE_MODULES)
     if leaf_modules:
         _leaf_modules.extend(leaf_modules)
-    return _symbolic_trace(root, concrete_args, _leaf_modules)
+    gm = _symbolic_trace(root, concrete_args, _leaf_modules)
+    inserted = False
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target not in (
+            _mcc_lazy_init_inplace,
+            _permute_kjt,
+        ):
+            continue
+        source = node.args[0] if node.args else node.kwargs["features"]
+        # Split exporters can trace an already guarded graph again.
+        if len(node.users) == 1:
+            user = next(iter(node.users))
+            if user.target == _restore_unweighted_kjt and user.args == (source, node):
+                continue
+        with gm.graph.inserting_after(node):
+            restored = gm.graph.call_function(
+                _restore_unweighted_kjt, args=(source, node)
+            )
+        # Keep the guard opaque when FX traces the generated module again.
+        restored.meta["is_wrapped"] = True
+        node.replace_all_uses_with(restored)
+        # Replace-all also rewrites the guard's input; restore it to avoid a cycle.
+        restored.args = (source, node)
+        inserted = True
+    if inserted:
+        gm.graph.lint()
+        gm.recompile()
+    return gm
 
 
 @torch.fx.wrap
@@ -96,6 +149,44 @@ def fx_numel(x: torch.Tensor) -> int:
         torch._check(total_len >= 0)
         torch._check(total_len <= 2**31 - 1)
     return total_len
+
+
+@torch.fx.wrap
+def fx_avg_counts(lengths: torch.Tensor) -> torch.Tensor:
+    """Fx trace wrapper for the DDP-averaged ``(requests, candidates)`` counts.
+
+    Used to rescale a local-batch mean loss into a global-batch mean so
+    DDP's cross-rank gradient average stays unbiased on ragged batches. A
+    loss that reduces over requests takes the first element and one that
+    reduces over candidates the second; both travel in one all-reduce
+    because a scalar collective costs a rank synchronization, not
+    bandwidth.
+
+    Args:
+        lengths (torch.Tensor): ``(B,)`` candidates per request.
+
+    Returns:
+        torch.Tensor: ``(2,)`` cross-rank mean of ``B`` and ``sum(lengths)``.
+    """
+    counts = torch.stack(
+        [
+            torch.tensor(lengths.size(0), dtype=torch.float, device=lengths.device),
+            lengths.sum().to(torch.float),
+        ]
+    )
+    if dist.is_initialized():
+        dist.all_reduce(counts, op=dist.ReduceOp.AVG)
+    return counts
+
+
+@torch.fx.wrap
+def fx_size0_max1(x: torch.Tensor) -> int:
+    """Fx trace wrapper for max(x.size(0), 1).
+
+    The inline ``max()`` compares a traced ``size()`` proxy in a bool context,
+    which raises ``TraceError`` under torchrec's train-pipeline FX rewrite.
+    """
+    return max(x.size(0), 1)
 
 
 @torch.fx.wrap

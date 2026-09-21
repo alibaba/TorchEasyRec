@@ -73,12 +73,20 @@ class KvDotProduct(RawFeature):
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
         if self.config.HasField("kv_delimiter"):
+            if len(self.config.kv_delimiter) != 1:
+                raise ValueError(
+                    f"{self.__class__.__name__}[{self.name}] has invalid "
+                    f"kv_delimiter [{self.config.kv_delimiter}], "
+                    "only one char is allowed."
+                )
             fg_cfg["kv_delimiter"] = self.config.kv_delimiter
+        if self.config.HasField("normalizer"):
+            fg_cfg["normalizer"] = self.config.normalizer
         if len(self.config.boundaries) > 0:
             fg_cfg["boundaries"] = list(self.config.boundaries)
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
 
-        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+        if self.is_sequence and len(self.config.sequence_fields) > 0:
             fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]

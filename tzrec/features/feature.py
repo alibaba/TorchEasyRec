@@ -69,11 +69,15 @@ _meta_cls = get_register_class_meta(_FEATURE_CLASS_MAP)
 
 
 MAX_HASH_BUCKET_SIZE = 2**63 - 1
+# combiners fg implements. gap_min/gap_max parse but are never accumulated,
+# and fg falls back to sum for any other value without warning.
+FG_COMBINERS = frozenset({"sum", "mean", "avg", "min", "max", "count"})
 SINGLE_INPUT_FEATURE_CLASSES = [
     "IdFeature",
     "RawFeature",
     "TokenizeFeature",
     "CombineFeature",
+    "RegexReplaceFeature",
 ]
 
 
@@ -874,17 +878,6 @@ class BaseFeature(object, metaclass=_meta_cls):
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Build input field names with side."""
         return NotImplemented
-
-    def _parse(self, input_data: Dict[str, pa.Array]) -> ParsedData:
-        """Parse input data for the feature impl.
-
-        Args:
-            input_data (dict): raw input feature data.
-
-        Return:
-            parsed feature data.
-        """
-        raise NotImplementedError
 
     def parse(
         self, input_data: Dict[str, pa.Array], is_training: bool = False

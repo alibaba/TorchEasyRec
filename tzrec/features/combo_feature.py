@@ -81,7 +81,7 @@ class ComboFeature(IdFeature):
             "expression": list(self.config.expression),
             "value_type": "string",
             "need_prefix": False,
-            "value_dim": self.config.value_dim,
+            "value_dim": self.value_dim,
         }
         if self.config.separator != "\x1d":
             fg_cfg["separator"] = self.config.separator
@@ -101,6 +101,6 @@ class ComboFeature(IdFeature):
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
 
-        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+        if self.is_sequence and len(self.config.sequence_fields) > 0:
             fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]

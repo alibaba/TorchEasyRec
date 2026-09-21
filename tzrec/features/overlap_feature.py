@@ -17,6 +17,22 @@ from tzrec.datasets.utils import (
 from tzrec.features.raw_feature import RawFeature
 from tzrec.protos.feature_pb2 import FeatureConfig
 
+# fg logs an error for an unknown method but still builds the feature, and
+# every row then falls back to the default value.
+FG_OVERLAP_METHODS = frozenset(
+    {
+        "is_equal",
+        "is_contain",
+        "index_of",
+        "query_common_ratio",
+        "title_common_ratio",
+        "proximity_min_dist",
+        "proximity_max_dist",
+        "proximity_avg_dist",
+        "proximity_min_cover",
+    }
+)
+
 
 class OverlapFeature(RawFeature):
     """OverlapFeature class.
@@ -61,6 +77,12 @@ class OverlapFeature(RawFeature):
 
     def _fg_json(self) -> List[Dict[str, Any]]:
         """Get fg json config impl."""
+        if self.config.method not in FG_OVERLAP_METHODS:
+            raise ValueError(
+                f"{self.__class__.__name__}[{self.name}] has invalid method "
+                f"[{self.config.method}], available is "
+                f"{sorted(FG_OVERLAP_METHODS)}."
+            )
         fg_cfg = {
             "feature_type": "overlap_feature",
             "feature_name": self.config.feature_name,
@@ -77,6 +99,6 @@ class OverlapFeature(RawFeature):
         if self.config.HasField("stub_type"):
             fg_cfg["stub_type"] = self.config.stub_type
 
-        if self.is_grouped_sequence and len(self.config.sequence_fields) > 0:
+        if self.is_sequence and len(self.config.sequence_fields) > 0:
             fg_cfg["sequence_fields"] = list(self.config.sequence_fields)
         return [fg_cfg]

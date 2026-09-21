@@ -391,3 +391,174 @@ export NUMPY_MANUAL_SEED=100007
 export TORCH_MANUAL_SEED=100007          # 同时会设置所有CUDA设备的种子
 export USE_DETERMINISTIC_ALGORITHMS=1    # 已包含cudnn的确定性行为
 ```
+
+______________________________________________________________________
+
+**Q19: tokenize_feature如何截断文本并保留EOS token**
+
+`tokenize_feature`不会自动添加EOS等特殊token。这里有三个机制容易混淆：**按字符截断发生在分词之前，tokenizer的truncation发生在分词之后，EOS在哪一步加入决定了它会不会被截掉**。如果希望文本截断后仍然以EOS结尾，需要根据截断方式选择不同的方案。
+
+**先确定需要哪种截断方式**
+
+| 需求                                       | 推荐方案                                                   | 说明                                                                  |
+| ------------------------------------------ | ---------------------------------------------------------- | --------------------------------------------------------------------- |
+| 只需要限制token数量，不需要EOS             | 在`tokenizer.json`中配置`truncation`，用`direction: Right` | 直接按token数截断，不需要`regex_replace_feature`                      |
+| 需要EOS，并保留文本开头                    | 在分词前用`regex_replace_feature`按字符截断并追加EOS       | 推荐方案；不要再配置`direction: Right`的tokenizer truncation          |
+| 需要EOS，可以丢弃文本开头                  | 上游追加EOS，再配置`direction: Left`                       | Left truncation保留文本末尾，因此EOS不会被截掉                        |
+| 既要精确的token数量上限，又要EOS且保留开头 | 当前配置方式无法同时严格保证                               | 可以按字符数保守截断；如果再用Right truncation兜底，超长样本仍会丢EOS |
+
+**1. 推荐方案：分词前截断文本并追加EOS**
+
+例如，需要：
+
+```
+原始 title
+    ↓ 最多保留前200个字符
+截断后的 title + <|im_end|>
+    ↓ tokenize
+title_token
+```
+
+可以通过`regex_replace_feature`和`tokenize_feature`串联实现：
+
+```
+feature_configs {
+    regex_replace_feature {
+        feature_name: "title_eos"
+        expression: "item:title"
+        regex_pattern: "(?s)^(.{0,200}).*$"
+        replacement: "\\1<|im_end|>"
+        replace_all: false
+        stub_type: true
+    }
+}
+feature_configs {
+    tokenize_feature {
+        feature_name: "title_token"
+        expression: "feature:title_eos"
+        vocab_file: "tokenizer.json"
+        embedding_dim: 128
+        tokens_as_sequence: true
+        sequence_length: 64
+    }
+}
+```
+
+这里：
+
+- `regex_replace_feature`先截取最多200个字符，再追加`<|im_end|>`。`.`按字符（UTF-8）计数，不是字节也不是token；`(?s)`让`.`可以匹配换行符；`$`匹配的是文本结尾而不是行结尾，配合`replace_all: false`保证只追加一个EOS
+- `stub_type: true`表示`title_eos`只是FG的中间结果，不会作为特征输出给模型
+- `tokenize_feature`通过`feature:title_eos`消费上一步的结果
+- 特征之间通过`feature:`输入域串联，因此`data_config.fg_mode`需要配置为`FG_DAG`
+
+**2. EOS token的注意事项**
+
+- EOS字面量必须已经存在于`tokenizer.json`的`added_tokens`中，例如Qwen的`<|im_end|>`，否则会被BPE拆成多个token
+- `tokenizer_type: sentencepiece`不支持上述方式
+- 如果已经用`regex_replace_feature`在文本末尾追加了EOS，就不要再在`tokenizer.json`中配置`direction: Right`的truncation，tokenizer的截断发生在分词之后，会把末尾的EOS再截掉
+- 输入为空时，可以不给`regex_replace_feature`配置`default_value`，由后面的`tokenize_feature.default_value`兜底
+
+**3. 序列特征的多段文本**
+
+对于分组序列特征，也可以用相同的方式：
+
+```
+feature_configs {
+    sequence_feature {
+        sequence_name: "click_50_seq"
+        sequence_length: 50
+        sequence_delim: ";"
+        features {
+            regex_replace_feature {
+                feature_name: "title_eos"
+                expression: "item:title"
+                regex_pattern: "(?s)^(.{0,200}).*$"
+                replacement: "\\1<|im_end|>"
+                replace_all: false
+                stub_type: true
+            }
+        }
+        features {
+            tokenize_feature {
+                feature_name: "title_token"
+                expression: "feature:title_eos"
+                sequence_fields: ["title_eos"]
+                vocab_file: "tokenizer.json"
+                embedding_dim: 128
+            }
+        }
+    }
+}
+```
+
+这里需要用`sequence_fields: ["title_eos"]`声明`title_eos`是序列字段，FG会把输入改写成`feature:<sequence_name>__<feature_name>`，从而引用到同一个序列下的中间特征。
+
+**4. 如果需要按token数截断**
+
+如果不要求“保留文本开头的同时保证EOS存在”，可以直接用`tokenizer.json`的`truncation`：
+
+```json
+"truncation": {
+    "max_length": 128,
+    "strategy": "LongestFirst",
+    "direction": "Right",
+    "stride": 0
+}
+```
+
+`tokenize_feature`是直接调用tokenizer做Encode的，因此这里的`max_length`限制的是**分词后的token数量**，而不是原始文本的字符数。需要特别区分：
+
+- `direction: Right`：保留前面的token，截掉末尾，因此可能把EOS截掉
+- `direction: Left`：保留末尾的token，EOS可以保留，但会丢掉文本开头
+
+`strategy`主要影响文本对的截断方式，单段文本保持默认即可。
+
+**5. 容易混淆的两个参数**
+
+- `text_normalizer`的`max_length`不是文本截断参数，文本超过该长度时它只是跳过normalization并原样输出
+- `tokens_as_sequence`时配置的`sequence_length`也不会传给tokenizer做token截断，token数量只能通过tokenizer的`truncation`或分词前的字符截断来控制
+
+`tokenizer.json`中的`padding`见Q20。
+
+______________________________________________________________________
+
+**Q20: tokenize_feature是否应该在tokenizer.json中配置padding**
+
+**一般不建议。** `padding`确实会生效，但补齐出来的pad token在下游和真实token没有区别，TorchEasyRec也不需要定长的输入。
+
+`strategy`配成`{"Fixed": N}`时每条文本都会补齐到N个token；配成`"BatchLongest"`则不起作用，因为FG是逐条调用Encode的，一个“batch”里只有一条文本。
+
+```json
+"padding": {
+    "strategy": { "Fixed": 128 },
+    "direction": "Right",
+    "pad_to_multiple_of": null,
+    "pad_id": 248044,
+    "pad_type_id": 0,
+    "pad_token": "<|endoftext|>"
+}
+```
+
+不建议配置的原因：
+
+- 默认的`tokenize_feature`会把补齐的pad token一起pooling，短文本的向量会被pad的embedding淹没
+- `tokens_as_sequence: true`时每条样本的序列长度都变成N，sequence_encoder拿到的长度也全是N，无法区分真实token和padding
+- TorchEasyRec在需要稠密序列时会自己按batch内的最大长度padding，并保留每条样本真实的长度用于mask，在tokenizer里补齐反而会丢掉这个信息
+
+如果确实需要定长输出，注意TorchEasyRec生成的FG配置中`output_type`固定为`word_id`，因此只有`pad_id`生效：`pad_token`不会和`pad_id`做一致性校验，配错了不会报错；`pad_id`也不会校验是否在词表范围内，超出词表大小时训练会在embedding查表时越界。
+
+**Q21: 训练报 ValueError: Expected more than 1 value per channel when training**
+
+**报错信息：**
+
+```
+  File ".../torch/nn/functional.py", line ..., in batch_norm
+    _verify_batch_size(input.size())
+  File ".../torch/nn/functional.py", line ..., in _verify_batch_size
+    raise ValueError(
+ValueError: Expected more than 1 value per channel when training, got input size torch.Size([1, 1024])
+```
+
+**原因：** 样本表的行数恰好使得某一轮训练的最后一个batch只有1行。BatchNorm在训练模式下需要在batch内计算统计量，1行样本无法计算方差；batch内负采样、listwise loss等也要求batch内至少有2行样本。TorchEasyRec默认不丢弃任何样本，因此最后一个不足batch_size的batch会原样送入模型。
+
+**解决方法：** 在`data_config`中设置`min_batch_size: 2`，训练时行数小于2的最后一个batch会被丢弃，每个`proc`每轮最多丢弃1行样本；也可以设置`drop_remainder: true`丢弃所有不足batch_size的batch。两个参数都只在训练时生效，评估和预测不受影响。

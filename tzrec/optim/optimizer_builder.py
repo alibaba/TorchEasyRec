@@ -21,7 +21,11 @@ from torchrec.optim import optimizers, rowwise_adagrad
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 from tzrec.optim.lr_scheduler import BaseLR
-from tzrec.optim.optimizer import set_sparse_init_accumulator_value
+from tzrec.optim.optimizer import (
+    FTRL,
+    register_ftrl_emb_opt_type,
+    set_sparse_init_accumulator_value,
+)
 from tzrec.protos import optimizer_pb2
 from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.logging_util import logger
@@ -92,6 +96,9 @@ def create_sparse_optimizer(
         # FBGEMM reuses the beta1 OptimizerArgs slot for RMSProp's alpha.
         optimizer_kwargs["beta1"] = optimizer_kwargs.pop("alpha")
         return optimizers.RMSProp, optimizer_kwargs
+    elif optimizer_type == "ftrl_optimizer":
+        register_ftrl_emb_opt_type()
+        return FTRL, optimizer_kwargs
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_type}")
 

@@ -13,7 +13,6 @@
 from typing import Any, Dict, List, Optional
 
 import torch
-from torch import distributed as dist
 from torch.autograd.profiler import record_function
 from torchrec import JaggedTensor
 
@@ -36,8 +35,14 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
-from tzrec.utils.fx_util import fx_flip_tensor_dict, fx_int_item, fx_numel
+from tzrec.utils.fx_util import (
+    fx_avg_counts,
+    fx_flip_tensor_dict,
+    fx_int_item,
+    fx_numel,
+)
 
+torch.fx.wrap(fx_avg_counts)
 torch.fx.wrap(fx_flip_tensor_dict)
 torch.fx.wrap(fx_int_item)
 torch.fx.wrap(fx_numel)
@@ -60,14 +65,6 @@ def _fx_construct_payload(
         results[k] = v.values()
     results.update(payload_features)
     return results
-
-
-@torch.fx.wrap
-def _fx_avg_batch_size(x: torch.Tensor) -> torch.Tensor:
-    batch_size = torch.tensor(x.size(0), dtype=torch.float, device=x.device)
-    if dist.is_initialized():
-        dist.all_reduce(batch_size, op=dist.ReduceOp.AVG)
-    return batch_size
 
 
 class DlrmHSTU(RankModel):
@@ -142,7 +139,15 @@ class DlrmHSTU(RankModel):
         )
 
         # item embeddings
-        stu_embedding_dim = self._stu_embedding_dim()
+        self._build_output_modules(self._stu_embedding_dim())
+
+    def _build_output_modules(self, stu_embedding_dim: int) -> None:
+        """Subclass hook: modules turning STU output into per-task logits.
+
+        Kept separate from the rest of ``_init`` so a subclass that scores
+        differently does not have to register these parameters -- DDP
+        errors out on parameters that never receive a gradient.
+        """
         self._item_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(
                 in_features=self.embedding_group.group_total_dim("candidate"),
@@ -201,17 +206,7 @@ class DlrmHSTU(RankModel):
             # we should reverse all features
             grouped_features = fx_flip_tensor_dict(grouped_features)
 
-        with record_function("## item_forward ##"):
-            candidates_item_embeddings = self._item_embedding_mlp(
-                grouped_features["candidate.sequence"]
-            )
-
-        with record_function("## user_forward ##"):
-            candidates_user_embeddings, _ = self._hstu_transducer(grouped_features)
-        with record_function("## multitask_module ##"):
-            mt_preds = self._multitask_module(
-                candidates_user_embeddings, candidates_item_embeddings
-            )
+        mt_preds = self._predict_impl(grouped_features)
 
         if not self._model_config.sequence_timestamp_is_ascending:
             # if timestamp of sequence is descending,
@@ -233,6 +228,29 @@ class DlrmHSTU(RankModel):
         predictions[TARGET_REPEAT_INTERLEAVE_KEY] = num_targets
 
         return predictions
+
+    def _predict_impl(
+        self, grouped_features: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Turn grouped features into one prediction tensor per task.
+
+        The hook sees the features *after* the descending-timestamp flip
+        and must return its tensors in that same request order;
+        :meth:`predict` owns the flip bookkeeping and the prediction
+        publication, so a subclass that scores differently overrides
+        only this hook (see ``DlrmHSTUOneRank``).
+        """
+        with record_function("## item_forward ##"):
+            candidates_item_embeddings = self._item_embedding_mlp(
+                grouped_features["candidate.sequence"]
+            )
+
+        with record_function("## user_forward ##"):
+            candidates_user_embeddings, _ = self._hstu_transducer(grouped_features)
+        with record_function("## multitask_module ##"):
+            return self._multitask_module(
+                candidates_user_embeddings, candidates_item_embeddings
+            )
 
     def _get_label(self, batch: Batch, task_cfg: FusionSubTaskConfig) -> torch.Tensor:
         label_name = task_cfg.label_name
@@ -265,15 +283,28 @@ class DlrmHSTU(RankModel):
     ) -> Dict[str, torch.Tensor]:
         """Compute loss of the model."""
         losses = {}
+        request_avg_weight = None
+        sample_avg_weight = None
+        if self._model_config.enable_global_average_loss:
+            # Cost-based batching makes both counts ragged across ranks, and
+            # every task's label spans the same candidates, so one reduction
+            # of the two serves every loss of every task.
+            lengths = predictions[TARGET_REPEAT_INTERLEAVE_KEY]
+            avg_counts = fx_avg_counts(lengths)
+            request_avg_weight = lengths.size(0) / avg_counts[0]
+            sample_avg_weight = lengths.sum() / avg_counts[1]
+
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
             label = self._get_label(batch, task_cfg)
-            loss_weight = None
-            if self._model_config.enable_global_average_loss:
-                avg_batch_size = _fx_avg_batch_size(label)
-                loss_weight = label.size(0) / avg_batch_size
-
             for loss_cfg in task_cfg.losses:
+                # The list-wise term reduces over requests, the rest over
+                # candidates, so they take different rescaling factors.
+                loss_weight = (
+                    request_avg_weight
+                    if loss_cfg.WhichOneof("loss") == "listwise_rank_loss"
+                    else sample_avg_weight
+                )
                 task_losses = self._loss_impl(
                     predictions,
                     batch,

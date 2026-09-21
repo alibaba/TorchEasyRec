@@ -21,6 +21,7 @@ from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.focal_loss import BinaryFocalLoss
 from tzrec.loss.jrc_loss import JRCLoss
+from tzrec.loss.listwise_rank_loss import ListwiseRankLoss
 from tzrec.metrics.decay_auc import DecayAUC
 from tzrec.metrics.grouped_auc import GroupedAUC
 from tzrec.metrics.grouped_xauc import GroupedXAUC
@@ -162,6 +163,14 @@ class RankModel(BaseModel):
         elif loss_type == "l2_loss":
             output = torch.squeeze(output, dim=1)
             predictions["y" + suffix] = output
+        elif loss_type == "listwise_rank_loss":
+            # A valid standalone objective: publish the same logits/probs
+            # pair the point-wise logit losses would, so the task need not
+            # carry a BCE/focal sibling just to produce them.  A task that
+            # also configures one updates these keys with identical values.
+            output = torch.squeeze(output, dim=1)
+            predictions["logits" + suffix] = output
+            predictions["probs" + suffix] = torch.sigmoid(output)
         else:
             raise NotImplementedError
         return predictions
@@ -207,6 +216,13 @@ class RankModel(BaseModel):
             )
         elif loss_type == "l2_loss":
             self._loss_modules[loss_name] = nn.MSELoss(reduction=reduction)
+        elif loss_type == "listwise_rank_loss":
+            # The module averages over requests itself, so the per-sample
+            # `reduction` of the surrounding losses does not apply.
+            self._loss_modules[loss_name] = ListwiseRankLoss(
+                temperature_init=loss_cfg.listwise_rank_loss.temperature_init,
+                learnable_temperature=loss_cfg.listwise_rank_loss.learnable_temperature,
+            )
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
 
@@ -255,10 +271,25 @@ class RankModel(BaseModel):
         elif loss_type == "l2_loss":
             pred = predictions["y" + suffix]
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
+        elif loss_type == "listwise_rank_loss":
+            pred = predictions["logits" + suffix]
+            lengths = predictions.get(TARGET_REPEAT_INTERLEAVE_KEY)
+            if lengths is None:
+                raise ValueError(
+                    "listwise_rank_loss needs per-request candidate counts "
+                    "(predictions[TARGET_REPEAT_INTERLEAVE_KEY]), which "
+                    "this model does not publish."
+                )
+            # NOTE: this loss is a mean over requests, so a loss_weight
+            # reaching the tail below must be request-level too, not the
+            # per-candidate weight the sibling losses take.
+            losses[loss_name] = self._loss_modules[loss_name](pred, label, lengths)
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
         if loss_weight is not None:
             losses[loss_name] = torch.mean(losses[loss_name] * loss_weight)
+        if loss_cfg.weight != 1.0:
+            losses[loss_name] = losses[loss_name] * loss_cfg.weight
         return losses
 
     def loss(

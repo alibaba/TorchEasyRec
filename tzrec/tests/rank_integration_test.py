@@ -1163,6 +1163,22 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertTrue(self.success)
 
     @unittest.skipIf(
+        gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
+        "dynamicemb not available.",
+    )
+    @mark_ci_scope("gpu")
+    def test_multi_tower_din_with_dynamicemb_ftrl_train_eval(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_dynamicemb_ftrl_mock.config",
+            self.test_dir,
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
+        self.assertTrue(self.success)
+
+    @unittest.skipIf(
         gpu_unavailable[0] or not trt_utils.has_tensorrt, "tensorrt not available."
     )
     @mark_ci_scope("gpu")

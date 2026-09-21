@@ -14,7 +14,7 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     PoolingType,
@@ -242,6 +242,70 @@ class SequenceComboFeatureTest(unittest.TestCase):
         self.assertTrue(
             np.allclose(parsed_feat.seq_lengths, np.array(expected_seq_lengths))
         )
+
+    def test_sequence_combo_feature_default_value_dim(self):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            combo_feature=feature_pb2.ComboFeature(
+                feature_name="combo_feat",
+                hash_bucket_size=100,
+                embedding_dim=16,
+                expression=["user:id_str", "item:iid_str"],
+                default_value="0",
+            )
+        )
+        seq_feat = combo_feature_lib.ComboFeature(
+            seq_feat_cfg,
+            is_sequence=True,
+            sequence_name="click_50_seq",
+            sequence_delim=";",
+            sequence_length=50,
+        )
+        # fg would emit multi-value sequence steps the model does not reduce
+        self.assertEqual(seq_feat.value_dim, 1)
+        self.assertEqual(seq_feat.fg_json()[0]["value_dim"], 1)
+
+    @parameterized.expand(
+        [
+            param("item_side_seq", iid_str="item:iid_str", sequence_fields=[]),
+            param("user_side_seq", iid_str="user:iid_str", sequence_fields=["iid_str"]),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_simple_sequence_combo_feature_with_hash_bucket_size(
+        self, name, iid_str, sequence_fields
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            sequence_combo_feature=feature_pb2.ComboFeature(
+                feature_name="click_50_seq_combo_feat",
+                sequence_delim=";",
+                sequence_length=50,
+                expression=["user:id_str", iid_str],
+                sequence_fields=sequence_fields,
+                hash_bucket_size=100,
+                embedding_dim=16,
+                default_value="0",
+            )
+        )
+        seq_feat = combo_feature_lib.ComboFeature(
+            seq_feat_cfg, is_sequence=True, fg_mode=FgMode.FG_NORMAL
+        )
+        self.assertEqual(seq_feat.output_dim, 16)
+        self.assertEqual(seq_feat.is_sparse, True)
+        self.assertEqual(seq_feat.inputs, ["id_str", "iid_str"])
+        self.assertEqual(seq_feat.sequence_input_names, ["iid_str"])
+        self.assertEqual(
+            seq_feat.fg_json()[0].get("sequence_fields"), sequence_fields or None
+        )
+
+        input_data = {
+            "id_str": pa.array(["ua", "ub"]),
+            "iid_str": pa.array(["abc;efg", "hij"]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq_combo_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array([2, 42, 23]))
+        np.testing.assert_allclose(parsed_feat.key_lengths, np.array([1, 1, 1]))
+        np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([2, 1]))
 
 
 if __name__ == "__main__":

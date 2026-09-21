@@ -151,6 +151,127 @@ def build_sla_func_tensor(
     return func_2d.unsqueeze(0).expand(nheads, HSTU_ARBITRARY_NFUNC, total_q)
 
 
+def build_onerank_func_tensor(
+    nheads: int,
+    seq_offsets: torch.Tensor,
+    total_q: int,
+    num_targets: torch.Tensor,
+    group_size: int,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Build the arbitrary-mask func tensor for the OneRank paper layout.
+
+    Same encoding as :func:`build_sla_func_tensor`: shape
+    ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)`` int32, jagged along
+    ``total_q``, where query row ``p`` attends to the union of
+    ``(NFUNC + 1) // 2`` column intervals ``[0, col_max0) u
+    [col_min0, col_max1) u [col_min1, col_max2)``.
+
+    Each candidate is a group of ``K + 1`` tokens -- the candidate token
+    ``e^C_i`` followed by the task tokens ``t_1..t_K`` (paper 2.1 / 2.2,
+    ``G_i = [e^C_i, t_1, ..., t_K]``) -- laid out after the history
+    prefix.  With ``H_b = L_b - T_b`` the prefix boundary, ``base`` the
+    group's first column and ``j`` the slot inside the group:
+
+    * prefix row ``p < H_b``: ``(p+1, p+1, p+1, p+1, p+1)`` decodes to
+      ``[0, p+1)`` -- plain causal;
+    * candidate row ``j = 0``: ``(H_b, base, base+1, base+1, base+1)``
+      decodes to ``[0, H_b) u {base}``;
+    * task-token row ``j >= 1``: ``(H_b, base, base+1, p, p+1)`` decodes
+      to ``[0, H_b) u {base, p}``.
+
+    Consequences, all of them intended:
+
+    - the prefix is plain causal. Note the ``DlrmHSTU`` baseline resolves
+      an unset ``stu.contextual_seq_len`` sentinel to the number of
+      contextual features (> 0) and applies a *bidirectional* contextual
+      block; OneRank pins the value to 0 so contextual tokens are ordinary
+      causal history, which is a deliberate (minor) deviation from the
+      baseline's attention pattern;
+    - candidate groups are mutually invisible, matching the data (candidate
+      timestamps are flat -- there is no causal order between candidates);
+    - within a group, ``t_k`` sees the candidate and itself, never ``t_j``
+      for ``j != k``, so a task token cannot leak another task's state.
+      The three intervals are exactly what the paper layout needs: the
+      mutually invisible ``t_1..t_{k-1}`` sit between ``e^C_i`` and
+      ``t_k``, splitting its visible set into ``[0, H_b)``, ``{e^C_i}``
+      and ``{t_k}`` -- one interval each, no replicas required.
+
+    Args:
+        nheads: number of attention heads.
+        seq_offsets: cumulative sequence offsets ``(B+1,)`` of the
+            **expanded** sequence.
+        total_q: total jagged tokens in the batch (= ``seq_offsets[-1]``);
+            taken from the caller's tensor metadata to avoid a D->H sync.
+        num_targets: **expanded** per-sample target counts ``(B,)``, i.e.
+            ``candidates * group_size``.
+        group_size: tokens per candidate group, ``num_tasks + 1``.
+        device: target device (inferred from ``seq_offsets`` if None).
+
+    Returns:
+        func tensor of shape ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)``,
+        dtype int32, as a strided view (stride 0 on the head dim).
+    """
+    if group_size < 2:
+        raise ValueError(
+            f"group_size must be at least 2 (candidate token + one task "
+            f"token, i.e. num_tasks + 1); got {group_size}"
+        )
+    if device is None:
+        device = seq_offsets.device
+    # The tensor-plumbing below deliberately mirrors build_sla_func_tensor:
+    # unconditional int32 cast (no `Proxy.dtype` compare under fx), diff +
+    # repeat_interleave instead of searchsorted on a slice, and no
+    # `.contiguous()` on the returned view.  Each of those shapes is a
+    # workaround for an Inductor / AOT-compile failure documented there.
+    seq_offsets_i32 = seq_offsets.to(torch.int32)
+    seq_lengths = torch.diff(seq_offsets_i32)  # (B,)
+    B = seq_lengths.size(0)
+    pos_global = torch.arange(total_q, device=device, dtype=torch.int32)
+    seq_offsets_starts = seq_offsets_i32.narrow(0, 0, B).contiguous()
+    pos_local = pos_global - torch.repeat_interleave(
+        seq_offsets_starts, seq_lengths, output_size=total_q
+    )
+    L = torch.repeat_interleave(seq_lengths, seq_lengths, output_size=total_q)
+    T = torch.repeat_interleave(
+        num_targets.to(torch.int32), seq_lengths, output_size=total_q
+    )
+    # Clamp so a pathological num_targets[b] > seq_lengths[b] cannot produce
+    # a negative boundary that collapses every row to an empty interval.
+    prefix_boundary = torch.clamp(L - T, min=0)
+
+    is_prefix = pos_local < prefix_boundary
+    # Slot inside the candidate group: 0 -> candidate token e^C_i,
+    # 1..K -> task tokens t_1..t_K.  torch.remainder takes the divisor's
+    # sign, so with a positive group_size the slot is non-negative even on
+    # prefix rows, where the value is meaningless but those rows are
+    # selected away below.
+    slot = torch.remainder(pos_local - prefix_boundary, group_size)
+    is_task_token = slot >= 1
+    # First column of the row's own group; on prefix rows it is unused.
+    group_base = pos_local - slot
+
+    causal = pos_local + 1
+    # Interval 1 covers exactly the candidate column {base} for both row
+    # kinds; interval 2 adds the task token's own column only on task rows
+    # (candidate rows leave it empty: min == max).
+    group_col_min0 = group_base
+    group_col_max1 = group_base + 1
+    self_col_min1 = torch.where(is_task_token, pos_local, group_col_max1)
+    self_col_max2 = torch.where(is_task_token, causal, group_col_max1)
+
+    col_max0 = torch.where(is_prefix, causal, prefix_boundary)
+    col_min0 = torch.where(is_prefix, causal, group_col_min0)
+    col_max1 = torch.where(is_prefix, causal, group_col_max1)
+    col_min1 = torch.where(is_prefix, causal, self_col_min1)
+    col_max2 = torch.where(is_prefix, causal, self_col_max2)
+
+    func_2d = torch.stack(
+        [col_max0, col_min0, col_max1, col_min1, col_max2], dim=0
+    )  # (HSTU_ARBITRARY_NFUNC, total_q)
+    return func_2d.unsqueeze(0).expand(nheads, HSTU_ARBITRARY_NFUNC, total_q)
+
+
 @dataclass(frozen=True)
 class STUTruncationPlan:
     """Precomputed offsets for a UIH-only truncation, replayable across tensors.
