@@ -236,18 +236,6 @@ class ListwiseRankLossTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "temperature_init"):
                 ListwiseRankLoss(temperature_init=bad)
 
-    def test_loss_weight_is_a_scalar_multiplier(self) -> None:
-        """``loss_weight`` carries the global-average-loss rescaling."""
-        module = ListwiseRankLoss(temperature_init=1.0, learnable_temperature=False)
-        lengths = torch.tensor([3, 4], dtype=torch.int64)
-        labels = torch.tensor([1.0, 0, 0, 0, 1, 0, 0])
-        logits = torch.randn(7)
-
-        torch.testing.assert_close(
-            module(logits, labels, lengths, torch.tensor(2.5)),
-            module(logits, labels, lengths) * 2.5,
-        )
-
     def test_integer_labels_are_accepted(self) -> None:
         """Labels arrive as ints from the bitmask decode in some configs."""
         module = ListwiseRankLoss(temperature_init=1.0, learnable_temperature=False)

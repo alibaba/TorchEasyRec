@@ -36,13 +36,13 @@ from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.protos.tower_pb2 import FusionSubTaskConfig
 from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.fx_util import (
-    fx_avg_batch_size,
+    fx_avg_counts,
     fx_flip_tensor_dict,
     fx_int_item,
     fx_numel,
 )
 
-torch.fx.wrap(fx_avg_batch_size)
+torch.fx.wrap(fx_avg_counts)
 torch.fx.wrap(fx_flip_tensor_dict)
 torch.fx.wrap(fx_int_item)
 torch.fx.wrap(fx_numel)
@@ -283,15 +283,28 @@ class DlrmHSTU(RankModel):
     ) -> Dict[str, torch.Tensor]:
         """Compute loss of the model."""
         losses = {}
+        request_avg_weight = None
+        sample_avg_weight = None
+        if self._model_config.enable_global_average_loss:
+            # Cost-based batching makes both counts ragged across ranks, and
+            # every task's label spans the same candidates, so one reduction
+            # of the two serves every loss of every task.
+            lengths = predictions[TARGET_REPEAT_INTERLEAVE_KEY]
+            avg_counts = fx_avg_counts(lengths)
+            request_avg_weight = lengths.size(0) / avg_counts[0]
+            sample_avg_weight = lengths.sum() / avg_counts[1]
+
         for task_cfg in self._task_configs:
             task_name = task_cfg.task_name
             label = self._get_label(batch, task_cfg)
-            loss_weight = None
-            if self._model_config.enable_global_average_loss:
-                avg_batch_size = fx_avg_batch_size(label)
-                loss_weight = label.size(0) / avg_batch_size
-
             for loss_cfg in task_cfg.losses:
+                # The list-wise term reduces over requests, the rest over
+                # candidates, so they take different rescaling factors.
+                loss_weight = (
+                    request_avg_weight
+                    if loss_cfg.WhichOneof("loss") == "listwise_rank_loss"
+                    else sample_avg_weight
+                )
                 task_losses = self._loss_impl(
                     predictions,
                     batch,
