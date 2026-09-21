@@ -15,6 +15,7 @@ import torch
 from parameterized import param, parameterized
 from torch import Tensor, nn
 from torch.optim import Optimizer
+from torchrec.distributed.utils import _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 from tzrec.optim import optimizer_builder
@@ -37,6 +38,9 @@ except ImportError:
 class OpimizerBuilderTest(unittest.TestCase):
     def tearDown(self):
         set_sparse_init_accumulator_value(0.0)
+        # The whole suite runs in one process, so leaving FTRL registered would
+        # mask a missing register_ftrl_emb_opt_type() call in a later test.
+        _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE.pop(FTRL, None)
 
     @parameterized.expand(
         [

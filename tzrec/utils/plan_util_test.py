@@ -690,15 +690,15 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         from tzrec.optim.optimizer import FTRL
 
         search_space, topology = self._enumerate(with_plain_table=True)
-        for kernel, raises in (
-            (EmbeddingComputeKernel.FUSED.value, True),
-            (EmbeddingComputeKernel.DENSE.value, False),
+        for sharding_type, raises in (
+            (ShardingType.ROW_WISE.value, True),
+            (ShardingType.DATA_PARALLEL.value, False),
         ):
             sharding_option = next(
                 so
                 for so in search_space
                 if not getattr(so, "use_dynamicemb", False)
-                and so.compute_kernel == kernel
+                and so.sharding_type == sharding_type
             )
             for rank, shard in enumerate(sharding_option.shards):
                 shard.rank = rank

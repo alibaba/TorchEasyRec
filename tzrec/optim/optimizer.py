@@ -138,7 +138,7 @@ def set_sparse_init_accumulator_value(value: float) -> None:
 
 
 def sparse_init_accumulator_value() -> float:
-    """Sparse Adagrad accumulator initial value, 0.0 when not configured."""
+    """Sparse accumulator initial value, 0.0 when not configured."""
     return _sparse_init_accumulator_value
 
 

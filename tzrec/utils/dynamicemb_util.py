@@ -632,20 +632,19 @@ if has_dynamicemb:
                     ddr_bytes=int(shards[0].storage.ddr),
                 )
             else:
-                # A data_parallel table gets the dense kernel, which ignores the
-                # fused params and is updated by the dense optimizer, so only a
-                # fused TBE actually has to honor the sparse optimizer.
+                # A data_parallel table is replicated and updated by the dense
+                # optimizer, so the sparse optimizer never reaches it.
                 if (
                     getattr(sharding_option.tensor, "_optimizer_classes", [None])[0]
                     is FTRL
-                    and sharding_option.compute_kernel
-                    != EmbeddingComputeKernel.DENSE.value
+                    and sharding_type != ShardingType.DATA_PARALLEL.value
                 ):
                     raise ValueError(
                         "sparse ftrl_optimizer only supports dynamicemb embedding "
                         "tables, but table["
                         f"{sharding_option.path}.{sharding_option.name}] is planned "
-                        f"with compute_kernel[{sharding_option.compute_kernel}]. "
+                        f"with sharding_type[{sharding_type}] and "
+                        f"compute_kernel[{sharding_option.compute_kernel}]. "
                         "Set `dynamicemb { }` on every sparse feature, or use "
                         "another sparse optimizer."
                     )
