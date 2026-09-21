@@ -9,23 +9,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HuggingFace export for HF-backed models.
-
-Kept out of ``export_util`` so ``checkpoint_util`` can call it without a
-circular import.
-"""
+"""HuggingFace export for HF-backed models."""
 
 import json
 import os
 import shutil
 import tempfile
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from safetensors.torch import save_file
 from torch import nn
+from transformers import GenerationConfig, PretrainedConfig
 
-from tzrec.constant import HF_EXPORT_META_FILENAME
 from tzrec.features.feature import BaseFeature
 from tzrec.prompt.compile import compile_prompt
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -36,78 +32,75 @@ from tzrec.utils.logging_util import logger
 SERVING_ARCH = "GenRecForCausalLM"
 SERVING_MODEL_TYPE = "genrec"
 
-_HF_ASSET_FILES = (
-    "generation_config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "vocab.json",
-    "merges.txt",
-    "added_tokens.json",
-    "special_tokens_map.json",
-)
 
+def capture_hf_backbone(
+    wrapped_model: nn.Module,
+) -> Tuple[PretrainedConfig, Optional[GenerationConfig], str]:
+    """Read what HF conversion needs off a live model, before export drops it.
 
-def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
-    """Write HF config, optional tokenizer, and export metadata beside a checkpoint.
+    Nothing returned here references the backbone module: the caller deletes it
+    right after this call and must be free to.
 
-    The backbone's FQN prefix goes into ``hf_export_meta.json`` so ``dcp_to_hf``
-    can strip it without hard-coding a wrapper convention. Rank 0 only.
+    Args:
+        wrapped_model: the wrapper whose ``state_dict()`` names match the
+            checkpoint's.
+
+    Returns:
+        The backbone config, its generation config when it has one, and the
+        prefix its parameters carry in the checkpoint.
+
+    Raises:
+        ValueError: no module in the wrapper chain declares ``hf_backbone``.
     """
-    if int(os.environ.get("RANK", 0)) != 0:
-        return
     inner = checkpoint_util.unwrap_to(wrapped_model, "hf_backbone")
     if inner is None:
-        return
-    os.makedirs(save_dir, exist_ok=True)
-
+        raise ValueError(
+            f"capture_hf_backbone: {type(wrapped_model).__name__} wraps no "
+            "module declaring hf_backbone()."
+        )
     backbone = inner.hf_backbone()
-    backbone.config.save_pretrained(save_dir)
-    gen_cfg = getattr(backbone, "generation_config", None)
-    if gen_cfg is not None:
-        gen_cfg.save_pretrained(save_dir)
-    tokenizer = getattr(inner, "hf_tokenizer", None)
-    if tokenizer is not None:
-        tokenizer().save_pretrained(save_dir)
-
     # named_modules() FQNs carry the DMP prefix that state_dict() strips.
     raw_prefix = next(
         (n for n, m in wrapped_model.named_modules() if m is backbone), ""
     )
     prefix = checkpoint_util._strip_dmp_prefix(raw_prefix)
-    meta = {"backbone_state_dict_prefix": prefix + ("." if prefix else "")}
-    with open(os.path.join(save_dir, HF_EXPORT_META_FILENAME), "w") as f:
-        json.dump(meta, f, indent=2)
+    return (
+        backbone.config,
+        getattr(backbone, "generation_config", None),
+        prefix + ("." if prefix else ""),
+    )
 
 
-def dcp_to_hf(ckpt_dir: str, out_dir: str) -> Dict[str, Any]:
-    """Convert a checkpoint with co-located HF assets to a ``from_pretrained`` dir.
+def dcp_to_hf(
+    ckpt_dir: str,
+    out_dir: str,
+    config: PretrainedConfig,
+    state_dict_prefix: str,
+) -> None:
+    """Write the backbone of a checkpoint as a ``from_pretrained`` safetensors file.
 
-    Keys that do not map 1:1 onto the co-located ``config.json`` raise rather
-    than write a partial model. The config itself is not written: the caller
-    composes the one ``config.json`` the export carries.
+    Keys that do not map 1:1 onto ``config`` raise rather than write a partial
+    model. No config is written: the caller composes the one ``config.json``
+    the export carries.
 
-    Returns:
-        The backbone config as ``config.json`` would hold it.
+    Args:
+        ckpt_dir: the checkpoint the weights come from.
+        out_dir: where ``model.safetensors`` is written.
+        config: the backbone config, read off the live model.
+        state_dict_prefix: the prefix the backbone's keys carry in ``ckpt_dir``.
     """
     from torch.distributed.checkpoint.state_dict_loader import (
         _load_state_dict_from_keys,
         _storage_setup,
     )
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM
 
     model_ckpt_path = os.path.join(ckpt_dir, "model")
     if not os.path.exists(model_ckpt_path):
         raise RuntimeError(f"dcp_to_hf: model DCP dir [{model_ckpt_path}] not exists.")
 
-    meta_path = os.path.join(ckpt_dir, HF_EXPORT_META_FILENAME)
-    prefix: Optional[str] = None
-    if os.path.exists(meta_path):
-        with open(meta_path, "r") as f:
-            prefix = json.load(f).get("backbone_state_dict_prefix")
-
-    cfg = AutoConfig.from_pretrained(ckpt_dir)
     with torch.device("meta"):
-        empty = AutoModelForCausalLM.from_config(cfg)
+        empty = AutoModelForCausalLM.from_config(config)
     target_keys: Set[str] = set(empty.state_dict().keys())
     tied_keys: Set[str] = set(getattr(empty, "_tied_weights_keys", None) or [])
     del empty
@@ -117,11 +110,13 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str) -> Dict[str, Any]:
     reader = _storage_setup(None, model_ckpt_path, reader=True)
     ckpt_keys: Set[str] = set(reader.read_metadata().state_dict_metadata)
 
-    def _strip_recorded_prefix() -> Optional[Dict[str, str]]:
-        """Strip the recorded prefix; None unless it yields an EXACT match."""
-        if not prefix:
-            return None
-        out = {k[len(prefix) :]: k for k in ckpt_keys if k.startswith(prefix)}
+    def _strip_model_prefix() -> Optional[Dict[str, str]]:
+        """Strip the export-time prefix; None unless it yields an EXACT match."""
+        out = {
+            k[len(state_dict_prefix) :]: k
+            for k in ckpt_keys
+            if k.startswith(state_dict_prefix)
+        }
         return out if set(out) == target_keys else None
 
     def _derive_by_suffix() -> Optional[Dict[str, str]]:
@@ -134,19 +129,19 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str) -> Dict[str, Any]:
             out[tk] = matches[0]
         return out
 
-    key_map = _strip_recorded_prefix()
+    key_map = _strip_model_prefix()
     if key_map is None:
-        if prefix:
-            logger.warning(
-                f"dcp_to_hf: recorded prefix [{prefix}] did not map exactly onto "
-                "the architecture; deriving the backbone prefix by suffix-matching."
-            )
+        logger.warning(
+            f"dcp_to_hf: export-time prefix [{state_dict_prefix}] did not map "
+            "exactly onto the architecture; deriving the backbone prefix by "
+            "suffix-matching."
+        )
         key_map = _derive_by_suffix()
 
     if key_map is None:
         raise RuntimeError(
             "dcp_to_hf: cannot map the DCP state dict onto the backbone "
-            f"architecture (recorded prefix={prefix!r}). Wanted "
+            f"architecture (state_dict_prefix={state_dict_prefix!r}). Wanted "
             f"{len(target_keys)} keys like {sorted(target_keys)[:3]}; the "
             f"checkpoint holds {len(ckpt_keys)} like {sorted(ckpt_keys)[:3]}. "
             "Refusing to write a partially-loaded HF model."
@@ -159,18 +154,12 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str) -> Dict[str, Any]:
     mapped = {tk: raw_state[ck] for tk, ck in key_map.items()}
 
     # from_pretrained re-ties them.
-    if getattr(cfg, "tie_word_embeddings", False):
+    if getattr(config, "tie_word_embeddings", False):
         mapped = {k: v for k, v in mapped.items() if k not in tied_keys}
     mapped = {k: v.contiguous() for k, v in mapped.items()}  # save_file rejects views
     del raw_state
     os.makedirs(out_dir, exist_ok=True)
     save_file(mapped, os.path.join(out_dir, "model.safetensors"))
-
-    for fname in _HF_ASSET_FILES:
-        src = os.path.join(ckpt_dir, fname)
-        if os.path.exists(src):
-            shutil.copy(src, os.path.join(out_dir, fname))
-    return json.loads(cfg.to_json_string())
 
 
 def export_hf_assets(
@@ -178,6 +167,9 @@ def export_hf_assets(
     features: List[BaseFeature],
     checkpoint_path: str,
     export_dir: str,
+    backbone_config: PretrainedConfig,
+    generation_config: Optional[GenerationConfig],
+    state_dict_prefix: str,
 ) -> None:
     """Write what an LLM engine reads beside the scripted front-end.
 
@@ -193,12 +185,19 @@ def export_hf_assets(
         features: the created features the prompt compiles against.
         checkpoint_path: the checkpoint the weights come from.
         export_dir: the export directory.
+        backbone_config: the backbone config, read off the live model.
+        generation_config: the backbone's generation config, when it has one.
+        state_dict_prefix: the prefix the backbone's keys carry in the
+            checkpoint.
     """
     fs, local_dir = url_to_fs(export_dir)
     if fs is not None:
         local_dir = tempfile.mkdtemp()
     try:
-        backbone = dcp_to_hf(checkpoint_path, local_dir)
+        dcp_to_hf(checkpoint_path, local_dir, backbone_config, state_dict_prefix)
+        if generation_config is not None:
+            generation_config.save_pretrained(local_dir)
+        backbone = json.loads(backbone_config.to_json_string())
         compiled = compile_prompt(
             pipeline_config.prompt_config,
             features,

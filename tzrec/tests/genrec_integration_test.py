@@ -129,6 +129,7 @@ class GenRecIntegrationTest(unittest.TestCase):
             "pipeline.config",
             "model_acc.json",
             "config.json",
+            "generation_config.json",
             "model.safetensors",
             "tokenizer.json",
             "tokenizer_config.json",
@@ -136,8 +137,19 @@ class GenRecIntegrationTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(export_dir, name)), name)
         self.assertFalse(os.path.exists(os.path.join(export_dir, "sparse")))
 
-        # the artifact is the collator's walk plus the serving-only fold
         config = config_util.load_pipeline_config(trained)
+        # the HF assets are composed at export time; checkpoints carry none
+        for ckpt in glob.glob(os.path.join(config.model_dir, "model.ckpt-*")):
+            for name in (
+                "config.json",
+                "generation_config.json",
+                "hf_export_meta.json",
+            ):
+                self.assertFalse(
+                    os.path.exists(os.path.join(ckpt, name)), f"{ckpt}/{name}"
+                )
+
+        # the artifact is the collator's walk plus the serving-only fold
         features = _create_features(list(config.feature_configs), config.data_config)
         compiled = compile_prompt(config.prompt_config, features, ["answer"])
         data = self._request(["hist", "beh"])

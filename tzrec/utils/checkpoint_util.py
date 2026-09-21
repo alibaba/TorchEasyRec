@@ -428,27 +428,9 @@ class CheckpointManager:
         dense_ema: Optional[DenseEMA] = None,
         data_ts: Optional[float] = None,
     ) -> str:
-        """Save a checkpoint at the given step, then request an async prune.
-
-        For HF-backed models, writes the config, optional tokenizer, and the
-        state dict metadata HF conversion reads.
-        """
+        """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
         save_model(ckpt_dir, model, optimizer, dense_ema)
-        # Local import avoids a circular import (hf_export_util imports us).
-        from tzrec.utils.hf_export_util import write_hf_assets
-
-        asset_error: Optional[str] = None
-        try:
-            write_hf_assets(model, ckpt_dir)
-        except Exception as e:  # noqa: BLE001
-            asset_error = f"{type(e).__name__}: {e}"
-        if dist.is_initialized():
-            error_box = [asset_error]
-            dist.broadcast_object_list(error_box, src=0)
-            asset_error = error_box[0]
-        if asset_error is not None:
-            raise RuntimeError(f"write_hf_assets failed for {ckpt_dir}: {asset_error}")
         if dataloader_state is not None:
             save_dataloader_state(ckpt_dir, dataloader_state)
         save_meta(ckpt_dir, step, data_ts)

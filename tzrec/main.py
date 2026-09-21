@@ -101,7 +101,7 @@ from tzrec.utils.export_util import (
     export_model,
 )
 from tzrec.utils.filesystem_util import url_to_fs
-from tzrec.utils.hf_export_util import export_hf_assets
+from tzrec.utils.hf_export_util import capture_hf_backbone, export_hf_assets
 from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
@@ -1279,6 +1279,9 @@ def export(
         if not checkpoint_path:
             raise ValueError("HF export: no checkpoint found to convert.")
         front_end = InferWrapper(GenRecFrontEnd(model.model))
+        # the wrapper, not the inner module: its name is what prefixes the
+        # backbone's keys in the checkpoint
+        backbone_config, generation_config, prefix = capture_hf_backbone(model)
         # the front-end carries no backbone: the engine serves the LM from the
         # HuggingFace weights, so the copy built here is dead weight on every rank
         del model.model.lm
@@ -1291,7 +1294,15 @@ def export(
             additional_export_config=additional_export_config,
         )
         if is_rank_zero:
-            export_hf_assets(pipeline_config, features, checkpoint_path, export_dir)
+            export_hf_assets(
+                pipeline_config,
+                features,
+                checkpoint_path,
+                export_dir,
+                backbone_config,
+                generation_config,
+                prefix,
+            )
     else:
         export_model(
             ori_pipeline_config,

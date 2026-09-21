@@ -15,6 +15,7 @@ import multiprocessing as mp
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -181,40 +182,6 @@ def _report_ts_worker(
         f.write(f"{mgr.save.call_args.args[5]!r} {len(gathers)}")
 
 
-def _hf_asset_failure_worker(test_dir, rank, world_size, port):
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend="gloo")
-
-    manager = checkpoint_util.CheckpointManager(test_dir)
-    manager.prune = mock.MagicMock()
-    side_effect = RuntimeError("asset write failed") if rank == 0 else None
-    try:
-        with (
-            mock.patch.object(checkpoint_util, "save_model"),
-            mock.patch(
-                "tzrec.utils.hf_export_util.write_hf_assets",
-                side_effect=side_effect,
-            ),
-        ):
-            manager.save(
-                7,
-                nn.Linear(2, 1),
-                dataloader_state={f"source:{rank}": rank},
-            )
-    except RuntimeError as e:
-        result = {"error": str(e), "prune_calls": manager.prune.call_count}
-    else:
-        result = {"error": None, "prune_calls": manager.prune.call_count}
-    finally:
-        dist.destroy_process_group()
-
-    with open(os.path.join(test_dir, f"hf_asset_failure.{rank}.json"), "w") as f:
-        json.dump(result, f)
-
-
 def _partial_restore_worker(test_dir, rank, world_size, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -262,6 +229,26 @@ class CheckpointUtilTest(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
+
+    def test_unwrap_terminates_on_a_wrapper_cycle(self):
+        """A .model/.module cycle must return None, not spin.
+
+        Every genrec export walks this on every rank right before a collective,
+        so an unbounded loop here would hang them all at that barrier. Run on a
+        thread so a regression fails the test instead of hanging the suite.
+        """
+        a, b = nn.Linear(4, 4), nn.Linear(4, 4)
+        object.__setattr__(a, "model", b)
+        object.__setattr__(b, "model", a)
+        out = []
+        t = threading.Thread(
+            target=lambda: out.append(checkpoint_util.unwrap_to(a, "hf_backbone"))
+        )
+        t.daemon = True
+        t.start()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive(), "unwrap_to did not terminate")
+        self.assertEqual(out, [None])
 
     def test_latest_checkpoint_with_model_dir(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-0"))
@@ -461,45 +448,6 @@ class CheckpointUtilTest(unittest.TestCase):
             checkpoint_util.best_checkpoint(self.test_dir, export_config),
         )
         self.assertEqual(manager.best_checkpoint()[1], 10)
-
-    def test_dist_checkpoint_manager_propagates_hf_asset_failure(self):
-        port = misc_util.get_free_port()
-        ctx = mp.get_context("spawn")
-        procs = [
-            ctx.Process(
-                target=_hf_asset_failure_worker,
-                args=(self.test_dir, rank, 2, port),
-            )
-            for rank in range(2)
-        ]
-        for process in procs:
-            process.start()
-        for process in procs:
-            process.join(timeout=30)
-        hung = [rank for rank, process in enumerate(procs) if process.is_alive()]
-        if hung:
-            for process in procs:
-                if process.is_alive():
-                    process.terminate()
-                    process.join()
-            self.fail(f"workers {hung} hung.")
-        for rank, process in enumerate(procs):
-            self.assertEqual(process.exitcode, 0, f"worker-{rank} failed.")
-
-        for rank in range(2):
-            with open(
-                os.path.join(self.test_dir, f"hf_asset_failure.{rank}.json")
-            ) as f:
-                result = json.load(f)
-            self.assertIn("asset write failed", result["error"])
-            self.assertEqual(result["prune_calls"], 0)
-        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-7")
-        for filename in (
-            checkpoint_util.DATALOADER_CKPT_FILENAME,
-            checkpoint_util.CKPT_META_FILENAME,
-            checkpoint_util.CKPT_SUCCESS_FILENAME,
-        ):
-            self.assertFalse(os.path.exists(os.path.join(ckpt_dir, filename)))
 
     def test_dist_report_ts_agrees_across_ranks(self):
         """Ranks at different event-times record the same one on the checkpoint.
