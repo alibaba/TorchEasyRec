@@ -547,34 +547,34 @@ class OdpsReader(BaseReader):
     def _restore_sessions(self, checkpoint_state: Dict[str, int]) -> None:
         """Restore ODPS sessions from checkpoint state.
 
-        Parses session_ids from checkpoint keys and validates they are still active.
-        Raises RuntimeError if any session is expired/invalid.
+        Parses session ids and their positions from checkpoint keys, validates the
+        sessions are still active and puts each one back at its own position, so
+        partitions that never produced a key (e.g. empty ones) keep the freshly
+        created session at their own index. Keys of unknown input paths are skipped
+        with a warning. Raises RuntimeError if a key of a current input path has no
+        session index (written by an older version), if an index exceeds the current
+        number of partition sessions, or if any session is expired/invalid.
 
-        Checkpoint key format: "{input_path}#{session_id}:{start}"
+        Checkpoint key format: "{input_path}#{sess_idx}#{session_id}:{start}"
 
         Args:
             checkpoint_state: Checkpoint state dict mapping source_key to row index.
         """
-        # Parse unique session_ids from checkpoint keys
-        session_ids_by_input: Dict[str, List[str]] = {}  # {input_path: [session_ids]}
+        sess_by_input: Dict[str, Dict[int, str]] = {}  # {input_path: {idx: sess_id}}
         for key in checkpoint_state.keys():
-            # Parse: "{input_path}#{session_id}:{start}"
-            last_colon = key.rfind(":")
-            if last_colon == -1:
+            prefix, sep, _ = key.rpartition(":")
+            if not sep:
                 continue
-            prefix = key[:last_colon]  # "{input_path}#{session_id}"
-            hash_idx = prefix.rfind("#")
-            if hash_idx == -1:
+            input_and_idx, sep, session_id = prefix.rpartition("#")
+            if not sep:
                 continue
-            input_path = prefix[:hash_idx]
-            session_id = prefix[hash_idx + 1 :]
-            if input_path not in session_ids_by_input:
-                session_ids_by_input[input_path] = []
-            if session_id not in session_ids_by_input[input_path]:
-                session_ids_by_input[input_path].append(session_id)
+            input_path, sep, sess_idx = input_and_idx.rpartition("#")
+            if not sep or not sess_idx.isdigit():
+                # "{input_path}#{session_id}" key of an older version
+                input_path, sess_idx = input_and_idx, "-1"
+            sess_by_input.setdefault(input_path, {})[int(sess_idx)] = session_id
 
-        # Restore sessions for each input_path
-        for input_path, session_ids in session_ids_by_input.items():
+        for input_path, idx_to_sess in sess_by_input.items():
             if input_path not in self._input_to_sess:
                 logger.warning(
                     f"Checkpoint contains unknown input_path: {input_path}. "
@@ -583,9 +583,23 @@ class OdpsReader(BaseReader):
                 continue
             _, table_name, _, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
+            sess_reqs = list(self._input_to_sess[input_path])
 
-            restored_sess_reqs = []
-            for session_id in session_ids:
+            for sess_idx, session_id in idx_to_sess.items():
+                if sess_idx < 0:
+                    raise RuntimeError(
+                        f"Cannot resume from checkpoint: ODPS session {session_id} "
+                        f"for {input_path} has no session index, the checkpoint was "
+                        "written by an older TorchEasyRec version. "
+                        "Please restart training from scratch."
+                    )
+                if sess_idx >= len(sess_reqs):
+                    raise RuntimeError(
+                        f"Cannot resume from checkpoint: ODPS session {session_id} "
+                        f"for {input_path} has index {sess_idx} but only "
+                        f"{len(sess_reqs)} partition sessions exist now. "
+                        "Please restart training from scratch."
+                    )
                 sess_req = SessionRequest(session_id=session_id)
                 try:
                     resp = client.get_read_session(sess_req)
@@ -595,7 +609,7 @@ class OdpsReader(BaseReader):
                             f"for {input_path} has expired. Row order may have changed."
                             " Please restart training from scratch."
                         )
-                    restored_sess_reqs.append(sess_req)
+                    sess_reqs[sess_idx] = sess_req
                     self._sess_row_counts[session_id] = resp.record_count
                 except ODPSError as e:
                     raise RuntimeError(
@@ -603,19 +617,7 @@ class OdpsReader(BaseReader):
                         f"for {input_path} is invalid. Error: {e}. "
                         "Please restart training from scratch."
                     ) from e
-
-            # When orderby partition, partitions are consumed in order.
-            # Checkpoint only contains consumed partition sessions.
-            # Merge: restored sessions + unconsumed partition sessions (newly created)
-            current_sessions = self._input_to_sess.get(input_path, [])
-            n_restored = len(restored_sess_reqs)
-            if n_restored < len(current_sessions):
-                # Keep sessions for unconsumed partitions
-                self._input_to_sess[input_path] = (
-                    restored_sess_reqs + current_sessions[n_restored:]
-                )
-            else:
-                self._input_to_sess[input_path] = restored_sess_reqs
+            self._input_to_sess[input_path] = sess_reqs
 
     def load_state_dict(self, state: Optional[Dict[str, int]]) -> None:
         """Set checkpoint state and restore sessions.
@@ -636,10 +638,10 @@ class OdpsReader(BaseReader):
         for input_path in self._input_path.split(","):
             _, table_name, _, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
-            for sess_req in self._input_to_sess[input_path]:
+            for sess_idx, sess_req in enumerate(self._input_to_sess[input_path]):
                 sources.append(
                     (
-                        f"{input_path}#{sess_req.session_id}",
+                        f"{input_path}#{sess_idx}#{sess_req.session_id}",
                         self._sess_row_counts[sess_req.session_id],
                         client,
                         sess_req,
