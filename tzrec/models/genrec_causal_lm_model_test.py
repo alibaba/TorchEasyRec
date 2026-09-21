@@ -94,10 +94,7 @@ class _DifferentiableLM(nn.Module):
         return SimpleNamespace(logits=self.lm_head(hidden))
 
 
-def _stub_model(
-    lm: Optional[nn.Module] = None,
-    attn_kernel: int = GenRecModelConfig.FLASH_ATTENTION_2,
-) -> GenRecCausalLMModel:
+def _stub_model(lm: Optional[nn.Module] = None) -> GenRecCausalLMModel:
     """A model with just the attributes ``_forward`` reads, over a stub LM.
 
     Defaults to the varlen kernel: these cases are about the packed layout,
@@ -106,7 +103,7 @@ def _stub_model(
     model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
     nn.Module.__init__(model)
     model.lm = _CapturingLM() if lm is None else lm
-    model._attn_kernel = attn_kernel
+    model._attn_kernel = GenRecModelConfig.FLASH_ATTENTION_2
     model._ignore_index = -7
     model._prompt = SimpleNamespace(prompt_plan=SimpleNamespace(logits_suffix_len=4))
     return model
@@ -122,7 +119,7 @@ def _varlen_batch(
     """The four varlen keys ``_forward`` reads, over ``cu_seqlens[-1]`` tokens.
 
     ``PromptAssembler`` emits ``cu_seqlens`` as int32; the int64 default is
-    what makes ``_forward``'s cast to int32 observable.
+    what makes ``_packed_logits``' cast to int32 observable.
     """
     return Batch(
         additional_infos={
@@ -168,7 +165,6 @@ class PackedForwardTest(unittest.TestCase):
             cu_seqlens=(0, 3, 12),
             max_seqlen=9,
             response_lengths=(3, 3),
-            cu_dtype=torch.int32,
         )
 
         with self.assertRaisesRegex(ValueError, "at least logits_suffix_len"):

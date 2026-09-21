@@ -23,7 +23,6 @@ not supported; Qwen2.5/Qwen3 are what CI covers.
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -164,19 +163,10 @@ class GenRecCausalLMModel(BaseGenRecModel):
             suffix_offsets[None, :] < -infos[RESPONSE_LENGTHS][:, None],
             self._ignore_index,
         )
-        # CUDNN_ATTENTION is eligible for the packed mask and returns NaN
-        # losses on it; exclude it here rather than disabling it process-wide
-        with sdpa_kernel(
-            [
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-                SDPBackend.MATH,
-            ]
-        ):
-            if self._attn_kernel == GenRecModelConfig.FLASH_ATTENTION_2:
-                logits = self._packed_logits(embeds, batch, keep)
-            else:
-                logits = self._padded_logits(embeds, batch, suffix)
+        if self._attn_kernel == GenRecModelConfig.FLASH_ATTENTION_2:
+            logits = self._packed_logits(embeds, batch, keep)
+        else:
+            logits = self._padded_logits(embeds, batch, suffix)
         return logits, labels
 
     def _packed_logits(

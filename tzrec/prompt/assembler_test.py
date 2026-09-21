@@ -226,8 +226,8 @@ class PromptAssemblerTest(unittest.TestCase):
         """The walk no longer measures rows, so its consumer must.
 
         A row whose body assembles to nothing is shorter than the supervised
-        suffix window, and the packed forward's window would then reach back
-        into the sample before it. The assembler emits the row regardless --
+        suffix window, whose logits would then reach back into the sample
+        before it, on either attention layout. The assembler emits the row regardless --
         it trusts the parsed batch -- so the guard belongs to the model; this
         pins the shape that guard has to reject.
         """

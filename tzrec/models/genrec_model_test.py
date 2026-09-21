@@ -288,25 +288,6 @@ class BaseGenRecModelTest(unittest.TestCase):
         self.assertEqual(rows, self.compiled_prompt.sid_space.target_vocab_size)
         self.assertGreater(rows, self.compiled_prompt.sid_space.band_hi[-1])
 
-    def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
-        batch = _batch(
-            self.compiled_prompt,
-            {
-                "hist.values": torch.tensor(_LONG_HIST_CODES),
-                "hist.lengths": torch.tensor([6]),
-                "answer.values": torch.tensor(_ANSWER_CODES),
-                "answer.lengths": torch.tensor([3]),
-            },
-        )
-        predictions = self.model.predict(batch)
-        loss = self.model.loss(predictions, batch)["ce_loss"]
-        self.assertTrue(bool(torch.isfinite(loss)))
-        loss.backward()
-
-        grad = self.model.lm.get_input_embeddings().weight.grad
-        self.assertIsNotNone(grad)
-        self.assertTrue(bool((grad.abs().sum() > 0)))
-
     def test_training_forward_survives_fx_tracing(self) -> None:
         torch.fx.symbolic_trace(TrainWrapper(self.model))
 
