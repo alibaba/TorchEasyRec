@@ -12,6 +12,7 @@
 """Per-request list-wise InfoNCE over a jagged candidate list (paper 2.5)."""
 
 import math
+from typing import Optional
 
 import torch
 from torch import nn
@@ -87,12 +88,13 @@ class ListwiseRankLoss(_Loss):
         logits: torch.Tensor,
         labels: torch.Tensor,
         lengths: torch.Tensor,
+        segment_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute the list-wise InfoNCE term.
 
-        ``logits``, ``labels`` and ``lengths`` must all be in the same
-        request order, with the candidates of a request laid out
-        contiguously.
+        Without ``segment_ids``, ``logits`` and ``labels`` are laid out
+        request by request in ``lengths`` order, each request's candidates
+        contiguous.
 
         Args:
             logits (torch.Tensor): ``(total,)`` per-candidate score.
@@ -100,13 +102,16 @@ class ListwiseRankLoss(_Loss):
                 non-zero value counts as a positive.
             lengths (torch.Tensor): ``(B,)`` candidates per request,
                 summing to ``total``.
+            segment_ids (torch.Tensor, optional): ``(total,)`` request index
+                of each candidate, for candidates in arbitrary order.
 
         Returns:
             torch.Tensor: scalar loss -- the mean of per-request losses over
             *all* ``B`` requests (masked-out requests contribute 0), so the
             denominator matches the ``enable_global_average_loss`` rescale.
         """
-        segment_ids = jagged_segment_ids(lengths, output_size=logits.size(0))
+        if segment_ids is None:
+            segment_ids = jagged_segment_ids(lengths, output_size=logits.size(0))
         # Clamp before exp so a large temperature can't overflow to +Inf.
         scale = self.logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp()
         scaled = (logits * scale).unsqueeze(-1)

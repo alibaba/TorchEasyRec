@@ -237,3 +237,21 @@ def jagged_segment_max(
         include_self=False,
     )
     return torch.nan_to_num(maxes, neginf=0.0)
+
+
+def jagged_segment_logsumexp(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    segment_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Log-sum-exp of a jagged ``(total, C)`` tensor within each segment.
+
+    Shifts by the detached segment max, which the gradient does not depend
+    on, so the result is exact while ``exp`` cannot overflow.  An empty
+    segment yields ``-inf``; nothing that has rows reads it back.
+    """
+    maxes = jagged_segment_max(values.detach(), lengths, segment_ids)
+    sums = jagged_segment_sum(
+        torch.exp(values - maxes.index_select(0, segment_ids)), lengths, segment_ids
+    )
+    return maxes + torch.log(sums)

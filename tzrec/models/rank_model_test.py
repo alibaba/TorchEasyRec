@@ -450,6 +450,106 @@ class RankModelTest(unittest.TestCase):
                 metric_result["accuracy"], expected_acc, rtol=1e-4, atol=1e-4
             )
 
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]],
+        name_func=parameterized_name_func,
+    )
+    def test_listwise_rank_loss_with_session(self, graph_type):
+        """``session_name`` groups the rows of a flat batch into lists.
+
+        Rows are deliberately not sorted by session. Session 1 holds one
+        positive and two negatives and is the only list that counts; session
+        2 is all-positive and session 3 has a single row, so both are masked
+        out but still count in the mean's denominator.
+        """
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy()),
+                loss_pb2.LossConfig(
+                    listwise_rank_loss=loss_pb2.ListwiseRankLoss(
+                        session_name="id_a", learnable_temperature=False
+                    ),
+                    weight=0.5,
+                ),
+            ],
+        )
+        model = _TestClassficationModel(
+            model_config=model_config, features=[], labels=["label"]
+        )
+        model = TrainWrapper(model)
+        model = create_test_model(model, graph_type)
+
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["id_a"],
+            values=torch.tensor([1, 2, 1, 2, 1, 3]),
+            lengths=torch.tensor([1, 1, 1, 1, 1, 1]),
+        )
+        logits = torch.tensor([0.2, 0.3, -0.1, 0.5, 0.1, 0.4])
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[logits.unsqueeze(1)]
+        )
+        label = torch.tensor([0, 1, 1, 1, 0, 0])
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={BASE_DATA_GROUP: sparse_feature},
+            labels={"label": label},
+        )
+        total_loss, (losses, predictions, batch) = model(batch)
+
+        session1 = torch.log_softmax(logits[[0, 2, 4]] / 0.07, dim=0)[1]
+        expected_listwise = -session1 / 3 * 0.5
+        expected_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, label.float()
+        )
+        torch.testing.assert_close(
+            losses["listwise_rank_loss"], expected_listwise, rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            losses["binary_cross_entropy"], expected_bce, rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            total_loss, expected_bce + expected_listwise, rtol=1e-4, atol=1e-4
+        )
+
+    def test_listwise_rank_loss_rejects_sample_weight(self):
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(
+                    listwise_rank_loss=loss_pb2.ListwiseRankLoss(session_name="id_a")
+                )
+            ],
+        )
+        model = _TestClassficationModel(
+            model_config=model_config,
+            features=[],
+            labels=["label"],
+            sample_weights=["weight"],
+        )
+        with self.assertRaisesRegex(ValueError, "per-sample weights"):
+            TrainWrapper(model)
+
+    def test_listwise_rank_loss_needs_list_source(self):
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(listwise_rank_loss=loss_pb2.ListwiseRankLoss())
+            ],
+        )
+        model = TrainWrapper(
+            _TestClassficationModel(
+                model_config=model_config, features=[], labels=["label"]
+            )
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={},
+            labels={"label": torch.tensor([0, 1])},
+        )
+        with self.assertRaisesRegex(ValueError, "session_name"):
+            model(batch)
+
 
 if __name__ == "__main__":
     unittest.main()
