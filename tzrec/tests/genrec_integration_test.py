@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import unittest
+from typing import Optional
 from unittest import mock
 
 import numpy as np
@@ -31,14 +32,17 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
+from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 from tzrec.tests import utils
 from tzrec.utils import config_util
 from tzrec.utils.test_util import (
     create_genrec_test_tokenizer,
     create_tiny_causal_lm,
+    flash_attn_unavailable,
     gpu_unavailable,
     make_test_dir,
     mark_ci_scope,
+    nv_gpu_unavailable,
 )
 
 _MOCK_CONFIG = "tzrec/tests/configs/genrec_causal_lm_model_mock.config"
@@ -65,8 +69,16 @@ class GenRecIntegrationTest(unittest.TestCase):
         if self.success and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
-    def _prepare_config(self) -> str:
-        """Write the tiny backbone, tokenizer, manifest and data; return the config."""
+    def _prepare_config(self, attn_kernel: Optional[int] = None) -> str:
+        """Write the tiny backbone, tokenizer, manifest and data; return the config.
+
+        Args:
+            attn_kernel (int, optional): ``GenRecModelConfig.AttnKernel`` to run
+                the pipeline on; the config's own default when None.
+
+        Returns:
+            str: path to the written pipeline config.
+        """
         backbone = os.path.join(self.test_dir, "backbone")
         create_tiny_causal_lm(64).save_pretrained(backbone)
         tokenizer = create_genrec_test_tokenizer(
@@ -87,13 +99,23 @@ class GenRecIntegrationTest(unittest.TestCase):
         config.prompt_config.sid_space.manifest_path = manifest
         text_format.Merge(_BEH, config.feature_configs.add())
         config.prompt_config.prompt = "History : {{hist}} . {{beh}} Predict :"
+        if attn_kernel is not None:
+            config.model_config.genrec_causal_lm_model.common.attn_kernel = attn_kernel
         config_path = os.path.join(self.test_dir, "genrec.config")
         config_util.save_message(config, config_path)
         return config_path
 
-    def _train_eval_export(self) -> str:
-        """Run the pipeline; return the trained ``pipeline.config`` path."""
-        config_path = self._prepare_config()
+    def _train_eval_export(self, attn_kernel: Optional[int] = None) -> str:
+        """Run the pipeline; return the trained ``pipeline.config`` path.
+
+        Args:
+            attn_kernel (int, optional): ``GenRecModelConfig.AttnKernel`` to run
+                the pipeline on; the config's own default when None.
+
+        Returns:
+            str: path to the trained ``pipeline.config``.
+        """
+        config_path = self._prepare_config(attn_kernel)
         self.success = utils.test_train_eval(config_path, self.test_dir)
         trained = os.path.join(self.test_dir, "pipeline.config")
         if self.success:
@@ -193,6 +215,17 @@ class GenRecIntegrationTest(unittest.TestCase):
             "<|pg_hole|>",
         )
         self.assertEqual(tokenizer.eos_token_id, compiled.sid_space.eos_token_id)
+
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skipIf(*flash_attn_unavailable)
+    @mark_ci_scope("gpu")
+    def test_genrec_train_eval_export_on_the_varlen_kernel(self):
+        """The packed forward, through the train pipeline and out to an export.
+
+        The default kernel is SDPA, so the sibling case above covers the padded
+        layout; this is the only end-to-end run of the packed one.
+        """
+        self._train_eval_export(attn_kernel=GenRecModelConfig.FLASH_ATTENTION_2)
 
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")

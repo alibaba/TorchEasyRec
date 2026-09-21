@@ -29,6 +29,9 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 from tzrec.utils.test_util import (
+    GENREC_ANSWER_CODES,
+    GENREC_HIST_CODES,
+    GENREC_LONG_HIST_CODES,
     create_genrec_test_model,
     create_genrec_test_prompt,
     flash_attn_unavailable,
@@ -114,16 +117,15 @@ def _varlen_batch(
     max_seqlen: int = 7,
     response_lengths: Sequence[int] = (3, 2),
     first_input_id: int = 100,
-    cu_dtype: torch.dtype = torch.int64,
 ) -> Batch:
     """The four varlen keys ``_forward`` reads, over ``cu_seqlens[-1]`` tokens.
 
-    ``PromptAssembler`` emits ``cu_seqlens`` as int32; the int64 default is
-    what makes ``_packed_logits``' cast to int32 observable.
+    ``PromptAssembler`` emits ``cu_seqlens`` as int32; int64 here is what
+    makes ``_packed_logits``' cast to int32 do visible work.
     """
     return Batch(
         additional_infos={
-            CU_SEQLENS: torch.tensor(cu_seqlens, dtype=cu_dtype),
+            CU_SEQLENS: torch.tensor(cu_seqlens),
             INPUT_IDS: torch.arange(first_input_id, first_input_id + cu_seqlens[-1]),
             MAX_SEQLEN: torch.tensor(max_seqlen),
             RESPONSE_LENGTHS: torch.tensor(response_lengths),
@@ -245,15 +247,9 @@ class GenRecCausalLMModelTest(unittest.TestCase):
             )
 
 
-# offset SID codes for the (4, 4, 4) codebook: level_offsets[l] + code
-_HIST_CODES = [0, 5, 10]
-_LONG_HIST_CODES = [0, 5, 10, 3, 4, 9]
-_ANSWER_CODES = [1, 6, 11]
-
-
-# a second answer, and a rewrite of _HIST_CODES that keeps its width
-_OTHER_ANSWER_CODES = [2, 7, 8]
-_REWRITTEN_HIST_CODES = [3, 7, 11]
+# a second answer, and a rewrite of GENREC_HIST_CODES that keeps its width
+_OTHERGENREC_ANSWER_CODES = [2, 7, 8]
+_REWRITTENGENREC_HIST_CODES = [3, 7, 11]
 
 
 def _packed_batch(compiled_prompt, hist_rows, answer_rows) -> Batch:
@@ -305,8 +301,8 @@ class _RowIsolationCase:
         )
         model.to(device)
         model.eval()
-        hist_rows = [_HIST_CODES, _LONG_HIST_CODES]
-        answer_rows = [_ANSWER_CODES, _OTHER_ANSWER_CODES]
+        hist_rows = [GENREC_HIST_CODES, GENREC_LONG_HIST_CODES]
+        answer_rows = [GENREC_ANSWER_CODES, _OTHERGENREC_ANSWER_CODES]
         packed_batch = _packed_batch(compiled_prompt, hist_rows, answer_rows).to(device)
 
         packed = model.predict(packed_batch)
@@ -320,7 +316,7 @@ class _RowIsolationCase:
             changed = model.predict(
                 _packed_batch(
                     compiled_prompt,
-                    [_REWRITTEN_HIST_CODES, hist_rows[1]],
+                    [_REWRITTENGENREC_HIST_CODES, hist_rows[1]],
                     answer_rows,
                 ).to(device)
             )

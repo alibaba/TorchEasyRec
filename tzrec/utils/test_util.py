@@ -400,6 +400,13 @@ def create_genrec_test_tokenizer(
     return path
 
 
+# offset SID codes for the (4, 4, 4) codebook create_genrec_test_prompt fixes:
+# level_offsets[l] + code, with offsets (0, 4, 8)
+GENREC_HIST_CODES = [0, 5, 10]
+GENREC_LONG_HIST_CODES = [0, 5, 10, 3, 4, 9]
+GENREC_ANSWER_CODES = [1, 6, 11]
+
+
 def create_genrec_test_prompt(
     test_dir: str,
     feature_configs: Optional[List[feature_pb2.FeatureConfig]] = None,

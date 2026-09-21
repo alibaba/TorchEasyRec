@@ -224,9 +224,13 @@ class GenRecCausalLMModel(BaseGenRecModel):
             ``(rows, suffix, vocab)`` logits over the response window.
         """
         padded, mask = self._left_pad_packed_inputs(embeds, batch)
+        # left padding offsets every row, so spell the positions out rather
+        # than letting HF assign arange(max_seqlen) over the padding too
+        position_ids = (mask.cumsum(-1) - 1).clamp(min=0)
         outputs = self.lm(
             inputs_embeds=padded,
             attention_mask=mask,
+            position_ids=position_ids,
             use_cache=False,
             logits_to_keep=suffix,
         )

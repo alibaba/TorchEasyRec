@@ -43,15 +43,13 @@ from tzrec.protos.prompt_pb2 import PromptSlot
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
+    GENREC_ANSWER_CODES,
+    GENREC_HIST_CODES,
+    GENREC_LONG_HIST_CODES,
     create_genrec_test_model,
     make_test_dir,
     parameterized_name_func,
 )
-
-# offset SID codes for the (4, 4, 4) codebook: level_offsets[l] + code
-_HIST_CODES = [0, 5, 10]
-_LONG_HIST_CODES = [0, 5, 10, 3, 4, 9]
-_ANSWER_CODES = [1, 6, 11]
 
 
 def _hist() -> feature_pb2.FeatureConfig:
@@ -86,9 +84,9 @@ def _projected_batch(compiled_prompt) -> Batch:
     return _batch(
         compiled_prompt,
         {
-            "hist.values": torch.tensor(_HIST_CODES).reshape(-1, 1),
+            "hist.values": torch.tensor(GENREC_HIST_CODES).reshape(-1, 1),
             "hist.lengths": torch.tensor([3]),
-            "answer.values": torch.tensor(_ANSWER_CODES),
+            "answer.values": torch.tensor(GENREC_ANSWER_CODES),
             "answer.lengths": torch.tensor([3]),
             "prof.values": torch.tensor([5, 9]),
             "prof.lengths": torch.tensor([2]),
@@ -306,9 +304,9 @@ class GenRecFrontEndTest(unittest.TestCase):
         # the parsed dict as the data parser emits it: a dense sequence of codes
         # and a sparse behaviour sequence
         self.data = {
-            "hist.values": torch.tensor(_LONG_HIST_CODES, dtype=torch.float32).reshape(
-                -1, 1
-            ),
+            "hist.values": torch.tensor(
+                GENREC_LONG_HIST_CODES, dtype=torch.float32
+            ).reshape(-1, 1),
             "hist.lengths": torch.tensor([6]),
             "beh.values": torch.tensor([3, 9]),
             "beh.lengths": torch.tensor([2]),

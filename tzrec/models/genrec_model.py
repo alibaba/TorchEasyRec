@@ -104,6 +104,9 @@ class BaseGenRecModel(BaseModel):
         self._ignore_index = int(cfg.common.ignore_index)
         self.lm: nn.Module
         self._attn_kernel: int
+        # the forward picks its layout from this: only the varlen kernel reads
+        # cu_seq_lens, so every other kernel has to be handed padded rows
+        self._attn_kernel = cfg.common.attn_kernel
         self.init_backbone(
             cfg.hf_model_name_or_path,
             cfg.common.lm_parameter_dtype,
@@ -143,9 +146,6 @@ class BaseGenRecModel(BaseModel):
             lm_parameter_dtype: dtype of the LM parameters.
             attn_kernel: attention kernel to build the backbone with.
         """
-        # the forward picks its layout from this: only the varlen kernel reads
-        # cu_seq_lens, so every other kernel has to be handed padded rows
-        self._attn_kernel = attn_kernel
         config = AutoConfig.from_pretrained(hf_model_name_or_path)
         self.lm = AutoModelForCausalLM.from_config(
             config,
