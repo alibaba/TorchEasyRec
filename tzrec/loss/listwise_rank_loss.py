@@ -18,11 +18,8 @@ import torch
 from torch import nn
 from torch.nn.modules.loss import _Loss
 
-from tzrec.ops.jagged_tensors import (
-    jagged_segment_ids,
-    jagged_segment_max,
-    jagged_segment_sum,
-)
+from tzrec.ops.jagged_tensors import jagged_segment_ids
+from tzrec.ops.scatter_ops import scatter_max, scatter_sum
 from tzrec.utils.fx_util import fx_size0_max1
 
 # `torch.fx.wrap` registers by name in the *calling* module's globals; the
@@ -116,20 +113,19 @@ class ListwiseRankLoss(_Loss):
         scale = self.logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp()
         scaled = (logits * scale).unsqueeze(-1)
 
-        maxes = jagged_segment_max(scaled.detach(), lengths, segment_ids)
+        num_lists = lengths.size(0)
+        maxes = scatter_max(scaled.detach(), segment_ids, num_lists)
         shifted = scaled - maxes.index_select(0, segment_ids)
         # A non-empty segment always sums to >= 1, because the row holding
         # the segment max contributes exp(0) == 1.  So the clamp is exact
         # where it matters and only rewrites empty segments, where log(0)
         # would otherwise leak -inf into the tensor.
-        denom = jagged_segment_sum(torch.exp(shifted), lengths, segment_ids).clamp(
-            min=1.0
-        )
+        denom = scatter_sum(torch.exp(shifted), segment_ids, num_lists).clamp(min=1.0)
         log_probs = shifted - torch.log(denom).index_select(0, segment_ids)
 
         positives = (labels != 0).to(log_probs.dtype).unsqueeze(-1)
-        num_pos = jagged_segment_sum(positives, lengths, segment_ids)
-        pos_log_prob = jagged_segment_sum(log_probs * positives, lengths, segment_ids)
+        num_pos = scatter_sum(positives, segment_ids, num_lists)
+        pos_log_prob = scatter_sum(log_probs * positives, segment_ids, num_lists)
 
         num_candidates = lengths.to(num_pos.dtype).unsqueeze(-1)
         valid = ((num_pos > 0) & (num_pos < num_candidates)).to(log_probs.dtype)

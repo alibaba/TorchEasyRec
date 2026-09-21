@@ -18,7 +18,8 @@ from torch import Tensor
 from torch.nn import CrossEntropyLoss
 from torch.nn.modules.loss import _Loss
 
-from tzrec.ops.jagged_tensors import jagged_segment_ids, jagged_segment_logsumexp
+from tzrec.ops.jagged_tensors import jagged_segment_ids
+from tzrec.ops.scatter_ops import scatter_logsumexp
 
 # Logit assigned to samples that must not compete: exp underflows to exactly
 # 0 after the segment max shift, so they drop out of the log-sum-exp.
@@ -88,11 +89,12 @@ class JRCLoss(_Loss):
         # logit; of a negative: the session's positives on the negative logit.
         neg_competitors = torch.where(is_pos, _MASKED_LOGIT, logits_pos)
         pos_competitors = torch.where(is_pos, logits_neg, _MASKED_LOGIT)
-        lse_neg = jagged_segment_logsumexp(
-            neg_competitors.unsqueeze(-1), lengths, segment_ids
+        num_sessions = lengths.size(0)
+        lse_neg = scatter_logsumexp(
+            neg_competitors.unsqueeze(-1), segment_ids, num_sessions
         ).squeeze(-1)
-        lse_pos = jagged_segment_logsumexp(
-            pos_competitors.unsqueeze(-1), lengths, segment_ids
+        lse_pos = scatter_logsumexp(
+            pos_competitors.unsqueeze(-1), segment_ids, num_sessions
         ).squeeze(-1)
         ge_loss = torch.where(
             is_pos,

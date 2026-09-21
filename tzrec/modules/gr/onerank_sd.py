@@ -40,11 +40,8 @@ import torch.nn.functional as F
 
 from tzrec.modules.norm import LayerNorm
 from tzrec.modules.utils import BaseModule
-from tzrec.ops.jagged_tensors import (
-    jagged_segment_ids,
-    jagged_segment_max,
-    jagged_segment_sum,
-)
+from tzrec.ops.jagged_tensors import jagged_segment_ids
+from tzrec.ops.scatter_ops import scatter_max, scatter_sum
 
 
 def _jagged_softmax(logits: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -55,9 +52,9 @@ def _jagged_softmax(logits: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor
     detached, because it is a constant of the softmax identity.
     """
     segment_ids = jagged_segment_ids(lengths, output_size=logits.size(0))
-    maxes = jagged_segment_max(logits.detach(), lengths, segment_ids)
+    maxes = scatter_max(logits.detach(), segment_ids, lengths.size(0))
     exp = torch.exp(logits - maxes.index_select(0, segment_ids))
-    denom = jagged_segment_sum(exp, lengths, segment_ids)
+    denom = scatter_sum(exp, segment_ids, lengths.size(0))
     return exp / torch.repeat_interleave(denom, lengths, dim=0, output_size=exp.size(0))
 
 
@@ -138,7 +135,7 @@ def _jagged_single_query_attn(
     attn = _jagged_softmax(logits, lengths)
     attn = F.dropout(attn, p=dropout_ratio, training=training)
     weighted = (attn.unsqueeze(-1) * v).reshape(-1, num_heads * head_dim)
-    return jagged_segment_sum(weighted, lengths, segment_ids)
+    return scatter_sum(weighted, segment_ids, lengths.size(0))
 
 
 torch.fx.wrap(_jagged_single_query_attn)
