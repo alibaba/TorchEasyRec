@@ -81,7 +81,14 @@ class MultiTaskRank(RankModel):
         """Initialize loss modules."""
         for task_tower_cfg in self._task_tower_cfgs:
             tower_name = task_tower_cfg.tower_name
-            reduction = "none" if self.has_weight(task_tower_cfg) else "mean"
+            # Only a per-sample weight needs the unreduced loss; the scalar
+            # tower weight scales a mean just the same.
+            reduction = (
+                "none"
+                if task_tower_cfg.HasField("sample_weight_name")
+                or task_tower_cfg.HasField("task_space_indicator_label")
+                else "mean"
+            )
             for loss_cfg in task_tower_cfg.losses:
                 self._init_loss_impl(
                     loss_cfg,

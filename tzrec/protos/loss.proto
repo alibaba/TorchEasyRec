@@ -50,13 +50,17 @@ message BinaryCrossEntropy {
     optional float label_smoothing = 1 [default = 0.0];
 }
 
-// Per-request list-wise ranking loss: softmax cross-entropy over the
-// candidates of one request, where the negatives of a candidate are the
-// other candidates of the same request.  Requires the model to publish
-// per-request candidate counts and the task's `logits_<task_name>`
-// prediction (carry it next to a logit loss such as
-// binary_cross_entropy); currently the DlrmHSTU family satisfies both.
+// List-wise ranking loss: softmax cross-entropy over the samples of one
+// list, where the negatives of a sample are the other samples of the same
+// list.  The list is the per-request candidate sequence a model publishes
+// (the DlrmHSTU family) or the samples of a batch that share the
+// `session_name` feature value.
 message ListwiseRankLoss {
+    // Feature (e.g. request_id or user_id) whose value groups the samples of
+    // a batch into lists, for models that do not publish per-request
+    // candidate counts. The DlrmHSTU family uses each request as the list
+    // and rejects this field.
+    optional string session_name = 1;
     // initial softmax temperature; the logits are multiplied by
     // 1 / temperature.
     optional float temperature_init = 2 [default = 0.07];
@@ -71,8 +75,15 @@ message SoftmaxCrossEntropy {
 message L2Loss {
 }
 
+// Joint ranking and calibration loss: cross-entropy plus a per-session
+// term in which each positive competes with the negatives of its session
+// and vice versa.  The session is defined like ListwiseRankLoss's list.
 message JRCLoss {
-    required string session_name = 1;
+    // Feature (e.g. user_id) whose value groups the samples of a batch into
+    // sessions. Required unless the model publishes per-request candidate
+    // counts (the DlrmHSTU family), where it overrides the per-request
+    // session.
+    optional string session_name = 1;
     optional float alpha = 2 [default = 0.5];
 }
 
