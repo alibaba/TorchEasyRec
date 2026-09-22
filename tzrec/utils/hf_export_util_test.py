@@ -20,10 +20,7 @@ from safetensors.torch import load_file
 from torch import nn
 
 from tzrec.utils.checkpoint_util import save_model
-from tzrec.utils.hf_export_util import (
-    capture_hf_backbone,
-    dcp_to_hf,
-)
+from tzrec.utils.hf_export_util import dcp_to_hf
 from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
 
@@ -63,23 +60,12 @@ class HfExportUtilTest(unittest.TestCase):
             save_model(ckpt_dir, wrapped)
         return ckpt_dir
 
-    def test_capture_hf_backbone_prefix_matches_the_checkpoint(self) -> None:
-        lm = _tied_lm()
-        wrapped = _TrainWrapper(_GenRec(lm))
-        config, gen_config, prefix = capture_hf_backbone(wrapped)
-        self.assertIs(config, lm.config)
-        self.assertIs(gen_config, lm.generation_config)
-        self.assertEqual(prefix, "model.lm.")
-        # the prefix must reconstruct the exact FQNs save_model writes
-        saved = set(wrapped.state_dict())
-        self.assertTrue(all(prefix + k in saved for k in lm.state_dict()))
-
-    def _convert(self, out_name, prefix):
+    def _convert(self, out_name):
         """Save a checkpoint, convert it, and leave a config.json for the reload."""
         lm = _tied_lm()
         ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(lm)))
         out_dir = os.path.join(self.test_dir, out_name)
-        dcp_to_hf(ckpt_dir, out_dir, lm.config, prefix)
+        dcp_to_hf(ckpt_dir, out_dir, lm.config)
         # the caller composes config.json; here the backbone's own is enough
         with open(os.path.join(out_dir, "config.json"), "w") as f:
             json.dump(json.loads(lm.config.to_json_string()), f)
@@ -88,7 +74,7 @@ class HfExportUtilTest(unittest.TestCase):
     def test_dcp_to_hf_round_trip_drops_tied_head(self) -> None:
         from transformers import AutoModelForCausalLM
 
-        lm, out_dir = self._convert("hf_out", "model.lm.")
+        lm, out_dir = self._convert("hf_out")
 
         st = load_file(os.path.join(out_dir, "model.safetensors"))
         self.assertNotIn("lm_head.weight", st)
@@ -100,14 +86,22 @@ class HfExportUtilTest(unittest.TestCase):
         for k, v in lm.state_dict().items():
             self.assertTrue(torch.equal(back.state_dict()[k], v), k)
 
-    def test_dcp_to_hf_falls_back_to_suffix_matching(self) -> None:
-        """A prefix that does not fit still converts, by matching key suffixes."""
-        from transformers import AutoModelForCausalLM
+    def test_dcp_to_hf_refuses_keys_from_two_prefixes(self) -> None:
+        """One backbone lives under one prefix; a look-alike key cannot stand in."""
+        from torch.distributed.checkpoint import state_dict_loader
 
-        lm, out_dir = self._convert("hf_out_suffix", "nope.")
-        back = AutoModelForCausalLM.from_pretrained(out_dir)
-        for k, v in lm.state_dict().items():
-            self.assertTrue(torch.equal(back.state_dict()[k], v), k)
+        lm = _tied_lm()
+        ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(lm)))
+        keys = ["model.lm." + k for k in lm.state_dict()]
+        keys[0] = "other.lm." + keys[0][len("model.lm.") :]
+        reader = mock.MagicMock()
+        reader.read_metadata.return_value.state_dict_metadata = dict.fromkeys(keys)
+        patched = mock.patch.object(
+            state_dict_loader, "_storage_setup", return_value=reader
+        )
+        out_dir = os.path.join(self.test_dir, "hf_out_mixed")
+        with patched, self.assertRaisesRegex(RuntimeError, "Refusing to write"):
+            dcp_to_hf(ckpt_dir, out_dir, lm.config)
 
     def test_dcp_to_hf_loads_only_the_backbone_keys(self) -> None:
         """The rest of a genrec checkpoint is the sparse tables; never read them."""
@@ -123,12 +117,8 @@ class HfExportUtilTest(unittest.TestCase):
             return original(keys, **kwargs)
 
         with mock.patch.object(state_dict_loader, "_load_state_dict_from_keys", _spy):
-            dcp_to_hf(
-                ckpt_dir,
-                os.path.join(self.test_dir, "hf_out_keys"),
-                lm.config,
-                "model.lm.",
-            )
+            out_dir = os.path.join(self.test_dir, "hf_out_keys")
+            dcp_to_hf(ckpt_dir, out_dir, lm.config)
         self.assertEqual(len(requested), 1)
         self.assertIsNotNone(requested[0])
         self.assertFalse([k for k in requested[0] if ".other." in k])
@@ -146,7 +136,6 @@ class HfExportUtilTest(unittest.TestCase):
                 ckpt_dir,
                 os.path.join(self.test_dir, "hf_out_bad"),
                 type(lm.config)(**cfg),
-                "model.lm.",
             )
 
     def test_dcp_to_hf_missing_dcp_dir(self) -> None:
@@ -154,10 +143,7 @@ class HfExportUtilTest(unittest.TestCase):
         os.makedirs(empty, exist_ok=True)
         with self.assertRaisesRegex(RuntimeError, "not exists"):
             dcp_to_hf(
-                empty,
-                os.path.join(self.test_dir, "hf_out_missing"),
-                _tied_lm().config,
-                "model.lm.",
+                empty, os.path.join(self.test_dir, "hf_out_missing"), _tied_lm().config
             )
 
 
