@@ -54,14 +54,16 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str, config: PretrainedConfig) -> None:
 
     with torch.device("meta"):
         empty = AutoModelForCausalLM.from_config(config)
-    target_keys: Set[str] = set(empty.state_dict().keys())
+    target_shapes = {k: tuple(v.shape) for k, v in empty.state_dict().items()}
+    target_keys: Set[str] = set(target_shapes)
     tied_keys: Set[str] = set(getattr(empty, "_tied_weights_keys", None) or [])
     del empty
 
     # the mapping is decided on names alone, so the load below reads the
     # backbone and not the sparse tables beside it
     reader = _storage_setup(None, model_ckpt_path, reader=True)
-    ckpt_keys: Set[str] = set(reader.read_metadata().state_dict_metadata)
+    metadata = reader.read_metadata().state_dict_metadata
+    ckpt_keys: Set[str] = set(metadata)
 
     def _derive_by_suffix() -> Optional[Dict[str, str]]:
         """Each target key is a unique suffix of exactly one DCP key; None if not."""
@@ -84,6 +86,19 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str, config: PretrainedConfig) -> None:
             f"{sorted(target_keys)[:3]}; the checkpoint holds {len(ckpt_keys)} "
             f"like {sorted(ckpt_keys)[:3]}. Refusing to write a partially-loaded "
             "HF model."
+        )
+    # names alone would let a resized vocabulary or a swapped backbone through
+    drifted = [
+        (tk, target_shapes[tk], tuple(metadata[ck].size))
+        for tk, ck in key_map.items()
+        if tuple(metadata[ck].size) != target_shapes[tk]
+    ]
+    if drifted:
+        raise RuntimeError(
+            "dcp_to_hf: the checkpoint's tensors do not fit the exported config, "
+            f"e.g. {drifted[:3]} as (key, config shape, checkpoint shape); was it "
+            "trained under a different sid_space or backbone? Refusing to write "
+            "a partially-loaded HF model."
         )
 
     # non-distributed => full tensors locally

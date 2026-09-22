@@ -138,6 +138,20 @@ class HfExportUtilTest(unittest.TestCase):
                 type(lm.config)(**cfg),
             )
 
+    def test_dcp_to_hf_refuses_a_shape_that_drifted(self) -> None:
+        """Same key names, a resized vocabulary: the config no longer fits."""
+        lm = _tied_lm()
+        ckpt_dir = self._save_ckpt(_TrainWrapper(_GenRec(lm)))
+        cfg = lm.config.to_dict()
+        cfg["vocab_size"] += 64
+        cfg.pop("layer_types", None)
+        with self.assertRaisesRegex(RuntimeError, "do not fit"):
+            dcp_to_hf(
+                ckpt_dir,
+                os.path.join(self.test_dir, "hf_out_grown"),
+                type(lm.config)(**cfg),
+            )
+
     def test_dcp_to_hf_missing_dcp_dir(self) -> None:
         empty = os.path.join(self.test_dir, "no_dcp")
         os.makedirs(empty, exist_ok=True)
