@@ -98,7 +98,15 @@ class BaseGenRecModel(BaseModel):
 
         self._ignore_index = int(cfg.common.ignore_index)
         self.lm: nn.Module
-        self.init_backbone(cfg.hf_model_name_or_path, cfg.common.lm_parameter_dtype)
+        self._attn_kernel: str
+        # the forward picks its layout from this: only the varlen kernel reads
+        # cu_seq_lens, so every other kernel has to be handed padded rows
+        self._attn_kernel = cfg.common.attn_kernel
+        self.init_backbone(
+            cfg.hf_model_name_or_path,
+            cfg.common.lm_parameter_dtype,
+            cfg.common.attn_kernel,
+        )
         # Every run replaces this initialization from pretrained or DCP weights.
         self.lm.resize_token_embeddings(
             compiled_prompt.sid_space.target_vocab_size, mean_resizing=False
@@ -120,7 +128,10 @@ class BaseGenRecModel(BaseModel):
         self.init_projections()
 
     def init_backbone(
-        self, hf_model_name_or_path: str, lm_parameter_dtype: int
+        self,
+        hf_model_name_or_path: str,
+        lm_parameter_dtype: int,
+        attn_kernel: str,
     ) -> None:
         """Assign ``self.lm`` from config, so HF weights load only on cold start.
 
@@ -128,10 +139,14 @@ class BaseGenRecModel(BaseModel):
             hf_model_name_or_path: hub id or local directory naming the
                 architecture and cold-start weights.
             lm_parameter_dtype: dtype of the LM parameters.
+            attn_kernel: transformers attn_implementation name.
         """
         config = AutoConfig.from_pretrained(hf_model_name_or_path)
-        model = AutoModelForCausalLM.from_config(config)
-        self.lm = model.to(_PARAM_DTYPE[lm_parameter_dtype])
+        self.lm = AutoModelForCausalLM.from_config(
+            config,
+            attn_implementation=attn_kernel,
+            torch_dtype=_PARAM_DTYPE[lm_parameter_dtype],
+        )
         self._check_backbone_interfaces(hf_model_name_or_path)
 
     def _check_backbone_interfaces(self, hf_model_name_or_path: str) -> None:

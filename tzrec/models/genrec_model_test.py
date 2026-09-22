@@ -11,6 +11,8 @@
 
 import os
 import unittest
+from typing import Tuple
+from unittest import mock
 
 import torch
 import torch.fx
@@ -26,7 +28,7 @@ from tzrec.models.genrec_model import (
     GenRecFrontEnd,
     project_slots,
 )
-from tzrec.models.model import ScriptWrapper, TrainWrapper
+from tzrec.models.model import BaseModel, ScriptWrapper, TrainWrapper
 from tzrec.prompt.assembler import (
     HOLE_POSITIONS,
     HOLE_SLOT_COUNTS,
@@ -41,15 +43,13 @@ from tzrec.protos.prompt_pb2 import PromptSlot
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
+    GENREC_ANSWER_CODES,
+    GENREC_HIST_CODES,
+    GENREC_LONG_HIST_CODES,
     create_genrec_test_model,
     make_test_dir,
     parameterized_name_func,
 )
-
-# offset SID codes for the (4, 4, 4) codebook: level_offsets[l] + code
-_HIST_CODES = [0, 5, 10]
-_LONG_HIST_CODES = [0, 5, 10, 3, 4, 9]
-_ANSWER_CODES = [1, 6, 11]
 
 
 def _hist() -> feature_pb2.FeatureConfig:
@@ -84,9 +84,9 @@ def _projected_batch(compiled_prompt) -> Batch:
     return _batch(
         compiled_prompt,
         {
-            "hist.values": torch.tensor(_HIST_CODES).reshape(-1, 1),
+            "hist.values": torch.tensor(GENREC_HIST_CODES).reshape(-1, 1),
             "hist.lengths": torch.tensor([3]),
-            "answer.values": torch.tensor(_ANSWER_CODES),
+            "answer.values": torch.tensor(GENREC_ANSWER_CODES),
             "answer.lengths": torch.tensor([3]),
             "prof.values": torch.tensor([5, 9]),
             "prof.lengths": torch.tensor([2]),
@@ -128,6 +128,48 @@ class BaseGenRecModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "needs a compiled prompt"):
             _create_model(model_config, [], ["answer"], compiled_prompt=None)
 
+    @parameterized.expand(
+        [
+            ["sdpa"],
+            ["flash_attention_2"],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_builds_backbone_with_the_configured_kernel_and_dtype(
+        self, attn_kernel: str
+    ) -> None:
+        # from_config is mocked, so this pins the kwargs init_backbone sends
+        # without building a second backbone; setUp still builds a real one.
+        stand_in = AutoModelForCausalLM.from_pretrained(
+            os.path.join(self.test_dir, "backbone")
+        )
+
+        with (
+            mock.patch.object(stand_in, "to", wraps=stand_in.to) as to_mock,
+            mock.patch.object(
+                AutoModelForCausalLM, "from_config", return_value=stand_in
+            ) as from_config,
+        ):
+            create_genrec_test_model(
+                self.test_dir,
+                lm_parameter_dtype=GenRecModelConfig.BF16,
+                attn_kernel=attn_kernel,
+            )
+
+        # the fixture backbone is built through from_config too, so this
+        # reads the last call, which is init_backbone's
+        args, kwargs = from_config.call_args
+        self.assertEqual(len(args), 1)
+        self.assertEqual(args[0].model_type, "qwen2")
+        self.assertEqual(
+            kwargs,
+            {
+                "attn_implementation": attn_kernel,
+                "torch_dtype": torch.bfloat16,
+            },
+        )
+        to_mock.assert_not_called()
+
     def test_shared_projection_name_requires_matching_widths(self) -> None:
         with self.assertRaisesRegex(ValueError, "cannot share a module"):
             create_genrec_test_model(
@@ -144,15 +186,20 @@ class BaseGenRecModelTest(unittest.TestCase):
                 ],
             )
 
-    def test_projected_slot_overwrites_sentinels_and_backpropagates(self) -> None:
+    def _projected_model(self, **kwargs) -> Tuple[BaseModel, Batch]:
+        """A model with one projected ``prof`` slot, materialized, and its batch."""
         model, compiled_prompt = create_genrec_test_model(
             self.test_dir,
             feature_configs=[_hist(), _projected("prof", 8)],
             prompt="History : {{hist}} . Predict {{prof}} :",
+            **kwargs,
         )
         # the embedding table is built on meta until something materializes it
         init_parameters(model, device=torch.device("cpu"))
-        batch = _projected_batch(compiled_prompt)
+        return model, _projected_batch(compiled_prompt)
+
+    def test_projected_slot_overwrites_sentinels_and_backpropagates(self) -> None:
+        model, batch = self._projected_model()
 
         embeds = model.build_input(batch)
         raw = model.lm.get_input_embeddings()(batch.additional_infos[INPUT_IDS])
@@ -171,14 +218,7 @@ class BaseGenRecModelTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_projected_slot_follows_a_narrow_lm_dtype(self, lm_parameter_dtype) -> None:
-        model, compiled_prompt = create_genrec_test_model(
-            self.test_dir,
-            feature_configs=[_hist(), _projected("prof", 8)],
-            prompt="History : {{hist}} . Predict {{prof}} :",
-            lm_parameter_dtype=lm_parameter_dtype,
-        )
-        init_parameters(model, device=torch.device("cpu"))
-        batch = _projected_batch(compiled_prompt)
+        model, batch = self._projected_model(lm_parameter_dtype=lm_parameter_dtype)
 
         embeds = model.build_input(batch)
         self.assertIs(embeds.dtype, _PARAM_DTYPE[lm_parameter_dtype])
@@ -191,6 +231,31 @@ class BaseGenRecModelTest(unittest.TestCase):
         proj = next(iter(model.projections.values()))
         self.assertIs(proj.head.weight.dtype, torch.float32)
         self.assertGreater(float(proj.head.weight.grad.abs().sum()), 0.0)
+
+    def test_projected_slot_trains_with_fp32_masters_and_bf16_autocast(self) -> None:
+        model, compiled_prompt = create_genrec_test_model(
+            self.test_dir,
+            feature_configs=[_hist(), _projected("prof", 8)],
+            prompt="History : {{hist}} . Predict {{prof}} :",
+        )
+        init_parameters(model, device=torch.device("cpu"))
+        batch = _projected_batch(compiled_prompt)
+
+        wrapper = TrainWrapper(
+            model, device=torch.device("cpu"), mixed_precision="BF16"
+        )
+        loss, _ = wrapper(batch)
+        self.assertTrue(bool(torch.isfinite(loss)))
+        loss.backward()
+
+        lm_weight = model.lm.model.layers[0].self_attn.q_proj.weight
+        self.assertIs(lm_weight.dtype, torch.float32)
+        self.assertIsNotNone(lm_weight.grad)
+        self.assertTrue(bool(torch.isfinite(lm_weight.grad).all()))
+        proj_weight = next(iter(model.projections.values())).head.weight
+        self.assertIs(proj_weight.dtype, torch.float32)
+        self.assertIsNotNone(proj_weight.grad)
+        self.assertTrue(bool(torch.isfinite(proj_weight.grad).all()))
 
     def test_metric_averages_the_loss_across_batches(self) -> None:
         self.model.init_metric()
@@ -221,25 +286,6 @@ class BaseGenRecModelTest(unittest.TestCase):
         self.assertEqual(rows, self.compiled_prompt.sid_space.target_vocab_size)
         self.assertGreater(rows, self.compiled_prompt.sid_space.band_hi[-1])
 
-    def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
-        batch = _batch(
-            self.compiled_prompt,
-            {
-                "hist.values": torch.tensor(_LONG_HIST_CODES),
-                "hist.lengths": torch.tensor([6]),
-                "answer.values": torch.tensor(_ANSWER_CODES),
-                "answer.lengths": torch.tensor([3]),
-            },
-        )
-        predictions = self.model.predict(batch)
-        loss = self.model.loss(predictions, batch)["ce_loss"]
-        self.assertTrue(bool(torch.isfinite(loss)))
-        loss.backward()
-
-        grad = self.model.lm.get_input_embeddings().weight.grad
-        self.assertIsNotNone(grad)
-        self.assertTrue(bool((grad.abs().sum() > 0)))
-
     def test_training_forward_survives_fx_tracing(self) -> None:
         torch.fx.symbolic_trace(TrainWrapper(self.model))
 
@@ -258,9 +304,9 @@ class GenRecFrontEndTest(unittest.TestCase):
         # the parsed dict as the data parser emits it: a dense sequence of codes
         # and a sparse behaviour sequence
         self.data = {
-            "hist.values": torch.tensor(_LONG_HIST_CODES, dtype=torch.float32).reshape(
-                -1, 1
-            ),
+            "hist.values": torch.tensor(
+                GENREC_LONG_HIST_CODES, dtype=torch.float32
+            ).reshape(-1, 1),
             "hist.lengths": torch.tensor([6]),
             "beh.values": torch.tensor([3, 9]),
             "beh.lengths": torch.tensor([2]),
