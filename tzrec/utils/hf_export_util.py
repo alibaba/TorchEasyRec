@@ -15,15 +15,14 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 import torch
 from safetensors.torch import save_file
 from transformers import GenerationConfig, PretrainedConfig
 
-from tzrec.features.feature import BaseFeature
-from tzrec.prompt.compile import compile_prompt
-from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.prompt.compile import save_tokenizer_dir
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.utils.filesystem_util import url_to_fs
 
 SERVING_ARCH = "GenRecForCausalLM"
@@ -103,10 +102,9 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str, config: PretrainedConfig) -> None:
 
 
 def export_hf_assets(
-    pipeline_config: EasyRecConfig,
-    features: List[BaseFeature],
     checkpoint_path: str,
     export_dir: str,
+    compiled_prompt: CompiledPrompt,
     backbone_config: PretrainedConfig,
     generation_config: Optional[GenerationConfig],
 ) -> None:
@@ -120,10 +118,10 @@ def export_hf_assets(
     does for its own files.
 
     Args:
-        pipeline_config: the pipeline being exported.
-        features: the created features the prompt compiles against.
         checkpoint_path: the checkpoint the weights come from.
         export_dir: the export directory.
+        compiled_prompt: the prompt the model was built on; its tokenizer and
+            SID space are what the engine decodes with.
         backbone_config: the backbone config, read off the live model.
         generation_config: the backbone's generation config, when it has one.
     """
@@ -135,18 +133,13 @@ def export_hf_assets(
         if generation_config is not None:
             generation_config.save_pretrained(local_dir)
         backbone = json.loads(backbone_config.to_json_string())
-        compiled = compile_prompt(
-            pipeline_config.prompt_config,
-            features,
-            list(pipeline_config.data_config.label_fields),
-            tokenizer_dir=local_dir,
-        )
+        save_tokenizer_dir(compiled_prompt, local_dir)
         composite: Dict[str, Any] = {
             "architectures": [SERVING_ARCH],
             "model_type": SERVING_MODEL_TYPE,
             "text_config": backbone,
-            "eos_token_id": compiled.sid_space.eos_token_id,
-            "pad_token_id": compiled.sid_space.pad_token_id,
+            "eos_token_id": compiled_prompt.sid_space.eos_token_id,
+            "pad_token_id": compiled_prompt.sid_space.pad_token_id,
         }
         # a runtime that reads only the outer config still needs to size its cache
         for key in ("vocab_size", "hidden_size", "num_hidden_layers", "torch_dtype"):

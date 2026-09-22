@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Optional, Tuple, Union
 
+from tokenizers import Tokenizer
+
 from tzrec.protos.model_pb2 import FeatureGroupConfig, FeatureGroupType
 from tzrec.protos.prompt_pb2 import PromptProjection
 
@@ -192,8 +194,11 @@ class CompiledPrompt:
         sid_space: the resolved SID token space.
         prompt_plan: assembler walk order and ceilings.
         projection_plan: projection topology.
+        tokenizer: the base tokenizer extended with the SID atoms and the
+            sentinel; only export writes it out.
     """
 
     sid_space: ResolvedSidSpace
     prompt_plan: PromptPlan
     projection_plan: ProjectionPlan
+    tokenizer: Tokenizer

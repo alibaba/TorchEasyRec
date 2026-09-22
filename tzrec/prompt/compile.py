@@ -269,16 +269,19 @@ def _build_sid_space(
     )
 
 
-def _save_tokenizer_dir(
-    tok: Tokenizer, sid_space: ResolvedSidSpace, tokenizer_dir: str
-) -> None:
+def save_tokenizer_dir(compiled: CompiledPrompt, tokenizer_dir: str) -> None:
     """Write the extended tokenizer as a directory ``AutoTokenizer`` loads.
 
     ``tokenizer.json`` carries the vocabulary and the added SID atoms; the
     minimal ``tokenizer_config.json`` beside it names the tokenizer class and
     the two special tokens the prompt resolved, which is all a serving runtime
     needs to decode a generated SID atom through ``--tokenizer-path``.
+
+    Args:
+        compiled: the compiled prompt whose tokenizer is written.
+        tokenizer_dir: the directory to write into.
     """
+    tok, sid_space = compiled.tokenizer, compiled.sid_space
     os.makedirs(tokenizer_dir, exist_ok=True)
     tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
     config = {
@@ -306,17 +309,16 @@ def compile_prompt(
     cfg: PromptConfig,
     features: Sequence[BaseFeature],
     label_fields: Sequence[str] = (),
-    tokenizer_dir: Optional[str] = None,
 ) -> CompiledPrompt:
     """Compile a prompt config into its plan, module and vocabulary artifacts.
+
+    Writes nothing: the extended tokenizer rides on the result for export to
+    persist, and nothing reads a training-time copy.
 
     Args:
         cfg: the prompt config to compile.
         features: every feature a body slot may reference, already created.
         label_fields: data_config.label_fields; a response slot names these.
-        tokenizer_dir: where to write the extended tokenizer as a directory
-            ``AutoTokenizer`` loads; skipped when None. Only export persists
-            it -- nothing reads a training-time copy.
 
     Returns:
         The compiled prompt.
@@ -396,9 +398,6 @@ def compile_prompt(
     )
     sid_space = _build_sid_space(cfg, tok, base_vocab_size, has_projection)
 
-    if tokenizer_dir:
-        _save_tokenizer_dir(tok, sid_space, tokenizer_dir)
-
     slot_ids = {name: i for i, name in enumerate(resolved_slots_by_name)}
     segs: Dict[str, SlotSeg] = {}
     for name, slot in resolved_slots_by_name.items():
@@ -446,7 +445,10 @@ def compile_prompt(
     _validate(plan)
 
     return CompiledPrompt(
-        sid_space=sid_space, prompt_plan=plan, projection_plan=projection_plan
+        sid_space=sid_space,
+        prompt_plan=plan,
+        projection_plan=projection_plan,
+        tokenizer=tok,
     )
 
 

@@ -18,7 +18,7 @@ from google.protobuf import text_format
 from tokenizers import Tokenizer
 
 from tzrec.features.feature import FgMode, create_features
-from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.compile import compile_prompt, save_tokenizer_dir
 from tzrec.prompt.types import FillMode, SlotSeg, Static, WidthKind
 from tzrec.protos import feature_pb2
 from tzrec.protos.prompt_pb2 import PromptConfig
@@ -304,7 +304,7 @@ class CompilePromptTest(unittest.TestCase):
         cfg = self._config(prompt="History : {{hist}}")
         cfg.sid_space.codebook.extend([4, 4])
         out = os.path.join(self.test_dir, "export")
-        compile_prompt(cfg, [_feature(_HIST)], ["answer"], tokenizer_dir=out)
+        save_tokenizer_dir(compile_prompt(cfg, [_feature(_HIST)], ["answer"]), out)
         written = os.path.join(out, "tokenizer.json")
         self.assertTrue(os.path.exists(written))
         # the SID tokens round-trip, which is what serving reloads

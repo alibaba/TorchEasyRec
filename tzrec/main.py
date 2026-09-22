@@ -1296,10 +1296,9 @@ def export(
         )
         if is_rank_zero:
             export_hf_assets(
-                pipeline_config,
-                features,
                 checkpoint_path,
                 export_dir,
+                compiled_prompt,
                 backbone_config,
                 generation_config,
             )
