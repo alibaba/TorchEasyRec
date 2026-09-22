@@ -301,7 +301,8 @@ class CheckpointUtilTest(unittest.TestCase):
         checkpoint_util.restore_lr_schedulers(ckpt_dir, [restored])
         self.assertEqual(restored.last_epoch, saved.last_epoch)
         self.assertEqual(
-            restored.optimizer.param_groups[0]["lr"], saved.optimizer.param_groups[0]["lr"]
+            restored.optimizer.param_groups[0]["lr"],
+            saved.optimizer.param_groups[0]["lr"],
         )
 
     def test_restore_lr_schedulers_uses_saved_state(self):

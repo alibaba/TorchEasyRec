@@ -1353,10 +1353,11 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
             # A rank's fused-optimizer parameter groups follow its shards, so a
             # replanned restart can hold a different number of them than the
             # saved state. The step-based rebuild gives the same rates.
+            local_groups = [len(s.optimizer.param_groups) for s in schedulers]
+            saved_groups = [len(s["state"]["base_lrs"]) for s in local_state]
             logger.warning(
                 "Saved LR scheduler state does not fit this rank's parameter "
-                f"groups ({[len(s.optimizer.param_groups) for s in schedulers]} "
-                f"groups vs saved {[len(s['state']['base_lrs']) for s in local_state]}); "
+                f"groups ({local_groups} groups vs saved {saved_groups}); "
                 "rebuilding the schedule from the checkpoint step instead."
             )
             _set_lr_schedulers_from_progress(checkpoint_dir, schedulers)
