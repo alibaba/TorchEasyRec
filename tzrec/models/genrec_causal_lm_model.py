@@ -214,7 +214,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Returns:
             ``(rows, suffix, vocab)`` logits over the response window.
         """
-        padded, mask = self._left_pad_packed_inputs(embeds, batch)
+        padded, mask = self._left_pad(embeds, batch)
         if padded.shape[1] < suffix:
             raise ValueError(
                 f"{type(self).__name__}: no sample reaches the supervised "
@@ -244,19 +244,21 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Returns:
             ``(B, num_return, num_levels)`` local codes, best first.
         """
-        padded, mask = self._left_pad_packed_inputs(embeds, batch)
+        padded, mask = self._left_pad(embeds, batch)
         tokens = dynamic_beam_search(
             self.lm, padded, mask, self._capped_widths, self._bands
         )
         codes = self._tokens_to_local_codes(tokens, padded.shape[0])
         return codes[:, : self._num_return_sequences, :]
 
-    def _left_pad_packed_inputs(
+    def _left_pad(
         self,
         embeds: torch.Tensor,
         batch: Batch,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Left-pad packed prompt embeddings for beam decode and the padded forward.
+        """Pad the packed rows into a rectangle, newest token last.
+
+        Used by beam decode and by the padded training forward.
 
         Args:
             embeds: packed embeddings, ``(total_tokens, hidden)``.

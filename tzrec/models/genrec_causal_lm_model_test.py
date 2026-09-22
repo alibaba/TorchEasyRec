@@ -70,7 +70,7 @@ class PaddedForwardTest(unittest.TestCase):
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         torch.nn.Module.__init__(model)
 
-        padded, mask = model._left_pad_packed_inputs(embeds, batch)
+        padded, mask = model._left_pad(embeds, batch)
 
         self.assertEqual(padded.shape, (2, 7, 2))
         self.assertEqual(
