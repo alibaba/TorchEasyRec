@@ -537,18 +537,20 @@ def create_mock_data(
 def create_mock_prompt_data(
     path: str, codebook: Sequence[int], num_rows: int = 8, num_words: int = 6
 ) -> str:
-    """Write a parquet of SID histories for the prompt-native tests.
+    """Write a parquet of prompt features for the prompt-native tests.
 
     ``hist__sid`` is a grouped SID history of two items, each one offset code
     per level, ``level_offsets[l] + code``; ``answer`` is one such item;
     ``title`` is pre-tokenized word ids of the test tokenizer for an inline
-    text slot; ``beh`` is an id sequence for a PROJECTED slot.
+    text slot. The profile ids and the ``score`` vector fill DEEP slots; the
+    ``tags__*`` columns are one grouped sequence of two items whose members
+    carry one id, a variable number of ids and a few token ids per item.
 
     Args:
         path: directory to write into.
         codebook: per-level SID vocabulary sizes.
         num_rows: samples to write.
-        num_words: vocabulary size the ``title`` ids are drawn from.
+        num_words: vocabulary size the token ids are drawn from.
 
     Returns:
         The glob a data config points at.
@@ -560,19 +562,30 @@ def create_mock_prompt_data(
         drawn = rng.integers(0, codebook, size=(items, len(codebook)))
         return (drawn + offsets).tolist()
 
+    def ids(high: int, count: int) -> List[int]:
+        return rng.integers(0, high, size=count).tolist()
+
     int_list = pa.list_(pa.int64())
+    nested = pa.list_(int_list)
+    rows = range(num_rows)
     columns = {
-        "hist__sid": pa.array(
-            [codes(2) for _ in range(num_rows)], type=pa.list_(int_list)
+        "hist__sid": pa.array([codes(2) for _ in rows], type=nested),
+        "answer": pa.array([codes(1)[0] for _ in rows], type=int_list),
+        "title": pa.array([ids(num_words, 3) for _ in rows], type=int_list),
+        "age": pa.array([ids(8, 1) for _ in rows], type=int_list),
+        "city": pa.array([ids(16, 1) for _ in rows], type=int_list),
+        "home_city": pa.array([ids(16, 1) for _ in rows], type=int_list),
+        "context_id": pa.array([ids(16, 1) for _ in rows], type=int_list),
+        "score": pa.array(
+            [rng.random(4).tolist() for _ in rows], type=pa.list_(pa.float32())
         ),
-        "answer": pa.array([codes(1)[0] for _ in range(num_rows)], type=int_list),
-        "title": pa.array(
-            [rng.integers(0, num_words, size=3).tolist() for _ in range(num_rows)],
-            type=int_list,
+        "tags__tag_a": pa.array([ids(16, 2) for _ in rows], type=int_list),
+        "tags__tag_b": pa.array(
+            [[ids(16, int(rng.integers(1, 4))) for _ in range(2)] for _ in rows],
+            type=nested,
         ),
-        "beh": pa.array(
-            [rng.integers(0, 32, size=2).tolist() for _ in range(num_rows)],
-            type=int_list,
+        "tags__text": pa.array(
+            [[ids(num_words, 3) for _ in range(2)] for _ in rows], type=nested
         ),
     }
     os.makedirs(path, exist_ok=True)
