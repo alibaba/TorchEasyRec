@@ -16,6 +16,7 @@ tokenizer. It resolves no physical dimension: the model does that at
 ``__init__`` from ``group_total_dim``.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,7 @@ from tzrec.prompt.types import (
     Width,
     WidthKind,
 )
+from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, FeatureGroupType
 from tzrec.protos.prompt_pb2 import (
     PromptConfig,
@@ -97,6 +99,17 @@ def _slot_width(
     return Width(WidthKind.BOUNDED, max(caps))
 
 
+def _fills_inline(member: BaseFeature) -> bool:
+    """Whether one sequence member carries LM-ready ids rather than an embedding.
+
+    An id or tokenize feature says so by omitting ``embedding_dim``; a raw
+    sequence feature by having no dense embedding.
+    """
+    if isinstance(member.config, (feature_pb2.IdFeature, feature_pb2.TokenizeFeature)):
+        return not member.config.HasField("embedding_dim")
+    return not member.has_embedding
+
+
 def _derive_slot_layout(
     name: str, members: Sequence[BaseFeature]
 ) -> Tuple["FeatureGroupType.ValueType", FillMode]:
@@ -114,10 +127,56 @@ def _derive_slot_layout(
     )
     fill_mode = (
         FillMode.INLINE
-        if is_sequence and len(members) == 1 and not members[0].has_embedding
+        if is_sequence and len(members) == 1 and _fills_inline(members[0])
         else FillMode.PROJECTED
     )
     return group_type, fill_mode
+
+
+def _id_shift(
+    members: Sequence[BaseFeature], fill_mode: FillMode, base_vocab_size: int
+) -> int:
+    """The shift an INLINE slot adds; tokenizer word ids are already LM ids."""
+    if fill_mode is FillMode.PROJECTED:
+        return 0
+    if members and isinstance(members[0].config, feature_pb2.TokenizeFeature):
+        return 0
+    return base_vocab_size
+
+
+def _file_md5(path: str) -> str:
+    """Content hash of one file."""
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+
+def _check_inline_member(
+    member: BaseFeature, cfg: PromptConfig, sid_space: ResolvedSidSpace
+) -> None:
+    """Reject an INLINE member whose values cannot be LM token ids."""
+    if isinstance(member.config, feature_pb2.TokenizeFeature):
+        vocab_file = member.vocab_file
+        if not vocab_file:
+            raise ValueError(
+                f"prompt slot member [{member.name}] has no vocab_file; "
+                "load_pipeline_config fills it from prompt_config.tokenizer_path."
+            )
+        if vocab_file != cfg.tokenizer_path and _file_md5(vocab_file) != _file_md5(
+            cfg.tokenizer_path
+        ):
+            raise ValueError(
+                f"prompt slot member [{member.name}] tokenizes with [{vocab_file}], "
+                f"which differs from prompt_config.tokenizer_path "
+                f"[{cfg.tokenizer_path}]; an inline text slot must emit ids of the "
+                "vocabulary the LM was extended from."
+            )
+    elif isinstance(member.config, feature_pb2.IdFeature):
+        if member.value_dim != sid_space.num_levels:
+            raise ValueError(
+                f"prompt slot member [{member.name}] declares value_dim "
+                f"{member.value_dim}; an inline SID history needs value_dim: "
+                f"{sid_space.num_levels}, one offset code per level for each item."
+            )
 
 
 def _render_sid_tokens(sid_space: SidSpace) -> List[str]:
@@ -350,6 +409,8 @@ def compile_prompt(
     for name, slot in resolved_slots_by_name.items():
         group_type = group_types_by_slot_name[name]
         fill_mode = fill_modes_by_slot_name[name]
+        if fill_mode is FillMode.INLINE and name not in response_slot_names:
+            _check_inline_member(members[name][0], cfg, sid_space)
         segs[name] = SlotSeg(
             slot_id=slot_ids[name],
             name=name,
@@ -364,6 +425,7 @@ def compile_prompt(
                 if name in response_slot_names
                 else _slot_width(members[name], group_type)
             ),
+            id_shift=_id_shift(members[name], fill_mode, sid_space.base_vocab_size),
         )
 
     body = _build_template_segments(body_runs, body_names, segs, tok)

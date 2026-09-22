@@ -218,7 +218,9 @@ class TokenizeFeature(IdFeature):
 
     def assets(self) -> Dict[str, str]:
         """Asset file paths."""
-        assets = {"vocab_file": self.vocab_file}
+        assets = {}
+        if len(self.vocab_file) > 0:
+            assets["vocab_file"] = self.vocab_file
         if len(self.stop_char_file) > 0:
             assets["text_normalizer.stop_char_file"] = self.stop_char_file
         return assets

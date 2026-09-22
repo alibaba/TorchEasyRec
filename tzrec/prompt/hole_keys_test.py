@@ -48,6 +48,7 @@ def _slot(
         else "",
         fill=FillMode.PROJECTED,
         width=Width(WidthKind.BOUNDED, 30),
+        id_shift=0,
     )
 
 

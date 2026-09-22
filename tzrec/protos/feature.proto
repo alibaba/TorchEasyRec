@@ -129,8 +129,9 @@ message IdFeature {
     required string expression = 2;
     // embedding name, feature with same embedding name will share embedding
     optional string embedding_name = 3;
-    // embedding dimension
-    required uint32 embedding_dim = 4;
+    // embedding dimension; omitted when the feature fills a prompt slot
+    // inline and owns no embedding table
+    optional uint32 embedding_dim = 4;
     // number of hash size
     optional uint64 hash_bucket_size = 5;
     // number of id enumerators
@@ -736,12 +737,13 @@ message TokenizeFeature {
     required string expression = 2;
     // embedding name, feature with same embedding name will share embedding
     optional string embedding_name = 3;
-    // embedding dimension
-    required uint32 embedding_dim = 4;
+    // embedding dimension; omitted when the feature fills a prompt slot
+    // inline and owns no embedding table
+    optional uint32 embedding_dim = 4;
     // text normalizer
     optional TextNormalizer text_normalizer = 6;
-    // tokenizer vocabulary file path
-    required string vocab_file = 7;
+    // tokenizer vocabulary file path; omitted -> prompt_config.tokenizer_path
+    optional string vocab_file = 7;
     // vocab file relative directory
     optional string asset_dir = 8;
     // embedding pooling type, available is {sum | mean}

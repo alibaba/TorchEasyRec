@@ -68,7 +68,10 @@ def _slot(
     feature_names=None,
     group_type=FeatureGroupType.JAGGED_SEQUENCE,
     slot_id=0,
+    id_shift=None,
 ) -> SlotSeg:
+    if id_shift is None:
+        id_shift = _BASE_VOCAB_SIZE if fill is FillMode.INLINE else 0
     return SlotSeg(
         slot_id=slot_id,
         name=name,
@@ -81,6 +84,7 @@ def _slot(
         width=Width(WidthKind.BOUNDED, width_n)
         if width_n
         else Width(WidthKind.STATIC, _NUM_LEVELS),
+        id_shift=id_shift,
     )
 
 
@@ -308,11 +312,37 @@ class PromptAssemblerTest(unittest.TestCase):
         )
         self.assertEqual(out[INPUT_IDS].tolist(), [7, 7])
 
+    def test_text_and_sid_inline_slots_shift_independently(self) -> None:
+        """Tokenizer word ids are LM ids already; only SID codes are shifted."""
+        asm = _asm(
+            (
+                Static((7,)),
+                _slot("title", FillMode.INLINE, 8, id_shift=0),
+                _slot("hist", FillMode.INLINE),
+            )
+        )
+        out = asm(
+            _parsed({"title": [np.array([3, 5])], "hist": [np.array([1, 6, 11])]})
+        )
+        self.assertEqual(
+            out[INPUT_IDS].tolist(),
+            [
+                7,
+                3,
+                5,
+                _BASE_VOCAB_SIZE + 1,
+                _BASE_VOCAB_SIZE + 6,
+                _BASE_VOCAB_SIZE + 11,
+            ],
+        )
+        self.assertEqual(out[CU_SEQLENS].tolist(), [0, 6])
+
     def test_scripting_preserves_every_output(self) -> None:
         """The artifact and the collator's module are the same function."""
         plan = _plan(
             (
                 Static((7,)),
+                _slot("title", FillMode.INLINE, 8, id_shift=0),
                 _slot("hist", FillMode.INLINE),
                 _slot("beh", FillMode.PROJECTED, 4),
             ),
@@ -320,6 +350,8 @@ class PromptAssemblerTest(unittest.TestCase):
         )
         module = PromptAssembler(plan, _sid_space())
         batch = {
+            "title.values": torch.tensor([3, 5, 2]),
+            "title.lengths": torch.tensor([2, 1]),
             "hist.values": torch.tensor([1, 6, 11, 2, 7, 10]),
             "hist.lengths": torch.tensor([1, 1]),
             "hist.key_lengths": torch.tensor([3, 3]),

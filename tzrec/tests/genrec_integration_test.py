@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -48,6 +49,17 @@ _BEH = (
     'sequence_id_feature { feature_name: "beh" expression: "user:beh" '
     "num_buckets: 32 embedding_dim: 8 sequence_length: 2 }"
 )
+# no embedding_dim and no vocab_file: an inline text slot whose vocabulary
+# load_pipeline_config fills from the prompt tokenizer
+_TITLE = (
+    'tokenize_feature { feature_name: "title" expression: "user:title" '
+    "tokens_as_sequence: true sequence_length: 4 }"
+)
+
+
+def _md5(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
 
 
 class GenRecIntegrationTest(unittest.TestCase):
@@ -86,7 +98,10 @@ class GenRecIntegrationTest(unittest.TestCase):
         config.prompt_config.tokenizer_path = tokenizer
         config.prompt_config.sid_space.manifest_path = manifest
         text_format.Merge(_BEH, config.feature_configs.add())
-        config.prompt_config.prompt = "History : {{hist}} . {{beh}} Predict :"
+        text_format.Merge(_TITLE, config.feature_configs.add())
+        config.prompt_config.prompt = (
+            "History : {{hist__sid}} . {{beh}} {{title}} Predict :"
+        )
         config_path = os.path.join(self.test_dir, "genrec.config")
         config_util.save_message(config, config_path)
         return config_path
@@ -109,15 +124,21 @@ class GenRecIntegrationTest(unittest.TestCase):
         return trained
 
     def _request(self, columns, rows: int = 4):
-        """The parsed dict a served front-end reads, from the first mock rows."""
+        """The parsed dict a served front-end reads, from the first mock rows.
+
+        A multi-value sequence column is one list per item; it also carries
+        ``key_lengths``, the codes each item holds.
+        """
         table = pq.read_table(sorted(glob.glob(self.data_glob))[0]).slice(0, rows)
         out = {}
         for column in columns:
             lists = table.column(column).to_pylist()
-            out[column + ".values"] = torch.tensor(
-                [v for row in lists for v in row], dtype=torch.int64
-            )
             out[column + ".lengths"] = torch.tensor([len(row) for row in lists])
+            items = [v for row in lists for v in row]
+            if items and isinstance(items[0], list):
+                out[column + ".key_lengths"] = torch.tensor([len(i) for i in items])
+                items = [v for item in items for v in item]
+            out[column + ".values"] = torch.tensor(items, dtype=torch.int64)
         return out
 
     def test_genrec_train_eval_export(self):
@@ -149,10 +170,29 @@ class GenRecIntegrationTest(unittest.TestCase):
                     os.path.exists(os.path.join(ckpt, name)), f"{ckpt}/{name}"
                 )
 
+        # the loaded config carries the injected vocabulary, and the export
+        # ships it as an FG asset beside fg.json
+        title = next(
+            fc.tokenize_feature
+            for fc in config.feature_configs
+            if fc.WhichOneof("feature") == "tokenize_feature"
+        )
+        self.assertEqual(title.vocab_file, config.prompt_config.tokenizer_path)
+        with open(os.path.join(export_dir, "fg.json")) as f:
+            fg_title = next(
+                fg
+                for fg in json.load(f)["features"]
+                if fg.get("feature_name") == "title"
+            )
+        self.assertEqual(
+            _md5(os.path.join(export_dir, fg_title["vocab_file"])),
+            _md5(config.prompt_config.tokenizer_path),
+        )
+
         # the artifact is the collator's walk plus the serving-only fold
         features = _create_features(list(config.feature_configs), config.data_config)
         compiled = compile_prompt(config.prompt_config, features, ["answer"])
-        data = self._request(["hist", "beh"])
+        data = self._request(["hist__sid", "beh", "title"])
         front_end = torch.jit.load(os.path.join(export_dir, "scripted_model.pt"))
         # an LLM engine calls it with the batch alone; a processor adds a device
         out = front_end(data)
@@ -235,7 +275,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         # a processor simulator: one request is one user, looked up in the
         # exported tables the way the distributed-embedding stage does, then
         # fed to the dense stage input-tiled with one candidate
-        request = self._request(["hist", "beh"], rows=1)
+        request = self._request(["hist__sid", "beh", "title"], rows=1)
         with open(os.path.join(sparse_dir, "sparse_features.json"), "r") as f:
             table_name = json.load(f)["beh__ec"]["embedding_name"]
         with np.load(os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")) as npz:

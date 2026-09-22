@@ -48,6 +48,7 @@ def load_pipeline_config(
         text_format.Merge(content, config, allow_unknown_field=allow_unknown_field)
     # compatible for fg_encoded
     config.data_config.fg_mode = _get_compatible_fg_mode(config.data_config)
+    _fill_prompt_tokenizer(config)
     return config
 
 
@@ -183,6 +184,29 @@ def _get_compatible_fg_mode(data_config: data_pb2.DataConfig) -> FgMode:
     else:
         fg_mode = data_config.fg_mode
     return fg_mode
+
+
+def _fill_prompt_tokenizer(config: pipeline_pb2.EasyRecConfig) -> None:
+    """Default every tokenize feature's ``vocab_file`` to the prompt tokenizer.
+
+    A text feature that fills a prompt slot must tokenize with the vocabulary
+    the LM was extended from. Filling it on load, before any feature is built,
+    also covers FG_NORMAL, whose FG handler is constructed inside the feature.
+    """
+    if not config.HasField("prompt_config"):
+        return
+    tokenize_configs = []
+    for feature_config in config.feature_configs:
+        feature_type = feature_config.WhichOneof("feature")
+        if feature_type in ("tokenize_feature", "sequence_tokenize_feature"):
+            tokenize_configs.append(getattr(feature_config, feature_type))
+        elif feature_type == "sequence_feature":
+            for sub_config in feature_config.sequence_feature.features:
+                if sub_config.WhichOneof("feature") == "tokenize_feature":
+                    tokenize_configs.append(sub_config.tokenize_feature)
+    for tokenize_config in tokenize_configs:
+        if not tokenize_config.HasField("vocab_file"):
+            tokenize_config.vocab_file = config.prompt_config.tokenizer_path
 
 
 # pyre-ignore [24]

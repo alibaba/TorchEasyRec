@@ -161,6 +161,20 @@ class TokenizeFeatureTest(unittest.TestCase):
             parsed_feat.seq_lengths, np.array(expected_seq_lengths)
         )
 
+    def test_tokens_as_sequence_without_embedding_or_vocab(self):
+        """An inline prompt slot member owns no table and, until load, no vocab."""
+        token_feat_cfg = feature_pb2.FeatureConfig(
+            tokenize_feature=feature_pb2.TokenizeFeature(
+                feature_name="token_feat", tokens_as_sequence=True
+            )
+        )
+        token_feat = tokenize_feature_lib.TokenizeFeature(token_feat_cfg)
+        self.assertFalse(token_feat.config.HasField("embedding_dim"))
+        self.assertEqual(token_feat.assets(), {})
+        parsed_feat = token_feat.parse({"token_feat": pa.array([[1, 2], [3]])})
+        np.testing.assert_equal(parsed_feat.values, np.array([1, 2, 3]))
+        np.testing.assert_equal(parsed_feat.seq_lengths, np.array([2, 1]))
+
     @parameterized.expand(
         [
             [

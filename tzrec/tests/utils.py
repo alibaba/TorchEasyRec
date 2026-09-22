@@ -535,17 +535,20 @@ def create_mock_data(
 
 
 def create_mock_prompt_data(
-    path: str, codebook: Sequence[int], num_rows: int = 8
+    path: str, codebook: Sequence[int], num_rows: int = 8, num_words: int = 6
 ) -> str:
     """Write a parquet of SID histories for the prompt-native tests.
 
-    ``hist`` and ``answer`` carry offset SID codes, ``level_offsets[l] + code``,
-    which is what a prompt reads; ``beh`` is an id sequence for a PROJECTED slot.
+    ``hist__sid`` is a grouped SID history of two items, each one offset code
+    per level, ``level_offsets[l] + code``; ``answer`` is one such item;
+    ``title`` is pre-tokenized word ids of the test tokenizer for an inline
+    text slot; ``beh`` is an id sequence for a PROJECTED slot.
 
     Args:
         path: directory to write into.
         codebook: per-level SID vocabulary sizes.
         num_rows: samples to write.
+        num_words: vocabulary size the ``title`` ids are drawn from.
 
     Returns:
         The glob a data config points at.
@@ -553,22 +556,27 @@ def create_mock_prompt_data(
     rng = np.random.default_rng(0)
     offsets = np.cumsum([0, *codebook[:-1]])
 
-    def codes(items: int) -> List[int]:
+    def codes(items: int) -> List[List[int]]:
         drawn = rng.integers(0, codebook, size=(items, len(codebook)))
-        return (drawn + offsets).reshape(-1).tolist()
+        return (drawn + offsets).tolist()
 
+    int_list = pa.list_(pa.int64())
     columns = {
-        "hist": [codes(2) for _ in range(num_rows)],
-        "answer": [codes(1) for _ in range(num_rows)],
-        "beh": [rng.integers(0, 32, size=2).tolist() for _ in range(num_rows)],
+        "hist__sid": pa.array(
+            [codes(2) for _ in range(num_rows)], type=pa.list_(int_list)
+        ),
+        "answer": pa.array([codes(1)[0] for _ in range(num_rows)], type=int_list),
+        "title": pa.array(
+            [rng.integers(0, num_words, size=3).tolist() for _ in range(num_rows)],
+            type=int_list,
+        ),
+        "beh": pa.array(
+            [rng.integers(0, 32, size=2).tolist() for _ in range(num_rows)],
+            type=int_list,
+        ),
     }
     os.makedirs(path, exist_ok=True)
-    pq.write_table(
-        pa.table(
-            {k: pa.array(v, type=pa.list_(pa.int64())) for k, v in columns.items()}
-        ),
-        os.path.join(path, "part-0.parquet"),
-    )
+    pq.write_table(pa.table(columns), os.path.join(path, "part-0.parquet"))
     return os.path.join(path, "*.parquet")
 
 

@@ -121,6 +121,8 @@ class SlotSeg:
         output_key: "" for DEEP, ".sequence" otherwise.
         fill: INLINE writes token ids, PROJECTED writes sentinels and a hole.
         width: position count of this slot.
+        id_shift: added to INLINE values to reach LM token ids; 0 for tokenizer
+            word ids and PROJECTED, ``base_vocab_size`` for offset SID codes.
     """
 
     slot_id: int
@@ -130,6 +132,7 @@ class SlotSeg:
     output_key: str
     fill: FillMode
     width: Width
+    id_shift: int
 
 
 Segment = Union[Static, SlotSeg]
