@@ -121,7 +121,7 @@ feature_configs {
 
 - **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
 
-- **embedding_dim** 可省略：省略时该特征不建 embedding 表，只能作为 prompt_config 中的 inline slot，此时 `value_dim` 需等于 `sid_space.codebook` 的层数，每个序列元素携带每层一个 offset SID 编码
+- **embedding_dim** 可省略：省略时该特征不建 embedding 表，只能作为 prompt_config 中的 inline slot，此时 `value_dim` 需等于 `sid_space.codebook` 的层数，每个序列元素携带每层一个 offset SID 编码，且不能再声明 `num_buckets`/`hash_bucket_size`/`vocab_*`/`zch`/`dynamicemb`
 
 - **default_bucketize_value**: （可选）指定超出词表的词的编码。当配置了default_bucketize_value时，vocab_list和vocab_dict将不会预留编码给默认值和超出词表的词，用户可完全自主控制vocab_list或vocab_dict
 
@@ -595,9 +595,9 @@ feature_configs {
 
 - **expression**: 特征FG所依赖分词字段的来源
 
-- **vocab_file**: 分词字典，完全兼容 https://github.com/mlc-ai/tokenizers-cpp 库的分词文件。未配置时自动取 `prompt_config.tokenizer_path`；配置了但内容与之不一致时，prompt 编译报错
+- **vocab_file**: 分词字典，完全兼容 https://github.com/mlc-ai/tokenizers-cpp 库的分词文件。未配置时自动取 `prompt_config.tokenizer_path`（未声明 `prompt_config` 时必须配置，否则创建特征时报错）；作为 inline slot 使用时，内容与之不一致会在 prompt 编译时报错
 
-- **embedding_dim** 可省略：省略时该特征不建 embedding 表，分词 id 直接作为 prompt_config 中 inline slot 的 token 输入
+- **embedding_dim** 可省略：省略时该特征不建 embedding 表，分词 id 直接作为 prompt_config 中 inline slot 的 token 输入；仅序列形态可 inline，即 `tokens_as_sequence: true`、`sequence_tokenize_feature` 或 `sequence_feature` 的子特征
 
 - **tokenizer_type**: 分词类型，默认为`bpe`。`bpe`表示用huggingface tokenizers的json词典，具体是BPE还是WordPiece等由`tokenizer.json`的内容决定；`sentencepiece`表示用sentencepiece模型
 
