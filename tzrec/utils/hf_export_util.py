@@ -25,7 +25,6 @@ from transformers import GenerationConfig, PretrainedConfig
 from tzrec.features.feature import BaseFeature
 from tzrec.prompt.compile import compile_prompt
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.logging_util import logger
 
@@ -42,28 +41,15 @@ def capture_hf_backbone(
     right after this call and must be free to.
 
     Args:
-        wrapped_model: the wrapper whose ``state_dict()`` names match the
-            checkpoint's.
+        wrapped_model: the export wrapper around the genrec model; its
+            ``state_dict()`` names match the checkpoint's.
 
     Returns:
         The backbone config, its generation config when it has one, and the
         prefix its parameters carry in the checkpoint.
-
-    Raises:
-        ValueError: no module in the wrapper chain declares ``hf_backbone``.
     """
-    inner = checkpoint_util.unwrap_to(wrapped_model, "hf_backbone")
-    if inner is None:
-        raise ValueError(
-            f"capture_hf_backbone: {type(wrapped_model).__name__} wraps no "
-            "module declaring hf_backbone()."
-        )
-    backbone = inner.hf_backbone()
-    # named_modules() FQNs carry the DMP prefix that state_dict() strips.
-    raw_prefix = next(
-        (n for n, m in wrapped_model.named_modules() if m is backbone), ""
-    )
-    prefix = checkpoint_util._strip_dmp_prefix(raw_prefix)
+    backbone = wrapped_model.model.hf_backbone()
+    prefix = next((n for n, m in wrapped_model.named_modules() if m is backbone), "")
     return (
         backbone.config,
         getattr(backbone, "generation_config", None),

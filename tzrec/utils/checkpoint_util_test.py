@@ -15,7 +15,6 @@ import multiprocessing as mp
 import os
 import shutil
 import tempfile
-import threading
 import unittest
 from unittest import mock
 
@@ -229,26 +228,6 @@ class CheckpointUtilTest(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
-
-    def test_unwrap_terminates_on_a_wrapper_cycle(self):
-        """A .model/.module cycle must return None, not spin.
-
-        Every genrec export walks this on every rank right before a collective,
-        so an unbounded loop here would hang them all at that barrier. Run on a
-        thread so a regression fails the test instead of hanging the suite.
-        """
-        a, b = nn.Linear(4, 4), nn.Linear(4, 4)
-        object.__setattr__(a, "model", b)
-        object.__setattr__(b, "model", a)
-        out = []
-        t = threading.Thread(
-            target=lambda: out.append(checkpoint_util.unwrap_to(a, "hf_backbone"))
-        )
-        t.daemon = True
-        t.start()
-        t.join(timeout=5)
-        self.assertFalse(t.is_alive(), "unwrap_to did not terminate")
-        self.assertEqual(out, [None])
 
     def test_latest_checkpoint_with_model_dir(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-0"))

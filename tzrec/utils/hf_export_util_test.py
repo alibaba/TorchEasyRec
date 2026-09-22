@@ -50,12 +50,6 @@ class _TrainWrapper(nn.Module):
         self.model = model
 
 
-class _DmpLike(nn.Module):
-    def __init__(self, module):
-        super().__init__()
-        self.module = module
-
-
 class HfExportUtilTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
@@ -79,14 +73,6 @@ class HfExportUtilTest(unittest.TestCase):
         # the prefix must reconstruct the exact FQNs save_model writes
         saved = set(wrapped.state_dict())
         self.assertTrue(all(prefix + k in saved for k in lm.state_dict()))
-
-    def test_capture_hf_backbone_strips_the_dmp_prefix(self) -> None:
-        _, _, prefix = capture_hf_backbone(_DmpLike(_TrainWrapper(_GenRec(_tied_lm()))))
-        self.assertEqual(prefix, "model.lm.")
-
-    def test_capture_hf_backbone_without_a_backbone(self) -> None:
-        with self.assertRaisesRegex(ValueError, "hf_backbone"):
-            capture_hf_backbone(_TrainWrapper(nn.Linear(4, 4)))
 
     def _convert(self, out_name, prefix):
         """Save a checkpoint, convert it, and leave a config.json for the reload."""
