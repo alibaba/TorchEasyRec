@@ -63,10 +63,11 @@ class HoleKeyBuilder(nn.Module):
     Every value contributing to a hole is discriminated by slot, by member and
     by its index inside the hole; without those, two slots holding the same id,
     a two-member slot with ``(a, b)`` against ``(b, a)``, and a permuted
-    multi-value item would all match silently. A dense member contributes its
-    float32 bit pattern per row, the parsed input rather than a computed
-    reduction. Response slots compile INLINE, so ``projected_slots`` is
-    body-only and stays aligned with the assembler's holes.
+    multi-value item would all match silently. A dense member contributes each
+    float32 of its row as an exact exponent and mantissa, the parsed input
+    rather than a computed reduction. Response slots compile INLINE, so
+    ``projected_slots`` is body-only and stays aligned with the assembler's
+    holes.
 
     Args:
         prompt_plan: the compiled plan; its ``projected_slots`` fix the hole
@@ -121,14 +122,13 @@ class HoleKeyBuilder(nn.Module):
             if raw.is_floating_point():
                 rows = raw.size(0)
                 width = raw.size(1)
+                # TorchScript cannot view a float as its bits; frexp's exponent
+                # and 24-bit mantissa identify a float32 just as exactly
+                mantissa, exponent = torch.frexp(raw.to(torch.float32))
                 values = (
-                    raw.to(torch.float32)
-                    .contiguous()
-                    .view(torch.int32)
-                    .to(torch.int64)
-                    .reshape(-1)
-                    & 0xFFFFFFFF
-                )
+                    exponent.to(torch.int64) * (1 << 25)
+                    + (mantissa * (1 << 24)).to(torch.int64)
+                ).reshape(-1)
                 hole = torch.arange(
                     rows, dtype=torch.int64, device=raw.device
                 ).repeat_interleave(width)

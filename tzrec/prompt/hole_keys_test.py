@@ -198,8 +198,8 @@ class HoleKeyBuilderTest(unittest.TestCase):
 
         self.assertNotEqual(keys([3], [9]).tolist(), keys([9], [3]).tolist())
 
-    def test_a_dense_member_folds_its_bit_pattern(self) -> None:
-        """A float member contributes the parsed input verbatim, so it is stable."""
+    def test_a_dense_member_folds_its_value(self) -> None:
+        """A float member folds the value it was parsed as, so it is stable."""
         module = HoleKeyBuilder(
             _plan((_slot("vec", group_type=FeatureGroupType.DEEP),))
         )
@@ -232,14 +232,23 @@ class HoleKeyBuilderTest(unittest.TestCase):
 
     def test_scripting_preserves_the_keys(self) -> None:
         """The exported front-end folds exactly what the eager module does."""
+        module = HoleKeyBuilder(
+            _plan(
+                (
+                    _slot("beh"),
+                    _slot("vec", group_type=FeatureGroupType.DEEP, slot_id=1),
+                )
+            )
+        )
         batch = _tensors(
             {
                 "beh.values": np.array([7, 8, 9, 21, 22], dtype=np.int64),
                 "beh.lengths": np.array([3, 2], dtype=np.int64),
+                "vec.values": np.array([[0.5, -1.0, 3e30], [0.0, 1e-30, 2.0]]),
             }
         )
-        scripted = torch.jit.script(self.module)
-        self.assertTrue(torch.equal(scripted(batch), self.module(batch)))
+        scripted = torch.jit.script(module)
+        self.assertTrue(torch.equal(scripted(batch), module(batch)))
 
     def test_is_an_fx_leaf(self) -> None:
         """Export traces the wrapper first; the fold must stay one opaque node."""
