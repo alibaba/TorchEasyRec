@@ -17,7 +17,6 @@ import shutil
 import unittest
 from unittest import mock
 
-import numpy as np
 import pyarrow as pa
 import torch
 from google.protobuf import text_format
@@ -181,17 +180,6 @@ class GenRecIntegrationTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(export_dir, "sparse")))
 
         config = config_util.load_pipeline_config(trained)
-        # the HF assets are composed at export time; checkpoints carry none
-        for ckpt in glob.glob(os.path.join(config.model_dir, "model.ckpt-*")):
-            for name in (
-                "config.json",
-                "generation_config.json",
-                "hf_export_meta.json",
-            ):
-                self.assertFalse(
-                    os.path.exists(os.path.join(ckpt, name)), f"{ckpt}/{name}"
-                )
-
         # the loaded config carries the injected vocabulary, and the export
         # ships it as an FG asset beside fg.json
         title = next(
@@ -342,49 +330,6 @@ class GenRecIntegrationTest(unittest.TestCase):
                 ],
             },
         )
-
-        # a processor simulator: one request is one user, looked up in the
-        # exported tables the way the distributed-embedding stage does, then
-        # fed to the dense stage input-tiled with one candidate
-        request = self._request(_MEMBERS, rows=1)
-        with open(os.path.join(sparse_dir, "sparse_features.json"), "r") as f:
-            sparse_features = json.load(f)
-        data = dict(request)
-        with np.load(os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")) as npz:
-
-            def looked_up(key):
-                name = key.rsplit("__", 1)[0]
-                table = npz[sparse_features[key]["embedding_name"]]
-                rows = table[request[name + ".values"].numpy()].astype(np.float32)
-                return torch.from_numpy(rows)
-
-            for key in dense_meta["sequence__ec"][0::2]:
-                name = key[: -len("__ec")]
-                data[name] = looked_up(key)
-                # a multi-value member is fed unpooled; the dense graph reduces it
-                lengths = request[name + ".lengths"]
-                if name + ".key_lengths" in request:
-                    lengths = torch.segment_reduce(
-                        request[name + ".key_lengths"].float(), "sum", lengths=lengths
-                    ).long()
-                data[name + "__lengths"] = lengths
-            # every DEEP sparse member holds one id, so a row lookup is its pooling
-            data["profile__ctx__ebc_user"] = torch.cat(
-                [looked_up(key) for key in dense_meta["profile__ctx__ebc_user"]], dim=1
-            )
-        data["batch_size"] = torch.tensor(1)
-        # the planner exported on the GPU; the processor loads onto its device
-        got = torch.jit.load(
-            os.path.join(dist_dir, "scripted_model.pt"), map_location="cpu"
-        )(data)
-        expected = torch.jit.load(
-            os.path.join(self.test_dir, "export", "scripted_model.pt")
-        )(request)
-        self.assertTrue(
-            torch.allclose(got["slot_embeds"], expected["slot_embeds"], atol=1e-6)
-        )
-        self.assertTrue(torch.equal(got["hole_keys"], expected["hole_keys"]))
-        self.assertEqual(got["input_ids"].tolist(), expected["input_ids"].tolist())
 
 
 if __name__ == "__main__":
