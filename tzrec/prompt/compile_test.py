@@ -138,6 +138,21 @@ class CompilePromptTest(unittest.TestCase):
         self.assertEqual(len(compiled.projection_plan.feature_groups), 0)
         self.assertIsNone(compiled.sid_space.sentinel_token_id)
 
+    def test_sequence_tokenize_without_embedding_is_inline_with_no_shift(self) -> None:
+        """The standalone sequence entry carries the same TokenizeFeature payload."""
+        text = (
+            'sequence_tokenize_feature { feature_name: "title" '
+            'expression: "user:title" sequence_length: 2 '
+            f'vocab_file: "{self.tok_path}" }}'
+        )
+        cfg = self._config(prompt="Title : {{title}}")
+        cfg.sid_space.codebook.extend([4])
+        compiled = self._compile(cfg, [_feature(text)])
+        seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
+        self.assertIs(seg.fill, FillMode.INLINE)
+        self.assertEqual(seg.id_shift, 0)
+        self.assertEqual(seg.width.num_positions, 2)
+
     def test_tokenize_with_embedding_is_projected(self) -> None:
         cfg = self._config(prompt="Title : {{title}}")
         cfg.sid_space.codebook.extend([4])
