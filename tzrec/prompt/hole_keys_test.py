@@ -210,6 +210,12 @@ class HoleKeyBuilderTest(unittest.TestCase):
         self.assertEqual(keys([[0.5, 1.0]]).tolist(), keys([[0.5, 1.0]]).tolist())
         self.assertNotEqual(keys([[0.5, 1.0]]).tolist(), keys([[1.0, 0.5]]).tolist())
         self.assertEqual(keys([[0.5, 1.0], [0.5, 1.0]]).numel(), 2)
+        # the fold is lossless: the last mantissa bit and the sign both count
+        self.assertNotEqual(keys([[1.0]]).tolist(), keys([[1.0 + 2**-23]]).tolist())
+        self.assertNotEqual(keys([[1.0]]).tolist(), keys([[-1.0]]).tolist())
+        inf, nan = float("inf"), float("nan")
+        folded = {keys([[v]]).item() for v in (0.0, inf, -inf, nan)}
+        self.assertEqual(len(folded), 4)
 
     def test_a_dense_sequence_member_folds_each_item(self) -> None:
         """Every row of a dense sequence is one item, so one hole and one key."""
@@ -279,15 +285,35 @@ class HoleKeyBuilderTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")
     def test_the_fold_is_bit_identical_across_devices(self) -> None:
-        """Integer addition cannot depend on the order a device reduces in."""
+        """Integer addition cannot depend on the order a device reduces in.
+
+        The float member carries the non-finite values whose int casts differ
+        by device, so the fixed codes they take are what keeps the keys equal.
+        """
+        module = HoleKeyBuilder(
+            _plan(
+                (
+                    _slot("beh"),
+                    _slot("vec", group_type=FeatureGroupType.DEEP, slot_id=1),
+                )
+            )
+        )
+        inf, nan = float("inf"), float("nan")
         batch = _tensors(
             {
                 "beh.values": np.arange(64, dtype=np.int64),
                 "beh.lengths": np.array([32, 32], dtype=np.int64),
+                "vec.values": np.array(
+                    [
+                        [0.5, -1.0, 3e30, inf, -inf, nan],
+                        [1e-30, 2.0, 0.0, -inf, nan, inf],
+                    ],
+                    dtype=np.float32,
+                ),
             }
         )
-        on_cpu = self.module(batch)
-        on_gpu = self.module({k: v.cuda() for k, v in batch.items()})
+        on_cpu = module(batch)
+        on_gpu = module({k: v.cuda() for k, v in batch.items()})
         self.assertTrue(torch.equal(on_cpu, on_gpu.cpu()))
 
 

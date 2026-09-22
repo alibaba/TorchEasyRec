@@ -123,12 +123,23 @@ class HoleKeyBuilder(nn.Module):
                 rows = raw.size(0)
                 width = raw.size(1)
                 # TorchScript cannot view a float as its bits; frexp's exponent
-                # and 24-bit mantissa identify a float32 just as exactly
-                mantissa, exponent = torch.frexp(raw.to(torch.float32))
-                values = (
-                    exponent.to(torch.int64) * (1 << 25)
-                    + (mantissa * (1 << 24)).to(torch.int64)
-                ).reshape(-1)
+                # and 24-bit mantissa identify every finite float32 just as
+                # exactly, and the three non-finite values take fixed codes
+                # above that range rather than a device-dependent cast
+                floats = raw.to(torch.float32)
+                finite = torch.isfinite(floats)
+                mantissa, exponent = torch.frexp(
+                    torch.where(finite, floats, torch.zeros_like(floats))
+                )
+                encoded = exponent.to(torch.int64) * (1 << 25) + (
+                    mantissa * (1 << 24)
+                ).to(torch.int64)
+                special = (
+                    (1 << 40)
+                    + torch.isnan(floats).to(torch.int64)
+                    + 2 * torch.isneginf(floats).to(torch.int64)
+                )
+                values = torch.where(finite, encoded, special).reshape(-1)
                 hole = torch.arange(
                     rows, dtype=torch.int64, device=raw.device
                 ).repeat_interleave(width)
