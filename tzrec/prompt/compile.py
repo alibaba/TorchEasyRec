@@ -156,11 +156,6 @@ def _check_inline_member(
     """Reject an INLINE member whose values cannot be LM token ids."""
     if isinstance(member.config, feature_pb2.TokenizeFeature):
         vocab_file = member.vocab_file
-        if not vocab_file:
-            raise ValueError(
-                f"prompt slot member [{member.name}] has no vocab_file; "
-                "load_pipeline_config fills it from prompt_config.tokenizer_path."
-            )
         if vocab_file != cfg.tokenizer_path and _file_md5(vocab_file) != _file_md5(
             cfg.tokenizer_path
         ):

@@ -189,11 +189,9 @@ class CompilePromptTest(unittest.TestCase):
         seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
         self.assertIs(seg.fill, FillMode.INLINE)
 
-    def test_unset_tokenize_vocab_is_rejected(self) -> None:
-        cfg = self._config(prompt="Title : {{title}}")
-        cfg.sid_space.codebook.extend([4])
+    def test_tokenize_without_vocab_does_not_get_created(self) -> None:
         with self.assertRaisesRegex(ValueError, "load_pipeline_config"):
-            self._compile(cfg, [_feature(_tokenize())])
+            _feature(_tokenize())
 
     def test_static_runs_are_woven_between_slots(self) -> None:
         cfg = self._config(prompt="History : {{hist}} . Predict :")
