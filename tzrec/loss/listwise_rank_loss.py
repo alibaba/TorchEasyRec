@@ -9,19 +9,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-request list-wise InfoNCE over a jagged candidate list (paper 2.5)."""
+"""List-wise InfoNCE over the samples of one list (paper 2.5).
+
+A list is a request's candidates (models that publish per-request counts)
+or the samples of one session (grouped by a session feature).
+"""
 
 import math
+from typing import Optional
 
 import torch
 from torch import nn
 from torch.nn.modules.loss import _Loss
 
-from tzrec.ops.jagged_tensors import (
-    jagged_segment_ids,
-    jagged_segment_max,
-    jagged_segment_sum,
-)
+from tzrec.ops.scatter_ops import lengths_to_index, scatter_max, scatter_sum
 from tzrec.utils.fx_util import fx_size0_max1
 
 # `torch.fx.wrap` registers by name in the *calling* module's globals; the
@@ -35,16 +36,16 @@ _LOGIT_SCALE_MAX = math.log(100)
 
 
 class ListwiseRankLoss(_Loss):
-    """Softmax cross-entropy over the candidates of one request.
+    """Softmax cross-entropy over the samples of one list.
 
-    The negatives of a candidate are the other candidates of the *same*
-    request, so this stays inside the jagged layout and needs no cross-rank
-    all-gather -- unlike an in-batch contrastive loss such as
+    The negatives of a sample are the other samples of the *same* list, and
+    a list never crosses a rank, so this needs no cross-rank all-gather --
+    unlike an in-batch contrastive loss such as
     :class:`~tzrec.loss.sid_contrastive_loss.SidContrastiveLoss`, gathering
-    other ranks here would add candidates that are not negatives of this
-    list at all.
+    other ranks here would add samples that are not negatives of this list
+    at all.
 
-    Two kinds of request contribute nothing and are masked out rather than
+    Two kinds of list contribute nothing and are masked out rather than
     branched on, so the shapes stay data-independent (``torch.compile``
     friendly):
 
@@ -52,7 +53,7 @@ class ListwiseRankLoss(_Loss):
     * no negative -- the objective degenerates to "make all scores equal",
       which is a gradient with no ranking information in it.
 
-    A request with several positives uses the multi-positive form, i.e. the
+    A list with several positives uses the multi-positive form, i.e. the
     mean of the positives' log-probabilities.
 
     Consumed through ``LossConfig.listwise_rank_loss`` in a task's
@@ -87,12 +88,13 @@ class ListwiseRankLoss(_Loss):
         logits: torch.Tensor,
         labels: torch.Tensor,
         lengths: torch.Tensor,
+        index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute the list-wise InfoNCE term.
 
-        ``logits``, ``labels`` and ``lengths`` must all be in the same
-        request order, with the candidates of a request laid out
-        contiguously.
+        Without ``index``, ``logits`` and ``labels`` are laid out
+        request by request in ``lengths`` order, each request's candidates
+        contiguous.
 
         Args:
             logits (torch.Tensor): ``(total,)`` per-candidate score.
@@ -100,31 +102,34 @@ class ListwiseRankLoss(_Loss):
                 non-zero value counts as a positive.
             lengths (torch.Tensor): ``(B,)`` candidates per request,
                 summing to ``total``.
+            index (torch.Tensor, optional): ``(total,)`` request of each
+                candidate (torch_scatter's ``index``), for candidates in
+                arbitrary order.
 
         Returns:
             torch.Tensor: scalar loss -- the mean of per-request losses over
             *all* ``B`` requests (masked-out requests contribute 0), so the
             denominator matches the ``enable_global_average_loss`` rescale.
         """
-        segment_ids = jagged_segment_ids(lengths, output_size=logits.size(0))
+        if index is None:
+            index = lengths_to_index(lengths, output_size=logits.size(0))
         # Clamp before exp so a large temperature can't overflow to +Inf.
         scale = self.logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp()
         scaled = (logits * scale).unsqueeze(-1)
 
-        maxes = jagged_segment_max(scaled.detach(), lengths, segment_ids)
-        shifted = scaled - maxes.index_select(0, segment_ids)
+        num_lists = lengths.size(0)
+        maxes = scatter_max(scaled.detach(), index, num_lists)
+        shifted = scaled - maxes.index_select(0, index)
         # A non-empty segment always sums to >= 1, because the row holding
         # the segment max contributes exp(0) == 1.  So the clamp is exact
         # where it matters and only rewrites empty segments, where log(0)
         # would otherwise leak -inf into the tensor.
-        denom = jagged_segment_sum(torch.exp(shifted), lengths, segment_ids).clamp(
-            min=1.0
-        )
-        log_probs = shifted - torch.log(denom).index_select(0, segment_ids)
+        denom = scatter_sum(torch.exp(shifted), index, num_lists).clamp(min=1.0)
+        log_probs = shifted - torch.log(denom).index_select(0, index)
 
         positives = (labels != 0).to(log_probs.dtype).unsqueeze(-1)
-        num_pos = jagged_segment_sum(positives, lengths, segment_ids)
-        pos_log_prob = jagged_segment_sum(log_probs * positives, lengths, segment_ids)
+        num_pos = scatter_sum(positives, index, num_lists)
+        pos_log_prob = scatter_sum(log_probs * positives, index, num_lists)
 
         num_candidates = lengths.to(num_pos.dtype).unsqueeze(-1)
         valid = ((num_pos > 0) & (num_pos < num_candidates)).to(log_probs.dtype)

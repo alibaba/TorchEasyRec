@@ -246,6 +246,20 @@ class ListwiseRankLossTest(unittest.TestCase):
             module(logits, torch.tensor([0.0, 1.0, 0.0, 0.0]), lengths),
         )
 
+    def test_index_in_any_order(self) -> None:
+        torch.manual_seed(0)
+        lengths = torch.tensor([2, 5, 3, 4])
+        labels = torch.tensor([1, 0] + [0, 1, 1, 0, 0] + [1, 1, 1] + [0, 0, 0, 1])
+        logits = torch.randn(labels.numel())
+        perm = torch.randperm(labels.numel())
+        index = torch.repeat_interleave(torch.arange(4), lengths)[perm]
+
+        loss = ListwiseRankLoss()
+        torch.testing.assert_close(
+            loss(logits[perm], labels[perm], lengths, index),
+            loss(logits, labels, lengths),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
