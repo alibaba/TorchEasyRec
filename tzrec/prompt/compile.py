@@ -82,21 +82,25 @@ def _resolve_slot(
 def _slot_width(
     members: Sequence[BaseFeature],
     group_type: "FeatureGroupType.ValueType",
+    fill_mode: FillMode,
 ) -> Width:
     """Derive a slot's position count from its members.
 
-    A DEEP slot pools to exactly one position. Any other sequence slot is
-    bounded by its members' sequence_length, and unbounded when none declares
-    one.
+    A DEEP slot pools to exactly one position. A PROJECTED sequence slot holds
+    one per item, bounded by its members' sequence_length. An INLINE slot emits
+    every value of every item, so its bound is that cap times the values an
+    item carries; unbounded when no member declares a cap, or when an item may
+    carry any number of values.
     """
     if group_type == FeatureGroupType.DEEP:
         return Width(WidthKind.STATIC, 1)
     # BaseFeature.sequence_length, not config: a member of a SequenceFeature
     # group inherits the group's cap and never sets its own field.
     caps = [f.sequence_length for f in members if f.sequence_length]
-    if not caps:
+    per_item = members[0].value_dim if fill_mode is FillMode.INLINE else 1
+    if not caps or per_item == 0:
         return Width(WidthKind.UNBOUNDED)
-    return Width(WidthKind.BOUNDED, max(caps))
+    return Width(WidthKind.BOUNDED, max(caps) * per_item)
 
 
 def _fills_inline(member: BaseFeature) -> bool:
@@ -156,9 +160,16 @@ def _check_inline_member(
     """Reject an INLINE member whose values cannot be LM token ids."""
     if isinstance(member.config, feature_pb2.TokenizeFeature):
         vocab_file = member.vocab_file
-        if vocab_file != cfg.tokenizer_path and _file_md5(vocab_file) != _file_md5(
-            cfg.tokenizer_path
-        ):
+        try:
+            same = vocab_file == cfg.tokenizer_path or _file_md5(
+                vocab_file
+            ) == _file_md5(cfg.tokenizer_path)
+        except OSError as e:
+            raise ValueError(
+                f"prompt slot member [{member.name}] names vocab_file "
+                f"[{vocab_file}], which cannot be read: {e}"
+            ) from e
+        if not same:
             raise ValueError(
                 f"prompt slot member [{member.name}] tokenizes with [{vocab_file}], "
                 f"which differs from prompt_config.tokenizer_path "
@@ -171,6 +182,22 @@ def _check_inline_member(
                 f"prompt slot member [{member.name}] declares value_dim "
                 f"{member.value_dim}; an inline SID history needs value_dim: "
                 f"{sid_space.num_levels}, one offset code per level for each item."
+            )
+        id_space = [
+            name
+            for name in ("hash_bucket_size", "num_buckets", "zch", "dynamicemb")
+            if member.config.HasField(name)
+        ] + [
+            name
+            for name in ("vocab_list", "vocab_dict", "vocab_file")
+            if len(getattr(member.config, name)) > 0
+        ]
+        if id_space:
+            raise ValueError(
+                f"prompt slot member [{member.name}] declares an id space "
+                f"({', '.join(id_space)}); an inline SID history carries offset "
+                "codes and needs none. Drop it, or give the feature an "
+                "embedding_dim to project it instead."
             )
 
 
@@ -417,7 +444,7 @@ def compile_prompt(
             width=(
                 Width(WidthKind.STATIC, sid_space.num_levels)
                 if name in response_slot_names
-                else _slot_width(members[name], group_type)
+                else _slot_width(members[name], group_type, fill_mode)
             ),
             id_shift=_id_shift(members[name], fill_mode, sid_space.base_vocab_size),
         )
