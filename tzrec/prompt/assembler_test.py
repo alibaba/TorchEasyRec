@@ -222,14 +222,12 @@ class PromptAssemblerTest(unittest.TestCase):
         )
         self.assertEqual(prompt_only[RESPONSE_LENGTHS].tolist(), [0])
 
-    def test_an_empty_prompt_body_leaves_only_the_response(self) -> None:
-        """The walk no longer measures rows, so its consumer must.
+    def test_a_row_with_no_prompt_body_supervises_nothing(self) -> None:
+        """Its first response token has no token before it to be predicted by.
 
-        A row whose body assembles to nothing is shorter than the supervised
-        suffix window, whose logits would then reach back into the sample
-        before it, on either attention layout. The assembler emits the row regardless --
-        it trusts the parsed batch -- so the guard belongs to the model; this
-        pins the shape that guard has to reject.
+        The row stays in the packed stream -- dropping it would desync the
+        batch's features from its ids -- so the walk zeroes its response length
+        instead, which masks every column of its window downstream.
         """
         asm = _asm(
             (_slot("hist", FillMode.INLINE),),
@@ -238,18 +236,31 @@ class PromptAssemblerTest(unittest.TestCase):
         out = asm(
             _parsed(
                 {
-                    "hist": [np.array([], dtype=np.int64)],
-                    "answer": [np.array([1, 6, 11])],
+                    "hist": [np.array([1, 6, 11]), np.array([], dtype=np.int64)],
+                    "answer": [np.array([2, 7, 10]), np.array([1, 6, 11])],
                 }
             )
         )
 
-        row_lengths = torch.diff(out[CU_SEQLENS])
-        self.assertEqual(row_lengths.tolist(), out[RESPONSE_LENGTHS].tolist())
-        self.assertEqual(
-            out[INPUT_IDS].tolist(),
-            [_BASE_VOCAB_SIZE + 1, _BASE_VOCAB_SIZE + 6, _BASE_VOCAB_SIZE + 11],
+        self.assertEqual(torch.diff(out[CU_SEQLENS]).tolist(), [6, 3])
+        self.assertEqual(out[RESPONSE_LENGTHS].tolist(), [3, 0])
+        self.assertEqual(out[INPUT_IDS].numel(), 9)
+
+    def test_a_batch_that_supervises_nothing_is_refused(self) -> None:
+        """Masking every row would leave the loss averaging over no tokens."""
+        asm = _asm(
+            (_slot("hist", FillMode.INLINE),),
+            response=(_slot("answer", FillMode.INLINE),),
         )
+        with self.assertRaisesRegex(ValueError, "nothing in this batch"):
+            asm(
+                _parsed(
+                    {
+                        "hist": [np.array([], dtype=np.int64)],
+                        "answer": [np.array([1, 6, 11])],
+                    }
+                )
+            )
 
     def test_a_multi_value_history_walks_like_the_flat_layout(self) -> None:
         """Items with key_lengths and one code per position are one stream."""

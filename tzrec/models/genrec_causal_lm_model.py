@@ -145,16 +145,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         """
         infos = batch.additional_infos
         cu_seqlens = infos[CU_SEQLENS]
-        lengths = torch.diff(cu_seqlens)
         suffix = cast(int, self._prompt.prompt_plan.logits_suffix_len)
-        # a row shorter than the window reads the row before it
-        if bool((lengths < suffix).any()):
-            raise ValueError(
-                f"{type(self).__name__}: every assembled sample must be at "
-                f"least logits_suffix_len ({suffix}) tokens long. Drop the "
-                f"rows whose prompt features are all empty, or give the "
-                f"template static text."
-            )
         suffix_offsets = torch.arange(-suffix, 0, device=embeds.device)
         # (rows, suffix): the window each row is supervised over, the same
         # absolute positions whichever layout the kernel is given
@@ -164,12 +155,12 @@ class GenRecCausalLMModel(BaseGenRecModel):
             self._ignore_index,
         )
         if self._attn_kernel == GenRecModelConfig.FLASH_ATTENTION_2:
-            logits = self._packed_logits(embeds, batch, keep)
+            logits = self._varlen_logits(embeds, batch, keep)
         else:
             logits = self._padded_logits(embeds, batch, suffix)
         return logits, labels
 
-    def _packed_logits(
+    def _varlen_logits(
         self, embeds: torch.Tensor, batch: Batch, keep: torch.Tensor
     ) -> torch.Tensor:
         """Score every row in one varlen call, with no padding at all.
@@ -224,6 +215,13 @@ class GenRecCausalLMModel(BaseGenRecModel):
             ``(rows, suffix, vocab)`` logits over the response window.
         """
         padded, mask = self._left_pad_packed_inputs(embeds, batch)
+        if padded.shape[1] < suffix:
+            raise ValueError(
+                f"{type(self).__name__}: no sample reaches the supervised "
+                f"window -- the padded width is {padded.shape[1]}, the window "
+                f"is {suffix}, and logits_to_keep would silently return the "
+                f"narrower one."
+            )
         # left padding offsets every row, so spell the positions out rather
         # than letting HF assign arange(max_seqlen) over the padding too
         position_ids = (mask.cumsum(-1) - 1).clamp(min=0)
@@ -258,7 +256,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         embeds: torch.Tensor,
         batch: Batch,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Left-pad packed prompt embeddings for beam decode.
+        """Left-pad packed prompt embeddings for beam decode and the padded forward.
 
         Args:
             embeds: packed embeddings, ``(total_tokens, hidden)``.

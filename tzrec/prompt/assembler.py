@@ -309,6 +309,18 @@ class PromptAssembler(nn.Module):
                 response_lengths = response_lengths + seg_lens[i]
         out.index_copy_(0, torch.cat(dests, dim=0), torch.cat(seg_values, dim=0))
 
+        if self.num_segments > self.num_body:
+            # the first response token is predicted by the one before it, so a
+            # row that is nothing but its response supervises nothing
+            response_lengths = response_lengths * (row_total > response_lengths)
+            if not bool((response_lengths > 0).any()):
+                raise ValueError(
+                    "PromptAssembler: nothing in this batch can be supervised "
+                    "-- every sample either carries no response or no token "
+                    "before it. Give the template static text, or drop the "
+                    "samples whose prompt features are all empty."
+                )
+
         hole_positions = torch.cat(hole_parts, dim=0)
         # how many of those holes each projected occurrence owns, so a host can
         # cut the flat streams back into per-slot spans without the plan

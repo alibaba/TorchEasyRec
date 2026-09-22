@@ -42,8 +42,21 @@ from tzrec.utils.test_util import (
 )
 
 
-class LeftPadPackedInputsTest(unittest.TestCase):
-    """The one adapter where padding lives."""
+class PaddedForwardTest(unittest.TestCase):
+    """The layout every kernel but the varlen one is given."""
+
+    def test_a_padded_width_under_the_window_is_rejected(self) -> None:
+        """``logits_to_keep`` would return fewer columns than there are labels."""
+        model = _stub_model()
+        model._attn_kernel = GenRecModelConfig.SDPA
+        batch = _varlen_batch(
+            cu_seqlens=(0, 3, 6),
+            max_seqlen=3,
+            response_lengths=(2, 2),
+        )
+
+        with self.assertRaisesRegex(ValueError, "no sample reaches the supervised"):
+            model._forward(torch.zeros(6, 6), batch)
 
     def test_packs_rows_of_different_lengths(self) -> None:
         embeds = torch.arange(18, dtype=torch.float32).reshape(9, 2)
@@ -121,7 +134,7 @@ def _varlen_batch(
     """The four varlen keys ``_forward`` reads, over ``cu_seqlens[-1]`` tokens.
 
     ``PromptAssembler`` emits ``cu_seqlens`` as int32; int64 here is what
-    makes ``_packed_logits``' cast to int32 do visible work.
+    makes ``_varlen_logits``' cast to int32 do visible work.
     """
     return Batch(
         additional_infos={
@@ -160,17 +173,24 @@ class PackedForwardTest(unittest.TestCase):
             [[-7, 102, 103, 104], [-7, -7, 110, 111]],
         )
 
-    def test_a_row_shorter_than_the_window_is_rejected(self) -> None:
-        """A row under ``logits_suffix_len`` would index into its neighbour."""
+    def test_a_row_the_assembler_zeroed_supervises_nothing(self) -> None:
+        """A prompt-less row reaches here with ``response_lengths`` at zero.
+
+        ``PromptAssembler`` zeroes it rather than failing the batch, so every
+        column of that row's window has to mask out -- including the ones whose
+        ``keep`` indices fall in the row before it.
+        """
         model = _stub_model()
         batch = _varlen_batch(
             cu_seqlens=(0, 3, 12),
             max_seqlen=9,
-            response_lengths=(3, 3),
+            response_lengths=(0, 3),
         )
 
-        with self.assertRaisesRegex(ValueError, "at least logits_suffix_len"):
-            model._forward(torch.zeros(12, 6), batch)
+        _, labels = model._forward(torch.zeros(12, 6), batch)
+
+        self.assertEqual(labels[0].tolist(), [-7, -7, -7, -7])
+        self.assertEqual(labels[1].tolist(), [-7, 109, 110, 111])
 
     def test_loss_and_gradients_cover_only_valid_response_pairs(self) -> None:
         model = _stub_model(_DifferentiableLM(hidden_size=6, vocab_size=32))
@@ -272,37 +292,57 @@ def _packed_batch(compiled_prompt, hist_rows, answer_rows) -> Batch:
     return batch
 
 
-class _RowIsolationCase:
-    """Every row must read exactly as it does alone, whatever the layout.
+# the two rows every layout case runs: different histories, different answers
+_TWO_ROWS = (
+    [GENREC_HIST_CODES, GENREC_LONG_HIST_CODES],
+    [GENREC_ANSWER_CODES, _OTHERGENREC_ANSWER_CODES],
+)
 
-    The failure this guards against is a row attending into the row before it,
-    which the two kernels avoid by different means: the varlen kernel is handed
-    ``cu_seq_lens``, every other kernel is handed left-padded rows. Rewriting
-    row 0 to different codes of the same width leaves row 1 at the same
-    offsets, so its logits have to stay bit identical either way.
+
+class LayoutInvarianceTest(unittest.TestCase):
+    """Neither batching nor the kernel may change what a row scores.
+
+    Two invariants, one fixture. Row isolation: a row must not attend into the
+    row before it, which the kernels avoid by different means -- the varlen
+    kernel is handed ``cu_seq_lens``, every other kernel left-padded rows.
+    Rewriting row 0 to different codes of the same width leaves row 1 at the
+    same offsets, so its logits have to stay bit identical either way. Layout
+    equivalence: the two arms must then agree with each other, which comparing
+    each against its own solo runs never establishes.
     """
-
-    device = torch.device("cpu")
-    attn_kernel = GenRecModelConfig.SDPA
-    lm_parameter_dtype = GenRecModelConfig.FP32
 
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
 
-    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
-    def test_rows_match_solo_runs_and_backpropagate(self, model_type: str) -> None:
-        device = self.device
+    def _eval_model(
+        self,
+        model_type: str,
+        attn_kernel: "GenRecModelConfig.AttnKernel",
+        device: torch.device,
+        lm_parameter_dtype: "GenRecModelConfig.ParamDtype",
+    ):
+        """The same backbone from the same seed, under one kernel."""
         model, compiled_prompt = create_genrec_test_model(
             self.test_dir,
             model_type=model_type,
-            attn_kernel=self.attn_kernel,
-            lm_parameter_dtype=self.lm_parameter_dtype,
+            attn_kernel=attn_kernel,
+            lm_parameter_dtype=lm_parameter_dtype,
             init_seed=0,
         )
-        model.to(device)
-        model.eval()
-        hist_rows = [GENREC_HIST_CODES, GENREC_LONG_HIST_CODES]
-        answer_rows = [GENREC_ANSWER_CODES, _OTHERGENREC_ANSWER_CODES]
+        return model.to(device).eval(), compiled_prompt
+
+    def _assert_rows_match_solo_runs(
+        self,
+        model_type: str,
+        attn_kernel: "GenRecModelConfig.AttnKernel",
+        device: torch.device,
+        lm_parameter_dtype: "GenRecModelConfig.ParamDtype",
+    ) -> None:
+        """Run the isolation invariant under one kernel."""
+        model, compiled_prompt = self._eval_model(
+            model_type, attn_kernel, device, lm_parameter_dtype
+        )
+        hist_rows, answer_rows = _TWO_ROWS
         packed_batch = _packed_batch(compiled_prompt, hist_rows, answer_rows).to(device)
 
         packed = model.predict(packed_batch)
@@ -342,21 +382,61 @@ class _RowIsolationCase:
         self.assertTrue(bool(torch.isfinite(grad).all()))
         self.assertGreater(float(grad.abs().sum()), 0)
 
+    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
+    def test_sdpa_rows_match_solo_runs(self, model_type: str) -> None:
+        self._assert_rows_match_solo_runs(
+            model_type,
+            GenRecModelConfig.SDPA,
+            torch.device("cpu"),
+            GenRecModelConfig.FP32,
+        )
 
-class SdpaRowIsolationTest(_RowIsolationCase, unittest.TestCase):
-    """The left-padded layout sdpa is given, which needs no GPU and no wheel."""
+    # mark_ci_scope must sit below expand: expand returns None, so tagging
+    # above it raises at import
+    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skipIf(*flash_attn_unavailable)
+    @mark_ci_scope("gpu")
+    def test_flash_rows_match_solo_runs(self, model_type: str) -> None:
+        self._assert_rows_match_solo_runs(
+            model_type,
+            GenRecModelConfig.FLASH_ATTENTION_2,
+            torch.device("cuda"),
+            # the flash kernel takes fp16/bf16 only, and this carries no autocast
+            GenRecModelConfig.BF16,
+        )
 
+    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skipIf(*flash_attn_unavailable)
+    @mark_ci_scope("gpu")
+    def test_the_packed_and_padded_arms_agree(self, model_type: str) -> None:
+        """The kernel is a speed choice, so it must not change the result.
 
-@mark_ci_scope("gpu")
-@unittest.skipIf(*nv_gpu_unavailable)
-@unittest.skipIf(*flash_attn_unavailable)
-class FlashAttentionRowIsolationTest(_RowIsolationCase, unittest.TestCase):
-    """The same rows packed into one stream, through the varlen flash kernel."""
+        The two cases above each compare a kernel against solo runs of itself,
+        which pins neither arm to the other. Both run BF16 here because the
+        flash kernel takes no fp32.
+        """
+        device = torch.device("cuda")
+        outputs = []
+        for attn_kernel in (
+            GenRecModelConfig.SDPA,
+            GenRecModelConfig.FLASH_ATTENTION_2,
+        ):
+            model, compiled_prompt = self._eval_model(
+                model_type, attn_kernel, device, GenRecModelConfig.BF16
+            )
+            batch = _packed_batch(compiled_prompt, *_TWO_ROWS).to(device)
+            with torch.no_grad():
+                outputs.append(model.predict(batch))
 
-    device = torch.device("cuda")
-    attn_kernel = GenRecModelConfig.FLASH_ATTENTION_2
-    # the flash kernel takes fp16/bf16 only, and this arm carries no autocast
-    lm_parameter_dtype = GenRecModelConfig.BF16
+        padded, packed = outputs
+        # the same absolute window either way, so the labels are built once and
+        # only the logits path differs
+        torch.testing.assert_close(packed["labels"], padded["labels"])
+        torch.testing.assert_close(
+            packed["logits"], padded["logits"], atol=1e-2, rtol=1e-2
+        )
 
 
 if __name__ == "__main__":
