@@ -114,6 +114,7 @@ class PromptAssembler(nn.Module):
     hole_slots: List[int]
     is_sequences: List[bool]
     member_names: List[List[str]]
+    id_shifts: List[int]
 
     def __init__(
         self,
@@ -132,13 +133,13 @@ class PromptAssembler(nn.Module):
         self.sentinel = -1
         if sid_space.sentinel_token_id is not None:
             self.sentinel = int(sid_space.sentinel_token_id)
-        self.id_shift = int(sid_space.base_vocab_size)
 
         self.kinds = []
         self.static_tokens = []
         self.hole_slots = []
         self.is_sequences = []
         self.member_names = []
+        self.id_shifts = []
         # the first slot member sizes the batch; an all-static plan reads the
         # batch_size the parser passes along
         self.anchor = ""
@@ -149,7 +150,7 @@ class PromptAssembler(nn.Module):
         for seg in segments:
             if isinstance(seg, Static):
                 self._append(
-                    self.KIND_STATIC, [int(t) for t in seg.token_ids], -1, False, []
+                    self.KIND_STATIC, [int(t) for t in seg.token_ids], -1, False, [], 0
                 )
                 continue
             assert isinstance(seg, SlotSeg)
@@ -158,7 +159,12 @@ class PromptAssembler(nn.Module):
             is_sequence = seg.group_type == FeatureGroupType.JAGGED_SEQUENCE
             if seg.fill is FillMode.INLINE:
                 self._append(
-                    self.KIND_INLINE, [], -1, is_sequence, [seg.feature_names[0]]
+                    self.KIND_INLINE,
+                    [],
+                    -1,
+                    is_sequence,
+                    [seg.feature_names[0]],
+                    int(seg.id_shift),
                 )
             else:
                 self._append(
@@ -167,6 +173,7 @@ class PromptAssembler(nn.Module):
                     occurrences,
                     is_sequence,
                     list(seg.feature_names),
+                    0,
                 )
                 occurrences += 1
 
@@ -180,6 +187,7 @@ class PromptAssembler(nn.Module):
         hole_slot: int,
         is_sequence: bool,
         members: List[str],
+        id_shift: int,
     ) -> None:
         """Record one unrolled segment's constants."""
         self.kinds.append(kind)
@@ -187,6 +195,7 @@ class PromptAssembler(nn.Module):
         self.hole_slots.append(hole_slot)
         self.is_sequences.append(is_sequence)
         self.member_names.append(members)
+        self.id_shifts.append(id_shift)
 
     def _batch_size(self, batch: Dict[str, torch.Tensor]) -> int:
         """Row count, from the anchor member.
@@ -241,11 +250,10 @@ class PromptAssembler(nn.Module):
 
         member = self.member_names[index][0]
         if kind == self.KIND_INLINE:
-            # the data carries ``level_offsets[l] + code``; the LM vocabulary
-            # needs one further uniform shift by ``base_vocab_size``
+            # offset SID codes need the base-vocab shift; tokenizer word ids none
             counts = self._inline_counts(batch, index, batch_size)
             values = batch[member + ".values"].to(torch.int64).reshape(-1)
-            return counts, values + self.id_shift
+            return counts, values + self.id_shifts[index]
 
         if self.is_sequences[index]:
             seg_len = batch[member + ".lengths"].to(torch.int64)

@@ -535,17 +535,22 @@ def create_mock_data(
 
 
 def create_mock_prompt_data(
-    path: str, codebook: Sequence[int], num_rows: int = 8
+    path: str, codebook: Sequence[int], num_rows: int = 8, num_words: int = 6
 ) -> str:
-    """Write a parquet of SID histories for the prompt-native tests.
+    """Write a parquet of prompt features for the prompt-native tests.
 
-    ``hist`` and ``answer`` carry offset SID codes, ``level_offsets[l] + code``,
-    which is what a prompt reads; ``beh`` is an id sequence for a PROJECTED slot.
+    ``hist__sid`` is a grouped SID history of two items, each one offset code
+    per level, ``level_offsets[l] + code``; ``answer`` is one such item;
+    ``title`` is pre-tokenized word ids of the test tokenizer for an inline
+    text slot. The profile ids and the ``score`` vector fill DEEP slots; the
+    ``tags__*`` columns are one grouped sequence of two items whose members
+    carry one id, a variable number of ids and a few token ids per item.
 
     Args:
         path: directory to write into.
         codebook: per-level SID vocabulary sizes.
         num_rows: samples to write.
+        num_words: vocabulary size the token ids are drawn from.
 
     Returns:
         The glob a data config points at.
@@ -553,22 +558,38 @@ def create_mock_prompt_data(
     rng = np.random.default_rng(0)
     offsets = np.cumsum([0, *codebook[:-1]])
 
-    def codes(items: int) -> List[int]:
+    def codes(items: int) -> List[List[int]]:
         drawn = rng.integers(0, codebook, size=(items, len(codebook)))
-        return (drawn + offsets).reshape(-1).tolist()
+        return (drawn + offsets).tolist()
 
+    def ids(high: int, count: int) -> List[int]:
+        return rng.integers(0, high, size=count).tolist()
+
+    int_list = pa.list_(pa.int64())
+    nested = pa.list_(int_list)
+    rows = range(num_rows)
     columns = {
-        "hist": [codes(2) for _ in range(num_rows)],
-        "answer": [codes(1) for _ in range(num_rows)],
-        "beh": [rng.integers(0, 32, size=2).tolist() for _ in range(num_rows)],
+        "hist__sid": pa.array([codes(2) for _ in rows], type=nested),
+        "answer": pa.array([codes(1)[0] for _ in rows], type=int_list),
+        "title": pa.array([ids(num_words, 3) for _ in rows], type=int_list),
+        "age": pa.array([ids(8, 1) for _ in rows], type=int_list),
+        "city": pa.array([ids(16, 1) for _ in rows], type=int_list),
+        "home_city": pa.array([ids(16, 1) for _ in rows], type=int_list),
+        "context_id": pa.array([ids(16, 1) for _ in rows], type=int_list),
+        "score": pa.array(
+            [rng.random(4).tolist() for _ in rows], type=pa.list_(pa.float32())
+        ),
+        "tags__tag_a": pa.array([ids(16, 2) for _ in rows], type=int_list),
+        "tags__tag_b": pa.array(
+            [[ids(16, int(rng.integers(1, 4))) for _ in range(2)] for _ in rows],
+            type=nested,
+        ),
+        "tags__text": pa.array(
+            [[ids(num_words, 3) for _ in range(2)] for _ in rows], type=nested
+        ),
     }
     os.makedirs(path, exist_ok=True)
-    pq.write_table(
-        pa.table(
-            {k: pa.array(v, type=pa.list_(pa.int64())) for k, v in columns.items()}
-        ),
-        os.path.join(path, "part-0.parquet"),
-    )
+    pq.write_table(pa.table(columns), os.path.join(path, "part-0.parquet"))
     return os.path.join(path, "*.parquet")
 
 
