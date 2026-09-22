@@ -44,7 +44,7 @@ from tzrec.optim.lr_scheduler import (
     LinearDecayLR,
 )
 from tzrec.protos.export_pb2 import ExportConfig
-from tzrec.utils import checkpoint_util, misc_util
+from tzrec.utils import checkpoint_util, filesystem_util, misc_util
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
@@ -979,6 +979,30 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
             self.assertEqual(
                 actual.optimizer.param_groups[0]["lr"], expected.get_last_lr()[0]
             )
+
+    def test_round_trip_through_fsspec_uri(self):
+        """model_dir may be an fsspec URI, where os.replace does not apply."""
+        filesystem_util.apply_monkeypatch()
+        self.addCleanup(filesystem_util.remove_monkeypatch)
+        ckpt_dir = "file://" + os.path.join(self.test_dir, "model.ckpt-4")
+        original = self._scheduler()
+        original.set_step(4)
+        checkpoint_util.save_lr_schedulers(ckpt_dir, [original])
+        resumed = self._scheduler()
+        checkpoint_util.restore_lr_schedulers(ckpt_dir, [resumed])
+        self.assertEqual(resumed.state_dict(), original.state_dict())
+
+    def test_unreadable_state_falls_back_to_step(self):
+        """A torn in-place rewrite rebuilds from the step, it does not abort."""
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-4")
+        os.makedirs(ckpt_dir)
+        with open(
+            os.path.join(ckpt_dir, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME), "w"
+        ) as f:
+            f.write('[[{"type": "ExponentialDecayLR", "state": {"last')
+        scheduler = self._scheduler()
+        checkpoint_util.restore_lr_schedulers(ckpt_dir, [scheduler])
+        self.assertEqual(scheduler.last_epoch, 5)
 
     @parameterized.expand(
         [("meta", True), ("filename", False)], name_func=parameterized_name_func

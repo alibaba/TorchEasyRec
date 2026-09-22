@@ -1268,9 +1268,12 @@ LR_SCHEDULER_CKPT_FILENAME = "lr_scheduler.json"
 def save_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
     """Save per-rank scheduler states, including rank-local parameter groups.
 
-    The JSON list is indexed by rank. Restoring requires the same world size,
-    scheduler types/order and local parameter-group counts. Atomic replacement
-    also supports refreshing an epoch boundary deduplicated against a step save.
+    The JSON list is indexed by rank. Restoring requires the same world size
+    and scheduler types/order. Written in place like the dataloader state
+    beside it: ``model_dir`` may be an fsspec URI, where only the patched
+    helpers in ``filesystem_util`` work and ``os.replace`` does not, so an
+    epoch-boundary refresh overwrites rather than renames. ``restore`` treats
+    an unreadable file as absent instead.
     """
     local_state = [
         {"type": type(scheduler).__name__, "state": scheduler.state_dict()}
@@ -1283,9 +1286,8 @@ def save_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
     if int(os.environ.get("RANK", 0)) == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         path = os.path.join(checkpoint_dir, LR_SCHEDULER_CKPT_FILENAME)
-        with open(path + ".tmp", "w") as f:
+        with open(path, "w") as f:
             json.dump(states, f)
-        os.replace(path + ".tmp", path)
 
 
 def _set_lr_schedulers_from_progress(
@@ -1334,9 +1336,17 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
     progress is an error rather than silently restarting the learning rate.
     """
     path = os.path.join(checkpoint_dir, LR_SCHEDULER_CKPT_FILENAME)
+    states = None
     if os.path.exists(path):
-        with open(path) as f:
-            states = json.load(f)
+        try:
+            with open(path) as f:
+                states = json.load(f)
+        except json.JSONDecodeError as err:
+            # The file is overwritten in place when an epoch-boundary save
+            # dedupes against a step save, so a torn one is possible. Fall
+            # through to the step-based rebuild rather than ending the run.
+            logger.warning(f"LR scheduler state at {path} is unreadable ({err}).")
+    if states is not None:
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
         if len(states) != world_size:
