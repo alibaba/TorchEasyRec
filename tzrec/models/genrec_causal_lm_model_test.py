@@ -48,7 +48,7 @@ class PaddedForwardTest(unittest.TestCase):
     def test_a_padded_width_under_the_window_is_rejected(self) -> None:
         """``logits_to_keep`` would return fewer columns than there are labels."""
         model = _stub_model()
-        model._attn_kernel = GenRecModelConfig.SDPA
+        model._attn_kernel = "sdpa"
         batch = _varlen_batch(
             cu_seqlens=(0, 3, 6),
             max_seqlen=3,
@@ -119,7 +119,7 @@ def _stub_model(lm: Optional[nn.Module] = None) -> GenRecCausalLMModel:
     model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
     nn.Module.__init__(model)
     model.lm = _CapturingLM() if lm is None else lm
-    model._attn_kernel = GenRecModelConfig.FLASH_ATTENTION_2
+    model._attn_kernel = "flash_attention_2"
     model._ignore_index = -7
     model._prompt = SimpleNamespace(prompt_plan=SimpleNamespace(logits_suffix_len=4))
     return model
@@ -317,7 +317,7 @@ class LayoutInvarianceTest(unittest.TestCase):
     def _eval_model(
         self,
         model_type: str,
-        attn_kernel: "GenRecModelConfig.AttnKernel",
+        attn_kernel: str,
         device: torch.device,
         lm_parameter_dtype: "GenRecModelConfig.ParamDtype",
     ):
@@ -334,7 +334,7 @@ class LayoutInvarianceTest(unittest.TestCase):
     def _assert_rows_match_solo_runs(
         self,
         model_type: str,
-        attn_kernel: "GenRecModelConfig.AttnKernel",
+        attn_kernel: str,
         device: torch.device,
         lm_parameter_dtype: "GenRecModelConfig.ParamDtype",
     ) -> None:
@@ -386,7 +386,7 @@ class LayoutInvarianceTest(unittest.TestCase):
     def test_sdpa_rows_match_solo_runs(self, model_type: str) -> None:
         self._assert_rows_match_solo_runs(
             model_type,
-            GenRecModelConfig.SDPA,
+            "sdpa",
             torch.device("cpu"),
             GenRecModelConfig.FP32,
         )
@@ -400,7 +400,7 @@ class LayoutInvarianceTest(unittest.TestCase):
     def test_flash_rows_match_solo_runs(self, model_type: str) -> None:
         self._assert_rows_match_solo_runs(
             model_type,
-            GenRecModelConfig.FLASH_ATTENTION_2,
+            "flash_attention_2",
             torch.device("cuda"),
             # the flash kernel takes fp16/bf16 only, and this carries no autocast
             GenRecModelConfig.BF16,
@@ -420,8 +420,8 @@ class LayoutInvarianceTest(unittest.TestCase):
         device = torch.device("cuda")
         outputs = []
         for attn_kernel in (
-            GenRecModelConfig.SDPA,
-            GenRecModelConfig.FLASH_ATTENTION_2,
+            "sdpa",
+            "flash_attention_2",
         ):
             model, compiled_prompt = self._eval_model(
                 model_type, attn_kernel, device, GenRecModelConfig.BF16

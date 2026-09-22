@@ -53,11 +53,6 @@ _PARAM_DTYPE: Dict[int, torch.dtype] = {
     GenRecModelConfig.FP16: torch.float16,
 }
 
-_ATTN_KERNEL: Dict[int, str] = {
-    GenRecModelConfig.SDPA: "sdpa",
-    GenRecModelConfig.FLASH_ATTENTION_2: "flash_attention_2",
-}
-
 _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
     "loss_function",
     "get_input_embeddings",
@@ -103,7 +98,7 @@ class BaseGenRecModel(BaseModel):
 
         self._ignore_index = int(cfg.common.ignore_index)
         self.lm: nn.Module
-        self._attn_kernel: int
+        self._attn_kernel: str
         # the forward picks its layout from this: only the varlen kernel reads
         # cu_seq_lens, so every other kernel has to be handed padded rows
         self._attn_kernel = cfg.common.attn_kernel
@@ -136,7 +131,7 @@ class BaseGenRecModel(BaseModel):
         self,
         hf_model_name_or_path: str,
         lm_parameter_dtype: int,
-        attn_kernel: int,
+        attn_kernel: str,
     ) -> None:
         """Assign ``self.lm`` from config, so HF weights load only on cold start.
 
@@ -144,12 +139,12 @@ class BaseGenRecModel(BaseModel):
             hf_model_name_or_path: hub id or local directory naming the
                 architecture and cold-start weights.
             lm_parameter_dtype: dtype of the LM parameters.
-            attn_kernel: attention kernel to build the backbone with.
+            attn_kernel: transformers attn_implementation name.
         """
         config = AutoConfig.from_pretrained(hf_model_name_or_path)
         self.lm = AutoModelForCausalLM.from_config(
             config,
-            attn_implementation=_ATTN_KERNEL[attn_kernel],
+            attn_implementation=attn_kernel,
             torch_dtype=_PARAM_DTYPE[lm_parameter_dtype],
         )
         self._check_backbone_interfaces(hf_model_name_or_path)

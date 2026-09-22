@@ -464,7 +464,7 @@ def create_genrec_test_model(
     beam_widths: Sequence[int] = (2, 2, 2),
     num_return_sequences: int = 2,
     lm_parameter_dtype: Optional["GenRecModelConfig.ParamDtype"] = None,
-    attn_kernel: Optional["GenRecModelConfig.AttnKernel"] = None,
+    attn_kernel: Optional[str] = None,
     model_type: str = "qwen2",
     init_seed: Optional[int] = None,
 ) -> Tuple[BaseModel, CompiledPrompt]:
@@ -484,7 +484,7 @@ def create_genrec_test_model(
         beam_widths (Sequence[int]): per-level beam widths.
         num_return_sequences (int): sequences returned per sample.
         lm_parameter_dtype (optional): ``GenRecModelConfig.ParamDtype`` value.
-        attn_kernel (optional): ``GenRecModelConfig.AttnKernel`` value.
+        attn_kernel (optional): transformers attn_implementation name.
         model_type (str): hugging-face ``model_type`` of the backbone.
         init_seed (int, optional): seed the random init draws from, when the
             caller needs two builds to agree.

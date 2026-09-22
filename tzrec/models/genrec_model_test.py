@@ -130,13 +130,13 @@ class BaseGenRecModelTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [GenRecModelConfig.SDPA, "sdpa"],
-            [GenRecModelConfig.FLASH_ATTENTION_2, "flash_attention_2"],
+            ["sdpa"],
+            ["flash_attention_2"],
         ],
         name_func=parameterized_name_func,
     )
     def test_builds_backbone_with_the_configured_kernel_and_dtype(
-        self, attn_kernel, expected_impl
+        self, attn_kernel: str
     ) -> None:
         # from_config is mocked, so this pins the kwargs init_backbone sends
         # without building a second backbone; setUp still builds a real one.
@@ -164,7 +164,7 @@ class BaseGenRecModelTest(unittest.TestCase):
         self.assertEqual(
             kwargs,
             {
-                "attn_implementation": expected_impl,
+                "attn_implementation": attn_kernel,
                 "torch_dtype": torch.bfloat16,
             },
         )

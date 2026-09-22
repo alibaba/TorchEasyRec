@@ -154,7 +154,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
             suffix_offsets[None, :] < -infos[RESPONSE_LENGTHS][:, None],
             self._ignore_index,
         )
-        if self._attn_kernel == GenRecModelConfig.FLASH_ATTENTION_2:
+        if self._attn_kernel == "flash_attention_2":
             logits = self._varlen_logits(embeds, batch, keep)
         else:
             logits = self._padded_logits(embeds, batch, suffix)

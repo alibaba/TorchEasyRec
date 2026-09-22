@@ -32,7 +32,6 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
-from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 from tzrec.tests import utils
 from tzrec.utils import config_util
 from tzrec.utils.test_util import (
@@ -69,11 +68,11 @@ class GenRecIntegrationTest(unittest.TestCase):
         if self.success and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
-    def _prepare_config(self, attn_kernel: Optional[int] = None) -> str:
+    def _prepare_config(self, attn_kernel: Optional[str] = None) -> str:
         """Write the tiny backbone, tokenizer, manifest and data; return the config.
 
         Args:
-            attn_kernel (int, optional): ``GenRecModelConfig.AttnKernel`` to run
+            attn_kernel (str, optional): transformers attn_implementation to run
                 the pipeline on; the config's own default when None.
 
         Returns:
@@ -105,11 +104,11 @@ class GenRecIntegrationTest(unittest.TestCase):
         config_util.save_message(config, config_path)
         return config_path
 
-    def _train_eval_export(self, attn_kernel: Optional[int] = None) -> str:
+    def _train_eval_export(self, attn_kernel: Optional[str] = None) -> str:
         """Run the pipeline; return the trained ``pipeline.config`` path.
 
         Args:
-            attn_kernel (int, optional): ``GenRecModelConfig.AttnKernel`` to run
+            attn_kernel (str, optional): transformers attn_implementation to run
                 the pipeline on; the config's own default when None.
 
         Returns:
@@ -225,7 +224,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         The default kernel is SDPA, so the sibling case above covers the padded
         layout; this is the only end-to-end run of the packed one.
         """
-        self._train_eval_export(attn_kernel=GenRecModelConfig.FLASH_ATTENTION_2)
+        self._train_eval_export(attn_kernel="flash_attention_2")
 
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")
