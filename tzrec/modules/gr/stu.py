@@ -442,6 +442,38 @@ class STULayer(STU):
             f"{self._max_attn_len}:{int(self._causal)}"
         )
 
+    @property
+    def uses_arbitrary_mask(self) -> bool:
+        """Whether attention is driven by an NFUNC func tensor.
+
+        Must be a static Python bool -- it selects branches under fx
+        symbolic trace.  Subclass hook: override alongside
+        ``_build_attn_func`` and ``attn_func_static_sig`` to drive a
+        different two-interval mask (see ``OneRankSTULayer``).
+        """
+        return self._sla_k1 > 0 or self._sla_k2 > 0
+
+    def _build_attn_func(
+        self,
+        x: torch.Tensor,
+        x_offsets: torch.Tensor,
+        num_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build this layer's NFUNC=3 mask tensor.
+
+        Only reached when ``uses_arbitrary_mask`` is True and no tensor
+        cached from an earlier layer matched ``attn_func_static_sig``.
+        """
+        return build_sla_func_tensor(
+            nheads=self._num_heads,
+            sla_k1=self._sla_k1,
+            sla_k2=self._sla_k2,
+            seq_offsets=x_offsets,
+            total_q=x.size(0),
+            num_targets=num_targets if self._target_aware else None,
+            contextual_seq_len=self._contextual_seq_len,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -476,12 +508,13 @@ class STULayer(STU):
             ``(output, attn_func)``.
         """
         attn_func: Optional[torch.Tensor] = None
-        uses_sla = self._sla_k1 > 0 or self._sla_k2 > 0
-        if uses_sla:
+        uses_arbitrary_mask: bool = self.uses_arbitrary_mask
+        if uses_arbitrary_mask:
             if self.kernel() == Kernel.TRITON:
                 raise ValueError(
-                    "SLA (sla_k1 / sla_k2 > 0) requires Kernel.CUTLASS or "
-                    "Kernel.PYTORCH; Kernel.TRITON has no NFUNC mask path."
+                    "the NFUNC arbitrary-mask path (SLA, OneRank) requires "
+                    "Kernel.CUTLASS or Kernel.PYTORCH; Kernel.TRITON has no "
+                    "NFUNC mask path."
                 )
             # str==str, fx-trace-safe. Truncation-boundary invalidation
             # is encoded by the caller passing prev_attn_func_sig=None.
@@ -491,19 +524,27 @@ class STULayer(STU):
             ):
                 attn_func = prev_attn_func
             else:
-                attn_func = build_sla_func_tensor(
-                    nheads=self._num_heads,
-                    sla_k1=self._sla_k1,
-                    sla_k2=self._sla_k2,
-                    seq_offsets=x_offsets,
-                    total_q=x.size(0),
-                    num_targets=num_targets if self._target_aware else None,
-                    contextual_seq_len=self._contextual_seq_len,
+                attn_func = self._build_attn_func(
+                    x=x, x_offsets=x_offsets, num_targets=num_targets
                 )
         else:
             attn_func = prev_attn_func
 
-        local_attn_func = attn_func if uses_sla else None
+        local_attn_func = attn_func if uses_arbitrary_mask else None
+        # A func tensor is the *sole* mask: it already encodes causality,
+        # the local window, the contextual prefix and target isolation.
+        # Withhold num_targets / contextual_seq_len from the kernel so no
+        # backend can AND a second mask on top -- CUTLASS forwards both to
+        # the kernel while the PyTorch reference ignores them, so a mask
+        # that deliberately lets a target row attend *inside* the target
+        # block (OneRank task tokens) would silently lose those columns on
+        # CUTLASS only.  For SLA this is a no-op: its func intervals are a
+        # subset of both fixed masks.
+        kernel_num_targets: Optional[torch.Tensor] = None
+        kernel_contextual_seq_len: int = 0
+        if not uses_arbitrary_mask:
+            kernel_num_targets = num_targets if self._target_aware else None
+            kernel_contextual_seq_len = self._contextual_seq_len
         with record_function("## stu_preprocess_and_attention ##"):
             u, attn_output, k, v = hstu_preprocess_and_attention(
                 x=x,
@@ -519,9 +560,9 @@ class STULayer(STU):
                 seq_offsets=x_offsets,
                 attn_alpha=self._attn_alpha,
                 causal=self._causal,
-                num_targets=num_targets if self._target_aware else None,
+                num_targets=kernel_num_targets,
                 max_attn_len=self._max_attn_len,
-                contextual_seq_len=self._contextual_seq_len,
+                contextual_seq_len=kernel_contextual_seq_len,
                 recompute_uvqk_in_backward=self._recompute_uvqk,
                 recompute_normed_x_in_backward=self._recompute_normed_x,
                 sort_by_length=self._sort_by_length,

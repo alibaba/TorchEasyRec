@@ -13,7 +13,7 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
@@ -23,6 +23,7 @@ from torchrec.modules.embedding_configs import (
 from tzrec.features import overlap_feature as overlap_feature_lib
 from tzrec.features.feature import FgMode
 from tzrec.protos import feature_pb2
+from tzrec.utils import test_util
 
 
 class OverlapFeatureTest(unittest.TestCase):
@@ -177,6 +178,95 @@ class OverlapFeatureTest(unittest.TestCase):
         self.assertEqual(parsed_feat.name, "overlap_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+
+    def test_overlap_feature_with_invalid_method(self):
+        overlap_feat_cfg = feature_pb2.FeatureConfig(
+            overlap_feature=feature_pb2.OverlapFeature(
+                feature_name="overlap_feat",
+                query="user:query",
+                title="item:title",
+                method="is_common",
+            )
+        )
+        overlap_feat = overlap_feature_lib.OverlapFeature(overlap_feat_cfg)
+        with self.assertRaisesRegex(ValueError, "invalid method"):
+            overlap_feat.fg_json()
+
+    @parameterized.expand(
+        [
+            ["is_equal", 0.0],
+            ["is_contain", 1.0],
+            ["index_of", 1.0],
+            ["query_common_ratio", 1.0],
+            ["title_common_ratio", 0.5],
+            ["proximity_min_dist", 1.0],
+            ["proximity_max_dist", 1.0],
+            ["proximity_avg_dist", 1.0],
+            ["proximity_min_cover", 2.0],
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_overlap_feature_methods(self, method, expected_value):
+        # every method in FG_OVERLAP_METHODS should be honored by fg, an entry
+        # fg does not know would make it return the default value for all rows
+        overlap_feat_cfg = feature_pb2.FeatureConfig(
+            overlap_feature=feature_pb2.OverlapFeature(
+                feature_name="overlap_feat",
+                query="user:query",
+                title="item:title",
+                method=method,
+            )
+        )
+        overlap_feat = overlap_feature_lib.OverlapFeature(
+            overlap_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
+        input_data = {
+            "query": pa.array([["b", "c"]]),
+            "title": pa.array([["a", "b", "c", "d"]]),
+        }
+        parsed_feat = overlap_feat.parse(input_data)
+        np.testing.assert_allclose(parsed_feat.values, np.array([[expected_value]]))
+
+
+class SequenceOverlapFeatureTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            param("item_side_seq", title="item:title", sequence_fields=[]),
+            param("user_side_seq", title="user:title", sequence_fields=["title"]),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_simple_sequence_overlap_feature_dense(self, name, title, sequence_fields):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            sequence_overlap_feature=feature_pb2.OverlapFeature(
+                feature_name="click_50_seq_overlap_feat",
+                sequence_delim=";",
+                sequence_length=50,
+                query="user:query",
+                title=title,
+                sequence_fields=sequence_fields,
+                method="query_common_ratio",
+            )
+        )
+        seq_feat = overlap_feature_lib.OverlapFeature(
+            seq_feat_cfg, is_sequence=True, fg_mode=FgMode.FG_NORMAL
+        )
+        self.assertEqual(seq_feat.output_dim, 1)
+        self.assertEqual(seq_feat.is_sparse, False)
+        self.assertEqual(seq_feat.inputs, ["query", "title"])
+        self.assertEqual(seq_feat.sequence_input_names, ["title"])
+        self.assertEqual(
+            seq_feat.fg_json()[0].get("sequence_fields"), sequence_fields or None
+        )
+
+        input_data = {
+            "query": pa.array(["abc\x1defg", "abc\x1defg"]),
+            "title": pa.array(["abc\x1drty;abc\x1defg", "qwe"]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq_overlap_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array([[0.5], [1.0], [0.0]]))
+        np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([2, 1]))
 
 
 if __name__ == "__main__":

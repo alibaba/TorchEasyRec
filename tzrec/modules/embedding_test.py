@@ -30,10 +30,12 @@ from tzrec.modules.embedding import (
     SequenceEmbeddingGroupImpl,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
+from tzrec.utils import dynamicemb_util
 from tzrec.utils.fx_util import fx_mark_seq_ec_jt, symbolic_trace
 from tzrec.utils.test_util import (
     TestGraphType,
     create_test_module,
+    mark_ci_scope,
     parameterized_name_func,
 )
 
@@ -557,7 +559,19 @@ class EmbeddingGroupTest(unittest.TestCase):
             embedding_group.ebc.embedding_bag_configs()[0].pooling, PoolingType.MEAN
         )
 
-    def test_embedding_group_impl_weighted_with_dynamicemb(self) -> None:
+    @parameterized.expand(
+        [
+            param("sum_dynamicemb", pooling="sum"),
+            param("mean_dynamicemb", pooling="mean"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipIf(not dynamicemb_util.has_dynamicemb, "dynamicemb not available.")
+    @mark_ci_scope("gpu")
+    def test_embedding_group_impl_weighted_with_dynamicemb(self, name, pooling) -> None:
+        # dynamicemb only pools with weights in sum mode, and it reads the kjt
+        # weights only when the collection is weighted, so both must hold for
+        # every table of a weighted data group.
         feature_cfgs = [
             feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
@@ -572,6 +586,7 @@ class EmbeddingGroupTest(unittest.TestCase):
                 id_feature=feature_pb2.IdFeature(
                     feature_name="cat_b",
                     embedding_dim=8,
+                    pooling=pooling,
                     dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=1024),
                 )
             ),
@@ -584,8 +599,12 @@ class EmbeddingGroupTest(unittest.TestCase):
                 group_type=model_pb2.FeatureGroupType.DEEP,
             ),
         ]
-        with self.assertRaises(ValueError):
-            EmbeddingGroupImpl(features, feature_groups, device=torch.device("cpu"))
+        embedding_group = EmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertTrue(embedding_group.ebc.is_weighted())
+        for emb_bag_config in embedding_group.ebc.embedding_bag_configs():
+            self.assertEqual(emb_bag_config.pooling, PoolingType.SUM)
 
     @parameterized.expand(
         [

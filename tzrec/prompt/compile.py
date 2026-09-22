@@ -16,11 +16,10 @@ tokenizer. It resolves no physical dimension: the model does that at
 ``__init__`` from ``group_total_dim``.
 """
 
-import hashlib
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from tokenizers import Tokenizer
 
@@ -134,12 +133,13 @@ def _render_sid_tokens(sid_space: SidSpace) -> List[str]:
     return [fmt.replace("{i}", str(i)) for i in range(sum(sid_space.codebook))]
 
 
-def _read_manifest_codebook(path: str) -> List[int]:
+def _read_manifest(path: str) -> List[int]:
     """Read ``codebook`` from a SID manifest."""
     if not os.path.exists(path):
         raise ValueError(f"sid_space.manifest_path [{path}] does not exist.")
     with open(path, "r") as f:
-        return [int(c) for c in json.load(f)["codebook"]]
+        manifest = json.load(f)
+    return [int(c) for c in manifest["codebook"]]
 
 
 def _build_sid_space(
@@ -160,7 +160,7 @@ def _build_sid_space(
         raise ValueError(f"every codebook size must be positive, got {codebook}.")
 
     if space.HasField("manifest_path"):
-        declared = _read_manifest_codebook(space.manifest_path)
+        declared = _read_manifest(space.manifest_path)
         if declared != codebook:
             raise ValueError(
                 f"sid_space.codebook {codebook} does not match the manifest at "
@@ -215,6 +215,27 @@ def _build_sid_space(
     )
 
 
+def _save_tokenizer_dir(
+    tok: Tokenizer, sid_space: ResolvedSidSpace, tokenizer_dir: str
+) -> None:
+    """Write the extended tokenizer as a directory ``AutoTokenizer`` loads.
+
+    ``tokenizer.json`` carries the vocabulary and the added SID atoms; the
+    minimal ``tokenizer_config.json`` beside it names the tokenizer class and
+    the two special tokens the prompt resolved, which is all a serving runtime
+    needs to decode a generated SID atom through ``--tokenizer-path``.
+    """
+    os.makedirs(tokenizer_dir, exist_ok=True)
+    tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
+    config = {
+        "tokenizer_class": "PreTrainedTokenizerFast",
+        "eos_token": tok.id_to_token(sid_space.eos_token_id),
+        "pad_token": tok.id_to_token(sid_space.pad_token_id),
+    }
+    with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+
+
 def _special_id(tok: Tokenizer, candidates: Sequence[str]) -> int:
     """First candidate the tokenizer knows, so a family swap does not break."""
     for name in candidates:
@@ -225,14 +246,6 @@ def _special_id(tok: Tokenizer, candidates: Sequence[str]) -> int:
         f"none of {list(candidates)} is in the tokenizer; the prompt cannot "
         f"resolve its EOS/pad ids."
     )
-
-
-def _hash(*parts: Any) -> str:
-    """Stable sha256 over the given parts."""
-    digest = hashlib.sha256()
-    for part in parts:
-        digest.update(repr(part).encode("utf-8"))
-    return digest.hexdigest()
 
 
 def compile_prompt(
@@ -247,9 +260,9 @@ def compile_prompt(
         cfg: the prompt config to compile.
         features: every feature a body slot may reference, already created.
         label_fields: data_config.label_fields; a response slot names these.
-        tokenizer_dir: where to write the extended tokenizer, flat, which is
-            what an exported HuggingFace directory loads; skipped when None.
-            Only export persists it -- nothing reads a training-time copy.
+        tokenizer_dir: where to write the extended tokenizer as a directory
+            ``AutoTokenizer`` loads; skipped when None. Only export persists
+            it -- nothing reads a training-time copy.
 
     Returns:
         The compiled prompt.
@@ -330,10 +343,8 @@ def compile_prompt(
     sid_space = _build_sid_space(cfg, tok, base_vocab_size, has_projection)
 
     if tokenizer_dir:
-        os.makedirs(tokenizer_dir, exist_ok=True)
-        tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
+        _save_tokenizer_dir(tok, sid_space, tokenizer_dir)
 
-    tokenizer_json = tok.to_str()
     slot_ids = {name: i for i, name in enumerate(resolved_slots_by_name)}
     segs: Dict[str, SlotSeg] = {}
     for name, slot in resolved_slots_by_name.items():
@@ -378,19 +389,7 @@ def compile_prompt(
     _validate(plan)
 
     return CompiledPrompt(
-        sid_space=sid_space,
-        prompt_plan=plan,
-        projection_plan=projection_plan,
-        vocab_hash=_hash(sid_space, tokenizer_json),
-        plan_hash=_hash(
-            sid_space,
-            plan,
-            # items(), not the bare dict: iterating one yields only its keys
-            sorted(projection_plan.projections.items()),
-            # routing too: matching bodies can still be wired to other slots
-            sorted(projection_plan.slot_to_module.items()),
-            tokenizer_json,
-        ),
+        sid_space=sid_space, prompt_plan=plan, projection_plan=projection_plan
     )
 
 

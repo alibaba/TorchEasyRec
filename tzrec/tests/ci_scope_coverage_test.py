@@ -26,6 +26,7 @@ _GPU_SKIP_TOKENS = (
     "has_dynamicemb",
     "has_tensorrt",
     "torch_fx_tool_unavailable",
+    "flash_attn_unavailable",
     "device_count",
 )
 _TZREC_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))

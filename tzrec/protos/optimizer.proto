@@ -13,6 +13,7 @@ message SparseOptimizer {
         FusedRowWiseAdagradOptimizer rowwise_adagrad_optimizer = 8;
         FusedAdadeltaOptimizer adadelta_optimizer = 9;
         FusedRMSpropOptimizer rmsprop_optimizer = 10;
+        FusedFTRLOptimizer ftrl_optimizer = 11;
     }
     oneof learning_rate {
         ConstantLR constant_learning_rate = 101;
@@ -139,6 +140,7 @@ message FusedRowWiseAdagradOptimizer {
     optional WeightDecayMode weight_decay_mode = 3 [default = NONE];
     optional bool gradient_clipping = 4 [default = false];
     optional float max_gradient = 5 [default = 1.0];
+    optional float initial_accumulator_value = 6 [default = 0.0];
 }
 
 message FusedAdadeltaOptimizer {
@@ -157,6 +159,26 @@ message FusedRMSpropOptimizer {
     optional float weight_decay = 4 [default = 0.0];
     optional bool gradient_clipping = 5 [default = false];
     optional float max_gradient = 6 [default = 1.0];
+}
+
+// FTRL-Proximal, Algorithm 1 of McMahan et al. 2013, with the paper's fixed
+// square root generalized to an arbitrary exponent. dynamicemb tables only.
+message FusedFTRLOptimizer {
+    // alpha in the paper, must be > 0 because the update divides by it.
+    required float lr = 1 [default = 0.002];
+    // exponent on the accumulator in the learning rate, must be <= 0.
+    // -0.5 recovers the paper's alpha / (beta + sqrt(n)).
+    optional float learning_rate_power = 2 [default = -0.5];
+    // beta in the paper, bounds the learning rate while the accumulator is small.
+    optional float ftrl_beta = 3 [default = 0.0];
+    // lambda1 in the paper, L1 regularization.
+    optional float l1_reg = 4 [default = 0.0];
+    // lambda2 in the paper, L2 regularization.
+    optional float l2_reg = 5 [default = 0.0];
+    optional bool gradient_clipping = 6 [default = false];
+    optional float max_gradient = 7 [default = 1.0];
+    // initial value of the squared-gradient accumulator.
+    optional float initial_accumulator_value = 8 [default = 0.0];
 }
 
 message SGDOptimizer {

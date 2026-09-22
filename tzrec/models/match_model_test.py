@@ -127,6 +127,49 @@ class MatchModelTest(unittest.TestCase):
                 atol=1e-4,
             )
 
+    def test_loss_weight_scales_loss(self):
+        """``LossConfig.weight`` scales the loss of a match model too."""
+        loss_weight = 0.5
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(
+                    softmax_cross_entropy=loss_pb2.SoftmaxCrossEntropy(),
+                    weight=loss_weight,
+                )
+            ],
+            metrics=[
+                metric_pb2.MetricConfig(recall_at_k=metric_pb2.RecallAtK(top_k=2))
+            ],
+        )
+        model = _TestMatchModel(
+            model_config=model_config,
+            features=[],
+            labels=["label"],
+            sampler_type="negative_sampler",
+        )
+        model = TrainWrapper(model)
+
+        batch = Batch(
+            dense_features={
+                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+                ),
+                NEG_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["int_b"], tensors=[torch.tensor([[0.2], [0.3], [0.4]])]
+                ),
+            },
+            sparse_features={},
+            labels={"label": torch.tensor([1, 1])},
+        )
+        total_loss, (losses, _, _) = model(batch)
+
+        # Same batch as test_match_model without in-batch negatives.
+        expected_loss = torch.tensor(0.71080) * loss_weight
+        torch.testing.assert_close(total_loss, expected_loss, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(
+            losses["softmax_cross_entropy"], expected_loss, rtol=1e-4, atol=1e-4
+        )
+
     @parameterized.expand(
         [
             [TestGraphType.NORMAL],

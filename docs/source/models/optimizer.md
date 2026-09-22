@@ -52,6 +52,10 @@ train_config {
 
   **Note**: 被分片为`data_parallel`的Embedding表不受sparse_optimizer管理，实际由dense_optimizer更新，并跟随dense_optimizer的LR策略，详见[训练文档](../usage/train.md)的Embedding分片约束章节
 
+  **Note**: `adagrad_optimizer`和`rowwise_adagrad_optimizer`的`initial_accumulator_value`对齐TensorFlow Adagrad的同名参数（TF默认0.1，TorchEasyRec默认0.0），对普通Embedding表和[dynamicemb](../feature/dynamicemb.md)表同时生效：普通Embedding表在建表时把整个accumulator初始化为该值，dynamicemb表则在key首次写入时把该key的accumulator初始化为该值。`ftrl_optimizer`也用该字段初始化它的accumulator
+
+  **Note**: `ftrl_optimizer`（FTRL-Proximal，McMahan et al. 2013）**只支持[dynamicemb](../feature/dynamicemb.md)表**，FBGEMM没有FTRL的embedding kernel，模型中只要还有一张非dynamicemb的sparse表，训练会在plan阶段直接报错并给出表名。可配置`dynamicemb`的特征类型见[dynamicemb文档](../feature/dynamicemb.md)，配置了`boundaries`的`raw_feature`等不支持dynamicemb的特征，无法与`ftrl_optimizer`一起使用。被分片为`data_parallel`的表不受此限制（由dense_optimizer更新）
+
 - dense_optimizer
 
   - optimizer: 优化器类型，具体见dense optimize的[配置文档](../reference.md)

@@ -14,7 +14,7 @@ import unittest
 
 import numpy as np
 import pyarrow as pa
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
@@ -24,6 +24,7 @@ from torchrec.modules.embedding_configs import (
 from tzrec.features import kv_dot_product as kv_dot_product_lib
 from tzrec.features.feature import FgMode
 from tzrec.protos import feature_pb2
+from tzrec.utils import test_util
 
 
 class KvDotProductTest(unittest.TestCase):
@@ -168,6 +169,88 @@ class KvDotProductTest(unittest.TestCase):
         self.assertEqual(parsed_feat.name, "kdp_feat")
         np.testing.assert_allclose(parsed_feat.values, np.array(expected_values))
         np.testing.assert_allclose(parsed_feat.lengths, np.array(expected_lengths))
+
+    def test_kv_dot_product_with_kv_delimiter_and_normalizer(self):
+        kdp_feat_cfg = feature_pb2.FeatureConfig(
+            kv_dot_product=feature_pb2.KvDotProduct(
+                feature_name="kdp_feat",
+                query="user:q",
+                document="item:d",
+                default_value="0",
+                separator="|",
+                kv_delimiter="=",
+                normalizer="method=log10,threshold=1e-10,default=-10",
+            )
+        )
+        kdp_feat = kv_dot_product_lib.KvDotProduct(
+            kdp_feat_cfg, fg_mode=FgMode.FG_NORMAL
+        )
+        fg_cfg = kdp_feat.fg_json()[0]
+        self.assertEqual(fg_cfg["kv_delimiter"], "=")
+        self.assertEqual(
+            fg_cfg["normalizer"], "method=log10,threshold=1e-10,default=-10"
+        )
+
+        input_data = {"q": pa.array(["a=2|b=3"]), "d": pa.array(["a=2|b=2"])}
+        parsed_feat = kdp_feat.parse(input_data)
+        np.testing.assert_allclose(parsed_feat.values, np.array([[1.0]]))
+
+    def test_kv_dot_product_with_invalid_kv_delimiter(self):
+        kdp_feat_cfg = feature_pb2.FeatureConfig(
+            kv_dot_product=feature_pb2.KvDotProduct(
+                feature_name="kdp_feat",
+                query="user:q",
+                document="item:d",
+                kv_delimiter="::",
+            )
+        )
+        kdp_feat = kv_dot_product_lib.KvDotProduct(kdp_feat_cfg)
+        with self.assertRaisesRegex(ValueError, "invalid kv_delimiter"):
+            kdp_feat.fg_json()
+
+
+class SequenceKvDotProductTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            param("item_side_seq", document="item:d", sequence_fields=[]),
+            param("user_side_seq", document="user:d", sequence_fields=["d"]),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_simple_sequence_kv_dot_product_dense(
+        self, name, document, sequence_fields
+    ):
+        seq_feat_cfg = feature_pb2.FeatureConfig(
+            sequence_kv_dot_product=feature_pb2.KvDotProduct(
+                feature_name="click_50_seq_kdp_feat",
+                sequence_delim=";",
+                sequence_length=50,
+                query="user:q",
+                document=document,
+                sequence_fields=sequence_fields,
+                separator="|",
+                default_value="0.1",
+            )
+        )
+        seq_feat = kv_dot_product_lib.KvDotProduct(
+            seq_feat_cfg, is_sequence=True, fg_mode=FgMode.FG_NORMAL
+        )
+        self.assertEqual(seq_feat.output_dim, 1)
+        self.assertEqual(seq_feat.is_sparse, False)
+        self.assertEqual(seq_feat.inputs, ["q", "d"])
+        self.assertEqual(seq_feat.sequence_input_names, ["d"])
+        self.assertEqual(
+            seq_feat.fg_json()[0].get("sequence_fields"), sequence_fields or None
+        )
+
+        input_data = {
+            "q": pa.array(["a:0.5|b:0.5", "a|b|c"]),
+            "d": pa.array(["a:0.5|b:0.5;a|b", "a|b"]),
+        }
+        parsed_feat = seq_feat.parse(input_data)
+        self.assertEqual(parsed_feat.name, "click_50_seq_kdp_feat")
+        np.testing.assert_allclose(parsed_feat.values, np.array([[0.5], [1.0], [2.0]]))
+        np.testing.assert_allclose(parsed_feat.seq_lengths, np.array([2, 1]))
 
 
 if __name__ == "__main__":

@@ -9,8 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-import os
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Iterable, Optional, Union
 
 import torch
 from fbgemm_gpu import split_table_batched_embeddings_ops_training
@@ -20,6 +19,8 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
 )
 from torch import nn
 from torch.amp import GradScaler
+from torch.optim.optimizer import Optimizer
+from torchrec.distributed.utils import _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE
 from torchrec.optim import KeyedOptimizer, OptimizerWrapper
 
 
@@ -68,10 +69,79 @@ class TZRecOptimizer(OptimizerWrapper):
                 self._optimizer.step(closure=closure)
 
 
+class FTRL(Optimizer):
+    """Placeholder for the dynamicemb FTRL sparse embedding optimizer.
+
+    FBGEMM has no FTRL kernel, so torchrec ships no FTRL wrapper to reuse. Like
+    torchrec's own placeholders this class never runs: it names the optimizer so
+    that the sharding plan can resolve it, and the update happens inside the
+    dynamicemb table.
+
+    Args:
+        params (Iterable[nn.Parameter]): parameters to attach the optimizer to.
+        **kwargs: fused params, forwarded to the dynamicemb table.
+    """
+
+    def __init__(self, params: Iterable[nn.Parameter], **kwargs: Any) -> None:
+        self._params = params
+        self._kwargs = kwargs
+
+    # pyrefly: ignore[bad-override]  # matches torchrec's placeholder optimizers
+    def step(self, closure: Optional[Callable[[], float]] = None) -> None:
+        """Step, never reached, the dynamicemb table applies the update."""
+        raise NotImplementedError
+
+
+def register_ftrl_emb_opt_type() -> None:
+    """Map :class:`FTRL` to dynamicemb's optimizer type in torchrec's table.
+
+    torchrec derives an embedding table's fused `optimizer` param from the
+    in-backward optimizer class, and does so unconditionally on the
+    EmbeddingCollection path, so FTRL has to be registered in that table rather
+    than injected into the fused params. Must be called before planning.
+
+    Raises:
+        RuntimeError: dynamicemb is missing or predates its FTRL support.
+    """
+    try:
+        from dynamicemb import DynamicEmbOptimType
+    except ImportError as e:
+        raise RuntimeError(
+            "sparse ftrl_optimizer requires dynamicemb >= "
+            "0.1.0+20260920.9643985; FBGEMM has no FTRL embedding kernel. "
+            "Please reinstall dynamicemb, see docs/source/feature/dynamicemb.md."
+        ) from e
+    _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE[FTRL] = DynamicEmbOptimType.FTRL
+
+
 # The Adagrad optimizer in TensorFlow includes the parameter
 # `initial_accumulator_value`, with a default value of 0.1.
 # Here, we patch the fbgemm embedding optimizer state split helper
 # to support `momentum1` (Adagrad) with the specified initial value.
+_sparse_init_accumulator_value = 0.0
+
+
+def set_sparse_init_accumulator_value(value: float) -> None:
+    """Record the accumulator initial value for embedding tables built later.
+
+    Takes effect at table build time, in the ``apply_split_helper`` patch below and
+    in ``dynamicemb_util``'s plan-time fused params, so it must be set before
+    planning; FBGEMM TBE has no such kwarg, hence this module-level switch. Used
+    by Adagrad and, on dynamicemb tables, by FTRL for its squared-gradient
+    accumulator.
+
+    Args:
+        value: accumulator initial value, 0.0 for optimizers without one.
+    """
+    global _sparse_init_accumulator_value
+    _sparse_init_accumulator_value = value
+
+
+def sparse_init_accumulator_value() -> float:
+    """Sparse accumulator initial value, 0.0 when not configured."""
+    return _sparse_init_accumulator_value
+
+
 def apply_split_helper(
     persistent_state_fn: Callable[[str, torch.Tensor], None],
     set_attr_fn: Callable[
@@ -93,16 +163,10 @@ def apply_split_helper(
     preallocated_host_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     """Patch for state split helper of FBGEMM SplitTableBatchedEmbeddingBagsCodegen."""
-    # Adagrad of tensorflow has param initial_accumulator_value with default value 0.1
-    momentum1_init_value_str = os.environ.get("FBGEMM_MOMENTUM1_STATE_INIT_VALUE", None)
-    init_value = 0.0
+    init_value = sparse_init_accumulator_value()
     use_init_value = (
-        momentum1_init_value_str is not None
-        and prefix == "momentum1"
-        and dtype.is_floating_point
+        init_value != 0.0 and prefix == "momentum1" and dtype.is_floating_point
     )
-    if use_init_value:
-        init_value = float(momentum1_init_value_str)
 
     set_attr_fn(f"{prefix}_physical_placements", split.placements)
     set_attr_fn(f"{prefix}_physical_offsets", split.offsets)

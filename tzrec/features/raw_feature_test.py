@@ -639,6 +639,23 @@ class SequenceRawFeatureTest(unittest.TestCase):
 
     # TODO(hongsheng.jhs): add normalizer tests.
 
+    def test_raw_feature_separator_not_emitted_for_scalar(self):
+        raw_feat_cfg = feature_pb2.FeatureConfig(
+            raw_feature=feature_pb2.RawFeature(
+                feature_name="num",
+                expression="user:num",
+                separator=",",
+            )
+        )
+        raw_feat = raw_feature_lib.RawFeature(raw_feat_cfg)
+        # a scalar value has nothing to split, and fg abandons the row without
+        # filling it when an input splits into more values than value_dim
+        self.assertNotIn("separator", raw_feat.fg_json()[0])
+
+        raw_feat_cfg.raw_feature.value_dim = 2
+        raw_feat = raw_feature_lib.RawFeature(raw_feat_cfg)
+        self.assertEqual(raw_feat.fg_json()[0]["separator"], ",")
+
 
 if __name__ == "__main__":
     unittest.main()

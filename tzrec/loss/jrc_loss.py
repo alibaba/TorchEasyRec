@@ -10,26 +10,32 @@
 # limitations under the License.
 
 
+from typing import Optional
+
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import CrossEntropyLoss
 from torch.nn.modules.loss import _Loss
 
+from tzrec.ops.scatter_ops import lengths_to_index, scatter_logsumexp
 
-@torch.fx.wrap
-def _label_mask(labels: torch.Tensor) -> torch.Tensor:
-    return torch.eye(labels.size(0), dtype=torch.int64, device=labels.device)
-
-
-@torch.fx.wrap
-def _diag_index(labels: torch.Tensor) -> torch.Tensor:
-    return torch.arange(0, labels.size(0), dtype=torch.int64, device=labels.device)
+# Logit assigned to samples that must not compete: exp underflows to exactly
+# 0 after the segment max shift, so they drop out of the log-sum-exp.
+_MASKED_LOGIT = -1e9
 
 
 class JRCLoss(_Loss):
     """Positive sample probability competes in session.
 
     https://arxiv.org/abs/2208.06164
+
+    The session term of the paper is a softmax of each positive against the
+    negatives of its session (on the positive logit) and of each negative
+    against the positives of its session (on the negative logit).  Both
+    reduce to ``softplus(logsumexp(competitors) - own logit)``, where the
+    log-sum-exp is one value per session, so the term costs two segment
+    reductions instead of a batch-by-batch session mask.
 
     Args:
         alpha (float): cross entropy loss weight.
@@ -52,14 +58,22 @@ class JRCLoss(_Loss):
         self,
         logits: Tensor,
         labels: Tensor,
-        session_ids: Tensor,
+        lengths: Tensor,
+        index: Optional[Tensor] = None,
     ) -> Tensor:
         """JRC loss.
+
+        Without ``index``, ``logits`` and ``labels`` are laid out
+        session by session in ``lengths`` order, each session contiguous.
 
         Args:
             logits: a `Tensor` with shape [batch_size, 2].
             labels: a `Tensor` with shape [batch_size].
-            session_ids: a `Tensor` with shape [batch_size].
+            lengths: a `Tensor` with shape [num_sessions], samples per
+                session, summing to batch_size.
+            index: a `Tensor` with shape [batch_size], session of each
+                sample (torch_scatter's ``index``), for samples in arbitrary
+                order.
 
         Return:
             loss: a `Tensor` with shape [batch_size] if reduction is 'none',
@@ -67,54 +81,27 @@ class JRCLoss(_Loss):
         """
         ce_loss = self._ce_loss(logits, labels)
 
-        batch_size = labels.shape[0]
-        mask = torch.eq(session_ids.unsqueeze(1), session_ids.unsqueeze(0)).float()
-        diag_index = _diag_index(labels)
+        if index is None:
+            index = lengths_to_index(lengths, output_size=logits.size(0))
         logits_neg, logits_pos = logits[:, 0], logits[:, 1]
-        diag = _label_mask(labels)
-        pos_num = torch.sum(labels)
-        neg_num = batch_size - pos_num
-
-        # first, we calculate pos sample loss in during the session.
-        pos_mask_index = torch.where(labels == 1.0)[0]
-        pos_diag_label = torch.index_select(diag_index, 0, pos_mask_index)
-        # pyre-ignore [6]
-        logits_pos = logits_pos.unsqueeze(0).tile([pos_num, 1])
-        pos_session_mask = torch.index_select(mask, 0, pos_mask_index)
-        # pyre-ignore [6]
-        y_pos = labels.unsqueeze(0).tile([pos_num, 1])
-        diag_pos = torch.index_select(diag, 0, pos_mask_index)
-        # we mask not in the same session, is diagonal and is positive.
-        logits_pos = (
-            logits_pos + ((1 - pos_session_mask) + (1 - diag_pos) * y_pos) * -1e9
+        is_pos = labels == 1
+        # Competitors of a positive: the session's negatives on the positive
+        # logit; of a negative: the session's positives on the negative logit.
+        neg_competitors = torch.where(is_pos, _MASKED_LOGIT, logits_pos)
+        pos_competitors = torch.where(is_pos, logits_neg, _MASKED_LOGIT)
+        num_sessions = lengths.size(0)
+        lse_neg = scatter_logsumexp(
+            neg_competitors.unsqueeze(-1), index, num_sessions
+        ).squeeze(-1)
+        lse_pos = scatter_logsumexp(
+            pos_competitors.unsqueeze(-1), index, num_sessions
+        ).squeeze(-1)
+        ge_loss = torch.where(
+            is_pos,
+            F.softplus(lse_neg.index_select(0, index) - logits_pos),
+            F.softplus(lse_pos.index_select(0, index) - logits_neg),
         )
-        loss_pos = self._ce_loss(logits_pos, pos_diag_label)
-
-        # next, we calculate neg sample loss in during the session.
-        neg_mask_index = torch.where(labels == 0.0)[0]
-        neg_diag_label = torch.index_select(diag_index, 0, neg_mask_index)
-        # neg_num is a 0-d integer tensor, which tile accepts via __index__.
-        # pyrefly: ignore[no-matching-overload]
-        logits_neg = logits_neg.unsqueeze(0).tile([neg_num, 1])
-        neg_session_mask = torch.index_select(mask, 0, neg_mask_index)
-        # pyrefly: ignore[no-matching-overload]
-        y_neg = (1 - labels).unsqueeze(0).tile([neg_num, 1])
-        diag_neg = torch.index_select(diag, 0, neg_mask_index)
-        # we mask not in the same session, is diagonal and is negative.
-        logits_neg = (
-            logits_neg + ((1 - neg_session_mask) + (1 - diag_neg) * y_neg) * -1e9
-        )
-        loss_neg = self._ce_loss(logits_neg, neg_diag_label)
-
         if self._reduction != "none":
-            loss_pos = loss_pos * pos_num / batch_size
-            loss_neg = loss_neg * neg_num / batch_size
-            ge_loss = loss_pos + loss_neg
-        else:
-            ge_loss = torch.zeros_like(labels, dtype=torch.float)
-            ge_loss.index_put_(torch.where(labels == 1.0), loss_pos)
-            ge_loss.index_put_(torch.where(labels == 0.0), loss_neg)
+            ge_loss = ge_loss.mean()
 
-        loss = self._alpha * ce_loss + (1 - self._alpha) * ge_loss
-        # pyre-ignore [7]
-        return loss
+        return self._alpha * ce_loss + (1 - self._alpha) * ge_loss

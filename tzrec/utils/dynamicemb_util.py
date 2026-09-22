@@ -45,6 +45,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
+from tzrec.optim.optimizer import FTRL, sparse_init_accumulator_value
 from tzrec.protos import feature_pb2
 from tzrec.utils.logging_util import logger
 
@@ -206,6 +207,28 @@ def _log_dynamicemb_table_plan(
     )
 
 
+def _get_optimizer_multipler(
+    optimizer_class: Optional[Type[torch.optim.Optimizer]], shape: torch.Size
+) -> float:
+    """Optimizer state size per embedding element, including dynamicemb's FTRL.
+
+    torchrec's table maps any class it does not know to 1, and FTRL keeps a
+    linear and an accumulator term per element, so its rows are ``2 * dim`` wide
+    like Adam's.
+
+    Args:
+        optimizer_class (type, optional): in-backward optimizer class of the
+            table, None when the table is not trained.
+        shape (torch.Size): unsharded table shape, used by row-wise optimizers.
+
+    Returns:
+        the multiplier applied to the embedding width.
+    """
+    if optimizer_class is FTRL:
+        return 2.0
+    return shard_estimators._get_optimizer_multipler(optimizer_class, shape)
+
+
 has_dynamicemb = False
 try:
     import dynamicemb
@@ -215,6 +238,7 @@ try:
         DynamicEmbScoreStrategy,
         FrequencyAdmissionStrategy,
         KVCounter,
+        ProbabilisticAdmissionStrategy,
         align_to_table_size,
     )
     from dynamicemb.dynamicemb_config import DynamicEmbKernel
@@ -251,6 +275,23 @@ try:
 
     # pyre-ignore [9]
     DynamicEmbeddingCollectionContext.__init__ = _demb_ctx_init_coerce_none
+
+    @dataclasses.dataclass
+    class TZRecDynamicEmbParameterSharding(DynamicEmbParameterSharding):
+        """DynamicEmbParameterSharding carrying the Adagrad accumulator init value.
+
+        The value is not a DynamicEmbTableOptions field, and FBGEMM TBE rejects it as
+        a kwarg, so it can only reach BatchedDynamicEmbeddingTables as a per-table
+        fused param of the customized kernel.
+        """
+
+        initial_accumulator_value: float = 0.0
+
+        def get_additional_fused_params(self) -> Dict[str, Any]:
+            """Extra fused params of the customized kernel."""
+            params = super().get_additional_fused_params()
+            params["initial_accumulator_value"] = self.initial_accumulator_value
+            return params
 
     has_dynamicemb = True
 except Exception:
@@ -340,30 +381,35 @@ def build_dynamicemb_constraints(
     if dynamicemb_cfg.HasField("init_capacity_per_rank"):
         init_capacity = align_to_table_size(dynamicemb_cfg.init_capacity_per_rank)
 
-    admission_counter = None
     admit_strategy = None
     admission_strategy_type = dynamicemb_cfg.WhichOneof("admission_strategy")
     if admission_strategy_type is not None:
+        admission_strategy_cfg = getattr(dynamicemb_cfg, admission_strategy_type)
+        non_admitted_initializer_args = _build_dynamicemb_initializer(
+            admission_strategy_cfg.initializer_args,
+            num_embeddings,
+            embedding_dim,
+            is_eval=True,
+        )
         if admission_strategy_type == "frequency_admission_strategy":
-            admission_strategy_cfg = getattr(dynamicemb_cfg, admission_strategy_type)
             counter_capacity = (
                 admission_strategy_cfg.counter_capacity
                 if admission_strategy_cfg.HasField("counter_capacity")
                 else num_embeddings
             )
             world_size = int(os.environ.get("WORLD_SIZE", 1))
-            admission_counter = KVCounter(
-                capacity=align_to_table_size(int(counter_capacity / world_size)),
-                bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
-            )
             admit_strategy = FrequencyAdmissionStrategy(
                 threshold=admission_strategy_cfg.threshold,
-                initializer_args=_build_dynamicemb_initializer(
-                    admission_strategy_cfg.initializer_args,
-                    num_embeddings,
-                    embedding_dim,
-                    is_eval=True,
+                counter=KVCounter(
+                    capacity=align_to_table_size(int(counter_capacity / world_size)),
+                    bucket_capacity=admission_strategy_cfg.counter_bucket_capacity,
                 ),
+                initializer_args=non_admitted_initializer_args,
+            )
+        elif admission_strategy_type == "probabilistic_admission_strategy":
+            admit_strategy = ProbabilisticAdmissionStrategy(
+                probability=admission_strategy_cfg.probability,
+                initializer_args=non_admitted_initializer_args,
             )
         else:
             raise ValueError(f"Unknown AdmissionStrategy: {admission_strategy_type}")
@@ -389,7 +435,6 @@ def build_dynamicemb_constraints(
         ),
         score_strategy=score_strategy,
         admit_strategy=admit_strategy,
-        admission_counter=admission_counter,
         **demb_opt_kwargs,
     )
 
@@ -541,7 +586,7 @@ if has_dynamicemb:
                 # calc local_hbm_for_values
                 tensor = sharding_option.tensor
                 optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
-                optimizer_multipler = shard_estimators._get_optimizer_multipler(
+                optimizer_multipler = _get_optimizer_multipler(
                     optimizer_class, tensor.shape
                 )
                 dynamicemb_options.training = optimizer_class is not None
@@ -569,7 +614,7 @@ if has_dynamicemb:
                 if dynamicemb_options.index_type is None:
                     dynamicemb_options.index_type = torch.int64
 
-                module_plan[sharding_option.name] = DynamicEmbParameterSharding(
+                module_plan[sharding_option.name] = TZRecDynamicEmbParameterSharding(
                     sharding_spec=sharding_spec,
                     sharding_type=ShardingType.ROW_WISE.value,
                     ranks=[i for i in range(world_size)],
@@ -577,6 +622,7 @@ if has_dynamicemb:
                     customized_compute_kernel=DynamicEmbKernel,
                     dist_type="roundrobin",
                     dynamicemb_options=dynamicemb_options,
+                    initial_accumulator_value=sparse_init_accumulator_value(),
                 )
                 _log_dynamicemb_table_plan(
                     fqn=f"{sharding_option.path}.{sharding_option.name}",
@@ -586,6 +632,22 @@ if has_dynamicemb:
                     ddr_bytes=int(shards[0].storage.ddr),
                 )
             else:
+                # A data_parallel table is replicated and updated by the dense
+                # optimizer, so the sparse optimizer never reaches it.
+                if (
+                    getattr(sharding_option.tensor, "_optimizer_classes", [None])[0]
+                    is FTRL
+                    and sharding_type != ShardingType.DATA_PARALLEL.value
+                ):
+                    raise ValueError(
+                        "sparse ftrl_optimizer only supports dynamicemb embedding "
+                        "tables, but table["
+                        f"{sharding_option.path}.{sharding_option.name}] is planned "
+                        f"with sharding_type[{sharding_type}] and "
+                        f"compute_kernel[{sharding_option.compute_kernel}]. "
+                        "Set `dynamicemb { }` on every sparse feature, or use "
+                        "another sparse optimizer."
+                    )
                 module_plan[sharding_option.name] = ParameterSharding(
                     sharding_spec=sharding_spec,
                     sharding_type=sharding_type,
@@ -708,7 +770,7 @@ if has_dynamicemb:
         optimizer_multipler = 0.0
         optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
         if not is_inference:
-            optimizer_multipler = shard_estimators._get_optimizer_multipler(
+            optimizer_multipler = _get_optimizer_multipler(
                 optimizer_class, tensor.shape
             )
 
@@ -826,17 +888,18 @@ if has_dynamicemb:
                 caching=bool(getattr(dynamicemb_options, "caching", False)),
             )
         )
+        # The counter belongs to the strategy that counts with it; a
+        # probabilistic admitter keeps no state, so it costs nothing.
         counter_hbm_specific_size = 0
-        if dynamicemb_options.admission_counter is not None:
-            counter = dynamicemb_options.admission_counter
-            if isinstance(counter, KVCounter):
-                counter_hbm_specific_size = (
-                    _calculate_dynamicemb_table_storage_specific_size(
-                        [counter.capacity, 0],
-                        element_size=0,  # counter does not contain embedding value
-                        bucket_capacity=counter.bucket_capacity,
-                    )
+        if isinstance(dynamicemb_options.admit_strategy, FrequencyAdmissionStrategy):
+            counter = dynamicemb_options.admit_strategy.counter
+            counter_hbm_specific_size = (
+                _calculate_dynamicemb_table_storage_specific_size(
+                    [counter.capacity, 0],
+                    element_size=0,  # counter does not contain embedding value
+                    bucket_capacity=counter.bucket_capacity,
                 )
+            )
 
         hbm_sizes: List[int] = [
             (

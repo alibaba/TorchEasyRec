@@ -21,6 +21,7 @@ import numpy as np
 import pyarrow as pa
 import requests
 from odps import ODPS
+from odps.apis.storage_api import SessionRequest, SessionStatus
 from odps.errors import ODPSError
 from parameterized import parameterized
 from torch import distributed as dist
@@ -255,7 +256,7 @@ class OdpsDatasetTest(unittest.TestCase):
         self.assertIsNotNone(batch.checkpoint_info)
         self.assertIsInstance(batch.checkpoint_info, dict)
 
-        # Checkpoint keys should be in format "{input_path}#{session_id}:{start}"
+        # Checkpoint keys are "{input_path}#{sess_idx}#{session_id}:{start}"
         for key, value in batch.checkpoint_info.items():
             self.assertIn(":", key)
             self.assertIn("#", key)
@@ -263,11 +264,9 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertEqual(len(parts), 2)
             # start should be numeric
             self.assertTrue(parts[1].isdigit())
-            # Verify session_id is present (between # and last :)
-            prefix = parts[0]
-            hash_idx = prefix.rfind("#")
-            self.assertGreater(hash_idx, 0)
-            session_id = prefix[hash_idx + 1 :]
+            input_path, sess_idx, session_id = parts[0].split("#")
+            self.assertGreater(len(input_path), 0)
+            self.assertTrue(sess_idx.isdigit())
             self.assertGreater(len(session_id), 0)
             # Value should be a non-negative integer
             self.assertIsInstance(value, int)
@@ -387,6 +386,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 is_orderby_partition=True,
                 odps_data_quota_name=self.test_quota,
+                min_batch_size=2,
             ),
             features=features,
             input_path=input_path,
@@ -437,8 +437,85 @@ class OdpsDatasetTest(unittest.TestCase):
         )
         self.assertEqual(
             restored_sess_list[0].session_id,
-            list(first_checkpoint_state.keys())[0].split("#")[1].split(":")[0],
+            list(first_checkpoint_state.keys())[0].rsplit("#", 1)[1].split(":")[0],
         )
+
+    @unittest.skipIf(
+        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
+        "odps config not found",
+    )
+    def test_odps_dataset_checkpoint_resume_empty_partition(self):
+        """Test checkpoint resume keeps sessions at their partition position."""
+        account, odps_endpoint = _create_odps_account()
+        project = self.test_project
+        self.o = ODPS(account=account, project=project, endpoint=odps_endpoint)
+        feature_cfgs = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        table_name = f"test_odps_dataset_{self.test_suffix}"
+        # an empty partition between two 10000-row partitions never yields a
+        # checkpoint key, so the consumed sessions are not a prefix of the list
+        self.o.get_table(table_name).create_partition("dt=20240318")
+        input_path = (
+            f"odps://{project}/tables/{table_name}/dt=20240319&dt=20240318&dt=20240320"
+        )
+        data_config = data_pb2.DataConfig(
+            batch_size=1024,
+            dataset_type=data_pb2.DatasetType.OdpsDataset,
+            fg_mode=FgMode.FG_DAG,
+            label_fields=["label"],
+            is_orderby_partition=True,
+            odps_data_quota_name=self.test_quota,
+        )
+
+        dataset1 = OdpsDataset(
+            data_config=data_config, features=features, input_path=input_path
+        )
+        self.assertEqual(len(list(dataset1._reader._input_to_sess.values())[0]), 3)
+        dataloader1 = DataLoader(
+            dataset=dataset1,
+            batch_size=None,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=lambda x: x,
+        )
+        iterator1 = iter(dataloader1)
+
+        # consume into the last partition
+        checkpoint_state = {}
+        num_consumed = 0
+        for _ in range(20):
+            batch = next(iterator1)
+            update_dataloder_state(checkpoint_state, batch.checkpoint_info.copy())
+            num_consumed += len(batch.labels["label"])
+            if any("#2#" in key for key in checkpoint_state):
+                break
+        self.assertTrue(any("#2#" in key for key in checkpoint_state))
+        self.assertFalse(any("#1#" in key for key in checkpoint_state))
+        del iterator1
+        del dataloader1
+
+        dataset2 = OdpsDataset(
+            data_config=data_config, features=features, input_path=input_path
+        )
+        fresh_sess_list = list(dataset2._reader._input_to_sess.values())[0]
+        dataset2.load_state_dict(checkpoint_state)
+
+        ckpt_sess_ids = {
+            int(key.rsplit("#", 2)[1]): key.rsplit("#", 1)[1].split(":")[0]
+            for key in checkpoint_state
+        }
+        restored_sess_list = list(dataset2._reader._input_to_sess.values())[0]
+        self.assertEqual(len(restored_sess_list), 3)
+        self.assertEqual(restored_sess_list[0].session_id, ckpt_sess_ids[0])
+        self.assertEqual(
+            restored_sess_list[1].session_id, fresh_sess_list[1].session_id
+        )
+        self.assertEqual(restored_sess_list[2].session_id, ckpt_sess_ids[2])
+
+        # the remaining rows are read exactly once
+        num_remaining = sum(len(batch.labels["label"]) for batch in dataset2)
+        self.assertEqual(num_consumed + num_remaining, 20000)
 
     def _test_odps_dataset_with_sampler(self, id_type="bigint", schema=None):
         account, odps_endpoint = _create_odps_account()
@@ -731,6 +808,65 @@ class _RetryingStorageClient:
         if self.calls <= self._fail_times:
             raise ODPSError("synthetic ODPS error", request_id="REQ-XYZ")
         return self.sentinel
+
+
+class _StubScanClient:
+    def __init__(self, status=SessionStatus.NORMAL):
+        self.status = status
+
+    def get_read_session(self, sess_req):
+        return SimpleNamespace(session_status=self.status, record_count=100)
+
+
+class OdpsRestoreSessionsTest(unittest.TestCase):
+    input_path = "odps://p/tables/t/dt=1&dt=2&dt=3"
+
+    def _reader(self):
+        reader = odps_dataset.OdpsReader.__new__(odps_dataset.OdpsReader)
+        reader._input_to_sess = {
+            self.input_path: [SessionRequest(session_id=f"new{i}") for i in range(3)]
+        }
+        reader._table_to_cli = {"t": _StubScanClient()}
+        reader._sess_row_counts = {"new0": 100, "new1": 0, "new2": 100}
+        return reader
+
+    def test_restore_keeps_partition_position(self):
+        reader = self._reader()
+        reader._restore_sessions(
+            {
+                f"{self.input_path}#2#old2:0": 39,
+                f"{self.input_path}#0#old0:50": 99,
+                f"{self.input_path}#0#old0:0": 49,
+                "__data_ts_watermark__": 5,
+            }
+        )
+        self.assertEqual(
+            [x.session_id for x in reader._input_to_sess[self.input_path]],
+            ["old0", "new1", "old2"],
+        )
+        self.assertEqual(reader._sess_row_counts["old2"], 100)
+
+    def test_restore_skips_unknown_input_path(self):
+        reader = self._reader()
+        with mock.patch.object(odps_dataset, "logger") as m_logger:
+            reader._restore_sessions(
+                {"odps://p/tables/other/dt=1#0#old0:0": 9, "/data/a#b.parquet:0": 9}
+            )
+        self.assertEqual(m_logger.warning.call_count, 2)
+        self.assertEqual(
+            [x.session_id for x in reader._input_to_sess[self.input_path]],
+            ["new0", "new1", "new2"],
+        )
+
+    def test_restore_rejects_key_without_session_index(self):
+        reader = self._reader()
+        with self.assertRaisesRegex(RuntimeError, "older TorchEasyRec version"):
+            reader._restore_sessions({f"{self.input_path}#old0:0": 9})
+
+    def test_restore_rejects_session_index_out_of_range(self):
+        reader = self._reader()
+        with self.assertRaisesRegex(RuntimeError, "only 3 partition sessions"):
+            reader._restore_sessions({f"{self.input_path}#3#old3:0": 9})
 
 
 class OdpsStorageErrorLogTest(unittest.TestCase):

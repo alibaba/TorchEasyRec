@@ -17,7 +17,13 @@ import torch
 from parameterized import parameterized
 
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
-from tzrec.utils.test_util import create_tiny_causal_lm, parameterized_name_func
+from tzrec.utils.test_util import (
+    create_tiny_causal_lm,
+    flash_attn_unavailable,
+    mark_ci_scope,
+    nv_gpu_unavailable,
+    parameterized_name_func,
+)
 
 
 def _decode(lm, ids, pairs, width=8, beam_widths=None, attention_mask=None):
@@ -130,6 +136,43 @@ class DynamicBeamSearchTest(unittest.TestCase):
             all(scores[i] >= scores[i + 1] - 1e-4 for i in range(len(scores) - 1))
         )
         self.assertEqual(got[0], max(ref, key=lambda combo: ref[combo]))
+
+
+@mark_ci_scope("gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_unavailable)
+class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
+    @parameterized.expand(
+        [["qwen2"], ["qwen3"]],
+        name_func=parameterized_name_func,
+    )
+    def test_ragged_batch_matches_solo_dynamic_cache(self, model_type: str) -> None:
+        device = torch.device("cuda")
+        lm = create_tiny_causal_lm(
+            30,
+            model_type=model_type,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+        ).to(device)
+        pairs = [(20, 21), (22, 24), (25, 28)]
+        ids = torch.tensor(
+            [[5, 6, 7, 8], [0, 9, 10, 11]],
+            device=device,
+        )
+        attention_mask = torch.tensor(
+            [[1, 1, 1, 1], [0, 1, 1, 1]],
+            device=device,
+        )
+
+        out = _decode(lm, ids, pairs, attention_mask=attention_mask)
+        width = out.shape[0] // 2
+        solos = [
+            torch.tensor([[5, 6, 7, 8]], device=device),
+            torch.tensor([[9, 10, 11]], device=device),
+        ]
+        for index, solo_ids in enumerate(solos):
+            solo = _decode(lm, solo_ids, pairs)
+            torch.testing.assert_close(out[index * width : (index + 1) * width], solo)
 
 
 if __name__ == "__main__":

@@ -13,16 +13,23 @@ import unittest
 from typing import Dict, List, Optional
 
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
+from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.loss.jrc_loss import JRCLoss
+from tzrec.loss.listwise_rank_loss import ListwiseRankLoss
 from tzrec.models.model import TrainWrapper
 from tzrec.models.rank_model import RankModel
 from tzrec.protos import loss_pb2, metric_pb2, model_pb2
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.utils.test_util import TestGraphType, create_test_model
+from tzrec.utils.test_util import (
+    TestGraphType,
+    create_test_model,
+    parameterized_name_func,
+)
 
 
 class _TestClassficationModel(RankModel):
@@ -39,6 +46,19 @@ class _TestClassficationModel(RankModel):
         dense_feat_kt = batch.dense_features[BASE_DATA_GROUP]
         y = dense_feat_kt.values()
         return self._output_to_prediction(y)
+
+
+class _TestJaggedModel(_TestClassficationModel):
+    """Publishes per-request candidate counts like the DlrmHSTU family.
+
+    Sparse features are carried once per request (2 rows), dense logits and
+    labels once per candidate (6 rows).
+    """
+
+    def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        predictions = super().predict(batch)
+        predictions[TARGET_REPEAT_INTERLEAVE_KEY] = torch.tensor([2, 4])
+        return predictions
 
 
 class _TestRegressionModel(RankModel):
@@ -145,6 +165,74 @@ class RankModelTest(unittest.TestCase):
             )
             torch.testing.assert_close(
                 metric_result["accuracy"], expected_acc, rtol=1e-4, atol=1e-4
+            )
+
+    @parameterized.expand(
+        [
+            param("plain", graph_type=TestGraphType.NORMAL, weighted=False),
+            param("plain_fx", graph_type=TestGraphType.FX_TRACE, weighted=False),
+            param("sample_weighted", graph_type=TestGraphType.NORMAL, weighted=True),
+            param(
+                "sample_weighted_fx", graph_type=TestGraphType.FX_TRACE, weighted=True
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_loss_weight_scales_loss(self, _name, graph_type, weighted):
+        """``LossConfig.weight`` scales the loss after the sample-weight step.
+
+        Same batch and same expected values as
+        ``test_binary_classification_model``, so a weight folded into the
+        sample weights instead -- which would renormalize away -- would not
+        reproduce them.
+        """
+        loss_weight = 0.5
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(
+                    binary_cross_entropy=loss_pb2.BinaryCrossEntropy(),
+                    weight=loss_weight,
+                )
+            ],
+            metrics=[metric_pb2.MetricConfig(auc=metric_pb2.AUC())],
+        )
+        model = _TestClassficationModel(
+            model_config=model_config,
+            features=[],
+            labels=["label"],
+            sample_weights=["weight"] if weighted else None,
+        )
+        model = TrainWrapper(model)
+        model = create_test_model(model, graph_type)
+
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["id_a"], values=torch.tensor([1, 1]), lengths=torch.tensor([1, 1])
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={BASE_DATA_GROUP: sparse_feature},
+            labels={"label": torch.tensor([0, 1])},
+            sample_weights={"weight": torch.tensor([1.0, 2.0])},
+        )
+        total_loss, (losses, predictions, batch) = model(batch)
+
+        expected_loss = torch.tensor(0.6356 if weighted else 0.6762) * loss_weight
+        torch.testing.assert_close(total_loss, expected_loss, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(
+            losses["binary_cross_entropy"], expected_loss, rtol=1e-4, atol=1e-4
+        )
+
+        if graph_type == TestGraphType.NORMAL:
+            model.model.update_metric(predictions, batch, losses)
+            metric_result = model.model.compute_metric()
+            torch.testing.assert_close(
+                metric_result["binary_cross_entropy"],
+                expected_loss,
+                rtol=1e-4,
+                atol=1e-4,
             )
 
     @parameterized.expand(
@@ -377,6 +465,223 @@ class RankModelTest(unittest.TestCase):
             torch.testing.assert_close(
                 metric_result["accuracy"], expected_acc, rtol=1e-4, atol=1e-4
             )
+
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]],
+        name_func=parameterized_name_func,
+    )
+    def test_listwise_rank_loss_with_session(self, graph_type):
+        """``session_name`` groups the rows of a flat batch into lists.
+
+        Rows are deliberately not sorted by session. Session 1 holds one
+        positive and two negatives and is the only list that counts; session
+        2 is all-positive and session 3 has a single row, so both are masked
+        out but still count in the mean's denominator.
+        """
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(binary_cross_entropy=loss_pb2.BinaryCrossEntropy()),
+                loss_pb2.LossConfig(
+                    listwise_rank_loss=loss_pb2.ListwiseRankLoss(
+                        session_name="id_a", learnable_temperature=False
+                    ),
+                    weight=0.5,
+                ),
+            ],
+        )
+        model = _TestClassficationModel(
+            model_config=model_config, features=[], labels=["label"]
+        )
+        model = TrainWrapper(model)
+        model = create_test_model(model, graph_type)
+
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["id_a"],
+            values=torch.tensor([1, 2, 1, 2, 1, 3]),
+            lengths=torch.tensor([1, 1, 1, 1, 1, 1]),
+        )
+        logits = torch.tensor([0.2, 0.3, -0.1, 0.5, 0.1, 0.4])
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[logits.unsqueeze(1)]
+        )
+        label = torch.tensor([0, 1, 1, 1, 0, 0])
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={BASE_DATA_GROUP: sparse_feature},
+            labels={"label": label},
+        )
+        total_loss, (losses, predictions, batch) = model(batch)
+
+        session1 = torch.log_softmax(logits[[0, 2, 4]] / 0.07, dim=0)[1]
+        expected_listwise = -session1 / 3 * 0.5
+        expected_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, label.float()
+        )
+        torch.testing.assert_close(
+            losses["listwise_rank_loss"], expected_listwise, rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            losses["binary_cross_entropy"], expected_bce, rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            total_loss, expected_bce + expected_listwise, rtol=1e-4, atol=1e-4
+        )
+
+    def test_listwise_rank_loss_rejects_sample_weight(self):
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(
+                    listwise_rank_loss=loss_pb2.ListwiseRankLoss(session_name="id_a")
+                )
+            ],
+        )
+        model = _TestClassficationModel(
+            model_config=model_config,
+            features=[],
+            labels=["label"],
+            sample_weights=["weight"],
+        )
+        with self.assertRaisesRegex(ValueError, "per-sample weights"):
+            TrainWrapper(model)
+
+    def test_listwise_rank_loss_needs_list_source(self):
+        model_config = model_pb2.ModelConfig(
+            losses=[
+                loss_pb2.LossConfig(listwise_rank_loss=loss_pb2.ListwiseRankLoss())
+            ],
+        )
+        model = TrainWrapper(
+            _TestClassficationModel(
+                model_config=model_config, features=[], labels=["label"]
+            )
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+        )
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={},
+            labels={"label": torch.tensor([0, 1])},
+        )
+        with self.assertRaisesRegex(ValueError, "session_name"):
+            model(batch)
+
+    @parameterized.expand(
+        [[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]],
+        name_func=parameterized_name_func,
+    )
+    def test_jrc_loss_with_session(self, graph_type):
+        model_config = model_pb2.ModelConfig(
+            num_class=2,
+            losses=[
+                loss_pb2.LossConfig(
+                    jrc_loss=loss_pb2.JRCLoss(session_name="id_a", alpha=0.3)
+                )
+            ],
+        )
+        model = TrainWrapper(
+            _TestClassficationModel(
+                model_config=model_config, features=[], labels=["label"]
+            )
+        )
+        model = create_test_model(model, graph_type)
+
+        ids = torch.tensor([1, 2, 1, 2, 1, 3])
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["id_a"], values=ids, lengths=torch.ones(6, dtype=torch.int64)
+        )
+        torch.manual_seed(0)
+        logits = torch.randn(6, 2)
+        dense_feature = KeyedTensor.from_tensor_list(keys=["int_a"], tensors=[logits])
+        label = torch.tensor([0, 1, 1, 1, 0, 0])
+        batch = Batch(
+            dense_features={BASE_DATA_GROUP: dense_feature},
+            sparse_features={BASE_DATA_GROUP: sparse_feature},
+            labels={"label": label},
+        )
+        total_loss, (losses, predictions, batch) = model(batch)
+
+        _, index, lengths = torch.unique(ids, return_inverse=True, return_counts=True)
+        expected = JRCLoss(alpha=0.3)(logits, label, lengths, index)
+        torch.testing.assert_close(losses["jrc_loss"], expected)
+        torch.testing.assert_close(total_loss, expected)
+
+    def test_published_counts_define_the_lists(self):
+        """A model with per-request counts uses them; session_name is refused."""
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["id_a"], values=torch.tensor([7, 7]), lengths=torch.tensor([1, 1])
+        )
+        torch.manual_seed(0)
+        logits = torch.randn(6)
+        label = torch.tensor([0, 1, 1, 0, 0, 1])
+        batch = Batch(
+            dense_features={
+                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["int_a"], tensors=[logits.unsqueeze(1)]
+                )
+            },
+            sparse_features={BASE_DATA_GROUP: sparse_feature},
+            labels={"label": label},
+        )
+
+        def build(**listwise_kwargs):
+            model_config = model_pb2.ModelConfig(
+                losses=[
+                    loss_pb2.LossConfig(
+                        listwise_rank_loss=loss_pb2.ListwiseRankLoss(
+                            learnable_temperature=False, **listwise_kwargs
+                        )
+                    )
+                ],
+            )
+            return TrainWrapper(
+                _TestJaggedModel(
+                    model_config=model_config, features=[], labels=["label"]
+                )
+            )
+
+        _, (losses, _, _) = build()(batch)
+        expected = ListwiseRankLoss(learnable_temperature=False)(
+            logits, label, torch.tensor([2, 4])
+        )
+        torch.testing.assert_close(losses["listwise_rank_loss"], expected)
+
+        with self.assertRaisesRegex(ValueError, "only for models"):
+            build(session_name="id_a")(batch)
+
+    def test_jrc_session_spans_requests_on_published_counts(self):
+        """Jrc's session_name repeats the request-level id over its candidates."""
+        torch.manual_seed(0)
+        logits = torch.randn(6, 2)
+        label = torch.tensor([0, 1, 1, 0, 0, 1])
+        model_config = model_pb2.ModelConfig(
+            num_class=2,
+            losses=[
+                loss_pb2.LossConfig(jrc_loss=loss_pb2.JRCLoss(session_name="id_a"))
+            ],
+        )
+        model = TrainWrapper(
+            _TestJaggedModel(model_config=model_config, features=[], labels=["label"])
+        )
+        for ids, lengths in (([7, 7], [6]), ([7, 8], [2, 4])):
+            batch = Batch(
+                dense_features={
+                    BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                        keys=["int_a"], tensors=[logits]
+                    )
+                },
+                sparse_features={
+                    BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                        keys=["id_a"],
+                        values=torch.tensor(ids),
+                        lengths=torch.tensor([1, 1]),
+                    )
+                },
+                labels={"label": label},
+            )
+            _, (losses, _, _) = model(batch)
+            expected = JRCLoss()(logits, label, torch.tensor(lengths))
+            torch.testing.assert_close(losses["jrc_loss"], expected, msg=str(ids))
 
 
 if __name__ == "__main__":

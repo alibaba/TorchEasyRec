@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -18,6 +19,7 @@ import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.compute as pc
 import torch
+from torch import distributed as dist
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Pipelineable
 
@@ -41,6 +43,40 @@ CKPT_ROW_IDX = "__ckpt_row_idx__"  # int64 column for absolute row index
 # transient event-time column (Unix-epoch seconds, -1 when unavailable); its
 # per-batch max is surfaced on Batch.data_timestamp.
 DATA_TIMESTAMP = "__data_timestamp__"  # float64 column, event-time (seconds)
+
+
+def list_input_files(
+    input_path: str, pg: Optional[dist.ProcessGroup] = None
+) -> List[str]:
+    """List input files of comma separated path patterns.
+
+    Args:
+        input_path (str): comma separated input path patterns.
+        pg (ProcessGroup): process group to check file list consistency on.
+
+    Returns:
+        input files, in an order identical on every rank.
+    """
+    input_files = []
+    for pattern in input_path.split(","):
+        # NOTE: sort as glob returns filesystem order, which may differ by rank.
+        input_files.extend(sorted(glob.glob(pattern)))
+    if pg is not None:
+        object_list = [input_files]
+        dist.broadcast_object_list(object_list, group=pg)
+        rank0_files = object_list[0]
+        if rank0_files != input_files:
+            missing = sorted(set(rank0_files) - set(input_files))
+            extra = sorted(set(input_files) - set(rank0_files))
+            diff = (
+                f"missing: {missing}, extra: {extra}"
+                if missing or extra
+                else "same files in a different order"
+            )
+            raise RuntimeError(
+                f"input files of {input_path} are inconsistent with rank 0, {diff}."
+            )
+    return input_files
 
 
 def inject_checkpoint_metadata(
@@ -723,65 +759,6 @@ def combine_negs_to_candidate_sequence(
         return pa.array(rows, type=pa.string()), pos_lengths
 
 
-def calc_slice_position(
-    row_count: int,
-    slice_id: int,
-    slice_count: int,
-    batch_size: int,
-    drop_redundant_bs_eq_one: bool,
-    pre_total_remain: int = 0,
-) -> Tuple[int, int, int]:
-    """Calc table read position according to the slice information.
-
-    Args:
-        row_count (int): table total row count.
-        slice_id (int): worker id.
-        slice_count (int): total worker number.
-        batch_size (int): batch_size.
-        drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
-            equal one to prevent train_eval hung.
-        pre_total_remain (int): remaining total count in pre-table is
-            insufficient to meet the batch_size requirement for each worker.
-
-    Return:
-        start (int): start row position in table.
-        end (int): start row position in table.
-        total_remain (int): remaining total count in curr-table is
-            insufficient to meet the batch_size requirement for each worker.
-    """
-    pre_remain_size = int(pre_total_remain / slice_count)
-    pre_remain_split_point = pre_total_remain % slice_count
-
-    size = int((row_count + pre_total_remain) / slice_count)
-    split_point = (row_count + pre_total_remain) % slice_count
-    if slice_id < split_point:
-        start = slice_id * (size + 1)
-        end = start + (size + 1)
-    else:
-        start = split_point * (size + 1) + (slice_id - split_point) * size
-        end = start + size
-
-    real_start = (
-        start - pre_remain_size * slice_id - min(pre_remain_split_point, slice_id)
-    )
-    real_end = (
-        end
-        - pre_remain_size * (slice_id + 1)
-        - min(pre_remain_split_point, slice_id + 1)
-    )
-    # when (end - start) % bz = 1 on some workers and
-    # (end - start) % bz = 0 on other workers, train_eval will hang
-    if (
-        drop_redundant_bs_eq_one
-        and split_point != 0
-        and (end - start) % batch_size == 1
-        and size % batch_size == 0
-    ):
-        real_end = real_end - 1
-        split_point = 0
-    return real_start, real_end, (size % batch_size) * slice_count + split_point
-
-
 def calc_remaining_intervals(
     checkpoint_state: Optional[Dict[str, int]],
     input_path: str,
@@ -823,8 +800,11 @@ def calc_remaining_intervals(
     # Sort by start to infer original ranges
     entries.sort(key=lambda x: x[0])
 
-    # Calculate remaining intervals
+    # Calculate remaining intervals; rows before the first keyed range were
+    # never read, a consumed range always leaves its own key
     remaining = []
+    if entries[0][0] > 0:
+        remaining.append((0, entries[0][0]))
     num_entries = len(entries)
     for i, (_, consumed) in enumerate(entries):
         # Infer the end of this worker's range
@@ -840,79 +820,212 @@ def calc_remaining_intervals(
     return remaining if remaining else []
 
 
-def calc_slice_intervals(
-    total_rows: int,
+def plan_rank_worker_intervals(
+    source_rows: List[int],
+    rank: int,
+    world_size: int,
     worker_id: int,
     num_workers: int,
-    batch_size: int = 1,
-    drop_redundant_bs_eq_one: bool = False,
-    pre_total_remain: int = 0,
-    checkpoint_state: Optional[Dict[str, int]] = None,
-    input_path: Optional[str] = None,
-) -> Tuple[List[Tuple[int, int]], int]:
-    """Redistribute remaining intervals among workers.
+    batch_size: int,
+    equalize_rank_steps: bool = False,
+    min_batch_size: int = 0,
+) -> List[List[Tuple[int, int]]]:
+    """Plan the row intervals one dataloader worker reads from every source.
 
-    Flattens all intervals into a total row count, then assigns a portion
-    to each worker based on worker_id and num_workers.
+    Sources (tables, sessions, or remaining checkpoint intervals) are consumed in
+    order by a single buffered reader per worker, so they are planned as one
+    stream, identically on every rank:
+
+    1. Ranks split the stream as if its rows were dealt round-robin: of the
+       first ``S`` rows rank ``r`` owns ``(S + W - 1 - r) // W``, laid out
+       contiguously inside every source, so every source stays spread over all
+       ranks (partition order is kept) while the rank totals are ``R // W`` or
+       ``R // W + 1``.
+    2. With ``equalize_rank_steps`` every rank yields the same number of batches:
+       a rank drops its extra row only when it would buy a step, that is when
+       ``(R // W) % batch_size == 0``. A final batch shorter than
+       ``min_batch_size`` is cut off the end of the stream, on every rank alike.
+    3. Inside a rank the stream is cut into whole batches plus one tail and dealt
+       to the workers source by source: the rows completing the open batch go to
+       its holder, whole batches go to the least loaded workers first, and the
+       tail opens the next batch on the least loaded worker. Every worker reads
+       one contiguous chunk per source, and only the holder ever buffers a
+       partial batch, so a rank ends a pass with at most one.
+
+    Dropped rows are never read.
 
     Args:
-        total_rows (int): total number of rows in the dataset.
-        worker_id: Current worker's ID (0-indexed).
-        num_workers: Total number of workers.
-        batch_size: batch_size.
-        drop_redundant_bs_eq_one: drop last redundant batch with batch_size
-            equal one to prevent train_eval hung.
-        pre_total_remain (int): remaining total count in pre-table is
-            insufficient to meet the batch_size requirement for each worker.
-        checkpoint_state (dict): dict mapping source_id to max consumed row index.
-        input_path (str): the input path to filter checkpoint entries.
+        source_rows (list): row count of every source, in read order.
+        rank (int): rank of this process.
+        world_size (int): number of ranks.
+        worker_id (int): dataloader worker id within the rank.
+        num_workers (int): dataloader workers per rank.
+        batch_size (int): batch size.
+        equalize_rank_steps (bool): make every rank yield the same number of batches.
+        min_batch_size (int): drop a final batch with fewer rows, 0 disables.
 
     Returns:
-        worker_intervals (list): List of (start, end) tuples assigned to this worker.
-        total_remain (int): remaining total count in curr-table is
-            insufficient to meet the batch_size requirement for each worker.
+        for every source, a list holding the (start, end) interval this worker
+        reads, empty when it reads nothing from that source.
     """
-    intervals: List[Tuple[int, int]] = []
-    if checkpoint_state:
-        intervals = calc_remaining_intervals(checkpoint_state, input_path, total_rows)
-        total_rows = sum(end - start for start, end in intervals)
+    assert 0 < num_workers and 0 <= worker_id < num_workers
+    assert 0 < world_size and 0 <= rank < world_size
+    assert 0 <= min_batch_size <= batch_size
 
-    # Reuse calc_slice_position for worker start/end calculation
-    worker_start, worker_end, total_remain = calc_slice_position(
-        row_count=total_rows,
-        slice_id=worker_id,
-        slice_count=num_workers,
-        batch_size=batch_size,
-        drop_redundant_bs_eq_one=drop_redundant_bs_eq_one,
-        pre_total_remain=pre_total_remain,
-    )
+    def _rows_before(num_rows: int, r: int) -> int:
+        # rows of ranks < r among the first num_rows rows of the stream
+        return num_rows // world_size * r + min(num_rows % world_size, r)
 
-    if checkpoint_state:
-        # Map worker's logical range [worker_start, worker_end) to actual intervals
-        result = []
-        current_pos = 0
-        for interval_start, interval_end in intervals:
-            interval_len = interval_end - interval_start
-            interval_logical_start = current_pos
-            interval_logical_end = current_pos + interval_len
+    # this rank's (start, rows) in every source
+    shares: List[Tuple[int, int]] = []
+    prefix = 0
+    for rows in source_rows:
+        lo = _rows_before(prefix + rows, rank) - _rows_before(prefix, rank)
+        hi = _rows_before(prefix + rows, rank + 1) - _rows_before(prefix, rank + 1)
+        shares.append((lo, hi - lo))
+        prefix += rows
+    total = sum(rows for _, rows in shares)
+    base = prefix // world_size
 
-            # Check if this interval overlaps with worker's range
-            overlap_start = max(worker_start, interval_logical_start)
-            overlap_end = min(worker_end, interval_logical_end)
+    cut = 0
+    if equalize_rank_steps:
+        if base % batch_size == 0:
+            cut = total - base
+        elif base % batch_size < min_batch_size:
+            cut = total - base + base % batch_size
+    elif 0 < total % batch_size < min_batch_size:
+        cut = total % batch_size
+    for t in range(len(shares) - 1, -1, -1):
+        if cut == 0:
+            break
+        start, rows = shares[t]
+        take = min(rows, cut)
+        shares[t] = (start, rows - take)
+        cut -= take
 
-            if overlap_start < overlap_end:
-                # Map back to actual row indices
-                actual_start = interval_start + (overlap_start - interval_logical_start)
-                actual_end = interval_start + (overlap_end - interval_logical_start)
-                result.append((actual_start, actual_end))
+    result: List[List[Tuple[int, int]]] = []
+    loads = [0] * num_workers
+    holder, carry = 0, 0
+    for start, rows in shares:
+        # a worker's buffer only cares how many rows it gets from a source, so
+        # every worker reads one contiguous chunk: its whole batches, plus the
+        # rows completing the open batch for its holder, plus the tail for the
+        # least loaded worker, which then holds the next open batch
+        need = min(batch_size - carry, rows) if carry else 0
+        loads[holder] += need
+        carry = (carry + need) % batch_size
+        full, tail = divmod(rows - need, batch_size)
+        q, r = divmod(full, num_workers)
+        order = sorted(range(num_workers), key=lambda w: (loads[w], w))
+        chunk = [0] * num_workers
+        for i, w in enumerate(order):
+            chunk[w] = (q + 1 if i < r else q) * batch_size
+            loads[w] += chunk[w]
+        chunk[holder] += need
+        if tail:
+            owner = min(range(num_workers), key=lambda w: (loads[w], w))
+            chunk[owner] += tail
+            loads[owner] += tail
+            holder, carry = owner, tail
+        pos = start + sum(chunk[:worker_id])
+        result.append([(pos, pos + chunk[worker_id])] if chunk[worker_id] else [])
+    return result
 
-            current_pos = interval_logical_end
-            if current_pos >= worker_end:
-                break
+
+def _map_logical_range(
+    intervals: List[Tuple[int, int]], logical_start: int, logical_end: int
+) -> List[Tuple[int, int]]:
+    """Map a range over the concatenated intervals back to row intervals."""
+    result = []
+    current_pos = 0
+    for interval_start, interval_end in intervals:
+        interval_len = interval_end - interval_start
+        overlap_start = max(logical_start, current_pos)
+        overlap_end = min(logical_end, current_pos + interval_len)
+        if overlap_start < overlap_end:
+            result.append(
+                (
+                    interval_start + overlap_start - current_pos,
+                    interval_start + overlap_end - current_pos,
+                )
+            )
+        current_pos += interval_len
+        if current_pos >= logical_end:
+            break
+    return result
+
+
+def calc_slice_intervals(
+    sources: List[Tuple[str, int]],
+    worker_id: int,
+    num_workers: int,
+    batch_size: int,
+    equalize_rank_steps: bool = False,
+    min_batch_size: int = 0,
+    checkpoint_state: Optional[Dict[str, int]] = None,
+    world_size: Optional[int] = None,
+) -> List[List[Tuple[int, int]]]:
+    """Assign the row intervals of every source to one of ``num_workers`` slices.
+
+    Without ``world_size`` every slice is an independent even share of the rows.
+    With ``world_size`` the slices are the rank-major dataloader workers of
+    ``BaseDataset.get_worker_info``, ``num_workers // world_size`` per rank, and
+    the rows each source still has after the checkpoint state is applied are
+    planned per rank and worker by ``plan_rank_worker_intervals`` and mapped back
+    onto the remaining intervals.
+
+    Args:
+        sources (list): (source_id_prefix, total_rows) in read order.
+        worker_id (int): slice id.
+        num_workers (int): slice number.
+        batch_size (int): batch size.
+        equalize_rank_steps (bool): make every rank yield the same number of batches.
+        min_batch_size (int): drop a final batch with fewer rows, 0 disables.
+        checkpoint_state (dict): dict mapping source_id to max consumed row index.
+        world_size (int, optional): number of ranks the slices are grouped into.
+
+    Returns:
+        for every source, in the order of ``sources``, the (start, end) intervals
+        of this slice.
+    """
+    if world_size is None:
+        rank, world_size, local_worker_id, local_workers = worker_id, num_workers, 0, 1
     else:
-        result = [(worker_start, worker_end)]
+        assert num_workers % world_size == 0, (
+            f"num_workers[{num_workers}] must be a multiple of world_size[{world_size}]"
+        )
+        local_workers = num_workers // world_size
+        rank, local_worker_id = divmod(worker_id, local_workers)
 
-    return result, total_remain
+    # hand every source only its own checkpoint entries, in one pass over the keys
+    state_by_prefix: Dict[str, Dict[str, int]] = {}
+    for key, consumed in (checkpoint_state or {}).items():
+        prefix, sep, _ = key.rpartition(":")
+        if sep:
+            state_by_prefix.setdefault(prefix, {})[key] = consumed
+    remaining = [
+        calc_remaining_intervals(state_by_prefix.get(prefix), prefix, total_rows)
+        for prefix, total_rows in sources
+    ]
+    plan = plan_rank_worker_intervals(
+        [sum(end - start for start, end in intervals) for intervals in remaining],
+        rank,
+        world_size,
+        local_worker_id,
+        local_workers,
+        batch_size,
+        equalize_rank_steps,
+        min_batch_size,
+    )
+    result = [
+        [
+            physical
+            for start, end in logical
+            for physical in _map_logical_range(intervals, start, end)
+        ]
+        for intervals, logical in zip(remaining, plan)
+    ]
+    return result
 
 
 def remove_nullable(field_type: pa.DataType) -> pa.DataType:

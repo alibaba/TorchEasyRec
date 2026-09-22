@@ -472,14 +472,25 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             dynamicemb_options=opts,
         )
 
-    def _build_model(self):
-        table = EmbeddingBagConfig(
-            num_embeddings=4096,
-            embedding_dim=32,
-            name="table_de",
-            feature_names=["feat_de"],
-        )
-        return TestSparseNN(tables=[table], sparse_device=torch.device("meta"))
+    def _build_model(self, with_plain_table=False):
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=4096,
+                embedding_dim=32,
+                name="table_de",
+                feature_names=["feat_de"],
+            )
+        ]
+        if with_plain_table:
+            tables.append(
+                EmbeddingBagConfig(
+                    num_embeddings=4096,
+                    embedding_dim=32,
+                    name="table_plain",
+                    feature_names=["feat_plain"],
+                )
+            )
+        return TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
 
     def test_enumerate_yields_both_modes_and_all_factors(self):
         from tzrec.utils.plan_util import (
@@ -558,6 +569,145 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             proposer.feedback(partitionable=True, storage_constraint=topology)
             proposal = proposer.propose()
         self.assertGreater(count, 0)
+
+    def test_sharding_plan_carries_initial_accumulator_value(self):
+        import inspect
+
+        from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+        from dynamicemb.planner import DynamicEmbParameterSharding
+        from torchrec.distributed.planner import planners
+
+        from tzrec.optim.optimizer import set_sparse_init_accumulator_value
+        from tzrec.utils.plan_util import (
+            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
+        )
+        from tzrec.utils.plan_util import (
+            get_default_sharders as _tzrec_get_default_sharders,
+        )
+
+        # The value travels as a plain kwarg of the dynamicemb table module.
+        self.assertIn(
+            "initial_accumulator_value",
+            inspect.signature(BatchedDynamicEmbeddingTablesV2.__init__).parameters,
+        )
+
+        model = self._build_model()
+        topology = Topology(world_size=2, compute_device="cuda")
+        enumerator = _TzrecEmbeddingEnumerator(
+            topology=topology,
+            batch_size=128,
+            fqn_constraints={"sparse.ebc.table_de": self._build_constraint()},
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=_tzrec_get_default_sharders()
+        )
+        sharding_option = next(
+            so for so in search_space if getattr(so, "use_dynamicemb", False)
+        )
+        for rank, shard in enumerate(sharding_option.shards):
+            shard.rank = rank
+
+        set_sparse_init_accumulator_value(0.1)
+        try:
+            plan = planners.to_sharding_plan([sharding_option], topology)
+        finally:
+            set_sparse_init_accumulator_value(0.0)
+
+        param_sharding = plan.plan[sharding_option.path][sharding_option.name]
+        fused_params = param_sharding.get_additional_fused_params()
+        self.assertAlmostEqual(fused_params["initial_accumulator_value"], 0.1)
+        # dynamicemb strips only its planner-only keys before the table module.
+        DynamicEmbParameterSharding.pop_additional_fused_params(fused_params)
+        self.assertIn("initial_accumulator_value", fused_params)
+
+    def _enumerate(self, with_plain_table=False):
+        from tzrec.utils.plan_util import (
+            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
+        )
+        from tzrec.utils.plan_util import (
+            get_default_sharders as _tzrec_get_default_sharders,
+        )
+
+        model = self._build_model(with_plain_table=with_plain_table)
+        topology = Topology(world_size=2, compute_device="cuda")
+        enumerator = _TzrecEmbeddingEnumerator(
+            topology=topology,
+            batch_size=128,
+            fqn_constraints={"sparse.ebc.table_de": self._build_constraint()},
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=_tzrec_get_default_sharders()
+        )
+        return search_space, topology
+
+    def test_sharding_plan_sizes_ftrl_optimizer_state(self):
+        import inspect
+
+        from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+        from torchrec.distributed.planner import planners
+
+        from tzrec.optim.optimizer import FTRL
+        from tzrec.utils.dynamicemb_util import (
+            _calculate_dynamicemb_table_storage_specific_size,
+        )
+
+        # FTRL's knobs travel as plain kwargs of the dynamicemb table module.
+        signature = inspect.signature(BatchedDynamicEmbeddingTablesV2.__init__)
+        for name in ("learning_rate_power", "ftrl_beta", "l1_reg", "l2_reg"):
+            self.assertIn(name, signature.parameters)
+
+        search_space, topology = self._enumerate()
+        sharding_option = next(
+            so for so in search_space if getattr(so, "use_dynamicemb", False)
+        )
+        for rank, shard in enumerate(sharding_option.shards):
+            shard.rank = rank
+        sharding_option.tensor._optimizer_classes = [FTRL]
+
+        plan = planners.to_sharding_plan([sharding_option], topology)
+
+        param_sharding = plan.plan[sharding_option.path][sharding_option.name]
+        options = param_sharding.dynamicemb_options
+        self.assertTrue(options.training)
+        # FTRL keeps `linear` and `accum` per element, so the values are sized
+        # as if the row were three times the embedding width.
+        self.assertEqual(
+            options.local_hbm_for_values,
+            _calculate_dynamicemb_table_storage_specific_size(
+                sharding_option.shards[0].size,
+                sharding_option.tensor.element_size(),
+                2.0,
+                sharding_option.cache_load_factor,
+                is_hbm=True,
+                only_values=True,
+                bucket_capacity=options.bucket_capacity,
+            ),
+        )
+
+    def test_sharding_plan_rejects_ftrl_on_non_dynamicemb_table(self):
+        from torchrec.distributed.planner import planners
+
+        from tzrec.optim.optimizer import FTRL
+
+        search_space, topology = self._enumerate(with_plain_table=True)
+        for sharding_type, raises in (
+            (ShardingType.ROW_WISE.value, True),
+            (ShardingType.DATA_PARALLEL.value, False),
+        ):
+            sharding_option = next(
+                so
+                for so in search_space
+                if not getattr(so, "use_dynamicemb", False)
+                and so.sharding_type == sharding_type
+            )
+            for rank, shard in enumerate(sharding_option.shards):
+                shard.rank = rank
+            sharding_option.tensor._optimizer_classes = [FTRL]
+            if raises:
+                with self.assertRaisesRegex(ValueError, "ftrl_optimizer"):
+                    planners.to_sharding_plan([sharding_option], topology)
+            else:
+                planners.to_sharding_plan([sharding_option], topology)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import re
 from functools import partial
 from typing import Any, Dict, List, Tuple, Type, Union
@@ -22,6 +21,11 @@ from torchrec.optim import optimizers, rowwise_adagrad
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 from tzrec.optim.lr_scheduler import BaseLR
+from tzrec.optim.optimizer import (
+    FTRL,
+    register_ftrl_emb_opt_type,
+    set_sparse_init_accumulator_value,
+)
 from tzrec.protos import optimizer_pb2
 from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.logging_util import logger
@@ -47,15 +51,14 @@ def create_sparse_optimizer(
         optimizer_kwargs["weight_decay_mode"] = WeightDecayMode[
             optimizer_kwargs["weight_decay_mode"]
         ]
+    # FBGEMM TBE has no such kwarg; see set_sparse_init_accumulator_value.
+    set_sparse_init_accumulator_value(
+        optimizer_kwargs.pop("initial_accumulator_value", 0.0)
+    )
 
     if optimizer_type == "sgd_optimizer":
         return optimizers.SGD, optimizer_kwargs
     elif optimizer_type == "adagrad_optimizer":
-        # config_to_kwargs emits every optional field with its zero default.
-        init_acc = optimizer_kwargs.pop("initial_accumulator_value", 0)
-        if init_acc:
-            # see apply_split_helper function patch in tzrec.optim.optimizer.py
-            os.environ["FBGEMM_MOMENTUM1_STATE_INIT_VALUE"] = str(init_acc)
         return optimizers.Adagrad, optimizer_kwargs
     elif optimizer_type == "adam_optimizer":
         return optimizers.Adam, optimizer_kwargs
@@ -93,6 +96,9 @@ def create_sparse_optimizer(
         # FBGEMM reuses the beta1 OptimizerArgs slot for RMSProp's alpha.
         optimizer_kwargs["beta1"] = optimizer_kwargs.pop("alpha")
         return optimizers.RMSProp, optimizer_kwargs
+    elif optimizer_type == "ftrl_optimizer":
+        register_ftrl_emb_opt_type()
+        return FTRL, optimizer_kwargs
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
