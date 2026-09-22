@@ -14,10 +14,11 @@ from typing import Dict, List, Optional
 
 import torch
 from parameterized import parameterized
-from torchrec import KeyedTensor
+from torchrec import KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.loss.listwise_rank_loss import ListwiseRankLoss
 from tzrec.models.model import TrainWrapper
 from tzrec.models.multi_task_rank import MultiTaskRank
 from tzrec.protos import loss_pb2, metric_pb2, model_pb2
@@ -166,6 +167,87 @@ class MultiTaskRankTest(unittest.TestCase):
                     rtol=1e-4,
                     atol=1e-4,
                 )
+
+    def test_listwise_loss_with_tower_weight(self):
+        """A scalar tower weight is not a per-sample weight.
+
+        It must neither trip the listwise guard at construction nor change
+        the reduction the point-wise sibling sees; a genuine per-sample
+        weight on the same tower is still refused.
+        """
+
+        def model_config(**tower_kwargs):
+            return model_pb2.ModelConfig(
+                simple_multi_task=multi_task_rank_pb2.SimpleMultiTask(
+                    task_towers=[
+                        TaskTower(
+                            tower_name="t1",
+                            label_name="label1",
+                            weight=0.5,
+                            losses=[
+                                loss_pb2.LossConfig(
+                                    binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                                ),
+                                loss_pb2.LossConfig(
+                                    listwise_rank_loss=loss_pb2.ListwiseRankLoss(
+                                        session_name="id_a",
+                                        learnable_temperature=False,
+                                    )
+                                ),
+                            ],
+                            **tower_kwargs,
+                        )
+                    ]
+                )
+            )
+
+        model = TrainWrapper(
+            _TestMultiTaskRankModel(
+                model_config=model_config(), features=[], labels=["label1"]
+            )
+        )
+        ids = torch.tensor([1, 2, 1, 2, 1, 3])
+        torch.manual_seed(0)
+        logits = torch.randn(6)
+        label = torch.tensor([0, 1, 1, 1, 0, 0])
+        batch = Batch(
+            dense_features={
+                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["int_a"], tensors=[logits.unsqueeze(1)]
+                )
+            },
+            sparse_features={
+                BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                    keys=["id_a"], values=ids, lengths=torch.ones(6, dtype=torch.int64)
+                )
+            },
+            labels={"label1": label},
+        )
+        _, (losses, _, _) = model(batch)
+
+        _, index, lengths = torch.unique(ids, return_inverse=True, return_counts=True)
+        expected_listwise = ListwiseRankLoss(learnable_temperature=False)(
+            logits, label, lengths, index
+        )
+        expected_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, label.float()
+        )
+        torch.testing.assert_close(
+            losses["listwise_rank_loss_t1"], 0.5 * expected_listwise
+        )
+        torch.testing.assert_close(
+            losses["binary_cross_entropy_t1"], 0.5 * expected_bce
+        )
+
+        with self.assertRaisesRegex(ValueError, "per-sample weights"):
+            TrainWrapper(
+                _TestMultiTaskRankModel(
+                    model_config=model_config(sample_weight_name="w"),
+                    features=[],
+                    labels=["label1"],
+                    sample_weights=["w"],
+                )
+            )
 
 
 if __name__ == "__main__":

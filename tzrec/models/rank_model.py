@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torchmetrics
@@ -43,6 +43,75 @@ def _update_tensor_dict(
     tensor_dict: Dict[str, torch.Tensor], new_tensor: torch.Tensor, key: str
 ) -> None:
     tensor_dict[key] = new_tensor
+
+
+def _group_ids(
+    predictions: Dict[str, torch.Tensor], batch: Batch, name: str, num_samples: int
+) -> torch.Tensor:
+    """Per-sample value of the id feature ``name`` (a session or user id).
+
+    A model that publishes per-request candidate counts carries the feature
+    once per request, so it is repeated to line up with the candidate rows.
+
+    Args:
+        predictions (dict): the model predictions.
+        batch (Batch): the input batch.
+        name (str): the sparse feature holding the id.
+        num_samples (int): number of samples, the statically known size of
+            the result (spares ``repeat_interleave`` a device-to-host sync).
+
+    Returns:
+        torch.Tensor: ``(num_samples,)`` id tensor aligned with the samples.
+    """
+    ids = batch.sparse_features[BASE_DATA_GROUP][name].to_padded_dense(1)[:, 0]
+    if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
+        ids = ids.repeat_interleave(
+            predictions[TARGET_REPEAT_INTERLEAVE_KEY], output_size=num_samples
+        )
+    return ids
+
+
+def _list_index(
+    predictions: Dict[str, torch.Tensor],
+    batch: Batch,
+    session_name: str,
+    num_samples: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Per-list sample counts and the list index of each row for a list-wise loss.
+
+    With ``session_name`` set, the samples of the batch that share that
+    feature value form one list, in any order; on a model that publishes
+    per-request candidate counts this widens the list beyond one request
+    (``jrc_loss`` allows that, ``listwise_rank_loss`` rejects it). Without
+    it, the published per-request counts define the lists.
+
+    Args:
+        predictions (dict): the model predictions.
+        batch (Batch): the input batch.
+        session_name (str): the list-grouping feature, or empty.
+        num_samples (int): number of samples in the batch.
+
+    Returns:
+        tuple: ``(lengths, index)`` -- ``(num_lists,)`` sample count of
+        each list and the ``(num_samples,)`` list of each row in the
+        torch_scatter sense, the latter ``None`` when the lists are
+        contiguous in row order.
+    """
+    if session_name:
+        _, index, lengths = torch.unique(
+            _group_ids(predictions, batch, session_name, num_samples),
+            return_inverse=True,
+            return_counts=True,
+        )
+        return lengths, index
+    lengths = predictions.get(TARGET_REPEAT_INTERLEAVE_KEY)
+    if lengths is None:
+        raise ValueError(
+            "a list-wise loss needs per-request candidate counts "
+            "(predictions[TARGET_REPEAT_INTERLEAVE_KEY]), which this model does "
+            "not publish; set session_name instead."
+        )
+    return lengths, None
 
 
 def _is_classification_loss(loss_cfg: LossConfig) -> bool:
@@ -217,8 +286,14 @@ class RankModel(BaseModel):
         elif loss_type == "l2_loss":
             self._loss_modules[loss_name] = nn.MSELoss(reduction=reduction)
         elif loss_type == "listwise_rank_loss":
-            # The module averages over requests itself, so the per-sample
-            # `reduction` of the surrounding losses does not apply.
+            # The module averages over lists, so a per-sample weight (which
+            # the callers signal with reduction="none") has nowhere to apply.
+            if reduction == "none":
+                raise ValueError(
+                    "listwise_rank_loss averages over lists and does not support "
+                    "per-sample weights; drop sample_weight_name / "
+                    "task_space_indicator_label from its task."
+                )
             self._loss_modules[loss_name] = ListwiseRankLoss(
                 temperature_init=loss_cfg.listwise_rank_loss.temperature_init,
                 learnable_temperature=loss_cfg.listwise_rank_loss.learnable_temperature,
@@ -260,30 +335,28 @@ class RankModel(BaseModel):
         elif loss_type == "jrc_loss":
             assert num_class == 2, f"num_class must be 2 when loss type is {loss_type}"
             pred = predictions["logits" + suffix]
-            session_id = batch.sparse_features[BASE_DATA_GROUP][
-                loss_cfg.jrc_loss.session_name
-            ].to_padded_dense(1)[:, 0]
-            if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
-                session_id = session_id.repeat_interleave(
-                    predictions[TARGET_REPEAT_INTERLEAVE_KEY]
-                )
-            losses[loss_name] = self._loss_modules[loss_name](pred, label, session_id)
+            lengths, index = _list_index(
+                predictions, batch, loss_cfg.jrc_loss.session_name, pred.size(0)
+            )
+            losses[loss_name] = self._loss_modules[loss_name](
+                pred, label, lengths, index
+            )
         elif loss_type == "l2_loss":
             pred = predictions["y" + suffix]
             losses[loss_name] = self._loss_modules[loss_name](pred, label)
         elif loss_type == "listwise_rank_loss":
             pred = predictions["logits" + suffix]
-            lengths = predictions.get(TARGET_REPEAT_INTERLEAVE_KEY)
-            if lengths is None:
+            session_name = loss_cfg.listwise_rank_loss.session_name
+            if session_name and TARGET_REPEAT_INTERLEAVE_KEY in predictions:
                 raise ValueError(
-                    "listwise_rank_loss needs per-request candidate counts "
-                    "(predictions[TARGET_REPEAT_INTERLEAVE_KEY]), which "
-                    "this model does not publish."
+                    "listwise_rank_loss.session_name is only for models that do "
+                    "not publish per-request candidate counts; this model's lists "
+                    "are its requests."
                 )
-            # NOTE: this loss is a mean over requests, so a loss_weight
-            # reaching the tail below must be request-level too, not the
-            # per-candidate weight the sibling losses take.
-            losses[loss_name] = self._loss_modules[loss_name](pred, label, lengths)
+            lengths, index = _list_index(predictions, batch, session_name, pred.size(0))
+            losses[loss_name] = self._loss_modules[loss_name](
+                pred, label, lengths, index
+            )
         else:
             raise ValueError(f"loss[{loss_type}] is not supported yet.")
         if loss_weight is not None:
@@ -416,10 +489,6 @@ class RankModel(BaseModel):
         oneof_metric_cfg = getattr(metric_cfg, metric_type)
         metric_name = metric_type + suffix
 
-        base_sparse_feat = None
-        if metric_type in ["grouped_auc", "grouped_xauc"]:
-            base_sparse_feat = batch.sparse_features[BASE_DATA_GROUP].to_dict()
-
         if metric_type == "auc":
             pred = (
                 predictions["probs" + suffix]
@@ -445,27 +514,18 @@ class RankModel(BaseModel):
                 if num_class == 1
                 else predictions["probs1" + suffix]
             )
-            # pyre-ignore [16]
-            grouping_key = base_sparse_feat[
-                oneof_metric_cfg.grouping_key
-            ].to_padded_dense(1)[:, 0]
-            if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
-                grouping_key = grouping_key.repeat_interleave(
-                    predictions[TARGET_REPEAT_INTERLEAVE_KEY]
-                )
+            grouping_key = _group_ids(
+                predictions, batch, oneof_metric_cfg.grouping_key, label.size(0)
+            )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
         elif metric_type == "xauc":
             pred = predictions["y" + suffix]
             self._metric_modules[metric_name].update(pred, label)
         elif metric_type == "grouped_xauc":
             pred = predictions["y" + suffix]
-            grouping_key = base_sparse_feat[
-                oneof_metric_cfg.grouping_key
-            ].to_padded_dense(1)[:, 0]
-            if TARGET_REPEAT_INTERLEAVE_KEY in predictions:
-                grouping_key = grouping_key.repeat_interleave(
-                    predictions[TARGET_REPEAT_INTERLEAVE_KEY]
-                )
+            grouping_key = _group_ids(
+                predictions, batch, oneof_metric_cfg.grouping_key, label.size(0)
+            )
             self._metric_modules[metric_name].update(pred, label, grouping_key)
         elif metric_type == "normalized_entropy":
             pred = predictions["probs" + suffix]

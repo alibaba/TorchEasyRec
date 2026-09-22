@@ -20,7 +20,7 @@ from tzrec.modules.gr.onerank_cross_task import OneRankCrossTaskAttention
 from tzrec.modules.gr.onerank_sd import OneRankSituationDiscernment
 from tzrec.modules.mlp import MLP
 from tzrec.modules.utils import BaseModule
-from tzrec.ops.jagged_tensors import jagged_segment_ids, jagged_segment_sum
+from tzrec.ops.scatter_ops import lengths_to_index, scatter_sum
 
 
 class TaskTower(nn.Module):
@@ -109,8 +109,8 @@ def _jagged_mean(values: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     num_tasks = values.size(1)
     dim = values.size(2)
     flat = values.reshape(values.size(0), num_tasks * dim)
-    sums = jagged_segment_sum(
-        flat, lengths, jagged_segment_ids(lengths, output_size=flat.size(0))
+    sums = scatter_sum(
+        flat, lengths_to_index(lengths, output_size=flat.size(0)), batch_size
     )
     denom = lengths.clamp(min=1).to(flat.dtype).unsqueeze(-1)
     return (sums / denom).reshape(batch_size, num_tasks, dim)
