@@ -576,6 +576,7 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
         ckpt_path=None,
         by_epoch=False,
         save_by_epoch=False,
+        fine_tune=False,
     ):
         parameter = torch.nn.Parameter(torch.ones(1))
         parameter.grad = torch.ones_like(parameter)
@@ -590,8 +591,12 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
         model = mock.Mock()
         model.module.model.compute_train_metric.return_value = {}
         loader = mock.Mock()
+        # train_and_evaluate drops a fine-tune checkpoint's step, so the job
+        # trains from batch 0 rather than resuming the source job's position.
         skip_steps = (
-            checkpoint_util._get_checkpoint_step(ckpt_path) if ckpt_path else -1
+            checkpoint_util._get_checkpoint_step(ckpt_path)
+            if ckpt_path and not fine_tune
+            else -1
         )
         pass_sizes = itertools.chain([3 - (skip_steps + 1) % 3], itertools.repeat(3))
         loader.get_iterator.side_effect = lambda: iter(range(next(pass_sizes)))
@@ -610,6 +615,12 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
 
         pipeline = mock.Mock()
         pipeline.progress.side_effect = progress
+        dataloader_state = (
+            checkpoint_util.restore_dataloader_state(ckpt_path) if ckpt_path else None
+        )
+        if dataloader_state and fine_tune:
+            # fine-tune checkpoints do not carry this job's epoch budget
+            dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
         manager = checkpoint_util.CheckpointManager(model_dir)
         exporter = mock.Mock(enabled=False)
         config = TrainConfig(
@@ -643,10 +654,8 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
                 ckpt_path=ckpt_path,
                 skip_steps=skip_steps,
                 ignore_restore_optimizer=ignore_optimizer,
-                restore_from_model_dir=ckpt_path is not None,
-                dataloader_state=checkpoint_util.restore_dataloader_state(ckpt_path)
-                if ckpt_path
-                else None,
+                restore_from_model_dir=ckpt_path is not None and not fine_tune,
+                dataloader_state=dataloader_state,
                 **restore_kwargs,
             )
         if ckpt_path:
@@ -661,6 +670,27 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
     def test_cold_start_with_restore_enabled(self):
         reference = self._run(os.path.join(self.test_dir, "reference"))
         actual = self._run(os.path.join(self.test_dir, "cold_start"), restore=True)
+        torch.testing.assert_close(actual, reference)
+
+    def test_fine_tune_ignores_restore_lr_scheduler(self):
+        """A fine-tune job runs its own schedule, not the source job's."""
+        source = os.path.join(self.test_dir, "source")
+        reference = self._run(source)
+        ckpt = os.path.join(source, "model.ckpt-3")
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)
+            )
+        )
+        actual = self._run(
+            os.path.join(self.test_dir, "fine_tuned"),
+            restore=True,
+            ignore_optimizer=True,
+            ckpt_path=ckpt,
+            fine_tune=True,
+        )
+        # the source checkpoint carries scheduler state at batch 3, but the
+        # fine-tune starts the configured schedule from the beginning
         torch.testing.assert_close(actual, reference)
 
     @parameterized.expand(

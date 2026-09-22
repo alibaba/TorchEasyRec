@@ -18,9 +18,24 @@ from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
 
 from tzrec.utils.load_class import get_register_class_meta
+from tzrec.utils.logging_util import logger
 
 _LR_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_LR_CLASS_MAP)
+
+# torch's LRScheduler.state_dict() returns the whole instance __dict__ minus
+# the optimizer, so a checkpoint carries the schedule's configuration next to
+# its progress. Only these keys describe progress; everything else is rebuilt
+# from pipeline.config on every launch and must survive a restore.
+_PROGRESS_KEYS = frozenset(
+    {
+        "last_epoch",
+        "_step_count",
+        "_last_lr",
+        "_is_initial",
+        "_get_lr_called_within_step",
+    }
+)
 
 
 class BaseLR(LRScheduler, metaclass=_meta_cls):
@@ -49,16 +64,36 @@ class BaseLR(LRScheduler, metaclass=_meta_cls):
         raise NotImplementedError
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Restore scheduler state and the optimizer's next learning rates."""
-        group_count = len(self.optimizer.param_groups)
-        if any(len(state_dict[key]) != group_count for key in ("base_lrs", "_last_lr")):
-            raise ValueError("Restored LR scheduler parameter groups do not match.")
-        super().load_state_dict(state_dict)
-        for group, lr in zip(self.optimizer.param_groups, self._last_lr):
-            group["lr"] = lr
+        """Restore progress only, keeping the schedule this run is configured for.
+
+        Applying the saved ``__dict__`` wholesale would reinstate the
+        checkpoint's learning rates, warmup and horizon over an edited
+        pipeline.config, and with them ``_by_epoch`` -- which decides whether
+        the trainer advances this scheduler per batch or per epoch. The live
+        configuration wins instead, and the schedule position is replayed onto
+        it; any drift is logged. Position alone also makes the restore
+        insensitive to a rank's parameter-group count, so a replanned restart
+        resumes on its own shards.
+        """
+        if "last_epoch" not in state_dict:
+            raise ValueError("Restored LR scheduler state records no last_epoch.")
+        drifted = sorted(
+            key
+            for key, value in state_dict.items()
+            if key not in _PROGRESS_KEYS
+            and key in self.__dict__
+            and self.__dict__[key] != value
+        )
+        if drifted:
+            logger.warning(
+                f"{type(self).__name__}: the checkpoint's LR configuration differs "
+                f"from this run's ({', '.join(drifted)}); keeping this run's "
+                "configuration and restoring only the schedule position."
+            )
+        self.set_step(int(state_dict["last_epoch"]))
 
     def set_step(self, step: int) -> None:
-        """Rebuild a legacy scheduler after this many batch or epoch advances."""
+        """Place the schedule after this many batch or epoch advances."""
         if step < 0:
             raise ValueError(f"LR scheduler step must be non-negative, got {step}.")
         self.last_epoch = step

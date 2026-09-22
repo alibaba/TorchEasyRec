@@ -563,12 +563,26 @@ def _train_and_evaluate(
 
             # Restore model and optimizer checkpoint
             if i_step == 0 and ckpt_path is not None:
+                # A fine-tune checkpoint's schedule position belongs to the
+                # source job, like the step counter dropped in
+                # train_and_evaluate and the epoch budget popped with it.
+                restore_schedulers = (
+                    lr_scheduler
+                    if restore_lr_scheduler and restore_from_model_dir
+                    else None
+                )
                 if is_rank_zero:
                     logger.info(
                         "Checkpoint restore options: "
                         f"ignore_restore_optimizer={ignore_restore_optimizer}, "
                         f"restore_lr_scheduler={restore_lr_scheduler}."
                     )
+                    if restore_lr_scheduler and not restore_from_model_dir:
+                        logger.warning(
+                            "--restore_lr_scheduler is ignored for a fine-tune "
+                            "checkpoint: its schedule position describes the "
+                            "source job. The configured schedule starts fresh."
+                        )
                 if ignore_restore_optimizer:
                     ckpt_manager.restore(
                         ckpt_path,
@@ -576,7 +590,7 @@ def _train_and_evaluate(
                         None,
                         train_config.fine_tune_ckpt_param_map,
                         dense_ema=dense_ema,
-                        lr_schedulers=lr_scheduler if restore_lr_scheduler else None,
+                        lr_schedulers=restore_schedulers,
                     )
                 else:
                     # optimizer state is lazy, so peek one batch to init it
@@ -590,7 +604,7 @@ def _train_and_evaluate(
                         optimizer,
                         train_config.fine_tune_ckpt_param_map,
                         dense_ema=dense_ema,
-                        lr_schedulers=lr_scheduler if restore_lr_scheduler else None,
+                        lr_schedulers=restore_schedulers,
                     )
                 if not restore_from_model_dir:
                     # a fine-tune checkpoint's train metric describes the source

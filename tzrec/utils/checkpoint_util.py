@@ -1349,16 +1349,14 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
         try:
             for scheduler, state in zip(schedulers, local_state):
                 scheduler.load_state_dict(state["state"])
-        except ValueError:
-            # A rank's fused-optimizer parameter groups follow its shards, so a
-            # replanned restart can hold a different number of them than the
-            # saved state. The step-based rebuild gives the same rates.
-            local_groups = [len(s.optimizer.param_groups) for s in schedulers]
-            saved_groups = [len(s["state"]["base_lrs"]) for s in local_state]
+        except (KeyError, TypeError, ValueError) as err:
+            # Saved progress that will not apply -- a truncated payload, or one
+            # written by a build that recorded a different shape -- must not end
+            # the run. These schedules derive their rate from the step count, so
+            # the checkpoint's own step rebuilds them.
             logger.warning(
-                "Saved LR scheduler state does not fit this rank's parameter "
-                f"groups ({local_groups} groups vs saved {saved_groups}); "
-                "rebuilding the schedule from the checkpoint step instead."
+                f"Saved LR scheduler state did not apply ({err}); rebuilding "
+                "the schedule from the checkpoint step instead."
             )
             _set_lr_schedulers_from_progress(checkpoint_dir, schedulers)
     else:
