@@ -992,52 +992,37 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         checkpoint_util.restore_lr_schedulers(ckpt_dir, [resumed])
         self.assertEqual(resumed.state_dict(), original.state_dict())
 
-    def test_unreadable_state_falls_back_to_step(self):
-        """A torn in-place rewrite rebuilds from the step, it does not abort."""
+    def test_unreadable_state_is_an_error(self):
+        """Recorded-but-damaged is not the same as never recorded."""
         ckpt_dir = os.path.join(self.test_dir, "model.ckpt-4")
         os.makedirs(ckpt_dir)
         with open(
             os.path.join(ckpt_dir, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME), "w"
         ) as f:
             f.write('[[{"type": "ExponentialDecayLR", "state": {"last')
-        scheduler = self._scheduler()
-        checkpoint_util.restore_lr_schedulers(ckpt_dir, [scheduler])
-        self.assertEqual(scheduler.last_epoch, 5)
-
-    @parameterized.expand(
-        [("meta", True), ("filename", False)], name_func=parameterized_name_func
-    )
-    def test_legacy_step(self, name, with_meta):
-        ckpt = os.path.join(self.test_dir, "model.ckpt-3")
-        os.makedirs(ckpt)
-        if with_meta:
-            checkpoint_util.save_meta(ckpt, 3)
-        scheduler = self._scheduler()
-        checkpoint_util.restore_lr_schedulers(ckpt, [scheduler])
-        self.assertEqual(scheduler.last_epoch, 4)
-        self.assertAlmostEqual(scheduler.optimizer.param_groups[0]["lr"], 0.000625)
-
-    def test_legacy_epoch(self):
-        checkpoint_util.save_dataloader_state(
-            self.test_dir, {checkpoint_util.EPOCHS_COMPLETED: 2}
-        )
-        scheduler = self._scheduler(by_epoch=True)
-        checkpoint_util.restore_lr_schedulers(self.test_dir, [scheduler])
-        self.assertEqual(scheduler.last_epoch, 2)
-        self.assertAlmostEqual(scheduler.optimizer.param_groups[0]["lr"], 0.0025)
+        with self.assertRaisesRegex(ValueError, "unreadable"):
+            checkpoint_util.restore_lr_schedulers(ckpt_dir, [self._scheduler()])
 
     @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
-    def test_legacy_missing_progress(self, by_epoch):
-        with self.assertRaisesRegex(ValueError, "Cannot reconstruct"):
-            checkpoint_util.restore_lr_schedulers(
-                self.test_dir, [self._scheduler(by_epoch=by_epoch)]
-            )
-
-    def test_legacy_constant_without_progress(self):
-        opt = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.01)
-        scheduler = ConstantLR(opt)
-        checkpoint_util.restore_lr_schedulers(self.test_dir, [scheduler])
-        self.assertEqual(opt.param_groups[0]["lr"], 0.01)
+    def test_no_saved_state_warns_and_keeps_initial_schedule(self, by_epoch):
+        """A checkpoint from before this existed has nothing to restore."""
+        ckpt = os.path.join(self.test_dir, "model.ckpt-3")
+        os.makedirs(ckpt)
+        checkpoint_util.save_meta(ckpt, 3)
+        checkpoint_util.save_dataloader_state(
+            ckpt, {checkpoint_util.EPOCHS_COMPLETED: 2}
+        )
+        scheduler = self._scheduler(by_epoch=by_epoch)
+        fresh = self._scheduler(by_epoch=by_epoch)
+        with self.assertLogs(level="WARNING") as logs:
+            checkpoint_util.restore_lr_schedulers(ckpt, [scheduler])
+        self.assertIn("omit --restore_lr_scheduler", "".join(logs.output))
+        # the step counter and the completed-epoch count are both on disk and
+        # both ignored: neither is the position the schedule actually held
+        self.assertEqual(scheduler.state_dict(), fresh.state_dict())
+        self.assertEqual(
+            scheduler.optimizer.param_groups[0]["lr"], fresh.get_last_lr()[0]
+        )
 
     def test_scheduler_type_mismatch(self):
         scheduler = self._scheduler()

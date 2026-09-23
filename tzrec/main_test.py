@@ -699,15 +699,17 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
             ("weights_only", None, True, False),
             ("resume", True, False, False),
             ("resume_without_optimizer", True, True, False),
-            ("legacy_checkpoint", True, False, True),
+            ("no_saved_state", True, False, True),
         ],
         name_func=parameterized_name_func,
     )
-    def test_batch_resume_and_legacy_default(self, name, restore, ignore, legacy):
+    def test_batch_resume(self, name, restore, ignore, no_saved_state):
         source = os.path.join(self.test_dir, "source")
         reference = self._run(source)
         ckpt = os.path.join(source, "model.ckpt-3")
-        if legacy:
+        if no_saved_state:
+            # stand in for a checkpoint written before --restore_lr_scheduler
+            # existed; nothing removes this file in practice
             os.remove(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME))
         actual = self._run(
             os.path.join(self.test_dir, "resumed"),
@@ -715,7 +717,9 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
             ignore_optimizer=ignore,
             ckpt_path=ckpt,
         )
-        expected = reference[4:] if restore else reference[:2]
+        # with no recorded position there is nothing to restore, so the flag
+        # makes no difference and the configured schedule starts over
+        expected = reference[4:] if restore and not no_saved_state else reference[:2]
         torch.testing.assert_close(actual, expected)
 
     @parameterized.expand(

@@ -42,7 +42,7 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from tzrec.acc.utils import is_input_tile_emb
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.optim.ema import DenseEMA
-from tzrec.optim.lr_scheduler import BaseLR, ConstantLR
+from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.protos import export_pb2
 from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
@@ -1290,91 +1290,45 @@ def save_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
             json.dump(states, f)
 
 
-def _set_lr_schedulers_from_progress(
-    checkpoint_dir: str, schedulers: List[BaseLR]
-) -> None:
-    """Advance schedulers by the batch or epoch count the checkpoint records.
-
-    The schedulers here derive their learning rate from that count alone, so
-    this reproduces the saved rates without the saved parameter groups.
-    """
-    meta_path = os.path.join(checkpoint_dir, CKPT_META_FILENAME)
-    meta = {}
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-    step = meta.get("step")
-    if step is None:
-        match = re.search(r"model\.ckpt-(\d+)$", checkpoint_dir.rstrip("/"))
-        if match:
-            step = int(match.group(1))
-    dataloader_state = restore_dataloader_state(checkpoint_dir) or {}
-    counts = []
-    for scheduler in schedulers:
-        if isinstance(scheduler, ConstantLR):
-            count = 0
-        elif scheduler.by_epoch:
-            count = dataloader_state.get(EPOCHS_COMPLETED)
-        else:
-            count = step + 1 if step is not None else None
-        if count is None:
-            raise ValueError(
-                "Cannot reconstruct LR scheduler progress: checkpoint "
-                "must record step / completed epochs. Omit --restore_lr_scheduler "
-                "to keep the configured initial schedule."
-            )
-        counts.append(count)
-    for scheduler, count in zip(schedulers, counts):
-        scheduler.set_step(count)
-
-
 def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
-    """Restore schedulers, or reconstruct their progress from unchanged config.
+    """Restore each scheduler's position from the state the checkpoint recorded.
 
-    A stepped checkpoint records a zero-based batch index. Epoch-based
-    schedules additionally require an explicit completed-epoch count; missing
-    progress is an error rather than silently restarting the learning rate.
+    Only the position is taken; see ``BaseLR.load_state_dict``. A checkpoint
+    written before this existed records none, which is not an error -- there is
+    simply nothing to restore, and the configured schedule starts from the
+    beginning. Reconstructing a position from the checkpoint's step counter
+    instead would be a guess, not a restore: a resume that ran without
+    ``--restore_lr_scheduler`` advances the step counter while deliberately
+    holding the schedule back, so the two can differ by a wide margin.
     """
     path = os.path.join(checkpoint_dir, LR_SCHEDULER_CKPT_FILENAME)
-    states = None
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                states = json.load(f)
-        except json.JSONDecodeError as err:
-            # The file is overwritten in place when an epoch-boundary save
-            # dedupes against a step save, so a torn one is possible. Fall
-            # through to the step-based rebuild rather than ending the run.
-            logger.warning(f"LR scheduler state at {path} is unreadable ({err}).")
-    if states is not None:
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if len(states) != world_size:
-            raise ValueError("Restored LR scheduler world size does not match.")
-        local_state = states[rank]
-        if [state["type"] for state in local_state] != [
-            type(scheduler).__name__ for scheduler in schedulers
-        ]:
-            raise ValueError("Restored LR scheduler types/order do not match.")
-        try:
-            for scheduler, state in zip(schedulers, local_state):
-                scheduler.load_state_dict(state["state"])
-        except (KeyError, TypeError, ValueError) as err:
-            # Saved progress that will not apply -- a truncated payload, or one
-            # written by a build that recorded a different shape -- must not end
-            # the run. These schedules derive their rate from the step count, so
-            # the checkpoint's own step rebuilds them.
-            logger.warning(
-                f"Saved LR scheduler state did not apply ({err}); rebuilding "
-                "the schedule from the checkpoint step instead."
-            )
-            _set_lr_schedulers_from_progress(checkpoint_dir, schedulers)
-    else:
+    if not os.path.exists(path):
         logger.warning(
-            "Checkpoint has no LR scheduler state; reconstructing progress from "
-            "checkpoint metadata. The original LR configuration must be unchanged."
+            f"{checkpoint_dir} has no scheduler state; omit --restore_lr_scheduler. "
+            "The configured schedule starts from the beginning."
         )
-        _set_lr_schedulers_from_progress(checkpoint_dir, schedulers)
+        return
+    try:
+        with open(path) as f:
+            states = json.load(f)
+    except json.JSONDecodeError as err:
+        # Recorded but damaged is not the same as never recorded: a position
+        # existed and is gone, so say so rather than quietly starting over.
+        raise ValueError(
+            f"LR scheduler state at {path} is unreadable ({err}). Delete the file "
+            "to resume with a fresh schedule, or omit --restore_lr_scheduler."
+        ) from err
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if len(states) != world_size:
+        raise ValueError("Restored LR scheduler world size does not match.")
+    local_state = states[rank]
+    if [state["type"] for state in local_state] != [
+        type(scheduler).__name__ for scheduler in schedulers
+    ]:
+        raise ValueError("Restored LR scheduler types/order do not match.")
+    for scheduler, state in zip(schedulers, local_state):
+        scheduler.load_state_dict(state["state"])
     logger.info(f"Restored LR schedulers from {checkpoint_dir}.")
 
 

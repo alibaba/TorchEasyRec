@@ -23,7 +23,8 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --restore_lr_scheduler: 从选中的checkpoint恢复学习率调度器，默认false，保持旧版本从头调度的行为。该参数独立于`--ignore_restore_optimizer`，后者仍只控制优化器状态的恢复。
   - 续训时使用`--continue_train --restore_lr_scheduler`，恢复稀疏、稠密和part optimizer的调度进度及当前学习率；续训第一批即使用恢复后的学习率。新checkpoint会保存调度状态，恢复时要求world size与调度器类型/顺序一致；各rank的参数组数量可以不同，重新分片后仍能恢复。
   - 只恢复调度进度，不恢复学习率配置：`pipeline.config`中改过的学习率、warmup、衰减区间以及`by_epoch`都以本次启动的配置为准，与checkpoint不一致时会在日志中列出差异字段。
-  - 旧checkpoint没有调度状态时，按checkpoint步数（从0开始）或已完成epoch数重建，要求学习率配置与原训练一致。按epoch调度但缺少已完成epoch数等无法确定进度的情况会报错，不会静默从头调度。
+  - 旧版本的checkpoint没有保存调度状态，此时没有可恢复的进度：会打印warning并从配置的调度起点开始，不按checkpoint步数推算。（续训时不开启此参数会让step计数领先于调度进度，两者可能相差数倍，按step推算得到的并不是当时真实的调度位置。）
+  - 调度状态文件存在但损坏时会报错，而不是退回从头调度：删除该文件即可按上一条处理。
   - 此参数只对`--continue_train`从`model_dir`恢复生效；`--fine_tune_checkpoint`会忽略它并从配置的调度起点开始，日志中会给出提示。
   - 不传此参数时，即使checkpoint中有调度状态，也不会加载；切换版本无需修改旧配置。按step调度仍以训练batch计数，不改变梯度累积下现有的调度口径。
   - 此开关不写入`pipeline.config`，复现任务时需保留启动命令；恢复checkpoint时会在日志中记录优化器和调度器恢复开关。
