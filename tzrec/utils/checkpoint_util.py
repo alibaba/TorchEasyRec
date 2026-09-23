@@ -1308,16 +1308,8 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
             "The configured schedule starts from the beginning."
         )
         return
-    try:
-        with open(path) as f:
-            states = json.load(f)
-    except json.JSONDecodeError as err:
-        # Recorded but damaged is not the same as never recorded: a position
-        # existed and is gone, so say so rather than quietly starting over.
-        raise ValueError(
-            f"LR scheduler state at {path} is unreadable ({err}). Delete the file "
-            "to resume with a fresh schedule, or omit --restore_lr_scheduler."
-        ) from err
+    with open(path) as f:
+        states = json.load(f)
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     rank = dist.get_rank() if dist.is_initialized() else 0
     if len(states) != world_size:

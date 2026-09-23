@@ -1000,7 +1000,7 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
             os.path.join(ckpt_dir, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME), "w"
         ) as f:
             f.write('[[{"type": "ExponentialDecayLR", "state": {"last')
-        with self.assertRaisesRegex(ValueError, "unreadable"):
+        with self.assertRaises(json.JSONDecodeError):
             checkpoint_util.restore_lr_schedulers(ckpt_dir, [self._scheduler()])
 
     @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
