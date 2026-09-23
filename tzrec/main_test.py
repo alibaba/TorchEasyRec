@@ -563,6 +563,12 @@ class PredictionLifecycleTest(unittest.TestCase):
 
 
 class TrainLRSchedulerResumeTest(unittest.TestCase):
+    """Guard the LR sequence a resumed run actually trains on.
+
+    ``_run`` returns the LR each batch used; a resume replays the reference
+    sequence from the checkpoint on, and without the flag restarts it.
+    """
+
     def setUp(self):
         self.test_dir = make_test_dir()
         self.addCleanup(shutil.rmtree, self.test_dir)
@@ -590,13 +596,13 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
         used_lrs = []
         model = mock.Mock()
         model.module.model.compute_train_metric.return_value = {}
-        # train_and_evaluate drops a fine-tune checkpoint's step, so the job
-        # trains from batch 0 rather than resuming the source job's position.
+        # a fine-tune keeps its own step budget, so it trains from batch 0
         skip_steps = (
             checkpoint_util._get_checkpoint_step(ckpt_path)
             if ckpt_path and not fine_tune
             else -1
         )
+        # 3-batch passes; a resume rejoins mid-pass, so the first is short
         pass_sizes = itertools.chain([3 - (skip_steps + 1) % 3], itertools.repeat(3))
         loader = mock.Mock()
         loader.get_iterator.side_effect = lambda: iter(range(next(pass_sizes)))
@@ -688,8 +694,7 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
         reference = self._run("source")
         ckpt = os.path.join(self.test_dir, "source", "model.ckpt-3")
         if no_saved_state:
-            # stand in for a checkpoint written before --restore_lr_scheduler
-            # existed; nothing removes this file in practice
+            # stands in for a checkpoint written before the flag existed
             os.remove(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME))
         else:
             self.assertTrue(
@@ -705,14 +710,11 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
             fine_tune=fine_tune,
         )
         if fine_tune:
-            # the source records a position at batch 3, but a fine-tune runs
-            # its own schedule from the beginning
             expected = reference
         elif restore and not no_saved_state:
+            # model.ckpt-3 follows batch index 3, i.e. 4 advances
             expected = reference[4:]
         else:
-            # nothing recorded means nothing to restore, so the flag makes no
-            # difference and the configured schedule starts over
             expected = reference[:2]
         torch.testing.assert_close(actual, expected)
 
@@ -736,6 +738,7 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
         )
         expected = reference[step + 1 :]
         if not restore:
+            # one epoch behind with decay_factor=0.5 ⇒ every rate doubles
             expected = [lr * 2 for lr in expected]
         torch.testing.assert_close(actual, expected)
 

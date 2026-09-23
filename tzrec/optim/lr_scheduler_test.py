@@ -29,10 +29,21 @@ def _sgd(*lrs: float) -> torch.optim.Optimizer:
 
 class LRSchedulerTest(unittest.TestCase):
     @parameterized.expand(
-        [(count, legacy) for count in [1, 4, 12] for legacy in [False, True]],
+        [
+            (count, via_set_step)
+            for count in [1, 4, 12]
+            for via_set_step in [False, True]
+        ],
         name_func=parameterized_name_func,
     )
-    def test_restore_progress(self, count, legacy):
+    def test_restore_position(self, count, via_set_step):
+        """A restored schedule continues where the original left off.
+
+        The via_set_step axis pins load_state_dict as a thin wrapper: a clamp
+        added inside it would survive the other axis. Counts land in warmup,
+        mid-decay and past the horizon.
+        """
+
         def build():
             opt = _sgd(0.01, 0.0)
             return opt, lr_scheduler.LinearDecayLR(
@@ -44,7 +55,7 @@ class LRSchedulerTest(unittest.TestCase):
             optimizer.step()
             scheduler.step()
         resumed_optimizer, resumed = build()
-        if legacy:
+        if via_set_step:
             resumed.set_step(count)
         else:
             resumed.load_state_dict(scheduler.state_dict())
@@ -69,17 +80,14 @@ class LRSchedulerTest(unittest.TestCase):
             source_opt.step()
             source.step()
 
-        # the second phase asks for a lower base rate and a slower decay
         opt = _sgd(0.001)
         resumed = lr_scheduler.ExponentialDecayLR(opt, 100, 0.9, by_epoch=True)
         resumed.load_state_dict(source.state_dict())
 
-        # position 12 discriminates: the source is one decay_size=10 step in
-        # (0.01 * 0.5 = 0.005), this run is not yet (0.001 * 0.9 ** 0 = 0.001)
+        # 12 discriminates: the source has decayed once, this run has not
         self.assertEqual(resumed.last_epoch, 12)
         self.assertEqual(opt.param_groups[0]["lr"], 0.001)
-        # by_epoch drives which loop steps the scheduler, so a flip would
-        # silently change the cadence for the whole resumed run
+        # by_epoch picks which loop steps it; a flip would change the cadence
         self.assertTrue(resumed.by_epoch)
 
     def test_restore_accepts_different_parameter_groups(self):
