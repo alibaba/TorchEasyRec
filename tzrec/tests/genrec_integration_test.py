@@ -254,6 +254,9 @@ class GenRecIntegrationTest(unittest.TestCase):
         self.assertEqual(hf_config["vocab_size"], compiled.sid_space.target_vocab_size)
         self.assertEqual(hf_config["eos_token_id"], compiled.sid_space.eos_token_id)
         self.assertEqual(hf_config["pad_token_id"], compiled.sid_space.pad_token_id)
+        # served at the export precision, though the parameters train in FP32
+        self.assertEqual(hf_config["dtype"], "bfloat16")
+        self.assertEqual(hf_config["text_config"]["dtype"], "bfloat16")
         self.assertNotIn("sid_space", hf_config)
         from transformers import AutoTokenizer
 
