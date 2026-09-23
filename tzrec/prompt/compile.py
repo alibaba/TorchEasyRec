@@ -183,10 +183,14 @@ def _check_inline_member(
                 f"{member.value_dim}; an inline SID history needs value_dim: "
                 f"{sid_space.num_levels}, one offset code per level for each item."
             )
+        # FG will not run a sequence id feature without a bucketize config, and
+        # num_buckets over exactly the offset-code space maps every code to itself
+        num_codes = sum(sid_space.codebook)
         id_space = [
             name
             for name in ("hash_bucket_size", "num_buckets", "zch", "dynamicemb")
             if member.config.HasField(name)
+            and not (name == "num_buckets" and member.config.num_buckets == num_codes)
         ] + [
             name
             for name in ("vocab_list", "vocab_dict", "vocab_file")
@@ -196,8 +200,9 @@ def _check_inline_member(
             raise ValueError(
                 f"prompt slot member [{member.name}] declares an id space "
                 f"({', '.join(id_space)}); an inline SID history carries offset "
-                "codes and needs none. Drop it, or give the feature an "
-                "embedding_dim to project it instead."
+                f"codes and takes no id space but num_buckets: {num_codes}, which "
+                "FG needs and which leaves every code as it is. Drop it, or give "
+                "the feature an embedding_dim to project it instead."
             )
 
 
