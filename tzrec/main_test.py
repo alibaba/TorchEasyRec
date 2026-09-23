@@ -647,7 +647,6 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
             mock.patch("tzrec.main._log_train"),
             mock.patch("tzrec.utils.checkpoint_util.save_model"),
             mock.patch("tzrec.utils.checkpoint_util.restore_model") as restore_model,
-            mock.patch("tzrec.utils.hf_export_util.write_hf_assets"),
         ):
             _train_and_evaluate(
                 model,

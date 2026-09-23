@@ -16,6 +16,7 @@ tokenizer. It resolves no physical dimension: the model does that at
 ``__init__`` from ``group_total_dim``.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,7 @@ from tzrec.prompt.types import (
     Width,
     WidthKind,
 )
+from tzrec.protos import feature_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, FeatureGroupType
 from tzrec.protos.prompt_pb2 import (
     PromptConfig,
@@ -80,21 +82,36 @@ def _resolve_slot(
 def _slot_width(
     members: Sequence[BaseFeature],
     group_type: "FeatureGroupType.ValueType",
+    fill_mode: FillMode,
 ) -> Width:
     """Derive a slot's position count from its members.
 
-    A DEEP slot pools to exactly one position. Any other sequence slot is
-    bounded by its members' sequence_length, and unbounded when none declares
-    one.
+    A DEEP slot pools to exactly one position. A PROJECTED sequence slot holds
+    one per item, bounded by its members' sequence_length. An INLINE slot emits
+    every value of every item, so its bound is that cap times the values an
+    item carries; unbounded when no member declares a cap, or when an item may
+    carry any number of values.
     """
     if group_type == FeatureGroupType.DEEP:
         return Width(WidthKind.STATIC, 1)
     # BaseFeature.sequence_length, not config: a member of a SequenceFeature
     # group inherits the group's cap and never sets its own field.
     caps = [f.sequence_length for f in members if f.sequence_length]
-    if not caps:
+    per_item = members[0].value_dim if fill_mode is FillMode.INLINE else 1
+    if not caps or per_item == 0:
         return Width(WidthKind.UNBOUNDED)
-    return Width(WidthKind.BOUNDED, max(caps))
+    return Width(WidthKind.BOUNDED, max(caps) * per_item)
+
+
+def _fills_inline(member: BaseFeature) -> bool:
+    """Whether one sequence member carries LM-ready ids rather than an embedding.
+
+    An id or tokenize feature says so by omitting ``embedding_dim``; a raw
+    sequence feature by having no dense embedding.
+    """
+    if isinstance(member.config, (feature_pb2.IdFeature, feature_pb2.TokenizeFeature)):
+        return not member.config.HasField("embedding_dim")
+    return not member.has_embedding
 
 
 def _derive_slot_layout(
@@ -114,10 +131,74 @@ def _derive_slot_layout(
     )
     fill_mode = (
         FillMode.INLINE
-        if is_sequence and len(members) == 1 and not members[0].has_embedding
+        if is_sequence and len(members) == 1 and _fills_inline(members[0])
         else FillMode.PROJECTED
     )
     return group_type, fill_mode
+
+
+def _id_shift(
+    members: Sequence[BaseFeature], fill_mode: FillMode, base_vocab_size: int
+) -> int:
+    """The shift an INLINE slot adds; tokenizer word ids are already LM ids."""
+    if fill_mode is FillMode.PROJECTED:
+        return 0
+    if members and isinstance(members[0].config, feature_pb2.TokenizeFeature):
+        return 0
+    return base_vocab_size
+
+
+def _file_md5(path: str) -> str:
+    """Content hash of one file."""
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+
+def _check_inline_member(
+    member: BaseFeature, cfg: PromptConfig, sid_space: ResolvedSidSpace
+) -> None:
+    """Reject an INLINE member whose values cannot be LM token ids."""
+    if isinstance(member.config, feature_pb2.TokenizeFeature):
+        vocab_file = member.vocab_file
+        try:
+            same = vocab_file == cfg.tokenizer_path or _file_md5(
+                vocab_file
+            ) == _file_md5(cfg.tokenizer_path)
+        except OSError as e:
+            raise ValueError(
+                f"prompt slot member [{member.name}] names vocab_file "
+                f"[{vocab_file}], which cannot be read: {e}"
+            ) from e
+        if not same:
+            raise ValueError(
+                f"prompt slot member [{member.name}] tokenizes with [{vocab_file}], "
+                f"which differs from prompt_config.tokenizer_path "
+                f"[{cfg.tokenizer_path}]; an inline text slot must emit ids of the "
+                "vocabulary the LM was extended from."
+            )
+    elif isinstance(member.config, feature_pb2.IdFeature):
+        if member.value_dim != sid_space.num_levels:
+            raise ValueError(
+                f"prompt slot member [{member.name}] declares value_dim "
+                f"{member.value_dim}; an inline SID history needs value_dim: "
+                f"{sid_space.num_levels}, one offset code per level for each item."
+            )
+        id_space = [
+            name
+            for name in ("hash_bucket_size", "num_buckets", "zch", "dynamicemb")
+            if member.config.HasField(name)
+        ] + [
+            name
+            for name in ("vocab_list", "vocab_dict", "vocab_file")
+            if len(getattr(member.config, name)) > 0
+        ]
+        if id_space:
+            raise ValueError(
+                f"prompt slot member [{member.name}] declares an id space "
+                f"({', '.join(id_space)}); an inline SID history carries offset "
+                "codes and needs none. Drop it, or give the feature an "
+                "embedding_dim to project it instead."
+            )
 
 
 def _render_sid_tokens(sid_space: SidSpace) -> List[str]:
@@ -215,16 +296,19 @@ def _build_sid_space(
     )
 
 
-def _save_tokenizer_dir(
-    tok: Tokenizer, sid_space: ResolvedSidSpace, tokenizer_dir: str
-) -> None:
+def save_tokenizer_dir(compiled: CompiledPrompt, tokenizer_dir: str) -> None:
     """Write the extended tokenizer as a directory ``AutoTokenizer`` loads.
 
     ``tokenizer.json`` carries the vocabulary and the added SID atoms; the
     minimal ``tokenizer_config.json`` beside it names the tokenizer class and
     the two special tokens the prompt resolved, which is all a serving runtime
     needs to decode a generated SID atom through ``--tokenizer-path``.
+
+    Args:
+        compiled: the compiled prompt whose tokenizer is written.
+        tokenizer_dir: the directory to write into.
     """
+    tok, sid_space = compiled.tokenizer, compiled.sid_space
     os.makedirs(tokenizer_dir, exist_ok=True)
     tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
     config = {
@@ -252,17 +336,16 @@ def compile_prompt(
     cfg: PromptConfig,
     features: Sequence[BaseFeature],
     label_fields: Sequence[str] = (),
-    tokenizer_dir: Optional[str] = None,
 ) -> CompiledPrompt:
     """Compile a prompt config into its plan, module and vocabulary artifacts.
+
+    Writes nothing: the extended tokenizer rides on the result for export to
+    persist, and nothing reads a training-time copy.
 
     Args:
         cfg: the prompt config to compile.
         features: every feature a body slot may reference, already created.
         label_fields: data_config.label_fields; a response slot names these.
-        tokenizer_dir: where to write the extended tokenizer as a directory
-            ``AutoTokenizer`` loads; skipped when None. Only export persists
-            it -- nothing reads a training-time copy.
 
     Returns:
         The compiled prompt.
@@ -342,14 +425,13 @@ def compile_prompt(
     )
     sid_space = _build_sid_space(cfg, tok, base_vocab_size, has_projection)
 
-    if tokenizer_dir:
-        _save_tokenizer_dir(tok, sid_space, tokenizer_dir)
-
     slot_ids = {name: i for i, name in enumerate(resolved_slots_by_name)}
     segs: Dict[str, SlotSeg] = {}
     for name, slot in resolved_slots_by_name.items():
         group_type = group_types_by_slot_name[name]
         fill_mode = fill_modes_by_slot_name[name]
+        if fill_mode is FillMode.INLINE and name not in response_slot_names:
+            _check_inline_member(members[name][0], cfg, sid_space)
         segs[name] = SlotSeg(
             slot_id=slot_ids[name],
             name=name,
@@ -362,8 +444,9 @@ def compile_prompt(
             width=(
                 Width(WidthKind.STATIC, sid_space.num_levels)
                 if name in response_slot_names
-                else _slot_width(members[name], group_type)
+                else _slot_width(members[name], group_type, fill_mode)
             ),
+            id_shift=_id_shift(members[name], fill_mode, sid_space.base_vocab_size),
         )
 
     body = _build_template_segments(body_runs, body_names, segs, tok)
@@ -389,7 +472,10 @@ def compile_prompt(
     _validate(plan)
 
     return CompiledPrompt(
-        sid_space=sid_space, prompt_plan=plan, projection_plan=projection_plan
+        sid_space=sid_space,
+        prompt_plan=plan,
+        projection_plan=projection_plan,
+        tokenizer=tok,
     )
 
 

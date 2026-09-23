@@ -43,6 +43,47 @@ class ConfigUtilTest(unittest.TestCase):
         }
         """
 
+    _PROMPT_CONFIG = """
+        train_input_path: "odps://train"
+        prompt_config {
+          tokenizer_path: "tok.json" prompt: "{{a}}" sid_space { codebook: 4 }
+        }
+        feature_configs { tokenize_feature { feature_name: "a" expression: "u:a" } }
+        feature_configs {
+          sequence_tokenize_feature { feature_name: "b" expression: "u:b" }
+        }
+        feature_configs {
+          tokenize_feature { feature_name: "c" expression: "u:c" vocab_file: "own" }
+        }
+        feature_configs {
+          sequence_feature {
+            sequence_name: "s" sequence_length: 4 sequence_delim: ";"
+            features { tokenize_feature { feature_name: "d" expression: "i:d" } }
+            features { id_feature { feature_name: "e" expression: "i:e" } }
+          }
+        }
+    """
+
+    def test_load_pipeline_config_fills_tokenize_vocab_file(self):
+        path = os.path.join(make_test_dir(), "pipeline.config")
+        with open(path, "w") as f:
+            f.write(self._PROMPT_CONFIG)
+        config = config_util.load_pipeline_config(path)
+        fcs = config.feature_configs
+        self.assertEqual(fcs[0].tokenize_feature.vocab_file, "tok.json")
+        self.assertEqual(fcs[1].sequence_tokenize_feature.vocab_file, "tok.json")
+        # a user-set vocabulary is left alone
+        self.assertEqual(fcs[2].tokenize_feature.vocab_file, "own")
+        grouped = fcs[3].sequence_feature.features
+        self.assertEqual(grouped[0].tokenize_feature.vocab_file, "tok.json")
+        self.assertFalse(grouped[1].id_feature.HasField("vocab_file"))
+
+        # without a prompt there is nothing to default to
+        config.ClearField("prompt_config")
+        fcs[0].tokenize_feature.ClearField("vocab_file")
+        config_util._fill_prompt_tokenizer(config)
+        self.assertFalse(fcs[0].tokenize_feature.HasField("vocab_file"))
+
     def test_preload_custom_model(self):
         with mock.patch("tzrec.utils.config_util.import_class") as import_class:
             config_util._preload_custom_model(

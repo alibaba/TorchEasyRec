@@ -56,6 +56,12 @@ class TokenizeFeature(IdFeature):
                     "oneof entry, not `sequence_tokenize_feature`."
                 )
             kwargs["is_sequence"] = True
+        if not cfg.vocab_file:
+            raise ValueError(
+                f"TokenizeFeature[{cfg.feature_name}] has no vocab_file; set it, or "
+                "declare prompt_config.tokenizer_path, which load_pipeline_config "
+                "fills it from."
+            )
         super().__init__(feature_config, **kwargs)
 
     @property

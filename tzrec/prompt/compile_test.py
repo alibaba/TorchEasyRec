@@ -11,13 +11,14 @@
 
 import json
 import os
+import shutil
 import unittest
 
 from google.protobuf import text_format
 from tokenizers import Tokenizer
 
 from tzrec.features.feature import FgMode, create_features
-from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.compile import compile_prompt, save_tokenizer_dir
 from tzrec.prompt.types import FillMode, SlotSeg, Static, WidthKind
 from tzrec.protos import feature_pb2
 from tzrec.protos.prompt_pb2 import PromptConfig
@@ -32,6 +33,27 @@ _PROF = (
     "num_buckets: 768 embedding_dim: 16 sequence_length: 4 }"
 )
 _AGE = 'id_feature { feature_name: "age" expression: "user:age" num_buckets: 8 }'
+_SID = (
+    'sequence_id_feature { feature_name: "sid" expression: "user:sid" '
+    "value_dim: 3 sequence_length: 4 }"
+)
+_GROUPED_SID = """sequence_feature {
+     sequence_name: "clk" sequence_length: 16 sequence_delim: ";"
+     features { id_feature { feature_name: "sid" expression: "item:sid"
+                value_dim: 3 } }
+   }"""
+
+
+def _tokenize(vocab_file: str = "", embedding_dim: int = 0) -> str:
+    text = (
+        'tokenize_feature { feature_name: "title" expression: "user:title" '
+        "tokens_as_sequence: true sequence_length: 8"
+    )
+    if vocab_file:
+        text += f' vocab_file: "{vocab_file}"'
+    if embedding_dim:
+        text += f" embedding_dim: {embedding_dim}"
+    return text + " }"
 
 
 def _feature(text: str):
@@ -96,6 +118,111 @@ class CompilePromptTest(unittest.TestCase):
         self.assertEqual(list(groups[0].feature_names), ["prof"])
         self.assertEqual(compiled.prompt_plan.max_holes, 4)
         self.assertIsNotNone(compiled.sid_space.sentinel_token_id)
+        self.assertEqual(by_name["hist"].id_shift, compiled.sid_space.base_vocab_size)
+        self.assertEqual(by_name["prof"].id_shift, 0)
+
+    def test_tokenize_without_embedding_is_inline_with_no_shift(self) -> None:
+        cfg = self._config(prompt="Title : {{title}} History : {{hist}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        compiled = self._compile(
+            cfg, [_feature(_tokenize(self.tok_path)), _feature(_HIST)]
+        )
+
+        by_name = {
+            s.name: s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg)
+        }
+        self.assertIs(by_name["title"].fill, FillMode.INLINE)
+        # word ids of the prompt tokenizer are LM ids already
+        self.assertEqual(by_name["title"].id_shift, 0)
+        self.assertEqual(by_name["hist"].id_shift, compiled.sid_space.base_vocab_size)
+        self.assertEqual(len(compiled.projection_plan.feature_groups), 0)
+        self.assertIsNone(compiled.sid_space.sentinel_token_id)
+
+    def test_sequence_tokenize_without_embedding_is_inline_with_no_shift(self) -> None:
+        """The standalone sequence entry carries the same TokenizeFeature payload."""
+        text = (
+            'sequence_tokenize_feature { feature_name: "title" '
+            'expression: "user:title" sequence_length: 2 '
+            f'vocab_file: "{self.tok_path}" }}'
+        )
+        cfg = self._config(prompt="Title : {{title}}")
+        cfg.sid_space.codebook.extend([4])
+        compiled = self._compile(cfg, [_feature(text)])
+        seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
+        self.assertIs(seg.fill, FillMode.INLINE)
+        self.assertEqual(seg.id_shift, 0)
+        # each text is any number of tokens, so no cap on items bounds the slot
+        self.assertIs(seg.width.kind, WidthKind.UNBOUNDED)
+
+    def test_tokenize_with_embedding_is_projected(self) -> None:
+        cfg = self._config(prompt="Title : {{title}}")
+        cfg.sid_space.codebook.extend([4])
+        compiled = self._compile(cfg, [_feature(_tokenize(self.tok_path, 8))])
+        seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
+        self.assertIs(seg.fill, FillMode.PROJECTED)
+        self.assertEqual(seg.id_shift, 0)
+
+    def test_sid_id_feature_without_embedding_is_inline(self) -> None:
+        cfg = self._config(prompt="History : {{sid}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        compiled = self._compile(cfg, [_feature(_SID)])
+        seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
+        self.assertIs(seg.fill, FillMode.INLINE)
+        self.assertEqual(seg.id_shift, compiled.sid_space.base_vocab_size)
+        # width counts positions: sequence_length items of one code per level
+        self.assertIs(seg.width.kind, WidthKind.BOUNDED)
+        self.assertEqual(seg.width.num_positions, 12)
+
+    def test_grouped_sid_id_feature_is_inline(self) -> None:
+        fc = feature_pb2.FeatureConfig()
+        text_format.Merge(_GROUPED_SID, fc)
+        grouped = create_features([fc], fg_mode=FgMode.FG_NONE)
+        cfg = self._config(prompt="History : {{clk__sid}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        compiled = self._compile(cfg, grouped)
+        seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
+        self.assertIs(seg.fill, FillMode.INLINE)
+        self.assertEqual(seg.id_shift, compiled.sid_space.base_vocab_size)
+        self.assertEqual(seg.width.num_positions, 48)
+
+    def test_inline_id_feature_needs_one_code_per_level(self) -> None:
+        cfg = self._config(prompt="History : {{sid}}")
+        cfg.sid_space.codebook.extend([4, 4])
+        with self.assertRaisesRegex(ValueError, "value_dim: 2"):
+            self._compile(cfg, [_feature(_SID)])
+
+    def test_inline_id_feature_may_not_declare_an_id_space(self) -> None:
+        text = _SID.replace("value_dim: 3", "value_dim: 3 num_buckets: 32")
+        cfg = self._config(prompt="History : {{sid}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        with self.assertRaisesRegex(ValueError, "num_buckets"):
+            self._compile(cfg, [_feature(text)])
+
+    def test_unreadable_vocab_file_is_a_config_error(self) -> None:
+        cfg = self._config(prompt="Title : {{title}}")
+        cfg.sid_space.codebook.extend([4])
+        missing = os.path.join(self.test_dir, "missing.json")
+        with self.assertRaisesRegex(ValueError, "cannot be read"):
+            self._compile(cfg, [_feature(_tokenize(missing))])
+
+    def test_tokenize_vocab_must_match_the_prompt_tokenizer(self) -> None:
+        other = create_genrec_test_tokenizer(
+            os.path.join(self.test_dir, "other.json"), ["a", "b"]
+        )
+        cfg = self._config(prompt="Title : {{title}}")
+        cfg.sid_space.codebook.extend([4])
+        with self.assertRaisesRegex(ValueError, "differs from prompt_config"):
+            self._compile(cfg, [_feature(_tokenize(other))])
+        # a byte-identical copy elsewhere is the same vocabulary
+        copy = os.path.join(self.test_dir, "copy.json")
+        shutil.copy(self.tok_path, copy)
+        compiled = self._compile(cfg, [_feature(_tokenize(copy))])
+        seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
+        self.assertIs(seg.fill, FillMode.INLINE)
+
+    def test_tokenize_without_vocab_does_not_get_created(self) -> None:
+        with self.assertRaisesRegex(ValueError, "load_pipeline_config"):
+            _feature(_tokenize())
 
     def test_static_runs_are_woven_between_slots(self) -> None:
         cfg = self._config(prompt="History : {{hist}} . Predict :")
@@ -193,7 +320,7 @@ class CompilePromptTest(unittest.TestCase):
         cfg = self._config(prompt="History : {{hist}}")
         cfg.sid_space.codebook.extend([4, 4])
         out = os.path.join(self.test_dir, "export")
-        compile_prompt(cfg, [_feature(_HIST)], ["answer"], tokenizer_dir=out)
+        save_tokenizer_dir(compile_prompt(cfg, [_feature(_HIST)], ["answer"]), out)
         written = os.path.join(out, "tokenizer.json")
         self.assertTrue(os.path.exists(written))
         # the SID tokens round-trip, which is what serving reloads
@@ -215,6 +342,7 @@ class CompilePromptTest(unittest.TestCase):
         # +1 because HF shifts logits: the window opens one column before the
         # first supervised label
         self.assertEqual(compiled.prompt_plan.logits_suffix_len, 4)
+        self.assertEqual(seg.id_shift, compiled.sid_space.base_vocab_size)
 
     def test_response_must_name_a_label_field(self) -> None:
         cfg = self._config(prompt="History : {{hist}}", response="{{prof}}")
