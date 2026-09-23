@@ -149,6 +149,8 @@ def _save_restore_worker(test_dir, rank, world_size, port):
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo")
     model, optimizer = _create_test_model()
+    # distinct rates per rank: the file rank 0 writes carries only the shared
+    # position, so each rank must land back on its own shard's base LRs
     for i, group in enumerate(optimizer.param_groups):
         group["lr"] = 0.01 * (rank + 1) * (i + 1)
     scheduler = LinearDecayLR(optimizer, num_training_steps=10)
@@ -289,7 +291,7 @@ class CheckpointUtilTest(unittest.TestCase):
         optimizer = torch.optim.SGD([{"params": [p]} for p in params], lr=0.1)
         return LinearDecayLR(optimizer, num_training_steps=100)
 
-    def test_restore_lr_schedulers_rebuilds_on_param_group_change(self):
+    def test_restore_lr_schedulers_survives_param_group_change(self):
         ckpt_dir = os.path.join(self.test_dir, "model.ckpt-40")
         saved = self._lr_scheduler(2)
         # a checkpoint named after batch index 40 has stepped 41 times
@@ -992,6 +994,15 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         checkpoint_util.restore_lr_schedulers(ckpt_dir, [resumed])
         self.assertEqual(resumed.state_dict(), original.state_dict())
 
+    def test_file_holds_one_entry_per_scheduler(self):
+        """One entry per scheduler, not one per rank."""
+        ckpt = os.path.join(self.test_dir, "model.ckpt-4")
+        checkpoint_util.save_lr_schedulers(ckpt, [self._scheduler(), self._scheduler()])
+        with open(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)) as f:
+            self.assertEqual(
+                [state["type"] for state in json.load(f)], ["ExponentialDecayLR"] * 2
+            )
+
     def test_unreadable_state_is_an_error(self):
         """Recorded-but-damaged is not the same as never recorded."""
         ckpt_dir = os.path.join(self.test_dir, "model.ckpt-4")
@@ -999,7 +1010,7 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         with open(
             os.path.join(ckpt_dir, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME), "w"
         ) as f:
-            f.write('[[{"type": "ExponentialDecayLR", "state": {"last')
+            f.write('[{"type": "ExponentialDecayLR", "position": 4, "conf')
         with self.assertRaises(json.JSONDecodeError):
             checkpoint_util.restore_lr_schedulers(ckpt_dir, [self._scheduler()])
 

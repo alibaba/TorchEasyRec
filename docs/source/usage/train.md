@@ -21,7 +21,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --edit_config_json: 命令行以json的方式动态修改配置文件，如{"model_dir":"experiments/","feature_configs[0].raw_feature.boundaries":[4,5,6,7]}
 - --ignore_restore_optimizer: 加载checkpoint参数时，忽略加载优化器的参数
 - --restore_lr_scheduler: 从选中的checkpoint恢复学习率调度器，默认false，保持旧版本从头调度的行为。该参数独立于`--ignore_restore_optimizer`，后者仍只控制优化器状态的恢复。
-  - 续训时使用`--continue_train --restore_lr_scheduler`，恢复稀疏、稠密和part optimizer的调度进度及当前学习率；续训第一批即使用恢复后的学习率。新checkpoint会保存调度状态，恢复时要求world size与调度器类型/顺序一致；各rank的参数组数量可以不同，重新分片后仍能恢复。
+  - 续训时使用`--continue_train --restore_lr_scheduler`，恢复稀疏、稠密和part optimizer的调度进度及当前学习率；续训第一批即使用恢复后的学习率。恢复只要求调度器类型/顺序一致，改变卡数或重新分片后仍能恢复。
   - 只恢复调度进度，不恢复学习率配置：`pipeline.config`中改过的学习率、warmup、衰减区间以及`by_epoch`都以本次启动的配置为准，与checkpoint不一致时会在日志中列出差异字段。
   - 旧版本的checkpoint没有保存调度状态，此时没有可恢复的进度：会打印warning并从配置的调度起点开始，不按checkpoint步数推算。（续训时不开启此参数会让step计数领先于调度进度，两者可能相差数倍，按step推算得到的并不是当时真实的调度位置。）
   - 调度状态文件存在但损坏时会报错，而不是退回从头调度：删除该文件即可按上一条处理。

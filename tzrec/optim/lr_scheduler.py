@@ -12,7 +12,7 @@
 
 import bisect
 import math
-from typing import Any, Dict, List
+from typing import Any, Dict, FrozenSet, List
 
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
@@ -23,20 +23,6 @@ from tzrec.utils.logging_util import logger
 _LR_CLASS_MAP = {}
 _meta_cls = get_register_class_meta(_LR_CLASS_MAP)
 
-# torch's LRScheduler.state_dict() returns the whole instance __dict__ minus
-# the optimizer, so a checkpoint carries the schedule's configuration next to
-# its progress. Only these keys describe progress; everything else is rebuilt
-# from pipeline.config on every launch and must survive a restore.
-_PROGRESS_KEYS = frozenset(
-    {
-        "last_epoch",
-        "_step_count",
-        "_last_lr",
-        "_is_initial",
-        "_get_lr_called_within_step",
-    }
-)
-
 
 class BaseLR(LRScheduler, metaclass=_meta_cls):
     """LearningRate Scheduler base class."""
@@ -44,10 +30,31 @@ class BaseLR(LRScheduler, metaclass=_meta_cls):
     # torch types this as list[Tensor | float]; every scheduler here stores floats.
     # pyrefly: ignore[bad-override-mutable-attribute]
     base_lrs: List[float]
+    _config_keys: FrozenSet[str]
 
     def __init__(self, optimizer: Optimizer, by_epoch: bool = False) -> None:
+        # Every subclass assigns its configuration before delegating here, so
+        # whatever is already on the instance is exactly that configuration --
+        # captured rather than declared, so a new scheduler needs no
+        # bookkeeping. base_lrs arrives later, from the optimizer's groups.
+        self._config_keys = frozenset(self.__dict__) | {"_by_epoch", "base_lrs"}
         self._by_epoch = by_epoch
         super().__init__(optimizer)
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Persist the schedule position and the configuration behind it.
+
+        torch would return the whole instance ``__dict__``, which pins the
+        on-disk shape to its internals and buries the one field a restore
+        needs among its bookkeeping. Record what this class declares instead.
+
+        Returns:
+            the schedule position and the configuration it was computed from.
+        """
+        return {
+            "position": int(self.last_epoch),
+            "config": {key: self.__dict__[key] for key in sorted(self._config_keys)},
+        }
 
     # pyre-ignore [3]
     def get_lr(self):
@@ -64,25 +71,25 @@ class BaseLR(LRScheduler, metaclass=_meta_cls):
         raise NotImplementedError
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Restore progress only, keeping the schedule this run is configured for.
+        """Restore the position only, keeping the schedule this run configures.
 
-        Applying the saved ``__dict__`` wholesale would reinstate the
-        checkpoint's learning rates, warmup and horizon over an edited
-        pipeline.config, and with them ``_by_epoch`` -- which decides whether
-        the trainer advances this scheduler per batch or per epoch. The live
-        configuration wins instead, and the schedule position is replayed onto
-        it; any drift is logged. Position alone also makes the restore
-        insensitive to a rank's parameter-group count, so a replanned restart
-        resumes on its own shards.
+        Adopting the checkpoint's configuration would reinstate its learning
+        rates, warmup and horizon over an edited pipeline.config, and with
+        them ``_by_epoch`` -- which decides whether the trainer advances this
+        scheduler per batch or per epoch. The live configuration wins instead
+        and the position is replayed onto it; any drift is logged. Position
+        alone also makes the restore insensitive to a rank's parameter-group
+        count, so a replanned restart resumes on its own shards.
+
+        Args:
+            state_dict: a mapping as returned by ``state_dict``.
         """
-        if "last_epoch" not in state_dict:
-            raise ValueError("Restored LR scheduler state records no last_epoch.")
+        if "position" not in state_dict:
+            raise ValueError("Restored LR scheduler state records no position.")
         drifted = sorted(
             key
-            for key, value in state_dict.items()
-            if key not in _PROGRESS_KEYS
-            and key in self.__dict__
-            and self.__dict__[key] != value
+            for key, value in state_dict.get("config", {}).items()
+            if key in self.__dict__ and self.__dict__[key] != value
         )
         if drifted:
             logger.warning(
@@ -90,7 +97,7 @@ class BaseLR(LRScheduler, metaclass=_meta_cls):
                 f"from this run's ({', '.join(drifted)}); keeping this run's "
                 "configuration and restoring only the schedule position."
             )
-        self.set_step(int(state_dict["last_epoch"]))
+        self.set_step(int(state_dict["position"]))
 
     def set_step(self, step: int) -> None:
         """Place the schedule after this many batch or epoch advances."""

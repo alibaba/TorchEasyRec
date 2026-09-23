@@ -575,7 +575,7 @@ class CheckpointManager:
             data_timestamp: this rank's consumed event-time (seconds), -1.0 if none;
                 reconciled across workers (quorum) for the event-time trigger.
             final: force a save (still subject to the dedupe), e.g. at train end.
-            lr_schedulers: learning rate schedulers to save on every rank.
+            lr_schedulers: learning rate schedulers to save, if any.
 
         Returns:
             True if a checkpoint was saved.
@@ -1266,28 +1266,28 @@ LR_SCHEDULER_CKPT_FILENAME = "lr_scheduler.json"
 
 
 def save_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
-    """Save per-rank scheduler states, including rank-local parameter groups.
+    """Save one entry per scheduler; rank 0 writes for everyone.
 
-    The JSON list is indexed by rank. Restoring requires the same world size
-    and scheduler types/order. Written in place like the dataloader state
-    beside it: ``model_dir`` may be an fsspec URI, where only the patched
-    helpers in ``filesystem_util`` work and ``os.replace`` does not, so an
-    epoch-boundary refresh overwrites rather than renames. ``restore`` treats
-    an unreadable file as absent instead.
+    Every rank steps its schedulers in lockstep, so one recorded position
+    describes them all.
+
+    Args:
+        checkpoint_dir: directory of the checkpoint.
+        schedulers: learning rate schedulers to save.
     """
-    local_state = [
-        {"type": type(scheduler).__name__, "state": scheduler.state_dict()}
+    if int(os.environ.get("RANK", 0)) != 0:
+        return
+    states = [
+        {"type": type(scheduler).__name__, **scheduler.state_dict()}
         for scheduler in schedulers
     ]
-    states: List[Any] = [local_state]
-    if dist.is_initialized():
-        states = [None] * dist.get_world_size()
-        dist.all_gather_object(states, local_state)
-    if int(os.environ.get("RANK", 0)) == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        path = os.path.join(checkpoint_dir, LR_SCHEDULER_CKPT_FILENAME)
-        with open(path, "w") as f:
-            json.dump(states, f)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, LR_SCHEDULER_CKPT_FILENAME)
+    # written in place like the dataloader state beside it: model_dir may be an
+    # fsspec URI, where only the patched helpers in filesystem_util work and
+    # os.replace does not, so an epoch-boundary refresh overwrites, not renames.
+    with open(path, "w") as f:
+        json.dump(states, f)
 
 
 def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
@@ -1300,6 +1300,10 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
     instead would be a guess, not a restore: a resume that ran without
     ``--restore_lr_scheduler`` advances the step counter while deliberately
     holding the schedule back, so the two can differ by a wide margin.
+
+    Args:
+        checkpoint_dir: directory of the checkpoint.
+        schedulers: learning rate schedulers to restore, in save order.
     """
     path = os.path.join(checkpoint_dir, LR_SCHEDULER_CKPT_FILENAME)
     if not os.path.exists(path):
@@ -1310,17 +1314,15 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
         return
     with open(path) as f:
         states = json.load(f)
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if len(states) != world_size:
-        raise ValueError("Restored LR scheduler world size does not match.")
-    local_state = states[rank]
-    if [state["type"] for state in local_state] != [
-        type(scheduler).__name__ for scheduler in schedulers
-    ]:
-        raise ValueError("Restored LR scheduler types/order do not match.")
-    for scheduler, state in zip(schedulers, local_state):
-        scheduler.load_state_dict(state["state"])
+    saved_types = [state["type"] for state in states]
+    live_types = [type(scheduler).__name__ for scheduler in schedulers]
+    if saved_types != live_types:
+        raise ValueError(
+            f"Restored LR scheduler types/order do not match: checkpoint has "
+            f"{saved_types}, this run builds {live_types}."
+        )
+    for scheduler, state in zip(schedulers, states):
+        scheduler.load_state_dict(state)
     logger.info(f"Restored LR schedulers from {checkpoint_dir}.")
 
 

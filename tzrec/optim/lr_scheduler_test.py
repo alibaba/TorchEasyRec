@@ -114,8 +114,8 @@ class LRSchedulerTest(unittest.TestCase):
         optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=0.01)
         scheduler = lr_scheduler.ConstantLR(optimizer)
         state = scheduler.state_dict()
-        del state["last_epoch"]
-        with self.assertRaisesRegex(ValueError, "last_epoch"):
+        del state["position"]
+        with self.assertRaisesRegex(ValueError, "position"):
             scheduler.load_state_dict(state)
 
     def test_constant_lr(self) -> None:
