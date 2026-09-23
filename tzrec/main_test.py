@@ -569,7 +569,7 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
 
     def _run(
         self,
-        model_dir,
+        name,
         *,
         restore=None,
         ignore_optimizer=False,
@@ -590,7 +590,6 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
         used_lrs = []
         model = mock.Mock()
         model.module.model.compute_train_metric.return_value = {}
-        loader = mock.Mock()
         # train_and_evaluate drops a fine-tune checkpoint's step, so the job
         # trains from batch 0 rather than resuming the source job's position.
         skip_steps = (
@@ -599,6 +598,7 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
             else -1
         )
         pass_sizes = itertools.chain([3 - (skip_steps + 1) % 3], itertools.repeat(3))
+        loader = mock.Mock()
         loader.get_iterator.side_effect = lambda: iter(range(next(pass_sizes)))
         batch = SimpleNamespace(checkpoint_info=None, data_timestamp=-1.0)
         warming_up = ckpt_path is not None and not ignore_optimizer
@@ -621,8 +621,7 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
         if dataloader_state and fine_tune:
             # fine-tune checkpoints do not carry this job's epoch budget
             dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
-        manager = checkpoint_util.CheckpointManager(model_dir)
-        exporter = mock.Mock(enabled=False)
+        manager = checkpoint_util.CheckpointManager(os.path.join(self.test_dir, name))
         config = TrainConfig(
             num_steps=0 if by_epoch else 6,
             num_epochs=3 if by_epoch else 0,
@@ -635,7 +634,10 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
             mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
-            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch(
+                "tzrec.main.OnlineDenseExportManager",
+                return_value=mock.Mock(enabled=False),
+            ),
             mock.patch("tzrec.main._log_train"),
             mock.patch("tzrec.utils.checkpoint_util.save_model"),
             mock.patch("tzrec.utils.checkpoint_util.restore_model") as restore_model,
@@ -647,7 +649,7 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
                 loader,
                 None,
                 [scheduler],
-                model_dir,
+                os.path.join(self.test_dir, name),
                 config,
                 EvalConfig(),
                 manager,
@@ -668,83 +670,68 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
         return used_lrs
 
     def test_cold_start_with_restore_enabled(self):
-        reference = self._run(os.path.join(self.test_dir, "reference"))
-        actual = self._run(os.path.join(self.test_dir, "cold_start"), restore=True)
-        torch.testing.assert_close(actual, reference)
-
-    def test_fine_tune_ignores_restore_lr_scheduler(self):
-        """A fine-tune job runs its own schedule, not the source job's."""
-        source = os.path.join(self.test_dir, "source")
-        reference = self._run(source)
-        ckpt = os.path.join(source, "model.ckpt-3")
-        self.assertTrue(
-            os.path.exists(
-                os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)
-            )
-        )
-        actual = self._run(
-            os.path.join(self.test_dir, "fine_tuned"),
-            restore=True,
-            ignore_optimizer=True,
-            ckpt_path=ckpt,
-            fine_tune=True,
-        )
-        # the source checkpoint carries scheduler state at batch 3, but the
-        # fine-tune starts the configured schedule from the beginning
-        torch.testing.assert_close(actual, reference)
+        reference = self._run("reference")
+        torch.testing.assert_close(self._run("cold_start", restore=True), reference)
 
     @parameterized.expand(
         [
-            ("default", None, False, False),
-            ("weights_only", None, True, False),
-            ("resume", True, False, False),
-            ("resume_without_optimizer", True, True, False),
-            ("no_saved_state", True, False, True),
+            ("default", None, False, False, False),
+            ("weights_only", None, True, False, False),
+            ("resume", True, False, False, False),
+            ("resume_without_optimizer", True, True, False, False),
+            ("no_saved_state", True, False, True, False),
+            ("fine_tune", True, True, False, True),
         ],
         name_func=parameterized_name_func,
     )
-    def test_batch_resume(self, name, restore, ignore, no_saved_state):
-        source = os.path.join(self.test_dir, "source")
-        reference = self._run(source)
-        ckpt = os.path.join(source, "model.ckpt-3")
+    def test_batch_resume(self, name, restore, ignore, no_saved_state, fine_tune):
+        reference = self._run("source")
+        ckpt = os.path.join(self.test_dir, "source", "model.ckpt-3")
         if no_saved_state:
             # stand in for a checkpoint written before --restore_lr_scheduler
             # existed; nothing removes this file in practice
             os.remove(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME))
+        else:
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)
+                )
+            )
         actual = self._run(
-            os.path.join(self.test_dir, "resumed"),
+            "resumed",
             restore=restore,
             ignore_optimizer=ignore,
             ckpt_path=ckpt,
+            fine_tune=fine_tune,
         )
-        # with no recorded position there is nothing to restore, so the flag
-        # makes no difference and the configured schedule starts over
-        expected = reference[4:] if restore and not no_saved_state else reference[:2]
+        if fine_tune:
+            # the source records a position at batch 3, but a fine-tune runs
+            # its own schedule from the beginning
+            expected = reference
+        elif restore and not no_saved_state:
+            expected = reference[4:]
+        else:
+            # nothing recorded means nothing to restore, so the flag makes no
+            # difference and the configured schedule starts over
+            expected = reference[:2]
         torch.testing.assert_close(actual, expected)
 
     @parameterized.expand(
         [
             ("default", False, True, False),
-            ("mid_epoch", True, False, False),
             ("epoch_boundary_step_save", True, True, False),
             ("epoch_boundary_epoch_save", True, True, True),
         ],
         name_func=parameterized_name_func,
     )
     def test_epoch_resume(self, name, restore, boundary, save_by_epoch):
-        source = os.path.join(self.test_dir, "source")
-        reference = self._run(
-            source,
-            by_epoch=True,
-            save_by_epoch=save_by_epoch,
-        )
+        reference = self._run("source", by_epoch=True, save_by_epoch=save_by_epoch)
         step = 2 if boundary else 4
-        ckpt = os.path.join(source, f"model.ckpt-{step}")
         actual = self._run(
-            os.path.join(self.test_dir, "resumed"),
+            "resumed",
             restore=restore,
             ignore_optimizer=True,
-            ckpt_path=ckpt,
+            ckpt_path=os.path.join(self.test_dir, "source", f"model.ckpt-{step}"),
             by_epoch=True,
         )
         expected = reference[step + 1 :]

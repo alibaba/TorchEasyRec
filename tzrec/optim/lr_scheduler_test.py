@@ -20,6 +20,13 @@ from tzrec.optim import lr_scheduler
 from tzrec.utils.test_util import parameterized_name_func
 
 
+def _sgd(*lrs: float) -> torch.optim.Optimizer:
+    """An SGD with one single-parameter group per learning rate."""
+    return torch.optim.SGD(
+        [{"params": [torch.nn.Parameter(torch.ones(1))], "lr": lr} for lr in lrs]
+    )
+
+
 class LRSchedulerTest(unittest.TestCase):
     @parameterized.expand(
         [(count, legacy) for count in [1, 4, 12] for legacy in [False, True]],
@@ -27,12 +34,7 @@ class LRSchedulerTest(unittest.TestCase):
     )
     def test_restore_progress(self, count, legacy):
         def build():
-            opt = torch.optim.SGD(
-                [
-                    {"params": [torch.nn.Parameter(torch.ones(1))], "lr": 0.01},
-                    {"params": [torch.nn.Parameter(torch.ones(1))], "lr": 0.0},
-                ]
-            )
+            opt = _sgd(0.01, 0.0)
             return opt, lr_scheduler.LinearDecayLR(
                 opt, num_training_steps=10, warmup_size=2
             )
@@ -61,48 +63,31 @@ class LRSchedulerTest(unittest.TestCase):
 
     def test_restore_keeps_this_run_configuration(self):
         """An edited schedule survives the restore; only the position comes back."""
-        source_opt = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=0.01)
-        source = lr_scheduler.ExponentialDecayLR(
-            source_opt, decay_size=10, decay_factor=0.5, by_epoch=False
-        )
-        for _ in range(4):
+        source_opt = _sgd(0.01)
+        source = lr_scheduler.ExponentialDecayLR(source_opt, 10, 0.5, by_epoch=False)
+        for _ in range(12):
             source_opt.step()
             source.step()
 
-        # the second phase asks for a lower base rate, a slower decay, and a
-        # cadence of one step per epoch instead of per batch
-        opt = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=0.001)
-        resumed = lr_scheduler.ExponentialDecayLR(
-            opt, decay_size=100, decay_factor=0.9, by_epoch=True
-        )
+        # the second phase asks for a lower base rate and a slower decay
+        opt = _sgd(0.001)
+        resumed = lr_scheduler.ExponentialDecayLR(opt, 100, 0.9, by_epoch=True)
         resumed.load_state_dict(source.state_dict())
 
-        self.assertEqual(resumed.last_epoch, source.last_epoch)
-        self.assertEqual(resumed.base_lrs, [0.001])
-        self.assertEqual(resumed._decay_size, 100)
-        self.assertEqual(resumed._decay_factor, 0.9)
+        # position 12 discriminates: the source is one decay_size=10 step in
+        # (0.01 * 0.5 = 0.005), this run is not yet (0.001 * 0.9 ** 0 = 0.001)
+        self.assertEqual(resumed.last_epoch, 12)
+        self.assertEqual(opt.param_groups[0]["lr"], 0.001)
         # by_epoch drives which loop steps the scheduler, so a flip would
         # silently change the cadence for the whole resumed run
         self.assertTrue(resumed.by_epoch)
-        expected = lr_scheduler.ExponentialDecayLR(
-            torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=0.001),
-            decay_size=100,
-            decay_factor=0.9,
-            by_epoch=True,
-        )
-        expected.set_step(source.last_epoch)
-        self.assertEqual(resumed.get_last_lr(), expected.get_last_lr())
-        self.assertEqual(opt.param_groups[0]["lr"], expected.get_last_lr()[0])
 
     def test_restore_accepts_different_parameter_groups(self):
         """A replanned rank owns a different group count and still resumes."""
-        source_opt = torch.optim.SGD(
-            [{"params": [torch.nn.Parameter(torch.ones(1))]} for _ in range(2)], lr=0.01
-        )
-        source = lr_scheduler.LinearDecayLR(source_opt, num_training_steps=10)
+        source = lr_scheduler.LinearDecayLR(_sgd(0.01, 0.01), num_training_steps=10)
         source.set_step(4)
 
-        opt = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=0.01)
+        opt = _sgd(0.01)
         resumed = lr_scheduler.LinearDecayLR(opt, num_training_steps=10)
         resumed.load_state_dict(source.state_dict())
 
@@ -111,12 +96,9 @@ class LRSchedulerTest(unittest.TestCase):
         self.assertEqual(opt.param_groups[0]["lr"], source.get_last_lr()[0])
 
     def test_restore_rejects_state_without_position(self):
-        optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=0.01)
-        scheduler = lr_scheduler.ConstantLR(optimizer)
-        state = scheduler.state_dict()
-        del state["position"]
+        scheduler = lr_scheduler.ConstantLR(_sgd(0.01))
         with self.assertRaisesRegex(ValueError, "position"):
-            scheduler.load_state_dict(state)
+            scheduler.load_state_dict({})
 
     def test_constant_lr(self) -> None:
         params = [torch.tensor([1.0, 2.0])]

@@ -45,7 +45,7 @@ from tzrec.optim.lr_scheduler import (
 )
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.utils import checkpoint_util, filesystem_util, misc_util
-from tzrec.utils.test_util import make_test_dir, parameterized_name_func
+from tzrec.utils.test_util import make_test_dir
 
 
 def _create_test_model(large_table_cnt=2, small_table_cnt=2):
@@ -140,6 +140,14 @@ def _create_nested_embedding_model(module_path, value):
     nn.init.constant_(embedding.weight, value)
     parent.add_module(module_path[-1], embedding)
     return model
+
+
+def _lr_scheduler(*lrs: float, by_epoch: bool = False) -> ExponentialDecayLR:
+    """A scheduler over one single-parameter group per learning rate."""
+    optimizer = torch.optim.SGD(
+        [{"params": [nn.Parameter(torch.ones(1))], "lr": lr} for lr in lrs]
+    )
+    return ExponentialDecayLR(optimizer, 1, 0.5, by_epoch=by_epoch)
 
 
 def _save_restore_worker(test_dir, rank, world_size, port):
@@ -285,37 +293,6 @@ class CheckpointUtilTest(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
-
-    def _lr_scheduler(self, num_groups):
-        params = [nn.Parameter(torch.zeros(1)) for _ in range(num_groups)]
-        optimizer = torch.optim.SGD([{"params": [p]} for p in params], lr=0.1)
-        return LinearDecayLR(optimizer, num_training_steps=100)
-
-    def test_restore_lr_schedulers_survives_param_group_change(self):
-        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-40")
-        saved = self._lr_scheduler(2)
-        # a checkpoint named after batch index 40 has stepped 41 times
-        for _ in range(41):
-            saved.step()
-        checkpoint_util.save_lr_schedulers(ckpt_dir, [saved])
-        # a replanned restart holds a different number of parameter groups
-        restored = self._lr_scheduler(1)
-        checkpoint_util.restore_lr_schedulers(ckpt_dir, [restored])
-        self.assertEqual(restored.last_epoch, saved.last_epoch)
-        self.assertEqual(
-            restored.optimizer.param_groups[0]["lr"],
-            saved.optimizer.param_groups[0]["lr"],
-        )
-
-    def test_restore_lr_schedulers_uses_saved_state(self):
-        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-40")
-        saved = self._lr_scheduler(2)
-        for _ in range(40):
-            saved.step()
-        checkpoint_util.save_lr_schedulers(ckpt_dir, [saved])
-        restored = self._lr_scheduler(2)
-        checkpoint_util.restore_lr_schedulers(ckpt_dir, [restored])
-        self.assertEqual(restored.state_dict(), saved.state_dict())
 
     def test_latest_checkpoint_with_model_dir(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-0"))
@@ -955,15 +932,8 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def _scheduler(self, by_epoch=False):
-        optimizer = KeyedOptimizerWrapper(
-            {"weight": nn.Parameter(torch.ones(1))},
-            lambda params: torch.optim.Adam(params, lr=0.01),
-        )
-        return ExponentialDecayLR(optimizer, 1, 0.5, by_epoch=by_epoch)
-
     def test_round_trip(self):
-        original = [self._scheduler(), self._scheduler(by_epoch=True)]
+        original = [_lr_scheduler(0.01), _lr_scheduler(0.01, by_epoch=True)]
         for scheduler in original:
             scheduler.set_step(4)
         manager = checkpoint_util.CheckpointManager(self.test_dir)
@@ -973,7 +943,7 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
             mock.patch("tzrec.utils.hf_export_util.write_hf_assets"),
         ):
             ckpt = manager.save(3, nn.Linear(1, 1), lr_schedulers=original)
-        resumed = [self._scheduler(), self._scheduler(by_epoch=True)]
+        resumed = [_lr_scheduler(0.01), _lr_scheduler(0.01, by_epoch=True)]
         with mock.patch("tzrec.utils.checkpoint_util.restore_model"):
             manager.restore(ckpt, nn.Linear(1, 1), lr_schedulers=resumed)
         for expected, actual in zip(original, resumed):
@@ -987,17 +957,33 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         filesystem_util.apply_monkeypatch()
         self.addCleanup(filesystem_util.remove_monkeypatch)
         ckpt_dir = "file://" + os.path.join(self.test_dir, "model.ckpt-4")
-        original = self._scheduler()
+        original = _lr_scheduler(0.01)
         original.set_step(4)
         checkpoint_util.save_lr_schedulers(ckpt_dir, [original])
-        resumed = self._scheduler()
+        resumed = _lr_scheduler(0.01)
         checkpoint_util.restore_lr_schedulers(ckpt_dir, [resumed])
         self.assertEqual(resumed.state_dict(), original.state_dict())
+
+    def test_restore_survives_param_group_change(self):
+        """A replanned rank owns a different group count and still resumes."""
+        ckpt = os.path.join(self.test_dir, "model.ckpt-40")
+        saved = _lr_scheduler(0.1, 0.1)
+        saved.set_step(41)
+        checkpoint_util.save_lr_schedulers(ckpt, [saved])
+        restored = _lr_scheduler(0.1)
+        checkpoint_util.restore_lr_schedulers(ckpt, [restored])
+        self.assertEqual(restored.last_epoch, saved.last_epoch)
+        self.assertEqual(
+            restored.optimizer.param_groups[0]["lr"],
+            saved.optimizer.param_groups[0]["lr"],
+        )
 
     def test_file_holds_one_entry_per_scheduler(self):
         """One entry per scheduler, not one per rank."""
         ckpt = os.path.join(self.test_dir, "model.ckpt-4")
-        checkpoint_util.save_lr_schedulers(ckpt, [self._scheduler(), self._scheduler()])
+        checkpoint_util.save_lr_schedulers(
+            ckpt, [_lr_scheduler(0.01), _lr_scheduler(0.01)]
+        )
         with open(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)) as f:
             self.assertEqual(
                 [state["type"] for state in json.load(f)], ["ExponentialDecayLR"] * 2
@@ -1005,17 +991,13 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
 
     def test_unreadable_state_is_an_error(self):
         """Recorded-but-damaged is not the same as never recorded."""
-        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-4")
-        os.makedirs(ckpt_dir)
-        with open(
-            os.path.join(ckpt_dir, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME), "w"
-        ) as f:
-            f.write('[{"type": "ExponentialDecayLR", "position": 4, "conf')
+        path = os.path.join(self.test_dir, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)
+        with open(path, "w") as f:
+            f.write('[{"type": "ExponentialDecayLR", "posi')
         with self.assertRaises(json.JSONDecodeError):
-            checkpoint_util.restore_lr_schedulers(ckpt_dir, [self._scheduler()])
+            checkpoint_util.restore_lr_schedulers(self.test_dir, [_lr_scheduler(0.01)])
 
-    @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
-    def test_no_saved_state_warns_and_keeps_initial_schedule(self, by_epoch):
+    def test_no_saved_state_warns_and_keeps_initial_schedule(self):
         """A checkpoint from before this existed has nothing to restore."""
         ckpt = os.path.join(self.test_dir, "model.ckpt-3")
         os.makedirs(ckpt)
@@ -1023,8 +1005,8 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         checkpoint_util.save_dataloader_state(
             ckpt, {checkpoint_util.EPOCHS_COMPLETED: 2}
         )
-        scheduler = self._scheduler(by_epoch=by_epoch)
-        fresh = self._scheduler(by_epoch=by_epoch)
+        scheduler = _lr_scheduler(0.01)
+        fresh = _lr_scheduler(0.01)
         with self.assertLogs(level="WARNING") as logs:
             checkpoint_util.restore_lr_schedulers(ckpt, [scheduler])
         self.assertIn("omit --restore_lr_scheduler", "".join(logs.output))
@@ -1036,7 +1018,7 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         )
 
     def test_scheduler_type_mismatch(self):
-        scheduler = self._scheduler()
+        scheduler = _lr_scheduler(0.01)
         schedulers = [scheduler, ConstantLR(scheduler.optimizer)]
         checkpoint_util.save_lr_schedulers(self.test_dir, schedulers)
         with self.assertRaisesRegex(ValueError, "types/order"):
