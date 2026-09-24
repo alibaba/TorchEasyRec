@@ -571,18 +571,12 @@ def _train_and_evaluate(
                     if restore_lr_scheduler and restore_from_model_dir
                     else None
                 )
-                if is_rank_zero:
-                    logger.info(
-                        "Checkpoint restore options: "
-                        f"ignore_restore_optimizer={ignore_restore_optimizer}, "
-                        f"restore_lr_scheduler={restore_lr_scheduler}."
+                if is_rank_zero and restore_lr_scheduler and not restore_from_model_dir:
+                    logger.warning(
+                        "--restore_lr_scheduler is ignored for a fine-tune "
+                        "checkpoint: its schedule position describes the "
+                        "source job. The configured schedule starts fresh."
                     )
-                    if restore_lr_scheduler and not restore_from_model_dir:
-                        logger.warning(
-                            "--restore_lr_scheduler is ignored for a fine-tune "
-                            "checkpoint: its schedule position describes the "
-                            "source job. The configured schedule starts fresh."
-                        )
                 if ignore_restore_optimizer:
                     ckpt_manager.restore(
                         ckpt_path,
