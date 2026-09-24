@@ -49,7 +49,7 @@ class LRSchedulerTest(unittest.TestCase):
             optimizer.step()
             scheduler.step()
         resumed_optimizer, resumed = build()
-        resumed.load_state_dict(scheduler.state_dict())
+        resumed.load_state_dict({"last_epoch": scheduler.last_epoch})
         for _ in range(2):
             self.assertEqual(resumed.last_epoch, scheduler.last_epoch)
             self.assertEqual(resumed._step_count, scheduler._step_count)
@@ -62,42 +62,6 @@ class LRSchedulerTest(unittest.TestCase):
             resumed_optimizer.step()
             scheduler.step()
             resumed.step()
-
-    def test_restore_keeps_this_run_configuration(self):
-        """An edited schedule survives the restore; only the position comes back."""
-        source_opt = _sgd(0.01)
-        source = lr_scheduler.ExponentialDecayLR(source_opt, 10, 0.5, by_epoch=False)
-        for _ in range(12):
-            source_opt.step()
-            source.step()
-
-        opt = _sgd(0.001)
-        resumed = lr_scheduler.ExponentialDecayLR(opt, 100, 0.9, by_epoch=True)
-        resumed.load_state_dict(source.state_dict())
-
-        # 12 discriminates: the source has decayed once, this run has not
-        self.assertEqual(resumed.last_epoch, 12)
-        self.assertEqual(opt.param_groups[0]["lr"], 0.001)
-        # by_epoch picks which loop steps it; a flip would change the cadence
-        self.assertTrue(resumed.by_epoch)
-
-    def test_restore_accepts_different_parameter_groups(self):
-        """A replanned rank owns a different group count and still resumes."""
-        source = lr_scheduler.LinearDecayLR(_sgd(0.01, 0.01), num_training_steps=10)
-        source.set_step(4)
-
-        opt = _sgd(0.01)
-        resumed = lr_scheduler.LinearDecayLR(opt, num_training_steps=10)
-        resumed.load_state_dict(source.state_dict())
-
-        self.assertEqual(resumed.last_epoch, 4)
-        self.assertEqual(resumed.get_last_lr(), source.get_last_lr()[:1])
-        self.assertEqual(opt.param_groups[0]["lr"], source.get_last_lr()[0])
-
-    def test_restore_rejects_state_without_position(self):
-        scheduler = lr_scheduler.ConstantLR(_sgd(0.01))
-        with self.assertRaisesRegex(ValueError, "position"):
-            scheduler.load_state_dict({})
 
     def test_constant_lr(self) -> None:
         params = [torch.tensor([1.0, 2.0])]

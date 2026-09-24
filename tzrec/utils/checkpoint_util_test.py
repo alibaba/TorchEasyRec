@@ -874,8 +874,8 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         self.assertEqual(
             states,
             [
-                {"type": "ExponentialDecayLR", "position": 4},
-                {"type": "ExponentialDecayLR", "position": 7},
+                {"type": "ExponentialDecayLR", "state": {"last_epoch": 4}},
+                {"type": "ExponentialDecayLR", "state": {"last_epoch": 7}},
             ],
         )
         resumed = [_lr_scheduler(0.01), _lr_scheduler(0.01, by_epoch=True)]

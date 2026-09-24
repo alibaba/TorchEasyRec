@@ -1221,7 +1221,10 @@ def save_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
     """Save one entry per scheduler; rank 0 writes for everyone.
 
     Every rank steps its schedulers in lockstep, so one recorded position
-    describes them all.
+    describes them all. Each entry holds the class name and, under ``state``,
+    only ``last_epoch``: the schedule itself is rebuilt from pipeline.config on
+    every launch, and recording it would only create something a restore could
+    wrongly prefer over the live configuration.
 
     Args:
         checkpoint_dir: directory of the checkpoint.
@@ -1230,7 +1233,10 @@ def save_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
     if int(os.environ.get("RANK", 0)) != 0:
         return
     states = [
-        {"type": type(scheduler).__name__, **scheduler.state_dict()}
+        {
+            "type": type(scheduler).__name__,
+            "state": {"last_epoch": scheduler.last_epoch},
+        }
         for scheduler in schedulers
     ]
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -1245,13 +1251,14 @@ def save_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
 def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None:
     """Restore each scheduler's position from the state the checkpoint recorded.
 
-    Only the position is taken; see ``BaseLR.load_state_dict``. A checkpoint
-    written before this existed records none, which is not an error -- there is
-    simply nothing to restore, and the configured schedule starts from the
-    beginning. Reconstructing a position from the checkpoint's step counter
-    instead would be a guess, not a restore: a resume that ran without
-    ``--restore_lr_scheduler`` advances the step counter while deliberately
-    holding the schedule back, so the two can differ by a wide margin.
+    Only the position was recorded, so only it comes back; the schedule itself
+    is this run's configuration. A checkpoint written before this existed
+    records none, which is not an error -- there is simply nothing to restore,
+    and the configured schedule starts from the beginning. Reconstructing a
+    position from the checkpoint's step counter instead would be a guess, not
+    a restore: a resume that ran without ``--restore_lr_scheduler`` advances
+    the step counter while deliberately holding the schedule back, so the two
+    can differ by a wide margin.
 
     Args:
         checkpoint_dir: directory of the checkpoint.
@@ -1274,7 +1281,7 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
             f"{saved_types}, this run builds {live_types}."
         )
     for scheduler, state in zip(schedulers, states):
-        scheduler.load_state_dict(state)
+        scheduler.load_state_dict(state["state"])
     logger.info(f"Restored LR schedulers from {checkpoint_dir}.")
 
 

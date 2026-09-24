@@ -34,22 +34,6 @@ class BaseLR(LRScheduler, metaclass=_meta_cls):
         self._by_epoch = by_epoch
         super().__init__(optimizer)
 
-    def state_dict(self) -> Dict[str, Any]:
-        """Persist the schedule position, and nothing else.
-
-        torch would return nearly the whole instance ``__dict__`` -- every
-        attribute but the optimizer -- pinning the on-disk shape to its
-        internals and burying the one field a restore needs among its
-        bookkeeping. The schedule itself is rebuilt from pipeline.config on
-        every launch, so recording it would only create something a restore
-        could wrongly prefer over the live configuration.
-
-        Returns:
-            a dict with a single key ``position``: the number of advances the
-            schedule has made.
-        """
-        return {"position": int(self.last_epoch)}
-
     # pyre-ignore [3]
     def get_lr(self):
         """Calculates the learning rate."""
@@ -65,21 +49,19 @@ class BaseLR(LRScheduler, metaclass=_meta_cls):
         raise NotImplementedError
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Replay the recorded position onto the schedule this run configures.
+        """Load the state, then realign what torch leaves behind.
 
-        A learning rate edited in pipeline.config takes effect on resume, and
-        so does ``_by_epoch`` -- which decides whether the trainer advances
-        this scheduler per batch or per epoch. Nothing but the position is
-        recorded, so nothing else can be adopted. Position alone also makes
-        the restore insensitive to a rank's parameter-group count, so a
-        replanned restart resumes on its own shards.
+        torch only updates ``__dict__``. ``_step_count``, ``_last_lr`` and the
+        optimizer's ``lr`` stay where the fresh scheduler had them, and every
+        ``_get_lr`` reads ``_step_count``, so the schedule would compute from
+        the wrong step until the next ``step()``. ``set_step`` moves all three
+        to where ``last_epoch`` now points.
 
         Args:
-            state_dict: a mapping as returned by ``state_dict``.
+            state_dict: scheduler state, as returned by ``state_dict``.
         """
-        if "position" not in state_dict:
-            raise ValueError("Restored LR scheduler state records no position.")
-        self.set_step(int(state_dict["position"]))
+        super().load_state_dict(state_dict)
+        self.set_step(self.last_epoch)
 
     def set_step(self, step: int) -> None:
         """Place the schedule after this many batch or epoch advances."""
