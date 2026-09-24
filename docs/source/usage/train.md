@@ -20,7 +20,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --fine_tune_checkpoint: 增量训练的checkpoint路径，如experiments/multi_tower_din_taobao_local/model.ckpt-0，如果不设置，增量训练使用model_dir下最近的检查点
 - --edit_config_json: 命令行以json的方式动态修改配置文件，如{"model_dir":"experiments/","feature_configs[0].raw_feature.boundaries":[4,5,6,7]}
 - --ignore_restore_optimizer: 加载checkpoint参数时，忽略加载优化器的参数
-- --restore_lr_scheduler: 续训时从checkpoint恢复学习率调度进度，默认false即从头调度；只对`--continue_train`生效，且只恢复进度，学习率配置仍以`pipeline.config`为准
+- --restore_lr_scheduler: 续训时从checkpoint恢复学习率调度进度，默认false即从头调度。只恢复进度，学习率配置仍以`pipeline.config`为准；但调度器的类型/个数/顺序改变会直接报错，换调度策略时需去掉该参数。该参数只对`--continue_train`从`model_dir`恢复生效，`--fine_tune_checkpoint`会忽略它（仅日志提示）。旧版本checkpoint没有调度状态，会打印warning并从配置的调度起点开始
 
 ### 环境变量
 

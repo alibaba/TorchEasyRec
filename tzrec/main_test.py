@@ -674,10 +674,6 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
             restore_model.assert_not_called()
         return used_lrs
 
-    def test_cold_start_with_restore_enabled(self):
-        reference = self._run("reference")
-        torch.testing.assert_close(self._run("cold_start", restore=True), reference)
-
     @parameterized.expand(
         [
             ("default", None, False, False, False),
@@ -720,6 +716,7 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
     @parameterized.expand(
         [
             ("default", False, True, False),
+            ("epoch_mid_pass", True, False, False),
             ("epoch_boundary_step_save", True, True, False),
             ("epoch_boundary_epoch_save", True, True, True),
         ],

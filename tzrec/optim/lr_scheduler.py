@@ -37,14 +37,16 @@ class BaseLR(LRScheduler, metaclass=_meta_cls):
     def state_dict(self) -> Dict[str, Any]:
         """Persist the schedule position, and nothing else.
 
-        torch would return the whole instance ``__dict__``, pinning the
-        on-disk shape to its internals and burying the one field a restore
-        needs among its bookkeeping. The schedule itself is rebuilt from
-        pipeline.config on every launch, so recording it would only create
-        something a restore could wrongly prefer over the live configuration.
+        torch would return nearly the whole instance ``__dict__`` -- every
+        attribute but the optimizer -- pinning the on-disk shape to its
+        internals and burying the one field a restore needs among its
+        bookkeeping. The schedule itself is rebuilt from pipeline.config on
+        every launch, so recording it would only create something a restore
+        could wrongly prefer over the live configuration.
 
         Returns:
-            the number of advances the schedule has made.
+            a dict with a single key ``position``: the number of advances the
+            schedule has made.
         """
         return {"position": int(self.last_epoch)}
 

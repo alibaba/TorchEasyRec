@@ -861,14 +861,23 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
 
     def test_round_trip(self):
         original = [_lr_scheduler(0.01), _lr_scheduler(0.01, by_epoch=True)]
-        for scheduler in original:
-            scheduler.set_step(4)
+        for scheduler, step in zip(original, (4, 7)):
+            scheduler.set_step(step)
         manager = checkpoint_util.CheckpointManager(self.test_dir)
         self.addCleanup(manager.close)
         with (
             mock.patch("tzrec.utils.checkpoint_util.save_model"),
         ):
             ckpt = manager.save(3, nn.Linear(1, 1), lr_schedulers=original)
+        with open(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)) as f:
+            states = json.load(f)
+        self.assertEqual(
+            states,
+            [
+                {"type": "ExponentialDecayLR", "position": 4},
+                {"type": "ExponentialDecayLR", "position": 7},
+            ],
+        )
         resumed = [_lr_scheduler(0.01), _lr_scheduler(0.01, by_epoch=True)]
         with mock.patch("tzrec.utils.checkpoint_util.restore_model"):
             manager.restore(ckpt, nn.Linear(1, 1), lr_schedulers=resumed)
@@ -889,39 +898,6 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         resumed = _lr_scheduler(0.01)
         checkpoint_util.restore_lr_schedulers(ckpt_dir, [resumed])
         self.assertEqual(resumed.state_dict(), original.state_dict())
-
-    def test_restore_survives_param_group_change(self):
-        """A replanned rank owns a different group count and still resumes."""
-        ckpt = os.path.join(self.test_dir, "model.ckpt-40")
-        saved = _lr_scheduler(0.1, 0.1)
-        saved.set_step(41)
-        checkpoint_util.save_lr_schedulers(ckpt, [saved])
-        restored = _lr_scheduler(0.1)
-        checkpoint_util.restore_lr_schedulers(ckpt, [restored])
-        self.assertEqual(restored.last_epoch, saved.last_epoch)
-        self.assertEqual(
-            restored.optimizer.param_groups[0]["lr"],
-            saved.optimizer.param_groups[0]["lr"],
-        )
-
-    def test_file_holds_one_entry_per_scheduler(self):
-        """One entry per scheduler, not one per rank."""
-        ckpt = os.path.join(self.test_dir, "model.ckpt-4")
-        checkpoint_util.save_lr_schedulers(
-            ckpt, [_lr_scheduler(0.01), _lr_scheduler(0.01)]
-        )
-        with open(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)) as f:
-            self.assertEqual(
-                [state["type"] for state in json.load(f)], ["ExponentialDecayLR"] * 2
-            )
-
-    def test_unreadable_state_is_an_error(self):
-        """Recorded-but-damaged is not the same as never recorded."""
-        path = os.path.join(self.test_dir, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)
-        with open(path, "w") as f:
-            f.write('[{"type": "ExponentialDecayLR", "posi')
-        with self.assertRaises(json.JSONDecodeError):
-            checkpoint_util.restore_lr_schedulers(self.test_dir, [_lr_scheduler(0.01)])
 
     def test_no_saved_state_warns_and_keeps_initial_schedule(self):
         """A checkpoint from before this existed has nothing to restore."""

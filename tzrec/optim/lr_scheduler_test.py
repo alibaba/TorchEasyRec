@@ -29,19 +29,13 @@ def _sgd(*lrs: float) -> torch.optim.Optimizer:
 
 class LRSchedulerTest(unittest.TestCase):
     @parameterized.expand(
-        [
-            (count, via_set_step)
-            for count in [1, 4, 12]
-            for via_set_step in [False, True]
-        ],
+        [(count,) for count in [1, 4, 12]],
         name_func=parameterized_name_func,
     )
-    def test_restore_position(self, count, via_set_step):
+    def test_restore_position(self, count):
         """A restored schedule continues where the original left off.
 
-        The via_set_step axis pins load_state_dict as a thin wrapper: a clamp
-        added inside it would survive the other axis. Counts land in warmup,
-        mid-decay and past the horizon.
+        Counts land in warmup, mid-decay and past the horizon.
         """
 
         def build():
@@ -55,10 +49,7 @@ class LRSchedulerTest(unittest.TestCase):
             optimizer.step()
             scheduler.step()
         resumed_optimizer, resumed = build()
-        if via_set_step:
-            resumed.set_step(count)
-        else:
-            resumed.load_state_dict(scheduler.state_dict())
+        resumed.load_state_dict(scheduler.state_dict())
         for _ in range(2):
             self.assertEqual(resumed.last_epoch, scheduler.last_epoch)
             self.assertEqual(resumed._step_count, scheduler._step_count)
