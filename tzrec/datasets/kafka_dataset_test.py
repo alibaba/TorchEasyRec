@@ -26,6 +26,7 @@ from confluent_kafka import KafkaException, Producer, TopicPartition
 from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
+from tzrec.constant import Mode
 from tzrec.datasets.kafka_dataset import (
     KafkaDataset,
     _build_projection,
@@ -292,6 +293,45 @@ class BuildProjectionTest(unittest.TestCase):
             [src_batch.column(i) for i in projection], names=dst.names
         ).cast(dst)
         self.assertEqual(len(pa.Table.from_batches([projected, dst_batch])), 2)
+
+
+class KafkaDatasetConfigTest(unittest.TestCase):
+    """data_config fields reach the reader, broker-free."""
+
+    @parameterized.expand(
+        [
+            param("train", mode=Mode.TRAIN, expected_shuffle=True),
+            param("eval", mode=Mode.EVAL, expected_shuffle=False),
+        ]
+    )
+    def test_shuffle_config_reaches_reader(self, _name, mode, expected_shuffle):
+        data_config = data_pb2.DataConfig(
+            batch_size=4,
+            dataset_type=data_pb2.DatasetType.KafkaDataset,
+            fg_mode=data_pb2.FgMode.FG_NONE,
+            label_fields=["label"],
+            shuffle=True,
+            shuffle_buffer_size=64,
+            input_fields=[
+                data_pb2.Field(input_name="id_a", input_type=data_pb2.STRING),
+                data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
+            ],
+        )
+        features = create_features(
+            [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(feature_name="id_a")
+                )
+            ]
+        )
+        dataset = KafkaDataset(
+            data_config=data_config,
+            features=features,
+            input_path="kafka://broker:9092/topic?group.id=tzrec_test_group",
+            mode=mode,
+        )
+        self.assertEqual(dataset._reader._shuffle, expected_shuffle)
+        self.assertEqual(dataset._reader._shuffle_buffer_size, 64)
 
 
 class KafkaDatasetTest(unittest.TestCase):
