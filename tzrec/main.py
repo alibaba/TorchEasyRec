@@ -1284,6 +1284,13 @@ def export(
         # rank once its config is read
         lm = model.model.lm
         backbone_config = lm.config
+        # the engine runs the LM at the export precision, not in the parameter
+        # dtype training kept its weights in
+        export_dtype = acc_utils.mixed_precision_to_dtype(
+            pipeline_config.export_config.mixed_precision
+        )
+        if export_dtype is not None:
+            backbone_config.dtype = export_dtype
         generation_config = getattr(lm, "generation_config", None)
         del model.model.lm, lm
         export_model(
