@@ -157,7 +157,7 @@ def export_hf_assets(
             "pad_token_id": compiled_prompt.sid_space.pad_token_id,
         }
         # a runtime that reads only the outer config still needs to size its cache
-        for key in ("vocab_size", "hidden_size", "num_hidden_layers", "torch_dtype"):
+        for key in ("vocab_size", "hidden_size", "num_hidden_layers", "dtype"):
             if key in backbone:
                 composite[key] = backbone[key]
         with open(os.path.join(local_dir, "config.json"), "w") as f:

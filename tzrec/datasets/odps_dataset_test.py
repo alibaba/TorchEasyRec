@@ -23,10 +23,11 @@ import requests
 from odps import ODPS
 from odps.apis.storage_api import SessionRequest, SessionStatus
 from odps.errors import ODPSError
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 
+from tzrec.constant import Mode
 from tzrec.datasets import odps_dataset
 from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_account
 from tzrec.features.feature import FgMode, create_features
@@ -816,6 +817,42 @@ class _StubScanClient:
 
     def get_read_session(self, sess_req):
         return SimpleNamespace(session_status=self.status, record_count=100)
+
+
+class OdpsDatasetConfigTest(unittest.TestCase):
+    """data_config fields reach the reader, without odps access."""
+
+    @parameterized.expand(
+        [
+            param("train", mode=Mode.TRAIN, expected_shuffle=True),
+            param("eval", mode=Mode.EVAL, expected_shuffle=False),
+        ]
+    )
+    def test_shuffle_config_reaches_reader(self, _name, mode, expected_shuffle):
+        data_config = data_pb2.DataConfig(
+            batch_size=4,
+            dataset_type=data_pb2.DatasetType.OdpsDataset,
+            fg_mode=data_pb2.FgMode.FG_NONE,
+            label_fields=["label"],
+            shuffle=True,
+            shuffle_buffer_size=64,
+        )
+        features = create_features(
+            [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(feature_name="id_a")
+                )
+            ]
+        )
+        with mock.patch.object(odps_dataset, "OdpsReader") as m_reader:
+            OdpsDataset(
+                data_config=data_config,
+                features=features,
+                input_path="odps://test_project/tables/test_table/dt=20240319",
+                mode=mode,
+            )
+        self.assertEqual(m_reader.call_args.kwargs["shuffle"], expected_shuffle)
+        self.assertEqual(m_reader.call_args.kwargs["shuffle_buffer_size"], 64)
 
 
 class OdpsRestoreSessionsTest(unittest.TestCase):

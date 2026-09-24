@@ -121,7 +121,7 @@ feature_configs {
 
 - **value_dim**: 默认值是0，可以设置1，value_dim=0时支持多值ID输出
 
-- **embedding_dim** 可省略：省略时该特征不建 embedding 表，只能作为 prompt_config 中的 inline slot，此时 `value_dim` 需等于 `sid_space.codebook` 的层数，每个序列元素携带每层一个 offset SID 编码，且不能再声明 `num_buckets`/`hash_bucket_size`/`vocab_*`/`zch`/`dynamicemb`
+- **embedding_dim** 可省略：省略时该特征不建 embedding 表，只能作为 prompt_config 中的 inline slot，此时 `value_dim` 需等于 `sid_space.codebook` 的层数，每个序列元素携带每层一个 offset SID 编码，且不能再声明 `hash_bucket_size`/`vocab_*`/`zch`/`dynamicemb`；`num_buckets` 只能等于 `sid_space.codebook` 之和（各层编码总数）。需要 FG 时（训练时 fg_mode 不是 FG_NONE，或线上 Processor 按导出的 fg.json 做 FG）必须这样配置，否则 FG 不处理该序列特征，这个取值下每个编码原样输出
 
 - **default_bucketize_value**: （可选）指定超出词表的词的编码。当配置了default_bucketize_value时，vocab_list和vocab_dict将不会预留编码给默认值和超出词表的词，用户可完全自主控制vocab_list或vocab_dict
 
