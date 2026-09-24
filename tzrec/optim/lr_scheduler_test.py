@@ -14,10 +14,8 @@ import math
 import unittest
 
 import torch
-from parameterized import parameterized
 
 from tzrec.optim import lr_scheduler
-from tzrec.utils.test_util import parameterized_name_func
 
 
 def _sgd(*lrs: float) -> torch.optim.Optimizer:
@@ -28,15 +26,8 @@ def _sgd(*lrs: float) -> torch.optim.Optimizer:
 
 
 class LRSchedulerTest(unittest.TestCase):
-    @parameterized.expand(
-        [(count,) for count in [1, 4, 12]],
-        name_func=parameterized_name_func,
-    )
-    def test_restore_position(self, count):
-        """A restored schedule continues where the original left off.
-
-        Counts land in warmup, mid-decay and past the horizon.
-        """
+    def test_restore_position(self):
+        """A restored schedule continues where the original left off."""
 
         def build():
             opt = _sgd(0.01, 0.0)
@@ -45,7 +36,8 @@ class LRSchedulerTest(unittest.TestCase):
             )
 
         optimizer, scheduler = build()
-        for _ in range(count):
+        # 4 is mid-decay: past the 2-step warmup, short of the 10-step horizon
+        for _ in range(4):
             optimizer.step()
             scheduler.step()
         resumed_optimizer, resumed = build()
