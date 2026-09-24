@@ -58,6 +58,12 @@ if __name__ == "__main__":
         default=False,
         help="ignore restore optimizer state from checkpoint.",
     )
+    parser.add_argument(
+        "--restore_lr_scheduler",
+        action="store_true",
+        default=False,
+        help="restore LR scheduler state from checkpoint.",
+    )
     args, extra_args = parser.parse_known_args()
 
     train_and_evaluate(
@@ -69,4 +75,5 @@ if __name__ == "__main__":
         args.fine_tune_checkpoint,
         args.edit_config_json,
         args.ignore_restore_optimizer,
+        restore_lr_scheduler=args.restore_lr_scheduler,
     )

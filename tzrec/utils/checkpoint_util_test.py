@@ -38,8 +38,13 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.optim.ema import DenseEMA
+from tzrec.optim.lr_scheduler import (
+    ConstantLR,
+    ExponentialDecayLR,
+    LinearDecayLR,
+)
 from tzrec.protos.export_pb2 import ExportConfig
-from tzrec.utils import checkpoint_util, misc_util
+from tzrec.utils import checkpoint_util, filesystem_util, misc_util
 from tzrec.utils.test_util import make_test_dir
 
 
@@ -137,6 +142,14 @@ def _create_nested_embedding_model(module_path, value):
     return model
 
 
+def _lr_scheduler(*lrs: float, by_epoch: bool = False) -> ExponentialDecayLR:
+    """A scheduler over one single-parameter group per learning rate."""
+    optimizer = torch.optim.SGD(
+        [{"params": [nn.Parameter(torch.ones(1))], "lr": lr} for lr in lrs]
+    )
+    return ExponentialDecayLR(optimizer, 1, 0.5, by_epoch=by_epoch)
+
+
 def _save_restore_worker(test_dir, rank, world_size, port):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -144,8 +157,26 @@ def _save_restore_worker(test_dir, rank, world_size, port):
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo")
     model, optimizer = _create_test_model()
+    # distinct rates per rank: the file rank 0 writes carries only the shared
+    # position, so each rank must land back on its own shard's base LRs
+    for i, group in enumerate(optimizer.param_groups):
+        group["lr"] = 0.01 * (rank + 1) * (i + 1)
+    scheduler = LinearDecayLR(optimizer, num_training_steps=10)
+    scheduler.set_step(4)
+    expected = scheduler.get_last_lr()
     checkpoint_util.save_model(test_dir, model, optimizer)
+    checkpoint_util.save_lr_schedulers(test_dir, [scheduler])
+    dist.barrier()
     checkpoint_util.restore_model(test_dir, model, optimizer)
+    scheduler.set_step(0)
+    checkpoint_util.restore_lr_schedulers(test_dir, [scheduler])
+    torch.testing.assert_close(scheduler.get_last_lr(), expected)
+    torch.testing.assert_close(
+        [group["lr"] for group in optimizer.param_groups], expected
+    )
+    optimizer.step()
+    scheduler.step()
+    torch.testing.assert_close(scheduler.get_last_lr(), [lr * 5 / 6 for lr in expected])
 
 
 def _report_ts_worker(
@@ -818,6 +849,82 @@ class CheckpointUtilTest(unittest.TestCase):
         self.assertEqual(
             checkpoint_util.remap_input_tile_user_key(fqn, {target}), target
         )
+
+
+class LRSchedulerCheckpointTest(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+        env = mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_round_trip(self):
+        original = [_lr_scheduler(0.01), _lr_scheduler(0.01, by_epoch=True)]
+        for scheduler, step in zip(original, (4, 7)):
+            scheduler.set_step(step)
+        manager = checkpoint_util.CheckpointManager(self.test_dir)
+        self.addCleanup(manager.close)
+        with (
+            mock.patch("tzrec.utils.checkpoint_util.save_model"),
+        ):
+            ckpt = manager.save(3, nn.Linear(1, 1), lr_schedulers=original)
+        with open(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)) as f:
+            states = json.load(f)
+        self.assertEqual(
+            states,
+            [
+                {"type": "ExponentialDecayLR", "state": {"last_epoch": 4}},
+                {"type": "ExponentialDecayLR", "state": {"last_epoch": 7}},
+            ],
+        )
+        resumed = [_lr_scheduler(0.01), _lr_scheduler(0.01, by_epoch=True)]
+        with mock.patch("tzrec.utils.checkpoint_util.restore_model"):
+            manager.restore(ckpt, nn.Linear(1, 1), lr_schedulers=resumed)
+        for expected, actual in zip(original, resumed):
+            self.assertEqual(expected.state_dict(), actual.state_dict())
+            self.assertEqual(
+                actual.optimizer.param_groups[0]["lr"], expected.get_last_lr()[0]
+            )
+
+    def test_round_trip_through_fsspec_uri(self):
+        """model_dir may be an fsspec URI, where os.replace does not apply."""
+        filesystem_util.apply_monkeypatch()
+        self.addCleanup(filesystem_util.remove_monkeypatch)
+        ckpt_dir = "file://" + os.path.join(self.test_dir, "model.ckpt-4")
+        original = _lr_scheduler(0.01)
+        original.set_step(4)
+        checkpoint_util.save_lr_schedulers(ckpt_dir, [original])
+        resumed = _lr_scheduler(0.01)
+        checkpoint_util.restore_lr_schedulers(ckpt_dir, [resumed])
+        self.assertEqual(resumed.state_dict(), original.state_dict())
+
+    def test_no_saved_state_warns_and_keeps_initial_schedule(self):
+        """A checkpoint from before this existed has nothing to restore."""
+        ckpt = os.path.join(self.test_dir, "model.ckpt-3")
+        os.makedirs(ckpt)
+        checkpoint_util.save_meta(ckpt, 3)
+        checkpoint_util.save_dataloader_state(
+            ckpt, {checkpoint_util.EPOCHS_COMPLETED: 2}
+        )
+        scheduler = _lr_scheduler(0.01)
+        fresh = _lr_scheduler(0.01)
+        with self.assertLogs(level="WARNING") as logs:
+            checkpoint_util.restore_lr_schedulers(ckpt, [scheduler])
+        self.assertIn("omit --restore_lr_scheduler", "".join(logs.output))
+        # the step counter and the completed-epoch count are both on disk and
+        # both ignored: neither is the position the schedule actually held
+        self.assertEqual(scheduler.state_dict(), fresh.state_dict())
+        self.assertEqual(
+            scheduler.optimizer.param_groups[0]["lr"], fresh.get_last_lr()[0]
+        )
+
+    def test_scheduler_type_mismatch(self):
+        scheduler = _lr_scheduler(0.01)
+        schedulers = [scheduler, ConstantLR(scheduler.optimizer)]
+        checkpoint_util.save_lr_schedulers(self.test_dir, schedulers)
+        with self.assertRaisesRegex(ValueError, "types/order"):
+            checkpoint_util.restore_lr_schedulers(self.test_dir, schedulers[::-1])
 
 
 class DataloaderCheckpointTest(unittest.TestCase):
