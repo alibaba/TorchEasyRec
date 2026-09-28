@@ -48,6 +48,18 @@ from tzrec.utils.delta_embedding_dump import DumpDecision
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
+def _train_config(**overrides) -> TrainConfig:
+    """A TrainConfig for driving ``_train_and_evaluate`` against mocks."""
+    fields = dict(
+        num_steps=1,
+        save_checkpoints_steps=0,
+        use_tensorboard=False,
+        dense_optimizer=DenseOptimizer(),
+    )
+    fields.update(overrides)
+    return TrainConfig(**fields)
+
+
 class MainTest(unittest.TestCase):
     """Tests for tzrec.main orchestration."""
 
@@ -111,20 +123,7 @@ class MainTest(unittest.TestCase):
         pipeline = mock.Mock()
         pipeline.progress.side_effect = RuntimeError("boom")
 
-        train_config = TrainConfig(
-            num_steps=1,
-            num_epochs=0,
-            save_checkpoints_steps=0,
-            save_checkpoints_epochs=0,
-            save_checkpoints_timestamp_interval=0,
-            save_checkpoints_timestamps=[],
-            save_checkpoints_timestamp_quorum=0.0,
-            use_tensorboard=False,
-            tensorboard_summaries=[],
-            is_profiling=False,
-            log_step_count_steps=1,
-            dense_optimizer=DenseOptimizer(),
-        )
+        train_config = _train_config(log_step_count_steps=1)
         eval_config = EvalConfig()
 
         with tempfile.TemporaryDirectory() as model_dir:
@@ -177,17 +176,8 @@ class MainTest(unittest.TestCase):
         ckpt_manager.maybe_save.side_effect = [True, False, False]
         exporter = mock.Mock()
         exporter.enabled = False
-        train_config = TrainConfig(
-            num_steps=1,
-            num_epochs=0,
+        train_config = _train_config(
             save_checkpoints_steps=1,
-            save_checkpoints_epochs=0,
-            save_checkpoints_timestamp_interval=0,
-            save_checkpoints_timestamps=[],
-            save_checkpoints_timestamp_quorum=0.0,
-            use_tensorboard=False,
-            tensorboard_summaries=[],
-            is_profiling=False,
             log_step_count_steps=10,
             dense_optimizer=DenseOptimizer(ema=EMAConfig()),
         )
@@ -245,13 +235,7 @@ class MainTest(unittest.TestCase):
         """
         exporter = mock.Mock()
         exporter.enabled = True
-        train_config = TrainConfig(
-            num_steps=1,
-            num_epochs=0,
-            save_checkpoints_steps=0,
-            use_tensorboard=False,
-            dense_optimizer=DenseOptimizer(),
-        )
+        train_config = _train_config()
         if dump_config is not None:
             train_config.delta_embedding_dump_config.CopyFrom(dump_config)
 
@@ -309,14 +293,7 @@ class MainTest(unittest.TestCase):
         parent = mock.Mock()
         parent.attach_mock(dumper, "dumper")
         parent.attach_mock(exporter, "exporter")
-        train_config = TrainConfig(
-            num_steps=3,
-            num_epochs=0,
-            save_checkpoints_steps=0,
-            use_tensorboard=False,
-            log_step_count_steps=10,
-            dense_optimizer=DenseOptimizer(),
-        )
+        train_config = _train_config(num_steps=3, log_step_count_steps=10)
         train_config.delta_embedding_dump_config.paired_dump_interval_steps = 1
         train_config.delta_embedding_dump_config.feature_store_config.project_name = (
             "project"
@@ -628,13 +605,11 @@ class TrainLRSchedulerResumeTest(unittest.TestCase):
             # fine-tune checkpoints do not carry this job's epoch budget
             dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
         manager = checkpoint_util.CheckpointManager(os.path.join(self.test_dir, name))
-        config = TrainConfig(
+        config = _train_config(
             num_steps=0 if by_epoch else 6,
             num_epochs=3 if by_epoch else 0,
             save_checkpoints_steps=1,
             save_checkpoints_epochs=1 if save_by_epoch else 0,
-            use_tensorboard=False,
-            dense_optimizer=DenseOptimizer(),
         )
         restore_kwargs = {} if restore is None else {"restore_lr_scheduler": restore}
         with (
