@@ -68,15 +68,17 @@ class MainTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.test_dir)
 
     @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
-    def test_train_cli_restore_lr_scheduler(self, restore):
-        argv = ["tzrec.train_eval"] + (["--restore_lr_scheduler"] if restore else [])
+    def test_train_cli_ignore_restore_lr_scheduler(self, ignore):
+        argv = ["tzrec.train_eval"] + (
+            ["--ignore_restore_lr_scheduler"] if ignore else []
+        )
         with (
             mock.patch.object(sys, "argv", argv),
             mock.patch("tzrec.main.train_and_evaluate", autospec=True) as train,
         ):
             runpy.run_module("tzrec.train_eval", run_name="__main__")
         train.assert_called_once()
-        self.assertIs(train.call_args.kwargs["restore_lr_scheduler"], restore)
+        self.assertIs(train.call_args.kwargs["ignore_restore_lr_scheduler"], ignore)
 
     def test_create_custom_model(self) -> None:
         """A custom model receives its unpacked protobuf configuration."""
@@ -364,7 +366,7 @@ class MainTest(unittest.TestCase):
         self,
         name,
         *,
-        restore=None,
+        ignore_lr=None,
         ignore_optimizer=False,
         ckpt_path=None,
         by_epoch=False,
@@ -426,7 +428,9 @@ class MainTest(unittest.TestCase):
             save_checkpoints_steps=1,
             save_checkpoints_epochs=1 if save_by_epoch else 0,
         )
-        restore_kwargs = {} if restore is None else {"restore_lr_scheduler": restore}
+        restore_kwargs = (
+            {} if ignore_lr is None else {"ignore_restore_lr_scheduler": ignore_lr}
+        )
         with (
             mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
             mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
@@ -468,18 +472,18 @@ class MainTest(unittest.TestCase):
         [
             ("default", None, False, False, False),
             ("weights_only", None, True, False, False),
-            ("resume", True, False, False, False),
-            ("resume_without_optimizer", True, True, False, False),
-            ("no_saved_state", True, False, True, False),
-            ("fine_tune", True, True, False, True),
+            ("ignore", True, False, False, False),
+            ("ignore_without_optimizer", True, True, False, False),
+            ("no_saved_state", None, False, True, False),
+            ("fine_tune", None, True, False, True),
         ],
         name_func=parameterized_name_func,
     )
-    def test_batch_resume(self, name, restore, ignore, no_saved_state, fine_tune):
+    def test_batch_resume(self, name, ignore_lr, ignore, no_saved_state, fine_tune):
         reference = self._run("source")
         ckpt = os.path.join(self.test_dir, "source", "model.ckpt-3")
         if no_saved_state:
-            # stands in for a checkpoint written before the flag existed
+            # stands in for a checkpoint written before this existed
             os.remove(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME))
         else:
             self.assertTrue(
@@ -489,41 +493,41 @@ class MainTest(unittest.TestCase):
             )
         actual = self._run(
             "resumed",
-            restore=restore,
+            ignore_lr=ignore_lr,
             ignore_optimizer=ignore,
             ckpt_path=ckpt,
             fine_tune=fine_tune,
         )
         if fine_tune:
             expected = reference
-        elif restore and not no_saved_state:
+        elif ignore_lr or no_saved_state:
+            expected = reference[:2]
+        else:
             # model.ckpt-3 follows batch index 3, i.e. 4 advances
             expected = reference[4:]
-        else:
-            expected = reference[:2]
         torch.testing.assert_close(actual, expected)
 
     @parameterized.expand(
         [
-            ("default", False, True, False),
-            ("epoch_mid_pass", True, False, False),
-            ("epoch_boundary_step_save", True, True, False),
-            ("epoch_boundary_epoch_save", True, True, True),
+            ("default", None, True, False),
+            ("ignore", True, True, False),
+            ("epoch_mid_pass", None, False, False),
+            ("epoch_boundary_epoch_save", None, True, True),
         ],
         name_func=parameterized_name_func,
     )
-    def test_epoch_resume(self, name, restore, boundary, save_by_epoch):
+    def test_epoch_resume(self, name, ignore_lr, boundary, save_by_epoch):
         reference = self._run("source", by_epoch=True, save_by_epoch=save_by_epoch)
         step = 2 if boundary else 4
         actual = self._run(
             "resumed",
-            restore=restore,
+            ignore_lr=ignore_lr,
             ignore_optimizer=True,
             ckpt_path=os.path.join(self.test_dir, "source", f"model.ckpt-{step}"),
             by_epoch=True,
         )
         expected = reference[step + 1 :]
-        if not restore:
+        if ignore_lr:
             # one epoch behind with decay_factor=0.5 ⇒ every rate doubles
             expected = [lr * 2 for lr in expected]
         torch.testing.assert_close(actual, expected)

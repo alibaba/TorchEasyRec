@@ -389,7 +389,7 @@ def _train_and_evaluate(
     pipeline_config_path: Optional[str] = None,
     dense_ema: Optional[DenseEMA] = None,
     export_config: Optional[ExportConfig] = None,
-    restore_lr_scheduler: bool = False,
+    ignore_restore_lr_scheduler: bool = False,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -568,15 +568,9 @@ def _train_and_evaluate(
                 # train_and_evaluate and the epoch budget popped with it.
                 restore_schedulers = (
                     lr_scheduler
-                    if restore_lr_scheduler and restore_from_model_dir
+                    if restore_from_model_dir and not ignore_restore_lr_scheduler
                     else None
                 )
-                if is_rank_zero and restore_lr_scheduler and not restore_from_model_dir:
-                    logger.warning(
-                        "--restore_lr_scheduler is ignored for a fine-tune "
-                        "checkpoint: its schedule position describes the "
-                        "source job. The configured schedule starts fresh."
-                    )
                 if ignore_restore_optimizer:
                     ckpt_manager.restore(
                         ckpt_path,
@@ -773,7 +767,7 @@ def train_and_evaluate(
     fine_tune_checkpoint: Optional[str] = None,
     edit_config_json: Optional[str] = None,
     ignore_restore_optimizer: bool = False,
-    restore_lr_scheduler: bool = False,
+    ignore_restore_lr_scheduler: bool = False,
 ) -> None:
     """Train and evaluate a EasyRec model.
 
@@ -789,8 +783,9 @@ def train_and_evaluate(
         edit_config_json (str, optional): edit pipeline config json str.
         ignore_restore_optimizer (bool): whether to skip restoring optimizer
             state from checkpoint.
-        restore_lr_scheduler (bool): whether to restore LR scheduler state
-            independently of optimizer state; defaults to a fresh schedule.
+        ignore_restore_lr_scheduler (bool): whether to skip restoring LR
+            scheduler state; by default the schedule resumes where the
+            checkpoint left it.
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     train_config = pipeline_config.train_config
@@ -1049,7 +1044,7 @@ def train_and_evaluate(
         ckpt_path=ckpt_path,
         check_all_workers_data_status=check_all_workers_data_status,
         ignore_restore_optimizer=ignore_restore_optimizer,
-        restore_lr_scheduler=restore_lr_scheduler,
+        ignore_restore_lr_scheduler=ignore_restore_lr_scheduler,
         restore_from_model_dir=restore_from_model_dir,
         dataloader_state=dataloader_state,
         delta_embedding_dumper=delta_embedding_dumper,

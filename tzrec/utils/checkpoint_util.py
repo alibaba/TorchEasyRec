@@ -1256,7 +1256,7 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
     records none, which is not an error -- there is simply nothing to restore,
     and the configured schedule starts from the beginning. Reconstructing a
     position from the checkpoint's step counter instead would be a guess, not
-    a restore: a resume that ran without ``--restore_lr_scheduler`` advances
+    a restore: a resume that ran with ``--ignore_restore_lr_scheduler`` advances
     the step counter while deliberately holding the schedule back, so the two
     can differ by a wide margin.
 
@@ -1267,8 +1267,8 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
     path = os.path.join(checkpoint_dir, LR_SCHEDULER_CKPT_FILENAME)
     if not os.path.exists(path):
         logger.warning(
-            f"{checkpoint_dir} has no scheduler state; omit --restore_lr_scheduler. "
-            "The configured schedule starts from the beginning."
+            f"{checkpoint_dir} has no LR scheduler state; the configured schedule "
+            "starts from the beginning."
         )
         return
     with open(path) as f:
@@ -1278,7 +1278,8 @@ def restore_lr_schedulers(checkpoint_dir: str, schedulers: List[BaseLR]) -> None
     if saved_types != live_types:
         raise ValueError(
             f"Restored LR scheduler types/order do not match: checkpoint has "
-            f"{saved_types}, this run builds {live_types}."
+            f"{saved_types}, this run builds {live_types}. Pass "
+            "--ignore_restore_lr_scheduler to start the new schedule fresh."
         )
     for scheduler, state in zip(schedulers, states):
         scheduler.load_state_dict(state["state"])

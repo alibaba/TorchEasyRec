@@ -911,7 +911,7 @@ class LRSchedulerCheckpointTest(unittest.TestCase):
         fresh = _lr_scheduler(0.01)
         with self.assertLogs(level="WARNING") as logs:
             checkpoint_util.restore_lr_schedulers(ckpt, [scheduler])
-        self.assertIn("omit --restore_lr_scheduler", "".join(logs.output))
+        self.assertIn("no LR scheduler state", "".join(logs.output))
         # the step counter and the completed-epoch count are both on disk and
         # both ignored: neither is the position the schedule actually held
         self.assertEqual(scheduler.state_dict(), fresh.state_dict())
