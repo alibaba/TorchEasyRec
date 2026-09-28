@@ -850,15 +850,6 @@ class CheckpointUtilTest(unittest.TestCase):
             checkpoint_util.remap_input_tile_user_key(fqn, {target}), target
         )
 
-
-class LRSchedulerCheckpointTest(unittest.TestCase):
-    def setUp(self):
-        self.test_dir = make_test_dir()
-        self.addCleanup(shutil.rmtree, self.test_dir)
-        env = mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"})
-        env.start()
-        self.addCleanup(env.stop)
-
     def test_round_trip(self):
         original = [_lr_scheduler(0.01), _lr_scheduler(0.01, by_epoch=True)]
         for scheduler, step in zip(original, (4, 7)):

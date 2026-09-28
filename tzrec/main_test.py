@@ -358,7 +358,7 @@ class MainTest(unittest.TestCase):
             ],
         )
 
-    def _run(
+    def _train_lrs(
         self,
         name,
         *,
@@ -476,7 +476,7 @@ class MainTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_batch_resume(self, name, ignore_lr, ignore, no_saved_state, fine_tune):
-        reference = self._run("source")
+        reference = self._train_lrs("source")
         ckpt = os.path.join(self.test_dir, "source", "model.ckpt-3")
         if no_saved_state:
             # stands in for a checkpoint written before this existed
@@ -487,7 +487,7 @@ class MainTest(unittest.TestCase):
                     os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)
                 )
             )
-        actual = self._run(
+        actual = self._train_lrs(
             "resumed",
             ignore_lr=ignore_lr,
             ignore_optimizer=ignore,
@@ -513,9 +513,11 @@ class MainTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_epoch_resume(self, name, ignore_lr, boundary, save_by_epoch):
-        reference = self._run("source", by_epoch=True, save_by_epoch=save_by_epoch)
+        reference = self._train_lrs(
+            "source", by_epoch=True, save_by_epoch=save_by_epoch
+        )
         step = 2 if boundary else 4
-        actual = self._run(
+        actual = self._train_lrs(
             "resumed",
             ignore_lr=ignore_lr,
             ignore_optimizer=True,
