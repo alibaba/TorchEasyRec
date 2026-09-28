@@ -13,7 +13,9 @@
 
 import itertools
 import os
-import tempfile
+import runpy
+import shutil
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -31,6 +33,7 @@ from tzrec.main import (
 )
 from tzrec.models.model import BaseModel
 from tzrec.optim.ema import DenseEMA
+from tzrec.optim.lr_scheduler import ExponentialDecayLR, LinearDecayLR
 from tzrec.protos.data_pb2 import DataConfig
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.export_pb2 import ExportConfig
@@ -39,13 +42,42 @@ from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, TrainConfig
-from tzrec.utils import predict_util
+from tzrec.utils import checkpoint_util, predict_util
 from tzrec.utils.delta_embedding_dump import DumpDecision
-from tzrec.utils.test_util import parameterized_name_func
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
+
+
+def _train_config(**overrides) -> TrainConfig:
+    """A TrainConfig for driving ``_train_and_evaluate`` against mocks."""
+    fields = dict(
+        num_steps=1,
+        save_checkpoints_steps=0,
+        use_tensorboard=False,
+        dense_optimizer=DenseOptimizer(),
+    )
+    fields.update(overrides)
+    return TrainConfig(**fields)
 
 
 class MainTest(unittest.TestCase):
     """Tests for tzrec.main orchestration."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
+    def test_train_cli_ignore_restore_lr_scheduler(self, ignore):
+        argv = ["tzrec.train_eval"] + (
+            ["--ignore_restore_lr_scheduler"] if ignore else []
+        )
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch("tzrec.main.train_and_evaluate", autospec=True) as train,
+        ):
+            runpy.run_module("tzrec.train_eval", run_name="__main__")
+        train.assert_called_once()
+        self.assertIs(train.call_args.kwargs["ignore_restore_lr_scheduler"], ignore)
 
     def test_create_custom_model(self) -> None:
         """A custom model receives its unpacked protobuf configuration."""
@@ -96,42 +128,26 @@ class MainTest(unittest.TestCase):
         pipeline = mock.Mock()
         pipeline.progress.side_effect = RuntimeError("boom")
 
-        train_config = TrainConfig(
-            num_steps=1,
-            num_epochs=0,
-            save_checkpoints_steps=0,
-            save_checkpoints_epochs=0,
-            save_checkpoints_timestamp_interval=0,
-            save_checkpoints_timestamps=[],
-            save_checkpoints_timestamp_quorum=0.0,
-            use_tensorboard=False,
-            tensorboard_summaries=[],
-            is_profiling=False,
-            log_step_count_steps=1,
-            dense_optimizer=DenseOptimizer(),
-        )
+        train_config = _train_config(log_step_count_steps=1)
         eval_config = EvalConfig()
 
-        with tempfile.TemporaryDirectory() as model_dir:
-            with (
-                mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
-                mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
-                mock.patch(
-                    "tzrec.main.OnlineDenseExportManager", return_value=exporter
-                ),
-            ):
-                with self.assertRaises(RuntimeError):
-                    _train_and_evaluate(
-                        model=model,
-                        optimizer=optimizer,
-                        train_dataloader=train_dataloader,
-                        eval_dataloader=None,
-                        lr_scheduler=[],
-                        model_dir=model_dir,
-                        train_config=train_config,
-                        eval_config=eval_config,
-                        ckpt_manager=ckpt_manager,
-                    )
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            with self.assertRaises(RuntimeError):
+                _train_and_evaluate(
+                    model=model,
+                    optimizer=optimizer,
+                    train_dataloader=train_dataloader,
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir=self.test_dir,
+                    train_config=train_config,
+                    eval_config=eval_config,
+                    ckpt_manager=ckpt_manager,
+                )
         self.assertTrue(exporter.close.called)
         self.assertTrue(ckpt_manager.close.called)
         # a collective; missing ranks would hang it on exception paths
@@ -162,17 +178,8 @@ class MainTest(unittest.TestCase):
         ckpt_manager.maybe_save.side_effect = [True, False, False]
         exporter = mock.Mock()
         exporter.enabled = False
-        train_config = TrainConfig(
-            num_steps=1,
-            num_epochs=0,
+        train_config = _train_config(
             save_checkpoints_steps=1,
-            save_checkpoints_epochs=0,
-            save_checkpoints_timestamp_interval=0,
-            save_checkpoints_timestamps=[],
-            save_checkpoints_timestamp_quorum=0.0,
-            use_tensorboard=False,
-            tensorboard_summaries=[],
-            is_profiling=False,
             log_step_count_steps=10,
             dense_optimizer=DenseOptimizer(ema=EMAConfig()),
         )
@@ -230,13 +237,7 @@ class MainTest(unittest.TestCase):
         """
         exporter = mock.Mock()
         exporter.enabled = True
-        train_config = TrainConfig(
-            num_steps=1,
-            num_epochs=0,
-            save_checkpoints_steps=0,
-            use_tensorboard=False,
-            dense_optimizer=DenseOptimizer(),
-        )
+        train_config = _train_config()
         if dump_config is not None:
             train_config.delta_embedding_dump_config.CopyFrom(dump_config)
 
@@ -294,14 +295,7 @@ class MainTest(unittest.TestCase):
         parent = mock.Mock()
         parent.attach_mock(dumper, "dumper")
         parent.attach_mock(exporter, "exporter")
-        train_config = TrainConfig(
-            num_steps=3,
-            num_epochs=0,
-            save_checkpoints_steps=0,
-            use_tensorboard=False,
-            log_step_count_steps=10,
-            dense_optimizer=DenseOptimizer(),
-        )
+        train_config = _train_config(num_steps=3, log_step_count_steps=10)
         train_config.delta_embedding_dump_config.paired_dump_interval_steps = 1
         train_config.delta_embedding_dump_config.feature_store_config.project_name = (
             "project"
@@ -363,6 +357,178 @@ class MainTest(unittest.TestCase):
                 "exporter.close",
             ],
         )
+
+    def _train_lrs(
+        self,
+        name,
+        *,
+        ignore_lr=None,
+        ignore_optimizer=False,
+        ckpt_path=None,
+        by_epoch=False,
+        save_by_epoch=False,
+        fine_tune=False,
+    ):
+        """Train against mocks and return the LR each batch used.
+
+        A resume replays the reference sequence from the checkpoint on; with
+        the schedule restore skipped it restarts from the beginning.
+        """
+        parameter = torch.nn.Parameter(torch.ones(1))
+        parameter.grad = torch.ones_like(parameter)
+        optimizer = torch.optim.SGD([parameter], lr=0.01)
+        optimizer.params = {"weight": parameter}
+        scheduler = (
+            ExponentialDecayLR(optimizer, 1, 0.5, by_epoch=True)
+            if by_epoch
+            else LinearDecayLR(optimizer, num_training_steps=10)
+        )
+        used_lrs = []
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        # a fine-tune keeps its own step budget, so it trains from batch 0
+        skip_steps = (
+            checkpoint_util._get_checkpoint_step(ckpt_path)
+            if ckpt_path and not fine_tune
+            else -1
+        )
+        # 3-batch passes; a resume rejoins mid-pass, so the first is short
+        pass_sizes = itertools.chain([3 - (skip_steps + 1) % 3], itertools.repeat(3))
+        loader = mock.Mock()
+        loader.get_iterator.side_effect = lambda: iter(range(next(pass_sizes)))
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=-1.0)
+        warming_up = ckpt_path is not None and not ignore_optimizer
+
+        def progress(iterator):
+            nonlocal warming_up
+            next(iterator)
+            if warming_up:
+                warming_up = False
+            else:
+                used_lrs.append(optimizer.param_groups[0]["lr"])
+            optimizer.step()
+            return {"loss": parameter.detach().sum()}, {}, batch
+
+        pipeline = mock.Mock()
+        pipeline.progress.side_effect = progress
+        dataloader_state = (
+            checkpoint_util.restore_dataloader_state(ckpt_path) if ckpt_path else None
+        )
+        if dataloader_state and fine_tune:
+            # fine-tune checkpoints do not carry this job's epoch budget
+            dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
+        manager = checkpoint_util.CheckpointManager(os.path.join(self.test_dir, name))
+        config = _train_config(
+            num_steps=0 if by_epoch else 6,
+            num_epochs=3 if by_epoch else 0,
+            save_checkpoints_steps=1,
+            save_checkpoints_epochs=1 if save_by_epoch else 0,
+        )
+        restore_kwargs = (
+            {} if ignore_lr is None else {"ignore_restore_lr_scheduler": ignore_lr}
+        )
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch(
+                "tzrec.main.OnlineDenseExportManager",
+                return_value=mock.Mock(enabled=False),
+            ),
+            mock.patch("tzrec.main._log_train"),
+            mock.patch("tzrec.utils.checkpoint_util.save_model"),
+            mock.patch("tzrec.utils.checkpoint_util.restore_model") as restore_model,
+        ):
+            _train_and_evaluate(
+                model,
+                optimizer,
+                loader,
+                None,
+                [scheduler],
+                os.path.join(self.test_dir, name),
+                config,
+                EvalConfig(),
+                manager,
+                ckpt_path=ckpt_path,
+                skip_steps=skip_steps,
+                ignore_restore_optimizer=ignore_optimizer,
+                restore_from_model_dir=ckpt_path is not None and not fine_tune,
+                dataloader_state=dataloader_state,
+                **restore_kwargs,
+            )
+        if ckpt_path:
+            self.assertEqual(restore_model.call_count, 1)
+            self.assertIs(
+                restore_model.call_args.args[2], None if ignore_optimizer else optimizer
+            )
+        else:
+            restore_model.assert_not_called()
+        return used_lrs
+
+    @parameterized.expand(
+        [
+            ("default", None, False, False, False),
+            ("weights_only", None, True, False, False),
+            ("ignore", True, False, False, False),
+            ("ignore_without_optimizer", True, True, False, False),
+            ("no_saved_state", None, False, True, False),
+            ("fine_tune", None, True, False, True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_batch_resume(self, name, ignore_lr, ignore, no_saved_state, fine_tune):
+        reference = self._train_lrs("source")
+        ckpt = os.path.join(self.test_dir, "source", "model.ckpt-3")
+        if no_saved_state:
+            # stands in for a checkpoint written before this existed
+            os.remove(os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME))
+        else:
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(ckpt, checkpoint_util.LR_SCHEDULER_CKPT_FILENAME)
+                )
+            )
+        actual = self._train_lrs(
+            "resumed",
+            ignore_lr=ignore_lr,
+            ignore_optimizer=ignore,
+            ckpt_path=ckpt,
+            fine_tune=fine_tune,
+        )
+        if fine_tune:
+            expected = reference
+        elif ignore_lr or no_saved_state:
+            expected = reference[:2]
+        else:
+            # model.ckpt-3 follows batch index 3, i.e. 4 advances
+            expected = reference[4:]
+        torch.testing.assert_close(actual, expected)
+
+    @parameterized.expand(
+        [
+            ("default", None, True, False),
+            ("ignore", True, True, False),
+            ("epoch_mid_pass", None, False, False),
+            ("epoch_boundary_epoch_save", None, True, True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_epoch_resume(self, name, ignore_lr, boundary, save_by_epoch):
+        reference = self._train_lrs(
+            "source", by_epoch=True, save_by_epoch=save_by_epoch
+        )
+        step = 2 if boundary else 4
+        actual = self._train_lrs(
+            "resumed",
+            ignore_lr=ignore_lr,
+            ignore_optimizer=True,
+            ckpt_path=os.path.join(self.test_dir, "source", f"model.ckpt-{step}"),
+            by_epoch=True,
+        )
+        expected = reference[step + 1 :]
+        if ignore_lr:
+            # one epoch behind with decay_factor=0.5 ⇒ every rate doubles
+            expected = [lr * 2 for lr in expected]
+        torch.testing.assert_close(actual, expected)
 
 
 class PredictionLifecycleTest(unittest.TestCase):
