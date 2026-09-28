@@ -16,7 +16,6 @@ import os
 import runpy
 import shutil
 import sys
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -132,26 +131,23 @@ class MainTest(unittest.TestCase):
         train_config = _train_config(log_step_count_steps=1)
         eval_config = EvalConfig()
 
-        with tempfile.TemporaryDirectory() as model_dir:
-            with (
-                mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
-                mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
-                mock.patch(
-                    "tzrec.main.OnlineDenseExportManager", return_value=exporter
-                ),
-            ):
-                with self.assertRaises(RuntimeError):
-                    _train_and_evaluate(
-                        model=model,
-                        optimizer=optimizer,
-                        train_dataloader=train_dataloader,
-                        eval_dataloader=None,
-                        lr_scheduler=[],
-                        model_dir=model_dir,
-                        train_config=train_config,
-                        eval_config=eval_config,
-                        ckpt_manager=ckpt_manager,
-                    )
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            with self.assertRaises(RuntimeError):
+                _train_and_evaluate(
+                    model=model,
+                    optimizer=optimizer,
+                    train_dataloader=train_dataloader,
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir=self.test_dir,
+                    train_config=train_config,
+                    eval_config=eval_config,
+                    ckpt_manager=ckpt_manager,
+                )
         self.assertTrue(exporter.close.called)
         self.assertTrue(ckpt_manager.close.called)
         # a collective; missing ranks would hang it on exception paths
