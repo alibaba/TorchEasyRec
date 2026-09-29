@@ -14,15 +14,23 @@ import os
 import shutil
 import unittest
 
+import pyarrow as pa
+import torch
 from google.protobuf import text_format
+from parameterized import parameterized
 from tokenizers import Tokenizer
 
+from tzrec.datasets.data_parser import DataParser
 from tzrec.features.feature import FgMode, create_features
 from tzrec.prompt.compile import compile_prompt, save_tokenizer_dir
 from tzrec.prompt.types import FillMode, SlotSeg, Static, WidthKind
 from tzrec.protos import feature_pb2
 from tzrec.protos.prompt_pb2 import PromptConfig
-from tzrec.utils.test_util import create_genrec_test_tokenizer, make_test_dir
+from tzrec.utils.test_util import (
+    create_genrec_test_tokenizer,
+    make_test_dir,
+    parameterized_name_func,
+)
 
 _WORDS = ["History", "Profile", "Predict", ":", ".", "Histor0", "<unk>", "<|im_end|>"]
 
@@ -197,6 +205,42 @@ class CompilePromptTest(unittest.TestCase):
         cfg.sid_space.codebook.extend([4, 4, 4])
         with self.assertRaisesRegex(ValueError, "num_buckets"):
             self._compile(cfg, [_feature(text)])
+
+    @parameterized.expand(
+        [[FgMode.FG_NORMAL], [FgMode.FG_DAG]], name_func=parameterized_name_func
+    )
+    def test_inline_id_feature_may_bucketize_over_the_code_space(self, fg_mode) -> None:
+        # FG needs a bucketize config to run the feature at all
+        fc = feature_pb2.FeatureConfig()
+        text_format.Merge(
+            _GROUPED_SID.replace("value_dim: 3", "value_dim: 3 num_buckets: 12"), fc
+        )
+        grouped = create_features([fc], fg_mode=fg_mode)
+        cfg = self._config(prompt="History : {{clk__sid}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        compiled = self._compile(cfg, grouped)
+        seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
+        self.assertIs(seg.fill, FillMode.INLINE)
+
+        data = DataParser(features=grouped).parse(
+            input_data={
+                "clk__sid": pa.array(
+                    [[[0, 5, 11], [3, 4, 8]], [[1, 7, 9]]],
+                    type=pa.list_(pa.list_(pa.int64())),
+                )
+            }
+        )
+        # every offset code comes out as it went in
+        torch.testing.assert_close(
+            data["clk__sid.values"],
+            torch.tensor([0, 5, 11, 3, 4, 8, 1, 7, 9], dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            data["clk__sid.lengths"], torch.tensor([2, 1], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            data["clk__sid.key_lengths"], torch.tensor([3, 3, 3], dtype=torch.int32)
+        )
 
     def test_unreadable_vocab_file_is_a_config_error(self) -> None:
         cfg = self._config(prompt="Title : {{title}}")

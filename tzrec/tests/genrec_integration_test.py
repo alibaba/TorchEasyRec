@@ -18,11 +18,11 @@ import unittest
 from typing import Optional
 from unittest import mock
 
-import pyarrow as pa
 import torch
 from google.protobuf import text_format
 from pyarrow import parquet as pq
 
+from tzrec.datasets.data_parser import DataParser
 from tzrec.main import _create_features
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
@@ -49,7 +49,7 @@ from tzrec.utils.test_util import (
 _MOCK_CONFIG = "tzrec/tests/configs/genrec_causal_lm_model_mock.config"
 _BUNDLE_UUID = "bundle-test"
 _CODEBOOK = [4, 4, 4]
-# the template's words plus what the tokenizer needs; token ids are drawn below it
+# the template's words plus what the tokenizer needs; mock texts use the plain ones
 _WORDS = (
     "User",
     "Context",
@@ -62,7 +62,7 @@ _WORDS = (
     "<unk>",
     "<|im_end|>",
 )
-# every slot member the served front-end reads raw, DEEP, dense and jagged alike
+# every slot member the served front-end reads, DEEP, dense and jagged alike
 _MEMBERS = [
     "hist__sid",
     "title",
@@ -116,7 +116,9 @@ class GenRecIntegrationTest(unittest.TestCase):
         with open(manifest, "w") as f:
             json.dump({"codebook": _CODEBOOK, "bundle_uuid": _BUNDLE_UUID}, f)
         self.data_glob = utils.create_mock_prompt_data(
-            os.path.join(self.test_dir, "data"), _CODEBOOK, num_words=len(_WORDS)
+            os.path.join(self.test_dir, "data"),
+            _CODEBOOK,
+            [word for word in _WORDS if not word.startswith("<")],
         )
 
         # parse rather than load: loading would default the tokenize features'
@@ -160,28 +162,13 @@ class GenRecIntegrationTest(unittest.TestCase):
         )
         return trained
 
-    def _request(self, columns, rows: int = 4):
-        """The parsed dict a served front-end reads, from the first mock rows.
-
-        A multi-value sequence column is one list per item; it also carries
-        ``key_lengths``, the codes each item holds.
-        """
+    def _request(self, features, rows: int = 4):
+        """What a processor hands the served front-end: FG on the first mock rows."""
         table = pq.read_table(sorted(glob.glob(self.data_glob))[0]).slice(0, rows)
-        out = {}
-        for column in columns:
-            arrow = table.column(column)
-            lists = arrow.to_pylist()
-            if pa.types.is_floating(arrow.type.value_type):
-                # a dense member is one row of values with no lengths
-                out[column + ".values"] = torch.tensor(lists, dtype=torch.float32)
-                continue
-            out[column + ".lengths"] = torch.tensor([len(row) for row in lists])
-            items = [v for row in lists for v in row]
-            if items and isinstance(items[0], list):
-                out[column + ".key_lengths"] = torch.tensor([len(i) for i in items])
-                items = [v for item in items for v in item]
-            out[column + ".values"] = torch.tensor(items, dtype=torch.int64)
-        return out
+        data = DataParser(features=features).parse(
+            {name: table.column(name).combine_chunks() for name in table.column_names}
+        )
+        return {k: v for k, v in data.items() if k.split(".")[0] in _MEMBERS}
 
     def test_genrec_train_eval_export(self):
         trained = self._train_eval_export()
@@ -223,7 +210,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         # the artifact is the collator's walk plus the serving-only fold
         features = _create_features(list(config.feature_configs), config.data_config)
         compiled = compile_prompt(config.prompt_config, features, ["answer"])
-        data = self._request(_MEMBERS)
+        data = self._request(features)
         front_end = torch.jit.load(os.path.join(export_dir, "scripted_model.pt"))
         # an LLM engine calls it with the batch alone; a processor adds a device
         out = front_end(data)
@@ -267,6 +254,9 @@ class GenRecIntegrationTest(unittest.TestCase):
         self.assertEqual(hf_config["vocab_size"], compiled.sid_space.target_vocab_size)
         self.assertEqual(hf_config["eos_token_id"], compiled.sid_space.eos_token_id)
         self.assertEqual(hf_config["pad_token_id"], compiled.sid_space.pad_token_id)
+        # served at the export precision, though the parameters train in FP32
+        self.assertEqual(hf_config["dtype"], "bfloat16")
+        self.assertEqual(hf_config["text_config"]["dtype"], "bfloat16")
         self.assertNotIn("sid_space", hf_config)
         from transformers import AutoTokenizer
 

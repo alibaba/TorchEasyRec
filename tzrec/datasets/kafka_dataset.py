@@ -25,6 +25,7 @@ from confluent_kafka import (
     TopicPartition,
 )
 
+from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader
 from tzrec.datasets.utils import (
     CKPT_ROW_IDX,
@@ -246,6 +247,8 @@ class KafkaDataset(BaseDataset):
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
             self._data_config.drop_remainder,
+            shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
+            shuffle_buffer_size=self._data_config.shuffle_buffer_size,
             input_fields=input_fields if input_fields else None,
         )
 
@@ -259,6 +262,8 @@ class KafkaReader(BaseReader):
         selected_cols (list): selection column names.
         drop_remainder (bool): inert, the consume loop never ends so no tail
             batch is formed; min_batch_size is inert for the same reason.
+        shuffle (bool): shuffle data or not.
+        shuffle_buffer_size (int): buffer size for shuffle.
         input_fields (list): list of pa.Field for schema definition.
     """
 
@@ -268,6 +273,8 @@ class KafkaReader(BaseReader):
         batch_size: int,
         selected_cols: Optional[List[str]] = None,
         drop_remainder: bool = False,
+        shuffle: bool = False,
+        shuffle_buffer_size: int = 32,
         input_fields: Optional[List[pa.Field]] = None,
         **kwargs: Any,
     ) -> None:
@@ -276,6 +283,8 @@ class KafkaReader(BaseReader):
             batch_size,
             selected_cols,
             drop_remainder,
+            shuffle,
+            shuffle_buffer_size,
         )
 
         self._has_embedded_schema = False

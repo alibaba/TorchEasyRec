@@ -389,6 +389,8 @@ class OdpsDataset(BaseDataset):
             self._batch_size,
             list(self._selected_input_names) if self._selected_input_names else None,
             self._drop_remainder,
+            shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
+            shuffle_buffer_size=self._data_config.shuffle_buffer_size,
             is_orderby_partition=self._data_config.is_orderby_partition,
             quota_name=self._data_config.odps_data_quota_name,
             compression=self._data_config.odps_data_compression,

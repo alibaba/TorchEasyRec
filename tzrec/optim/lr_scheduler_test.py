@@ -18,7 +18,43 @@ import torch
 from tzrec.optim import lr_scheduler
 
 
+def _sgd(*lrs: float) -> torch.optim.Optimizer:
+    """An SGD with one single-parameter group per learning rate."""
+    return torch.optim.SGD(
+        [{"params": [torch.nn.Parameter(torch.ones(1))], "lr": lr} for lr in lrs]
+    )
+
+
 class LRSchedulerTest(unittest.TestCase):
+    def test_restore_position(self):
+        """A restored schedule continues where the original left off."""
+
+        def build():
+            opt = _sgd(0.01, 0.0)
+            return opt, lr_scheduler.LinearDecayLR(
+                opt, num_training_steps=10, warmup_size=2
+            )
+
+        optimizer, scheduler = build()
+        # 4 is mid-decay: past the 2-step warmup, short of the 10-step horizon
+        for _ in range(4):
+            optimizer.step()
+            scheduler.step()
+        resumed_optimizer, resumed = build()
+        resumed.load_state_dict({"last_epoch": scheduler.last_epoch})
+        for _ in range(2):
+            self.assertEqual(resumed.last_epoch, scheduler.last_epoch)
+            self.assertEqual(resumed._step_count, scheduler._step_count)
+            self.assertEqual(resumed.get_last_lr(), scheduler.get_last_lr())
+            self.assertEqual(
+                [group["lr"] for group in resumed_optimizer.param_groups],
+                [group["lr"] for group in optimizer.param_groups],
+            )
+            optimizer.step()
+            resumed_optimizer.step()
+            scheduler.step()
+            resumed.step()
+
     def test_constant_lr(self) -> None:
         params = [torch.tensor([1.0, 2.0])]
         opt = torch.optim.Adam(params, lr=0.01)
