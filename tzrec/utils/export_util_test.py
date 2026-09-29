@@ -2838,7 +2838,11 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
             self.assertFalse(restore.call_args.kwargs["load_dynamicemb"])
             if upload:
                 uploader_class.assert_called_once()
-                uploader.start.assert_called_once()
+                uploader.start.assert_called_once_with(
+                    total_records=sum(
+                        len(expected_dynamic[name][0]) for name in dynamic_names
+                    )
+                )
             else:
                 uploader_class.assert_not_called()
 

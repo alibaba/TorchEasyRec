@@ -72,10 +72,15 @@ class FeatureStoreExportUploader:
         self._closed = False
         self._error: Optional[FeatureStoreUploadError] = None
         self._uploaded_records = 0
+        self._total_records = 0
         self._last_progress_time = time.monotonic()
 
-    def start(self) -> None:
-        """Create or validate the remote view before reading checkpoint data."""
+    def start(self, total_records: int) -> None:
+        """Prepare the remote view and report the number of dynemb rows to upload.
+
+        Args:
+            total_records: Total native dynemb rows in the checkpoint export.
+        """
         if self._closed:
             raise RuntimeError("FeatureStoreExportUploader is already closed")
         if self._started:
@@ -86,6 +91,13 @@ class FeatureStoreExportUploader:
             self._writer._reset_view(suppress_errors=True)
             raise
         self._started = True
+        self._total_records = total_records
+        self._last_progress_time = time.monotonic()
+        logger.info(
+            "Dynemb upload to FeatureStore started: version=%s total_records=%s",
+            self._writer._settings.version,
+            self._total_records,
+        )
 
     def write(self, embedding_name: str, keys: np.ndarray, values: np.ndarray) -> None:
         """Upload one bounded chunk, waiting before its arrays can be released.
@@ -182,9 +194,14 @@ class FeatureStoreExportUploader:
                 now = time.monotonic()
                 if now - self._last_progress_time >= 30:
                     logger.info(
-                        "FeatureStore full export progress: version=%s records=%s",
+                        "Dynemb upload to FeatureStore progress: "
+                        "version=%s records=%s/%s progress=%.2f%%",
                         settings.version,
                         self._uploaded_records,
+                        self._total_records,
+                        100.0 * self._uploaded_records / self._total_records
+                        if self._total_records
+                        else 100.0,
                     )
                     self._last_progress_time = now
                 return
@@ -203,7 +220,7 @@ class FeatureStoreExportUploader:
                     )
                     raise self._error from exc
                 logger.warning(
-                    "FeatureStore full export window attempt %s/%s failed (%s); "
+                    "Dynemb upload to FeatureStore window attempt %s/%s failed (%s); "
                     "retrying after backoff",
                     attempt,
                     settings.max_retries,
@@ -225,9 +242,14 @@ class FeatureStoreExportUploader:
             self._window.clear()
             self._closed = True
             self._writer._reset_view(suppress_errors=not raise_on_error)
-        if raise_on_error:
+        if raise_on_error and self._started:
             logger.info(
-                "FeatureStore full export completed: version=%s records=%s",
+                "Dynemb upload to FeatureStore completed: "
+                "version=%s records=%s/%s progress=%.2f%%",
                 self._writer._settings.version,
                 self._uploaded_records,
+                self._total_records,
+                100.0 * self._uploaded_records / self._total_records
+                if self._total_records
+                else 100.0,
             )

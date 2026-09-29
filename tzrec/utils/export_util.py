@@ -2033,18 +2033,19 @@ def _export_dynamic_embedding_checkpoint(
             "dynamic embedding checkpoint is missing tables: "
             + ", ".join(sorted(missing_tables))
         )
+    total_records = sum(meta["shape"][0] for meta in dynamic_export[1].values())
     logger.info(
         "Streaming dynamic export: tables=%s rows=%s read_chunk_size_mb=%s "
         "feature_store_upload=%s",
         len(dynamic_export[1]),
-        sum(meta["shape"][0] for meta in dynamic_export[1].values()),
+        total_records,
         settings.read_chunk_size_mb,
         uploader is not None,
     )
 
     try:
         if uploader is not None:
-            uploader.start()
+            uploader.start(total_records=total_records)
         _restore_export_sparse_state(
             model, checkpoint_path, set(dimensions), set(dynamic_export[1])
         )
