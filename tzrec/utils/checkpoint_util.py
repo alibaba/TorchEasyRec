@@ -976,6 +976,7 @@ def restore_model(
     error_on_missing_keys: bool = False,
     dense_ema: Optional[DenseEMA] = None,
     use_dense_ema: bool = False,
+    load_dynamicemb: bool = True,
 ) -> None:
     """Restore model state.
 
@@ -989,6 +990,7 @@ def restore_model(
             them with a warning (which would leave them uninitialized).
         dense_ema: Dense EMA state to restore for continued training.
         use_dense_ema: Overlay Dense EMA parameters onto the restored model.
+        load_dynamicemb: Restore native dynamic tables from the checkpoint.
     """
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
@@ -1095,7 +1097,7 @@ def restore_model(
                 "using original model parameters."
             )
 
-    if has_dynamicemb:
+    if has_dynamicemb and load_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbLoad
 
         dynamicemb_path = os.path.join(checkpoint_dir, "dynamicemb")

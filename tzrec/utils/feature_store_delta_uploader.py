@@ -653,7 +653,13 @@ class FeatureStoreDeltaUploader:
                 }
             )
 
-    def _submit_one_batch(self, view: Any, batch: pa.RecordBatch, ts: int) -> int:
+    def _submit_one_batch(
+        self,
+        view: Any,
+        batch: pa.RecordBatch,
+        ts: int,
+        write_mode: str = FEATURE_STORE_WRITE_MODE,
+    ) -> int:
         """Validate, build, and submit one batch; return submitted rows (0 skip).
 
         Dispatches on upload_format: ARROW streams a columnar RecordBatch through
@@ -667,7 +673,7 @@ class FeatureStoreDeltaUploader:
             view.write_features_arrow(
                 batch=wire_batch,
                 version=self._settings.version,
-                write_mode=FEATURE_STORE_WRITE_MODE,
+                write_mode=write_mode,
                 ts=ts,
             )
         else:
@@ -678,7 +684,7 @@ class FeatureStoreDeltaUploader:
             view.write_features(
                 data=payload,
                 version=self._settings.version,
-                write_mode=FEATURE_STORE_WRITE_MODE,
+                write_mode=write_mode,
                 ts=ts,
             )
         return num_rows
