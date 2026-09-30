@@ -257,7 +257,16 @@ class GenRecIntegrationTest(unittest.TestCase):
         # served at the export precision, though the parameters train in FP32
         self.assertEqual(hf_config["dtype"], "bfloat16")
         self.assertEqual(hf_config["text_config"]["dtype"], "bfloat16")
-        self.assertNotIn("sid_space", hf_config)
+        # what serving needs to decode against the bundle the model was built on
+        self.assertEqual(
+            hf_config["sid_space"],
+            {
+                "codebook": _CODEBOOK,
+                "base_vocab_size": compiled.sid_space.base_vocab_size,
+                "token_format": "<|sid_{i}|>",
+                "bundle_uuid": _BUNDLE_UUID,
+            },
+        )
         from transformers import AutoTokenizer
 
         # the index builder derives the token base from the first SID token

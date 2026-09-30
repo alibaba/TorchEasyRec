@@ -293,7 +293,7 @@ class CompilePromptTest(unittest.TestCase):
     def test_manifest_mismatch_is_fatal(self) -> None:
         manifest = os.path.join(self.test_dir, "manifest.json")
         with open(manifest, "w") as f:
-            json.dump({"codebook": [8, 8, 8]}, f)
+            json.dump({"codebook": [8, 8, 8], "bundle_uuid": "b-1"}, f)
         cfg = self._config(prompt="History : {{hist}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
         cfg.sid_space.manifest_path = manifest
@@ -303,13 +303,36 @@ class CompilePromptTest(unittest.TestCase):
     def test_manifest_match_compiles(self) -> None:
         manifest = os.path.join(self.test_dir, "manifest.json")
         with open(manifest, "w") as f:
-            json.dump({"codebook": [4, 4, 4]}, f)
+            json.dump({"codebook": [4, 4, 4], "bundle_uuid": "b-1"}, f)
         cfg = self._config(prompt="History : {{hist}}")
         cfg.sid_space.codebook.extend([4, 4, 4])
         cfg.sid_space.manifest_path = manifest
+        space = self._compile(cfg, [_feature(_HIST)]).sid_space
+        self.assertEqual(space.num_levels, 3)
+        # the bundle the codebook was checked against, for serving to check too
+        self.assertEqual(space.bundle_uuid, "b-1")
+
+    def test_manifest_without_bundle_uuid_is_fatal(self) -> None:
+        manifest = os.path.join(self.test_dir, "manifest.json")
+        for extra in ({}, {"bundle_uuid": None}, {"bundle_uuid": ""}):
+            with open(manifest, "w") as f:
+                json.dump({"codebook": [4, 4, 4], **extra}, f)
+            cfg = self._config(prompt="History : {{hist}}")
+            cfg.sid_space.codebook.extend([4, 4, 4])
+            cfg.sid_space.manifest_path = manifest
+            with self.assertRaisesRegex(ValueError, "has no bundle_uuid"):
+                self._compile(cfg, [_feature(_HIST)])
+
+    def test_sid_space_records_how_it_was_rendered(self) -> None:
+        cfg = self._config(prompt="History : {{hist}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        compiled = self._compile(cfg, [_feature(_HIST)])
+        space = compiled.sid_space
+        self.assertIsNone(space.bundle_uuid)
+        # token_format names the tokens that start at base_vocab_size
         self.assertEqual(
-            self._compile(cfg, [_feature(_HIST)]).sid_space.num_levels,
-            3,
+            compiled.tokenizer.token_to_id(space.token_format.replace("{i}", "0")),
+            space.base_vocab_size,
         )
 
     def test_rejects_a_mixed_kind_slot(self) -> None:
@@ -441,6 +464,8 @@ class CompilePromptTest(unittest.TestCase):
 
         space = compiled.sid_space
         self.assertEqual(space.band_hi[-1] - space.band_lo[0] + 1, 12)
+        # what the export records must name the tokens actually rendered
+        self.assertEqual(space.token_format, "C{i}")
 
     def test_missing_response_is_rejected(self) -> None:
         # no response collapses the window to one ignored position: nan loss
