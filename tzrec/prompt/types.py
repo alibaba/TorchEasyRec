@@ -87,8 +87,8 @@ class ResolvedSidSpace:
         eos_token_id: end-of-sequence id of the extended tokenizer.
         pad_token_id: padding id of the extended tokenizer.
         token_format: how the SID tokens were named, ``{i}`` the flat index.
-        bundle_uuid: the SID bundle the codebook was checked against
-            (``sid_space.manifest_path``), None when none was named.
+        bundle_uuid: the SID bundle ``sid_space.manifest_path`` names, None
+            when no manifest was named.
     """
 
     codebook: Tuple[int, ...]

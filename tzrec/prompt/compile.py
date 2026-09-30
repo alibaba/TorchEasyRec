@@ -254,6 +254,13 @@ def _build_sid_space(
                 f"[{space.manifest_path}] which describes {declared}. The data "
                 f"and the decode bands would disagree."
             )
+        # the export records it for serving to tell this bundle from one whose
+        # SIDs mean other items; a manifest resolve_sid_collisions wrote has one
+        if not isinstance(bundle_uuid, str) or not bundle_uuid:
+            raise ValueError(
+                f"the manifest at [{space.manifest_path}] has no bundle_uuid; a "
+                f"SID bundle manifest carries one, and serving checks it."
+            )
 
     sid_tokens = _render_sid_tokens(space)
     existing_sid_tokens = [

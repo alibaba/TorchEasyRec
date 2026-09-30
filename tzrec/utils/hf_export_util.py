@@ -124,6 +124,12 @@ def sid_space_config(space: ResolvedSidSpace) -> Dict[str, Any]:
     the levels, and ``bundle_uuid`` -- present when the prompt named a manifest
     -- is the bundle the model was compiled against, so an engine can refuse a
     bundle whose SIDs mean other items.
+
+    Args:
+        space: the resolved SID space the model was compiled with.
+
+    Returns:
+        dict: the ``sid_space`` block of the exported ``config.json``.
     """
     config: Dict[str, Any] = {
         "codebook": list(space.codebook),
