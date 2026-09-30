@@ -58,6 +58,8 @@ def _sid_space(codebook=_CODEBOOK) -> ResolvedSidSpace:
         sentinel_token_id=_SENTINEL,
         eos_token_id=2,
         pad_token_id=3,
+        token_format="<|sid_{i}|>",
+        bundle_uuid=None,
     )
 
 

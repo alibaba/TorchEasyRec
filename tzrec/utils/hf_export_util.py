@@ -22,7 +22,7 @@ from safetensors.torch import save_file
 from transformers import GenerationConfig, PretrainedConfig
 
 from tzrec.prompt.compile import save_tokenizer_dir
-from tzrec.prompt.types import CompiledPrompt
+from tzrec.prompt.types import CompiledPrompt, ResolvedSidSpace
 from tzrec.utils.filesystem_util import url_to_fs
 
 SERVING_ARCH = "GenRecForCausalLM"
@@ -116,6 +116,25 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str, config: PretrainedConfig) -> None:
     save_file(mapped, os.path.join(out_dir, "model.safetensors"))
 
 
+def sid_space_config(space: ResolvedSidSpace) -> Dict[str, Any]:
+    """What a serving engine needs to decode against a SID bundle.
+
+    A bundle stores each SID as offset codes (``level_offsets[l] + code``); the
+    model generates token ids ``base_vocab_size + offset``. The codebook gives
+    the levels, and ``bundle_uuid`` -- present when the prompt named a manifest
+    -- is the bundle the model was compiled against, so an engine can refuse a
+    bundle whose SIDs mean other items.
+    """
+    config: Dict[str, Any] = {
+        "codebook": list(space.codebook),
+        "base_vocab_size": space.base_vocab_size,
+        "token_format": space.token_format,
+    }
+    if space.bundle_uuid is not None:
+        config["bundle_uuid"] = space.bundle_uuid
+    return config
+
+
 def export_hf_assets(
     checkpoint_path: str,
     export_dir: str,
@@ -155,6 +174,7 @@ def export_hf_assets(
             "text_config": backbone,
             "eos_token_id": compiled_prompt.sid_space.eos_token_id,
             "pad_token_id": compiled_prompt.sid_space.pad_token_id,
+            "sid_space": sid_space_config(compiled_prompt.sid_space),
         }
         # a runtime that reads only the outer config still needs to size its cache
         for key in ("vocab_size", "hidden_size", "num_hidden_layers", "dtype"):
