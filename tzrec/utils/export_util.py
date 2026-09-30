@@ -70,6 +70,8 @@ from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util, env_util, npz_util, quant_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
+from tzrec.utils.dynamic_embedding_export import get_dynamic_embedding_export
+from tzrec.utils.feature_store_export_uploader import FeatureStoreExportUploader
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     UNTRACEABLE_MODULES,
@@ -154,6 +156,12 @@ def export_model(
 
     use_rtp = env_util.use_rtp()
     use_dist_embedding = acc_utils.use_distributed_embedding()
+    if pipeline_config.export_config.HasField("dynamic_embedding_export_config"):
+        if use_rtp or not use_dist_embedding:
+            raise ValueError(
+                "dynamic_embedding_export_config requires "
+                "USE_DISTRIBUTED_EMBEDDING=1 and a non-RTP export"
+            )
     if use_rtp:
         impl = export_rtp_model
     elif use_dist_embedding:
@@ -1599,6 +1607,30 @@ def export_distributed_embedding(
     if not _prepare_single_rank_distributed_embedding_export():
         return
 
+    table_to_embedding_bag_info, table_to_embedding_info = (
+        _get_sparse_table_to_embedding_info(model)
+    )
+    has_dynamic_tables = any(
+        getattr(info, "use_dynamicemb", False)
+        for info in list(table_to_embedding_bag_info.values())
+        + list(table_to_embedding_info.values())
+    )
+    if checkpoint_path and (
+        os.path.isdir(os.path.join(checkpoint_path, "dynamicemb"))
+        or pipeline_config.export_config.HasField("dynamic_embedding_export_config")
+        or has_dynamic_tables
+    ):
+        _export_dynamic_embedding_checkpoint(
+            pipeline_config,
+            model,
+            checkpoint_path,
+            save_dir,
+            assets,
+            additional_export_config,
+            data_input_path,
+        )
+        return
+
     device, _ = init_process_group()
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -1616,10 +1648,6 @@ def export_distributed_embedding(
     sparse_quant_format = acc_utils.distributed_sparse_quant_format()
     if sparse_quant_format:
         logger.info(f"distributed sparse quant export enabled: {sparse_quant_format}")
-
-    table_to_embedding_bag_info, table_to_embedding_info = (
-        _get_sparse_table_to_embedding_info(model)
-    )
 
     # make dataparser to get user feats before create model
     data_config = copy.deepcopy(pipeline_config.data_config)
@@ -1886,6 +1914,211 @@ def export_distributed_embedding(
             json.dump(merged_emb_json, f, indent=4)
 
 
+def _restore_export_sparse_state(
+    model: nn.Module,
+    checkpoint_path: str,
+    table_names: Set[str],
+    dynamic_names: Set[str],
+) -> None:
+    """Restore ordinary sparse weights and ZCH buffers on CPU for export.
+
+    Dynamic table weights remain on meta; their checkpoint files are consumed
+    separately by the streaming writer. Ordinary sparse and ZCH state retain
+    their existing in-memory export behavior.
+    """
+    mch_prefixes = tuple(
+        f"{name}."
+        for name, module in model.named_modules()
+        if isinstance(module, MCHManagedCollisionModule)
+    )
+    sparse_state = {}
+    for name, value in model.state_dict().items():
+        table_name = (
+            checkpoint_util.remap_input_tile_user_key(name[: -len(".weight")])
+            if name.endswith(".weight")
+            else ""
+        )
+        is_weight = table_name in table_names and table_name not in dynamic_names
+        is_mch_buffer = name.startswith(mch_prefixes) and not name.endswith(
+            "._output_segments_tensor"
+        )
+        if is_weight or is_mch_buffer:
+            sparse_state[name] = torch.empty_like(value, device="cpu")
+    if not sparse_state:
+        return
+    planner = checkpoint_util.PartialLoadPlanner()
+    checkpoint_util.load(
+        sparse_state,
+        checkpoint_id=os.path.join(checkpoint_path, "model"),
+        planner=planner,
+    )
+    if planner.skipped_keys:
+        raise RuntimeError(
+            "sparse export checkpoint is missing states: "
+            + ", ".join(sorted(planner.skipped_keys))
+        )
+    for name, value in sparse_state.items():
+        module_path, _, state_name = name.rpartition(".")
+        module = model.get_submodule(module_path)
+        if state_name in module._parameters:
+            parameter = cast(nn.Parameter, module._parameters[state_name])
+            module._parameters[state_name] = nn.Parameter(
+                value, requires_grad=parameter.requires_grad
+            )
+        else:
+            module._buffers[state_name] = value
+    for module in model.modules():
+        if isinstance(module, MCHManagedCollisionModule):
+            for metadata_name in module._mch_metadata:
+                module._mch_metadata[metadata_name] = module._buffers[
+                    f"_mch_{metadata_name}"
+                ]
+
+
+def _export_dynamic_embedding_checkpoint(
+    pipeline_config: EasyRecConfig,
+    model: BaseModule,
+    checkpoint_path: str,
+    save_dir: str,
+    assets: Optional[List[str]],
+    additional_export_config: Optional[Dict[str, Union[bool, str]]],
+    data_input_path: Optional[str],
+) -> None:
+    """Export dense and sparse artifacts without loading native dynamic tables.
+
+    All checkpoint shard sizes are checked before output starts. Each values
+    chunk is shared by the NPZ writer and the bounded full-upload writer. The
+    final sparse metadata is written only after both outputs complete.
+    """
+    settings = pipeline_config.export_config.dynamic_embedding_export_config
+    if settings.read_chunk_size_mb <= 0:
+        raise ValueError(
+            "dynamic_embedding_export_config.read_chunk_size_mb must be > 0"
+        )
+    if settings.upload_max_in_flight_batches <= 0:
+        raise ValueError(
+            "dynamic_embedding_export_config.upload_max_in_flight_batches must be > 0"
+        )
+    bag_infos, embedding_infos = _get_sparse_table_to_embedding_info(model)
+    infos = {**bag_infos, **embedding_infos}
+    dimensions = {
+        checkpoint_util.remap_input_tile_user_key(name): info.embedding_dim
+        for name, info in infos.items()
+    }
+    expected_dynamic = {
+        checkpoint_util.remap_input_tile_user_key(name)
+        for name, info in infos.items()
+        if getattr(info, "use_dynamicemb", False)
+    }
+    uploader = None
+    if settings.HasField("feature_store_config"):
+        uploader = FeatureStoreExportUploader(
+            settings.feature_store_config,
+            dimensions,
+            embedding_field_type="ARRAY<UINT8>"
+            if acc_utils.distributed_sparse_quant_format()
+            else "ARRAY<FLOAT>",
+            max_in_flight_batches=settings.upload_max_in_flight_batches,
+        )
+    dynamic_export = get_dynamic_embedding_export(
+        checkpoint_path,
+        dimensions,
+        read_chunk_bytes=int(settings.read_chunk_size_mb) * 1024 * 1024,
+        quant_format=acc_utils.distributed_sparse_quant_format(),
+        on_values=uploader.write if uploader is not None else None,
+    )
+    missing_tables = expected_dynamic - dynamic_export[1].keys()
+    if missing_tables:
+        raise ValueError(
+            "dynamic embedding checkpoint is missing tables: "
+            + ", ".join(sorted(missing_tables))
+        )
+    total_records = sum(meta["shape"][0] for meta in dynamic_export[1].values())
+    logger.info(
+        "Streaming dynamic export: tables=%s rows=%s read_chunk_size_mb=%s "
+        "feature_store_upload=%s",
+        len(dynamic_export[1]),
+        total_records,
+        settings.read_chunk_size_mb,
+        uploader is not None,
+    )
+
+    try:
+        if uploader is not None:
+            uploader.start(total_records=total_records)
+        _restore_export_sparse_state(
+            model, checkpoint_path, set(dimensions), set(dynamic_export[1])
+        )
+        sparse_arrays, dynamic_arrays, embedding_meta, feature_meta = (
+            _get_sparse_embedding_tensor(
+                model,
+                checkpoint_path,
+                embedding_infos,
+                bag_infos,
+                dynamic_export=dynamic_export,
+            )
+        )
+        dense_device = torch.device("cpu")
+        if pipeline_config.model_config.kernel != model_pb2.PYTORCH:
+            if not torch.cuda.is_available():
+                raise RuntimeError("TRITON/CUTLASS dense export requires a CUDA device")
+            dense_device = torch.device("cuda:0")
+            torch.cuda.set_device(dense_device)
+        _export_dense_model_on_device(
+            pipeline_config,
+            model,
+            checkpoint_path,
+            save_dir,
+            dense_device,
+            data_input_path=data_input_path,
+        )
+        sparse_dir = os.path.join(save_dir, "sparse")
+        os.makedirs(sparse_dir, exist_ok=True)
+        npz_util.savez_streaming(
+            os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"), sparse_arrays
+        )
+        if dynamic_arrays:
+            npz_util.savez_streaming(
+                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz"),
+                dynamic_arrays,
+            )
+        if uploader is not None:
+            uploader.close()
+    except BaseException:
+        if uploader is not None:
+            uploader.close(raise_on_error=False)
+        raise
+
+    for name in ("sparse_embeddings-00-of-01.json", "sparse_embedding.json"):
+        with open(os.path.join(sparse_dir, name), "w") as output:
+            json.dump(embedding_meta, output, indent=4)
+    with open(os.path.join(sparse_dir, "sparse_features.json"), "w") as output:
+        json.dump(feature_meta, output, indent=4)
+
+    features = cast(List[BaseFeature], model.features)
+    feature_configs = create_feature_configs(features, asset_dir=save_dir)
+    export_config = copy.deepcopy(pipeline_config)
+    export_config.ClearField("feature_configs")
+    export_config.feature_configs.extend(feature_configs)
+    config_util.save_message(export_config, os.path.join(save_dir, "pipeline.config"))
+    with open(os.path.join(save_dir, "model_acc.json"), "w") as output:
+        json.dump(
+            acc_utils.export_acc_config(
+                additional_export_config=additional_export_config
+            ),
+            output,
+            indent=4,
+        )
+    has_fg_asset = False
+    for asset in assets or []:
+        has_fg_asset = has_fg_asset or asset.endswith("fg.json")
+        shutil.copy(asset, save_dir)
+    if not has_fg_asset:
+        with open(os.path.join(save_dir, "fg.json"), "w") as output:
+            json.dump(create_fg_json(features, asset_dir=save_dir), output, indent=4)
+    logger.info("Completed streaming dynamic embedding export to %s", save_dir)
+
+
 class _SparseMarkCapture(Interpreter):
     """FX interpreter that records fx-marked sparse group outputs."""
 
@@ -2117,13 +2350,14 @@ def build_dense_graph_module(
     # submodules from concrete tensor shapes on their first forward; during
     # FX trace those shapes become Proxy objects and cannot construct
     # Parameters.
-    logger.info("running pre-trace warm-up for CPU dense export...")
+    logger.info("running pre-trace warm-up for dense export on %s...", device)
     # Shrink sparse tables to 1 row before materialization: their values are
     # never used by the dense graph (pruned after surgery), and full-size
     # dynamicemb / zch tables can OOM the host before the pruning runs.
     _shrink_sparse_embedding_tables(model)
     # Materialize meta params; real weights are loaded by the caller.
     init_parameters(model, device)
+    model.to(device)
     with torch.no_grad():
         model(data, device=device)
 
@@ -2133,7 +2367,7 @@ def build_dense_graph_module(
     tracer = Tracer(leaf_modules=leaf_modules)
     full_graph = tracer.trace(model)
 
-    logger.info("collecting sparse attrs statically for CPU dense export...")
+    logger.info("collecting sparse attrs statically for dense export...")
     sparse_attrs = {}
     for node in list(full_graph.nodes):
         if node.op != "call_function" or node.target != fx_mark_keyed_tensor:
@@ -2167,13 +2401,13 @@ def build_dense_graph_module(
             or _is_fx_node(length_per_key)
         ):
             raise RuntimeError(
-                "CPU dense export cannot statically infer KeyedTensor attrs "
+                "Dense export cannot statically infer KeyedTensor attrs "
                 f"for feature group [{name}]."
             )
         sparse_attrs[name + "__keys"] = keys
         sparse_attrs[name + "__length_per_key"] = length_per_key
 
-    logger.info("exporting dense model on CPU...")
+    logger.info("exporting dense model on %s...", device)
     gm, dense_graph_config = _rewrite_dense_serving_graph(
         full_graph, model, sparse_attrs, device
     )
@@ -2263,7 +2497,25 @@ def export_dense_model_cpu(
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
-    device = torch.device("cpu")
+    _export_dense_model_on_device(
+        pipeline_config,
+        model,
+        checkpoint_path,
+        save_dir,
+        torch.device("cpu"),
+        data_input_path,
+    )
+
+
+def _export_dense_model_on_device(
+    pipeline_config: EasyRecConfig,
+    model: BaseModule,
+    checkpoint_path: str,
+    save_dir: str,
+    device: torch.device,
+    data_input_path: Optional[str] = None,
+) -> None:
+    """Build and restore a dense graph on the device its configured kernels need."""
     data = create_dense_export_warmup_data(
         pipeline_config, model, device, data_input_path
     )
@@ -2276,6 +2528,7 @@ def export_dense_model_cpu(
             pipeline_config.export_config,
             pipeline_config.train_config,
         ),
+        load_dynamicemb=False,
     )
     finalize_dense_export(
         model, full_graph, gm, data, device, save_dir, dense_graph_config
@@ -2394,16 +2647,6 @@ def _get_sparse_table_to_embedding_info(
     return table_to_embedding_bag_info, table_to_embedding_info
 
 
-def _dynamic_sparse_module_fqn(dynamicemb_path: str, key_file: str) -> str:
-    """Build a normalized module FQN from a dynamic checkpoint shard path."""
-    module_fqn = os.path.relpath(os.path.dirname(key_file), dynamicemb_path).replace(
-        os.path.sep, "."
-    )
-    if module_fqn.startswith("model.model."):
-        module_fqn = module_fqn[len("model.") :]
-    return module_fqn
-
-
 def _remove_torch_prefix(src: str) -> str:
     prefix = "torch."
     if src.startswith(prefix):
@@ -2516,7 +2759,7 @@ def _zch_table_to_dynamic(
         emb_name: export table name, for error messages.
 
     Returns:
-        keys: raw ids, ascending.
+        keys: raw ids in the module's stored order.
         values: embedding row per key.
         scores: eviction score per key, zero when no eviction metadata is kept.
         default_value: single embedding row served for any other key.
@@ -2571,9 +2814,12 @@ def _get_sparse_embedding_tensor(
     checkpoint_path: str,
     embedding_infos: Dict[str, BaseEmbeddingConfig],
     embedding_bag_info: Dict[str, BaseEmbeddingConfig],
+    dynamic_export: Optional[
+        Tuple[Dict[str, npz_util.StreamingArray], Dict[str, Dict[str, Any]]]
+    ] = None,
 ) -> Tuple[
-    Dict[str, torch.Tensor],
-    Dict[str, torch.Tensor],
+    Dict[str, Any],
+    Dict[str, Any],
     Dict[str, Any],
     Dict[str, Any],
 ]:
@@ -2581,9 +2827,8 @@ def _get_sparse_embedding_tensor(
 
     Returns:
         out: regular sparse embedding tensors keyed by table FQN.
-        dynamic_out: dynamicemb and zch keys/values/scores keyed by composite
-            names, plus a default value entry per zch table. Empty if no
-            dynamic embedding table exists.
+        dynamic_out: streaming dynamic checkpoint arrays and in-memory ZCH
+            keys/values/scores, plus a default value entry per ZCH table.
         emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
         feat_meta: feature -> embedding_name / pooling mapping.
     """
@@ -2616,8 +2861,17 @@ def _get_sparse_embedding_tensor(
             feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[-1]
 
     out: Dict[str, Any] = {}
-    # dynamicemb keys/values are saved into a separate npz, kept in this dict.
     dynamic_out: Dict[str, Any] = {}
+    if dynamic_export is None:
+        dynamic_export = get_dynamic_embedding_export(
+            checkpoint_path,
+            emb_name_to_emb_dim,
+            read_chunk_bytes=64 * 1024 * 1024,
+            quant_format=acc_utils.distributed_sparse_quant_format(),
+            rank=int(os.environ.get("RANK", 0)),
+            world_size=int(os.environ.get("WORLD_SIZE", 1)),
+        )
+    checkpoint_arrays, checkpoint_meta = dynamic_export
 
     # per-table export metadata (logical shape/dtype plus optional storage info).
     emb_name_to_export_meta: Dict[str, Any] = {}
@@ -2632,7 +2886,6 @@ def _get_sparse_embedding_tensor(
     # have no such row, so this entry is optional.
     dynamic_default_value_names: Dict[str, List[str]] = defaultdict(list)
     rank = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
     zch_tables: Dict[str, MCHManagedCollisionModule] = _get_zch_export_tables(
         model, emb_name_to_emb_dim
     )
@@ -2692,6 +2945,8 @@ def _get_sparse_embedding_tensor(
         # head, which the sparse export does not carry
         if export_emb_name not in emb_name_to_emb_dim:
             continue
+        if export_emb_name in checkpoint_meta:
+            continue
         state_values_by_emb[export_emb_name] = values
 
     for export_emb_name, values in state_values_by_emb.items():
@@ -2721,116 +2976,13 @@ def _get_sparse_embedding_tensor(
             _add_sparse_table(export_emb_name, values, 0)
             # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
-    dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
-    if os.path.exists(dynamicemb_path):
-        key_files = sorted(
-            glob.glob(os.path.join(dynamicemb_path, "*/*_emb_keys.rank_*.world_size_*"))
-        )
-        key_files = _dedup_key_files_by_realpath(key_files)
-        key_pattern = re.compile(
-            r"^(?P<emb_name>.+)_emb_keys\.rank_(?P<idx>\d+)\.world_size_(?P<num_shards>\d+)$"
-        )
-        key_files_by_emb = defaultdict(list)
-        for key_file in key_files:
-            path_parts = key_file.split(os.path.sep)
-            match = key_pattern.match(path_parts[-1])
-            if not match:
-                continue
-            emb_name = match.group("emb_name")
-            module_fqn = _dynamic_sparse_module_fqn(dynamicemb_path, key_file)
-            table_candidates = [
-                f"{module_fqn}.embedding_bags.{emb_name}",
-                f"{module_fqn}.embeddings.{emb_name}",
-            ]
-            export_emb_name = next(
-                table_fqn
-                for table_fqn in map(
-                    checkpoint_util.remap_input_tile_user_key, table_candidates
-                )
-                if table_fqn in emb_name_to_emb_dim
-            )
-            ckpt_rank = int(match.group("idx"))
-            ckpt_world_size = int(match.group("num_shards"))
-            key_files_by_emb[export_emb_name].append(
-                (emb_name, ckpt_rank, ckpt_world_size, key_file)
-            )
-
-        for emb_name, emb_key_files in key_files_by_emb.items():
-            emb_dim = emb_name_to_emb_dim[emb_name]
-            key_name = f"{emb_name}.keys"
-            value_name = f"{emb_name}.values"
-            score_name = f"{emb_name}.scores"
-            keys_list = []
-            values_list = []
-            scores_list = []
-            ckpt_world_sizes = {x[2] for x in emb_key_files}
-            if len(ckpt_world_sizes) > 1:
-                raise ValueError(
-                    f"dynamic embedding {emb_name} has inconsistent checkpoint "
-                    f"world_size values: {sorted(ckpt_world_sizes)}"
-                )
-            for ckpt_emb_name, ckpt_rank, ckpt_world_size, key_file in sorted(
-                emb_key_files
-            ):
-                if ckpt_rank % world_size != rank:
-                    continue
-                with open(key_file, "rb") as f:
-                    keys = torch.tensor(
-                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
-                    )
-                value_file = os.path.join(
-                    os.path.dirname(key_file),
-                    f"{ckpt_emb_name}_emb_values.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
-                )
-                with open(value_file, "rb") as f:
-                    values = torch.tensor(
-                        np.fromfile(f, dtype=np.float32), dtype=torch.float32
-                    )
-                score_file = os.path.join(
-                    os.path.dirname(key_file),
-                    f"{ckpt_emb_name}_emb_scores.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
-                )
-                if not os.path.exists(score_file):
-                    raise FileNotFoundError(
-                        f"dynamic embedding {emb_name} score file not found: "
-                        f"{score_file}"
-                    )
-                with open(score_file, "rb") as f:
-                    scores = torch.tensor(
-                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
-                    )
-                if keys.numel() != scores.numel():
-                    raise ValueError(
-                        f"dynamic embedding {emb_name} key/score row mismatch: "
-                        f"keys={keys.numel()}, scores={scores.numel()}, "
-                        f"key_file={key_file}, score_file={score_file}"
-                    )
-                if values.numel() != keys.numel() * emb_dim:
-                    raise ValueError(
-                        f"dynamic embedding {emb_name} value row mismatch: "
-                        f"keys={keys.numel()}, value_elements={values.numel()}, "
-                        f"embedding_dim={emb_dim}"
-                    )
-                keys_list.append(keys)
-                values_list.append(values.view([-1, emb_dim]))
-                scores_list.append(scores)
-
-            if not keys_list:
-                continue
-            keys = torch.cat(keys_list)
-            values_2d = torch.cat(values_list, dim=0)
-            scores = torch.cat(scores_list)
-            export_values, export_meta = _prepare_sparse_export_values(
-                values_2d, emb_dim, emb_name
-            )
-            dynamic_out[key_name] = keys
-            dynamic_out[value_name] = export_values
-            dynamic_out[score_name] = scores
-            emb_name_to_export_meta[emb_name] = export_meta
-            dynamic_emb_names.add(emb_name)
-            dynamic_key_names[emb_name].append(key_name)
-            dynamic_value_names[emb_name].append(value_name)
-            dynamic_score_names[emb_name].append(score_name)
+    dynamic_out.update(checkpoint_arrays)
+    for emb_name, export_meta in checkpoint_meta.items():
+        emb_name_to_export_meta[emb_name] = export_meta
+        dynamic_emb_names.add(emb_name)
+        dynamic_key_names[emb_name].append(export_meta["key_name"])
+        dynamic_value_names[emb_name].append(export_meta["value_name"])
+        dynamic_score_names[emb_name].append(export_meta["score_name"])
 
     emb_meta = {}
     for emb_name, feat_name_impl_list in emb_name_to_feat_name_impl.items():
