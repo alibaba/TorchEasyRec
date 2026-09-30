@@ -48,6 +48,23 @@ class _TrainWrapper(nn.Module):
         self.model = model
 
 
+def _space(bundle_uuid):
+    return ResolvedSidSpace(
+        codebook=(4, 4, 4),
+        num_levels=3,
+        base_vocab_size=1000,
+        level_offsets=(0, 4, 8),
+        band_lo=(1000, 1004, 1008),
+        band_hi=(1003, 1007, 1011),
+        target_vocab_size=1152,
+        sentinel_token_id=None,
+        eos_token_id=2,
+        pad_token_id=3,
+        token_format="<|sid_{i}|>",
+        bundle_uuid=bundle_uuid,
+    )
+
+
 class HfExportUtilTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
@@ -161,26 +178,7 @@ class HfExportUtilTest(unittest.TestCase):
                 empty, os.path.join(self.test_dir, "hf_out_missing"), _tied_lm().config
             )
 
-
-def _space(bundle_uuid):
-    return ResolvedSidSpace(
-        codebook=(4, 4, 4),
-        num_levels=3,
-        base_vocab_size=1000,
-        level_offsets=(0, 4, 8),
-        band_lo=(1000, 1004, 1008),
-        band_hi=(1003, 1007, 1011),
-        target_vocab_size=1152,
-        sentinel_token_id=None,
-        eos_token_id=2,
-        pad_token_id=3,
-        token_format="<|sid_{i}|>",
-        bundle_uuid=bundle_uuid,
-    )
-
-
-class SidSpaceConfigTest(unittest.TestCase):
-    def test_carries_what_decoding_a_bundle_needs(self) -> None:
+    def test_sid_space_config_carries_what_decoding_a_bundle_needs(self) -> None:
         self.assertEqual(
             sid_space_config(_space("b-1")),
             {
@@ -191,10 +189,10 @@ class SidSpaceConfigTest(unittest.TestCase):
             },
         )
 
-    def test_omits_the_bundle_when_none_was_named(self) -> None:
+    def test_sid_space_config_omits_the_bundle_when_none_was_named(self) -> None:
         self.assertNotIn("bundle_uuid", sid_space_config(_space(None)))
 
-    def test_is_json_serializable(self) -> None:
+    def test_sid_space_config_is_json_serializable(self) -> None:
         json.loads(json.dumps(sid_space_config(_space("b-1"))))
 
 
