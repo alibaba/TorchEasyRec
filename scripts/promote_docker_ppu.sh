@@ -9,7 +9,7 @@ REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 SRC_REPO=tzrec-test
 DST_REPO=tzrec-devel
 DOCKER_TAG=1.4
-DOCKER_TAG_SUFFIX=
+DOCKER_TAG_SUFFIX=-u1
 
 docker pull ${REGISTRY}/${SRC_REPO}:${DOCKER_TAG}-ppu${DOCKER_TAG_SUFFIX}
 docker tag ${REGISTRY}/${SRC_REPO}:${DOCKER_TAG}-ppu${DOCKER_TAG_SUFFIX} ${REGISTRY}/${DST_REPO}:${DOCKER_TAG}-ppu
