@@ -6,9 +6,9 @@ set -eo pipefail
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 REPO_NAME=tzrec-test
-DOCKER_TAG=1.2
-DOCKER_TAG_SUFFIX=-u1
-BASE_IMAGE=pkg.flytiger-eco.com/docker_release/ppu:v2.1.1-cuda13.0-ubuntu24-py312
+DOCKER_TAG=1.4
+DOCKER_TAG_SUFFIX=
+BASE_IMAGE=pkg.flytiger-eco.com/docker_release/ppu:sdk2.2.0-cuda13.0-ubuntu24-py312-20261001
 PPU_PIP_INDEX=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
 
 rm -rf docker/requirements*
