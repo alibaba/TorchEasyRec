@@ -3,7 +3,6 @@ name: Unit Test PPU CI
 on:
   pull_request:
     types: [opened, reopened, synchronize]
-    branches: ['release/**']
   workflow_dispatch:
 
 concurrency:
@@ -44,7 +43,7 @@ jobs:
             -v "$WORK_ROOT/_temp/_github_home":/github/home \
             -v "$WORK_ROOT/_temp/_github_workflow":/github/workflow \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.4-ppu \
-            bash -c 'mkdir -p /__w/TorchEasyRec/tzrec-ci-cache/triton /__w/TorchEasyRec/tzrec-ci-cache/inductor && cd run_${{ github.run_id }} && bash scripts/ci/ci_test_ppu.sh'
+            bash -c 'mkdir -p /__w/TorchEasyRec/tzrec-ci-cache/triton /__w/TorchEasyRec/tzrec-ci-cache/inductor && cd run_${{ github.run_id }} && bash scripts/ci/ci_test_ppu.sh --scope gpu'
       - name: StopDockerContainer
         if: always()
         run: |
