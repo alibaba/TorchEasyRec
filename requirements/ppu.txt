@@ -1,0 +1,4 @@
+dynamicemb @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/ppu2.2.0-cu130/dynamicemb-0.1.0%2B20261008.9643985.ppu2.2.0.cu130-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
+faiss==1.14.3+v0.1.0.ppu2.2.0
+fbgemm_gpu_hstu @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/hstu/ppu2.2.0-cu130/fbgemm_gpu_hstu-0.1.0%2B20261008.fece651b.fn5.ppu2.2.0.cu130-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
+flash_attn==2.8.2+v0.2.0.ppu2.2.0

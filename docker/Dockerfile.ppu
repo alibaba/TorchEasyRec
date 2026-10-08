@@ -19,15 +19,10 @@ RUN mkdir -p /root/.config/pip && \
     printf '[global]\nindex-url = http://%s/pypi/simple\ntrusted-host = %s\ntimeout = 120\n' "${PIP_MIRROR}" "${PIP_MIRROR}" > /root/.config/pip/pip.conf
 
 ARG PPU_PIP_INDEX
-ARG PPU_WHEEL_URL=https://tzrec.oss-accelerate.aliyuncs.com/third_party
 RUN pip install torch==2.13.0 triton==3.7.0 -i ${PPU_PIP_INDEX} && \
-    pip install faiss==1.14.3 flash_attn==2.8.2 -i ${PPU_PIP_INDEX} && \
+    pip install fbgemm-gpu==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/ppu2.2.0-cu130/repo.html && \
     pip install torchmetrics==1.0.3 tensordict && \
-    pip install \
-        ${PPU_WHEEL_URL}/fbgemm_gpu/ppu2.2.0-cu130/fbgemm_gpu-1.8.0%2Bppu2.2.0.cu130-cp312-cp312-linux_x86_64.whl \
-        ${PPU_WHEEL_URL}/dynamicemb/ppu2.2.0-cu130/dynamicemb-0.1.0%2B20261008.9643985.ppu2.2.0.cu130-cp312-cp312-linux_x86_64.whl \
-        ${PPU_WHEEL_URL}/hstu/ppu2.2.0-cu130/fbgemm_gpu_hstu-0.1.0%2B20261008.fece651b.fn5.ppu2.2.0.cu130-cp312-cp312-linux_x86_64.whl && \
-    pip install torchrec==1.8.0 -f ${PPU_WHEEL_URL}/torchrec/repo.html && \
+    pip install torchrec==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
     pip cache purge
 
 ENV NVIDIA_VISIBLE_DEVICES all
@@ -35,9 +30,10 @@ ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
 
 ADD requirements /root/requirements
 ADD requirements.txt /root/requirements.txt
+ADD requirements-ppu.txt /root/requirements-ppu.txt
 RUN cd /root && \
-    pip install -r requirements.txt && \
-    rm -rf requirements requirements.txt && \
+    pip install -r requirements-ppu.txt --extra-index-url ${PPU_PIP_INDEX} && \
+    rm -rf requirements requirements.txt requirements-*.txt && \
     pip cache purge
 
 RUN mkdir -p /home/pai/bin && \
