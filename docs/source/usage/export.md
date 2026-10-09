@@ -15,6 +15,7 @@ export_config {
 - best_exporter_metric: 当exporter_type为best的时候，确定最优导出模型的metric，注意该metric要在对应任务的metrics设置了才行。对于多任务模型则需要设置 {metric_name}\_{tower_name}。
 - metric_larger_is_better: 确定最优导出模型的metric是越大越好，还是越小越好，默认是越大越好
 - use_dense_ema: 是否使用稠密EMA参数导出模型。未配置时默认跟随`train_config.dense_optimizer.ema`是否启用；可显式配置为`true`或`false`覆盖默认行为，在线Dense导出同样使用该配置
+- dynamic_embedding_export_config: 分布式 embedding 导出时的 dynemb 读取块大小和可选 FeatureDB 全量上传配置，详见下文 [dynemb 流式导出与 FeatureDB 全量上传](#dynamic-embedding-full-export)
 
 ## 导出命令
 
@@ -55,6 +56,75 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（sparse 部分用 JIT，dense 部分用 AOTI）
   - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]
+
+(dynamic-embedding-full-export)=
+
+## dynemb 流式导出与 FeatureDB 全量上传
+
+在 `USE_DISTRIBUTED_EMBEDDING=1` 下，dynemb 默认按块读取 checkpoint 并写入 NPZ，不需要将全部 dynemb 参数恢复到主机内存或显存。配置 `export_config.dynamic_embedding_export_config.feature_store_config` 后，同一批 dynemb 参数还会上传到 FeatureDB；不配置时只生成导出文件。该能力适用于原生 dynemb 参数。
+
+### 配置
+
+在 `pipeline.config` 中添加：
+
+```protobuf
+export_config {
+  dynamic_embedding_export_config {
+    read_chunk_size_mb: 64
+    upload_max_in_flight_batches: 4
+    feature_store_config {
+      region: "cn-beijing"
+      project_name: "recommendation"
+      feature_view_name: "model_embeddings"
+      version: "full_ckpt100000_run1"
+      upload_batch_size: 1000
+      max_retries: 3
+      retry_backoff_secs: 5
+      upload_format: "ARROW"
+    }
+  }
+}
+```
+
+| 配置项                         | 默认值 | 说明                                                               |
+| ------------------------------ | ------ | ------------------------------------------------------------------ |
+| `read_chunk_size_mb`           | `64`   | checkpoint 原始数据的读取块预算，单位 MiB，必须大于 0              |
+| `upload_max_in_flight_batches` | `4`    | 每个上传窗口最多包含的请求批次，必须大于 0；窗口完成前停止继续读取 |
+| `feature_store_config`         | 未设置 | 设置后同时上传 dynemb 到 FeatureDB，仍保留 NPZ                     |
+
+`feature_store_config` 复用 [FeatureStoreConfig](../proto.html#tzrec.protos.FeatureStoreConfig)：
+
+| 配置项               | 要求或默认值 | 导出时的含义                                                     |
+| -------------------- | ------------ | ---------------------------------------------------------------- |
+| `region`             | 必填         | FeatureStore 地域；显式为空时从 `ALIBABA_CLOUD_REGION` 获取      |
+| `project_name`       | 必填         | 已存在的 FeatureStore 项目                                       |
+| `feature_view_name`  | 必填         | DynamicEmbedding FeatureView；不存在时按配置创建                 |
+| `version`            | 必填         | 每次导出使用新的、尚未用于线上服务的版本，不能为 `default`       |
+| `upload_batch_size`  | `1000`       | 每个请求的最大行数，范围为 1 到 1000；同时受内部请求字节预算限制 |
+| `max_retries`        | `3`          | 当前窗口的总尝试次数，包含第一次；成功的历史窗口不会重传         |
+| `retry_backoff_secs` | `5`          | 重试退避基准秒数，等待时间随重试次数增加                         |
+| `upload_format`      | `ARROW`      | 推荐使用 Arrow；也支持 `JSON`                                    |
+
+`endpoint`、`test_mode` 及 FeatureView 的 TTL、分片、副本配置沿用既有含义。`max_pending_steps`、`poll_interval_secs` 和 `shutdown_timeout_secs` 用于训练增量上传，不参与全量导出的队列或超时控制；保持默认值即可，共用的配置校验仍要求它们大于 0。
+
+凭证沿用阿里云默认凭证链，以及运行环境中的 `FEATUREDB_USERNAME`、`FEATUREDB_PASSWORD`；不要将凭证写入 `pipeline.config`。
+
+### 执行导出
+
+从仓库根目录、依赖版本匹配的项目环境执行，显式指定一个已写入完成、导出期间不会再改变的 checkpoint，并使用新的导出目录：
+
+```bash
+PYTHONPATH=. USE_DISTRIBUTED_EMBEDDING=1 \
+torchrun --standalone --nnodes=1 --nproc-per-node=1 \
+    -m tzrec.export \
+    --pipeline_config_path /mnt/model/pipeline.config \
+    --checkpoint_path /mnt/model/model.ckpt-100000 \
+    --export_dir /mnt/model/export/full_ckpt100000_run1
+```
+
+使用一个导出进程即可读取所有训练 checkpoint shard，导出进程数不需要与训练卡数一致。TB 级产物建议写入有足够容量的挂载文件系统；当前通用 URI 导出入口仍会先写本地目录再上传，直接设置远端 URI 并不能消除本地磁盘暂存。
+
+未设置 `DIST_QUANT` 时，NPZ 和 FeatureDB 使用 FP32 values，FeatureView 类型必须为 `ARRAY<FLOAT>`。在命令前增加 `DIST_QUANT=INT8` 后，两处使用同一份 UINT8 行量化结果，包含每行 4 字节的 scale/offset；FeatureView 类型必须为 `ARRAY<UINT8>`，导出时会校验已存在的表类型。量化维度必须为偶数。
 
 (online-dense-export)=
 
