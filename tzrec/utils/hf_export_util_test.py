@@ -19,8 +19,9 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
+from tzrec.prompt.types import ResolvedSidSpace
 from tzrec.utils.checkpoint_util import save_model
-from tzrec.utils.hf_export_util import dcp_to_hf
+from tzrec.utils.hf_export_util import dcp_to_hf, sid_space_config
 from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 
 
@@ -45,6 +46,23 @@ class _TrainWrapper(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
+
+
+def _space(bundle_uuid):
+    return ResolvedSidSpace(
+        codebook=(4, 4, 4),
+        num_levels=3,
+        base_vocab_size=1000,
+        level_offsets=(0, 4, 8),
+        band_lo=(1000, 1004, 1008),
+        band_hi=(1003, 1007, 1011),
+        target_vocab_size=1152,
+        sentinel_token_id=None,
+        eos_token_id=2,
+        pad_token_id=3,
+        token_format="<|sid_{i}|>",
+        bundle_uuid=bundle_uuid,
+    )
 
 
 class HfExportUtilTest(unittest.TestCase):
@@ -159,6 +177,23 @@ class HfExportUtilTest(unittest.TestCase):
             dcp_to_hf(
                 empty, os.path.join(self.test_dir, "hf_out_missing"), _tied_lm().config
             )
+
+    def test_sid_space_config_carries_what_decoding_a_bundle_needs(self) -> None:
+        self.assertEqual(
+            sid_space_config(_space("b-1")),
+            {
+                "codebook": [4, 4, 4],
+                "base_vocab_size": 1000,
+                "token_format": "<|sid_{i}|>",
+                "bundle_uuid": "b-1",
+            },
+        )
+
+    def test_sid_space_config_omits_the_bundle_when_none_was_named(self) -> None:
+        self.assertNotIn("bundle_uuid", sid_space_config(_space(None)))
+
+    def test_sid_space_config_is_json_serializable(self) -> None:
+        json.loads(json.dumps(sid_space_config(_space("b-1"))))
 
 
 if __name__ == "__main__":
