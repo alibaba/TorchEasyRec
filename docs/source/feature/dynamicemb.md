@@ -2,11 +2,11 @@
 
 DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`hash_bucket_size`的方式能避免hash冲突，相比设置`vocab_dict`和`vocab_list`的方式能更灵活动态地进行id的准入和驱逐。DynamicEmbedding 常用于user id，item id，combo feature等超大id枚举数的特征配置中。DynamicEmbedding 相比 ZCH 能外接PS，支撑十亿百亿甚至更多的Id枚举数，Id准入和淘汰无需攒Batch，可以更加及时。
 
-cu126/cu129/cu130 镜像已预装 dynamicemb，其它环境需先安装如下whl包
+cu126/cu130 镜像已预装 dynamicemb，其它环境需先安装如下whl包
 
 ```bash
-# DEVICE 可选: cu126/cu129/cu130 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb==0.1.0+20260920.9643985.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
+# DEVICE 可选: cu126/cu130 (支持 Python 3.10/3.11/3.12)
+pip install dynamicemb==0.1.0+20261010.6b983fc.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
 ```
 
 支持配置 DynamicEmbedding 的特征类型为 `id_feature`、`combo_feature`、`lookup_feature`、`match_feature`、`regex_replace_feature`、`custom_feature`、`bool_mask_feature`，其余特征类型（如配置了 `boundaries` 的 `raw_feature`、`expr_feature`、`tokenize_feature`、`combine_feature`）暂不支持。
@@ -15,7 +15,7 @@ pip install dynamicemb==0.1.0+20260920.9643985.${DEVICE} -f https://tzrec.oss-ac
 
 注：配置了 DynamicEmbedding 的模型导出时需设置环境变量 `USE_DISTRIBUTED_EMBEDDING=1`，使用分布式 embedding 导出模式，详见[模型导出](../usage/export.md)的环境变量章节。
 
-注：DynamicEmbedding 表额外支持 `ftrl_optimizer`（普通 Embedding 表不支持），配置方式见[优化器](../models/optimizer.md)文档。
+注：DynamicEmbedding 表支持 `ftrl_optimizer`，配置方式见[优化器](../models/optimizer.md)文档。
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
 

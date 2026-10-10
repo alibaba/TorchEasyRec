@@ -1,1 +1,6 @@
 faiss-cpu
+fbgemm-gpu @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cpu/fbgemm_gpu-1.9.0%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl ; python_version=="3.10"
+fbgemm-gpu @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cpu/fbgemm_gpu-1.9.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl ; python_version=="3.11"
+fbgemm-gpu @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cpu/fbgemm_gpu-1.9.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl ; python_version=="3.12"
+torch==2.14.0
+torchrec @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/torchrec-1.9.0-py3-none-any.whl

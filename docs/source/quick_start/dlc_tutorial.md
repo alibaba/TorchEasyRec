@@ -33,7 +33,7 @@ pip index versions tzrec -f https://tzrec.oss-accelerate.aliyuncs.com/release/ni
 
 进入[PAI控制台](https://pai.console.aliyun.com)，并选择需要使用的工作空间，点击 **模型开发与训练-分布式训练(DLC)**，点击创建任务。
 
-**节点镜像** 选择官方镜像`torcheasyrec:1.4.0-pytorch2.13.0-gpu-py311-cu126-ubuntu22.04`
+**节点镜像** 选择官方镜像`torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu126-ubuntu22.04`
 
 **数据集配置** 选择刚新建的NAS数据集。如果选择的是OSS数据集，注意在高级配置中设置{"mountType":"ossfs"}，以使用ossfs方式进行挂载。
 
@@ -148,7 +148,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT --nnodes=$WORLD_S
     --security_group_id=${SG_ID} \
     --priority=1 \
     --workers=1 \
-    --worker_image=dsw-registry-vpc.{REGION}.cr.aliyuncs.com/pai/torcheasyrec:1.4.0-pytorch2.13.0-gpu-py311-cu126-ubuntu22.04 \
+    --worker_image=dsw-registry-vpc.{REGION}.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu126-ubuntu22.04 \
     --driver=535.161.08 \
     --worker_spec=ecs.gn6v-c10g1.20xlarge
 ```

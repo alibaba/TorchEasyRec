@@ -65,7 +65,7 @@ class TZRecOptimizerTest(unittest.TestCase):
 
 
 class SparseInitAccumulatorValueTest(unittest.TestCase):
-    """The apply_split_helper patch that fills FBGEMM's momentum1 state."""
+    """The apply_split_helper patch that fills FBGEMM's accumulator state."""
 
     _NUM_EMBEDDINGS = 16
     _EMBEDDING_DIM = 8
@@ -73,8 +73,8 @@ class SparseInitAccumulatorValueTest(unittest.TestCase):
     def tearDown(self):
         set_sparse_init_accumulator_value(0.0)
 
-    def _build_tbe(self, optimizer, value):
-        set_sparse_init_accumulator_value(value)
+    def _build_tbe(self, optimizer, value, prefix="momentum1"):
+        set_sparse_init_accumulator_value(value, prefix)
         return SplitTableBatchedEmbeddingBagsCodegen(
             embedding_specs=[
                 (
@@ -115,6 +115,16 @@ class SparseInitAccumulatorValueTest(unittest.TestCase):
         )
 
         emb = self._build_tbe(optimizer, 0.0)
+        torch.testing.assert_close(emb.momentum1_host, torch.zeros(state_numel))
+
+    @unittest.skipUnless(
+        hasattr(EmbOptimType, "FTRL"), "fbgemm_gpu has no FTRL embedding kernel."
+    )
+    def test_ftrl_momentum2_init_value(self):
+        state_numel = self._NUM_EMBEDDINGS * self._EMBEDDING_DIM
+        emb = self._build_tbe(EmbOptimType.FTRL, 0.1, "momentum2")
+        # FTRL keeps its accumulator in momentum2; momentum1 is `linear`.
+        torch.testing.assert_close(emb.momentum2_host, torch.full((state_numel,), 0.1))
         torch.testing.assert_close(emb.momentum1_host, torch.zeros(state_numel))
 
 

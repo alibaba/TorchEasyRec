@@ -21,6 +21,7 @@ from tzrec.acc import trt_utils
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.main import _create_features
+from tzrec.optim.optimizer import has_fbgemm_ftrl
 from tzrec.tests import utils
 from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
 from tzrec.utils.test_util import (
@@ -1160,6 +1161,22 @@ class RankIntegrationTest(unittest.TestCase):
         #     self.success = utils.test_export(
         #         os.path.join(self.test_dir, "pipeline.config"), self.test_dir
         #     )
+        self.assertTrue(self.success)
+
+    @unittest.skipIf(
+        gpu_unavailable[0] or not has_fbgemm_ftrl(),
+        "fbgemm_gpu / torchrec FTRL embedding kernel not available.",
+    )
+    @mark_ci_scope("gpu")
+    def test_multi_tower_din_with_ftrl_train_eval(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_ftrl_mock.config",
+            self.test_dir,
+        )
+        if self.success:
+            self.success = utils.test_eval(
+                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+            )
         self.assertTrue(self.success)
 
     @unittest.skipIf(
