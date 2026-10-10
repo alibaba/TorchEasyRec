@@ -186,6 +186,7 @@ class OptimizerMultiplerTest(unittest.TestCase):
     dynamicemb_util.has_dynamicemb and has_fbgemm_ftrl(),
     "dynamicemb or the FBGEMM FTRL embedding kernel is not installed; skipping.",
 )
+@mark_ci_scope("gpu")
 class DynamicEmbFTRLFusedParamsTest(unittest.TestCase):
     """torchrec's fused FTRL is rewritten into dynamicemb's on dynamicemb tables."""
 
