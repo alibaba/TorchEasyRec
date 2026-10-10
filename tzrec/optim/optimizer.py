@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable, Optional, Union
 
 import torch
 from fbgemm_gpu import split_table_batched_embeddings_ops_training
+from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     EmbeddingLocation,
     SplitState,
@@ -20,6 +21,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
 from torch import nn
 from torch.amp import GradScaler
 from torch.optim.optimizer import Optimizer
+from torchrec import optim as trec_optim
 from torchrec.distributed.utils import _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE
 from torchrec.optim import KeyedOptimizer, OptimizerWrapper
 
@@ -69,13 +71,21 @@ class TZRecOptimizer(OptimizerWrapper):
                 self._optimizer.step(closure=closure)
 
 
+def has_fbgemm_ftrl() -> bool:
+    """Whether the installed fbgemm_gpu and torchrec carry the fused FTRL kernel.
+
+    Upstream releases do not; the TorchEasyRec builds of both add it.
+    """
+    return hasattr(EmbOptimType, "FTRL") and hasattr(trec_optim, "FTRL")
+
+
 class FTRL(Optimizer):
     """Placeholder for the dynamicemb FTRL sparse embedding optimizer.
 
-    FBGEMM has no FTRL kernel, so torchrec ships no FTRL wrapper to reuse. Like
-    torchrec's own placeholders this class never runs: it names the optimizer so
-    that the sharding plan can resolve it, and the update happens inside the
-    dynamicemb table.
+    Used when FBGEMM has no FTRL kernel (see :func:`has_fbgemm_ftrl`), so torchrec
+    ships no FTRL wrapper to reuse. Like torchrec's own placeholders this class
+    never runs: it names the optimizer so that the sharding plan can resolve it,
+    and the update happens inside the dynamicemb table.
 
     Args:
         params (Iterable[nn.Parameter]): parameters to attach the optimizer to.
@@ -108,8 +118,9 @@ def register_ftrl_emb_opt_type() -> None:
     except ImportError as e:
         raise RuntimeError(
             "sparse ftrl_optimizer requires dynamicemb >= "
-            "0.1.0+20260920.9643985; FBGEMM has no FTRL embedding kernel. "
-            "Please reinstall dynamicemb, see docs/source/feature/dynamicemb.md."
+            "0.1.0+20260920.9643985, or the TorchEasyRec fbgemm-gpu and torchrec "
+            "wheels that carry the FTRL embedding kernel. Please reinstall them, "
+            "see docs/source/models/optimizer.md."
         ) from e
     _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE[FTRL] = DynamicEmbOptimType.FTRL
 
@@ -119,22 +130,25 @@ def register_ftrl_emb_opt_type() -> None:
 # Here, we patch the fbgemm embedding optimizer state split helper
 # to support `momentum1` (Adagrad) with the specified initial value.
 _sparse_init_accumulator_value = 0.0
+_sparse_init_accumulator_prefix = "momentum1"
 
 
-def set_sparse_init_accumulator_value(value: float) -> None:
+def set_sparse_init_accumulator_value(value: float, prefix: str = "momentum1") -> None:
     """Record the accumulator initial value for embedding tables built later.
 
     Takes effect at table build time, in the ``apply_split_helper`` patch below and
     in ``dynamicemb_util``'s plan-time fused params, so it must be set before
     planning; FBGEMM TBE has no such kwarg, hence this module-level switch. Used
-    by Adagrad and, on dynamicemb tables, by FTRL for its squared-gradient
-    accumulator.
+    by Adagrad and by FTRL for its squared-gradient accumulator.
 
     Args:
         value: accumulator initial value, 0.0 for optimizers without one.
+        prefix: FBGEMM TBE optimizer state holding the accumulator, ``momentum1``
+            for Adagrad and ``momentum2`` for FTRL, whose ``momentum1`` is linear.
     """
-    global _sparse_init_accumulator_value
+    global _sparse_init_accumulator_value, _sparse_init_accumulator_prefix
     _sparse_init_accumulator_value = value
+    _sparse_init_accumulator_prefix = prefix
 
 
 def sparse_init_accumulator_value() -> float:
@@ -165,7 +179,9 @@ def apply_split_helper(
     """Patch for state split helper of FBGEMM SplitTableBatchedEmbeddingBagsCodegen."""
     init_value = sparse_init_accumulator_value()
     use_init_value = (
-        init_value != 0.0 and prefix == "momentum1" and dtype.is_floating_point
+        init_value != 0.0
+        and prefix == _sparse_init_accumulator_prefix
+        and dtype.is_floating_point
     )
 
     set_attr_fn(f"{prefix}_physical_placements", split.placements)

@@ -54,7 +54,9 @@ train_config {
 
   **Note**: `adagrad_optimizer`和`rowwise_adagrad_optimizer`的`initial_accumulator_value`对齐TensorFlow Adagrad的同名参数（TF默认0.1，TorchEasyRec默认0.0），对普通Embedding表和[dynamicemb](../feature/dynamicemb.md)表同时生效：普通Embedding表在建表时把整个accumulator初始化为该值，dynamicemb表则在key首次写入时把该key的accumulator初始化为该值。`ftrl_optimizer`也用该字段初始化它的accumulator
 
-  **Note**: `ftrl_optimizer`（FTRL-Proximal，McMahan et al. 2013）**只支持[dynamicemb](../feature/dynamicemb.md)表**，FBGEMM没有FTRL的embedding kernel，模型中只要还有一张非dynamicemb的sparse表，训练会在plan阶段直接报错并给出表名。可配置`dynamicemb`的特征类型见[dynamicemb文档](../feature/dynamicemb.md)，配置了`boundaries`的`raw_feature`等不支持dynamicemb的特征，无法与`ftrl_optimizer`一起使用。被分片为`data_parallel`的表不受此限制（由dense_optimizer更新）
+  **Note**: `ftrl_optimizer`（FTRL-Proximal，McMahan et al. 2013）同时支持普通Embedding表和[dynamicemb](../feature/dynamicemb.md)表。普通Embedding表依赖TorchEasyRec构建的fbgemm-gpu和torchrec提供的FTRL embedding kernel（1.5.0起的官方镜像已预装，本地环境按[本地安装文档](../quick_start/local_tutorial.md)安装即可）；若安装的是上游PyPI版本（不含FTRL），则只支持dynamicemb表，模型中只要还有一张非dynamicemb的sparse表，训练会在plan阶段直接报错并给出表名。被分片为`data_parallel`的表不受此限制（由dense_optimizer更新）
+
+  **Note**: `ftrl_optimizer`的`l2_reg`即论文中的λ2，TensorFlow与x-deeplearning的l2系数按`2 * l2`计入，从这两者迁移配置时需将`l2_reg`减半。普通Embedding表的FTRL状态在checkpoint中保存为`momentum1`（linear）与`accum`两项，与dynamicemb表的FTRL状态不能相互加载
 
 - dense_optimizer
 

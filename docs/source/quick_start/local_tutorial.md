@@ -15,10 +15,10 @@ pip index versions tzrec -f http://tzrec.oss-accelerate.aliyuncs.com/release/nig
 ```bash
 conda create -n tzrec python=3.11
 conda activate tzrec
-pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
-pip install fbgemm-gpu==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu130/repo.html
+pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu130
+pip install fbgemm-gpu==1.9.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu130/repo.html
 pip install torchmetrics==1.0.3 tensordict
-pip install torchrec==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html
+pip install https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/torchrec-1.9.0-py3-none-any.whl
 pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
@@ -35,8 +35,6 @@ pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerat
 ```
 GPU版本（CUDA 12.6) 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu126
-GPU版本（CUDA 12.9) 镜像地址:
-  mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu129
 GPU版本（CUDA 13.0，含 TensorRT) 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu130
 CPU版本 镜像地址:
@@ -48,16 +46,16 @@ CPU版本 镜像地址:
 | 镜像             | 最低驱动  | SASS 覆盖                             | TensorRT |
 | ---------------- | --------- | ------------------------------------- | -------- |
 | `-cu126`         | 525.60.13 | `sm_50 / 60 / 70 / 75 / 80 / 86 / 90` | 否       |
-| `-cu129`         | 550.54.14 | `sm_75 / 80 / 86 / 90 / 100 / 120`    | 否       |
 | `-cu130`（默认） | 580.65.06 | `sm_75 / 80 / 86 / 90 / 100 / 120`    | 是       |
 
 - **CUDA 12.6** 镜像覆盖 Maxwell (M40)、Pascal (P100)、Volta (V100)、Turing (T4)、
   Ampere (A10/A30/A100)、Ada (L4/L20/L40)、Hopper (H100) 等 CC 5.0–9.0 的卡，
   不支持 Blackwell。驱动要求最低，老机器优先选它。
-- **CUDA 12.9** 镜像覆盖 CC 7.5–12.0，含 Blackwell (B100/B200)，且只需 550 驱动；
-  驱动升不到 580、又要用 Blackwell 或新版工具链时选它。
-- **CUDA 13.0** 镜像与 cu129 覆盖相同的架构，另预装 torch-tensorrt 2.13 /
-  TensorRT 11.0，用于 TRT 导出与推理，但需要 580 驱动。
+- **CUDA 13.0** 镜像覆盖 CC 7.5–12.0，含 Blackwell (B100/B200)，另预装 torch-tensorrt 2.14 /
+  TensorRT 11.1，用于 TRT 导出与推理，但需要 580 驱动。
+
+注：PyTorch 2.14 不再发布 CUDA 12.9 版本，1.5 起不再提供 `-cu129` 镜像，原 cu129 用户请改用
+cu130 镜像（驱动不足 580 时见下文 cuda-compat 说明）或 cu126 镜像。
 
 注：fbgemm_gpu 等算子库的 wheel 不含 PTX，显卡架构不在上表时无法 JIT 回退，请按卡选择镜像。
 驱动低于所选镜像要求时，可改用低一档的镜像，或为 cu130 镜像设置

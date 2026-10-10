@@ -22,7 +22,7 @@ from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.optim import optimizers, rowwise_adagrad
 
-from tzrec.optim.optimizer import FTRL
+from tzrec.optim.optimizer import FTRL, has_fbgemm_ftrl
 from tzrec.protos import feature_pb2
 from tzrec.utils import dynamicemb_util
 from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
@@ -179,6 +179,56 @@ class OptimizerMultiplerTest(unittest.TestCase):
                 optimizer_class, torch.Size([1024, 16])
             ),
             expected,
+        )
+
+
+@unittest.skipUnless(
+    dynamicemb_util.has_dynamicemb and has_fbgemm_ftrl(),
+    "dynamicemb or the FBGEMM FTRL embedding kernel is not installed; skipping.",
+)
+@mark_ci_scope("gpu")
+class DynamicEmbFTRLFusedParamsTest(unittest.TestCase):
+    """torchrec's fused FTRL is rewritten into dynamicemb's on dynamicemb tables."""
+
+    _KWARGS = {
+        "lr": 0.01,
+        "ftrl_learning_rate_power": -0.4,
+        "ftrl_beta": 1.0,
+        "ftrl_l1_reg": 0.01,
+        "ftrl_l2_reg": 0.02,
+    }
+
+    def test_trec_ftrl(self):
+        from dynamicemb import DynamicEmbOptimType
+        from torchrec import optim as trec_optim
+
+        params = dynamicemb_util._dynamicemb_ftrl_fused_params(
+            trec_optim.FTRL, dict(self._KWARGS)
+        )
+        self.assertEqual(
+            params,
+            {
+                "optimizer": DynamicEmbOptimType.FTRL,
+                "learning_rate_power": -0.4,
+                "l1_reg": 0.01,
+                "l2_reg": 0.02,
+            },
+        )
+
+    @parameterized.expand(
+        [
+            param("untrained", optimizer_class=None),
+            param("adam", optimizer_class=optimizers.Adam),
+            param("placeholder_ftrl", optimizer_class=FTRL),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_other_optimizer(self, _name, optimizer_class):
+        self.assertEqual(
+            dynamicemb_util._dynamicemb_ftrl_fused_params(
+                optimizer_class, dict(self._KWARGS)
+            ),
+            {},
         )
 
 

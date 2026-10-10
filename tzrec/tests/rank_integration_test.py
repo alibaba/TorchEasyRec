@@ -21,6 +21,7 @@ from tzrec.acc import trt_utils
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.main import _create_features
+from tzrec.optim.optimizer import has_fbgemm_ftrl
 from tzrec.tests import utils
 from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
 from tzrec.utils.test_util import (
@@ -1162,9 +1163,14 @@ class RankIntegrationTest(unittest.TestCase):
         #     )
         self.assertTrue(self.success)
 
+    # id_1 is a regular embedding table, the rest are dynamicemb, so one run
+    # covers FTRL on both the fused TBE kernel and the dynamicemb path.
     @unittest.skipIf(
-        gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
-        "dynamicemb not available.",
+        gpu_unavailable[0]
+        or not dynamicemb_util.has_dynamicemb
+        or not has_fbgemm_ftrl(),
+        "dynamicemb or the fbgemm_gpu / torchrec FTRL embedding kernel is not "
+        "available.",
     )
     @mark_ci_scope("gpu")
     def test_multi_tower_din_with_dynamicemb_ftrl_train_eval(self):

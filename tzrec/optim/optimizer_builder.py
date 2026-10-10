@@ -17,12 +17,14 @@ import torch
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import WeightDecayMode
 from torch import nn
 from torch.optim.optimizer import Optimizer
+from torchrec import optim as trec_optim
 from torchrec.optim import optimizers, rowwise_adagrad
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import (
     FTRL,
+    has_fbgemm_ftrl,
     register_ftrl_emb_opt_type,
     set_sparse_init_accumulator_value,
 )
@@ -51,9 +53,11 @@ def create_sparse_optimizer(
         optimizer_kwargs["weight_decay_mode"] = WeightDecayMode[
             optimizer_kwargs["weight_decay_mode"]
         ]
+    use_fbgemm_ftrl = optimizer_type == "ftrl_optimizer" and has_fbgemm_ftrl()
     # FBGEMM TBE has no such kwarg; see set_sparse_init_accumulator_value.
     set_sparse_init_accumulator_value(
-        optimizer_kwargs.pop("initial_accumulator_value", 0.0)
+        optimizer_kwargs.pop("initial_accumulator_value", 0.0),
+        "momentum2" if use_fbgemm_ftrl else "momentum1",
     )
 
     if optimizer_type == "sgd_optimizer":
@@ -97,6 +101,12 @@ def create_sparse_optimizer(
         optimizer_kwargs["beta1"] = optimizer_kwargs.pop("alpha")
         return optimizers.RMSProp, optimizer_kwargs
     elif optimizer_type == "ftrl_optimizer":
+        if use_fbgemm_ftrl:
+            # The fused TBE takes FTRL hyperparameters with an ftrl_ prefix.
+            for name in ("learning_rate_power", "l1_reg", "l2_reg"):
+                optimizer_kwargs[f"ftrl_{name}"] = optimizer_kwargs.pop(name)
+            # pyrefly: ignore[missing-attribute]  # only in the TorchEasyRec torchrec build
+            return trec_optim.FTRL, optimizer_kwargs
         register_ftrl_emb_opt_type()
         return FTRL, optimizer_kwargs
     else:
