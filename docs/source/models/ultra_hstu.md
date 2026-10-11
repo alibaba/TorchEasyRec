@@ -141,7 +141,7 @@ model_config {
 
 - **`hstu`**：`repeated HSTU`。≥ 2 个时每个 entry 必须设置唯一非空 `name`。各 channel 的 STU `embedding_dim` 不要求一致；item 侧 MLP 与 `FusionMTLTower` 的输入维度自动取所有 channel `embedding_dim` 之和。
 - **`HSTU.name`**：MoT 通道名。非空时通道名 *替换* 默认 `uih` 前缀，preprocessor 据此从 `grouped_features` 读取 `<name>.sequence` / `<name>_action.sequence` / `<name>_watchtime.sequence` / `<name>_timestamp.sequence`。
-- **`HSTU.stu.sla_k1` / `sla_k2`**：SLA 的局部窗口长度与全局 prefix 长度。任一 `> 0` 即启用 SLA；要求 `kernel: CUTLASS`（或 `PYTORCH`）。CUTLASS 为基于CUTLASS的CUDA融合算子实现，需安装fbgemm_gpu_hstu包（官方镜像的 `-cu126`/`-cu130` 变体已预装，无需手动安装；其它环境可按[本地安装教程](../quick_start/local_tutorial.md)安装 `tzrec[cu126]` 或 `tzrec[cu130]`，或在 TorchEasyRec 仓库根目录执行 `pip install -r requirements/${DEVICE}.txt`（DEVICE 取 cu126 或 cu130）——用与所运行 TorchEasyRec 同一 checkout 的 requirements 安装，版本组合经过该版本 CI 验证，优于手动安装单个包），要求`attention_dim`等于`hidden_dim`，支持Ampere/Ada/Hopper GPU。
+- **`HSTU.stu.sla_k1` / `sla_k2`**：SLA 的局部窗口长度与全局 prefix 长度。任一 `> 0` 即启用 SLA；要求 `kernel: CUTLASS`（或 `PYTORCH`）。CUTLASS 为基于CUTLASS的CUDA融合算子实现，需安装fbgemm_gpu_hstu包（官方镜像的 `-cu126`/`-cu130` 变体已预装，无需手动安装；其它环境可按[本地安装教程](../quick_start/local_tutorial.md)安装 `tzrec[cu126]` 或 `tzrec[cu130]`），要求`attention_dim`等于`hidden_dim`，支持Ampere/Ada/Hopper GPU。
 - **`HSTU.attn_truncation_split_layer` / `attn_truncation_tail_len`**：mid-stack truncation 的分裂 layer 索引与 UIH 尾部保留长度。两者都必须 `> 0` 才启用，单独设置其一会被拒绝。
 
 ### Embedding 表共享

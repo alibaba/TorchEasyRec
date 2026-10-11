@@ -2,19 +2,16 @@
 
 DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`hash_bucket_size`的方式能避免hash冲突，相比设置`vocab_dict`和`vocab_list`的方式能更灵活动态地进行id的准入和驱逐。DynamicEmbedding 常用于user id，item id，combo feature等超大id枚举数的特征配置中。DynamicEmbedding 相比 ZCH 能外接PS，支撑十亿百亿甚至更多的Id枚举数，Id准入和淘汰无需攒Batch，可以更加及时。
 
-dynamicemb 的安装与 TorchEasyRec 的安装方式绑定：
+dynamicemb安装方式:
 
 - 官方镜像：`-cu126` 与 `-cu130` 变体已预装 dynamicemb，无需手动安装。
 - pip 安装：按[本地安装教程](../quick_start/local_tutorial.md)安装 `tzrec[cu126]` 或 `tzrec[cu130]`（支持 Python 3.10/3.11/3.12），dynamicemb 已包含在对应 device 的依赖中。
-- 源码使用：在 TorchEasyRec 仓库根目录执行 `pip install -r requirements/${DEVICE}.txt`（DEVICE 同上）。使用与所运行的 TorchEasyRec 同一 checkout 的 requirements 安装，版本组合经过该版本 CI 验证，优于手动安装单个包。
 
 支持配置 DynamicEmbedding 的特征类型为 `id_feature`、`combo_feature`、`lookup_feature`、`match_feature`、`regex_replace_feature`、`custom_feature`、`bool_mask_feature`，其余特征类型（如配置了 `boundaries` 的 `raw_feature`、`expr_feature`、`tokenize_feature`、`combine_feature`）暂不支持。
 
 注：同一个 FeatureGroup 中若存在多个配置了 DynamicEmbedding 的特征，底层 dynamicemb 会自动将这些表融合到同一份存储里（table fusion），共享 cache/admission counter，降低显存占用并减少内存碎片，无需额外配置。
 
 注：配置了 DynamicEmbedding 的模型导出时需设置环境变量 `USE_DISTRIBUTED_EMBEDDING=1`，使用分布式 embedding 导出模式，详见[模型导出](../usage/export.md)的环境变量章节。
-
-注：DynamicEmbedding 表支持 `ftrl_optimizer`，配置方式见[优化器](../models/optimizer.md)文档。
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
 
