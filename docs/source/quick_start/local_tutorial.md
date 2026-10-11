@@ -54,9 +54,6 @@ CPU版本 镜像地址:
 - **CUDA 13.0** 镜像覆盖 CC 7.5–12.0，含 Blackwell (B100/B200)，另预装 torch-tensorrt 2.14 /
   TensorRT 11.1，用于 TRT 导出与推理，但需要 580 驱动。
 
-注：PyTorch 2.14 不再发布 CUDA 12.9 版本，1.5 起不再提供 `-cu129` 镜像，原 cu129 用户请改用
-cu130 镜像（驱动不足 580 时见下文 cuda-compat 说明）或 cu126 镜像。
-
 注：fbgemm_gpu 等算子库的 wheel 不含 PTX，显卡架构不在上表时无法 JIT 回退，请按卡选择镜像。
 驱动低于所选镜像要求时，可改用低一档的镜像，或为 cu130 镜像设置
 `LD_LIBRARY_PATH=/usr/local/cuda-13/compat` 使用镜像内置的 cuda-compat 前向兼容库。
