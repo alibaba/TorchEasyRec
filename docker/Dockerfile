@@ -74,10 +74,20 @@ ENV LD_LIBRARY_PATH ${LD_LIBRARY_PATH}
 ADD requirements /root/requirements
 ADD requirements.txt /root/requirements.txt
 ADD requirements-${DEVICE}.txt /root/requirements-${DEVICE}.txt
+# pip re-downloads every `name @ URL` requirement (no metadata sidecar) to
+# validate it, so tzrec re-installs in DLC/CI jobs would re-fetch wheels the
+# image already carries. Re-fetch the URL-pinned set after the purge to keep
+# the pip HTTP cache warm (the pins live in requirements/${DEVICE}.txt --
+# requirements-${DEVICE}.txt is only the include file). The build may pass a
+# local PIP_MIRROR for speed; rewrite pip.conf to the canonical mirror so the
+# shipped image never points at it.
 RUN cd /root && \
     pip install -r requirements-${DEVICE}.txt && \
-    rm -rf requirements requirements.txt requirements-*.txt && \
     pip cache purge && \
+    grep -h ' @ ' requirements/${DEVICE}.txt requirements/runtime.txt > /tmp/urlpins.txt && \
+    pip download --no-deps -r /tmp/urlpins.txt -d /tmp/wheels && \
+    rm -rf /tmp/wheels /tmp/urlpins.txt requirements requirements.txt requirements-*.txt && \
+    printf '[global]\nindex-url = http://mirrors.aliyun.com/pypi/simple\ntrusted-host = mirrors.aliyun.com\ntimeout = 120\n' > /root/.config/pip/pip.conf && \
     /opt/conda/bin/conda clean -ya
 
 RUN mkdir -p /home/pai/bin && \
