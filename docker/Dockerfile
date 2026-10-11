@@ -79,8 +79,10 @@ ENV LD_LIBRARY_PATH ${LD_LIBRARY_PATH}
 ADD requirements /root/requirements
 ADD requirements.txt /root/requirements.txt
 ADD requirements-${DEVICE}.txt /root/requirements-${DEVICE}.txt
+# The torchrec find-links index serves 1.9.0+tzrec, which outranks PyPI's plain
+# 1.9.0 so the requirements' torchrec==1.9.0 pin resolves to the FTRL build.
 RUN cd /root && \
-    pip install -r requirements-${DEVICE}.txt && \
+    pip install -r requirements-${DEVICE}.txt -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
     rm -rf requirements requirements.txt requirements-*.txt && \
     pip cache purge && \
     /opt/conda/bin/conda clean -ya

@@ -18,7 +18,7 @@ conda activate tzrec
 pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu130
 pip install fbgemm-gpu==1.9.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cu130/repo.html
 pip install torchmetrics==1.0.3 tensordict
-pip install https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/torchrec-1.9.0-py3-none-any.whl
+pip install torchrec==1.9.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html
 pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
 
