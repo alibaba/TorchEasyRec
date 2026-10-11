@@ -2,12 +2,11 @@
 
 DynamicEmbedding 是特征零Hash冲突Id化的一种方式，它相比设置`hash_bucket_size`的方式能避免hash冲突，相比设置`vocab_dict`和`vocab_list`的方式能更灵活动态地进行id的准入和驱逐。DynamicEmbedding 常用于user id，item id，combo feature等超大id枚举数的特征配置中。DynamicEmbedding 相比 ZCH 能外接PS，支撑十亿百亿甚至更多的Id枚举数，Id准入和淘汰无需攒Batch，可以更加及时。
 
-cu126/cu130 镜像已预装 dynamicemb，其它环境需先安装如下whl包
+dynamicemb 的安装与 TorchEasyRec 的安装方式绑定：
 
-```bash
-# DEVICE 可选: cu126/cu130 (支持 Python 3.10/3.11/3.12)
-pip install dynamicemb==0.1.0+20261010.6b983fc.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/dynamicemb/${DEVICE}/repo.html
-```
+- 官方镜像：`-cu126` 与 `-cu130` 变体已预装 dynamicemb，无需手动安装。
+- pip 安装：按[本地安装教程](../quick_start/local_tutorial.md)安装 `tzrec[cu126]` 或 `tzrec[cu130]`（支持 Python 3.10/3.11/3.12），dynamicemb 已包含在对应 device 的依赖中。
+- 源码使用：在 TorchEasyRec 仓库根目录执行 `pip install -r requirements/${DEVICE}.txt`（DEVICE 同上）。使用与所运行的 TorchEasyRec 同一 checkout 的 requirements 安装，版本组合经过该版本 CI 验证，优于手动安装单个包。
 
 支持配置 DynamicEmbedding 的特征类型为 `id_feature`、`combo_feature`、`lookup_feature`、`match_feature`、`regex_replace_feature`、`custom_feature`、`bool_mask_feature`，其余特征类型（如配置了 `boundaries` 的 `raw_feature`、`expr_feature`、`tokenize_feature`、`combine_feature`）暂不支持。
 

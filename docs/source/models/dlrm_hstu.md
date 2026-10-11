@@ -168,7 +168,7 @@ model_config {
 - kernel: 算子实现，可选TRITON/PYTORCH/CUTLASS
 
   - TRITON: 基于Triton的实现，通常比PYTORCH快2-3x，节省2-3x显存
-  - CUTLASS: 基于CUTLASS的CUDA融合算子实现，需安装fbgemm_gpu_hstu包（cu126/cu130 镜像已预装，其它环境可手动安装，DEVICE可选cu126/cu130：`pip install fbgemm_gpu_hstu==0.1.0+20261010.fece651b.fn5.${DEVICE} -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/hstu/${DEVICE}/repo.html`），要求`attention_dim`等于`hidden_dim`，支持Ampere/Ada/Hopper GPU
+  - CUTLASS: 基于CUTLASS的CUDA融合算子实现，需安装fbgemm_gpu_hstu包（官方镜像的 `-cu126`/`-cu130` 变体已预装，无需手动安装；其它环境可按[本地安装教程](../quick_start/local_tutorial.md)安装 `tzrec[cu126]` 或 `tzrec[cu130]`，或在 TorchEasyRec 仓库根目录执行 `pip install -r requirements/${DEVICE}.txt`（DEVICE 取 cu126 或 cu130）——用与所运行 TorchEasyRec 同一 checkout 的 requirements 安装，版本组合经过该版本 CI 验证，优于手动安装单个包），要求`attention_dim`等于`hidden_dim`，支持Ampere/Ada/Hopper GPU
   - PYTORCH: 纯PyTorch实现，兼容性最好
 
 ### MTGR Style 配置方式
