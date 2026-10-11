@@ -181,6 +181,25 @@ class OptimizerMultiplerTest(unittest.TestCase):
             expected,
         )
 
+    @unittest.skipUnless(
+        has_fbgemm_ftrl(), "fbgemm_gpu / torchrec have no FTRL embedding kernel."
+    )
+    def test_trec_ftrl_multiplier(self):
+        """Torchrec's FTRL keeps two elementwise states, like Adam.
+
+        The multiplier comes from the TorchEasyRec torchrec build's
+        ``shard_estimators``; this pins that contract -- a torchrec rebuild
+        dropping it would silently halve dynamicemb HBM planning.
+        """
+        from torchrec import optim as trec_optim
+
+        self.assertAlmostEqual(
+            dynamicemb_util._get_optimizer_multipler(
+                trec_optim.FTRL, torch.Size([1024, 16])
+            ),
+            2.0,
+        )
+
 
 @unittest.skipUnless(
     dynamicemb_util.has_dynamicemb and has_fbgemm_ftrl(),

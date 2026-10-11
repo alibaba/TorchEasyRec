@@ -42,17 +42,12 @@ RUN case ${DEVICE} in \
                  rm -f /usr/local/cuda && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
-# Only torch is installed here: the --no-deps pass pins the device wheel, the
-# second pass installs the nvidia-* wheels torch needs at runtime (cuDNN, NCCL,
-# cusparseLt, nvshmem stay; the base CUDA libs the system cuda-toolkit provides
-# are uninstalled and scrubbed from torch's METADATA so the requirements install
-# below does not re-pull them). fbgemm-gpu, torchrec and the op wheels are all
-# URL-pinned in requirements-${DEVICE}.txt. torchrec comes by URL because PyPI's
-# torchrec of the same version has py3XX-tagged wheels that pip prefers over the
-# py3-none-any build, which carries FTRL.
-# torch_tensorrt comes from PyPI, not the pytorch-wheels index: the +cu130 build
-# there ships no C++ runtime, so TorchTensorRTModule falls back to a Python engine
-# object that torch.jit.trace cannot pass to tensorrt::execute_engine.
+# Only torch is installed here: the first pass pins the device wheel, the second
+# pulls its nvidia-* deps; the base CUDA libs are then uninstalled and scrubbed
+# from torch's METADATA in favor of the system cuda-toolkit (cuDNN / NCCL and
+# friends stay). Everything else is pinned in requirements-${DEVICE}.txt.
+# torch_tensorrt comes from PyPI: the pytorch-wheels +cu130 build ships no C++
+# runtime, breaking torch.jit.trace on tensorrt::execute_engine.
 RUN case ${DEVICE} in \
         "cu126") pip install torch==2.14.0 -f https://${PIP_MIRROR}/pytorch-wheels/${DEVICE}/ --no-deps && \
                  pip install torch==2.14.0 && \
@@ -79,10 +74,8 @@ ENV LD_LIBRARY_PATH ${LD_LIBRARY_PATH}
 ADD requirements /root/requirements
 ADD requirements.txt /root/requirements.txt
 ADD requirements-${DEVICE}.txt /root/requirements-${DEVICE}.txt
-# The torchrec find-links index serves 1.9.0+tzrec, which outranks PyPI's plain
-# 1.9.0 so the requirements' torchrec==1.9.0 pin resolves to the FTRL build.
 RUN cd /root && \
-    pip install -r requirements-${DEVICE}.txt -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
+    pip install -r requirements-${DEVICE}.txt && \
     rm -rf requirements requirements.txt requirements-*.txt && \
     pip cache purge && \
     /opt/conda/bin/conda clean -ya

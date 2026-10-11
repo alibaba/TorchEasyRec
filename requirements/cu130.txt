@@ -15,5 +15,5 @@ flash_attn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/flash_attn/cu
 flash_attn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/flash_attn/cu130/flash_attn-2.8.3%2B20261010.cu130.torch214.sm80.90.100.120.g060c9188beec-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
 torch==2.14.0
 torch-tensorrt==2.14.0
-torchrec==1.9.0
+torchrec @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/torchrec-1.9.0+tzrec-py3-none-any.whl
 triton==3.8.0

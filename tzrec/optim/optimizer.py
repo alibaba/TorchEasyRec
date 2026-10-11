@@ -128,7 +128,8 @@ def register_ftrl_emb_opt_type() -> None:
 # The Adagrad optimizer in TensorFlow includes the parameter
 # `initial_accumulator_value`, with a default value of 0.1.
 # Here, we patch the fbgemm embedding optimizer state split helper
-# to support `momentum1` (Adagrad) with the specified initial value.
+# to support `momentum1` (Adagrad) and `momentum2` (FTRL's accum) with the
+# specified initial value.
 _sparse_init_accumulator_value = 0.0
 _sparse_init_accumulator_prefix = "momentum1"
 
