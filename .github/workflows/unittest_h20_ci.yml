@@ -25,7 +25,7 @@ jobs:
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
           # Resolve symlink: runner self-update makes externals a symlink, which DSW authZ rejects as a mount source.
           EXTERNALS_ROOT="$(readlink -f "$(dirname "$WORK_ROOT")/externals")"
-          docker run --rm --name "h20-ci-${{ github.run_id }}" \
+          docker run --rm --pull=always --name "h20-ci-${{ github.run_id }}" \
             --workdir /__w/TorchEasyRec/TorchEasyRec \
             --gpus all --shm-size=512g --ulimit memlock=-1 \
             -e HOME=/github/home \
