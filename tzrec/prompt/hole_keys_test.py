@@ -328,6 +328,8 @@ _SID_SPACE = ResolvedSidSpace(
     sentinel_token_id=1099,
     eos_token_id=2,
     pad_token_id=3,
+    token_format="<|sid_{i}|>",
+    bundle_uuid=None,
 )
 
 

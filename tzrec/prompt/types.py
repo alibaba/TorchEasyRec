@@ -86,6 +86,9 @@ class ResolvedSidSpace:
             slot is projected.
         eos_token_id: end-of-sequence id of the extended tokenizer.
         pad_token_id: padding id of the extended tokenizer.
+        token_format: how the SID tokens were named, ``{i}`` the flat index.
+        bundle_uuid: the SID bundle ``sid_space.manifest_path`` names, None
+            when no manifest was named.
     """
 
     codebook: Tuple[int, ...]
@@ -98,6 +101,8 @@ class ResolvedSidSpace:
     sentinel_token_id: Optional[int]
     eos_token_id: int
     pad_token_id: int
+    token_format: str
+    bundle_uuid: Optional[str]
 
 
 @dataclass(frozen=True)

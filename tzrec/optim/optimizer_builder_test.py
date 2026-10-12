@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
 
 import torch
 from parameterized import param, parameterized
@@ -18,9 +19,11 @@ from torch.optim import Optimizer
 from torchrec.distributed.utils import _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 
+from tzrec.optim import optimizer as optimizer_module
 from tzrec.optim import optimizer_builder
 from tzrec.optim.optimizer import (
     FTRL,
+    has_fbgemm_ftrl,
     set_sparse_init_accumulator_value,
     sparse_init_accumulator_value,
 )
@@ -89,7 +92,47 @@ class OpimizerBuilderTest(unittest.TestCase):
         has_dynamicemb, "dynamicemb with FTRL support is not installed."
     )
     @mark_ci_scope("gpu")
-    def test_create_sparse_optimizer_ftrl(self):
+    def test_create_sparse_optimizer_ftrl_dynamicemb_only(self):
+        from torchrec.distributed.utils import optimizer_type_to_emb_opt_type
+
+        optimizer_config = optimizer_pb2.SparseOptimizer(
+            ftrl_optimizer=optimizer_pb2.FusedFTRLOptimizer(
+                lr=0.01,
+                learning_rate_power=-0.4,
+                ftrl_beta=1.0,
+                l1_reg=0.01,
+                l2_reg=0.02,
+                initial_accumulator_value=0.1,
+            ),
+            constant_learning_rate=optimizer_pb2.ConstantLR(),
+        )
+        with mock.patch.object(
+            optimizer_builder, "has_fbgemm_ftrl", return_value=False
+        ):
+            optim_cls, kwargs = optimizer_builder.create_sparse_optimizer(
+                optimizer_config
+            )
+        self.assertIs(optim_cls, FTRL)
+        # torchrec turns the class into the fused optimizer param of the table.
+        self.assertIs(
+            optimizer_type_to_emb_opt_type(optim_cls), DynamicEmbOptimType.FTRL
+        )
+        self.assertNotIn("initial_accumulator_value", kwargs)
+        self.assertAlmostEqual(sparse_init_accumulator_value(), 0.1)
+        self.assertAlmostEqual(kwargs["lr"], 0.01)
+        self.assertAlmostEqual(kwargs["learning_rate_power"], -0.4)
+        self.assertAlmostEqual(kwargs["ftrl_beta"], 1.0)
+        self.assertAlmostEqual(kwargs["l1_reg"], 0.01)
+        self.assertAlmostEqual(kwargs["l2_reg"], 0.02)
+        # apply_optimizer_in_backward constructs the class with these kwargs.
+        optim_cls([nn.Parameter(torch.zeros(4, 8))], **kwargs)
+
+    @unittest.skipUnless(
+        has_fbgemm_ftrl(), "fbgemm_gpu / torchrec have no FTRL embedding kernel."
+    )
+    def test_create_sparse_optimizer_ftrl_fbgemm(self):
+        from fbgemm_gpu.split_embedding_configs import EmbOptimType
+        from torchrec import optim as trec_optim
         from torchrec.distributed.utils import optimizer_type_to_emb_opt_type
 
         optimizer_config = optimizer_pb2.SparseOptimizer(
@@ -104,18 +147,26 @@ class OpimizerBuilderTest(unittest.TestCase):
             constant_learning_rate=optimizer_pb2.ConstantLR(),
         )
         optim_cls, kwargs = optimizer_builder.create_sparse_optimizer(optimizer_config)
-        self.assertIs(optim_cls, FTRL)
-        # torchrec turns the class into the fused optimizer param of the table.
-        self.assertIs(
-            optimizer_type_to_emb_opt_type(optim_cls), DynamicEmbOptimType.FTRL
-        )
-        self.assertNotIn("initial_accumulator_value", kwargs)
+        self.assertIs(optim_cls, trec_optim.FTRL)
+        self.assertIs(optimizer_type_to_emb_opt_type(optim_cls), EmbOptimType.FTRL)
         self.assertAlmostEqual(sparse_init_accumulator_value(), 0.1)
-        self.assertAlmostEqual(kwargs["lr"], 0.01)
-        self.assertAlmostEqual(kwargs["learning_rate_power"], -0.4)
-        self.assertAlmostEqual(kwargs["ftrl_beta"], 1.0)
-        self.assertAlmostEqual(kwargs["l1_reg"], 0.01)
-        self.assertAlmostEqual(kwargs["l2_reg"], 0.02)
+        # FBGEMM's FTRL keeps its accumulator in momentum2.
+        self.assertEqual(optimizer_module._sparse_init_accumulator_prefix, "momentum2")
+        self.assertEqual(
+            set(kwargs),
+            {
+                "lr",
+                "ftrl_learning_rate_power",
+                "ftrl_beta",
+                "ftrl_l1_reg",
+                "ftrl_l2_reg",
+                "gradient_clipping",
+                "max_gradient",
+            },
+        )
+        self.assertAlmostEqual(kwargs["ftrl_learning_rate_power"], -0.4)
+        self.assertAlmostEqual(kwargs["ftrl_l1_reg"], 0.01)
+        self.assertAlmostEqual(kwargs["ftrl_l2_reg"], 0.02)
         # apply_optimizer_in_backward constructs the class with these kwargs.
         optim_cls([nn.Parameter(torch.zeros(4, 8))], **kwargs)
 
