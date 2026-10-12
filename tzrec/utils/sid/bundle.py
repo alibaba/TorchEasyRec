@@ -33,7 +33,7 @@ import os
 import uuid
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from tzrec.utils.logging_util import logger
 from tzrec.utils.path_util import is_odps_path
@@ -232,17 +232,6 @@ class Bundle:
         if is_odps_path(location):
             return location
         return os.path.join(location, f"part-*.{entry.save_type}")
-
-    def prior_locations(self) -> List[Tuple[str, str]]:
-        """Every published artifact an append reads, labelled for errors.
-
-        The manifest is not among them: resolving these paths is what reads it,
-        so its absence has already raised by the time this returns.
-        """
-        return [
-            (artifact, self.read_path(artifact))
-            for artifact in (SID_TO_ITEMS_ARTIFACT, ITEM_TO_SID_ARTIFACT)
-        ]
 
     def check_prior_compatible(self, codebook: List[int], capacity: int) -> None:
         """Reject an append whose SID space differs from the published corpus.

@@ -321,7 +321,7 @@ class CollisionResolutionRunner:
     def run(self) -> CollisionResolutionStats:
         """Read, resolve collisions, and publish the resulting generation."""
         item_ids, codes = self._load_codes()
-        prior, published_items = self._load_prior_state(item_ids, codes)
+        prior, published_items = self._load_prior_occupancy(item_ids, codes)
         plan = prepare_collision_plan(
             item_ids, codes, self._config.resolution_config, prior=prior
         )
@@ -392,7 +392,10 @@ class CollisionResolutionRunner:
         """Reject a run whose inputs are not all present, before any pass runs."""
         wanted = [("--input_path", self._config.input_path)]
         if self._config.is_append:
-            wanted += self._bundle.prior_locations()
+            wanted += [
+                (artifact, self._bundle.read_path(artifact))
+                for artifact in (SID_TO_ITEMS_ARTIFACT, ITEM_TO_SID_ARTIFACT)
+            ]
         missing = [
             f"{name} -> {path}"
             for name, path in wanted
@@ -627,39 +630,6 @@ class CollisionResolutionRunner:
             )
         return candidates
 
-    def _load_prior_state(
-        self, new_item_ids: np.ndarray, new_codes: np.ndarray
-    ) -> Tuple[PriorOccupancy, int]:
-        """Load the published occupancy, or empty for a full resolve.
-
-        Args:
-            new_item_ids: IDs of the items this run places.
-            new_codes: Their SID matrix, shape ``(N, n_layers)``; only its prefixes
-                are used, to load the published buckets those items can reach.
-
-        Returns:
-            Occupancy of the published buckets in the affected prefixes, and the
-            number of published items.
-        """
-        if not self._config.is_append:
-            logger.info("full-resolve mode: no published generation supplied")
-            return PriorOccupancy.empty(), 0
-
-        prior, published_items = self._load_prior_occupancy(
-            self._bundle.read_path(SID_TO_ITEMS_ARTIFACT),
-            self._config.resolution_config.prefix_ids(new_codes),
-            new_item_ids,
-        )
-        logger.info(
-            "append mode: %d new items onto %d published items; %d published "
-            "buckets loaded from the prefixes this run touches, generation %s",
-            new_item_ids.shape[0],
-            published_items,
-            prior.bucket_keys.shape[0],
-            self._config.from_generation,
-        )
-        return prior, published_items
-
     def _decode_grouped_item_ids(self, values: pa.Array) -> Tuple[np.ndarray, pa.Array]:
         """Split an ``itemids`` list column into per-bucket counts and flat IDs."""
         return (
@@ -687,8 +657,6 @@ class CollisionResolutionRunner:
 
     def _check_prior_item_id_type(self, values: pa.Array) -> None:
         """Reject a published artifact whose item ID type differs from the input."""
-        if len(values) == 0:
-            return
         if values.type != self._item_id_type:
             raise ValueError(
                 f"published item_to_sid item ID type {values.type} differs from the "
@@ -698,23 +666,26 @@ class CollisionResolutionRunner:
             )
 
     def _load_prior_occupancy(
-        self,
-        sid_to_items_path: str,
-        new_prefix_ids: np.ndarray,
-        new_item_ids: np.ndarray,
+        self, new_item_ids: np.ndarray, new_codes: np.ndarray
     ) -> Tuple[PriorOccupancy, int]:
-        """Read affected-prefix occupancy and item count from published sid_to_items.
+        """Load the published occupancy, or empty for a full resolve.
 
         Args:
-            sid_to_items_path: Published sid_to_items of the generation appended onto.
-            new_prefix_ids: SID prefix of every item this run places.
             new_item_ids: IDs of the items this run places.
+            new_codes: Their SID matrix, shape ``(N, n_layers)``; only its prefixes
+                are used to select the published buckets those items can reach.
 
         Returns:
             Occupancy of the published buckets in the affected prefixes, and the
-            number of published items.
+            number of published items assigned to this rank.
         """
-        wanted_prefixes = np.unique(new_prefix_ids)
+        if not self._config.is_append:
+            logger.info("full-resolve mode: no published generation supplied")
+            return PriorOccupancy.empty(), 0
+
+        wanted_prefixes = np.unique(
+            self._config.resolution_config.prefix_ids(new_codes)
+        )
         new_id_values = self._item_id_array(new_item_ids)
 
         key_batches: List[np.ndarray] = []
@@ -723,7 +694,9 @@ class CollisionResolutionRunner:
         overlap_count = 0
         published_items = 0
         previous_max_key = -1
-        reader = self._make_reader(sid_to_items_path, ["codebook", "itemids"])
+        reader = self._make_reader(
+            self._bundle.read_path(SID_TO_ITEMS_ARTIFACT), ["codebook", "itemids"]
+        )
         for batch in self._iter_batches(reader, "Reading published sid_to_items"):
             codes = self._codes_matrix(batch["codebook"])
             keys = self._config.resolution_config.bucket_keys(codes)
@@ -760,12 +733,21 @@ class CollisionResolutionRunner:
                 "cannot hold two SIDs. Remove them from --input_path. First "
                 f"offending IDs: {preview}."
             )
-        if not key_batches:
-            return PriorOccupancy.empty(), published_items
-        return (
-            PriorOccupancy(np.concatenate(key_batches), np.concatenate(count_batches)),
+        if key_batches:
+            prior = PriorOccupancy(
+                np.concatenate(key_batches), np.concatenate(count_batches)
+            )
+        else:
+            prior = PriorOccupancy.empty()
+        logger.info(
+            "append mode: %d new items onto %d published items; %d published "
+            "buckets loaded from the prefixes this run touches, generation %s",
+            new_item_ids.shape[0],
             published_items,
+            prior.bucket_keys.shape[0],
+            self._config.from_generation,
         )
+        return prior, published_items
 
     def _make_writer(
         self, output_path: str, writer_type: Optional[str] = None
@@ -808,33 +790,6 @@ class CollisionResolutionRunner:
         return pa.FixedSizeListArray.from_arrays(
             pa.array(codes.reshape(-1)), layer_count
         ).cast(pa.list_(pa.int64()))
-
-    def _write_new_item_to_sid_rows(
-        self,
-        writers: List[BaseWriter],
-        item_ids: np.ndarray,
-        origin_codes: np.ndarray,
-        result: CollisionResolutionResult,
-        written: int,
-    ) -> None:
-        """Encode this run's item rows once and write them to each artifact."""
-        is_csv = self._resolved_writer_type == "CsvWriter"
-        resolved_codes = origin_codes.copy()
-        resolved_codes[:, -1] = result.resolved_last_codes
-        columns = {
-            "item_id": self._item_id_array(item_ids),
-            "origin_codebook": self._codes_column(origin_codes, is_csv),
-            "codebook": self._codes_column(resolved_codes, is_csv),
-            "offset_codebook": self._offset_codes_column(resolved_codes, is_csv),
-            "index": pa.array(result.slot_indices, type=pa.int64()),
-        }
-        for writer in writers:
-            writer.write(columns)
-        ProgressLogger(
-            "Writing resolved item_to_sid",
-            start_n=written,
-            miniters=self._config.progress_interval,
-        ).log(written + item_ids.shape[0])
 
     def _copy_prior_item_to_sid_rows(self, writer: BaseWriter) -> int:
         """Copy every published item_to_sid row into the merged output.
@@ -909,13 +864,19 @@ class CollisionResolutionRunner:
                 "of this tool. Appending onto them would drop published items or "
                 "reuse their slots."
             )
-        self._write_new_item_to_sid_rows(
-            writers,
-            item_ids,
-            origin_codes,
-            result,
-            copied,
-        )
+        is_csv = self._resolved_writer_type == "CsvWriter"
+        resolved_codes = origin_codes.copy()
+        resolved_codes[:, -1] = result.resolved_last_codes
+        columns = {
+            "item_id": self._item_id_array(item_ids),
+            "origin_codebook": self._codes_column(origin_codes, is_csv),
+            "codebook": self._codes_column(resolved_codes, is_csv),
+            "offset_codebook": self._offset_codes_column(resolved_codes, is_csv),
+            "index": pa.array(result.slot_indices, type=pa.int64()),
+        }
+        for item_writer in writers:
+            item_writer.write(columns)
+        del columns, resolved_codes
         for item_writer in writers:
             item_writer.close()
         self._bundle.rows[ITEM_TO_SID_ARTIFACT] = copied + item_ids.shape[0]
