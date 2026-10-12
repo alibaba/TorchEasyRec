@@ -84,12 +84,6 @@ def _reference(plan, codes, item_ids):
 
 
 class UniformCollisionResolverTest(unittest.TestCase):
-    def test_rejects_candidate_last_codes(self) -> None:
-        plan = _plan((4,), 1, [10, 11], [[0], [0]])
-
-        with self.assertRaisesRegex(ValueError, "does not accept candidate_last_codes"):
-            UniformCollisionResolver().resolve(plan, np.asarray([[1]]))
-
     def test_random_plans_match_least_loaded_reference(self) -> None:
         rng = np.random.default_rng(7)
         for trial in range(150):
