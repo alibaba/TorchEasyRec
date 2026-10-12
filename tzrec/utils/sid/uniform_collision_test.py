@@ -9,6 +9,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
+import dataclasses
 import unittest
 from unittest import mock
 
@@ -21,7 +23,6 @@ from tzrec.utils.sid.collision import (
     PriorOccupancy,
     build_resolved_item_grouping,
     prepare_collision_plan,
-    sid_prefix_ids,
     stable_order_hash,
 )
 from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
@@ -50,9 +51,13 @@ def _rotation(prefix_id, last_size):
 
 
 def _reference(plan, codes, item_ids):
-    """Place overflow rows one at a time on the least-loaded rotated code."""
+    """Place overflow rows one at a time on the least-loaded rotated code.
+
+    Returns the code and slot of every overflow row and the final load of every
+    occupied bucket, published-only buckets included.
+    """
     last_size = plan.config.layer_sizes[-1]
-    prefixes = sid_prefix_ids(np.asarray(codes), plan.config.layer_sizes)
+    prefixes = plan.config.prefix_ids(np.asarray(codes))
     moving = set(plan.overflow_rows.tolist())
     loads = {}
     for row, prefix in enumerate(prefixes.tolist()):
@@ -79,150 +84,17 @@ def _reference(plan, codes, item_ids):
         loads[key] = loads.get(key, 0) + 1
         codes_out[row] = code
         slots_out[row] = loads[key]
-    return codes_out, slots_out
+    return codes_out, slots_out, loads
 
 
 class UniformCollisionResolverTest(unittest.TestCase):
-    def test_no_overflow_keeps_assignments(self) -> None:
-        plan = _plan((3,), 1, ["a", "b"], [[0], [1]])
-
-        result = UniformCollisionResolver().resolve(plan)
-
-        np.testing.assert_array_equal(result.resolved_last_codes, [0, 1])
-        np.testing.assert_array_equal(result.slot_indices, [1, 1])
-        self.assertEqual(result.stats.relocated_count, 0)
-
-    def test_rejects_candidate_codes(self) -> None:
+    def test_rejects_candidate_last_codes(self) -> None:
         plan = _plan((4,), 1, [10, 11], [[0], [0]])
 
-        with self.assertRaisesRegex(ValueError, "does not accept candidate_codes"):
+        with self.assertRaisesRegex(ValueError, "does not accept candidate_last_codes"):
             UniformCollisionResolver().resolve(plan, np.asarray([[1]]))
 
-    def test_overflow_takes_empty_codes_in_rotated_order(self) -> None:
-        plan = _plan((8,), 1, [10, 11, 12], [[3], [3], [3]])
-        rotation = _rotation(0, 8)
-        rotated = [(rotation + step) % 8 for step in range(8)]
-        expected = [code for code in rotated if code != 3][:2]
-
-        result = UniformCollisionResolver().resolve(plan)
-
-        moved = sorted(
-            plan.overflow_rows.tolist(),
-            key=lambda row: stable_order_hash(np.asarray([10, 11, 12]))[row],
-        )
-        self.assertEqual([int(result.resolved_last_codes[r]) for r in moved], expected)
-        np.testing.assert_array_equal(result.slot_indices[plan.overflow_rows], [1, 1])
-        self.assertEqual(result.stats.relocated_count, 2)
-        self.assertEqual(result.stats.max_final_bucket_size, 1)
-
-    def test_empty_codes_fill_before_partly_loaded_ones(self) -> None:
-        plan = _plan((4,), 2, [10, 11, 12, 13, 14, 20], [[0]] * 5 + [[1]])
-
-        result = UniformCollisionResolver().resolve(plan)
-
-        moved = result.resolved_last_codes[plan.overflow_rows].tolist()
-        self.assertTrue({2, 3} <= set(moved))
-        np.testing.assert_array_equal(
-            np.sort(result.slot_indices[plan.overflow_rows]), [1, 1, 2]
-        )
-        self.assertEqual(result.stats.unresolved_count, 0)
-        self.assertEqual(result.stats.max_final_bucket_size, 2)
-
-    def test_full_prefix_spreads_excess_past_capacity(self) -> None:
-        plan = _plan((2,), 1, [10, 11, 12, 13, 14], [[0]] * 5)
-
-        result = UniformCollisionResolver().resolve(plan)
-
-        np.testing.assert_array_equal(np.sort(result.final_bucket_counts), [2, 3])
-        self.assertEqual(result.stats.max_final_bucket_size, 3)
-        self.assertEqual(result.stats.relocated_count, 1)
-        self.assertEqual(result.stats.unresolved_count, 3)
-        grouping = build_resolved_item_grouping(plan, result)
-        np.testing.assert_array_equal(np.sort(grouping.row_order), np.arange(5))
-
-    def test_single_code_space_keeps_rows_in_the_only_bucket(self) -> None:
-        plan = _plan((1,), 1, [10, 11, 12], [[0]] * 3)
-
-        result = UniformCollisionResolver().resolve(plan)
-
-        np.testing.assert_array_equal(result.resolved_last_codes, [0, 0, 0])
-        np.testing.assert_array_equal(np.sort(result.slot_indices), [1, 2, 3])
-        self.assertEqual(result.stats.unresolved_count, 2)
-
-    def test_append_never_shrinks_published_buckets(self) -> None:
-        plan = _plan((4,), 2, [10, 11], [[0], [0]], prior=_prior([0, 1], [3, 1]))
-
-        result = UniformCollisionResolver().resolve(plan)
-
-        np.testing.assert_array_equal(
-            np.sort(result.resolved_last_codes[plan.overflow_rows]), [2, 3]
-        )
-        np.testing.assert_array_equal(result.slot_indices[plan.overflow_rows], [1, 1])
-        np.testing.assert_array_equal(result.final_bucket_keys, [0, 1, 2, 3])
-        np.testing.assert_array_equal(result.final_bucket_counts, [3, 1, 1, 1])
-
-    def test_append_into_full_prefix_continues_published_slots(self) -> None:
-        plan = _plan((2,), 1, [10], [[0]], prior=_prior([0, 1], [1, 1]))
-
-        result = UniformCollisionResolver().resolve(plan)
-
-        self.assertEqual(int(result.slot_indices[0]), 2)
-        self.assertEqual(result.stats.unresolved_count, 1)
-        np.testing.assert_array_equal(np.sort(result.final_bucket_counts), [1, 2])
-
-    def test_collect_grouping_false_omits_only_bucket_metadata(self) -> None:
-        plan = _plan((4,), 1, [10, 11], [[0], [0]])
-
-        grouped = UniformCollisionResolver().resolve(plan)
-        rate_only = UniformCollisionResolver().resolve(plan, collect_grouping=False)
-
-        self.assertFalse(rate_only.grouping_collected)
-        np.testing.assert_array_equal(rate_only.final_bucket_keys, [])
-        np.testing.assert_array_equal(
-            rate_only.resolved_last_codes, grouped.resolved_last_codes
-        )
-        self.assertEqual(rate_only.stats, grouped.stats)
-
-    @parameterized.expand(
-        [
-            ("integer", np.arange(24, dtype=np.int64)),
-            ("string", np.asarray([f"item-{index}" for index in range(24)])),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_assignments_are_deterministic_under_input_reordering(
-        self, _case_name, item_ids
-    ) -> None:
-        codes = np.stack([np.arange(24) % 2, np.arange(24) % 3], axis=1)
-
-        def assignments(order):
-            ordered_ids = item_ids[order]
-            result = UniformCollisionResolver().resolve(
-                _plan((2, 4), 1, ordered_ids, codes[order])
-            )
-            return {
-                item_id: (
-                    int(result.resolved_last_codes[row]),
-                    int(result.slot_indices[row]),
-                )
-                for row, item_id in enumerate(ordered_ids.tolist())
-            }
-
-        expected = assignments(np.arange(24))
-        actual = assignments(np.random.default_rng(3).permutation(24))
-
-        self.assertEqual(actual, expected)
-
-    @parameterized.expand(
-        [
-            ("one_prefix_per_batch", 1, 1),
-            ("small_batches", 7, 5),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_batching_matches_single_batch(
-        self, _name, window_cells, dense_cells
-    ) -> None:
+    def test_small_chunks_match_single_chunk(self) -> None:
         rng = np.random.default_rng(2026)
         for trial in range(40):
             layer_sizes = (rng.integers(1, 6), rng.integers(2, 9))
@@ -232,24 +104,27 @@ class UniformCollisionResolverTest(unittest.TestCase):
             )
             plan = _plan(layer_sizes, rng.integers(1, 3), np.arange(item_count), codes)
 
-            batched = UniformCollisionResolver().resolve(plan)
-            with (
-                mock.patch.object(uniform_collision, "_WINDOW_CELLS", window_cells),
-                mock.patch.object(uniform_collision, "_DENSE_CELLS", dense_cells),
-            ):
+            single = UniformCollisionResolver().resolve(plan)
+            with mock.patch.object(uniform_collision, "_CHUNK_CELLS", 7):
                 split = UniformCollisionResolver().resolve(plan)
 
             with self.subTest(trial=trial):
                 np.testing.assert_array_equal(
-                    split.resolved_last_codes, batched.resolved_last_codes
+                    split.resolved_last_codes, single.resolved_last_codes
                 )
-                np.testing.assert_array_equal(split.slot_indices, batched.slot_indices)
+                np.testing.assert_array_equal(split.slot_indices, single.slot_indices)
                 np.testing.assert_array_equal(
-                    split.final_bucket_counts, batched.final_bucket_counts
+                    split.final_bucket_counts, single.final_bucket_counts
                 )
-                self.assertEqual(split.stats, batched.stats)
+                self.assertEqual(split.stats, single.stats)
 
-    def test_random_plans_match_least_loaded_reference(self) -> None:
+    @parameterized.expand(
+        [("default_chunks", uniform_collision._CHUNK_CELLS), ("small_chunks", 1)],
+        name_func=parameterized_name_func,
+    )
+    def test_random_plans_match_least_loaded_reference(
+        self, _name, chunk_cells
+    ) -> None:
         rng = np.random.default_rng(7)
         for trial in range(150):
             last_size = rng.integers(1, 9)
@@ -270,8 +145,22 @@ class UniformCollisionResolverTest(unittest.TestCase):
             item_ids = np.arange(item_count) * 7 + 1000
             plan = _plan(layer_sizes, capacity, item_ids, codes, prior=prior)
 
-            result = UniformCollisionResolver().resolve(plan)
-            expected_codes, expected_slots = _reference(plan, codes, item_ids)
+            with mock.patch.object(uniform_collision, "_CHUNK_CELLS", chunk_cells):
+                result = UniformCollisionResolver().resolve(plan)
+            expected_codes, expected_slots, loads = _reference(plan, codes, item_ids)
+            origin_keys = plan.config.bucket_keys(codes).tolist()
+            published = dict(
+                zip(plan.prior.bucket_keys.tolist(), plan.prior.bucket_counts.tolist())
+            )
+            overflow_prefixes = {
+                origin_keys[row] // last_size for row in plan.overflow_rows.tolist()
+            }
+            final = {
+                key: count
+                for key, count in loads.items()
+                if key in origin_keys or key // last_size in overflow_prefixes
+            }
+            unresolved = sum(slot > capacity for slot in expected_slots.values())
 
             with self.subTest(trial=trial):
                 for row in plan.overflow_rows.tolist():
@@ -280,8 +169,27 @@ class UniformCollisionResolverTest(unittest.TestCase):
                     )
                     self.assertEqual(int(result.slot_indices[row]), expected_slots[row])
                 self.assertEqual(
-                    result.stats.unresolved_count,
-                    sum(slot > capacity for slot in expected_slots.values()),
+                    dict(
+                        zip(
+                            result.final_bucket_keys.tolist(),
+                            result.final_bucket_counts.tolist(),
+                        )
+                    ),
+                    final,
+                )
+                self.assertEqual(
+                    dataclasses.astuple(result.stats),
+                    (
+                        item_count,
+                        sum(
+                            published.get(key, 0) + count > capacity
+                            for key, count in collections.Counter(origin_keys).items()
+                        ),
+                        sum(count > capacity for count in final.values()),
+                        plan.overflow_rows.shape[0] - unresolved,
+                        unresolved,
+                        max(final.values()),
+                    ),
                 )
                 build_resolved_item_grouping(plan, result)
 

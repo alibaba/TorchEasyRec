@@ -18,7 +18,6 @@ import numpy as np
 from tzrec.utils.sid.collision import (
     CollisionPlan,
     CollisionResolutionResult,
-    CollisionResolutionStats,
     CollisionResolver,
     concat_ranges,
     lookup_sorted,
@@ -27,8 +26,7 @@ from tzrec.utils.sid.collision import (
     stable_order_hash,
 )
 
-_WINDOW_CELLS = 1 << 22
-_DENSE_CELLS = 1 << 22
+_CHUNK_CELLS = 1 << 22
 
 
 class UniformCollisionResolver(CollisionResolver):
@@ -44,21 +42,22 @@ class UniformCollisionResolver(CollisionResolver):
     published occupancy allows; rows left over capacity count as unresolved
     even when they changed code.
 
-    Published append-state items participate only through their occupancy. They
-    are never overflow rows, so they cannot be moved.
+    Published items participate only through their occupancy. They are never
+    overflow rows, so they cannot be moved.
     """
 
     def resolve(
         self,
         plan: CollisionPlan,
-        candidate_codes: Optional[np.ndarray] = None,
+        candidate_last_codes: Optional[np.ndarray] = None,
         collect_grouping: bool = True,
     ) -> CollisionResolutionResult:
         """Resolve overflow rows by least-loaded filling within each prefix.
 
         Args:
             plan: Grouping and append-aware occupancy plan.
-            candidate_codes: Must be ``None``; this strategy uses no candidates.
+            candidate_last_codes: Must be ``None``; this strategy uses no
+                candidates.
             collect_grouping: Whether to retain final bucket metadata.
 
         Returns:
@@ -67,83 +66,67 @@ class UniformCollisionResolver(CollisionResolver):
         Raises:
             ValueError: If candidate codes are supplied.
         """
-        if candidate_codes is not None:
+        if candidate_last_codes is not None:
             raise ValueError(
-                "UniformCollisionResolver does not accept candidate_codes."
+                "UniformCollisionResolver does not accept candidate_last_codes."
             )
+        in_overflow_prefix, initial_keys, initial_counts = self._initial_occupancy(plan)
         overflow_count = plan.overflow_rows.shape[0]
         if overflow_count == 0:
-            return self._build_no_overflow_result(plan, collect_grouping)
+            return self._build_result(
+                plan,
+                plan.origin_last_codes,
+                plan.initial_slot_indices,
+                np.empty(0, dtype=np.int64),
+                in_overflow_prefix,
+                initial_keys,
+                initial_counts,
+                collect_grouping,
+            )
 
-        capacity = plan.config.capacity
         last_size = plan.config.layer_sizes[-1]
-        prior_counts = plan.prior_bucket_counts
-        combined_counts = prior_counts + plan.bucket_counts
-        initial_counts = np.maximum(prior_counts, np.minimum(combined_counts, capacity))
-
-        prefix_starts = run_starts(plan.overflow_bucket_key_prefixes)
-        prefix_rows = np.diff(np.append(prefix_starts, overflow_count))
-        prefix_keys = plan.overflow_bucket_key_prefixes[prefix_starts]
-        prefix_ids = prefix_keys // last_size
-        _, in_overflow_prefix = lookup_sorted(prefix_ids, plan.bucket_keys // last_size)
-
-        occupied_keys = plan.bucket_keys[in_overflow_prefix]
-        occupied_counts = initial_counts[in_overflow_prefix]
-        if not plan.prior.is_empty:
-            touched_prior = plan.prior.restrict_to_prefixes(prefix_ids, last_size)
-            _, known = lookup_sorted(occupied_keys, touched_prior.bucket_keys)
-            occupied_keys = np.concatenate(
-                (occupied_keys, touched_prior.bucket_keys[~known])
-            )
-            occupied_counts = np.concatenate(
-                (occupied_counts, touched_prior.bucket_counts[~known])
-            )
-            order = np.argsort(occupied_keys, kind="stable")
-            occupied_keys = occupied_keys[order]
-            occupied_counts = occupied_counts[order]
-        nonzero = occupied_counts > 0
-        occupied_keys = occupied_keys[nonzero]
-        occupied_counts = occupied_counts[nonzero]
-        occupied_starts = np.searchsorted(occupied_keys, prefix_keys)
-        occupied_lengths = (
-            np.searchsorted(occupied_keys, prefix_keys + last_size) - occupied_starts
+        prefix_starts = run_starts(plan.overflow_prefix_ids)
+        prefix_row_counts = np.diff(np.append(prefix_starts, overflow_count))
+        prefix_ids = plan.overflow_prefix_ids[prefix_starts]
+        base_keys = prefix_ids * last_size
+        occupied_starts = np.searchsorted(initial_keys, base_keys)
+        prefix_occupied_counts = (
+            np.searchsorted(initial_keys, base_keys + last_size) - occupied_starts
         )
         # uint64 modulus: a Python-int modulus would promote a uint64 scalar to float.
         rotations = (stable_order_hash(prefix_ids) % np.uint64(last_size)).astype(
             np.int64
         )
 
-        prefix_of_row = np.repeat(
-            np.arange(prefix_starts.shape[0], dtype=np.int64), prefix_rows
-        )
         ordered_rows = plan.overflow_rows[
             np.lexsort(
                 (
                     plan.overflow_rows,
                     stable_order_hash(plan.overflow_item_ids),
-                    prefix_of_row,
+                    plan.overflow_prefix_ids,
                 )
             )
         ]
-        del prefix_of_row
         assigned_codes = np.empty(overflow_count, dtype=np.int64)
         assigned_slots = np.empty(overflow_count, dtype=np.int64)
 
         # Rows that all fit on empty codes need no load tracking.
-        fits_empty = prefix_rows <= last_size - occupied_lengths
+        fits_empty = prefix_row_counts <= last_size - prefix_occupied_counts
         fast_prefixes = np.flatnonzero(fits_empty)
         fast_key_parts = []
         if fast_prefixes.size:
-            windows = np.minimum(
-                last_size, prefix_rows[fast_prefixes] + occupied_lengths[fast_prefixes]
+            scan_widths = np.minimum(
+                last_size,
+                prefix_row_counts[fast_prefixes]
+                + prefix_occupied_counts[fast_prefixes],
             )
-            window_ends = np.cumsum(windows)
+            scan_ends = np.cumsum(scan_widths)
             first = 0
             while first < fast_prefixes.shape[0]:
                 end = int(
                     np.searchsorted(
-                        window_ends,
-                        int(window_ends[first] - windows[first]) + _WINDOW_CELLS,
+                        scan_ends,
+                        int(scan_ends[first] - scan_widths[first]) + _CHUNK_CELLS,
                         side="right",
                     )
                 )
@@ -151,14 +134,14 @@ class UniformCollisionResolver(CollisionResolver):
                 fast_key_parts.append(
                     self._fill_empty_codes(
                         fast_prefixes[first:end],
-                        windows[first:end],
-                        prefix_rows,
+                        scan_widths[first:end],
+                        prefix_row_counts,
                         prefix_starts,
-                        prefix_keys,
+                        base_keys,
                         rotations,
-                        occupied_keys,
+                        initial_keys,
                         occupied_starts,
-                        occupied_lengths,
+                        prefix_occupied_counts,
                         last_size,
                         assigned_codes,
                         assigned_slots,
@@ -168,80 +151,61 @@ class UniformCollisionResolver(CollisionResolver):
 
         general_prefixes = np.flatnonzero(~fits_empty)
         general_key_parts = []
-        chunk = max(1, _DENSE_CELLS // last_size)
-        for first in range(0, general_prefixes.shape[0], chunk):
+        chunk_prefixes = max(1, _CHUNK_CELLS // last_size)
+        for first in range(0, general_prefixes.shape[0], chunk_prefixes):
             general_key_parts.append(
                 self._water_fill(
-                    general_prefixes[first : first + chunk],
-                    prefix_rows,
+                    general_prefixes[first : first + chunk_prefixes],
+                    prefix_row_counts,
                     prefix_starts,
-                    prefix_keys,
+                    base_keys,
                     rotations,
-                    occupied_keys,
-                    occupied_counts,
+                    initial_keys,
+                    initial_counts,
                     occupied_starts,
-                    occupied_lengths,
+                    prefix_occupied_counts,
                     last_size,
                     assigned_codes,
                     assigned_slots,
                 )
             )
 
-        resolved_last_codes = plan.original_last_codes.copy()
+        resolved_last_codes = plan.origin_last_codes.copy()
         slot_indices = plan.initial_slot_indices.copy()
         resolved_last_codes[ordered_rows] = assigned_codes
         slot_indices[ordered_rows] = assigned_slots
-        unresolved_rows = ordered_rows[assigned_slots > capacity]
+        unresolved_rows = ordered_rows[assigned_slots > plan.config.capacity]
 
         general_keys = np.concatenate((np.empty(0, dtype=np.int64), *general_key_parts))
-        final_counts = occupied_counts.copy()
-        positions, found = lookup_sorted(occupied_keys, general_keys)
+        final_counts = initial_counts.copy()
+        positions, found = lookup_sorted(initial_keys, general_keys)
         np.add.at(final_counts, positions[found], 1)
         new_keys, new_counts = np.unique(general_keys[~found], return_counts=True)
         fast_keys = np.concatenate((np.empty(0, dtype=np.int64), *fast_key_parts))
-        (
-            final_bucket_keys,
-            final_bucket_counts,
-            final_collision_buckets,
-            max_final_bucket_size,
-        ) = self._summarize_final_buckets(
+        return self._build_result(
             plan,
-            initial_counts,
+            resolved_last_codes,
+            slot_indices,
+            unresolved_rows,
             in_overflow_prefix,
-            np.concatenate((occupied_keys, fast_keys, new_keys)),
+            np.concatenate((initial_keys, fast_keys, new_keys)),
             np.concatenate(
                 (final_counts, np.ones(fast_keys.shape[0], dtype=np.int64), new_counts)
             ),
             collect_grouping,
         )
-        return CollisionResolutionResult(
-            resolved_last_codes=resolved_last_codes,
-            slot_indices=slot_indices,
-            unresolved_rows=unresolved_rows,
-            final_bucket_keys=final_bucket_keys,
-            final_bucket_counts=final_bucket_counts,
-            grouping_collected=collect_grouping,
-            stats=CollisionResolutionStats(
-                total_items=plan.item_count,
-                raw_collision_buckets=int((combined_counts > capacity).sum()),
-                final_collision_buckets=final_collision_buckets,
-                relocated_count=overflow_count - unresolved_rows.shape[0],
-                unresolved_count=unresolved_rows.shape[0],
-                max_final_bucket_size=max_final_bucket_size,
-            ),
-        )
 
     @staticmethod
     def _fill_empty_codes(
-        prefixes: np.ndarray,
-        windows: np.ndarray,
-        prefix_rows: np.ndarray,
+        prefix_indices: np.ndarray,
+        scan_widths: np.ndarray,
+        prefix_row_counts: np.ndarray,
         prefix_starts: np.ndarray,
-        prefix_keys: np.ndarray,
+        base_keys: np.ndarray,
         rotations: np.ndarray,
-        occupied_keys: np.ndarray,
+        initial_keys: np.ndarray,
         occupied_starts: np.ndarray,
-        occupied_lengths: np.ndarray,
+        prefix_occupied_counts: np.ndarray,
         last_size: int,
         assigned_codes: np.ndarray,
         assigned_slots: np.ndarray,
@@ -252,15 +216,15 @@ class UniformCollisionResolver(CollisionResolver):
         ``m + occupied`` rotated positions, so only that window is scanned.
 
         Args:
-            prefixes: Indices of the prefixes to fill, ascending.
-            windows: Rotated positions to scan for each of ``prefixes``.
-            prefix_rows: Overflow row count of every prefix.
+            prefix_indices: Indices of the prefixes to fill, ascending.
+            scan_widths: Rotated positions to scan for each of ``prefix_indices``.
+            prefix_row_counts: Overflow row count of every prefix.
             prefix_starts: Offset of every prefix's rows in stable item order.
-            prefix_keys: Bucket key of code 0 in every prefix.
+            base_keys: Bucket key of code 0 in every prefix.
             rotations: Tie-break rotation of every prefix.
-            occupied_keys: Sorted keys of occupied buckets in overflow prefixes.
-            occupied_starts: First ``occupied_keys`` position of every prefix.
-            occupied_lengths: Occupied bucket count of every prefix.
+            initial_keys: Sorted keys of occupied buckets in overflow prefixes.
+            occupied_starts: First ``initial_keys`` position of every prefix.
+            prefix_occupied_counts: Occupied bucket count of every prefix.
             last_size: Cardinality of the last SID layer.
             assigned_codes: Per-row last codes in stable item order, updated.
             assigned_slots: Per-row slots in stable item order, updated.
@@ -268,39 +232,46 @@ class UniformCollisionResolver(CollisionResolver):
         Returns:
             Global keys of the buckets the rows now occupy.
         """
-        owners = np.repeat(np.arange(prefixes.shape[0], dtype=np.int64), windows)
-        codes = rotations[prefixes][owners] + concat_ranges(
-            np.zeros(prefixes.shape[0], dtype=np.int64), windows
+        owners = np.repeat(
+            np.arange(prefix_indices.shape[0], dtype=np.int64), scan_widths
         )
-        codes %= last_size
-        keys = prefix_keys[prefixes][owners] + codes
+        codes = (
+            rotations[prefix_indices][owners] + ranks_within_runs(owners)
+        ) % last_size
+        keys = base_keys[prefix_indices][owners] + codes
         _, taken = lookup_sorted(
-            occupied_keys[
-                int(occupied_starts[prefixes[0]]) : int(
-                    occupied_starts[prefixes[-1]] + occupied_lengths[prefixes[-1]]
+            initial_keys[
+                int(occupied_starts[prefix_indices[0]]) : int(
+                    occupied_starts[prefix_indices[-1]]
+                    + prefix_occupied_counts[prefix_indices[-1]]
                 )
             ],
             keys,
         )
         free = np.flatnonzero(~taken)
         free_owners = owners[free]
-        free = free[ranks_within_runs(free_owners) < prefix_rows[prefixes][free_owners]]
-        rows = concat_ranges(prefix_starts[prefixes], prefix_rows[prefixes])
-        assigned_codes[rows] = codes[free]
-        assigned_slots[rows] = 1
+        free = free[
+            ranks_within_runs(free_owners)
+            < prefix_row_counts[prefix_indices][free_owners]
+        ]
+        order_positions = concat_ranges(
+            prefix_starts[prefix_indices], prefix_row_counts[prefix_indices]
+        )
+        assigned_codes[order_positions] = codes[free]
+        assigned_slots[order_positions] = 1
         return keys[free]
 
     @staticmethod
     def _water_fill(
-        prefixes: np.ndarray,
-        prefix_rows: np.ndarray,
+        prefix_indices: np.ndarray,
+        prefix_row_counts: np.ndarray,
         prefix_starts: np.ndarray,
-        prefix_keys: np.ndarray,
+        base_keys: np.ndarray,
         rotations: np.ndarray,
-        occupied_keys: np.ndarray,
-        occupied_counts: np.ndarray,
+        initial_keys: np.ndarray,
+        initial_counts: np.ndarray,
         occupied_starts: np.ndarray,
-        occupied_lengths: np.ndarray,
+        prefix_occupied_counts: np.ndarray,
         last_size: int,
         assigned_codes: np.ndarray,
         assigned_slots: np.ndarray,
@@ -313,15 +284,15 @@ class UniformCollisionResolver(CollisionResolver):
         and the pairs are enumerated directly.
 
         Args:
-            prefixes: Indices of the prefixes to fill.
-            prefix_rows: Overflow row count of every prefix.
+            prefix_indices: Indices of the prefixes to fill.
+            prefix_row_counts: Overflow row count of every prefix.
             prefix_starts: Offset of every prefix's rows in stable item order.
-            prefix_keys: Bucket key of code 0 in every prefix.
+            base_keys: Bucket key of code 0 in every prefix.
             rotations: Tie-break rotation of every prefix.
-            occupied_keys: Sorted keys of occupied buckets in overflow prefixes.
-            occupied_counts: Initial counts aligned with ``occupied_keys``.
-            occupied_starts: First ``occupied_keys`` position of every prefix.
-            occupied_lengths: Occupied bucket count of every prefix.
+            initial_keys: Sorted keys of occupied buckets in overflow prefixes.
+            initial_counts: Initial counts aligned with ``initial_keys``.
+            occupied_starts: First ``initial_keys`` position of every prefix.
+            prefix_occupied_counts: Occupied bucket count of every prefix.
             last_size: Cardinality of the last SID layer.
             assigned_codes: Per-row last codes in stable item order, updated.
             assigned_slots: Per-row slots in stable item order, updated.
@@ -329,33 +300,37 @@ class UniformCollisionResolver(CollisionResolver):
         Returns:
             Global bucket key of every assigned row.
         """
-        group = prefixes.shape[0]
-        loads = np.zeros((group, last_size), dtype=np.int64)
-        lengths = occupied_lengths[prefixes]
-        selected = concat_ranges(occupied_starts[prefixes], lengths)
-        owners = np.repeat(np.arange(group, dtype=np.int64), lengths)
+        prefix_count = prefix_indices.shape[0]
+        loads = np.zeros((prefix_count, last_size), dtype=np.int64)
+        lengths = prefix_occupied_counts[prefix_indices]
+        selected = concat_ranges(occupied_starts[prefix_indices], lengths)
+        owners = np.repeat(np.arange(prefix_count, dtype=np.int64), lengths)
         loads[
             owners,
             (
-                occupied_keys[selected]
-                - prefix_keys[prefixes][owners]
-                - rotations[prefixes][owners]
+                initial_keys[selected]
+                - base_keys[prefix_indices][owners]
+                - rotations[prefix_indices][owners]
             )
             % last_size,
-        ] = occupied_counts[selected]
+        ] = initial_counts[selected]
 
-        rows = prefix_rows[prefixes]
+        row_counts = prefix_row_counts[prefix_indices]
         low = loads.min(axis=1)
-        high = loads.max(axis=1) + -(-rows // last_size)
+        high = loads.max(axis=1) + -(-row_counts // last_size)
         while np.any(low < high):
             middle = (low + high) // 2
-            enough = np.maximum(middle[:, None] + 1 - loads, 0).sum(axis=1) >= rows
+            enough = (
+                np.maximum(middle[:, None] + 1 - loads, 0).sum(axis=1) >= row_counts
+            )
             high = np.where(enough, middle, high)
             low = np.where(enough, low, middle + 1)
         level = low
         below = np.maximum(level[:, None] - loads, 0)
         at_level = loads <= level[:, None]
-        at_level &= np.cumsum(at_level, axis=1) <= (rows - below.sum(axis=1))[:, None]
+        at_level &= (
+            np.cumsum(at_level, axis=1) <= (row_counts - below.sum(axis=1))[:, None]
+        )
 
         below_cells = np.flatnonzero(below)
         below_counts = below.ravel()[below_cells]
@@ -374,9 +349,9 @@ class UniformCollisionResolver(CollisionResolver):
         order = np.lexsort((pair_positions, pair_levels, pair_owners))
         pair_owners = pair_owners[order]
         pair_codes = (
-            pair_positions[order] + rotations[prefixes][pair_owners]
+            pair_positions[order] + rotations[prefix_indices][pair_owners]
         ) % last_size
-        targets = concat_ranges(prefix_starts[prefixes], rows)
-        assigned_codes[targets] = pair_codes
-        assigned_slots[targets] = pair_levels[order] + 1
-        return prefix_keys[prefixes][pair_owners] + pair_codes
+        order_positions = concat_ranges(prefix_starts[prefix_indices], row_counts)
+        assigned_codes[order_positions] = pair_codes
+        assigned_slots[order_positions] = pair_levels[order] + 1
+        return base_keys[prefix_indices][pair_owners] + pair_codes
