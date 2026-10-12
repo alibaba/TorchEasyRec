@@ -27,6 +27,8 @@ jobs:
           CACHE_ROOT="/__w/TorchEasyRec/tzrec-ci-cache"
           mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
           cd run_${{ github.run_id }}
+          # GHA overrides HOME to /github/home, hiding the image's warm pip cache.
+          PIP_CACHE_DIR=/root/.cache/pip \
           TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
           TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
           LD_LIBRARY_PATH=/usr/local/cuda-13/compat \

@@ -33,6 +33,7 @@ jobs:
           mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
           cd run_${{ github.run_id }}
           CI_NIGHTLY=true \
+          PIP_CACHE_DIR=/root/.cache/pip \
           TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
           TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
           CUDA_HOME=/usr/local/cuda-13 bash scripts/ci/ci_test.sh

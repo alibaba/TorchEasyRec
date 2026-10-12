@@ -29,6 +29,7 @@ jobs:
             --workdir /__w/TorchEasyRec/TorchEasyRec \
             --gpus all --shm-size=512g --ulimit memlock=-1 \
             -e HOME=/github/home \
+            -e PIP_CACHE_DIR=/root/.cache/pip \
             -e GITHUB_ACTIONS=true \
             -e CI=true \
             -e CUDA_HOME=/usr/local/cuda-13 \
