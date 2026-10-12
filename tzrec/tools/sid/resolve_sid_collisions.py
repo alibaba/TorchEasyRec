@@ -96,7 +96,7 @@ import math
 import os
 from dataclasses import asdict, dataclass
 from functools import cached_property
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Type
 
 import numpy as np
 import pyarrow as pa
@@ -358,10 +358,10 @@ class CollisionResolutionRunner:
             logger.info("SID collision resolution finished: %s", stats)
         return stats
 
-    def _owned_rows(self, codes: np.ndarray) -> Union[slice, np.ndarray]:
-        """Select the complete SID prefixes assigned to this rank."""
+    def _get_prefix_mask(self, codes: np.ndarray) -> np.ndarray:
+        """Return a boolean mask for rows in this rank's SID prefix range."""
         if self._world_size == 1:
-            return slice(None)
+            return np.ones(codes.shape[0], dtype=bool)
         prefixes = self._config.resolution_config.prefix_ids(codes)
         # NOTE: Keep invalid prefixes so the core can reject out-of-range codes.
         prefixes = np.clip(prefixes, 0, math.prod(self._config.layer_sizes[:-1]) - 1)
@@ -465,7 +465,9 @@ class CollisionResolutionRunner:
         for batch in reader.to_batches():
             batch_size = len(next(iter(batch.values())))
             if code_field is not None and self._world_size > 1:
-                keep = pa.array(self._owned_rows(self._codes_matrix(batch[code_field])))
+                keep = pa.array(
+                    self._get_prefix_mask(self._codes_matrix(batch[code_field]))
+                )
                 batch = {name: values.filter(keep) for name, values in batch.items()}
             if len(next(iter(batch.values()))):
                 yield batch
@@ -536,7 +538,7 @@ class CollisionResolutionRunner:
             item_ids = batch[self._config.item_id_field]
             self._validate_item_ids(item_ids)
             codes = self._codes_matrix(batch[self._config.code_field])
-            keep = self._owned_rows(codes)
+            keep = self._get_prefix_mask(codes)
             id_batches.append(item_ids.to_numpy(zero_copy_only=False)[keep])
             code_batches.append(codes[keep])
 
@@ -709,7 +711,7 @@ class CollisionResolutionRunner:
             previous_max_key = int(keys[-1])
 
             lengths, flat_ids = self._decode_grouped_item_ids(batch["itemids"])
-            published_items += int(lengths[self._owned_rows(codes)].sum())
+            published_items += int(lengths[self._get_prefix_mask(codes)].sum())
             if len(flat_ids):
                 overlap = pc.is_in(flat_ids, value_set=new_id_values)
                 batch_overlap = overlap.true_count

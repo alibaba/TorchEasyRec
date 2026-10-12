@@ -318,7 +318,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 runner = self._runner(
                     inp, os.path.join(self.test_dir, "out"), layer_sizes=(4, 4, 4)
                 )
-            owned = codes[runner._owned_rows(codes)]
+            owned = codes[runner._get_prefix_mask(codes)]
             with self.assertRaisesRegex(ValueError, "out-of-range"):
                 prepare_collision_plan(
                     np.arange(len(owned)), owned, runner._config.resolution_config
