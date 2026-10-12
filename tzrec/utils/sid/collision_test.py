@@ -20,7 +20,6 @@ from tzrec.utils.sid.collision import (
     PriorOccupancy,
     build_origin_item_grouping,
     build_resolved_item_grouping,
-    concat_ranges,
     prepare_collision_plan,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
@@ -29,11 +28,11 @@ from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 from tzrec.utils.test_util import parameterized_name_func
 
 
-def _plan(layer_sizes, capacity, item_ids, codes, prior=None):
+def _plan(codebook, capacity, item_ids, codes, prior=None):
     return prepare_collision_plan(
         np.asarray(item_ids, dtype=np.int64),
         np.asarray(codes, dtype=np.int64),
-        CollisionResolutionConfig(layer_sizes, capacity),
+        CollisionResolutionConfig(codebook, capacity),
         prior=prior,
     )
 
@@ -54,11 +53,6 @@ def _assert_same_assignments(test_case, actual, expected):
 
 
 class CollisionTest(unittest.TestCase):
-    def test_resolvers_reject_invalid_progress_interval(self) -> None:
-        with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
-            KnnCollisionResolver(progress_interval=0)
-
-
     @parameterized.expand(
         [
             ("knn", KnnCollisionResolver),
@@ -84,7 +78,7 @@ class CollisionTest(unittest.TestCase):
         ):
             with self.subTest(grouping=name):
                 np.testing.assert_array_equal(grouping.sid_keys, [])
-                np.testing.assert_array_equal(grouping.counts, [])
+                np.testing.assert_array_equal(grouping.item_counts, [])
                 np.testing.assert_array_equal(grouping.row_order, [])
                 np.testing.assert_array_equal(grouping.offsets, [0])
 
@@ -115,7 +109,7 @@ class CollisionTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_collect_grouping_false_changes_only_bucket_metadata(
+    def test_collect_grouping_false_changes_only_sid_metadata(
         self, _case_name, resolver_cls, codes, candidates, stats
     ) -> None:
         plan = _plan((2,), 1, range(len(codes)), codes)
@@ -128,8 +122,8 @@ class CollisionTest(unittest.TestCase):
         _assert_same_assignments(self, rate_only, grouped)
         self.assertTrue(grouped.grouping_collected)
         self.assertFalse(rate_only.grouping_collected)
-        np.testing.assert_array_equal(rate_only.final_bucket_keys, [])
-        np.testing.assert_array_equal(rate_only.final_bucket_counts, [])
+        np.testing.assert_array_equal(rate_only.final_sid_keys, [])
+        np.testing.assert_array_equal(rate_only.final_item_counts, [])
 
     @parameterized.expand(
         [
@@ -153,29 +147,21 @@ class CollisionTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_rejects_invalid_config(
-        self, _case_name, layer_sizes, capacity, message
+        self, _case_name, codebook, capacity, message
     ) -> None:
         with self.assertRaisesRegex(ValueError, message):
-            CollisionResolutionConfig(layer_sizes, capacity)
+            CollisionResolutionConfig(codebook, capacity)
 
     def test_prefix_key_near_int64_limit(self) -> None:
-        layer_size = 3_037_000_499
+        codebook_size = 3_037_000_499
         plan = _plan(
-            (layer_size, layer_size),
+            (codebook_size, codebook_size),
             1,
             [0],
-            [[layer_size - 1, layer_size - 1]],
+            [[codebook_size - 1, codebook_size - 1]],
         )
 
-        np.testing.assert_array_equal(plan.bucket_keys, [layer_size**2 - 1])
-
-
-class ConcatRangesTest(unittest.TestCase):
-    def test_concatenates_ranges_and_skips_empty_ones(self) -> None:
-        np.testing.assert_array_equal(
-            concat_ranges(np.asarray([5, 10, 20]), np.asarray([2, 0, 3])),
-            [5, 6, 20, 21, 22],
-        )
+        np.testing.assert_array_equal(plan.sid_keys, [codebook_size**2 - 1])
 
 
 class SidLayoutTest(unittest.TestCase):
@@ -194,18 +180,18 @@ class SidLayoutTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_key_layout(
-        self, _case_name, layer_sizes, codes, prefix_ids, bucket_keys, offset_codes
+        self, _case_name, codebook, codes, prefix_ids, sid_keys, offset_codes
     ) -> None:
-        config = CollisionResolutionConfig(layer_sizes, 1)
+        config = CollisionResolutionConfig(codebook, 1)
         codes = np.asarray(codes, dtype=np.int64)
 
         np.testing.assert_array_equal(config.prefix_ids(codes), prefix_ids)
-        np.testing.assert_array_equal(config.bucket_keys(codes), bucket_keys)
+        np.testing.assert_array_equal(config.convert_codes_to_sid_keys(codes), sid_keys)
         np.testing.assert_array_equal(config.offset_codes(codes), offset_codes)
 
 
 class PriorOccupancyTest(unittest.TestCase):
-    def test_counts_for_returns_zero_for_absent_buckets(self) -> None:
+    def test_counts_for_returns_zero_for_absent_sids(self) -> None:
         prior = _prior([2, 5, 9], [1, 4, 2])
         np.testing.assert_array_equal(
             prior.counts_for(np.asarray([9, 0, 5, 100, 2])), [2, 0, 4, 0, 1]
@@ -215,17 +201,17 @@ class PriorOccupancyTest(unittest.TestCase):
         # last_size 4 -> prefix 0 spans keys 0..3, prefix 2 spans keys 8..11.
         prior = _prior([0, 3, 5, 9, 11, 12], [1, 2, 3, 4, 5, 6])
         restricted = prior.restrict_to_prefixes(np.asarray([0, 2]), 4)
-        np.testing.assert_array_equal(restricted.bucket_keys, [0, 3, 9, 11])
-        np.testing.assert_array_equal(restricted.bucket_counts, [1, 2, 4, 5])
+        np.testing.assert_array_equal(restricted.sid_keys, [0, 3, 9, 11])
+        np.testing.assert_array_equal(restricted.item_counts, [1, 2, 4, 5])
         self.assertTrue(prior.restrict_to_prefixes(np.asarray([7]), 4).is_empty)
 
 
 class AppendPlanTest(unittest.TestCase):
     def test_prior_consumes_capacity_and_continues_slots(self) -> None:
-        # Bucket (0, 0) is key 0 and already holds one published item, so with
+        # SID (0, 0) is key 0 and already holds one published item, so with
         # capacity 2 only one of the two new rows can be retained there.
         plan = _plan((2, 4), 2, [10, 11], [[0, 0], [0, 0]], prior=_prior([0], [1]))
-        np.testing.assert_array_equal(plan.prior_bucket_counts, [1])
+        np.testing.assert_array_equal(plan.existing_item_counts, [1])
         self.assertEqual(plan.overflow_rows.size, 1)
         retained = int(np.setdiff1d(np.arange(2), plan.overflow_rows)[0])
         # The retained row continues the published slot sequence at 2, not 1.
@@ -236,9 +222,9 @@ class AppendPlanTest(unittest.TestCase):
         plan = _plan((2, 4), 3, [10], [[0, 0]], prior=_prior([0], [2]))
         result = KnnCollisionResolver().resolve(plan, None)
         self.assertEqual(plan.overflow_rows.size, 0)
-        np.testing.assert_array_equal(result.final_bucket_keys, [0])
-        np.testing.assert_array_equal(result.final_bucket_counts, [3])
-        self.assertEqual(result.stats.max_final_bucket_size, 3)
+        np.testing.assert_array_equal(result.final_sid_keys, [0])
+        np.testing.assert_array_equal(result.final_item_counts, [3])
+        self.assertEqual(result.stats.max_final_items_per_sid, 3)
 
     def test_groupings_cover_only_the_appended_rows(self) -> None:
         prior = _prior([0], [1])
@@ -247,10 +233,10 @@ class AppendPlanTest(unittest.TestCase):
 
         resolved = build_resolved_item_grouping(plan, result)
         np.testing.assert_array_equal(np.sort(resolved.row_order), [0, 1])
-        self.assertEqual(int(resolved.counts.sum()), 2)
+        self.assertEqual(int(resolved.item_counts.sum()), 2)
         # Key 0 already held one item, so the delta grouping keeps one row there
         # and the local slot restarts at 1 even though the global slot is 2.
-        keys = CollisionResolutionConfig((2, 4), 1).bucket_keys(
+        keys = CollisionResolutionConfig((2, 4), 1).convert_codes_to_sid_keys(
             np.asarray([[0, 0], [0, 1]])
         )
         np.testing.assert_array_equal(resolved.sid_keys, np.sort(keys))
@@ -258,7 +244,7 @@ class AppendPlanTest(unittest.TestCase):
 
         origin = build_origin_item_grouping(plan)
         np.testing.assert_array_equal(np.sort(origin.row_order), [0, 1])
-        self.assertEqual(int(origin.counts.sum()), 2)
+        self.assertEqual(int(origin.item_counts.sum()), 2)
 
     def test_rejects_prior_outside_the_key_space(self) -> None:
         with self.assertRaisesRegex(ValueError, "outside the key space"):

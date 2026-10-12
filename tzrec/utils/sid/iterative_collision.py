@@ -32,7 +32,7 @@ class IterativeCollisionResolver(CollisionResolver):
 
     Each SID prefix is independent. In every round, each unplaced
     overflow row proposes to its candidates that still have room, except that
-    within one origin bucket only the first ``capacity`` rows (in stable item
+    within one origin SID only the first ``capacity`` rows (in stable item
     order) with room at a candidate position propose at that position, which
     bounds the proposals of large same-origin groups whose candidate lists are
     near-identical. A target accepts up to its remaining capacity, ordered by
@@ -41,15 +41,15 @@ class IterativeCollisionResolver(CollisionResolver):
     committed elsewhere reopen in the next round. A row left with no candidate
     that has room keeps its origin SID over capacity.
 
-    Acceptance favors candidate proximity: a bucket goes to the row that ranks
+    Acceptance favors candidate proximity: a SID goes to the row that ranks
     it earlier even when that row has other options, so this policy can leave
-    more rows unresolved than first-fit placement. Within a bucket, relocated
+    more rows unresolved than first-fit placement. Within a SID, relocated
     rows are numbered after its initial occupancy by round, candidate position
     and stable item order.
 
     Published items participate only through their occupancy. They are never
     proposal rows, so they cannot be moved, and an already over-capacity
-    published bucket retains its complete count.
+    published SID retains its complete count.
 
     """
 
@@ -65,7 +65,7 @@ class IterativeCollisionResolver(CollisionResolver):
             plan: Grouping and append-aware occupancy plan.
             candidate_last_codes: Ordered last-layer candidates aligned with
                 ``plan.overflow_rows``. It may be omitted only without overflow.
-            collect_grouping: Whether to retain final bucket metadata.
+            collect_grouping: Whether to retain final SID metadata.
 
         Returns:
             Resolved last-layer codes, slot indices, and summary statistics.
@@ -90,7 +90,7 @@ class IterativeCollisionResolver(CollisionResolver):
             )
 
         capacity = plan.config.capacity
-        last_size = plan.config.layer_sizes[-1]
+        last_size = plan.config.codebook[-1]
         overflow_rows = plan.overflow_rows
         row_count = overflow_rows.shape[0]
         prefix_ids, prefix_indices = np.unique(

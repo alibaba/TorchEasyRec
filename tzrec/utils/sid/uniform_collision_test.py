@@ -25,11 +25,11 @@ from tzrec.utils.sid.collision import (
 from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 
 
-def _plan(layer_sizes, capacity, item_ids, codes, prior=None):
+def _plan(codebook, capacity, item_ids, codes, prior=None):
     return prepare_collision_plan(
         np.asarray(item_ids),
         np.asarray(codes, dtype=np.int64),
-        CollisionResolutionConfig(layer_sizes, capacity),
+        CollisionResolutionConfig(codebook, capacity),
         prior=prior,
     )
 
@@ -50,9 +50,9 @@ def _reference(plan, codes, item_ids):
     """Place overflow rows one at a time on the least-loaded rotated code.
 
     Returns the code and slot of every overflow row and the final load of every
-    occupied bucket, published-only buckets included.
+    occupied SID, published-only SIDs included.
     """
-    last_size = plan.config.layer_sizes[-1]
+    last_size = plan.config.codebook[-1]
     prefixes = plan.config.prefix_ids(np.asarray(codes))
     moving = set(plan.overflow_rows.tolist())
     loads = {}
@@ -61,7 +61,7 @@ def _reference(plan, codes, item_ids):
             key = prefix * last_size + int(codes[row][-1])
             loads[key] = loads.get(key, 0) + 1
     for key, count in zip(
-        plan.prior.bucket_keys.tolist(), plan.prior.bucket_counts.tolist()
+        plan.prior.sid_keys.tolist(), plan.prior.item_counts.tolist()
     ):
         loads[key] = loads.get(key, 0) + count
     hashes = stable_order_hash(np.asarray(item_ids)).tolist()
@@ -94,28 +94,28 @@ class UniformCollisionResolverTest(unittest.TestCase):
         rng = np.random.default_rng(7)
         for trial in range(150):
             last_size = rng.integers(1, 9)
-            layer_sizes = (rng.integers(1, 4), last_size)
+            codebook = (rng.integers(1, 4), last_size)
             capacity = rng.integers(1, 3)
             item_count = rng.integers(1, 40)
             codes = np.stack(
                 [
                     np.minimum(rng.geometric(0.4, item_count) - 1, size - 1)
-                    for size in layer_sizes
+                    for size in codebook
                 ],
                 axis=1,
             )
             prior = None
             if trial % 3 == 0:
-                keys = np.unique(rng.integers(0, layer_sizes[0] * last_size, 4))
+                keys = np.unique(rng.integers(0, codebook[0] * last_size, 4))
                 prior = _prior(keys, rng.integers(1, capacity + 3, keys.shape[0]))
             item_ids = np.arange(item_count) * 7 + 1000
-            plan = _plan(layer_sizes, capacity, item_ids, codes, prior=prior)
+            plan = _plan(codebook, capacity, item_ids, codes, prior=prior)
 
             result = UniformCollisionResolver().resolve(plan)
             expected_codes, expected_slots, loads = _reference(plan, codes, item_ids)
-            origin_keys = plan.config.bucket_keys(codes).tolist()
+            origin_keys = plan.config.convert_codes_to_sid_keys(codes).tolist()
             published = dict(
-                zip(plan.prior.bucket_keys.tolist(), plan.prior.bucket_counts.tolist())
+                zip(plan.prior.sid_keys.tolist(), plan.prior.item_counts.tolist())
             )
             overflow_prefixes = {
                 origin_keys[row] // last_size for row in plan.overflow_rows.tolist()
@@ -136,8 +136,8 @@ class UniformCollisionResolverTest(unittest.TestCase):
                 self.assertEqual(
                     dict(
                         zip(
-                            result.final_bucket_keys.tolist(),
-                            result.final_bucket_counts.tolist(),
+                            result.final_sid_keys.tolist(),
+                            result.final_item_counts.tolist(),
                         )
                     ),
                     final,

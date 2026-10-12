@@ -45,7 +45,7 @@ class KnnCollisionResolver(CollisionResolver):
             candidate_last_codes: Last-layer candidate matrix with shape
                 ``(M, K)``, row-aligned with ``plan.overflow_rows``. It may be
                 omitted only when the plan has no overflow rows.
-            collect_grouping: Whether to retain final bucket metadata required
+            collect_grouping: Whether to retain final SID metadata required
                 by :func:`build_resolved_item_grouping`.
 
         Returns:
@@ -75,7 +75,7 @@ class KnnCollisionResolver(CollisionResolver):
                 collect_grouping,
             )
 
-        last_size = plan.config.layer_sizes[-1]
+        last_size = plan.config.codebook[-1]
         capacity = plan.config.capacity
         occupancy = dict(zip(affected_keys.tolist(), affected_counts.tolist()))
         get_occupancy = occupancy.get

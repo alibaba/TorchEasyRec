@@ -236,11 +236,11 @@ class Bundle:
     def check_prior_compatible(self, codebook: List[int], capacity: int) -> None:
         """Reject an append whose SID space differs from the published corpus.
 
-        The codebook fixes how a SID packs into a bucket key and how its layers
+        The codebook fixes how a SID packs into a SID key and how its layers
         shift into one vocabulary, so appending under a different one re-keys
         every published SID and rewrites its ``offset_codebook``.
 
-        A differing ``capacity`` is only warned about: published buckets keep
+        A differing ``capacity`` is only warned about: published SIDs keep
         the occupancy they were published with.
 
         Raises:
@@ -260,7 +260,7 @@ class Bundle:
         if capacity != prior.capacity:
             logger.warning(
                 "capacity is %d but generation %s was published with %d; already "
-                "published buckets keep the occupancy they have",
+                "published SIDs keep the occupancy they have",
                 capacity,
                 self._from_generation,
                 prior.capacity,
@@ -277,7 +277,7 @@ class Bundle:
         """Write the manifest last and return where it landed.
 
         ``observed`` is carried forward as a running maximum: an append only
-        sees the buckets of the prefixes it affects, so the published ceiling
+        sees the SIDs of the prefixes it affects, so the published ceiling
         is the larger of this run's and the one it appended onto.
 
         An ODPS root fixes an artifact's ``save_type`` to ``odps``, so it cannot

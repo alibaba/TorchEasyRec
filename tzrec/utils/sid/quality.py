@@ -26,12 +26,12 @@ class SidQualityMetrics:
 
     Attributes:
         total: Number of evaluated items.
-        unique_sid: Number of occupied SID buckets.
-        no_collision_rate: Ratio of occupied SID buckets to items.
-        uniquely_identified_item_rate: Ratio of items in singleton buckets.
-        max_collision: Size of the largest occupied SID bucket.
-        gini: Gini coefficient over occupied bucket sizes.
-        entropy: Shannon entropy over occupied bucket probabilities.
+        unique_sid: Number of occupied SIDs.
+        no_collision_rate: Ratio of occupied SIDs to items.
+        uniquely_identified_item_rate: Ratio of items in singleton sids.
+        max_collision: Size of the largest occupied SID.
+        gini: Gini coefficient over occupied SID sizes.
+        entropy: Shannon entropy over occupied SID probabilities.
         max_entropy: Logarithm of the full codebook capacity.
         entropy_ratio: Entropy divided by maximum entropy.
     """
@@ -82,7 +82,7 @@ class SidQualityResult:
 
 
 def compute_gini(counts: npt.ArrayLike) -> float:
-    """Compute the Gini coefficient of occupied SID bucket sizes.
+    """Compute the Gini coefficient of occupied SID sizes.
 
     Args:
         counts: Per-SID occurrence counts.
@@ -94,7 +94,7 @@ def compute_gini(counts: npt.ArrayLike) -> float:
     if count_array.size == 0:
         return 0.0
     values, frequencies = np.unique(count_array, return_counts=True)
-    num_buckets = int(frequencies.sum())
+    occupied_sid_count = int(frequencies.sum())
     weighted_sum = int(np.dot(values, frequencies))
     if weighted_sum == 0:
         return 0.0
@@ -102,14 +102,14 @@ def compute_gini(counts: npt.ArrayLike) -> float:
     total_dot_product = 0
     cumulative_frequency = 0
     for value, frequency in zip(values.tolist(), frequencies.tolist()):
-        first_term = num_buckets - cumulative_frequency
-        last_term = num_buckets - cumulative_frequency - frequency + 1
+        first_term = occupied_sid_count - cumulative_frequency
+        last_term = occupied_sid_count - cumulative_frequency - frequency + 1
         rank_sum = (first_term + last_term) * frequency // 2
         total_dot_product += value * rank_sum
         cumulative_frequency += frequency
     return float(
-        (num_buckets + 1) / num_buckets
-        - (2 * total_dot_product / (num_buckets * weighted_sum))
+        (occupied_sid_count + 1) / occupied_sid_count
+        - (2 * total_dot_product / (occupied_sid_count * weighted_sum))
     )
 
 

@@ -1,6 +1,6 @@
 # SID 冲突消解
 
-`resolve_sid_collisions` 处理 SID 预测结果：保留每个 SID 桶容量内的 item，将超出容量的 item
+`resolve_sid_collisions` 处理 SID 预测结果：保留每个 SID 容量内的 item，将超出容量的 item
 重新分配到同一 SID 前缀下的末层码。前缀是除最后一层外的 SID，不会在消解时改变。
 
 输入包含 `item_id` 和 `codes`；`candidate`、`iterative` 策略还需要 `candidate_codes`。
@@ -38,11 +38,11 @@ item。增加进程数可减少每个进程保留的数组，但不能保证读�
 ## 选择策略
 
 - `candidate`：按稳定 item 顺序，选择第一个仍有容量的候选末层码。
-- `iterative`：多轮提议和竞争，优先接收将目标桶排在更靠前位置的 item。
+- `iterative`：多轮提议和竞争，优先接收将目标 SID排在更靠前位置的 item。
 - `uniform`：无需候选，将溢出 item 分配到前缀内负载最小的末层码。
 
 `candidate`、`iterative` 在候选耗尽后保留原 SID；`uniform` 在前缀容量不足时继续均匀
-分配，最终仍超过桶容量的 item 计为未解决。所有输入 item 都会保留。
+分配，最终仍超过SID 容量的 item 计为未解决。所有输入 item 都会保留。
 
 ## 追加一代
 
@@ -61,7 +61,7 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
 ```
 
 每一代的 `item_to_sid` 和 `sid_to_items` 都是完整语料。追加还写出
-`delta_item_to_sid` 和 `delta_sid_to_items`，后者包含本次获得新 item 的完整桶，方便下游
+`delta_item_to_sid` 和 `delta_sid_to_items`，后者包含本次获得新 item 的完整 SID 分组，方便下游
 进行幂等更新。新 item ID 如果已存在于上一代，会报错。
 
 `--rate_only` 计算全局统计并跳过产物写出，可用于比较不同策略。
@@ -79,7 +79,7 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
 溢出，所有进程的占用表合计需要 4 TiB；增加进程数不能减少这个总量。
 因此 256 GiB 是否足够还取决于溢出前缀数和候选规模，不能只按写出阶段判断。
 
-以下是 5 字符字符串 ID、三层 SID、每桶一个 item 的合成数据实测。调用真实的 Parquet
+以下是 5 字符字符串 ID、三层 SID、每个 SID 一个 item 的合成数据实测。调用真实的 Parquet
 编码器并将输出丢弃，只测写出阶段 RSS；包含已加载的 ID 和分组数组，不包含前面的
 collision plan、消解结果和候选矩阵，不能作为全流程峰值。
 

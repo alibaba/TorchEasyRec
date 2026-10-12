@@ -30,13 +30,13 @@ from tzrec.utils.sid.collision import (
 class UniformCollisionResolver(CollisionResolver):
     """Spread overflow evenly over the least-loaded codes of each SID prefix.
 
-    Each bucket keeps the rows :func:`prepare_collision_plan` retains. The
+    Each SID keeps the rows :func:`prepare_collision_plan` retains. The
     overflow rows of a prefix take, in stable item order, the prefix's
     least-loaded last-layer codes one at a time, so a prefix with room never
     leaves a row over capacity. Ties between equally loaded codes follow a
     per-prefix rotated code order, which keeps relocated rows from piling onto
     the same codes in every prefix. When a prefix has more rows than room, the
-    filling continues past capacity, so its largest bucket is as small as its
+    filling continues past capacity, so its largest SID is as small as its
     published occupancy allows; rows left over capacity count as unresolved
     even when they changed code.
 
@@ -56,7 +56,7 @@ class UniformCollisionResolver(CollisionResolver):
             plan: Grouping and append-aware occupancy plan.
             candidate_last_codes: Must be ``None``; this strategy uses no
                 candidates.
-            collect_grouping: Whether to retain final bucket metadata.
+            collect_grouping: Whether to retain final SID metadata.
 
         Returns:
             Resolved last-layer codes, slot indices, and summary statistics.
@@ -82,7 +82,7 @@ class UniformCollisionResolver(CollisionResolver):
                 collect_grouping,
             )
 
-        last_size = plan.config.layer_sizes[-1]
+        last_size = plan.config.codebook[-1]
         prefix_starts = run_starts(plan.overflow_prefix_ids)
         prefix_row_counts = np.diff(np.append(prefix_starts, overflow_count))
         prefix_ids = plan.overflow_prefix_ids[prefix_starts]
@@ -199,17 +199,17 @@ class UniformCollisionResolver(CollisionResolver):
             scan_widths: Rotated positions to scan for each of ``prefix_indices``.
             prefix_row_counts: Overflow row count of every prefix.
             prefix_starts: Offset of every prefix's rows in stable item order.
-            base_keys: Bucket key of code 0 in every prefix.
+            base_keys: SID key of code 0 in every prefix.
             rotations: Tie-break rotation of every prefix.
-            initial_keys: Sorted keys of occupied buckets in overflow prefixes.
+            initial_keys: Sorted keys of occupied SIDs in overflow prefixes.
             occupied_starts: First ``initial_keys`` position of every prefix.
-            prefix_occupied_counts: Occupied bucket count of every prefix.
+            prefix_occupied_counts: Occupied SID count of every prefix.
             last_size: Cardinality of the last SID layer.
             assigned_codes: Per-row last codes in stable item order, updated.
             assigned_slots: Per-row slots in stable item order, updated.
 
         Returns:
-            Global keys of the buckets the rows now occupy.
+            Global keys of the SIDs the rows now occupy.
         """
         owners = np.repeat(
             np.arange(prefix_indices.shape[0], dtype=np.int64), scan_widths
@@ -266,18 +266,18 @@ class UniformCollisionResolver(CollisionResolver):
             prefix_indices: Indices of the prefixes to fill.
             prefix_row_counts: Overflow row count of every prefix.
             prefix_starts: Offset of every prefix's rows in stable item order.
-            base_keys: Bucket key of code 0 in every prefix.
+            base_keys: SID key of code 0 in every prefix.
             rotations: Tie-break rotation of every prefix.
-            initial_keys: Sorted keys of occupied buckets in overflow prefixes.
+            initial_keys: Sorted keys of occupied SIDs in overflow prefixes.
             initial_counts: Initial counts aligned with ``initial_keys``.
             occupied_starts: First ``initial_keys`` position of every prefix.
-            prefix_occupied_counts: Occupied bucket count of every prefix.
+            prefix_occupied_counts: Occupied SID count of every prefix.
             last_size: Cardinality of the last SID layer.
             assigned_codes: Per-row last codes in stable item order, updated.
             assigned_slots: Per-row slots in stable item order, updated.
 
         Returns:
-            Global bucket key of every assigned row.
+            Global SID key of every assigned row.
         """
         prefix_count = prefix_indices.shape[0]
         loads = np.zeros((prefix_count, last_size), dtype=np.int64)
