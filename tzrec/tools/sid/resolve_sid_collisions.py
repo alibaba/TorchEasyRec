@@ -125,7 +125,6 @@ from tzrec.utils.sid.collision import (
     CollisionResolutionResult,
     CollisionResolutionStats,
     CollisionResolver,
-    KnnCollisionResolver,
     PriorOccupancy,
     build_origin_item_grouping,
     build_resolved_item_grouping,
@@ -134,6 +133,7 @@ from tzrec.utils.sid.collision import (
     run_starts,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
+from tzrec.utils.sid.knn_collision import KnnCollisionResolver
 from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 
 _RESOLVERS: Dict[str, Type[CollisionResolver]] = {

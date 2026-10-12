@@ -15,12 +15,12 @@ import numpy as np
 
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
-    KnnCollisionResolver,
     PriorOccupancy,
     build_resolved_item_grouping,
     prepare_collision_plan,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
+from tzrec.utils.sid.knn_collision import KnnCollisionResolver
 
 
 def _plan(layer_sizes, capacity, item_ids, codes, prior=None):
