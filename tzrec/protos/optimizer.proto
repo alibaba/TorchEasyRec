@@ -162,7 +162,8 @@ message FusedRMSpropOptimizer {
 }
 
 // FTRL-Proximal, Algorithm 1 of McMahan et al. 2013, with the paper's fixed
-// square root generalized to an arbitrary exponent. dynamicemb tables only.
+// square root generalized to an arbitrary exponent. Regular embedding tables need
+// the TorchEasyRec fbgemm-gpu / torchrec builds; dynamicemb tables always work.
 message FusedFTRLOptimizer {
     // alpha in the paper, must be > 0 because the update divides by it.
     required float lr = 1 [default = 0.002];

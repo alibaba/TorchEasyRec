@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-# Recorded per environment; enough to match one against requirements/runtime.txt.
+# Recorded per environment; enough to match one against the requirements/ files.
 _INTERESTING = ("torch", "torchrec", "fbgemm_gpu", "transformers", "torchmetrics")
 
 
@@ -122,8 +122,10 @@ def describe(base: Optional[Path], conda: Path) -> str:
         )
     return (
         "Installed dependency sources on this runner. Read these to check an API\n"
-        "against the version actually in use; match the environment to\n"
-        "requirements/runtime.txt.\n\n" + "\n".join(entries) + "\n"
+        "against the version actually in use; match the environment to the\n"
+        "torch / fbgemm-gpu / torchrec pins in requirements/<device>.txt.\n\n"
+        + "\n".join(entries)
+        + "\n"
     )
 
 

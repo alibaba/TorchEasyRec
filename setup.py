@@ -80,7 +80,6 @@ setup(
         "tests": parse_requirements("requirements/test.txt"),
         "gpu": parse_requirements("requirements/cu130.txt"),
         "cu126": parse_requirements("requirements/cu126.txt"),
-        "cu129": parse_requirements("requirements/cu129.txt"),
         "cu130": parse_requirements("requirements/cu130.txt"),
         "cpu": parse_requirements("requirements/cpu.txt"),
         "ppu": parse_requirements("requirements/ppu.txt"),
