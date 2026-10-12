@@ -26,8 +26,6 @@ from tzrec.utils.sid.collision import (
     stable_order_hash,
 )
 
-_CHUNK_CELLS = 1 << 22
-
 
 class UniformCollisionResolver(CollisionResolver):
     """Spread overflow evenly over the least-loaded codes of each SID prefix.
@@ -113,61 +111,44 @@ class UniformCollisionResolver(CollisionResolver):
         # Rows that all fit on empty codes need no load tracking.
         fits_empty = prefix_row_counts <= last_size - prefix_occupied_counts
         fast_prefixes = np.flatnonzero(fits_empty)
-        fast_key_parts = []
+        fast_keys = np.empty(0, dtype=np.int64)
         if fast_prefixes.size:
             scan_widths = np.minimum(
                 last_size,
                 prefix_row_counts[fast_prefixes]
                 + prefix_occupied_counts[fast_prefixes],
             )
-            scan_ends = np.cumsum(scan_widths)
-            first = 0
-            while first < fast_prefixes.shape[0]:
-                end = int(
-                    np.searchsorted(
-                        scan_ends,
-                        int(scan_ends[first] - scan_widths[first]) + _CHUNK_CELLS,
-                        side="right",
-                    )
-                )
-                end = max(end, first + 1)
-                fast_key_parts.append(
-                    self._fill_empty_codes(
-                        fast_prefixes[first:end],
-                        scan_widths[first:end],
-                        prefix_row_counts,
-                        prefix_starts,
-                        base_keys,
-                        rotations,
-                        initial_keys,
-                        occupied_starts,
-                        prefix_occupied_counts,
-                        last_size,
-                        assigned_codes,
-                        assigned_slots,
-                    )
-                )
-                first = end
+            fast_keys = self._fill_empty_codes(
+                fast_prefixes,
+                scan_widths,
+                prefix_row_counts,
+                prefix_starts,
+                base_keys,
+                rotations,
+                initial_keys,
+                occupied_starts,
+                prefix_occupied_counts,
+                last_size,
+                assigned_codes,
+                assigned_slots,
+            )
 
         general_prefixes = np.flatnonzero(~fits_empty)
-        general_key_parts = []
-        chunk_prefixes = max(1, _CHUNK_CELLS // last_size)
-        for first in range(0, general_prefixes.shape[0], chunk_prefixes):
-            general_key_parts.append(
-                self._water_fill(
-                    general_prefixes[first : first + chunk_prefixes],
-                    prefix_row_counts,
-                    prefix_starts,
-                    base_keys,
-                    rotations,
-                    initial_keys,
-                    initial_counts,
-                    occupied_starts,
-                    prefix_occupied_counts,
-                    last_size,
-                    assigned_codes,
-                    assigned_slots,
-                )
+        general_keys = np.empty(0, dtype=np.int64)
+        if general_prefixes.size:
+            general_keys = self._water_fill(
+                general_prefixes,
+                prefix_row_counts,
+                prefix_starts,
+                base_keys,
+                rotations,
+                initial_keys,
+                initial_counts,
+                occupied_starts,
+                prefix_occupied_counts,
+                last_size,
+                assigned_codes,
+                assigned_slots,
             )
 
         resolved_last_codes = plan.origin_last_codes.copy()
@@ -176,12 +157,10 @@ class UniformCollisionResolver(CollisionResolver):
         slot_indices[ordered_rows] = assigned_slots
         unresolved_rows = ordered_rows[assigned_slots > plan.config.capacity]
 
-        general_keys = np.concatenate((np.empty(0, dtype=np.int64), *general_key_parts))
         final_counts = initial_counts.copy()
         positions, found = lookup_sorted(initial_keys, general_keys)
         np.add.at(final_counts, positions[found], 1)
         new_keys, new_counts = np.unique(general_keys[~found], return_counts=True)
-        fast_keys = np.concatenate((np.empty(0, dtype=np.int64), *fast_key_parts))
         return self._build_result(
             plan,
             resolved_last_codes,

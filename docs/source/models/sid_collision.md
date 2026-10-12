@@ -1,0 +1,100 @@
+# SID 冲突消解
+
+`resolve_sid_collisions` 处理 SID 预测结果：保留每个 SID 桶容量内的 item，将超出容量的 item
+重新分配到同一 SID 前缀下的末层码。前缀是除最后一层外的 SID，不会在消解时改变。
+
+输入包含 `item_id` 和 `codes`；`candidate`、`iterative` 策略还需要 `candidate_codes`。
+Parquet 的 `codes` 是整数列表，`candidate_codes` 是按候选顺序展开的 `topk × SID 层数`
+个整数。CSV 使用逗号分隔的字符串表示这些列表。
+
+## 使用 torchrun 启动
+
+在仓库根目录执行，给所有进程传入同一份完整输入和同一输出目录：
+
+```bash
+PYTHONPATH=. torchrun --standalone --nproc_per_node=8 \
+    -m tzrec.tools.sid.resolve_sid_collisions \
+    --input_path 'sid_predict/*.parquet' \
+    --output_path sid_collision \
+    --generation v1 \
+    --codebook 8192,8192,8192 \
+    --max_items_per_codebook 1 \
+    --strategy uniform \
+    --batch_size 100000
+```
+
+`--nproc_per_node=8` 由 torchrun 创建 8 个进程。工具依据 `RANK/WORLD_SIZE`，将 SID
+前缀空间划为连续区间，每个进程负责其中一个区间。同一前缀的全部 item 在同一个进程中
+消解，不会因输入文件或批次的边界而被拆开。不需要提前生成 16 个输入分区，也不需要
+额外的并发启动脚本。单进程使用 `--nproc_per_node=1`。
+
+当前各进程扫描完整输入批次，只保留自己负责的前缀；候选读取也只保留本进程的溢出
+item。增加进程数可减少每个进程保留的数组，但不能保证读取速度按进程数同比提高。
+前缀分布不均时，各进程的工作量也会不同。单层 SID 只有一个空前缀，由 rank 0 处理。
+
+各进程写出各自的 `part-*` 文件，rank 0 在全部写出完成后发布一个 `manifest.json`，
+其中的统计和产物行数是全局汇总值。所有进程必须能访问相同的输入和输出路径。
+
+## 选择策略
+
+- `candidate`：按稳定 item 顺序，选择第一个仍有容量的候选末层码。
+- `iterative`：多轮提议和竞争，优先接收将目标桶排在更靠前位置的 item。
+- `uniform`：无需候选，将溢出 item 分配到前缀内负载最小的末层码。
+
+`candidate`、`iterative` 在候选耗尽后保留原 SID；`uniform` 在前缀容量不足时继续均匀
+分配，最终仍超过桶容量的 item 计为未解决。所有输入 item 都会保留。
+
+## 追加一代
+
+追加输入只包含新 item，已发布 item 的 SID 不移动。追加可以使用不同的进程数：
+
+```bash
+PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
+    -m tzrec.tools.sid.resolve_sid_collisions \
+    --input_path 'sid_predict_new/*.parquet' \
+    --output_path sid_collision \
+    --generation v2 \
+    --from_generation v1 \
+    --codebook 8192,8192,8192 \
+    --max_items_per_codebook 1 \
+    --strategy uniform
+```
+
+每一代的 `item_to_sid` 和 `sid_to_items` 都是完整语料。追加还写出
+`delta_item_to_sid` 和 `delta_sid_to_items`，后者包含本次获得新 item 的完整桶，方便下游
+进行幂等更新。新 item ID 如果已存在于上一代，会报错。
+
+`--rate_only` 计算全局统计并跳过产物写出，可用于比较不同策略。
+
+## 内存
+
+工具不再对消解计算、分组数组或新 item 的写出做内部 chunk 分块。每个进程一次处理
+自己负责的数据；reader 的 `--batch_size` 仍控制文件读取批次。进程数决定各进程负责的
+前缀区间，评估整机内存时要合计所有进程的占用。
+
+`candidate`、`iterative` 的候选矩阵需要约 `溢出 item 数 × topk × 8` 字节。
+`iterative` 还为溢出前缀建立稠密占用表，需要约
+`溢出前缀数 × 末层码本大小 × 8` 字节，并有提议和排序的临时数组。例如 8192 大小的
+末层码本、100 万个溢出前缀，仅占用表就需要约 61 GiB。如果 8192 × 8192 个前缀全部
+溢出，所有进程的占用表合计需要 4 TiB；增加进程数不能减少这个总量。
+因此 256 GiB 是否足够还取决于溢出前缀数和候选规模，不能只按写出阶段判断。
+
+以下是 5 字符字符串 ID、三层 SID、每桶一个 item 的合成数据实测。调用真实的 Parquet
+编码器并将输出丢弃，只测写出阶段 RSS；包含已加载的 ID 和分组数组，不包含前面的
+collision plan、消解结果和候选矩阵，不能作为全流程峰值。
+
+| item 数 | 原分块写出 | 当前一次性写出 |
+| ------- | ---------- | -------------- |
+| 1620 万 | 3.44 GiB   | 4.51 GiB       |
+| 1 亿    | 11.62 GiB  | 18.75 GiB      |
+| 2.55 亿 | 26.71 GiB  | 45.10 GiB      |
+
+这组数据的写出阶段可以容纳于 256 GiB 内存；表中数值不是全流程内存需求。
+
+## 排查运行问题
+
+- 未出现 `manifest.json`：该代尚未完成，查看 torchrun 中报错进程的日志；重跑使用新的
+  `generation`，或先清理该次未完成的输出目录。
+- 部分进程没有 item：其前缀区间没有数据，仍会参加全局统计汇总。
+- 内存不足：查看溢出前缀数、末层码本大小和候选矩阵规模；调整 `--batch_size` 只影响
+  读取批次，不能降低完整计算数组的占用。

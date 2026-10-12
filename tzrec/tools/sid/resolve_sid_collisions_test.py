@@ -11,6 +11,8 @@
 
 import os
 import shutil
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -300,19 +302,155 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         ):
             self._run(inp, out, max_items_per_codebook=2)
 
-    def test_multi_process_launch_rejected(self) -> None:
-        with (
-            mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}),
-            self.assertRaisesRegex(RuntimeError, "single-process"),
-        ):
-            self._runner("input", "map")
-
     def test_missing_input_rejected_before_reading(self) -> None:
         with self.assertRaisesRegex(ValueError, "hold no files"):
             self._runner(
                 os.path.join(self.test_dir, "absent.parquet"),
                 os.path.join(self.test_dir, "out"),
             )
+
+    def test_partition_does_not_drop_invalid_codes(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        codes = np.array([[-1, 0, 0], [0, 0, 0], [4, 0, 0]])
+        _parquet(inp, [0, 1, 2], codes.tolist())
+        for rank in range(2):
+            with mock.patch.dict(os.environ, {"WORLD_SIZE": "2", "RANK": str(rank)}):
+                runner = self._runner(
+                    inp, os.path.join(self.test_dir, "out"), layer_sizes=(4, 4, 4)
+                )
+            owned = codes[runner._owned_rows(codes)]
+            with self.assertRaisesRegex(ValueError, "out-of-range"):
+                prepare_collision_plan(
+                    np.arange(len(owned)), owned, runner._config.resolution_config
+                )
+
+    def _torchrun(self, inp, out, codebook, strategy, ranks=2, extra=()):
+        command = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc_per_node={ranks}",
+            "-m",
+            "tzrec.tools.sid.resolve_sid_collisions",
+            "--input_path",
+            inp,
+            "--output_path",
+            out,
+            "--generation",
+            "v1",
+            "--codebook",
+            codebook,
+            "--strategy",
+            strategy,
+            "--max_items_per_codebook",
+            "1",
+            "--batch_size",
+            "2",
+            *extra,
+        ]
+        log = os.path.join(self.test_dir, "torchrun.log")
+        with open(log, "w") as handle:
+            completed = subprocess.run(
+                command, stdout=handle, stderr=subprocess.STDOUT, timeout=180
+            )
+        with open(log) as handle:
+            output = handle.read()
+        self.assertEqual(completed.returncode, 0, output)
+        return output
+
+    def _assert_distributed_matches_single(self, single, distributed, generation):
+        expected_manifest = self._manifest(single, generation)
+        actual_manifest = self._manifest(distributed, generation)
+        for artifact in expected_manifest.artifacts:
+            key = "item_id" if artifact in bundle.ITEM_TO_SID_ARTIFACTS else "codebook"
+            expected = parquet.read_table(
+                bundle.artifact_location(single, generation, artifact)
+            ).to_pylist()
+            actual = parquet.read_table(
+                bundle.artifact_location(distributed, generation, artifact)
+            ).to_pylist()
+            self.assertEqual(
+                sorted(actual, key=lambda row: row[key]),
+                sorted(expected, key=lambda row: row[key]),
+            )
+        self.assertEqual(
+            {name: entry.rows for name, entry in actual_manifest.artifacts.items()},
+            {name: entry.rows for name, entry in expected_manifest.artifacts.items()},
+        )
+        self.assertEqual(
+            actual_manifest.max_observed_items_per_sid,
+            expected_manifest.max_observed_items_per_sid,
+        )
+
+    def test_torchrun_matches_single_and_appends_with_a_new_rank_count(self) -> None:
+        strategy = "iterative"
+        input_dir = os.path.join(self.test_dir, "input")
+        os.makedirs(input_dir)
+        codes = [[2, 0, 0], [0, 0, 0], [2, 0, 0], [0, 0, 0], [3, 1, 0], [1, 3, 2]]
+        candidates = [
+            [[*code[:-1], (code[-1] + offset) % 4] for offset in range(4)]
+            for code in codes
+        ]
+        for first, stop in ((0, 3), (3, 6)):
+            _parquet(
+                os.path.join(input_dir, f"part-{first}.parquet"),
+                list(range(first, stop)),
+                codes[first:stop],
+                candidates[first:stop],
+            )
+        inp = os.path.join(input_dir, "*.parquet")
+        single = os.path.join(self.test_dir, "single")
+        distributed = os.path.join(self.test_dir, "distributed")
+        self._run(
+            inp,
+            single,
+            layer_sizes=(4, 4, 4),
+            max_items_per_codebook=1,
+            strategy=strategy,
+        )
+        self._torchrun(inp, distributed, "4,4,4", strategy)
+        self._assert_distributed_matches_single(single, distributed, "v1")
+
+        appended = os.path.join(self.test_dir, "append.parquet")
+        codes = [[0, 0, 0], [2, 0, 0], [3, 1, 0]]
+        candidates = [[[code[0], code[1], last] for last in range(4)] for code in codes]
+        _parquet(appended, [10, 11, 12], codes, candidates)
+        self._append(
+            appended,
+            single,
+            layer_sizes=(4, 4, 4),
+            max_items_per_codebook=1,
+            strategy=strategy,
+        )
+        self._torchrun(
+            appended,
+            distributed,
+            "4,4,4",
+            strategy,
+            ranks=3,
+            extra=("--generation", "v2", "--from_generation", "v1"),
+        )
+        self._assert_distributed_matches_single(single, distributed, "v2")
+        self.assertEqual(
+            self._manifest(distributed, "v2").since_bundle_uuid,
+            self._manifest(distributed, "v1").bundle_uuid,
+        )
+
+    def test_torchrun_handles_empty_ranks_and_rate_only(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        _parquet(inp, [0, 1, 2], [[0]] * 3, [[[last] for last in range(4)]] * 3)
+        single = os.path.join(self.test_dir, "single")
+        distributed = os.path.join(self.test_dir, "distributed")
+        self._run(inp, single, layer_sizes=(4,), max_items_per_codebook=1)
+        self._torchrun(inp, distributed, "4", "candidate")
+        self._assert_distributed_matches_single(single, distributed, "v1")
+        rate_output = os.path.join(self.test_dir, "rate")
+        output = self._torchrun(
+            inp, rate_output, "4", "candidate", extra=("--rate_only",)
+        )
+        self.assertIn("total_items=3", output)
+        self.assertFalse(os.path.exists(rate_output))
 
     def test_append_rejects_a_different_codebook(self) -> None:
         out = self._seed_prior(
@@ -446,53 +584,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             bucket_schema.field("itemids").type, pa.list_(pa.large_string())
         )
 
-    def test_io_large_loops_report_sample_progress(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(
-            inp,
-            list(range(8)),
-            [[0, 0]] * 8,
-            [[[0, 1], [0, 2], [0, 3]]] * 8,
-        )
-        progress_by_description = {}
-
-        def make_progress(description, **kwargs):
-            progress = mock.Mock()
-            progress_by_description[description] = (kwargs, progress)
-            return progress
-
-        with (
-            mock.patch.object(
-                resolve_sid_collisions,
-                "ProgressLogger",
-                side_effect=make_progress,
-            ),
-            mock.patch.object(resolve_sid_collisions, "_ITEM_TO_SID_WRITE_ROWS", 2),
-            mock.patch.object(resolve_sid_collisions, "_SID_TO_ITEMS_WRITE_ITEMS", 2),
-        ):
-            self._run(
-                inp,
-                out,
-                batch_size=2,
-                progress_interval=3,
-                max_items_per_codebook=2,
-            )
-
-        for description in (
-            "Reading SID input",
-            "Scanning candidate input",
-            "Writing resolved item_to_sid",
-            "Writing resolved sid_to_items",
-        ):
-            kwargs, progress = progress_by_description[description]
-            with self.subTest(description=description):
-                self.assertEqual(kwargs["miniters"], 3)
-                self.assertEqual(
-                    progress.log.call_args_list,
-                    [mock.call(2), mock.call(4), mock.call(6), mock.call(8)],
-                )
-
     @parameterized.expand(
         [
             ("generation", {"generation": None}, "generation is required"),
@@ -569,30 +660,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             ],
         )
         self.assertEqual(make_writer.return_value.close.call_count, 2)
-
-    def test_sid_to_items_chunks_by_item_count_without_splitting_buckets(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, list(range(4)), [[0, 0], [0, 0], [0, 0], [0, 1]])
-
-        with mock.patch.object(resolve_sid_collisions, "_SID_TO_ITEMS_WRITE_ITEMS", 2):
-            self._run(inp, out, max_items_per_codebook=3)
-
-        output_file = self._part(out, SID_TO_ITEMS)
-        self.assertEqual(parquet.ParquetFile(output_file).metadata.num_row_groups, 2)
-        buckets = self._read(out, SID_TO_ITEMS)
-        self.assertEqual([len(bucket) for bucket in buckets["itemids"]], [3, 1])
-
-    def test_map_writer_chunks_by_row_count(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, list(range(5)), [[0, code] for code in range(5)])
-
-        with mock.patch.object(resolve_sid_collisions, "_ITEM_TO_SID_WRITE_ROWS", 2):
-            self._run(inp, out, max_items_per_codebook=1)
-
-        output_file = self._part(out, ITEM_TO_SID)
-        self.assertEqual(parquet.ParquetFile(output_file).metadata.num_row_groups, 3)
 
     def test_rate_only_with_overflow_allows_omitted_outputs_and_skips_writes(
         self,

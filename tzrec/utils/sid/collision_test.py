@@ -11,12 +11,10 @@
 
 import dataclasses
 import unittest
-from unittest import mock
 
 import numpy as np
 from parameterized import parameterized
 
-from tzrec.utils.sid import collision
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     KnnCollisionResolver,
@@ -56,27 +54,6 @@ def _assert_same_assignments(test_case, actual, expected):
 
 
 class CollisionTest(unittest.TestCase):
-    def test_resolution_chunking_preserves_greedy_results(self) -> None:
-        plan = _plan((8,), 1, range(8), [[0]] * 8)
-        expected_codes = np.zeros(8, dtype=np.int64)
-        expected_codes[plan.overflow_rows] = np.arange(1, 8)
-
-        with mock.patch.object(collision, "_ROW_CHUNK_SIZE", 2):
-            result = KnnCollisionResolver().resolve(plan, np.arange(1, 8)[:, None])
-            np.testing.assert_array_equal(result.resolved_last_codes, expected_codes)
-            np.testing.assert_array_equal(result.slot_indices, np.ones(8))
-
-    def test_first_fit_logs_progress_with_miniters(self) -> None:
-        plan = _plan((5,), 1, range(5), [[0]] * 5)
-        with mock.patch.object(collision, "ProgressLogger") as progress_cls:
-            KnnCollisionResolver(progress_interval=3).resolve(
-                plan, np.arange(1, 5)[:, None]
-            )
-
-        progress_cls.assert_called_once_with(
-            "Resolving collision overflow", start_n=0, miniters=3
-        )
-
     def test_resolvers_reject_invalid_progress_interval(self) -> None:
         with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
             KnnCollisionResolver(progress_interval=0)
@@ -87,12 +64,11 @@ class CollisionTest(unittest.TestCase):
         codes = np.asarray(
             [[0, 0]] * 4 + [[0, 1]] + [[0, 2]] * 2 + [[1, 0]] * 3, dtype=np.int64
         )
-        with mock.patch.object(collision, "_ROW_CHUNK_SIZE", 2):
-            plan = _plan((2, 4), 2, item_ids, codes)
-            candidates = np.asarray([[0, 1, 2], [1, 2, 3], [0, 1, 2]], dtype=np.int64)
-            result = KnnCollisionResolver().resolve(plan, candidates)
-            origin_grouping = build_origin_item_grouping(plan)
-            resolved_grouping = build_resolved_item_grouping(plan, result)
+        plan = _plan((2, 4), 2, item_ids, codes)
+        candidates = np.asarray([[0, 1, 2], [1, 2, 3], [0, 1, 2]], dtype=np.int64)
+        result = KnnCollisionResolver().resolve(plan, candidates)
+        origin_grouping = build_origin_item_grouping(plan)
+        resolved_grouping = build_resolved_item_grouping(plan, result)
 
         np.testing.assert_array_equal(plan.overflow_rows, [1, 3, 8])
         np.testing.assert_array_equal(plan.overflow_item_ids, [1, 3, 8])

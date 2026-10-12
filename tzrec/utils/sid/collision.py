@@ -17,7 +17,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Iterable, Optional
+from typing import Optional
 
 import numpy as np
 
@@ -27,7 +27,6 @@ _INT64_MAX = int(np.iinfo(np.int64).max)
 _MASK64 = (1 << 64) - 1
 _SEED = 2026
 _SPLITMIX_INCREMENT = 0x9E3779B97F4A7C15
-_ROW_CHUNK_SIZE = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -553,31 +552,35 @@ class KnnCollisionResolver(CollisionResolver):
             miniters=self._progress_interval,
         )
 
-        for start in range(0, overflow_count, _ROW_CHUNK_SIZE):
-            end = min(start + _ROW_CHUNK_SIZE, overflow_count)
-            rows = plan.overflow_rows[start:end]
-            for row, base_key, origin_last_code, candidate_row in zip(
-                rows.tolist(),
-                (plan.overflow_prefix_ids[start:end] * last_size).tolist(),
-                plan.origin_last_codes[rows].tolist(),
-                candidates[start:end],
-            ):
-                for candidate in candidate_row.tolist():
-                    destination_key = base_key + candidate
-                    destination_occupancy = get_occupancy(destination_key, 0)
-                    if destination_occupancy < capacity:
-                        occupancy[destination_key] = destination_occupancy + 1
-                        resolved_last_codes[row] = candidate
-                        slot_indices[row] = destination_occupancy + 1
-                        break
-                else:
-                    # No free candidate slot: keep the origin SID over capacity.
-                    unresolved_rows.append(row)
-                    origin_key = base_key + origin_last_code
-                    origin_occupancy = get_occupancy(origin_key, 0) + 1
-                    occupancy[origin_key] = origin_occupancy
-                    slot_indices[row] = origin_occupancy
-            progress.log(end)
+        for resolved_count, (
+            row,
+            base_key,
+            origin_last_code,
+            candidate_row,
+        ) in enumerate(
+            zip(
+                plan.overflow_rows,
+                plan.overflow_prefix_ids * last_size,
+                plan.origin_last_codes[plan.overflow_rows],
+                candidates,
+            ),
+            start=1,
+        ):
+            for candidate in candidate_row:
+                destination_key = base_key + candidate
+                destination_occupancy = get_occupancy(destination_key, 0)
+                if destination_occupancy < capacity:
+                    occupancy[destination_key] = destination_occupancy + 1
+                    resolved_last_codes[row] = candidate
+                    slot_indices[row] = destination_occupancy + 1
+                    break
+            else:
+                unresolved_rows.append(row)
+                origin_key = base_key + origin_last_code
+                origin_occupancy = get_occupancy(origin_key, 0) + 1
+                occupancy[origin_key] = origin_occupancy
+                slot_indices[row] = origin_occupancy
+            progress.log(resolved_count)
 
         return self._build_result(
             plan,
@@ -736,38 +739,17 @@ def prepare_collision_plan(
 def _scatter_item_grouping(
     sid_keys: np.ndarray,
     counts: np.ndarray,
-    row_count: int,
-    chunks: Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    bucket_indices: np.ndarray,
+    slot_indices: np.ndarray,
 ) -> CodebookItemGrouping:
-    """Build a CSR row order from bounded row, bucket-index, and slot chunks."""
+    """Build a CSR row order from each row's bucket and one-based local slot."""
     grouping = CodebookItemGrouping(
         sid_keys=sid_keys,
         counts=counts,
-        row_order=np.empty(row_count, dtype=np.int64),
+        row_order=np.empty(bucket_indices.size, dtype=np.int64),
     )
-    offsets = grouping.offsets
-    if int(offsets[-1]) != row_count:
-        raise RuntimeError(
-            "bucket counts do not match grouped row count: "
-            f"{int(offsets[-1])} vs {row_count}."
-        )
-    written_count = 0
-    for rows, bucket_indices, slot_indices in chunks:
-        if rows.shape != bucket_indices.shape or rows.shape != slot_indices.shape:
-            raise RuntimeError("grouping row, bucket, and slot chunks must align.")
-        if rows.size == 0:
-            continue
-        if np.any(bucket_indices < 0) or np.any(bucket_indices >= counts.shape[0]):
-            raise RuntimeError("grouping bucket indices are outside the SID key array.")
-        positions = offsets[bucket_indices] + slot_indices - 1
-        if np.any(slot_indices < 1) or np.any(positions >= offsets[bucket_indices + 1]):
-            raise RuntimeError("slot indices are outside their SID bucket bounds.")
-        grouping.row_order[positions] = rows
-        written_count += rows.shape[0]
-    if written_count != row_count:
-        raise RuntimeError(
-            f"grouping chunks contain {written_count} rows, expected {row_count}."
-        )
+    positions = grouping.offsets[bucket_indices] + slot_indices - 1
+    grouping.row_order[positions] = np.arange(bucket_indices.size)
     return grouping
 
 
@@ -783,24 +765,12 @@ def build_origin_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
     Returns:
         Sorted origin SID keys, bucket counts, and grouped original row order.
     """
-    row_count = plan.origin_last_codes.shape[0]
-
-    def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        for start in range(0, row_count, _ROW_CHUNK_SIZE):
-            end = min(start + _ROW_CHUNK_SIZE, row_count)
-            bucket_indices = plan.origin_bucket_indices[start:end]
-            yield (
-                np.arange(start, end, dtype=np.int64),
-                bucket_indices,
-                plan.initial_slot_indices[start:end]
-                - plan.prior_bucket_counts[bucket_indices],
-            )
-
+    bucket_indices = plan.origin_bucket_indices
     return _scatter_item_grouping(
         plan.bucket_keys,
         plan.bucket_counts,
-        row_count,
-        row_chunks(),
+        bucket_indices,
+        plan.initial_slot_indices - plan.prior_bucket_counts[bucket_indices],
     )
 
 
@@ -834,24 +804,15 @@ def build_resolved_item_grouping(
     gained = delta_counts > 0
     sid_keys = result.final_bucket_keys[gained]
     prior_counts = final_prior_counts[gained]
-    row_count = plan.origin_last_codes.shape[0]
-
-    def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        for start in range(0, row_count, _ROW_CHUNK_SIZE):
-            end = min(start + _ROW_CHUNK_SIZE, row_count)
-            chunk = slice(start, end)
-            resolved_keys = plan.bucket_keys[plan.origin_bucket_indices[chunk]]
-            resolved_keys -= plan.origin_last_codes[chunk]
-            resolved_keys += result.resolved_last_codes[chunk]
-            bucket_indices, found = lookup_sorted(sid_keys, resolved_keys)
-            if not np.all(found):
-                raise RuntimeError("final bucket keys do not cover every resolved SID.")
-            yield (
-                np.arange(start, end, dtype=np.int64),
-                bucket_indices,
-                result.slot_indices[chunk] - prior_counts[bucket_indices],
-            )
-
+    resolved_keys = plan.bucket_keys[plan.origin_bucket_indices]
+    resolved_keys -= plan.origin_last_codes
+    resolved_keys += result.resolved_last_codes
+    bucket_indices, found = lookup_sorted(sid_keys, resolved_keys)
+    if not np.all(found):
+        raise RuntimeError("final bucket keys do not cover every resolved SID.")
     return _scatter_item_grouping(
-        sid_keys, delta_counts[gained], row_count, row_chunks()
+        sid_keys,
+        delta_counts[gained],
+        bucket_indices,
+        result.slot_indices - prior_counts[bucket_indices],
     )

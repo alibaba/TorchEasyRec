@@ -17,7 +17,6 @@ import numpy as np
 
 from tzrec.utils.logging_util import ProgressLogger
 from tzrec.utils.sid.collision import (
-    _INT64_MAX,
     CollisionPlan,
     CollisionResolutionResult,
     CollisionResolver,
@@ -26,8 +25,6 @@ from tzrec.utils.sid.collision import (
     run_starts,
     stable_order_hash,
 )
-
-_CHUNK_CELLS = 1 << 22
 
 
 class IterativeCollisionResolver(CollisionResolver):
@@ -54,9 +51,6 @@ class IterativeCollisionResolver(CollisionResolver):
     proposal rows, so they cannot be moved, and an already over-capacity
     published bucket retains its complete count.
 
-    Prefixes are resolved in chunks that share dense occupancy and run their
-    rounds together; a prefix that stops proposing never changes again, so the
-    result is the same as resolving each prefix alone.
     """
 
     def resolve(
@@ -95,118 +89,24 @@ class IterativeCollisionResolver(CollisionResolver):
                 collect_grouping,
             )
 
-        last_size = plan.config.layer_sizes[-1]
-        resolved_last_codes = plan.origin_last_codes.copy()
-        slot_indices = plan.initial_slot_indices.copy()
-        unresolved_parts = []
-        final_key_parts = []
-        final_count_parts = []
-        prefix_starts = run_starts(plan.overflow_prefix_ids)
-        prefix_stops = np.append(prefix_starts[1:], plan.overflow_rows.shape[0])
-        prefix_count = prefix_starts.shape[0]
-        chunk_prefixes = max(1, _CHUNK_CELLS // last_size)
-        max_chunk_rows = max(1, _CHUNK_CELLS // max(1, candidates.shape[1]))
-        occupancy = np.zeros(
-            min(chunk_prefixes, prefix_count) * last_size, dtype=np.int64
-        )
-        progress = ProgressLogger(
-            "Resolving collision overflow",
-            start_n=0,
-            miniters=self._progress_interval,
-        )
-
-        first_prefix = 0
-        while first_prefix < prefix_count:
-            start = int(prefix_starts[first_prefix])
-            end_prefix = int(
-                np.searchsorted(prefix_stops, start + max_chunk_rows, side="right")
-            )
-            end_prefix = min(
-                max(end_prefix, first_prefix + 1), first_prefix + chunk_prefixes
-            )
-            stop = int(prefix_stops[end_prefix - 1])
-            rows = plan.overflow_rows[start:stop]
-            (
-                resolved_last_codes[rows],
-                slot_indices[rows],
-                unresolved_rows,
-                final_keys,
-                final_counts,
-            ) = self._resolve_chunk(
-                plan,
-                affected_keys,
-                affected_counts,
-                occupancy,
-                slice(start, stop),
-                candidates[start:stop],
-            )
-            unresolved_parts.append(unresolved_rows)
-            final_key_parts.append(final_keys)
-            final_count_parts.append(final_counts)
-            progress.log(stop)
-            first_prefix = end_prefix
-
-        return self._build_result(
-            plan,
-            resolved_last_codes,
-            slot_indices,
-            np.concatenate(unresolved_parts),
-            in_overflow_prefix,
-            np.concatenate(final_key_parts),
-            np.concatenate(final_count_parts),
-            collect_grouping,
-        )
-
-    def _resolve_chunk(
-        self,
-        plan: CollisionPlan,
-        affected_keys: np.ndarray,
-        affected_counts: np.ndarray,
-        occupancy: np.ndarray,
-        span: slice,
-        candidates: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Resolve a contiguous run of whole prefixes through shared rounds.
-
-        Buckets are addressed by a chunk-local key, ``prefix position * last_size
-        + last code``, into ``occupancy``, which must be all zero on entry and
-        is zeroed again on return.
-
-        Args:
-            plan: Grouping and append-aware occupancy plan.
-            affected_keys: Ascending keys of the occupied buckets in overflow
-                prefixes.
-            affected_counts: Initial occupancy aligned with ``affected_keys``.
-            occupancy: Reusable dense occupancy buffer of at least ``last_size``
-                cells per prefix in ``span``.
-            span: Slice of the overflow-aligned plan arrays covering whole
-                prefixes.
-            candidates: Int64 candidate last codes of the rows in ``span``.
-
-        Returns:
-            Last codes and slots of the rows in ``span`` order, the unresolved
-            rows, and the keys and final counts of the chunk's occupied buckets.
-
-        Raises:
-            ValueError: If the chunk is too large to pack arbitration keys.
-        """
         capacity = plan.config.capacity
         last_size = plan.config.layer_sizes[-1]
-        overflow_rows = plan.overflow_rows[span]
+        overflow_rows = plan.overflow_rows
         row_count = overflow_rows.shape[0]
         prefix_ids, prefix_indices = np.unique(
-            plan.overflow_prefix_ids[span], return_inverse=True
+            plan.overflow_prefix_ids, return_inverse=True
         )
         prefix_count = prefix_ids.shape[0]
         candidate_count = candidates.shape[1]
         base_keys = prefix_ids * last_size
         local_base_keys = prefix_indices * last_size
         origin_keys = local_base_keys + plan.origin_last_codes[overflow_rows]
-        if prefix_count * last_size * candidate_count * row_count > _INT64_MAX:
-            raise ValueError(
-                f"{row_count} overflow rows with {candidate_count} candidates in "
-                "one prefix chunk are too many to pack arbitration keys."
-            )
+        occupancy = np.zeros(prefix_count * last_size, dtype=np.int64)
+        progress = ProgressLogger(
+            "Resolving collision overflow",
+            start_n=0,
+            miniters=self._progress_interval,
+        )
 
         starts = np.searchsorted(affected_keys, base_keys)
         lengths = np.searchsorted(affected_keys, base_keys + last_size) - starts
@@ -219,7 +119,7 @@ class IterativeCollisionResolver(CollisionResolver):
 
         row_ranks = np.empty(row_count, dtype=np.int64)
         row_ranks[
-            np.lexsort((overflow_rows, stable_order_hash(plan.overflow_item_ids[span])))
+            np.lexsort((overflow_rows, stable_order_hash(plan.overflow_item_ids)))
         ] = np.arange(row_count)
 
         resolved_keys = origin_keys.copy()
@@ -250,9 +150,8 @@ class IterativeCollisionResolver(CollisionResolver):
             proposal_rows = pending[pending_idx]
             proposal_targets = targets.ravel()[proposals]
 
-            target_order = np.argsort(
-                (proposal_targets * candidate_count + proposal_positions) * row_count
-                + row_ranks[proposal_rows]
+            target_order = np.lexsort(
+                (row_ranks[proposal_rows], proposal_positions, proposal_targets)
             )
             ordered_targets = proposal_targets[target_order]
             accepted = np.zeros(proposal_rows.shape[0], dtype=bool)
@@ -280,6 +179,7 @@ class IterativeCollisionResolver(CollisionResolver):
             still_pending = ~assigned[pending]
             pending = pending[still_pending]
             targets = targets[still_pending]
+            progress.log(row_count - pending.size)
 
         unresolved = ~assigned
         unresolved_keys = origin_keys[unresolved]
@@ -290,12 +190,19 @@ class IterativeCollisionResolver(CollisionResolver):
 
         final_keys = np.unique(np.concatenate((seeded_keys, resolved_keys)))
         final_counts = occupancy[final_keys]
-        occupancy[final_keys] = 0
         owners, last_codes = np.divmod(final_keys, last_size)
-        return (
-            resolved_keys - local_base_keys,
-            slot_indices,
+        resolved_last_codes = plan.origin_last_codes.copy()
+        resolved_last_codes[overflow_rows] = resolved_keys - local_base_keys
+        final_slot_indices = plan.initial_slot_indices.copy()
+        final_slot_indices[overflow_rows] = slot_indices
+        progress.log(row_count)
+        return self._build_result(
+            plan,
+            resolved_last_codes,
+            final_slot_indices,
             overflow_rows[unresolved],
+            in_overflow_prefix,
             base_keys[owners] + last_codes,
             final_counts,
+            collect_grouping,
         )

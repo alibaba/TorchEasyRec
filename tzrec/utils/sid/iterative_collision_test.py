@@ -10,12 +10,9 @@
 # limitations under the License.
 
 import unittest
-from unittest import mock
 
 import numpy as np
-from parameterized import parameterized
 
-from tzrec.utils.sid import iterative_collision
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     KnnCollisionResolver,
@@ -24,7 +21,6 @@ from tzrec.utils.sid.collision import (
     prepare_collision_plan,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
-from tzrec.utils.test_util import parameterized_name_func
 
 
 def _plan(layer_sizes, capacity, item_ids, codes, prior=None):
@@ -202,35 +198,6 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         np.testing.assert_array_equal(result.final_bucket_keys, [0, 1, 2, 4, 5, 6])
         np.testing.assert_array_equal(result.final_bucket_counts, [1, 1, 1, 1, 1, 1])
         np.testing.assert_array_equal(result.slot_indices[plan.overflow_rows], [1, 1])
-
-    @parameterized.expand(
-        [("prefix_limit_binds", 12), ("row_limit_binds", 64)],
-        name_func=parameterized_name_func,
-    )
-    def test_prefix_chunking_matches_single_chunk(self, _name, chunk_cells) -> None:
-        rng = np.random.default_rng(2026)
-        for trial in range(40):
-            layer_sizes = (rng.integers(1, 6), 8)
-            item_count = rng.integers(1, 200)
-            codes = np.stack(
-                [rng.integers(0, size, item_count) for size in layer_sizes], axis=1
-            )
-            plan = _plan(layer_sizes, rng.integers(1, 3), np.arange(item_count), codes)
-            candidates = rng.integers(0, 8, (plan.overflow_rows.size, 4))
-
-            whole = IterativeCollisionResolver().resolve(plan, candidates)
-            with mock.patch.object(iterative_collision, "_CHUNK_CELLS", chunk_cells):
-                split = IterativeCollisionResolver().resolve(plan, candidates)
-
-            with self.subTest(trial=trial):
-                np.testing.assert_array_equal(
-                    split.resolved_last_codes, whole.resolved_last_codes
-                )
-                np.testing.assert_array_equal(split.slot_indices, whole.slot_indices)
-                np.testing.assert_array_equal(
-                    split.final_bucket_counts, whole.final_bucket_counts
-                )
-                self.assertEqual(split.stats, whole.stats)
 
     def test_random_plans_keep_placement_invariants(self) -> None:
         rng = np.random.default_rng(7)

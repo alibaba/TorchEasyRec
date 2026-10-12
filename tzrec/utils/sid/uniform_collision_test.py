@@ -12,12 +12,9 @@
 import collections
 import dataclasses
 import unittest
-from unittest import mock
 
 import numpy as np
-from parameterized import parameterized
 
-from tzrec.utils.sid import uniform_collision
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     PriorOccupancy,
@@ -26,7 +23,6 @@ from tzrec.utils.sid.collision import (
     stable_order_hash,
 )
 from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
-from tzrec.utils.test_util import parameterized_name_func
 
 
 def _plan(layer_sizes, capacity, item_ids, codes, prior=None):
@@ -94,37 +90,7 @@ class UniformCollisionResolverTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not accept candidate_last_codes"):
             UniformCollisionResolver().resolve(plan, np.asarray([[1]]))
 
-    def test_small_chunks_match_single_chunk(self) -> None:
-        rng = np.random.default_rng(2026)
-        for trial in range(40):
-            layer_sizes = (rng.integers(1, 6), rng.integers(2, 9))
-            item_count = rng.integers(1, 120)
-            codes = np.stack(
-                [rng.integers(0, size, item_count) for size in layer_sizes], axis=1
-            )
-            plan = _plan(layer_sizes, rng.integers(1, 3), np.arange(item_count), codes)
-
-            single = UniformCollisionResolver().resolve(plan)
-            with mock.patch.object(uniform_collision, "_CHUNK_CELLS", 7):
-                split = UniformCollisionResolver().resolve(plan)
-
-            with self.subTest(trial=trial):
-                np.testing.assert_array_equal(
-                    split.resolved_last_codes, single.resolved_last_codes
-                )
-                np.testing.assert_array_equal(split.slot_indices, single.slot_indices)
-                np.testing.assert_array_equal(
-                    split.final_bucket_counts, single.final_bucket_counts
-                )
-                self.assertEqual(split.stats, single.stats)
-
-    @parameterized.expand(
-        [("default_chunks", uniform_collision._CHUNK_CELLS), ("small_chunks", 1)],
-        name_func=parameterized_name_func,
-    )
-    def test_random_plans_match_least_loaded_reference(
-        self, _name, chunk_cells
-    ) -> None:
+    def test_random_plans_match_least_loaded_reference(self) -> None:
         rng = np.random.default_rng(7)
         for trial in range(150):
             last_size = rng.integers(1, 9)
@@ -145,8 +111,7 @@ class UniformCollisionResolverTest(unittest.TestCase):
             item_ids = np.arange(item_count) * 7 + 1000
             plan = _plan(layer_sizes, capacity, item_ids, codes, prior=prior)
 
-            with mock.patch.object(uniform_collision, "_CHUNK_CELLS", chunk_cells):
-                result = UniformCollisionResolver().resolve(plan)
+            result = UniformCollisionResolver().resolve(plan)
             expected_codes, expected_slots, loads = _reference(plan, codes, item_ids)
             origin_keys = plan.config.bucket_keys(codes).tolist()
             published = dict(
