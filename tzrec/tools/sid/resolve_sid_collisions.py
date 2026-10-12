@@ -456,20 +456,27 @@ class CollisionResolutionRunner:
         reader: BaseReader,
         description: str,
         code_field: Optional[str] = None,
+        keep_empty: bool = False,
     ) -> Iterator[Dict[str, pa.Array]]:
-        """Stream batches, optionally selecting this rank's SID prefixes."""
+        """Stream batches, optionally selecting this rank's SID prefixes.
+
+        ``keep_empty`` retains batches made empty by prefix selection so idle
+        ranks can initialize input types. Empty source batches are skipped.
+        """
         progress = ProgressLogger(
             description, start_n=0, miniters=self._config.progress_interval
         )
         scanned = 0
         for batch in reader.to_batches():
             batch_size = len(next(iter(batch.values())))
+            if batch_size == 0:
+                continue
             if code_field is not None and self._world_size > 1:
                 keep = pa.array(
                     self._get_prefix_mask(self._codes_matrix(batch[code_field]))
                 )
                 batch = {name: values.filter(keep) for name, values in batch.items()}
-            if len(next(iter(batch.values()))):
+            if keep_empty or len(next(iter(batch.values()))):
                 yield batch
             scanned += batch_size
             progress.log(scanned)
@@ -534,13 +541,20 @@ class CollisionResolutionRunner:
         )
         id_batches: List[np.ndarray] = []
         code_batches: List[np.ndarray] = []
-        for batch in self._iter_batches(reader, "Reading SID input"):
+        for batch in self._iter_batches(
+            reader,
+            "Reading SID input",
+            self._config.code_field,
+            keep_empty=True,
+        ):
             item_ids = batch[self._config.item_id_field]
             self._validate_item_ids(item_ids)
-            codes = self._codes_matrix(batch[self._config.code_field])
-            keep = self._get_prefix_mask(codes)
-            id_batches.append(item_ids.to_numpy(zero_copy_only=False)[keep])
-            code_batches.append(codes[keep])
+            id_batches.append(item_ids.to_numpy(zero_copy_only=False))
+            code_batches.append(
+                self._codes_matrix(batch[self._config.code_field])
+                if len(item_ids)
+                else np.empty((0, len(self._config.layer_sizes)), dtype=np.int64)
+            )
 
         if not id_batches:
             raise ValueError("SID input is empty.")
