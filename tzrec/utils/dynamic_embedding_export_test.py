@@ -198,11 +198,15 @@ class DynamicEmbeddingExportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, error):
             get_dynamic_embedding_export(self.test_dir, {self.table: 2}, 16)
 
-    def test_missing_score_file(self) -> None:
+    @parameterized.expand([("values",), ("scores",)], name_func=parameterized_name_func)
+    def test_missing_checkpoint_file(self, field) -> None:
         directory = self._write_shard(0, np.array([1]), np.ones((1, 2)))
-        os.unlink(os.path.join(directory, "table_emb_scores.rank_0.world_size_1"))
-        with self.assertRaises(FileNotFoundError):
+        path = os.path.join(directory, f"table_emb_{field}.rank_0.world_size_1")
+        os.unlink(path)
+        with self.assertRaises(FileNotFoundError) as error:
             get_dynamic_embedding_export(self.test_dir, {self.table: 2}, 16)
+        self.assertIn(self.table, str(error.exception))
+        self.assertIn(path, str(error.exception))
 
     def test_inconsistent_checkpoint_world_sizes(self) -> None:
         self._write_shard(0, np.array([1]), np.ones((1, 2)), world_size=1)

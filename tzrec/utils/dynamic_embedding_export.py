@@ -165,9 +165,15 @@ def _find_shards(
         score_file = os.path.join(
             os.path.dirname(key_file), f"{table_name}_emb_scores{suffix}"
         )
-        key_size = os.path.getsize(key_file)
-        value_size = os.path.getsize(value_file)
-        score_size = os.path.getsize(score_file)
+        try:
+            key_size = os.path.getsize(key_file)
+            value_size = os.path.getsize(value_file)
+            score_size = os.path.getsize(score_file)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Dynamic embedding {embedding_name} is missing checkpoint file: "
+                f"{exc.filename}"
+            ) from exc
         if key_size % 8:
             raise ValueError(f"Invalid int64 key file size: {key_file}: {key_size}")
         rows = key_size // 8
