@@ -239,6 +239,10 @@ def get_dynamic_embedding_export(
     Returns:
         NPZ array descriptors and per-table metadata, without feature mappings.
         Descriptors hold single-use iterators and must be consumed exactly once.
+
+    Raises:
+        FileNotFoundError: A checkpoint shard file is missing.
+        ValueError: The read budget, dimensions, or checkpoint shards are invalid.
     """
     if read_chunk_bytes <= 0:
         raise ValueError("read_chunk_bytes must be positive")

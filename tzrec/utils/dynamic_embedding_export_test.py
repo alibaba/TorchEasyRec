@@ -260,6 +260,42 @@ class DynamicEmbeddingExportTest(unittest.TestCase):
         callback.assert_called_once()
 
     @parameterized.expand(
+        [
+            ("keys", "keys"),
+            ("scores", "scores"),
+            ("values", "keys"),
+            ("values", "values"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_file_growth_during_iteration(self, array_field, file_field) -> None:
+        directory = self._write_shard(0, np.array([1, 2]), np.ones((2, 2)))
+        arrays, _ = get_dynamic_embedding_export(self.test_dir, {self.table: 2}, 16)
+        chunks = arrays[f"{self.table}.{array_field}"].chunks
+        next(chunks)
+        path = os.path.join(directory, f"table_emb_{file_field}.rank_0.world_size_1")
+        with open(path, "ab") as stream:
+            stream.write(b"x")
+        with self.assertRaisesRegex(ValueError, "file grew during export"):
+            list(chunks)
+
+    @parameterized.expand(
+        [
+            ("zero_dimension", 0, 1, 0, "Invalid embedding dimension"),
+            ("negative_dimension", 0, 1, -1, "Invalid embedding dimension"),
+            ("invalid_checkpoint_rank", 1, 1, 2, "Invalid checkpoint rank"),
+            ("zero_checkpoint_world_size", 0, 0, 2, "Invalid checkpoint rank"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_invalid_checkpoint_contract(
+        self, _name, rank, world_size, dimension, error
+    ) -> None:
+        self._write_shard(rank, np.array([1]), np.ones((1, 2)), world_size=world_size)
+        with self.assertRaisesRegex(ValueError, error):
+            get_dynamic_embedding_export(self.test_dir, {self.table: dimension}, 16)
+
+    @parameterized.expand(
         [("zero", 0), ("negative", -1), ("sub_row", 15)],
         name_func=parameterized_name_func,
     )
