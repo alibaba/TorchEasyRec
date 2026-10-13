@@ -2663,6 +2663,7 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
         [
             ("npz_only", False, "", ""),
             ("mixed_zch", False, "", ""),
+            ("mixed_zch_upload", True, "", ""),
             ("fp32_upload", True, "", ""),
             ("int8_upload", True, "INT8", ""),
             ("write_failure", True, "", "write"),
@@ -2687,7 +2688,7 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
     ):
         os.environ["DIST_QUANT"] = quant
         self.pipeline_config.model_config.kernel = kernel
-        if case_name == "mixed_zch":
+        if case_name in ("mixed_zch", "mixed_zch_upload"):
             self.pipeline_config.feature_configs[1].id_feature.zch.CopyFrom(
                 feature_pb2.ZeroCollisionHash(
                     zch_size=8,
@@ -2744,10 +2745,8 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
         with mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False):
             checkpoint_util.save_model(self.checkpoint_dir, checkpoint_model)
 
+        settings = self.pipeline_config.export_config.dynamic_embedding_export_config
         if upload:
-            settings = (
-                self.pipeline_config.export_config.dynamic_embedding_export_config
-            )
             settings.read_chunk_size_mb = 1
             settings.upload_max_in_flight_batches = 2
             settings.feature_store_config.region = "cn-beijing"
@@ -2842,7 +2841,17 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
             restore.assert_called_once()
             self.assertFalse(restore.call_args.kwargs["load_dynamicemb"])
             if upload:
-                uploader_class.assert_called_once()
+                uploader_class.assert_called_once_with(
+                    settings.feature_store_config,
+                    {
+                        checkpoint_util.remap_input_tile_user_key(
+                            name
+                        ): info.embedding_dim
+                        for name, info in table_infos.items()
+                    },
+                    embedding_field_type="ARRAY<UINT8>" if quant else "ARRAY<FLOAT>",
+                    max_in_flight_batches=2,
+                )
                 uploader.start.assert_called_once_with(
                     total_records=sum(
                         len(expected_dynamic[name][0]) for name in dynamic_names
@@ -2861,6 +2870,7 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
             return
         if upload:
             uploader.close.assert_called_once_with()
+            self.assertEqual(set(uploaded), dynamic_names)
         with np.load(
             os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
         ) as output:
@@ -2877,7 +2887,7 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
                     )
                 else:
                     np.testing.assert_array_equal(exported, values)
-                if upload:
+                if upload and name in dynamic_names:
                     np.testing.assert_array_equal(
                         np.concatenate([chunk[0] for chunk in uploaded[name]]), keys
                     )
@@ -2923,6 +2933,34 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
         self.assertTrue(scripted.state_dict())
         for name, value in scripted.state_dict().items():
             torch.testing.assert_close(value, checkpoint_state[name])
+
+    @parameterized.expand(
+        [("rtp", True, True), ("no_distributed_embedding", False, False)],
+        name_func=parameterized_name_func,
+    )
+    def test_dynamic_export_config_rejects_incompatible_modes(
+        self, _name, rtp, distributed_embedding
+    ):
+        self.pipeline_config.export_config.dynamic_embedding_export_config.SetInParent()
+        with (
+            mock.patch.object(export_util.env_util, "use_rtp", return_value=rtp),
+            mock.patch.object(
+                acc_utils,
+                "use_distributed_embedding",
+                return_value=distributed_embedding,
+            ),
+            mock.patch.object(export_util, "url_to_fs") as resolve_output,
+            self.assertRaisesRegex(
+                ValueError, "USE_DISTRIBUTED_EMBEDDING=1 and a non-RTP export"
+            ),
+        ):
+            export_util.export_model(
+                self.pipeline_config,
+                self._build_model(),
+                self.checkpoint_dir,
+                self.export_dir,
+            )
+        resolve_output.assert_not_called()
 
     @parameterized.expand(
         [
