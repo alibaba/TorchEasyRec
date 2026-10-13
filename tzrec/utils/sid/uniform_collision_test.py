@@ -18,7 +18,7 @@ import numpy as np
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     PriorOccupancy,
-    build_resolved_item_grouping,
+    build_resolved_sid_item_row_index,
     prepare_collision_plan,
     stable_order_hash,
 )
@@ -150,7 +150,7 @@ class UniformCollisionResolverTest(unittest.TestCase):
                         max(final.values()),
                     ),
                 )
-                build_resolved_item_grouping(plan, result)
+                build_resolved_sid_item_row_index(plan, result)
 
 
 if __name__ == "__main__":

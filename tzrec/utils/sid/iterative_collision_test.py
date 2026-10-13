@@ -16,7 +16,7 @@ import numpy as np
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     PriorOccupancy,
-    build_resolved_item_grouping,
+    build_resolved_sid_item_row_index,
     prepare_collision_plan,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
@@ -128,8 +128,10 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         np.testing.assert_array_equal(result.unresolved_rows, [plan.overflow_rows[2]])
         self.assertEqual(result.stats.relocated_count, 2)
         np.testing.assert_array_equal(result.final_item_counts, [2, 1, 1])
-        grouping = build_resolved_item_grouping(plan, result)
-        np.testing.assert_array_equal(np.sort(grouping.row_order), np.arange(4))
+        sid_item_row_index = build_resolved_sid_item_row_index(plan, result)
+        np.testing.assert_array_equal(
+            np.sort(sid_item_row_index.item_row_indices), np.arange(4)
+        )
 
     def test_assignments_are_deterministic_under_input_reordering(self) -> None:
         item_ids = np.asarray([f"item-{index}" for index in range(12)])

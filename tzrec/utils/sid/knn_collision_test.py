@@ -17,8 +17,8 @@ from parameterized import parameterized
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     PriorOccupancy,
-    build_origin_item_grouping,
-    build_resolved_item_grouping,
+    build_origin_sid_item_row_index,
+    build_resolved_sid_item_row_index,
     prepare_collision_plan,
 )
 from tzrec.utils.sid.knn_collision import KnnCollisionResolver
@@ -50,8 +50,8 @@ class KnnCollisionResolverTest(unittest.TestCase):
         plan = _plan((2, 4), 2, item_ids, codes)
         candidates = np.asarray([[0, 1, 2], [1, 2, 3], [0, 1, 2]], dtype=np.int64)
         result = KnnCollisionResolver().resolve(plan, candidates)
-        origin_grouping = build_origin_item_grouping(plan)
-        resolved_grouping = build_resolved_item_grouping(plan, result)
+        origin_sid_item_row_index = build_origin_sid_item_row_index(plan)
+        resolved_sid_item_row_index = build_resolved_sid_item_row_index(plan, result)
 
         np.testing.assert_array_equal(plan.overflow_rows, [1, 3, 8])
         np.testing.assert_array_equal(plan.overflow_item_ids, [1, 3, 8])
@@ -69,24 +69,32 @@ class KnnCollisionResolverTest(unittest.TestCase):
         np.testing.assert_array_equal(result.unresolved_rows, [])
         np.testing.assert_array_equal(result.final_sid_keys, [0, 1, 2, 3, 4, 5])
         np.testing.assert_array_equal(result.final_item_counts, [2, 2, 2, 1, 2, 1])
-        self.assertTrue(result.grouping_collected)
+        self.assertTrue(result.sid_metadata_collected)
         self.assertEqual(result.stats.raw_colliding_sid_count, 2)
         self.assertEqual(result.stats.final_colliding_sid_count, 0)
         self.assertEqual(result.stats.relocated_count, 3)
         self.assertEqual(result.stats.unresolved_count, 0)
         self.assertEqual(result.stats.max_final_items_per_sid, 2)
 
-        np.testing.assert_array_equal(origin_grouping.sid_keys, [0, 1, 2, 4])
-        np.testing.assert_array_equal(origin_grouping.item_counts, [4, 1, 2, 3])
-        np.testing.assert_array_equal(origin_grouping.offsets, [0, 4, 5, 7, 10])
+        np.testing.assert_array_equal(origin_sid_item_row_index.sid_keys, [0, 1, 2, 4])
         np.testing.assert_array_equal(
-            origin_grouping.row_order, [2, 0, 1, 3, 4, 6, 5, 9, 7, 8]
+            origin_sid_item_row_index.item_counts, [4, 1, 2, 3]
+        )
+        np.testing.assert_array_equal(
+            origin_sid_item_row_index.offsets, [0, 4, 5, 7, 10]
+        )
+        np.testing.assert_array_equal(
+            origin_sid_item_row_index.item_row_indices, [2, 0, 1, 3, 4, 6, 5, 9, 7, 8]
         )
 
-        np.testing.assert_array_equal(resolved_grouping.sid_keys, [0, 1, 2, 3, 4, 5])
-        np.testing.assert_array_equal(resolved_grouping.item_counts, [2, 2, 2, 1, 2, 1])
         np.testing.assert_array_equal(
-            resolved_grouping.row_order, [2, 0, 4, 1, 6, 5, 3, 9, 7, 8]
+            resolved_sid_item_row_index.sid_keys, [0, 1, 2, 3, 4, 5]
+        )
+        np.testing.assert_array_equal(
+            resolved_sid_item_row_index.item_counts, [2, 2, 2, 1, 2, 1]
+        )
+        np.testing.assert_array_equal(
+            resolved_sid_item_row_index.item_row_indices, [2, 0, 4, 1, 6, 5, 3, 9, 7, 8]
         )
 
     def test_resolution_is_deterministic_and_order_independent(self) -> None:
@@ -109,24 +117,26 @@ class KnnCollisionResolverTest(unittest.TestCase):
             resolved_codes = ordered_codes.copy()
             resolved_codes[:, -1] = result.resolved_last_codes
 
-            def grouped_item_ids(grouping):
+            def grouped_item_ids(sid_item_row_index):
                 return {
                     int(sid_key): tuple(
                         ordered_item_ids[
-                            grouping.row_order[
-                                grouping.offsets[index] : grouping.offsets[index + 1]
+                            sid_item_row_index.item_row_indices[
+                                sid_item_row_index.offsets[index] : (
+                                    sid_item_row_index.offsets[index + 1]
+                                )
                             ]
                         ].tolist()
                     )
-                    for index, sid_key in enumerate(grouping.sid_keys)
+                    for index, sid_key in enumerate(sid_item_row_index.sid_keys)
                 }
 
             return (
                 dict(
                     zip(ordered_item_ids.tolist(), map(tuple, resolved_codes.tolist()))
                 ),
-                grouped_item_ids(build_origin_item_grouping(plan)),
-                grouped_item_ids(build_resolved_item_grouping(plan, result)),
+                grouped_item_ids(build_origin_sid_item_row_index(plan)),
+                grouped_item_ids(build_resolved_sid_item_row_index(plan, result)),
                 result.stats,
             )
 
@@ -143,10 +153,12 @@ class KnnCollisionResolverTest(unittest.TestCase):
         self.assertEqual(result.stats.final_colliding_sid_count, 1)
         self.assertEqual(result.stats.max_final_items_per_sid, 2)
         self.assertEqual(result.stats.unresolved_count, 1)
-        resolved_grouping = build_resolved_item_grouping(plan, result)
-        np.testing.assert_array_equal(resolved_grouping.sid_keys, [0])
-        np.testing.assert_array_equal(resolved_grouping.item_counts, [2])
-        np.testing.assert_array_equal(resolved_grouping.row_order, [0, 1])
+        resolved_sid_item_row_index = build_resolved_sid_item_row_index(plan, result)
+        np.testing.assert_array_equal(resolved_sid_item_row_index.sid_keys, [0])
+        np.testing.assert_array_equal(resolved_sid_item_row_index.item_counts, [2])
+        np.testing.assert_array_equal(
+            resolved_sid_item_row_index.item_row_indices, [0, 1]
+        )
 
     def test_no_overflow(self) -> None:
         plan = _plan((2, 4), 2, [0, 1, 2], [[0, 0], [0, 0], [1, 2]])
@@ -212,7 +224,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
             [[0, 2, 0], [0, 2, 0], [0, 2, 0], [0, 0, 0], [1, 0, 0]],
         )
         np.testing.assert_array_equal(plan.sid_keys, [0, 8, 12])
-        np.testing.assert_array_equal(plan.new_item_counts, [1, 3, 1])
+        np.testing.assert_array_equal(plan.input_item_counts, [1, 3, 1])
         np.testing.assert_array_equal(plan.overflow_prefix_ids, [2])
 
         result = KnnCollisionResolver().resolve(
@@ -226,9 +238,13 @@ class KnnCollisionResolverTest(unittest.TestCase):
         self.assertEqual(result.resolved_last_codes[4], 0)
         np.testing.assert_array_equal(result.final_sid_keys, [0, 8, 9, 12])
         np.testing.assert_array_equal(result.final_item_counts, [1, 2, 1, 1])
-        grouping = build_resolved_item_grouping(plan, result)
-        np.testing.assert_array_equal(grouping.sid_keys, result.final_sid_keys)
-        np.testing.assert_array_equal(grouping.item_counts, result.final_item_counts)
+        sid_item_row_index = build_resolved_sid_item_row_index(plan, result)
+        np.testing.assert_array_equal(
+            sid_item_row_index.sid_keys, result.final_sid_keys
+        )
+        np.testing.assert_array_equal(
+            sid_item_row_index.item_counts, result.final_item_counts
+        )
 
     def test_prior_over_capacity_never_reissues_a_published_slot(self) -> None:
         # A previous run left three items on key 0 at capacity 1 (unresolved
@@ -249,7 +265,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
         self.assertEqual(int(result.resolved_last_codes[0]), 2)
         self.assertEqual(int(result.slot_indices[0]), 1)
         np.testing.assert_array_equal(
-            build_resolved_item_grouping(plan, result).sid_keys, [2]
+            build_resolved_sid_item_row_index(plan, result).sid_keys, [2]
         )
 
 

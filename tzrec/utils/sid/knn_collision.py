@@ -32,7 +32,7 @@ class KnnCollisionResolver(CollisionResolver):
         self,
         plan: CollisionPlan,
         candidate_last_codes: Optional[np.ndarray] = None,
-        collect_grouping: bool = True,
+        collect_sid_metadata: bool = True,
     ) -> CollisionResolutionResult:
         """Greedily relocate overflow rows to their first free candidate slot.
 
@@ -45,8 +45,8 @@ class KnnCollisionResolver(CollisionResolver):
             candidate_last_codes: Last-layer candidate matrix with shape
                 ``(M, K)``, row-aligned with ``plan.overflow_rows``. It may be
                 omitted only when the plan has no overflow rows.
-            collect_grouping: Whether to retain final SID metadata required
-                by :func:`build_resolved_item_grouping`.
+            collect_sid_metadata: Whether to retain final SID metadata required
+                by :func:`build_resolved_sid_item_row_index`.
 
         Returns:
             Resolved last-layer codes, slot indices, unresolved row indices,
@@ -59,17 +59,16 @@ class KnnCollisionResolver(CollisionResolver):
                 out-of-range last-layer indices.
         """
         candidates = self._validate_candidate_last_codes(plan, candidate_last_codes)
-        in_overflow_prefix, affected_keys, affected_counts, result = (
-            self._prepare_collision(plan, collect_grouping)
-        )
+        initial_state, result = self._prepare_collision(plan, collect_sid_metadata)
         if result is not None:
             return result
 
         target_last_codes = plan.origin_last_codes.copy()
         target_slot_indices = plan.initial_slot_indices.copy()
         unresolved_rows = []
-        occupancy = dict(zip(affected_keys.tolist(), affected_counts.tolist()))
-        get_occupancy = occupancy.get
+        occupancy = dict(
+            zip(initial_state.sid_keys.tolist(), initial_state.item_counts.tolist())
+        )
         capacity = plan.config.capacity
         last_size = plan.config.codebook[-1]
         progress = ProgressLogger(
@@ -94,7 +93,7 @@ class KnnCollisionResolver(CollisionResolver):
         ):
             for candidate in candidate_row:
                 destination_key = base_key + candidate
-                destination_occupancy = get_occupancy(destination_key, 0)
+                destination_occupancy = occupancy.get(destination_key, 0)
                 if destination_occupancy < capacity:
                     occupancy[destination_key] = destination_occupancy + 1
                     target_last_codes[row] = candidate
@@ -103,7 +102,7 @@ class KnnCollisionResolver(CollisionResolver):
             else:
                 unresolved_rows.append(row)
                 origin_key = base_key + origin_last_code
-                origin_occupancy = get_occupancy(origin_key, 0) + 1
+                origin_occupancy = occupancy.get(origin_key, 0) + 1
                 occupancy[origin_key] = origin_occupancy
                 target_slot_indices[row] = origin_occupancy
             progress.log(resolved_count)
@@ -113,8 +112,8 @@ class KnnCollisionResolver(CollisionResolver):
             target_last_codes,
             target_slot_indices,
             np.asarray(unresolved_rows, dtype=np.int64),
-            in_overflow_prefix,
+            initial_state,
             np.fromiter(occupancy, dtype=np.int64, count=len(occupancy)),
             np.fromiter(occupancy.values(), dtype=np.int64, count=len(occupancy)),
-            collect_grouping,
+            collect_sid_metadata,
         )

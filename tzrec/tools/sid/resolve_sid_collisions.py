@@ -119,17 +119,17 @@ from tzrec.utils.sid.bundle import (
     Bundle,
 )
 from tzrec.utils.sid.collision import (
-    CodebookItemGrouping,
     CollisionPlan,
     CollisionResolutionConfig,
     CollisionResolutionResult,
     CollisionResolutionStats,
     CollisionResolver,
     PriorOccupancy,
-    build_origin_item_grouping,
-    build_resolved_item_grouping,
+    SidItemRowIndex,
+    build_origin_sid_item_row_index,
+    build_resolved_sid_item_row_index,
+    find_in_sorted_array,
     get_same_value_start_indices,
-    lookup_sorted,
     prepare_collision_plan,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
@@ -174,7 +174,7 @@ class _ItemIdLookup:
 
     def match(self, item_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Return matching batch indices and their requested-ID indices."""
-        positions, found = lookup_sorted(self._sorted_ids, item_ids)
+        positions, found = find_in_sorted_array(self._sorted_ids, item_ids)
         matching_batch_indices = np.flatnonzero(found)
         return (
             matching_batch_indices,
@@ -344,7 +344,7 @@ class CollisionResolutionRunner:
         result = self._resolver.resolve(
             plan,
             candidate_last_codes,
-            collect_grouping=not self._config.rate_only
+            collect_sid_metadata=not self._config.rate_only
             and bool(plan.overflow_rows.size),
         )
         del candidate_last_codes
@@ -741,7 +741,7 @@ class CollisionResolutionRunner:
                         flat_ids.filter(overlap).slice(0, 10).to_pylist()
                     )
 
-            _, keep = lookup_sorted(
+            _, keep = find_in_sorted_array(
                 wanted_prefixes, self._config.collision_config.prefix_ids(codes)
             )
             if np.any(keep):
@@ -913,31 +913,31 @@ class CollisionResolutionRunner:
     ) -> None:
         """Group this run's rows by resolved SID and write them."""
         if plan.overflow_rows.size:
-            grouping = build_resolved_item_grouping(plan, result)
+            sid_item_row_index = build_resolved_sid_item_row_index(plan, result)
         else:
-            grouping = build_origin_item_grouping(plan)
+            sid_item_row_index = build_origin_sid_item_row_index(plan)
         if self._config.is_append:
-            self._write_merged_sid_to_items(item_ids, grouping, plan.prior)
+            self._write_merged_sid_to_items(item_ids, sid_item_row_index, plan.prior)
         else:
-            self._write_sid_to_items(item_ids, grouping)
+            self._write_sid_to_items(item_ids, sid_item_row_index)
 
     def _write_sid_to_items_rows(
-        self, writer: BaseWriter, keys: np.ndarray, itemids: pa.Array
+        self, writer: BaseWriter, sid_keys: np.ndarray, item_id_lists: pa.Array
     ) -> None:
         """Write one sid_to_items row per SID key, with its SID from the key."""
-        codes = np.stack(np.unravel_index(keys, self._config.codebook), axis=1)
+        codes = np.stack(np.unravel_index(sid_keys, self._config.codebook), axis=1)
         writer.write(
             {
                 "codebook": self._codes_column(codes, False),
                 "offset_codebook": self._offset_codes_column(codes, False),
-                "itemids": itemids,
+                "itemids": item_id_lists,
             }
         )
 
     def _write_merged_sid_to_items(
         self,
         item_ids: np.ndarray,
-        grouping: CodebookItemGrouping,
+        sid_item_row_index: SidItemRowIndex,
         prior: PriorOccupancy,
     ) -> None:
         """Merge this run's SIDs into the published sid_to_items, writing both.
@@ -947,7 +947,7 @@ class CollisionResolutionRunner:
 
         Args:
             item_ids: Input item IDs in original row order.
-            grouping: This run's SIDs by resolved SID.
+            sid_item_row_index: Input row indices ordered by resolved SID and slot.
             prior: Published SIDs of the affected prefixes, which hold every
                 published SID a new SID can share a key with.
         """
@@ -957,18 +957,23 @@ class CollisionResolutionRunner:
         delta_writer = self._make_writer(
             self._bundle.write_path(DELTA_SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
         )
-        new_keys = grouping.sid_keys
-        new_itemids = _item_lists(
-            grouping.offsets, self._item_id_array(item_ids[grouping.row_order])
+        input_sid_keys = sid_item_row_index.sid_keys
+        input_item_id_lists = _item_lists(
+            sid_item_row_index.offsets,
+            self._item_id_array(item_ids[sid_item_row_index.item_row_indices]),
         )
 
         def write_new_sid_rows(low: int, high: int) -> None:
             """Write new SIDs ``[low, high)``, which no published SID shares."""
             if low == high:
                 return
-            itemids = new_itemids.slice(low, high - low)
-            self._write_sid_to_items_rows(writer, new_keys[low:high], itemids)
-            self._write_sid_to_items_rows(delta_writer, new_keys[low:high], itemids)
+            item_id_lists = input_item_id_lists.slice(low, high - low)
+            self._write_sid_to_items_rows(
+                writer, input_sid_keys[low:high], item_id_lists
+            )
+            self._write_sid_to_items_rows(
+                delta_writer, input_sid_keys[low:high], item_id_lists
+            )
 
         reader = self._make_reader(
             self._bundle.read_path(SID_TO_ITEMS_ARTIFACT), ["codebook", "itemids"]
@@ -979,45 +984,47 @@ class CollisionResolutionRunner:
             reader, "Writing merged sid_to_items", "codebook"
         ):
             codes = self._convert_codes_to_numpy(batch["codebook"])
-            keys = self._config.collision_config.convert_codes_to_sid_keys(codes)
-            existing_sid_count += keys.shape[0]
-            low = int(np.searchsorted(new_keys, keys[0], side="left"))
+            sid_keys = self._config.collision_config.convert_codes_to_sid_keys(codes)
+            existing_sid_count += sid_keys.shape[0]
+            low = int(np.searchsorted(input_sid_keys, sid_keys[0], side="left"))
             write_new_sid_rows(cursor, low)
-            high = int(np.searchsorted(new_keys, keys[-1], side="right"))
-            itemids = pc.cast(batch["itemids"], new_itemids.type)
+            high = int(np.searchsorted(input_sid_keys, sid_keys[-1], side="right"))
+            item_id_lists = pc.cast(batch["itemids"], input_item_id_lists.type)
             if low == high:
                 # No new SID in range: the merge would rebuild the batch.
-                self._write_sid_to_items_rows(writer, keys, itemids)
+                self._write_sid_to_items_rows(writer, sid_keys, item_id_lists)
             else:
-                keys, itemids, gained = _merge_sid_to_items(
-                    keys,
-                    itemids,
-                    new_keys[low:high],
-                    new_itemids.slice(low, high - low),
+                sid_keys, item_id_lists, updated_sid_indices = _merge_sid_to_items(
+                    sid_keys,
+                    item_id_lists,
+                    input_sid_keys[low:high],
+                    input_item_id_lists.slice(low, high - low),
                 )
-                self._write_sid_to_items_rows(writer, keys, itemids)
+                self._write_sid_to_items_rows(writer, sid_keys, item_id_lists)
                 self._write_sid_to_items_rows(
-                    delta_writer, keys[gained], itemids.take(gained)
+                    delta_writer,
+                    sid_keys[updated_sid_indices],
+                    item_id_lists.take(updated_sid_indices),
                 )
             cursor = high
-        write_new_sid_rows(cursor, new_keys.shape[0])
+        write_new_sid_rows(cursor, input_sid_keys.shape[0])
         writer.close()
         delta_writer.close()
 
-        _, shared = lookup_sorted(prior.sid_keys, new_keys)
+        _, shared = find_in_sorted_array(prior.sid_keys, input_sid_keys)
         self._bundle.rows[SID_TO_ITEMS_ARTIFACT] = existing_sid_count + int(
             np.count_nonzero(~shared)
         )
-        self._bundle.rows[DELTA_SID_TO_ITEMS_ARTIFACT] = new_keys.shape[0]
+        self._bundle.rows[DELTA_SID_TO_ITEMS_ARTIFACT] = input_sid_keys.shape[0]
 
     def _write_sid_to_items(
-        self, item_ids: np.ndarray, grouping: CodebookItemGrouping
+        self, item_ids: np.ndarray, sid_item_row_index: SidItemRowIndex
     ) -> None:
         """Write sid_to_items in SID and slot order.
 
         Args:
             item_ids: Input item IDs in original row order.
-            grouping: Sorted SIDs and their flattened original row order.
+            sid_item_row_index: Input row indices ordered by SID and slot.
         """
         writer = self._make_writer(
             self._bundle.write_path(SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
@@ -1027,54 +1034,62 @@ class CollisionResolutionRunner:
             start_n=0,
             miniters=self._config.progress_interval,
         )
-        values = self._item_id_array(item_ids[grouping.row_order])
-        offsets = grouping.offsets
-        itemids = _item_lists(offsets, values)
-        self._write_sid_to_items_rows(writer, grouping.sid_keys, itemids)
+        ordered_item_ids = self._item_id_array(
+            item_ids[sid_item_row_index.item_row_indices]
+        )
+        offsets = sid_item_row_index.offsets
+        item_id_lists = _item_lists(offsets, ordered_item_ids)
+        self._write_sid_to_items_rows(
+            writer, sid_item_row_index.sid_keys, item_id_lists
+        )
         progress.log(item_ids.shape[0])
         writer.close()
-        self._bundle.rows[SID_TO_ITEMS_ARTIFACT] = grouping.sid_keys.shape[0]
+        self._bundle.rows[SID_TO_ITEMS_ARTIFACT] = sid_item_row_index.sid_keys.shape[0]
 
 
-def _item_lists(offsets: np.ndarray, values: pa.Array) -> pa.ListArray:
+def _item_lists(offsets: np.ndarray, ordered_item_ids: pa.Array) -> pa.ListArray:
     """Wrap flat item IDs into one ``itemids`` list per SID."""
-    return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), values)
+    return pa.ListArray.from_arrays(
+        pa.array(offsets, type=pa.int32()), ordered_item_ids
+    )
 
 
 def _merge_sid_to_items(
-    keys: np.ndarray,
-    itemids: pa.ListArray,
-    new_keys: np.ndarray,
-    new_itemids: pa.ListArray,
+    sid_keys: np.ndarray,
+    item_id_lists: pa.ListArray,
+    input_sid_keys: np.ndarray,
+    input_item_id_lists: pa.ListArray,
 ) -> Tuple[np.ndarray, pa.ListArray, np.ndarray]:
-    """Merge key-sorted published SIDs with the new SIDs in their range.
+    """Merge key-sorted published SIDs with input SIDs in their range.
 
     The stable sort keeps each side in slot order and lists a shared SID's
     published items first.
 
     Returns:
         The merged SID keys, their item ID lists, and the
-        positions of the merged SIDs that gained new items.
+        positions of the merged SIDs that received input items.
     """
-    item_keys = np.concatenate(
+    item_sid_keys = np.concatenate(
         (
-            np.repeat(keys, pc.list_value_length(itemids).to_numpy()),
-            np.repeat(new_keys, pc.list_value_length(new_itemids).to_numpy()),
+            np.repeat(sid_keys, pc.list_value_length(item_id_lists).to_numpy()),
+            np.repeat(
+                input_sid_keys, pc.list_value_length(input_item_id_lists).to_numpy()
+            ),
         )
     )
-    order = np.argsort(item_keys, kind="stable")
-    ordered_keys = item_keys[order]
-    starts = get_same_value_start_indices(ordered_keys)
-    values = (
-        pa.chunked_array([itemids.flatten(), new_itemids.flatten()])
+    order = np.argsort(item_sid_keys, kind="stable")
+    ordered_sid_keys = item_sid_keys[order]
+    starts = get_same_value_start_indices(ordered_sid_keys)
+    ordered_item_ids = (
+        pa.chunked_array([item_id_lists.flatten(), input_item_id_lists.flatten()])
         .take(pa.array(order, type=pa.int64()))
         .combine_chunks()
     )
-    merged_keys = ordered_keys[starts]
+    merged_sid_keys = ordered_sid_keys[starts]
     return (
-        merged_keys,
-        _item_lists(np.append(starts, item_keys.shape[0]), values),
-        np.flatnonzero(lookup_sorted(new_keys, merged_keys)[1]),
+        merged_sid_keys,
+        _item_lists(np.append(starts, item_sid_keys.shape[0]), ordered_item_ids),
+        np.flatnonzero(find_in_sorted_array(input_sid_keys, merged_sid_keys)[1]),
     )
 
 

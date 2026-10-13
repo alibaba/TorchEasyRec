@@ -11,8 +11,6 @@
 
 """NumPy collision-resolution core for semantic IDs."""
 
-from __future__ import annotations
-
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -93,14 +91,14 @@ def concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     )
 
 
-def lookup_sorted(
+def find_in_sorted_array(
     sorted_keys: np.ndarray, keys: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Locate ``keys`` inside an ascending ``sorted_keys``.
+    """Find ``keys`` inside ascending ``sorted_keys`` without modifying it.
 
-    Returns the insertion positions and a mask of exact hits; a position is
-    meaningful only where the mask is set, and repeated keys resolve to their
-    first occurrence.
+    Returns insertion positions relative to the unchanged input array and a
+    mask of exact hits. Use positions with a set mask to retrieve matching
+    values; repeated keys resolve to their first occurrence.
     """
     positions = np.searchsorted(sorted_keys, keys)
     found = positions < sorted_keys.shape[0]
@@ -129,8 +127,19 @@ def get_same_value_start_indices(ordered_values: np.ndarray) -> np.ndarray:
     )
 
 
-def ranks_within_runs(ordered_values: np.ndarray) -> np.ndarray:
-    """Return zero-based ranks within equal-value runs in a sorted array."""
+def get_same_value_positions(ordered_values: np.ndarray) -> np.ndarray:
+    """Return each element's position within consecutive equal values.
+
+    Args:
+        ordered_values: Nonempty sorted one-dimensional array.
+
+    Returns:
+        An int64 array of positions starting at zero for each distinct value.
+
+    Examples:
+        >>> get_same_value_positions(np.array([7, 7, 7, 9, 9, 12]))
+        array([0, 1, 2, 0, 1, 0])
+    """
     starts = get_same_value_start_indices(ordered_values)
     return np.arange(ordered_values.shape[0], dtype=np.int64) - np.repeat(
         starts, np.diff(np.append(starts, ordered_values.shape[0]))
@@ -162,7 +171,7 @@ class PriorOccupancy:
 
     def counts_for(self, sid_keys: np.ndarray) -> np.ndarray:
         """Return prior counts aligned with ``sid_keys``, zero when absent."""
-        positions, found = lookup_sorted(self.sid_keys, sid_keys)
+        positions, found = find_in_sorted_array(self.sid_keys, sid_keys)
         counts = np.zeros(sid_keys.shape[0], dtype=np.int64)
         counts[found] = self.item_counts[positions[found]]
         return counts
@@ -189,7 +198,7 @@ class PriorOccupancy:
 
 @dataclass(frozen=True)
 class CollisionPlan:
-    """Compact grouping plan consumed by collision resolution.
+    """Input SID counts, item positions, and rows requiring collision resolution.
 
     The plan stores full-length last codes, dense SID key indices and slot index
     arrays, plus only the overflow-aligned identity and prefix data needed by
@@ -208,7 +217,7 @@ class CollisionPlan:
             order.
         sid_keys: Ascending mixed-radix keys of SIDs present in this input,
             int64 shape ``(occupied_sid_count,)``.
-        new_item_counts: Number of this plan's rows in every SID before
+        input_item_counts: Number of this plan's rows in every SID before
             capacity capping, int64 shape ``(occupied_sid_count,)`` aligned with
             ``sid_keys``; add ``existing_item_counts`` for the corpus total.
         overflow_rows: Original row indices ranked at or beyond ``capacity``
@@ -225,7 +234,7 @@ class CollisionPlan:
             SID inside those prefixes.
         existing_item_counts: Published occupancy of every SID in
             ``sid_keys``, int64 aligned with it and zero where the SID
-            is new; ``existing_item_counts + new_item_counts`` is a SID's
+            is new; ``existing_item_counts + input_item_counts`` is a SID's
             uncapped total over the published corpus and these rows.
     """
 
@@ -233,7 +242,7 @@ class CollisionPlan:
     origin_sid_key_indices: np.ndarray
     initial_slot_indices: np.ndarray
     sid_keys: np.ndarray
-    new_item_counts: np.ndarray
+    input_item_counts: np.ndarray
     overflow_rows: np.ndarray
     overflow_item_ids: np.ndarray
     overflow_prefix_ids: np.ndarray
@@ -276,30 +285,48 @@ class CollisionResolutionResult:
     unresolved_rows: np.ndarray
     final_sid_keys: np.ndarray
     final_item_counts: np.ndarray
-    grouping_collected: bool
+    sid_metadata_collected: bool
     stats: CollisionResolutionStats
 
 
 @dataclass(frozen=True)
-class CodebookItemGrouping:
-    """CSR-like row grouping for sorted flattened SID keys.
+class InitialCollisionState:
+    """SID state before placing overflow items.
 
-    ``row_order[offsets[i]:offsets[i + 1]]`` contains the original row indices
+    Args:
+        in_overflow_prefix: Mask of ``plan.sid_keys`` whose prefixes contain
+            overflow items. It is aligned with the plan, not ``sid_keys``.
+        sid_keys: Sorted keys of occupied SIDs in overflow prefixes, including
+            published SIDs that have no input items.
+        item_counts: Published plus retained input item counts aligned with
+            ``sid_keys``. Overflow items have not been placed yet.
+    """
+
+    in_overflow_prefix: np.ndarray
+    sid_keys: np.ndarray
+    item_counts: np.ndarray
+
+
+@dataclass(frozen=True)
+class SidItemRowIndex:
+    """Input row indices organized by sorted SID keys and SID-local slots.
+
+    ``item_row_indices[offsets[i]:offsets[i + 1]]`` contains the original row indices
     for ``sid_keys[i]``. Rows within a SID follow their one-based slot order.
 
     Args:
         sid_keys: Sorted flattened SID keys, one per occupied SID.
         item_counts: Counts of this run's items, aligned with ``sid_keys``.
-        row_order: Original row indices flattened in SID and slot order.
+        item_row_indices: Original row indices flattened in SID and slot order.
     """
 
     sid_keys: np.ndarray
     item_counts: np.ndarray
-    row_order: np.ndarray
+    item_row_indices: np.ndarray
 
     @cached_property
     def offsets(self) -> np.ndarray:
-        """Return CSR offsets into ``row_order`` for every SID."""
+        """Return CSR offsets into ``item_row_indices`` for every SID."""
         offsets = np.empty(self.item_counts.shape[0] + 1, dtype=np.int64)
         offsets[0] = 0
         np.cumsum(self.item_counts, dtype=np.int64, out=offsets[1:])
@@ -326,7 +353,7 @@ class CollisionResolver(ABC):
         self,
         plan: CollisionPlan,
         candidate_last_codes: Optional[np.ndarray] = None,
-        collect_grouping: bool = True,
+        collect_sid_metadata: bool = True,
     ) -> CollisionResolutionResult:
         """Resolve overflow rows while preserving every input item.
 
@@ -335,8 +362,8 @@ class CollisionResolver(ABC):
                 :func:`prepare_collision_plan`.
             candidate_last_codes: Optional strategy-specific candidate last
                 codes.
-            collect_grouping: Whether to retain final SID metadata required
-                by :func:`build_resolved_item_grouping`.
+            collect_sid_metadata: Whether to retain final SID metadata required
+                by :func:`build_resolved_sid_item_row_index`.
 
         Returns:
             Resolved last-layer codes, slot indices, and diagnostics.
@@ -344,24 +371,19 @@ class CollisionResolver(ABC):
         raise NotImplementedError
 
     def _prepare_collision(
-        self, plan: CollisionPlan, collect_grouping: bool
-    ) -> tuple[
-        np.ndarray, np.ndarray, np.ndarray, Optional[CollisionResolutionResult]
-    ]:
+        self, plan: CollisionPlan, collect_sid_metadata: bool
+    ) -> tuple[InitialCollisionState, Optional[CollisionResolutionResult]]:
         """Prepare initial occupancy and finish plans without overflow.
 
         Args:
             plan: Grouping and overflow plan from ``prepare_collision_plan``.
-            collect_grouping: Whether to retain final SID metadata.
+            collect_sid_metadata: Whether to retain final SID metadata.
 
         Returns:
-            The prefix mask, affected SID keys, initial item counts, and a
-            completed result when no overflow exists. The result is ``None``
-            when overflow rows still need resolution.
+            The initial SID state and a completed result when no overflow
+            exists. The result is ``None`` when overflow rows need resolution.
         """
-        in_overflow_prefix, affected_keys, affected_counts = self._initial_occupancy(
-            plan
-        )
+        initial_state = self._initial_occupancy(plan)
         result = None
         if plan.overflow_rows.size == 0:
             result = self._build_result(
@@ -369,12 +391,12 @@ class CollisionResolver(ABC):
                 plan.origin_last_codes,
                 plan.initial_slot_indices,
                 np.empty(0, dtype=np.int64),
-                in_overflow_prefix,
-                affected_keys,
-                affected_counts,
-                collect_grouping,
+                initial_state,
+                initial_state.sid_keys,
+                initial_state.item_counts,
+                collect_sid_metadata,
             )
-        return in_overflow_prefix, affected_keys, affected_counts, result
+        return initial_state, result
 
     def _validate_candidate_last_codes(
         self, plan: CollisionPlan, candidate_last_codes: Optional[np.ndarray]
@@ -430,7 +452,7 @@ class CollisionResolver(ABC):
     @staticmethod
     def _initial_occupancy(
         plan: CollisionPlan,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> InitialCollisionState:
         """Return the occupancy before relocation of every affected sid.
 
         Relocation only reads or writes SIDs in a prefix with an overflow
@@ -443,13 +465,14 @@ class CollisionResolver(ABC):
                 :func:`prepare_collision_plan`.
 
         Returns:
-            A mask of ``plan.sid_keys`` lying in an overflow prefix, and the
-            ascending keys and initial counts of every occupied SID in those
-            prefixes.
+            The plan's overflow prefix mask and occupied SID keys with their
+            item counts before overflow items are placed.
         """
         last_size = plan.config.codebook[-1]
         prefix_ids = np.unique(plan.overflow_prefix_ids)
-        _, in_overflow_prefix = lookup_sorted(prefix_ids, plan.sid_keys // last_size)
+        _, in_overflow_prefix = find_in_sorted_array(
+            prefix_ids, plan.sid_keys // last_size
+        )
         affected_prior = plan.prior.restrict_to_prefixes(prefix_ids, last_size)
         # np.unique keeps the first occurrence, so a plan count wins over the prior.
         affected_keys, first = np.unique(
@@ -464,14 +487,18 @@ class CollisionResolver(ABC):
                 np.maximum(
                     prior_counts,
                     np.minimum(
-                        prior_counts + plan.new_item_counts[in_overflow_prefix],
+                        prior_counts + plan.input_item_counts[in_overflow_prefix],
                         plan.config.capacity,
                     ),
                 ),
                 affected_prior.item_counts,
             )
         )[first]
-        return in_overflow_prefix, affected_keys, affected_counts
+        return InitialCollisionState(
+            in_overflow_prefix=in_overflow_prefix,
+            sid_keys=affected_keys,
+            item_counts=affected_counts,
+        )
 
     @staticmethod
     def _build_result(
@@ -479,10 +506,10 @@ class CollisionResolver(ABC):
         resolved_last_codes: np.ndarray,
         slot_indices: np.ndarray,
         unresolved_rows: np.ndarray,
-        in_overflow_prefix: np.ndarray,
+        initial_state: InitialCollisionState,
         affected_keys: np.ndarray,
         affected_counts: np.ndarray,
-        collect_grouping: bool,
+        collect_sid_metadata: bool,
     ) -> CollisionResolutionResult:
         """Assemble the resolution result and its statistics.
 
@@ -491,24 +518,23 @@ class CollisionResolver(ABC):
             resolved_last_codes: Final last-layer code of every row.
             slot_indices: Final one-based slot of every row.
             unresolved_rows: Overflow rows whose final slot exceeds capacity.
-            in_overflow_prefix: Mask of ``plan.sid_keys`` lying in an
-                overflow prefix.
+            initial_state: SID state before overflow items were placed.
             affected_keys: Unique keys of the occupied SIDs in overflow
                 prefixes.
             affected_counts: Final counts aligned with ``affected_keys``.
-            collect_grouping: Whether to retain final SID metadata required
-                by :func:`build_resolved_item_grouping`.
+            collect_sid_metadata: Whether to retain final SID metadata required
+                by :func:`build_resolved_sid_item_row_index`.
 
         Returns:
             Resolved last-layer codes, slot indices, and diagnostics.
         """
-        combined_counts = plan.existing_item_counts + plan.new_item_counts
-        unaffected = ~in_overflow_prefix
+        combined_counts = plan.existing_item_counts + plan.input_item_counts
+        unaffected = ~initial_state.in_overflow_prefix
         # An unaffected SID has no overflow row, so it is already within capacity.
         final_counts = np.concatenate((combined_counts[unaffected], affected_counts))
         final_sid_keys = np.empty(0, dtype=np.int64)
         final_item_counts = np.empty(0, dtype=np.int64)
-        if collect_grouping:
+        if collect_sid_metadata:
             final_keys = np.concatenate((plan.sid_keys[unaffected], affected_keys))
             order = np.argsort(final_keys, kind="stable")
             final_sid_keys = final_keys[order]
@@ -520,7 +546,7 @@ class CollisionResolver(ABC):
             unresolved_rows=unresolved_rows,
             final_sid_keys=final_sid_keys,
             final_item_counts=final_item_counts,
-            grouping_collected=collect_grouping,
+            sid_metadata_collected=collect_sid_metadata,
             stats=CollisionResolutionStats(
                 total_items=plan.origin_last_codes.shape[0],
                 raw_colliding_sid_count=int((combined_counts > capacity).sum()),
@@ -636,38 +662,38 @@ def prepare_collision_plan(
 
     keys = config.convert_codes_to_sid_keys(codes)
     sorted_rows = np.lexsort((stable_order_hash(item_ids), keys))
-    sid_keys, new_item_counts = np.unique(keys[sorted_rows], return_counts=True)
+    sid_keys, input_item_counts = np.unique(keys[sorted_rows], return_counts=True)
     del keys
     # Equal SIDs are contiguous in sorted_rows. Repeat each sid_keys index by
-    # its new item count, then scatter the indices back to original input rows.
+    # its input item count, then scatter the indices back to original input rows.
     row_count = codes.shape[0]
     origin_sid_key_indices = np.empty(row_count, dtype=np.int64)
     origin_sid_key_indices[sorted_rows] = np.repeat(
-        np.arange(sid_keys.shape[0]), new_item_counts
+        np.arange(sid_keys.shape[0]), input_item_counts
     )
     # cumsum(counts) - counts gives each SID group's start in sorted_rows.
-    # Subtracting start - existing_count gives each new item's zero-based
+    # Subtracting start - existing_count gives each input item's zero-based
     # position within its SID: sorted position - group start + existing count.
-    # Repeat each group's adjustment by its new item count to align with rows.
-    new_item_positions = np.arange(row_count)
+    # Repeat each group's adjustment by its input item count to align with rows.
+    input_item_positions = np.arange(row_count)
     existing_item_counts = prior.counts_for(sid_keys)
-    new_item_positions -= np.repeat(
-        np.cumsum(new_item_counts) - new_item_counts - existing_item_counts,
-        new_item_counts,
+    input_item_positions -= np.repeat(
+        np.cumsum(input_item_counts) - input_item_counts - existing_item_counts,
+        input_item_counts,
     )
-    overflow_rows = sorted_rows[new_item_positions >= config.capacity]
+    overflow_rows = sorted_rows[input_item_positions >= config.capacity]
     # Convert to one-based slots and restore original input row order.
-    new_item_positions += 1
+    input_item_positions += 1
     initial_slot_indices = np.empty(row_count, dtype=np.int64)
-    initial_slot_indices[sorted_rows] = new_item_positions
-    del sorted_rows, new_item_positions
+    initial_slot_indices[sorted_rows] = input_item_positions
+    del sorted_rows, input_item_positions
 
     return CollisionPlan(
         origin_last_codes=codes[:, -1].astype(np.int64, copy=False),
         origin_sid_key_indices=origin_sid_key_indices,
         initial_slot_indices=initial_slot_indices,
         sid_keys=sid_keys,
-        new_item_counts=new_item_counts,
+        input_item_counts=input_item_counts,
         overflow_rows=overflow_rows,
         overflow_item_ids=item_ids[overflow_rows],
         overflow_prefix_ids=sid_keys[origin_sid_key_indices[overflow_rows]]
@@ -678,28 +704,30 @@ def prepare_collision_plan(
     )
 
 
-def _scatter_item_grouping(
+def _build_sid_item_row_index(
     sid_keys: np.ndarray,
     item_counts: np.ndarray,
     sid_key_indices: np.ndarray,
-    slot_indices: np.ndarray,
-) -> CodebookItemGrouping:
-    """Build a CSR row order from each row's SID and one-based local slot."""
-    grouping = CodebookItemGrouping(
+    input_item_slot_indices: np.ndarray,
+) -> SidItemRowIndex:
+    """Index input rows by SID and their one-based input item slots."""
+    sid_item_row_index = SidItemRowIndex(
         sid_keys=sid_keys,
         item_counts=item_counts,
-        row_order=np.empty(sid_key_indices.size, dtype=np.int64),
+        item_row_indices=np.empty(sid_key_indices.size, dtype=np.int64),
     )
-    positions = grouping.offsets[sid_key_indices] + slot_indices - 1
-    grouping.row_order[positions] = np.arange(sid_key_indices.size)
-    return grouping
+    positions = (
+        sid_item_row_index.offsets[sid_key_indices] + input_item_slot_indices - 1
+    )
+    sid_item_row_index.item_row_indices[positions] = np.arange(sid_key_indices.size)
+    return sid_item_row_index
 
 
-def build_origin_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
-    """Group all rows by origin SID and initial one-based slot index.
+def build_origin_sid_item_row_index(plan: CollisionPlan) -> SidItemRowIndex:
+    """Index input rows by origin SID and initial one-based slot index.
 
     Slot indices are made SID-local by subtracting the prior occupancy, so
-    the grouping covers only this plan's rows even when appending to a corpus.
+    the index covers only this plan's rows even when appending to a corpus.
 
     Args:
         plan: Grouping and overflow plan from :func:`prepare_collision_plan`.
@@ -708,21 +736,21 @@ def build_origin_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
         Sorted origin SID keys, SID counts, and grouped original row order.
     """
     sid_key_indices = plan.origin_sid_key_indices
-    return _scatter_item_grouping(
+    return _build_sid_item_row_index(
         plan.sid_keys,
-        plan.new_item_counts,
+        plan.input_item_counts,
         sid_key_indices,
         plan.initial_slot_indices - plan.existing_item_counts[sid_key_indices],
     )
 
 
-def build_resolved_item_grouping(
+def build_resolved_sid_item_row_index(
     plan: CollisionPlan, result: CollisionResolutionResult
-) -> CodebookItemGrouping:
-    """Group this plan's rows by resolved SID and SID-local slot index.
+) -> SidItemRowIndex:
+    """Index this plan's rows by resolved SID and SID-local slot index.
 
-    Only SIDs that gained rows appear, and slot indices have the prior
-    occupancy subtracted, so the grouping covers only this plan's rows.
+    Only SIDs that received input items appear. Existing item counts are
+    subtracted from slot indices, so the index covers only this plan's rows.
 
     Args:
         plan: Grouping and overflow plan from :func:`prepare_collision_plan`.
@@ -732,29 +760,29 @@ def build_resolved_item_grouping(
         Sorted final SID keys, SID counts, and grouped row order.
 
     Raises:
-        RuntimeError: If grouping metadata was not collected or result SID
+        RuntimeError: If SID metadata was not collected or result SID
             keys do not cover a resolved SID.
     """
-    if not result.grouping_collected:
+    if not result.sid_metadata_collected:
         raise RuntimeError(
-            "resolved item grouping metadata was not collected; call resolve "
-            "with collect_grouping=True."
+            "SID metadata was not collected; call resolve "
+            "with collect_sid_metadata=True."
         )
 
-    resolved_keys = plan.sid_keys[plan.origin_sid_key_indices]
-    resolved_keys -= plan.origin_last_codes
-    resolved_keys += result.resolved_last_codes
-    final_prior_counts = plan.prior.counts_for(result.final_sid_keys)
-    delta_counts = result.final_item_counts - final_prior_counts
-    gained = delta_counts > 0
-    sid_keys = result.final_sid_keys[gained]
-    sid_key_indices, found = lookup_sorted(sid_keys, resolved_keys)
+    resolved_sid_keys = plan.sid_keys[plan.origin_sid_key_indices]
+    resolved_sid_keys -= plan.origin_last_codes
+    resolved_sid_keys += result.resolved_last_codes
+    existing_item_counts = plan.prior.counts_for(result.final_sid_keys)
+    input_item_counts = result.final_item_counts - existing_item_counts
+    has_input_items = input_item_counts > 0
+    sid_keys = result.final_sid_keys[has_input_items]
+    sid_key_indices, found = find_in_sorted_array(sid_keys, resolved_sid_keys)
     if not np.all(found):
         raise RuntimeError("final SID keys do not cover every resolved SID.")
-    prior_counts = final_prior_counts[gained]
-    return _scatter_item_grouping(
+    selected_existing_item_counts = existing_item_counts[has_input_items]
+    return _build_sid_item_row_index(
         sid_keys,
-        delta_counts[gained],
+        input_item_counts[has_input_items],
         sid_key_indices,
-        result.slot_indices - prior_counts[sid_key_indices],
+        result.slot_indices - selected_existing_item_counts[sid_key_indices],
     )

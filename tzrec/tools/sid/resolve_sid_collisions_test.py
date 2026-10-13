@@ -600,7 +600,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         ):
             stats = runner.run()
 
-        self.assertFalse(resolve.call_args.kwargs["collect_grouping"])
+        self.assertFalse(resolve.call_args.kwargs["collect_sid_metadata"])
         make_writer.assert_not_called()
         self.assertEqual(stats.total_items, 5)
         self.assertEqual(stats.relocated_count, 3)

@@ -18,8 +18,8 @@ from parameterized import parameterized
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     PriorOccupancy,
-    build_origin_item_grouping,
-    build_resolved_item_grouping,
+    build_origin_sid_item_row_index,
+    build_resolved_sid_item_row_index,
     prepare_collision_plan,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
@@ -72,15 +72,15 @@ class CollisionTest(unittest.TestCase):
         plan = _plan((2, 4), 2, [], np.empty((0, 2)))
         result = KnnCollisionResolver().resolve(plan)
 
-        for name, grouping in (
-            ("origin", build_origin_item_grouping(plan)),
-            ("resolved", build_resolved_item_grouping(plan, result)),
+        for name, sid_item_row_index in (
+            ("origin", build_origin_sid_item_row_index(plan)),
+            ("resolved", build_resolved_sid_item_row_index(plan, result)),
         ):
-            with self.subTest(grouping=name):
-                np.testing.assert_array_equal(grouping.sid_keys, [])
-                np.testing.assert_array_equal(grouping.item_counts, [])
-                np.testing.assert_array_equal(grouping.row_order, [])
-                np.testing.assert_array_equal(grouping.offsets, [0])
+            with self.subTest(sid_item_row_index=name):
+                np.testing.assert_array_equal(sid_item_row_index.sid_keys, [])
+                np.testing.assert_array_equal(sid_item_row_index.item_counts, [])
+                np.testing.assert_array_equal(sid_item_row_index.item_row_indices, [])
+                np.testing.assert_array_equal(sid_item_row_index.offsets, [0])
 
 
     @parameterized.expand(
@@ -109,19 +109,19 @@ class CollisionTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_collect_grouping_false_changes_only_sid_metadata(
+    def test_collect_sid_metadata_false_changes_only_sid_metadata(
         self, _case_name, resolver_cls, codes, candidates, stats
     ) -> None:
         plan = _plan((2,), 1, range(len(codes)), codes)
         resolver = resolver_cls()
 
         grouped = resolver.resolve(plan, candidates)
-        rate_only = resolver.resolve(plan, candidates, collect_grouping=False)
+        rate_only = resolver.resolve(plan, candidates, collect_sid_metadata=False)
 
         self.assertEqual(dataclasses.astuple(grouped.stats), stats)
         _assert_same_assignments(self, rate_only, grouped)
-        self.assertTrue(grouped.grouping_collected)
-        self.assertFalse(rate_only.grouping_collected)
+        self.assertTrue(grouped.sid_metadata_collected)
+        self.assertFalse(rate_only.sid_metadata_collected)
         np.testing.assert_array_equal(rate_only.final_sid_keys, [])
         np.testing.assert_array_equal(rate_only.final_item_counts, [])
 
@@ -231,8 +231,8 @@ class AppendPlanTest(unittest.TestCase):
         plan = _plan((2, 4), 3, [10, 11], [[0, 0], [0, 1]], prior=prior)
         result = KnnCollisionResolver().resolve(plan, None)
 
-        resolved = build_resolved_item_grouping(plan, result)
-        np.testing.assert_array_equal(np.sort(resolved.row_order), [0, 1])
+        resolved = build_resolved_sid_item_row_index(plan, result)
+        np.testing.assert_array_equal(np.sort(resolved.item_row_indices), [0, 1])
         self.assertEqual(int(resolved.item_counts.sum()), 2)
         # Key 0 already held one item, so the delta grouping keeps one row there
         # and the local slot restarts at 1 even though the global slot is 2.
@@ -242,8 +242,8 @@ class AppendPlanTest(unittest.TestCase):
         np.testing.assert_array_equal(resolved.sid_keys, np.sort(keys))
         self.assertEqual(int(result.slot_indices[0]), 2)
 
-        origin = build_origin_item_grouping(plan)
-        np.testing.assert_array_equal(np.sort(origin.row_order), [0, 1])
+        origin = build_origin_sid_item_row_index(plan)
+        np.testing.assert_array_equal(np.sort(origin.item_row_indices), [0, 1])
         self.assertEqual(int(origin.item_counts.sum()), 2)
 
     def test_rejects_prior_outside_the_key_space(self) -> None:

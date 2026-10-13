@@ -20,9 +20,8 @@ from tzrec.utils.sid.collision import (
     CollisionPlan,
     CollisionResolutionResult,
     CollisionResolver,
-    concat_ranges,
+    get_same_value_positions,
     get_same_value_start_indices,
-    ranks_within_runs,
     stable_order_hash,
 )
 
@@ -57,7 +56,7 @@ class IterativeCollisionResolver(CollisionResolver):
         self,
         plan: CollisionPlan,
         candidate_last_codes: Optional[np.ndarray] = None,
-        collect_grouping: bool = True,
+        collect_sid_metadata: bool = True,
     ) -> CollisionResolutionResult:
         """Resolve overflow rows through synchronous proposal rounds.
 
@@ -65,7 +64,7 @@ class IterativeCollisionResolver(CollisionResolver):
             plan: Grouping and append-aware occupancy plan.
             candidate_last_codes: Ordered last-layer candidates aligned with
                 ``plan.overflow_rows``. It may be omitted only without overflow.
-            collect_grouping: Whether to retain final SID metadata.
+            collect_sid_metadata: Whether to retain final SID metadata.
 
         Returns:
             Resolved last-layer codes, slot indices, and summary statistics.
@@ -73,49 +72,51 @@ class IterativeCollisionResolver(CollisionResolver):
         Raises:
             ValueError: If candidates are absent while overflow rows exist.
         """
-        candidates = self._validate_candidate_last_codes(plan, candidate_last_codes)
-        in_overflow_prefix, affected_keys, affected_counts, result = (
-            self._prepare_collision(plan, collect_grouping)
+        candidate_last_codes = self._validate_candidate_last_codes(
+            plan, candidate_last_codes
         )
+        initial_state, result = self._prepare_collision(plan, collect_sid_metadata)
         if result is not None:
             return result
 
-        prefix_ids, prefix_indices = np.unique(
+        prefix_ids, overflow_prefix_indices = np.unique(
             plan.overflow_prefix_ids, return_inverse=True
         )
 
-        last_size = plan.config.codebook[-1]
-        base_keys = prefix_ids * last_size
-        used_code_offsets = np.searchsorted(affected_keys, base_keys)
-        used_code_counts = (
-            np.searchsorted(affected_keys, base_keys + last_size) - used_code_offsets
+        last_codebook_size = plan.config.codebook[-1]
+        prefix_base_keys = prefix_ids * last_codebook_size
+        used_code_offsets = np.append(
+            np.searchsorted(initial_state.sid_keys, prefix_base_keys),
+            initial_state.sid_keys.size,
         )
-        selected = concat_ranges(used_code_offsets, used_code_counts)
+        used_code_counts = np.diff(used_code_offsets)
         prefix_count = prefix_ids.shape[0]
-        seeded_keys = (
+        initial_sid_indices = (
             np.repeat(
-                np.arange(prefix_count, dtype=np.int64) * last_size, used_code_counts
+                np.arange(prefix_count, dtype=np.int64) * last_codebook_size,
+                used_code_counts,
             )
-            + affected_keys[selected] % last_size
+            + initial_state.sid_keys % last_codebook_size
         )
-        occupancy = np.zeros(prefix_count * last_size, dtype=np.int64)
-        occupancy[seeded_keys] = affected_counts[selected]
+        sid_item_counts = np.zeros(prefix_count * last_codebook_size, dtype=np.int64)
+        sid_item_counts[initial_sid_indices] = initial_state.item_counts
 
         overflow_rows = plan.overflow_rows
-        row_count = overflow_rows.shape[0]
-        row_ranks = np.empty(row_count, dtype=np.int64)
-        row_ranks[
+        overflow_item_count = overflow_rows.shape[0]
+        item_priority_indices = np.empty(overflow_item_count, dtype=np.int64)
+        item_priority_indices[
             np.lexsort((overflow_rows, stable_order_hash(plan.overflow_item_ids)))
-        ] = np.arange(row_count)
+        ] = np.arange(overflow_item_count)
 
-        local_base_keys = prefix_indices * last_size
-        origin_keys = local_base_keys + plan.origin_last_codes[overflow_rows]
-        target_keys = origin_keys.copy()
-        assigned = np.zeros(row_count, dtype=bool)
-        target_slot_indices = np.empty(row_count, dtype=np.int64)
-        pending = np.arange(row_count, dtype=np.int64)
-        targets = candidates + local_base_keys[:, None]
-        candidate_count = candidates.shape[1]
+        prefix_sid_offsets = overflow_prefix_indices * last_codebook_size
+        origin_sid_indices = prefix_sid_offsets + plan.origin_last_codes[overflow_rows]
+        target_sid_indices = origin_sid_indices.copy()
+        is_resolved = np.zeros(overflow_item_count, dtype=bool)
+        target_slot_indices = np.empty(overflow_item_count, dtype=np.int64)
+        pending_item_indices = np.arange(overflow_item_count, dtype=np.int64)
+        pending_candidate_sid_indices = (
+            candidate_last_codes + prefix_sid_offsets[:, None]
+        )
         capacity = plan.config.capacity
         progress = ProgressLogger(
             "Resolving collision overflow",
@@ -123,83 +124,115 @@ class IterativeCollisionResolver(CollisionResolver):
             miniters=self._progress_interval,
         )
         while True:
-            has_room = occupancy[targets] < capacity
+            candidate_has_capacity = (
+                sid_item_counts[pending_candidate_sid_indices] < capacity
+            )
             # Occupancy only grows, so a row without room anywhere is final.
-            reachable = has_room.any(axis=1)
-            if not reachable.all():
-                pending = pending[reachable]
-                targets = targets[reachable]
-                has_room = has_room[reachable]
-            if pending.size == 0:
+            has_available_candidate = candidate_has_capacity.any(axis=1)
+            if not has_available_candidate.all():
+                pending_item_indices = pending_item_indices[has_available_candidate]
+                pending_candidate_sid_indices = pending_candidate_sid_indices[
+                    has_available_candidate
+                ]
+                candidate_has_capacity = candidate_has_capacity[has_available_candidate]
+            if pending_item_indices.size == 0:
                 break
 
-            origin_starts = get_same_value_start_indices(origin_keys[pending])
-            room_ranks = np.cumsum(has_room, axis=0, dtype=np.int32)
-            room_ranks -= np.repeat(
-                room_ranks[origin_starts] - has_room[origin_starts],
-                np.diff(np.append(origin_starts, pending.shape[0])),
+            origin_sid_start_indices = get_same_value_start_indices(
+                origin_sid_indices[pending_item_indices]
+            )
+            candidate_proposal_positions = np.cumsum(
+                candidate_has_capacity, axis=0, dtype=np.int32
+            )
+            candidate_proposal_positions -= np.repeat(
+                candidate_proposal_positions[origin_sid_start_indices]
+                - candidate_has_capacity[origin_sid_start_indices],
+                np.diff(
+                    np.append(origin_sid_start_indices, pending_item_indices.shape[0])
+                ),
                 axis=0,
             )
-            proposals = np.flatnonzero(has_room & (room_ranks <= capacity))
-            pending_idx, proposal_positions = np.divmod(proposals, candidate_count)
-            proposal_rows = pending[pending_idx]
-            proposal_targets = targets.ravel()[proposals]
-
-            target_order = np.lexsort(
-                (row_ranks[proposal_rows], proposal_positions, proposal_targets)
+            proposal_pending_item_indices, proposal_candidate_positions = np.nonzero(
+                candidate_has_capacity & (candidate_proposal_positions <= capacity)
             )
-            ordered_targets = proposal_targets[target_order]
-            accepted = np.zeros(proposal_rows.shape[0], dtype=bool)
-            accepted[
-                target_order[
-                    ranks_within_runs(ordered_targets)
-                    < capacity - occupancy[ordered_targets]
+            proposal_item_indices = pending_item_indices[proposal_pending_item_indices]
+            proposal_sid_indices = pending_candidate_sid_indices[
+                proposal_pending_item_indices, proposal_candidate_positions
+            ]
+
+            proposal_sort_indices = np.lexsort(
+                (
+                    item_priority_indices[proposal_item_indices],
+                    proposal_candidate_positions,
+                    proposal_sid_indices,
+                )
+            )
+            sorted_proposal_sid_indices = proposal_sid_indices[proposal_sort_indices]
+            is_proposal_accepted = np.zeros(proposal_item_indices.shape[0], dtype=bool)
+            is_proposal_accepted[
+                proposal_sort_indices[
+                    get_same_value_positions(sorted_proposal_sid_indices)
+                    < capacity - sid_item_counts[sorted_proposal_sid_indices]
                 ]
             ] = True
             # Proposals are row-major, so a row's first accepted one is its best.
-            accepted_proposals = np.flatnonzero(accepted)
-            winners = accepted_proposals[
-                get_same_value_start_indices(proposal_rows[accepted_proposals])
+            accepted_proposal_indices = np.flatnonzero(is_proposal_accepted)
+            selected_proposal_indices = accepted_proposal_indices[
+                get_same_value_start_indices(
+                    proposal_item_indices[accepted_proposal_indices]
+                )
             ]
-            won = np.zeros(proposal_rows.shape[0], dtype=bool)
-            won[winners] = True
-            winners = target_order[won[target_order]]
-            winner_rows = proposal_rows[winners]
-            winner_targets = proposal_targets[winners]
+            is_proposal_selected = np.zeros(proposal_item_indices.shape[0], dtype=bool)
+            is_proposal_selected[selected_proposal_indices] = True
+            selected_proposal_indices = proposal_sort_indices[
+                is_proposal_selected[proposal_sort_indices]
+            ]
+            selected_item_indices = proposal_item_indices[selected_proposal_indices]
+            selected_sid_indices = proposal_sid_indices[selected_proposal_indices]
 
-            target_slot_indices[winner_rows] = (
-                occupancy[winner_targets] + ranks_within_runs(winner_targets) + 1
+            target_slot_indices[selected_item_indices] = (
+                sid_item_counts[selected_sid_indices]
+                + get_same_value_positions(selected_sid_indices)
+                + 1
             )
-            np.add.at(occupancy, winner_targets, 1)
-            assigned[winner_rows] = True
-            target_keys[winner_rows] = winner_targets
-            still_pending = ~assigned[pending]
-            pending = pending[still_pending]
-            targets = targets[still_pending]
-            progress.log(row_count - pending.size)
+            np.add.at(sid_item_counts, selected_sid_indices, 1)
+            is_resolved[selected_item_indices] = True
+            target_sid_indices[selected_item_indices] = selected_sid_indices
+            is_still_pending = ~is_resolved[pending_item_indices]
+            pending_item_indices = pending_item_indices[is_still_pending]
+            pending_candidate_sid_indices = pending_candidate_sid_indices[
+                is_still_pending
+            ]
+            progress.log(overflow_item_count - pending_item_indices.size)
 
-        unresolved = ~assigned
-        unresolved_keys = origin_keys[unresolved]
-        target_slot_indices[unresolved] = (
-            occupancy[unresolved_keys] + ranks_within_runs(unresolved_keys) + 1
+        is_unresolved = ~is_resolved
+        unresolved_sid_indices = origin_sid_indices[is_unresolved]
+        target_slot_indices[is_unresolved] = (
+            sid_item_counts[unresolved_sid_indices]
+            + get_same_value_positions(unresolved_sid_indices)
+            + 1
         )
-        np.add.at(occupancy, unresolved_keys, 1)
+        np.add.at(sid_item_counts, unresolved_sid_indices, 1)
 
-        final_keys = np.unique(np.concatenate((seeded_keys, target_keys)))
-        owners, last_codes = np.divmod(final_keys, last_size)
+        final_sid_indices = np.unique(
+            np.concatenate((initial_sid_indices, target_sid_indices))
+        )
+        final_prefix_indices, final_last_codes = np.divmod(
+            final_sid_indices, last_codebook_size
+        )
         resolved_last_codes = plan.origin_last_codes.copy()
-        resolved_last_codes[overflow_rows] = target_keys - local_base_keys
+        resolved_last_codes[overflow_rows] = target_sid_indices - prefix_sid_offsets
         final_slot_indices = plan.initial_slot_indices.copy()
         final_slot_indices[overflow_rows] = target_slot_indices
-        progress.log(row_count)
-        final_counts = occupancy[final_keys]
+        progress.log(overflow_item_count)
+        final_item_counts = sid_item_counts[final_sid_indices]
         return self._build_result(
             plan,
             resolved_last_codes,
             final_slot_indices,
-            overflow_rows[unresolved],
-            in_overflow_prefix,
-            base_keys[owners] + last_codes,
-            final_counts,
-            collect_grouping,
+            overflow_rows[is_unresolved],
+            initial_state,
+            prefix_base_keys[final_prefix_indices] + final_last_codes,
+            final_item_counts,
+            collect_sid_metadata,
         )
