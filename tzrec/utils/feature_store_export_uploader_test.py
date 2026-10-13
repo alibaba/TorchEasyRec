@@ -73,7 +73,13 @@ class FeatureStoreExportUploaderTest(unittest.TestCase):
         keys = np.arange(2501, dtype=np.int64)
         values = np.arange(5002, dtype=np.float32).reshape(-1, 2)
         uploader.start(total_records=len(keys))
-        uploader.write(_TABLE_NAME, keys, values)
+        with mock.patch.object(
+            uploader._writer,
+            "_validate_delta_batch",
+            wraps=uploader._writer._validate_delta_batch,
+        ) as validate:
+            uploader.write(_TABLE_NAME, keys, values)
+        self.assertEqual(validate.call_count, 3)
         self.assertEqual(view.flush_calls, [[1000, 1000], [501]])
         self.assertEqual(uploader._window, [])
         self.assertIsNone(uploader._writer._worker)

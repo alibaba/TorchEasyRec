@@ -143,23 +143,25 @@ class FeatureStoreExportUploader:
             )
 
         arrow_type = pa.uint8() if self._quantized else pa.float32()
+        batch_rows = min(rows_per_batch, len(keys))
+        table_fqns = pa.array([embedding_name] * batch_rows, type=pa.string())
+        offsets = pa.array(np.arange(batch_rows + 1, dtype=np.int32) * dimension)
         try:
             for start in range(0, len(keys), rows_per_batch):
                 stop = min(start + rows_per_batch, len(keys))
                 count = stop - start
                 embeddings = pa.ListArray.from_arrays(
-                    pa.array(np.arange(count + 1, dtype=np.int32) * dimension),
+                    offsets.slice(0, count + 1),
                     pa.array(values[start:stop].reshape(-1), type=arrow_type),
                 )
                 batch = pa.RecordBatch.from_arrays(
                     [
-                        pa.array([embedding_name] * count, type=pa.string()),
+                        table_fqns.slice(0, count),
                         pa.array(keys[start:stop], type=pa.int64()),
                         embeddings,
                     ],
                     names=["table_fqn", "key_id", "embedding"],
                 )
-                self._writer._validate_delta_batch(batch)
                 timestamp, _ = self._writer._allocate_timestamp_range(1)
                 self._window.append((batch, timestamp))
                 if len(self._window) >= self._max_in_flight_batches:
@@ -205,6 +207,8 @@ class FeatureStoreExportUploader:
                     )
                     self._last_progress_time = now
                 return
+            except ValueError:
+                raise
             except Exception as exc:
                 try:
                     self._writer._reset_view()
