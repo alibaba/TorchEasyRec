@@ -107,24 +107,19 @@ class DynamicEmbeddingExportTest(unittest.TestCase):
             np.concatenate([call.args[2] for call in calls]), exported_values
         )
 
-    def test_rank_assignment_and_numeric_order(self) -> None:
+    def test_checkpoint_shards_in_numeric_rank_order(self) -> None:
         for rank in reversed(range(12)):
             self._write_shard(
                 rank, np.array([rank]), np.full((1, 2), rank), world_size=12
             )
         arrays, metadata = get_dynamic_embedding_export(
-            self.test_dir, {self.table: 2}, 16, rank=0, world_size=2
+            self.test_dir, {self.table: 2}, 16
         )
         np.testing.assert_array_equal(
             np.concatenate(list(arrays[f"{self.table}.keys"].chunks)),
-            [0, 2, 4, 6, 8, 10],
+            np.arange(12),
         )
-        self.assertEqual(metadata[self.table]["shape"], [6, 2])
-        arrays, metadata = get_dynamic_embedding_export(
-            self.test_dir, {self.table: 2}, 16, rank=15, world_size=16
-        )
-        self.assertEqual(arrays, {})
-        self.assertEqual(metadata, {})
+        self.assertEqual(metadata[self.table]["shape"], [12, 2])
 
     @parameterized.expand(
         [("fp32", ""), ("int8", "QUint8RowwiseF16")],

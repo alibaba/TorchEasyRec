@@ -2690,7 +2690,7 @@ def _prepare_sparse_export_values(
     return quantized_values, {
         "dimension": emb_dim,
         "dtype": quant_format,
-        "storage_dtype": quant_util._DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
+        "storage_dtype": quant_util.DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
         "storage_shape": list(quantized_values.shape),
         "row_bytes": int(quantized_values.shape[1]),
         "memory": int(quantized_values.nbytes),
@@ -2870,8 +2870,6 @@ def _get_sparse_embedding_tensor(
             emb_name_to_emb_dim,
             read_chunk_bytes=64 * 1024 * 1024,
             quant_format=acc_utils.distributed_sparse_quant_format(),
-            rank=int(os.environ.get("RANK", 0)),
-            world_size=int(os.environ.get("WORLD_SIZE", 1)),
         )
     checkpoint_arrays, checkpoint_meta = dynamic_export
 

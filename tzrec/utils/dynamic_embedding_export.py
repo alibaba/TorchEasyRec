@@ -222,8 +222,6 @@ def get_dynamic_embedding_export(
     read_chunk_bytes: int,
     quant_format: str = "",
     on_values: Optional[Callable[[str, np.ndarray, np.ndarray], None]] = None,
-    rank: int = 0,
-    world_size: int = 1,
 ) -> Tuple[Dict[str, StreamingArray], Dict[str, Dict[str, Any]]]:
     """Describe dynamic checkpoint arrays and defer their bounded payload reads.
 
@@ -237,8 +235,6 @@ def get_dynamic_embedding_export(
         read_chunk_bytes: Maximum combined raw key/value bytes per block.
         quant_format: Distributed quantization format, or empty for FP32.
         on_values: Synchronous callback receiving the exported key/value block.
-        rank: Export process rank.
-        world_size: Number of export processes.
 
     Returns:
         NPZ array descriptors and per-table metadata, without feature mappings.
@@ -246,14 +242,9 @@ def get_dynamic_embedding_export(
     """
     if read_chunk_bytes <= 0:
         raise ValueError("read_chunk_bytes must be positive")
-    if not 0 <= rank < world_size:
-        raise ValueError("Export rank must be in [0, world_size)")
     arrays: Dict[str, StreamingArray] = {}
     metadata: Dict[str, Dict[str, Any]] = {}
-    for name, all_shards in _find_shards(checkpoint_path, embedding_dimensions).items():
-        shards = [shard for shard in all_shards if shard.rank % world_size == rank]
-        if not shards:
-            continue
+    for name, shards in _find_shards(checkpoint_path, embedding_dimensions).items():
         dimension = embedding_dimensions[name]
         chunk_rows = read_chunk_bytes // (8 + dimension * 4)
         if chunk_rows == 0:
@@ -288,7 +279,7 @@ def get_dynamic_embedding_export(
             table_meta.update(
                 {
                     "dtype": quant_format,
-                    "storage_dtype": quant_util._DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
+                    "storage_dtype": quant_util.DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
                     "storage_shape": list(shape),
                     "row_bytes": shape[1],
                     "quant": {
