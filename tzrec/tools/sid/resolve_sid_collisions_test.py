@@ -744,22 +744,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             ):
                 self.assertEqual(offset, [codebook[0], codebook[1] + 8])
 
-    def test_append_never_moves_a_published_item(self) -> None:
-        out = self._seed_generation()
-        published = self._item_to_sid_rows(out, "v1")
-
-        inp = os.path.join(self.test_dir, "v2_in.parquet")
-        _parquet(inp, [10, 11, 12], [[0, 0], [0, 0], [1, 1]], [[[0, 2], [0, 3]]] * 3)
-        stats = self._append(inp, out)
-
-        self.assertEqual(stats.total_items, 3)
-        merged = self._item_to_sid_rows(out, "v2")
-        self.assertEqual(len(merged), 8)
-        for item_id, row in published.items():
-            self.assertEqual(merged[item_id], row, f"item {item_id} moved")
-        self._assert_dense_indices(out, "v2")
-        self._assert_item_to_sid_matches_sid_to_items(out, "v2")
-
     @parameterized.expand(
         [
             ("candidate", "candidate"),
@@ -863,8 +847,10 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 [[[0, 2], [0, 3]]] * 2,
             )
             published = self._item_to_sid_rows(out, previous)
-            self._append(inp, out, previous=previous, generation=current)
+            stats = self._append(inp, out, previous=previous, generation=current)
+            self.assertEqual(stats.total_items, 2)
             merged = self._item_to_sid_rows(out, current)
+            self.assertEqual(len(merged), len(published) + 2)
             for item_id, row in published.items():
                 self.assertEqual(merged[item_id], row)
             self._assert_dense_indices(out, current)

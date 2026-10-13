@@ -59,29 +59,19 @@ class KnnCollisionResolver(CollisionResolver):
                 out-of-range last-layer indices.
         """
         candidates = self._validate_candidate_last_codes(plan, candidate_last_codes)
-        in_overflow_prefix, affected_keys, affected_counts = self._initial_occupancy(
-            plan
+        in_overflow_prefix, affected_keys, affected_counts, result = (
+            self._prepare_collision(plan, collect_grouping)
         )
-        overflow_count = plan.overflow_rows.shape[0]
-        if overflow_count == 0:
-            return self._build_result(
-                plan,
-                plan.origin_last_codes,
-                plan.initial_slot_indices,
-                np.empty(0, dtype=np.int64),
-                in_overflow_prefix,
-                affected_keys,
-                affected_counts,
-                collect_grouping,
-            )
+        if result is not None:
+            return result
 
-        last_size = plan.config.codebook[-1]
-        capacity = plan.config.capacity
+        target_last_codes = plan.origin_last_codes.copy()
+        target_slot_indices = plan.initial_slot_indices.copy()
+        unresolved_rows = []
         occupancy = dict(zip(affected_keys.tolist(), affected_counts.tolist()))
         get_occupancy = occupancy.get
-        resolved_last_codes = plan.origin_last_codes.copy()
-        slot_indices = plan.initial_slot_indices.copy()
-        unresolved_rows = []
+        capacity = plan.config.capacity
+        last_size = plan.config.codebook[-1]
         progress = ProgressLogger(
             "Resolving collision overflow",
             start_n=0,
@@ -107,21 +97,21 @@ class KnnCollisionResolver(CollisionResolver):
                 destination_occupancy = get_occupancy(destination_key, 0)
                 if destination_occupancy < capacity:
                     occupancy[destination_key] = destination_occupancy + 1
-                    resolved_last_codes[row] = candidate
-                    slot_indices[row] = destination_occupancy + 1
+                    target_last_codes[row] = candidate
+                    target_slot_indices[row] = destination_occupancy + 1
                     break
             else:
                 unresolved_rows.append(row)
                 origin_key = base_key + origin_last_code
                 origin_occupancy = get_occupancy(origin_key, 0) + 1
                 occupancy[origin_key] = origin_occupancy
-                slot_indices[row] = origin_occupancy
+                target_slot_indices[row] = origin_occupancy
             progress.log(resolved_count)
 
         return self._build_result(
             plan,
-            resolved_last_codes,
-            slot_indices,
+            target_last_codes,
+            target_slot_indices,
             np.asarray(unresolved_rows, dtype=np.int64),
             in_overflow_prefix,
             np.fromiter(occupancy, dtype=np.int64, count=len(occupancy)),

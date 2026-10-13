@@ -128,9 +128,9 @@ from tzrec.utils.sid.collision import (
     PriorOccupancy,
     build_origin_item_grouping,
     build_resolved_item_grouping,
+    get_same_value_start_indices,
     lookup_sorted,
     prepare_collision_plan,
-    run_starts,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
 from tzrec.utils.sid.knn_collision import KnnCollisionResolver
@@ -566,8 +566,6 @@ class CollisionResolutionRunner:
 
         if not id_batches:
             raise ValueError("SID input is empty.")
-        item_id_array = np.concatenate(id_batches)
-        del id_batches
         numpy_codes = np.concatenate(code_batches, axis=0)
         del code_batches
         if numpy_codes.shape[1] != len(self._config.codebook):
@@ -575,6 +573,8 @@ class CollisionResolutionRunner:
                 f"codes have {numpy_codes.shape[1]} layers but --codebook has "
                 f"{len(self._config.codebook)}."
             )
+        item_id_array = np.concatenate(id_batches)
+        del id_batches
         return item_id_array, numpy_codes
 
     def _candidate_last_matrix(self, values: pa.Array) -> np.ndarray:
@@ -605,12 +605,12 @@ class CollisionResolutionRunner:
 
     def _load_candidate_last_codes(self, overflow_item_ids: np.ndarray) -> np.ndarray:
         """Load fixed-width candidates aligned to ``overflow_item_ids``."""
-        item_count = overflow_item_ids.shape[0]
         columns = [self._config.item_id_field, self._config.candidate_codes_field]
         # _iter_batches needs original SID codes to select this rank's prefixes.
         if self._world_size > 1:
             columns.append(self._config.code_field)
         reader = self._make_reader(self._config.input_path, columns)
+        item_count = overflow_item_ids.shape[0]
         if item_count == 0:
             return np.empty((0, 0), dtype=np.int64)
         item_lookup = _ItemIdLookup(overflow_item_ids)
@@ -701,11 +701,6 @@ class CollisionResolutionRunner:
             logger.info("full-resolve mode: no published generation supplied")
             return PriorOccupancy.empty(), 0
 
-        wanted_prefixes = np.unique(
-            self._config.collision_config.prefix_ids(new_codes)
-        )
-        new_id_values = self._item_id_array(new_item_ids)
-
         key_batches: List[np.ndarray] = []
         count_batches: List[np.ndarray] = []
         overlap_preview: List[object] = []
@@ -715,6 +710,10 @@ class CollisionResolutionRunner:
         reader = self._make_reader(
             self._bundle.read_path(SID_TO_ITEMS_ARTIFACT), ["codebook", "itemids"]
         )
+        wanted_prefixes = np.unique(
+            self._config.collision_config.prefix_ids(new_codes)
+        )
+        new_id_values = self._item_id_array(new_item_ids)
         for batch in self._iter_batches(reader, "Reading published sid_to_items"):
             codes = self._convert_codes_to_numpy(batch["codebook"])
             keys = self._config.collision_config.convert_codes_to_sid_keys(codes)
@@ -731,8 +730,8 @@ class CollisionResolutionRunner:
                 .to_numpy(zero_copy_only=False)
                 .astype(np.int64, copy=False)
             )
-            flat_ids = pc.cast(batch["itemids"].flatten(), self._item_id_type)
             existing_item_count += int(item_counts[self._get_prefix_mask(codes)].sum())
+            flat_ids = pc.cast(batch["itemids"].flatten(), self._item_id_type)
             if len(flat_ids):
                 overlap = pc.is_in(flat_ids, value_set=new_id_values)
                 batch_overlap = overlap.true_count
@@ -822,12 +821,12 @@ class CollisionResolutionRunner:
         """
         if not self._config.is_append:
             return 0
-        is_csv = self._resolved_writer_type == "CsvWriter"
-        written = 0
         reader = self._make_reader(
             self._bundle.read_path(ITEM_TO_SID_ARTIFACT),
             ["item_id", "origin_codebook", "codebook", "index"],
         )
+        is_csv = self._resolved_writer_type == "CsvWriter"
+        written = 0
         for batch in self._iter_batches(
             reader, "Copying published item_to_sid", "codebook"
         ):
@@ -887,9 +886,9 @@ class CollisionResolutionRunner:
                 "of this tool. Appending onto them would drop published items or "
                 "reuse their slots."
             )
-        is_csv = self._resolved_writer_type == "CsvWriter"
         resolved_codes = origin_codes.copy()
         resolved_codes[:, -1] = result.resolved_last_codes
+        is_csv = self._resolved_writer_type == "CsvWriter"
         columns = {
             "item_id": self._item_id_array(item_ids),
             "origin_codebook": self._codes_column(origin_codes, is_csv),
@@ -952,15 +951,15 @@ class CollisionResolutionRunner:
             prior: Published SIDs of the affected prefixes, which hold every
                 published SID a new SID can share a key with.
         """
-        new_keys = grouping.sid_keys
-        new_itemids = _item_lists(
-            grouping.offsets, self._item_id_array(item_ids[grouping.row_order])
-        )
         writer = self._make_writer(
             self._bundle.write_path(SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
         )
         delta_writer = self._make_writer(
             self._bundle.write_path(DELTA_SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
+        )
+        new_keys = grouping.sid_keys
+        new_itemids = _item_lists(
+            grouping.offsets, self._item_id_array(item_ids[grouping.row_order])
         )
 
         def write_new_sid_rows(low: int, high: int) -> None:
@@ -1020,7 +1019,6 @@ class CollisionResolutionRunner:
             item_ids: Input item IDs in original row order.
             grouping: Sorted SIDs and their flattened original row order.
         """
-        offsets = grouping.offsets
         writer = self._make_writer(
             self._bundle.write_path(SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
         )
@@ -1030,6 +1028,7 @@ class CollisionResolutionRunner:
             miniters=self._config.progress_interval,
         )
         values = self._item_id_array(item_ids[grouping.row_order])
+        offsets = grouping.offsets
         itemids = _item_lists(offsets, values)
         self._write_sid_to_items_rows(writer, grouping.sid_keys, itemids)
         progress.log(item_ids.shape[0])
@@ -1065,13 +1064,13 @@ def _merge_sid_to_items(
     )
     order = np.argsort(item_keys, kind="stable")
     ordered_keys = item_keys[order]
-    starts = run_starts(ordered_keys)
-    merged_keys = ordered_keys[starts]
+    starts = get_same_value_start_indices(ordered_keys)
     values = (
         pa.chunked_array([itemids.flatten(), new_itemids.flatten()])
         .take(pa.array(order, type=pa.int64()))
         .combine_chunks()
     )
+    merged_keys = ordered_keys[starts]
     return (
         merged_keys,
         _item_lists(np.append(starts, item_keys.shape[0]), values),

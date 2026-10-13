@@ -108,8 +108,19 @@ def lookup_sorted(
     return positions, found
 
 
-def run_starts(ordered_values: np.ndarray) -> np.ndarray:
-    """Return start offsets of equal-value runs in a nonempty sorted array."""
+def get_same_value_start_indices(ordered_values: np.ndarray) -> np.ndarray:
+    """Return start indices of consecutive equal values in a sorted array.
+
+    Args:
+        ordered_values: Nonempty sorted one-dimensional array.
+
+    Returns:
+        An int64 array of start indices, including values that appear only once.
+
+    Examples:
+        >>> get_same_value_start_indices(np.array([7, 7, 7, 9, 9, 12]))
+        array([0, 3, 5])
+    """
     return np.concatenate(
         (
             np.asarray([0], dtype=np.int64),
@@ -120,7 +131,7 @@ def run_starts(ordered_values: np.ndarray) -> np.ndarray:
 
 def ranks_within_runs(ordered_values: np.ndarray) -> np.ndarray:
     """Return zero-based ranks within equal-value runs in a sorted array."""
-    starts = run_starts(ordered_values)
+    starts = get_same_value_start_indices(ordered_values)
     return np.arange(ordered_values.shape[0], dtype=np.int64) - np.repeat(
         starts, np.diff(np.append(starts, ordered_values.shape[0]))
     )
@@ -151,8 +162,8 @@ class PriorOccupancy:
 
     def counts_for(self, sid_keys: np.ndarray) -> np.ndarray:
         """Return prior counts aligned with ``sid_keys``, zero when absent."""
-        counts = np.zeros(sid_keys.shape[0], dtype=np.int64)
         positions, found = lookup_sorted(self.sid_keys, sid_keys)
+        counts = np.zeros(sid_keys.shape[0], dtype=np.int64)
         counts[found] = self.item_counts[positions[found]]
         return counts
 
@@ -165,11 +176,13 @@ class PriorOccupancy:
         so this is a range gather, not a membership test over every prior key.
         ``prefix_ids`` must be unique and ascending.
         """
-        starts = np.searchsorted(self.sid_keys, prefix_ids * last_size, side="left")
+        used_code_offsets = np.searchsorted(
+            self.sid_keys, prefix_ids * last_size, side="left"
+        )
         selected = concat_ranges(
-            starts,
+            used_code_offsets,
             np.searchsorted(self.sid_keys, (prefix_ids + 1) * last_size, side="left")
-            - starts,
+            - used_code_offsets,
         )
         return PriorOccupancy(self.sid_keys[selected], self.item_counts[selected])
 
@@ -330,6 +343,39 @@ class CollisionResolver(ABC):
         """
         raise NotImplementedError
 
+    def _prepare_collision(
+        self, plan: CollisionPlan, collect_grouping: bool
+    ) -> tuple[
+        np.ndarray, np.ndarray, np.ndarray, Optional[CollisionResolutionResult]
+    ]:
+        """Prepare initial occupancy and finish plans without overflow.
+
+        Args:
+            plan: Grouping and overflow plan from ``prepare_collision_plan``.
+            collect_grouping: Whether to retain final SID metadata.
+
+        Returns:
+            The prefix mask, affected SID keys, initial item counts, and a
+            completed result when no overflow exists. The result is ``None``
+            when overflow rows still need resolution.
+        """
+        in_overflow_prefix, affected_keys, affected_counts = self._initial_occupancy(
+            plan
+        )
+        result = None
+        if plan.overflow_rows.size == 0:
+            result = self._build_result(
+                plan,
+                plan.origin_last_codes,
+                plan.initial_slot_indices,
+                np.empty(0, dtype=np.int64),
+                in_overflow_prefix,
+                affected_keys,
+                affected_counts,
+                collect_grouping,
+            )
+        return in_overflow_prefix, affected_keys, affected_counts, result
+
     def _validate_candidate_last_codes(
         self, plan: CollisionPlan, candidate_last_codes: Optional[np.ndarray]
     ) -> np.ndarray:
@@ -405,7 +451,6 @@ class CollisionResolver(ABC):
         prefix_ids = np.unique(plan.overflow_prefix_ids)
         _, in_overflow_prefix = lookup_sorted(prefix_ids, plan.sid_keys // last_size)
         affected_prior = plan.prior.restrict_to_prefixes(prefix_ids, last_size)
-        prior_counts = plan.existing_item_counts[in_overflow_prefix]
         # np.unique keeps the first occurrence, so a plan count wins over the prior.
         affected_keys, first = np.unique(
             np.concatenate(
@@ -413,6 +458,7 @@ class CollisionResolver(ABC):
             ),
             return_index=True,
         )
+        prior_counts = plan.existing_item_counts[in_overflow_prefix]
         affected_counts = np.concatenate(
             (
                 np.maximum(
@@ -456,7 +502,6 @@ class CollisionResolver(ABC):
         Returns:
             Resolved last-layer codes, slot indices, and diagnostics.
         """
-        capacity = plan.config.capacity
         combined_counts = plan.existing_item_counts + plan.new_item_counts
         unaffected = ~in_overflow_prefix
         # An unaffected SID has no overflow row, so it is already within capacity.
@@ -468,6 +513,7 @@ class CollisionResolver(ABC):
             order = np.argsort(final_keys, kind="stable")
             final_sid_keys = final_keys[order]
             final_item_counts = final_counts[order]
+        capacity = plan.config.capacity
         return CollisionResolutionResult(
             resolved_last_codes=resolved_last_codes,
             slot_indices=slot_indices,
@@ -588,14 +634,13 @@ def prepare_collision_plan(
                 "that produced the published SID artifacts."
             )
 
-    row_count = codes.shape[0]
     keys = config.convert_codes_to_sid_keys(codes)
     sorted_rows = np.lexsort((stable_order_hash(item_ids), keys))
     sid_keys, new_item_counts = np.unique(keys[sorted_rows], return_counts=True)
     del keys
-    existing_item_counts = prior.counts_for(sid_keys)
     # Equal SIDs are contiguous in sorted_rows. Repeat each sid_keys index by
     # its new item count, then scatter the indices back to original input rows.
+    row_count = codes.shape[0]
     origin_sid_key_indices = np.empty(row_count, dtype=np.int64)
     origin_sid_key_indices[sorted_rows] = np.repeat(
         np.arange(sid_keys.shape[0]), new_item_counts
@@ -605,6 +650,7 @@ def prepare_collision_plan(
     # position within its SID: sorted position - group start + existing count.
     # Repeat each group's adjustment by its new item count to align with rows.
     new_item_positions = np.arange(row_count)
+    existing_item_counts = prior.counts_for(sid_keys)
     new_item_positions -= np.repeat(
         np.cumsum(new_item_counts) - new_item_counts - existing_item_counts,
         new_item_counts,
@@ -695,17 +741,17 @@ def build_resolved_item_grouping(
             "with collect_grouping=True."
         )
 
+    resolved_keys = plan.sid_keys[plan.origin_sid_key_indices]
+    resolved_keys -= plan.origin_last_codes
+    resolved_keys += result.resolved_last_codes
     final_prior_counts = plan.prior.counts_for(result.final_sid_keys)
     delta_counts = result.final_item_counts - final_prior_counts
     gained = delta_counts > 0
     sid_keys = result.final_sid_keys[gained]
-    prior_counts = final_prior_counts[gained]
-    resolved_keys = plan.sid_keys[plan.origin_sid_key_indices]
-    resolved_keys -= plan.origin_last_codes
-    resolved_keys += result.resolved_last_codes
     sid_key_indices, found = lookup_sorted(sid_keys, resolved_keys)
     if not np.all(found):
         raise RuntimeError("final SID keys do not cover every resolved SID.")
+    prior_counts = final_prior_counts[gained]
     return _scatter_item_grouping(
         sid_keys,
         delta_counts[gained],

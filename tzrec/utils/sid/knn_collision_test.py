@@ -130,9 +130,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
                 result.stats,
             )
 
-        base_order = np.arange(item_ids.size)
-        expected = decisions(base_order)
-        self.assertEqual(decisions(base_order), expected)
+        expected = decisions(np.arange(item_ids.size))
         self.assertEqual(decisions(rng.permutation(item_ids.size)), expected)
 
     def test_keep_origin_over_capacity(self) -> None:

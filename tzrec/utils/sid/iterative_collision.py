@@ -21,8 +21,8 @@ from tzrec.utils.sid.collision import (
     CollisionResolutionResult,
     CollisionResolver,
     concat_ranges,
+    get_same_value_start_indices,
     ranks_within_runs,
-    run_starts,
     stable_order_hash,
 )
 
@@ -74,59 +74,54 @@ class IterativeCollisionResolver(CollisionResolver):
             ValueError: If candidates are absent while overflow rows exist.
         """
         candidates = self._validate_candidate_last_codes(plan, candidate_last_codes)
-        in_overflow_prefix, affected_keys, affected_counts = self._initial_occupancy(
-            plan
+        in_overflow_prefix, affected_keys, affected_counts, result = (
+            self._prepare_collision(plan, collect_grouping)
         )
-        if plan.overflow_rows.size == 0:
-            return self._build_result(
-                plan,
-                plan.origin_last_codes,
-                plan.initial_slot_indices,
-                np.empty(0, dtype=np.int64),
-                in_overflow_prefix,
-                affected_keys,
-                affected_counts,
-                collect_grouping,
-            )
+        if result is not None:
+            return result
 
-        capacity = plan.config.capacity
-        last_size = plan.config.codebook[-1]
-        overflow_rows = plan.overflow_rows
-        row_count = overflow_rows.shape[0]
         prefix_ids, prefix_indices = np.unique(
             plan.overflow_prefix_ids, return_inverse=True
         )
-        prefix_count = prefix_ids.shape[0]
-        candidate_count = candidates.shape[1]
-        base_keys = prefix_ids * last_size
-        local_base_keys = prefix_indices * last_size
-        origin_keys = local_base_keys + plan.origin_last_codes[overflow_rows]
-        occupancy = np.zeros(prefix_count * last_size, dtype=np.int64)
-        progress = ProgressLogger(
-            "Resolving collision overflow",
-            start_n=0,
-            miniters=self._progress_interval,
-        )
 
-        starts = np.searchsorted(affected_keys, base_keys)
-        lengths = np.searchsorted(affected_keys, base_keys + last_size) - starts
-        selected = concat_ranges(starts, lengths)
+        last_size = plan.config.codebook[-1]
+        base_keys = prefix_ids * last_size
+        used_code_offsets = np.searchsorted(affected_keys, base_keys)
+        used_code_counts = (
+            np.searchsorted(affected_keys, base_keys + last_size) - used_code_offsets
+        )
+        selected = concat_ranges(used_code_offsets, used_code_counts)
+        prefix_count = prefix_ids.shape[0]
         seeded_keys = (
-            np.repeat(np.arange(prefix_count, dtype=np.int64) * last_size, lengths)
+            np.repeat(
+                np.arange(prefix_count, dtype=np.int64) * last_size, used_code_counts
+            )
             + affected_keys[selected] % last_size
         )
+        occupancy = np.zeros(prefix_count * last_size, dtype=np.int64)
         occupancy[seeded_keys] = affected_counts[selected]
 
+        overflow_rows = plan.overflow_rows
+        row_count = overflow_rows.shape[0]
         row_ranks = np.empty(row_count, dtype=np.int64)
         row_ranks[
             np.lexsort((overflow_rows, stable_order_hash(plan.overflow_item_ids)))
         ] = np.arange(row_count)
 
-        resolved_keys = origin_keys.copy()
+        local_base_keys = prefix_indices * last_size
+        origin_keys = local_base_keys + plan.origin_last_codes[overflow_rows]
+        target_keys = origin_keys.copy()
         assigned = np.zeros(row_count, dtype=bool)
-        slot_indices = np.empty(row_count, dtype=np.int64)
+        target_slot_indices = np.empty(row_count, dtype=np.int64)
         pending = np.arange(row_count, dtype=np.int64)
         targets = candidates + local_base_keys[:, None]
+        candidate_count = candidates.shape[1]
+        capacity = plan.config.capacity
+        progress = ProgressLogger(
+            "Resolving collision overflow",
+            start_n=0,
+            miniters=self._progress_interval,
+        )
         while True:
             has_room = occupancy[targets] < capacity
             # Occupancy only grows, so a row without room anywhere is final.
@@ -138,7 +133,7 @@ class IterativeCollisionResolver(CollisionResolver):
             if pending.size == 0:
                 break
 
-            origin_starts = run_starts(origin_keys[pending])
+            origin_starts = get_same_value_start_indices(origin_keys[pending])
             room_ranks = np.cumsum(has_room, axis=0, dtype=np.int32)
             room_ranks -= np.repeat(
                 room_ranks[origin_starts] - has_room[origin_starts],
@@ -163,19 +158,21 @@ class IterativeCollisionResolver(CollisionResolver):
             ] = True
             # Proposals are row-major, so a row's first accepted one is its best.
             accepted_proposals = np.flatnonzero(accepted)
-            winners = accepted_proposals[run_starts(proposal_rows[accepted_proposals])]
+            winners = accepted_proposals[
+                get_same_value_start_indices(proposal_rows[accepted_proposals])
+            ]
             won = np.zeros(proposal_rows.shape[0], dtype=bool)
             won[winners] = True
             winners = target_order[won[target_order]]
             winner_rows = proposal_rows[winners]
             winner_targets = proposal_targets[winners]
 
-            slot_indices[winner_rows] = (
+            target_slot_indices[winner_rows] = (
                 occupancy[winner_targets] + ranks_within_runs(winner_targets) + 1
             )
             np.add.at(occupancy, winner_targets, 1)
             assigned[winner_rows] = True
-            resolved_keys[winner_rows] = winner_targets
+            target_keys[winner_rows] = winner_targets
             still_pending = ~assigned[pending]
             pending = pending[still_pending]
             targets = targets[still_pending]
@@ -183,19 +180,19 @@ class IterativeCollisionResolver(CollisionResolver):
 
         unresolved = ~assigned
         unresolved_keys = origin_keys[unresolved]
-        slot_indices[unresolved] = (
+        target_slot_indices[unresolved] = (
             occupancy[unresolved_keys] + ranks_within_runs(unresolved_keys) + 1
         )
         np.add.at(occupancy, unresolved_keys, 1)
 
-        final_keys = np.unique(np.concatenate((seeded_keys, resolved_keys)))
-        final_counts = occupancy[final_keys]
+        final_keys = np.unique(np.concatenate((seeded_keys, target_keys)))
         owners, last_codes = np.divmod(final_keys, last_size)
         resolved_last_codes = plan.origin_last_codes.copy()
-        resolved_last_codes[overflow_rows] = resolved_keys - local_base_keys
+        resolved_last_codes[overflow_rows] = target_keys - local_base_keys
         final_slot_indices = plan.initial_slot_indices.copy()
-        final_slot_indices[overflow_rows] = slot_indices
+        final_slot_indices[overflow_rows] = target_slot_indices
         progress.log(row_count)
+        final_counts = occupancy[final_keys]
         return self._build_result(
             plan,
             resolved_last_codes,
