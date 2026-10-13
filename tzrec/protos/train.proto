@@ -67,10 +67,11 @@ message FeatureStoreConfig {
     optional uint32 feature_view_replication_count = 15 [default = 1];
     reserved 4, 16, 17;
     reserved "feature_entity_name", "allow_custom_endpoint", "retain_local_dump";
-    // Wire format for delta upload. "ARROW" (default) streams a columnar Arrow
+    // Wire format for embedding upload. "ARROW" (default) streams a columnar Arrow
     // IPC batch through write_features_arrow(), avoiding the JSON path's per-row
     // dict construction and embedding deep-copy; "JSON" keeps the legacy
-    // write_features() per-row payload. Both paths use MERGE write_mode.
+    // write_features() per-row payload. Delta uploads use MERGE; full checkpoint
+    // exports use OVERWRITE within an explicit unpublished version.
     optional string upload_format = 18 [default = "ARROW"];
     // Local/dev testing outside the VPC: the FeatureStore SDK prefers the
     // FeatureDB public endpoint for the data plane, which stays reachable
