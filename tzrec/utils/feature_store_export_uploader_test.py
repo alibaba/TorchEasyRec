@@ -52,7 +52,7 @@ class FeatureStoreExportUploaderTest(unittest.TestCase):
             version="export_1",
             upload_batch_size=kwargs.pop("upload_batch_size", 1000),
             max_retries=kwargs.pop("max_retries", 1),
-            retry_backoff_secs=0,
+            retry_backoff_secs=kwargs.pop("retry_backoff_secs", 0),
             upload_format=kwargs.pop("upload_format", "ARROW"),
         )
         uploader = FeatureStoreExportUploader(
@@ -318,6 +318,77 @@ class FeatureStoreExportUploaderTest(unittest.TestCase):
         self.assertEqual(view.calls, [])
         with self.assertNoLogs("tzrec", level="INFO"):
             uploader.close()
+
+    @parameterized.expand(
+        [
+            ("zero_window", {_TABLE_NAME: 2}, 0, "max_in_flight_batches"),
+            ("negative_window", {_TABLE_NAME: 2}, -1, "max_in_flight_batches"),
+            ("empty_name", {"": 2}, 1, "names must be nonempty"),
+            ("zero_dimension", {_TABLE_NAME: 0}, 1, "dimensions positive"),
+            ("negative_dimension", {_TABLE_NAME: -1}, 1, "dimensions positive"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_invalid_constructor_contract(self, _name, dimensions, window, error):
+        with self.assertRaisesRegex(ValueError, error):
+            self._uploader(
+                [_FakeView()], dimensions=dimensions, max_in_flight_batches=window
+            )
+
+    @parameterized.expand(
+        [
+            (
+                "write_before_start",
+                False,
+                False,
+                "write",
+                RuntimeError,
+                "started and open",
+            ),
+            (
+                "write_after_close",
+                True,
+                True,
+                "write",
+                RuntimeError,
+                "started and open",
+            ),
+            ("start_after_close", True, True, "start", RuntimeError, "already closed"),
+            ("unknown_table", True, False, "unknown", ValueError, "absent from model"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_lifecycle_guards(self, _name, start, close, operation, error_type, error):
+        view = _FakeView()
+        uploader = self._uploader([view])
+        if start:
+            uploader.start(total_records=1)
+        if close:
+            uploader.close()
+        with self.assertRaisesRegex(error_type, error):
+            if operation == "start":
+                uploader.start(total_records=1)
+            else:
+                uploader.write(
+                    "unknown" if operation == "unknown" else _TABLE_NAME,
+                    np.array([1], dtype=np.int64),
+                    np.ones((1, 2), dtype=np.float32),
+                )
+        self.assertEqual(view.calls, [])
+
+    def test_retry_backoff_scales_with_attempt(self):
+        views = [_FakeView(summaries=[{}]), _FakeView(summaries=[{}]), _FakeView()]
+        uploader = self._uploader(views, max_retries=3, retry_backoff_secs=1)
+        uploader.start(total_records=1)
+        with mock.patch.object(feature_store_export_uploader.time, "sleep") as sleep:
+            uploader.write(
+                _TABLE_NAME,
+                np.array([1], dtype=np.int64),
+                np.ones((1, 2), dtype=np.float32),
+            )
+        self.assertEqual(sleep.call_args_list, [mock.call(1), mock.call(2)])
+        self.assertEqual(uploader._uploaded_records, 1)
+        self.assertEqual(uploader._writer._create_client.call_count, 3)
 
 
 if __name__ == "__main__":

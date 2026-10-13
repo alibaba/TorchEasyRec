@@ -49,7 +49,11 @@ class FeatureStoreExportUploader:
         embedding_field_type: str = FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
         max_in_flight_batches: int = 16,
     ) -> None:
-        """Initialize the writer using logical, unquantized embedding dimensions."""
+        """Initialize the writer using logical, unquantized embedding dimensions.
+
+        Raises:
+            ValueError: Upload settings, table names, or dimensions are invalid.
+        """
         if max_in_flight_batches <= 0:
             raise ValueError("upload_max_in_flight_batches must be > 0")
         dimensions = {str(name): int(dim) for name, dim in embedding_dimensions.items()}
@@ -80,6 +84,9 @@ class FeatureStoreExportUploader:
 
         Args:
             total_records: Total native dynemb rows in the checkpoint export.
+
+        Raises:
+            RuntimeError: The uploader is closed or the remote schema is invalid.
         """
         if self._closed:
             raise RuntimeError("FeatureStoreExportUploader is already closed")
@@ -106,6 +113,11 @@ class FeatureStoreExportUploader:
             embedding_name: Table FQN from the sparse export contract.
             keys: One-dimensional int64 raw feature IDs.
             values: FP32 rows, or UINT8 rows including four scale/offset bytes.
+
+        Raises:
+            RuntimeError: The uploader is not started or has been closed.
+            ValueError: Input rows violate the table contract or byte budget.
+            FeatureStoreUploadError: The upload window cannot be drained.
         """
         if self._error is not None:
             raise self._error
