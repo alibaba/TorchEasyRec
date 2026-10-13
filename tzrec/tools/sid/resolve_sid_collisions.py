@@ -333,11 +333,11 @@ class CollisionResolutionRunner:
         )
         candidate_last_codes = None
         has_overflow = bool(plan.overflow_rows.size)
-        if self._world_size > 1 and self._config.strategy != "uniform":
+        if self._world_size > 1 and self._resolver.is_requires_candidates():
             overflow_by_rank = [None] * self._world_size
             dist.all_gather_object(overflow_by_rank, has_overflow)
             has_overflow = any(overflow_by_rank)
-        if has_overflow and self._config.strategy != "uniform":
+        if has_overflow and self._resolver.is_requires_candidates():
             candidate_last_codes = self._load_candidate_last_codes(
                 plan.overflow_item_ids
             )
@@ -358,7 +358,13 @@ class CollisionResolutionRunner:
             self._write_item_to_sid(item_ids, codes, result, existing_item_count)
         stats = self._gather_stats(result.stats)
         if not self._config.rate_only and self._rank == 0:
-            self._write_manifest(stats)
+            self._bundle.write_manifest(
+                codebook=list(self._config.codebook),
+                capacity=self._config.max_items_per_codebook,
+                observed=stats.max_final_items_per_sid,
+                item_id_type=str(self._item_id_type),
+                writer_type=self._resolved_writer_type,
+            )
 
         if self._rank == 0:
             logger.info("SID collision resolution finished: %s", stats)
@@ -385,14 +391,14 @@ class CollisionResolutionRunner:
             artifact: sum(rows[artifact] for _, rows in summaries)
             for artifact in self._bundle.rows
         }
-        return CollisionResolutionStats(
-            **{
-                name: (max if name == "max_final_items_per_sid" else sum)(
-                    summary[name] for summary, _ in summaries
-                )
-                for name in asdict(stats)
-            }
-        )
+        merged_stats = {}
+        for name in asdict(stats):
+            values = [summary[name] for summary, _ in summaries]
+            if name == "max_final_items_per_sid":
+                merged_stats[name] = max(values)
+            else:
+                merged_stats[name] = sum(values)
+        return CollisionResolutionStats(**merged_stats)
 
     def _check_input_locations(self) -> None:
         """Reject a run whose inputs are not all present, before any pass runs."""
@@ -414,20 +420,6 @@ class CollisionResolutionRunner:
                 + "\nA directory that exists but holds no part files counts as "
                 "missing, because the readers cannot tell the two apart."
             )
-
-    def _write_manifest(self, stats: CollisionResolutionStats) -> None:
-        """Describe every artifact this run published, written last.
-
-        Its presence is the completion marker, so nothing may be written after it.
-        """
-        path = self._bundle.publish(
-            codebook=list(self._config.codebook),
-            capacity=self._config.max_items_per_codebook,
-            observed=stats.max_final_items_per_sid,
-            item_id_type=str(self._item_id_type),
-            writer_type=self._resolved_writer_type,
-        )
-        logger.info("wrote bundle %s manifest to %s", self._bundle.uuid, path)
 
     def _make_reader(self, path: str, columns: List[str]) -> BaseReader:
         """Open a repository reader projecting ``columns``.
@@ -710,9 +702,7 @@ class CollisionResolutionRunner:
         reader = self._make_reader(
             self._bundle.read_path(SID_TO_ITEMS_ARTIFACT), ["codebook", "itemids"]
         )
-        wanted_prefixes = np.unique(
-            self._config.collision_config.prefix_ids(new_codes)
-        )
+        wanted_prefixes = np.unique(self._config.collision_config.prefix_ids(new_codes))
         new_id_values = self._item_id_array(new_item_ids)
         for batch in self._iter_batches(reader, "Reading published sid_to_items"):
             codes = self._convert_codes_to_numpy(batch["codebook"])

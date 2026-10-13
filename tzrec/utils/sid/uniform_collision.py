@@ -44,6 +44,10 @@ class UniformCollisionResolver(CollisionResolver):
     overflow rows, so they cannot be moved.
     """
 
+    def is_requires_candidates(self) -> bool:
+        """Return False because uniform placement needs no candidates."""
+        return False
+
     def resolve(
         self,
         plan: CollisionPlan,
@@ -131,9 +135,9 @@ class UniformCollisionResolver(CollisionResolver):
             insert_positions, is_existing = find_in_sorted_array(
                 initial_codes, target_codes
             )
-            final_counts[
-                prefix_sid_start + insert_positions[is_existing]
-            ] += added_item_counts[is_existing]
+            final_counts[prefix_sid_start + insert_positions[is_existing]] += (
+                added_item_counts[is_existing]
+            )
             new_key_arrays.append(base_key + target_codes[~is_existing])
             new_count_arrays.append(added_item_counts[~is_existing])
 

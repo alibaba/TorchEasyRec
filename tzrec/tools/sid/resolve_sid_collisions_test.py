@@ -529,9 +529,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         schema = parquet.read_schema(self._part(out, ITEM_TO_SID))
         self.assertEqual(schema.field("item_id").type, pa.large_string())
         sid_schema = parquet.read_schema(self._part(out, SID_TO_ITEMS))
-        self.assertEqual(
-            sid_schema.field("itemids").type, pa.list_(pa.large_string())
-        )
+        self.assertEqual(sid_schema.field("itemids").type, pa.list_(pa.large_string()))
 
     @parameterized.expand(
         [
@@ -676,9 +674,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         for codebook, offset in zip(item_map["codebook"], item_map["offset_codebook"]):
             self.assertEqual(offset, [codebook[0], codebook[1] + 8])
 
-    def _seed_generation(
-        self, name="v1", item_ids=None, codes=None, item_id_type=None
-    ):
+    def _seed_generation(self, name="v1", item_ids=None, codes=None, item_id_type=None):
         """Run a full resolve at generation v1, the prior a later append reads."""
         inp = os.path.join(self.test_dir, f"{name}_in.parquet")
         out = os.path.join(self.test_dir, name)
@@ -902,9 +898,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self, _name, map_rows, sid_rows
     ) -> None:
         # Prefix 5 has no new items, so only the totals catch the missing item.
-        out = self._seed_prior(
-            os.path.join(self.test_dir, "out"), map_rows, sid_rows
-        )
+        out = self._seed_prior(os.path.join(self.test_dir, "out"), map_rows, sid_rows)
         with self.assertRaisesRegex(ValueError, "one of the two artifacts is"):
             self._append(self._prepare_single(10), out)
 

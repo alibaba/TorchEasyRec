@@ -68,7 +68,7 @@ class CollisionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "candidate_last_codes are required"):
             resolver_cls().resolve(plan)
 
-    def test_empty_groupings(self) -> None:
+    def test_empty_sid_item_row_indices(self) -> None:
         plan = _plan((2, 4), 2, [], np.empty((0, 2)))
         result = KnnCollisionResolver().resolve(plan)
 
@@ -81,7 +81,6 @@ class CollisionTest(unittest.TestCase):
                 np.testing.assert_array_equal(sid_item_row_index.item_counts, [])
                 np.testing.assert_array_equal(sid_item_row_index.item_row_indices, [])
                 np.testing.assert_array_equal(sid_item_row_index.offsets, [0])
-
 
     @parameterized.expand(
         [
@@ -217,7 +216,6 @@ class AppendPlanTest(unittest.TestCase):
         # The retained row continues the published slot sequence at 2, not 1.
         self.assertEqual(int(plan.initial_slot_indices[retained]), 2)
 
-
     def test_final_counts_are_corpus_totals(self) -> None:
         plan = _plan((2, 4), 3, [10], [[0, 0]], prior=_prior([0], [2]))
         result = KnnCollisionResolver().resolve(plan, None)
@@ -226,7 +224,7 @@ class AppendPlanTest(unittest.TestCase):
         np.testing.assert_array_equal(result.final_item_counts, [3])
         self.assertEqual(result.stats.max_final_items_per_sid, 3)
 
-    def test_groupings_cover_only_the_appended_rows(self) -> None:
+    def test_sid_item_row_indices_cover_only_the_appended_rows(self) -> None:
         prior = _prior([0], [1])
         plan = _plan((2, 4), 3, [10, 11], [[0, 0], [0, 1]], prior=prior)
         result = KnnCollisionResolver().resolve(plan, None)

@@ -266,15 +266,17 @@ class Bundle:
                 prior.capacity,
             )
 
-    def publish(
+    def write_manifest(
         self,
         codebook: List[int],
         capacity: int,
         observed: int,
         item_id_type: Optional[str],
         writer_type: Optional[str],
-    ) -> str:
-        """Write the manifest last and return where it landed.
+    ) -> None:
+        """Write the manifest last and log its location.
+
+        Its presence marks a completed generation, so write it after all artifacts.
 
         ``observed`` is carried forward as a running maximum: an append only
         sees the SIDs of the prefixes it affects, so the published ceiling
@@ -312,4 +314,4 @@ class Bundle:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as handle:
             handle.write(manifest.to_json())
-        return path
+        logger.info("wrote bundle %s manifest to %s", self.uuid, path)

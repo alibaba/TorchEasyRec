@@ -72,8 +72,7 @@ class CollisionResolutionConfig:
     def convert_codes_to_sid_keys(self, codes: np.ndarray) -> np.ndarray:
         """Convert SID codes to one int64 mixed-radix key per row."""
         radix = [
-            math.prod(self.codebook[layer + 1 :])
-            for layer in range(len(self.codebook))
+            math.prod(self.codebook[layer + 1 :]) for layer in range(len(self.codebook))
         ]
         return np.asarray(codes).astype(np.int64, copy=False) @ np.asarray(
             radix, dtype=np.int64
@@ -347,6 +346,10 @@ class CollisionResolver(ABC):
                 f"progress_interval must be >= 1, got {progress_interval}."
             )
         self._progress_interval = progress_interval
+
+    def is_requires_candidates(self) -> bool:
+        """Return whether this strategy needs candidates to resolve overflow."""
+        return True
 
     @abstractmethod
     def resolve(
@@ -641,9 +644,7 @@ def prepare_collision_plan(
             f"codes have {codes.shape[1]} layers but codebook has "
             f"{len(config.codebook)}."
         )
-    if codes.size and (
-        codes.min() < 0 or np.any(codes >= np.asarray(config.codebook))
-    ):
+    if codes.size and (codes.min() < 0 or np.any(codes >= np.asarray(config.codebook))):
         raise ValueError(
             "codes contain out-of-range values for codebook "
             f"{config.codebook}; check that --codebook matches the model that "

@@ -96,7 +96,7 @@ class BundleTest(unittest.TestCase):
         prior = bundle.Bundle(self.test_dir, item_to_sid_root, "v1", None)
         prior.rows[bundle.SID_TO_ITEMS_ARTIFACT] = 2
         prior.rows[bundle.ITEM_TO_SID_ARTIFACT] = 3
-        prior.publish([8, 8], 5, 3, "int64", writer_type)
+        prior.write_manifest([8, 8], 5, 3, "int64", writer_type)
         layout = self._bundle(
             output_path=self.test_dir, item_to_sid_root=item_to_sid_root
         )
@@ -164,7 +164,7 @@ class BundleTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_publish_records_where_and_how_each_artifact_landed(
+    def test_write_manifest_records_artifact_locations_and_formats(
         self, _name, item_to_sid_root, artifact, writer_type, save_type, location
     ) -> None:
         published = self._bundle(
@@ -173,7 +173,8 @@ class BundleTest(unittest.TestCase):
             from_generation=None,
         )
         published.rows[artifact] = 4
-        path = published.publish([8, 8], 5, 3, "int64", writer_type)
+        published.write_manifest([8, 8], 5, 3, "int64", writer_type)
+        path = bundle.manifest_path(self.test_dir, "v2")
         entry = bundle.read_manifest(path).artifacts[artifact]
         self.assertEqual(entry.save_type, save_type)
         self.assertEqual(entry.location, location.format(out=self.test_dir))
@@ -183,16 +184,15 @@ class BundleManifestTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
 
-    def test_publish_round_trips_every_field_through_disk(self) -> None:
+    def test_write_manifest_round_trips_every_field_through_disk(self) -> None:
         prior = bundle.Bundle(self.test_dir, "./map", "v1", None)
         prior.rows[bundle.SID_TO_ITEMS_ARTIFACT] = 1
-        prior.publish([8, 8], 5, 7, "int64", "ParquetWriter")
+        prior.write_manifest([8, 8], 5, 7, "int64", "ParquetWriter")
         appended = bundle.Bundle(self.test_dir, "./map", "v2", "v1")
         appended.rows[bundle.SID_TO_ITEMS_ARTIFACT] = 4
 
-        path = appended.publish([8, 8], 5, 3, "int64", "ParquetWriter")
-
-        self.assertEqual(path, bundle.manifest_path(self.test_dir, "v2"))
+        appended.write_manifest([8, 8], 5, 3, "int64", "ParquetWriter")
+        path = bundle.manifest_path(self.test_dir, "v2")
         self.assertEqual(
             bundle.read_manifest(path),
             _manifest(
