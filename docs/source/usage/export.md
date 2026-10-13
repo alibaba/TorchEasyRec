@@ -130,6 +130,15 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
 
 未设置 `DIST_QUANT` 时，NPZ 和 FeatureDB 使用 FP32 values，FeatureView 类型必须为 `ARRAY<FLOAT>`。在命令前增加 `DIST_QUANT=INT8` 后，两处使用同一份 UINT8 行量化结果，包含每行 4 字节的 scale/offset；FeatureView 类型必须为 `ARRAY<UINT8>`，导出时会校验已存在的表类型。量化维度必须为偶数。
 
+### 与旧导出路径的兼容性
+
+使用分布式 embedding 模式导出 checkpoint 时，只要 checkpoint 包含 `dynamicemb/` 目录，或模型包含原生 dynemb 表，就会进入流式路径；不配置 `dynamic_embedding_export_config` 也会生效。普通 sparse 和 ZCH 表仍按原有方式恢复到内存，不能据此认为整个模型的导出内存都受读取块预算限制。
+
+- `PYTORCH` kernel 的 dense 图在 CPU 上导出；`TRITON`、`CUTLASS` 使用 CUDA，没有可用 CUDA 时会报错。
+- 流式路径不再生成调试文件 `graph/gm_sparse.graph`。
+- checkpoint 缺少普通 sparse/ZCH 状态或模型声明的 dynemb 表数据时，导出会报错，不再静默跳过。
+- ZCH 导出仍按 raw ID 升序排列，values 和 scores 随 keys 一起重排。
+
 (online-dense-export)=
 
 ## 在线学习 dense 模型热导出
