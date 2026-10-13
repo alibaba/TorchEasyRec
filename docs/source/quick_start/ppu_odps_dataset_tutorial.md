@@ -36,7 +36,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 进入[PAI控制台](https://pai.console.aliyun.com)，并选择需要使用的工作空间，点击 **模型开发与训练-分布式训练(DLC)**，点击创建任务。
 
-**节点镜像** 选择官方镜像`torcheasyrec:1.4.0-pytorch2.13.0-ppu-py312-cu130-ubuntu24.04`
+**节点镜像** 选择官方镜像`torcheasyrec:1.5.0-pytorch2.13.0-ppu-py312-cu130-ubuntu24.04`
 
 **数据集配置** 选择刚新建的NAS数据集
 
@@ -45,6 +45,28 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 **角色信息** 选择**PAI默认角色**
 
 **执行命令** 如下
+
+### PPU810E + EIC 机型的网络设置
+
+若任务资源使用PPU810E + EIC机型，需在下文的训练、评估、导出、预测命令之前先执行如下设置，清理系统默认的NCCL IB配置并切换到EIC网络：
+
+```bash
+unset NCCL_IB_TC \
+      NCCL_IB_QPS_PER_CONNECTION \
+      NCCL_IB_SL \
+      NCCL_IB_TIMEOUT \
+      NCCL_IB_HCA \
+      NCCL_MIN_NCHANNELS \
+      NCCL_NET_PLUGIN \
+      NCCL_IB_GID_INDEX
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_DEBUG=WARN
+export NCCL_IB_HCA=fic2,vsolar
+export PCCL_NET_PLUGIN_ENABLE=1
+export EIC_VSOLAR=1
+```
+
+其他PPU机型无需此设置。
 
 ### 训练命令
 
