@@ -2827,6 +2827,16 @@ def _get_sparse_embedding_tensor(
 ]:
     """Get Embedding Tensors for sparse part.
 
+    Args:
+        model: Model containing ordinary sparse weights and ZCH state.
+        checkpoint_path: Training checkpoint directory containing dynemb shards.
+        embedding_infos: Sparse embedding table configurations keyed by FQN.
+        embedding_bag_info: Sparse embedding bag configurations keyed by FQN.
+        dynamic_export: Pre-scanned checkpoint arrays and metadata. The arrays
+            contain single-use iterators that the NPZ writer must consume once.
+            When None, scan all checkpoint shards with a 64 MiB read budget and
+            the quantization format selected by DIST_QUANT.
+
     Returns:
         out: regular sparse embedding tensors keyed by table FQN.
         dynamic_out: streaming dynamic checkpoint arrays and in-memory ZCH
