@@ -4,6 +4,7 @@ package tzrec.protos;
 import "tzrec/protos/train.proto";
 
 message DynamicEmbeddingExportConfig {
+    // Requires USE_DISTRIBUTED_EMBEDDING=1 and a non-RTP export.
     // Raw checkpoint chunk size in MiB.
     optional uint32 read_chunk_size_mb = 1 [default = 64];
     // Maximum upload batches in flight.
