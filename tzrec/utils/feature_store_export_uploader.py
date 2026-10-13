@@ -47,7 +47,7 @@ class FeatureStoreExportUploader:
         config: FeatureStoreConfig,
         embedding_dimensions: Mapping[str, int],
         embedding_field_type: str = FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
-        max_in_flight_batches: int = 4,
+        max_in_flight_batches: int = 16,
     ) -> None:
         """Initialize the writer using logical, unquantized embedding dimensions."""
         if max_in_flight_batches <= 0:

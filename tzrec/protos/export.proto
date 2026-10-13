@@ -8,7 +8,7 @@ message DynamicEmbeddingExportConfig {
     // Raw checkpoint chunk size in MiB.
     optional uint32 read_chunk_size_mb = 1 [default = 64];
     // Maximum upload batches in flight.
-    optional uint32 upload_max_in_flight_batches = 2 [default = 4];
+    optional uint32 upload_max_in_flight_batches = 2 [default = 16];
     // Also upload to FeatureDB without activating the target version.
     optional FeatureStoreConfig feature_store_config = 3;
 }

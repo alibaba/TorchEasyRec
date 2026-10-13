@@ -73,7 +73,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 export_config {
   dynamic_embedding_export_config {
     read_chunk_size_mb: 64
-    upload_max_in_flight_batches: 4
+    upload_max_in_flight_batches: 16
     feature_store_config {
       region: "cn-beijing"
       project_name: "recommendation"
@@ -91,7 +91,7 @@ export_config {
 | 配置项                         | 默认值 | 说明                                                               |
 | ------------------------------ | ------ | ------------------------------------------------------------------ |
 | `read_chunk_size_mb`           | `64`   | checkpoint 原始数据的读取块预算，单位 MiB，必须大于 0              |
-| `upload_max_in_flight_batches` | `4`    | 每个上传窗口最多包含的请求批次，必须大于 0；窗口完成前停止继续读取 |
+| `upload_max_in_flight_batches` | `16`   | 每个上传窗口最多包含的请求批次，必须大于 0；窗口完成前停止继续读取 |
 | `feature_store_config`         | 未设置 | 设置后同时上传 dynemb 到 FeatureDB，仍保留 NPZ                     |
 
 `feature_store_config` 复用 [FeatureStoreConfig](../proto.html#tzrec.protos.FeatureStoreConfig)：
@@ -108,6 +108,8 @@ export_config {
 | `upload_format`      | `ARROW`      | 推荐使用 Arrow；也支持 `JSON`                                    |
 
 `endpoint`、`test_mode` 及 FeatureView 的 TTL、分片、副本配置沿用既有含义。`max_pending_steps`、`poll_interval_secs` 和 `shutdown_timeout_secs` 用于训练增量上传，不参与全量导出的队列或超时控制；保持默认值即可，共用的配置校验仍要求它们大于 0。
+
+全量导出按读取、量化、上传、写入 NPZ 的顺序同步处理每个块，上传耗时会累加到总导出耗时。窗口内的请求由 SDK 并发发送；增大 `upload_max_in_flight_batches` 可减少 flush 次数、保持请求排队，但会增加在途数据占用，实际吞吐取决于网络和服务端。每个读取块结束时仍会 flush，以便释放该块的数据引用。
 
 凭证沿用阿里云默认凭证链，以及运行环境中的 `FEATUREDB_USERNAME`、`FEATUREDB_PASSWORD`；不要将凭证写入 `pipeline.config`。
 
