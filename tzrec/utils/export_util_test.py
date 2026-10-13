@@ -106,6 +106,55 @@ def _dequant_quint8_rowwise_f16(values: np.ndarray, emb_dim: int) -> np.ndarray:
 
 
 class ExportUtilTest(unittest.TestCase):
+    @parameterized.expand(
+        [("generated_fg", False), ("supplied_fg", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_export_metadata_preserves_config_and_fg_asset(self, _name, supplied_fg):
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir, ignore_errors=True)
+        save_dir = os.path.join(test_dir, "export")
+        os.mkdir(save_dir)
+        config = EasyRecConfig(train_input_path="training-input")
+        original_feature = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(feature_name="original")
+        )
+        config.feature_configs.append(original_feature)
+        export_feature = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(feature_name="exported")
+        )
+        assets = []
+        if supplied_fg:
+            asset = os.path.join(test_dir, "fg.json")
+            with open(asset, "w") as output:
+                json.dump({"supplied": True}, output)
+            assets.append(asset)
+        with (
+            mock.patch.object(
+                export_util, "create_feature_configs", return_value=[export_feature]
+            ),
+            mock.patch.object(
+                export_util, "create_fg_json", return_value={"generated": True}
+            ) as create_fg,
+        ):
+            export_util._write_export_metadata(
+                config, [], save_dir, assets, {"CUSTOM_EXPORT": "enabled"}
+            )
+        self.assertEqual(list(config.feature_configs), [original_feature])
+        saved_config = config_util.load_pipeline_config(
+            os.path.join(save_dir, "pipeline.config")
+        )
+        self.assertEqual(list(saved_config.feature_configs), [export_feature])
+        self.assertEqual(saved_config.train_input_path, "training-input")
+        with open(os.path.join(save_dir, "fg.json")) as input_file:
+            self.assertEqual(
+                json.load(input_file),
+                {"supplied": True} if supplied_fg else {"generated": True},
+            )
+        with open(os.path.join(save_dir, "model_acc.json")) as input_file:
+            self.assertEqual(json.load(input_file)["CUSTOM_EXPORT"], "enabled")
+        self.assertEqual(create_fg.call_count, 0 if supplied_fg else 1)
+
     def test_distributed_sparse_quant_env(self) -> None:
         old_env = {
             "DIST_QUANT": os.environ.get("DIST_QUANT"),

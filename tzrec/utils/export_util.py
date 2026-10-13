@@ -361,29 +361,40 @@ def export_model_normal(
             scripted_model = torch.jit.script(gm)
             scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
 
-        feature_configs = create_feature_configs(features, asset_dir=save_dir)
-        pipeline_config = copy.copy(pipeline_config)
-        pipeline_config.ClearField("feature_configs")
-        pipeline_config.feature_configs.extend(feature_configs)
-        config_util.save_message(
-            pipeline_config, os.path.join(save_dir, "pipeline.config")
+        _write_export_metadata(
+            pipeline_config, features, save_dir, assets, additional_export_config
         )
-        logger.info("saving fg json...")
-        fg_json = create_fg_json(features, asset_dir=save_dir)
-        with open(os.path.join(save_dir, "fg.json"), "w") as f:
-            json.dump(fg_json, f, indent=4)
-        with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(
-                acc_utils.export_acc_config(
-                    additional_export_config=additional_export_config
-                ),
-                f,
-                indent=4,
-            )
 
-        if assets is not None:
-            for asset in assets:
-                shutil.copy(asset, save_dir)
+
+def _write_export_metadata(
+    pipeline_config: EasyRecConfig,
+    features: List[BaseFeature],
+    save_dir: str,
+    assets: Optional[List[str]],
+    additional_export_config: Optional[Dict[str, Union[bool, str]]],
+) -> None:
+    """Write serving metadata and assets without mutating the training config."""
+    feature_configs = create_feature_configs(features, asset_dir=save_dir)
+    export_config = copy.deepcopy(pipeline_config)
+    export_config.ClearField("feature_configs")
+    export_config.feature_configs.extend(feature_configs)
+    config_util.save_message(export_config, os.path.join(save_dir, "pipeline.config"))
+    with open(os.path.join(save_dir, "model_acc.json"), "w") as output:
+        json.dump(
+            acc_utils.export_acc_config(
+                additional_export_config=additional_export_config
+            ),
+            output,
+            indent=4,
+        )
+    has_fg_asset = False
+    for asset in assets or []:
+        has_fg_asset = has_fg_asset or asset.endswith("fg.json")
+        shutil.copy(asset, save_dir)
+    if not has_fg_asset:
+        logger.info("saving fg json...")
+        with open(os.path.join(save_dir, "fg.json"), "w") as output:
+            json.dump(create_fg_json(features, asset_dir=save_dir), output, indent=4)
 
 
 def _prepare_single_rank_distributed_embedding_export() -> bool:
@@ -1628,6 +1639,8 @@ def export_distributed_embedding(
             assets,
             additional_export_config,
             data_input_path,
+            bag_infos=table_to_embedding_bag_info,
+            embedding_infos=table_to_embedding_info,
         )
         return
 
@@ -1866,37 +1879,9 @@ def export_distributed_embedding(
         dense_model_scripted = torch.jit.script(dense_model_traced)
         dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
 
-        logger.info("saving pipeline.config...")
-        feature_configs = create_feature_configs(features, asset_dir=save_dir)
-        pipeline_config = copy.copy(pipeline_config)
-        pipeline_config.ClearField("feature_configs")
-        pipeline_config.feature_configs.extend(feature_configs)
-        config_util.save_message(
-            pipeline_config, os.path.join(save_dir, "pipeline.config")
+        _write_export_metadata(
+            pipeline_config, features, save_dir, assets, additional_export_config
         )
-
-        with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
-            json.dump(
-                acc_utils.export_acc_config(
-                    additional_export_config=additional_export_config
-                ),
-                f,
-                indent=4,
-            )
-
-        has_fg_asset = False
-        if assets is not None:
-            for asset in assets:
-                if asset.endswith("fg.json"):
-                    has_fg_asset = True
-                shutil.copy(asset, save_dir)
-
-        # Save FG
-        if not has_fg_asset:
-            logger.info("saving fg json...")
-            fg_json = create_fg_json(features, asset_dir=save_dir)
-            with open(os.path.join(save_dir, "fg.json"), "w") as f:
-                json.dump(fg_json, f, indent=4)
 
     if is_rank_zero:
         # merge sharded sparse meta files
@@ -1985,6 +1970,8 @@ def _export_dynamic_embedding_checkpoint(
     assets: Optional[List[str]],
     additional_export_config: Optional[Dict[str, Union[bool, str]]],
     data_input_path: Optional[str],
+    bag_infos: Dict[str, BaseEmbeddingConfig],
+    embedding_infos: Dict[str, BaseEmbeddingConfig],
 ) -> None:
     """Export dense and sparse artifacts without loading native dynamic tables.
 
@@ -2001,7 +1988,6 @@ def _export_dynamic_embedding_checkpoint(
         raise ValueError(
             "dynamic_embedding_export_config.upload_max_in_flight_batches must be > 0"
         )
-    bag_infos, embedding_infos = _get_sparse_table_to_embedding_info(model)
     infos = {**bag_infos, **embedding_infos}
     dimensions = {
         checkpoint_util.remap_input_tile_user_key(name): info.embedding_dim
@@ -2097,27 +2083,13 @@ def _export_dynamic_embedding_checkpoint(
     with open(os.path.join(sparse_dir, "sparse_features.json"), "w") as output:
         json.dump(feature_meta, output, indent=4)
 
-    features = cast(List[BaseFeature], model.features)
-    feature_configs = create_feature_configs(features, asset_dir=save_dir)
-    export_config = copy.deepcopy(pipeline_config)
-    export_config.ClearField("feature_configs")
-    export_config.feature_configs.extend(feature_configs)
-    config_util.save_message(export_config, os.path.join(save_dir, "pipeline.config"))
-    with open(os.path.join(save_dir, "model_acc.json"), "w") as output:
-        json.dump(
-            acc_utils.export_acc_config(
-                additional_export_config=additional_export_config
-            ),
-            output,
-            indent=4,
-        )
-    has_fg_asset = False
-    for asset in assets or []:
-        has_fg_asset = has_fg_asset or asset.endswith("fg.json")
-        shutil.copy(asset, save_dir)
-    if not has_fg_asset:
-        with open(os.path.join(save_dir, "fg.json"), "w") as output:
-            json.dump(create_fg_json(features, asset_dir=save_dir), output, indent=4)
+    _write_export_metadata(
+        pipeline_config,
+        cast(List[BaseFeature], model.features),
+        save_dir,
+        assets,
+        additional_export_config,
+    )
     logger.info("Completed streaming dynamic embedding export to %s", save_dir)
 
 
