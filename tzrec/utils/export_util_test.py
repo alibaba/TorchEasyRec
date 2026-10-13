@@ -2717,12 +2717,17 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
             {name: info.embedding_dim for name, info in table_infos.items()},
         ).items():
             mch._buffers["_mch_sorted_raw_ids"].copy_(
-                torch.tensor([11, 31] + [torch.iinfo(torch.int64).max] * 6)
+                torch.tensor(
+                    [31]
+                    + [torch.iinfo(torch.int64).max] * 3
+                    + [11]
+                    + [torch.iinfo(torch.int64).max] * 3
+                )
             )
             mch._buffers["_mch_remapped_ids_mapping"].copy_(
-                torch.tensor([1, 0, 2, 3, 4, 5, 6, 7])
+                torch.tensor([0, 2, 3, 4, 1, 5, 6, 7])
             )
-            mch._buffers["_mch_counts"].copy_(torch.tensor([4, 6, 0, 0, 0, 0, 0, 0]))
+            mch._buffers["_mch_counts"].copy_(torch.tensor([6, 0, 0, 0, 4, 0, 0, 0]))
             weight = checkpoint_model.state_dict()[f"{name}.weight"].numpy()
             expected_dynamic[name] = (
                 np.array([11, 31], dtype=np.int64),

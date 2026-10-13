@@ -1924,7 +1924,8 @@ def _restore_export_sparse_state(
 
     Dynamic table weights remain on meta; their checkpoint files are consumed
     separately by the streaming writer. Ordinary sparse and ZCH state retain
-    their existing in-memory export behavior.
+    their existing in-memory export behavior. Restored ZCH bindings are sorted;
+    unused output-segment buffers stay on meta and export checks row bounds.
     """
     mch_prefixes = tuple(
         f"{name}."
@@ -1973,6 +1974,7 @@ def _restore_export_sparse_state(
                 module._mch_metadata[metadata_name] = module._buffers[
                     f"_mch_{metadata_name}"
                 ]
+            module._sort_mch_buffers()
 
 
 def _export_dynamic_embedding_checkpoint(
