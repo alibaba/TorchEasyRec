@@ -10,7 +10,7 @@ jobs:
     runs-on: tzrec-bench-runner
     timeout-minutes: 960
     container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.4
+      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5
       options: --gpus all --ipc host --ulimit memlock=-1
     steps:
       - name: FetchCommit ${{ github.event.pull_request.head.sha }}
@@ -27,6 +27,6 @@ jobs:
           ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
         run: |
           cd run_${{ github.run_id }}
-          pip install -r requirements.txt
+          PIP_CACHE_DIR=/root/.cache/pip pip install -r requirements.txt
           bash scripts/gen_proto.sh
           PYTHONPATH=. PYTHONUNBUFFERED=1 MKL_THREADING_LAYER=GNU python tzrec/benchmark/benchmark.py

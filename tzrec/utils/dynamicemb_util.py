@@ -15,6 +15,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple, Type, cast
 
 import torch
+from torchrec import optim as trec_optim
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import (
     enumerators,
@@ -45,7 +46,11 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
-from tzrec.optim.optimizer import FTRL, sparse_init_accumulator_value
+from tzrec.optim.optimizer import (
+    FTRL,
+    has_fbgemm_ftrl,
+    sparse_init_accumulator_value,
+)
 from tzrec.protos import feature_pb2
 from tzrec.utils.logging_util import logger
 
@@ -235,6 +240,7 @@ try:
     from dynamicemb import (
         DynamicEmbInitializerArgs,
         DynamicEmbInitializerMode,
+        DynamicEmbOptimType,
         DynamicEmbScoreStrategy,
         FrequencyAdmissionStrategy,
         KVCounter,
@@ -286,12 +292,42 @@ try:
         """
 
         initial_accumulator_value: float = 0.0
+        ftrl_fused_params: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
         def get_additional_fused_params(self) -> Dict[str, Any]:
             """Extra fused params of the customized kernel."""
             params = super().get_additional_fused_params()
             params["initial_accumulator_value"] = self.initial_accumulator_value
+            params.update(self.ftrl_fused_params)
             return params
+
+    def _dynamicemb_ftrl_fused_params(
+        optimizer_class: Optional[Type[torch.optim.Optimizer]],
+        optimizer_kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Fused params turning torchrec's fused FTRL into dynamicemb's.
+
+        torchrec maps its FTRL class to FBGEMM's ``EmbOptimType.FTRL``, which
+        dynamicemb tables reject, and passes the hyperparameters under the TBE
+        kwarg names; these per-table params override both.
+
+        Args:
+            optimizer_class (type, optional): in-backward optimizer class of the
+                table, None when the table is not trained.
+            optimizer_kwargs (dict): in-backward optimizer kwargs of the table.
+
+        Returns:
+            the overriding fused params, empty unless the table uses FBGEMM FTRL.
+        """
+        # pyrefly: ignore[missing-attribute]  # only in the TorchEasyRec torchrec build
+        if not has_fbgemm_ftrl() or optimizer_class is not trec_optim.FTRL:
+            return {}
+        return {
+            "optimizer": DynamicEmbOptimType.FTRL,
+            "learning_rate_power": optimizer_kwargs["ftrl_learning_rate_power"],
+            "l1_reg": optimizer_kwargs["ftrl_l1_reg"],
+            "l2_reg": optimizer_kwargs["ftrl_l2_reg"],
+        }
 
     has_dynamicemb = True
 except Exception:
@@ -586,6 +622,7 @@ if has_dynamicemb:
                 # calc local_hbm_for_values
                 tensor = sharding_option.tensor
                 optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
+                optimizer_kwargs = getattr(tensor, "_optimizer_kwargs", [{}])[0]
                 optimizer_multipler = _get_optimizer_multipler(
                     optimizer_class, tensor.shape
                 )
@@ -623,6 +660,9 @@ if has_dynamicemb:
                     dist_type="roundrobin",
                     dynamicemb_options=dynamicemb_options,
                     initial_accumulator_value=sparse_init_accumulator_value(),
+                    ftrl_fused_params=_dynamicemb_ftrl_fused_params(
+                        optimizer_class, optimizer_kwargs
+                    ),
                 )
                 _log_dynamicemb_table_plan(
                     fqn=f"{sharding_option.path}.{sharding_option.name}",
@@ -645,7 +685,9 @@ if has_dynamicemb:
                         f"{sharding_option.path}.{sharding_option.name}] is planned "
                         f"with sharding_type[{sharding_type}] and "
                         f"compute_kernel[{sharding_option.compute_kernel}]. "
-                        "Set `dynamicemb { }` on every sparse feature, or use "
+                        "The installed fbgemm-gpu has no FTRL embedding kernel: "
+                        "install the TorchEasyRec fbgemm-gpu and torchrec wheels, "
+                        "set `dynamicemb { }` on every sparse feature, or use "
                         "another sparse optimizer."
                     )
                 module_plan[sharding_option.name] = ParameterSharding(

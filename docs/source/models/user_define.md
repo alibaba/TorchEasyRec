@@ -33,8 +33,10 @@ TorchEasyRec 可以通过 pip 安装，也可以作为 git submodule 引入，�
 ### 方式一：pip 安装 TorchEasyRec
 
 ```bash
-pip install tzrec==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
 ```
+
+注：`[cu130]` 按环境替换为 `cpu`、`cu126`、`cu130` 或 `ppu`，它决定安装的 torch、fbgemm-gpu、torchrec 版本；不带该后缀时不会安装这三者，仅适用于官方镜像等已预装它们的环境。
 
 运行命令时用 `PYTHONPATH=.` 让 python 可以导入你的包即可：
 
