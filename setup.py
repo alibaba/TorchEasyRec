@@ -46,7 +46,7 @@ def parse_requirements(fname="requirements.txt"):
             target = line.split(" ")[1]
             for line in parse_require_file(target):
                 yield line
-        else:
+        elif not line.startswith("--find-links "):
             yield line
 
     def parse_require_file(fpath):
