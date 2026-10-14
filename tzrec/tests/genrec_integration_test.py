@@ -317,18 +317,25 @@ class GenRecIntegrationTest(unittest.TestCase):
         self._train_eval_export(attn_kernel="flash_attention_2")
 
     @parameterized.expand(
-        [("default", False), ("streaming_routing", True)],
+        [("legacy_routing", False), ("streaming_routing", True)],
         name_func=parameterized_name_func,
     )
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")
     def test_genrec_export_distributed_embedding(self, _name, streaming):
-        """Check export routing with ordinary sparse tables and no dynemb rows."""
+        """Check legacy and explicit streaming export with no dynemb rows."""
         trained = self._train_eval_export()
         if streaming:
             config = config_util.load_pipeline_config(trained)
             config.export_config.dynamic_embedding_export_config.SetInParent()
             config_util.save_message(config, trained)
+        else:
+            # NOTE: Empty SDK dump directories also select streaming export.
+            for directory in glob.glob(
+                os.path.join(self.test_dir, "train", "model.ckpt-*", "dynamicemb")
+            ):
+                self.assertFalse(any(files for _, _, files in os.walk(directory)))
+                shutil.rmtree(directory)
         dist_dir = os.path.join(self.test_dir, "export_dist")
         self.success = utils.test_export(
             trained,
