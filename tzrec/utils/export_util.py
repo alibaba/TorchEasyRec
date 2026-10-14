@@ -2032,8 +2032,6 @@ def _export_dynamic_embedding_checkpoint(
     )
 
     try:
-        if uploader is not None:
-            uploader.start(total_records=total_records)
         _restore_export_sparse_state(
             model, checkpoint_path, set(dimensions), set(dynamic_export[1])
         )
@@ -2045,6 +2043,11 @@ def _export_dynamic_embedding_checkpoint(
                 bag_infos,
                 dynamic_export=dynamic_export,
             )
+        )
+        sparse_dir = os.path.join(save_dir, "sparse")
+        os.makedirs(sparse_dir, exist_ok=True)
+        npz_util.savez_streaming(
+            os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"), sparse_arrays
         )
         dense_device = torch.device("cpu")
         if pipeline_config.model_config.kernel != model_pb2.PYTORCH:
@@ -2060,11 +2063,19 @@ def _export_dynamic_embedding_checkpoint(
             dense_device,
             data_input_path=data_input_path,
         )
-        sparse_dir = os.path.join(save_dir, "sparse")
-        os.makedirs(sparse_dir, exist_ok=True)
-        npz_util.savez_streaming(
-            os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"), sparse_arrays
-        )
+        if uploader is not None:
+            zch_tables = {
+                name
+                for name, meta in embedding_meta.items()
+                if meta.get("is_dynamic") and name not in dynamic_export[1]
+            }
+            if zch_tables:
+                logger.warning(
+                    "FeatureStore full export uploads only native dynemb tables; "
+                    "ZCH tables remain NPZ-only: %s",
+                    ", ".join(sorted(zch_tables)),
+                )
+            uploader.start(total_records=total_records)
         if dynamic_arrays:
             npz_util.savez_streaming(
                 os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz"),

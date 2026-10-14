@@ -15,6 +15,7 @@ import glob
 import os
 import re
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -90,12 +91,13 @@ def _iter_values(
     """Read aligned key/value blocks and pass exported values to both sinks."""
     for shard in shards:
         with (
-            open(shard.key_file, "rb") as key_stream,
+            open(shard.key_file, "rb")
+            if on_values is not None
+            else nullcontext() as key_stream,
             open(shard.value_file, "rb") as value_stream,
         ):
             for start in range(0, shard.rows, chunk_rows):
                 rows = min(chunk_rows, shard.rows - start)
-                keys = _read_array(key_stream, np.dtype(np.int64), (rows,))
                 values = _read_array(
                     value_stream, np.dtype(np.float32), (rows, embedding_dim)
                 )
@@ -103,12 +105,14 @@ def _iter_values(
                     values = quant_util.distributed_quantize_embeddings(
                         values, embedding_dim, embedding_name, quant_format
                     )
-                if on_values is not None:
+                if on_values is not None and key_stream is not None:
+                    keys = _read_array(key_stream, np.dtype(np.int64), (rows,))
                     on_values(embedding_name, keys, values)
+                    del keys
                 yield values
-                del keys, values
+                del values
             for stream in (key_stream, value_stream):
-                if stream.read(1):
+                if stream is not None and stream.read(1):
                     raise ValueError(
                         f"Dynamic embedding file grew during export: {stream.name}"
                     )

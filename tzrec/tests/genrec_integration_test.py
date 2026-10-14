@@ -317,12 +317,13 @@ class GenRecIntegrationTest(unittest.TestCase):
         self._train_eval_export(attn_kernel="flash_attention_2")
 
     @parameterized.expand(
-        [("default", False), ("streaming", True)],
+        [("default", False), ("streaming_routing", True)],
         name_func=parameterized_name_func,
     )
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")
     def test_genrec_export_distributed_embedding(self, _name, streaming):
+        """Check export routing with ordinary sparse tables and no dynemb rows."""
         trained = self._train_eval_export()
         if streaming:
             config = config_util.load_pipeline_config(trained)
@@ -336,7 +337,17 @@ class GenRecIntegrationTest(unittest.TestCase):
             env_str="USE_DISTRIBUTED_EMBEDDING=1 QUANT_EMB=0",
         )
         self.assertTrue(self.success)
+        graph_dir = os.path.join(dist_dir, "graph")
+        self.assertTrue(os.path.exists(os.path.join(graph_dir, "gm_dense.graph")))
+        self.assertEqual(
+            os.path.exists(os.path.join(graph_dir, "gm_sparse.graph")), not streaming
+        )
         sparse_dir = os.path.join(dist_dir, "sparse")
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
+            )
+        )
         for name in (
             "sparse_embeddings-00-of-01.npz",
             "sparse_embedding.json",

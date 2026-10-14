@@ -107,6 +107,26 @@ class DynamicEmbeddingExportTest(unittest.TestCase):
             np.concatenate([call.args[2] for call in calls]), exported_values
         )
 
+    @parameterized.expand(
+        [("npz_only", False), ("upload", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_key_files_are_reread_only_for_upload(self, _name, upload) -> None:
+        directory = self._write_shard(0, np.arange(3), np.ones((3, 2)))
+        arrays, _ = get_dynamic_embedding_export(
+            self.test_dir,
+            {self.table: 2},
+            16,
+            on_values=mock.Mock() if upload else None,
+        )
+        with mock.patch.object(dynamic_embedding_export, "open", wraps=open) as reads:
+            savez_streaming(os.path.join(self.test_dir, "export.npz"), arrays)
+        key_file = os.path.join(directory, "table_emb_keys.rank_0.world_size_1")
+        self.assertEqual(
+            sum(call.args[0] == key_file for call in reads.call_args_list),
+            2 if upload else 1,
+        )
+
     def test_checkpoint_shards_in_numeric_rank_order(self) -> None:
         for rank in reversed(range(12)):
             self._write_shard(
@@ -270,7 +290,14 @@ class DynamicEmbeddingExportTest(unittest.TestCase):
     )
     def test_file_growth_during_iteration(self, array_field, file_field) -> None:
         directory = self._write_shard(0, np.array([1, 2]), np.ones((2, 2)))
-        arrays, _ = get_dynamic_embedding_export(self.test_dir, {self.table: 2}, 16)
+        arrays, _ = get_dynamic_embedding_export(
+            self.test_dir,
+            {self.table: 2},
+            16,
+            on_values=mock.Mock()
+            if array_field == "values" and file_field == "keys"
+            else None,
+        )
         chunks = arrays[f"{self.table}.{array_field}"].chunks
         next(chunks)
         path = os.path.join(directory, f"table_emb_{file_field}.rank_0.world_size_1")

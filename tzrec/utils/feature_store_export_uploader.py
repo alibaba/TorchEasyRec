@@ -225,10 +225,14 @@ class FeatureStoreExportUploader:
                 try:
                     self._writer._reset_view()
                 except Exception as close_exc:
+                    logger.error(
+                        "Failed to drain FeatureStore full export writer (%s)",
+                        type(close_exc).__name__,
+                    )
                     self._error = FeatureStoreUploadError(
                         "FeatureStore full export could not drain the failed writer"
                     )
-                    raise self._error from close_exc
+                    raise self._error from exc
                 if attempt >= settings.max_retries:
                     self._error = FeatureStoreUploadError(
                         "FeatureStore full export failed after "
@@ -251,13 +255,17 @@ class FeatureStoreExportUploader:
             if raise_on_error and self._error is not None:
                 raise self._error
             return
+        flush_failed = False
         try:
             if raise_on_error:
                 self.flush()
+        except BaseException:
+            flush_failed = True
+            raise
         finally:
             self._window.clear()
             self._closed = True
-            self._writer._reset_view(suppress_errors=not raise_on_error)
+            self._writer._reset_view(suppress_errors=flush_failed or not raise_on_error)
         if raise_on_error and self._started:
             logger.info(
                 "Dynemb upload to FeatureStore completed: "

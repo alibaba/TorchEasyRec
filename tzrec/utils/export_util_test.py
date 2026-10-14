@@ -2834,6 +2834,25 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
 
         real_init = export_util.init_parameters
         real_empty_like = torch.empty_like
+        real_dense_export = export_util._export_dense_model_on_device
+
+        def guarded_dense_export(*args, **kwargs):
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        self.export_dir, "sparse", "sparse_embeddings-00-of-01.npz"
+                    )
+                )
+            )
+            uploader.start.assert_not_called()
+            real_dense_export(*args, **kwargs)
+
+        def start_upload(*args, **kwargs):
+            self.assertTrue(
+                os.path.exists(os.path.join(self.export_dir, "scripted_model.pt"))
+            )
+
+        uploader.start.side_effect = start_upload
 
         def guarded_init(module, device):
             self.assertEqual(
@@ -2858,6 +2877,11 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
                 export_util, "create_dataloader", return_value=iter([batch])
             ) as dataloader,
             mock.patch.object(export_util, "init_parameters", side_effect=guarded_init),
+            mock.patch.object(
+                export_util,
+                "_export_dense_model_on_device",
+                side_effect=guarded_dense_export,
+            ),
             mock.patch.object(torch, "empty_like", new=guarded_empty_like),
             mock.patch.object(
                 checkpoint_util, "restore_model", wraps=checkpoint_util.restore_model
@@ -2867,6 +2891,7 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
                 "DistributedModelParallel",
                 side_effect=AssertionError("dynamic tables must not be materialized"),
             ),
+            mock.patch.object(export_util.logger, "warning") as warning,
         ):
             if failure:
                 with self.assertRaisesRegex(RuntimeError, "upload failed"):
@@ -2906,11 +2931,22 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
                         len(expected_dynamic[name][0]) for name in dynamic_names
                     )
                 )
+                if case_name == "mixed_zch_upload":
+                    warning.assert_any_call(
+                        "FeatureStore full export uploads only native dynemb tables; "
+                        "ZCH tables remain NPZ-only: %s",
+                        ", ".join(sorted(expected_defaults)),
+                    )
             else:
                 uploader_class.assert_not_called()
 
         sparse_dir = os.path.join(self.export_dir, "sparse")
         if failure:
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")
+                )
+            )
             self.assertFalse(
                 os.path.exists(os.path.join(sparse_dir, "sparse_embedding.json"))
             )

@@ -9,6 +9,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import shutil
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +21,8 @@ import pyarrow as pa
 from parameterized import parameterized
 
 from tzrec.protos.train_pb2 import FeatureStoreConfig
-from tzrec.utils import feature_store_export_uploader
+from tzrec.utils import feature_store_export_uploader, quant_util
+from tzrec.utils.dynamic_embedding_export import get_dynamic_embedding_export
 from tzrec.utils.feature_store_delta_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
     FeatureStoreDeltaUploader,
@@ -31,7 +34,8 @@ from tzrec.utils.feature_store_delta_uploader_test import (
     _FakeView,
 )
 from tzrec.utils.feature_store_export_uploader import FeatureStoreExportUploader
-from tzrec.utils.test_util import parameterized_name_func
+from tzrec.utils.npz_util import savez_streaming
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 _TABLE_NAME = "model.ebc.embedding_bags.user_emb"
 
@@ -133,6 +137,75 @@ class FeatureStoreExportUploaderTest(unittest.TestCase):
         self.assertEqual(batch.column("embedding").type, pa.list_(pa.uint8()))
         np.testing.assert_array_equal(batch.column("embedding").to_pylist(), values)
         self.assertEqual(batch.column("embedding_name").to_pylist(), [_TABLE_NAME])
+
+    def test_quantized_checkpoint_upload_matches_npz(self):
+        test_dir = make_test_dir("quantized_export_upload_")
+        self.addCleanup(shutil.rmtree, test_dir)
+        directory = os.path.join(test_dir, "dynamicemb", "model.ebc")
+        os.makedirs(directory)
+        keys = np.array([-7, 2**60 + 1, 0], dtype=np.int64)
+        values = np.array([[-2.0, 2.0], [-1.0, 1.0], [0.25, 0.75]], dtype=np.float32)
+        for rank, rows in enumerate((slice(0, 2), slice(2, 3))):
+            for field, array in (
+                ("keys", keys),
+                ("values", values),
+                ("scores", np.arange(3, dtype=np.int64)),
+            ):
+                array[rows].tofile(
+                    os.path.join(
+                        directory, f"user_emb_emb_{field}.rank_{rank}.world_size_2"
+                    )
+                )
+        view = _FakeView(embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8)
+        uploader = self._uploader(
+            [view], embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_UINT8
+        )
+        arrays, metadata = get_dynamic_embedding_export(
+            test_dir,
+            {_TABLE_NAME: 2},
+            read_chunk_bytes=16,
+            quant_format="QUint8RowwiseF16",
+            on_values=uploader.write,
+        )
+        uploader.start(total_records=metadata[_TABLE_NAME]["shape"][0])
+        npz_path = os.path.join(test_dir, "export.npz")
+        savez_streaming(npz_path, arrays)
+        uploader.close()
+        self.assertEqual(len(view.arrow_calls), 3)
+        for call in view.arrow_calls:
+            self.assertEqual(
+                call["batch"].column("embedding").type, pa.list_(pa.uint8())
+            )
+            self.assertEqual(call["write_mode"], "OVERWRITE")
+            self.assertEqual(call["version"], "export_1")
+        uploaded_keys = [
+            key
+            for call in view.arrow_calls
+            for key in call["batch"].column("key_id").to_pylist()
+        ]
+        uploaded_values = np.array(
+            [
+                row
+                for call in view.arrow_calls
+                for row in call["batch"].column("embedding").to_pylist()
+            ],
+            dtype=np.uint8,
+        )
+        with np.load(npz_path) as exported:
+            np.testing.assert_array_equal(
+                uploaded_keys, exported[f"{_TABLE_NAME}.keys"]
+            )
+            np.testing.assert_array_equal(
+                uploaded_values, exported[f"{_TABLE_NAME}.values"]
+            )
+        np.testing.assert_array_equal(uploaded_keys, keys)
+        self.assertEqual(uploaded_values.shape, (3, 6))
+        np.testing.assert_allclose(
+            quant_util.dequantize_quint8_rowwise_f16(uploaded_values, emb_dim=2),
+            values,
+            atol=5e-3,
+        )
+        self.assertEqual(uploader._uploaded_records, 3)
 
     @parameterized.expand(
         [
@@ -267,16 +340,46 @@ class FeatureStoreExportUploaderTest(unittest.TestCase):
         uploader.close(raise_on_error=False)
 
     def test_close_failure_stops_retries(self):
-        first = _FakeView(summaries=[{}], close_error=RuntimeError("close failed"))
+        upload_error = RuntimeError("upload failed")
+        first = _FakeView(close_error=RuntimeError("close failed"))
+        first.write_flush = mock.Mock(side_effect=upload_error)
         uploader = self._uploader([first, _FakeView()], max_retries=2)
         uploader.start(total_records=1)
-        with self.assertRaisesRegex(FeatureStoreUploadError, "could not drain"):
+        with self.assertRaisesRegex(
+            FeatureStoreUploadError, "could not drain"
+        ) as error:
             uploader.write(
                 _TABLE_NAME,
                 np.array([1], dtype=np.int64),
                 np.ones((1, 2), dtype=np.float32),
             )
         self.assertEqual(uploader._writer._create_client.call_count, 1)
+        self.assertIs(error.exception.__cause__, upload_error)
+
+    @parameterized.expand(
+        [("upload", FeatureStoreUploadError), ("validation", ValueError)],
+        name_func=parameterized_name_func,
+    )
+    def test_close_preserves_flush_error_when_sdk_close_fails(self, _name, error_type):
+        view = _FakeView(close_error=RuntimeError("close failed"))
+        uploader = self._uploader([view])
+        uploader.start(total_records=1)
+        flush_error = error_type("original flush failure")
+        with (
+            mock.patch.object(uploader, "flush", side_effect=flush_error),
+            self.assertRaises(error_type) as error,
+        ):
+            uploader.close()
+        self.assertIs(error.exception, flush_error)
+        self.assertTrue(uploader._closed)
+        self.assertEqual(view.closed, [True])
+
+    def test_close_surfaces_sdk_failure_after_successful_flush(self):
+        view = _FakeView(close_error=RuntimeError("close failed"))
+        uploader = self._uploader([view])
+        uploader.start(total_records=1)
+        with self.assertRaisesRegex(FeatureStoreUploadError, "writer close failed"):
+            uploader.close()
 
     def test_blocking_flush_applies_backpressure(self):
         view = _FakeView()
