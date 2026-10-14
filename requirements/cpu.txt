@@ -1,1 +1,3 @@
+--find-links https://mirrors.aliyun.com/pytorch-wheels/cpu/
+--find-links https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/cpu/repo.html
 faiss-cpu
