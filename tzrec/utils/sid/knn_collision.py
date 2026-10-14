@@ -19,6 +19,7 @@ import numpy as np
 
 from tzrec.utils.logging_util import ProgressLogger
 from tzrec.utils.sid.collision import (
+    CandidateLastCodes,
     CollisionPlan,
     CollisionResolutionResult,
     CollisionResolver,
@@ -31,7 +32,7 @@ class KnnCollisionResolver(CollisionResolver):
     def resolve(
         self,
         plan: CollisionPlan,
-        candidate_last_codes: Optional[np.ndarray] = None,
+        candidate_last_codes: Optional[CandidateLastCodes] = None,
         collect_sid_metadata: bool = True,
     ) -> CollisionResolutionResult:
         """Greedily relocate overflow rows to their first free candidate slot.
@@ -43,8 +44,8 @@ class KnnCollisionResolver(CollisionResolver):
             plan: Grouping and overflow plan from
                 :func:`prepare_collision_plan`.
             candidate_last_codes: Last-layer candidate matrix with shape
-                ``(M, K)``, row-aligned with ``plan.overflow_rows``. It may be
-                omitted only when the plan has no overflow rows.
+                ``(M, K)``, row-aligned with ``plan.overflow_rows``, or their
+                loader. It may be omitted only without overflow.
             collect_sid_metadata: Whether to retain final SID metadata required
                 by :func:`build_resolved_sid_item_row_index`.
 

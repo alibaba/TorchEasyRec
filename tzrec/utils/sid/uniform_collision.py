@@ -16,6 +16,7 @@ from typing import Optional
 import numpy as np
 
 from tzrec.utils.sid.collision import (
+    CandidateLastCodes,
     CollisionPlan,
     CollisionResolutionResult,
     CollisionResolver,
@@ -44,14 +45,14 @@ class UniformCollisionResolver(CollisionResolver):
     overflow rows, so they cannot be moved.
     """
 
-    def is_requires_candidates(self) -> bool:
+    def requires_candidates(self) -> bool:
         """Return False because uniform placement needs no candidates."""
         return False
 
     def resolve(
         self,
         plan: CollisionPlan,
-        candidate_last_codes: Optional[np.ndarray] = None,
+        candidate_last_codes: Optional[CandidateLastCodes] = None,
         collect_sid_metadata: bool = True,
     ) -> CollisionResolutionResult:
         """Resolve overflow rows by least-loaded filling within each prefix.
@@ -88,9 +89,9 @@ class UniformCollisionResolver(CollisionResolver):
         fast_prefixes = np.flatnonzero(fits_empty)
         # uint64 modulus: a Python-int modulus would promote a uint64 scalar to float.
         rotations = (stable_order_hash(prefix_ids) % np.uint64(last_size)).astype(
-            np.int64
+            np.int32
         )
-        target_last_codes = np.empty(overflow_count, dtype=np.int64)
+        target_last_codes = np.empty(overflow_count, dtype=np.int32)
         target_slot_indices = np.empty(overflow_count, dtype=np.int64)
         fast_keys = np.empty(0, dtype=np.int64)
         # All overflow items fit in empty codes; use _get_empty_last_codes.
@@ -119,7 +120,7 @@ class UniformCollisionResolver(CollisionResolver):
             base_key = base_keys[prefix_index]
             initial_codes = (
                 initial_state.sid_keys[prefix_sid_start:prefix_sid_end] - base_key
-            )
+            ).astype(np.int32, copy=False)
             (
                 target_last_codes[row_start:row_end],
                 target_slot_indices[row_start:row_end],
@@ -197,8 +198,9 @@ class UniformCollisionResolver(CollisionResolver):
             np.arange(prefix_row_counts.shape[0], dtype=np.int64), scan_widths
         )
         codes = (
-            rotations[prefix_indices] + get_same_value_positions(prefix_indices)
-        ) % last_size
+            (rotations[prefix_indices] + get_same_value_positions(prefix_indices))
+            % last_size
+        ).astype(np.int32, copy=False)
         keys = base_keys[prefix_indices] + codes
         _, is_existing = find_in_sorted_array(initial_keys, keys)
         empty_code_positions = np.flatnonzero(~is_existing)
@@ -208,6 +210,29 @@ class UniformCollisionResolver(CollisionResolver):
             < prefix_row_counts[empty_prefix_indices]
         ]
         return codes[empty_code_positions], keys[empty_code_positions]
+
+    @staticmethod
+    def _get_fill_level(loads: np.ndarray, overflow_count: int) -> int:
+        """Find the last load level needed to place the overflow items.
+
+        Args:
+            loads: Current item count of each last-layer code in one prefix.
+            overflow_count: Number of items to place in this prefix.
+
+        Returns:
+            The smallest level where filling each lower load through
+            ``level + 1`` provides enough positions for all overflow items.
+        """
+        last_size = loads.size
+        low = int(loads.min())
+        high = int(loads.max()) + (overflow_count + last_size - 1) // last_size
+        while low < high:
+            middle = (low + high) // 2
+            if np.maximum(middle + 1 - loads, 0).sum() >= overflow_count:
+                high = middle
+            else:
+                low = middle + 1
+        return low
 
     @staticmethod
     def _water_fill(
@@ -238,15 +263,7 @@ class UniformCollisionResolver(CollisionResolver):
         loads = np.zeros(last_size, dtype=np.int64)
         loads[(initial_codes - rotation) % last_size] = initial_counts
 
-        low = int(loads.min())
-        high = int(loads.max()) + (overflow_count + last_size - 1) // last_size
-        while low < high:
-            middle = (low + high) // 2
-            if np.maximum(middle + 1 - loads, 0).sum() >= overflow_count:
-                high = middle
-            else:
-                low = middle + 1
-        level = low
+        level = UniformCollisionResolver._get_fill_level(loads, overflow_count)
         below = np.maximum(level - loads, 0)
         below_positions = np.flatnonzero(below)
         below_counts = below[below_positions]
@@ -266,8 +283,8 @@ class UniformCollisionResolver(CollisionResolver):
         target_positions = np.flatnonzero(added_item_counts)
         order = np.lexsort((pair_positions, pair_levels))
         return (
-            (pair_positions[order] + rotation) % last_size,
+            ((pair_positions[order] + rotation) % last_size).astype(np.int32),
             pair_levels[order] + 1,
-            (target_positions + rotation) % last_size,
+            ((target_positions + rotation) % last_size).astype(np.int32),
             added_item_counts[target_positions],
         )

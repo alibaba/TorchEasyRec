@@ -326,28 +326,26 @@ class CollisionResolutionRunner:
 
     def run(self) -> CollisionResolutionStats:
         """Read, resolve collisions, and publish the resulting generation."""
+        if not self._config.rate_only:
+            self._check_output_locations()
         item_ids, codes = self._load_codes()
         prior, existing_item_count = self._load_existing_sid_state(item_ids, codes)
         plan = prepare_collision_plan(
             item_ids, codes, self._config.collision_config, prior=prior
         )
-        candidate_last_codes = None
         has_overflow = bool(plan.overflow_rows.size)
-        if self._world_size > 1 and self._resolver.is_requires_candidates():
+        if self._world_size > 1 and self._resolver.requires_candidates():
             overflow_by_rank = [None] * self._world_size
             dist.all_gather_object(overflow_by_rank, has_overflow)
             has_overflow = any(overflow_by_rank)
-        if has_overflow and self._resolver.is_requires_candidates():
-            candidate_last_codes = self._load_candidate_last_codes(
-                plan.overflow_item_ids
-            )
         result = self._resolver.resolve(
             plan,
-            candidate_last_codes,
+            (lambda: self._load_candidate_last_codes(plan.overflow_item_ids))
+            if has_overflow and self._resolver.requires_candidates()
+            else None,
             collect_sid_metadata=not self._config.rate_only
             and bool(plan.overflow_rows.size),
         )
-        del candidate_last_codes
 
         if self._config.rate_only:
             logger.info("rate_only: skipping item_to_sid and sid_to_items writes")
@@ -421,6 +419,35 @@ class CollisionResolutionRunner:
                 "missing, because the readers cannot tell the two apart."
             )
 
+    def _check_output_locations(self) -> None:
+        """Reject nonempty local generation directories before any rank writes.
+
+        Rank 0 checks both output roots and broadcasts the result before a
+        writer can create directories or overwrite part files.
+        """
+        nonempty_paths: List[str] = []
+        if self._rank == 0:
+            generation_paths = set()
+            for artifact in (SID_TO_ITEMS_ARTIFACT, ITEM_TO_SID_ARTIFACT):
+                location = self._bundle.write_path(artifact)
+                if not is_odps_path(location):
+                    generation_paths.add(os.path.dirname(location))
+            nonempty_paths = [
+                path
+                for path in sorted(generation_paths)
+                if os.path.exists(path) and os.listdir(path)
+            ]
+        if self._world_size > 1:
+            check_result = [nonempty_paths]
+            dist.broadcast_object_list(check_result, src=0)
+            nonempty_paths = check_result[0]
+        if nonempty_paths:
+            raise ValueError(
+                f"generation output is not empty: {nonempty_paths}. "
+                "Use a new --generation or remove the incomplete generation "
+                "before retrying."
+            )
+
     def _make_reader(self, path: str, columns: List[str]) -> BaseReader:
         """Open a repository reader projecting ``columns``.
 
@@ -483,24 +510,20 @@ class CollisionResolutionRunner:
 
     @staticmethod
     def _convert_codes_to_numpy(values: pa.Array) -> np.ndarray:
-        """Decode an SID column into an ``(N, n_layers)`` int64 matrix."""
+        """Decode an SID column into an ``(N, n_layers)`` int32 matrix."""
         if _is_list_column(values):
             row_count = len(values)
-            flat = (
-                values.flatten()
-                .to_numpy(zero_copy_only=False)
-                .astype(np.int64, copy=False)
-            )
+            flat = pc.cast(values.flatten(), pa.int32()).to_numpy(zero_copy_only=False)
         elif pa.types.is_integer(values.type):
             return (
-                values.to_numpy(zero_copy_only=False)
-                .astype(np.int64, copy=False)
+                pc.cast(values, pa.int32())
+                .to_numpy(zero_copy_only=False)
                 .reshape(-1, 1)
             )
         else:
             parts = pc.split_pattern(values, ",")
             row_count = len(parts)
-            flat = pc.cast(parts.flatten(), pa.int64()).to_numpy(zero_copy_only=False)
+            flat = pc.cast(parts.flatten(), pa.int32()).to_numpy(zero_copy_only=False)
 
         layer_count = flat.shape[0] // row_count
         if flat.shape[0] != row_count * layer_count:
@@ -553,7 +576,7 @@ class CollisionResolutionRunner:
             code_batches.append(
                 self._convert_codes_to_numpy(batch[self._config.code_field])
                 if len(item_ids)
-                else np.empty((0, len(self._config.codebook)), dtype=np.int64)
+                else np.empty((0, len(self._config.codebook)), dtype=np.int32)
             )
 
         if not id_batches:
@@ -598,23 +621,34 @@ class CollisionResolutionRunner:
     def _load_candidate_last_codes(self, overflow_item_ids: np.ndarray) -> np.ndarray:
         """Load fixed-width candidates aligned to ``overflow_item_ids``."""
         columns = [self._config.item_id_field, self._config.candidate_codes_field]
-        # _iter_batches needs original SID codes to select this rank's prefixes.
+        # NOTE: Duplicate IDs in other ranks' prefixes must not supply candidates.
         if self._world_size > 1:
             columns.append(self._config.code_field)
         reader = self._make_reader(self._config.input_path, columns)
         item_count = overflow_item_ids.shape[0]
         if item_count == 0:
-            return np.empty((0, 0), dtype=np.int64)
+            return np.empty((0, 0), dtype=np.int32)
         item_lookup = _ItemIdLookup(overflow_item_ids)
         candidates: Optional[np.ndarray] = None
         seen = np.zeros(item_count, dtype=bool)
-        for batch in self._iter_batches(
-            reader, "Scanning candidate input", self._config.code_field
-        ):
+        for batch in self._iter_batches(reader, "Scanning candidate input"):
             batch_ids = batch[self._config.item_id_field].to_numpy(zero_copy_only=False)
             matching_batch_indices, overflow_item_indices = item_lookup.match(batch_ids)
             if matching_batch_indices.size == 0:
                 continue
+
+            if self._world_size > 1:
+                codes = self._convert_codes_to_numpy(
+                    pc.take(
+                        batch[self._config.code_field],
+                        pa.array(matching_batch_indices, type=pa.int64()),
+                    )
+                )
+                keep = self._get_prefix_mask(codes)
+                matching_batch_indices = matching_batch_indices[keep]
+                overflow_item_indices = overflow_item_indices[keep]
+                if matching_batch_indices.size == 0:
+                    continue
 
             batch_candidates = self._candidate_last_matrix(
                 pc.take(
@@ -624,7 +658,7 @@ class CollisionResolutionRunner:
             )
             if candidates is None:
                 candidates = np.empty(
-                    (item_count, batch_candidates.shape[1]), dtype=np.int64
+                    (item_count, batch_candidates.shape[1]), dtype=np.int32
                 )
             elif candidates.shape[1] != batch_candidates.shape[1]:
                 raise ValueError(
@@ -649,21 +683,30 @@ class CollisionResolutionRunner:
             )
         return candidates
 
-    def _offset_codes_column(self, codes: np.ndarray, is_csv: bool) -> pa.Array:
+    def _offset_codes_column(
+        self, codes: np.ndarray, writer_type: Optional[str]
+    ) -> pa.Array:
         """Encode an SID matrix shifted into one contiguous vocabulary."""
         return self._codes_column(
-            self._config.collision_config.offset_codes(codes), is_csv
+            self._config.collision_config.offset_codes(codes), writer_type
         )
 
-    def _align_codes_column(self, values: pa.Array, is_csv: bool) -> pa.Array:
+    def _align_codes_column(
+        self, values: pa.Array, writer_type: Optional[str]
+    ) -> pa.Array:
         """Return an SID column in the encoding the destination writer needs."""
-        if (
-            (pa.types.is_string(values.type) or pa.types.is_large_string(values.type))
-            if is_csv
-            else _is_list_column(values)
-        ):
-            return values
-        return self._codes_column(self._convert_codes_to_numpy(values), is_csv)
+        if writer_type == "CsvWriter":
+            if pa.types.is_string(values.type) or pa.types.is_large_string(values.type):
+                return values
+        elif _is_list_column(values):
+            codes_type = (
+                pa.list_(pa.int64())
+                if writer_type == "OdpsWriter"
+                else pa.large_list(pa.int64())
+            )
+            if values.type == codes_type:
+                return values
+        return self._codes_column(self._convert_codes_to_numpy(values), writer_type)
 
     def _check_prior_item_id_type(self, values: pa.Array) -> None:
         """Reject a published artifact whose item ID type differs from the input."""
@@ -785,10 +828,10 @@ class CollisionResolutionRunner:
         return pa.array(values, type=self._item_id_type)
 
     @staticmethod
-    def _codes_column(codes: np.ndarray, is_csv: bool) -> pa.Array:
+    def _codes_column(codes: np.ndarray, writer_type: Optional[str]) -> pa.Array:
         """Encode an SID matrix for the actual output writer."""
         row_count, layer_count = codes.shape
-        if is_csv:
+        if writer_type == "CsvWriter":
             values = pc.cast(pa.array(codes.reshape(-1)), pa.string())
             offsets = pa.array(
                 np.arange(
@@ -799,9 +842,14 @@ class CollisionResolutionRunner:
                 )
             )
             return pc.binary_join(pa.LargeListArray.from_arrays(offsets, values), ",")
+        codes_type = (
+            pa.list_(pa.int64())
+            if writer_type == "OdpsWriter"
+            else pa.large_list(pa.int64())
+        )
         return pa.FixedSizeListArray.from_arrays(
             pa.array(codes.reshape(-1)), layer_count
-        ).cast(pa.list_(pa.int64()))
+        ).cast(codes_type)
 
     def _copy_prior_item_to_sid_rows(self, writer: BaseWriter) -> int:
         """Copy every published item_to_sid row into the merged output.
@@ -815,7 +863,7 @@ class CollisionResolutionRunner:
             self._bundle.read_path(ITEM_TO_SID_ARTIFACT),
             ["item_id", "origin_codebook", "codebook", "index"],
         )
-        is_csv = self._resolved_writer_type == "CsvWriter"
+        writer_type = self._resolved_writer_type
         written = 0
         for batch in self._iter_batches(
             reader, "Copying published item_to_sid", "codebook"
@@ -826,11 +874,13 @@ class CollisionResolutionRunner:
                 {
                     "item_id": item_id_column,
                     "origin_codebook": self._align_codes_column(
-                        batch["origin_codebook"], is_csv
+                        batch["origin_codebook"], writer_type
                     ),
-                    "codebook": self._align_codes_column(batch["codebook"], is_csv),
+                    "codebook": self._align_codes_column(
+                        batch["codebook"], writer_type
+                    ),
                     "offset_codebook": self._offset_codes_column(
-                        self._convert_codes_to_numpy(batch["codebook"]), is_csv
+                        self._convert_codes_to_numpy(batch["codebook"]), writer_type
                     ),
                     "index": pc.cast(batch["index"], pa.int64()),
                 }
@@ -878,12 +928,12 @@ class CollisionResolutionRunner:
             )
         resolved_codes = origin_codes.copy()
         resolved_codes[:, -1] = result.resolved_last_codes
-        is_csv = self._resolved_writer_type == "CsvWriter"
+        writer_type = self._resolved_writer_type
         columns = {
             "item_id": self._item_id_array(item_ids),
-            "origin_codebook": self._codes_column(origin_codes, is_csv),
-            "codebook": self._codes_column(resolved_codes, is_csv),
-            "offset_codebook": self._offset_codes_column(resolved_codes, is_csv),
+            "origin_codebook": self._codes_column(origin_codes, writer_type),
+            "codebook": self._codes_column(resolved_codes, writer_type),
+            "offset_codebook": self._offset_codes_column(resolved_codes, writer_type),
             "index": pa.array(result.slot_indices, type=pa.int64()),
         }
         for item_writer in writers:
@@ -915,11 +965,13 @@ class CollisionResolutionRunner:
         self, writer: BaseWriter, sid_keys: np.ndarray, item_id_lists: pa.Array
     ) -> None:
         """Write one sid_to_items row per SID key, with its SID from the key."""
-        codes = np.stack(np.unravel_index(sid_keys, self._config.codebook), axis=1)
+        codes = np.stack(
+            np.unravel_index(sid_keys, self._config.codebook), axis=1
+        ).astype(np.int32)
         writer.write(
             {
-                "codebook": self._codes_column(codes, False),
-                "offset_codebook": self._offset_codes_column(codes, False),
+                "codebook": self._codes_column(codes, "ParquetWriter"),
+                "offset_codebook": self._offset_codes_column(codes, "ParquetWriter"),
                 "itemids": item_id_lists,
             }
         )
@@ -979,7 +1031,7 @@ class CollisionResolutionRunner:
             low = int(np.searchsorted(input_sid_keys, sid_keys[0], side="left"))
             write_new_sid_rows(cursor, low)
             high = int(np.searchsorted(input_sid_keys, sid_keys[-1], side="right"))
-            item_id_lists = pc.cast(batch["itemids"], input_item_id_lists.type)
+            item_id_lists = batch["itemids"]
             if low == high:
                 # No new SID in range: the merge would rebuild the batch.
                 self._write_sid_to_items_rows(writer, sid_keys, item_id_lists)
@@ -1037,19 +1089,19 @@ class CollisionResolutionRunner:
         self._bundle.rows[SID_TO_ITEMS_ARTIFACT] = sid_item_row_index.sid_keys.shape[0]
 
 
-def _item_lists(offsets: np.ndarray, ordered_item_ids: pa.Array) -> pa.ListArray:
+def _item_lists(offsets: np.ndarray, ordered_item_ids: pa.Array) -> pa.LargeListArray:
     """Wrap flat item IDs into one ``itemids`` list per SID."""
-    return pa.ListArray.from_arrays(
-        pa.array(offsets, type=pa.int32()), ordered_item_ids
+    return pa.LargeListArray.from_arrays(
+        pa.array(offsets, type=pa.int64()), ordered_item_ids
     )
 
 
 def _merge_sid_to_items(
     sid_keys: np.ndarray,
-    item_id_lists: pa.ListArray,
+    item_id_lists: pa.LargeListArray,
     input_sid_keys: np.ndarray,
-    input_item_id_lists: pa.ListArray,
-) -> Tuple[np.ndarray, pa.ListArray, np.ndarray]:
+    input_item_id_lists: pa.LargeListArray,
+) -> Tuple[np.ndarray, pa.LargeListArray, np.ndarray]:
     """Merge key-sorted published SIDs with input SIDs in their range.
 
     The stable sort keeps each side in slot order and lists a shared SID's

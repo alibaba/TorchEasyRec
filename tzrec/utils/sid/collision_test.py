@@ -152,15 +152,15 @@ class CollisionTest(unittest.TestCase):
             CollisionResolutionConfig(codebook, capacity)
 
     def test_prefix_key_near_int64_limit(self) -> None:
-        codebook_size = 3_037_000_499
+        codebook = (2**21 - 1, 2**21, 2**21)
         plan = _plan(
-            (codebook_size, codebook_size),
+            codebook,
             1,
             [0],
-            [[codebook_size - 1, codebook_size - 1]],
+            [[size - 1 for size in codebook]],
         )
 
-        np.testing.assert_array_equal(plan.sid_keys, [codebook_size**2 - 1])
+        np.testing.assert_array_equal(plan.sid_keys, [(2**21 - 1) * 2**42 - 1])
 
 
 class SidLayoutTest(unittest.TestCase):

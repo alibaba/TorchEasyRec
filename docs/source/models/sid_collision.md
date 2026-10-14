@@ -25,7 +25,7 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=8 \
 
 `--nproc_per_node=8` 由 torchrun 创建 8 个进程。工具依据 `RANK/WORLD_SIZE`，将 SID
 前缀空间划为连续区间，每个进程负责其中一个区间。同一前缀的全部 item 在同一个进程中
-消解，不会因输入文件或批次的边界而被拆开。不需要提前生成 16 个输入分区，也不需要
+消解，不会因输入文件或批次的边界而被拆开。无需提前拆分输入，也不需要
 额外的并发启动脚本。单进程使用 `--nproc_per_node=1`。
 
 当前各进程扫描完整输入批次，只保留自己负责的前缀；候选读取也只保留本进程的溢出
@@ -34,8 +34,16 @@ item。增加进程数可减少每个进程保留的数组，但不能保证读�
 
 各进程写出各自的 `part-*` 文件，rank 0 在全部写出完成后发布一个 `manifest.json`，
 其中的统计和产物行数是全局汇总值。所有进程必须能访问相同的输入和输出路径。
+manifest 先写入同目录临时文件，完整写入并关闭后再原子替换为正式文件；
+正式 `manifest.json` 出现才表示本代完成。
+
+写出前检查本次 generation 的本地目录，目录已有内容时直接报错，不覆盖或自动清理。
+检查同时覆盖 `output_path` 和本地 `item_to_sid_root`；不存在或为空的目标目录可以使用。
+追加的新 generation 可以与已有上一代共用输出根目录，`--rate_only` 不执行写出目录检查。
 
 ## 选择策略
+
+省略 `--strategy` 时默认使用 `candidate`。
 
 - `candidate`：按稳定 item 顺序，选择第一个仍有容量的候选末层码。
 - `iterative`：多轮提议和竞争，优先接收将目标 SID排在更靠前位置的 item。
@@ -63,6 +71,10 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
 每一代的 `item_to_sid` 和 `sid_to_items` 都是完整语料。追加还写出
 `delta_item_to_sid` 和 `delta_sid_to_items`，后者包含本次获得新 item 的完整 SID 分组，方便下游
 进行幂等更新。新 item ID 如果已存在于上一代，会报错。
+
+Parquet 产物的 SID 和 item ID 列表使用 Arrow `LargeList`，其 offsets 为 int64。
+列名和列表内容不变。CSV 仍输出列表字符串，
+ODPS 的 item 映射仍使用其支持的普通 `List`。`manifest.json` 的结构和 `save_type` 不变。
 
 `--rate_only` 计算全局统计并跳过产物写出，可用于比较不同策略。
 

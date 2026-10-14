@@ -274,7 +274,7 @@ class Bundle:
         item_id_type: Optional[str],
         writer_type: Optional[str],
     ) -> None:
-        """Write the manifest last and log its location.
+        """Write the manifest atomically after all artifacts and log its location.
 
         Its presence marks a completed generation, so write it after all artifacts.
 
@@ -312,6 +312,8 @@ class Bundle:
         )
         path = self._manifest_path(self._generation)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as handle:
+        temporary_path = path + ".tmp"
+        with open(temporary_path, "w") as handle:
             handle.write(manifest.to_json())
+        os.replace(temporary_path, path)
         logger.info("wrote bundle %s manifest to %s", self.uuid, path)

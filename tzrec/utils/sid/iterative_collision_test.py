@@ -51,8 +51,8 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         )
         candidates = np.asarray([[2, 3, 4], [3, 2, 2]], dtype=np.int64)
 
-        iterative = IterativeCollisionResolver().resolve(plan, candidates)
         first_fit = KnnCollisionResolver().resolve(plan, candidates)
+        iterative = IterativeCollisionResolver().resolve(plan, candidates)
 
         np.testing.assert_array_equal(
             iterative.resolved_last_codes[plan.overflow_rows], [4, 3]
@@ -65,14 +65,14 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         self.assertEqual(first_fit.stats.relocated_count, 1)
         self.assertEqual(first_fit.stats.unresolved_count, 1)
 
-    def test_origin_cap_limits_same_origin_proposals(self) -> None:
+    def test_origin_cap_limits_same_origin_requests(self) -> None:
         plan = _plan((4,), 1, [0, 10, 20, 30], [[1], [1], [1], [1]])
         np.testing.assert_array_equal(plan.overflow_rows, [0, 1, 2])
         candidates = np.asarray([[1, 0], [3, 1], [0, 2]], dtype=np.uint64)
 
         result = IterativeCollisionResolver().resolve(plan, candidates)
 
-        # Row 2 may not propose at position 0 behind row 1, so code 0 stays
+        # Row 2 cannot request position 0 behind row 1, so code 0 stays
         # free for row 0, whose only other candidate is its origin.
         np.testing.assert_array_equal(result.resolved_last_codes, [0, 3, 2, 1])
         self.assertEqual(result.stats.unresolved_count, 0)
@@ -190,10 +190,11 @@ class IterativeCollisionResolverTest(unittest.TestCase):
             [[0, 0], [0, 0], [1, 0], [1, 0]],
             prior=_prior([1, 6], [1, 1]),
         )
-        candidates = np.asarray([[1, 2], [2, 1]], dtype=np.int64)
+        candidates = np.asarray([[1, 2], [2, 1]], dtype=np.int32)
 
         result = IterativeCollisionResolver().resolve(plan, candidates)
 
+        np.testing.assert_array_equal(candidates, [[1, 2], [2, 1]])
         np.testing.assert_array_equal(
             result.resolved_last_codes[plan.overflow_rows], [2, 1]
         )
