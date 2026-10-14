@@ -2335,9 +2335,11 @@ def build_dense_graph_module(
     with torch.no_grad():
         model(data, device=device)
 
-    leaf_modules = _get_sparse_embedding_leaf_module_names(
-        model
-    ) + _get_dense_embedding_leaf_module_names(model)
+    leaf_modules = (
+        _get_sparse_embedding_leaf_module_names(model)
+        + _get_dense_embedding_leaf_module_names(model)
+        + _get_untraceable_leaf_module_names(model)
+    )
     tracer = Tracer(leaf_modules=leaf_modules)
     full_graph = tracer.trace(model)
 
