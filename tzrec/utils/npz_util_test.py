@@ -356,6 +356,26 @@ class NpzUtilTest(unittest.TestCase):
             self.assertEqual(zf.namelist(), [])
             self.assertIsNone(zf.testzip())
 
+    @parameterized.expand(
+        [
+            ("rows_2d", np.uint8, (7, 6), 3),
+            ("keys_1d", np.int64, (7,), 4),
+            ("single_batch", np.float32, (5, 2), 16),
+            ("empty", np.float32, (0, 2), 4),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_iter_npz_entry(self, _name, dtype, shape, batch_rows):
+        arr = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+        path = self._path()
+        npz_util.savez_streaming(path, {"other": np.ones(3), "emb.values": arr})
+        batches = list(npz_util.iter_npz_entry(path, "emb.values", batch_rows))
+        self.assertTrue(all(len(b) <= batch_rows for b in batches))
+        self.assertTrue(all(b.flags.writeable for b in batches))
+        result = np.concatenate(batches) if batches else np.empty(shape, dtype)
+        np.testing.assert_array_equal(result, arr)
+        self.assertEqual(result.dtype, arr.dtype)
+
 
 if __name__ == "__main__":
     unittest.main()
