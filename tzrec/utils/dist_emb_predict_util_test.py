@@ -129,29 +129,44 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_lookup_matches_reference(self, _name, quant) -> None:
+        # dyn, dyn2 and static merge into one host table (same dtype, dim and
+        # default row); zch keeps its own for its default row, small for its dim.
         dyn = _Table("model.ebc.dyn", 50, 8, quant, dynamic=True)
+        dyn2 = _Table("model.ebc.dyn2", 40, 8, quant, dynamic=True)
         zch = _Table("model.ebc.zch", 30, 8, quant, dynamic=True, default=True)
-        static = _Table("model.ebc.static", 20, 4, quant, dynamic=False)
+        static = _Table("model.ebc.static", 20, 8, quant, dynamic=False)
+        small = _Table("model.ebc.small", 10, 4, quant, dynamic=False)
+        tables = [dyn, dyn2, zch, static, small]
         features = {
             "a__ebc": {"embedding_name": dyn.name, "pooling": "SUM"},
             "b__ebc": {"embedding_name": zch.name, "pooling": "MEAN"},
             "c__ebc": {"embedding_name": static.name, "pooling": "SUM"},
+            "d__ebc": {"embedding_name": dyn2.name, "pooling": "MEAN"},
+            "e__ebc": {"embedding_name": dyn.name, "pooling": "SUM"},
+            "f__ebc": {"embedding_name": small.name, "pooling": "SUM"},
             "seq__ec": {"embedding_name": dyn.name, "pooling": "NONE"},
+            "seq2__ec": {"embedding_name": dyn2.name, "pooling": "NONE"},
         }
+        deep = ["a__ebc", "b__ebc", "c__ebc", "d__ebc", "e__ebc", "f__ebc"]
         dense_meta = {
-            "sequence__ec": ["seq__ec", "seq__lengths"],
-            "deep": ["a__ebc", "b__ebc", "c__ebc"],
+            "sequence__ec": ["seq__ec", "seq__lengths", "seq2__ec", "seq2__lengths"],
+            "deep": deep,
         }
-        _write_export(self.export_dir, [dyn, zch, static], features, dense_meta)
+        _write_export(self.export_dir, tables, features, dense_meta)
 
         bags = {
             "a": ([dyn.keys[0], -1, dyn.keys[3]], [], [_MISS_KEY, dyn.keys[7]]),
             "b": ([zch.keys[1], _MISS_KEY], [zch.keys[2]], []),
             "c": ([0, 19], [5], [3, 3, 3]),
+            # a key of dyn looked up in dyn2 must miss.
+            "d": ([dyn2.keys[4], dyn.keys[4]], [dyn2.keys[0]], [-1]),
+            "e": ([dyn.keys[9]], [dyn.keys[9], dyn.keys[1]], []),
+            "f": ([1], [], [9, 0]),
             "seq": ([dyn.keys[1], _MISS_KEY], [], [dyn.keys[2]]),
+            "seq2": ([dyn2.keys[1]], [dyn.keys[1], -1], [dyn2.keys[3]]),
         }
         # weighted features: "b" (MEAN divides the weighted sum by the bag length,
-        # as torchrec does) and "c" (SUM).
+        # as torchrec does) and "c" (SUM), each fused with unweighted features.
         weights = {
             "b": ([0.5, 2.0], [3.0], []),
             "c": ([1.0, -1.0], [0.25], [2.0, 1.0, 0.5]),
@@ -167,6 +182,8 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
 
         device = torch.device("cuda:0")
         lookup = DistributedEmbeddingLookup(self.export_dir, [device])
+        # merged dim-8 group (pooled + sequence), zch, small
+        self.assertEqual(len(lookup._layers[device]), 4)
         for _ in range(2):
             out = lookup(data, device)
 
@@ -184,6 +201,9 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
                     pooled(dyn, bags["a"], False),
                     pooled(zch, bags["b"], True, weights["b"]),
                     pooled(static, bags["c"], False, weights["c"]),
+                    pooled(dyn2, bags["d"], True),
+                    pooled(dyn, bags["e"], False),
+                    pooled(small, bags["f"], False),
                 ],
                 axis=1,
             )
@@ -196,6 +216,10 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             expected_seq = np.stack([dyn.lookup(k) for r in bags["seq"] for k in r])
             np.testing.assert_allclose(
                 out["seq"].cpu().numpy(), expected_seq, rtol=tol, atol=tol
+            )
+            expected_seq2 = np.stack([dyn2.lookup(k) for r in bags["seq2"] for k in r])
+            np.testing.assert_allclose(
+                out["seq2"].cpu().numpy(), expected_seq2, rtol=tol, atol=tol
             )
             self.assertEqual(out["seq__lengths"].dtype, torch.int32)
             self.assertEqual(out["seq__lengths"].tolist(), [2, 0, 1])
