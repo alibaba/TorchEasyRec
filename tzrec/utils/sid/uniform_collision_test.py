@@ -17,7 +17,7 @@ import numpy as np
 
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
-    PriorOccupancy,
+    ExistingSidState,
     build_resolved_sid_item_row_index,
     prepare_collision_plan,
     stable_order_hash,
@@ -25,17 +25,17 @@ from tzrec.utils.sid.collision import (
 from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 
 
-def _plan(codebook, capacity, item_ids, codes, prior=None):
+def _plan(codebook, capacity, item_ids, codes, existing_sid_state=None):
     return prepare_collision_plan(
         np.asarray(item_ids),
         np.asarray(codes, dtype=np.int64),
         CollisionResolutionConfig(codebook, capacity),
-        prior=prior,
+        existing_sid_state=existing_sid_state,
     )
 
 
-def _prior(keys, counts):
-    return PriorOccupancy(
+def _existing_sid_state(keys, counts):
+    return ExistingSidState(
         np.asarray(keys, dtype=np.int64), np.asarray(counts, dtype=np.int64)
     )
 
@@ -61,7 +61,8 @@ def _reference(plan, codes, item_ids):
             key = prefix * last_size + int(codes[row][-1])
             loads[key] = loads.get(key, 0) + 1
     for key, count in zip(
-        plan.prior.sid_keys.tolist(), plan.prior.item_counts.tolist()
+        plan.existing_sid_state.sid_keys.tolist(),
+        plan.existing_sid_state.item_counts.tolist(),
     ):
         loads[key] = loads.get(key, 0) + count
     hashes = stable_order_hash(np.asarray(item_ids)).tolist()
@@ -98,18 +99,29 @@ class UniformCollisionResolverTest(unittest.TestCase):
                 ],
                 axis=1,
             )
-            prior = None
+            existing_sid_state = None
             if trial % 3 == 0:
                 keys = np.unique(rng.integers(0, codebook[0] * last_size, 4))
-                prior = _prior(keys, rng.integers(1, capacity + 3, keys.shape[0]))
+                existing_sid_state = _existing_sid_state(
+                    keys, rng.integers(1, capacity + 3, keys.shape[0])
+                )
             item_ids = np.arange(item_count) * 7 + 1000
-            plan = _plan(codebook, capacity, item_ids, codes, prior=prior)
+            plan = _plan(
+                codebook,
+                capacity,
+                item_ids,
+                codes,
+                existing_sid_state=existing_sid_state,
+            )
 
             result = UniformCollisionResolver().resolve(plan)
             expected_codes, expected_slots, loads = _reference(plan, codes, item_ids)
             origin_keys = plan.config.convert_codes_to_sid_keys(codes).tolist()
             published = dict(
-                zip(plan.prior.sid_keys.tolist(), plan.prior.item_counts.tolist())
+                zip(
+                    plan.existing_sid_state.sid_keys.tolist(),
+                    plan.existing_sid_state.item_counts.tolist(),
+                )
             )
             overflow_prefixes = {
                 origin_keys[row] // last_size for row in plan.overflow_rows.tolist()

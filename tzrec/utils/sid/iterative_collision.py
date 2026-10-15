@@ -258,9 +258,8 @@ class IterativeCollisionResolver(CollisionResolver):
             array([1, 2, 0])
         """
         item_priority = np.empty(overflow_rows.size, dtype=np.int64)
-        item_priority[
-            np.lexsort((overflow_rows, stable_order_hash(overflow_item_ids)))
-        ] = np.arange(overflow_rows.size)
+        sort_indices = np.lexsort((overflow_rows, stable_order_hash(overflow_item_ids)))
+        item_priority[sort_indices] = np.arange(overflow_rows.size)
         return item_priority
 
     def _select_target_sids(

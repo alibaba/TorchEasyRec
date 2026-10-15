@@ -16,7 +16,7 @@ from parameterized import parameterized
 
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
-    PriorOccupancy,
+    ExistingSidState,
     build_origin_sid_item_row_index,
     build_resolved_sid_item_row_index,
     prepare_collision_plan,
@@ -25,17 +25,17 @@ from tzrec.utils.sid.knn_collision import KnnCollisionResolver
 from tzrec.utils.test_util import parameterized_name_func
 
 
-def _plan(codebook, capacity, item_ids, codes, prior=None):
+def _plan(codebook, capacity, item_ids, codes, existing_sid_state=None):
     return prepare_collision_plan(
         np.asarray(item_ids, dtype=np.int64),
         np.asarray(codes, dtype=np.int64),
         CollisionResolutionConfig(codebook, capacity),
-        prior=prior,
+        existing_sid_state=existing_sid_state,
     )
 
 
-def _prior(keys, counts):
-    return PriorOccupancy(
+def _existing_sid_state(keys, counts):
+    return ExistingSidState(
         np.asarray(keys, dtype=np.int64), np.asarray(counts, dtype=np.int64)
     )
 
@@ -249,7 +249,9 @@ class KnnCollisionResolverTest(unittest.TestCase):
     def test_prior_over_capacity_never_reissues_a_published_slot(self) -> None:
         # A previous run left three items on key 0 at capacity 1 (unresolved
         # overflow). The new row cannot relocate, so it must land at slot 4.
-        plan = _plan((2, 4), 1, [10], [[0, 0]], prior=_prior([0], [3]))
+        plan = _plan(
+            (2, 4), 1, [10], [[0, 0]], existing_sid_state=_existing_sid_state([0], [3])
+        )
         result = KnnCollisionResolver().resolve(plan, np.asarray([[0]], dtype=np.int64))
         self.assertEqual(result.stats.unresolved_count, 1)
         self.assertEqual(int(result.slot_indices[0]), 4)
@@ -257,7 +259,13 @@ class KnnCollisionResolverTest(unittest.TestCase):
     def test_relocation_sees_prior_only_sids_in_the_prefix(self) -> None:
         # Key 0 is full, and key 1 -- in the same prefix but holding no new row --
         # is already full too. The only free candidate is key 2.
-        plan = _plan((1, 4), 1, [10], [[0, 0]], prior=_prior([0, 1], [1, 1]))
+        plan = _plan(
+            (1, 4),
+            1,
+            [10],
+            [[0, 0]],
+            existing_sid_state=_existing_sid_state([0, 1], [1, 1]),
+        )
         result = KnnCollisionResolver().resolve(
             plan, np.asarray([[1, 2]], dtype=np.int64)
         )

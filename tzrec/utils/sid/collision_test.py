@@ -17,7 +17,7 @@ from parameterized import parameterized
 
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
-    PriorOccupancy,
+    ExistingSidState,
     build_origin_sid_item_row_index,
     build_resolved_sid_item_row_index,
     prepare_collision_plan,
@@ -28,17 +28,17 @@ from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 from tzrec.utils.test_util import parameterized_name_func
 
 
-def _plan(codebook, capacity, item_ids, codes, prior=None):
+def _plan(codebook, capacity, item_ids, codes, existing_sid_state=None):
     return prepare_collision_plan(
         np.asarray(item_ids, dtype=np.int64),
         np.asarray(codes, dtype=np.int64),
         CollisionResolutionConfig(codebook, capacity),
-        prior=prior,
+        existing_sid_state=existing_sid_state,
     )
 
 
-def _prior(keys, counts):
-    return PriorOccupancy(
+def _existing_sid_state(keys, counts):
+    return ExistingSidState(
         np.asarray(keys, dtype=np.int64), np.asarray(counts, dtype=np.int64)
     )
 
@@ -189,27 +189,38 @@ class SidLayoutTest(unittest.TestCase):
         np.testing.assert_array_equal(config.offset_codes(codes), offset_codes)
 
 
-class PriorOccupancyTest(unittest.TestCase):
+class ExistingSidStateTest(unittest.TestCase):
     def test_counts_for_returns_zero_for_absent_sids(self) -> None:
-        prior = _prior([2, 5, 9], [1, 4, 2])
+        existing_sid_state = _existing_sid_state([2, 5, 9], [1, 4, 2])
         np.testing.assert_array_equal(
-            prior.counts_for(np.asarray([9, 0, 5, 100, 2])), [2, 0, 4, 0, 1]
+            existing_sid_state.counts_for(np.asarray([9, 0, 5, 100, 2])),
+            [2, 0, 4, 0, 1],
         )
 
     def test_restrict_to_prefixes_keeps_only_requested_prefixes(self) -> None:
         # last_size 4 -> prefix 0 spans keys 0..3, prefix 2 spans keys 8..11.
-        prior = _prior([0, 3, 5, 9, 11, 12], [1, 2, 3, 4, 5, 6])
-        restricted = prior.restrict_to_prefixes(np.asarray([0, 2]), 4)
+        existing_sid_state = _existing_sid_state(
+            [0, 3, 5, 9, 11, 12], [1, 2, 3, 4, 5, 6]
+        )
+        restricted = existing_sid_state.restrict_to_prefixes(np.asarray([0, 2]), 4)
         np.testing.assert_array_equal(restricted.sid_keys, [0, 3, 9, 11])
         np.testing.assert_array_equal(restricted.item_counts, [1, 2, 4, 5])
-        self.assertTrue(prior.restrict_to_prefixes(np.asarray([7]), 4).is_empty)
+        self.assertTrue(
+            existing_sid_state.restrict_to_prefixes(np.asarray([7]), 4).is_empty
+        )
 
 
 class AppendPlanTest(unittest.TestCase):
-    def test_prior_consumes_capacity_and_continues_slots(self) -> None:
+    def test_existing_state_consumes_capacity_and_continues_slots(self) -> None:
         # SID (0, 0) is key 0 and already holds one published item, so with
         # capacity 2 only one of the two new rows can be retained there.
-        plan = _plan((2, 4), 2, [10, 11], [[0, 0], [0, 0]], prior=_prior([0], [1]))
+        plan = _plan(
+            (2, 4),
+            2,
+            [10, 11],
+            [[0, 0], [0, 0]],
+            existing_sid_state=_existing_sid_state([0], [1]),
+        )
         np.testing.assert_array_equal(plan.existing_item_counts, [1])
         self.assertEqual(plan.overflow_rows.size, 1)
         retained = int(np.setdiff1d(np.arange(2), plan.overflow_rows)[0])
@@ -217,7 +228,9 @@ class AppendPlanTest(unittest.TestCase):
         self.assertEqual(int(plan.initial_slot_indices[retained]), 2)
 
     def test_final_counts_are_corpus_totals(self) -> None:
-        plan = _plan((2, 4), 3, [10], [[0, 0]], prior=_prior([0], [2]))
+        plan = _plan(
+            (2, 4), 3, [10], [[0, 0]], existing_sid_state=_existing_sid_state([0], [2])
+        )
         result = KnnCollisionResolver().resolve(plan, None)
         self.assertEqual(plan.overflow_rows.size, 0)
         np.testing.assert_array_equal(result.final_sid_keys, [0])
@@ -225,8 +238,10 @@ class AppendPlanTest(unittest.TestCase):
         self.assertEqual(result.stats.max_final_items_per_sid, 3)
 
     def test_sid_item_row_indices_cover_only_the_appended_rows(self) -> None:
-        prior = _prior([0], [1])
-        plan = _plan((2, 4), 3, [10, 11], [[0, 0], [0, 1]], prior=prior)
+        existing_sid_state = _existing_sid_state([0], [1])
+        plan = _plan(
+            (2, 4), 3, [10, 11], [[0, 0], [0, 1]], existing_sid_state=existing_sid_state
+        )
         result = KnnCollisionResolver().resolve(plan, None)
 
         resolved = build_resolved_sid_item_row_index(plan, result)
@@ -244,9 +259,15 @@ class AppendPlanTest(unittest.TestCase):
         np.testing.assert_array_equal(np.sort(origin.item_row_indices), [0, 1])
         self.assertEqual(int(origin.item_counts.sum()), 2)
 
-    def test_rejects_prior_outside_the_key_space(self) -> None:
+    def test_rejects_existing_state_outside_the_key_space(self) -> None:
         with self.assertRaisesRegex(ValueError, "outside the key space"):
-            _plan((2, 4), 2, [10], [[0, 0]], prior=_prior([8], [1]))
+            _plan(
+                (2, 4),
+                2,
+                [10],
+                [[0, 0]],
+                existing_sid_state=_existing_sid_state([8], [1]),
+            )
 
 
 if __name__ == "__main__":

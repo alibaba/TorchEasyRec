@@ -15,7 +15,7 @@ import numpy as np
 
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
-    PriorOccupancy,
+    ExistingSidState,
     build_resolved_sid_item_row_index,
     prepare_collision_plan,
 )
@@ -23,17 +23,17 @@ from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
 from tzrec.utils.sid.knn_collision import KnnCollisionResolver
 
 
-def _plan(codebook, capacity, item_ids, codes, prior=None):
+def _plan(codebook, capacity, item_ids, codes, existing_sid_state=None):
     return prepare_collision_plan(
         np.asarray(item_ids),
         np.asarray(codes, dtype=np.int64),
         CollisionResolutionConfig(codebook, capacity),
-        prior=prior,
+        existing_sid_state=existing_sid_state,
     )
 
 
-def _prior(keys, counts):
-    return PriorOccupancy(
+def _existing_sid_state(keys, counts):
+    return ExistingSidState(
         np.asarray(keys, dtype=np.int64), np.asarray(counts, dtype=np.int64)
     )
 
@@ -103,7 +103,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
             1,
             [10],
             [[0]],
-            prior=_prior(np.arange(200), np.ones(200)),
+            existing_sid_state=_existing_sid_state(np.arange(200), np.ones(200)),
         )
         candidates = np.arange(1, 201, dtype=np.int64)[None, :]
 
@@ -166,7 +166,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
             2,
             [10, 11],
             [[0], [0]],
-            prior=_prior([0, 1], [3, 1]),
+            existing_sid_state=_existing_sid_state([0, 1], [3, 1]),
         )
         candidates = np.asarray([[1, 2], [1, 2]], dtype=np.int64)
 
@@ -188,7 +188,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
             1,
             [10, 11, 20, 21],
             [[0, 0], [0, 0], [1, 0], [1, 0]],
-            prior=_prior([1, 6], [1, 1]),
+            existing_sid_state=_existing_sid_state([1, 6], [1, 1]),
         )
         candidates = np.asarray([[1, 2], [2, 1]], dtype=np.int32)
 

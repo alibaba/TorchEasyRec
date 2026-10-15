@@ -59,62 +59,66 @@ class KnnCollisionResolver(CollisionResolver):
                 not a row-aligned two-dimensional matrix, or contain
                 out-of-range last-layer indices.
         """
-        candidates = self._validate_candidate_last_codes(plan, candidate_last_codes)
+        candidate_last_codes = self._validate_candidate_last_codes(
+            plan, candidate_last_codes
+        )
         initial_state, result = self._prepare_collision(plan, collect_sid_metadata)
         if result is not None:
             return result
 
-        target_last_codes = plan.origin_last_codes.copy()
-        target_slot_indices = plan.initial_slot_indices.copy()
+        resolved_last_codes = plan.origin_last_codes.copy()
+        final_slot_indices = plan.initial_slot_indices.copy()
         unresolved_rows = []
-        occupancy = dict(
+        sid_item_counts = dict(
             zip(initial_state.sid_keys.tolist(), initial_state.item_counts.tolist())
         )
         capacity = plan.config.capacity
-        last_size = plan.config.codebook[-1]
+        last_codebook_size = plan.config.codebook[-1]
         progress = ProgressLogger(
             "Resolving collision overflow",
             start_n=0,
             miniters=self._progress_interval,
         )
 
-        for resolved_count, (
+        for processed_item_count, (
             row,
-            base_key,
+            prefix_base_key,
             origin_last_code,
-            candidate_row,
+            item_candidate_last_codes,
         ) in enumerate(
             zip(
                 plan.overflow_rows,
-                plan.overflow_prefix_ids * last_size,
+                plan.overflow_prefix_ids * last_codebook_size,
                 plan.origin_last_codes[plan.overflow_rows],
-                candidates,
+                candidate_last_codes,
             ),
             start=1,
         ):
-            for candidate in candidate_row:
-                destination_key = base_key + candidate
-                destination_occupancy = occupancy.get(destination_key, 0)
-                if destination_occupancy < capacity:
-                    occupancy[destination_key] = destination_occupancy + 1
-                    target_last_codes[row] = candidate
-                    target_slot_indices[row] = destination_occupancy + 1
+            for candidate_last_code in item_candidate_last_codes:
+                target_sid_key = prefix_base_key + candidate_last_code
+                target_sid_item_count = sid_item_counts.get(target_sid_key, 0)
+                if target_sid_item_count < capacity:
+                    sid_item_counts[target_sid_key] = target_sid_item_count + 1
+                    resolved_last_codes[row] = candidate_last_code
+                    final_slot_indices[row] = target_sid_item_count + 1
                     break
             else:
                 unresolved_rows.append(row)
-                origin_key = base_key + origin_last_code
-                origin_occupancy = occupancy.get(origin_key, 0) + 1
-                occupancy[origin_key] = origin_occupancy
-                target_slot_indices[row] = origin_occupancy
-            progress.log(resolved_count)
+                origin_sid_key = prefix_base_key + origin_last_code
+                origin_sid_item_count = sid_item_counts.get(origin_sid_key, 0) + 1
+                sid_item_counts[origin_sid_key] = origin_sid_item_count
+                final_slot_indices[row] = origin_sid_item_count
+            progress.log(processed_item_count)
 
         return self._build_result(
             plan,
-            target_last_codes,
-            target_slot_indices,
+            resolved_last_codes,
+            final_slot_indices,
             np.asarray(unresolved_rows, dtype=np.int64),
             initial_state,
-            np.fromiter(occupancy, dtype=np.int64, count=len(occupancy)),
-            np.fromiter(occupancy.values(), dtype=np.int64, count=len(occupancy)),
+            np.fromiter(sid_item_counts, dtype=np.int64, count=len(sid_item_counts)),
+            np.fromiter(
+                sid_item_counts.values(), dtype=np.int64, count=len(sid_item_counts)
+            ),
             collect_sid_metadata,
         )
