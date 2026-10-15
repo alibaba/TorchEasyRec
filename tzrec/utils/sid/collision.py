@@ -105,8 +105,10 @@ def find_in_sorted_array(
         >>> insert_positions, is_existing = find_in_sorted_array(
         ...     np.array([10, 20, 40]), np.array([20, 30, 50])
         ... )
-        >>> insert_positions: array([1, 2, 3])
-        >>> is_existing: array([ True, False, False])
+        >>> insert_positions
+        array([1, 2, 3])
+        >>> is_existing
+        array([ True, False, False])
     """
     insert_positions = np.searchsorted(sorted_keys, keys)
     is_existing = insert_positions < sorted_keys.shape[0]
@@ -270,7 +272,7 @@ class CollisionResolutionStats:
 
 @dataclass(frozen=True)
 class CollisionResolutionResult:
-    """Resolved last codes, slot indexes, and diagnostics."""
+    """Resolved last codes, slot indices, and diagnostics."""
 
     resolved_last_codes: np.ndarray
     slot_indices: np.ndarray
@@ -353,7 +355,7 @@ class CollisionResolver(ABC):
             plan: Grouping and overflow plan from
                 :func:`prepare_collision_plan`.
             candidate_last_codes: Optional strategy-specific candidate last
-                codes,.
+                codes.
             collect_sid_metadata: Whether to retain final SID metadata required
                 by :func:`build_resolved_sid_item_row_index`.
 

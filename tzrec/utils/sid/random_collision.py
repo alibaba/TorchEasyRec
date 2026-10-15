@@ -50,8 +50,8 @@ class RandomCollisionResolver(KnnCollisionResolver):
         """Generate deterministic full-space random candidate draws.
 
         Sampling is with replacement and includes each item's original code
-        because that code is not an input to this method. The placement step
-        skips an origin draw without replacing it, preserving current behavior.
+        because that code is not an input to this method. The origin SID is
+        already full, so an origin draw cannot place the item and is not replaced.
 
         Args:
             item_ids: One-dimensional IDs for the overflow rows.
@@ -88,7 +88,7 @@ class RandomCollisionResolver(KnnCollisionResolver):
                 :func:`prepare_collision_plan`.
             candidate_last_codes: Must be ``None`` because this strategy generates
                 its own candidates.
-            collect_sid_metadata: Whether to retain final bucket metadata.
+            collect_sid_metadata: Whether to retain final SID metadata.
 
         Returns:
             Resolved last-layer codes, slot indices, and diagnostics.

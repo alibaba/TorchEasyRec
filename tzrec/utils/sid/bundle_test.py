@@ -12,6 +12,7 @@
 import json
 import os
 import unittest
+from unittest import mock
 
 from parameterized import parameterized
 
@@ -198,6 +199,19 @@ class BundleTest(unittest.TestCase):
                 },
             ),
         )
+
+    def test_failed_manifest_replace_does_not_mark_generation_complete(self) -> None:
+        layout = bundle.Bundle(self.test_dir, "./map", "v1", None)
+        path = bundle.manifest_path(self.test_dir, "v1")
+        with mock.patch.object(
+            bundle.os, "replace", side_effect=OSError("manifest replace failed")
+        ):
+            with self.assertRaisesRegex(OSError, "manifest replace failed"):
+                layout.write_manifest([8, 8], 5, 3, "int64", "ParquetWriter")
+
+        self.assertEqual(bundle.read_manifest(path + ".tmp").bundle_uuid, layout.uuid)
+        with self.assertRaisesRegex(FileNotFoundError, "did not finish"):
+            bundle.read_manifest(path)
 
 
 class BundleManifestTest(unittest.TestCase):

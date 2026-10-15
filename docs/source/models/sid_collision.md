@@ -50,7 +50,8 @@ PYTHONPATH=. python -m tzrec.tools.sid.resolve_sid_collisions \
 
 省略 `--strategy` 时默认使用 `candidate`。
 
-- `candidate`：按稳定的物品顺序，选择第一个仍有容量的候选末层码。
+- `candidate`：先按原 SID 键、再按物品哈希的确定性顺序处理溢出物品，
+  为每个物品选择第一个仍有容量的候选末层码。
 - `random`：无需模型候选，为溢出物品生成确定性的随机末层码候选，再按相同的规则分配。
   `--random_num_candidates` 控制每个溢出物品的抽样次数，默认 64，最多为末层码本大小减一。
   抽样允许重复，命中原码或重复候选时不补抽，因此前缀有剩余容量也可能无法分配。
@@ -60,6 +61,8 @@ PYTHONPATH=. python -m tzrec.tools.sid.resolve_sid_collisions \
 ## 产物与限制
 
 产物位于 `<output_path>/<generation>/<artifact>`，`manifest.json` 在全部产物写出后生成。
+manifest 先写入同目录临时文件，完整写入并关闭后再原子替换为正式文件；
+正式 `manifest.json` 出现才表示本代完成。
 `item_to_sid` 默认使用输入格式，可通过 `--item_to_sid_writer_type` 指定格式，或通过
 `--item_to_sid_root` 指定独立存储位置。`sid_to_items` 始终使用 Parquet，保留原生列表。
 

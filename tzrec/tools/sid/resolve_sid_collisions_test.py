@@ -781,6 +781,11 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(len(merged), 4)
         self.assertEqual(merged[0], ((0, 0), (0, 0), 1))
         self.assertEqual(merged[10], ((0, 0), (0, 0), 2))
+        item_to_sid = self._read(out, ITEM_TO_SID, "v2")
+        offset_codes_by_item_id = dict(
+            zip(item_to_sid["item_id"], item_to_sid["offset_codebook"])
+        )
+        self.assertEqual(offset_codes_by_item_id[1], [1, 9])
         self._assert_dense_indices(out, "v2")
         self._assert_item_to_sid_matches_sid_to_items(out, "v2")
 

@@ -28,8 +28,8 @@ run split by the ``--codebook`` length. ``sid_to_items`` is always parquet, so
 it keeps native list columns whatever ``--item_to_sid_writer_type`` says.
 
 The random strategy intentionally preserves the legacy deterministic baseline:
-it draws with replacement from the full last-layer space. Placement skips an
-item's origin, so an origin draw or a duplicate draw is not replaced.
+it draws with replacement from the full last-layer space. An item's origin SID
+is already full; origin draws and duplicate draws are not replaced.
 
 Both item_to_sid and sid_to_items carry an ``offset_codebook`` column
 alongside ``codebook``: the same SID with each layer shifted into one
@@ -798,8 +798,8 @@ class CollisionResolutionRunner:
             item_ids: Input item IDs in original row order.
             origin_codes: Their SID matrix before relocation.
             result: Resolved last-layer codes and slots of those rows.
-            existing_item_count: Number of existing items in this rank's prefix
-                range, which the copied item_to_sid rows must match.
+            existing_item_count: Total item count of the published generation,
+                which the copied item_to_sid rows must match.
 
         Raises:
             ValueError: If the published item_to_sid and sid_to_items disagree.
