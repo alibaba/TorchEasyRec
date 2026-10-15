@@ -83,11 +83,9 @@ def _item_to_sid_parquet(path, rows):
             {
                 "item_id": pa.array([r[0] for r in rows], type=pa.int64()),
                 "origin_codebook": pa.array(
-                    [r[1] for r in rows], type=pa.large_list(pa.int64())
+                    [r[1] for r in rows], type=pa.list_(pa.int64())
                 ),
-                "codebook": pa.array(
-                    [r[2] for r in rows], type=pa.large_list(pa.int64())
-                ),
+                "codebook": pa.array([r[2] for r in rows], type=pa.list_(pa.int64())),
                 "index": pa.array([r[3] for r in rows], type=pa.int64()),
             }
         ),
@@ -100,12 +98,8 @@ def _sid_to_items_parquet(path, rows):
         path,
         pa.table(
             {
-                "codebook": pa.array(
-                    [r[0] for r in rows], type=pa.large_list(pa.int64())
-                ),
-                "itemids": pa.array(
-                    [r[1] for r in rows], type=pa.large_list(pa.int64())
-                ),
+                "codebook": pa.array([r[0] for r in rows], type=pa.list_(pa.int64())),
+                "itemids": pa.array([r[1] for r in rows], type=pa.list_(pa.int64())),
             }
         ),
     )
@@ -600,7 +594,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         else:
             item_map = parquet.read_table(self._part(out, ITEM_TO_SID))
             sids = [[3, 3, 0], [3, 3, 1], [3, 3, 2]]
-            sid_type = pa.large_list(pa.int64())
+            sid_type = pa.list_(pa.int64())
         for column in ("origin_codebook", "codebook", "offset_codebook"):
             self.assertEqual(item_map.schema.field(column).type, sid_type)
         self.assertCountEqual(item_map["codebook"].to_pylist(), sids)
@@ -611,7 +605,34 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertCountEqual(sum(resolved["itemids"], []), item_ids)
         sid_schema = parquet.read_schema(self._part(out, SID_TO_ITEMS))
         for column in ("codebook", "offset_codebook"):
-            self.assertEqual(sid_schema.field(column).type, pa.large_list(pa.int64()))
+            self.assertEqual(sid_schema.field(column).type, pa.list_(pa.int64()))
+
+    @parameterized.expand(
+        [("parquet", "ParquetWriter"), ("csv", "CsvWriter"), ("odps", "OdpsWriter")],
+        name_func=parameterized_name_func,
+    )
+    def test_codes_reject_int32_offset_overflow(self, _name, writer_type) -> None:
+        codes = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 6):
+            column = CollisionResolutionRunner._codes_column(codes, writer_type)
+        self.assertEqual(
+            column.to_pylist(),
+            ["0,1,2", "3,4,5"] if writer_type == "CsvWriter" else codes.tolist(),
+        )
+        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 5):
+            with self.assertRaisesRegex(ValueError, "int32 offset limit"):
+                CollisionResolutionRunner._codes_column(codes, writer_type)
+
+    def test_item_lists_reject_int32_offset_overflow(self) -> None:
+        offsets = np.array([0, 3, 6], dtype=np.int64)
+        item_ids = pa.array([0, 1, 2, 3, 4, 5])
+        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 6):
+            lists = resolve_sid_collisions._item_lists(offsets, item_ids)
+        self.assertEqual(lists.to_pylist(), [[0, 1, 2], [3, 4, 5]])
+        self.assertEqual(lists.offsets.type, pa.int32())
+        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 5):
+            with self.assertRaisesRegex(ValueError, "int32 offset limit"):
+                resolve_sid_collisions._item_lists(offsets, item_ids)
 
     def test_preserves_item_id_type(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -626,9 +647,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         schema = parquet.read_schema(self._part(out, ITEM_TO_SID))
         self.assertEqual(schema.field("item_id").type, pa.large_string())
         sid_schema = parquet.read_schema(self._part(out, SID_TO_ITEMS))
-        self.assertEqual(
-            sid_schema.field("itemids").type, pa.large_list(pa.large_string())
-        )
+        self.assertEqual(sid_schema.field("itemids").type, pa.list_(pa.large_string()))
 
     @parameterized.expand(
         [
@@ -678,8 +697,8 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             call.args[0] for call in make_writer.return_value.write.call_args_list
         ]
         for column in ("codebook", "offset_codebook"):
-            self.assertEqual(sid_columns[column].type, pa.large_list(pa.int64()))
-        self.assertEqual(sid_columns["itemids"].type, pa.large_list(pa.int64()))
+            self.assertEqual(sid_columns[column].type, pa.list_(pa.int64()))
+        self.assertEqual(sid_columns["itemids"].type, pa.list_(pa.int64()))
         for column in ("origin_codebook", "codebook", "offset_codebook"):
             self.assertEqual(item_columns[column].type, pa.list_(pa.int64()))
 
@@ -836,7 +855,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             schema = parquet.read_schema(self._part(out, artifact, "v2"))
             for column in schema:
                 if column.name not in ("item_id", "index"):
-                    self.assertEqual(column.type, pa.large_list(pa.int64()))
+                    self.assertEqual(column.type, pa.list_(pa.int64()))
 
     @parameterized.expand(
         [
@@ -925,7 +944,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             [[new_ids[0]], [new_ids[1]], [prior_ids[1], new_ids[2]], [new_ids[3]]],
         )
         schema = parquet.read_schema(self._part(out, SID_TO_ITEMS, "v2"))
-        self.assertEqual(schema.field("itemids").type, pa.large_list(item_id_type))
+        self.assertEqual(schema.field("itemids").type, pa.list_(item_id_type))
         self._assert_item_to_sid_matches_sid_to_items(out, "v2")
 
     def test_append_chain_stays_consistent(self) -> None:

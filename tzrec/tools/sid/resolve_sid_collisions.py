@@ -141,6 +141,7 @@ _RESOLVERS: Dict[str, Type[CollisionResolver]] = {
     "iterative": IterativeCollisionResolver,
     "uniform": UniformCollisionResolver,
 }
+_INT32_MAX = int(np.iinfo(np.int32).max)
 
 
 def _is_list_column(values: pa.Array) -> bool:
@@ -704,11 +705,7 @@ class CollisionResolutionRunner:
             if pa.types.is_string(values.type) or pa.types.is_large_string(values.type):
                 return values
         elif _is_list_column(values):
-            codes_type = (
-                pa.list_(pa.int64())
-                if writer_type == "OdpsWriter"
-                else pa.large_list(pa.int64())
-            )
+            codes_type = pa.list_(pa.int64())
             if values.type == codes_type:
                 return values
         return self._codes_column(self._convert_codes_to_numpy(values), writer_type)
@@ -836,25 +833,19 @@ class CollisionResolutionRunner:
     def _codes_column(codes: np.ndarray, writer_type: Optional[str]) -> pa.Array:
         """Encode an SID matrix for the actual output writer."""
         row_count, layer_count = codes.shape
+        if codes.size > _INT32_MAX:
+            raise ValueError(
+                f"SID codes contain {codes.size} elements "
+                f"({row_count} rows x {layer_count} layers), exceeding the "
+                f"Arrow List int32 offset limit of {_INT32_MAX}."
+            )
         if writer_type == "CsvWriter":
             values = pc.cast(pa.array(codes.reshape(-1)), pa.string())
-            offsets = pa.array(
-                np.arange(
-                    0,
-                    (row_count + 1) * layer_count,
-                    layer_count,
-                    dtype=np.int64,
-                )
-            )
-            return pc.binary_join(pa.LargeListArray.from_arrays(offsets, values), ",")
-        codes_type = (
-            pa.list_(pa.int64())
-            if writer_type == "OdpsWriter"
-            else pa.large_list(pa.int64())
-        )
+            offsets = pa.array(np.arange(row_count + 1, dtype=np.int32) * layer_count)
+            return pc.binary_join(pa.ListArray.from_arrays(offsets, values), ",")
         return pa.FixedSizeListArray.from_arrays(
             pa.array(codes.reshape(-1)), layer_count
-        ).cast(codes_type)
+        ).cast(pa.list_(pa.int64()))
 
     def _copy_prior_item_to_sid_rows(self, writer: BaseWriter) -> int:
         """Copy every published item_to_sid row into the merged output.
@@ -1096,19 +1087,24 @@ class CollisionResolutionRunner:
         self._bundle.rows[SID_TO_ITEMS_ARTIFACT] = sid_item_row_index.sid_keys.shape[0]
 
 
-def _item_lists(offsets: np.ndarray, ordered_item_ids: pa.Array) -> pa.LargeListArray:
+def _item_lists(offsets: np.ndarray, ordered_item_ids: pa.Array) -> pa.ListArray:
     """Wrap flat item IDs into one ``itemids`` list per SID."""
-    return pa.LargeListArray.from_arrays(
-        pa.array(offsets, type=pa.int64()), ordered_item_ids
+    if offsets[-1] > _INT32_MAX:
+        raise ValueError(
+            f"SID item lists contain {offsets[-1]} items, exceeding the "
+            f"Arrow List int32 offset limit of {_INT32_MAX}."
+        )
+    return pa.ListArray.from_arrays(
+        pa.array(offsets, type=pa.int32()), ordered_item_ids
     )
 
 
 def _merge_sid_to_items(
     sid_keys: np.ndarray,
-    item_id_lists: pa.LargeListArray,
+    item_id_lists: pa.ListArray,
     input_sid_keys: np.ndarray,
-    input_item_id_lists: pa.LargeListArray,
-) -> Tuple[np.ndarray, pa.LargeListArray, np.ndarray]:
+    input_item_id_lists: pa.ListArray,
+) -> Tuple[np.ndarray, pa.ListArray, np.ndarray]:
     """Merge key-sorted published SIDs with input SIDs in their range.
 
     The stable sort keeps each side in slot order and lists a shared SID's

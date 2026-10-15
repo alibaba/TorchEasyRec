@@ -72,9 +72,12 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
 `delta_item_to_sid` 和 `delta_sid_to_items`，后者包含本次获得新 item 的完整 SID 分组，方便下游
 进行幂等更新。新 item ID 如果已存在于上一代，会报错。
 
-Parquet 产物的 SID 和 item ID 列表使用 Arrow `LargeList`，其 offsets 为 int64。
-列名和列表内容不变。CSV 仍输出列表字符串，
-ODPS 的 item 映射仍使用其支持的普通 `List`。`manifest.json` 的结构和 `save_type` 不变。
+Parquet 产物的 SID 和 item ID 列表使用普通 Arrow `List`，其 offsets 为 int32。
+构造列表时，展开后的元素总数超过 `2^31 - 1` 会报错终止，不自动分块或切换为 LargeList。
+对于三层 codes，单次构造最多容纳 715,827,882 行；itemids 列表按展开后的 item 总数检查。
+该限制作用于每个 rank 构造的数组，输入拆成多个 Parquet 文件不会改变上限。
+CSV 仍输出列表字符串，ODPS 的 item 映射仍使用普通 `List`。
+列名、列表内容、`manifest.json` 的结构和 `save_type` 不变。
 
 `--rate_only` 计算全局统计并跳过产物写出，可用于比较不同策略。
 
