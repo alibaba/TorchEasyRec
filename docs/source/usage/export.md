@@ -61,55 +61,35 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 ## dynemb 流式导出与 FeatureDB 全量上传
 
-在 `USE_DISTRIBUTED_EMBEDDING=1` 下，dynemb 默认按块读取 checkpoint 并写入 NPZ，不需要将全部 dynemb 参数恢复到主机内存或显存。配置 `export_config.dynamic_embedding_export_config.feature_store_config` 后，同一批 dynemb 参数还会上传到 FeatureDB；不配置时只生成导出文件。该能力适用于原生 dynemb 参数。
+在 `USE_DISTRIBUTED_EMBEDDING=1` 下，dynemb 默认按块读取 checkpoint 并写入 NPZ，不需要将全部 dynemb 参数恢复到主机内存或显存。配置 `export_config.dynamic_embedding_export_config.feature_store_config` 后，同一批 dynemb 参数还会上传到 FeatureDB；不配置时只生成导出文件。该能力适用于原生 dynemb 参数。普通 sparse 和 ZCH 表仍按原有方式恢复到内存，其内存占用不受 dynemb 读取块预算限制。
 
 配置 `dynamic_embedding_export_config` 要求 `USE_DISTRIBUTED_EMBEDDING=1` 且非 RTP 导出，否则导出启动时会报错。
 
 ### 配置
 
-在 `pipeline.config` 中添加：
+在 `pipeline.config` 中添加以下必填配置，其他参数使用默认值，仅在需要调整时显式设置：
 
 ```protobuf
 export_config {
   dynamic_embedding_export_config {
-    read_chunk_size_mb: 64
-    upload_max_in_flight_batches: 16
     feature_store_config {
       region: "cn-beijing"
       project_name: "recommendation"
       feature_view_name: "model_embeddings"
       version: "full_ckpt100000_run1"
-      upload_batch_size: 1000
-      max_retries: 3
-      retry_backoff_secs: 5
-      upload_format: "ARROW"
     }
   }
 }
 ```
 
-| 配置项                         | 默认值 | 说明                                                               |
-| ------------------------------ | ------ | ------------------------------------------------------------------ |
-| `read_chunk_size_mb`           | `64`   | checkpoint 原始数据的读取块预算，单位 MiB，必须大于 0              |
-| `upload_max_in_flight_batches` | `16`   | 每个上传窗口最多包含的请求批次，必须大于 0；窗口完成前停止继续读取 |
-| `feature_store_config`         | 未设置 | 设置后同时上传 dynemb 到 FeatureDB，仍保留 NPZ                     |
+`feature_store_config` 复用 [FeatureStoreConfig](../proto.html#tzrec.protos.FeatureStoreConfig)，必填参数如下：
 
-`feature_store_config` 复用 [FeatureStoreConfig](../proto.html#tzrec.protos.FeatureStoreConfig)：
-
-| 配置项               | 要求或默认值 | 导出时的含义                                                     |
-| -------------------- | ------------ | ---------------------------------------------------------------- |
-| `region`             | 必填         | FeatureStore 地域；显式为空时从 `ALIBABA_CLOUD_REGION` 获取      |
-| `project_name`       | 必填         | 已存在的 FeatureStore 项目                                       |
-| `feature_view_name`  | 必填         | DynamicEmbedding FeatureView；不存在时按配置创建                 |
-| `version`            | 必填         | 每次导出使用新的、尚未用于线上服务的版本，不能为 `default`       |
-| `upload_batch_size`  | `1000`       | 每个请求的最大行数，范围为 1 到 1000；同时受内部请求字节预算限制 |
-| `max_retries`        | `3`          | 当前窗口的总尝试次数，包含第一次；成功的历史窗口不会重传         |
-| `retry_backoff_secs` | `5`          | 重试退避基准秒数，等待时间随重试次数增加                         |
-| `upload_format`      | `ARROW`      | 推荐使用 Arrow；也支持 `JSON`                                    |
-
-`endpoint`、`test_mode` 及 FeatureView 的 TTL、分片、副本配置沿用既有含义。`max_pending_steps`、`poll_interval_secs` 和 `shutdown_timeout_secs` 用于训练增量上传，不参与全量导出的队列或超时控制；保持默认值即可，共用的配置校验仍要求它们大于 0。
-
-全量导出按读取、量化、上传、写入 NPZ 的顺序同步处理每个块，上传耗时会累加到总导出耗时。窗口内的请求由 SDK 并发发送；增大 `upload_max_in_flight_batches` 可减少 flush 次数、保持请求排队，但会增加在途数据占用，实际吞吐取决于网络和服务端。每个读取块结束时仍会 flush，以便释放该块的数据引用。
+| 配置项              | 导出时的含义                                                |
+| ------------------- | ----------------------------------------------------------- |
+| `region`            | FeatureStore 地域；显式为空时从 `ALIBABA_CLOUD_REGION` 获取 |
+| `project_name`      | 已存在的 FeatureStore 项目                                  |
+| `feature_view_name` | DynamicEmbedding FeatureView；不存在时按配置创建            |
+| `version`           | 每次导出使用新的、尚未用于线上服务的版本，不能为 `default`  |
 
 凭证沿用阿里云默认凭证链，以及运行环境中的 `FEATUREDB_USERNAME`、`FEATUREDB_PASSWORD`；不要将凭证写入 `pipeline.config`。
 
@@ -126,20 +106,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
     --export_dir /mnt/model/export/full_ckpt100000_run1
 ```
 
-使用一个导出进程即可读取所有训练 checkpoint shard，导出进程数不需要与训练卡数一致。TB 级产物建议写入有足够容量的挂载文件系统；当前通用 URI 导出入口仍会先写本地目录再上传，直接设置远端 URI 并不能消除本地磁盘暂存。
-
 未设置 `DIST_QUANT` 时，NPZ 和 FeatureDB 使用 FP32 values，FeatureView 类型必须为 `ARRAY<FLOAT>`。在命令前增加 `DIST_QUANT=INT8` 后，两处使用同一份 UINT8 行量化结果，包含每行 4 字节的 scale/offset；FeatureView 类型必须为 `ARRAY<UINT8>`，导出时会校验已存在的表类型。量化维度必须为偶数。
-
-### 与旧导出路径的兼容性
-
-使用分布式 embedding 模式导出 checkpoint 时，只要 checkpoint 包含 `dynamicemb/` 目录，或模型包含原生 dynemb 表，就会进入流式路径；不配置 `dynamic_embedding_export_config` 也会生效。普通 sparse 和 ZCH 表仍按原有方式恢复到内存，不能据此认为整个模型的导出内存都受读取块预算限制。
-
-- `PYTORCH` kernel 的 dense 图在 CPU 上导出；`TRITON`、`CUTLASS` 使用 CUDA，没有可用 CUDA 时会报错。
-- 流式路径不再生成调试文件 `graph/gm_sparse.graph`。
-- checkpoint 缺少普通 sparse/ZCH 状态或模型声明的 dynemb 表数据时，导出会报错，不再静默跳过。
-- ZCH 导出仍按 raw ID 升序排列，values 和 scores 随 keys 一起重排。
-
-(online-dense-export)=
 
 ## 在线学习 dense 模型热导出
 
