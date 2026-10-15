@@ -103,11 +103,10 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 
 ### Semantic ID (SID) Generation
 
-| Model                                                           | Description                                                                          |
-| --------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| [SID RQVAE](docs/source/models/sid_rqvae.md)                    | RQ-VAE residual-quantized semantic-ID generation for generative retrieval            |
-| [SID RQKMeans](docs/source/models/sid_rqkmeans.md)              | FAISS residual K-Means semantic-ID generation                                        |
-| [SID Collision Resolution](docs/source/models/sid_collision.md) | Resolve collisions in predicted SIDs with candidate, iterative, or uniform placement |
+| Model                                              | Description                                                               |
+| -------------------------------------------------- | ------------------------------------------------------------------------- |
+| [SID RQVAE](docs/source/models/sid_rqvae.md)       | RQ-VAE residual-quantized semantic-ID generation for generative retrieval |
+| [SID RQKMeans](docs/source/models/sid_rqkmeans.md) | FAISS residual K-Means semantic-ID generation                             |
 
 ## Documentation
 
