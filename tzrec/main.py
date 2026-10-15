@@ -90,6 +90,7 @@ from tzrec.utils import (
     predict_util,
 )
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
+from tzrec.utils.dist_emb_predict_util import DistributedEmbeddingLookup
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -1443,6 +1444,7 @@ def predict(
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
+    is_dist_emb: bool = acc_utils.is_distributed_embedding_predict(scripted_model_path)
 
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
@@ -1500,6 +1502,31 @@ def predict(
         )
         model.eval()
 
+    # forward workers are spread over forward_devices, each with its own model.
+    forward_devices = [device]
+    models = {device: model}
+    sparse_lookup = None
+    if is_dist_emb:
+        if int(os.environ.get("LOCAL_WORLD_SIZE", 1)) == 1:
+            # one process per node: the local GPUs share one host copy of the tables.
+            forward_devices = [
+                torch.device("cuda", i) for i in range(torch.cuda.device_count())
+            ]
+        else:
+            logger.warning(
+                "each predict process loads its own host copy of the sparse "
+                "embeddings, launch with --nproc_per_node=1 to share one copy "
+                "between all GPUs of a node."
+            )
+        for d in forward_devices:
+            if d not in models:
+                models[d] = torch.jit.load(
+                    os.path.join(scripted_model_path, "scripted_model.pt"),
+                    map_location=d,
+                )
+                models[d].eval()
+        sparse_lookup = DistributedEmbeddingLookup(scripted_model_path, forward_devices)
+
     plogger = None
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Predicting", miniters=10)
@@ -1520,7 +1547,7 @@ def predict(
         prof.start()
 
     if predict_threads is None:
-        predict_threads = max(data_config.num_workers, 1)
+        predict_threads = max(data_config.num_workers, len(forward_devices))
     data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
     pred_queue: Queue[Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]] = (
         Queue(maxsize=predict_threads * 2)
@@ -1530,7 +1557,7 @@ def predict(
     input_batches = 0
 
     def _forward(
-        batch: Batch,
+        batch: Batch, device: torch.device = device
     ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
             parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
@@ -1538,7 +1565,9 @@ def predict(
                 # when predicting with a model exported using INPUT_TILE,
                 #  we set the batch size tensor to 1 to disable tiling.
                 parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            predictions = model(parsed_inputs, device)
+            if sparse_lookup is not None:
+                parsed_inputs = sparse_lookup(parsed_inputs, device)
+            predictions = models[device](parsed_inputs, device)
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
@@ -1568,22 +1597,30 @@ def predict(
 
     def _forward_loop(worker_id: int) -> None:
         stage = "forward"
+        worker_device = forward_devices[worker_id % len(forward_devices)]
+        # NVE keeps one lookup context per CUDA stream, so give each worker its own.
+        stream_ctx = (
+            torch.cuda.stream(torch.cuda.Stream(worker_device))
+            if sparse_lookup is not None
+            else nullcontext()
+        )
         try:
-            while True:
-                batch = predict_util.queue_get_interruptibly(
-                    data_queue,
-                    cancel_event,
-                    f"{stage}[{worker_id}] input",
-                )
-                if batch is None:
-                    return
-                pred = _forward(batch)
-                predict_util.queue_put_interruptibly(
-                    pred_queue,
-                    pred,
-                    cancel_event,
-                    f"{stage}[{worker_id}] output",
-                )
+            with stream_ctx:
+                while True:
+                    batch = predict_util.queue_get_interruptibly(
+                        data_queue,
+                        cancel_event,
+                        f"{stage}[{worker_id}] input",
+                    )
+                    if batch is None:
+                        return
+                    pred = _forward(batch, worker_device)
+                    predict_util.queue_put_interruptibly(
+                        pred_queue,
+                        pred,
+                        cancel_event,
+                        f"{stage}[{worker_id}] output",
+                    )
         except predict_util.PredictPipelineCancelled:
             return
         except BaseException as error:
