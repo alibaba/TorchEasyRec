@@ -121,6 +121,81 @@ def _item_to_sid_csv(path, rows):
     )
 
 
+class ResolveSidCollisionsConfigTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            ("generation", {"generation": None}, "generation is required"),
+            ("output_path", {"output_path": None}, "output_path is required"),
+            ("same_generation", {"from_generation": "v1"}, "writing over the"),
+            ("item_to_sid_root", {"item_to_sid_root": "input"}, "path conflict"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_config_rejects_invalid_arguments(self, _name, overrides, message) -> None:
+        args = resolve_sid_collisions.build_parser().parse_args(
+            [
+                "--input_path",
+                "input",
+                "--output_path",
+                "map",
+                "--generation",
+                "v1",
+                "--codebook",
+                "8,8",
+                "--max_items_per_codebook",
+                "2",
+            ]
+        )
+        for name, value in overrides.items():
+            setattr(args, name, value)
+        with self.assertRaisesRegex(ValueError, message):
+            ResolveSidCollisionsConfig.from_namespace(args)
+
+    def test_empty_codebook_token_raises(self) -> None:
+        args = resolve_sid_collisions.build_parser().parse_args(
+            [
+                "--input_path",
+                "input",
+                "--codebook",
+                "8,,8",
+                "--max_items_per_codebook",
+                "2",
+                "--rate_only",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "codebook"):
+            ResolveSidCollisionsConfig.from_namespace(args)
+
+
+class ArrowEncodingTest(unittest.TestCase):
+    @parameterized.expand(
+        [("parquet", "ParquetWriter"), ("csv", "CsvWriter")],
+        name_func=parameterized_name_func,
+    )
+    def test_codes_reject_int32_offset_overflow(self, _name, writer_type) -> None:
+        codes = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 6):
+            column = CollisionResolutionRunner._codes_column(codes, writer_type)
+        self.assertEqual(
+            column.to_pylist(),
+            ["0,1,2", "3,4,5"] if writer_type == "CsvWriter" else codes.tolist(),
+        )
+        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 5):
+            with self.assertRaisesRegex(ValueError, "int32 offset limit"):
+                CollisionResolutionRunner._codes_column(codes, writer_type)
+
+    def test_item_lists_reject_int32_offset_overflow(self) -> None:
+        offsets = np.array([0, 3, 6], dtype=np.int64)
+        item_ids = pa.array([0, 1, 2, 3, 4, 5])
+        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 6):
+            lists = resolve_sid_collisions._item_lists(offsets, item_ids)
+        self.assertEqual(lists.to_pylist(), [[0, 1, 2], [3, 4, 5]])
+        self.assertEqual(lists.offsets.type, pa.int32())
+        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 5):
+            with self.assertRaisesRegex(ValueError, "int32 offset limit"):
+                resolve_sid_collisions._item_lists(offsets, item_ids)
+
+
 class ResolveSidCollisionsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()
@@ -281,6 +356,10 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             ValueError, "columns .*candidate_codes.* are missing"
         ):
             self._run(inp, out, max_items_per_codebook=2)
+
+    def test_rejects_invalid_progress_interval(self) -> None:
+        with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
+            self._runner("input", "map", progress_interval=0)
 
     def test_missing_input_rejected_before_reading(self) -> None:
         with self.assertRaisesRegex(ValueError, "hold no files"):
@@ -539,12 +618,17 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 inp, os.path.join(self.test_dir, "out"), codebook=(4, 4)
             )
         with mock.patch.object(
-            runner, "_convert_codes_to_numpy", wraps=runner._convert_codes_to_numpy
-        ) as convert_codes:
+            runner, "_candidate_last_matrix", wraps=runner._candidate_last_matrix
+        ) as decode_candidates:
             candidates = runner._load_candidate_last_codes(np.array([7, 7]))
 
         np.testing.assert_array_equal(candidates, [[1], [1]])
-        self.assertEqual(len(convert_codes.call_args_list[0].args[0]), 2)
+        decoded_rows = [
+            row
+            for call in decode_candidates.call_args_list
+            for row in call.args[0].to_pylist()
+        ]
+        self.assertEqual(decoded_rows, [[0, 1]])
 
     def test_no_overflow_reuses_sids_with_gapped_prefixes(self) -> None:
         _, out = self._resolve(
@@ -607,33 +691,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         for column in ("codebook", "offset_codebook"):
             self.assertEqual(sid_schema.field(column).type, pa.list_(pa.int64()))
 
-    @parameterized.expand(
-        [("parquet", "ParquetWriter"), ("csv", "CsvWriter"), ("odps", "OdpsWriter")],
-        name_func=parameterized_name_func,
-    )
-    def test_codes_reject_int32_offset_overflow(self, _name, writer_type) -> None:
-        codes = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
-        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 6):
-            column = CollisionResolutionRunner._codes_column(codes, writer_type)
-        self.assertEqual(
-            column.to_pylist(),
-            ["0,1,2", "3,4,5"] if writer_type == "CsvWriter" else codes.tolist(),
-        )
-        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 5):
-            with self.assertRaisesRegex(ValueError, "int32 offset limit"):
-                CollisionResolutionRunner._codes_column(codes, writer_type)
-
-    def test_item_lists_reject_int32_offset_overflow(self) -> None:
-        offsets = np.array([0, 3, 6], dtype=np.int64)
-        item_ids = pa.array([0, 1, 2, 3, 4, 5])
-        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 6):
-            lists = resolve_sid_collisions._item_lists(offsets, item_ids)
-        self.assertEqual(lists.to_pylist(), [[0, 1, 2], [3, 4, 5]])
-        self.assertEqual(lists.offsets.type, pa.int32())
-        with mock.patch.object(resolve_sid_collisions, "_INT32_MAX", 5):
-            with self.assertRaisesRegex(ValueError, "int32 offset limit"):
-                resolve_sid_collisions._item_lists(offsets, item_ids)
-
     def test_preserves_item_id_type(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
@@ -649,53 +706,28 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         sid_schema = parquet.read_schema(self._part(out, SID_TO_ITEMS))
         self.assertEqual(sid_schema.field("itemids").type, pa.list_(pa.large_string()))
 
-    @parameterized.expand(
-        [
-            ("generation", {"generation": None}, "generation is required"),
-            ("output_path", {"output_path": None}, "output_path is required"),
-            (
-                "progress_interval",
-                {"progress_interval": 0},
-                "progress_interval must be >= 1",
-            ),
-            ("same_generation", {"from_generation": "v1"}, "writing over the"),
-            ("item_to_sid_root", {"item_to_sid_root": "input"}, "path conflict"),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_config_rejects_invalid_arguments(self, _name, overrides, message) -> None:
-        with self.assertRaisesRegex(ValueError, message):
-            self._runner("input", "map", **overrides)
-
     def test_serving_set_stays_parquet_under_an_odps_writer_type(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, [1, 2], [[0, 0], [0, 1]])
 
-        with mock.patch.object(
-            CollisionResolutionRunner, "_make_writer"
-        ) as make_writer:
-            self._run(
-                inp,
-                out,
-                item_to_sid_writer_type="OdpsWriter",
-                max_items_per_codebook=1,
-            )
-
-        # item_to_sid follows the flag; sid_to_items overrides it
-        self.assertCountEqual(
-            make_writer.call_args_list,
-            [
-                mock.call(bundle.artifact_location(out, "v1", ITEM_TO_SID)),
-                mock.call(
-                    bundle.artifact_location(out, "v1", SID_TO_ITEMS), "ParquetWriter"
-                ),
-            ],
+        runner = self._runner(
+            inp, out, item_to_sid_writer_type="OdpsWriter", max_items_per_codebook=1
         )
-        self.assertEqual(make_writer.return_value.close.call_count, 2)
-        sid_columns, item_columns = [
-            call.args[0] for call in make_writer.return_value.write.call_args_list
-        ]
+        make_file_writer = runner._make_writer
+        item_writer = mock.Mock()
+
+        def make_writer(output_path, writer_type=None):
+            if writer_type == "ParquetWriter":
+                return make_file_writer(output_path, writer_type)
+            return item_writer
+
+        with mock.patch.object(runner, "_make_writer", side_effect=make_writer):
+            runner.run()
+
+        sid_columns = parquet.read_table(self._part(out, SID_TO_ITEMS))
+        self.assertEqual(sid_columns["itemids"].to_pylist(), [[1], [2]])
+        item_columns = item_writer.write.call_args.args[0]
         for column in ("codebook", "offset_codebook"):
             self.assertEqual(sid_columns[column].type, pa.list_(pa.int64()))
         self.assertEqual(sid_columns["itemids"].type, pa.list_(pa.int64()))
@@ -746,7 +778,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SID input is empty"):
             self._run(inp, out, max_items_per_codebook=2)
 
-    def test_candidate_tolerates_duplicate_item_ids(self) -> None:
+    def test_candidate_loader_broadcasts_duplicate_item_ids(self) -> None:
         # Both overflow rows share ID 7, so one matched candidate list serves both.
         stats, out = self._resolve(
             [7, 7, 7],
@@ -759,21 +791,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(stats.relocated_count, 2)
         self.assertEqual(self._read(out, ITEM_TO_SID)["item_id"], [7, 7, 7])
         self._assert_item_to_sid_matches_sid_to_items(out)
-
-    def test_empty_codebook_token_raises(self) -> None:
-        args = resolve_sid_collisions.build_parser().parse_args(
-            [
-                "--input_path",
-                "input",
-                "--codebook",
-                "8,,8",
-                "--max_items_per_codebook",
-                "2",
-                "--rate_only",
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "codebook"):
-            ResolveSidCollisionsConfig.from_namespace(args)
 
     def test_offset_codebook_follows_the_resolved_sid(self) -> None:
         _, out = self._resolve([0, 1, 2, 3], [[1, 2]] * 3 + [[3, 4]], [[[1, 5]]] * 4)

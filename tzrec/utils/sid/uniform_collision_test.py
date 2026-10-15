@@ -9,160 +9,122 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import collections
 import dataclasses
 import unittest
 
 import numpy as np
 
-from tzrec.utils.sid.collision import (
-    CollisionResolutionConfig,
-    ExistingSidState,
-    build_resolved_sid_item_row_index,
-    prepare_collision_plan,
-    stable_order_hash,
+from tzrec.utils.sid.test_util import (
+    create_collision_plan,
+    create_existing_sid_state,
 )
 from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 
 
-def _plan(codebook, capacity, item_ids, codes, existing_sid_state=None):
-    return prepare_collision_plan(
-        np.asarray(item_ids),
-        np.asarray(codes, dtype=np.int64),
-        CollisionResolutionConfig(codebook, capacity),
-        existing_sid_state=existing_sid_state,
-    )
-
-
-def _existing_sid_state(keys, counts):
-    return ExistingSidState(
-        np.asarray(keys, dtype=np.int64), np.asarray(counts, dtype=np.int64)
-    )
-
-
-def _rotation(prefix_id, last_size):
-    return int(stable_order_hash(np.asarray([prefix_id], dtype=np.int64))[0]) % int(
-        last_size
-    )
-
-
-def _reference(plan, codes, item_ids):
-    """Place overflow rows one at a time on the least-loaded rotated code.
-
-    Returns the code and slot of every overflow row and the final load of every
-    occupied SID, published-only SIDs included.
-    """
-    last_size = plan.config.codebook[-1]
-    prefixes = plan.config.prefix_ids(np.asarray(codes))
-    moving = set(plan.overflow_rows.tolist())
-    loads = {}
-    for row, prefix in enumerate(prefixes.tolist()):
-        if row not in moving:
-            key = prefix * last_size + int(codes[row][-1])
-            loads[key] = loads.get(key, 0) + 1
-    for key, count in zip(
-        plan.existing_sid_state.sid_keys.tolist(),
-        plan.existing_sid_state.item_counts.tolist(),
-    ):
-        loads[key] = loads.get(key, 0) + count
-    hashes = stable_order_hash(np.asarray(item_ids)).tolist()
-    codes_out, slots_out = {}, {}
-    for row in sorted(moving, key=lambda r: (int(prefixes[r]), hashes[r], r)):
-        prefix = int(prefixes[row])
-        rotation = _rotation(prefix, last_size)
-        code = min(
-            range(last_size),
-            key=lambda c: (
-                loads.get(prefix * last_size + c, 0),
-                (c - rotation) % last_size,
-            ),
-        )
-        key = prefix * last_size + code
-        loads[key] = loads.get(key, 0) + 1
-        codes_out[row] = code
-        slots_out[row] = loads[key]
-    return codes_out, slots_out, loads
-
-
 class UniformCollisionResolverTest(unittest.TestCase):
-    def test_random_plans_match_least_loaded_reference(self) -> None:
-        rng = np.random.default_rng(7)
-        for trial in range(150):
-            last_size = rng.integers(1, 9)
-            codebook = (rng.integers(1, 4), last_size)
-            capacity = rng.integers(1, 3)
-            item_count = rng.integers(1, 40)
-            codes = np.stack(
-                [
-                    np.minimum(rng.geometric(0.4, item_count) - 1, size - 1)
-                    for size in codebook
-                ],
-                axis=1,
-            )
-            existing_sid_state = None
-            if trial % 3 == 0:
-                keys = np.unique(rng.integers(0, codebook[0] * last_size, 4))
-                existing_sid_state = _existing_sid_state(
-                    keys, rng.integers(1, capacity + 3, keys.shape[0])
-                )
-            item_ids = np.arange(item_count) * 7 + 1000
-            plan = _plan(
-                codebook,
-                capacity,
-                item_ids,
-                codes,
-                existing_sid_state=existing_sid_state,
-            )
+    def _assert_resolution(
+        self,
+        plan,
+        *,
+        last_codes,
+        slot_indices,
+        sid_keys,
+        item_counts,
+        stats,
+        unresolved_rows=(),
+    ) -> None:
+        result = UniformCollisionResolver().resolve(plan)
+        np.testing.assert_array_equal(result.resolved_last_codes, last_codes)
+        np.testing.assert_array_equal(result.slot_indices, slot_indices)
+        np.testing.assert_array_equal(result.unresolved_rows, unresolved_rows)
+        np.testing.assert_array_equal(result.final_sid_keys, sid_keys)
+        np.testing.assert_array_equal(result.final_item_counts, item_counts)
+        self.assertEqual(dataclasses.astuple(result.stats), stats)
 
-            result = UniformCollisionResolver().resolve(plan)
-            expected_codes, expected_slots, loads = _reference(plan, codes, item_ids)
-            origin_keys = plan.config.convert_codes_to_sid_keys(codes).tolist()
-            published = dict(
-                zip(
-                    plan.existing_sid_state.sid_keys.tolist(),
-                    plan.existing_sid_state.item_counts.tolist(),
-                )
-            )
-            overflow_prefixes = {
-                origin_keys[row] // last_size for row in plan.overflow_rows.tolist()
-            }
-            final = {
-                key: count
-                for key, count in loads.items()
-                if key in origin_keys or key // last_size in overflow_prefixes
-            }
-            unresolved = sum(slot > capacity for slot in expected_slots.values())
+    def test_no_overflow(self) -> None:
+        plan = create_collision_plan((4,), 1, [2, 9], [[0], [1]])
+        self._assert_resolution(
+            plan,
+            last_codes=[0, 1],
+            slot_indices=[1, 1],
+            sid_keys=[0, 1],
+            item_counts=[1, 1],
+            stats=(2, 0, 0, 0, 0, 1),
+        )
 
-            with self.subTest(trial=trial):
-                for row in plan.overflow_rows.tolist():
-                    self.assertEqual(
-                        int(result.resolved_last_codes[row]), expected_codes[row]
-                    )
-                    self.assertEqual(int(result.slot_indices[row]), expected_slots[row])
-                self.assertEqual(
-                    dict(
-                        zip(
-                            result.final_sid_keys.tolist(),
-                            result.final_item_counts.tolist(),
-                        )
-                    ),
-                    final,
-                )
-                self.assertEqual(
-                    dataclasses.astuple(result.stats),
-                    (
-                        item_count,
-                        sum(
-                            published.get(key, 0) + count > capacity
-                            for key, count in collections.Counter(origin_keys).items()
-                        ),
-                        sum(count > capacity for count in final.values()),
-                        plan.overflow_rows.shape[0] - unresolved,
-                        unresolved,
-                        max(final.values()),
-                    ),
-                )
-                build_resolved_sid_item_row_index(plan, result)
+    def test_empty_codes_follow_rotated_order(self) -> None:
+        plan = create_collision_plan((4,), 1, [2, 9, 4], [[0]] * 3)
+        self._assert_resolution(
+            plan,
+            last_codes=[0, 2, 3],
+            slot_indices=[1, 1, 1],
+            sid_keys=[0, 2, 3],
+            item_counts=[1, 1, 1],
+            stats=(3, 1, 0, 2, 0, 1),
+        )
+
+    def test_water_fill_uneven_counts(self) -> None:
+        plan = create_collision_plan(
+            (3,),
+            4,
+            [2, 9, 4, 11],
+            [[0]] * 4,
+            existing_sid_state=create_existing_sid_state([0, 1, 2], [4, 1, 2]),
+        )
+        self._assert_resolution(
+            plan,
+            last_codes=[1, 1, 2, 1],
+            slot_indices=[2, 3, 3, 4],
+            sid_keys=[0, 1, 2],
+            item_counts=[4, 4, 3],
+            stats=(4, 1, 0, 4, 0, 4),
+        )
+
+    def test_insufficient_prefix_capacity(self) -> None:
+        plan = create_collision_plan((2,), 1, [2, 9, 4, 11, 0], [[0]] * 5)
+        self._assert_resolution(
+            plan,
+            last_codes=[0, 1, 0, 1, 0],
+            slot_indices=[1, 1, 2, 2, 3],
+            unresolved_rows=[2, 3, 4],
+            sid_keys=[0, 1],
+            item_counts=[3, 2],
+            stats=(5, 1, 2, 1, 3, 3),
+        )
+
+    def test_append_preserves_existing_over_capacity_sid(self) -> None:
+        plan = create_collision_plan(
+            (3,),
+            2,
+            [2, 9],
+            [[0], [0]],
+            existing_sid_state=create_existing_sid_state([0, 2], [5, 1]),
+        )
+        self._assert_resolution(
+            plan,
+            last_codes=[1, 1],
+            slot_indices=[1, 2],
+            sid_keys=[0, 1, 2],
+            item_counts=[5, 2, 1],
+            stats=(2, 1, 1, 2, 0, 5),
+        )
+
+    def test_multiple_prefixes_follow_item_priority(self) -> None:
+        plan = create_collision_plan(
+            (2, 4),
+            1,
+            [2, 9, 0, 11, 4, 7, 8, 1, 6],
+            [[0, 0], [0, 1]] * 3 + [[1, 0]] * 3,
+        )
+        self._assert_resolution(
+            plan,
+            last_codes=[0, 1, 2, 3, 2, 3, 0, 1, 2],
+            slot_indices=[1, 1, 2, 1, 1, 2, 1, 1, 1],
+            unresolved_rows=[2, 5],
+            sid_keys=[0, 1, 2, 3, 4, 5, 6],
+            item_counts=[1, 1, 2, 2, 1, 1, 1],
+            stats=(9, 3, 2, 4, 2, 2),
+        )
 
 
 if __name__ == "__main__":

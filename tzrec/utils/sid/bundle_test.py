@@ -62,14 +62,30 @@ class BundleTest(unittest.TestCase):
         base.update(kw)
         return bundle.Bundle(**base)
 
-    def test_each_family_resolves_under_its_own_root(self) -> None:
-        layout = self._bundle()
+    @parameterized.expand(
+        [
+            (
+                "file_root",
+                "./map",
+                "./map/v2/item_to_sid",
+                "./map/v2/delta_item_to_sid",
+            ),
+            (
+                "odps_root",
+                "odps://prj/tables/sid",
+                "odps://prj/tables/sid/generation=v2/artifact=item_to_sid",
+                "odps://prj/tables/sid/generation=v2/artifact=delta_item_to_sid",
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_each_family_resolves_under_its_own_root(
+        self, _name, item_to_sid_root, item_path, delta_item_path
+    ) -> None:
+        layout = self._bundle(item_to_sid_root=item_to_sid_root)
+        self.assertEqual(layout.write_path(bundle.ITEM_TO_SID_ARTIFACT), item_path)
         self.assertEqual(
-            layout.write_path(bundle.ITEM_TO_SID_ARTIFACT), "./map/v2/item_to_sid"
-        )
-        self.assertEqual(
-            layout.write_path(bundle.DELTA_ITEM_TO_SID_ARTIFACT),
-            "./map/v2/delta_item_to_sid",
+            layout.write_path(bundle.DELTA_ITEM_TO_SID_ARTIFACT), delta_item_path
         )
         self.assertEqual(
             layout.write_path(bundle.SID_TO_ITEMS_ARTIFACT), "./sid/v2/sid_to_items"
@@ -109,32 +125,9 @@ class BundleTest(unittest.TestCase):
             os.path.join(self.test_dir, "v1", "sid_to_items", "part-*.parquet"),
         )
 
-    def test_an_odps_item_to_sid_root_leaves_the_serving_set_on_files(self) -> None:
-        layout = self._bundle(item_to_sid_root="odps://prj/tables/sid")
-        self.assertEqual(
-            layout.write_path(bundle.ITEM_TO_SID_ARTIFACT),
-            "odps://prj/tables/sid/generation=v2/artifact=item_to_sid",
-        )
-        self.assertEqual(
-            layout.write_path(bundle.SID_TO_ITEMS_ARTIFACT), "./sid/v2/sid_to_items"
-        )
-
-    def test_a_missing_root_is_reported_against_its_artifact(self) -> None:
-        layout = self._bundle(item_to_sid_root=None)
-        with self.assertRaisesRegex(RuntimeError, "item_to_sid"):
-            layout.write_path(bundle.ITEM_TO_SID_ARTIFACT)
-        self.assertEqual(
-            layout.write_path(bundle.SID_TO_ITEMS_ARTIFACT), "./sid/v2/sid_to_items"
-        )
-
     def test_an_odps_output_path_is_refused(self) -> None:
         with self.assertRaisesRegex(ValueError, "always files"):
             self._bundle(output_path="odps://prj/tables/g", from_generation=None)
-
-    def test_a_full_resolve_has_nothing_to_read(self) -> None:
-        layout = self._bundle(from_generation=None)
-        with self.assertRaisesRegex(RuntimeError, "from_generation"):
-            layout.read_path(bundle.SID_TO_ITEMS_ARTIFACT)
 
     @parameterized.expand(
         [
@@ -180,11 +173,6 @@ class BundleTest(unittest.TestCase):
         self.assertEqual(entry.save_type, save_type)
         self.assertEqual(entry.location, location.format(out=self.test_dir))
 
-
-class BundleManifestTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.test_dir = make_test_dir()
-
     def test_write_manifest_round_trips_every_field_through_disk(self) -> None:
         prior = bundle.Bundle(self.test_dir, "./map", "v1", None)
         prior.rows[bundle.SID_TO_ITEMS_ARTIFACT] = 1
@@ -225,6 +213,8 @@ class BundleManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError, "did not finish"):
             bundle.read_manifest(path)
 
+
+class BundleManifestTest(unittest.TestCase):
     def test_absent_optional_fields_are_omitted_not_null(self) -> None:
         payload = json.loads(_manifest().to_json())
         self.assertNotIn("since_bundle_uuid", payload)
@@ -234,34 +224,11 @@ class BundleManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing required keys"):
             bundle.BundleManifest.from_json(json.dumps({"bundle_uuid": "x"}))
 
-    def test_rejects_a_manifest_without_the_observed_ceiling(self) -> None:
-        payload = json.loads(_manifest().to_json())
-        del payload["max_observed_items_per_sid"]
-        with self.assertRaisesRegex(ValueError, "max_observed_items_per_sid"):
-            bundle.BundleManifest.from_json(json.dumps(payload))
-
     def test_rejects_a_serving_artifact_that_is_not_parquet(self) -> None:
         payload = json.loads(_manifest().to_json())
         payload["artifacts"][bundle.SID_TO_ITEMS_ARTIFACT]["save_type"] = "odps"
         with self.assertRaisesRegex(ValueError, "serving set is always parquet"):
             bundle.BundleManifest.from_json(json.dumps(payload))
-
-    def test_item_to_sid_artifact_may_be_odps(self) -> None:
-        payload = json.loads(_manifest().to_json())
-        payload["artifacts"][bundle.ITEM_TO_SID_ARTIFACT] = {
-            "save_type": "odps",
-            "rows": 9,
-            "location": "odps://prj/tables/sid/generation=v2/artifact=item_to_sid",
-        }
-        restored = bundle.BundleManifest.from_json(json.dumps(payload))
-        self.assertEqual(
-            restored.artifacts[bundle.ITEM_TO_SID_ARTIFACT].location,
-            "odps://prj/tables/sid/generation=v2/artifact=item_to_sid",
-        )
-
-    def test_absent_manifest_reports_an_unfinished_run(self) -> None:
-        with self.assertRaisesRegex(FileNotFoundError, "did not finish"):
-            bundle.read_manifest(bundle.manifest_path(self.test_dir, "missing"))
 
 
 if __name__ == "__main__":

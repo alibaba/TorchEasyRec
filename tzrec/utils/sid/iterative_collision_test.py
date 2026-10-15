@@ -14,33 +14,19 @@ import unittest
 import numpy as np
 
 from tzrec.utils.sid.collision import (
-    CollisionResolutionConfig,
-    ExistingSidState,
     build_resolved_sid_item_row_index,
-    prepare_collision_plan,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
 from tzrec.utils.sid.knn_collision import KnnCollisionResolver
-
-
-def _plan(codebook, capacity, item_ids, codes, existing_sid_state=None):
-    return prepare_collision_plan(
-        np.asarray(item_ids),
-        np.asarray(codes, dtype=np.int64),
-        CollisionResolutionConfig(codebook, capacity),
-        existing_sid_state=existing_sid_state,
-    )
-
-
-def _existing_sid_state(keys, counts):
-    return ExistingSidState(
-        np.asarray(keys, dtype=np.int64), np.asarray(counts, dtype=np.int64)
-    )
+from tzrec.utils.sid.test_util import (
+    create_collision_plan,
+    create_existing_sid_state,
+)
 
 
 class IterativeCollisionResolverTest(unittest.TestCase):
     def test_arbitration_prefers_earlier_candidate_positions(self) -> None:
-        plan = _plan(
+        plan = create_collision_plan(
             (5,),
             1,
             [10, 11, 20, 21, 30],
@@ -66,7 +52,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         self.assertEqual(first_fit.stats.unresolved_count, 1)
 
     def test_origin_cap_limits_same_origin_requests(self) -> None:
-        plan = _plan((4,), 1, [0, 10, 20, 30], [[1], [1], [1], [1]])
+        plan = create_collision_plan((4,), 1, [0, 10, 20, 30], [[1], [1], [1], [1]])
         np.testing.assert_array_equal(plan.overflow_rows, [0, 1, 2])
         candidates = np.asarray([[1, 0], [3, 1], [0, 2]], dtype=np.uint64)
 
@@ -78,7 +64,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         self.assertEqual(result.stats.unresolved_count, 0)
 
     def test_uncommitted_acceptance_reopens_next_round(self) -> None:
-        plan = _plan((3,), 1, [0, 10, 20], [[0], [0], [0]])
+        plan = create_collision_plan((3,), 1, [0, 10, 20], [[0], [0], [0]])
         np.testing.assert_array_equal(plan.overflow_rows, [1, 2])
         candidates = np.asarray([[2, 1], [0, 1]], dtype=np.int64)
 
@@ -88,7 +74,9 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         self.assertEqual(result.stats.unresolved_count, 0)
 
     def test_slots_follow_round_then_candidate_position(self) -> None:
-        plan = _plan((3,), 2, [0, 10, 20, 30, 40, 50], [[0], [1], [0], [0], [0], [0]])
+        plan = create_collision_plan(
+            (3,), 2, [0, 10, 20, 30, 40, 50], [[0], [1], [0], [0], [0], [0]]
+        )
         np.testing.assert_array_equal(plan.overflow_rows, [0, 4, 2])
         candidates = np.asarray([[1, 1], [1, 2], [2, 1]], dtype=np.int64)
 
@@ -98,12 +86,12 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         np.testing.assert_array_equal(result.slot_indices, [2, 1, 2, 2, 1, 1])
 
     def test_candidate_width_is_consumed_without_truncation(self) -> None:
-        plan = _plan(
+        plan = create_collision_plan(
             (256,),
             1,
             [10],
             [[0]],
-            existing_sid_state=_existing_sid_state(np.arange(200), np.ones(200)),
+            existing_sid_state=create_existing_sid_state(np.arange(200), np.ones(200)),
         )
         candidates = np.arange(1, 201, dtype=np.int64)[None, :]
 
@@ -114,7 +102,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         self.assertEqual(result.stats.unresolved_count, 0)
 
     def test_exhausted_candidates_keep_origin_and_dense_slots(self) -> None:
-        plan = _plan((3,), 1, [10, 11, 12, 13], [[0], [0], [0], [0]])
+        plan = create_collision_plan((3,), 1, [10, 11, 12, 13], [[0], [0], [0], [0]])
         candidates = np.asarray([[1], [2], [0]], dtype=np.int64)
 
         result = IterativeCollisionResolver().resolve(plan, candidates)
@@ -139,7 +127,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
 
         def assignments(order):
             ordered_ids = item_ids[order]
-            plan = _plan((4,), 2, ordered_ids, codes[order])
+            plan = create_collision_plan((4,), 2, ordered_ids, codes[order])
             candidates = np.tile(
                 np.asarray([1, 2, 3, 1], dtype=np.int64),
                 (plan.overflow_rows.size, 1),
@@ -161,12 +149,12 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_append_preserves_prior_over_capacity_and_moves_only_new_rows(self) -> None:
-        plan = _plan(
+        plan = create_collision_plan(
             (4,),
             2,
             [10, 11],
             [[0], [0]],
-            existing_sid_state=_existing_sid_state([0, 1], [3, 1]),
+            existing_sid_state=create_existing_sid_state([0, 1], [3, 1]),
         )
         candidates = np.asarray([[1, 2], [1, 2]], dtype=np.int64)
 
@@ -183,12 +171,12 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         )
 
     def test_append_multi_prefix_preserves_prior_only_destinations(self) -> None:
-        plan = _plan(
+        plan = create_collision_plan(
             (2, 4),
             1,
             [10, 11, 20, 21],
             [[0, 0], [0, 0], [1, 0], [1, 0]],
-            existing_sid_state=_existing_sid_state([1, 6], [1, 1]),
+            existing_sid_state=create_existing_sid_state([1, 6], [1, 1]),
         )
         candidates = np.asarray([[1, 2], [2, 1]], dtype=np.int32)
 
@@ -212,7 +200,9 @@ class IterativeCollisionResolverTest(unittest.TestCase):
             codes = np.stack(
                 [rng.integers(0, size, item_count) for size in codebook], axis=1
             )
-            plan = _plan(codebook, capacity, np.arange(item_count), codes)
+            plan = create_collision_plan(
+                codebook, capacity, np.arange(item_count), codes
+            )
             candidates = rng.integers(
                 0, last_size, (plan.overflow_rows.size, rng.integers(1, 5))
             )
