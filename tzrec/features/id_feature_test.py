@@ -337,6 +337,44 @@ class IdFeatureTest(unittest.TestCase):
 
     @parameterized.expand(
         [
+            param(
+                "array",
+                ids=pa.array([[3], [5, 5], None, [7]]),
+                weights=pa.array([[0.5], [1.0, 2.0], [9.0], [2.5]]),
+            ),
+            param(
+                "string",
+                ids=pa.array(["3", "5\x1d5", None, "7"]),
+                weights=pa.array(["0.5", "1\x1d2", "9", "2.5"]),
+            ),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_id_feature_with_weight_expression(self, name, ids, weights):
+        id_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="tag",
+                num_buckets=100,
+                embedding_dim=16,
+                expression="item:tag_ids",
+                weight_expression="item:tag_weights",
+                use_weight=True,
+            )
+        )
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
+        self.assertTrue(id_feat.is_weighted)
+        self.assertEqual(id_feat.inputs, ["tag_ids", "tag_weights"])
+        fg_cfg = id_feat.fg_json()[0]
+        self.assertEqual(fg_cfg["weight_expression"], "item:tag_weights")
+
+        parsed_feat = id_feat.parse({"tag_ids": ids, "tag_weights": weights})
+        # the null ids row drops its weight, the repeated id sums its weights
+        np.testing.assert_allclose(parsed_feat.values, np.array([3, 5, 7]))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 0, 1]))
+        np.testing.assert_allclose(parsed_feat.weights, np.array([0.5, 3.0, 2.5]))
+
+    @parameterized.expand(
+        [
             ["", ["abc\x1defg", None, "hij"], [33, 44, 66], [2, 0, 1], [], False],
             [
                 "xyz",
