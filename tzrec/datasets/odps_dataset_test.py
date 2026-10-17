@@ -235,8 +235,12 @@ class OdpsDatasetTest(unittest.TestCase):
         )
         feature_cfgs = self._create_test_table_and_feature_cfgs()
         t = self.o.get_table(f"test_odps_dataset_{self.test_suffix}")
-        with t.open_writer(partition="dt=20240321", create_partition=True) as writer:
-            writer.write([["unused", "1", "2", 4, 5.0, 3, 4.0, [1.0], {}, 0]] * 5000)
+        # distinct partition sizes pin the session order
+        for dt, num_rows in [("20240321", 5000), ("20240322", 3000)]:
+            with t.open_writer(partition=f"dt={dt}", create_partition=True) as writer:
+                writer.write(
+                    [["unused", "1", "2", 4, 5.0, 3, 4.0, [1.0], {}, 0]] * num_rows
+                )
 
         world_size = 2
         queue = mp.Queue()
@@ -259,7 +263,7 @@ class OdpsDatasetTest(unittest.TestCase):
                     num_workers=2,
                 ),
                 features=create_features(feature_cfgs, fg_mode=FgMode.FG_DAG),
-                input_path=f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320&dt=20240321",
+                input_path=f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240321&dt=20240322",
             )
             reader = dataset._reader
             session_ids = [
@@ -279,15 +283,19 @@ class OdpsDatasetTest(unittest.TestCase):
             p = mp.Process(target=_reader_worker, args=(rank, port))
             p.start()
             procs.append(p)
-        results = sorted(queue.get(timeout=600) for _ in range(world_size))
+        for p in procs:
+            p.join(timeout=600)
         for i, p in enumerate(procs):
-            p.join()
+            if p.is_alive():
+                p.terminate()
+                p.join()
             if p.exitcode != 0:
                 raise RuntimeError(f"reader worker-{i} failed.")
+        results = sorted(queue.get(timeout=10) for _ in range(world_size))
 
         self.assertEqual(results[0][1:], results[1][1:])
         self.assertEqual(len(set(results[0][1])), 3)
-        self.assertEqual(results[0][2], [10000, 10000, 5000])
+        self.assertEqual(results[0][2], [10000, 5000, 3000])
 
     @unittest.skipIf(
         os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
