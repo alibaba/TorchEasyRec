@@ -872,6 +872,49 @@ class ExportUtilTest(unittest.TestCase):
             },
         )
 
+    def test_sparse_export_rejects_missing_or_conflicting_feature_tables(self) -> None:
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir)
+        features = create_features(
+            [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="user_id",
+                        expression="user:user_id",
+                        embedding_dim=4,
+                        num_buckets=8,
+                    )
+                )
+            ]
+        )
+        model = EmbeddingGroupImpl(
+            features,
+            [
+                model_pb2.FeatureGroupConfig(
+                    group_name="deep",
+                    feature_names=["user_id"],
+                    group_type=model_pb2.FeatureGroupType.DEEP,
+                ),
+                model_pb2.FeatureGroupConfig(
+                    group_name="wide",
+                    feature_names=["user_id"],
+                    group_type=model_pb2.FeatureGroupType.WIDE,
+                ),
+            ],
+            device=torch.device("cpu"),
+        )
+        embedding_bag_info, embedding_info = (
+            export_util._get_sparse_table_to_embedding_info(model)
+        )
+        with self.assertRaisesRegex(ValueError, "maps to multiple embedding tables"):
+            _get_sparse_embedding_tensor(
+                model, test_dir, embedding_info, embedding_bag_info, features
+            )
+        with self.assertRaisesRegex(ValueError, "not found in model features"):
+            _get_sparse_embedding_tensor(
+                model, test_dir, embedding_info, embedding_bag_info, []
+            )
+
     def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
         """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
         tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_")

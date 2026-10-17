@@ -2615,6 +2615,13 @@ def _get_sparse_embedding_tensor(
         feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
         for feat_name in emb_info.feature_names:
             feat_name_impl = feat_name + "__ec"
+            existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
+            if existing_emb_name is not None and existing_emb_name != export_emb_name:
+                raise ValueError(
+                    f"sparse feature [{feat_name}] maps to multiple embedding "
+                    f"tables [{existing_emb_name}] and [{export_emb_name}] in "
+                    "distributed embedding export."
+                )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
@@ -2626,7 +2633,19 @@ def _get_sparse_embedding_tensor(
         emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
         feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
         for feat_name in emb_info.feature_names:
+            if feat_name not in name_to_feature:
+                raise ValueError(
+                    f"sparse feature [{feat_name}] in embedding table "
+                    f"[{export_emb_name}] is not found in model features."
+                )
             feat_name_impl = feat_name + "__ebc"
+            existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
+            if existing_emb_name is not None and existing_emb_name != export_emb_name:
+                raise ValueError(
+                    f"sparse feature [{feat_name}] maps to multiple embedding "
+                    f"tables [{existing_emb_name}] and [{export_emb_name}] in "
+                    "distributed embedding export."
+                )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
