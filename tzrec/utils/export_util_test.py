@@ -21,6 +21,7 @@ from unittest import mock
 
 import numpy as np
 import torch
+from parameterized import parameterized
 from torch import distributed as dist
 from torchrec import KeyedJaggedTensor, KeyedTensor
 from torchrec.distributed.model_parallel import ShardedModule
@@ -28,6 +29,7 @@ from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
+    PoolingType,
 )
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -54,6 +56,7 @@ from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingCollection,
     MLPDenseEmbeddingConfig,
 )
+from tzrec.modules.embedding import EmbeddingGroupImpl
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -80,7 +83,7 @@ from tzrec.utils.export_util import (
 )
 from tzrec.utils.fx_util import fx_mark_keyed_tensor
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 # register the mark for fx tracing from this module's call sites, as
 # tzrec/modules/embedding.py does for its own
@@ -221,6 +224,33 @@ class ExportUtilTest(unittest.TestCase):
                     os.environ[key] = value
 
     def test_distributed_embedding_export_uses_export_overrides(self) -> None:
+        features = create_features(
+            [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name=name,
+                        expression=f"user:{name}",
+                        embedding_dim=4,
+                        num_buckets=8,
+                        pooling="mean",
+                        weighted=weighted,
+                        use_weight=weighted,
+                    )
+                )
+                for name, weighted in (("weighted", True), ("plain", False))
+            ]
+        )
+        table_fqn = "ebc.embedding_bags.shared_emb"
+        embedding_bag_info = {
+            table_fqn: EmbeddingBagConfig(
+                name="shared_emb",
+                embedding_dim=4,
+                num_embeddings=8,
+                feature_names=[feature.name for feature in features],
+                pooling=PoolingType.SUM,
+            )
+        }
+
         class FakeBatch:
             def to(self, device):  # type: ignore[no-untyped-def]
                 return self
@@ -237,7 +267,7 @@ class ExportUtilTest(unittest.TestCase):
         class TinyModel(torch.nn.Module):
             def __init__(self):  # type: ignore[no-untyped-def]
                 super().__init__()
-                self.features = []
+                self.features = features
 
             def set_is_inference(self, is_inference):  # type: ignore[no-untyped-def]
                 self.is_inference = is_inference
@@ -278,7 +308,7 @@ class ExportUtilTest(unittest.TestCase):
                 ),
                 mock.patch(
                     "tzrec.utils.export_util._get_sparse_table_to_embedding_info",
-                    return_value=({}, {}),
+                    return_value=(embedding_bag_info, {}),
                 ),
                 mock.patch(
                     "tzrec.utils.export_util.create_dataloader",
@@ -297,10 +327,6 @@ class ExportUtilTest(unittest.TestCase):
                 ),
                 mock.patch("tzrec.utils.export_util.checkpoint_util.restore_model"),
                 mock.patch("tzrec.utils.export_util.init_parameters"),
-                mock.patch(
-                    "tzrec.utils.export_util._get_sparse_embedding_tensor",
-                    return_value=({}, {}, {}, {}),
-                ),
                 mock.patch("tzrec.utils.export_util.config_util.save_message"),
                 mock.patch(
                     "tzrec.utils.export_util.create_fg_json",
@@ -335,6 +361,18 @@ class ExportUtilTest(unittest.TestCase):
             )
             with open(os.path.join(tmp, "model_acc.json")) as f:
                 self.assertEqual(json.load(f), model_acc)
+            with open(os.path.join(tmp, "sparse", "sparse_features.json")) as f:
+                self.assertEqual(
+                    json.load(f),
+                    {
+                        f"{name}__ebc": {
+                            "embedding_name": table_fqn,
+                            "pooling": "MEAN",
+                            "use_weight": weighted,
+                        }
+                        for name, weighted in (("weighted", True), ("plain", False))
+                    },
+                )
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
@@ -750,6 +788,90 @@ class ExportUtilTest(unittest.TestCase):
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
 
+    @parameterized.expand(
+        [
+            ("weighted_sum_plain_sum", "sum", "sum", True),
+            ("weighted_mean_plain_sum", "mean", "sum", True),
+            ("weighted_sum_plain_mean", "sum", "mean", True),
+            ("weighted_mean_plain_mean", "mean", "mean", True),
+            ("disabled_weight_sum", "sum", "sum", False),
+            ("disabled_weight_mean", "mean", "mean", False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sparse_export_shared_table_feature_semantics(
+        self, name, weighted_pooling, plain_pooling, use_weight
+    ) -> None:
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir)
+        with mock.patch.dict(
+            os.environ,
+            {"RANK": "0", "WORLD_SIZE": "1", "INPUT_TILE": "0", "DIST_QUANT": "0"},
+        ):
+            features = create_features(
+                [
+                    feature_pb2.FeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name=feature_name,
+                            expression=f"user:{feature_name}",
+                            embedding_dim=4,
+                            num_buckets=8,
+                            embedding_name="shared_emb",
+                            pooling=pooling,
+                            weighted=weighted,
+                            use_weight=use_weight if weighted else False,
+                        )
+                    )
+                    for feature_name, pooling, weighted in (
+                        ("weighted", weighted_pooling, True),
+                        ("plain", plain_pooling, False),
+                    )
+                ]
+            )
+            model = EmbeddingGroupImpl(
+                features,
+                [
+                    model_pb2.FeatureGroupConfig(
+                        group_name="deep",
+                        feature_names=["weighted", "plain"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    )
+                ],
+                device=torch.device("cpu"),
+            )
+            embedding_bag_info, embedding_info = (
+                export_util._get_sparse_table_to_embedding_info(model)
+            )
+            self.assertEqual(len(embedding_bag_info), 1)
+            table_fqn, table_config = next(iter(embedding_bag_info.items()))
+            self.assertEqual(
+                table_config.pooling,
+                PoolingType.SUM
+                if use_weight
+                else getattr(PoolingType, plain_pooling.upper()),
+            )
+            self.assertEqual(model.ebc.is_weighted(), use_weight)
+            _, _, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                model, test_dir, embedding_info, embedding_bag_info, features
+            )
+
+        self.assertEqual(len(emb_meta), 1)
+        self.assertEqual(
+            feat_meta,
+            {
+                "weighted__ebc": {
+                    "embedding_name": table_fqn,
+                    "pooling": weighted_pooling.upper(),
+                    "use_weight": use_weight,
+                },
+                "plain__ebc": {
+                    "embedding_name": table_fqn,
+                    "pooling": plain_pooling.upper(),
+                    "use_weight": False,
+                },
+            },
+        )
+
     def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
         """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
         tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_")
@@ -814,6 +936,15 @@ class ExportUtilTest(unittest.TestCase):
                 ckpt_dir,
                 {},
                 embedding_bag_info,
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="user_id", expression="user:user_id"
+                            )
+                        )
+                    ]
+                ),
             )
 
             torch.testing.assert_close(
@@ -833,7 +964,7 @@ class ExportUtilTest(unittest.TestCase):
             self.assertEqual(emb_meta[table_fqn]["score_name"], f"{table_fqn}.scores")
             self.assertEqual(
                 feat_meta["user_id__ebc"],
-                {"embedding_name": table_fqn, "pooling": "SUM"},
+                {"embedding_name": table_fqn, "pooling": "SUM", "use_weight": False},
             )
         finally:
             if old_rank is None:
@@ -899,6 +1030,15 @@ class ExportUtilTest(unittest.TestCase):
                 ckpt_dir,
                 {},
                 embedding_bag_info,
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="user_id", expression="user:user_id"
+                            )
+                        )
+                    ]
+                ),
             )
 
             torch.testing.assert_close(
@@ -1064,6 +1204,16 @@ class ExportUtilTest(unittest.TestCase):
                             pooling="SUM",
                         ),
                     },
+                    create_features(
+                        [
+                            feature_pb2.FeatureConfig(
+                                id_feature=feature_pb2.IdFeature(
+                                    feature_name=name, expression=f"user:{name}"
+                                )
+                            )
+                            for name in ("user_id", "plain_id")
+                        ]
+                    ),
                 )
 
             self.assertEqual(sorted(out.keys()), [plain_fqn])
@@ -1105,7 +1255,11 @@ class ExportUtilTest(unittest.TestCase):
             )
             self.assertEqual(
                 feat_meta["user_id__ebc"],
-                {"embedding_name": zch_ebc_fqn, "pooling": "SUM"},
+                {
+                    "embedding_name": zch_ebc_fqn,
+                    "pooling": "SUM",
+                    "use_weight": False,
+                },
             )
 
             torch.testing.assert_close(
@@ -1205,6 +1359,15 @@ class ExportUtilTest(unittest.TestCase):
                         pooling="SUM",
                     )
                 },
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="user_id", expression="user:user_id"
+                            )
+                        )
+                    ]
+                ),
             )
 
             default_value = dynamic_out[f"{table_fqn}.default_value"]
@@ -1286,6 +1449,15 @@ class ExportUtilTest(unittest.TestCase):
                         pooling="SUM",
                     )
                 },
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="user_id", expression="user:user_id"
+                            )
+                        )
+                    ]
+                ),
             )
 
             torch.testing.assert_close(
@@ -1369,6 +1541,16 @@ class ExportUtilTest(unittest.TestCase):
                         pooling="SUM",
                     ),
                 },
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name=name, expression=f"user:{name}"
+                            )
+                        )
+                        for name in ("id_feat", "user_feat")
+                    ]
+                ),
             )
 
             self.assertEqual(dynamic_out, {})
@@ -1390,15 +1572,15 @@ class ExportUtilTest(unittest.TestCase):
             )
             self.assertEqual(
                 feat_meta["seq_feat__ec"],
-                {"embedding_name": ec_fqn, "pooling": "NONE"},
+                {"embedding_name": ec_fqn, "pooling": "NONE", "use_weight": False},
             )
             self.assertEqual(
                 feat_meta["id_feat__ebc"],
-                {"embedding_name": ebc_fqn, "pooling": "SUM"},
+                {"embedding_name": ebc_fqn, "pooling": "SUM", "use_weight": False},
             )
             self.assertEqual(
                 feat_meta["user_feat__ebc"],
-                {"embedding_name": ebc_fqn, "pooling": "SUM"},
+                {"embedding_name": ebc_fqn, "pooling": "SUM", "use_weight": False},
             )
         finally:
             _restore_env(old_env)
@@ -1461,6 +1643,16 @@ class ExportUtilTest(unittest.TestCase):
                         pooling="SUM",
                     ),
                 },
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name=name, expression=f"user:{name}"
+                            )
+                        )
+                        for name in ("id_feat", "user_feat")
+                    ]
+                ),
             )
 
             self.assertEqual(dynamic_out, {})
@@ -1526,6 +1718,15 @@ class ExportUtilTest(unittest.TestCase):
                             pooling="SUM",
                         )
                     },
+                    create_features(
+                        [
+                            feature_pb2.FeatureConfig(
+                                id_feature=feature_pb2.IdFeature(
+                                    feature_name="user_id", expression="user:user_id"
+                                )
+                            )
+                        ]
+                    ),
                 )
         finally:
             _restore_env(old_env)
