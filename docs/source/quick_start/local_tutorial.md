@@ -34,6 +34,8 @@ GPU版本（CUDA 12.6) 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu126
 GPU版本（CUDA 13.0，含 TensorRT) 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu130
+GPU版本（CUDA 13.0，含 TensorRT，eRDMA 机型) 镜像地址:
+  mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cu130-erdma
 CPU版本 镜像地址:
   mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:${TZREC_DOCKER_VERSION}-cpu
 ```
@@ -44,12 +46,16 @@ CPU版本 镜像地址:
 | ---------------- | --------- | ------------------------------------- | -------- |
 | `-cu126`         | 525.60.13 | `sm_50 / 60 / 70 / 75 / 80 / 86 / 90` | 否       |
 | `-cu130`（默认） | 580.65.06 | `sm_75 / 80 / 86 / 90 / 100 / 120`    | 是       |
+| `-cu130-erdma`   | 580.65.06 | `sm_75 / 80 / 86 / 90 / 100 / 120`    | 是       |
 
 - **CUDA 12.6** 镜像覆盖 Maxwell (M40)、Pascal (P100)、Volta (V100)、Turing (T4)、
   Ampere (A10/A30/A100)、Ada (L4/L20/L40)、Hopper (H100) 等 CC 5.0–9.0 的卡，
   不支持 Blackwell。驱动要求最低，老机器优先选它。
 - **CUDA 13.0** 镜像覆盖 CC 7.5–12.0，含 Blackwell (B100/B200)，另预装 torch-tensorrt 2.14 /
   TensorRT 11.1，用于 TRT 导出与推理，但需要 580 驱动。
+- **CUDA 13.0 eRDMA** 镜像与 CUDA 13.0 镜像内容相同，仅将 RDMA 用户态库换成支持
+  [eRDMA](https://help.aliyun.com/zh/ecs/user-guide/erdma-overview) 的版本。机型支持 eRDMA 时请选它，
+  否则多机通信会回退到 TCP。
 
 注：fbgemm_gpu 等算子库的 wheel 不含 PTX，显卡架构不在上表时无法 JIT 回退，请按卡选择镜像。
 驱动低于所选镜像要求时，可改用低一档的镜像，或为 cu130 镜像设置
