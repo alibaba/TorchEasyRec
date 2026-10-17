@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -1665,9 +1666,10 @@ def export_distributed_embedding(
     #
     # Keep the existing sparse/dense GraphModule restore steps below as the
     # final source of exported weights. This warm-up is only to make the module
-    # structure traceable.
+    # structure traceable, so it skips the dynamic embedding tables, which
+    # `_get_sparse_embedding_tensor` reads straight from the checkpoint files.
     logger.info("running pre-trace warm-up for distributed embedding export...")
-    checkpoint_util.restore_model(checkpoint_path, dmp_model)
+    checkpoint_util.restore_model(checkpoint_path, dmp_model, load_dynamicemb=False)
     dmp_model.to(device)
     with torch.no_grad():
         warmup_result = dmp_model(data, device=device)
@@ -2755,6 +2757,47 @@ def _get_sparse_embedding_tensor(
                 (emb_name, ckpt_rank, ckpt_world_size, key_file)
             )
 
+        def _read_dynamic_shard(
+            shard: Tuple[str, int, int, str],
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
+            ckpt_emb_name, ckpt_rank, ckpt_world_size, key_file = shard
+            # f.read() releases the GIL for the whole file, np.fromfile does not.
+            with open(key_file, "rb") as f:
+                keys = torch.tensor(np.frombuffer(f.read(), dtype=np.int64))
+            value_file = os.path.join(
+                os.path.dirname(key_file),
+                f"{ckpt_emb_name}_emb_values.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
+            )
+            with open(value_file, "rb") as f:
+                values = torch.tensor(np.frombuffer(f.read(), dtype=np.float32))
+            score_file = os.path.join(
+                os.path.dirname(key_file),
+                f"{ckpt_emb_name}_emb_scores.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
+            )
+            if not os.path.exists(score_file):
+                raise FileNotFoundError(
+                    f"dynamic embedding {ckpt_emb_name} score file not found: "
+                    f"{score_file}"
+                )
+            with open(score_file, "rb") as f:
+                scores = torch.tensor(np.frombuffer(f.read(), dtype=np.int64))
+            return keys, values, scores, score_file
+
+        owned_shards = {
+            emb_name: [s for s in sorted(emb_key_files) if s[1] % world_size == rank]
+            for emb_name, emb_key_files in key_files_by_emb.items()
+        }
+        # Shard files are small and many, so on high-latency filesystems (e.g.
+        # object-storage mounts) reading them one by one is latency-bound.
+        with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 1)) as pool:
+            shard_data = iter(
+                list(
+                    pool.map(
+                        _read_dynamic_shard,
+                        [s for v in owned_shards.values() for s in v],
+                    )
+                )
+            )
         for emb_name, emb_key_files in key_files_by_emb.items():
             emb_dim = emb_name_to_emb_dim[emb_name]
             key_name = f"{emb_name}.keys"
@@ -2769,36 +2812,8 @@ def _get_sparse_embedding_tensor(
                     f"dynamic embedding {emb_name} has inconsistent checkpoint "
                     f"world_size values: {sorted(ckpt_world_sizes)}"
                 )
-            for ckpt_emb_name, ckpt_rank, ckpt_world_size, key_file in sorted(
-                emb_key_files
-            ):
-                if ckpt_rank % world_size != rank:
-                    continue
-                with open(key_file, "rb") as f:
-                    keys = torch.tensor(
-                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
-                    )
-                value_file = os.path.join(
-                    os.path.dirname(key_file),
-                    f"{ckpt_emb_name}_emb_values.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
-                )
-                with open(value_file, "rb") as f:
-                    values = torch.tensor(
-                        np.fromfile(f, dtype=np.float32), dtype=torch.float32
-                    )
-                score_file = os.path.join(
-                    os.path.dirname(key_file),
-                    f"{ckpt_emb_name}_emb_scores.rank_{ckpt_rank}.world_size_{ckpt_world_size}",
-                )
-                if not os.path.exists(score_file):
-                    raise FileNotFoundError(
-                        f"dynamic embedding {emb_name} score file not found: "
-                        f"{score_file}"
-                    )
-                with open(score_file, "rb") as f:
-                    scores = torch.tensor(
-                        np.fromfile(f, dtype=np.int64), dtype=torch.int64
-                    )
+            for _, _, _, key_file in owned_shards[emb_name]:
+                keys, values, scores, score_file = next(shard_data)
                 if keys.numel() != scores.numel():
                     raise ValueError(
                         f"dynamic embedding {emb_name} key/score row mismatch: "

@@ -657,6 +657,21 @@ class CheckpointUtilTest(unittest.TestCase):
         finally:
             dist.destroy_process_group()
 
+    @unittest.skipUnless(checkpoint_util.has_dynamicemb, "dynamicemb not installed")
+    def test_restore_model_can_skip_dynamicemb(self):
+        model = nn.Linear(4, 2)
+        with mock.patch.object(checkpoint_util, "has_dynamicemb", False):
+            checkpoint_util.save_model(self.test_dir, model)
+        os.makedirs(os.path.join(self.test_dir, "dynamicemb"))
+
+        with mock.patch("dynamicemb.dump_load.DynamicEmbLoad") as dynamicemb_load:
+            checkpoint_util.restore_model(
+                self.test_dir, nn.Linear(4, 2), load_dynamicemb=False
+            )
+            dynamicemb_load.assert_not_called()
+            checkpoint_util.restore_model(self.test_dir, nn.Linear(4, 2))
+            dynamicemb_load.assert_called_once()
+
     def test_dense_ema_save_restore_and_inference_overlay(self):
         class Model(nn.Module):
             def __init__(self):
