@@ -15,7 +15,7 @@ export_config {
 - best_exporter_metric: 当exporter_type为best的时候，确定最优导出模型的metric，注意该metric要在对应任务的metrics设置了才行。对于多任务模型则需要设置 {metric_name}\_{tower_name}。
 - metric_larger_is_better: 确定最优导出模型的metric是越大越好，还是越小越好，默认是越大越好
 - use_dense_ema: 是否使用稠密EMA参数导出模型。未配置时默认跟随`train_config.dense_optimizer.ema`是否启用；可显式配置为`true`或`false`覆盖默认行为，在线Dense导出同样使用该配置
-- dynamic_embedding_export_config: 分布式 embedding 导出时的 dynemb 读取块大小和可选 FeatureDB 全量上传配置，详见下文 [dynemb 流式导出与 FeatureDB 全量上传](#dynamic-embedding-full-export)
+- dynamic_embedding: 分布式 embedding 导出时的 dynemb 读取块大小和可选 FeatureDB 全量上传配置，详见下文 [dynemb 流式导出与 FeatureDB 全量上传](#dynamic-embedding-full-export)
 
 ## 导出命令
 
@@ -61,9 +61,9 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 ## dynemb 流式导出与 FeatureDB 全量上传
 
-在 `USE_DISTRIBUTED_EMBEDDING=1` 下，dynemb 默认按块读取 checkpoint 并写入 NPZ，不需要将全部 dynemb 参数恢复到主机内存或显存。配置 `export_config.dynamic_embedding_export_config.feature_store_config` 后，同一批 dynemb 参数还会上传到 FeatureDB；不配置时只生成导出文件。该能力适用于原生 dynemb 参数。普通 sparse 和 ZCH 表仍按原有方式恢复到内存，其内存占用不受 dynemb 读取块预算限制。
+在 `USE_DISTRIBUTED_EMBEDDING=1` 下，dynemb 默认按块读取 checkpoint 并写入 NPZ，不需要将全部 dynemb 参数恢复到主机内存或显存。配置 `export_config.dynamic_embedding.feature_store_config` 后，同一批 dynemb 参数还会上传到 FeatureDB；不配置时只生成导出文件。该能力适用于原生 dynemb 参数。普通 sparse 和 ZCH 表仍按原有方式恢复到内存，其内存占用不受 dynemb 读取块预算限制。
 
-配置 `dynamic_embedding_export_config` 要求 `USE_DISTRIBUTED_EMBEDDING=1` 且非 RTP 导出，否则导出启动时会报错。
+配置 `dynamic_embedding` 要求 `USE_DISTRIBUTED_EMBEDDING=1` 且非 RTP 导出，否则导出启动时会报错。
 
 ### 配置
 
@@ -71,7 +71,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 ```protobuf
 export_config {
-  dynamic_embedding_export_config {
+  dynamic_embedding {
     feature_store_config {
       region: "cn-beijing"
       project_name: "recommendation"

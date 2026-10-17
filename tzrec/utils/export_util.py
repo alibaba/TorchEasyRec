@@ -156,10 +156,10 @@ def export_model(
 
     use_rtp = env_util.use_rtp()
     use_dist_embedding = acc_utils.use_distributed_embedding()
-    if pipeline_config.export_config.HasField("dynamic_embedding_export_config"):
+    if pipeline_config.export_config.HasField("dynamic_embedding"):
         if use_rtp or not use_dist_embedding:
             raise ValueError(
-                "dynamic_embedding_export_config requires "
+                "dynamic_embedding requires "
                 "USE_DISTRIBUTED_EMBEDDING=1 and a non-RTP export"
             )
     if use_rtp:
@@ -1628,7 +1628,7 @@ def export_distributed_embedding(
     )
     if checkpoint_path and (
         os.path.isdir(os.path.join(checkpoint_path, "dynamicemb"))
-        or pipeline_config.export_config.HasField("dynamic_embedding_export_config")
+        or pipeline_config.export_config.HasField("dynamic_embedding")
         or has_dynamic_tables
     ):
         _export_dynamic_embedding_checkpoint(
@@ -1979,15 +1979,11 @@ def _export_dynamic_embedding_checkpoint(
     chunk is shared by the NPZ writer and the bounded full-upload writer. The
     final sparse metadata is written only after both outputs complete.
     """
-    settings = pipeline_config.export_config.dynamic_embedding_export_config
+    settings = pipeline_config.export_config.dynamic_embedding
     if settings.read_chunk_size_mb <= 0:
-        raise ValueError(
-            "dynamic_embedding_export_config.read_chunk_size_mb must be > 0"
-        )
+        raise ValueError("dynamic_embedding.read_chunk_size_mb must be > 0")
     if settings.upload_max_in_flight_batches <= 0:
-        raise ValueError(
-            "dynamic_embedding_export_config.upload_max_in_flight_batches must be > 0"
-        )
+        raise ValueError("dynamic_embedding.upload_max_in_flight_batches must be > 0")
     infos = {**bag_infos, **embedding_infos}
     dimensions = {
         checkpoint_util.remap_input_tile_user_key(name): info.embedding_dim

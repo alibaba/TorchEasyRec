@@ -36,5 +36,5 @@ message ExportConfig {
     // Whether export uses dense EMA parameters.
     optional bool use_dense_ema = 7;
     // Dynamic checkpoint reads and NPZ writes are streamed even when unset.
-    optional DynamicEmbeddingExportConfig dynamic_embedding_export_config = 8;
+    optional DynamicEmbeddingExportConfig dynamic_embedding = 8;
 }

@@ -327,7 +327,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         trained = self._train_eval_export()
         if streaming:
             config = config_util.load_pipeline_config(trained)
-            config.export_config.dynamic_embedding_export_config.SetInParent()
+            config.export_config.dynamic_embedding.SetInParent()
             config_util.save_message(config, trained)
         else:
             # NOTE: Empty SDK dump directories also select streaming export.

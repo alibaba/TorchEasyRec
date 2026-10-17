@@ -2794,7 +2794,7 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
         with mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False):
             checkpoint_util.save_model(self.checkpoint_dir, checkpoint_model)
 
-        settings = self.pipeline_config.export_config.dynamic_embedding_export_config
+        settings = self.pipeline_config.export_config.dynamic_embedding
         if upload:
             settings.read_chunk_size_mb = 1
             settings.upload_max_in_flight_batches = 2
@@ -3026,7 +3026,7 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
     def test_dynamic_export_config_rejects_incompatible_modes(
         self, _name, rtp, distributed_embedding
     ):
-        self.pipeline_config.export_config.dynamic_embedding_export_config.SetInParent()
+        self.pipeline_config.export_config.dynamic_embedding.SetInParent()
         with (
             mock.patch.object(export_util.env_util, "use_rtp", return_value=rtp),
             mock.patch.object(
@@ -3108,7 +3108,7 @@ class DynamicEmbeddingCheckpointExportTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_invalid_export_fails_before_materialization(self, setting, error):
-        settings = self.pipeline_config.export_config.dynamic_embedding_export_config
+        settings = self.pipeline_config.export_config.dynamic_embedding
         settings.SetInParent()
         if setting != "missing_tables":
             setattr(settings, setting, 0)
