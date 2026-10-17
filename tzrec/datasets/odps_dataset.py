@@ -277,6 +277,27 @@ def _get_session_record_count(
     return scan_resp.record_count
 
 
+def _create_read_session(
+    client: StorageApiArrowClient,
+    columns: List[str],
+    partitions: Optional[List[str]],
+) -> Tuple[str, int]:
+    """Create a batch scan session, return its id and record count."""
+    scan_req = TableBatchScanRequest(
+        split_options=SplitOptions(split_mode="RowOffset"),
+        required_data_columns=columns,
+        required_partitions=partitions,
+    )
+    try:
+        session_id = client.create_read_session(scan_req).session_id
+    except Exception as e:
+        debug_info = _storage_debug_info(client, partitions=partitions)
+        logger.error(f"create_read_session failed ({debug_info}): {e!r}")
+        raise
+    sess_req = SessionRequest(session_id=session_id)
+    return session_id, _get_session_record_count(client, sess_req)
+
+
 def _reader_iter(
     client: StorageApiArrowClient,
     sess_req: SessionRequest,
@@ -398,6 +419,7 @@ class OdpsDataset(BaseDataset):
             batch_cost_size=self._data_config.batch_cost_size,
             min_batch_size=self._min_batch_size,
             equalize_rank_steps=self._mode != Mode.PREDICT,
+            init_session_threads=max(self._data_config.num_workers, 1),
         )
 
 
@@ -416,6 +438,8 @@ class OdpsReader(BaseReader):
         compression (str):  storage api data compression name.
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
+        init_session_threads (int): threads per rank to create read sessions and
+            fetch their record counts.
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
         equalize_rank_steps (bool): make every rank yield the same number of batches.
     """
@@ -433,6 +457,7 @@ class OdpsReader(BaseReader):
         compression: str = "LZ4_FRAME",
         sample_cost_field: Optional[str] = None,
         batch_cost_size: Optional[int] = None,
+        init_session_threads: int = 1,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -448,6 +473,7 @@ class OdpsReader(BaseReader):
         )
         self._pg = dist_util.get_dist_object_pg()
         self._is_orderby_partition = is_orderby_partition
+        self._init_session_threads = init_session_threads
         self._quota_name = quota_name
         self._compression = _get_compression_type(compression)
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
@@ -502,43 +528,42 @@ class OdpsReader(BaseReader):
 
     def _init_session(self) -> None:
         """Init table scan session."""
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
         sess_id_to_cli = {}
         for input_path in self._input_path.split(","):
-            session_ids = []
             _, table_name, partitions, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
             if self._is_orderby_partition and partitions is not None:
                 splited_partitions = [[x] for x in partitions]
             else:
                 splited_partitions = [partitions]
-            for partitions in splited_partitions:
-                if int(os.environ.get("RANK", 0)) == 0:
-                    scan_req = TableBatchScanRequest(
-                        split_options=SplitOptions(split_mode="RowOffset"),
-                        required_data_columns=self._ordered_cols,
-                        required_partitions=partitions,
-                    )
-                    scan_resp = client.create_read_session(scan_req)
-                    session_ids.append(scan_resp.session_id)
-                    sess_id_to_cli[scan_resp.session_id] = client
-                else:
-                    session_ids.append(None)
-
-            if self._pg is not None:
-                dist.broadcast_object_list(session_ids, group=self._pg)
-            sess_reqs = [SessionRequest(session_id=x) for x in session_ids]
-            self._input_to_sess[input_path] = sess_reqs
-            # a session's record count is an immutable snapshot: every rank fetches
-            # it once here, outside any collective, instead of in every worker
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                record_counts = list(
+            # every rank creates a strided slice of the sessions, then all gather
+            rank_partitions = splited_partitions[rank::world_size]
+            with ThreadPoolExecutor(max_workers=self._init_session_threads) as executor:
+                sessions = list(
                     executor.map(
-                        _get_session_record_count, [client] * len(sess_reqs), sess_reqs
+                        _create_read_session,
+                        [client] * len(rank_partitions),
+                        [self._ordered_cols] * len(rank_partitions),
+                        rank_partitions,
                     )
                 )
-            self._sess_row_counts.update(zip(session_ids, record_counts))
+            if self._pg is not None:
+                sessions_list: List[Any] = [None] * world_size
+                dist.all_gather_object(sessions_list, sessions, group=self._pg)
+                sessions = [
+                    sessions_list[i % world_size][i // world_size]
+                    for i in range(len(splited_partitions))
+                ]
+            self._input_to_sess[input_path] = [
+                SessionRequest(session_id=x) for x, _ in sessions
+            ]
+            self._sess_row_counts.update(sessions)
+            if rank == 0:
+                sess_id_to_cli.update((x, client) for x, _ in sessions)
         # refresh session
-        if int(os.environ.get("RANK", 0)) == 0:
+        if rank == 0:
             t = threading.Thread(
                 target=_refresh_sessions_daemon,
                 args=(sess_id_to_cli,),
@@ -635,22 +660,26 @@ class OdpsReader(BaseReader):
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
-        # (source_id_prefix, record_count, client, session) in read order
+        # (source_id_prefix, record_count, client, session, name) in read order
         sources = []
         for input_path in self._input_path.split(","):
-            _, table_name, _, _ = _parse_table_path(input_path)
+            _, table_name, partitions, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
             for sess_idx, sess_req in enumerate(self._input_to_sess[input_path]):
+                name = table_name
+                if self._is_orderby_partition and partitions is not None:
+                    name = f"{table_name}/{partitions[sess_idx]}"
                 sources.append(
                     (
                         f"{input_path}#{sess_idx}#{sess_req.session_id}",
                         self._sess_row_counts[sess_req.session_id],
                         client,
                         sess_req,
+                        name,
                     )
                 )
         plan = calc_slice_intervals(
-            [(prefix, record_count) for prefix, record_count, _, _ in sources],
+            [(prefix, record_count) for prefix, record_count, _, _, _ in sources],
             worker_id,
             num_workers,
             self._batch_size,
@@ -661,7 +690,11 @@ class OdpsReader(BaseReader):
         )
 
         def _combined_reader() -> Iterator[pa.RecordBatch]:
-            for (prefix, _, client, sess_req), intervals in zip(sources, plan):
+            for i, ((prefix, _, client, sess_req, name), intervals) in enumerate(
+                zip(sources, plan)
+            ):
+                if worker_id == 0 and any(start < end for start, end in intervals):
+                    logger.info(f"Reading {name} ({i + 1}/{len(sources)})")
                 for start, end in intervals:
                     if start >= end:
                         continue
