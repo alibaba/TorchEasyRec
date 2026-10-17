@@ -872,7 +872,16 @@ class ExportUtilTest(unittest.TestCase):
             },
         )
 
-    def test_sparse_export_rejects_missing_or_conflicting_feature_tables(self) -> None:
+    @parameterized.expand(
+        [
+            ("wide_and_deep", model_pb2.FeatureGroupType.WIDE, ""),
+            ("suffixed_towers", model_pb2.FeatureGroupType.DEEP, "tower_b"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sparse_export_rejects_missing_or_conflicting_feature_tables(
+        self, name, group_type, embedding_name_suffix
+    ) -> None:
         test_dir = make_test_dir()
         self.addCleanup(shutil.rmtree, test_dir)
         features = create_features(
@@ -896,9 +905,10 @@ class ExportUtilTest(unittest.TestCase):
                     group_type=model_pb2.FeatureGroupType.DEEP,
                 ),
                 model_pb2.FeatureGroupConfig(
-                    group_name="wide",
+                    group_name="other",
                     feature_names=["user_id"],
-                    group_type=model_pb2.FeatureGroupType.WIDE,
+                    group_type=group_type,
+                    embedding_name_suffix=embedding_name_suffix,
                 ),
             ],
             device=torch.device("cpu"),
@@ -906,7 +916,10 @@ class ExportUtilTest(unittest.TestCase):
         embedding_bag_info, embedding_info = (
             export_util._get_sparse_table_to_embedding_info(model)
         )
-        with self.assertRaisesRegex(ValueError, "maps to multiple embedding tables"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "maps to multiple embedding tables.*distinct feature_name values per group",
+        ):
             _get_sparse_embedding_tensor(
                 model, test_dir, embedding_info, embedding_bag_info, features
             )

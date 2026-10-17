@@ -2620,7 +2620,9 @@ def _get_sparse_embedding_tensor(
                 raise ValueError(
                     f"sparse feature [{feat_name}] maps to multiple embedding "
                     f"tables [{existing_emb_name}] and [{export_emb_name}] in "
-                    "distributed embedding export."
+                    "distributed embedding export. Use distinct feature_name "
+                    "values per group (with the same input expression if needed), "
+                    "or keep the feature in only one group."
                 )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
@@ -2644,7 +2646,9 @@ def _get_sparse_embedding_tensor(
                 raise ValueError(
                     f"sparse feature [{feat_name}] maps to multiple embedding "
                     f"tables [{existing_emb_name}] and [{export_emb_name}] in "
-                    "distributed embedding export."
+                    "distributed embedding export. Use distinct feature_name "
+                    "values per group (with the same input expression if needed), "
+                    "or keep the feature in only one group."
                 )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
