@@ -2582,9 +2582,9 @@ def _get_sparse_embedding_tensor(
     """Get embedding tensors and per-feature serving metadata for the sparse part.
 
     Feature pooling describes the reduction over raw FG outputs before kernel
-    rewrites. Weighted MEAN divides by the bag's weight sum, using one when the
-    sum is zero; unweighted MEAN divides by the bag length. EC features use
-    NONE pooling and do not use weights.
+    rewrites. Weighted SUM uses raw, unnormalized weights. Weighted MEAN divides
+    by the bag's weight sum, using one when the sum is zero; unweighted MEAN
+    divides by the bag length. EC features use NONE pooling and do not use weights.
 
     Args:
         model: sparse model containing the embedding tables.
