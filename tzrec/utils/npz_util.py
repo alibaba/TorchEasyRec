@@ -30,7 +30,7 @@ import errno
 import os
 import uuid
 import zipfile
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import numpy as np
 
@@ -125,3 +125,37 @@ def savez_streaming(path: str, arrays: Mapping[str, Any]) -> None:
         with contextlib.suppress(OSError):
             os.unlink(part)
         raise
+
+
+def has_npz_entry(path: str, name: str) -> bool:
+    """Return whether the npz at *path* holds entry *name* (no ``.npy`` suffix)."""
+    with zipfile.ZipFile(path) as zf:
+        return f"{name}.npy" in zf.namelist()
+
+
+def iter_npz_entry(path: str, name: str, batch_rows: int) -> Iterator[np.ndarray]:
+    """Stream the rows of an npz entry in batches without loading it whole.
+
+    Args:
+        path: ``.npz`` file path.
+        name: entry name without the ``.npy`` suffix.
+        batch_rows: maximum number of rows per yielded batch.
+
+    Yields:
+        Consecutive row batches of the entry, shaped ``(n, *shape[1:])``.
+    """
+    with zipfile.ZipFile(path) as zf, zf.open(f"{name}.npy") as f:
+        version = np.lib.format.read_magic(f)
+        if version == (1, 0):
+            shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(f)
+        else:
+            shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(f)
+        if fortran_order:
+            raise ValueError(f"{path}:{name} is fortran ordered.")
+        row_shape = tuple(shape[1:])
+        row_bytes = int(np.prod(row_shape, dtype=np.int64)) * dtype.itemsize
+        for start in range(0, shape[0], batch_rows):
+            n = min(batch_rows, shape[0] - start)
+            # a bytearray keeps the batch writable, e.g. for torch.from_numpy.
+            buf = bytearray(f.read(n * row_bytes))
+            yield np.frombuffer(buf, dtype=dtype).reshape((n,) + row_shape)
