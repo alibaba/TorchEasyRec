@@ -71,7 +71,7 @@ from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util, env_util, npz_util, quant_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.dynamic_embedding_export import get_dynamic_embedding_export
-from tzrec.utils.feature_store_export_uploader import FeatureStoreExportUploader
+from tzrec.utils.feature_store_uploader import FeatureStoreFullUploader
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     UNTRACEABLE_MODULES,
@@ -1581,7 +1581,7 @@ def export_distributed_embedding(
     }
     uploader = None
     if settings.HasField("feature_store_config"):
-        uploader = FeatureStoreExportUploader(
+        uploader = FeatureStoreFullUploader(
             settings.feature_store_config,
             dimensions,
             embedding_field_type="ARRAY<UINT8>"

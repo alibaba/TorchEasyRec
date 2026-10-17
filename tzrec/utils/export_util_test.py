@@ -2569,7 +2569,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                export_util, "FeatureStoreExportUploader", return_value=uploader
+                export_util, "FeatureStoreFullUploader", return_value=uploader
             ) as uploader_class,
             mock.patch.object(
                 export_util, "create_dataloader", return_value=iter([batch])
