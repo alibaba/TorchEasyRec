@@ -107,8 +107,11 @@ RUN case ${DEVICE} in \
                  apt-get clean && \
                  rm -rf /var/lib/apt/lists/* ;; \
     esac
-RUN case ${DEVICE} in \
-        "cu126"|"cu130") cd /tmp/ && \
+# RDMA userspace: hpn = Mellanox rdma-core for Lingjun/HPN NICs, erdma = rdma-core with the
+# eRDMA provider. They cannot coexist since providers are tied to their libibverbs build.
+ARG RDMA
+RUN case ${RDMA} in \
+        "hpn") cd /tmp/ && \
                  wget https://hpn-driver.oss-cn-hangzhou.aliyuncs.com/nic-drivers/shuyao/drivers/ubuntu22.04-rdma-core-23.10.tar && \
                  tar xf ubuntu22.04-rdma-core-23.10.tar && \
                  cd ubuntu22.04-rdma-core-23.10 && \
@@ -118,4 +121,9 @@ RUN case ${DEVICE} in \
                  cd .. && \
                  rm -rf ubuntu22.04-rdma-core-23.10 && \
                  rm -f ubuntu22.04-rdma-core-23.10.tar ;; \
+        "erdma") wget -O /etc/apt/trusted.gpg.d/erdma.asc http://mirrors.aliyun.com/erdma/GPGKEY && \
+                 echo "deb [ ] http://mirrors.aliyun.com/erdma/apt/ubuntu jammy/erdma main" > /etc/apt/sources.list.d/erdma.list && \
+                 apt-get update && \
+                 apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers ibverbs-utils librdmacm1 && \
+                 apt-get clean && rm -rf /var/lib/apt/lists/* ;; \
 esac
