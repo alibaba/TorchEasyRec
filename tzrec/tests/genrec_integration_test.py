@@ -20,7 +20,6 @@ from unittest import mock
 
 import torch
 from google.protobuf import text_format
-from parameterized import parameterized
 from pyarrow import parquet as pq
 
 from tzrec.datasets.data_parser import DataParser
@@ -45,7 +44,6 @@ from tzrec.utils.test_util import (
     make_test_dir,
     mark_ci_scope,
     nv_gpu_unavailable,
-    parameterized_name_func,
 )
 
 _MOCK_CONFIG = "tzrec/tests/configs/genrec_causal_lm_model_mock.config"
@@ -316,26 +314,11 @@ class GenRecIntegrationTest(unittest.TestCase):
         """
         self._train_eval_export(attn_kernel="flash_attention_2")
 
-    @parameterized.expand(
-        [("legacy_routing", False), ("streaming_routing", True)],
-        name_func=parameterized_name_func,
-    )
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")
-    def test_genrec_export_distributed_embedding(self, _name, streaming):
-        """Check legacy and explicit streaming export with no dynemb rows."""
+    def test_genrec_export_distributed_embedding(self):
+        """Export a regular sparse model through the unified export path."""
         trained = self._train_eval_export()
-        if streaming:
-            config = config_util.load_pipeline_config(trained)
-            config.export_config.dynamic_embedding.SetInParent()
-            config_util.save_message(config, trained)
-        else:
-            # NOTE: Empty SDK dump directories also select streaming export.
-            for directory in glob.glob(
-                os.path.join(self.test_dir, "train", "model.ckpt-*", "dynamicemb")
-            ):
-                self.assertFalse(any(files for _, _, files in os.walk(directory)))
-                shutil.rmtree(directory)
         dist_dir = os.path.join(self.test_dir, "export_dist")
         self.success = utils.test_export(
             trained,
@@ -346,9 +329,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         self.assertTrue(self.success)
         graph_dir = os.path.join(dist_dir, "graph")
         self.assertTrue(os.path.exists(os.path.join(graph_dir, "gm_dense.graph")))
-        self.assertEqual(
-            os.path.exists(os.path.join(graph_dir, "gm_sparse.graph")), not streaming
-        )
+        self.assertFalse(os.path.exists(os.path.join(graph_dir, "gm_sparse.graph")))
         sparse_dir = os.path.join(dist_dir, "sparse")
         self.assertFalse(
             os.path.exists(
