@@ -928,6 +928,28 @@ class ExportUtilTest(unittest.TestCase):
                 model, test_dir, embedding_info, embedding_bag_info, []
             )
 
+    def test_sparse_export_rejects_conflicting_ec_feature_tables(self) -> None:
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir)
+        embedding_infos = {
+            f"ec.embeddings.{name}": EmbeddingConfig(
+                name=name,
+                embedding_dim=4,
+                num_embeddings=8,
+                feature_names=["seq_feat"],
+            )
+            for name in ("first_emb", "second_emb")
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            r"sparse feature \[seq_feat\] maps to multiple embedding tables "
+            r"\[ec.embeddings.first_emb\] and \[ec.embeddings.second_emb\].*"
+            "distinct feature_name values per group",
+        ):
+            _get_sparse_embedding_tensor(
+                torch.nn.Module(), test_dir, embedding_infos, {}, []
+            )
+
     def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
         """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
         tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_")
