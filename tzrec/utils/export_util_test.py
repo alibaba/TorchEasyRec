@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
+from typing import Dict, Optional
 from unittest import mock
 
 import numpy as np
@@ -24,7 +25,6 @@ import torch
 from parameterized import parameterized
 from torch import distributed as dist
 from torchrec import KeyedJaggedTensor, KeyedTensor
-from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
@@ -60,18 +60,15 @@ from tzrec.modules.embedding import EmbeddingGroupImpl
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util, export_util, misc_util
+from tzrec.utils import checkpoint_util, config_util, export_util, misc_util, npz_util
 from tzrec.utils.export_util import (
     _add_module_by_dotted_path,
-    _canonicalize_keyed_tensor_attrs,
     _dedup_key_files_by_realpath,
     _get_dense_embedding_leaf_module_names,
     _get_embedding_bag_configs,
     _get_sparse_embedding_tensor,
     _infer_keyed_tensor_attrs_from_module,
     _isolate_kafka_export_group,
-    _merge_sharded_embedding_json,
-    _permute_keyed_tensor_values,
     _prepare_single_rank_distributed_embedding_export,
     _prune_unused_param_and_buffer,
     _shrink_sparse_embedding_tables,
@@ -83,7 +80,7 @@ from tzrec.utils.export_util import (
 )
 from tzrec.utils.fx_util import fx_mark_keyed_tensor
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import make_test_dir, parameterized_name_func
+from tzrec.utils.test_util import make_test_dir, mark_ci_scope, parameterized_name_func
 
 # register the mark for fx tracing from this module's call sites, as
 # tzrec/modules/embedding.py does for its own
@@ -108,6 +105,55 @@ def _dequant_quint8_rowwise_f16(values: np.ndarray, emb_dim: int) -> np.ndarray:
 
 
 class ExportUtilTest(unittest.TestCase):
+    @parameterized.expand(
+        [("generated_fg", False), ("supplied_fg", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_export_metadata_preserves_config_and_fg_asset(self, _name, supplied_fg):
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir, ignore_errors=True)
+        save_dir = os.path.join(test_dir, "export")
+        os.mkdir(save_dir)
+        config = EasyRecConfig(train_input_path="training-input")
+        original_feature = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(feature_name="original")
+        )
+        config.feature_configs.append(original_feature)
+        export_feature = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(feature_name="exported")
+        )
+        assets = []
+        if supplied_fg:
+            asset = os.path.join(test_dir, "fg.json")
+            with open(asset, "w") as output:
+                json.dump({"supplied": True}, output)
+            assets.append(asset)
+        with (
+            mock.patch.object(
+                export_util, "create_feature_configs", return_value=[export_feature]
+            ),
+            mock.patch.object(
+                export_util, "create_fg_json", return_value={"generated": True}
+            ) as create_fg,
+        ):
+            export_util._write_export_metadata(
+                config, [], save_dir, assets, {"CUSTOM_EXPORT": "enabled"}
+            )
+        self.assertEqual(list(config.feature_configs), [original_feature])
+        saved_config = config_util.load_pipeline_config(
+            os.path.join(save_dir, "pipeline.config")
+        )
+        self.assertEqual(list(saved_config.feature_configs), [export_feature])
+        self.assertEqual(saved_config.train_input_path, "training-input")
+        with open(os.path.join(save_dir, "fg.json")) as input_file:
+            self.assertEqual(
+                json.load(input_file),
+                {"supplied": True} if supplied_fg else {"generated": True},
+            )
+        with open(os.path.join(save_dir, "model_acc.json")) as input_file:
+            self.assertEqual(json.load(input_file)["CUSTOM_EXPORT"], "enabled")
+        self.assertEqual(create_fg.call_count, 0 if supplied_fg else 1)
+
     def test_distributed_sparse_quant_env(self) -> None:
         old_env = {
             "DIST_QUANT": os.environ.get("DIST_QUANT"),
@@ -252,6 +298,8 @@ class ExportUtilTest(unittest.TestCase):
         }
 
         class FakeBatch:
+            sparse_features = {}
+
             def to(self, device):  # type: ignore[no-untyped-def]
                 return self
 
@@ -275,14 +323,6 @@ class ExportUtilTest(unittest.TestCase):
             def forward(self, data, device=None):  # type: ignore[no-untyped-def]
                 return {"score": data["x"] + 1}
 
-        class FakeDMP(torch.nn.Module):
-            def __init__(self, module, *args, **kwargs):  # type: ignore[no-untyped-def]
-                super().__init__()
-                self.module = module
-
-            def forward(self, data, device=None):  # type: ignore[no-untyped-def]
-                return self.module(data, device=device)
-
         tmp = tempfile.mkdtemp(prefix="tzrec_export_dist_overrides_")
         old_env = {
             key: os.environ.get(key)
@@ -303,10 +343,6 @@ class ExportUtilTest(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "tzrec.utils.export_util.init_process_group",
-                    return_value=(torch.device("cpu"), None),
-                ),
-                mock.patch(
                     "tzrec.utils.export_util._get_sparse_table_to_embedding_info",
                     return_value=(embedding_bag_info, {}),
                 ),
@@ -314,17 +350,6 @@ class ExportUtilTest(unittest.TestCase):
                     "tzrec.utils.export_util.create_dataloader",
                     return_value=FakeDataloader(),
                 ) as create_dataloader_mock,
-                mock.patch(
-                    "tzrec.utils.export_util.create_planner",
-                    return_value=SimpleNamespace(collective_plan=lambda *args: None),
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.get_default_sharders", return_value=[]
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.DistributedModelParallel",
-                    side_effect=lambda *args, **kwargs: FakeDMP(kwargs["module"]),
-                ),
                 mock.patch("tzrec.utils.export_util.checkpoint_util.restore_model"),
                 mock.patch("tzrec.utils.export_util.init_parameters"),
                 mock.patch("tzrec.utils.export_util.config_util.save_message"),
@@ -381,6 +406,8 @@ class ExportUtilTest(unittest.TestCase):
         self,
     ) -> None:
         class FakeBatch:
+            sparse_features = {}
+
             def to(self, device):  # type: ignore[no-untyped-def]
                 return self
 
@@ -403,14 +430,6 @@ class ExportUtilTest(unittest.TestCase):
 
             def forward(self, data, device=None):  # type: ignore[no-untyped-def]
                 return {"score": data["x"] + 1}
-
-        class FakeDMP(torch.nn.Module):
-            def __init__(self, module, *args, **kwargs):  # type: ignore[no-untyped-def]
-                super().__init__()
-                self.module = module
-
-            def forward(self, data, device=None):  # type: ignore[no-untyped-def]
-                return self.module(data, device=device)
 
         tmp = tempfile.mkdtemp(prefix="tzrec_export_dist_overrides_")
         old_env = {
@@ -438,10 +457,6 @@ class ExportUtilTest(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "tzrec.utils.export_util.init_process_group",
-                    return_value=(torch.device("cpu"), None),
-                ),
-                mock.patch(
                     "tzrec.utils.export_util._get_sparse_table_to_embedding_info",
                     return_value=({}, {}),
                 ),
@@ -449,17 +464,6 @@ class ExportUtilTest(unittest.TestCase):
                     "tzrec.utils.export_util.create_dataloader",
                     return_value=FakeDataloader(),
                 ) as create_dataloader_mock,
-                mock.patch(
-                    "tzrec.utils.export_util.create_planner",
-                    return_value=SimpleNamespace(collective_plan=lambda *args: None),
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.get_default_sharders", return_value=[]
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.DistributedModelParallel",
-                    side_effect=lambda *args, **kwargs: FakeDMP(kwargs["module"]),
-                ),
                 mock.patch("tzrec.utils.export_util.checkpoint_util.restore_model"),
                 mock.patch("tzrec.utils.export_util.init_parameters"),
                 mock.patch(
@@ -510,283 +514,122 @@ class ExportUtilTest(unittest.TestCase):
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_distributed_embedding_export_bakes_config_order_keyed_tensor(
-        self,
-    ) -> None:
-        """The dense export must bake config-order keys, not sharded runtime order.
-
-        A sharded EBC emits its KeyedTensor grouped by sharding type / compute
-        kernel (e.g. dynamicemb tables move to the tail), while the online
-        dense export derives keys statically in config order; baking the
-        runtime order makes the serving processor reject every hot dense
-        update with dense_meta_mismatch. The fake sharded EBC below outputs
-        keys rotated to (f_b, f_c, f_a) whereas its ``_embedding_bag_configs``
-        order is (f_a, f_b, f_c). The INPUT_TILE=3 user side is also covered:
-        its marked KeyedTensor carries kwargs-sourced keys and tiled values,
-        while the sparse extraction captures the raw batch=1 values, so the
-        smoke-run permute must handle the pre-tile layout.
-        """
+    def test_distributed_embedding_export_preserves_keyed_tensor_layout(self):
         tables = [
             EmbeddingBagConfig(
-                name="t_a", embedding_dim=4, num_embeddings=10, feature_names=["f_a"]
-            ),
-            EmbeddingBagConfig(
-                name="t_b", embedding_dim=8, num_embeddings=10, feature_names=["f_b"]
-            ),
-            EmbeddingBagConfig(
-                name="t_c", embedding_dim=4, num_embeddings=10, feature_names=["f_c"]
-            ),
+                name=f"t_{name}",
+                embedding_dim=dim,
+                num_embeddings=4,
+                feature_names=[name],
+            )
+            for name, dim in (("f_a", 4), ("f_b", 8), ("f_c", 4))
         ]
         user_tables = [
             EmbeddingBagConfig(
-                name="t_ua", embedding_dim=4, num_embeddings=10, feature_names=["u_a"]
-            ),
-            EmbeddingBagConfig(
-                name="t_ub", embedding_dim=8, num_embeddings=10, feature_names=["u_b"]
-            ),
+                name=f"t_{name}",
+                embedding_dim=dim,
+                num_embeddings=4,
+                feature_names=[name],
+            )
+            for name, dim in (("u_a", 4), ("u_b", 8))
         ]
 
-        class FakeShardedEBC(ShardedModule):
-            def __init__(self, tables, keys, fills):  # type: ignore[no-untyped-def]
-                super().__init__()
-                self._embedding_bag_configs = tables
-                dims = {
-                    f: cfg.embedding_dim for cfg in tables for f in cfg.feature_names
-                }
-                self._runtime_keys = keys
-                self._runtime_length_per_key = [dims[k] for k in keys]
-                self._runtime_fills = fills
-
-            def forward(self, features):  # type: ignore[no-untyped-def]
-                batch_size = features.size(0)
-                values = torch.cat(
-                    [
-                        torch.full((batch_size, dim), fill)
-                        for dim, fill in zip(
-                            self._runtime_length_per_key, self._runtime_fills
-                        )
-                    ],
-                    dim=1,
-                )
-                return KeyedTensor(
-                    keys=self._runtime_keys,
-                    length_per_key=self._runtime_length_per_key,
-                    values=values,
-                )
-
-            def create_context(self):  # type: ignore[no-untyped-def]
-                return None
-
-            def input_dist(self, ctx, *inputs, **kwargs):  # type: ignore[no-untyped-def]
-                raise NotImplementedError
-
-            def compute(self, ctx, dist_input):  # type: ignore[no-untyped-def]
-                raise NotImplementedError
-
-            def output_dist(self, ctx, output):  # type: ignore[no-untyped-def]
-                raise NotImplementedError
-
-            @property
-            def unsharded_module_type(self):  # type: ignore[no-untyped-def]
-                return EmbeddingBagCollection
-
         class TinyModel(torch.nn.Module):
-            def __init__(self):  # type: ignore[no-untyped-def]
+            def __init__(self):
                 super().__init__()
                 self.features = []
-                self.ebc = FakeShardedEBC(
-                    tables, ["f_b", "f_c", "f_a"], [2.0, 3.0, 1.0]
+                self.ebc = EmbeddingBagCollection(tables, device=torch.device("cpu"))
+                self.ebc_user = EmbeddingBagCollection(
+                    user_tables, device=torch.device("cpu")
                 )
-                self.ebc_user = FakeShardedEBC(user_tables, ["u_b", "u_a"], [5.0, 4.0])
+                with torch.no_grad():
+                    for i, table in enumerate(self.ebc.embedding_bags.values(), 1):
+                        table.weight.fill_(i)
+                    for i, table in enumerate(self.ebc_user.embedding_bags.values(), 4):
+                        table.weight.fill_(i)
 
-            def set_is_inference(self, is_inference):  # type: ignore[no-untyped-def]
+            def set_is_inference(self, is_inference):
                 self.is_inference = is_inference
 
-            def forward(self, data, device=None):  # type: ignore[no-untyped-def]
+            def forward(
+                self,
+                data: Dict[str, torch.Tensor],
+                device: Optional[torch.device] = None,
+            ):
                 kt = self.ebc(data["x"])
                 fx_mark_keyed_tensor("grp__ebc", kt)
-                # mirror EmbeddingGroupImpl's INPUT_TILE=3 user side: raw
-                # batch=1 lookup, kwargs from the raw KT, tiled values
-                kt_user_raw = self.ebc_user(data["x_user"])
-                kt_user = KeyedTensor(
-                    keys=kt_user_raw.keys(),
-                    length_per_key=kt_user_raw.length_per_key(),
-                    values=kt_user_raw.values().tile(2, 1),
+                raw_user = self.ebc_user(data["x_user"])
+                user = KeyedTensor(
+                    keys=raw_user.keys(),
+                    length_per_key=raw_user.length_per_key(),
+                    values=raw_user.values().tile(2, 1),
                 )
-                fx_mark_keyed_tensor("grp__ebc_user", kt_user)
+                fx_mark_keyed_tensor("grp__ebc_user", user)
                 grouped = KeyedTensor.regroup_as_dict(
-                    [kt, kt_user],
+                    [kt, user],
                     [["f_a"], ["f_b", "f_c"], ["u_a", "u_b"]],
                     ["y_a", "y_bc", "y_u"],
                 )
                 return {
-                    "y_a": grouped["y_a"].sum(dim=1),
-                    "y_bc": grouped["y_bc"].sum(dim=1),
-                    "y_u": grouped["y_u"].sum(dim=1),
+                    name: grouped[name].sum(dim=1) for name in ("y_a", "y_bc", "y_u")
                 }
 
-        # the same dict flows through warm-up, sparse run and the dense
-        # smoke run, so it exposes the permuted smoke-run inputs afterwards
         data = {
-            "x": torch.ones(2, 3),
-            "x_user": torch.ones(1, 3),
+            "x": KeyedJaggedTensor.from_lengths_sync(
+                keys=["f_a", "f_b", "f_c"],
+                values=torch.zeros(6, dtype=torch.int64),
+                lengths=torch.ones(6, dtype=torch.int64),
+            ),
+            "x_user": KeyedJaggedTensor.from_lengths_sync(
+                keys=["u_a", "u_b"],
+                values=torch.zeros(2, dtype=torch.int64),
+                lengths=torch.ones(2, dtype=torch.int64),
+            ),
             "batch_size": torch.tensor(2),
         }
-
-        class FakeBatch:
-            def to(self, device):  # type: ignore[no-untyped-def]
-                return self
-
-            def to_dict(self, sparse_dtype):  # type: ignore[no-untyped-def]
-                return data
-
-        class FakeDataloader:
-            dataset = SimpleNamespace(sampled_batch_size=2)
-
-            def __iter__(self):  # type: ignore[no-untyped-def]
-                return iter([FakeBatch()])
-
-        class FakeDMP(torch.nn.Module):
-            def __init__(self, module, *args, **kwargs):  # type: ignore[no-untyped-def]
-                super().__init__()
-                self.module = module
-
-            def forward(self, data, device=None):  # type: ignore[no-untyped-def]
-                return self.module(data, device=device)
-
-        tmp = make_test_dir()
-        old_env = {
-            key: os.environ.get(key)
-            for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
+        model = TinyModel().eval()
+        expected = model(data)
+        serving_data = {
+            "grp__ebc": model.ebc(data["x"]).values().detach().clone(),
+            "grp__ebc_user": model.ebc_user(data["x_user"]).values().detach().clone(),
+            "batch_size": data["batch_size"],
         }
-        try:
-            os.environ["RANK"] = "0"
-            os.environ["LOCAL_RANK"] = "0"
-            os.environ["WORLD_SIZE"] = "1"
-            os.environ["LOCAL_WORLD_SIZE"] = "1"
-            pipeline_config = EasyRecConfig(
-                train_input_path="train_input",
-                eval_input_path="eval_input",
-                model_dir="model_dir",
-            )
-            captured = {}
-
-            def _capture_symbolic_trace(gm):  # type: ignore[no-untyped-def]
-                captured["gm"] = gm
-                return SimpleNamespace(code="def forward(self):\n    pass\n")
-
-            with (
-                mock.patch(
-                    "tzrec.utils.export_util.init_process_group",
-                    return_value=(torch.device("cpu"), None),
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util._get_sparse_table_to_embedding_info",
-                    return_value=({}, {}),
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.create_dataloader",
-                    return_value=FakeDataloader(),
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.create_planner",
-                    return_value=SimpleNamespace(collective_plan=lambda *args: None),
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.get_default_sharders", return_value=[]
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.DistributedModelParallel",
-                    side_effect=lambda *args, **kwargs: FakeDMP(kwargs["module"]),
-                ),
-                mock.patch("tzrec.utils.export_util.checkpoint_util.restore_model"),
-                mock.patch("tzrec.utils.export_util.init_parameters"),
-                mock.patch(
-                    "tzrec.utils.export_util._get_sparse_embedding_tensor",
-                    return_value=({}, {}, {}, {}),
-                ),
-                mock.patch("tzrec.utils.export_util.config_util.save_message"),
-                mock.patch(
-                    "tzrec.utils.export_util.create_fg_json",
-                    return_value={"features": []},
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.symbolic_trace",
-                    side_effect=_capture_symbolic_trace,
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.torch.jit.script",
-                    return_value=mock.Mock(),
-                ),
-                mock.patch(
-                    "tzrec.utils.export_util.acc_utils.export_acc_config",
-                    return_value={},
-                ),
-            ):
-                export_distributed_embedding(
-                    pipeline_config, TinyModel(), "checkpoint_dir", tmp
-                )
-
-            # dense_meta.json lists the marked group in config order
-            with open(os.path.join(tmp, "dense_meta.json")) as f:
-                dense_meta = json.load(f)
-            self.assertEqual(
-                dense_meta["grp__ebc"], ["f_a__ebc", "f_b__ebc", "f_c__ebc"]
-            )
-            self.assertEqual(dense_meta["grp__ebc_user"], ["u_a__ebc", "u_b__ebc"])
-            self.assertEqual(dense_meta["sequence__ec"], [])
-
-            # the dense graph bakes the canonical keys/length_per_key
-            gm = captured["gm"]
-            kt_nodes = {
-                tuple(node.kwargs["keys"]): node
-                for node in gm.graph.nodes
-                if node.op == "call_function" and node.target is KeyedTensor
-            }
-            self.assertEqual(len(kt_nodes), 2)
-            self.assertEqual(
-                kt_nodes[("f_a", "f_b", "f_c")].kwargs["length_per_key"], [4, 8, 4]
-            )
-            user_node = kt_nodes[("u_a", "u_b")]
-            self.assertEqual(user_node.kwargs["length_per_key"], [4, 8])
-            # the user-side reconstruction tiles the raw batch=1 values itself
-            self.assertEqual(user_node.kwargs["values"].op, "call_method")
-            self.assertEqual(user_node.kwargs["values"].target, "tile")
-
-            # the smoke-run input was permuted from the runtime layout
-            # (f_b=2.0 x8, f_c=3.0 x4, f_a=1.0 x4) to the canonical layout
-            canonical_values = torch.cat(
-                [
-                    torch.full((2, 4), 1.0),
-                    torch.full((2, 8), 2.0),
-                    torch.full((2, 4), 3.0),
-                ],
-                dim=1,
-            )
-            torch.testing.assert_close(data["grp__ebc"], canonical_values)
-            # the raw batch=1 user values were permuted pre-tile from
-            # (u_b=5.0 x8, u_a=4.0 x4) to the canonical (u_a, u_b) layout
-            canonical_user_values = torch.cat(
-                [torch.full((1, 4), 4.0), torch.full((1, 8), 5.0)], dim=1
-            )
-            torch.testing.assert_close(data["grp__ebc_user"], canonical_user_values)
-
-            # the exported dense graph regroups canonical-layout inputs by
-            # key name into the right slices, tiling the user side itself
-            out = gm(
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir)
+        with (
+            mock.patch.dict(
+                os.environ,
                 {
-                    "grp__ebc": canonical_values.clone(),
-                    "grp__ebc_user": canonical_user_values.clone(),
-                    "batch_size": torch.tensor(2),
+                    "RANK": "0",
+                    "LOCAL_RANK": "0",
+                    "WORLD_SIZE": "1",
+                    "LOCAL_WORLD_SIZE": "1",
                 },
-                torch.device("cpu"),
+            ),
+            mock.patch.object(
+                export_util,
+                "_get_sparse_table_to_embedding_info",
+                return_value=({}, {}),
+            ),
+            mock.patch.object(
+                export_util, "create_dense_export_warmup_data", return_value=data
+            ),
+            mock.patch.object(
+                export_util,
+                "_get_sparse_embedding_tensor",
+                return_value=({}, {}, {}, {}),
+            ),
+            mock.patch.object(checkpoint_util, "restore_model"),
+        ):
+            export_distributed_embedding(
+                EasyRecConfig(), model, "checkpoint_dir", test_dir
             )
-            torch.testing.assert_close(out["y_a"], torch.full((2,), 4.0))
-            torch.testing.assert_close(out["y_bc"], torch.full((2,), 28.0))
-            torch.testing.assert_close(out["y_u"], torch.full((2,), 56.0))
-        finally:
-            _restore_env(old_env)
-            shutil.rmtree(tmp, ignore_errors=True)
+        with open(os.path.join(test_dir, "dense_meta.json")) as f:
+            dense_meta = json.load(f)
+        self.assertEqual(dense_meta["grp__ebc"], ["f_a__ebc", "f_b__ebc", "f_c__ebc"])
+        self.assertEqual(dense_meta["grp__ebc_user"], ["u_a__ebc", "u_b__ebc"])
+        scripted = torch.jit.load(os.path.join(test_dir, "scripted_model.pt"))
+        torch.testing.assert_close(scripted(serving_data), expected)
 
     @parameterized.expand(
         [
@@ -1025,17 +868,17 @@ class ExportUtilTest(unittest.TestCase):
                 ),
             )
 
-            torch.testing.assert_close(
-                dynamic_out[f"{table_fqn}.keys"], torch.tensor([0, 2, 1, 3])
-            )
-            torch.testing.assert_close(
-                dynamic_out[f"{table_fqn}.scores"],
-                torch.tensor([100, 102, 101, 103]),
-            )
-            torch.testing.assert_close(
-                dynamic_out[f"{table_fqn}.values"],
-                torch.tensor([[0.0, 0.1], [2.0, 2.1], [1.0, 1.1], [3.0, 3.1]]),
-            )
+            output_path = os.path.join(tmp, "dynamic.npz")
+            npz_util.savez_streaming(output_path, dynamic_out)
+            with np.load(output_path) as output:
+                np.testing.assert_array_equal(output[f"{table_fqn}.keys"], [0, 2, 1, 3])
+                np.testing.assert_array_equal(
+                    output[f"{table_fqn}.scores"], [100, 102, 101, 103]
+                )
+                np.testing.assert_allclose(
+                    output[f"{table_fqn}.values"],
+                    [[0.0, 0.1], [2.0, 2.1], [1.0, 1.1], [3.0, 3.1]],
+                )
             self.assertEqual(emb_meta[table_fqn]["shape"], [4, 2])
             self.assertEqual(emb_meta[table_fqn]["key_name"], f"{table_fqn}.keys")
             self.assertEqual(emb_meta[table_fqn]["value_name"], f"{table_fqn}.values")
@@ -1119,21 +962,20 @@ class ExportUtilTest(unittest.TestCase):
                 ),
             )
 
-            torch.testing.assert_close(
-                dynamic_out[f"{table_fqn}.keys"], torch.tensor([0, 1])
-            )
-            torch.testing.assert_close(
-                dynamic_out[f"{table_fqn}.scores"], torch.tensor([100, 101])
-            )
-            self.assertEqual(dynamic_out[f"{table_fqn}.values"].dtype, np.uint8)
-            self.assertEqual(dynamic_out[f"{table_fqn}.values"].shape, (2, 6))
-            np.testing.assert_allclose(
-                _dequant_quint8_rowwise_f16(
-                    dynamic_out[f"{table_fqn}.values"], emb_dim=2
-                ),
-                values,
-                atol=5e-3,
-            )
+            output_path = os.path.join(tmp, "dynamic.npz")
+            npz_util.savez_streaming(output_path, dynamic_out)
+            with np.load(output_path) as output:
+                np.testing.assert_array_equal(output[f"{table_fqn}.keys"], [0, 1])
+                np.testing.assert_array_equal(output[f"{table_fqn}.scores"], [100, 101])
+                self.assertEqual(output[f"{table_fqn}.values"].dtype, np.uint8)
+                self.assertEqual(output[f"{table_fqn}.values"].shape, (2, 6))
+                np.testing.assert_allclose(
+                    _dequant_quint8_rowwise_f16(
+                        output[f"{table_fqn}.values"], emb_dim=2
+                    ),
+                    values,
+                    atol=5e-3,
+                )
             self.assertEqual(emb_meta[table_fqn]["dtype"], "QUint8RowwiseF16")
             self.assertEqual(emb_meta[table_fqn]["shape"], [2, 2])
             self.assertEqual(emb_meta[table_fqn]["storage_shape"], [2, 6])
@@ -1810,58 +1652,6 @@ class ExportUtilTest(unittest.TestCase):
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_merge_sharded_embedding_json_quant_meta(self) -> None:
-        left = {
-            "user_id_emb": {
-                "feat_name_impl": ["user_id__ebc"],
-                "dense": False,
-                "is_dynamic": False,
-                "dimension": 2,
-                "dtype": "QUint8RowwiseF16",
-                "storage_dtype": "uint8",
-                "storage_shape": [2, 6],
-                "row_bytes": 6,
-                "memory": 12,
-                "shape": [2, 2],
-                "quant": {
-                    "enabled": True,
-                    "format": "QUint8RowwiseF16",
-                    "scale_offset_dtype": "float16",
-                    "output_dtype": "float16",
-                },
-            }
-        }
-        right = {
-            "user_id_emb": {
-                "feat_name_impl": ["user_id__ebc"],
-                "dense": False,
-                "is_dynamic": False,
-                "dimension": 2,
-                "dtype": "QUint8RowwiseF16",
-                "storage_dtype": "uint8",
-                "storage_shape": [3, 6],
-                "row_bytes": 6,
-                "memory": 18,
-                "shape": [3, 2],
-                "quant": {
-                    "enabled": True,
-                    "format": "QUint8RowwiseF16",
-                    "scale_offset_dtype": "float16",
-                    "output_dtype": "float16",
-                },
-            }
-        }
-
-        merged = _merge_sharded_embedding_json([left, right])
-        self.assertEqual(merged["user_id_emb"]["shape"], [5, 2])
-        self.assertEqual(merged["user_id_emb"]["storage_shape"], [5, 6])
-        self.assertEqual(merged["user_id_emb"]["memory"], 30)
-
-        bad_right = copy.deepcopy(right)
-        bad_right["user_id_emb"]["row_bytes"] = 11
-        with self.assertRaisesRegex(ValueError, "row_bytes"):
-            _merge_sharded_embedding_json([left, bad_right])
-
     def test_dense_embedding_restore_survives_fx_flatten(self) -> None:
         """AutoDis/MLP params must restore after the RTP FX flatten.
 
@@ -1972,66 +1762,6 @@ class ExportUtilTest(unittest.TestCase):
         self.assertEqual(_get_embedding_bag_configs(ebc), configs)
 
         self.assertIsNone(_get_embedding_bag_configs(torch.nn.Module()))
-
-    def _make_canonicalize_test_ebc(self) -> EmbeddingBagCollection:
-        tables = [
-            EmbeddingBagConfig(
-                name="t_a", embedding_dim=4, num_embeddings=10, feature_names=["f_a"]
-            ),
-            EmbeddingBagConfig(
-                name="t_b", embedding_dim=8, num_embeddings=10, feature_names=["f_b"]
-            ),
-            EmbeddingBagConfig(
-                name="t_c", embedding_dim=4, num_embeddings=10, feature_names=["f_c"]
-            ),
-        ]
-        return EmbeddingBagCollection(tables=tables, device=torch.device("cpu"))
-
-    def test_canonicalize_keyed_tensor_attrs_returns_config_order(self) -> None:
-        """Sharding-plan-dependent runtime key order maps back to config order."""
-        ebc = self._make_canonicalize_test_ebc()
-        keys, length_per_key = _canonicalize_keyed_tensor_attrs(
-            ebc, "grp__ebc", ["f_b", "f_c", "f_a"], [8, 4, 4]
-        )
-        self.assertEqual(keys, ["f_a", "f_b", "f_c"])
-        self.assertEqual(length_per_key, [4, 8, 4])
-
-    def test_canonicalize_keyed_tensor_attrs_rejects_runtime_mismatch(self) -> None:
-        ebc = self._make_canonicalize_test_ebc()
-        # a runtime dim that disagrees with the config
-        with self.assertRaisesRegex(RuntimeError, "disagree"):
-            _canonicalize_keyed_tensor_attrs(
-                ebc, "grp__ebc", ["f_b", "f_c", "f_a"], [8, 4, 8]
-            )
-        # a renamed runtime key
-        with self.assertRaisesRegex(RuntimeError, "disagree"):
-            _canonicalize_keyed_tensor_attrs(
-                ebc, "grp__ebc", ["f_b", "f_c", "f_x"], [8, 4, 4]
-            )
-        # a missing runtime key
-        with self.assertRaisesRegex(RuntimeError, "disagree"):
-            _canonicalize_keyed_tensor_attrs(ebc, "grp__ebc", ["f_b", "f_c"], [8, 4])
-
-    def test_canonicalize_keyed_tensor_attrs_raises_without_module(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "statically infer"):
-            _canonicalize_keyed_tensor_attrs(
-                None, "grp__ebc", ["f_b", "f_c", "f_a"], [8, 4, 4]
-            )
-        # a resolved module without embedding bag configs must also fail fast
-        with self.assertRaisesRegex(RuntimeError, "statically infer"):
-            _canonicalize_keyed_tensor_attrs(
-                torch.nn.Linear(2, 2), "grp__ebc", ["f_b", "f_c", "f_a"], [8, 4, 4]
-            )
-
-    def test_permute_keyed_tensor_values_reorders_dim1_blocks(self) -> None:
-        values = torch.arange(2 * 16, dtype=torch.float32).reshape(2, 16)
-        permuted = _permute_keyed_tensor_values(
-            values, ["f_b", "f_c", "f_a"], [8, 4, 4], ["f_a", "f_b", "f_c"]
-        )
-        # src layout: f_b = cols 0:8, f_c = cols 8:12, f_a = cols 12:16
-        expected = torch.cat([values[:, 12:16], values[:, 0:8], values[:, 8:12]], dim=1)
-        self.assertEqual(permuted.shape, values.shape)
-        torch.testing.assert_close(permuted, expected)
 
     def test_isolate_kafka_export_group_swaps_group_id(self) -> None:
         """Isolate the export Kafka consumer from the live training group."""
@@ -2811,6 +2541,598 @@ class ExportUtilTest(unittest.TestCase):
             )
         finally:
             shutil.rmtree(test_dir, ignore_errors=True)
+
+
+class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "RANK": "0",
+                "LOCAL_RANK": "0",
+                "WORLD_SIZE": "1",
+                "LOCAL_WORLD_SIZE": "1",
+                "USE_DISTRIBUTED_EMBEDDING": "1",
+                "INPUT_TILE": "0",
+                "DIST_QUANT": "",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        self.checkpoint_dir = os.path.join(self.test_dir, "model.ckpt-1")
+        self.export_dir = os.path.join(self.test_dir, "export")
+        self.pipeline_config = EasyRecConfig(
+            train_input_path="training-input",
+            eval_input_path="eval-input",
+            model_dir=self.test_dir,
+            feature_configs=[
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_a",
+                        expression="item:cat_a",
+                        embedding_dim=16,
+                        dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=2**36),
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_a_wide",
+                        expression="item:cat_a",
+                        embedding_dim=16,
+                        dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=2**36),
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_b",
+                        expression="item:cat_b",
+                        embedding_dim=16,
+                        num_buckets=8,
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_b_wide",
+                        expression="item:cat_b",
+                        embedding_dim=16,
+                        num_buckets=8,
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    raw_feature=feature_pb2.RawFeature(
+                        feature_name="int_a", expression="item:int_a"
+                    )
+                ),
+            ],
+            model_config=model_pb2.ModelConfig(
+                feature_groups=[
+                    model_pb2.FeatureGroupConfig(
+                        group_name="wide",
+                        feature_names=["cat_a_wide", "cat_b_wide"],
+                        group_type=model_pb2.FeatureGroupType.WIDE,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="fm",
+                        feature_names=["cat_a", "cat_b"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                    model_pb2.FeatureGroupConfig(
+                        group_name="deep",
+                        feature_names=["cat_a", "cat_b", "int_a"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    ),
+                ],
+                deepfm=rank_model_pb2.DeepFM(
+                    deep=module_pb2.MLP(hidden_units=[8, 4]),
+                    final=module_pb2.MLP(hidden_units=[2]),
+                ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            ),
+        )
+
+    def _build_model(self, dynamic=True):
+        feature_configs = copy.deepcopy(self.pipeline_config.feature_configs)
+        if not dynamic:
+            for index in (0, 1):
+                feature_configs[index].id_feature.ClearField("dynamicemb")
+                feature_configs[index].id_feature.num_buckets = 8
+        with mock.patch(
+            "tzrec.utils.dynamicemb_util.build_dynamicemb_constraints",
+            return_value=None,
+        ):
+            return ScriptWrapper(
+                DeepFM(
+                    model_config=self.pipeline_config.model_config,
+                    features=create_features(feature_configs),
+                    labels=["label"],
+                )
+            )
+
+    def _write_dynamic_shards(self, table_infos):
+        expected = {}
+        for name, info in table_infos.items():
+            if not getattr(info, "use_dynamicemb", False):
+                continue
+            module_name, table_name = name.rsplit(".embedding_bags.", 1)
+            directory = os.path.join(
+                self.checkpoint_dir, "dynamicemb", f"model.{module_name}"
+            )
+            os.makedirs(directory, exist_ok=True)
+            keys = np.array([-7, 2**60 + 1, 0], dtype=np.int64)
+            values = np.arange(3 * info.embedding_dim, dtype=np.float32).reshape(
+                3, info.embedding_dim
+            )
+            values = values / 7 - 2
+            scores = np.array([10, 11, 12], dtype=np.int64)
+            for rank, shard_slice in enumerate((slice(0, 2), slice(2, 3))):
+                for column, data in (
+                    ("keys", keys),
+                    ("values", values),
+                    ("scores", scores),
+                ):
+                    data[shard_slice].tofile(
+                        os.path.join(
+                            directory,
+                            f"{table_name}_emb_{column}.rank_{rank}.world_size_2",
+                        )
+                    )
+            expected[name] = (keys, values, scores)
+        return expected
+
+    @parameterized.expand(
+        [
+            ("npz_only", False, "", ""),
+            ("ordinary", False, "", ""),
+            ("ordinary_configured", False, "", ""),
+            ("ordinary_empty_dump", False, "", ""),
+            ("ordinary_int8", False, "INT8", ""),
+            ("zch_only", False, "", ""),
+            ("mixed_zch", False, "", ""),
+            ("mixed_zch_upload", True, "", ""),
+            ("fp32_upload", True, "", ""),
+            ("int8_upload", True, "INT8", ""),
+            ("write_failure", True, "", "write"),
+            ("flush_failure", True, "", "flush"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_export_checkpoint_without_loading_dynamic_tables(
+        self, _name, upload, quant, failure
+    ):
+        self._check_export_without_loading_dynamic_tables(_name, upload, quant, failure)
+
+    @mark_ci_scope("gpu")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_export_checkpoint_with_cuda_dense_graph(self):
+        self._check_export_without_loading_dynamic_tables(
+            "cuda", True, "", "", kernel=model_pb2.TRITON
+        )
+
+    def _check_export_without_loading_dynamic_tables(
+        self, case_name, upload, quant, failure, kernel=model_pb2.PYTORCH
+    ):
+        os.environ["DIST_QUANT"] = quant
+        self.pipeline_config.model_config.kernel = kernel
+        has_dynamic_tables = (
+            not case_name.startswith("ordinary") and case_name != "zch_only"
+        )
+        if not has_dynamic_tables:
+            for index in (0, 1):
+                feature = self.pipeline_config.feature_configs[index].id_feature
+                feature.ClearField("dynamicemb")
+                feature.num_buckets = 8
+        if case_name in ("mixed_zch", "mixed_zch_upload", "zch_only"):
+            for index in (2, 3):
+                self.pipeline_config.feature_configs[index].id_feature.zch.CopyFrom(
+                    feature_pb2.ZeroCollisionHash(
+                        zch_size=8,
+                        eviction_interval=5,
+                        lfu=feature_pb2.LFU_EvictionPolicy(),
+                    )
+                )
+        model = self._build_model()
+        table_infos, _ = export_util._get_sparse_table_to_embedding_info(model)
+        dynamic_names = {
+            name
+            for name, info in table_infos.items()
+            if getattr(info, "use_dynamicemb", False)
+        }
+        self.assertEqual(bool(dynamic_names), has_dynamic_tables)
+        for name in dynamic_names:
+            weight = model.state_dict()[f"{name}.weight"]
+            self.assertTrue(weight.is_meta)
+            self.assertEqual(weight.shape[0], 2**36)
+
+        expected_dynamic = self._write_dynamic_shards(table_infos)
+        checkpoint_model = self._build_model(dynamic=False)
+        init_parameters(checkpoint_model, torch.device("cpu"))
+        expected_defaults = {}
+        for name, mch in export_util._get_zch_export_tables(
+            checkpoint_model,
+            {name: info.embedding_dim for name, info in table_infos.items()},
+        ).items():
+            mch._buffers["_mch_sorted_raw_ids"].copy_(
+                torch.tensor(
+                    [31]
+                    + [torch.iinfo(torch.int64).max] * 3
+                    + [11]
+                    + [torch.iinfo(torch.int64).max] * 3
+                )
+            )
+            mch._buffers["_mch_remapped_ids_mapping"].copy_(
+                torch.tensor([0, 2, 3, 4, 1, 5, 6, 7])
+            )
+            mch._buffers["_mch_counts"].copy_(torch.tensor([6, 0, 0, 0, 4, 0, 0, 0]))
+            weight = checkpoint_model.state_dict()[f"{name}.weight"].numpy()
+            expected_dynamic[name] = (
+                np.array([11, 31], dtype=np.int64),
+                weight[[1, 0]],
+                np.array([4, 6], dtype=np.int64),
+            )
+            expected_defaults[name] = weight[-1:]
+        checkpoint_state = checkpoint_model.state_dict()
+        port = misc_util.get_free_port()
+        dist.init_process_group(
+            "gloo", init_method=f"tcp://127.0.0.1:{port}", world_size=1, rank=0
+        )
+        self.addCleanup(dist.destroy_process_group)
+        with mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False):
+            checkpoint_util.save_model(self.checkpoint_dir, checkpoint_model)
+
+        if case_name == "ordinary_empty_dump":
+            os.makedirs(os.path.join(self.checkpoint_dir, "dynamicemb"))
+        settings = self.pipeline_config.export_config.dynamic_embedding
+        if case_name == "ordinary_configured":
+            settings.read_chunk_size_mb = 1
+        if upload:
+            settings.read_chunk_size_mb = 1
+            settings.upload_max_in_flight_batches = 2
+            settings.feature_store_config.region = "cn-beijing"
+            settings.feature_store_config.project_name = "test_project"
+            settings.feature_store_config.feature_view_name = "test_embeddings"
+            settings.feature_store_config.version = "full_test_1"
+        batch = Batch(
+            dense_features={
+                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+                )
+            },
+            sparse_features={
+                BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                    keys=["cat_a", "cat_a_wide", "cat_b", "cat_b_wide"],
+                    values=torch.tensor([2**60 + 1, -7, 2**60 + 1, -7, 3, 4, 3, 4]),
+                    lengths=torch.tensor([1, 1, 1, 1, 1, 1, 1, 1]),
+                )
+            },
+            labels={},
+        )
+        asset = os.path.join(self.test_dir, "fg.json")
+        with open(asset, "w") as output:
+            json.dump({"custom_asset": True}, output)
+        uploaded = {}
+
+        def capture_upload(name, keys, values):
+            if failure == "write":
+                raise RuntimeError("upload failed")
+            uploaded.setdefault(name, []).append((keys.copy(), values.copy()))
+
+        uploader = mock.Mock()
+        uploader.write.side_effect = capture_upload
+        if failure == "flush":
+            uploader.close.side_effect = [RuntimeError("upload failed"), None]
+
+        real_init = export_util.init_parameters
+        real_empty_like = torch.empty_like
+        real_dense_export = export_util._export_dense_model_on_device
+
+        def guarded_dense_export(*args, **kwargs):
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        self.export_dir, "sparse", "sparse_embeddings-00-of-01.npz"
+                    )
+                )
+            )
+            uploader.start.assert_not_called()
+            real_dense_export(*args, **kwargs)
+
+        def start_upload(*args, **kwargs):
+            self.assertTrue(
+                os.path.exists(os.path.join(self.export_dir, "scripted_model.pt"))
+            )
+
+        uploader.start.side_effect = start_upload
+
+        def guarded_init(module, device):
+            self.assertEqual(
+                device,
+                torch.device("cpu" if kernel == model_pb2.PYTORCH else "cuda:0"),
+            )
+            for submodule in module.modules():
+                if isinstance(submodule, EmbeddingBagCollection):
+                    for table in submodule.embedding_bags.values():
+                        self.assertEqual(table.weight.shape[0], 1)
+            real_init(module, device)
+
+        def guarded_empty_like(tensor, *args, **kwargs):
+            self.assertLess(tensor.numel(), 1_000_000)
+            return real_empty_like(tensor, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                export_util, "FeatureStoreFullUploader", return_value=uploader
+            ) as uploader_class,
+            mock.patch.object(
+                export_util, "create_dataloader", return_value=iter([batch])
+            ) as dataloader,
+            mock.patch.object(export_util, "init_parameters", side_effect=guarded_init),
+            mock.patch.object(
+                export_util,
+                "_export_dense_model_on_device",
+                side_effect=guarded_dense_export,
+            ),
+            mock.patch.object(torch, "empty_like", new=guarded_empty_like),
+            mock.patch.object(
+                checkpoint_util, "restore_model", wraps=checkpoint_util.restore_model
+            ) as restore,
+            mock.patch.object(
+                export_util,
+                "DistributedModelParallel",
+                side_effect=AssertionError("dynamic tables must not be materialized"),
+            ),
+            mock.patch.object(export_util.logger, "warning") as warning,
+        ):
+            if failure:
+                with self.assertRaisesRegex(RuntimeError, "upload failed"):
+                    export_distributed_embedding(
+                        self.pipeline_config,
+                        model,
+                        self.checkpoint_dir,
+                        self.export_dir,
+                    )
+            else:
+                export_distributed_embedding(
+                    self.pipeline_config,
+                    model,
+                    self.checkpoint_dir,
+                    self.export_dir,
+                    assets=[asset],
+                    additional_export_config={"CUSTOM_EXPORT": "enabled"},
+                    data_input_path="export-input",
+                )
+                self.assertEqual(dataloader.call_args.args[2], "export-input")
+            restore.assert_called_once()
+            self.assertFalse(restore.call_args.kwargs["load_dynamicemb"])
+            if upload:
+                uploader_class.assert_called_once_with(
+                    settings.feature_store_config,
+                    {
+                        checkpoint_util.remap_input_tile_user_key(
+                            name
+                        ): info.embedding_dim
+                        for name, info in table_infos.items()
+                    },
+                    embedding_field_type="ARRAY<UINT8>" if quant else "ARRAY<FLOAT>",
+                    max_in_flight_batches=2,
+                )
+                uploader.start.assert_called_once_with(
+                    total_records=sum(
+                        len(expected_dynamic[name][0]) for name in dynamic_names
+                    )
+                )
+                if case_name == "mixed_zch_upload":
+                    warning.assert_any_call(
+                        "FeatureStore full export uploads only native dynemb tables; "
+                        "ZCH tables remain NPZ-only: %s",
+                        ", ".join(sorted(expected_defaults)),
+                    )
+            else:
+                uploader_class.assert_not_called()
+
+        sparse_dir = os.path.join(self.export_dir, "sparse")
+        if failure:
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")
+                )
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(sparse_dir, "sparse_embedding.json"))
+            )
+            uploader.close.assert_called_with(raise_on_error=False)
+            self.assertFalse(any(".part." in name for name in os.listdir(sparse_dir)))
+            return
+        if upload:
+            uploader.close.assert_called_once_with()
+            self.assertEqual(set(uploaded), dynamic_names)
+        self.assertEqual(
+            os.path.exists(
+                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
+            ),
+            bool(expected_dynamic),
+        )
+        if expected_dynamic:
+            with np.load(
+                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
+            ) as output:
+                for name, (keys, values, scores) in expected_dynamic.items():
+                    np.testing.assert_array_equal(output[f"{name}.keys"], keys)
+                    np.testing.assert_array_equal(output[f"{name}.scores"], scores)
+                    exported = output[f"{name}.values"]
+                    if quant:
+                        self.assertEqual(exported.dtype, np.uint8)
+                        np.testing.assert_allclose(
+                            _dequant_quint8_rowwise_f16(exported, values.shape[1]),
+                            values,
+                            atol=0.02,
+                        )
+                    else:
+                        np.testing.assert_array_equal(exported, values)
+                    if upload and name in dynamic_names:
+                        np.testing.assert_array_equal(
+                            np.concatenate([chunk[0] for chunk in uploaded[name]]), keys
+                        )
+                        np.testing.assert_array_equal(
+                            np.concatenate([chunk[1] for chunk in uploaded[name]]),
+                            exported,
+                        )
+                for name, default_value in expected_defaults.items():
+                    np.testing.assert_array_equal(
+                        output[f"{name}.default_value"], default_value
+                    )
+        with np.load(
+            os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")
+        ) as output:
+            for name in set(table_infos) - dynamic_names - expected_defaults.keys():
+                expected = checkpoint_state[f"{name}.weight"].numpy()
+                if quant:
+                    np.testing.assert_allclose(
+                        _dequant_quint8_rowwise_f16(output[name], expected.shape[1]),
+                        expected,
+                        atol=0.02,
+                    )
+                else:
+                    np.testing.assert_array_equal(output[name], expected)
+        with open(os.path.join(sparse_dir, "sparse_embedding.json")) as input_file:
+            metadata = json.load(input_file)
+        for name, (keys, _, _) in expected_dynamic.items():
+            self.assertEqual(
+                metadata[name]["shape"], [len(keys), table_infos[name].embedding_dim]
+            )
+            self.assertTrue(metadata[name]["is_dynamic"])
+        with open(os.path.join(self.export_dir, "fg.json")) as input_file:
+            self.assertEqual(json.load(input_file), {"custom_asset": True})
+        with open(os.path.join(self.export_dir, "model_acc.json")) as input_file:
+            self.assertEqual(json.load(input_file)["CUSTOM_EXPORT"], "enabled")
+        saved_config = config_util.load_pipeline_config(
+            os.path.join(self.export_dir, "pipeline.config")
+        )
+        self.assertEqual(saved_config.export_config, self.pipeline_config.export_config)
+        self.assertEqual(saved_config.train_input_path, "training-input")
+        scripted = torch.jit.load(
+            os.path.join(self.export_dir, "scripted_model.pt"), map_location="cpu"
+        )
+        self.assertTrue(scripted.state_dict())
+        for name, value in scripted.state_dict().items():
+            torch.testing.assert_close(value, checkpoint_state[name])
+
+    @parameterized.expand(
+        [("rtp", True, True), ("no_distributed_embedding", False, False)],
+        name_func=parameterized_name_func,
+    )
+    def test_dynamic_export_config_rejects_incompatible_modes(
+        self, _name, rtp, distributed_embedding
+    ):
+        self.pipeline_config.export_config.dynamic_embedding.SetInParent()
+        with (
+            mock.patch.object(export_util.env_util, "use_rtp", return_value=rtp),
+            mock.patch.object(
+                acc_utils,
+                "use_distributed_embedding",
+                return_value=distributed_embedding,
+            ),
+            mock.patch.object(export_util, "url_to_fs") as resolve_output,
+            self.assertRaisesRegex(
+                ValueError, "USE_DISTRIBUTED_EMBEDDING=1 and a non-RTP export"
+            ),
+        ):
+            export_util.export_model(
+                self.pipeline_config,
+                self._build_model(),
+                self.checkpoint_dir,
+                self.export_dir,
+            )
+        resolve_output.assert_not_called()
+
+    @parameterized.expand(
+        [
+            ("pytorch", model_pb2.PYTORCH, False),
+            ("triton", model_pb2.TRITON, True),
+            ("cutlass", model_pb2.CUTLASS, True),
+            ("triton_without_cuda", model_pb2.TRITON, False),
+            ("cutlass_without_cuda", model_pb2.CUTLASS, False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_dense_export_uses_configured_kernel_device(self, _name, kernel, cuda):
+        model = self._build_model()
+        table_infos, _ = export_util._get_sparse_table_to_embedding_info(model)
+        self._write_dynamic_shards(table_infos)
+        self.pipeline_config.model_config.kernel = kernel
+        requires_cuda = kernel != model_pb2.PYTORCH
+        with (
+            mock.patch.object(export_util, "_restore_export_sparse_state"),
+            mock.patch.object(
+                export_util,
+                "_get_sparse_embedding_tensor",
+                return_value=({}, {}, {}, {}),
+            ),
+            mock.patch.object(torch.cuda, "is_available", return_value=cuda),
+            mock.patch.object(torch.cuda, "set_device") as set_device,
+            mock.patch.object(
+                export_util,
+                "_export_dense_model_on_device",
+                side_effect=RuntimeError("dense device selected"),
+            ) as dense_export,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "requires a CUDA device"
+                if requires_cuda and not cuda
+                else "dense device selected",
+            ),
+        ):
+            export_distributed_embedding(
+                self.pipeline_config, model, self.checkpoint_dir, self.export_dir
+            )
+        if requires_cuda and not cuda:
+            dense_export.assert_not_called()
+            set_device.assert_not_called()
+        else:
+            dense_export.assert_called_once()
+            device = torch.device("cuda:0" if requires_cuda else "cpu")
+            self.assertEqual(dense_export.call_args.args[4], device)
+            if requires_cuda:
+                set_device.assert_called_once_with(device)
+            else:
+                set_device.assert_not_called()
+
+    @parameterized.expand(
+        [
+            ("read_chunk_size_mb", "read_chunk_size_mb"),
+            ("upload_max_in_flight_batches", "upload_max_in_flight_batches"),
+            ("missing_tables", "missing tables"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_invalid_export_fails_before_materialization(self, setting, error):
+        settings = self.pipeline_config.export_config.dynamic_embedding
+        settings.SetInParent()
+        if setting != "missing_tables":
+            setattr(settings, setting, 0)
+        with (
+            mock.patch.object(
+                export_util, "_export_dense_model_on_device"
+            ) as dense_export,
+            mock.patch.object(
+                export_util, "_restore_export_sparse_state"
+            ) as sparse_restore,
+            self.assertRaisesRegex(ValueError, error),
+        ):
+            export_distributed_embedding(
+                self.pipeline_config,
+                self._build_model(),
+                self.checkpoint_dir,
+                self.export_dir,
+            )
+        dense_export.assert_not_called()
+        sparse_restore.assert_not_called()
+        self.assertFalse(os.path.exists(self.export_dir))
 
 
 if __name__ == "__main__":
