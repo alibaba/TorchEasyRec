@@ -1612,6 +1612,7 @@ def export_distributed_embedding(
         uploader is not None,
     )
 
+    features = cast(List[BaseFeature], model.features)
     try:
         _restore_export_sparse_state(
             model, checkpoint_path, set(dimensions), set(dynamic_export[1])
@@ -1622,6 +1623,7 @@ def export_distributed_embedding(
                 checkpoint_path,
                 embedding_infos,
                 bag_infos,
+                features,
                 dynamic_export=dynamic_export,
             )
         )
@@ -2366,6 +2368,7 @@ def _get_sparse_embedding_tensor(
     checkpoint_path: str,
     embedding_infos: Dict[str, BaseEmbeddingConfig],
     embedding_bag_info: Dict[str, BaseEmbeddingConfig],
+    features: List[BaseFeature],
     dynamic_export: Optional[
         Tuple[Dict[str, npz_util.StreamingArray], Dict[str, Dict[str, Any]]]
     ] = None,
@@ -2375,13 +2378,19 @@ def _get_sparse_embedding_tensor(
     Dict[str, Any],
     Dict[str, Any],
 ]:
-    """Get Embedding Tensors for sparse part.
+    """Get embedding tensors and per-feature serving metadata for the sparse part.
+
+    Feature pooling describes the reduction over raw FG outputs before kernel
+    rewrites. Weighted SUM uses raw, unnormalized weights. Weighted MEAN divides
+    by the bag's weight sum, using one when the sum is zero; unweighted MEAN
+    divides by the bag length. EC features use NONE pooling and do not use weights.
 
     Args:
         model: Model containing ordinary sparse weights and ZCH state.
         checkpoint_path: Training checkpoint directory containing dynemb shards.
         embedding_infos: Sparse embedding table configurations keyed by FQN.
         embedding_bag_info: Sparse embedding bag configurations keyed by FQN.
+        features: Original model features defining pooling and input weight use.
         dynamic_export: Pre-scanned checkpoint arrays and metadata. The arrays
             contain single-use iterators that the NPZ writer must consume once.
             When None, scan all checkpoint shards with a 64 MiB read budget and
@@ -2392,10 +2401,12 @@ def _get_sparse_embedding_tensor(
         dynamic_out: streaming dynamic checkpoint arrays and in-memory ZCH
             keys/values/scores, plus a default value entry per ZCH table.
         emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
-        feat_meta: feature -> embedding_name / pooling mapping.
+        feat_meta: feature -> embedding_name / pooling / use_weight mapping.
     """
     emb_name_to_emb_dim: Dict[str, int] = dict()
+    name_to_feature = {feature.name: feature for feature in features}
     feat_name_to_pooling = dict()
+    feat_name_to_use_weight = dict()
 
     feat_name_impl_to_emb_name = dict()
     emb_name_to_feat_name_impl = dict()
@@ -2406,21 +2417,47 @@ def _get_sparse_embedding_tensor(
         feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
         for feat_name in emb_info.feature_names:
             feat_name_impl = feat_name + "__ec"
+            existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
+            if existing_emb_name is not None and existing_emb_name != export_emb_name:
+                raise ValueError(
+                    f"sparse feature [{feat_name}] maps to multiple embedding "
+                    f"tables [{existing_emb_name}] and [{export_emb_name}] in "
+                    "distributed embedding export. Use distinct feature_name "
+                    "values per group (with the same input expression if needed), "
+                    "or keep the feature in only one group."
+                )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
             feat_name_to_pooling[feat_name_impl] = "NONE"
+            feat_name_to_use_weight[feat_name_impl] = False
 
     for table_fqn, emb_info in embedding_bag_info.items():
         export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
         emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
         feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
         for feat_name in emb_info.feature_names:
+            if feat_name not in name_to_feature:
+                raise ValueError(
+                    f"sparse feature [{feat_name}] in embedding table "
+                    f"[{export_emb_name}] is not found in model features."
+                )
             feat_name_impl = feat_name + "__ebc"
+            existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
+            if existing_emb_name is not None and existing_emb_name != export_emb_name:
+                raise ValueError(
+                    f"sparse feature [{feat_name}] maps to multiple embedding "
+                    f"tables [{existing_emb_name}] and [{export_emb_name}] in "
+                    "distributed embedding export. Use distinct feature_name "
+                    "values per group (with the same input expression if needed), "
+                    "or keep the feature in only one group."
+                )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
-            feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[-1]
+            feature = name_to_feature[feat_name]
+            feat_name_to_pooling[feat_name_impl] = feature.pooling_type.name
+            feat_name_to_use_weight[feat_name_impl] = feature.use_weight
 
     out: Dict[str, Any] = {}
     dynamic_out: Dict[str, Any] = {}
@@ -2595,6 +2632,7 @@ def _get_sparse_embedding_tensor(
         t_meta = {
             "embedding_name": emb_name,
             "pooling": feat_name_to_pooling[feat_name_impl],
+            "use_weight": feat_name_to_use_weight[feat_name_impl],
         }
         feat_meta[feat_name_impl] = t_meta
     return out, dynamic_out, emb_meta, feat_meta

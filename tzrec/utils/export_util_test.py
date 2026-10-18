@@ -29,6 +29,7 @@ from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
+    PoolingType,
 )
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -55,6 +56,7 @@ from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingCollection,
     MLPDenseEmbeddingConfig,
 )
+from tzrec.modules.embedding import EmbeddingGroupImpl
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -268,6 +270,33 @@ class ExportUtilTest(unittest.TestCase):
                     os.environ[key] = value
 
     def test_distributed_embedding_export_uses_export_overrides(self) -> None:
+        features = create_features(
+            [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name=name,
+                        expression=f"user:{name}",
+                        embedding_dim=4,
+                        num_buckets=8,
+                        pooling="mean",
+                        weighted=weighted,
+                        use_weight=weighted,
+                    )
+                )
+                for name, weighted in (("weighted", True), ("plain", False))
+            ]
+        )
+        table_fqn = "ebc.embedding_bags.shared_emb"
+        embedding_bag_info = {
+            table_fqn: EmbeddingBagConfig(
+                name="shared_emb",
+                embedding_dim=4,
+                num_embeddings=8,
+                feature_names=[feature.name for feature in features],
+                pooling=PoolingType.SUM,
+            )
+        }
+
         class FakeBatch:
             sparse_features = {}
 
@@ -286,7 +315,7 @@ class ExportUtilTest(unittest.TestCase):
         class TinyModel(torch.nn.Module):
             def __init__(self):  # type: ignore[no-untyped-def]
                 super().__init__()
-                self.features = []
+                self.features = features
 
             def set_is_inference(self, is_inference):  # type: ignore[no-untyped-def]
                 self.is_inference = is_inference
@@ -315,7 +344,7 @@ class ExportUtilTest(unittest.TestCase):
             with (
                 mock.patch(
                     "tzrec.utils.export_util._get_sparse_table_to_embedding_info",
-                    return_value=({}, {}),
+                    return_value=(embedding_bag_info, {}),
                 ),
                 mock.patch(
                     "tzrec.utils.export_util.create_dataloader",
@@ -323,10 +352,6 @@ class ExportUtilTest(unittest.TestCase):
                 ) as create_dataloader_mock,
                 mock.patch("tzrec.utils.export_util.checkpoint_util.restore_model"),
                 mock.patch("tzrec.utils.export_util.init_parameters"),
-                mock.patch(
-                    "tzrec.utils.export_util._get_sparse_embedding_tensor",
-                    return_value=({}, {}, {}, {}),
-                ),
                 mock.patch("tzrec.utils.export_util.config_util.save_message"),
                 mock.patch(
                     "tzrec.utils.export_util.create_fg_json",
@@ -361,6 +386,18 @@ class ExportUtilTest(unittest.TestCase):
             )
             with open(os.path.join(tmp, "model_acc.json")) as f:
                 self.assertEqual(json.load(f), model_acc)
+            with open(os.path.join(tmp, "sparse", "sparse_features.json")) as f:
+                self.assertEqual(
+                    json.load(f),
+                    {
+                        f"{name}__ebc": {
+                            "embedding_name": table_fqn,
+                            "pooling": "MEAN",
+                            "use_weight": weighted,
+                        }
+                        for name, weighted in (("weighted", True), ("plain", False))
+                    },
+                )
         finally:
             _restore_env(old_env)
             shutil.rmtree(tmp, ignore_errors=True)
@@ -594,6 +631,168 @@ class ExportUtilTest(unittest.TestCase):
         scripted = torch.jit.load(os.path.join(test_dir, "scripted_model.pt"))
         torch.testing.assert_close(scripted(serving_data), expected)
 
+    @parameterized.expand(
+        [
+            ("weighted_sum_plain_sum", "sum", "sum", True),
+            ("weighted_mean_plain_sum", "mean", "sum", True),
+            ("weighted_sum_plain_mean", "sum", "mean", True),
+            ("weighted_mean_plain_mean", "mean", "mean", True),
+            ("disabled_weight_sum", "sum", "sum", False),
+            ("disabled_weight_mean", "mean", "mean", False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sparse_export_shared_table_feature_semantics(
+        self, name, weighted_pooling, plain_pooling, use_weight
+    ) -> None:
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir)
+        with mock.patch.dict(
+            os.environ,
+            {"RANK": "0", "WORLD_SIZE": "1", "INPUT_TILE": "0", "DIST_QUANT": "0"},
+        ):
+            features = create_features(
+                [
+                    feature_pb2.FeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name=feature_name,
+                            expression=f"user:{feature_name}",
+                            embedding_dim=4,
+                            num_buckets=8,
+                            embedding_name="shared_emb",
+                            pooling=pooling,
+                            weighted=weighted,
+                            use_weight=use_weight if weighted else False,
+                        )
+                    )
+                    for feature_name, pooling, weighted in (
+                        ("weighted", weighted_pooling, True),
+                        ("plain", plain_pooling, False),
+                    )
+                ]
+            )
+            model = EmbeddingGroupImpl(
+                features,
+                [
+                    model_pb2.FeatureGroupConfig(
+                        group_name="deep",
+                        feature_names=["weighted", "plain"],
+                        group_type=model_pb2.FeatureGroupType.DEEP,
+                    )
+                ],
+                device=torch.device("cpu"),
+            )
+            embedding_bag_info, embedding_info = (
+                export_util._get_sparse_table_to_embedding_info(model)
+            )
+            self.assertEqual(len(embedding_bag_info), 1)
+            table_fqn, table_config = next(iter(embedding_bag_info.items()))
+            self.assertEqual(
+                table_config.pooling,
+                PoolingType.SUM
+                if use_weight
+                else getattr(PoolingType, plain_pooling.upper()),
+            )
+            self.assertEqual(model.ebc.is_weighted(), use_weight)
+            _, _, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+                model, test_dir, embedding_info, embedding_bag_info, features
+            )
+
+        self.assertEqual(len(emb_meta), 1)
+        self.assertEqual(
+            feat_meta,
+            {
+                "weighted__ebc": {
+                    "embedding_name": table_fqn,
+                    "pooling": weighted_pooling.upper(),
+                    "use_weight": use_weight,
+                },
+                "plain__ebc": {
+                    "embedding_name": table_fqn,
+                    "pooling": plain_pooling.upper(),
+                    "use_weight": False,
+                },
+            },
+        )
+
+    @parameterized.expand(
+        [
+            ("wide_and_deep", model_pb2.FeatureGroupType.WIDE, ""),
+            ("suffixed_towers", model_pb2.FeatureGroupType.DEEP, "tower_b"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sparse_export_rejects_missing_or_conflicting_feature_tables(
+        self, name, group_type, embedding_name_suffix
+    ) -> None:
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir)
+        features = create_features(
+            [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="user_id",
+                        expression="user:user_id",
+                        embedding_dim=4,
+                        num_buckets=8,
+                    )
+                )
+            ]
+        )
+        model = EmbeddingGroupImpl(
+            features,
+            [
+                model_pb2.FeatureGroupConfig(
+                    group_name="deep",
+                    feature_names=["user_id"],
+                    group_type=model_pb2.FeatureGroupType.DEEP,
+                ),
+                model_pb2.FeatureGroupConfig(
+                    group_name="other",
+                    feature_names=["user_id"],
+                    group_type=group_type,
+                    embedding_name_suffix=embedding_name_suffix,
+                ),
+            ],
+            device=torch.device("cpu"),
+        )
+        embedding_bag_info, embedding_info = (
+            export_util._get_sparse_table_to_embedding_info(model)
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "maps to multiple embedding tables.*distinct feature_name values per group",
+        ):
+            _get_sparse_embedding_tensor(
+                model, test_dir, embedding_info, embedding_bag_info, features
+            )
+        with self.assertRaisesRegex(ValueError, "not found in model features"):
+            _get_sparse_embedding_tensor(
+                model, test_dir, embedding_info, embedding_bag_info, []
+            )
+
+    def test_sparse_export_rejects_conflicting_ec_feature_tables(self) -> None:
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir)
+        embedding_infos = {
+            f"ec.embeddings.{name}": EmbeddingConfig(
+                name=name,
+                embedding_dim=4,
+                num_embeddings=8,
+                feature_names=["seq_feat"],
+            )
+            for name in ("first_emb", "second_emb")
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            r"sparse feature \[seq_feat\] maps to multiple embedding tables "
+            r"\[ec.embeddings.first_emb\] and \[ec.embeddings.second_emb\].*"
+            "distinct feature_name values per group",
+        ):
+            _get_sparse_embedding_tensor(
+                torch.nn.Module(), test_dir, embedding_infos, {}, []
+            )
+
     def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
         """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
         tmp = tempfile.mkdtemp(prefix="tzrec_export_dynemb_")
@@ -658,6 +857,15 @@ class ExportUtilTest(unittest.TestCase):
                 ckpt_dir,
                 {},
                 embedding_bag_info,
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="user_id", expression="user:user_id"
+                            )
+                        )
+                    ]
+                ),
             )
 
             output_path = os.path.join(tmp, "dynamic.npz")
@@ -677,7 +885,7 @@ class ExportUtilTest(unittest.TestCase):
             self.assertEqual(emb_meta[table_fqn]["score_name"], f"{table_fqn}.scores")
             self.assertEqual(
                 feat_meta["user_id__ebc"],
-                {"embedding_name": table_fqn, "pooling": "SUM"},
+                {"embedding_name": table_fqn, "pooling": "SUM", "use_weight": False},
             )
         finally:
             if old_rank is None:
@@ -743,6 +951,15 @@ class ExportUtilTest(unittest.TestCase):
                 ckpt_dir,
                 {},
                 embedding_bag_info,
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="user_id", expression="user:user_id"
+                            )
+                        )
+                    ]
+                ),
             )
 
             output_path = os.path.join(tmp, "dynamic.npz")
@@ -907,6 +1124,16 @@ class ExportUtilTest(unittest.TestCase):
                             pooling="SUM",
                         ),
                     },
+                    create_features(
+                        [
+                            feature_pb2.FeatureConfig(
+                                id_feature=feature_pb2.IdFeature(
+                                    feature_name=name, expression=f"user:{name}"
+                                )
+                            )
+                            for name in ("user_id", "plain_id")
+                        ]
+                    ),
                 )
 
             self.assertEqual(sorted(out.keys()), [plain_fqn])
@@ -948,7 +1175,11 @@ class ExportUtilTest(unittest.TestCase):
             )
             self.assertEqual(
                 feat_meta["user_id__ebc"],
-                {"embedding_name": zch_ebc_fqn, "pooling": "SUM"},
+                {
+                    "embedding_name": zch_ebc_fqn,
+                    "pooling": "SUM",
+                    "use_weight": False,
+                },
             )
 
             torch.testing.assert_close(
@@ -1048,6 +1279,15 @@ class ExportUtilTest(unittest.TestCase):
                         pooling="SUM",
                     )
                 },
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="user_id", expression="user:user_id"
+                            )
+                        )
+                    ]
+                ),
             )
 
             default_value = dynamic_out[f"{table_fqn}.default_value"]
@@ -1129,6 +1369,15 @@ class ExportUtilTest(unittest.TestCase):
                         pooling="SUM",
                     )
                 },
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="user_id", expression="user:user_id"
+                            )
+                        )
+                    ]
+                ),
             )
 
             torch.testing.assert_close(
@@ -1212,6 +1461,16 @@ class ExportUtilTest(unittest.TestCase):
                         pooling="SUM",
                     ),
                 },
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name=name, expression=f"user:{name}"
+                            )
+                        )
+                        for name in ("id_feat", "user_feat")
+                    ]
+                ),
             )
 
             self.assertEqual(dynamic_out, {})
@@ -1233,15 +1492,15 @@ class ExportUtilTest(unittest.TestCase):
             )
             self.assertEqual(
                 feat_meta["seq_feat__ec"],
-                {"embedding_name": ec_fqn, "pooling": "NONE"},
+                {"embedding_name": ec_fqn, "pooling": "NONE", "use_weight": False},
             )
             self.assertEqual(
                 feat_meta["id_feat__ebc"],
-                {"embedding_name": ebc_fqn, "pooling": "SUM"},
+                {"embedding_name": ebc_fqn, "pooling": "SUM", "use_weight": False},
             )
             self.assertEqual(
                 feat_meta["user_feat__ebc"],
-                {"embedding_name": ebc_fqn, "pooling": "SUM"},
+                {"embedding_name": ebc_fqn, "pooling": "SUM", "use_weight": False},
             )
         finally:
             _restore_env(old_env)
@@ -1304,6 +1563,16 @@ class ExportUtilTest(unittest.TestCase):
                         pooling="SUM",
                     ),
                 },
+                create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name=name, expression=f"user:{name}"
+                            )
+                        )
+                        for name in ("id_feat", "user_feat")
+                    ]
+                ),
             )
 
             self.assertEqual(dynamic_out, {})
@@ -1369,6 +1638,15 @@ class ExportUtilTest(unittest.TestCase):
                             pooling="SUM",
                         )
                     },
+                    create_features(
+                        [
+                            feature_pb2.FeatureConfig(
+                                id_feature=feature_pb2.IdFeature(
+                                    feature_name="user_id", expression="user:user_id"
+                                )
+                            )
+                        ]
+                    ),
                 )
         finally:
             _restore_env(old_env)
@@ -2300,7 +2578,23 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 ),
                 feature_pb2.FeatureConfig(
                     id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_a_wide",
+                        expression="item:cat_a",
+                        embedding_dim=16,
+                        dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=2**36),
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
                         feature_name="cat_b",
+                        expression="item:cat_b",
+                        embedding_dim=16,
+                        num_buckets=8,
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="cat_b_wide",
                         expression="item:cat_b",
                         embedding_dim=16,
                         num_buckets=8,
@@ -2316,7 +2610,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 feature_groups=[
                     model_pb2.FeatureGroupConfig(
                         group_name="wide",
-                        feature_names=["cat_a", "cat_b"],
+                        feature_names=["cat_a_wide", "cat_b_wide"],
                         group_type=model_pb2.FeatureGroupType.WIDE,
                     ),
                     model_pb2.FeatureGroupConfig(
@@ -2345,8 +2639,9 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
     def _build_model(self, dynamic=True):
         feature_configs = copy.deepcopy(self.pipeline_config.feature_configs)
         if not dynamic:
-            feature_configs[0].id_feature.ClearField("dynamicemb")
-            feature_configs[0].id_feature.num_buckets = 8
+            for index in (0, 1):
+                feature_configs[index].id_feature.ClearField("dynamicemb")
+                feature_configs[index].id_feature.num_buckets = 8
         with mock.patch(
             "tzrec.utils.dynamicemb_util.build_dynamicemb_constraints",
             return_value=None,
@@ -2428,17 +2723,19 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             not case_name.startswith("ordinary") and case_name != "zch_only"
         )
         if not has_dynamic_tables:
-            feature = self.pipeline_config.feature_configs[0].id_feature
-            feature.ClearField("dynamicemb")
-            feature.num_buckets = 8
+            for index in (0, 1):
+                feature = self.pipeline_config.feature_configs[index].id_feature
+                feature.ClearField("dynamicemb")
+                feature.num_buckets = 8
         if case_name in ("mixed_zch", "mixed_zch_upload", "zch_only"):
-            self.pipeline_config.feature_configs[1].id_feature.zch.CopyFrom(
-                feature_pb2.ZeroCollisionHash(
-                    zch_size=8,
-                    eviction_interval=5,
-                    lfu=feature_pb2.LFU_EvictionPolicy(),
+            for index in (2, 3):
+                self.pipeline_config.feature_configs[index].id_feature.zch.CopyFrom(
+                    feature_pb2.ZeroCollisionHash(
+                        zch_size=8,
+                        eviction_interval=5,
+                        lfu=feature_pb2.LFU_EvictionPolicy(),
+                    )
                 )
-            )
         model = self._build_model()
         table_infos, _ = export_util._get_sparse_table_to_embedding_info(model)
         dynamic_names = {
@@ -2508,9 +2805,9 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             },
             sparse_features={
                 BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
-                    keys=["cat_a", "cat_b"],
-                    values=torch.tensor([2**60 + 1, -7, 3, 4]),
-                    lengths=torch.tensor([1, 1, 1, 1]),
+                    keys=["cat_a", "cat_a_wide", "cat_b", "cat_b_wide"],
+                    values=torch.tensor([2**60 + 1, -7, 2**60 + 1, -7, 3, 4, 3, 4]),
+                    lengths=torch.tensor([1, 1, 1, 1, 1, 1, 1, 1]),
                 )
             },
             labels={},
