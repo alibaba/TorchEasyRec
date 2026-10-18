@@ -82,7 +82,7 @@ def _gather_test_cases(args):
                 if subp_pattern in test_case_str:
                     is_subproc = True
                     break
-            if not is_subproc:
+            if not is_subproc or isinstance(test_case, unittest.TestCase):
                 test_suite_main.addTest(test_case)
             else:
                 test_suite_subproc.addTest(test_case)
