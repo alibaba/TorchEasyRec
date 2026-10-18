@@ -40,6 +40,8 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 **资源配置** 选择框架为PyTorch，任务资源我们以选择`ecs.gn7i-c32g1.32xlarge`（单机4卡A10）为例（建议优先选择单机多卡机型，需要多机多卡训练时建议选择带RDMA的机型），**驱动设置选择580+**
 
+**GPU间通信** 如果所选机型的GPU之间既没有NVLink也不经过PCIe Switch（`nvidia-smi topo -m`中GPU之间均显示为`PHB`或`SYS`，如`ml.gn9gc.64xlarge-erdma`），NCCL默认不启用GPU间P2P，而是经主机内存中转。建议在执行命令开头加上`export NCCL_P2P_LEVEL=PHB`，让同一NUMA节点内的GPU直接P2P通信：在`ml.gn9gc.64xlarge-erdma`上实测单机alltoall带宽提升约30%~50%，两机all_reduce大消息带宽提升约30%~40%，未发现变慢的情况。不要设置为`SYS`，跨NUMA节点的P2P会使alltoall带宽大幅下降（单机实测仅约1.4 GB/s）
+
 **角色信息** 选择**PAI默认角色**
 
 **执行命令** 如下
