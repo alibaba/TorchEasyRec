@@ -34,7 +34,7 @@ bash upload_data.sh ${ODPS_PROJECT_NAME}
 
 进入[PAI控制台](https://pai.console.aliyun.com)，并选择需要使用的工作空间，点击 **模型开发与训练-分布式训练(DLC)**，点击创建任务。
 
-**节点镜像** 选择官方镜像`torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu130-ubuntu22.04`；如果所选机型支持[eRDMA](https://help.aliyun.com/zh/ecs/user-guide/erdma-overview)，请选择`torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu130-erdma-ubuntu22.04`，否则多机通信会回退到TCP
+**节点镜像** 选择官方镜像`torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu130-ubuntu22.04`；如果所选机型支持[eRDMA](https://help.aliyun.com/zh/ecs/user-guide/erdma-overview)，请选择`torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu130-ubuntu22.04-erdma`，否则多机通信会回退到TCP
 
 **数据集配置** 选择刚新建的NAS数据集
 
