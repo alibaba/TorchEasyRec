@@ -109,7 +109,7 @@ LR策略可以支持按epoch更新或者按step更新
       ```
 - log_step_count_steps: 打印log和summary的步数间隔（如果打印时间间隔小于1s，会跳过打印）
 - is_profiling: 是否做训练性能分析，设置为true，会在模型目录的train_eval_trace子目录下记录trace文件，文件名以`rank<N>_`开头
-- profiler_config: is_profiling为true时的性能分析配置，不设置时默认在训练开始后跳过1步、预热1步、记录10步，并记录shape、显存和调用栈
+- profiler_config: is_profiling为true时的性能分析配置，不设置时默认在训练开始后等待1步、预热1步、记录10步，并记录shape、显存和调用栈
   - skip_first_steps: 开始分析前跳过的步数，默认为0。训练初期dynamic embedding和数据缓存尚未稳定，可设置较大的值采集稳定阶段的trace，如`skip_first_steps: 2000, wait_steps: 0, warmup_steps: 2, active_steps: 5`
   - wait_steps / warmup_steps / active_steps: 每个周期内的等待、预热和记录步数，默认分别为1、1、10
   - repeat: 采集周期数，默认为1，设置为0表示一直重复到训练结束
