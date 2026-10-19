@@ -176,6 +176,12 @@ export INTRA_NODE_BANDWIDTH=$(awk 'BEGIN {printf("%f", 30 * 1024 * 1024 * 1024 /
 export CROSS_NODE_BANDWIDTH=$(awk 'BEGIN {printf("%f", 3 * 1024 * 1024 * 1024 / 1000)}')
 ```
 
+对于GPU之间既没有NVLink也不经过PCIe Switch的机型（`nvidia-smi topo -m`中GPU之间均显示为`PHB`或`SYS`，如`ml.gn9gc.64xlarge-erdma`），NCCL默认不启用GPU间P2P，而是经主机内存中转。建议设置`NCCL_P2P_LEVEL=PHB`，让同一NUMA节点内的GPU直接P2P通信，单机alltoall带宽可提升约30%~50%，两机all_reduce大消息带宽可提升约30%~40%
+
+```bash
+export NCCL_P2P_LEVEL=PHB
+```
+
 如果遇到CUDA OOM（out of memory）的情况，可以调高`STORAGE_RESERVE_PERCENT`适当增加显存的预留比例，默认值为0.15。调高后TorchEasyRec会在新的显存限制下重新寻优最好的Embedding分片和并行计算的方式
 
 ```bash
