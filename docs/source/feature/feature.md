@@ -77,6 +77,16 @@ feature_configs {
         }
     }
 }
+feature_configs {
+    id_feature {
+        feature_name: "tags"
+        expression: "item:tag_ids"
+        weight_expression: "item:tag_weights"
+        use_weight: true
+        hash_bucket_size: 100000
+        embedding_dim: 16
+    }
+}
 ```
 
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
@@ -117,26 +127,10 @@ feature_configs {
 
 - **weighted**: 是否为带权重的Id特征，输入形式为`k1:v1\x1dk2:v2`
 
-- **weight_expression**: 权重所在的输入字段，如`item:tag_weights`，用于id和权重分两列存放的场景，与**expression**按位置一一对应，设置后等价于weighted=true，需配合**use_weight**=true让权重参与embedding pooling
+- **weight_expression**: 权重所在的输入字段，如`item:tag_weights`，用于id和权重分两列存放的场景，设置后等价于weighted=true，需配合**use_weight**=true使权重参与embedding pooling
 
-  - 两列均支持array类型（如`array<string>` + `array<double>`）或按**separator**分隔的字符串，也可以混用
-  - 同一行id个数与权重个数必须相同，否则FG报错；id为空的行忽略权重，按**default_value**处理
-  - array类型的输入中不能包含null元素：null元素会在配对前被丢弃，导致id与权重错位
-  - 重复的id会累加权重，与对每次出现分别加权pooling的结果相同
-  - 需要pyfg>=1.0.8，线上Processor需使用对应版本的FG；分布式embedding导出（USE_DISTRIBUTED_EMBEDDING=1）不支持带权重的Id特征
-
-```
-feature_configs {
-    id_feature {
-        feature_name: "tags"
-        expression: "item:tag_ids"
-        weight_expression: "item:tag_weights"
-        use_weight: true
-        hash_bucket_size: 100000
-        embedding_dim: 16
-    }
-}
-```
+  - 与**expression**按位置一一对应，两列均支持array类型或按**separator**分隔的字符串；同一行id与权重个数须相同，array中不能有null元素
+  - 重复的id会累加权重
 
 - **use_weight**: 默认值是false，仅在**weighted**=true时生效。默认情况下，权重仅用于从`k:v`格式的输入中解析出id，解析后即被丢弃，不参与模型计算，也不会传输给模型。设置为true时，权重会参与embedding pooling。注意：开启后，同一**数据组**（data group）内的所有特征都会带上权重（其余特征填充为1），会有一定的内存和计算开销
 
