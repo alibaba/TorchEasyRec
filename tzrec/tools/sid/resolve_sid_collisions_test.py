@@ -356,6 +356,123 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         ):
             self._run(inp, out, max_items_per_codebook=2)
 
+    @parameterized.expand(
+        [
+            ("output_root", False),
+            ("independent_item_root", True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_existing_generation_is_preserved(
+        self, _name, independent_item_root
+    ) -> None:
+        inp = self._prepare_single(1)
+        out = os.path.join(self.test_dir, "out")
+        item_root = os.path.join(self.test_dir, "map")
+        existing_path = os.path.join(item_root if independent_item_root else out, "v1")
+        os.makedirs(existing_path)
+        marker = os.path.join(existing_path, "partial")
+        with open(marker, "w") as handle:
+            handle.write("existing data")
+        runner = self._runner(inp, out, item_to_sid_root=item_root)
+
+        with (
+            mock.patch.object(runner, "_load_codes") as load_codes,
+            self.assertRaisesRegex(FileExistsError, "generation already exists"),
+        ):
+            runner.run()
+
+        load_codes.assert_not_called()
+        with open(marker) as handle:
+            self.assertEqual(handle.read(), "existing data")
+        other_root = out if independent_item_root else item_root
+        self.assertFalse(os.path.exists(os.path.join(other_root, "v1")))
+
+    def test_existing_odps_generation_is_preserved(self) -> None:
+        out = os.path.join(self.test_dir, "out")
+        runner = self._runner(
+            self._prepare_single(1),
+            out,
+            item_to_sid_root="odps://prj/tables/items/ds=20261019",
+        )
+        with (
+            mock.patch.object(
+                bundle, "_create_odps_account", return_value=(None, "url")
+            ),
+            mock.patch.object(bundle, "ODPS") as odps,
+        ):
+            table = odps.return_value.get_table.return_value
+            table.iterate_partitions.return_value = iter([mock.Mock()])
+            with self.assertRaisesRegex(FileExistsError, "generation already exists"):
+                runner.run()
+            table.iterate_partitions.assert_called_once_with(
+                spec="ds=20261019,generation=v1"
+            )
+            table.delete_partition.assert_not_called()
+        self.assertFalse(os.path.exists(os.path.join(out, "v1")))
+
+    @parameterized.expand(
+        [("artifact_write", False), ("manifest_replace", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_failed_append_cleans_both_roots_and_allows_retry(
+        self, _name, fail_manifest
+    ) -> None:
+        inp = self._prepare_single(1)
+        out = os.path.join(self.test_dir, "out")
+        item_root = os.path.join(self.test_dir, "map")
+        self._run(inp, out, item_to_sid_root=item_root)
+        previous_manifest = self._manifest(out)
+        inp = self._prepare_single(2)
+        runner = self._runner(
+            inp, out, item_to_sid_root=item_root, generation="v2", from_generation="v1"
+        )
+        failure = (
+            mock.patch.object(bundle.os, "replace", side_effect=OSError("write failed"))
+            if fail_manifest
+            else mock.patch.object(
+                runner, "_write_item_to_sid", side_effect=OSError("write failed")
+            )
+        )
+        with failure, self.assertRaisesRegex(OSError, "write failed"):
+            runner.run()
+
+        for root in (out, item_root):
+            self.assertFalse(os.path.exists(os.path.join(root, "v2")))
+            self.assertTrue(os.path.exists(os.path.join(root, "v1")))
+        self.assertEqual(self._manifest(out), previous_manifest)
+        self._run(
+            inp, out, item_to_sid_root=item_root, generation="v2", from_generation="v1"
+        )
+        self.assertEqual(self._manifest(out, "v2").artifacts[ITEM_TO_SID].rows, 2)
+
+    def test_cleanup_failure_preserves_original_error_and_cleans_other_root(
+        self,
+    ) -> None:
+        out = os.path.join(self.test_dir, "out")
+        item_root = os.path.join(self.test_dir, "map")
+        runner = self._runner(self._prepare_single(1), out, item_to_sid_root=item_root)
+        remove_directory = bundle.shutil.rmtree
+
+        def remove(path):
+            if path == os.path.realpath(os.path.join(item_root, "v1")):
+                raise OSError("cleanup failed")
+            remove_directory(path)
+
+        with (
+            mock.patch.object(bundle.shutil, "rmtree", side_effect=remove),
+            mock.patch.object(
+                runner, "_write_item_to_sid", side_effect=RuntimeError("write failed")
+            ),
+            self.assertLogs("tzrec", level="ERROR") as logs,
+            self.assertRaisesRegex(RuntimeError, "write failed"),
+        ):
+            runner.run()
+
+        self.assertIn("cleanup failed", "\n".join(logs.output))
+        self.assertFalse(os.path.exists(os.path.join(out, "v1")))
+        self.assertTrue(os.path.exists(os.path.join(item_root, "v1")))
+
     def test_rejects_invalid_progress_interval(self) -> None:
         with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
             self._runner("input", "map", progress_interval=0)
@@ -607,7 +724,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         return manifest
 
     def test_manifest_rows_match_the_artifacts_on_a_full_resolve(self) -> None:
-        os.makedirs(os.path.join(self.test_dir, "out", "v1"))
         _, out = self._resolve(list(range(5)), [[0, 0], [0, 0], [0, 1], [1, 0], [1, 1]])
 
         manifest = self._assert_manifest_rows_match_artifacts(out, "v1")

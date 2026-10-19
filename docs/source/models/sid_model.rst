@@ -6,4 +6,3 @@
 
    sid_rqvae
    sid_rqkmeans
-   sid_collision

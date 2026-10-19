@@ -22,7 +22,7 @@ from tzrec.utils.sid.collision import (
 from tzrec.utils.sid.knn_collision import KnnCollisionResolver
 from tzrec.utils.sid.test_util import (
     create_collision_plan,
-    create_existing_sid_state,
+    create_existing_sid_occupancy,
 )
 from tzrec.utils.test_util import parameterized_name_func
 
@@ -118,6 +118,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
         np.testing.assert_array_equal(plan.sid_keys, [0, 8, 12])
         np.testing.assert_array_equal(plan.input_item_counts, [1, 3, 1])
         np.testing.assert_array_equal(plan.overflow_prefix_ids, [2])
+        np.testing.assert_array_equal(plan.in_overflow_prefix, [False, True, False])
 
         result = KnnCollisionResolver().resolve(
             plan, np.asarray([[1, 2, 3]], dtype=np.int64)
@@ -146,7 +147,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
             1,
             [10],
             [[0, 0]],
-            existing_sid_state=create_existing_sid_state([0], [3]),
+            existing_sid_occupancy=create_existing_sid_occupancy([0], [3]),
         )
         result = KnnCollisionResolver().resolve(plan, np.asarray([[0]], dtype=np.int64))
         self.assertEqual(result.stats.unresolved_count, 1)
@@ -160,7 +161,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
             1,
             [10],
             [[0, 0]],
-            existing_sid_state=create_existing_sid_state([0, 1], [1, 1]),
+            existing_sid_occupancy=create_existing_sid_occupancy([0, 1], [1, 1]),
         )
         result = KnnCollisionResolver().resolve(
             plan, np.asarray([[1, 2]], dtype=np.int64)

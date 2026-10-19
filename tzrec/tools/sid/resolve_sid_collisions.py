@@ -117,8 +117,8 @@ from tzrec.utils.sid.collision import (
     CollisionResolutionResult,
     CollisionResolutionStats,
     CollisionResolver,
-    ExistingSidState,
     SidItemRowIndex,
+    SidOccupancy,
     build_origin_sid_item_row_index,
     build_resolved_sid_item_row_index,
     find_in_sorted_array,
@@ -327,22 +327,36 @@ class CollisionResolutionRunner:
         self._item_id_type: Optional[pa.DataType] = None
         self._bundle = config.bundle
         self._check_input_locations()
-        self._bundle.check_prior_compatible(
+        self._bundle.validate_compatibility(
             list(config.codebook), config.max_items_per_codebook
         )
 
     def run(self) -> CollisionResolutionStats:
         """Read, resolve collisions, and publish the resulting generation."""
         _require_single_process()
+        try:
+            if not self._config.rate_only:
+                self._bundle.prepare_generation()
+            stats = self._resolve_and_write()
+        except BaseException:
+            if not self._config.rate_only:
+                self._bundle.remove_generation()
+            raise
+
+        logger.info("SID collision resolution finished: %s", stats)
+        return stats
+
+    def _resolve_and_write(self) -> CollisionResolutionStats:
+        """Read input, resolve collisions, and publish unless running rate_only."""
         item_ids, codes = self._load_codes()
-        existing_sid_state, existing_item_count = self._load_existing_sid_state(
+        existing_sid_occupancy, existing_item_count = self._load_existing_sid_occupancy(
             item_ids, codes
         )
         plan = prepare_collision_plan(
             item_ids,
             codes,
             self._config.collision_config,
-            existing_sid_state=existing_sid_state,
+            existing_sid_occupancy=existing_sid_occupancy,
         )
         candidate_last_codes = None
         if plan.overflow_rows.size and self._config.strategy == "candidate":
@@ -357,24 +371,21 @@ class CollisionResolutionRunner:
         )
         del candidate_last_codes
 
+        stats = result.stats
         if self._config.rate_only:
             logger.info("rate_only: skipping item_to_sid and sid_to_items writes")
-            del plan
-        else:
-            self._write_sid_to_items_outputs(item_ids, plan, result)
-            del plan
-            self._write_item_to_sid(item_ids, codes, result, existing_item_count)
-        stats = result.stats
-        if not self._config.rate_only:
-            self._bundle.write_manifest(
-                codebook=list(self._config.codebook),
-                capacity=self._config.max_items_per_codebook,
-                observed=stats.max_final_items_per_sid,
-                item_id_type=str(self._item_id_type),
-                writer_type=self._resolved_writer_type,
-            )
+            return stats
 
-        logger.info("SID collision resolution finished: %s", stats)
+        self._write_sid_to_items_outputs(item_ids, plan, result)
+        del plan
+        self._write_item_to_sid(item_ids, codes, result, existing_item_count)
+        self._bundle.write_manifest(
+            codebook=list(self._config.codebook),
+            capacity=self._config.max_items_per_codebook,
+            max_observed_items_per_sid=stats.max_final_items_per_sid,
+            item_id_type=str(self._item_id_type),
+            writer_type=self._resolved_writer_type,
+        )
         return stats
 
     def _check_input_locations(self) -> None:
@@ -382,7 +393,7 @@ class CollisionResolutionRunner:
         wanted = [("--input_path", self._config.input_path)]
         if self._config.is_append:
             wanted += [
-                (artifact, self._bundle.read_path(artifact))
+                (artifact, self._bundle.from_artifact_path(artifact))
                 for artifact in (SID_TO_ITEMS_ARTIFACT, ITEM_TO_SID_ARTIFACT)
             ]
         missing = [
@@ -627,10 +638,10 @@ class CollisionResolutionRunner:
                 "one type."
             )
 
-    def _load_existing_sid_state(
+    def _load_existing_sid_occupancy(
         self, new_item_ids: np.ndarray, new_codes: np.ndarray
-    ) -> Tuple[ExistingSidState, int]:
-        """Load the existing SID state, or empty state for a full resolve.
+    ) -> Tuple[SidOccupancy, int]:
+        """Load published SID occupancy, or empty occupancy for a full resolve.
 
         Args:
             new_item_ids: IDs of the items this run places.
@@ -643,7 +654,7 @@ class CollisionResolutionRunner:
         """
         if not self._config.is_append:
             logger.info("full-resolve mode: no published generation supplied")
-            return ExistingSidState.empty(), 0
+            return SidOccupancy.empty(), 0
 
         key_batches: List[np.ndarray] = []
         count_batches: List[np.ndarray] = []
@@ -652,7 +663,8 @@ class CollisionResolutionRunner:
         existing_item_count = 0
         previous_max_key = -1
         reader = self._make_reader(
-            self._bundle.read_path(SID_TO_ITEMS_ARTIFACT), ["codebook", "itemids"]
+            self._bundle.from_artifact_path(SID_TO_ITEMS_ARTIFACT),
+            ["codebook", "itemids"],
         )
         wanted_prefixes = np.unique(self._config.collision_config.prefix_ids(new_codes))
         new_id_values = self._item_id_array(new_item_ids)
@@ -698,20 +710,20 @@ class CollisionResolutionRunner:
                 f"offending IDs: {preview}."
             )
         if key_batches:
-            existing_sid_state = ExistingSidState(
+            existing_sid_occupancy = SidOccupancy(
                 np.concatenate(key_batches), np.concatenate(count_batches)
             )
         else:
-            existing_sid_state = ExistingSidState.empty()
+            existing_sid_occupancy = SidOccupancy.empty()
         logger.info(
             "append mode: %d new items onto %d published items; %d published "
             "SIDs loaded from the prefixes this run touches, generation %s",
             new_item_ids.shape[0],
             existing_item_count,
-            existing_sid_state.sid_keys.shape[0],
+            existing_sid_occupancy.sid_keys.shape[0],
             self._config.from_generation,
         )
-        return existing_sid_state, existing_item_count
+        return existing_sid_occupancy, existing_item_count
 
     def _make_writer(
         self, output_path: str, writer_type: Optional[str] = None
@@ -755,7 +767,7 @@ class CollisionResolutionRunner:
         if not self._config.is_append:
             return 0
         reader = self._make_reader(
-            self._bundle.read_path(ITEM_TO_SID_ARTIFACT),
+            self._bundle.from_artifact_path(ITEM_TO_SID_ARTIFACT),
             ["item_id", "origin_codebook", "codebook", "index"],
         )
         writer_type = self._resolved_writer_type
@@ -804,11 +816,13 @@ class CollisionResolutionRunner:
         Raises:
             ValueError: If the published item_to_sid and sid_to_items disagree.
         """
-        writer = self._make_writer(self._bundle.write_path(ITEM_TO_SID_ARTIFACT))
+        writer = self._make_writer(self._bundle.artifact_path(ITEM_TO_SID_ARTIFACT))
         writers = [writer]
         if self._config.is_append:
             writers.append(
-                self._make_writer(self._bundle.write_path(DELTA_ITEM_TO_SID_ARTIFACT))
+                self._make_writer(
+                    self._bundle.artifact_path(DELTA_ITEM_TO_SID_ARTIFACT)
+                )
             )
         copied = self._copy_prior_item_to_sid_rows(writer)
         if copied != existing_item_count:
@@ -834,9 +848,13 @@ class CollisionResolutionRunner:
         del columns, resolved_codes
         for item_writer in writers:
             item_writer.close()
-        self._bundle.rows[ITEM_TO_SID_ARTIFACT] = copied + item_ids.shape[0]
+        self._bundle.artifact_row_counts[ITEM_TO_SID_ARTIFACT] = (
+            copied + item_ids.shape[0]
+        )
         if self._config.is_append:
-            self._bundle.rows[DELTA_ITEM_TO_SID_ARTIFACT] = item_ids.shape[0]
+            self._bundle.artifact_row_counts[DELTA_ITEM_TO_SID_ARTIFACT] = (
+                item_ids.shape[0]
+            )
 
     def _write_sid_to_items_outputs(
         self,
@@ -851,7 +869,7 @@ class CollisionResolutionRunner:
             sid_item_row_index = build_origin_sid_item_row_index(plan)
         if self._config.is_append:
             self._write_merged_sid_to_items(
-                item_ids, sid_item_row_index, plan.existing_sid_state
+                item_ids, sid_item_row_index, plan.existing_sid_occupancy
             )
         else:
             self._write_sid_to_items(item_ids, sid_item_row_index)
@@ -875,7 +893,7 @@ class CollisionResolutionRunner:
         self,
         item_ids: np.ndarray,
         sid_item_row_index: SidItemRowIndex,
-        existing_sid_state: ExistingSidState,
+        existing_sid_occupancy: SidOccupancy,
     ) -> None:
         """Merge this run's SIDs into the published sid_to_items, writing both.
 
@@ -885,14 +903,14 @@ class CollisionResolutionRunner:
         Args:
             item_ids: Input item IDs in original row order.
             sid_item_row_index: Input row indices ordered by resolved SID and slot.
-            existing_sid_state: Published SIDs of the affected prefixes, including
-                every published SID a new SID can share a key with.
+            existing_sid_occupancy: Published SIDs in the affected prefixes,
+                including every published SID a new SID can share a key with.
         """
         writer = self._make_writer(
-            self._bundle.write_path(SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
+            self._bundle.artifact_path(SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
         )
         delta_writer = self._make_writer(
-            self._bundle.write_path(DELTA_SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
+            self._bundle.artifact_path(DELTA_SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
         )
         input_sid_keys = sid_item_row_index.sid_keys
         input_item_id_lists = _item_lists(
@@ -913,7 +931,8 @@ class CollisionResolutionRunner:
             )
 
         reader = self._make_reader(
-            self._bundle.read_path(SID_TO_ITEMS_ARTIFACT), ["codebook", "itemids"]
+            self._bundle.from_artifact_path(SID_TO_ITEMS_ARTIFACT),
+            ["codebook", "itemids"],
         )
         cursor = 0
         existing_sid_count = 0
@@ -946,11 +965,15 @@ class CollisionResolutionRunner:
         writer.close()
         delta_writer.close()
 
-        _, shared = find_in_sorted_array(existing_sid_state.sid_keys, input_sid_keys)
-        self._bundle.rows[SID_TO_ITEMS_ARTIFACT] = existing_sid_count + int(
-            np.count_nonzero(~shared)
+        _, shared = find_in_sorted_array(
+            existing_sid_occupancy.sid_keys, input_sid_keys
         )
-        self._bundle.rows[DELTA_SID_TO_ITEMS_ARTIFACT] = input_sid_keys.shape[0]
+        self._bundle.artifact_row_counts[SID_TO_ITEMS_ARTIFACT] = (
+            existing_sid_count + int(np.count_nonzero(~shared))
+        )
+        self._bundle.artifact_row_counts[DELTA_SID_TO_ITEMS_ARTIFACT] = (
+            input_sid_keys.shape[0]
+        )
 
     def _write_sid_to_items(
         self, item_ids: np.ndarray, sid_item_row_index: SidItemRowIndex
@@ -962,7 +985,7 @@ class CollisionResolutionRunner:
             sid_item_row_index: Input row indices ordered by SID and slot.
         """
         writer = self._make_writer(
-            self._bundle.write_path(SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
+            self._bundle.artifact_path(SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
         )
         progress = ProgressLogger(
             "Writing resolved sid_to_items",
@@ -979,7 +1002,9 @@ class CollisionResolutionRunner:
         )
         progress.log(item_ids.shape[0])
         writer.close()
-        self._bundle.rows[SID_TO_ITEMS_ARTIFACT] = sid_item_row_index.sid_keys.shape[0]
+        self._bundle.artifact_row_counts[SID_TO_ITEMS_ARTIFACT] = (
+            sid_item_row_index.sid_keys.shape[0]
+        )
 
 
 def _item_lists(offsets: np.ndarray, ordered_item_ids: pa.Array) -> pa.ListArray:

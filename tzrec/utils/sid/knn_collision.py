@@ -59,7 +59,7 @@ class KnnCollisionResolver(CollisionResolver):
         candidate_last_codes = self._validate_candidate_last_codes(
             plan, candidate_last_codes
         )
-        initial_state, result = self._prepare_collision(plan, collect_sid_metadata)
+        initial_occupancy, result = self._prepare_collision(plan, collect_sid_metadata)
         if result is not None:
             return result
 
@@ -67,7 +67,10 @@ class KnnCollisionResolver(CollisionResolver):
         final_slot_indices = plan.initial_slot_indices.copy()
         unresolved_rows = []
         sid_item_counts = dict(
-            zip(initial_state.sid_keys.tolist(), initial_state.item_counts.tolist())
+            zip(
+                initial_occupancy.sid_keys.tolist(),
+                initial_occupancy.item_counts.tolist(),
+            )
         )
         capacity = plan.config.capacity
         last_codebook_size = plan.config.codebook[-1]
@@ -112,7 +115,6 @@ class KnnCollisionResolver(CollisionResolver):
             resolved_last_codes,
             final_slot_indices,
             np.asarray(unresolved_rows, dtype=np.int64),
-            initial_state,
             np.fromiter(sid_item_counts, dtype=np.int64, count=len(sid_item_counts)),
             np.fromiter(
                 sid_item_counts.values(), dtype=np.int64, count=len(sid_item_counts)

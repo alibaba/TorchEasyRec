@@ -139,8 +139,7 @@ model_config {
 - codes: `array<int64>`, 即该物品的 SID, 长度等于 `codebook` 层数, 每个元素为对应残差层的码本下标 (取值范围 `[0, codebook_i)`)。例如 `[241, 134, 78]`。
 - item_id: 由 `--reserved_columns` 透传的原始物品 ID。
 
-预测结果中多个物品可能具有相同 SID。可使用 [SID 冲突消解工具](sid_collision.md)
-对预测结果进行后处理，支持全量处理和新增物品处理；工具的 `--codebook` 应与模型配置一致。
+预测结果中多个物品可能具有相同 SID。可使用 [SID 冲突消解工具](../usage/sid_collision.md) 对预测结果进行后处理，支持全量处理和新增物品处理；工具的 `--codebook` 应与模型配置一致。
 
 ### 非对比 (纯重建) 用法
 

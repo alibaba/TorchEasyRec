@@ -23,7 +23,7 @@ from tzrec.utils.sid.collision import (
 from tzrec.utils.sid.knn_collision import KnnCollisionResolver
 from tzrec.utils.sid.test_util import (
     create_collision_plan,
-    create_existing_sid_state,
+    create_existing_sid_occupancy,
 )
 from tzrec.utils.test_util import parameterized_name_func
 
@@ -91,24 +91,24 @@ class SidLayoutTest(unittest.TestCase):
         np.testing.assert_array_equal(plan.sid_keys, [(2**21 - 1) * 2**42 - 1])
 
 
-class ExistingSidStateTest(unittest.TestCase):
+class SidOccupancyTest(unittest.TestCase):
     def test_counts_for_returns_zero_for_absent_sids(self) -> None:
-        existing_sid_state = create_existing_sid_state([2, 5, 9], [1, 4, 2])
+        existing_sid_occupancy = create_existing_sid_occupancy([2, 5, 9], [1, 4, 2])
         np.testing.assert_array_equal(
-            existing_sid_state.counts_for(np.asarray([9, 0, 5, 100, 2])),
+            existing_sid_occupancy.counts_for(np.asarray([9, 0, 5, 100, 2])),
             [2, 0, 4, 0, 1],
         )
 
     def test_restrict_to_prefixes_keeps_only_requested_prefixes(self) -> None:
         # last_size 4 -> prefix 0 spans keys 0..3, prefix 2 spans keys 8..11.
-        existing_sid_state = create_existing_sid_state(
+        existing_sid_occupancy = create_existing_sid_occupancy(
             [0, 3, 5, 9, 11, 12], [1, 2, 3, 4, 5, 6]
         )
-        restricted = existing_sid_state.restrict_to_prefixes(np.asarray([0, 2]), 4)
+        restricted = existing_sid_occupancy.restrict_to_prefixes(np.asarray([0, 2]), 4)
         np.testing.assert_array_equal(restricted.sid_keys, [0, 3, 9, 11])
         np.testing.assert_array_equal(restricted.item_counts, [1, 2, 4, 5])
         self.assertTrue(
-            existing_sid_state.restrict_to_prefixes(np.asarray([7]), 4).is_empty
+            existing_sid_occupancy.restrict_to_prefixes(np.asarray([7]), 4).is_empty
         )
 
 
@@ -142,7 +142,7 @@ class CollisionPlanTest(unittest.TestCase):
 
 
 class AppendPlanTest(unittest.TestCase):
-    def test_existing_state_consumes_capacity_and_continues_slots(self) -> None:
+    def test_existing_occupancy_consumes_capacity_and_continues_slots(self) -> None:
         # SID (0, 0) is key 0 and already holds one published item, so with
         # capacity 2 only one of the two new rows can be retained there.
         plan = create_collision_plan(
@@ -150,7 +150,7 @@ class AppendPlanTest(unittest.TestCase):
             2,
             [10, 11],
             [[0, 0], [0, 0]],
-            existing_sid_state=create_existing_sid_state([0], [1]),
+            existing_sid_occupancy=create_existing_sid_occupancy([0], [1]),
         )
         np.testing.assert_array_equal(plan.existing_item_counts, [1])
         self.assertEqual(plan.overflow_rows.size, 1)
@@ -158,14 +158,14 @@ class AppendPlanTest(unittest.TestCase):
         # The retained row continues the published slot sequence at 2, not 1.
         self.assertEqual(int(plan.initial_slot_indices[retained]), 2)
 
-    def test_rejects_existing_state_outside_the_key_space(self) -> None:
+    def test_rejects_existing_occupancy_outside_the_key_space(self) -> None:
         with self.assertRaisesRegex(ValueError, "outside the key space"):
             create_collision_plan(
                 (2, 4),
                 2,
                 [10],
                 [[0, 0]],
-                existing_sid_state=create_existing_sid_state([8], [1]),
+                existing_sid_occupancy=create_existing_sid_occupancy([8], [1]),
             )
 
 
@@ -272,7 +272,7 @@ class CollisionResolverTest(unittest.TestCase):
             3,
             [10],
             [[0, 0]],
-            existing_sid_state=create_existing_sid_state([0], [2]),
+            existing_sid_occupancy=create_existing_sid_occupancy([0], [2]),
         )
         result = KnnCollisionResolver().resolve(plan, None)
         self.assertEqual(plan.overflow_rows.size, 0)
@@ -330,9 +330,13 @@ class SidItemRowIndexTest(unittest.TestCase):
         )
 
     def test_sid_item_row_indices_cover_only_the_appended_rows(self) -> None:
-        existing_sid_state = create_existing_sid_state([0], [1])
+        existing_sid_occupancy = create_existing_sid_occupancy([0], [1])
         plan = create_collision_plan(
-            (2, 4), 3, [10, 11], [[0, 0], [0, 1]], existing_sid_state=existing_sid_state
+            (2, 4),
+            3,
+            [10, 11],
+            [[0, 0], [0, 1]],
+            existing_sid_occupancy=existing_sid_occupancy,
         )
         result = KnnCollisionResolver().resolve(plan, None)
 
