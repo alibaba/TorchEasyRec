@@ -114,10 +114,6 @@ model_config {
   - commitment_loss: VQ commitment 损失; `latent_weight` 为 `[w1, w2]` 两个权重 (默认 `[1.0, 0.5]`, **必须长度为 2**), `commitment_type` 可选 `"l2"`/`"l1"`/`"cos"`
   - contrastive_loss: 开启双视图对比 (masked InfoNCE) 损失; **须与 `contrastive_config` 同时设置**; 仅在配对行上生效
 
-对比损失在多卡训练时使用所有卡当前 batch 的候选。重建行的对比目标设为 `ignore_index=-100`，不计算对比损失，也不作为其他样本的负样本；其重建损失和 commitment 损失仍正常计算。
-
-重复候选根据两侧原始输入 embedding 逐维完全相等自动识别，无需新增配置。每行指定的正样本保留，其他位置中与其正目标相同、与 query 自身相同或属于同一 anchor 的其他显式配对候选会被屏蔽；同视图对比也屏蔽重复自身和当前配对物品。该行为依赖同一物品使用固定的原始 embedding：不同物品的向量完全相同会被视为重复，同一物品的向量不同则无法识别。不使用近似相似度阈值，也不根据编码器输出、重建结果或 SID 判重。
-
 > 评估指标自动输出 `mse` (重建均方误差)、`rel_loss` (相对 L1)、`unique_sid_ratio` (每个 batch 内不重复 SID 占比, 反映码本利用/多样性)。
 
 ## 示例
