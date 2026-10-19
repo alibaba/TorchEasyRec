@@ -233,7 +233,14 @@ class IdFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 2, 1]))
         self.assertIsNone(parsed_feat.weights)
 
-    def test_weighted_sequence_id_feature_raises(self):
+    @parameterized.expand(
+        [
+            param("weighted", weighted=True),
+            param("weight_expression", weight_expression="item:cate_weights"),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_weighted_sequence_id_feature_raises(self, name, **kwargs):
         # fg ignores weighted on a sequence feature and SequenceSparseData has no
         # weight, so this used to blow up as a KeyError in a dataloader worker.
         id_feat_cfg = feature_pb2.FeatureConfig(
@@ -242,7 +249,7 @@ class IdFeatureTest(unittest.TestCase):
                 expression="item:cate",
                 embedding_dim=16,
                 num_buckets=100,
-                weighted=True,
+                **kwargs,
             )
         )
         with self.assertRaises(ValueError):
@@ -334,6 +341,56 @@ class IdFeatureTest(unittest.TestCase):
         np.testing.assert_allclose(parsed_values, np.array([123, 1391, 12, 123]))
         np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 0, 2, 0]))
         self.assertIsNone(parsed_feat.weights)
+
+    @parameterized.expand(
+        [
+            param(
+                "array",
+                ids=pa.array([[3], [5, 5], None, [7]]),
+                weights=pa.array([[0.5], [1.0, 2.0], [9.0], [2.5]]),
+                use_weight=True,
+            ),
+            param(
+                "string",
+                ids=pa.array(["3", "5\x1d5", None, "7"]),
+                weights=pa.array(["0.5", "1\x1d2", "9", "2.5"]),
+                use_weight=True,
+            ),
+            param(
+                "array_wo_use_weight",
+                ids=pa.array([[3], [5, 5], None, [7]]),
+                weights=pa.array([[0.5], [1.0, 2.0], [9.0], [2.5]]),
+                use_weight=False,
+            ),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_id_feature_with_weight_expression(self, name, ids, weights, use_weight):
+        id_feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="tag",
+                num_buckets=100,
+                embedding_dim=16,
+                expression="item:tag_ids",
+                weight_expression="item:tag_weights",
+                use_weight=use_weight,
+            )
+        )
+        id_feat = id_feature_lib.IdFeature(id_feat_cfg, fg_mode=FgMode.FG_NORMAL)
+        self.assertTrue(id_feat.is_weighted)
+        self.assertEqual(id_feat.use_weight, use_weight)
+        self.assertEqual(id_feat.inputs, ["tag_ids", "tag_weights"])
+        fg_cfg = id_feat.fg_json()[0]
+        self.assertEqual(fg_cfg["weight_expression"], "item:tag_weights")
+
+        parsed_feat = id_feat.parse({"tag_ids": ids, "tag_weights": weights})
+        # the null ids row drops its weight, the repeated id sums its weights
+        np.testing.assert_allclose(parsed_feat.values, np.array([3, 5, 7]))
+        np.testing.assert_allclose(parsed_feat.lengths, np.array([1, 1, 0, 1]))
+        if use_weight:
+            np.testing.assert_allclose(parsed_feat.weights, np.array([0.5, 3.0, 2.5]))
+        else:
+            self.assertIsNone(parsed_feat.weights)
 
     @parameterized.expand(
         [

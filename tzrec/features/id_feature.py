@@ -34,8 +34,10 @@ class IdFeature(BaseFeature):
         super().__init__(feature_config, **kwargs)
 
         if isinstance(self.config, feature_pb2.IdFeature):
-            self._is_weighted = self.config.weighted
-            self._use_weight = self.config.weighted and self.config.use_weight
+            self._is_weighted = self.config.weighted or self.config.HasField(
+                "weight_expression"
+            )
+            self._use_weight = self._is_weighted and self.config.use_weight
             if self._is_weighted and self.is_sequence:
                 # fg does not parse weight for a sequence feature and
                 # SequenceSparseData has no weight, so the weight of a sequence
@@ -96,7 +98,12 @@ class IdFeature(BaseFeature):
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Input field names with side."""
         if self.config.HasField("expression"):
-            return [tuple(self.config.expression.split(":"))]
+            side_inputs = [tuple(self.config.expression.split(":"))]
+            if isinstance(self.config, feature_pb2.IdFeature) and self.config.HasField(
+                "weight_expression"
+            ):
+                side_inputs.append(tuple(self.config.weight_expression.split(":")))
+            return side_inputs
         else:
             return None
 
@@ -129,6 +136,9 @@ class IdFeature(BaseFeature):
             fg_cfg["num_buckets"] = self.config.num_buckets
         if self.config.weighted:
             fg_cfg["weighted"] = True
+        if self.config.HasField("weight_expression"):
+            # fg implies weighted when weight_expression is set
+            fg_cfg["weight_expression"] = self.config.weight_expression
         fg_cfg["value_dim"] = self.value_dim
         if self.config.HasField("fg_value_type"):
             fg_cfg["value_type"] = self.config.fg_value_type

@@ -183,6 +183,9 @@ message IdFeature {
     optional string data_type = 35 [default = 'FP32'];
     // use weight in embedding pooling or not, only take effect when weighted = true
     optional bool use_weight = 36 [default = false];
+    // weight input aligned by position with expression, e.g. item:tag_weights,
+    // implies weighted = true
+    optional string weight_expression = 37;
 
     // embedding param constraints
     optional ParameterConstraints embedding_constraints = 50;
