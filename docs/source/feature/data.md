@@ -357,6 +357,12 @@ pipeline.global-job-parameters: |
 - 设置为false时，先处理完的worker可以先返回batch，避免慢worker阻塞其他worker，但可能降低可复现性，并改变训练样本或预测结果的输出顺序
 - 对于样本分布不均衡的数据，设置为false可能使训练过程看到的数据分布产生偏差
 
+### prefetch_factor
+
+- 每个dataloader worker预先准备的batch数，默认为2；仅在`num_workers > 0`时生效
+- `in_order=true`时，一个worker读数据变慢（如ODPS读取抖动）会阻塞该rank，其他worker最多只能提前准备`prefetch_factor`个batch；调大该值可以吸收读取抖动、减少训练等数据的时间，同时保持batch顺序
+- 每个rank最多缓存`num_workers * prefetch_factor`个batch，调大时需关注内存占用
+
 ### shuffle
 
 - 是否训练时打散数据，默认为false
