@@ -30,9 +30,65 @@ import errno
 import os
 import uuid
 import zipfile
-from typing import Any, Mapping
+from dataclasses import dataclass
+from typing import Any, BinaryIO, Iterable, Mapping, Tuple
 
 import numpy as np
+
+
+@dataclass
+class StreamingArray:
+    """An array provided as row chunks with a known final shape.
+
+    Attributes:
+        dtype: Numeric NumPy dtype of the complete array and every chunk.
+        shape: Complete array shape, including the total number of rows.
+        chunks: Iterable yielding arrays with matching dtype and trailing shape.
+            Chunks are consumed once and written in C order.
+    """
+
+    dtype: np.dtype
+    shape: Tuple[int, ...]
+    chunks: Iterable[np.ndarray]
+
+
+def _write_array_stream(fp: BinaryIO, array: StreamingArray) -> None:
+    """Write one NPY header followed by a validated stream of numeric rows.
+
+    Args:
+        fp: Writable binary stream for the NPY entry.
+        array: Array description and lazily produced row chunks.
+    """
+    dtype = np.dtype(array.dtype)
+    if dtype.kind not in "buifc":
+        raise ValueError(f"Streaming arrays require a numeric dtype, got {dtype}")
+    if not array.shape or any(dim < 0 for dim in array.shape):
+        raise ValueError(
+            f"Streaming arrays require a nonnegative row shape: {array.shape}"
+        )
+    np.lib.format.write_array_header_1_0(
+        fp,
+        {
+            "descr": np.lib.format.dtype_to_descr(dtype),
+            "fortran_order": False,
+            "shape": array.shape,
+        },
+    )
+    rows = 0
+    for chunk in array.chunks:
+        if chunk.dtype != dtype:
+            raise ValueError(f"Chunk dtype {chunk.dtype} does not match {dtype}")
+        if chunk.ndim != len(array.shape) or chunk.shape[1:] != array.shape[1:]:
+            raise ValueError(
+                f"Chunk shape {chunk.shape} does not match array shape {array.shape}"
+            )
+        rows += chunk.shape[0]
+        if rows > array.shape[0]:
+            raise ValueError(f"Too many rows: expected {array.shape[0]}, got {rows}")
+        if chunk.nbytes:
+            fp.write(memoryview(np.ascontiguousarray(chunk)).cast("B"))
+    if rows != array.shape[0]:
+        raise ValueError(f"Too few rows: expected {array.shape[0]}, got {rows}")
 
 
 class _Unseekable:
@@ -103,8 +159,9 @@ def savez_streaming(path: str, arrays: Mapping[str, Any]) -> None:
 
     Args:
         path: Destination ``.npz`` path on the (possibly seek-broken) DFS mount.
-        arrays: Mapping of entry name to array-like value (numpy or torch
-            tensor); names must not carry a ``.npy`` suffix, it is appended.
+        arrays: Mapping of entry name to an array-like value (numpy or torch
+            tensor) or a ``StreamingArray`` for bounded-memory row writes;
+            names must not carry a ``.npy`` suffix, it is appended.
     """
     part = f"{path}.part.{uuid.uuid4().hex}"
     # "xb" creates the staging file exclusively, never over an existing path
@@ -119,7 +176,10 @@ def savez_streaming(path: str, arrays: Mapping[str, Any]) -> None:
                     # force_zip64 keeps entries > ZIP64_LIMIT from raising and
                     # matches np.savez, which forces zip64 on every entry.
                     with zf.open(f"{name}.npy", "w", force_zip64=True) as ent:
-                        np.save(ent, arr)
+                        if isinstance(arr, StreamingArray):
+                            _write_array_stream(ent, arr)
+                        else:
+                            np.save(ent, arr)
         os.replace(part, path)
     except BaseException:
         with contextlib.suppress(OSError):

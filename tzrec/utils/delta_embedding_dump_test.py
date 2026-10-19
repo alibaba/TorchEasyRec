@@ -108,7 +108,7 @@ from tzrec.utils.dynamicemb_util import (
     has_dynamicemb,
     set_auto_retain_evicted_keys,
 )
-from tzrec.utils.feature_store_delta_uploader import (
+from tzrec.utils.feature_store_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
 )

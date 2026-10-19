@@ -9,11 +9,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import json
 import os
 import shutil
 import unittest
 
+import numpy as np
 import torch
 from pyarrow import dataset as ds
 
@@ -1146,7 +1148,7 @@ class RankIntegrationTest(unittest.TestCase):
         "dynamicemb not available.",
     )
     @mark_ci_scope("gpu")
-    def test_multi_tower_din_with_dynamicemb_train_eval(self):
+    def test_multi_tower_din_with_dynamicemb_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config",
             self.test_dir,
@@ -1157,11 +1159,42 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_eval(
                 os.path.join(self.test_dir, "pipeline.config"), self.test_dir
             )
-        # if self.success:
-        #     self.success = utils.test_export(
-        #         os.path.join(self.test_dir, "pipeline.config"), self.test_dir
-        #     )
+        if self.success:
+            self.success = utils.test_export(
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str="USE_DISTRIBUTED_EMBEDDING=1",
+            )
         self.assertTrue(self.success)
+        self.success = False
+        export_dir = os.path.join(self.test_dir, "export")
+        torch.jit.load(os.path.join(export_dir, "scripted_model.pt"))
+        sparse_dir = os.path.join(export_dir, "sparse")
+        with open(os.path.join(sparse_dir, "sparse_embedding.json")) as f:
+            metadata = json.load(f)
+        dynamic_tables = [info for info in metadata.values() if info["is_dynamic"]]
+        self.assertTrue(dynamic_tables)
+        checkpoint_path, _ = checkpoint_util.latest_checkpoint(
+            os.path.join(self.test_dir, "train")
+        )
+        assert checkpoint_path is not None
+        key_files = glob.glob(
+            os.path.join(checkpoint_path, "dynamicemb", "*", "*_emb_keys.rank_*")
+        )
+        checkpoint_rows = sum(os.path.getsize(path) // 8 for path in key_files)
+        self.assertGreater(checkpoint_rows, 0)
+        self.assertEqual(
+            sum(info["shape"][0] for info in dynamic_tables), checkpoint_rows
+        )
+        with np.load(
+            os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
+        ) as arrays:
+            for info in dynamic_tables:
+                keys = arrays[info["key_name"]]
+                self.assertEqual(len(keys), info["shape"][0])
+                self.assertEqual(arrays[info["value_name"]].shape, tuple(info["shape"]))
+                self.assertEqual(len(arrays[info["score_name"]]), len(keys))
+        self.success = True
 
     # id_1 is a regular embedding table, the rest are dynamicemb, so one run
     # covers FTRL on both the fused TBE kernel and the dynamicemb path.
