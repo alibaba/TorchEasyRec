@@ -11,13 +11,54 @@
 
 import os
 import unittest
+from functools import partial
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from parameterized import parameterized
+from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel
 
 from tzrec.loss.sid_contrastive_loss import SidContrastiveLoss
 from tzrec.utils import misc_util
+from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
+
+
+def _reference_loss(loss_fn, embed_a, embed_b, embed_a_ori, embed_b_ori, pair_mask):
+    """Compute CE after explicitly selecting each query's allowed candidates."""
+    a, b = F.normalize(embed_a, dim=-1), F.normalize(embed_b, dim=-1)
+    originals = [embed_a_ori.tolist(), embed_b_ori.tolist()]
+    groups = (
+        (loss_fn.logit_scale_self, (a, b), False),
+        (loss_fn.logit_scale_ori, (embed_a_ori, embed_b_ori), False),
+        (loss_fn.logit_scale_cl, (embed_a_ori, embed_b_ori), True),
+    )
+    loss = (a.sum() + b.sum()) * 0
+    for log_scale, targets, own_view in groups:
+        scale = log_scale.clamp(max=4.605170185988092).exp()
+        loss = loss + scale * 0
+        for side, query in enumerate((a, b)):
+            target_side = side if own_view else 1 - side
+            for row in range(len(pair_mask)):
+                if not pair_mask[row]:
+                    continue
+                candidates = [row]
+                for col in range(len(pair_mask)):
+                    if col == row or not pair_mask[col]:
+                        continue
+                    candidate = originals[target_side][col]
+                    if candidate in (originals[0][row], originals[1][row]):
+                        continue
+                    if not own_view and originals[side][col] == originals[side][row]:
+                        continue
+                    candidates.append(col)
+                logits = scale * query[row] @ targets[target_side][candidates].t()
+                loss = loss + F.cross_entropy(
+                    logits.unsqueeze(0),
+                    torch.zeros(1, dtype=torch.long, device=a.device),
+                )
+    return loss / (6 * pair_mask.sum().clamp(min=1))
 
 
 class AllGatherWithGradTest(unittest.TestCase):
@@ -150,6 +191,72 @@ class SidContrastiveLossTest(unittest.TestCase):
         loss_fn(**feats, pair_mask=mask).backward()
         self.assertTrue(torch.isfinite(feats["embed_a"].grad).all())
 
+    @parameterized.expand(
+        [
+            ("distinct", [0, 2, 4, 6], [1, 3, 5, 7]),
+            ("duplicate_target", [0, 2, 4, 6], [1, 1, 5, 7]),
+            ("duplicate_anchor", [0, 0, 4, 6], [1, 3, 5, 7]),
+            ("query_as_candidate", [0, 2, 4, 6], [1, 3, 0, 7]),
+            ("same_item_pair", [0, 2, 4, 6], [0, 3, 5, 7]),
+            ("all_identical", [0, 0, 0, 0], [0, 0, 0, 0]),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_duplicate_candidates_match_filtered_reference(self, _name, a_ids, b_ids):
+        feats = self._features(4, 8)
+        originals = torch.randn(8, 8)
+        feats["embed_a_ori"] = originals[a_ids]
+        feats["embed_b_ori"] = originals[b_ids]
+        reference_feats = {
+            key: value.detach().clone().requires_grad_(value.requires_grad)
+            for key, value in feats.items()
+        }
+        mask = torch.ones(4, dtype=torch.bool)
+        loss_fn, reference_fn = SidContrastiveLoss(), SidContrastiveLoss()
+        actual = loss_fn(**feats, pair_mask=mask)
+        expected = _reference_loss(reference_fn, **reference_feats, pair_mask=mask)
+        torch.testing.assert_close(actual, expected)
+        actual.backward()
+        expected.backward()
+        for name in ("embed_a", "embed_b"):
+            torch.testing.assert_close(feats[name].grad, reference_feats[name].grad)
+        for actual_param, expected_param in zip(
+            loss_fn.parameters(), reference_fn.parameters()
+        ):
+            torch.testing.assert_close(actual_param.grad, expected_param.grad)
+
+    def test_exact_equality_uses_original_precision(self):
+        feats = self._features(4, 8)
+        feats["embed_b_ori"][1] = feats["embed_b_ori"][0]
+        feats["embed_b_ori"][1, 0] += 1e-6
+        self.assertFalse(torch.equal(feats["embed_b_ori"][0], feats["embed_b_ori"][1]))
+        self.assertTrue(
+            torch.equal(
+                feats["embed_b_ori"][0].bfloat16(), feats["embed_b_ori"][1].bfloat16()
+            )
+        )
+        mask = torch.ones(4, dtype=torch.bool)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            actual = SidContrastiveLoss()(**feats, pair_mask=mask)
+            expected = _reference_loss(SidContrastiveLoss(), **feats, pair_mask=mask)
+        torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.01)
+
+    def test_nonpair_target_is_ignored_before_reduction(self):
+        logits_a = torch.tensor(
+            [[0.0, 1.0], [torch.finfo(torch.float32).min, 1.0]], requires_grad=True
+        )
+        logits_b = logits_a.detach().clone().requires_grad_()
+        loss = SidContrastiveLoss()._masked_cross_entropy(
+            logits_a, logits_b, torch.tensor([1, -100]), torch.tensor(1)
+        )
+        torch.testing.assert_close(
+            loss, F.cross_entropy(logits_a[:1], torch.tensor([1]))
+        )
+        loss.backward()
+        for logits in (logits_a, logits_b):
+            self.assertTrue(torch.isfinite(logits.grad).all())
+            torch.testing.assert_close(logits.grad[1], torch.zeros(2))
+
 
 # --- Multi-process tests for the contrastive distributed all-gather path. ---
 # Validates ``_all_gather_with_grad`` (built on the differentiable
@@ -224,6 +331,71 @@ def _contrastive_worker(rank: int, world_size: int, port: int) -> None:
     dist.destroy_process_group()
 
 
+def _mixed_ddp_worker(rank, world_size, port, use_bf16):
+    device = _init(rank, world_size, port)
+    loss_fn = SidContrastiveLoss().to(device)
+    model = DistributedDataParallel(
+        loss_fn,
+        device_ids=[rank] if device.type == "cuda" else None,
+        static_graph=True,
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    cases = (
+        ([False, True, True, False], [0, 2, 4, 6], [1, 1, 1, 7]),
+        ([False, False, True, True], [0, 2, 4, 6], [1, 3, 5, 7]),
+        ([False, False, False, False], [0, 2, 4, 6], [1, 3, 5, 7]),
+        ([True, True, True, True], [0, 2, 0, 6], [1, 1, 5, 0]),
+    )
+    for flags, a_ids, b_ids in cases:
+        torch.manual_seed(42)
+        originals = torch.randn(8, 8, device=device)
+        full = {
+            "embed_a": torch.randn(4, 8, device=device, requires_grad=True),
+            "embed_b": torch.randn(4, 8, device=device, requires_grad=True),
+            "embed_a_ori": originals[a_ids],
+            "embed_b_ori": originals[b_ids],
+        }
+        selection = slice(2 * rank, 2 * rank + 2)
+        local = {
+            key: value[selection].detach().clone().requires_grad_(value.requires_grad)
+            for key, value in full.items()
+        }
+        global_mask = torch.tensor(flags, device=device)
+        local_mask = global_mask[selection]
+        reference_fn = SidContrastiveLoss().to(device)
+        reference_fn.load_state_dict(loss_fn.state_dict())
+        optimizer.zero_grad()
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            actual = model(**local, pair_mask=local_mask) * local_mask.float().mean()
+            expected = _reference_loss(reference_fn, **full, pair_mask=global_mask)
+            expected = expected * global_mask.float().mean()
+        averaged = actual.detach().clone()
+        dist.all_reduce(averaged)
+        tolerance = {"atol": 0.04, "rtol": 0.04} if use_bf16 else {}
+        torch.testing.assert_close(averaged / world_size, expected, **tolerance)
+        actual.backward()
+        expected.backward()
+        for key in ("embed_a", "embed_b"):
+            assert local[key].grad is not None and torch.isfinite(local[key].grad).all()
+            torch.testing.assert_close(
+                local[key].grad / world_size, full[key].grad[selection], **tolerance
+            )
+        for actual_param, expected_param in zip(
+            loss_fn.parameters(), reference_fn.parameters()
+        ):
+            assert (
+                actual_param.grad is not None
+                and torch.isfinite(actual_param.grad).all()
+            )
+            torch.testing.assert_close(
+                actual_param.grad, expected_param.grad, **tolerance
+            )
+        optimizer.step()
+        for param in model.parameters():
+            assert torch.isfinite(param).all()
+    dist.destroy_process_group()
+
+
 def _run(target) -> None:
     port = misc_util.get_free_port()
     ctx = mp.get_context("spawn")
@@ -238,6 +410,7 @@ def _run(target) -> None:
             raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
 
 
+@mark_ci_scope("gpu")
 class SidContrastiveDistTest(unittest.TestCase):
     """2-rank tests for the contrastive distributed collectives."""
 
@@ -246,6 +419,12 @@ class SidContrastiveDistTest(unittest.TestCase):
 
     def test_masked_contrastive_loss(self) -> None:
         _run(_contrastive_worker)
+
+    @parameterized.expand(
+        [("fp32", False), ("bf16", True)], name_func=parameterized_name_func
+    )
+    def test_mixed_ddp_matches_global_reference(self, _name, use_bf16):
+        _run(partial(_mixed_ddp_worker, use_bf16=use_bf16))
 
 
 if __name__ == "__main__":
