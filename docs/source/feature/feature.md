@@ -77,6 +77,16 @@ feature_configs {
         }
     }
 }
+feature_configs {
+    id_feature {
+        feature_name: "tags"
+        expression: "item:tag_ids"
+        weight_expression: "item:tag_weights"
+        use_weight: true
+        hash_bucket_size: 100000
+        embedding_dim: 16
+    }
+}
 ```
 
 - **expression**: 特征FG所依赖的字段来源，由两部分组成`input_side`:`input_name`
@@ -116,6 +126,11 @@ feature_configs {
 - **zch**: 零冲突hash，可设置Id的准入和驱逐策略，详见[文档](./zch.md)
 
 - **weighted**: 是否为带权重的Id特征，输入形式为`k1:v1\x1dk2:v2`
+
+- **weight_expression**: 权重所在的输入字段，如`item:tag_weights`，用于id和权重分两列存放的场景，设置后等价于weighted=true，需配合**use_weight**=true使权重参与embedding pooling
+
+  - 与**expression**按位置一一对应，两列均支持array类型或按**separator**分隔的字符串；同一行id与权重个数须相同（id为空的行忽略权重），array中不能有null元素
+  - 重复的id会累加权重
 
 - **use_weight**: 默认值是false，仅在**weighted**=true时生效。默认情况下，权重仅用于从`k:v`格式的输入中解析出id，解析后即被丢弃，不参与模型计算，也不会传输给模型。设置为true时，权重会参与embedding pooling。注意：开启后，同一**数据组**（data group）内的所有特征都会带上权重（其余特征填充为1），会有一定的内存和计算开销
 
