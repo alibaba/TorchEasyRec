@@ -2401,7 +2401,10 @@ def _get_sparse_embedding_tensor(
         dynamic_out: streaming dynamic checkpoint arrays and in-memory ZCH
             keys/values/scores, plus a default value entry per ZCH table.
         emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
-        feat_meta: feature -> embedding_name / pooling / use_weight mapping.
+        feat_meta: feat_name_impl -> embedding_name / pooling / use_weight
+            mapping (`<feature>__ebc/__ec`, or `<feature>@<table_name>__ebc/__ec`
+            when shared across multiple tables of the same collection type,
+            matching `dense_meta.json`).
     """
     emb_name_to_emb_dim: Dict[str, int] = dict()
     name_to_feature = {feature.name: feature for feature in features}
@@ -2439,13 +2442,6 @@ def _get_sparse_embedding_tensor(
                 else feat_name
             )
             feat_name_impl = feat_key + "__ec"
-            existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
-            if existing_emb_name is not None and existing_emb_name != export_emb_name:
-                raise ValueError(
-                    f"sparse feature [{feat_key}] maps to multiple embedding "
-                    f"tables [{existing_emb_name}] and [{export_emb_name}] in "
-                    "distributed embedding export."
-                )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
@@ -2468,13 +2464,6 @@ def _get_sparse_embedding_tensor(
                 else feat_name
             )
             feat_name_impl = feat_key + "__ebc"
-            existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
-            if existing_emb_name is not None and existing_emb_name != export_emb_name:
-                raise ValueError(
-                    f"sparse feature [{feat_key}] maps to multiple embedding "
-                    f"tables [{existing_emb_name}] and [{export_emb_name}] in "
-                    "distributed embedding export."
-                )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name

@@ -803,17 +803,30 @@ class ExportUtilTest(unittest.TestCase):
     def test_sparse_export_shared_ec_feature_across_multiple_tables(self) -> None:
         test_dir = make_test_dir()
         self.addCleanup(shutil.rmtree, test_dir)
-        embedding_infos = {
-            f"ec.embeddings.{name}": EmbeddingConfig(
+        tables = [
+            EmbeddingConfig(
                 name=name,
                 embedding_dim=4,
                 num_embeddings=8,
                 feature_names=["seq_feat"],
             )
             for name in ("first_emb", "second_emb")
-        }
-        _, _, _, feat_meta = _get_sparse_embedding_tensor(
-            torch.nn.Module(), test_dir, embedding_infos, {}, []
+        ]
+        model = torch.nn.Module()
+        model.ec = EmbeddingCollection(tables, device=torch.device("cpu"))
+        embedding_bag_info, embedding_infos = (
+            export_util._get_sparse_table_to_embedding_info(model)
+        )
+        _, _, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+            model, test_dir, embedding_infos, embedding_bag_info, []
+        )
+        self.assertEqual(
+            emb_meta["ec.embeddings.first_emb"]["feat_name_impl"],
+            ["seq_feat@first_emb__ec"],
+        )
+        self.assertEqual(
+            emb_meta["ec.embeddings.second_emb"]["feat_name_impl"],
+            ["seq_feat@second_emb__ec"],
         )
         self.assertEqual(
             feat_meta,
