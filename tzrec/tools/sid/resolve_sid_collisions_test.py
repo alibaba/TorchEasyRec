@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import unittest
-from collections import Counter
 from unittest import mock
 
 import numpy as np
@@ -221,7 +220,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             codebook=(8, 8),
             max_items_per_codebook=2,
             strategy="candidate",
-            random_num_candidates=64,
             rate_only=False,
             odps_data_quota_name="pay-as-you-go",
         )
@@ -776,6 +774,8 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     @parameterized.expand(
         [
             ("candidate", "candidate"),
+            ("iterative", "iterative"),
+            ("uniform", "uniform"),
         ],
         name_func=parameterized_name_func,
     )
@@ -959,51 +959,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
         self.assertEqual(stats.total_items, 1)
         self.assertEqual(os.listdir(out), ["v1"])
-
-    def test_random_reassigns_within_prefix(self) -> None:
-        stats, out = self._resolve(
-            list(range(5)), [[0, 0]] * 5, max_items_per_codebook=2, strategy="random"
-        )
-        self.assertEqual(stats.relocated_count, 3)
-        d = self._read(out, ITEM_TO_SID)
-        self.assertTrue(all(cb[0] == 0 for cb in d["codebook"]))
-        self.assertLessEqual(max(Counter(map(tuple, d["codebook"])).values()), 2)
-        self._assert_item_to_sid_matches_sid_to_items(out)
-
-    def test_single_layer_sid(self) -> None:
-        stats, out = self._resolve(
-            list(range(4)),
-            [[0]] * 4,
-            max_items_per_codebook=1,
-            strategy="random",
-            codebook=(16,),
-        )
-        self.assertEqual(stats.relocated_count, 3)
-        d = self._read(out, ITEM_TO_SID)
-        self.assertEqual(len({tuple(cb) for cb in d["codebook"]}), 4)
-
-    def test_random_tolerates_duplicate_item_ids(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(
-            inp,
-            ["b", "a", "a"],
-            [[0, 0]] * 3,
-            item_id_type=pa.string(),
-        )
-
-        stats = self._run(
-            inp,
-            out,
-            strategy="random",
-            random_num_candidates=8,
-            max_items_per_codebook=1,
-        )
-
-        self.assertEqual(stats.total_items, 3)
-        result = self._read(out, ITEM_TO_SID)
-        self.assertEqual(result["item_id"], ["b", "a", "a"])
-        self._assert_item_to_sid_matches_sid_to_items(out)
 
     def test_partition_does_not_drop_invalid_codes(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")

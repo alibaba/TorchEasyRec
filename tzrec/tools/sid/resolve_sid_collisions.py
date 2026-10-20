@@ -36,8 +36,6 @@ overflow items within their SID prefix through the pure NumPy core:
 - ``uniform`` reads no candidates and spreads the items over the least-loaded
   last-layer codes of their prefix, so a prefix with room leaves nothing over
   capacity.
-- ``random`` draws deterministic candidates with replacement from the full
-  last-layer space; origin draws and duplicate draws are not replaced.
 
 It writes the ``item_to_sid`` and ``sid_to_items`` artifacts through
 TorchEasyRec readers and writers; ``tzrec/utils/sid/bundle.py`` describes where
@@ -142,7 +140,6 @@ from tzrec.utils.sid.collision import (
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
 from tzrec.utils.sid.knn_collision import KnnCollisionResolver
-from tzrec.utils.sid.random_collision import RandomCollisionResolver
 from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 
 _RESOLVERS: Dict[str, Type[CollisionResolver]] = {
@@ -219,7 +216,6 @@ class ResolveSidCollisionsConfig:
     codebook: Tuple[int, ...]
     max_items_per_codebook: int
     strategy: str
-    random_num_candidates: int
     rate_only: bool
     odps_data_quota_name: str
     from_generation: Optional[str] = None
@@ -227,10 +223,6 @@ class ResolveSidCollisionsConfig:
     def __post_init__(self) -> None:
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}.")
-        if self.random_num_candidates < 1:
-            raise ValueError(
-                f"random_num_candidates must be >= 1, got {self.random_num_candidates}."
-            )
         if not self.rate_only and not self.generation:
             raise ValueError("generation is required unless rate_only is set.")
         if not self.output_path and (not self.rate_only or self.is_append):
@@ -290,7 +282,6 @@ class ResolveSidCollisionsConfig:
             codebook=codebook,
             max_items_per_codebook=args.max_items_per_codebook,
             strategy=args.strategy,
-            random_num_candidates=args.random_num_candidates,
             rate_only=args.rate_only,
             odps_data_quota_name=args.odps_data_quota_name,
         )
@@ -322,15 +313,9 @@ class CollisionResolutionRunner:
         config: ResolveSidCollisionsConfig,
     ) -> None:
         self._config = config
-        self._resolver: CollisionResolver
-        if config.strategy == "random":
-            self._resolver = RandomCollisionResolver(
-                config.random_num_candidates, progress_interval=config.progress_interval
-            )
-        else:
-            self._resolver = _RESOLVERS[config.strategy](
-                progress_interval=config.progress_interval
-            )
+        self._resolver = _RESOLVERS[config.strategy](
+            progress_interval=config.progress_interval
+        )
         self._resolved_writer_type: Optional[str] = None
         self._item_id_type: Optional[pa.DataType] = None
         self._bundle = config.bundle
@@ -1260,21 +1245,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_items_per_codebook", type=int, required=True)
     parser.add_argument(
         "--strategy",
-        choices=[*_RESOLVERS, "random"],
+        choices=list(_RESOLVERS),
         default="candidate",
         help=(
             "Place overflow items greedily from model candidates (candidate), "
             "from model candidates by deterministic multi-round arbitration "
             "(iterative), or evenly over the least-loaded codes of their SID "
-            "prefix without candidates (uniform), or use deterministic legacy "
-            "random draws (random)."
+            "prefix without candidates (uniform)."
         ),
-    )
-    parser.add_argument(
-        "--random_num_candidates",
-        type=int,
-        default=64,
-        help="Full-space random draws per overflow item for random strategy.",
     )
     parser.add_argument(
         "--rate_only",
