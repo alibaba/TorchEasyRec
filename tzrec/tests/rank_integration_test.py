@@ -12,6 +12,7 @@
 import json
 import os
 import shutil
+import sys
 import unittest
 
 import torch
@@ -23,7 +24,7 @@ from tzrec.datasets.dataset import create_dataloader
 from tzrec.main import _create_features
 from tzrec.optim.optimizer import has_fbgemm_ftrl
 from tzrec.tests import utils
-from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
+from tzrec.utils import checkpoint_util, config_util, dynamicemb_util, misc_util
 from tzrec.utils.test_util import (
     cutlass_hstu_unavailable,
     dfs_are_close,
@@ -1259,6 +1260,128 @@ class RankIntegrationTest(unittest.TestCase):
                 additional_export_config='{"cand_seq_pk": "cand_seq"}',
             )
         self.assertTrue(self.success)
+
+
+_KAFKA_URI = (
+    "kafka://fake:9092/topic?group.id={group}&auto.offset.reset=earliest"
+    "&fake.num_partitions=2&fake.rows_per_msg=3"
+)
+
+_CONFIG_TEMPLATE = """
+train_input_path: "%s"
+eval_input_path: ""
+model_dir: "%s/model"
+train_config {
+    sparse_optimizer {
+        adagrad_optimizer { lr: 0.001 }
+        constant_learning_rate {}
+    }
+    dense_optimizer {
+        adam_optimizer { lr: 0.001 }
+        constant_learning_rate {}
+    }
+    num_steps: %d
+    save_checkpoints_steps: 10
+    log_step_count_steps: 10
+}
+eval_config {}
+data_config {
+    batch_size: 128
+    dataset_type: KafkaDataset
+    label_fields: "label"
+    num_workers: 2
+    fg_mode: FG_NONE
+    shuffle: true
+    shuffle_mode: SAMPLE_ROLLING
+    shuffle_buffer_size: 4
+    input_fields { input_name: "id" input_type: INT64 }
+    input_fields { input_name: "label" input_type: INT64 }
+}
+feature_configs {
+    id_feature { feature_name: "id" num_buckets: 100003 embedding_dim: 8 }
+}
+model_config {
+    feature_groups {
+        group_name: "wide"
+        feature_names: "id"
+        group_type: WIDE
+    }
+    feature_groups {
+        group_name: "deep"
+        feature_names: "id"
+        group_type: DEEP
+    }
+    deepfm {
+        deep { hidden_units: [32, 16] }
+    }
+    losses { binary_cross_entropy {} }
+    metrics { auc {} }
+}
+"""
+
+_FACTORY_ENV = (
+    "TZREC_KAFKA_CONSUMER_FACTORY=tzrec.datasets.kafka_dataset_test.FakeKafkaConsumer"
+)
+
+
+class KafkaSampleShuffleIntegrationTest(unittest.TestCase):
+    """Full torchrun training over the sample-shuffle path with fake Kafka."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir, True)
+
+    def _write_config(self, num_steps):
+        config_path = os.path.join(self.test_dir, f"pipeline_{num_steps}.config")
+        with open(config_path, "w") as f:
+            f.write(
+                _CONFIG_TEMPLATE
+                % (_KAFKA_URI.format(group="tzrec_it"), self.test_dir, num_steps)
+            )
+        return config_path
+
+    def _run(self, config_path, extra_args=""):
+        torchrun = os.path.join(os.path.dirname(sys.executable), "torchrun")
+        log_dir = os.path.join(self.test_dir, "log_train_eval")
+        cmd = (
+            f"{_FACTORY_ENV} PYTHONPATH=. {torchrun} --standalone "
+            f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
+            f"-r 3 -t 3 tzrec/train_eval.py "
+            f"--pipeline_config_path {config_path} {extra_args}"
+        )
+        return misc_util.run_cmd(
+            cmd, os.path.join(self.test_dir, "log_train_eval.txt"), timeout=600
+        )
+
+    def _read_state(self, ckpt_dir):
+        with open(os.path.join(ckpt_dir, "dataloader_state.json")) as f:
+            return json.load(f)
+
+    def test_train_save_resume(self):
+        ok = self._run(self._write_config(20))
+        self.assertTrue(ok, "initial training run failed; see log_train_eval.txt")
+        ckpt10 = os.path.join(self.test_dir, "model", "model.ckpt-10")
+        ckpt19 = os.path.join(self.test_dir, "model", "model.ckpt-19")
+        for ckpt in (ckpt10, ckpt19):
+            self.assertTrue(os.path.exists(os.path.join(ckpt, "_SUCCESS")), ckpt)
+            state = self._read_state(ckpt)
+            self.assertEqual(set(state), {"topic:0", "topic:1"})
+            for v in state.values():
+                self.assertGreaterEqual(v, -1)
+        state10 = self._read_state(ckpt10)
+        state19 = self._read_state(ckpt19)
+        for k in state10:
+            self.assertGreaterEqual(state19[k], state10[k])
+
+        # resume: skip_steps jumps past the last completed step and the
+        # final snapshot keeps the safe offsets at or beyond the resume base
+        ok = self._run(self._write_config(30), extra_args="--continue_train")
+        self.assertTrue(ok, "resume training run failed; see log_train_eval.txt")
+        ckpt29 = os.path.join(self.test_dir, "model", "model.ckpt-29")
+        self.assertTrue(os.path.exists(os.path.join(ckpt29, "_SUCCESS")))
+        state29 = self._read_state(ckpt29)
+        for k in state19:
+            self.assertGreaterEqual(state29[k], state19[k])
 
 
 if __name__ == "__main__":

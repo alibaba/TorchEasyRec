@@ -830,8 +830,23 @@ def create_dataloader(
         dataloader (dataloader): a DataLoader.
     """
     dataset_name = data_pb2.DatasetType.Name(data_config.dataset_type)
+    # lazy import: kafka_dataset imports this module
+    from tzrec.datasets import kafka_dataset
+
+    sample_shuffle = kafka_dataset.sample_shuffle_enabled(data_config, mode)
+    ss_resources = None
+    if sample_shuffle:
+        # sample contents are shuffled pool-wide and dispatch is a single
+        # shared queue, so in_order has no effect on this path
+        # resolve start offsets and create communication handles before the
+        # dataset exists so that queues predate the DataLoader worker fork
+        ss_resources = kafka_dataset.prepare_sample_shuffle(
+            data_config, input_path, checkpoint_state
+        )
     # pyre-ignore [16]
     dataset_cls = BaseDataset.create_class(dataset_name)
+    if sample_shuffle:
+        dataset_cls = kafka_dataset.KafkaSampleShuffleDataset
     dataset = dataset_cls(
         data_config=data_config,
         features=features,
@@ -840,8 +855,16 @@ def create_dataloader(
         mode=mode,
         debug_level=debug_level,
         compiled_prompt=compiled_prompt,
+        **(
+            {
+                "shared_dispatch_queue": ss_resources.shared_dispatch_queue,
+                "fatal_event": ss_resources.fatal_event,
+            }
+            if ss_resources is not None
+            else {}
+        ),
     )
-    if checkpoint_state:
+    if checkpoint_state and not sample_shuffle:
         dataset.load_state_dict(dict(checkpoint_state))
 
     kwargs = {}
@@ -896,6 +919,12 @@ def create_dataloader(
     # beginning the training process to avoid potential CUDA-related issues following
     # model saving.
     first_iterator = iter(dataloader)
+    if ss_resources is not None:
+        # spawn the coordinator after the eager iter() forked the workers, so
+        # consumers and reader processes never share state with them
+        dataloader.sample_shuffle_client = kafka_dataset.start_sample_shuffle(
+            data_config, input_path, dataset, ss_resources
+        )
 
     def get_iterator() -> Iterator[Batch]:
         # return the eager iterator first (keeps its prefetch), then fresh ones
