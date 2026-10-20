@@ -139,6 +139,8 @@ model_config {
 - codes: `array<int64>`, 即该物品的 SID, 长度等于 `codebook` 层数, 每个元素为对应残差层的码本下标 (取值范围 `[0, codebook_i)`)。例如 `[241, 134, 78]`。
 - item_id: 由 `--reserved_columns` 透传的原始物品 ID。
 
+预测结果中多个物品可能具有相同 SID。可使用 [SID 冲突后处理工具](../usage/sid_collision.md) 对预测结果进行后处理，支持全量处理和新增物品处理；工具的 `--codebook` 应与模型配置一致。
+
 ### 非对比 (纯重建) 用法
 
 如果不需要对比学习, 去掉 `pair` / `pair_flag` 两个特征组、对应的 `pair_emb` / `is_pair` 特征、`sid_rqvae.contrastive_config` 以及 `contrastive_loss`, 输入改用仅含 `item_id` + `embedding` 的 item-only 样本 (上方数据链接) 即可。
