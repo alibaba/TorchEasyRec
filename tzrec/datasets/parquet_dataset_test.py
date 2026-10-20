@@ -267,6 +267,7 @@ class ParquetDatasetTest(unittest.TestCase):
 
             dataloader1 = create_dataloader(data_config, features, input_path)
             self.assertTrue(dataloader1.in_order)
+            self.assertEqual(dataloader1.prefetch_factor, 2)
             iterator1 = iter(dataloader1)
             checkpoint_state = {}
             for _ in range(4):
@@ -423,11 +424,13 @@ class ParquetDatasetTest(unittest.TestCase):
                 label_fields=["label"],
                 num_workers=2,
                 in_order=False,
+                prefetch_factor=4,
             )
 
             # full pass to learn the per-worker interval keys + total rows
             dataloader0 = create_dataloader(data_config, features, input_path)
             self.assertFalse(dataloader0.in_order)
+            self.assertEqual(dataloader0.prefetch_factor, 4)
             full_state = {}
             num_total_rows = 0
             for batch in dataloader0.get_iterator():  # pyre-ignore[16]

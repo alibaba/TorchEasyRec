@@ -247,7 +247,6 @@ try:
         ProbabilisticAdmissionStrategy,
         align_to_table_size,
     )
-    from dynamicemb.dynamicemb_config import DynamicEmbKernel
     from dynamicemb.planner import (
         DynamicEmbParameterConstraints,
         DynamicEmbParameterSharding,
@@ -297,6 +296,8 @@ try:
         def get_additional_fused_params(self) -> Dict[str, Any]:
             """Extra fused params of the customized kernel."""
             params = super().get_additional_fused_params()
+            # torchrec hashes fused params to group tables, so flatten the dict.
+            params.pop("ftrl_fused_params", None)
             params["initial_accumulator_value"] = self.initial_accumulator_value
             params.update(self.ftrl_fused_params)
             return params
@@ -656,8 +657,6 @@ if has_dynamicemb:
                     sharding_type=ShardingType.ROW_WISE.value,
                     ranks=[i for i in range(world_size)],
                     compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
-                    customized_compute_kernel=DynamicEmbKernel,
-                    dist_type="roundrobin",
                     dynamicemb_options=dynamicemb_options,
                     initial_accumulator_value=sparse_init_accumulator_value(),
                     ftrl_fused_params=_dynamicemb_ftrl_fused_params(

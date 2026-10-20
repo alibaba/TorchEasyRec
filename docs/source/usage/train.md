@@ -108,7 +108,13 @@ LR策略可以支持按epoch更新或者按step更新
       torchrun --master_addr=localhost --master_port=32555 --nnodes=1 --nproc-per-node=1 --node_rank=0 convert.py
       ```
 - log_step_count_steps: 打印log和summary的步数间隔（如果打印时间间隔小于1s，会跳过打印）
-- is_profiling: 是否做训练性能分析，设置为true，会在模型目录下记录trace文件
+- is_profiling: 是否做训练性能分析，设置为true，会在模型目录的train_eval_trace子目录下记录trace文件，文件名以`rank<N>_`开头
+- profiler_config: is_profiling为true时的性能分析配置，不设置时默认在训练开始后等待1步、预热1步、记录10步，并记录shape、显存和调用栈
+  - skip_first_steps: 开始分析前跳过的步数，默认为0。训练初期dynamic embedding和数据缓存尚未稳定，可设置较大的值采集稳定阶段的trace，如`skip_first_steps: 2000, wait_steps: 0, warmup_steps: 2, active_steps: 5`
+  - wait_steps / warmup_steps / active_steps: 每个周期内的等待、预热和记录步数，默认分别为1、1、10
+  - repeat: 采集周期数，默认为1，设置为0表示一直重复到训练结束
+  - record_shapes / profile_memory / with_stack: 是否记录算子输入shape、显存分配和Python调用栈，默认均为true。profile_memory和with_stack开销较大，分析分布式训练耗时时建议关闭
+  - ranks: 需要做性能分析的rank，不设置时所有rank都会分析
 - use_tensorboard: 是否使用tensorboard，默认为true
 - tensorboard_summaries: 设置需要在tensorboard中展示的数据， 只在use_tensorboard为true时生效。 可选值为["loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"], 默认值是["loss", "learning_rate"]。 在训练数据量大， 训练时长较长时， 酌情开启"parameter"、 "gradient"、"gradient_norm", 避免出现性能问题。
 - cudnn_allow_tf32: cudnn是否打开tf32精度训练，默认为true

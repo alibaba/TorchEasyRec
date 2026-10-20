@@ -27,6 +27,7 @@ from parameterized import parameterized
 from tzrec.datasets.utils import RecordBatchTensor
 from tzrec.main import (
     _create_model,
+    _create_train_profiler,
     _train_and_evaluate,
     predict,
     predict_checkpoint,
@@ -41,7 +42,11 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, TrainConfig
+from tzrec.protos.train_pb2 import (
+    DeltaEmbeddingDumpConfig,
+    ProfilerConfig,
+    TrainConfig,
+)
 from tzrec.utils import checkpoint_util, predict_util
 from tzrec.utils.delta_embedding_dump import DumpDecision
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
@@ -756,6 +761,69 @@ class TrainStepCounterMultiPassTest(unittest.TestCase):
         # mid-run data exhaustion and retry at step 6: no reset to 0 -> no
         # model.ckpt-{step} collision across passes.
         self.assertEqual(trained, list(range(num_steps)))
+
+
+class TrainProfilerTest(unittest.TestCase):
+    """Tests for the configurable training profiler."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    def _actions(self, prof, num_steps=16):
+        return [prof.schedule(i) for i in range(num_steps)]
+
+    def test_default_config_matches_legacy_profiler(self):
+        prof = _create_train_profiler(TrainConfig().profiler_config, self.test_dir)
+        legacy = torch.profiler.schedule(wait=1, warmup=1, active=10, repeat=1)
+        self.assertEqual(self._actions(prof), [legacy(i) for i in range(16)])
+        self.assertTrue(prof.record_shapes)
+        self.assertTrue(prof.profile_memory)
+        self.assertTrue(prof.with_stack)
+
+    def test_later_window_and_low_overhead(self):
+        config = ProfilerConfig(
+            skip_first_steps=5,
+            wait_steps=0,
+            warmup_steps=2,
+            active_steps=3,
+            profile_memory=False,
+            with_stack=False,
+        )
+        prof = _create_train_profiler(config, self.test_dir)
+        A = torch.profiler.ProfilerAction
+        self.assertEqual(
+            self._actions(prof, 12),
+            [A.NONE] * 5
+            + [A.WARMUP] * 2
+            + [A.RECORD] * 2
+            + [A.RECORD_AND_SAVE]
+            + [A.NONE] * 2,
+        )
+        self.assertFalse(prof.profile_memory)
+        self.assertFalse(prof.with_stack)
+
+    @parameterized.expand(
+        [([], True), ([0, 3], True), ([0, 1], False)],
+        name_func=parameterized_name_func,
+    )
+    def test_rank_filter(self, ranks, profiled):
+        with mock.patch.dict(os.environ, {"RANK": "3"}):
+            prof = _create_train_profiler(ProfilerConfig(ranks=ranks), self.test_dir)
+        self.assertEqual(prof is not None, profiled)
+
+    def test_trace_file_named_by_rank(self):
+        config = ProfilerConfig(wait_steps=0, warmup_steps=1, active_steps=1)
+        with mock.patch.dict(os.environ, {"RANK": "3"}):
+            prof = _create_train_profiler(config, self.test_dir)
+        prof.start()
+        for _ in range(3):
+            torch.ones(4).sum()
+            prof.step()
+        prof.stop()
+        traces = os.listdir(self.test_dir)
+        self.assertEqual(len(traces), 1)
+        self.assertTrue(traces[0].startswith("rank3_"), traces[0])
 
 
 if __name__ == "__main__":
