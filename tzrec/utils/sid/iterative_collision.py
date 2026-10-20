@@ -78,7 +78,7 @@ class IterativeCollisionResolver(CollisionResolver):
         candidate_last_codes = self._validate_candidate_last_codes(
             plan, candidate_last_codes
         )
-        initial_state, result = self._prepare_collision(plan, collect_sid_metadata)
+        initial_occupancy, result = self._prepare_collision(plan, collect_sid_metadata)
         if result is not None:
             return result
 
@@ -89,8 +89,8 @@ class IterativeCollisionResolver(CollisionResolver):
         last_codebook_size = plan.config.codebook[-1]
         prefix_base_keys = prefix_ids * last_codebook_size
         used_code_offsets = np.append(
-            np.searchsorted(initial_state.sid_keys, prefix_base_keys),
-            initial_state.sid_keys.size,
+            np.searchsorted(initial_occupancy.sid_keys, prefix_base_keys),
+            initial_occupancy.sid_keys.size,
         )
         used_code_counts = np.diff(used_code_offsets)
         prefix_count = prefix_ids.shape[0]
@@ -101,10 +101,10 @@ class IterativeCollisionResolver(CollisionResolver):
             candidate_last_codes.shape[1],
         )
         used_sid_indices = self._get_used_sid_indices(
-            initial_state.sid_keys, used_code_counts, last_codebook_size
+            initial_occupancy.sid_keys, used_code_counts, last_codebook_size
         )
         sid_item_counts = np.zeros(prefix_count * last_codebook_size, dtype=np.int64)
-        sid_item_counts[used_sid_indices] = initial_state.item_counts
+        sid_item_counts[used_sid_indices] = initial_occupancy.item_counts
 
         overflow_item_count = plan.overflow_rows.shape[0]
         item_priority = self._get_item_priority(
@@ -192,7 +192,6 @@ class IterativeCollisionResolver(CollisionResolver):
             resolved_last_codes,
             final_slot_indices,
             plan.overflow_rows[is_unresolved],
-            initial_state,
             prefix_base_keys[final_prefix_indices] + final_last_codes,
             final_item_counts,
             collect_sid_metadata,

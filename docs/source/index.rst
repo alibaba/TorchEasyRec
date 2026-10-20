@@ -41,6 +41,7 @@ Welcome to TorchEasyRec's documentation!
    usage/eval
    usage/export
    usage/predict
+   usage/sid_collision
    usage/serving
    usage/feature_selection
    usage/convert_easyrec_config_to_tzrec_config

@@ -16,7 +16,7 @@ import numpy as np
 
 from tzrec.utils.sid.test_util import (
     create_collision_plan,
-    create_existing_sid_state,
+    create_existing_sid_occupancy,
 )
 from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 
@@ -69,7 +69,7 @@ class UniformCollisionResolverTest(unittest.TestCase):
             4,
             [2, 9, 4, 11],
             [[0]] * 4,
-            existing_sid_state=create_existing_sid_state([0, 1, 2], [4, 1, 2]),
+            existing_sid_occupancy=create_existing_sid_occupancy([0, 1, 2], [4, 1, 2]),
         )
         self._assert_resolution(
             plan,
@@ -98,7 +98,7 @@ class UniformCollisionResolverTest(unittest.TestCase):
             2,
             [2, 9],
             [[0], [0]],
-            existing_sid_state=create_existing_sid_state([0, 2], [5, 1]),
+            existing_sid_occupancy=create_existing_sid_occupancy([0, 2], [5, 1]),
         )
         self._assert_resolution(
             plan,

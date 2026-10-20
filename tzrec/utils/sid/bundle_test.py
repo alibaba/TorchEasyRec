@@ -83,15 +83,15 @@ class BundleTest(unittest.TestCase):
         self, _name, item_to_sid_root, item_path, delta_item_path
     ) -> None:
         layout = self._bundle(item_to_sid_root=item_to_sid_root)
-        self.assertEqual(layout.write_path(bundle.ITEM_TO_SID_ARTIFACT), item_path)
+        self.assertEqual(layout.artifact_path(bundle.ITEM_TO_SID_ARTIFACT), item_path)
         self.assertEqual(
-            layout.write_path(bundle.DELTA_ITEM_TO_SID_ARTIFACT), delta_item_path
+            layout.artifact_path(bundle.DELTA_ITEM_TO_SID_ARTIFACT), delta_item_path
         )
         self.assertEqual(
-            layout.write_path(bundle.SID_TO_ITEMS_ARTIFACT), "./sid/v2/sid_to_items"
+            layout.artifact_path(bundle.SID_TO_ITEMS_ARTIFACT), "./sid/v2/sid_to_items"
         )
         self.assertEqual(
-            layout.write_path(bundle.DELTA_SID_TO_ITEMS_ARTIFACT),
+            layout.artifact_path(bundle.DELTA_SID_TO_ITEMS_ARTIFACT),
             "./sid/v2/delta_sid_to_items",
         )
 
@@ -110,18 +110,18 @@ class BundleTest(unittest.TestCase):
     def test_reads_come_from_the_appended_onto_generation(
         self, _name, item_to_sid_root, writer_type, item_to_sid_path
     ) -> None:
-        prior = bundle.Bundle(self.test_dir, item_to_sid_root, "v1", None)
-        prior.rows[bundle.SID_TO_ITEMS_ARTIFACT] = 2
-        prior.rows[bundle.ITEM_TO_SID_ARTIFACT] = 3
-        prior.write_manifest([8, 8], 5, 3, "int64", writer_type)
+        from_bundle = bundle.Bundle(self.test_dir, item_to_sid_root, "v1", None)
+        from_bundle.artifact_row_counts[bundle.SID_TO_ITEMS_ARTIFACT] = 2
+        from_bundle.artifact_row_counts[bundle.ITEM_TO_SID_ARTIFACT] = 3
+        from_bundle.write_manifest([8, 8], 5, 3, "int64", writer_type)
         layout = self._bundle(
             output_path=self.test_dir, item_to_sid_root=item_to_sid_root
         )
         self.assertEqual(
-            layout.read_path(bundle.ITEM_TO_SID_ARTIFACT), item_to_sid_path
+            layout.from_artifact_path(bundle.ITEM_TO_SID_ARTIFACT), item_to_sid_path
         )
         self.assertEqual(
-            layout.read_path(bundle.SID_TO_ITEMS_ARTIFACT),
+            layout.from_artifact_path(bundle.SID_TO_ITEMS_ARTIFACT),
             os.path.join(self.test_dir, "v1", "sid_to_items", "part-*.parquet"),
         )
 
@@ -166,7 +166,7 @@ class BundleTest(unittest.TestCase):
             item_to_sid_root=item_to_sid_root,
             from_generation=None,
         )
-        published.rows[artifact] = 4
+        published.artifact_row_counts[artifact] = 4
         published.write_manifest([8, 8], 5, 3, "int64", writer_type)
         path = bundle.manifest_path(self.test_dir, "v2")
         entry = bundle.read_manifest(path).artifacts[artifact]
@@ -174,11 +174,11 @@ class BundleTest(unittest.TestCase):
         self.assertEqual(entry.location, location.format(out=self.test_dir))
 
     def test_write_manifest_round_trips_every_field_through_disk(self) -> None:
-        prior = bundle.Bundle(self.test_dir, "./map", "v1", None)
-        prior.rows[bundle.SID_TO_ITEMS_ARTIFACT] = 1
-        prior.write_manifest([8, 8], 5, 7, "int64", "ParquetWriter")
+        from_bundle = bundle.Bundle(self.test_dir, "./map", "v1", None)
+        from_bundle.artifact_row_counts[bundle.SID_TO_ITEMS_ARTIFACT] = 1
+        from_bundle.write_manifest([8, 8], 5, 7, "int64", "ParquetWriter")
         appended = bundle.Bundle(self.test_dir, "./map", "v2", "v1")
-        appended.rows[bundle.SID_TO_ITEMS_ARTIFACT] = 4
+        appended.artifact_row_counts[bundle.SID_TO_ITEMS_ARTIFACT] = 4
 
         appended.write_manifest([8, 8], 5, 3, "int64", "ParquetWriter")
         path = bundle.manifest_path(self.test_dir, "v2")
@@ -187,7 +187,7 @@ class BundleTest(unittest.TestCase):
             bundle.read_manifest(path),
             _manifest(
                 bundle_uuid=appended.uuid,
-                since_bundle_uuid=prior.uuid,
+                since_bundle_uuid=from_bundle.uuid,
                 max_observed_items_per_sid=7,
                 item_id_type="int64",
                 artifacts={
@@ -199,6 +199,31 @@ class BundleTest(unittest.TestCase):
                 },
             ),
         )
+
+    def test_remove_generation_deletes_only_the_odps_partitions(self) -> None:
+        layout = self._bundle(
+            output_path=self.test_dir,
+            item_to_sid_root="odps://prj/tables/items/ds=20261019",
+        )
+        partition_spec = "ds=20261019,generation=v2,artifact=item_to_sid"
+        with (
+            mock.patch.object(
+                bundle, "_create_odps_account", return_value=(None, "url")
+            ),
+            mock.patch.object(bundle, "ODPS") as odps,
+        ):
+            table = odps.return_value.get_table.return_value
+            table.iterate_partitions.side_effect = [
+                iter([]),
+                iter([mock.Mock(partition_spec=partition_spec)]),
+            ]
+            layout.prepare_generation()
+            layout.remove_generation()
+            table.delete_partition.assert_called_once_with(
+                partition_spec, if_exists=True
+            )
+            odps.return_value.delete_table.assert_not_called()
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "v2")))
 
     def test_failed_manifest_replace_does_not_mark_generation_complete(self) -> None:
         layout = bundle.Bundle(self.test_dir, "./map", "v1", None)

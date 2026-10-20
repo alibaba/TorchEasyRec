@@ -5,3 +5,4 @@ fbgemm_gpu_hstu @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/hstu/ppu
 flash_attn==2.8.2+v0.2.0.ppu2.2.0
 torch==2.13.0
 torchrec @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/torchrec-1.9.0%2Btzrec-py3-none-any.whl
+triton==3.7.0

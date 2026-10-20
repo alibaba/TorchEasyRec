@@ -65,7 +65,7 @@ class UniformCollisionResolver(CollisionResolver):
         Returns:
             Resolved last-layer codes, slot indices, and summary statistics.
         """
-        initial_state, result = self._prepare_collision(plan, collect_sid_metadata)
+        initial_occupancy, result = self._prepare_collision(plan, collect_sid_metadata)
         if result is not None:
             return result
 
@@ -79,8 +79,8 @@ class UniformCollisionResolver(CollisionResolver):
         prefix_base_keys = prefix_ids * last_codebook_size
         # Initial keys contain only these prefixes, so the next start is this one's end.
         used_code_offsets = np.append(
-            np.searchsorted(initial_state.sid_keys, prefix_base_keys),
-            initial_state.sid_keys.shape[0],
+            np.searchsorted(initial_occupancy.sid_keys, prefix_base_keys),
+            initial_occupancy.sid_keys.shape[0],
         )
 
         # Rows that all fit on empty codes need no load tracking.
@@ -105,12 +105,12 @@ class UniformCollisionResolver(CollisionResolver):
                 used_code_counts[fast_prefixes],
                 prefix_base_keys[fast_prefixes],
                 rotations[fast_prefixes],
-                initial_state.sid_keys,
+                initial_occupancy.sid_keys,
                 last_codebook_size,
             )
             target_slot_indices[fast_rows] = 1
 
-        final_counts = initial_state.item_counts.copy()
+        final_counts = initial_occupancy.item_counts.copy()
         new_key_arrays = [fast_keys]
         new_count_arrays = [np.ones(fast_keys.shape[0], dtype=np.int64)]
         for prefix_index in np.flatnonzero(~fits_empty):
@@ -120,7 +120,7 @@ class UniformCollisionResolver(CollisionResolver):
             ]
             prefix_base_key = prefix_base_keys[prefix_index]
             initial_last_codes = (
-                initial_state.sid_keys[prefix_sid_start:prefix_sid_end]
+                initial_occupancy.sid_keys[prefix_sid_start:prefix_sid_end]
                 - prefix_base_key
             ).astype(np.int32, copy=False)
             (
@@ -131,7 +131,7 @@ class UniformCollisionResolver(CollisionResolver):
             ) = self._water_fill(
                 int(row_end - row_start),
                 initial_last_codes,
-                initial_state.item_counts[prefix_sid_start:prefix_sid_end],
+                initial_occupancy.item_counts[prefix_sid_start:prefix_sid_end],
                 last_codebook_size,
                 int(rotations[prefix_index]),
             )
@@ -152,8 +152,7 @@ class UniformCollisionResolver(CollisionResolver):
             resolved_last_codes,
             final_slot_indices,
             unresolved_rows,
-            initial_state,
-            np.concatenate((initial_state.sid_keys, *new_key_arrays)),
+            np.concatenate((initial_occupancy.sid_keys, *new_key_arrays)),
             np.concatenate((final_counts, *new_count_arrays)),
             collect_sid_metadata,
         )

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-# Build the PPU image on top of the vendor PPU base image. torch/triton/faiss are the
-# PPU builds from the FlyTiger Eco pypi index; everything else comes from requirements/.
+# Build the PPU image on top of the vendor PPU base image. Only torch is
+# installed from the FlyTiger Eco pypi index; everything else is pinned in
+# requirements/ppu.txt.
 
 REGISTRY=mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec
 REPO_NAME=tzrec-test
-DOCKER_TAG=1.4
-DOCKER_TAG_SUFFIX=-u2
-BASE_IMAGE=pkg.flytiger-eco.com/docker_release/ppu:sdk2.2.0-cuda13.0-ubuntu24-py312-20261001
+DOCKER_TAG=1.5
+DOCKER_TAG_SUFFIX=-u5
+BASE_IMAGE=ais-hpn-acr-wulan-registry.cn-wulanchabu.cr.aliyuncs.com/eic/pfed-runtime:2.13.0-ubuntu24.04-cuda13.0-py312-eic-ppu202610070948
 PPU_PIP_INDEX=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
 
 rm -rf docker/requirements*
