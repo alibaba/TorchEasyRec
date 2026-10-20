@@ -2411,20 +2411,40 @@ def _get_sparse_embedding_tensor(
     feat_name_impl_to_emb_name = dict()
     emb_name_to_feat_name_impl = dict()
 
+    def _shared_feature_names(
+        table_infos: Dict[str, BaseEmbeddingConfig],
+    ) -> Set[str]:
+        table_names_by_feat: Dict[str, Set[str]] = defaultdict(set)
+        for table_fqn, emb_info in table_infos.items():
+            export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
+            for feat_name in emb_info.feature_names:
+                table_names_by_feat[feat_name].add(export_emb_name)
+        return {
+            feat_name
+            for feat_name, table_names in table_names_by_feat.items()
+            if len(table_names) > 1
+        }
+
+    shared_ec_features = _shared_feature_names(embedding_infos)
+    shared_ebc_features = _shared_feature_names(embedding_bag_info)
+
     for table_fqn, emb_info in embedding_infos.items():
         export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
         emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
         feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
         for feat_name in emb_info.feature_names:
-            feat_name_impl = feat_name + "__ec"
+            feat_key = (
+                f"{feat_name}@{emb_info.name}"
+                if feat_name in shared_ec_features
+                else feat_name
+            )
+            feat_name_impl = feat_key + "__ec"
             existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
             if existing_emb_name is not None and existing_emb_name != export_emb_name:
                 raise ValueError(
-                    f"sparse feature [{feat_name}] maps to multiple embedding "
+                    f"sparse feature [{feat_key}] maps to multiple embedding "
                     f"tables [{existing_emb_name}] and [{export_emb_name}] in "
-                    "distributed embedding export. Use distinct feature_name "
-                    "values per group (with the same input expression if needed), "
-                    "or keep the feature in only one group."
+                    "distributed embedding export."
                 )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
@@ -2442,15 +2462,18 @@ def _get_sparse_embedding_tensor(
                     f"sparse feature [{feat_name}] in embedding table "
                     f"[{export_emb_name}] is not found in model features."
                 )
-            feat_name_impl = feat_name + "__ebc"
+            feat_key = (
+                f"{feat_name}@{emb_info.name}"
+                if feat_name in shared_ebc_features
+                else feat_name
+            )
+            feat_name_impl = feat_key + "__ebc"
             existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
             if existing_emb_name is not None and existing_emb_name != export_emb_name:
                 raise ValueError(
-                    f"sparse feature [{feat_name}] maps to multiple embedding "
+                    f"sparse feature [{feat_key}] maps to multiple embedding "
                     f"tables [{existing_emb_name}] and [{export_emb_name}] in "
-                    "distributed embedding export. Use distinct feature_name "
-                    "values per group (with the same input expression if needed), "
-                    "or keep the feature in only one group."
+                    "distributed embedding export."
                 )
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)

@@ -722,7 +722,7 @@ class ExportUtilTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_sparse_export_rejects_missing_or_conflicting_feature_tables(
+    def test_sparse_export_shared_feature_across_multiple_tables(
         self, name, group_type, embedding_name_suffix
     ) -> None:
         test_dir = make_test_dir()
@@ -735,6 +735,9 @@ class ExportUtilTest(unittest.TestCase):
                         expression="user:user_id",
                         embedding_dim=4,
                         num_buckets=8,
+                        pooling="mean",
+                        weighted=True,
+                        use_weight=True,
                     )
                 )
             ]
@@ -759,19 +762,45 @@ class ExportUtilTest(unittest.TestCase):
         embedding_bag_info, embedding_info = (
             export_util._get_sparse_table_to_embedding_info(model)
         )
-        with self.assertRaisesRegex(
-            ValueError,
-            "maps to multiple embedding tables.*distinct feature_name values per group",
-        ):
-            _get_sparse_embedding_tensor(
-                model, test_dir, embedding_info, embedding_bag_info, features
-            )
+        _, _, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+            model, test_dir, embedding_info, embedding_bag_info, features
+        )
+        other_table_name = (
+            "user_id_emb_wide"
+            if group_type == model_pb2.FeatureGroupType.WIDE
+            else f"user_id_emb_{embedding_name_suffix}"
+        )
+        deep_fqn = "ebc.embedding_bags.user_id_emb"
+        other_fqn = f"ebc.embedding_bags.{other_table_name}"
+        self.assertEqual(
+            emb_meta[deep_fqn]["feat_name_impl"],
+            ["user_id@user_id_emb__ebc"],
+        )
+        self.assertEqual(
+            emb_meta[other_fqn]["feat_name_impl"],
+            [f"user_id@{other_table_name}__ebc"],
+        )
+        self.assertEqual(
+            feat_meta,
+            {
+                "user_id@user_id_emb__ebc": {
+                    "embedding_name": deep_fqn,
+                    "pooling": "MEAN",
+                    "use_weight": True,
+                },
+                f"user_id@{other_table_name}__ebc": {
+                    "embedding_name": other_fqn,
+                    "pooling": "MEAN",
+                    "use_weight": True,
+                },
+            },
+        )
         with self.assertRaisesRegex(ValueError, "not found in model features"):
             _get_sparse_embedding_tensor(
                 model, test_dir, embedding_info, embedding_bag_info, []
             )
 
-    def test_sparse_export_rejects_conflicting_ec_feature_tables(self) -> None:
+    def test_sparse_export_shared_ec_feature_across_multiple_tables(self) -> None:
         test_dir = make_test_dir()
         self.addCleanup(shutil.rmtree, test_dir)
         embedding_infos = {
@@ -783,15 +812,24 @@ class ExportUtilTest(unittest.TestCase):
             )
             for name in ("first_emb", "second_emb")
         }
-        with self.assertRaisesRegex(
-            ValueError,
-            r"sparse feature \[seq_feat\] maps to multiple embedding tables "
-            r"\[ec.embeddings.first_emb\] and \[ec.embeddings.second_emb\].*"
-            "distinct feature_name values per group",
-        ):
-            _get_sparse_embedding_tensor(
-                torch.nn.Module(), test_dir, embedding_infos, {}, []
-            )
+        _, _, _, feat_meta = _get_sparse_embedding_tensor(
+            torch.nn.Module(), test_dir, embedding_infos, {}, []
+        )
+        self.assertEqual(
+            feat_meta,
+            {
+                "seq_feat@first_emb__ec": {
+                    "embedding_name": "ec.embeddings.first_emb",
+                    "pooling": "NONE",
+                    "use_weight": False,
+                },
+                "seq_feat@second_emb__ec": {
+                    "embedding_name": "ec.embeddings.second_emb",
+                    "pooling": "NONE",
+                    "use_weight": False,
+                },
+            },
+        )
 
     def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
         """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
@@ -2578,23 +2616,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 ),
                 feature_pb2.FeatureConfig(
                     id_feature=feature_pb2.IdFeature(
-                        feature_name="cat_a_wide",
-                        expression="item:cat_a",
-                        embedding_dim=16,
-                        dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=2**36),
-                    )
-                ),
-                feature_pb2.FeatureConfig(
-                    id_feature=feature_pb2.IdFeature(
                         feature_name="cat_b",
-                        expression="item:cat_b",
-                        embedding_dim=16,
-                        num_buckets=8,
-                    )
-                ),
-                feature_pb2.FeatureConfig(
-                    id_feature=feature_pb2.IdFeature(
-                        feature_name="cat_b_wide",
                         expression="item:cat_b",
                         embedding_dim=16,
                         num_buckets=8,
@@ -2610,7 +2632,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 feature_groups=[
                     model_pb2.FeatureGroupConfig(
                         group_name="wide",
-                        feature_names=["cat_a_wide", "cat_b_wide"],
+                        feature_names=["cat_a", "cat_b"],
                         group_type=model_pb2.FeatureGroupType.WIDE,
                     ),
                     model_pb2.FeatureGroupConfig(
@@ -2639,9 +2661,8 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
     def _build_model(self, dynamic=True):
         feature_configs = copy.deepcopy(self.pipeline_config.feature_configs)
         if not dynamic:
-            for index in (0, 1):
-                feature_configs[index].id_feature.ClearField("dynamicemb")
-                feature_configs[index].id_feature.num_buckets = 8
+            feature_configs[0].id_feature.ClearField("dynamicemb")
+            feature_configs[0].id_feature.num_buckets = 8
         with mock.patch(
             "tzrec.utils.dynamicemb_util.build_dynamicemb_constraints",
             return_value=None,
@@ -2723,19 +2744,17 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             not case_name.startswith("ordinary") and case_name != "zch_only"
         )
         if not has_dynamic_tables:
-            for index in (0, 1):
-                feature = self.pipeline_config.feature_configs[index].id_feature
-                feature.ClearField("dynamicemb")
-                feature.num_buckets = 8
+            feature = self.pipeline_config.feature_configs[0].id_feature
+            feature.ClearField("dynamicemb")
+            feature.num_buckets = 8
         if case_name in ("mixed_zch", "mixed_zch_upload", "zch_only"):
-            for index in (2, 3):
-                self.pipeline_config.feature_configs[index].id_feature.zch.CopyFrom(
-                    feature_pb2.ZeroCollisionHash(
-                        zch_size=8,
-                        eviction_interval=5,
-                        lfu=feature_pb2.LFU_EvictionPolicy(),
-                    )
+            self.pipeline_config.feature_configs[1].id_feature.zch.CopyFrom(
+                feature_pb2.ZeroCollisionHash(
+                    zch_size=8,
+                    eviction_interval=5,
+                    lfu=feature_pb2.LFU_EvictionPolicy(),
                 )
+            )
         model = self._build_model()
         table_infos, _ = export_util._get_sparse_table_to_embedding_info(model)
         dynamic_names = {
@@ -2805,9 +2824,9 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             },
             sparse_features={
                 BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
-                    keys=["cat_a", "cat_a_wide", "cat_b", "cat_b_wide"],
-                    values=torch.tensor([2**60 + 1, -7, 2**60 + 1, -7, 3, 4, 3, 4]),
-                    lengths=torch.tensor([1, 1, 1, 1, 1, 1, 1, 1]),
+                    keys=["cat_a", "cat_b"],
+                    values=torch.tensor([2**60 + 1, -7, 3, 4]),
+                    lengths=torch.tensor([1, 1, 1, 1]),
                 )
             },
             labels={},
@@ -3006,6 +3025,18 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 metadata[name]["shape"], [len(keys), table_infos[name].embedding_dim]
             )
             self.assertTrue(metadata[name]["is_dynamic"])
+        with open(os.path.join(sparse_dir, "sparse_features.json")) as input_file:
+            feature_metadata = json.load(input_file)
+        with open(os.path.join(self.export_dir, "dense_meta.json")) as input_file:
+            dense_metadata = json.load(input_file)
+        for dense_features in dense_metadata.values():
+            for feat_name_impl in dense_features:
+                if feat_name_impl.endswith("__lengths"):
+                    continue
+                self.assertIn(feat_name_impl, feature_metadata)
+                self.assertIn(
+                    feature_metadata[feat_name_impl]["embedding_name"], metadata
+                )
         with open(os.path.join(self.export_dir, "fg.json")) as input_file:
             self.assertEqual(json.load(input_file), {"custom_asset": True})
         with open(os.path.join(self.export_dir, "model_acc.json")) as input_file:
