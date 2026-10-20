@@ -101,6 +101,13 @@ class SidContrastiveLoss(_Loss):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mask false negatives using exact equality of original embeddings.
 
+        Exclude three kinds of false negatives:
+        1. Duplicate positives: for A -> B, mask other copies of B.
+        2. The query itself: when A is the query, mask copies of A.
+        3. Other explicit pairs: if A -> B and A -> C both occur, mask C
+           when computing A -> B. Apply the same rule in the reverse direction.
+        Always preserve each row's designated positive.
+
         Args:
             embed_a_all_ori: (B_global, dim) original view-a embeddings.
             embed_b_all_ori: (B_global, dim) original view-b embeddings.
@@ -109,23 +116,24 @@ class SidContrastiveLoss(_Loss):
         Returns:
             Four (B, B_global) masks for cross-view a/b and own-view a/b.
         """
-        _, group_index = torch.unique(
+        _, unique_emb_ids = torch.unique(
             torch.cat([embed_a_all_ori, embed_b_all_ori]),
             dim=0,
             return_inverse=True,
         )
-        a_all, b_all = group_index.chunk(2)
-        a = a_all[label_index].unsqueeze(1)
-        b = b_all[label_index].unsqueeze(1)
-        same_a, same_b = a == a_all, b == b_all
-        same_pair = same_a | same_b
-        a_to_b, b_to_a = a == b_all, b == a_all
-        masks = (
-            same_pair | a_to_b,
-            same_pair | b_to_a,
-            same_a | b_to_a,
-            same_b | a_to_b,
-        )
+        all_a_ids, all_b_ids = unique_emb_ids.chunk(2)
+        local_a_ids = all_a_ids[label_index].unsqueeze(1)
+        local_b_ids = all_b_ids[label_index].unsqueeze(1)
+        a_matches_a = local_a_ids == all_a_ids
+        b_matches_b = local_b_ids == all_b_ids
+        a_matches_b = local_a_ids == all_b_ids
+        b_matches_a = local_b_ids == all_a_ids
+
+        cross_a_mask = a_matches_a | b_matches_b | a_matches_b  # A queries global B.
+        cross_b_mask = a_matches_a | b_matches_b | b_matches_a  # B queries global A.
+        own_a_mask = a_matches_a | b_matches_a  # A queries global A.
+        own_b_mask = b_matches_b | a_matches_b  # B queries global B.
+        masks = (cross_a_mask, cross_b_mask, own_a_mask, own_b_mask)
         for mask in masks:
             mask.scatter_(1, label_index.unsqueeze(1), False)
         return masks
