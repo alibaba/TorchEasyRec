@@ -12,6 +12,7 @@
 import unittest
 
 import numpy as np
+from parameterized import parameterized
 
 from tzrec.utils.sid.collision import (
     build_resolved_sid_item_row_index,
@@ -22,6 +23,7 @@ from tzrec.utils.sid.test_util import (
     create_collision_plan,
     create_existing_sid_occupancy,
 )
+from tzrec.utils.test_util import parameterized_name_func
 
 
 class IterativeCollisionResolverTest(unittest.TestCase):
@@ -123,32 +125,35 @@ class IterativeCollisionResolverTest(unittest.TestCase):
             np.sort(sid_item_row_index.item_row_indices), np.arange(4)
         )
 
-    def test_assignments_are_deterministic_under_input_reordering(self) -> None:
-        item_ids = np.asarray([f"item-{index}" for index in range(12)])
-        codes = (np.arange(item_ids.size, dtype=np.int64) % 3)[:, None]
+    @parameterized.expand(
+        [
+            ("original", list(range(12))),
+            ("reordered", [11, 7, 3, 0, 10, 6, 2, 9, 5, 1, 8, 4]),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_assignments_are_deterministic_under_input_reordering(
+        self, _name, order
+    ) -> None:
+        item_ids = np.asarray([f"item-{index}" for index in range(12)])[order]
+        codes = (np.arange(12, dtype=np.int64) % 3)[:, None][order]
+        plan = create_collision_plan((4,), 2, item_ids, codes)
+        candidates = np.tile([1, 2, 3, 1], (plan.overflow_rows.size, 1))
 
-        def assignments(order):
-            ordered_ids = item_ids[order]
-            plan = create_collision_plan((4,), 2, ordered_ids, codes[order])
-            candidates = np.tile(
-                np.asarray([1, 2, 3, 1], dtype=np.int64),
-                (plan.overflow_rows.size, 1),
-            )
-            result = IterativeCollisionResolver().resolve(plan, candidates)
-            unresolved = set(result.unresolved_rows.tolist())
-            return {
-                item_id: (
-                    int(result.resolved_last_codes[row]),
-                    int(result.slot_indices[row]),
-                    row in unresolved,
-                )
-                for row, item_id in enumerate(ordered_ids.tolist())
-            }
+        result = IterativeCollisionResolver().resolve(plan, candidates)
 
-        expected = assignments(np.arange(item_ids.size))
-        actual = assignments(np.random.default_rng(7).permutation(item_ids.size))
-
-        self.assertEqual(actual, expected)
+        original_order_indices = np.argsort(order)
+        np.testing.assert_array_equal(
+            result.resolved_last_codes[original_order_indices],
+            [0, 1, 2, 3, 1, 2, 3, 1, 2, 0, 1, 2],
+        )
+        np.testing.assert_array_equal(
+            result.slot_indices[original_order_indices],
+            [1, 2, 1, 2, 4, 4, 1, 1, 2, 2, 3, 3],
+        )
+        np.testing.assert_array_equal(
+            item_ids[result.unresolved_rows], ["item-10", "item-4", "item-11", "item-5"]
+        )
 
     def test_append_preserves_prior_over_capacity_and_moves_only_new_rows(self) -> None:
         plan = create_collision_plan(

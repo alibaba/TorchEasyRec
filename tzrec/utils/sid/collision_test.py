@@ -230,9 +230,17 @@ class CollisionResolverTest(unittest.TestCase):
         with self.assertRaisesRegex(exception_type, message):
             KnnCollisionResolver().resolve(plan, candidates)
 
-    def test_no_overflow(self) -> None:
+    @parameterized.expand(
+        [
+            ("candidate", KnnCollisionResolver),
+            ("iterative", IterativeCollisionResolver),
+            ("uniform", UniformCollisionResolver),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_no_overflow(self, _name, resolver_cls) -> None:
         plan = create_collision_plan((2, 4), 2, [0, 1, 2], [[0, 0], [0, 0], [1, 2]])
-        resolver = KnnCollisionResolver()
+        resolver = resolver_cls()
         result = resolver.resolve(plan)
         rate_only = resolver.resolve(plan, collect_sid_metadata=False)
 

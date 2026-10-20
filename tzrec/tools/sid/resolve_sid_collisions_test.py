@@ -10,8 +10,8 @@
 # limitations under the License.
 
 import os
+import shlex
 import shutil
-import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -26,6 +26,7 @@ from tzrec.tools.sid.resolve_sid_collisions import (
     CollisionResolutionRunner,
     ResolveSidCollisionsConfig,
 )
+from tzrec.utils.misc_util import run_cmd
 from tzrec.utils.sid import bundle
 from tzrec.utils.sid.collision import CollisionResolutionStats, prepare_collision_plan
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
@@ -511,10 +512,29 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(by_id[1], [0, 2])
         self.assertEqual(by_id[3], [0, 3])
 
-    def test_candidates_decode_only_matching_ids(self) -> None:
+    @parameterized.expand(
+        [("single_process", 1, 2), ("multiple_ranks", 2, 3)],
+        name_func=parameterized_name_func,
+    )
+    def test_candidates_decode_only_matching_ids_in_rank(
+        self, _name, world_size, row_count
+    ) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
-        _parquet(inp, [7, 99], [[0, 0], [3, 0]], [[[0, 1]], [[3, 3]]])
-        runner = self._runner(inp, os.path.join(self.test_dir, "out"), codebook=(4, 4))
+        _parquet(
+            inp,
+            [7, 99, 7][:row_count],
+            [[0, 0], [3, 0], [3, 0]][:row_count],
+            [[[0, 1]], [[3, 3]], [[3, 2]]][:row_count],
+        )
+        with mock.patch.multiple(
+            resolve_sid_collisions.dist,
+            is_initialized=mock.Mock(return_value=world_size > 1),
+            get_rank=mock.Mock(return_value=0),
+            get_world_size=mock.Mock(return_value=world_size),
+        ):
+            runner = self._runner(
+                inp, os.path.join(self.test_dir, "out"), codebook=(4, 4)
+            )
         with mock.patch.object(
             runner, "_candidate_last_matrix", wraps=runner._candidate_last_matrix
         ) as decode_candidates:
@@ -965,7 +985,12 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         codes = np.array([[-1, 0, 0], [0, 0, 0], [4, 0, 0]])
         _parquet(inp, [0, 1, 2], codes.tolist())
         for rank in range(2):
-            with mock.patch.dict(os.environ, {"WORLD_SIZE": "2", "RANK": str(rank)}):
+            with mock.patch.multiple(
+                resolve_sid_collisions.dist,
+                is_initialized=mock.Mock(return_value=True),
+                get_rank=mock.Mock(return_value=rank),
+                get_world_size=mock.Mock(return_value=2),
+            ):
                 runner = self._runner(
                     inp, os.path.join(self.test_dir, "out"), codebook=(4, 4, 4)
                 )
@@ -1001,13 +1026,10 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             *extra,
         ]
         log = os.path.join(self.test_dir, "torchrun.log")
-        with open(log, "w") as handle:
-            completed = subprocess.run(
-                command, stdout=handle, stderr=subprocess.STDOUT, timeout=180
-            )
+        succeeded = run_cmd(shlex.join(command), log, timeout=180)
         with open(log) as handle:
             output = handle.read()
-        self.assertEqual(completed.returncode, 0, output)
+        self.assertTrue(succeeded, output)
         return output
 
     def _assert_distributed_matches_single(self, single, distributed, generation):
@@ -1137,33 +1159,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
         self.assertIn("total_items=3", output)
         self.assertFalse(os.path.exists(rate_output))
-
-    def test_candidates_decode_only_matching_ids_and_keep_this_ranks_prefixes(
-        self,
-    ) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        _parquet(
-            inp,
-            [7, 99, 7],
-            [[0, 0], [3, 0], [3, 0]],
-            [[[0, 1]], [[3, 3]], [[3, 2]]],
-        )
-        with mock.patch.dict(os.environ, {"WORLD_SIZE": "2", "RANK": "0"}):
-            runner = self._runner(
-                inp, os.path.join(self.test_dir, "out"), codebook=(4, 4)
-            )
-        with mock.patch.object(
-            runner, "_candidate_last_matrix", wraps=runner._candidate_last_matrix
-        ) as decode_candidates:
-            candidates = runner._load_candidate_last_codes(np.array([7, 7]))
-
-        np.testing.assert_array_equal(candidates, [[1], [1]])
-        decoded_rows = [
-            row
-            for call in decode_candidates.call_args_list
-            for row in call.args[0].to_pylist()
-        ]
-        self.assertEqual(decoded_rows, [[0, 1]])
 
 
 if __name__ == "__main__":

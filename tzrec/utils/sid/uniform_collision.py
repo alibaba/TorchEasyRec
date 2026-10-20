@@ -211,7 +211,7 @@ class UniformCollisionResolver(CollisionResolver):
         used_code_counts: np.ndarray,
         prefix_base_keys: np.ndarray,
         rotations: np.ndarray,
-        initial_keys: np.ndarray,
+        initial_sid_keys: np.ndarray,
         last_codebook_size: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Get one empty last-layer code per overflow item, in rotated code order.
@@ -224,7 +224,7 @@ class UniformCollisionResolver(CollisionResolver):
             used_code_counts: Number of last-layer codes with items in each prefix.
             prefix_base_keys: SID key of code 0 in every prefix.
             rotations: Tie-break rotation of every prefix.
-            initial_keys: Sorted keys of occupied SIDs in overflow prefixes.
+            initial_sid_keys: Sorted keys of occupied SIDs in overflow prefixes.
             last_codebook_size: Cardinality of the last SID layer.
 
         Returns:
@@ -241,7 +241,7 @@ class UniformCollisionResolver(CollisionResolver):
             % last_codebook_size
         ).astype(np.int32, copy=False)
         keys = prefix_base_keys[prefix_indices] + codes
-        _, is_existing = find_in_sorted_array(initial_keys, keys)
+        _, is_existing = find_in_sorted_array(initial_sid_keys, keys)
         empty_code_positions = np.flatnonzero(~is_existing)
         empty_prefix_indices = prefix_indices[empty_code_positions]
         empty_code_positions = empty_code_positions[

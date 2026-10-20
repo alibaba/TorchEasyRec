@@ -319,8 +319,8 @@ class CollisionResolutionRunner:
         self._resolved_writer_type: Optional[str] = None
         self._item_id_type: Optional[pa.DataType] = None
         self._bundle = config.bundle
-        self._rank = int(os.environ.get("RANK", "0"))
-        self._world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self._rank = dist.get_rank() if dist.is_initialized() else 0
+        self._world_size = dist.get_world_size() if dist.is_initialized() else 1
         self._prefix_start, self._prefix_stop = self._get_current_rank_prefix_range()
         self._check_input_locations()
         self._bundle.validate_compatibility(
@@ -415,7 +415,9 @@ class CollisionResolutionRunner:
             summaries, (asdict(stats), self._bundle.artifact_row_counts)
         )
         self._bundle.artifact_row_counts = {
-            artifact: sum(rows[artifact] for _, rows in summaries)
+            artifact: sum(
+                artifact_row_counts[artifact] for _, artifact_row_counts in summaries
+            )
             for artifact in self._bundle.artifact_row_counts
         }
         merged_stats = {}
@@ -715,7 +717,7 @@ class CollisionResolutionRunner:
     def _load_existing_sid_occupancy(
         self, new_item_ids: np.ndarray, new_codes: np.ndarray
     ) -> Tuple[SidOccupancy, int]:
-        """Load the existing SID state, or empty state for a full resolve.
+        """Load published SID occupancy, or empty occupancy for a full resolve.
 
         Args:
             new_item_ids: IDs of the items this run places.

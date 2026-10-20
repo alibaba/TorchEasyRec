@@ -41,17 +41,6 @@ class UniformCollisionResolverTest(unittest.TestCase):
         np.testing.assert_array_equal(result.final_item_counts, item_counts)
         self.assertEqual(dataclasses.astuple(result.stats), stats)
 
-    def test_no_overflow(self) -> None:
-        plan = create_collision_plan((4,), 1, [2, 9], [[0], [1]])
-        self._assert_resolution(
-            plan,
-            last_codes=[0, 1],
-            slot_indices=[1, 1],
-            sid_keys=[0, 1],
-            item_counts=[1, 1],
-            stats=(2, 0, 0, 0, 0, 1),
-        )
-
     def test_empty_codes_follow_rotated_order(self) -> None:
         plan = create_collision_plan((4,), 1, [2, 9, 4], [[0]] * 3)
         self._assert_resolution(
