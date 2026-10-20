@@ -152,6 +152,9 @@ class SidContrastiveLoss(_Loss):
             logits_b: (B, B_global) column-masked logits (view-b branch).
             label_index: (B,) positive column indices; -100 ignores non-pair rows.
             n_valid: scalar pair-row count, clamped to >= 1.
+
+        Returns:
+            Scalar mean loss over both directions and valid pair rows.
         """
         ce_a = F.cross_entropy(logits_a, label_index, reduction="none")
         ce_b = F.cross_entropy(logits_b, label_index, reduction="none")
@@ -224,12 +227,8 @@ class SidContrastiveLoss(_Loss):
         for scale, a_target, b_target, mask_a, mask_b in groups:
             logits_a = scale * embed_a @ a_target.t()
             logits_b = scale * embed_b @ b_target.t()
-            # Fill masked columns with the LOGITS dtype's most negative finite
-            # value: below any real logit (masks like -inf) but finite, so an
-            # all-non-pair row yields a finite CE/grad instead of 0*NaN. Derive
-            # it from the logits dtype, not the embeddings': under autocast the
-            # matmul casts to bf16/fp16 and finfo(embed.dtype=fp32).min would
-            # overflow masked_fill on the lower-precision logits.
+            # Keep fully masked rows' backward finite; use the logits dtype to
+            # avoid fill-value overflow under autocast.
             neg_fill = torch.finfo(logits_a.dtype).min
             logits_a = logits_a.masked_fill(mask_a, neg_fill)
             logits_b = logits_b.masked_fill(mask_b, neg_fill)

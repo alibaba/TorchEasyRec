@@ -198,10 +198,18 @@ class SidContrastiveLossTest(unittest.TestCase):
             ("query_as_candidate", [0, 2, 4, 6], [1, 3, 0, 7]),
             ("same_item_pair", [0, 2, 4, 6], [0, 3, 5, 7]),
             ("all_identical", [0, 0, 0, 0], [0, 0, 0, 0]),
+            (
+                "duplicate_target_mixed",
+                [0, 2, 4, 6],
+                [1, 1, 5, 7],
+                [True, True, False, True],
+            ),
         ],
         name_func=parameterized_name_func,
     )
-    def test_duplicate_candidates_match_filtered_reference(self, _name, a_ids, b_ids):
+    def test_duplicate_candidates_match_filtered_reference(
+        self, _name, a_ids, b_ids, pair_mask=(True, True, True, True)
+    ):
         feats = self._features(4, 8)
         originals = torch.randn(8, 8)
         feats["embed_a_ori"] = originals[a_ids]
@@ -210,7 +218,7 @@ class SidContrastiveLossTest(unittest.TestCase):
             key: value.detach().clone().requires_grad_(value.requires_grad)
             for key, value in feats.items()
         }
-        mask = torch.ones(4, dtype=torch.bool)
+        mask = torch.tensor(pair_mask, dtype=torch.bool)
         loss_fn, reference_fn = SidContrastiveLoss(), SidContrastiveLoss()
         actual = loss_fn(**feats, pair_mask=mask)
         expected = _reference_loss(reference_fn, **reference_feats, pair_mask=mask)
