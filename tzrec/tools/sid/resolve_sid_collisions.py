@@ -321,11 +321,7 @@ class CollisionResolutionRunner:
         self._bundle = config.bundle
         self._rank = int(os.environ.get("RANK", "0"))
         self._world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        prefixes_per_rank = (
-            math.prod(config.codebook[:-1]) + self._world_size - 1
-        ) // self._world_size
-        self._prefix_start = self._rank * prefixes_per_rank
-        self._prefix_stop = self._prefix_start + prefixes_per_rank
+        self._prefix_start, self._prefix_stop = self._get_current_rank_prefix_range()
         self._check_input_locations()
         self._bundle.validate_compatibility(
             list(config.codebook), config.max_items_per_codebook
@@ -335,7 +331,7 @@ class CollisionResolutionRunner:
         """Read, resolve collisions, and publish the resulting generation."""
         try:
             if not self._config.rate_only:
-                self._prepare_generation()
+                self._bundle.prepare_generation(self._rank)
             stats = self._resolve_and_write()
         except BaseException:
             if not self._config.rate_only and self._rank == 0:
@@ -391,6 +387,14 @@ class CollisionResolutionRunner:
 
         return stats
 
+    def _get_current_rank_prefix_range(self) -> Tuple[int, int]:
+        """Return this rank's prefix ID range as ``[start, stop)``."""
+        prefixes_per_rank = (
+            math.prod(self._config.codebook[:-1]) + self._world_size - 1
+        ) // self._world_size
+        prefix_start = self._rank * prefixes_per_rank
+        return prefix_start, prefix_start + prefixes_per_rank
+
     def _get_prefix_mask(self, codes: np.ndarray) -> np.ndarray:
         """Return a boolean mask for rows in this rank's SID prefix range."""
         if self._world_size == 1:
@@ -444,19 +448,6 @@ class CollisionResolutionRunner:
                 "missing, because the readers cannot tell the two apart."
             )
 
-    def _prepare_generation(self) -> None:
-        """Prepare output locations on rank 0 before any rank starts writing."""
-        errors: List[Optional[Exception]] = [None]
-        if self._rank == 0:
-            try:
-                self._bundle.prepare_generation()
-            except Exception as error:
-                errors[0] = error
-        if self._world_size > 1:
-            dist.broadcast_object_list(errors, src=0)
-        if errors[0] is not None:
-            raise errors[0]
-
     def _make_reader(self, path: str, columns: List[str]) -> BaseReader:
         """Open a repository reader projecting ``columns``.
 
@@ -506,11 +497,9 @@ class CollisionResolutionRunner:
             if batch_size == 0:
                 continue
             if code_field is not None and self._world_size > 1:
-                keep = pa.array(
-                    self._get_prefix_mask(
-                        self._convert_codes_to_numpy(batch[code_field])
-                    )
-                )
+                codes = self._convert_codes_to_numpy(batch[code_field])
+                prefix_mask = self._get_prefix_mask(codes)
+                keep = pa.array(prefix_mask)
                 batch = {name: values.filter(keep) for name, values in batch.items()}
             if keep_empty or len(next(iter(batch.values()))):
                 yield batch
