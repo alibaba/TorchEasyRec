@@ -160,6 +160,9 @@ message DataConfig {
     // drop_remainder=true is equivalent to min_batch_size=batch_size.
     optional uint32 min_batch_size = 29 [default = 0];
 
+    // number of batches each dataloader worker prepares in advance
+    optional uint32 prefetch_factor = 30 [default = 2];
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;
