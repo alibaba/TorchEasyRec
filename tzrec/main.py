@@ -13,6 +13,7 @@ import copy
 import itertools
 import json
 import os
+import socket
 from collections import OrderedDict
 from contextlib import nullcontext
 from queue import Queue
@@ -82,7 +83,7 @@ from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.protos.train_pb2 import TrainConfig
+from tzrec.protos.train_pb2 import ProfilerConfig, TrainConfig
 from tzrec.utils import (
     checkpoint_util,
     config_util,
@@ -368,6 +369,39 @@ def _log_train(
                 summary_writer.add_scalar(f"metric/{k}", v, step)
 
 
+def _create_train_profiler(
+    profiler_config: ProfilerConfig, trace_dir: str
+) -> Optional[torch.profiler.profile]:
+    """Create the training profiler of the current rank.
+
+    Args:
+        profiler_config (ProfilerConfig): profiler schedule and collection options.
+        trace_dir (str): directory to write trace files into.
+
+    Returns:
+        profiler (torch.profiler.profile): the profiler, or None if the current
+            rank is not in profiler_config.ranks.
+    """
+    rank = int(os.environ.get("RANK", 0))
+    if profiler_config.ranks and rank not in profiler_config.ranks:
+        return None
+    return torch.profiler.profile(
+        schedule=torch.profiler.schedule(
+            skip_first=profiler_config.skip_first_steps,
+            wait=profiler_config.wait_steps,
+            warmup=profiler_config.warmup_steps,
+            active=profiler_config.active_steps,
+            repeat=profiler_config.repeat,
+        ),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            trace_dir, worker_name=f"rank{rank}_{socket.gethostname()}_{os.getpid()}"
+        ),
+        record_shapes=profiler_config.record_shapes,
+        profile_memory=profiler_config.profile_memory,
+        with_stack=profiler_config.with_stack,
+    )
+
+
 def _train_and_evaluate(
     model: nn.Module,
     optimizer: optim.Optimizer,
@@ -471,16 +505,11 @@ def _train_and_evaluate(
     if train_config.is_profiling:
         if is_rank_zero:
             logger.info(str(model))
-        prof = torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=10, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                os.path.join(model_dir, "train_eval_trace")
-            ),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
+        prof = _create_train_profiler(
+            train_config.profiler_config, os.path.join(model_dir, "train_eval_trace")
         )
-        prof.start()
+        if prof is not None:
+            prof.start()
 
     i_step = 0
     i_epoch = 0
