@@ -20,8 +20,8 @@ from tzrec.utils.sid.collision import (
     build_origin_sid_item_row_index,
     build_resolved_sid_item_row_index,
 )
+from tzrec.utils.sid.greedy_collision import GreedyCollisionResolver
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
-from tzrec.utils.sid.knn_collision import KnnCollisionResolver
 from tzrec.utils.sid.test_util import (
     create_collision_plan,
     create_existing_sid_occupancy,
@@ -174,7 +174,7 @@ class AppendPlanTest(unittest.TestCase):
 class CollisionResolverTest(unittest.TestCase):
     @parameterized.expand(
         [
-            ("knn", KnnCollisionResolver),
+            ("greedy", GreedyCollisionResolver),
             ("iterative", IterativeCollisionResolver),
         ],
         name_func=parameterized_name_func,
@@ -228,11 +228,11 @@ class CollisionResolverTest(unittest.TestCase):
         plan = create_collision_plan((4,), 1, [0, 1, 2], [[0], [0], [1]])
 
         with self.assertRaisesRegex(exception_type, message):
-            KnnCollisionResolver().resolve(plan, candidates)
+            GreedyCollisionResolver().resolve(plan, candidates)
 
     @parameterized.expand(
         [
-            ("candidate", KnnCollisionResolver),
+            ("greedy", GreedyCollisionResolver),
             ("iterative", IterativeCollisionResolver),
             ("uniform", UniformCollisionResolver),
         ],
@@ -258,7 +258,7 @@ class CollisionResolverTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("candidate", KnnCollisionResolver, np.asarray([[1], [1]])),
+            ("greedy", GreedyCollisionResolver, np.asarray([[1], [1]])),
             ("iterative", IterativeCollisionResolver, np.asarray([[1], [1]])),
             ("uniform", UniformCollisionResolver, None),
         ],
@@ -287,7 +287,7 @@ class CollisionResolverTest(unittest.TestCase):
             [[0, 0]],
             existing_sid_occupancy=create_existing_sid_occupancy([0], [2]),
         )
-        result = KnnCollisionResolver().resolve(plan, None)
+        result = GreedyCollisionResolver().resolve(plan, None)
         self.assertEqual(plan.overflow_rows.size, 0)
         np.testing.assert_array_equal(result.final_sid_keys, [0])
         np.testing.assert_array_equal(result.final_item_counts, [3])
@@ -297,7 +297,7 @@ class CollisionResolverTest(unittest.TestCase):
 class SidItemRowIndexTest(unittest.TestCase):
     def test_empty_sid_item_row_indices(self) -> None:
         plan = create_collision_plan((2, 4), 2, [], np.empty((0, 2)))
-        result = KnnCollisionResolver().resolve(plan)
+        result = GreedyCollisionResolver().resolve(plan)
 
         for name, sid_item_row_index in (
             ("origin", build_origin_sid_item_row_index(plan)),
@@ -317,7 +317,7 @@ class SidItemRowIndexTest(unittest.TestCase):
         )
         plan = create_collision_plan((2, 4), 2, item_ids, codes)
         candidates = np.asarray([[0, 1, 2], [1, 2, 3], [0, 1, 2]], dtype=np.int64)
-        result = KnnCollisionResolver().resolve(plan, candidates)
+        result = GreedyCollisionResolver().resolve(plan, candidates)
         origin_sid_item_row_index = build_origin_sid_item_row_index(plan)
         resolved_sid_item_row_index = build_resolved_sid_item_row_index(plan, result)
 
@@ -351,7 +351,7 @@ class SidItemRowIndexTest(unittest.TestCase):
             [[0, 0], [0, 1]],
             existing_sid_occupancy=existing_sid_occupancy,
         )
-        result = KnnCollisionResolver().resolve(plan, None)
+        result = GreedyCollisionResolver().resolve(plan, None)
 
         resolved = build_resolved_sid_item_row_index(plan, result)
         np.testing.assert_array_equal(np.sort(resolved.item_row_indices), [0, 1])

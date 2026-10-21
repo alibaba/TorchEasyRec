@@ -24,7 +24,7 @@ from tzrec.utils.sid.collision import (
 )
 
 
-class KnnCollisionResolver(CollisionResolver):
+class GreedyCollisionResolver(CollisionResolver):
     """Resolve collisions first-fit from externally supplied candidate codes."""
 
     def resolve(

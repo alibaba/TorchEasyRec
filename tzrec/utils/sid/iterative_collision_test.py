@@ -17,8 +17,8 @@ from parameterized import parameterized
 from tzrec.utils.sid.collision import (
     build_resolved_sid_item_row_index,
 )
+from tzrec.utils.sid.greedy_collision import GreedyCollisionResolver
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
-from tzrec.utils.sid.knn_collision import KnnCollisionResolver
 from tzrec.utils.sid.test_util import (
     create_collision_plan,
     create_existing_sid_occupancy,
@@ -39,19 +39,19 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         )
         candidates = np.asarray([[2, 3, 4], [3, 2, 2]], dtype=np.int64)
 
-        first_fit = KnnCollisionResolver().resolve(plan, candidates)
+        greedy = GreedyCollisionResolver().resolve(plan, candidates)
         iterative = IterativeCollisionResolver().resolve(plan, candidates)
 
         np.testing.assert_array_equal(
             iterative.resolved_last_codes[plan.overflow_rows], [4, 3]
         )
         np.testing.assert_array_equal(
-            first_fit.resolved_last_codes[plan.overflow_rows], [3, 1]
+            greedy.resolved_last_codes[plan.overflow_rows], [3, 1]
         )
         self.assertEqual(iterative.stats.relocated_count, 2)
         self.assertEqual(iterative.stats.unresolved_count, 0)
-        self.assertEqual(first_fit.stats.relocated_count, 1)
-        self.assertEqual(first_fit.stats.unresolved_count, 1)
+        self.assertEqual(greedy.stats.relocated_count, 1)
+        self.assertEqual(greedy.stats.unresolved_count, 1)
 
     def test_origin_cap_limits_same_origin_requests(self) -> None:
         plan = create_collision_plan((4,), 1, [0, 10, 20, 30], [[1], [1], [1], [1]])

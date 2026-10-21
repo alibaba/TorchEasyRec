@@ -12,7 +12,7 @@
 r"""Offline best-effort SID collision resolution with TorchEasyRec-native I/O.
 
 The input is a Semantic-ID table from ``tzrec.predict``: an ``item_id`` column,
-a ``codes`` ``list<int>`` column and, for ``--strategy candidate`` or
+a ``codes`` ``list<int>`` column and, for ``--strategy greedy`` or
 ``iterative``, a flat ``candidate_codes`` ``list<int>`` column holding
 ``topk * n_layers`` codes per item, split by the ``--codebook`` length. CSV
 encodes each SID and candidate column as comma-separated codes because Arrow's
@@ -21,18 +21,18 @@ CSV writer cannot serialize list columns.
 Item IDs are expected to be unique in the upstream prediction output. To avoid
 blocking a large job on rare upstream violations, this tool does not perform a
 full-input uniqueness check or remove duplicate rows. Duplicate rows remain
-independent items in collision accounting and outputs. When candidate-strategy
+independent items in collision accounting and outputs. When candidate-based
 overflow rows share an item ID, they reuse one candidate list matched for that
 ID. Duplicate data should still be fixed upstream.
 
 The runner retains the first capacity items in each SID and relocates
 overflow items within their SID prefix through the pure NumPy core:
 
-- ``candidate`` (the default) moves each item to its first model candidate
+- ``greedy`` (the default) moves each item to its first model candidate
   with room.
 - ``iterative`` places the same candidates in synchronous rounds that give a
   contested SID to the item ranking it earliest, so it can leave more items
-  unresolved than ``candidate``.
+  unresolved than ``greedy``.
 - ``uniform`` reads no candidates and spreads the items over the least-loaded
   last-layer codes of their prefix, so a prefix with room leaves nothing over
   capacity.
@@ -59,7 +59,7 @@ Example::
         -m tzrec.tools.sid.resolve_sid_collisions \
         --input_path 'sid_predict_output/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
-        --strategy candidate \
+        --strategy greedy \
         --output_path sid_collision \
         --generation v1
 
@@ -83,7 +83,7 @@ published occupancy instead of restarting at one::
         -m tzrec.tools.sid.resolve_sid_collisions \
         --input_path 'sid_predict_new_20260731/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
-        --strategy candidate \
+        --strategy greedy \
         --output_path sid_collision \
         --generation v2 --from_generation v1
 
@@ -138,12 +138,12 @@ from tzrec.utils.sid.collision import (
     get_same_value_start_indices,
     prepare_collision_plan,
 )
+from tzrec.utils.sid.greedy_collision import GreedyCollisionResolver
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
-from tzrec.utils.sid.knn_collision import KnnCollisionResolver
 from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 
 _RESOLVERS: Dict[str, Type[CollisionResolver]] = {
-    "candidate": KnnCollisionResolver,
+    "greedy": GreedyCollisionResolver,
     "iterative": IterativeCollisionResolver,
     "uniform": UniformCollisionResolver,
 }
@@ -1237,9 +1237,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strategy",
         choices=list(_RESOLVERS),
-        default="candidate",
+        default="greedy",
         help=(
-            "Place overflow items greedily from model candidates (candidate), "
+            "Place overflow items greedily from model candidates (greedy), "
             "from model candidates by deterministic multi-round arbitration "
             "(iterative), or evenly over the least-loaded codes of their SID "
             "prefix without candidates (uniform)."

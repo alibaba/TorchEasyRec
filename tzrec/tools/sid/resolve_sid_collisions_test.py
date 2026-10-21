@@ -220,7 +220,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             candidate_codes_field="candidate_codes",
             codebook=(8, 8),
             max_items_per_codebook=2,
-            strategy="candidate",
+            strategy="greedy",
             rate_only=False,
             odps_data_quota_name="pay-as-you-go",
         )
@@ -330,7 +330,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             )
 
     @parameterized.expand(
-        [("candidate", "candidate", 1, 1), ("iterative", "iterative", 2, 0)],
+        [("greedy", "greedy", 1, 1), ("iterative", "iterative", 2, 0)],
         name_func=parameterized_name_func,
     )
     def test_strategy_selects_candidate_arbitration(
@@ -793,7 +793,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("candidate", "candidate"),
+            ("greedy", "greedy"),
             ("iterative", "iterative"),
             ("uniform", "uniform"),
         ],
@@ -1151,12 +1151,10 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         single = os.path.join(self.test_dir, "single")
         distributed = os.path.join(self.test_dir, "distributed")
         self._run(inp, single, codebook=(4,), max_items_per_codebook=1)
-        self._torchrun(inp, distributed, "4", "candidate")
+        self._torchrun(inp, distributed, "4", "greedy")
         self._assert_distributed_matches_single(single, distributed, "v1")
         rate_output = os.path.join(self.test_dir, "rate")
-        output = self._torchrun(
-            inp, rate_output, "4", "candidate", extra=("--rate_only",)
-        )
+        output = self._torchrun(inp, rate_output, "4", "greedy", extra=("--rate_only",))
         self.assertIn("total_items=3", output)
         self.assertFalse(os.path.exists(rate_output))
 

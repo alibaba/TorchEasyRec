@@ -1,8 +1,8 @@
 # SID 冲突后处理工具
 
-`resolve_sid_collisions` 处理 SID 预测结果：保留每个 SID 容量内的物品，将超出容量的物品重新分配到同一 SID 前缀下的末层码。前缀是除最后一层外的 SID，不会在后处理时改变。所有输入物品都会保留；`candidate` 和 `iterative` 无法分配的物品保留原 SID，`uniform` 会继续均匀分配，最终仍超过容量的物品计为未解决。
+`resolve_sid_collisions` 处理 SID 预测结果：保留每个 SID 容量内的物品，将超出容量的物品重新分配到同一 SID 前缀下的末层码。前缀是除最后一层外的 SID，不会在后处理时改变。所有输入物品都会保留；`greedy` 和 `iterative` 无法分配的物品保留原 SID，`uniform` 会继续均匀分配，最终仍超过容量的物品计为未解决。
 
-输入包含 `item_id` 和 `codes`；默认的 `candidate` 策略及 `iterative` 策略还需要 `candidate_codes`。该字段由 SID 模型在预测阶段输出，需要在模型配置中启用 `candidate_output_config.enabled`，相关配置参见 [SID 模型文档](../models/sid_model.rst)。Parquet 的 `codes` 是整数列表，`candidate_codes` 是按候选顺序展开的 `topk × SID 层数` 个整数。CSV 使用逗号分隔的字符串表示这些列表。
+输入包含 `item_id` 和 `codes`；默认的 `greedy` 策略及 `iterative` 策略还需要 `candidate_codes`。该字段由 SID 模型在预测阶段输出，需要在模型配置中启用 `candidate_output_config.enabled`，相关配置参见 [SID 模型文档](../models/sid_model.rst)。Parquet 的 `codes` 是整数列表，`candidate_codes` 是按候选顺序展开的 `topk × SID 层数` 个整数。CSV 使用逗号分隔的字符串表示这些列表。
 
 ## 全量处理模式
 
@@ -16,7 +16,7 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=8 \
     --generation v1 \
     --codebook 8192,8192,8192 \
     --max_items_per_codebook 1 \
-    --strategy candidate \
+    --strategy greedy \
     --batch_size 100000
 ```
 
@@ -37,17 +37,17 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
     --from_generation v1 \
     --codebook 8192,8192,8192 \
     --max_items_per_codebook 1 \
-    --strategy candidate
+    --strategy greedy
 ```
 
 每一代的 `item_to_sid` 和 `sid_to_items` 都包含完整语料。新增物品处理还写出 `delta_item_to_sid` 和 `delta_sid_to_items`，后者包含本次获得新物品的完整 SID 分组，方便下游进行幂等更新。新增物品 ID 如果已存在于上一代，会报错。
 
 ## 选择策略
 
-省略 `--strategy` 时默认使用 `candidate`。
+省略 `--strategy` 时默认使用 `greedy`。
 
-- `candidate`：先按原 SID 键、再按物品哈希的确定性顺序处理溢出物品，为每个物品选择第一个仍有容量的候选末层码。
-- `iterative`：通过多轮分配选择候选末层码，优先匹配更靠前的候选；候选耗尽时保留原 SID，未解决数量可能多于 `candidate`。
+- `greedy`：先按原 SID 键、再按物品哈希的确定性顺序处理溢出物品，为每个物品选择第一个仍有容量的候选末层码。
+- `iterative`：通过多轮分配选择候选末层码，优先匹配更靠前的候选；候选耗尽时保留原 SID，未解决数量可能多于 `greedy`。
 - `uniform`：无需模型候选，将溢出物品分配到同一前缀内负载最小的末层码；前缀总容量不足时继续均匀分配，超过 SID 容量的物品计为未解决。
 
 `--rate_only` 计算统计并跳过产物写出，可用于比较不同策略。
@@ -90,7 +90,7 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
 
 ## 内存与数据规模要求
 
-运行前需要确保每个进程的可用内存足以容纳其负责数据的物品 ID、SID、排序索引和分配结果。`candidate` 和 `iterative` 还会加载溢出物品的候选末层码，溢出物品越多、候选数越大，内存需求越高；`uniform` 无需候选。新增物品处理模式还需要保留相关前缀下已有 SID 的物品数。内存不足时应增加可用内存、调整进程数或减少本次输入规模，并关注各进程的负载是否均衡。
+运行前需要确保每个进程的可用内存足以容纳其负责数据的物品 ID、SID、排序索引和分配结果。`greedy` 和 `iterative` 还会加载溢出物品的候选末层码，溢出物品越多、候选数越大，内存需求越高；`uniform` 无需候选。新增物品处理模式还需要保留相关前缀下已有 SID 的物品数。内存不足时应增加可用内存、调整进程数或减少本次输入规模，并关注各进程的负载是否均衡。
 
 `iterative` 还需为每个进程预留约 `溢出前缀数 × 末层码本大小 × 8` 字节的计数空间，溢出前缀越多，内存需求越高。
 
