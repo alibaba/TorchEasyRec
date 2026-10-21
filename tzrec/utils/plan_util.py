@@ -749,6 +749,11 @@ class EmbeddingStorageEstimator(ShardEstimator):
             dynamicemb_options = None
             if use_dynamicemb:
                 dynamicemb_options = sharding_option.dynamicemb_options
+            # A RocksDB table's 0.0 means HOST_PS (no GPU cache), not "default".
+            if not caching_ratio and not rocksdb_util.is_rocksdb_options(
+                dynamicemb_options
+            ):
+                caching_ratio = UVM_CACHING_RATIO
 
             shard_storages = calculate_shard_storages(
                 sharder_data=sharder_data,
@@ -762,7 +767,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 local_world_size=self._topology.local_world_size,
                 input_lengths=sharding_option.input_lengths,
                 num_poolings=num_poolings,
-                caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
+                caching_ratio=caching_ratio,
                 is_pooled=sharding_option.is_pooled,
                 input_data_type_size=input_data_type_size,
                 output_data_type_size=output_data_type_size,

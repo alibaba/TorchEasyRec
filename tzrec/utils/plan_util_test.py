@@ -495,6 +495,47 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             )
         return TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
 
+    def test_rocksdb_host_ps_uses_no_value_storage(self):
+        try:
+            import tzrec_rocksdb  # noqa: F401
+        except ImportError:
+            self.skipTest("tzrec_rocksdb is not installed")
+        from tzrec.protos import feature_pb2
+        from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
+        from tzrec.utils.plan_util import (
+            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
+        )
+        from tzrec.utils.plan_util import (
+            get_default_sharders as _tzrec_get_default_sharders,
+        )
+
+        rocksdb_util.set_rocksdb_config(train_pb2.RocksDBConfig(local_path="x"))
+        self.addCleanup(rocksdb_util.set_rocksdb_config, None)
+        config = EmbeddingBagConfig(
+            num_embeddings=1 << 30, embedding_dim=128, name="t", feature_names=["f"]
+        )
+        cfg = feature_pb2.DynamicEmbedding(
+            max_capacity=1 << 30, score_strategy="NO_EVICTION"
+        )
+        cfg.rocksdb.SetInParent()
+        model = TestSparseNN(tables=[config], sparse_device=torch.device("meta"))
+        enumerator = _TzrecEmbeddingEnumerator(
+            topology=Topology(world_size=1, compute_device="cuda"),
+            batch_size=128,
+            fqn_constraints={"sparse.ebc.t": build_dynamicemb_constraints(cfg, config)},
+        )
+        options = enumerator.enumerate(
+            module=model, sharders=_tzrec_get_default_sharders()
+        )
+        self.assertEqual(len(options), 1)
+        self.assertFalse(options[0].dynamicemb_options.caching)
+        self.assertEqual(options[0].cache_load_factor, 0.0)
+        # A 0.0 ratio must not fall back to a default cache: 2^30 x 128 values
+        # would otherwise be counted in HBM.
+        for shard in options[0].shards:
+            self.assertEqual(shard.storage.ddr, 0)
+            self.assertLess(shard.storage.hbm, 1 << 30)
+
     def test_enumerate_yields_both_modes_and_all_factors(self):
         from tzrec.utils.plan_util import (
             EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
