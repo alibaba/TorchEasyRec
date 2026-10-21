@@ -317,6 +317,7 @@ class GenRecIntegrationTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")
     def test_genrec_export_distributed_embedding(self):
+        """Export a regular sparse model through the unified export path."""
         trained = self._train_eval_export()
         dist_dir = os.path.join(self.test_dir, "export_dist")
         self.success = utils.test_export(
@@ -326,7 +327,15 @@ class GenRecIntegrationTest(unittest.TestCase):
             env_str="USE_DISTRIBUTED_EMBEDDING=1 QUANT_EMB=0",
         )
         self.assertTrue(self.success)
+        graph_dir = os.path.join(dist_dir, "graph")
+        self.assertTrue(os.path.exists(os.path.join(graph_dir, "gm_dense.graph")))
+        self.assertFalse(os.path.exists(os.path.join(graph_dir, "gm_sparse.graph")))
         sparse_dir = os.path.join(dist_dir, "sparse")
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
+            )
+        )
         for name in (
             "sparse_embeddings-00-of-01.npz",
             "sparse_embedding.json",

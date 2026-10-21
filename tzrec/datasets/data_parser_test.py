@@ -743,6 +743,49 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
+    @parameterized.expand(
+        [param("sum", pooling="sum"), param("mean", pooling="mean")],
+        name_func=parameterized_name_func,
+    )
+    def test_fg_dag_id_with_weight_expression(self, name, pooling):
+        feature_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="tag",
+                    expression="item:tag_ids",
+                    weight_expression="item:tag_weights",
+                    use_weight=True,
+                    embedding_dim=8,
+                    num_buckets=100,
+                    pooling=pooling,
+                )
+            ),
+        ]
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        data_parser = DataParser(features=features)
+        data = data_parser.parse(
+            input_data={
+                "tag_ids": pa.array([[1, 2], None, [3]]),
+                "tag_weights": pa.array([[1.0, 3.0], [9.0], [2.0]]),
+            }
+        )
+        # ids within a row come out of a hash map, so align the first row by id
+        idx = torch.cat([torch.argsort(data["tag.values"][:2]), torch.tensor([2])])
+        torch.testing.assert_close(data["tag.values"][idx], torch.tensor([1, 2, 3]))
+        torch.testing.assert_close(
+            data["tag.lengths"], torch.tensor([2, 0, 1], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            data["tag.weights"][idx], torch.tensor([1.0, 3.0, 2.0])
+        )
+
+        batch = data_parser.to_batch(data)
+        expected_weights = [0.25, 0.75, 1.0] if pooling == "mean" else [1.0, 3.0, 2.0]
+        torch.testing.assert_close(
+            batch.sparse_features["__BASE__"].weights()[idx],
+            torch.tensor(expected_weights),
+        )
+
     def test_fg_encoded_weighted_id_mean_pooling(self):
         # mean pooling in a weighted data group is carried by the per-sample
         # weights, normalized to sum to one per bag, so that pooling stays a

@@ -83,11 +83,112 @@ class NpzUtilTest(unittest.TestCase):
         for k in stream_loaded:
             np.testing.assert_array_equal(stream_loaded[k], savez_loaded[k])
 
-    def test_uses_streaming_data_descriptor_and_zip64(self):
+    @parameterized.expand(
+        [
+            ("float32", np.arange(20, dtype=np.float32).reshape(5, 4)),
+            ("int64", np.arange(5, dtype=np.int64)),
+            ("uint8", np.arange(20, dtype=np.uint8).reshape(5, 4)),
+            ("empty", np.zeros((0, 4), dtype=np.float32)),
+            ("empty_columns", np.zeros((5, 0), dtype=np.float32)),
+            ("noncontiguous", np.arange(40, dtype=np.float32).reshape(5, 8)[:, ::2]),
+            ("big_endian", np.arange(5, dtype=">i8")),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_row_chunks_roundtrip(self, _name, array):
+        chunks = (array[start : start + 2] for start in range(0, len(array), 2))
+        path = self._path()
+        npz_util.savez_streaming(
+            path,
+            {
+                "chunked": npz_util.StreamingArray(array.dtype, array.shape, chunks),
+                "regular": np.array([1, 2], dtype=np.int64),
+            },
+        )
+        with np.load(path) as loaded:
+            self.assertEqual(loaded["chunked"].dtype, array.dtype)
+            self.assertEqual(loaded["chunked"].shape, array.shape)
+            np.testing.assert_array_equal(loaded["chunked"], array)
+            np.testing.assert_array_equal(loaded["regular"], [1, 2])
+
+    def test_chunks_are_consumed_incrementally(self):
+        array = np.arange(20, dtype=np.float32).reshape(5, 4)
+        original_write = npz_util._Unseekable.write
+        written_sizes = []
+
+        def record_write(fp, data):
+            written_sizes.append(len(data))
+            return original_write(fp, data)
+
+        def chunks():
+            for start in range(0, len(array), 2):
+                chunk = array[start : start + 2]
+                writes_before = len(written_sizes)
+                yield chunk
+                self.assertGreater(len(written_sizes), writes_before)
+                self.assertEqual(written_sizes[-1], chunk.nbytes)
+
+        with mock.patch.object(npz_util._Unseekable, "write", record_write):
+            npz_util.savez_streaming(
+                self._path(),
+                {"a": npz_util.StreamingArray(array.dtype, array.shape, chunks())},
+            )
+
+    @parameterized.expand(
+        [
+            ("short", np.float32, (3, 4), [np.zeros((2, 4), dtype=np.float32)]),
+            ("extra", np.float32, (1, 4), [np.zeros((2, 4), dtype=np.float32)]),
+            ("dtype", np.float32, (2, 4), [np.zeros((2, 4), dtype=np.float64)]),
+            ("columns", np.float32, (2, 4), [np.zeros((2, 5), dtype=np.float32)]),
+            ("dimensions", np.float32, (2, 4), [np.zeros(8, dtype=np.float32)]),
+            ("object", object, (2,), [np.array([1, 2], dtype=object)]),
+            ("scalar", np.float32, (), []),
+            ("negative_shape", np.float32, (-1, 4), []),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_invalid_row_chunks_do_not_publish(self, _name, dtype, shape, chunks):
+        path = self._path()
+        original = np.arange(4, dtype=np.int64)
+        npz_util.savez_streaming(path, {"original": original})
+        with self.assertRaises(ValueError):
+            npz_util.savez_streaming(
+                path,
+                {"a": npz_util.StreamingArray(np.dtype(dtype), shape, iter(chunks))},
+            )
+        self.assertEqual(glob.glob(f"{path}.part.*"), [])
+        with np.load(path) as loaded:
+            self.assertEqual(loaded.files, ["original"])
+            np.testing.assert_array_equal(loaded["original"], original)
+
+    def test_chunk_iterator_failure_removes_part_file(self):
+        def chunks():
+            yield np.zeros((2, 4), dtype=np.float32)
+            raise RuntimeError("source failed")
+
+        path = self._path()
+        with self.assertRaisesRegex(RuntimeError, "source failed"):
+            npz_util.savez_streaming(
+                path,
+                {"a": npz_util.StreamingArray(np.dtype(np.float32), (3, 4), chunks())},
+            )
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(glob.glob(f"{path}.part.*"), [])
+
+    @parameterized.expand(
+        [("array", False), ("chunks", True)], name_func=parameterized_name_func
+    )
+    def test_uses_streaming_data_descriptor_and_zip64(self, _name, stream_chunks):
         # gp_flag bit 3 (data descriptor) => zipfile did not seek back to patch
         # the local header; version_needed 45 => zip64, required for large shards.
         path = self._path()
-        npz_util.savez_streaming(path, {"a": np.zeros(4, dtype=np.float32)})
+        array = np.zeros(4, dtype=np.float32)
+        value = (
+            npz_util.StreamingArray(array.dtype, array.shape, iter([array]))
+            if stream_chunks
+            else array
+        )
+        npz_util.savez_streaming(path, {"a": value})
         with open(path, "rb") as f:
             self.assertEqual(f.read(4), b"PK\x03\x04")
             version_needed = struct.unpack("<H", f.read(2))[0]
@@ -95,13 +196,21 @@ class NpzUtilTest(unittest.TestCase):
         self.assertTrue(gp_flag & 0x08, f"bit-3 not set: gp_flag=0x{gp_flag:04x}")
         self.assertEqual(version_needed, 45)
 
-    def test_large_entry_zip64_path(self):
+    @parameterized.expand(
+        [("array", False), ("chunks", True)], name_func=parameterized_name_func
+    )
+    def test_large_entry_zip64_path(self, _name, stream_chunks):
         # Lower the zip64 threshold so a small array exercises the >2GiB
         # central-directory/EOCD64 machinery without allocating gigabytes.
         arr = np.arange(1000, dtype=np.uint8)
+        value = (
+            npz_util.StreamingArray(arr.dtype, arr.shape, iter([arr[:500], arr[500:]]))
+            if stream_chunks
+            else arr
+        )
         path = self._path()
         with mock.patch("zipfile.ZIP64_LIMIT", 64):
-            npz_util.savez_streaming(path, {"big": arr})
+            npz_util.savez_streaming(path, {"big": value})
         np.testing.assert_array_equal(np.load(path)["big.npy"], arr)
         with zipfile.ZipFile(path) as zf:
             self.assertIsNone(zf.testzip())
@@ -198,11 +307,19 @@ class NpzUtilTest(unittest.TestCase):
             np.load(io.BytesIO(entries["a.npy"])), arrays["a"]
         )
 
-    def test_readable_via_central_directory_zip64(self):
+    @parameterized.expand(
+        [("array", False), ("chunks", True)], name_func=parameterized_name_func
+    )
+    def test_readable_via_central_directory_zip64(self, _name, stream_chunks):
         arr = np.arange(1000, dtype=np.uint8)
+        value = (
+            npz_util.StreamingArray(arr.dtype, arr.shape, iter([arr[:500], arr[500:]]))
+            if stream_chunks
+            else arr
+        )
         path = self._path()
         with mock.patch("zipfile.ZIP64_LIMIT", 64):
-            npz_util.savez_streaming(path, {"big": arr})
+            npz_util.savez_streaming(path, {"big": value})
         entries = self._central_directory_read(path)
         np.testing.assert_array_equal(np.load(io.BytesIO(entries["big.npy"])), arr)
 

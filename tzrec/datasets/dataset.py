@@ -868,6 +868,7 @@ def create_dataloader(
 
         kwargs["num_workers"] = num_workers
         kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = data_config.prefetch_factor
 
     if mode == Mode.TRAIN:
         # When in train_and_eval mode, use 2x worker in gl cluster

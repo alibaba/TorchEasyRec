@@ -167,6 +167,13 @@ class OdpsDatasetTest(unittest.TestCase):
             len(list(dataset._reader._input_to_sess.values())[0]),
             2 if is_orderby_partition else 1,
         )
+        if is_orderby_partition:
+            with self.assertLogs("tzrec", level="INFO") as logs:
+                next(iter(dataset))
+            self.assertIn(
+                f"Reading test_odps_dataset_{self.test_suffix}/dt=20240319 (1/2)",
+                "\n".join(logs.output),
+            )
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=None,
@@ -215,6 +222,80 @@ class OdpsDatasetTest(unittest.TestCase):
     )
     def test_odps_dataset_has_schema(self):
         self._test_odps_dataset(is_orderby_partition=False, schema="rec")
+
+    @unittest.skipIf(
+        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
+        "odps config not found",
+    )
+    def test_odps_dataset_init_session_multi_rank(self):
+        account, odps_endpoint = _create_odps_account()
+        self.o = ODPS(
+            account=account, project=self.test_project, endpoint=odps_endpoint
+        )
+        feature_cfgs = self._create_test_table_and_feature_cfgs()
+        t = self.o.get_table(f"test_odps_dataset_{self.test_suffix}")
+        # distinct partition sizes pin the session order
+        for dt, num_rows in [("20240321", 5000), ("20240322", 3000)]:
+            with t.open_writer(partition=f"dt={dt}", create_partition=True) as writer:
+                writer.write(
+                    [["unused", "1", "2", 4, 5.0, 3, 4.0, [1.0], {}, 0]] * num_rows
+                )
+
+        world_size = 2
+        queue = mp.Queue()
+
+        def _reader_worker(rank, port):
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(port)
+            dist.init_process_group(backend="gloo")
+            time.sleep(rank)  # prevent get credential failed
+            dataset = OdpsDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=8196,
+                    dataset_type=data_pb2.DatasetType.OdpsDataset,
+                    fg_mode=FgMode.FG_DAG,
+                    label_fields=["label"],
+                    is_orderby_partition=True,
+                    odps_data_quota_name=self.test_quota,
+                    num_workers=2,
+                ),
+                features=create_features(feature_cfgs, fg_mode=FgMode.FG_DAG),
+                input_path=f"odps://{self.test_project}/tables/test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240321&dt=20240322",
+            )
+            reader = dataset._reader
+            session_ids = [
+                x.session_id for x in list(reader._input_to_sess.values())[0]
+            ]
+            queue.put(
+                (
+                    rank,
+                    session_ids,
+                    [reader._sess_row_counts[x] for x in session_ids],
+                )
+            )
+
+        port = get_free_port()
+        procs = []
+        for rank in range(world_size):
+            p = mp.Process(target=_reader_worker, args=(rank, port))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join(timeout=600)
+        for i, p in enumerate(procs):
+            if p.is_alive():
+                p.terminate()
+                p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"reader worker-{i} failed.")
+        results = sorted(queue.get(timeout=10) for _ in range(world_size))
+
+        self.assertEqual(results[0][1:], results[1][1:])
+        self.assertEqual(len(set(results[0][1])), 3)
+        self.assertEqual(results[0][2], [10000, 5000, 3000])
 
     @unittest.skipIf(
         os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""

@@ -2,104 +2,17 @@
 
 ## 简介
 
-GenRec 是基于 HuggingFace Causal LM 的生成式召回模型。它将用户画像、行为历史和文本等特征按 Prompt 模板组合，使用自回归模型直接生成下一个物品的语义 ID（Semantic ID，简称 SID），再通过 SID 到物品的映射表得到召回结果。
+GenRec 是以 Transformer Decoder-Only 大语言模型（LLM）为底座的生成式召回模型。它将用户画像、SID、行为历史序列和文本等特征按 Prompt 模板组合，使用自回归模型直接生成下一个物品的语义 ID（Semantic ID，简称 SID），再通过 SID 到物品的映射表得到召回结果。
 
-当前模型配置为 `genrec_causal_lm_model`，骨干模型使用 `hf_model_name_or_path` 指定，支持 Qwen2.5/3 等 Decoder-Only 模型。骨干需要支持 `logits_to_keep` 和 HuggingFace 的 `Cache` 接口。物品 SID 可以由 [SID RQVAE](sid_rqvae.md) 或 [SID RQKMeans](sid_rqkmeans.md) 生成；GenRec 训练和解码使用的码本必须与数据中的 SID 一致。
+当前模型配置为 `genrec_causal_lm_model`，骨干模型使用 `hf_model_name_or_path` 指定，支持 Qwen2.5/3 等 Decoder-Only 模型。 物品 SID 可以由 [SID RQVAE](sid_rqvae.md) 或 [SID RQKMeans](sid_rqkmeans.md) 生成。
 
-GenRec 支持两种特征填充方式，均由特征配置自动推导：
-
-- INLINE：SID 编码或文本分词 ID 直接进入 LM 的 token 序列，使用 LM 的 embedding 表。
-- PROJECTED：结构化特征经自己的 embedding 或数值特征处理后，投影到 LM 的隐藏维度，在 Prompt 中占据一个或多个位置。
-
-GenRec 使用 `prompt_config` 进行模板、槽位和 SID 空间配置，`model_config` 负责 LM 参数和解码参数。
-
-## 数据格式
-
-### SID 编码
-
-SID 的每一层有独立的码本。**历史物品和训练标签都必须使用按层偏移后的编码（offset code），不能直接使用每层从 0 开始的编码，也不能预先加上 LM 的词表大小。**
-
-```
-level_offsets[l] = sum(codebook[:l])
-offset_code[l] = level_offsets[l] + local_code[l]
-LM token_id[l] = base_vocab_size + offset_code[l]
-```
-
-例如，`codebook: [256, 256, 256]` 的层偏移为 `[0, 256, 512]`：
-
-| 表示方式            | 示例                        | 用途                                          |
-| ------------------- | --------------------------- | --------------------------------------------- |
-| 每层从 0 开始的编码 | `[3, 5, 7]`                 | SID 模型的 `codes` 输出、GenRec 的预测输出    |
-| 按层偏移后的编码    | `[3, 261, 519]`             | GenRec 的历史输入和训练标签                   |
-| LM token ID         | `[V + 3, V + 261, V + 519]` | 模型内部使用，`V` 为基础 tokenizer 的词表大小 |
-
-如果使用 `tzrec.tools.sid.resolve_sid_collisions` 生成 SID 映射表，读取最终的 `offset_codebook` 列构建历史和标签；`codebook` 列未加层偏移，`origin_codebook` 列是碰撞处理前的编码。物品映射、历史、标签和可选的 SID manifest 应来自同一套 SID 数据。
-
-### 样本字段
-
-以下配置使用 Parquet 原始特征和 `fg_mode: FG_DAG`。一行对应一个用户的历史和一个目标物品：
-
-| 列名              | 类型                  | 示例及说明                                                                           |
-| ----------------- | --------------------- | ------------------------------------------------------------------------------------ |
-| `user_id`         | string                | `"u1"`，画像特征，也可在预测结果中透传                                               |
-| `user_age`        | double                | `34.0`，数值画像特征                                                                 |
-| `hist__sid_codes` | array\<array\<int64>> | `[[3, 261, 519], [9, 270, 522]]`，按顺序排列的历史物品，每个物品包含三层 offset code |
-| `title`           | string                | `"运动鞋"`，作为 INLINE 文本输入                                                     |
-| `answer`          | array\<int64>         | `[8, 260, 524]`，目标物品的三层 offset code，仅训练和评估需要                        |
-
-`hist__sid_codes` 是 `sequence_name: "hist"` 与子特征输入字段 `sid_codes` 组合后的列名，模板引用的特征名则为 `hist__sid`。历史每个物品的编码数和 `answer` 的长度都应等于码本层数；不要把历史编码存成嵌套数组的字符串。
-
-预测数据可以不包含 `answer` 列，但配置仍需保留 `data_config.label_fields: "answer"` 和 `prompt_config.response: "{{answer}}"`，供编译器解析监督段。预测时不会读取或拼接该段。
+GenRec 将 `prompt_config` 用于模板、槽位和 SID 空间配置，`model_config` 用于 LM 参数和解码参数。
 
 ## 配置说明
 
-下面是使用画像投影、SID 历史和文本槽位的完整配置示例。将其保存为 `experiments/genrec/genrec.config`，并准备训练数据、评估数据及本地骨干模型目录。示例中的 `data/genrec/backbone` 应包含与基础 `tokenizer.json` 对应的 HuggingFace 模型配置和预训练权重。
+下面展示组合 SID 历史和物品 tag 的关键配置，字段与样本说明见[数据](#genrec-sample-data)。
 
 ```
-train_input_path: "data/genrec/train/*.parquet"
-eval_input_path: "data/genrec/eval/*.parquet"
-model_dir: "experiments/genrec/train"
-
-train_config {
-    sparse_optimizer {
-        adagrad_optimizer { lr: 0.01 }
-        constant_learning_rate {}
-    }
-    dense_optimizer {
-        adam_optimizer { lr: 0.0001 }
-        constant_learning_rate {}
-    }
-    num_epochs: 1
-    save_checkpoints_epochs: 1
-    mixed_precision: "BF16"
-}
-eval_config {}
-export_config {
-    mixed_precision: "BF16"
-    use_dense_ema: false
-}
-data_config {
-    batch_size: 32
-    dataset_type: ParquetDataset
-    fg_mode: FG_DAG
-    label_fields: "answer"
-    num_workers: 2
-}
-feature_configs {
-    id_feature {
-        feature_name: "user_id"
-        expression: "user:user_id"
-        embedding_dim: 32
-        hash_bucket_size: 100000
-    }
-}
-feature_configs {
-    raw_feature {
-        feature_name: "user_age"
-        expression: "user:user_age"
-        value_dim: 1
-    }
-}
 feature_configs {
     sequence_feature {
         sequence_name: "hist"
@@ -110,36 +23,38 @@ feature_configs {
                 feature_name: "sid"
                 expression: "item:sid_codes"
                 value_dim: 3
-                num_buckets: 768
+                num_buckets: 24576
+            }
+        }
+        features {
+            id_feature {
+                feature_name: "tag"
+                expression: "item:tag_ids"
+                embedding_dim: 32
+                hash_bucket_size: 100000
+                value_dim: 0
+                pooling: "mean"
+                default_value: "__missing_tag__"
             }
         }
     }
 }
-feature_configs {
-    tokenize_feature {
-        feature_name: "title"
-        expression: "user:title"
-        tokens_as_sequence: true
-        sequence_length: 32
-    }
-}
 prompt_config {
     tokenizer_path: "data/genrec/backbone/tokenizer.json"
-    prompt: "用户画像：{{profile}}。历史物品：{{hist__sid}}。查询文本：{{title}}。推荐下一个物品："
+    prompt: "历史物品：{{hist__sid}}。对应的物品标签：{{history_tags}}。推荐下一个物品："
     response: "{{answer}}"
     slots {
-        name: "profile"
-        feature_names: "user_id"
-        feature_names: "user_age"
+        name: "history_tags"
+        feature_names: "hist__tag"
         projection {
             mlp { hidden_units: 128 }
             bias: true
         }
     }
     sid_space {
-        codebook: 256
-        codebook: 256
-        codebook: 256
+        codebook: 8192
+        codebook: 8192
+        codebook: 8192
     }
     max_length: 256
 }
@@ -173,7 +88,13 @@ model_config {
 | `max_length`                         | 编译时的长度校验上限，默认 `0`。计算范围包含静态文本、槽位和 response；已知最大长度超过此值时编译报错                     |
 | `sentinel_token`                     | PROJECTED 槽位的占位 token，默认 `<\|pg_hole\|>`；模型前向时用投影向量替换该位置                                          |
 
-模板中的 `{{name}}` 优先匹配 `slots.name`；没有显式声明时，按同名特征创建单成员槽位。例如 `{{hist__sid}}` 和 `{{title}}` 不需要额外的 `slots` 配置。显式声明的槽位必须在模板中被引用。
+`sid_space.codebook` 应与生成样本 SID 时使用的各层码本大小一致；使用冲突后处理结果时，应与工具的 `--codebook` 一致。
+
+#### 模板与槽位
+
+模板中的 `{{name}}` 优先匹配 `slots.name`；没有显式声明时，按同名特征创建单成员槽位。例如 `{{hist__sid}}` 不需要额外的 `slots` 配置，`{{history_tags}}` 则引用上面声明的 tag 槽位。显式声明的槽位必须在模板中被引用。
+
+#### 特征填充方式
 
 INLINE 和 PROJECTED 是编译器根据槽位引用的特征及其组合自动推导的填充方式，无需显式配置。单成员序列槽位中，`id_feature` 或 `tokenize_feature` 省略 `embedding_dim` 时使用 INLINE，数值序列特征不使用独立 embedding 时也使用 INLINE；标量槽位、带 embedding 的序列槽位或多成员槽位使用 PROJECTED。`projection` 仅配置 PROJECTED 槽位的投影方式，不用于选择填充方式。
 
@@ -183,7 +104,20 @@ INLINE 和 PROJECTED 是编译器根据槽位引用的特征及其组合自动�
 - 相同的 `projection_name` 可让不同槽位共享投影参数，但它们的投影配置和输入总维度必须相同。
 - INLINE 槽位不能配置 `projection`。
 
-`max_length` 不会在运行时逐行测量或截断输入。应通过特征的 `sequence_length` 控制历史和文本的长度；示例中的 50 个历史物品最多占据 `50 * 3 = 150` 个 SID token。PROJECTED 序列槽位必须声明长度上限；INLINE 多值序列还需要固定每个元素的值数，编译器才能推导总长度上界。
+本例的 `hist__sid` 不配置 `embedding_dim`，因此每个历史物品的三个 SID 编码以 INLINE 方式进入 LM；`hist__tag` 配置了 `embedding_dim: 32`，因此使用 PROJECTED 方式。每个物品的多个 tag 先做 mean pooling，得到 32 维向量，再通过 `history_tags.projection` 投影为 LM 隐藏维度，每个历史物品占一个位置。tag 的 `value_dim: 0` 允许每个物品拥有不同数量的 tag，池化后的位置数仍然固定；SID 则以 `value_dim: 3` 声明每个物品会展开为三个 token。
+
+以两个历史物品为例，Prompt 的组装过程如下。`sid(i, l)` 表示第 `i` 个物品第 `l` 层 SID 对应的 LM token，`p(i)` 表示该物品所有 tag 聚合并投影后的向量：
+
+```text
+历史物品：sid(1, 1) sid(1, 2) sid(1, 3) sid(2, 1) sid(2, 2) sid(2, 3)
+。对应的物品标签：p(1) p(2)。推荐下一个物品：
+```
+
+训练时再追加 `answer` 对应的三个 SID token 作为监督段；预测时仅组装前面的输入部分。tag 来自历史物品，不读取目标物品的 tag。
+
+#### 长度与分词器
+
+`max_length` 不会在运行时逐行测量或截断输入。应通过特征的 `sequence_length` 控制历史和文本的长度；示例中的 50 个历史物品最多占据 `50 * 3 = 150` 个 SID token，以及 50 个 tag 投影位置。PROJECTED 序列槽位必须声明长度上限；INLINE 多值序列还需要固定每个元素的值数，编译器才能推导总长度上界。
 
 基础 tokenizer 不应已经包含将要添加的 SID token 或 sentinel token。当前实现从 `<|im_end|>` 和 `<|endoftext|>` 中解析 EOS、PAD，基础词表至少需要包含其中一个。
 
@@ -205,19 +139,56 @@ INLINE 和 PROJECTED 是编译器根据槽位引用的特征及其组合自动�
 
 模型自动计算监督段的 `ce_loss`，并在评估时输出同名指标，无需额外声明 `model_config.losses` 或 `metrics`。评估采用真实答案作为输入的 teacher forcing；召回的 HitRate、Recall 等指标需根据预测 SID 与真实物品另行计算。
 
+## 模型输出
+
+默认输出列 `generated_sids` 的每行形状为 `(num_return_sequences, 码本层数)`，各 SID 按 beam 累计得分从高到低排列。例如 `[[3, 5, 7], [8, 4, 12], ...]`。**输出是每层从 0 开始的编码**，应与最终 SID 映射表的 `codebook` 列对齐；若使用 `offset_codebook` 做关联，需先加回层偏移。
+
+解码每层只允许生成该层码本对应的 token，生成长度固定为码本层数，不依赖 EOS 停止。该约束保证每层编码合法，但不会检查完整 SID 是否存在于物品映射表；召回时应过滤无映射的 SID，并展开同一 SID 对应的物品列表。
+
 ## 示例
 
 环境准备方式同 [local_tutorial](../quick_start/local_tutorial.md)。以下命令均在配置好项目依赖的 Docker 环境中、仓库根目录下执行；从源码运行时设置 `PYTHONPATH=.`。示例使用单机单进程，多卡训练可调整 `--nproc-per-node`。
+
+(genrec-sample-data)=
+
+### 数据
+
+#### SID 编码
+
+使用 [SID 冲突后处理工具](../usage/sid_collision.md) 生成物品 SID 后，按 `item_id` 关联同一代结果中的 `item_to_sid` 产物，直接使用 **`offset_codebook` 列**构建 GenRec 样本：
+
+- 历史物品：按行为序列的顺序组合各物品的 `offset_codebook`，作为历史 SID 序列输入。
+- 目标物品：使用目标物品的 `offset_codebook` 作为标签。
+
+`offset_codebook` 已包含各层码本大小的累计偏移，**不要再次进行层间偏移，也不要预先加上 LM 的词表大小**；LM 词表偏移由 GenRec 自动添加。工具输出的 `codebook` 列是未加层偏移的最终 SID，`origin_codebook` 列是碰撞处理前的原始 SID，均不能直接作为本例的历史和标签输入。
+
+物品映射、历史、标签和可选的 SID manifest 应来自同一代后处理结果。
+
+#### 示例数据
+
+示例数据使用 Parquet 格式：
+
+- 训练数据：`genrec_train.parquet`（1800 行）。
+- 评估数据：`genrec_eval.parquet`（200 行）。
+
+一行对应一条行为历史和一个目标物品：
+
+| 列名              | 类型                   | 说明                              |
+| ----------------- | ---------------------- | --------------------------------- |
+| `sample_id`       | string                 | 样本标识                          |
+| `hist__sid_codes` | array\<array\<int64>>  | 历史物品的 `offset_codebook` 序列 |
+| `hist__tag_ids`   | array\<array\<string>> | 历史物品的脱敏 tag ID 列表        |
+| `answer`          | array\<int64>          | 目标物品的 `offset_codebook`      |
+
+历史 SID 和 tag 序列须逐项对应，示例使用三层码本 `[8192, 8192, 8192]`。
 
 ### 训练和评估
 
 ```bash
 PYTHONPATH=. torchrun --standalone --nnodes=1 --nproc-per-node=1 \
     -m tzrec.train_eval \
-    --pipeline_config_path experiments/genrec/genrec.config
+    --pipeline_config_path genrec.config
 ```
-
-断点恢复使用相同配置并追加 `--continue_train`。恢复、评估和预测需要保留对应的基础 tokenizer 与骨干配置文件；码本大小、SID token 格式和基础词表应与训练时一致。
 
 独立评估：
 
@@ -231,25 +202,21 @@ PYTHONPATH=. torchrun --standalone --nnodes=1 --nproc-per-node=1 \
 
 ### 离线预测
 
-生成 SID 使用 [Checkpoint 预测](../usage/predict.md#%E9%A2%84%E6%B5%8Bcheckpoint)：
+生成 SID 使用 [Checkpoint 预测](../usage/predict.md)：
 
 ```bash
 PYTHONPATH=. torchrun --standalone --nnodes=1 --nproc-per-node=1 \
     -m tzrec.predict \
     --pipeline_config_path experiments/genrec/train/pipeline.config \
-    --predict_input_path 'data/genrec/predict/*.parquet' \
+    --predict_input_path 'data/genrec/eval/*.parquet' \
     --predict_output_path experiments/genrec/predict_result \
-    --reserved_columns user_id \
+    --reserved_columns sample_id \
     --output_columns generated_sids
 ```
 
 省略 `--checkpoint_path` 时使用 `model_dir` 下的最新 checkpoint。预测 batch 可以通过 `--batch_size` 调整；较大的 beam 宽度和历史长度会增加 KV cache 的显存占用。
 
-输出列 `generated_sids` 的每行形状为 `(num_return_sequences, 码本层数)`，各 SID 按 beam 累计得分从高到低排列。例如 `[[3, 5, 7], [8, 4, 12], ...]`。**输出是每层从 0 开始的编码**，应与最终 SID 映射表的 `codebook` 列对齐；若使用 `offset_codebook` 做关联，需先加回层偏移。
-
-解码每层只允许生成该层码本对应的 token，生成长度固定为码本层数，不依赖 EOS 停止。该约束保证每层编码合法，但不会检查完整 SID 是否存在于物品映射表；召回时应过滤无映射的 SID，并展开同一 SID 对应的物品列表。
-
-### 导出和服务
+### 模型导出
 
 ```bash
 PYTHONPATH=. QUANT_EMB=0 \
@@ -269,8 +236,6 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
 部署时需要支持 `GenRecForCausalLM`（`model_type: "genrec"`）的推理引擎，将前端产出的 Prompt 和投影向量送入 LM。`config.json.text_config` 保存骨干配置，`sid_space` 保存 `codebook`、`base_vocab_size` 和 `token_format`；配置了 manifest 时还会保存 `bundle_uuid`，供服务核对所使用的 SID 映射。
 
 `export_config.mixed_precision` 指定服务端加载 LM 的精度。当前前端导出仅支持 TorchScript，需关闭 `ENABLE_AOT`、`ENABLE_TRT` 和 `USE_RTP`；GenRec 的 HF 权重导出不支持 Dense EMA，启用 EMA 训练时须显式设置 `export_config.use_dense_ema: false`。量化及分布式 embedding 的通用参数参见 [导出](../usage/export.md)。
-
-仓库中的 [GenRec mock 配置](https://github.com/alibaba/TorchEasyRec/blob/master/tzrec/tests/configs/genrec_causal_lm_model_mock.config) 还提供了多个画像槽位共享投影、多成员序列投影和 INLINE 文本的组合示例。它的模型、词表和数据由集成测试准备，不能直接作为业务训练数据运行。
 
 ## 常见问题
 
