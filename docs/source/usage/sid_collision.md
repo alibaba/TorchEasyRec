@@ -48,7 +48,7 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
 
 - `greedy`：先按原 SID 键、再按Item处理顺序，为每个Item选择第一个仍有容量的候选末层码。
 - `iterative`：通过多轮分配选择候选末层码，SID优先匹配距离更接近的Item。
-- `uniform`：无视容量，在最后一层SID下进行均匀打散分配。原SID下的Item将尽可能保留。
+- `uniform`：在最后一层SID下对超容量Item进行均匀打散分配。空容量和低容量SID将优先被分配。
 
 `--rate_only` 计算统计并跳过产物写出，可用于比较不同策略。
 
