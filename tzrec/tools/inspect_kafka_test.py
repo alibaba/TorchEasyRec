@@ -20,7 +20,7 @@ import pyarrow as pa
 from parameterized import param, parameterized
 
 from tzrec.tools.inspect_kafka import _decode_message, _fetch_messages, inspect_kafka
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 _URI = "kafka://broker:9092/topic?group.id=g1"
 
@@ -53,7 +53,7 @@ def _message(value, offset, partition=0, ts_ms=1711929600000):
     return msg
 
 
-def _mock_consumer(values, low=0):
+def _mock_consumer(values, low=0, ts_ms=1711929600000):
     consumer = mock.MagicMock()
     consumer.get_watermark_offsets.return_value = (low, low + len(values))
     state = {}
@@ -65,7 +65,7 @@ def _mock_consumer(values, low=0):
         start = state["pos"]
         end = min(start + num, low + len(values))
         state["pos"] = end
-        return [_message(values[o - low], o) for o in range(start, end)]
+        return [_message(values[o - low], o, ts_ms=ts_ms) for o in range(start, end)]
 
     consumer.assign.side_effect = _assign
     consumer.consume.side_effect = _consume
@@ -78,7 +78,8 @@ class DecodeMessageTest(unittest.TestCase):
             param("single", num_batches=1, compression=None),
             param("multi", num_batches=2, compression=None),
             param("zstd", num_batches=1, compression="zstd"),
-        ]
+        ],
+        name_func=parameterized_name_func,
     )
     def test_ipc_stream(self, _name, num_batches, compression):
         batch = _batch().replace_schema_metadata({b"pandas": b"{}"})
@@ -113,7 +114,8 @@ class FetchMessagesTest(unittest.TestCase):
             param("clamp_low", offset=0, num_messages=1, expected=[10]),
             param("clamp_high", offset=100, num_messages=3, expected=[14]),
             param("clamp_count", offset=-2, num_messages=5, expected=[13, 14]),
-        ]
+        ],
+        name_func=parameterized_name_func,
     )
     def test_offset_resolution(self, _name, offset, num_messages, expected):
         consumer = _mock_consumer([b""] * 5, low=10)
@@ -129,6 +131,25 @@ class FetchMessagesTest(unittest.TestCase):
             self.assertEqual(_fetch_messages(_URI, 0, -1, 1), [])
         consumer.assign.assert_not_called()
 
+    def test_never_commits(self):
+        consumer = _mock_consumer([b""])
+        with mock.patch(
+            "tzrec.tools.inspect_kafka.Consumer", return_value=consumer
+        ) as consumer_cls:
+            _fetch_messages(_URI + "&enable.auto.commit=true", 0, -1, 1)
+        self.assertEqual(consumer_cls.call_args[0][0]["enable.auto.commit"], "false")
+
+    def test_message_error_raises(self):
+        consumer = _mock_consumer([b""])
+        bad = _message(b"", 0)
+        bad.error.return_value = "broker down"
+        consumer.consume.side_effect = None
+        consumer.consume.return_value = [bad]
+        with mock.patch("tzrec.tools.inspect_kafka.Consumer", return_value=consumer):
+            with self.assertRaisesRegex(RuntimeError, "broker down"):
+                _fetch_messages(_URI, 0, -1, 1)
+        consumer.close.assert_called_once()
+
 
 class InspectKafkaTest(unittest.TestCase):
     def setUp(self):
@@ -137,14 +158,17 @@ class InspectKafkaTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def _run(self, values, **kwargs):
-        consumer = _mock_consumer(values)
+    def _run(self, values, ts_ms=1711929600000, **kwargs):
+        consumer = _mock_consumer(values, ts_ms=ts_ms)
         out = io.StringIO()
         with (
-            mock.patch("tzrec.tools.inspect_kafka.Consumer", return_value=consumer),
+            mock.patch(
+                "tzrec.tools.inspect_kafka.Consumer", return_value=consumer
+            ) as consumer_cls,
             contextlib.redirect_stdout(out),
         ):
-            inspect_kafka(_URI, **kwargs)
+            inspect_kafka(_URI, num_messages=len(values), **kwargs)
+        self.consumer_cls = consumer_cls
         return out.getvalue()
 
     def test_ipc_stream(self):
@@ -164,6 +188,19 @@ class InspectKafkaTest(unittest.TestCase):
         self.assertIn('{"user_id": 0, "tags": ["a", "b"]}', output)
         self.assertIn("failed to decode message", self._run([value]))
 
+    def test_ipc_stream_with_input_fields_warns(self):
+        output = self._run([_ipc_stream([_batch()])], input_fields_str="user_id:INT64")
+        self.assertIn("embedded schema but input_fields is set", output)
+
+    def test_bad_messages_do_not_stop(self):
+        output = self._run(
+            [None, b"garbage", _ipc_stream([_batch()])], ts_ms=-1, offset=0
+        )
+        self.assertIn("offset=0 timestamp=-1 (N/A) size=0B", output)
+        self.assertEqual(output.count("failed to decode message"), 2)
+        self.assertIn("offset=2 timestamp=-1 (N/A) size=", output)
+        self.assertIn("format=ipc_stream batches=1 rows=3", output)
+
     def test_missing_columns(self):
         config_path = os.path.join(self.test_dir, "pipeline.config")
         with open(config_path, "w") as f:
@@ -174,7 +211,6 @@ data_config {
     dataset_type: KafkaDataset
     fg_mode: FG_DAG
     label_fields: "label"
-    input_fields_str: "user_id:INT64;tags:ARRAY<STRING>;item_id:INT64;label:INT64"
 }
 feature_configs {
     id_feature {
@@ -193,10 +229,11 @@ feature_configs {
 """
             )
         output = self._run([_ipc_stream([_batch()])], pipeline_config_path=config_path)
-        self.assertIn("embedded schema but data_config sets input_fields", output)
         self.assertIn(
             "columns required by the model but missing: ['item_id', 'label']", output
         )
+        # only the fetch consumer, no schema peek from building the dataset
+        self.consumer_cls.assert_called_once()
 
 
 if __name__ == "__main__":

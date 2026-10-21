@@ -17,7 +17,8 @@ from typing import Any, List, Optional, Set, Tuple
 import pyarrow as pa
 from confluent_kafka import Consumer, TopicPartition
 
-from tzrec.datasets.kafka_dataset import KafkaDataset, _parse_kafka_uri
+from tzrec.datasets.dataset import BaseDataset
+from tzrec.datasets.kafka_dataset import _parse_kafka_uri
 from tzrec.datasets.utils import FIELD_TYPE_TO_PA, get_input_fields_proto
 from tzrec.main import _create_features
 from tzrec.protos import data_pb2
@@ -74,6 +75,8 @@ def _fetch_messages(
         list: fetched confluent_kafka messages.
     """
     topic, config, _ = _parse_kafka_uri(input_path)
+    # never commit, the group.id may be shared with a training job
+    config["enable.auto.commit"] = "false"
     consumer = Consumer(config)
     try:
         low, high = consumer.get_watermark_offsets(
@@ -136,14 +139,14 @@ def inspect_kafka(
     """
     schema = None
     selected_cols: Optional[Set[str]] = None
-    config_has_input_fields = False
     if pipeline_config_path:
         pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
         data_config = pipeline_config.data_config
         schema = _parse_schema(data_config)
-        config_has_input_fields = schema is not None
         features = _create_features(list(pipeline_config.feature_configs), data_config)
-        dataset = KafkaDataset(data_config, features, input_path)
+        # BaseDataset selects the same columns as KafkaDataset without the
+        # KafkaReader peeking partition 0 for a schema.
+        dataset = BaseDataset(data_config, features, input_path)
         selected_cols = dataset._selected_input_names
     if input_fields_str:
         schema = _parse_schema(data_pb2.DataConfig(input_fields_str=input_fields_str))
@@ -160,7 +163,7 @@ def inspect_kafka(
             if ts_ms >= 0
             else "N/A"
         )
-        value = msg.value()
+        value = msg.value() or b""
         header = (
             f"=== partition={msg.partition()} offset={msg.offset()} "
             f"timestamp={ts_ms} ({ts_str}) size={len(value)}B"
@@ -177,10 +180,10 @@ def inspect_kafka(
                 "WARNING: KafkaDataset only reads the first record batch of a "
                 "message, the other batches are dropped."
             )
-        if fmt == "ipc_stream" and config_has_input_fields:
+        if fmt == "ipc_stream" and schema is not None:
             print(
-                "WARNING: message has an embedded schema but data_config sets "
-                "input_fields, KafkaDataset will decode it as schema-less."
+                "WARNING: message has an embedded schema but input_fields is set, "
+                "KafkaDataset will decode it as schema-less."
             )
         if not batches:
             print()

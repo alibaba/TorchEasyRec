@@ -588,7 +588,7 @@ ValueError: kafka message schema is incompatible with the reader schema: missing
 ```bash
 python -m tzrec.tools.inspect_kafka \
     --input_path 'kafka://broker:9092/topic?group.id=consumer_group' \
-    --partition 0 --offset -1 --num_messages 1 --num_rows 5 \
+    --partition 0 --offset -1 --num_messages 1 --num_rows 2 \
     --pipeline_config_path pipeline.config
 ```
 
@@ -616,4 +616,4 @@ rows (first 2 of 3):
 ```
 
 - format为`ipc_stream`表示带schema的格式，`schema_less`表示schema-less格式
-- 当单条消息包含多个record batch，或消息带schema但`data_config`配置了`input_fields`时，会打印WARNING
+- 当单条消息包含多个record batch，或消息带schema但设置了`input_fields`（`data_config`或`--input_fields_str`）时，会打印WARNING
