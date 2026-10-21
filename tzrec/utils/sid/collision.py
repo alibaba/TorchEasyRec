@@ -15,9 +15,11 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Optional
+from typing import Callable, Optional, Union
 
 import numpy as np
+
+CandidateLastCodes = Union[np.ndarray, Callable[[], np.ndarray]]
 
 _INT64_MAX = int(np.iinfo(np.int64).max)
 _MASK64 = (1 << 64) - 1
@@ -80,8 +82,8 @@ class CollisionResolutionConfig:
 
     def offset_codes(self, codes: np.ndarray) -> np.ndarray:
         """Shift each layer's codes into one contiguous vocabulary."""
-        return np.asarray(codes).astype(np.int64, copy=False) + np.cumsum(
-            (0, *self.codebook[:-1]), dtype=np.int64
+        return np.asarray(codes).astype(np.int32, copy=False) + np.cumsum(
+            (0, *self.codebook[:-1]), dtype=np.int32
         )
 
 
@@ -136,6 +138,25 @@ def get_same_value_start_indices(sorted_values: np.ndarray) -> np.ndarray:
             np.asarray([0], dtype=np.int64),
             np.flatnonzero(sorted_values[1:] != sorted_values[:-1]) + 1,
         )
+    )
+
+
+def get_same_value_positions(sorted_values: np.ndarray) -> np.ndarray:
+    """Return each element's position within consecutive equal values.
+
+    Args:
+        sorted_values: Nonempty sorted one-dimensional array.
+
+    Returns:
+        An int64 array of positions starting at zero for each distinct value.
+
+    Examples:
+        >>> get_same_value_positions(np.array([7, 7, 7, 9, 9, 12]))
+        array([0, 1, 2, 0, 1, 0])
+    """
+    starts = get_same_value_start_indices(sorted_values)
+    return np.arange(sorted_values.shape[0], dtype=np.int64) - np.repeat(
+        starts, np.diff(np.append(starts, sorted_values.shape[0]))
     )
 
 
@@ -200,7 +221,7 @@ class CollisionPlan:
     matrix.
 
     Args:
-        origin_last_codes: Last-layer code of every input row, int64 shape
+        origin_last_codes: Last-layer code of every input row, int32 shape
             ``(N,)`` in original row order.
         origin_sid_key_indices: Position of each input row's original SID key
             in ``sid_keys``, int64 shape ``(N,)`` in original row order.
@@ -265,7 +286,8 @@ class CollisionResolutionStats:
         final_colliding_sid_count: SIDs still over capacity after relocation.
         relocated_count: Overflow rows whose final slot is within capacity.
         unresolved_count: Overflow rows whose final slot exceeds capacity. They
-            keep their origin SID.
+            keep their origin SID, except under the uniform strategy, which may
+            still move them.
         max_final_items_per_sid: Largest final item count per SID within this
             run's affected SIDs, including published items.
     """
@@ -332,11 +354,15 @@ class CollisionResolver(ABC):
             )
         self._progress_interval = progress_interval
 
+    def requires_candidates(self) -> bool:
+        """Return whether this strategy needs candidates to resolve overflow."""
+        return True
+
     @abstractmethod
     def resolve(
         self,
         plan: CollisionPlan,
-        candidate_last_codes: Optional[np.ndarray] = None,
+        candidate_last_codes: Optional[CandidateLastCodes] = None,
         collect_sid_metadata: bool = True,
     ) -> CollisionResolutionResult:
         """Resolve overflow rows while preserving every input item.
@@ -345,7 +371,7 @@ class CollisionResolver(ABC):
             plan: Grouping and overflow plan from
                 :func:`prepare_collision_plan`.
             candidate_last_codes: Optional strategy-specific candidate last
-                codes.
+                codes, or a loader that creates them inside the resolver.
             collect_sid_metadata: Whether to retain final SID metadata required
                 by :func:`build_resolved_sid_item_row_index`.
 
@@ -382,17 +408,17 @@ class CollisionResolver(ABC):
         return initial_occupancy, result
 
     def _validate_candidate_last_codes(
-        self, plan: CollisionPlan, candidate_last_codes: Optional[np.ndarray]
+        self, plan: CollisionPlan, candidate_last_codes: Optional[CandidateLastCodes]
     ) -> np.ndarray:
         """Validate and normalize candidates aligned with overflow rows.
 
         Args:
             plan: Collision plan defining overflow rows and codebook bounds.
-            candidate_last_codes: Ordered candidate matrix. It
+            candidate_last_codes: Ordered candidate matrix or its loader. It
                 may be omitted only when the plan has no overflow rows.
 
         Returns:
-            The candidate matrix as an int64 NumPy array.
+            The candidate matrix as an int32 NumPy array.
 
         Raises:
             TypeError: If candidate codes do not use an integer dtype.
@@ -400,13 +426,15 @@ class CollisionResolver(ABC):
                 not a row-aligned two-dimensional matrix, or contain
                 out-of-range last-layer indices.
         """
+        if callable(candidate_last_codes):
+            candidate_last_codes = candidate_last_codes()
         if candidate_last_codes is None:
             if plan.overflow_rows.size:
                 raise ValueError(
                     "candidate_last_codes are required when the collision plan "
                     "has overflow rows."
                 )
-            candidate_last_codes = np.empty((0, 0), dtype=np.int64)
+            candidate_last_codes = np.empty((0, 0), dtype=np.int32)
         candidate_last_codes = np.asarray(candidate_last_codes)
         if candidate_last_codes.ndim != 2:
             raise ValueError(
@@ -432,7 +460,7 @@ class CollisionResolver(ABC):
                 f"candidate_last_codes must be in [0, {last_codebook_size}), "
                 "got values outside that range."
             )
-        return candidate_last_codes.astype(np.int64, copy=False)
+        return candidate_last_codes.astype(np.int32, copy=False)
 
     @staticmethod
     def _initial_occupancy(
@@ -681,7 +709,7 @@ def prepare_collision_plan(
     del sorted_rows, input_item_positions
 
     return CollisionPlan(
-        origin_last_codes=codes[:, -1].astype(np.int64, copy=False),
+        origin_last_codes=codes[:, -1].astype(np.int32, copy=False),
         origin_sid_key_indices=origin_sid_key_indices,
         initial_slot_indices=initial_slot_indices,
         sid_keys=sid_keys,
