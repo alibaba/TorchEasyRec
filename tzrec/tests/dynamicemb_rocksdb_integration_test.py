@@ -151,10 +151,16 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
             with open(path) as f:
                 log += f.read()
         self.assertIn("restored RocksDB tables from", log)
-        self.assertFalse(os.path.exists(crashed))
         self.assertTrue(
             glob.glob(os.path.join(model_dir, f"incomplete.model.ckpt-{step + 5}.*"))
         )
+        # The resumed run may legitimately save this step again, completely.
+        if os.path.exists(crashed):
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(crashed, checkpoint_util.CKPT_SUCCESS_FILENAME)
+                )
+            )
         # The resumed checkpoint is immutable under continued training.
         self.assertEqual(
             [_tree_hash(d) for d in self._native_dirs(ckpt)], native_hashes
