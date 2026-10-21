@@ -23,8 +23,8 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.optim import optimizers, rowwise_adagrad
 
 from tzrec.optim.optimizer import FTRL, has_fbgemm_ftrl
-from tzrec.protos import feature_pb2
-from tzrec.utils import dynamicemb_util
+from tzrec.protos import feature_pb2, train_pb2
+from tzrec.utils import dynamicemb_util, rocksdb_util
 from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
 
 
@@ -433,6 +433,122 @@ class AdmissionStrategyTest(unittest.TestCase):
         for base, prob, freq in zip(no_admission, probabilistic, frequency):
             self.assertEqual(prob.hbm, base.hbm)
             self.assertEqual(freq.hbm - base.hbm, counter_hbm)
+
+
+def _has_rocksdb() -> bool:
+    try:
+        import tzrec_rocksdb  # noqa: F401
+    except ImportError:
+        return False
+    return dynamicemb_util.has_dynamicemb
+
+
+@unittest.skipUnless(_has_rocksdb(), "tzrec_rocksdb is not installed; skipping.")
+@mark_ci_scope("gpu")
+class RocksDBTableTest(unittest.TestCase):
+    """Constraint building and storage estimates of `rocksdb {}` tables."""
+
+    NUM_EMBEDDINGS = 1 << 20
+    EMBEDDING_DIM = 16
+
+    def setUp(self):
+        rocksdb_util.set_rocksdb_config(
+            train_pb2.RocksDBConfig(
+                local_path="/tmp/unused", gpu_cache_value_bytes_per_rank=1 << 20
+            )
+        )
+
+    def tearDown(self):
+        rocksdb_util.set_rocksdb_config(None)
+        dynamicemb_util.set_auto_retain_evicted_keys(False)
+
+    def _options(self, **kwargs):
+        cfg = feature_pb2.DynamicEmbedding(
+            max_capacity=self.NUM_EMBEDDINGS, score_strategy="NO_EVICTION", **kwargs
+        )
+        cfg.rocksdb.SetInParent()
+        return dynamicemb_util.build_dynamicemb_constraints(
+            cfg,
+            EmbeddingBagConfig(
+                name="dyn_table",
+                num_embeddings=self.NUM_EMBEDDINGS,
+                embedding_dim=self.EMBEDDING_DIM,
+                feature_names=["user_id"],
+            ),
+        ).dynamicemb_options
+
+    def test_factory_attached_without_retention(self):
+        dynamicemb_util.set_auto_retain_evicted_keys(True)
+        options = self._options()
+        self.assertTrue(rocksdb_util.is_rocksdb_options(options))
+        self.assertEqual(options.external_storage.table_namespace, "dyn_table")
+        from dynamicemb.dynamicemb_config import EvictedItemMode
+
+        self.assertNotIn(EvictedItemMode.RETAIN_KEY, options.evicted_item_mode)
+
+    @parameterized.expand(
+        [
+            param("timestamp_strategy", score_strategy="TIMESTAMP"),
+            param("cache_load_factor", cache_load_factor=0.5),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_invalid_config_rejected(self, _name, **kwargs):
+        cfg = feature_pb2.DynamicEmbedding(
+            max_capacity=self.NUM_EMBEDDINGS, score_strategy="NO_EVICTION"
+        )
+        cfg.MergeFrom(feature_pb2.DynamicEmbedding(**kwargs))
+        cfg.rocksdb.SetInParent()
+        with self.assertRaises(ValueError):
+            dynamicemb_util.build_dynamicemb_constraints(
+                cfg,
+                EmbeddingBagConfig(
+                    name="t",
+                    num_embeddings=10,
+                    embedding_dim=self.EMBEDDING_DIM,
+                    feature_names=["f"],
+                ),
+            )
+
+    def test_missing_train_config_rejected(self):
+        rocksdb_util.set_rocksdb_config(None)
+        with self.assertRaises(ValueError):
+            self._options()
+
+    @parameterized.expand([(0.0,), (0.01,)])
+    def test_only_cache_rows_count(self, ratio):
+        rows = self.NUM_EMBEDDINGS // 2
+        storages = dynamicemb_util.dynamicemb_calculate_shard_storages(
+            sharder_data=None,
+            sharding_type=ShardingType.ROW_WISE.value,
+            tensor=torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM),
+            compute_device="cuda",
+            compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
+            shard_sizes=[[rows, self.EMBEDDING_DIM]] * 2,
+            batch_sizes=[16],
+            world_size=2,
+            local_world_size=2,
+            input_lengths=[1.0],
+            num_poolings=[1.0],
+            caching_ratio=ratio,
+            is_pooled=True,
+            input_data_type_size=4,
+            output_data_type_size=4,
+            dynamicemb_options=self._options(),
+        )
+        full = dynamicemb_util._calculate_dynamicemb_table_storage_specific_size(
+            [rows, self.EMBEDDING_DIM], 4, cache_ratio=1.0, is_hbm=True
+        )
+        for storage in storages:
+            self.assertEqual(storage.ddr, 0)
+            if ratio == 0.0:
+                self.assertLess(storage.hbm, 1 << 20)
+            else:
+                cache_rows = rocksdb_util.cache_rows(rows, ratio)
+                self.assertGreaterEqual(
+                    storage.hbm, cache_rows * self.EMBEDDING_DIM * 4
+                )
+                self.assertLess(storage.hbm, full * ratio * 2)
 
 
 if __name__ == "__main__":

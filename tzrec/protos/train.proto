@@ -156,6 +156,31 @@ message DeltaEmbeddingDumpConfig {
     optional uint32 sparse_dump_interval_minutes = 10;
 }
 
+// Rank-wide budgets of the RocksDB store behind `dynamicemb { rocksdb {} }`
+// tables. Each rank opens one database under local_path that serves all of
+// its RocksDB tables; the byte budgets are per rank, counted once.
+message RocksDBConfig {
+    // root directory of the rank-local databases and native checkpoints. Use
+    // a dedicated local or high-IOPS persistent filesystem, not shared tmpfs.
+    required string local_path = 1;
+    // GPU cache budget for embedding + optimizer-state values per rank, split
+    // across RocksDB tables in proportion to their rank-local value bytes.
+    // 0 disables the GPU cache (every lookup reads RocksDB). Must be smaller
+    // than the total rank-local value bytes of the RocksDB tables.
+    optional uint64 gpu_cache_value_bytes_per_rank = 2 [default = 0];
+    // RocksDB block cache per rank.
+    optional uint64 block_cache_bytes_per_rank = 3 [default = 8589934592];
+    // RocksDB memtable budget per rank.
+    optional uint64 write_buffer_bytes_per_rank = 4 [default = 1073741824];
+    // pinned host staging buffer per storage call; larger batches are chunked.
+    optional uint64 staging_buffer_bytes_per_rank = 5 [default = 268435456];
+    // native threads one batched lookup is split across (hides filesystem
+    // read latency; raise for network filesystems).
+    optional uint32 io_threads = 6 [default = 16];
+    // RocksDB flush and compaction threads per rank.
+    optional uint32 max_background_jobs = 7 [default = 8];
+}
+
 message TrainConfig {
     // embedding part optimizer
     required SparseOptimizer sparse_optimizer = 1;
@@ -214,5 +239,7 @@ message TrainConfig {
     optional DeltaEmbeddingDumpConfig delta_embedding_dump_config = 24;
     // profiler schedule and collection options, used when is_profiling=true
     optional ProfilerConfig profiler_config = 25;
+    // RocksDB store for dynamicemb tables configured with `rocksdb {}`.
+    optional RocksDBConfig rocksdb_config = 26;
     // TBD: qcomm config
 }

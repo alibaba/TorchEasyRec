@@ -85,7 +85,7 @@ from torchrec.modules.embedding_modules import (
 )
 
 from tzrec.protos import feature_pb2
-from tzrec.utils import env_util
+from tzrec.utils import env_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -107,6 +107,16 @@ def create_planner(
         topo_kwargs["hbm_cap"] = torch.cuda.get_device_properties(device).total_memory
 
     ddr_cap_per_rank = int(float(psutil.virtual_memory().total) / local_world_size)
+    # RocksDB block cache, memtables and staging are shared by all of a rank's
+    # RocksDB tables, so they are reserved once here rather than per table.
+    rocksdb_reserve = rocksdb_util.host_reserve_bytes()
+    if rocksdb_reserve > 0:
+        if rocksdb_reserve >= ddr_cap_per_rank:
+            raise ValueError(
+                f"rocksdb_config host budgets ({rocksdb_reserve} bytes) exceed the "
+                f"host memory per rank ({ddr_cap_per_rank} bytes)."
+            )
+        ddr_cap_per_rank -= rocksdb_reserve
     topo_kwargs["ddr_cap"] = ddr_cap_per_rank
     if "INTRA_NODE_BANDWIDTH" in os.environ:
         topo_kwargs["intra_host_bw"] = float(os.environ["INTRA_NODE_BANDWIDTH"])
@@ -897,6 +907,12 @@ def _emit_dynamicemb_variants(
     ``dynamicemb_options`` instance so per-option ``caching`` mutations do
     not bleed across variants.
     """
+    if rocksdb_util.is_rocksdb_options(
+        base_option.dynamicemb_options
+    ):  # pyre-ignore [16]
+        # Placement is fixed (CACHING_PS or HOST_PS); the shared cache ratio is
+        # assigned once all tables are known, see _pin_rocksdb_cache_ratio.
+        return [copy.deepcopy(base_option)]
     if base_option.cache_params is None:
         load_factors = [(i + 1) / 10 for i in range(10)]
         stats = None
@@ -912,6 +928,31 @@ def _emit_dynamicemb_variants(
             opt.dynamicemb_options.caching = caching_mode  # pyre-ignore [16]
             variants.append(opt)
     return variants
+
+
+def _pin_rocksdb_cache_ratio(sharding_options: List[ShardingOption]) -> None:
+    """Give every RocksDB table the rank-wide GPU cache ratio.
+
+    A positive ratio selects DynamicEmb's CACHING_PS layout and zero its
+    HOST_PS layout; every RocksDB table of a rank gets the same ratio, so the
+    budget is split in proportion to each table's rank-local value bytes.
+    """
+    from tzrec.utils.dynamicemb_util import rocksdb_table_value_bytes
+
+    options = [
+        o
+        for o in sharding_options
+        if getattr(o, "use_dynamicemb", False)
+        and rocksdb_util.is_rocksdb_options(o.dynamicemb_options)  # pyre-ignore [16]
+    ]
+    if not options:
+        return
+    ratio = rocksdb_util.cache_ratio(
+        [rocksdb_table_value_bytes(o.shards[0].size, o.tensor) for o in options]
+    )
+    for o in options:
+        o.cache_params = CacheParams(load_factor=ratio)
+        o.dynamicemb_options.caching = ratio > 0  # pyre-ignore [16]
 
 
 class EmbeddingEnumerator(_EmbeddingEnumerator):
@@ -1111,6 +1152,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
 
                 sharding_options.extend(sharding_options_per_table)
 
+        _pin_rocksdb_cache_ratio(sharding_options)
         self.populate_estimates(sharding_options)
 
         return sharding_options
