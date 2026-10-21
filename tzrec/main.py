@@ -451,6 +451,15 @@ def _train_and_evaluate(
                 "checkpoint, no epochs left to train."
             )
         return
+    if use_step and restore_from_model_dir and skip_steps >= train_config.num_steps - 1:
+        # nothing left to train; the final save would rewrite the restored
+        # model.ckpt-{skip_steps} in place.
+        if is_local_rank_zero:
+            logger.warning(
+                f"restored checkpoint at step {skip_steps} already reaches "
+                f"num_steps={train_config.num_steps}, no steps left to train."
+            )
+        return
     epoch_iter = (
         range(epochs_completed, train_config.num_epochs)
         if use_epoch
