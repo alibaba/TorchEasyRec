@@ -568,12 +568,20 @@ ValueError: Expected more than 1 value per channel when training, got input size
 **报错信息：**
 
 ```
+AssertionError: feature <xxx> has no input: xxx
+```
+
+或
+
+```
 ValueError: kafka message schema is incompatible with the reader schema: missing column(s) [...]
 ```
 
-或训练中报找不到某个输入列。
+**原因：** Kafka消息中的列与模型需要的列（特征输入、label、sample_weight等）不一致：
 
-**原因：** Kafka消息中的列与模型需要的列（特征输入、label、sample_weight等）不一致，常见于上游新增/删除/改名列、序列化格式与`data_config`配置不匹配（带schema的消息却配置了`input_fields`，或反之），或单条消息包含多个record batch（只有第一个会被读取）。
+- 使用带schema的格式（未配置`input_fields`）时，KafkaDataset在启动时读取分区0的最新一条消息推断schema。如果这条消息缺少模型需要的列，这些列不会被读取，训练读到第一个batch时FG报`has no input`。常见于上游在某一batch内某列全部为空时不写该列
+- 启动时推断的schema包含这些列，但之后的消息缺少，或列类型发生变化时，报`missing column(s)`或`changed column type(s)`
+- 序列化格式与`data_config`配置不匹配（带schema的消息却配置了`input_fields`，或反之），或单条消息包含多个record batch（只有第一个会被读取）
 
 **解决方法：** 使用如下工具反序列化消息，查看消息的实际schema和数据：
 
