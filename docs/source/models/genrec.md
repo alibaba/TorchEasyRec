@@ -10,7 +10,7 @@ GenRec 将 `prompt_config` 用于模板、槽位和 SID 空间配置，`model_co
 
 ## 配置说明
 
-下面展示组合 SID 历史和物品 tag 的关键配置，字段与样本说明见[数据](#genrec-sample-data)。
+下面展示组合 SID 历史和物品 tag 的关键配置，字段与样本说明见[数据说明](#genrec-sample-data)。
 
 ```
 feature_configs {
@@ -132,13 +132,13 @@ model_config {
 
 生成 SID 的层数与码本层数一致。召回时需查询 SID 到物品的映射表，过滤没有对应物品的 SID，并展开同一 SID 对应的物品列表。
 
-## 示例
+## 运行示例
 
-环境准备方式同 [local_tutorial](../quick_start/local_tutorial.md)。以下命令均在配置好项目依赖的 Docker 环境中、仓库根目录下执行；从源码运行时设置 `PYTHONPATH=.`。示例使用单机单进程，多卡训练可调整 `--nproc-per-node`。
+环境准备方式同 [local_tutorial](../quick_start/local_tutorial.md)。以下命令均在配置好项目依赖的 Docker 环境中、仓库根目录下执行。示例使用单机多进程，实际运行配置可参考 [DLC 多机多卡运行说明](../quick_start/dlc_tutorial.md) 调整。
 
 (genrec-sample-data)=
 
-### 数据
+### 数据说明
 
 #### SID 编码
 
@@ -155,8 +155,8 @@ model_config {
 
 示例数据使用 Parquet 格式：
 
-- 训练数据：`genrec_train.parquet`（1800 行）。
-- 评估数据：`genrec_eval.parquet`（200 行）。
+- 训练数据：[genrec_train.parquet](https://tzrec.oss-cn-beijing.aliyuncs.com/data/models/genrec_train.parquet)（1800 行）。
+- 评估数据：[genrec_eval.parquet](https://tzrec.oss-cn-beijing.aliyuncs.com/data/models/genrec_eval.parquet)（200 行）。
 
 一行对应一条行为历史和一个目标物品：
 
@@ -171,8 +171,10 @@ model_config {
 
 ### 训练和评估
 
+完整示例配置：[genrec.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/genrec.config)。
+
 ```bash
-PYTHONPATH=. torchrun --standalone --nnodes=1 --nproc-per-node=1 \
+torchrun --standalone --nnodes=1 --nproc-per-node=2 \
     -m tzrec.train_eval \
     --pipeline_config_path genrec.config
 ```
@@ -180,7 +182,7 @@ PYTHONPATH=. torchrun --standalone --nnodes=1 --nproc-per-node=1 \
 独立评估：
 
 ```bash
-PYTHONPATH=. torchrun --standalone --nnodes=1 --nproc-per-node=1 \
+torchrun --standalone --nnodes=1 --nproc-per-node=2 \
     -m tzrec.eval \
     --pipeline_config_path experiments/genrec/train/pipeline.config
 ```
@@ -189,10 +191,8 @@ PYTHONPATH=. torchrun --standalone --nnodes=1 --nproc-per-node=1 \
 
 ### 离线预测
 
-生成 SID 使用 [Checkpoint 预测](../usage/predict.md)：
-
 ```bash
-PYTHONPATH=. torchrun --standalone --nnodes=1 --nproc-per-node=1 \
+torchrun --standalone --nnodes=1 --nproc-per-node=2 \
     -m tzrec.predict \
     --pipeline_config_path experiments/genrec/train/pipeline.config \
     --predict_input_path 'data/genrec/eval/*.parquet' \
@@ -201,13 +201,11 @@ PYTHONPATH=. torchrun --standalone --nnodes=1 --nproc-per-node=1 \
     --output_columns generated_sids
 ```
 
-省略 `--checkpoint_path` 时使用 `model_dir` 下的最新 checkpoint。预测 batch 可以通过 `--batch_size` 调整；较大的 beam 宽度或较长的历史序列会增加显存占用。
-
 ### 模型导出
 
 ```bash
-PYTHONPATH=. QUANT_EMB=0 \
-torchrun --standalone --nnodes=1 --nproc-per-node=1 \
+QUANT_EMB=0 \
+torchrun --standalone --nnodes=1 --nproc-per-node=2 \
     -m tzrec.export \
     --pipeline_config_path experiments/genrec/train/pipeline.config \
     --export_dir experiments/genrec/export
