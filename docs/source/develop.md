@@ -70,7 +70,7 @@ bash scripts/build_wheel.sh nightly
 bash scripts/build_wheel.sh release
 ```
 
-构建完成后脚本会输出 wheel 的绝对路径（`wheel path: ...`），`nightly-oss` 模式还会输出上传后的下载地址（`wheel url: ...`）。安装构建好的 wheel 并指定设备依赖：
+构建完成后脚本会输出 wheel 的绝对路径（`wheel path: ...`）。
 
 ```bash
 # WHEEL_PATH 为脚本输出的 wheel 绝对路径，[cu130] 可替换为 cpu、cu126、ppu 等
