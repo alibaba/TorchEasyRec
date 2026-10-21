@@ -46,9 +46,9 @@ PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
 
 省略 `--strategy` 时默认使用 `greedy`。
 
-- `greedy`：先按原 SID 键、再按物品哈希的确定性顺序处理溢出物品，为每个物品选择第一个仍有容量的候选末层码。
-- `iterative`：通过多轮分配选择候选末层码，优先匹配更靠前的候选；候选耗尽时保留原 SID，未解决数量可能多于 `greedy`。
-- `uniform`：无需模型候选，将溢出物品分配到同一前缀内负载最小的末层码；前缀总容量不足时继续均匀分配，超过 SID 容量的物品计为未解决。
+- `greedy`：先按原 SID 键、再按Item处理顺序，为每个Item选择第一个仍有容量的候选末层码。
+- `iterative`：通过多轮分配选择候选末层码，SID优先匹配距离更接近的Item。
+- `uniform`：无视容量，在最后一层SID下进行均匀打散分配。原SID下的Item将尽可能保留。
 
 `--rate_only` 计算统计并跳过产物写出，可用于比较不同策略。
 
