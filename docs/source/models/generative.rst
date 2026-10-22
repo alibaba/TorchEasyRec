@@ -8,3 +8,4 @@
    dlrm_hstu_onerank
    ultra_hstu
    hstu_match
+   genrec

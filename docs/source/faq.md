@@ -617,3 +617,34 @@ rows (first 2 of 3):
 
 - format为`ipc_stream`表示带schema的格式，`schema_less`表示schema-less格式
 - 当单条消息包含多个record batch，或消息带schema但设置了`input_fields`（`data_config`或`--input_fields_str`）时，会打印WARNING
+
+______________________________________________________________________
+
+**Q23: GenRec 报错 SID tokens are already in the base tokenizer**
+
+**报错信息：**
+
+```
+SID tokens are already in the base tokenizer
+```
+
+**原因：** `prompt_config.tokenizer_path` 指定的 tokenizer 中已包含与 `sid_space.token_format` 重名的 SID token。`tokenizer_path` 需使用骨干模型配套的基础 tokenizer 文件，出现此错误可能使用了 GenRec 导出的 tokenizer，也可能是 SID token 格式与骨干词表中的已有 token 冲突。
+
+**解决方法：**
+
+- 若使用了 GenRec 导出的 tokenizer，改为 `hf_model_name_or_path` 对应骨干模型的基础 tokenizer。
+- 若骨干模型的基础 tokenizer 中已有同名 token，调整 `sid_space.token_format`，保留 `{i}` 占位符，并避免与已有 token 重名。
+
+______________________________________________________________________
+
+**Q24: GenRec 预测 SID 每层取值合法，但召回为空或物品错位**
+
+**问题描述：** `generated_sids` 的编码没有越界，但无法关联到物品，或关联出的物品与预期不符。
+
+**原因：** 输入、输出使用的 SID 编码格式或物品映射版本不一致。不同版本的映射可能使用相同的码本大小，因此取值范围合法也可能关联错误。
+
+**解决方法：**
+
+1. 检查历史 SID 和目标标签是否直接使用最终物品映射表的 `offset_codebook`，无需再次添加层偏移或 LM 词表偏移。
+1. `generated_sids` 输出每层从 0 开始的原始编码，非偏移后编码，检查sid检索时是否误用了偏移后编码。
+1. 历史、标签、物品映射及配置中的码本应对应同一代 SID 结果。配置了 `sid_space.manifest_path` 时，使用该代 [SID 冲突后处理工具](usage/sid_collision.md) 产出的完整 manifest，并核对其中的 `codebook` 和 `bundle_uuid`。
