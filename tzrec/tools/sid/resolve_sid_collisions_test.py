@@ -10,9 +10,10 @@
 # limitations under the License.
 
 import os
+import shlex
 import shutil
+import sys
 import unittest
-from collections import Counter
 from unittest import mock
 
 import numpy as np
@@ -25,7 +26,9 @@ from tzrec.tools.sid.resolve_sid_collisions import (
     CollisionResolutionRunner,
     ResolveSidCollisionsConfig,
 )
+from tzrec.utils.misc_util import run_cmd
 from tzrec.utils.sid import bundle
+from tzrec.utils.sid.collision import CollisionResolutionStats, prepare_collision_plan
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 ITEM_TO_SID = bundle.ITEM_TO_SID_ARTIFACT
@@ -217,8 +220,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             candidate_codes_field="candidate_codes",
             codebook=(8, 8),
             max_items_per_codebook=2,
-            strategy="candidate",
-            random_num_candidates=64,
+            strategy="greedy",
             rate_only=False,
             odps_data_quota_name="pay-as-you-go",
         )
@@ -328,7 +330,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             )
 
     @parameterized.expand(
-        [("candidate", "candidate", 1, 1)],
+        [("greedy", "greedy", 1, 1), ("iterative", "iterative", 2, 0)],
         name_func=parameterized_name_func,
     )
     def test_strategy_selects_candidate_arbitration(
@@ -510,10 +512,29 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(by_id[1], [0, 2])
         self.assertEqual(by_id[3], [0, 3])
 
-    def test_candidates_decode_only_matching_ids(self) -> None:
+    @parameterized.expand(
+        [("single_process", 1, 2), ("multiple_ranks", 2, 3)],
+        name_func=parameterized_name_func,
+    )
+    def test_candidates_decode_only_matching_ids_in_rank(
+        self, _name, world_size, row_count
+    ) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
-        _parquet(inp, [7, 99], [[0, 0], [3, 0]], [[[0, 1]], [[3, 3]]])
-        runner = self._runner(inp, os.path.join(self.test_dir, "out"), codebook=(4, 4))
+        _parquet(
+            inp,
+            [7, 99, 7][:row_count],
+            [[0, 0], [3, 0], [3, 0]][:row_count],
+            [[[0, 1]], [[3, 3]], [[3, 2]]][:row_count],
+        )
+        with mock.patch.multiple(
+            resolve_sid_collisions.dist,
+            is_initialized=mock.Mock(return_value=world_size > 1),
+            get_rank=mock.Mock(return_value=0),
+            get_world_size=mock.Mock(return_value=world_size),
+        ):
+            runner = self._runner(
+                inp, os.path.join(self.test_dir, "out"), codebook=(4, 4)
+            )
         with mock.patch.object(
             runner, "_candidate_last_matrix", wraps=runner._candidate_last_matrix
         ) as decode_candidates:
@@ -772,7 +793,9 @@ class ResolveSidCollisionsTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("candidate", "candidate"),
+            ("greedy", "greedy"),
+            ("iterative", "iterative"),
+            ("uniform", "uniform"),
         ],
         name_func=parameterized_name_func,
     )
@@ -957,60 +980,183 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(stats.total_items, 1)
         self.assertEqual(os.listdir(out), ["v1"])
 
-    def test_multi_process_launch_rejected(self) -> None:
+    def test_partition_does_not_drop_invalid_codes(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, list(range(3)), [[0, 0]] * 3, [[[0, 1]]] * 3)
-        with (
-            mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}),
-            self.assertRaisesRegex(RuntimeError, "single-process"),
-        ):
-            self._run(inp, out)
+        codes = np.array([[-1, 0, 0], [0, 0, 0], [4, 0, 0]])
+        _parquet(inp, [0, 1, 2], codes.tolist())
+        for rank in range(2):
+            with mock.patch.multiple(
+                resolve_sid_collisions.dist,
+                is_initialized=mock.Mock(return_value=True),
+                get_rank=mock.Mock(return_value=rank),
+                get_world_size=mock.Mock(return_value=2),
+            ):
+                runner = self._runner(
+                    inp, os.path.join(self.test_dir, "out"), codebook=(4, 4, 4)
+                )
+            owned = codes[runner._get_prefix_mask(codes)]
+            with self.assertRaisesRegex(ValueError, "out-of-range"):
+                prepare_collision_plan(
+                    np.arange(len(owned)), owned, runner._config.collision_config
+                )
 
-    def test_random_reassigns_within_prefix(self) -> None:
-        stats, out = self._resolve(
-            list(range(5)), [[0, 0]] * 5, max_items_per_codebook=2, strategy="random"
-        )
-        self.assertEqual(stats.relocated_count, 3)
-        d = self._read(out, ITEM_TO_SID)
-        self.assertTrue(all(cb[0] == 0 for cb in d["codebook"]))
-        self.assertLessEqual(max(Counter(map(tuple, d["codebook"])).values()), 2)
-        self._assert_item_to_sid_matches_sid_to_items(out)
-
-    def test_single_layer_sid(self) -> None:
-        stats, out = self._resolve(
-            list(range(4)),
-            [[0]] * 4,
-            max_items_per_codebook=1,
-            strategy="random",
-            codebook=(16,),
-        )
-        self.assertEqual(stats.relocated_count, 3)
-        d = self._read(out, ITEM_TO_SID)
-        self.assertEqual(len({tuple(cb) for cb in d["codebook"]}), 4)
-
-    def test_random_tolerates_duplicate_item_ids(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(
+    def _torchrun(self, inp, out, codebook, strategy, ranks=2, extra=()):
+        command = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc_per_node={ranks}",
+            "-m",
+            "tzrec.tools.sid.resolve_sid_collisions",
+            "--input_path",
             inp,
-            ["b", "a", "a"],
-            [[0, 0]] * 3,
-            item_id_type=pa.string(),
+            "--output_path",
+            out,
+            "--generation",
+            "v1",
+            "--codebook",
+            codebook,
+            "--strategy",
+            strategy,
+            "--max_items_per_codebook",
+            "1",
+            "--batch_size",
+            "2",
+            *extra,
+        ]
+        log = os.path.join(self.test_dir, "torchrun.log")
+        succeeded = run_cmd(shlex.join(command), log, timeout=180)
+        with open(log) as handle:
+            output = handle.read()
+        self.assertTrue(succeeded, output)
+        return output
+
+    def _assert_distributed_matches_single(self, single, distributed, generation):
+        expected_manifest = self._manifest(single, generation)
+        actual_manifest = self._manifest(distributed, generation)
+        for artifact in expected_manifest.artifacts:
+            key = "item_id" if artifact in bundle.ITEM_TO_SID_ARTIFACTS else "codebook"
+            expected = parquet.read_table(
+                bundle.artifact_location(single, generation, artifact)
+            ).to_pylist()
+            actual = parquet.read_table(
+                bundle.artifact_location(distributed, generation, artifact)
+            ).to_pylist()
+            self.assertEqual(
+                sorted(actual, key=lambda row: row[key]),
+                sorted(expected, key=lambda row: row[key]),
+            )
+        self.assertEqual(
+            {name: entry.rows for name, entry in actual_manifest.artifacts.items()},
+            {name: entry.rows for name, entry in expected_manifest.artifacts.items()},
+        )
+        self.assertEqual(
+            actual_manifest.max_observed_items_per_sid,
+            expected_manifest.max_observed_items_per_sid,
         )
 
+    def test_torchrun_matches_single_and_appends_with_a_new_rank_count(self) -> None:
+        strategy = "iterative"
+        input_dir = os.path.join(self.test_dir, "input")
+        os.makedirs(input_dir)
+        codes = [[2, 0, 0], [0, 0, 0], [2, 0, 0], [0, 0, 0], [3, 1, 0], [1, 3, 2]]
+        candidates = [
+            [[*code[:-1], (code[-1] + offset) % 4] for offset in range(4)]
+            for code in codes
+        ]
+        for first, stop in ((0, 3), (3, 6)):
+            _parquet(
+                os.path.join(input_dir, f"part-{first}.parquet"),
+                list(range(first, stop)),
+                codes[first:stop],
+                candidates[first:stop],
+            )
+        inp = os.path.join(input_dir, "*.parquet")
+        single = os.path.join(self.test_dir, "single")
+        distributed = os.path.join(self.test_dir, "distributed")
+        self._run(
+            inp,
+            single,
+            codebook=(4, 4, 4),
+            max_items_per_codebook=1,
+            strategy=strategy,
+        )
+        self._torchrun(inp, distributed, "4,4,4", strategy)
+        self._assert_distributed_matches_single(single, distributed, "v1")
+
+        appended = os.path.join(self.test_dir, "append.parquet")
+        codes = [[0, 0, 0], [2, 0, 0], [3, 1, 0]]
+        candidates = [[[code[0], code[1], last] for last in range(4)] for code in codes]
+        _parquet(appended, [10, 11, 12], codes, candidates)
+        self._append(
+            appended,
+            single,
+            codebook=(4, 4, 4),
+            max_items_per_codebook=1,
+            strategy=strategy,
+        )
+        self._torchrun(
+            appended,
+            distributed,
+            "4,4,4",
+            strategy,
+            ranks=3,
+            extra=("--generation", "v2", "--from_generation", "v1"),
+        )
+        self._assert_distributed_matches_single(single, distributed, "v2")
+        self.assertEqual(
+            self._manifest(distributed, "v2").since_bundle_uuid,
+            self._manifest(distributed, "v1").bundle_uuid,
+        )
+
+    def test_uniform_torchrun_matches_single_and_gathers_all_stats(self) -> None:
+        input_dir = os.path.join(self.test_dir, "input")
+        os.makedirs(input_dir)
+        codes = [[2, 0, 0]] * 5 + [[0, 0, 0]] * 3 + [[3, 1, 0], [1, 3, 2]]
+        for first, stop in ((0, 5), (5, 10)):
+            _parquet(
+                os.path.join(input_dir, f"part-{first}.parquet"),
+                list(range(first, stop)),
+                codes[first:stop],
+            )
+        inp = os.path.join(input_dir, "*.parquet")
+        single = os.path.join(self.test_dir, "single")
+        distributed = os.path.join(self.test_dir, "distributed")
         stats = self._run(
             inp,
-            out,
-            strategy="random",
-            random_num_candidates=8,
+            single,
+            codebook=(4, 4, 4),
             max_items_per_codebook=1,
+            strategy="uniform",
         )
+        self.assertEqual(
+            stats,
+            CollisionResolutionStats(
+                total_items=10,
+                raw_colliding_sid_count=2,
+                final_colliding_sid_count=1,
+                relocated_count=5,
+                unresolved_count=1,
+                max_final_items_per_sid=2,
+            ),
+        )
+        output = self._torchrun(inp, distributed, "4,4,4", "uniform")
+        self.assertIn(str(stats), output)
+        self._assert_distributed_matches_single(single, distributed, "v1")
 
-        self.assertEqual(stats.total_items, 3)
-        result = self._read(out, ITEM_TO_SID)
-        self.assertEqual(result["item_id"], ["b", "a", "a"])
-        self._assert_item_to_sid_matches_sid_to_items(out)
+    def test_torchrun_handles_empty_ranks_and_rate_only(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        _parquet(inp, [0, 1, 2], [[0]] * 3, [[[last] for last in range(4)]] * 3)
+        single = os.path.join(self.test_dir, "single")
+        distributed = os.path.join(self.test_dir, "distributed")
+        self._run(inp, single, codebook=(4,), max_items_per_codebook=1)
+        self._torchrun(inp, distributed, "4", "greedy")
+        self._assert_distributed_matches_single(single, distributed, "v1")
+        rate_output = os.path.join(self.test_dir, "rate")
+        output = self._torchrun(inp, rate_output, "4", "greedy", extra=("--rate_only",))
+        self.assertIn("total_items=3", output)
+        self.assertFalse(os.path.exists(rate_output))
 
 
 if __name__ == "__main__":

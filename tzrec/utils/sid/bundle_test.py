@@ -217,7 +217,7 @@ class BundleTest(unittest.TestCase):
                 iter([]),
                 iter([mock.Mock(partition_spec=partition_spec)]),
             ]
-            layout.prepare_generation()
+            layout.prepare_generation(rank=0)
             layout.remove_generation()
             table.delete_partition.assert_called_once_with(
                 partition_spec, if_exists=True
