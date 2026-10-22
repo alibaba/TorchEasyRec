@@ -10,7 +10,7 @@ GenRec 将 `prompt_config` 用于模板、槽位和 SID 空间配置，`model_co
 
 ## 配置说明
 
-下面展示组合 SID 历史和物品 tag 的关键配置，字段与样本说明见[数据说明](#genrec-sample-data)。
+下面展示组合 SID 历史和物品 tag 的关键配置，字段与样本说明见<a href="#genrec-sample-data">数据说明</a>。
 
 ```
 feature_configs {
@@ -134,9 +134,9 @@ model_config {
 
 ## 运行示例
 
-环境准备方式同 [local_tutorial](../quick_start/local_tutorial.md)。以下命令均在配置好项目依赖的 Docker 环境中、仓库根目录下执行。示例使用单机多进程，实际运行配置可参考 [DLC 多机多卡运行说明](../quick_start/dlc_tutorial.md) 调整。
+以下命令以单节点两卡启动为例，环境准备请参考 [local_tutorial](../quick_start/local_tutorial.md)，DLC 启动方式请参考 [DLC 多机多卡运行说明](../quick_start/dlc_tutorial.md)。
 
-(genrec-sample-data)=
+<a id="genrec-sample-data"></a>
 
 ### 数据说明
 
@@ -204,7 +204,6 @@ torchrun --standalone --nnodes=1 --nproc-per-node=2 \
 ### 模型导出
 
 ```bash
-QUANT_EMB=0 \
 torchrun --standalone --nnodes=1 --nproc-per-node=2 \
     -m tzrec.export \
     --pipeline_config_path experiments/genrec/train/pipeline.config \
