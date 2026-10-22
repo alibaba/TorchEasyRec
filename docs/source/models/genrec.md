@@ -222,19 +222,4 @@ model_config {
 
 训练和评估样本分别抽取自 FORGE 的公开搜索行为训练集和测试集，用于演示配置和运行流程。
 
-## 常见问题
-
-| 现象或报错                                                        | 排查方式                                                                                                       |
-| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `prompt slot [...] names [...] which are not in ...`              | 检查输入占位符是否引用正确的特征名；response 占位符引用的列须在 `data_config.label_fields` 中声明              |
-| `prompt_config.response is required`                              | 训练、评估、预测配置都保留 `response`；预测数据可以不提供标签列                                                |
-| `an inline SID history needs value_dim` 或 `declares an id space` | SID 历史设置 `value_dim = 码本层数`、`num_buckets = 各层码本大小之和`，省略 embedding 和其他 ID 映射参数       |
-| INLINE 文本 tokenizer 不一致                                      | `vocab_file` 使用与 `tokenizer_path` 相同的基础词表，或省略后让配置加载器自动填充                              |
-| `the prompt can reach ... but max_length is ...`                  | 根据静态文本、槽位和答案的总长度调整上限，或减小特征的 `sequence_length`；`max_length` 不负责截断              |
-| `PROJECTED and unbounded`                                         | 为序列槽位的特征设置 `sequence_length`                                                                         |
-| `beam_widths has ... entries` 或返回数量超出 beam                 | 每层配置一个正的宽度，返回数量不能超过最后一层经过候选数限制后的宽度                                           |
-| `nothing in this batch can be supervised`                         | 检查标签是否为空，以及答案前是否至少有一个 Prompt token；可在模板中保留静态指令文本                            |
-| `SID tokens are already in the base tokenizer`                    | 使用骨干模型对应的基础 tokenizer，不要使用导出时扩展过的词表                                                   |
-| 基础 tokenizer 缺少结束标记                                       | 使用骨干配套的 tokenizer；基础词表须包含 `<\|im_end\|>` 或 `<\|endoftext\|>` 中的至少一个                      |
-| manifest 不匹配或缺少 `bundle_uuid`                               | 使用与历史、标签对应的完整 SID bundle manifest，并核对码本大小                                                 |
-| SID 每层取值合法，但召回结果为空或错位                            | 核对输入是否使用最终 `offset_codebook`，输出是否按每层从 0 开始的编码关联最终 `codebook`，以及映射版本是否一致 |
+常见问题请参见 [FAQ](../faq.md) 中的 GenRec 相关条目（Q23、Q24）。
