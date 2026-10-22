@@ -134,7 +134,7 @@ model_config {
 
 ## 运行示例
 
-以下命令以单节点两卡启动为例，环境准备请参考 [local_tutorial](../quick_start/local_tutorial.md)，DLC 启动方式请参考 [DLC 多机多卡运行说明](../quick_start/dlc_tutorial.md)。
+以下命令以单节点两卡启动为例，环境准备请参考 [Local Tutorial](../quick_start/local_tutorial.md)，DLC 启动方式请参考 [DLC Tutorial](../quick_start/dlc_tutorial.md)。
 
 <a id="genrec-sample-data"></a>
 
@@ -153,7 +153,7 @@ model_config {
 
 #### 示例数据
 
-示例数据使用 Parquet 格式：
+示例数据来自 [FORGE](https://github.com/selous123/al_sid) 开源数据集，抽样并整理为 Parquet 格式：
 
 - 训练数据：[genrec_train.parquet](https://tzrec.oss-cn-beijing.aliyuncs.com/data/models/genrec_train.parquet)（1800 行）。
 - 评估数据：[genrec_eval.parquet](https://tzrec.oss-cn-beijing.aliyuncs.com/data/models/genrec_eval.parquet)（200 行）。
