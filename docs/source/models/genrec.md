@@ -4,15 +4,50 @@
 
 GenRec 是以大语言模型（LLM）为底座的生成式召回模型。它将用户画像、SID、行为历史序列和文本等特征按 Prompt 模板组合，使用自回归模型直接生成下一个物品的语义 ID（Semantic ID，简称 SID），再通过 SID 到物品的映射表得到召回结果。
 
+![GenRec 模型结构](../../images/models/genrec.png)
+
 当前模型配置为 `genrec_causal_lm_model`，骨干模型使用 `hf_model_name_or_path` 指定，支持 Qwen2.5/3 等 Decoder-Only 模型。 物品 SID 可以由 [SID RQVAE](sid_rqvae.md) 或 [SID RQKMeans](sid_rqkmeans.md) 生成。
 
 GenRec 将 `prompt_config` 用于模板、槽位和 SID 空间配置，`model_config` 用于 LM 参数和解码参数。
 
 ## 配置说明
 
-下面展示组合 SID 历史和物品 tag 的关键配置，字段与样本说明见<a href="#genrec-sample-data">数据说明</a>。
+下面展示文本、单值及多值稀疏、数值、历史 SID 与标签序列、多特征组合的关键配置，字段与样本说明见<a href="#genrec-sample-data">数据说明</a>。
 
 ```
+feature_configs {
+    tokenize_feature {
+        feature_name: "query"
+        expression: "user:query"
+        tokens_as_sequence: true
+        sequence_length: 32
+    }
+}
+feature_configs {
+    id_feature {
+        feature_name: "recent_item"
+        expression: "user:recent_item_id"
+        hash_bucket_size: 16384
+        embedding_dim: 16
+    }
+}
+feature_configs {
+    id_feature {
+        feature_name: "title_words"
+        expression: "user:recent_title_words"
+        hash_bucket_size: 8192
+        embedding_dim: 16
+        value_dim: 0
+        pooling: "mean"
+    }
+}
+feature_configs {
+    raw_feature {
+        feature_name: "history_count"
+        expression: "user:history_count"
+        value_dim: 1
+    }
+}
 feature_configs {
     sequence_feature {
         sequence_name: "hist"
@@ -41,8 +76,16 @@ feature_configs {
 }
 prompt_config {
     tokenizer_path: "data/genrec/backbone/tokenizer.json"
-    prompt: "你是一个推荐系统。历史行为按时间顺序排列，每个物品由三个语义编码表示。\n用户历史行为：{{hist__sid}}\n对应的物品标签：{{history_tags}}\n请预测下一个物品的语义编码："
+    prompt: "根据搜索词和历史行为预测下一个物品。\n搜索词：{{query}}；最近物品：{{recent_item}}；标题词：{{title_words}}；历史条数：{{history_count}}；\n物品组合：{{recent_meta}}；历史 SID：{{hist__sid}}；对应的历史物品标签：{{history_tags}}。请生成三个语义编码。"
     response: "{{answer}}"
+    slots {
+        name: "recent_meta"
+        feature_names: "recent_item"
+        feature_names: "title_words"
+        projection {
+            mlp { hidden_units: 64 }
+        }
+    }
     slots {
         name: "history_tags"
         feature_names: "hist__tag"
@@ -56,7 +99,7 @@ prompt_config {
         codebook: 8192
         codebook: 8192
     }
-    max_length: 256
+    max_length: 512
 }
 model_config {
     genrec_causal_lm_model {
@@ -64,10 +107,10 @@ model_config {
         common {
             lm_parameter_dtype: FP32
             attn_kernel: "sdpa"
-            beam_widths: 100
-            beam_widths: 200
-            beam_widths: 400
-            num_return_sequences: 50
+            beam_widths: 10
+            beam_widths: 20
+            beam_widths: 50
+            num_return_sequences: 5
         }
     }
 }
@@ -90,7 +133,7 @@ model_config {
 
 #### 模板与槽位
 
-直接引用单个特征时，可在模板中使用其特征名，例如 `{{hist__sid}}`。需要为槽位命名或配置投影时，在 `slots` 中声明，例如上面的 `{{history_tags}}`。`slots.name` 须与模板中的占位符一致，声明的槽位必须在模板中使用。
+直接引用单个特征时，可在模板中使用其特征名，例如 `{{hist__sid}}`。组合多个特征或配置投影时，在 `slots` 中声明，例如上面的 `{{recent_meta}}`。`slots.name` 须与模板中的占位符一致，声明的槽位必须在模板中使用。
 
 #### 特征填充方式
 
@@ -99,11 +142,13 @@ model_config {
 - **INLINE**：将 SID 或文本分词 ID 直接填入 Prompt。单个序列特征的 `id_feature`、`tokenize_feature` 省略 `embedding_dim` 时使用此方式，不配置 `projection`。
 - **PROJECTED**：用于需要 embedding 或数值处理的特征。可通过 `projection.mlp.hidden_units` 配置 MLP；省略 `projection` 时使用默认的线性投影。
 
-本例的 `hist__sid` 使用 INLINE，`value_dim: 3` 表示三层 SID；`hist__tag` 配置 `embedding_dim: 32` 后使用 PROJECTED，`pooling: "mean"` 聚合每个历史物品的 tag，`value_dim: 0` 允许每个物品的 tag 数量不同。
+本例的 `query` 和 `hist__sid` 使用 INLINE，SID 的 `value_dim: 3` 表示三层编码。`recent_item`、`title_words` 和 `history_count` 使用 PROJECTED；`title_words` 通过 `pooling: "mean"` 聚合多个标题词，`value_dim: 0` 允许词数不同。组合槽位 `recent_meta` 复用 `recent_item` 和 `title_words`，通过 `projection.mlp.hidden_units` 配置投影。
+
+`hist__tag` 保留每个历史物品的标签，经 `pooling: "mean"` 聚合后，使用 `history_tags` 槽位逐项投影；SID 与 tag 历史须逐项对应且长度一致。
 
 同一槽位组合多个特征时，成员必须同为标量或同为序列；序列须逐项对应且长度一致。
 
-`response` 指定监督目标；预测时仅使用 Prompt 中的输入特征。本例的 tag 均来自历史物品。
+`response` 指定监督目标；预测时仅使用 Prompt 中的输入特征。本例中的最近物品及其标题词均来自保留的历史行为。
 
 #### 长度配置
 
@@ -134,7 +179,9 @@ model_config {
 
 ## 运行示例
 
-以下命令以单节点两卡启动为例，环境准备请参考 [Local Tutorial](../quick_start/local_tutorial.md)，DLC 启动方式请参考 [DLC Tutorial](../quick_start/dlc_tutorial.md)。
+环境准备与启动方式请参考 [Local Tutorial](../quick_start/local_tutorial.md) 和 [DLC Tutorial](../quick_start/dlc_tutorial.md)；训练、评估、离线预测和模型导出流程分别参见 [训练](../usage/train.md)、[评估](../usage/eval.md)、[Checkpoint 预测](../usage/predict.md) 和 [导出](../usage/export.md)。
+
+完整示例配置：[genrec.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/genrec.config)。
 
 <a id="genrec-sample-data"></a>
 
@@ -158,61 +205,22 @@ model_config {
 - 训练数据：[genrec_train.parquet](https://tzrec.oss-cn-beijing.aliyuncs.com/data/models/genrec_train.parquet)（1800 行）。
 - 评估数据：[genrec_eval.parquet](https://tzrec.oss-cn-beijing.aliyuncs.com/data/models/genrec_eval.parquet)（200 行）。
 
-一行对应一条行为历史和一个目标物品：
+训练和评估文件的字段如下：
 
-| 列名              | 类型                   | 说明                              |
-| ----------------- | ---------------------- | --------------------------------- |
-| `sample_id`       | string                 | 样本标识                          |
-| `hist__sid_codes` | array\<array\<int64>>  | 历史物品的 `offset_codebook` 序列 |
-| `hist__tag_ids`   | array\<array\<string>> | 历史物品的脱敏 tag ID 列表        |
-| `answer`          | array\<int64>          | 目标物品的 `offset_codebook`      |
+| 列名                 | 类型                   | 说明                                      |
+| -------------------- | ---------------------- | ----------------------------------------- |
+| `sample_id`          | string                 | 样本标识，不作为模型输入                  |
+| `query`              | string                 | 搜索词                                    |
+| `recent_item_id`     | string                 | 最近一条保留历史行为的物品 ID             |
+| `recent_title_words` | array\<string>         | 最近保留物品的标题词列表                  |
+| `history_count`      | int64                  | 过滤和截断之前的原始历史行为条数          |
+| `hist__sid_codes`    | array\<array\<int64>>  | 历史物品的 `offset_codebook` 序列         |
+| `hist__tag_ids`      | array\<array\<string>> | 与 SID 历史逐项对应的物品脱敏 tag ID 列表 |
+| `answer`             | array\<int64>          | 目标物品的 `offset_codebook`              |
 
-历史 SID 和 tag 序列须逐项对应，示例使用三层码本 `[8192, 8192, 8192]`。
+示例使用三层码本 `[8192, 8192, 8192]`，保留有 SID 映射的最近最多 50 条历史行为，并同步保留对应的 tag。`history_count` 记录原始历史长度，可能大于保留的历史条数。组合槽位 `recent_meta` 由特征配置生成，无需在数据中增加同名列。
 
-### 训练和评估
-
-完整示例配置：[genrec.config](https://tzrec.oss-cn-beijing.aliyuncs.com/config/models/genrec.config)。
-
-```bash
-torchrun --standalone --nnodes=1 --nproc-per-node=2 \
-    -m tzrec.train_eval \
-    --pipeline_config_path genrec.config
-```
-
-独立评估：
-
-```bash
-torchrun --standalone --nnodes=1 --nproc-per-node=2 \
-    -m tzrec.eval \
-    --pipeline_config_path experiments/genrec/train/pipeline.config
-```
-
-评估默认读取 `model_dir` 下的最新 checkpoint，也可以通过 `--checkpoint_path` 指定。
-
-### 离线预测
-
-```bash
-torchrun --standalone --nnodes=1 --nproc-per-node=2 \
-    -m tzrec.predict \
-    --pipeline_config_path experiments/genrec/train/pipeline.config \
-    --predict_input_path 'data/genrec/eval/*.parquet' \
-    --predict_output_path experiments/genrec/predict_result \
-    --reserved_columns sample_id \
-    --output_columns generated_sids
-```
-
-### 模型导出
-
-```bash
-torchrun --standalone --nnodes=1 --nproc-per-node=2 \
-    -m tzrec.export \
-    --pipeline_config_path experiments/genrec/train/pipeline.config \
-    --export_dir experiments/genrec/export
-```
-
-导出目录包含模型文件、LM 权重、tokenizer 和相关配置。离线生成 SID 使用上一节的 checkpoint 预测命令。
-
-量化及分布式 embedding 的通用参数参见 [导出](../usage/export.md)。
+训练和评估样本分别抽取自 FORGE 的公开搜索行为训练集和测试集，用于演示配置和运行流程。
 
 ## 常见问题
 
