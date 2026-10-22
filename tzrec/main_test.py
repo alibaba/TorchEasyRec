@@ -22,7 +22,7 @@ from unittest import mock
 
 import pyarrow as pa
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 
 from tzrec.datasets.utils import RecordBatchTensor
 from tzrec.main import (
@@ -534,6 +534,90 @@ class MainTest(unittest.TestCase):
             # one epoch behind with decay_factor=0.5 ⇒ every rate doubles
             expected = [lr * 2 for lr in expected]
         torch.testing.assert_close(actual, expected)
+
+    @parameterized.expand(
+        [
+            param("fresh", num_steps=50, ckpt_step=None, fine_tune=False, start=0),
+            param("continue", num_steps=100, ckpt_step=49, fine_tune=False, start=50),
+            param("completed", num_steps=50, ckpt_step=49, fine_tune=False, start=50),
+            param("past_target", num_steps=50, ckpt_step=99, fine_tune=False, start=50),
+            param("fine_tune", num_steps=50, ckpt_step=49, fine_tune=True, start=0),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_step_resume(self, name, num_steps, ckpt_step, fine_tune, start):
+        """Resuming a reached num_steps target is a no-op without checkpoint writes.
+
+        Only a model_dir resume skips steps; a fine-tune checkpoint's step
+        belongs to the source job, so it trains (and saves) the full budget.
+        """
+        model_dir = os.path.join(self.test_dir, "model")
+        ckpt_path = None
+        if ckpt_step is not None:
+            ckpt_dir = os.path.join(self.test_dir, "source") if fine_tune else model_dir
+            ckpt_path = os.path.join(ckpt_dir, f"model.ckpt-{ckpt_step}")
+        restore_from_model_dir = ckpt_path is not None and not fine_tune
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        loader = mock.Mock()
+        loader.get_iterator.return_value = iter(range(num_steps))
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=-1.0)
+
+        def progress(iterator):
+            next(iterator)
+            return {"loss": torch.tensor(1.0)}, {}, batch
+
+        pipeline = mock.Mock()
+        pipeline.progress.side_effect = progress
+        writes = (
+            "save_model",
+            "save_lr_schedulers",
+            "save_dataloader_state",
+            "save_meta",
+            "save_success_marker",
+        )
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch(
+                "tzrec.main.OnlineDenseExportManager",
+                return_value=mock.Mock(enabled=False),
+            ),
+            mock.patch("tzrec.main._log_train") as log_train,
+            mock.patch("tzrec.utils.checkpoint_util.restore_model") as restore_model,
+            mock.patch.multiple(
+                "tzrec.utils.checkpoint_util", **{w: mock.DEFAULT for w in writes}
+            ) as write_mocks,
+        ):
+            _train_and_evaluate(
+                model,
+                mock.Mock(),
+                loader,
+                None,
+                [],
+                model_dir,
+                _train_config(num_steps=num_steps, log_step_count_steps=1),
+                EvalConfig(),
+                checkpoint_util.CheckpointManager(model_dir),
+                skip_steps=ckpt_step if restore_from_model_dir else -1,
+                ckpt_path=ckpt_path,
+                ignore_restore_optimizer=True,
+                restore_from_model_dir=restore_from_model_dir,
+            )
+        # the trailing _log_train call reports the final step after the loop
+        trained_steps = [call.args[0] for call in log_train.call_args_list[:-1]]
+        self.assertEqual(trained_steps, list(range(start, num_steps)))
+        if start >= num_steps:
+            for w in writes:
+                write_mocks[w].assert_not_called()
+            pipeline.progress.assert_not_called()
+            restore_model.assert_not_called()
+        else:
+            self.assertEqual(restore_model.call_count, int(ckpt_path is not None))
+            self.assertEqual(
+                [call.args[0] for call in write_mocks["save_model"].call_args_list],
+                [os.path.join(model_dir, f"model.ckpt-{num_steps - 1}")],
+            )
 
 
 class PredictionLifecycleTest(unittest.TestCase):
