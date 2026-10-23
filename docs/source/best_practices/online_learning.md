@@ -9,7 +9,7 @@
 1. 天级增量训练：从 T-1 的天级模型继续训练 MaxCompute 分区 `ds=T`，得到天级模型 T。
 1. 全量导出：把天级模型 T 的 embedding 全量上传到 FeatureDB 版本 `ol_T`。
 1. 流式训练 stream_T：从天级模型 T 出发，从 T+1 日 00:00 的 Kafka 位点开始消费，追赶到最新数据后持续训练，同时增量上传 embedding、发布 dense 模型。
-1. 交接：stream\_{T-1} 每隔 `log_step_count_steps` 步比较两条链路 `current.json` 中的 `data_timestamp`，stream_T 落后不超过容忍值（默认一个发布间隔加 5 分钟，见 `ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS`）时 stream\_{T-1} 跳过最终 checkpoint、完成最终发布后正常退出。
+1. 交接：stream\_{T-1} 每隔 `log_step_count_steps` 步比较两条链路 `model_dir` 下 `progress.json` 中已消费数据的事件时间，stream_T 落后不超过容忍值（默认 5 分钟，见 `ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS`）时 stream\_{T-1} 跳过最终 checkpoint、完成最终发布后正常退出。
 1. 切换：DataWorks 在 stream\_{T-1} 成功退出后，更新 EAS 服务到 stream_T。
 
 同一时刻最多有两条"链路"（lineage）在运行：正在服务的 stream\_{T-1}，以及正在追赶的 stream_T。每天的链路切换同时起到了[全量再基线](../usage/export.md)的作用：只要天级任务按时成功，崩溃重启带来的 FeatureDB 漂移最多存在于一条链路（约一天）。
@@ -26,8 +26,8 @@
 
 | 资源                                     | 链路 T 的取值                          | 说明                                                                                                  |
 | ---------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| 流式任务 `model_dir`                     | `/mnt/data/online/stream/${T}/model`   | checkpoint 与 Kafka 位点                                                                              |
-| 发布根目录 `ONLINE_DENSE_EXPORT_DIR`     | `/mnt/data/online/stream/${T}/serving` | `<发布根目录>/dense_hot_export/current.json` 既是 EAS 读取的入口，也是交接判断使用的进度信号          |
+| 流式任务 `model_dir`                     | `/mnt/data/online/stream/${T}/model`   | checkpoint、Kafka 位点，以及交接判断使用的进度 `progress.json`                                        |
+| 发布根目录 `ONLINE_DENSE_EXPORT_DIR`     | `/mnt/data/online/stream/${T}/serving` | `<发布根目录>/dense_hot_export/current.json` 是 EAS 热加载 dense 模型的入口                           |
 | Kafka `group.id`                         | `tzrec_ol_${T}`                        | KafkaDataset 以消费组订阅 topic，两条链路共用一个 `group.id` 会互相 rebalance、瓜分分区，**必须不同** |
 | FeatureDB `feature_store_config.version` | `ol_${T}`                              | 全量导入与增量写入不能叠写在同一个版本上                                                              |
 
@@ -148,7 +148,7 @@ dlc submit pytorchjob \
         USE_DISTRIBUTED_EMBEDDING=1 \
         ONLINE_DENSE_EXPORT=1 \
         ONLINE_DENSE_EXPORT_DIR=/mnt/data/online/stream/${bizdate}/serving \
-        ONLINE_LEARNING_SUCCESSOR_DIR=/mnt/data/online/stream/${next}/serving \
+        ONLINE_LEARNING_SUCCESSOR_DIR=/mnt/data/online/stream/${next}/model \
         FEATUREDB_USERNAME=<FeatureDB 用户名> FEATUREDB_PASSWORD=<FeatureDB 密码> \
         torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
             --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \

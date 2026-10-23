@@ -27,8 +27,8 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
 - CHECKPOINT_TAG: 给checkpoint打一个自定义标记，记录在`meta`中（见下面的checkpoint信息），便于外部调度识别是哪一次调度产出的checkpoint。默认为空，不做任何限制
-- ONLINE_LEARNING_SUCCESSOR_DIR: 在线学习中下一条流式链路的发布根目录（即其`ONLINE_DENSE_EXPORT_DIR`）。设置后，当下一条链路发布的`current.json`的`data_timestamp`落后本任务不超过`ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS`时，本任务正常结束训练且不保存最终checkpoint，需同时开启`ONLINE_DENSE_EXPORT=1`，详见[天级增量 + 流式训练的在线学习](../best_practices/online_learning.md)
-- ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS: 交接时允许下一条链路落后的秒数。两条链路都追到Kafka最新数据后，各自的`data_timestamp`只在各自发布时更新，严格比较可能一直无法满足，因此需要容忍值。默认取本任务一个发布间隔（`paired_dump_interval_minutes`）加5分钟余量；按步数发布（`paired_dump_interval_steps`）时`current.json`中没有发布间隔，默认为15分钟，建议按实际发布间隔显式设置
+- ONLINE_LEARNING_SUCCESSOR_DIR: 在线学习中下一条流式链路的`model_dir`。设置后，本任务每隔`log_step_count_steps`步把已消费数据的事件时间（与checkpoint `meta`中`data_ts`的定义相同）写入`model_dir`下的`progress.json`，并读取下一条链路的`progress.json`；当下一条链路落后本任务不超过`ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS`时，本任务正常结束训练且不保存最终checkpoint。需使用带timestamp的数据源（如KafkaDataset），详见[天级增量 + 流式训练的在线学习](../best_practices/online_learning.md)
+- ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS: 交接时允许下一条链路落后的秒数，默认300。两条链路都追到Kafka最新数据后，各自的事件时间只在检查时更新，且不同分区的时间存在偏差，严格比较可能一直无法满足，因此需要容忍值
 
 ## Checkpoint信息与完成标记
 

@@ -106,12 +106,7 @@ from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.hf_export_util import export_hf_assets
 from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import ProgressLogger, logger
-from tzrec.utils.online_dense_export_util import (
-    CURRENT_JSON,
-    OnlineDenseExportManager,
-    read_current_manifest,
-    resolve_dense_export_root,
-)
+from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
 
@@ -408,122 +403,148 @@ def _create_train_profiler(
     )
 
 
-# Publish-cadence slack when the manifest declares no interval (steps cadence):
-# a 10-minute interval plus the margin below.
-_HANDOVER_DEFAULT_TOLERANCE_SECS = 900.0
-# Covers upload delay and Kafka partition skew between the two lineages.
-_HANDOVER_TOLERANCE_MARGIN_SECS = 300.0
+_HANDOVER_PROGRESS_FILENAME = "progress.json"
+# Covers Kafka partition skew and progress write delay between the two lineages.
+_HANDOVER_DEFAULT_TOLERANCE_SECS = 300.0
 
 
-def _manifest_data_ts(manifest: Optional[Dict[str, Any]]) -> Optional[float]:
-    """Return a manifest's data_timestamp, or None if absent or not a valid time."""
-    ts = manifest.get("data_timestamp") if manifest is not None else None
+def _valid_data_ts(ts: Any) -> Optional[float]:
+    """Return ts as a float if it is a valid event-time, else None."""
     # bool is an int subclass; -1.0 is the "no timestamp" sentinel
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return None
     return float(ts) if math.isfinite(ts) and ts > 0 else None
 
 
-def _handover_tolerance_secs(own_manifest: Dict[str, Any]) -> float:
-    """Default hand-over tolerance: one publish interval plus a margin.
+class _LineageHandover:
+    """Retire a stream lineage once the next one has consumed data as fresh.
 
-    Once both lineages consume at the Kafka head, each one's published
-    data_timestamp only advances at its own publish, so the successor can trail
-    by up to one publish interval for good; a strict comparison could then
-    never pass.
-    """
-    interval = own_manifest.get("publish_interval_minutes")
-    if (
-        isinstance(interval, bool)
-        or not isinstance(interval, (int, float))
-        or not interval > 0
-    ):
-        return _HANDOVER_DEFAULT_TOLERANCE_SECS
-    return interval * 60.0 + _HANDOVER_TOLERANCE_MARGIN_SECS
-
-
-def _successor_caught_up(
-    own_current: str, successor_current: str, tolerance_secs: Optional[float]
-) -> bool:
-    """Whether the successor lineage has published data about as fresh as ours.
-
-    Rank zero compares the data_timestamp of the two published current.json
-    manifests and broadcasts the decision, so every rank leaves the train loop
-    at the same step. The successor counts as caught up when it trails by at
-    most the tolerance. A missing or invalid manifest on either side means not
-    caught up.
-
-    Args:
-        own_current: this run's published current.json path.
-        successor_current: the successor lineage's published current.json path.
-        tolerance_secs: allowed lag of the successor in seconds; None derives it
-            from this run's publish interval.
-
-    Returns:
-        True if this run should hand over to the successor.
-    """
-    decision = [False]
-    if int(os.environ.get("RANK", 0)) == 0:
-        own_manifest = read_current_manifest(own_current)
-        own_ts = _manifest_data_ts(own_manifest)
-        successor_ts = _manifest_data_ts(read_current_manifest(successor_current))
-        if own_manifest is not None and own_ts is not None and successor_ts is not None:
-            if tolerance_secs is None:
-                tolerance_secs = _handover_tolerance_secs(own_manifest)
-            lag = own_ts - successor_ts
-            decision[0] = lag <= tolerance_secs
-            logger.info(
-                f"successor lineage lags {lag:.0f}s behind this run "
-                f"(tolerance {tolerance_secs:.0f}s)."
-            )
-    if dist.is_initialized():
-        dist.broadcast_object_list(decision, src=0)
-    return decision[0]
-
-
-def _handover_config(
-    model_dir: str, online_dense_export_enabled: bool
-) -> Optional[Tuple[str, str, Optional[float]]]:
-    """Resolve the hand-over settings from ONLINE_LEARNING_SUCCESSOR_DIR.
+    Every lineage writes its quorum consumed event-time to
+    ``<model_dir>/progress.json``; the predecessor compares it with the
+    successor's and leaves training when the successor trails by at most the
+    tolerance.
 
     Args:
         model_dir: this run's model_dir.
-        online_dense_export_enabled: whether this run publishes current.json.
+        successor_model_dir: the successor lineage's model_dir.
+        tolerance_secs: allowed lag of the successor in seconds.
+        quorum: fraction of workers that must have reached the event-time.
+    """
+
+    def __init__(
+        self,
+        model_dir: str,
+        successor_model_dir: str,
+        tolerance_secs: float,
+        quorum: float,
+    ) -> None:
+        self.successor_model_dir = successor_model_dir
+        self._progress_path = os.path.join(model_dir, _HANDOVER_PROGRESS_FILENAME)
+        self._successor_progress_path = os.path.join(
+            successor_model_dir, _HANDOVER_PROGRESS_FILENAME
+        )
+        self._tolerance_secs = tolerance_secs
+        self._quorum = quorum
+        self._warned_no_data_ts = False
+
+    def _read_successor_ts(self) -> Optional[float]:
+        """Read the successor's progress; None while absent or unreadable."""
+        try:
+            with open(self._successor_progress_path) as f:
+                progress = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return (
+            _valid_data_ts(progress.get("data_ts"))
+            if isinstance(progress, dict)
+            else None
+        )
+
+    def caught_up(self, step: int, data_timestamp: float) -> bool:
+        """Publish this run's progress and decide whether to hand over.
+
+        A collective: every rank must call it at the same step. Rank zero
+        writes the progress, compares it with the successor's and broadcasts
+        the decision.
+
+        Args:
+            step: current global step.
+            data_timestamp: this rank's consumed event-time, -1.0 if none.
+
+        Returns:
+            True if this run should hand over to the successor.
+        """
+        if dist.is_initialized():
+            worker_ts: List[float] = [0.0] * dist.get_world_size()
+            dist.all_gather_object(worker_ts, data_timestamp)
+        else:
+            worker_ts = [data_timestamp]
+        data_ts = _valid_data_ts(
+            checkpoint_util.quorum_event_time(worker_ts, self._quorum)
+        )
+        decision = [False]
+        if int(os.environ.get("RANK", 0)) == 0:
+            if data_ts is None:
+                if not self._warned_no_data_ts:
+                    logger.warning(
+                        "no consumed event-time yet, so the lineage hand-over "
+                        "cannot progress; it requires a data source with "
+                        "timestamps such as KafkaDataset."
+                    )
+                    self._warned_no_data_ts = True
+            else:
+                tmp_path = f"{self._progress_path}.tmp.{os.getpid()}"
+                with open(tmp_path, "w") as f:
+                    json.dump({"step": step, "data_ts": data_ts}, f)
+                os.replace(tmp_path, self._progress_path)
+                successor_ts = self._read_successor_ts()
+                if successor_ts is not None:
+                    lag = data_ts - successor_ts
+                    decision[0] = lag <= self._tolerance_secs
+                    logger.info(
+                        f"successor lineage lags {lag:.0f}s behind this run "
+                        f"(tolerance {self._tolerance_secs:.0f}s)."
+                    )
+        if dist.is_initialized():
+            dist.broadcast_object_list(decision, src=0)
+        return decision[0]
+
+
+def _create_lineage_handover(
+    model_dir: str, train_config: TrainConfig
+) -> Optional[_LineageHandover]:
+    """Build the lineage hand-over from ONLINE_LEARNING_SUCCESSOR_DIR.
+
+    Args:
+        model_dir: this run's model_dir.
+        train_config: this run's train config.
 
     Returns:
-        (own current.json, successor current.json, tolerance override in
-        seconds or None), or None when no successor is configured.
+        The hand-over, or None when no successor is configured.
     """
-    successor_root = os.environ.get("ONLINE_LEARNING_SUCCESSOR_DIR")
-    if not successor_root:
+    successor_model_dir = os.environ.get("ONLINE_LEARNING_SUCCESSOR_DIR")
+    if not successor_model_dir:
         return None
-    if not online_dense_export_enabled:
+    if os.path.abspath(successor_model_dir) == os.path.abspath(model_dir):
         raise RuntimeError(
-            "ONLINE_LEARNING_SUCCESSOR_DIR requires ONLINE_DENSE_EXPORT=1: the "
-            "published current.json is the hand-over progress signal."
-        )
-    own_export_root = resolve_dense_export_root(model_dir)
-    # not resolve_dense_export_root: it prefers this run's ONLINE_DENSE_EXPORT_DIR
-    successor_export_root = os.path.join(successor_root, "dense_hot_export")
-    if os.path.abspath(successor_export_root) == os.path.abspath(own_export_root):
-        raise RuntimeError(
-            "ONLINE_LEARNING_SUCCESSOR_DIR must differ from this run's "
-            f"ONLINE_DENSE_EXPORT_DIR, got {successor_root}."
+            "ONLINE_LEARNING_SUCCESSOR_DIR must differ from this run's model_dir, "
+            f"got {successor_model_dir}."
         )
     # parsed on every rank so a bad value fails fast instead of on rank 0 only
     tolerance_env = os.environ.get("ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS")
-    tolerance_secs = float(tolerance_env) if tolerance_env else None
-    if tolerance_secs is not None and not (
-        math.isfinite(tolerance_secs) and tolerance_secs >= 0
-    ):
+    tolerance_secs = (
+        float(tolerance_env) if tolerance_env else _HANDOVER_DEFAULT_TOLERANCE_SECS
+    )
+    if not (math.isfinite(tolerance_secs) and tolerance_secs >= 0):
         raise ValueError(
             "ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS must be a non-negative "
             f"number, got {tolerance_env}."
         )
-    return (
-        os.path.join(own_export_root, CURRENT_JSON),
-        os.path.join(successor_export_root, CURRENT_JSON),
+    return _LineageHandover(
+        model_dir,
+        successor_model_dir,
         tolerance_secs,
+        train_config.save_checkpoints_timestamp_quorum,
     )
 
 
@@ -709,9 +730,9 @@ def _train_and_evaluate(
             "dense export trigger and the FeatureStore upload watermark is the only "
             "publish gate."
         )
-    # A stream lineage retires itself once the next day's lineage has published
-    # data at least as fresh; deployment of the successor follows its exit.
-    handover = _handover_config(model_dir, online_dense_exporter.enabled)
+    # A stream lineage retires itself once the next day's lineage has consumed
+    # data about as fresh; deployment of the successor follows its exit.
+    handover = _create_lineage_handover(model_dir, train_config)
     handed_over = False
 
     # this rank's last consumed event-time, reused by the epoch / final saves
@@ -841,11 +862,11 @@ def _train_and_evaluate(
                 if (
                     handover is not None
                     and i_step % train_config.log_step_count_steps == 0
-                    and _successor_caught_up(*handover)
+                    and handover.caught_up(i_step, data_timestamp)
                 ):
                     logger.info(
-                        f"successor lineage {handover[1]} caught up at step "
-                        f"{i_step}, handing over."
+                        f"successor lineage {handover.successor_model_dir} caught "
+                        f"up at step {i_step}, handing over."
                     )
                     handed_over = True
                     break

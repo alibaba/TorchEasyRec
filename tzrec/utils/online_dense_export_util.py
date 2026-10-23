@@ -110,25 +110,19 @@ def _publish_current(current_path: str, payload: Dict[str, Any]) -> None:
     _atomic_write_json(current_path, payload)
 
 
-def read_current_manifest(current_path: str) -> Optional[Dict[str, Any]]:
-    """Return the current.json manifest, or None if absent/unreadable.
+def _read_current_version(current_path: str) -> Optional[str]:
+    """Return the version current.json points at, or None if absent/unreadable.
 
-    Best-effort: a missing file is the normal state before the first publish
-    and is not logged; a corrupt or non-object manifest is logged and treated
-    as absent.
+    Best-effort: a missing or corrupt current.json means there is no live
+    pointer to spare, so pruning falls back to pure newest-K retention.
     """
     try:
         with open(current_path) as f:
             data = json.load(f)
-    except FileNotFoundError:
-        return None
     except (OSError, ValueError) as e:
-        logger.warning("could not read manifest %s: %s", current_path, e)
+        logger.warning("could not read current version from %s: %s", current_path, e)
         return None
-    if not isinstance(data, dict):
-        logger.warning("manifest %s is not a JSON object", current_path)
-        return None
-    return data
+    return data.get("version") if isinstance(data, dict) else None
 
 
 def _max_kept_versions() -> int:
@@ -190,10 +184,7 @@ def _prune_old_dense_versions(export_root: str, versions_root: str) -> None:
         entries = os.listdir(versions_root)
     except FileNotFoundError:
         return
-    # a missing or corrupt current.json means there is no live pointer to
-    # spare, so pruning falls back to pure newest-K retention.
-    manifest = read_current_manifest(os.path.join(export_root, CURRENT_JSON))
-    current_version = manifest.get("version") if manifest is not None else None
+    current_version = _read_current_version(os.path.join(export_root, CURRENT_JSON))
     version_dirs = sorted(
         os.path.join(versions_root, name)
         for name in entries
