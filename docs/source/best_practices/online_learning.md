@@ -53,17 +53,6 @@ bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd] next_day=$[yyyy-mm-dd]
 - deploy 依赖上一周期的本节点，保证切换严格按日期顺序执行，较旧的链路不会覆盖较新的部署。
 - 首次上线时没有前一天的 train_stream，EAS 服务需手动创建。
 
-### sample
-
-天级样本建议与 Kafka 样本流出自同一个 Flink 作业，并按 Kafka 消息时间戳切分分区，这样 `ds=T` 的结束时刻恰好等于 stream_T 的起始位点，不重不漏。切分与 `start.timestamp.ms` 的计算都需显式指定时区。
-
-三个 PAI-DLC 节点的内容都是一条 `dlc submit pytorchjob` 命令，DataWorks 会等待 DLC 任务结束后再标记节点完成，说明如下：
-
-- `${bizdate}` 等调度参数由 DataWorks 在提交前直接替换；`$MASTER_ADDR` 等变量在 `--command` 的单引号内，由 DLC 容器执行时展开。
-- `<...>` 为需要按实际环境填写的值；`TZREC_NIGHTLY_VERSION` 需在 DLC 节点的调度参数中配置为 tzrec nightly 版本号，且需支持 `ONLINE_LEARNING_SUCCESSOR_DIR`（>= 1.5.6）。
-- `--data_sources` 为挂载到 `/mnt/data` 的 OSS 数据集；`--enable_credential=true` 让任务以 PAI 默认角色访问 MaxCompute、FeatureStore 等云产品。
-- FeatureDB 的用户名和密码通过 `FEATUREDB_USERNAME`、`FEATUREDB_PASSWORD` 环境变量传入，不要写进 `pipeline.config`。
-
 ### train_daily
 
 ```bash
