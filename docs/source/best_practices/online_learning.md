@@ -1,6 +1,6 @@
 # 天级增量 + 流式训练的在线学习
 
-本文介绍基于 DataWorks、PAI-DLC、PAI-EAS 搭建在线学习链路的推荐方式：天级增量训练作为基线，每天基于天级模型启动一个流式训练任务；新的流式任务追上旧任务后，旧任务自动退出，再由 DataWorks 把 EAS 服务切换到新任务的产出。
+本文介绍基于 DataWorks、PAI-DLC、PAI-EAS 搭建在线学习链路的推荐方式：天级增量训练作为基线，每天基于天级模型启动一个流式训练任务；新的流式任务的消费进度接近旧任务后，旧任务自动退出，再由 DataWorks 把 EAS 服务切换到新任务的产出。
 
 ## 整体流程
 
@@ -16,9 +16,15 @@
 
 ### 时间线示例
 
-下图以业务日期 T 为例，横轴为 T+1 日的挂钟时间。假设天级样本 01:30 就绪、天级训练 03:30 完成、全量导出 04:30 完成；此时 stream_T 启动，但从 Kafka 中 00:00 的数据开始消费，即挂钟时间 04:30 时处理的是数据时间 00:00 的积压。若积压为 4.5 小时、流式训练速度是数据产生速度的 3 倍，stream_T 约在 06:45 追上，这只是示意值，发布与检查的周期都可能推迟发现的时间。
+下图以业务日期 T 为例，横轴为 T+1 日的挂钟时间。假设天级样本 01:30 就绪、天级训练 03:30 完成、全量导出 04:30 完成；此时 stream_T 启动，但从 Kafka 中 00:00 的数据开始消费，即挂钟时间 04:30 时处理的是数据时间 00:00 的积压。图中约 06:45 处为示意的交接条件满足时刻，并非确切的交接时间。
 
 ![在线学习链路示意时间线](../../images/best_practices/online_learning_timeline.svg)
+
+追赶耗时约为 `积压时长 × 生产速度 / (训练速度 − 生产速度)`，上例中为 4.5 × 1 / (3 − 1) = 2.25 小时，即 04:30 启动后 135 分钟、约 06:45 完全追上。交接并不要求完全追上：交接条件比较的是两条链路 `progress.json` 中按 `save_checkpoints_timestamp_quorum` 汇总各 rank 后的已消费数据事件时间，stream_T 落后不超过容忍值（默认 300 秒）即可，不比较已发布模型的新鲜度。若 stream\_{T-1} 已处于实时数据位置，5 分钟的容忍值可使条件在启动后约 132.5 分钟（约 06:42:30）满足；progress 的写入与检查周期会使实际交接略晚于该时刻。
+
+满足交接条件只说明 stream_T 的消费进度已接近 stream\_{T-1}，并不说明 stream_T 的 dense 模型与 embedding 已可加载。产物是否就绪由 deploy 与服务启动处理，例如 Processor 启动时 `current.json` 不存在会启动失败；stream\_{T-1} 退出前的最终发布只完成它自身链路的发布。
+
+stream\_{T-1} 退出后 deploy 通过 EAS 滚动更新切换服务：旧实例保持 stream\_{T-1} 的最终版本，新实例逐步启动并加载 stream_T，期间 stream_T 持续训练与发布。滚动更新期间不中断服务是 EAS 滚动更新的预期行为，而非训练代码提供的保证；退出与滚动更新的耗时不定。
 
 ## 链路隔离
 
@@ -31,8 +37,6 @@
 | Kafka `group.id`                         | `tzrec_ol_${T}`                        | KafkaDataset 以消费组订阅 topic，两条链路共用一个 `group.id` 会互相 rebalance、瓜分分区，**必须不同** |
 | FeatureDB `feature_store_config.version` | `ol_${T}`                              | 全量导入与增量写入不能叠写在同一个版本上                                                              |
 
-示例中 DLC 任务将 OSS 挂载到 `/mnt/data`，EAS 服务挂载其中的全量导出目录与发布根目录（见 [deploy](#online-learning-deploy)）。在线 dense 发布依赖 `os.rename`，并要求 EAS 读到新的 `current.json` 时，它指向的版本目录已经可读。请确认所用的 OSS 挂载方式支持 rename，且写入对其他客户端及时可见；不满足时发布根目录请改用 NAS/CPFS，`model_dir` 仍可以使用 OSS。
-
 ## DataWorks 调度
 
 在每个节点上配置调度参数（日调度时 `$[yyyymmdd]` 是业务日期的后一天）：
@@ -41,13 +45,13 @@
 bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd] next_day=$[yyyy-mm-dd]
 ```
 
-| 节点         | 节点类型 | 依赖                                                              | 作用                                 |
-| ------------ | -------- | ----------------------------------------------------------------- | ------------------------------------ |
-| sample       | ODPS SQL | 上游样本表                                                        | 产出 `ds=${bizdate}` 样本分区        |
-| train_daily  | PAI-DLC  | sample；**依赖上一周期（本节点）**                                | 天级增量训练                         |
-| full_export  | PAI-DLC  | train_daily                                                       | FeatureDB 全量上传                   |
-| train_stream | PAI-DLC  | full_export；**不依赖上一周期**，与前一天的 train_stream 并行运行 | 流式训练，追上下一条链路后自动退出   |
-| deploy       | PyODPS 3 | full_export；**依赖上一周期（本节点 + train_stream 节点）**       | 前一天的 train_stream 退出后切换 EAS |
+| 节点         | 节点类型 | 依赖                                                              | 作用                                       |
+| ------------ | -------- | ----------------------------------------------------------------- | ------------------------------------------ |
+| sample       | ODPS SQL | 上游样本表                                                        | 产出 `ds=${bizdate}` 样本分区              |
+| train_daily  | PAI-DLC  | sample；**依赖上一周期（本节点）**                                | 天级增量训练                               |
+| full_export  | PAI-DLC  | train_daily                                                       | FeatureDB 全量上传                         |
+| train_stream | PAI-DLC  | full_export；**不依赖上一周期**，与前一天的 train_stream 并行运行 | 流式训练，下一条链路满足交接条件后自动退出 |
+| deploy       | PyODPS 3 | full_export；**依赖上一周期（本节点 + train_stream 节点）**       | 前一天的 train_stream 退出后切换 EAS       |
 
 ### train_daily
 
@@ -134,7 +138,7 @@ data_config {
 }
 ```
 
-- 使用 `num_epochs: 1`，**不要设置 `num_steps`**：Kafka 数据流不会结束，任务只会因交接而正常退出；train_stream 正常退出会直接触发下一天的 deploy，deploy 不再重复判断是否追上。
+- 使用 `num_epochs: 1`，**不要设置 `num_steps`**：Kafka 数据流不会结束，任务只会因交接而正常退出；train_stream 正常退出会直接触发下一天的 deploy，deploy 不再重复判断交接条件。
 - 学习率建议使用常数学习率；从天级模型 fine-tune 时不会恢复学习率调度进度。
 
 节点内容（`job_max_running_time_minutes` 作为兜底，需大于链路的预期运行时长）：
@@ -176,8 +180,6 @@ dlc submit pytorchjob \
 
 - 首次启动时 `model_dir` 中没有 checkpoint，从天级模型加载参数；天级 checkpoint 中没有 Kafka 位点，因此按 `start.timestamp.ms` 开始消费。
 - 重启时 `model_dir` 中已有 checkpoint，优先从中恢复参数和 Kafka 位点，`--fine_tune_checkpoint` 不再生效。
-
-(online-learning-deploy)=
 
 ### deploy
 
