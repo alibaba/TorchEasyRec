@@ -92,12 +92,12 @@
   <!-- lane: old lineage stream_T-1 -->
   <rect x="140" y="290" width="472" height="28" rx="6" fill="#fde68a" stroke="#d97706"/>
   <text x="376" y="309" font-size="13" fill="#78350f" text-anchor="middle">训练并发布（自 T 日起持续运行）</text>
-  <rect x="612" y="290" width="60" height="28" fill="#fef3c7" stroke="#d97706" stroke-dasharray="4 3"/>
-  <text x="642" y="337" font-size="11.5" fill="#475569" text-anchor="middle">至下次检查</text>
-  <text x="672" y="285" font-size="11.5" fill="#78350f" text-anchor="middle">下次检查满足交接条件</text>
-  <rect x="672" y="290" width="118" height="28" fill="url(#hatch-amber)" stroke="#d97706"/>
-  <rect x="682" y="296" width="98" height="16" rx="3" fill="#ffffff" fill-opacity="0.85"/>
-  <text x="731" y="308" font-size="11.5" fill="#78350f" text-anchor="middle">排空上传·最终发布</text>
+  <rect x="612" y="290" width="14" height="28" fill="#fef3c7" stroke="#d97706" stroke-dasharray="4 3"/>
+  <text x="619" y="337" font-size="11.5" fill="#475569" text-anchor="middle">至下次检查</text>
+  <text x="626" y="285" font-size="11.5" fill="#78350f" text-anchor="middle">下次检查满足交接条件</text>
+  <rect x="626" y="290" width="164" height="28" fill="url(#hatch-amber)" stroke="#d97706"/>
+  <rect x="659" y="296" width="98" height="16" rx="3" fill="#ffffff" fill-opacity="0.85"/>
+  <text x="708" y="308" font-size="11.5" fill="#78350f" text-anchor="middle">排空上传·最终发布</text>
   <line x1="790" y1="284" x2="790" y2="324" stroke="#b45309" stroke-width="3"/>
   <text x="796" y="285" font-size="11.5" font-weight="bold" fill="#b45309">退出</text>
   <text x="810" y="309" font-size="12" fill="#94a3b8">已退出</text>
