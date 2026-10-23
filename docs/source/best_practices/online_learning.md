@@ -271,7 +271,7 @@ subprocess.run(cmd + ["modify", service_name, "-s", "service.json"], check=True)
 
 此外，全量导出与流式训练的产物需要相互兼容：
 
-- 两者需使用相同的模型配置与导出相关环境变量（如 `INPUT_TILE`）。Processor 会比较热加载版本与初始模型的 `dense_meta.json`，不一致时拒绝加载该版本（日志 `dense_meta_mismatch`）。
+- 两者需使用相同的模型配置与导出相关环境变量（如 `INPUT_TILE`）。Processor 会比较热加载版本与初始模型的 `dense_meta.json`。
 - full_export 的 `DIST_QUANT` 需与 train_stream 中 `delta_embedding_dump_config.quant_type` 一致（同为 INT8 或同为不量化），FeatureView 的元素类型需与模型一致，否则 apply 模式初始化失败。
 
 `model_config` 中其余参数见[模型服务](../usage/serving.md)，与线上服务保持一致即可。EAS 会滚动更新实例，滚动更新进度可在 EAS 控制台查看。
