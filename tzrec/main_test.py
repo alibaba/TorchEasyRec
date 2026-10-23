@@ -87,6 +87,17 @@ class MainTest(unittest.TestCase):
         train.assert_called_once()
         self.assertIs(train.call_args.kwargs["ignore_restore_lr_scheduler"], ignore)
 
+    def test_export_cli_edit_config_json(self):
+        edit = '{"export_config.dynamic_embedding.feature_store_config.version":"v1"}'
+        argv = ["tzrec.export", "--edit_config_json", edit]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch("tzrec.main.export", autospec=True) as export,
+        ):
+            runpy.run_module("tzrec.export", run_name="__main__")
+        export.assert_called_once()
+        self.assertEqual(export.call_args.kwargs["edit_config_json"], edit)
+
     def test_create_custom_model(self) -> None:
         """A custom model receives its unpacked protobuf configuration."""
         model_config = ModelConfig()

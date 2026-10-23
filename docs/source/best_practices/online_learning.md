@@ -35,17 +35,17 @@
 bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd]
 ```
 
-| 节点        | 节点类型 | 依赖                                                   | 作用                                     |
-| ----------- | -------- | ------------------------------------------------------ | ---------------------------------------- |
-| sample      | ODPS SQL | 上游样本表                                             | 产出 `ds=${bizdate}` 样本分区            |
-| train_daily | PAI-DLC  | sample；**依赖上一周期（本节点）**                     | 天级增量训练                             |
-| export      | PAI-DLC  | train_daily                                            | FeatureDB 全量上传                       |
-| stream      | PAI-DLC  | export；**不依赖上一周期**，与前一天的 stream 并行运行 | 流式训练，追上下一条链路后自动退出       |
-| deploy      | Shell    | export；**依赖上一周期（本节点 + stream 节点）**       | 前一天的 stream 退出后校验产物并切换 EAS |
+| 节点         | 节点类型 | 依赖                                                              | 作用                                           |
+| ------------ | -------- | ----------------------------------------------------------------- | ---------------------------------------------- |
+| sample       | ODPS SQL | 上游样本表                                                        | 产出 `ds=${bizdate}` 样本分区                  |
+| train_daily  | PAI-DLC  | sample；**依赖上一周期（本节点）**                                | 天级增量训练                                   |
+| full_export  | PAI-DLC  | train_daily                                                       | FeatureDB 全量上传                             |
+| train_stream | PAI-DLC  | full_export；**不依赖上一周期**，与前一天的 train_stream 并行运行 | 流式训练，追上下一条链路后自动退出             |
+| deploy       | Shell    | full_export；**依赖上一周期（本节点 + train_stream 节点）**       | 前一天的 train_stream 退出后校验产物并切换 EAS |
 
-- stream 节点会运行约 1.5 天（当天全天 + 次日追赶时间），节点超时时间需大于该时长；DLC 任务开启失败自动重启。
+- train_stream 节点在业务日期 T 的实例即流式任务 stream_T，会运行约 1.5 天（当天全天 + 次日追赶时间），节点超时时间需大于该时长；DLC 任务开启失败自动重启。
 - deploy 依赖上一周期的本节点，保证切换严格按日期顺序执行，较旧的链路不会覆盖较新的部署。
-- 首次上线时没有前一天的 stream，EAS 服务需手动创建。
+- 首次上线时没有前一天的 train_stream，EAS 服务需手动创建。
 
 ### sample
 
@@ -63,23 +63,21 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --train_input_path odps://${project}/tables/${sample_table}/ds=${bizdate}
 ```
 
-### export
+### full_export
 
-将天级模型的 embedding 全量上传到本链路的 FeatureDB 版本，详见[dynemb 流式导出与 FeatureDB 全量上传](../usage/export.md)。天级配置中 `export_config.dynamic_embedding.feature_store_config.version` 写为占位值 `ol_placeholder`，导出前按业务日期替换：
+将天级模型的 embedding 全量上传到本链路的 FeatureDB 版本，详见[dynemb 流式导出与 FeatureDB 全量上传](../usage/export.md)。天级配置中 `export_config.dynamic_embedding.feature_store_config` 不写 `version`，导出时通过 `--edit_config_json` 按业务日期指定：
 
 ```bash
-sed 's/ol_placeholder/ol_'${bizdate}'/' /mnt/data/online/daily/${bizdate}/pipeline.config \
-    > /mnt/data/online/daily/${bizdate}/export.config
-
 USE_DISTRIBUTED_EMBEDDING=1 \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.export \
-    --pipeline_config_path /mnt/data/online/daily/${bizdate}/export.config \
-    --export_dir /mnt/data/online/daily/${bizdate}/export
+    --pipeline_config_path /mnt/data/online/daily/${bizdate}/pipeline.config \
+    --export_dir /mnt/data/online/daily/${bizdate}/export \
+    --edit_config_json '{"export_config.dynamic_embedding.feature_store_config.version":"ol_'${bizdate}'"}'
 ```
 
-### stream
+### train_stream
 
 流式训练配置（只列出与在线学习相关的部分）：
 
@@ -94,7 +92,7 @@ train_config {
             region: "cn-beijing"
             project_name: "recommendation"
             feature_view_name: "model_embeddings"
-            version: "ol_placeholder"  # 由启动命令按链路覆盖
+            # version 不写，由启动命令的 --edit_config_json 按链路指定
         }
     }
     ...
@@ -192,11 +190,11 @@ stream\_{T-1} 每隔 `log_step_count_steps` 步检查一次：rank 0 读取自�
 
 - Kafka 保留时长 ≥ 天级样本延迟 + 天级训练与导出耗时 + 追赶耗时 + 一天的重跑余量。
 - Kafka 分区数需是 `nproc-per-node * nnodes * num_workers` 的倍数。
-- 下一条链路迟迟追不上时（天级任务失败、追赶太慢），stream\_{T-1} 会继续训练并服务，但受 stream 节点超时、DLC 最长运行时长与 FeatureDB 视图 TTL 的限制，需配置告警及时处理。
+- 下一条链路迟迟追不上时（天级任务失败、追赶太慢），stream\_{T-1} 会继续训练并服务，但受 train_stream 节点超时、DLC 最长运行时长与 FeatureDB 视图 TTL 的限制，需配置告警及时处理。
 
-| 故障                | 影响                                            | 处理                                       |
-| ------------------- | ----------------------------------------------- | ------------------------------------------ |
-| 天级训练或导出失败  | stream_T 不启动，stream\_{T-1} 继续服务         | 修复后重跑节点，下游自动继续               |
-| stream 任务异常退出 | DLC 自动重启，从 `model_dir` 的 checkpoint 恢复 | 重启失败时重跑 stream 节点，命令不变       |
-| deploy 校验失败     | EAS 保持原链路                                  | 检查下一条链路的发布情况后重跑 deploy 节点 |
-| EAS 滚动更新失败    | EAS 保持原链路                                  | 排查 Processor 日志后重跑 deploy 节点      |
+| 故障                      | 影响                                            | 处理                                       |
+| ------------------------- | ----------------------------------------------- | ------------------------------------------ |
+| 天级训练或导出失败        | stream_T 不启动，stream\_{T-1} 继续服务         | 修复后重跑节点，下游自动继续               |
+| train_stream 任务异常退出 | DLC 自动重启，从 `model_dir` 的 checkpoint 恢复 | 重启失败时重跑 train_stream 节点，命令不变 |
+| deploy 校验失败           | EAS 保持原链路                                  | 检查下一条链路的发布情况后重跑 deploy 节点 |
+| EAS 滚动更新失败          | EAS 保持原链路                                  | 排查 Processor 日志后重跑 deploy 节点      |

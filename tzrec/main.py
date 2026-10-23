@@ -1313,6 +1313,7 @@ def export(
     asset_files: Optional[str] = None,
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     item_input_path: Optional[str] = None,
+    edit_config_json: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -1327,12 +1328,15 @@ def export(
         item_input_path (str, optional): override for the item tower's
             predict-mode dataloader input path. When set, the item tower
             reads from this path instead of ``train_input_path``.
+        edit_config_json (str, optional): edit pipeline config json str.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
     ensure_input_tile_for_distributed_embedding()
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+    if edit_config_json:
+        config_util.edit_config(pipeline_config, json.loads(edit_config_json))
     ori_pipeline_config = copy.copy(pipeline_config)
 
     # AOTI bakes allow_tf32 into Triton constexprs at trace time.

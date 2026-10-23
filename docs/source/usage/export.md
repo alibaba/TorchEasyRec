@@ -30,6 +30,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --pipeline_config_path: 导出用的配置文件
 - --checkpoint_path: 指定要导出的checkpoint, 默认导出model_dir下面最新的checkpoint
 - --export_dir: 导出到的模型目录，对于向量召回模型，导出命令会自动进行切图，分别放在user和item的子目录下
+- --edit_config_json: 命令行以json的方式动态修改配置文件，如{"export_config.dynamic_embedding.feature_store_config.version":"v1"}
 
 (export-env-vars)=
 
