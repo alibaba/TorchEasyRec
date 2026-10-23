@@ -32,7 +32,7 @@
 在每个节点上配置调度参数（日调度时 `$[yyyymmdd]` 是业务日期的后一天）：
 
 ```
-bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd]
+bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd] next_day=$[yyyy-mm-dd]
 ```
 
 | 节点         | 节点类型 | 依赖                                                              | 作用                                 |
@@ -51,16 +51,38 @@ bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd]
 
 天级样本建议与 Kafka 样本流出自同一个 Flink 作业，并按 Kafka 消息时间戳切分分区，这样 `ds=T` 的结束时刻恰好等于 stream_T 的起始位点，不重不漏。切分与 `start.timestamp.ms` 的计算都需显式指定时区。
 
+三个 PAI-DLC 节点的内容都是一条 `dlc submit pytorchjob` 命令，DataWorks 会等待 DLC 任务结束后再标记节点完成，说明如下：
+
+- `${bizdate}` 等调度参数由 DataWorks 在提交前直接替换；`$MASTER_ADDR` 等变量在 `--command` 的单引号内，由 DLC 容器执行时展开。
+- `<...>` 为需要按实际环境填写的值；`tzrec` 需使用支持 `ONLINE_LEARNING_SUCCESSOR_DIR` 的版本（>= 1.5.6）。
+- `--data_sources` 为挂载到 `/mnt/data` 的 OSS 数据集；`--enable_credential=true` 让任务以 PAI 默认角色访问 MaxCompute、FeatureStore 等云产品。
+- FeatureDB 的用户名和密码通过 `FEATUREDB_USERNAME`、`FEATUREDB_PASSWORD` 环境变量传入，不要写进 `pipeline.config`。
+
 ### train_daily
 
 ```bash
-torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-    -m tzrec.train_eval \
-    --pipeline_config_path /mnt/data/online/daily.config \
-    --model_dir /mnt/data/online/daily/${bizdate} \
-    --fine_tune_checkpoint /mnt/data/online/daily/${prev} \
-    --train_input_path odps://${project}/tables/${sample_table}/ds=${bizdate}
+dlc submit pytorchjob \
+    --name=online_train_daily_${bizdate} \
+    --command='set -e
+        pip install tzrec[cu126]==<tzrec 版本> -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+        ODPS_ENDPOINT=http://service.<region>.maxcompute.aliyun-inc.com/api \
+        torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+            --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+            -m tzrec.train_eval \
+            --pipeline_config_path /mnt/data/online/daily.config \
+            --model_dir /mnt/data/online/daily/${bizdate} \
+            --fine_tune_checkpoint /mnt/data/online/daily/${prev} \
+            --train_input_path odps://<project>/tables/<sample_table>/ds=${bizdate}
+        ' \
+    --data_sources=<OSS 数据集 ID> \
+    --workspace_id=<工作空间 ID> \
+    --priority=1 \
+    --job_max_running_time_minutes=1440 \
+    --workers=<节点数> \
+    --worker_image=dsw-registry-vpc.<region>.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu126-ubuntu22.04 \
+    --worker_spec=<GPU 机型> \
+    --enable_credential=true \
+    --disable_ecs_stock_check=true
 ```
 
 ### full_export
@@ -68,13 +90,29 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 将天级模型的 embedding 全量上传到本链路的 FeatureDB 版本，详见[dynemb 流式导出与 FeatureDB 全量上传](../usage/export.md)。天级配置中 `export_config.dynamic_embedding.feature_store_config` 不写 `version`，导出时通过 `--edit_config_json` 按业务日期指定：
 
 ```bash
-USE_DISTRIBUTED_EMBEDDING=1 \
-torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-    -m tzrec.export \
-    --pipeline_config_path /mnt/data/online/daily/${bizdate}/pipeline.config \
-    --export_dir /mnt/data/online/daily/${bizdate}/export \
-    --edit_config_json '{"export_config.dynamic_embedding.feature_store_config.version":"ol_'${bizdate}'"}'
+dlc submit pytorchjob \
+    --name=online_full_export_${bizdate} \
+    --command='set -e
+        pip install tzrec[cu126]==<tzrec 版本> -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+        ODPS_ENDPOINT=http://service.<region>.maxcompute.aliyun-inc.com/api \
+        USE_DISTRIBUTED_EMBEDDING=1 \
+        FEATUREDB_USERNAME=<FeatureDB 用户名> FEATUREDB_PASSWORD=<FeatureDB 密码> \
+        torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+            --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+            -m tzrec.export \
+            --pipeline_config_path /mnt/data/online/daily/${bizdate}/pipeline.config \
+            --export_dir /mnt/data/online/daily/${bizdate}/export \
+            --edit_config_json "{\"export_config.dynamic_embedding.feature_store_config.version\":\"ol_${bizdate}\"}"
+        ' \
+    --data_sources=<OSS 数据集 ID> \
+    --workspace_id=<工作空间 ID> \
+    --priority=1 \
+    --job_max_running_time_minutes=1440 \
+    --workers=<节点数> \
+    --worker_image=dsw-registry-vpc.<region>.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu126-ubuntu22.04 \
+    --worker_spec=<GPU 机型> \
+    --enable_credential=true \
+    --disable_ecs_stock_check=true
 ```
 
 ### train_stream
@@ -106,24 +144,38 @@ data_config {
 - 使用 `num_epochs: 1`，**不要设置 `num_steps`**：Kafka 数据流不会结束，任务只会因交接而正常退出；train_stream 正常退出会直接触发下一天的 deploy，deploy 不再重复判断是否追上。
 - 学习率建议使用常数学习率；从天级模型 fine-tune 时不会恢复学习率调度进度。
 
-启动命令：
+节点内容（`job_max_running_time_minutes` 作为兜底，需大于链路的预期运行时长）：
 
 ```bash
-START_MS=$(( $(date -d "${next:0:4}-${next:4:2}-${next:6:2} 00:00:00 +0800" +%s) * 1000 ))
-
-USE_DISTRIBUTED_EMBEDDING=1 \
-ONLINE_DENSE_EXPORT=1 \
-ONLINE_DENSE_EXPORT_DIR=/mnt/data/online/stream/${bizdate}/serving \
-ONLINE_LEARNING_SUCCESSOR_DIR=/mnt/data/online/stream/${next}/serving \
-torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-    --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
-    -m tzrec.train_eval \
-    --pipeline_config_path /mnt/data/online/stream.config \
-    --continue_train \
-    --fine_tune_checkpoint /mnt/data/online/daily/${bizdate} \
-    --model_dir /mnt/data/online/stream/${bizdate}/model \
-    --train_input_path "kafka://${broker}/${topic}?group.id=tzrec_ol_${bizdate}&start.timestamp.ms=${START_MS}" \
-    --edit_config_json '{"train_config.delta_embedding_dump_config.feature_store_config.version":"ol_'${bizdate}'"}'
+dlc submit pytorchjob \
+    --name=online_train_stream_${bizdate} \
+    --command='set -e
+        pip install tzrec[cu126]==<tzrec 版本> -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+        START_MS=$(( $(date -d "${next_day} 00:00:00 +0800" +%s) * 1000 ))
+        USE_DISTRIBUTED_EMBEDDING=1 \
+        ONLINE_DENSE_EXPORT=1 \
+        ONLINE_DENSE_EXPORT_DIR=/mnt/data/online/stream/${bizdate}/serving \
+        ONLINE_LEARNING_SUCCESSOR_DIR=/mnt/data/online/stream/${next}/serving \
+        FEATUREDB_USERNAME=<FeatureDB 用户名> FEATUREDB_PASSWORD=<FeatureDB 密码> \
+        torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+            --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
+            -m tzrec.train_eval \
+            --pipeline_config_path /mnt/data/online/stream.config \
+            --continue_train \
+            --fine_tune_checkpoint /mnt/data/online/daily/${bizdate} \
+            --model_dir /mnt/data/online/stream/${bizdate}/model \
+            --train_input_path "kafka://<broker>/<topic>?group.id=tzrec_ol_${bizdate}&start.timestamp.ms=$START_MS" \
+            --edit_config_json "{\"train_config.delta_embedding_dump_config.feature_store_config.version\":\"ol_${bizdate}\"}"
+        ' \
+    --data_sources=<OSS 数据集 ID> \
+    --workspace_id=<工作空间 ID> \
+    --priority=1 \
+    --job_max_running_time_minutes=4320 \
+    --workers=<节点数> \
+    --worker_image=dsw-registry-vpc.<region>.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu126-ubuntu22.04 \
+    --worker_spec=<GPU 机型> \
+    --enable_credential=true \
+    --disable_ecs_stock_check=true
 ```
 
 首次启动与失败重启使用同一条命令：
