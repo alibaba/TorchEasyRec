@@ -51,7 +51,6 @@ bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd] next_day=$[yyyy-mm-dd]
 
 - train_stream 节点在业务日期 T 的实例即流式任务 stream_T，会运行约 1.5 天（当天全天 + 次日追赶时间），节点超时时间需大于该时长；DLC 任务开启失败自动重启。
 - deploy 依赖上一周期的本节点，保证切换严格按日期顺序执行，较旧的链路不会覆盖较新的部署。
-- 首次上线时没有前一天的 train_stream，EAS 服务需手动创建。
 
 ### train_daily
 
