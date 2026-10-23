@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 580" width="1060" height="580" role="img" aria-labelledby="timeline-title timeline-desc" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Source Han Sans SC', sans-serif">
-  <title id="timeline-title">在线学习链路交接时间线（示意）</title>
-  <desc id="timeline-desc">以挂钟时间（T+1 日）为横轴的泳道图，共四条泳道。天级准备：01:30 样本就绪，03:30 天级训练完成，04:30 全量导出完成。新链路 stream_T：04:30 启动，从 Kafka 00:00 的位点开始消费积压数据，约 06:45 追上（示意值，假设积压 4.5 小时、训练速度为数据产生速度的 3 倍），之后持续训练与发布，部署后继续运行。旧链路 stream_T-1：追赶期间继续训练与发布，在下一次检查时发现新链路已追上，随后排空上传、完成最终发布并退出。EAS 服务：先服务旧链路；旧任务退出后触发 deploy，滚动更新期间服务不中断，沿用旧链路最终版本并暂停更新，完成后改为服务新链路。06:45 之后各阶段时长不定，仅示意先后顺序。</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 500" width="1060" height="500" role="img" aria-labelledby="timeline-title timeline-desc" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Source Han Sans SC', sans-serif">
+  <title id="timeline-title">在线学习链路示意时间线</title>
+  <desc id="timeline-desc">以挂钟时间（T+1 日）为横轴的泳道图，共四条泳道。天级准备：01:30 样本就绪，03:30 天级训练完成，04:30 全量导出完成。新链路 stream_T：04:30 启动，从 Kafka 00:00 的位点开始消费积压数据，约 06:45 追上（示意值，假设积压 4.5 小时、训练速度为数据产生速度的 3 倍），之后持续训练与发布，部署后继续运行。旧链路 stream_T-1：追赶期间继续训练与发布，在下一次检查时发现新链路已追上，随后排空上传、完成最终发布并退出。EAS 服务：先服务旧链路；旧任务退出后触发 deploy，滚动更新期间服务不中断，沿用旧链路最终版本并暂停更新，完成后改为服务新链路。</desc>
 
   <defs>
     <pattern id="hatch-amber" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
@@ -16,10 +16,10 @@
     </marker>
   </defs>
 
-  <rect width="1060" height="580" fill="#ffffff"/>
+  <rect width="1060" height="500" fill="#ffffff"/>
 
   <!-- title and legend -->
-  <text x="20" y="36" font-size="19" font-weight="bold" fill="#0f172a">在线学习链路交接时间线（示意）</text>
+  <text x="20" y="36" font-size="19" font-weight="bold" fill="#0f172a">在线学习链路示意时间线</text>
   <rect x="610" y="22" width="18" height="14" rx="3" fill="#fde68a" stroke="#d97706"/>
   <text x="634" y="34" font-size="12.5" fill="#334155">旧链路 stream<tspan baseline-shift="sub" font-size="10">T-1</tspan></text>
   <rect x="760" y="22" width="18" height="14" rx="3" fill="#5eead4" stroke="#0d9488"/>
@@ -114,16 +114,11 @@
   <text x="850" y="390" font-size="11.5" fill="#334155" text-anchor="middle">滚动更新</text>
   <rect x="910" y="372" width="120" height="28" rx="6" fill="#5eead4" stroke="#0d9488"/>
   <text x="970" y="391" font-size="13" fill="#134e4a" text-anchor="middle">服务 stream<tspan baseline-shift="sub" font-size="10">T</tspan></text>
-  <text x="850" y="418" font-size="12" font-weight="bold" fill="#334155" text-anchor="middle">③ 不中断：沿用旧链路最终版本，暂停更新</text>
+  <text x="850" y="418" font-size="12" font-weight="bold" fill="#334155" text-anchor="middle">不中断：沿用旧链路最终版本，暂停更新</text>
 
   <!-- notes -->
   <g font-size="13" fill="#1e293b">
     <text x="20" y="460">① 追赶期间，新旧两条流式任务同时运行，各自训练并发布。</text>
     <text x="20" y="484">② deploy 等待旧任务 stream<tspan baseline-shift="sub" font-size="10">T-1</tspan> 退出后才更新 EAS；新任务 stream<tspan baseline-shift="sub" font-size="10">T</tspan> 不受影响，持续运行。</text>
-    <text x="20" y="508">③ 切换期间服务不中断：旧链路最终发布后不再更新，滚动更新完成后由新链路接管。</text>
-  </g>
-  <g font-size="12" fill="#64748b">
-    <text x="20" y="540">注：≈06:45 为示意值，假设 Kafka 积压 4.5 小时、训练速度为数据产生速度的 3 倍；发布与检查周期可能推迟发现追上的时间。</text>
-    <text x="20" y="560">≈06:45 之后的检查等待、排空上传与最终发布、滚动更新等阶段时长不定，图中仅示意先后顺序。</text>
   </g>
 </svg>
