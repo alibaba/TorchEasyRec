@@ -27,6 +27,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
 - CHECKPOINT_TAG: 给checkpoint打一个自定义标记，记录在`meta`中（见下面的checkpoint信息），便于外部调度识别是哪一次调度产出的checkpoint。默认为空，不做任何限制
+- ONLINE_LEARNING_SUCCESSOR_DIR: 在线学习中下一条流式链路的发布根目录（即其`ONLINE_DENSE_EXPORT_DIR`）。设置后，当下一条链路发布的`current.json`的`data_timestamp`不小于本任务时，本任务正常结束训练且不保存最终checkpoint，需同时开启`ONLINE_DENSE_EXPORT=1`，详见[天级增量 + 流式训练的在线学习](../best_practices/online_learning.md)
 
 ## Checkpoint信息与完成标记
 

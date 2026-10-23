@@ -12,6 +12,7 @@
 import copy
 import itertools
 import json
+import math
 import os
 import socket
 from collections import OrderedDict
@@ -105,7 +106,12 @@ from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.hf_export_util import export_hf_assets
 from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import ProgressLogger, logger
-from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
+from tzrec.utils.online_dense_export_util import (
+    CURRENT_JSON,
+    OnlineDenseExportManager,
+    read_current_manifest,
+    resolve_dense_export_root,
+)
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
 
@@ -402,6 +408,77 @@ def _create_train_profiler(
     )
 
 
+def _published_data_ts(current_path: str) -> Optional[float]:
+    """Return a manifest's data_timestamp, or None if absent or not a valid time."""
+    manifest = read_current_manifest(current_path)
+    ts = manifest.get("data_timestamp") if manifest is not None else None
+    # bool is an int subclass; -1.0 is the "no timestamp" sentinel
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return float(ts) if math.isfinite(ts) and ts > 0 else None
+
+
+def _successor_caught_up(own_current: str, successor_current: str) -> bool:
+    """Whether the successor lineage has published data at least as fresh as ours.
+
+    Rank zero compares the data_timestamp of the two published current.json
+    manifests and broadcasts the decision, so every rank leaves the train loop
+    at the same step. A missing or invalid manifest on either side means not
+    caught up.
+
+    Args:
+        own_current: this run's published current.json path.
+        successor_current: the successor lineage's published current.json path.
+
+    Returns:
+        True if this run should hand over to the successor.
+    """
+    decision = [False]
+    if int(os.environ.get("RANK", 0)) == 0:
+        own_ts = _published_data_ts(own_current)
+        successor_ts = _published_data_ts(successor_current)
+        decision[0] = (
+            own_ts is not None and successor_ts is not None and successor_ts >= own_ts
+        )
+    if dist.is_initialized():
+        dist.broadcast_object_list(decision, src=0)
+    return decision[0]
+
+
+def _handover_paths(
+    model_dir: str, online_dense_export_enabled: bool
+) -> Optional[Tuple[str, str]]:
+    """Resolve (own, successor) current.json paths from ONLINE_LEARNING_SUCCESSOR_DIR.
+
+    Args:
+        model_dir: this run's model_dir.
+        online_dense_export_enabled: whether this run publishes current.json.
+
+    Returns:
+        The two manifest paths, or None when no successor is configured.
+    """
+    successor_root = os.environ.get("ONLINE_LEARNING_SUCCESSOR_DIR")
+    if not successor_root:
+        return None
+    if not online_dense_export_enabled:
+        raise RuntimeError(
+            "ONLINE_LEARNING_SUCCESSOR_DIR requires ONLINE_DENSE_EXPORT=1: the "
+            "published current.json is the hand-over progress signal."
+        )
+    own_export_root = resolve_dense_export_root(model_dir)
+    # not resolve_dense_export_root: it prefers this run's ONLINE_DENSE_EXPORT_DIR
+    successor_export_root = os.path.join(successor_root, "dense_hot_export")
+    if os.path.abspath(successor_export_root) == os.path.abspath(own_export_root):
+        raise RuntimeError(
+            "ONLINE_LEARNING_SUCCESSOR_DIR must differ from this run's "
+            f"ONLINE_DENSE_EXPORT_DIR, got {successor_root}."
+        )
+    return (
+        os.path.join(own_export_root, CURRENT_JSON),
+        os.path.join(successor_export_root, CURRENT_JSON),
+    )
+
+
 def _train_and_evaluate(
     model: nn.Module,
     optimizer: optim.Optimizer,
@@ -584,6 +661,10 @@ def _train_and_evaluate(
             "dense export trigger and the FeatureStore upload watermark is the only "
             "publish gate."
         )
+    # A stream lineage retires itself once the next day's lineage has published
+    # data at least as fresh; deployment of the successor follows its exit.
+    handover_paths = _handover_paths(model_dir, online_dense_exporter.enabled)
+    handed_over = False
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
@@ -709,8 +790,22 @@ def _train_and_evaluate(
                     if delta_embedding_dumper is not None
                     else None
                 )
+                if (
+                    handover_paths is not None
+                    and i_step % train_config.log_step_count_steps == 0
+                    and _successor_caught_up(*handover_paths)
+                ):
+                    logger.info(
+                        f"successor lineage {handover_paths[1]} caught up at step "
+                        f"{i_step}, handing over."
+                    )
+                    handed_over = True
+                    break
                 if prof is not None:
                     prof.step()
+
+            if handed_over:
+                break
 
             if not (use_step and i_step >= train_config.num_steps - 1):
                 for lr in lr_scheduler:
@@ -760,7 +855,8 @@ def _train_and_evaluate(
             summary_writer.close()
         if prof is not None:
             prof.stop()
-        if ckpt_manager.maybe_save(
+        # a retired lineage is never resumed, so skip its final checkpoint
+        if not handed_over and ckpt_manager.maybe_save(
             i_step,
             model,
             optimizer,

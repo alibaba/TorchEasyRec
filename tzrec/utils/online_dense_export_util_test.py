@@ -42,8 +42,9 @@ from tzrec.utils.online_dense_export_util import (
     OnlineDenseExportManager,
     _atomic_write_json,
     _make_monotonic_version,
-    _read_current_version,
+    _prune_old_dense_versions,
     make_version,
+    read_current_manifest,
     resolve_dense_export_root,
 )
 
@@ -1172,16 +1173,34 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 os.listdir(os.path.join(tmp_dir, "nested")), ["current.json"]
             )
 
-    def test_read_current_version_best_effort(self) -> None:
+    def test_read_current_manifest_best_effort(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            missing = os.path.join(tmp_dir, "current.json")
-            self.assertIsNone(_read_current_version(missing))
-            with open(missing, "w") as f:
+            path = os.path.join(tmp_dir, "current.json")
+            self.assertIsNone(read_current_manifest(path))
+            with open(path, "w") as f:
                 f.write("{not json")
-            self.assertIsNone(_read_current_version(missing))
-            with open(missing, "w") as f:
+            self.assertIsNone(read_current_manifest(path))
+            with open(path, "w") as f:
+                json.dump(["20260101000001"], f)
+            self.assertIsNone(read_current_manifest(path))
+            with open(path, "w") as f:
                 json.dump({"version": "20260101000001"}, f)
-            self.assertEqual(_read_current_version(missing), "20260101000001")
+            self.assertEqual(read_current_manifest(path), {"version": "20260101000001"})
+
+    def test_prune_spares_current_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            versions_root = os.path.join(tmp_dir, "versions")
+            names = [f"2026010100000{i}" for i in range(5)]
+            for name in names:
+                os.makedirs(os.path.join(versions_root, name))
+            _atomic_write_json(
+                os.path.join(tmp_dir, "current.json"), {"version": names[0]}
+            )
+            with mock.patch.dict(
+                os.environ, {"ONLINE_DENSE_EXPORT_KEEP_VERSIONS": "3"}
+            ):
+                _prune_old_dense_versions(tmp_dir, versions_root)
+            self.assertEqual(sorted(os.listdir(versions_root)), [names[0]] + names[2:])
 
 
 if __name__ == "__main__":

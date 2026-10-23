@@ -12,6 +12,7 @@
 """Tests for tzrec.main orchestration and the train-loop step counter."""
 
 import itertools
+import json
 import os
 import runpy
 import shutil
@@ -28,6 +29,8 @@ from tzrec.datasets.utils import RecordBatchTensor
 from tzrec.main import (
     _create_model,
     _create_train_profiler,
+    _handover_paths,
+    _successor_caught_up,
     _train_and_evaluate,
     predict,
     predict_checkpoint,
@@ -908,6 +911,133 @@ class TrainProfilerTest(unittest.TestCase):
         traces = os.listdir(self.test_dir)
         self.assertEqual(len(traces), 1)
         self.assertTrue(traces[0].startswith("rank3_"), traces[0])
+
+
+class OnlineLearningHandoverTest(unittest.TestCase):
+    """Tests for retiring a stream lineage once its successor caught up."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    def _write_manifest(self, name, data_timestamp):
+        path = os.path.join(self.test_dir, name, "current.json")
+        if data_timestamp is not None:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump({"version": "v", "data_timestamp": data_timestamp}, f)
+        return path
+
+    @parameterized.expand(
+        [
+            param("ahead", own=100.0, successor=200.0, expected=True),
+            param("equal", own=100.0, successor=100.0, expected=True),
+            param("behind", own=200.0, successor=100.0, expected=False),
+            param("successor_missing", own=100.0, successor=None, expected=False),
+            param("own_missing", own=None, successor=100.0, expected=False),
+            param("sentinel", own=-1.0, successor=-1.0, expected=False),
+            param("nan", own=100.0, successor=float("nan"), expected=False),
+            param("inf", own=100.0, successor=float("inf"), expected=False),
+            param("non_numeric", own=100.0, successor="200", expected=False),
+            param("bool", own=0.5, successor=True, expected=False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_successor_caught_up(self, _name, own, successor, expected) -> None:
+        own_current = self._write_manifest("own", own)
+        successor_current = self._write_manifest("successor", successor)
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            self.assertIs(
+                _successor_caught_up(own_current, successor_current), expected
+            )
+
+    def test_handover_paths(self) -> None:
+        own_root = os.path.join(self.test_dir, "own")
+        successor_root = os.path.join(self.test_dir, "successor")
+        with mock.patch.dict(os.environ, {"ONLINE_DENSE_EXPORT_DIR": own_root}):
+            os.environ.pop("ONLINE_LEARNING_SUCCESSOR_DIR", None)
+            self.assertIsNone(_handover_paths("model_dir", True))
+            os.environ["ONLINE_LEARNING_SUCCESSOR_DIR"] = successor_root
+            self.assertEqual(
+                _handover_paths("model_dir", True),
+                (
+                    os.path.join(own_root, "dense_hot_export", "current.json"),
+                    os.path.join(successor_root, "dense_hot_export", "current.json"),
+                ),
+            )
+            with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT=1"):
+                _handover_paths("model_dir", False)
+            os.environ["ONLINE_LEARNING_SUCCESSOR_DIR"] = own_root + "/"
+            with self.assertRaisesRegex(RuntimeError, "must differ"):
+                _handover_paths("model_dir", True)
+
+    def test_train_loop_retires_on_handover(self) -> None:
+        """Hand-over leaves both loops, skips the epoch-end and final saves.
+
+        The successor check runs only at the log cadence after poll_publish;
+        once it passes, the trailing delta is still dumped, uploads drained
+        and the final publish finalized.
+        """
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()] * 10)
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=17.0)
+        pipeline = mock.Mock()
+        pipeline.progress.return_value = ({"loss": torch.tensor(1.0)}, {}, batch)
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        dumper = mock.Mock()
+        dumper.maybe_dump.return_value = DumpDecision.NONE
+        dumper.final_dump.return_value = 2
+        exporter = mock.Mock()
+        exporter.enabled = True
+        train_config = _train_config(num_steps=0, num_epochs=1, log_step_count_steps=2)
+        train_config.delta_embedding_dump_config.paired_dump_interval_steps = 1
+        train_config.delta_embedding_dump_config.feature_store_config.project_name = (
+            "project"
+        )
+        env = {
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "ONLINE_DENSE_EXPORT_DIR": os.path.join(self.test_dir, "own"),
+            "ONLINE_LEARNING_SUCCESSOR_DIR": os.path.join(self.test_dir, "successor"),
+        }
+
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch(
+                "tzrec.main._successor_caught_up", side_effect=[False, True]
+            ) as caught_up,
+        ):
+            _train_and_evaluate(
+                model=model,
+                optimizer=optimizer,
+                train_dataloader=train_dataloader,
+                eval_dataloader=None,
+                lr_scheduler=[],
+                model_dir="unused",
+                train_config=train_config,
+                eval_config=EvalConfig(),
+                ckpt_manager=ckpt_manager,
+                delta_embedding_dumper=dumper,
+            )
+
+        self.assertEqual(caught_up.call_count, 2)
+        self.assertEqual(pipeline.progress.call_count, 3)
+        self.assertEqual(exporter.poll_publish.call_count, 3)
+        for call in ckpt_manager.maybe_save.call_args_list:
+            self.assertNotIn("epoch", call.kwargs)
+            self.assertFalse(call.kwargs.get("final", False))
+        self.assertTrue(model.module.model.on_train_end.called)
+        dumper.final_dump.assert_called_once_with(2)
+        dumper.close.assert_called_once()
+        exporter.finalize_publish.assert_called_once()
 
 
 if __name__ == "__main__":
