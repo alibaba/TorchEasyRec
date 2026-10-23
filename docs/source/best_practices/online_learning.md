@@ -14,6 +14,16 @@
 
 同一时刻最多有两条"链路"（lineage）在运行：正在服务的 stream\_{T-1}，以及正在追赶的 stream_T。每天的链路切换同时起到了[全量再基线](../usage/export.md)的作用：只要天级任务按时成功，崩溃重启带来的 FeatureDB 漂移最多存在于一条链路（约一天）。
 
+### 时间线示例
+
+下图以业务日期 T 为例，横轴为 T+1 日的挂钟时间。假设天级样本 01:30 就绪、天级训练 03:30 完成、全量导出 04:30 完成；此时 stream_T 启动，但从 Kafka 中 00:00 的数据开始消费，即挂钟时间 04:30 时处理的是数据时间 00:00 的积压。若积压为 4.5 小时、流式训练速度是数据产生速度的 3 倍，stream_T 约在 06:45 追上，这只是示意值，发布与检查的周期都可能推迟发现的时间。
+
+![在线学习链路交接时间线](../../images/best_practices/online_learning_timeline.svg)
+
+追赶耗时约为 `积压时长 × 生产速度 / (训练速度 − 生产速度)`，上例中为 4.5 × 1 / (3 − 1) = 2.25 小时。
+
+stream\_{T-1} 在下一次检查时发现 stream_T 已追上，随后排空上传、完成最终发布并退出；deploy 只等待旧任务退出，stream_T 继续运行。从 stream\_{T-1} 最终发布到 EAS 滚动更新完成的这段时间内，服务不中断，但停留在 stream\_{T-1} 的最终版本上、不再更新，时长取决于退出过程与滚动更新耗时，通常为分钟级，但没有严格上界。
+
 ## 链路隔离
 
 每条链路的可变资源都按业务日期区分，两条链路互不干扰：
@@ -54,7 +64,7 @@ bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd] next_day=$[yyyy-mm-dd]
 三个 PAI-DLC 节点的内容都是一条 `dlc submit pytorchjob` 命令，DataWorks 会等待 DLC 任务结束后再标记节点完成，说明如下：
 
 - `${bizdate}` 等调度参数由 DataWorks 在提交前直接替换；`$MASTER_ADDR` 等变量在 `--command` 的单引号内，由 DLC 容器执行时展开。
-- `<...>` 为需要按实际环境填写的值；`tzrec` 需使用支持 `ONLINE_LEARNING_SUCCESSOR_DIR` 的版本（>= 1.5.6）。
+- `<...>` 为需要按实际环境填写的值；`TZREC_NIGHTLY_VERSION` 需在 DLC 节点的调度参数中配置为 tzrec nightly 版本号，且需支持 `ONLINE_LEARNING_SUCCESSOR_DIR`（>= 1.5.6）。
 - `--data_sources` 为挂载到 `/mnt/data` 的 OSS 数据集；`--enable_credential=true` 让任务以 PAI 默认角色访问 MaxCompute、FeatureStore 等云产品。
 - FeatureDB 的用户名和密码通过 `FEATUREDB_USERNAME`、`FEATUREDB_PASSWORD` 环境变量传入，不要写进 `pipeline.config`。
 
@@ -64,7 +74,7 @@ bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd] next_day=$[yyyy-mm-dd]
 dlc submit pytorchjob \
     --name=online_train_daily_${bizdate} \
     --command='set -e
-        pip install tzrec[cu126]==<tzrec 版本> -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+        pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
         ODPS_ENDPOINT=http://service.<region>.maxcompute.aliyun-inc.com/api \
         torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
             --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
@@ -79,7 +89,8 @@ dlc submit pytorchjob \
     --priority=1 \
     --job_max_running_time_minutes=1440 \
     --workers=<节点数> \
-    --worker_image=dsw-registry-vpc.<region>.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu126-ubuntu22.04 \
+    --worker_image=dsw-registry-vpc.<region>.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu130-ubuntu22.04 \
+    --driver=580.126.09 \
     --worker_spec=<GPU 机型> \
     --enable_credential=true \
     --disable_ecs_stock_check=true
@@ -93,7 +104,7 @@ dlc submit pytorchjob \
 dlc submit pytorchjob \
     --name=online_full_export_${bizdate} \
     --command='set -e
-        pip install tzrec[cu126]==<tzrec 版本> -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+        pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
         ODPS_ENDPOINT=http://service.<region>.maxcompute.aliyun-inc.com/api \
         USE_DISTRIBUTED_EMBEDDING=1 \
         FEATUREDB_USERNAME=<FeatureDB 用户名> FEATUREDB_PASSWORD=<FeatureDB 密码> \
@@ -109,7 +120,8 @@ dlc submit pytorchjob \
     --priority=1 \
     --job_max_running_time_minutes=1440 \
     --workers=<节点数> \
-    --worker_image=dsw-registry-vpc.<region>.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu126-ubuntu22.04 \
+    --worker_image=dsw-registry-vpc.<region>.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu130-ubuntu22.04 \
+    --driver=580.126.09 \
     --worker_spec=<GPU 机型> \
     --enable_credential=true \
     --disable_ecs_stock_check=true
@@ -150,7 +162,7 @@ data_config {
 dlc submit pytorchjob \
     --name=online_train_stream_${bizdate} \
     --command='set -e
-        pip install tzrec[cu126]==<tzrec 版本> -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
+        pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
         START_MS=$(( $(date -d "${next_day} 00:00:00 +0800" +%s) * 1000 ))
         USE_DISTRIBUTED_EMBEDDING=1 \
         ONLINE_DENSE_EXPORT=1 \
@@ -172,7 +184,8 @@ dlc submit pytorchjob \
     --priority=1 \
     --job_max_running_time_minutes=4320 \
     --workers=<节点数> \
-    --worker_image=dsw-registry-vpc.<region>.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu126-ubuntu22.04 \
+    --worker_image=dsw-registry-vpc.<region>.cr.aliyuncs.com/pai/torcheasyrec:1.5.0-pytorch2.14.0-gpu-py311-cu130-ubuntu22.04 \
+    --driver=580.126.09 \
     --worker_spec=<GPU 机型> \
     --enable_credential=true \
     --disable_ecs_stock_check=true
@@ -266,20 +279,6 @@ stream\_{T-1} 每隔 `log_step_count_steps` 步检查一次：rank 0 读取自�
 - stream\_{T-1} 在退出过程中可能再发布一个版本，切换后服务的新鲜度可能短暂回退。
 - `current.json` 只说明某个版本已经发布，不说明下一条链路的训练进程当前健康；EAS 是否成功加载该版本仍取决于产物加载与 Processor 侧的校验。
 - 由于 KafkaDataset 默认 `enable.auto.commit=false`，消费组已提交位点计算出的 lag 不能用于判断追赶进度。
-
-## 时间线示例
-
-假设 Kafka 积压 4.5 小时、流式训练速度是实时数据速度的 3 倍：
-
-| 时间（T+1 日） | 事件                                                                       |
-| -------------- | -------------------------------------------------------------------------- |
-| 01:30          | `ds=T` 样本就绪                                                            |
-| 03:30          | 天级训练完成                                                               |
-| 04:30          | 全量导出完成，stream_T 从 00:00 的位点开始追赶                             |
-| ~06:45         | stream_T 的发布时间戳追上 stream\_{T-1}                                    |
-| 之后           | stream\_{T-1} 在下一次检查时发现并开始退出，退出完成后 deploy 滚动更新 EAS |
-
-追赶耗时约为 `积压时长 × 生产速度 / (训练速度 − 生产速度)`。从 stream\_{T-1} 停止发布到 EAS 滚动更新完成的这段时间内，服务停留在 stream\_{T-1} 的最后一个版本上，时长取决于退出过程（上传排空、最终发布）与滚动更新耗时，通常为分钟级，但没有严格上界。
 
 ## 运维建议
 
