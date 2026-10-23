@@ -12,7 +12,6 @@
 """Tests for tzrec.main orchestration and the train-loop step counter."""
 
 import itertools
-import json
 import os
 import runpy
 import shutil
@@ -27,10 +26,8 @@ from parameterized import param, parameterized
 
 from tzrec.datasets.utils import RecordBatchTensor
 from tzrec.main import (
-    _create_lineage_handover,
     _create_model,
     _create_train_profiler,
-    _LineageHandover,
     _train_and_evaluate,
     predict,
     predict_checkpoint,
@@ -52,6 +49,7 @@ from tzrec.protos.train_pb2 import (
 )
 from tzrec.utils import checkpoint_util, predict_util
 from tzrec.utils.delta_embedding_dump import DumpDecision
+from tzrec.utils.online_learning_util import OnlineLearningHandover
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
@@ -925,129 +923,11 @@ class TrainProfilerTest(unittest.TestCase):
 
 
 class OnlineLearningHandoverTest(unittest.TestCase):
-    """Tests for retiring a stream lineage once its successor caught up."""
+    """Tests for the train loop retiring a stream lineage on hand-over."""
 
     def setUp(self):
         self.test_dir = make_test_dir()
         self.addCleanup(shutil.rmtree, self.test_dir)
-
-    def _handover(self, successor_progress, tolerance=0.0):
-        own_dir = os.path.join(self.test_dir, "own")
-        successor_dir = os.path.join(self.test_dir, "successor")
-        os.makedirs(own_dir)
-        os.makedirs(successor_dir)
-        if successor_progress is not None:
-            with open(os.path.join(successor_dir, "progress.json"), "w") as f:
-                if isinstance(successor_progress, str):
-                    f.write(successor_progress)
-                else:
-                    json.dump(successor_progress, f)
-        return _LineageHandover(own_dir, successor_dir, tolerance, 0.5), own_dir
-
-    @parameterized.expand(
-        [
-            param("ahead", own=1000.0, successor=2000.0, tolerance=0.0, expected=True),
-            param("equal", own=1000.0, successor=1000.0, tolerance=0.0, expected=True),
-            param(
-                "behind", own=2000.0, successor=1000.0, tolerance=0.0, expected=False
-            ),
-            param(
-                "within_tolerance",
-                own=2000.0,
-                successor=1500.0,
-                tolerance=500.0,
-                expected=True,
-            ),
-            param(
-                "beyond_tolerance",
-                own=2000.0,
-                successor=1499.0,
-                tolerance=500.0,
-                expected=False,
-            ),
-            param(
-                "successor_missing",
-                own=1000.0,
-                successor=None,
-                tolerance=0.0,
-                expected=False,
-            ),
-            param(
-                "sentinel", own=1000.0, successor=-1.0, tolerance=1e9, expected=False
-            ),
-            param(
-                "nan", own=1000.0, successor=float("nan"), tolerance=0.0, expected=False
-            ),
-            param(
-                "inf", own=1000.0, successor=float("inf"), tolerance=0.0, expected=False
-            ),
-            param(
-                "non_numeric",
-                own=1000.0,
-                successor="2000",
-                tolerance=0.0,
-                expected=False,
-            ),
-            param("bool", own=0.5, successor=True, tolerance=1.0, expected=False),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_caught_up(self, _name, own, successor, tolerance, expected) -> None:
-        progress = None if successor is None else {"data_ts": successor}
-        handover, own_dir = self._handover(progress, tolerance)
-        with mock.patch.dict(os.environ, {"RANK": "0"}):
-            self.assertIs(handover.caught_up(7, own), expected)
-        with open(os.path.join(own_dir, "progress.json")) as f:
-            self.assertEqual(json.load(f), {"step": 7, "data_ts": own})
-
-    @parameterized.expand(
-        [
-            param("corrupt", content="{not json"),
-            param("non_object", content='["2000"]'),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_caught_up_unreadable_successor(self, _name, content) -> None:
-        handover, _ = self._handover(content, tolerance=1e9)
-        with mock.patch.dict(os.environ, {"RANK": "0"}):
-            self.assertFalse(handover.caught_up(1, 1000.0))
-
-    def test_caught_up_without_data_ts(self) -> None:
-        """No event-time: no progress written, no hand-over, one warning."""
-        handover, own_dir = self._handover({"data_ts": 1000.0}, tolerance=1e9)
-        with (
-            mock.patch.dict(os.environ, {"RANK": "0"}),
-            mock.patch("tzrec.main.logger") as mock_logger,
-        ):
-            self.assertFalse(handover.caught_up(1, -1.0))
-            self.assertFalse(handover.caught_up(2, -1.0))
-        self.assertEqual(mock_logger.warning.call_count, 1)
-        self.assertFalse(os.path.exists(os.path.join(own_dir, "progress.json")))
-
-    def test_create_lineage_handover(self) -> None:
-        model_dir = os.path.join(self.test_dir, "own")
-        successor_dir = os.path.join(self.test_dir, "successor")
-        train_config = _train_config()
-        with mock.patch.dict(os.environ, {}):
-            os.environ.pop("ONLINE_LEARNING_SUCCESSOR_DIR", None)
-            os.environ.pop("ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS", None)
-            self.assertIsNone(_create_lineage_handover(model_dir, train_config))
-            # no online dense export needed
-            os.environ["ONLINE_LEARNING_SUCCESSOR_DIR"] = successor_dir
-            handover = _create_lineage_handover(model_dir, train_config)
-            self.assertEqual(handover.successor_model_dir, successor_dir)
-            self.assertEqual(handover._tolerance_secs, 300.0)
-            os.environ["ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS"] = "120"
-            handover = _create_lineage_handover(model_dir, train_config)
-            self.assertEqual(handover._tolerance_secs, 120.0)
-            for bad in ("-1", "nan", "abc"):
-                os.environ["ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS"] = bad
-                with self.assertRaises(ValueError):
-                    _create_lineage_handover(model_dir, train_config)
-            os.environ.pop("ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS")
-            os.environ["ONLINE_LEARNING_SUCCESSOR_DIR"] = model_dir + "/"
-            with self.assertRaisesRegex(RuntimeError, "must differ"):
-                _create_lineage_handover(model_dir, train_config)
 
     def test_train_loop_retires_on_handover(self) -> None:
         """Hand-over leaves both loops, skips the epoch-end and final saves.
@@ -1089,8 +969,8 @@ class OnlineLearningHandoverTest(unittest.TestCase):
             mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
             mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
             mock.patch.object(
-                _LineageHandover, "caught_up", side_effect=[False, True]
-            ) as caught_up,
+                OnlineLearningHandover, "update_and_check", side_effect=[False, True]
+            ) as update_and_check,
         ):
             _train_and_evaluate(
                 model=model,
@@ -1106,7 +986,8 @@ class OnlineLearningHandoverTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            caught_up.call_args_list, [mock.call(0, 17.0), mock.call(2, 17.0)]
+            update_and_check.call_args_list,
+            [mock.call(0, 17.0), mock.call(2, 17.0)],
         )
         self.assertEqual(pipeline.progress.call_count, 3)
         self.assertEqual(exporter.poll_publish.call_count, 3)
