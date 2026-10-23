@@ -267,7 +267,6 @@ subprocess.run(cmd + ["modify", service_name, "-s", "service.json"], check=True)
 - `feature_store_embedding_polling`：从 FeatureDB 轮询增量 embedding。配置该块且不写 `mode` 时即为 `apply` 模式：服务启动时先从头扫描版本 `version` 中的全部数据，再增量更新。`feature_view_name` 与 `version` 必填，且需与训练写入的 FeatureView 和版本一致；同时需要 `access_key_id`、`access_key_secret`、`region`、`fs_project`、`featuredb_username`、`featuredb_password`。
 - `sparse_poll_interval_secs`（位于 `feature_store_embedding_polling` 内）：默认 0，即不做周期扫描，只在加载新的 dense 版本前拉取一次增量，sparse 随 dense 按 `paired_dump_interval_*` 的节奏更新。若训练配置了更细的 `sparse_dump_interval_*`，希望线上 embedding 更快生效，需将其设为正数（秒）。
 - `dense_hot_load`：`enable` 为 `true` 时轮询 `current_json`，默认每分钟一次（`dense_poll_interval_minutes`）。服务启动时会先加载 `current.json` 指向的版本；`current.json` 不存在时服务启动失败，deploy 执行时 stream_T 已经发布过版本，满足该条件。加载新版本前会先拉取一次增量 embedding 并按 `sparse_probes` 抽样校验，保证 dense 不会领先 sparse。
-- 两个块中出现未知字段时服务启动失败，请勿拼错参数名。
 
 此外，全量导出与流式训练的产物需要相互兼容：
 
