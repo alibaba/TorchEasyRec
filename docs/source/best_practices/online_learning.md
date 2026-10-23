@@ -9,7 +9,7 @@
 1. 天级增量训练：从 T-1 的天级模型继续训练 MaxCompute 分区 `ds=T`，得到天级模型 T。
 1. 全量导出：把天级模型 T 的 embedding 全量上传到 FeatureDB 版本 `ol_T`。
 1. 流式训练 stream_T：从天级模型 T 出发，从 T+1 日 00:00 的 Kafka 位点开始消费，追赶到最新数据后持续训练，同时增量上传 embedding、发布 dense 模型。
-1. 交接：stream\_{T-1} 每隔 `log_step_count_steps` 步比较两条链路 `current.json` 中的 `data_timestamp`，stream_T 不落后时 stream\_{T-1} 跳过最终 checkpoint、完成最终发布后正常退出。
+1. 交接：stream\_{T-1} 每隔 `log_step_count_steps` 步比较两条链路 `current.json` 中的 `data_timestamp`，stream_T 落后不超过容忍值（默认一个发布间隔加 5 分钟，见 `ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS`）时 stream\_{T-1} 跳过最终 checkpoint、完成最终发布后正常退出。
 1. 切换：DataWorks 在 stream\_{T-1} 成功退出后，更新 EAS 服务到 stream_T。
 
 同一时刻最多有两条"链路"（lineage）在运行：正在服务的 stream\_{T-1}，以及正在追赶的 stream_T。每天的链路切换同时起到了[全量再基线](../usage/export.md)的作用：只要天级任务按时成功，崩溃重启带来的 FeatureDB 漂移最多存在于一条链路（约一天）。

@@ -408,9 +408,15 @@ def _create_train_profiler(
     )
 
 
-def _published_data_ts(current_path: str) -> Optional[float]:
+# Publish-cadence slack when the manifest declares no interval (steps cadence):
+# a 10-minute interval plus the margin below.
+_HANDOVER_DEFAULT_TOLERANCE_SECS = 900.0
+# Covers upload delay and Kafka partition skew between the two lineages.
+_HANDOVER_TOLERANCE_MARGIN_SECS = 300.0
+
+
+def _manifest_data_ts(manifest: Optional[Dict[str, Any]]) -> Optional[float]:
     """Return a manifest's data_timestamp, or None if absent or not a valid time."""
-    manifest = read_current_manifest(current_path)
     ts = manifest.get("data_timestamp") if manifest is not None else None
     # bool is an int subclass; -1.0 is the "no timestamp" sentinel
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
@@ -418,44 +424,75 @@ def _published_data_ts(current_path: str) -> Optional[float]:
     return float(ts) if math.isfinite(ts) and ts > 0 else None
 
 
-def _successor_caught_up(own_current: str, successor_current: str) -> bool:
-    """Whether the successor lineage has published data at least as fresh as ours.
+def _handover_tolerance_secs(own_manifest: Dict[str, Any]) -> float:
+    """Default hand-over tolerance: one publish interval plus a margin.
+
+    Once both lineages consume at the Kafka head, each one's published
+    data_timestamp only advances at its own publish, so the successor can trail
+    by up to one publish interval for good; a strict comparison could then
+    never pass.
+    """
+    interval = own_manifest.get("publish_interval_minutes")
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not interval > 0
+    ):
+        return _HANDOVER_DEFAULT_TOLERANCE_SECS
+    return interval * 60.0 + _HANDOVER_TOLERANCE_MARGIN_SECS
+
+
+def _successor_caught_up(
+    own_current: str, successor_current: str, tolerance_secs: Optional[float]
+) -> bool:
+    """Whether the successor lineage has published data about as fresh as ours.
 
     Rank zero compares the data_timestamp of the two published current.json
     manifests and broadcasts the decision, so every rank leaves the train loop
-    at the same step. A missing or invalid manifest on either side means not
+    at the same step. The successor counts as caught up when it trails by at
+    most the tolerance. A missing or invalid manifest on either side means not
     caught up.
 
     Args:
         own_current: this run's published current.json path.
         successor_current: the successor lineage's published current.json path.
+        tolerance_secs: allowed lag of the successor in seconds; None derives it
+            from this run's publish interval.
 
     Returns:
         True if this run should hand over to the successor.
     """
     decision = [False]
     if int(os.environ.get("RANK", 0)) == 0:
-        own_ts = _published_data_ts(own_current)
-        successor_ts = _published_data_ts(successor_current)
-        decision[0] = (
-            own_ts is not None and successor_ts is not None and successor_ts >= own_ts
-        )
+        own_manifest = read_current_manifest(own_current)
+        own_ts = _manifest_data_ts(own_manifest)
+        successor_ts = _manifest_data_ts(read_current_manifest(successor_current))
+        if own_manifest is not None and own_ts is not None and successor_ts is not None:
+            if tolerance_secs is None:
+                tolerance_secs = _handover_tolerance_secs(own_manifest)
+            lag = own_ts - successor_ts
+            decision[0] = lag <= tolerance_secs
+            logger.info(
+                f"successor lineage lags {lag:.0f}s behind this run "
+                f"(tolerance {tolerance_secs:.0f}s)."
+            )
     if dist.is_initialized():
         dist.broadcast_object_list(decision, src=0)
     return decision[0]
 
 
-def _handover_paths(
+def _handover_config(
     model_dir: str, online_dense_export_enabled: bool
-) -> Optional[Tuple[str, str]]:
-    """Resolve (own, successor) current.json paths from ONLINE_LEARNING_SUCCESSOR_DIR.
+) -> Optional[Tuple[str, str, Optional[float]]]:
+    """Resolve the hand-over settings from ONLINE_LEARNING_SUCCESSOR_DIR.
 
     Args:
         model_dir: this run's model_dir.
         online_dense_export_enabled: whether this run publishes current.json.
 
     Returns:
-        The two manifest paths, or None when no successor is configured.
+        (own current.json, successor current.json, tolerance override in
+        seconds or None), or None when no successor is configured.
     """
     successor_root = os.environ.get("ONLINE_LEARNING_SUCCESSOR_DIR")
     if not successor_root:
@@ -473,9 +510,20 @@ def _handover_paths(
             "ONLINE_LEARNING_SUCCESSOR_DIR must differ from this run's "
             f"ONLINE_DENSE_EXPORT_DIR, got {successor_root}."
         )
+    # parsed on every rank so a bad value fails fast instead of on rank 0 only
+    tolerance_env = os.environ.get("ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS")
+    tolerance_secs = float(tolerance_env) if tolerance_env else None
+    if tolerance_secs is not None and not (
+        math.isfinite(tolerance_secs) and tolerance_secs >= 0
+    ):
+        raise ValueError(
+            "ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS must be a non-negative "
+            f"number, got {tolerance_env}."
+        )
     return (
         os.path.join(own_export_root, CURRENT_JSON),
         os.path.join(successor_export_root, CURRENT_JSON),
+        tolerance_secs,
     )
 
 
@@ -663,7 +711,7 @@ def _train_and_evaluate(
         )
     # A stream lineage retires itself once the next day's lineage has published
     # data at least as fresh; deployment of the successor follows its exit.
-    handover_paths = _handover_paths(model_dir, online_dense_exporter.enabled)
+    handover = _handover_config(model_dir, online_dense_exporter.enabled)
     handed_over = False
 
     # this rank's last consumed event-time, reused by the epoch / final saves
@@ -791,12 +839,12 @@ def _train_and_evaluate(
                     else None
                 )
                 if (
-                    handover_paths is not None
+                    handover is not None
                     and i_step % train_config.log_step_count_steps == 0
-                    and _successor_caught_up(*handover_paths)
+                    and _successor_caught_up(*handover)
                 ):
                     logger.info(
-                        f"successor lineage {handover_paths[1]} caught up at step "
+                        f"successor lineage {handover[1]} caught up at step "
                         f"{i_step}, handing over."
                     )
                     handed_over = True

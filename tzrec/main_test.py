@@ -29,7 +29,7 @@ from tzrec.datasets.utils import RecordBatchTensor
 from tzrec.main import (
     _create_model,
     _create_train_profiler,
-    _handover_paths,
+    _handover_config,
     _successor_caught_up,
     _train_and_evaluate,
     predict,
@@ -931,56 +931,125 @@ class OnlineLearningHandoverTest(unittest.TestCase):
         self.test_dir = make_test_dir()
         self.addCleanup(shutil.rmtree, self.test_dir)
 
-    def _write_manifest(self, name, data_timestamp):
+    def _write_manifest(self, name, data_timestamp, publish_interval_minutes=None):
         path = os.path.join(self.test_dir, name, "current.json")
         if data_timestamp is not None:
+            manifest = {"version": "v", "data_timestamp": data_timestamp}
+            if publish_interval_minutes is not None:
+                manifest["publish_interval_minutes"] = publish_interval_minutes
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as f:
-                json.dump({"version": "v", "data_timestamp": data_timestamp}, f)
+                json.dump(manifest, f)
         return path
 
     @parameterized.expand(
         [
-            param("ahead", own=100.0, successor=200.0, expected=True),
-            param("equal", own=100.0, successor=100.0, expected=True),
-            param("behind", own=200.0, successor=100.0, expected=False),
-            param("successor_missing", own=100.0, successor=None, expected=False),
-            param("own_missing", own=None, successor=100.0, expected=False),
-            param("sentinel", own=-1.0, successor=-1.0, expected=False),
-            param("nan", own=100.0, successor=float("nan"), expected=False),
-            param("inf", own=100.0, successor=float("inf"), expected=False),
-            param("non_numeric", own=100.0, successor="200", expected=False),
-            param("bool", own=0.5, successor=True, expected=False),
+            param("ahead", own=1000.0, successor=2000.0, tolerance=0.0, expected=True),
+            param("equal", own=1000.0, successor=1000.0, tolerance=0.0, expected=True),
+            param(
+                "behind", own=2000.0, successor=1000.0, tolerance=0.0, expected=False
+            ),
+            param(
+                "within_tolerance",
+                own=2000.0,
+                successor=1500.0,
+                tolerance=500.0,
+                expected=True,
+            ),
+            param(
+                "beyond_tolerance",
+                own=2000.0,
+                successor=1499.0,
+                tolerance=500.0,
+                expected=False,
+            ),
+            param(
+                "successor_missing",
+                own=1000.0,
+                successor=None,
+                tolerance=0.0,
+                expected=False,
+            ),
+            param(
+                "own_missing", own=None, successor=1000.0, tolerance=0.0, expected=False
+            ),
+            param("sentinel", own=-1.0, successor=-1.0, tolerance=0.0, expected=False),
+            param(
+                "nan", own=1000.0, successor=float("nan"), tolerance=0.0, expected=False
+            ),
+            param(
+                "inf", own=1000.0, successor=float("inf"), tolerance=0.0, expected=False
+            ),
+            param(
+                "non_numeric",
+                own=1000.0,
+                successor="2000",
+                tolerance=0.0,
+                expected=False,
+            ),
+            param("bool", own=0.5, successor=True, tolerance=1.0, expected=False),
         ],
         name_func=parameterized_name_func,
     )
-    def test_successor_caught_up(self, _name, own, successor, expected) -> None:
+    def test_successor_caught_up(
+        self, _name, own, successor, tolerance, expected
+    ) -> None:
         own_current = self._write_manifest("own", own)
         successor_current = self._write_manifest("successor", successor)
         with mock.patch.dict(os.environ, {"RANK": "0"}):
             self.assertIs(
-                _successor_caught_up(own_current, successor_current), expected
+                _successor_caught_up(own_current, successor_current, tolerance),
+                expected,
             )
 
-    def test_handover_paths(self) -> None:
+    @parameterized.expand(
+        [
+            # one 10-minute publish interval plus the 5-minute margin
+            param("interval", interval=10, lag=900.0, expected=True),
+            param("interval_exceeded", interval=10, lag=901.0, expected=False),
+            param("interval_from_manifest", interval=30, lag=2100.0, expected=True),
+            # steps cadence publishes no interval: 15-minute fallback
+            param("no_interval", interval=None, lag=900.0, expected=True),
+            param("no_interval_exceeded", interval=None, lag=901.0, expected=False),
+            param("invalid_interval", interval="10", lag=901.0, expected=False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_successor_caught_up_default_tolerance(
+        self, _name, interval, lag, expected
+    ) -> None:
+        own_current = self._write_manifest("own", 10000.0, interval)
+        successor_current = self._write_manifest("successor", 10000.0 - lag)
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            self.assertIs(
+                _successor_caught_up(own_current, successor_current, None), expected
+            )
+
+    def test_handover_config(self) -> None:
         own_root = os.path.join(self.test_dir, "own")
         successor_root = os.path.join(self.test_dir, "successor")
         with mock.patch.dict(os.environ, {"ONLINE_DENSE_EXPORT_DIR": own_root}):
             os.environ.pop("ONLINE_LEARNING_SUCCESSOR_DIR", None)
-            self.assertIsNone(_handover_paths("model_dir", True))
+            os.environ.pop("ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS", None)
+            self.assertIsNone(_handover_config("model_dir", True))
             os.environ["ONLINE_LEARNING_SUCCESSOR_DIR"] = successor_root
-            self.assertEqual(
-                _handover_paths("model_dir", True),
-                (
-                    os.path.join(own_root, "dense_hot_export", "current.json"),
-                    os.path.join(successor_root, "dense_hot_export", "current.json"),
-                ),
+            paths = (
+                os.path.join(own_root, "dense_hot_export", "current.json"),
+                os.path.join(successor_root, "dense_hot_export", "current.json"),
             )
+            self.assertEqual(_handover_config("model_dir", True), (*paths, None))
+            os.environ["ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS"] = "120"
+            self.assertEqual(_handover_config("model_dir", True), (*paths, 120.0))
+            for bad in ("-1", "nan", "abc"):
+                os.environ["ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS"] = bad
+                with self.assertRaises(ValueError):
+                    _handover_config("model_dir", True)
+            os.environ.pop("ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS")
             with self.assertRaisesRegex(RuntimeError, "ONLINE_DENSE_EXPORT=1"):
-                _handover_paths("model_dir", False)
+                _handover_config("model_dir", False)
             os.environ["ONLINE_LEARNING_SUCCESSOR_DIR"] = own_root + "/"
             with self.assertRaisesRegex(RuntimeError, "must differ"):
-                _handover_paths("model_dir", True)
+                _handover_config("model_dir", True)
 
     def test_train_loop_retires_on_handover(self) -> None:
         """Hand-over leaves both loops, skips the epoch-end and final saves.
