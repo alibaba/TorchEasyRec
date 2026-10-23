@@ -9,7 +9,7 @@
 1. 天级增量训练：从 T-1 的天级模型继续训练 MaxCompute 分区 `ds=T`，得到天级模型 T。
 1. 全量导出：把天级模型 T 的 embedding 全量上传到 FeatureDB 版本 `ol_T`。
 1. 流式训练 stream_T：从天级模型 T 出发，从 T+1 日 00:00 的 Kafka 位点开始消费，追赶到最新数据后持续训练，同时增量上传 embedding、发布 dense 模型。
-1. 交接：stream_T 追上 stream\_{T-1} 后，stream\_{T-1} 在下一次检查时自动结束训练并正常退出。
+1. 交接：stream\_{T-1} 每隔 `log_step_count_steps` 步比较两条链路 `current.json` 中的 `data_timestamp`，stream_T 不落后时 stream\_{T-1} 跳过最终 checkpoint、完成最终发布后正常退出。
 1. 切换：DataWorks 在 stream\_{T-1} 成功退出后，更新 EAS 服务到 stream_T。
 
 同一时刻最多有两条"链路"（lineage）在运行：正在服务的 stream\_{T-1}，以及正在追赶的 stream_T。每天的链路切换同时起到了[全量再基线](../usage/export.md)的作用：只要天级任务按时成功，崩溃重启带来的 FeatureDB 漂移最多存在于一条链路（约一天）。
@@ -294,22 +294,6 @@ subprocess.run(cmd + ["modify", service_name, "-s", "service.json"], check=True)
 - full_export 的 `DIST_QUANT` 需与 train_stream 中 `delta_embedding_dump_config.quant_type` 一致（同为 INT8 或同为不量化），FeatureView 的元素类型需与模型一致，否则 apply 模式初始化失败。
 
 `model_config` 中其余参数见[模型服务](../usage/serving.md)，与线上服务保持一致即可。EAS 会滚动更新实例，滚动更新进度可在 EAS 控制台查看。
-
-## 交接规则
-
-stream\_{T-1} 每隔 `log_step_count_steps` 步检查一次：rank 0 读取自己和下一条链路的 `dense_hot_export/current.json`，当下一条链路的 `data_timestamp` 不小于自己的 `data_timestamp` 时，所有 rank 在同一步结束训练。退出时：
-
-- 不再保存最终 checkpoint，也不触发 epoch 结束时的保存：退役的链路不会再被恢复，跳过保存可以缩短退出时间。
-- 尾部增量 embedding 仍会 dump 并上传，最后一个 dense 版本仍会正常发布。
-
-任一侧的 `current.json` 不存在、无法解析，或 `data_timestamp` 不是有效的正数时，视为未追上，继续训练。设置 `ONLINE_LEARNING_SUCCESSOR_DIR` 时必须同时开启 `ONLINE_DENSE_EXPORT=1`，且两个发布根目录不能相同，否则训练启动即报错。
-
-这是一个近似的"发布新鲜度"规则，存在以下已知限制：
-
-- `data_timestamp` 是 rank 0 已消费数据的事件时间，不代表所有 Kafka 分区都已追上。
-- stream\_{T-1} 在退出过程中可能再发布一个版本，切换后服务的新鲜度可能短暂回退。
-- `current.json` 只说明某个版本已经发布，不说明下一条链路的训练进程当前健康；EAS 是否成功加载该版本仍取决于产物加载与 Processor 侧的校验。
-- 由于 KafkaDataset 默认 `enable.auto.commit=false`，消费组已提交位点计算出的 lag 不能用于判断追赶进度。
 
 ## 运维建议
 
