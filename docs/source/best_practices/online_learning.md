@@ -10,7 +10,7 @@
 1. 全量导出：把天级模型 T 的 embedding 全量上传到 FeatureDB 版本 `ol_T`。
 1. 流式训练 stream_T：从天级模型 T 出发，从 T+1 日 00:00 的 Kafka 位点开始消费，追赶到最新数据后持续训练，同时增量上传 embedding、发布 dense 模型。
 1. 交接：stream_T 追上 stream\_{T-1} 后，stream\_{T-1} 在下一次检查时自动结束训练并正常退出。
-1. 切换：DataWorks 在 stream\_{T-1} 成功退出后，校验 stream_T 的发布产物，再更新 EAS 服务到 stream_T。
+1. 切换：DataWorks 在 stream\_{T-1} 成功退出后，更新 EAS 服务到 stream_T。
 
 同一时刻最多有两条"链路"（lineage）在运行：正在服务的 stream\_{T-1}，以及正在追赶的 stream_T。每天的链路切换同时起到了[全量再基线](../usage/export.md)的作用：只要天级任务按时成功，崩溃重启带来的 FeatureDB 漂移最多存在于一条链路（约一天）。
 
@@ -35,13 +35,13 @@
 bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd]
 ```
 
-| 节点         | 节点类型 | 依赖                                                              | 作用                                           |
-| ------------ | -------- | ----------------------------------------------------------------- | ---------------------------------------------- |
-| sample       | ODPS SQL | 上游样本表                                                        | 产出 `ds=${bizdate}` 样本分区                  |
-| train_daily  | PAI-DLC  | sample；**依赖上一周期（本节点）**                                | 天级增量训练                                   |
-| full_export  | PAI-DLC  | train_daily                                                       | FeatureDB 全量上传                             |
-| train_stream | PAI-DLC  | full_export；**不依赖上一周期**，与前一天的 train_stream 并行运行 | 流式训练，追上下一条链路后自动退出             |
-| deploy       | Shell    | full_export；**依赖上一周期（本节点 + train_stream 节点）**       | 前一天的 train_stream 退出后校验产物并切换 EAS |
+| 节点         | 节点类型 | 依赖                                                              | 作用                                 |
+| ------------ | -------- | ----------------------------------------------------------------- | ------------------------------------ |
+| sample       | ODPS SQL | 上游样本表                                                        | 产出 `ds=${bizdate}` 样本分区        |
+| train_daily  | PAI-DLC  | sample；**依赖上一周期（本节点）**                                | 天级增量训练                         |
+| full_export  | PAI-DLC  | train_daily                                                       | FeatureDB 全量上传                   |
+| train_stream | PAI-DLC  | full_export；**不依赖上一周期**，与前一天的 train_stream 并行运行 | 流式训练，追上下一条链路后自动退出   |
+| deploy       | PyODPS 3 | full_export；**依赖上一周期（本节点 + train_stream 节点）**       | 前一天的 train_stream 退出后切换 EAS |
 
 - train_stream 节点在业务日期 T 的实例即流式任务 stream_T，会运行约 1.5 天（当天全天 + 次日追赶时间），节点超时时间需大于该时长；DLC 任务开启失败自动重启。
 - deploy 依赖上一周期的本节点，保证切换严格按日期顺序执行，较旧的链路不会覆盖较新的部署。
@@ -103,7 +103,7 @@ data_config {
 }
 ```
 
-- 使用 `num_epochs: 1` 而不是 `num_steps`：Kafka 数据流不会结束，任务只会因交接而正常退出。
+- 使用 `num_epochs: 1`，**不要设置 `num_steps`**：Kafka 数据流不会结束，任务只会因交接而正常退出；train_stream 正常退出会直接触发下一天的 deploy，deploy 不再重复判断是否追上。
 - 学习率建议使用常数学习率；从天级模型 fine-tune 时不会恢复学习率调度进度。
 
 启动命令：
@@ -133,28 +133,71 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 
 ### deploy
 
-stream\_{T-1} 退出不一定意味着 stream_T 已经追上（例如被人为配置了 `num_steps` 而提前结束），因此 deploy 节点在切换前按同样的规则重新校验发布产物，校验失败时节点失败，由 DataWorks 重跑：
+前一天的 train_stream 正常退出即表示交接条件已经满足（见[交接规则](#online-learning-handover)），deploy 节点不再重复比较新旧链路的 `data_timestamp`：stream\_{T-1} 在退出过程中可能再发布一个更新的版本，重复比较会无谓地阻塞切换，而这种短暂的新鲜度回退是可以接受的。
 
-```bash
-set -e
-OSS_ROOT=oss://${bucket}/online/stream
-NEW=$(ossutil cat ${OSS_ROOT}/${bizdate}/serving/dense_hot_export/current.json)
-OLD=$(ossutil cat ${OSS_ROOT}/${prev}/serving/dense_hot_export/current.json)
-VERSION=$(python3 - "$NEW" "$OLD" <<'EOF'
-import json, math, sys
-new, old = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-def ts(m):
-    t = m.get("data_timestamp")
-    ok = isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and t > 0
-    return t if ok else None
-assert ts(new) is not None and ts(old) is not None and ts(new) >= ts(old), (new, old)
-print(new["version"])
-EOF
-)
-ossutil stat ${OSS_ROOT}/${bizdate}/serving/dense_hot_export/versions/${VERSION}/READY
+deploy 使用 PyODPS 3 节点，调度资源组选择 `dataworks_pairec_task_pod`（其中预置了 `eascmd64`），调度参数同上，节点内通过 `args` 读取。脚本使用节点运行账号的 AK/STS 调用 `eascmd modify` 更新服务，命令失败时节点失败：
+
+```python
+import json
+import subprocess
+
+from odps.accounts import StsAccount
+
+service_name = "<EAS 服务名>"
+bizdate = args["bizdate"]
+
+sts_token = o.account.sts_token if isinstance(o.account, StsAccount) else None
+
+config = {
+    "name": service_name,
+    "cloud": {"computing": {"instances": [{"type": "<机型>"}]}},
+    "storage": [
+        {
+            "mount_path": "/home/admin/docker_ml/workspace/model/",
+            "oss": {
+                "path": f"oss://<bucket>/online/stream/{bizdate}/serving/",
+                "readOnly": False,
+            },
+            "properties": {"resource_type": "code"},
+        }
+    ],
+    "model_config": {
+        "outputs": "<输出名，逗号分隔>",
+        "fg_mode": "normal",
+        "region": "<region>",
+        "access_key_id": o.account.access_id,
+        "access_key_secret": o.account.secret_access_key,
+        "security_token": sts_token,
+        "fs_project": "<FeatureStore 项目>",
+        "fs_model": "<FeatureStore 模型特征>",
+        "fs_entity": "<FeatureStore 实体>",
+        "featuredb_username": "<FeatureDB 用户名>",
+        "featuredb_password": "<FeatureDB 密码>",
+        # 读取 dense_hot_export 与 FeatureDB 版本 ol_{bizdate} 的参数名需与 Processor 确认
+    },
+    "processor": "easyrec-torch-<版本>",
+}
+
+with open("service.json", "w") as f:
+    json.dump(config, f)
+
+cmd = [
+    "/home/admin/usertools/tools/eascmd64",
+    "-i",
+    o.account.access_id,
+    "-k",
+    o.account.secret_access_key,
+    "-e",
+    "pai-eas-manage-vpc.<region>.aliyuncs.com",
+]
+if sts_token:
+    cmd += ["-t", sts_token]
+subprocess.run(cmd + ["modify", service_name, "-s", "service.json"], check=True)
 ```
 
-校验通过后更新 EAS 服务，让服务改为读取 `/mnt/data/online/stream/${bizdate}/serving/dense_hot_export` 与 FeatureDB 版本 `ol_${bizdate}`，并等待滚动更新完成。**这两个配置项对应的 Processor 参数名请与 Processor 文档/负责人确认**，再写入 `eascmd modify ${service} -s service.json` 使用的配置文件。切换成功后可清理 FeatureDB 版本 `ol_${prev}` 之前的版本与对应的 OSS 目录。
+`model_config` 中其余参数见[模型服务](../usage/serving.md)，与线上服务保持一致即可。EAS 会滚动更新实例，滚动更新进度可在 EAS 控制台查看。**服务读取 `dense_hot_export` 目录与 FeatureDB 版本 `ol_${bizdate}` 所对应的 Processor 参数名请与 Processor 文档/负责人确认**后再补充到 `model_config` 中。切换成功后可清理 FeatureDB 版本 `ol_${prev}` 之前的版本与对应的 OSS 目录。
+
+(online-learning-handover)=
 
 ## 交接规则
 
@@ -176,13 +219,13 @@ stream\_{T-1} 每隔 `log_step_count_steps` 步检查一次：rank 0 读取自�
 
 假设 Kafka 积压 4.5 小时、流式训练速度是实时数据速度的 3 倍：
 
-| 时间（T+1 日） | 事件                                                                             |
-| -------------- | -------------------------------------------------------------------------------- |
-| 01:30          | `ds=T` 样本就绪                                                                  |
-| 03:30          | 天级训练完成                                                                     |
-| 04:30          | 全量导出完成，stream_T 从 00:00 的位点开始追赶                                   |
-| ~06:45         | stream_T 的发布时间戳追上 stream\_{T-1}                                          |
-| 之后           | stream\_{T-1} 在下一次检查时发现并开始退出，退出完成后 deploy 校验并滚动更新 EAS |
+| 时间（T+1 日） | 事件                                                                       |
+| -------------- | -------------------------------------------------------------------------- |
+| 01:30          | `ds=T` 样本就绪                                                            |
+| 03:30          | 天级训练完成                                                               |
+| 04:30          | 全量导出完成，stream_T 从 00:00 的位点开始追赶                             |
+| ~06:45         | stream_T 的发布时间戳追上 stream\_{T-1}                                    |
+| 之后           | stream\_{T-1} 在下一次检查时发现并开始退出，退出完成后 deploy 滚动更新 EAS |
 
 追赶耗时约为 `积压时长 × 生产速度 / (训练速度 − 生产速度)`。从 stream\_{T-1} 停止发布到 EAS 滚动更新完成的这段时间内，服务停留在 stream\_{T-1} 的最后一个版本上，时长取决于退出过程（上传排空、最终发布）与滚动更新耗时，通常为分钟级，但没有严格上界。
 
@@ -196,5 +239,4 @@ stream\_{T-1} 每隔 `log_step_count_steps` 步检查一次：rank 0 读取自�
 | ------------------------- | ----------------------------------------------- | ------------------------------------------ |
 | 天级训练或导出失败        | stream_T 不启动，stream\_{T-1} 继续服务         | 修复后重跑节点，下游自动继续               |
 | train_stream 任务异常退出 | DLC 自动重启，从 `model_dir` 的 checkpoint 恢复 | 重启失败时重跑 train_stream 节点，命令不变 |
-| deploy 校验失败           | EAS 保持原链路                                  | 检查下一条链路的发布情况后重跑 deploy 节点 |
 | EAS 滚动更新失败          | EAS 保持原链路                                  | 排查 Processor 日志后重跑 deploy 节点      |
