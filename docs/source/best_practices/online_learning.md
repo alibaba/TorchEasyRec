@@ -35,7 +35,7 @@ stream\_{T-1} 在下一次检查时发现 stream_T 已追上，随后排空上�
 | Kafka `group.id`                         | `tzrec_ol_${T}`                        | KafkaDataset 以消费组订阅 topic，两条链路共用一个 `group.id` 会互相 rebalance、瓜分分区，**必须不同** |
 | FeatureDB `feature_store_config.version` | `ol_${T}`                              | 全量导入与增量写入不能叠写在同一个版本上                                                              |
 
-示例中 `/mnt/data` 是 DLC 与 EAS 都挂载的 OSS 路径。在线 dense 发布依赖 `os.rename`，并要求 EAS 读到新的 `current.json` 时，它指向的版本目录已经可读。请确认所用的 OSS 挂载方式支持 rename，且写入对其他客户端及时可见；不满足时发布根目录请改用 NAS/CPFS，`model_dir` 仍可以使用 OSS。
+示例中 DLC 任务将 OSS 挂载到 `/mnt/data`，EAS 服务挂载其中的全量导出目录与发布根目录（见 [deploy](#online-learning-deploy)）。在线 dense 发布依赖 `os.rename`，并要求 EAS 读到新的 `current.json` 时，它指向的版本目录已经可读。请确认所用的 OSS 挂载方式支持 rename，且写入对其他客户端及时可见；不满足时发布根目录请改用 NAS/CPFS，`model_dir` 仍可以使用 OSS。
 
 ## DataWorks 调度
 
@@ -196,11 +196,16 @@ dlc submit pytorchjob \
 - 首次启动时 `model_dir` 中没有 checkpoint，从天级模型加载参数；天级 checkpoint 中没有 Kafka 位点，因此按 `start.timestamp.ms` 开始消费。
 - 重启时 `model_dir` 中已有 checkpoint，优先从中恢复参数和 Kafka 位点，`--fine_tune_checkpoint` 不再生效。
 
+(online-learning-deploy)=
+
 ### deploy
 
-前一天的 train_stream 正常退出即表示交接条件已经满足（见[交接规则](#online-learning-handover)），deploy 节点不再重复比较新旧链路的 `data_timestamp`：stream\_{T-1} 在退出过程中可能再发布一个更新的版本，重复比较会无谓地阻塞切换，而这种短暂的新鲜度回退是可以接受的。
+deploy 使用 PyODPS 3 节点，调度资源组选择 `dataworks_pairec_task_pod`（其中预置了 `eascmd64`），调度参数同上，节点内通过 `args` 读取。
 
-deploy 使用 PyODPS 3 节点，调度资源组选择 `dataworks_pairec_task_pod`（其中预置了 `eascmd64`），调度参数同上，节点内通过 `args` 读取。脚本使用节点运行账号的 AK/STS 调用 `eascmd modify` 更新服务，命令失败时节点失败：
+服务挂载两个 OSS 目录：
+
+- 模型目录：天级模型 T 的全量导出（full_export 节点的 `--export_dir`），Processor 从中加载初始模型与 embedding。
+- 发布根目录：stream_T 的 `ONLINE_DENSE_EXPORT_DIR`，Processor 轮询其中的 `dense_hot_export/current.json` 热加载 dense 模型。`current.json` 默认在模型目录下查找，这里两者分开，需通过 `dense_hot_load.current_json` 显式指定。
 
 ```python
 import json
@@ -220,15 +225,23 @@ config = {
         {
             "mount_path": "/home/admin/docker_ml/workspace/model/",
             "oss": {
-                "path": f"oss://<bucket>/online/stream/{bizdate}/serving/",
+                "path": f"oss://<bucket>/online/daily/{bizdate}/export/",
                 "readOnly": False,
             },
             "properties": {"resource_type": "code"},
-        }
+        },
+        {
+            "mount_path": "/mnt/serving/",
+            "oss": {
+                "path": f"oss://<bucket>/online/stream/{bizdate}/serving/",
+                "readOnly": True,
+            },
+        },
     ],
     "model_config": {
         "outputs": "<输出名，逗号分隔>",
         "fg_mode": "normal",
+        "distributed_embedding": True,
         "region": "<region>",
         "access_key_id": o.account.access_id,
         "access_key_secret": o.account.secret_access_key,
@@ -238,7 +251,14 @@ config = {
         "fs_entity": "<FeatureStore 实体>",
         "featuredb_username": "<FeatureDB 用户名>",
         "featuredb_password": "<FeatureDB 密码>",
-        # 读取 dense_hot_export 与 FeatureDB 版本 ol_{bizdate} 的参数名需与 Processor 确认
+        "feature_store_embedding_polling": {
+            "feature_view_name": "<与训练 feature_store_config 相同的 feature_view_name>",
+            "version": f"ol_{bizdate}",
+        },
+        "dense_hot_load": {
+            "enable": True,
+            "current_json": "/mnt/serving/dense_hot_export/current.json",
+        },
     },
     "processor": "easyrec-torch-<版本>",
 }
@@ -260,9 +280,20 @@ if sts_token:
 subprocess.run(cmd + ["modify", service_name, "-s", "service.json"], check=True)
 ```
 
-`model_config` 中其余参数见[模型服务](../usage/serving.md)，与线上服务保持一致即可。EAS 会滚动更新实例，滚动更新进度可在 EAS 控制台查看。**服务读取 `dense_hot_export` 目录与 FeatureDB 版本 `ol_${bizdate}` 所对应的 Processor 参数名请与 Processor 文档/负责人确认**后再补充到 `model_config` 中。切换成功后可清理 FeatureDB 版本 `ol_${prev}` 之前的版本与对应的 OSS 目录。
+在线学习相关的 Processor 参数：
 
-(online-learning-handover)=
+- `distributed_embedding`：需为 `true`，增量 embedding 轮询依赖分布式 embedding。
+- `feature_store_embedding_polling`：从 FeatureDB 轮询增量 embedding。配置该块且不写 `mode` 时即为 `apply` 模式：服务启动时先从头扫描版本 `version` 中的全部数据，再增量更新。`feature_view_name` 与 `version` 必填，且需与训练写入的 FeatureView 和版本一致；同时需要 `access_key_id`、`access_key_secret`、`region`、`fs_project`、`featuredb_username`、`featuredb_password`。
+- `sparse_poll_interval_secs`（位于 `feature_store_embedding_polling` 内）：默认 0，即不做周期扫描，只在加载新的 dense 版本前拉取一次增量，sparse 随 dense 按 `paired_dump_interval_*` 的节奏更新。若训练配置了更细的 `sparse_dump_interval_*`，希望线上 embedding 更快生效，需将其设为正数（秒）。
+- `dense_hot_load`：`enable` 为 `true` 时轮询 `current_json`，默认每分钟一次（`dense_poll_interval_minutes`）。服务启动时会先加载 `current.json` 指向的版本；`current.json` 不存在时服务启动失败，deploy 执行时 stream_T 已经发布过版本，满足该条件。加载新版本前会先拉取一次增量 embedding 并按 `sparse_probes` 抽样校验，保证 dense 不会领先 sparse。
+- 两个块中出现未知字段时服务启动失败，请勿拼错参数名。
+
+此外，全量导出与流式训练的产物需要相互兼容：
+
+- 两者需使用相同的模型配置与导出相关环境变量（如 `INPUT_TILE`）。Processor 会比较热加载版本与初始模型的 `dense_meta.json`，不一致时拒绝加载该版本（日志 `dense_meta_mismatch`）。
+- full_export 的 `DIST_QUANT` 需与 train_stream 中 `delta_embedding_dump_config.quant_type` 一致（同为 INT8 或同为不量化），FeatureView 的元素类型需与模型一致，否则 apply 模式初始化失败。
+
+`model_config` 中其余参数见[模型服务](../usage/serving.md)，与线上服务保持一致即可。EAS 会滚动更新实例，滚动更新进度可在 EAS 控制台查看。
 
 ## 交接规则
 
