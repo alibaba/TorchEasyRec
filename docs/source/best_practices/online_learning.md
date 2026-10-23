@@ -20,9 +20,7 @@
 
 ![在线学习链路示意时间线](../../images/best_practices/online_learning_timeline.svg)
 
-追赶耗时约为 `积压时长 × 生产速度 / (训练速度 − 生产速度)`，上例中为 4.5 × 1 / (3 − 1) = 2.25 小时，即 04:30 启动后 135 分钟、约 06:45 完全追上。交接并不要求完全追上：交接条件比较的是两条链路 `progress.json` 中按 `save_checkpoints_timestamp_quorum` 汇总各 rank 后的已消费数据事件时间，stream_T 落后不超过容忍值（默认 300 秒）即可，不比较已发布模型的新鲜度。若 stream\_{T-1} 已处于实时数据位置，5 分钟的容忍值可使条件在启动后约 132.5 分钟（约 06:42:30）满足；progress 的写入与检查周期会使实际交接略晚于该时刻。
-
-满足交接条件只说明 stream_T 的消费进度已接近 stream\_{T-1}，并不说明 stream_T 的 dense 模型与 embedding 已可加载。产物是否就绪由 deploy 与服务启动处理，例如 Processor 启动时 `current.json` 不存在会启动失败；stream\_{T-1} 退出前的最终发布只完成它自身链路的发布。
+追赶耗时约为 `积压时长 × 生产速度 / (训练速度 − 生产速度)`，上例中为 4.5 × 1 / (3 − 1) = 2.25 小时，即 04:30 启动后 135 分钟、约 06:45 完全追上。交接并不要求完全追上：交接条件比较的是两条链路 `progress.json` 中按 `save_checkpoints_timestamp_quorum` 汇总各 rank 后的已消费数据事件时间，stream_T 落后不超过容忍值（默认 300 秒）即可。
 
 stream\_{T-1} 退出后 deploy 通过 EAS 滚动更新切换服务：旧实例保持 stream\_{T-1} 的最终版本，新实例逐步启动并加载 stream_T，期间 stream_T 持续训练与发布。滚动更新期间不中断服务是 EAS 滚动更新的预期行为，而非训练代码提供的保证；退出与滚动更新的耗时不定。
 
