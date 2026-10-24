@@ -1,6 +1,6 @@
-# 天级增量 + 流式训练的在线学习
+# 在线学习
 
-本文介绍基于 TorchEasyRec，结合 [DataWorks](https://help.aliyun.com/zh/dataworks/product-overview/what-is-dataworks)、[PAI-DLC](https://help.aliyun.com/zh/pai/user-guide/what-is-dlc) 和 [PAI-EAS](https://help.aliyun.com/zh/pai/user-guide/eas-model-serving) 搭建在线学习链路的最佳实践：天级增量训练作为基线，每天基于天级模型启动一个流式训练任务；新的流式任务的消费进度接近旧任务后，旧任务自动退出，再由 DataWorks 把 EAS 服务切换到新任务的产出。
+本文介绍基于 TorchEasyRec，结合 [DataWorks](https://help.aliyun.com/zh/dataworks/product-overview/what-is-dataworks)、[PAI-DLC](https://help.aliyun.com/zh/pai/user-guide/what-is-dlc) 和 [PAI-EAS](https://help.aliyun.com/zh/pai/user-guide/eas-model-serving) 搭建推荐系统在线学习链路的最佳实践。该方案以天级增量训练为基线，每天基于天级模型启动新的流式训练任务；当新任务的消费进度追赶至接近旧任务时，旧任务自动退出，再由 DataWorks 将 EAS 服务切换至新任务的模型，实现在线学习链路的平滑交接。
 
 ## 整体流程
 
