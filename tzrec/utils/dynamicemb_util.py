@@ -52,6 +52,7 @@ from tzrec.optim.optimizer import (
     sparse_init_accumulator_value,
 )
 from tzrec.protos import feature_pb2
+from tzrec.utils import rocksdb_util
 from tzrec.utils.logging_util import logger
 
 _DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
@@ -400,7 +401,11 @@ def build_dynamicemb_constraints(
             "dynamicemb is not installed; required by features with "
             "`dynamicemb { }` set."
         )
-    _validate_eval_initializer_for_tombstones(dynamicemb_cfg, emb_config.name)
+    # RocksDB tables never delete rows (cache eviction writes back), so they
+    # publish no tombstones and need no evicted-key retention.
+    use_rocksdb = dynamicemb_cfg.HasField("rocksdb")
+    if not use_rocksdb:
+        _validate_eval_initializer_for_tombstones(dynamicemb_cfg, emb_config.name)
     embedding_dim = emb_config.embedding_dim
     num_embeddings = emb_config.num_embeddings
 
@@ -454,8 +459,12 @@ def build_dynamicemb_constraints(
     demb_opt_kwargs = {}
     if dynamicemb_cfg.HasField("bucket_capacity"):
         demb_opt_kwargs["bucket_capacity"] = dynamicemb_cfg.bucket_capacity
-    if _auto_retain_evicted_keys:
+    if _auto_retain_evicted_keys and not use_rocksdb:
         _arm_evicted_key_retention(demb_opt_kwargs)
+    if use_rocksdb:
+        demb_opt_kwargs["external_storage"] = rocksdb_util.table_factory(
+            dynamicemb_cfg, emb_config.name
+        )
 
     dynamicemb_options = dynamicemb.DynamicEmbTableOptions(
         max_capacity=dynamicemb_cfg.max_capacity,
@@ -651,6 +660,11 @@ if has_dynamicemb:
                     dynamicemb_options.embedding_dtype = tensor.dtype
                 if dynamicemb_options.index_type is None:
                     dynamicemb_options.index_type = torch.int64
+                if rocksdb_util.is_rocksdb_options(dynamicemb_options):
+                    rocksdb_util.with_namespace(
+                        dynamicemb_options,
+                        f"{sharding_option.path}.{sharding_option.name}",
+                    )
 
                 module_plan[sharding_option.name] = TZRecDynamicEmbParameterSharding(
                     sharding_spec=sharding_spec,
@@ -842,6 +856,32 @@ if has_dynamicemb:
         ]
         return hdm_value_sizes, ddr_value_sizes
 
+    def rocksdb_table_value_bytes(size: List[int], tensor: torch.Tensor) -> int:
+        """Rank-local value bytes (embedding + optimizer state) of one shard."""
+        optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
+        return _calculate_dynamicemb_table_storage_specific_size(
+            size,
+            tensor.element_size(),
+            _get_optimizer_multipler(optimizer_class, tensor.shape),
+            1.0,
+            is_hbm=True,
+            only_values=True,
+        )
+
+    def _rocksdb_cache_hbm_bytes(
+        size: List[int], tensor: torch.Tensor, ratio: float
+    ) -> int:
+        """HBM of a RocksDB table's GPU cache: cached rows with their metadata."""
+        rows = rocksdb_util.cache_rows(size[0], ratio)
+        optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
+        multiplier = _get_optimizer_multipler(optimizer_class, tensor.shape)
+        row_bytes = _round_up(
+            math.ceil(size[1] * (1 + multiplier) * tensor.element_size()), 16
+        )
+        return math.ceil(
+            rows * (row_bytes + 8 + 8 + 1 + 4 / rocksdb_util.CACHE_BUCKET_ROWS)
+        )
+
     def dynamicemb_calculate_shard_storages(
         sharder_data: SharderData,
         sharding_type: str,
@@ -919,16 +959,25 @@ if has_dynamicemb:
             is_pooled=is_pooled,
         )
 
-        hbm_specific_sizes, ddr_specific_sizes = (
-            _calculate_dynamicemb_storage_specific_sizes(
-                tensor=tensor,
-                shard_sizes=shard_sizes,
-                cache_ratio=caching_ratio if caching_ratio else 1.0,
-                is_inference=is_inference,
-                bucket_capacity=dynamicemb_options.bucket_capacity,
-                caching=bool(getattr(dynamicemb_options, "caching", False)),
+        if rocksdb_util.is_rocksdb_options(dynamicemb_options):
+            # Only the GPU cache is on this box: the full table is on disk and
+            # the shared host budget is reserved once per rank by the planner.
+            hbm_specific_sizes = [
+                _rocksdb_cache_hbm_bytes(size, tensor, caching_ratio or 0.0)
+                for size in shard_sizes
+            ]
+            ddr_specific_sizes = [0 for _ in shard_sizes]
+        else:
+            hbm_specific_sizes, ddr_specific_sizes = (
+                _calculate_dynamicemb_storage_specific_sizes(
+                    tensor=tensor,
+                    shard_sizes=shard_sizes,
+                    cache_ratio=caching_ratio if caching_ratio else 1.0,
+                    is_inference=is_inference,
+                    bucket_capacity=dynamicemb_options.bucket_capacity,
+                    caching=bool(getattr(dynamicemb_options, "caching", False)),
+                )
             )
-        )
         # The counter belongs to the strategy that counts with it; a
         # probabilistic admitter keeps no state, so it costs nothing.
         counter_hbm_specific_size = 0

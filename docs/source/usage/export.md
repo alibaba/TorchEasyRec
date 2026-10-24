@@ -96,6 +96,8 @@ export_config {
 
 凭证沿用阿里云默认凭证链，以及运行环境中的 `FEATUREDB_USERNAME`、`FEATUREDB_PASSWORD`；不要将凭证写入 `pipeline.config`。
 
+RocksDB 存储的 dynemb 表（见 [Dynamic Embedding](../feature/dynamicemb.md) 的 RocksDB 存储章节）直接以只读方式打开 checkpoint 对应的 RocksDB 原生 checkpoint 按块读取，同样不需要恢复整表，写出格式与普通 dynemb 表相同（values 统一为 FP32，同一 rank 内按 Id 的无符号字节序输出）。导出期间要求原生 checkpoint 仍然存在（训练任务按 `keep_checkpoint_max` 清理旧 checkpoint 时会一并删除，独立导出时请选择不会被清理的 checkpoint），且只支持 `USE_DISTRIBUTED_EMBEDDING=1` 的非 RTP 导出。导出会先扫描一遍 Id 以确定 NPZ 行数，大表的导出耗时约为多扫描一遍磁盘数据。
+
 ### 执行导出
 
 从仓库根目录、依赖版本匹配的项目环境执行，显式指定一个已写入完成、导出期间不会再改变的 checkpoint，并使用新的导出目录：

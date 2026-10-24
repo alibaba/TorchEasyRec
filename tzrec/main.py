@@ -89,6 +89,7 @@ from tzrec.utils import (
     config_util,
     dynamicemb_util,
     predict_util,
+    rocksdb_util,
 )
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
 from tzrec.utils.dist_util import (
@@ -870,6 +871,7 @@ def train_and_evaluate(
         enable_delta_embedding_dump
         and train_config.delta_embedding_dump_config.dump_evicted_tombstones
     )
+    use_rocksdb = rocksdb_util.start(train_config, pipeline_config.model_dir, "train")
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -888,7 +890,8 @@ def train_and_evaluate(
     if pipeline_config.train_config.fine_tune_checkpoint:
         # fine_tune_checkpoint is an external dir, outside the manager's model_dir.
         ckpt_path, _ = checkpoint_util.latest_checkpoint(
-            pipeline_config.train_config.fine_tune_checkpoint
+            pipeline_config.train_config.fine_tune_checkpoint,
+            require_success=use_rocksdb,
         )
         if ckpt_path is None or not os.path.exists(ckpt_path):
             raise RuntimeError(
@@ -898,7 +901,13 @@ def train_and_evaluate(
     restore_from_model_dir = False
     if os.path.exists(pipeline_config.model_dir):
         # Find the latest checkpoint in model_dir when continuing training
-        latest_ckpt_path, skip_steps = ckpt_manager.latest_checkpoint()
+        latest_ckpt_path, skip_steps = ckpt_manager.latest_checkpoint(
+            require_success=use_rocksdb
+        )
+        if use_rocksdb:
+            rocksdb_util.quarantine_incomplete_checkpoints(
+                pipeline_config.model_dir, skip_steps
+            )
         if latest_ckpt_path:
             if continue_train:
                 ckpt_path = latest_ckpt_path
@@ -990,6 +999,8 @@ def train_and_evaluate(
         sharders=sharders,
         plan=plan,
     )
+    if use_rocksdb:
+        rocksdb_util.validate_model(model)
     delta_embedding_dumper = None
     if enable_delta_embedding_dump:
         delta_embedding_dumper = DeltaEmbeddingDumper(
@@ -1088,28 +1099,33 @@ def train_and_evaluate(
         delta_embedding_dumper.start()
     # when slice batch by sample cost, data on all workers may not be balanced
     check_all_workers_data_status = data_config.HasField("batch_cost_size")
-    _train_and_evaluate(
-        model,
-        optimizer,
-        train_dataloader,
-        eval_dataloader,
-        [sparse_lr, dense_lr, *part_lrs],
-        pipeline_config.model_dir,
-        train_config=train_config,
-        eval_config=pipeline_config.eval_config,
-        ckpt_manager=ckpt_manager,
-        skip_steps=skip_steps,
-        ckpt_path=ckpt_path,
-        check_all_workers_data_status=check_all_workers_data_status,
-        ignore_restore_optimizer=ignore_restore_optimizer,
-        ignore_restore_lr_scheduler=ignore_restore_lr_scheduler,
-        restore_from_model_dir=restore_from_model_dir,
-        dataloader_state=dataloader_state,
-        delta_embedding_dumper=delta_embedding_dumper,
-        pipeline_config_path=os.path.join(pipeline_config.model_dir, "pipeline.config"),
-        dense_ema=dense_ema,
-        export_config=pipeline_config.export_config,
-    )
+    try:
+        _train_and_evaluate(
+            model,
+            optimizer,
+            train_dataloader,
+            eval_dataloader,
+            [sparse_lr, dense_lr, *part_lrs],
+            pipeline_config.model_dir,
+            train_config=train_config,
+            eval_config=pipeline_config.eval_config,
+            ckpt_manager=ckpt_manager,
+            skip_steps=skip_steps,
+            ckpt_path=ckpt_path,
+            check_all_workers_data_status=check_all_workers_data_status,
+            ignore_restore_optimizer=ignore_restore_optimizer,
+            ignore_restore_lr_scheduler=ignore_restore_lr_scheduler,
+            restore_from_model_dir=restore_from_model_dir,
+            dataloader_state=dataloader_state,
+            delta_embedding_dumper=delta_embedding_dumper,
+            pipeline_config_path=os.path.join(
+                pipeline_config.model_dir, "pipeline.config"
+            ),
+            dense_ema=dense_ema,
+            export_config=pipeline_config.export_config,
+        )
+    finally:
+        rocksdb_util.stop()
     # Drain background uploads only after training succeeds. A training failure
     # terminates the whole job (torchrun tears down every rank) and pending
     # in-memory deltas are intentionally abandoned: the restarted run re-dumps
@@ -1143,6 +1159,7 @@ def evaluate(
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     train_config = pipeline_config.train_config
     acc_utils.allow_tf32(train_config)
+    rocksdb_util.start(train_config, pipeline_config.model_dir, "eval")
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -1175,7 +1192,9 @@ def evaluate(
     ckpt_manager = checkpoint_util.CheckpointManager(pipeline_config.model_dir)
     global_step = None
     if not checkpoint_path:
-        checkpoint_path, global_step = ckpt_manager.latest_checkpoint()
+        checkpoint_path, global_step = ckpt_manager.latest_checkpoint(
+            require_success=rocksdb_util.get_rocksdb_config() is not None
+        )
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
@@ -1226,6 +1245,7 @@ def evaluate(
         eval_summary_writer=summary_writer,
         check_all_workers_data_status=check_all_workers_data_status,
     )
+    rocksdb_util.stop()
     if is_local_rank_zero:
         logger.info("Evaluate Finished.")
 
@@ -1274,6 +1294,9 @@ def export(
     if asset_files:
         assets = asset_files.split(",")
 
+    use_rocksdb = rocksdb_util.start(
+        pipeline_config.train_config, pipeline_config.model_dir, "export"
+    )
     ckpt_manager = checkpoint_util.CheckpointManager(
         pipeline_config.model_dir, export_config=pipeline_config.export_config
     )
@@ -1284,7 +1307,9 @@ def export(
         ):
             checkpoint_path, _ = ckpt_manager.best_checkpoint()
         else:
-            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
+            checkpoint_path, _ = ckpt_manager.latest_checkpoint(
+                require_success=use_rocksdb
+            )
 
     data_config = pipeline_config.data_config
 
@@ -1400,6 +1425,7 @@ def export(
             assets=assets,
             additional_export_config=additional_export_config,
         )
+    rocksdb_util.stop()
 
 
 def _write_predictions(
@@ -1799,6 +1825,7 @@ def predict_checkpoint(
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     train_config = pipeline_config.train_config
     acc_utils.allow_tf32(train_config)
+    use_rocksdb = rocksdb_util.start(train_config, pipeline_config.model_dir, "predict")
 
     data_config = pipeline_config.data_config
     # Build feature
@@ -1845,7 +1872,9 @@ def predict_checkpoint(
     ckpt_manager = checkpoint_util.CheckpointManager(pipeline_config.model_dir)
     global_step = None
     if not checkpoint_path:
-        checkpoint_path, global_step = ckpt_manager.latest_checkpoint()
+        checkpoint_path, global_step = ckpt_manager.latest_checkpoint(
+            require_success=use_rocksdb
+        )
     planner = create_planner(
         device=device,
         # pyre-ignore [16]
@@ -1978,5 +2007,6 @@ def predict_checkpoint(
             predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
 
     predict_util.commit_prediction_output(writer, pipeline_error, input_batches, device)
+    rocksdb_util.stop()
 
     logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")

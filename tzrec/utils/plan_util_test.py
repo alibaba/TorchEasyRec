@@ -13,6 +13,7 @@ import random
 import unittest
 from types import SimpleNamespace
 from typing import List, Tuple
+from unittest import mock
 
 import numpy as np
 import torch
@@ -27,6 +28,8 @@ from torchrec.distributed.test_utils.test_model import TestSparseNN
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
+from tzrec.protos import train_pb2
+from tzrec.utils import plan_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.plan_util import DynamicProgrammingProposer, _sparse_dp_proposor_numpy
 from tzrec.utils.test_util import mark_ci_scope
@@ -492,6 +495,47 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             )
         return TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
 
+    def test_rocksdb_host_ps_uses_no_value_storage(self):
+        try:
+            import tzrec_rocksdb  # noqa: F401
+        except ImportError:
+            self.skipTest("tzrec_rocksdb is not installed")
+        from tzrec.protos import feature_pb2
+        from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
+        from tzrec.utils.plan_util import (
+            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
+        )
+        from tzrec.utils.plan_util import (
+            get_default_sharders as _tzrec_get_default_sharders,
+        )
+
+        rocksdb_util.set_rocksdb_config(train_pb2.RocksDBConfig(local_path="x"))
+        self.addCleanup(rocksdb_util.set_rocksdb_config, None)
+        config = EmbeddingBagConfig(
+            num_embeddings=1 << 30, embedding_dim=128, name="t", feature_names=["f"]
+        )
+        cfg = feature_pb2.DynamicEmbedding(
+            max_capacity=1 << 30, score_strategy="NO_EVICTION"
+        )
+        cfg.rocksdb.SetInParent()
+        model = TestSparseNN(tables=[config], sparse_device=torch.device("meta"))
+        enumerator = _TzrecEmbeddingEnumerator(
+            topology=Topology(world_size=1, compute_device="cuda"),
+            batch_size=128,
+            fqn_constraints={"sparse.ebc.t": build_dynamicemb_constraints(cfg, config)},
+        )
+        options = enumerator.enumerate(
+            module=model, sharders=_tzrec_get_default_sharders()
+        )
+        self.assertEqual(len(options), 1)
+        self.assertFalse(options[0].dynamicemb_options.caching)
+        self.assertEqual(options[0].cache_load_factor, 0.0)
+        # A 0.0 ratio must not fall back to a default cache: 2^30 x 128 values
+        # would otherwise be counted in HBM.
+        for shard in options[0].shards:
+            self.assertEqual(shard.storage.ddr, 0)
+            self.assertLess(shard.storage.hbm, 1 << 30)
+
     def test_enumerate_yields_both_modes_and_all_factors(self):
         from tzrec.utils.plan_util import (
             EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
@@ -708,6 +752,58 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
                     planners.to_sharding_plan([sharding_option], topology)
             else:
                 planners.to_sharding_plan([sharding_option], topology)
+
+
+@unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+class RocksDBCacheRatioTest(unittest.TestCase):
+    """RocksDB tables share one rank-wide GPU cache ratio."""
+
+    def tearDown(self):
+        rocksdb_util.set_rocksdb_config(None)
+
+    def _option(self, rows, dim, rocksdb=True):
+        return SimpleNamespace(
+            use_dynamicemb=True,
+            dynamicemb_options=SimpleNamespace(caching=None, rocksdb=rocksdb),
+            shards=[SimpleNamespace(size=[rows, dim])],
+            tensor=torch.empty(0, dim),
+            cache_params=None,
+        )
+
+    def _pin(self, options, budget):
+        rocksdb_util.set_rocksdb_config(
+            train_pb2.RocksDBConfig(
+                local_path="x", gpu_cache_value_bytes_per_rank=budget
+            )
+        )
+        with mock.patch.object(
+            rocksdb_util, "is_rocksdb_options", side_effect=lambda o: o.rocksdb
+        ):
+            plan_util._pin_rocksdb_cache_ratio(options)
+
+    def test_uniform_ratio_and_mode(self):
+        a, b, other = (
+            self._option(1 << 16, 16),
+            self._option(1 << 16, 48),
+            self._option(1 << 16, 16, rocksdb=False),
+        )
+        total = (1 << 16) * (16 + 48) * 4
+        self._pin([a, b, other], total // 4)
+        for o in (a, b):
+            self.assertAlmostEqual(o.cache_params.load_factor, 0.25)
+            self.assertTrue(o.dynamicemb_options.caching)
+        self.assertIsNone(other.cache_params)
+        self.assertIsNone(other.dynamicemb_options.caching)
+
+    def test_zero_budget_is_host_ps(self):
+        a = self._option(1 << 16, 16)
+        self._pin([a], 0)
+        self.assertEqual(a.cache_params.load_factor, 0.0)
+        self.assertFalse(a.dynamicemb_options.caching)
+
+    def test_full_budget_rejected(self):
+        with self.assertRaises(ValueError):
+            self._pin([self._option(1 << 10, 16)], 1 << 30)
 
 
 if __name__ == "__main__":

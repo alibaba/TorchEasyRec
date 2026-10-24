@@ -95,6 +95,14 @@ message DynamicEmbProbabilisticAdmissionStrategy {
     optional DynamicEmbInitializerArgs initializer_args = 2;
 }
 
+// Keeps the full table in the rank's RocksDB store (train_config.rocksdb_config)
+// behind an optional GPU cache. The store never evicts: max_capacity stays the
+// declared logical size used for planning, not a disk quota or an exact limit
+// on admitted ids, and GPU cache eviction only writes rows back. Requires
+// score_strategy NO_EVICTION; cache_load_factor must be unset.
+message DynamicEmbRocksDB {
+}
+
 message DynamicEmbedding {
     // arguments for initializing dynamic embedding vector values.
     // default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / embedding_dim).
@@ -116,6 +124,8 @@ message DynamicEmbedding {
     // DEFAULT_BUCKET_CAPACITY). larger buckets trade probe cost for
     // higher load factor.
     optional uint64 bucket_capacity = 9;
+    // store the table in RocksDB instead of host/GPU memory.
+    optional DynamicEmbRocksDB rocksdb = 10;
     oneof admission_strategy {
         DynamicEmbFrequencyAdmissionStrategy frequency_admission_strategy = 100;
         DynamicEmbProbabilisticAdmissionStrategy probabilistic_admission_strategy = 101;
