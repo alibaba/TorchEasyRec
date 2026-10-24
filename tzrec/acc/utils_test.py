@@ -9,11 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
+import shutil
 import unittest
 from unittest import mock
 
 from tzrec.acc import utils
+from tzrec.utils.test_util import make_test_dir
 
 
 class AccUtilsTest(unittest.TestCase):
@@ -49,6 +52,21 @@ class AccUtilsTest(unittest.TestCase):
             acc_config = utils.export_acc_config()
 
         self.assertNotIn("DISTRIBUTED_EMBEDDING", acc_config)
+
+    def test_is_distributed_embedding_predict(self) -> None:
+        test_dir = make_test_dir()
+        try:
+            for acc_config, expected in [
+                ({"DISTRIBUTED_EMBEDDING": "1"}, True),
+                ({"SPARSE_INT64": "1"}, False),
+            ]:
+                with open(os.path.join(test_dir, "model_acc.json"), "w") as f:
+                    json.dump(acc_config, f)
+                self.assertEqual(
+                    utils.is_distributed_embedding_predict(test_dir), expected
+                )
+        finally:
+            shutil.rmtree(test_dir)
 
 
 if __name__ == "__main__":

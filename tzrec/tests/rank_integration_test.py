@@ -1148,7 +1148,7 @@ class RankIntegrationTest(unittest.TestCase):
         "dynamicemb not available.",
     )
     @mark_ci_scope("gpu")
-    def test_multi_tower_din_with_dynamicemb_train_eval_export(self):
+    def test_multi_tower_din_with_dynamicemb_train_eval_export_predict(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config",
             self.test_dir,
@@ -1194,7 +1194,49 @@ class RankIntegrationTest(unittest.TestCase):
                 self.assertEqual(len(keys), info["shape"][0])
                 self.assertEqual(arrays[info["value_name"]].shape, tuple(info["shape"]))
                 self.assertEqual(len(arrays[info["score_name"]]), len(keys))
-        self.success = True
+        predict_input_path = os.path.join(self.test_dir, r"eval_data/\*.parquet")
+        predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
+        self.success = utils.test_predict_checkpoint(
+            os.path.join(self.test_dir, "pipeline.config"),
+            predict_input_path=predict_input_path,
+            predict_output_path=predict_ckpt_path,
+            reserved_columns="user_id,item_id,clk",
+            output_columns="probs",
+            test_dir=self.test_dir,
+        )
+        # INT8 rows dequantize to fp16, hence the looser tolerance.
+        for name, env_str, abs_tol in [
+            ("export", None, 1e-5),
+            ("export_int8", "USE_DISTRIBUTED_EMBEDDING=1 DIST_QUANT=INT8", 2e-2),
+        ]:
+            export_dir = os.path.join(self.test_dir, name)
+            predict_output_path = os.path.join(self.test_dir, f"predict_{name}")
+            if self.success and env_str is not None:
+                self.success = utils.test_export(
+                    os.path.join(self.test_dir, "pipeline.config"),
+                    self.test_dir,
+                    export_dir=export_dir,
+                    env_str=env_str,
+                )
+            if self.success:
+                self.success = utils.test_predict(
+                    scripted_model_path=export_dir,
+                    predict_input_path=predict_input_path,
+                    predict_output_path=predict_output_path,
+                    reserved_columns="user_id,item_id,clk",
+                    output_columns="probs",
+                    test_dir=self.test_dir,
+                )
+            self.assertTrue(self.success)
+            predict_columns = ["user_id", "item_id", "clk"]
+            df = ds.dataset(predict_output_path, format="parquet").to_table()
+            df_ckpt = ds.dataset(predict_ckpt_path, format="parquet").to_table()
+            df = df.to_pandas().sort_values(by=predict_columns, ignore_index=True)
+            df_ckpt = df_ckpt.to_pandas().sort_values(
+                by=predict_columns, ignore_index=True
+            )
+            self.success = dfs_are_close(df, df_ckpt, abs_tol)
+            self.assertTrue(self.success, name)
 
     # id_1 is a regular embedding table, the rest are dynamicemb, so one run
     # covers FTRL on both the fused TBE kernel and the dynamicemb path.
