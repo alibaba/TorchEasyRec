@@ -28,12 +28,12 @@ stream\_{T-1} 退出后 deploy 通过 EAS 滚动更新切换服务：旧实例�
 
 每条链路的可变资源都按业务日期区分，两条链路互不干扰：
 
-| 资源                                     | 链路 T 的取值                        | 说明                                                                                                                                |
-| ---------------------------------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| 流式任务 `model_dir`                     | `/mnt/data/online/stream/${T}/model` | checkpoint、Kafka 位点，以及交接判断使用的进度 `progress.json`                                                                      |
-| 发布根目录 `ONLINE_DENSE_EXPORT_DIR`     | `/mnt/data/online/daily/${T}/export` | 天级模型 T 的全量导出目录，即 EAS 的模型目录；stream_T 在其中创建 `dense_hot_export/current.json`，作为 EAS 热加载 dense 模型的入口 |
-| Kafka `group.id`                         | `tzrec_ol_${T}`                      | KafkaDataset 以消费组订阅 topic，两条链路共用一个 `group.id` 会互相 rebalance、瓜分分区，**必须不同**                               |
-| FeatureDB `feature_store_config.version` | `ol_${T}`                            | 只包含 stream_T 的增量，EAS 将其叠加在天级模型 T 的全量导出之上；不同链路的增量基于不同的天级模型，不能写入同一版本                 |
+| 资源                                     | 链路 T 的取值                        | 说明                                                                                        |
+| ---------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------- |
+| 流式任务 `model_dir`                     | `/mnt/data/online/stream/${T}/model` | checkpoint、Kafka 位点，以及交接判断使用的进度 `progress.json`                              |
+| 模型导出目录 `ONLINE_DENSE_EXPORT_DIR`   | `/mnt/data/online/daily/${T}/export` | 天级模型 T 的全量导出目录，即 EAS 的模型目录；stream_T 也会在其中增量导出 dense 模型        |
+| Kafka `group.id`                         | `tzrec_ol_${T}`                      | KafkaDataset 以消费组订阅 topic，两条链路共用一个 `group.id` 会互相 rebalance，**必须不同** |
+| FeatureDB `feature_store_config.version` | `ol_${T}`                            | 包含 stream_T 的增量 embedding，不同链路的增量基于不同的天级模型，不能写入同一版本          |
 
 ## DataWorks 调度
 
@@ -137,8 +137,6 @@ data_config {
 - 使用 `num_epochs: 1`，**不要设置 `num_steps`**：Kafka 数据流不会结束，任务只会因交接而正常退出；train_stream 正常退出会直接触发下一天的 deploy，deploy 不再重复判断交接条件。
 - 学习率建议使用常数学习率；从天级模型 fine-tune 时不会恢复学习率调度进度。
 
-节点内容（`job_max_running_time_minutes` 作为兜底，需大于链路的预期运行时长）：
-
 ```bash
 dlc submit pytorchjob \
     --name=online_train_stream_${bizdate} \
@@ -175,13 +173,11 @@ dlc submit pytorchjob \
 首次启动与失败重启使用同一条命令：
 
 - 首次启动时 `model_dir` 中没有 checkpoint，从天级模型加载参数；天级 checkpoint 中没有 Kafka 位点，因此按 `start.timestamp.ms` 开始消费。
-- 重启时 `model_dir` 中已有 checkpoint，优先从中恢复参数和 Kafka 位点，`--fine_tune_checkpoint` 不再生效。
+- 失败重启时 `model_dir` 中已有 checkpoint，优先从中恢复参数和 Kafka 位点，`--fine_tune_checkpoint` 不再生效。
 
 ### deploy
 
 deploy 使用 PyODPS 3 节点，调度资源组选择 `dataworks_pairec_task_pod`（其中预置了 `eascmd64`），调度参数同上，节点内通过 `args` 读取。
-
-服务只需挂载一个 OSS 目录：天级模型 T 的全量导出目录（full_export 节点的 `--export_dir`，也是 stream_T 的 `ONLINE_DENSE_EXPORT_DIR`）。Processor 从中加载初始模型与 embedding，并轮询 stream_T 在其中创建的 `dense_hot_export/current.json` 热加载 dense 模型。
 
 ```python
 import json
@@ -252,12 +248,12 @@ subprocess.run(cmd + ["modify", service_name, "-s", "service.json"], check=True)
 
 - `feature_store_embedding_polling`：从 FeatureDB 轮询增量 embedding 的配置。必填项为 `feature_view_name` 和 `version`，且需与训练时写入的 FeatureView 和版本一致；选填 `sparse_poll_interval_secs`，默认 0，见下条。
 - `sparse_poll_interval_secs`（位于 `feature_store_embedding_polling` 内）：默认 0，即不做独立的周期扫描，只在加载新的 dense 版本时同时拉取一次增量 embedding，拉取频率由 `dense_hot_load.dense_poll_interval_minutes` 控制；设为正数（秒）时按该间隔独立、更高频地拉取增量 embedding，使其更快生效。
-- `dense_hot_load`：`enable` 为 `true` 时每隔 `dense_poll_interval_minutes` 分钟（默认 1）轮询模型目录下的 `dense_hot_export/current.json`。服务启动时会先加载 `current.json` 指向的版本；`current.json` 不存在时服务启动失败，deploy 执行时 stream_T 已经发布过版本，满足该条件。加载新版本前会先拉取一次增量 embedding 并按 `sparse_probes` 抽样校验，保证 dense 不会领先 sparse。
+- `dense_hot_load`：`enable` 为 `true` 时每隔 `dense_poll_interval_minutes` 分钟（默认 1）轮询模型目录下的 `dense_hot_export/current.json`。
 
 此外，全量导出与流式训练的产物需要相互兼容：
 
-- 两者需使用相同的模型配置。Processor 会比较热加载版本与初始模型的 `dense_meta.json`。
-- full_export 的 `DIST_QUANT` 需与 train_stream 中 `delta_embedding_dump_config.quant_type` 一致（同为 INT8 或同为不量化），FeatureView 的元素类型需与模型一致，否则增量 embedding 轮询初始化失败。
+- 两者需使用相同的模型配置。
+- full_export 的 `DIST_QUANT` 需与 train_stream 中 `delta_embedding_dump_config.quant_type` 一致（同为 INT8 或同为不量化），FeatureView 的元素类型需与模型一致。
 
 `model_config` 中其余参数见[模型服务](../usage/serving.md)，与线上服务保持一致即可。EAS 会滚动更新实例，滚动更新进度可在 EAS 控制台查看。
 
