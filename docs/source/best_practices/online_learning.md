@@ -7,8 +7,8 @@
 以业务日期 T 为例：
 
 1. 天级增量训练：从 T-1 的天级模型继续训练 MaxCompute 分区 `ds=T`，得到天级模型 T。
-1. 全量导出：把天级模型 T 的 embedding 全量上传到 FeatureDB 版本 `ol_T`。
-1. 流式训练 stream_T：从天级模型 T 出发，从 T+1 日 00:00 的 Kafka 位点开始消费，追赶到最新数据后持续训练，同时增量上传 embedding、发布 dense 模型。
+1. 全量导出：把天级模型 T 的 embedding 与 dense 参数导出到 OSS，作为 EAS 加载的初始模型，不上传 FeatureDB。
+1. 流式训练 stream_T：从天级模型 T 出发，从 T+1 日 00:00 的 Kafka 位点开始消费，追赶到最新数据后持续训练，同时把增量 embedding 上传到 FeatureDB 版本 `ol_T`、发布 dense 模型。
 1. 交接：stream\_{T-1} 每隔 `log_step_count_steps` 步比较两条链路 `model_dir` 下 `progress.json` 中已消费数据的事件时间，stream_T 落后不超过容忍值（默认 5 分钟，见 `ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS`）时 stream\_{T-1} 跳过最终 checkpoint、完成最终发布后正常退出。
 1. 切换：DataWorks 在 stream\_{T-1} 成功退出后，更新 EAS 服务到 stream_T。
 
@@ -28,12 +28,12 @@ stream\_{T-1} 退出后 deploy 通过 EAS 滚动更新切换服务：旧实例�
 
 每条链路的可变资源都按业务日期区分，两条链路互不干扰：
 
-| 资源                                     | 链路 T 的取值                          | 说明                                                                                                  |
-| ---------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| 流式任务 `model_dir`                     | `/mnt/data/online/stream/${T}/model`   | checkpoint、Kafka 位点，以及交接判断使用的进度 `progress.json`                                        |
-| 发布根目录 `ONLINE_DENSE_EXPORT_DIR`     | `/mnt/data/online/stream/${T}/serving` | `<发布根目录>/dense_hot_export/current.json` 是 EAS 热加载 dense 模型的入口                           |
-| Kafka `group.id`                         | `tzrec_ol_${T}`                        | KafkaDataset 以消费组订阅 topic，两条链路共用一个 `group.id` 会互相 rebalance、瓜分分区，**必须不同** |
-| FeatureDB `feature_store_config.version` | `ol_${T}`                              | 全量导入与增量写入不能叠写在同一个版本上                                                              |
+| 资源                                     | 链路 T 的取值                          | 说明                                                                                                                |
+| ---------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| 流式任务 `model_dir`                     | `/mnt/data/online/stream/${T}/model`   | checkpoint、Kafka 位点，以及交接判断使用的进度 `progress.json`                                                      |
+| 发布根目录 `ONLINE_DENSE_EXPORT_DIR`     | `/mnt/data/online/stream/${T}/serving` | `<发布根目录>/dense_hot_export/current.json` 是 EAS 热加载 dense 模型的入口                                         |
+| Kafka `group.id`                         | `tzrec_ol_${T}`                        | KafkaDataset 以消费组订阅 topic，两条链路共用一个 `group.id` 会互相 rebalance、瓜分分区，**必须不同**               |
+| FeatureDB `feature_store_config.version` | `ol_${T}`                              | 只包含 stream_T 的增量，EAS 将其叠加在天级模型 T 的全量导出之上；不同链路的增量基于不同的天级模型，不能写入同一版本 |
 
 ## DataWorks 调度
 
@@ -47,7 +47,7 @@ bizdate=$[yyyymmdd-1] prev=$[yyyymmdd-2] next=$[yyyymmdd] next_day=$[yyyy-mm-dd]
 | ------------ | -------- | ----------------------------------------------------------------- | ------------------------------------------ |
 | sample       | ODPS SQL | 上游样本表                                                        | 产出 `ds=${bizdate}` 样本分区              |
 | train_daily  | PAI-DLC  | sample；**依赖上一周期（本节点）**                                | 天级增量训练                               |
-| full_export  | PAI-DLC  | train_daily                                                       | FeatureDB 全量上传                         |
+| full_export  | PAI-DLC  | train_daily                                                       | 导出 embedding 与 dense 参数到 OSS         |
 | train_stream | PAI-DLC  | full_export；**不依赖上一周期**，与前一天的 train_stream 并行运行 | 流式训练，下一条链路满足交接条件后自动退出 |
 | deploy       | PyODPS 3 | full_export；**依赖上一周期（本节点 + train_stream 节点）**       | 前一天的 train_stream 退出后切换 EAS       |
 
@@ -81,7 +81,7 @@ dlc submit pytorchjob \
 
 ### full_export
 
-将天级模型的 embedding 全量上传到本链路的 FeatureDB 版本，详见[dynemb 流式导出与 FeatureDB 全量上传](../usage/export.md)。天级配置中 `export_config.dynamic_embedding.feature_store_config` 不写 `version`，导出时通过 `--edit_config_json` 按业务日期指定：
+将天级模型的 embedding 与 dense 参数全量导出到 OSS，作为 EAS 服务的模型目录。天级配置中不配置 `export_config.dynamic_embedding.feature_store_config`，导出时只生成导出文件，不上传 FeatureDB，详见[dynemb 流式导出与 FeatureDB 全量上传](../usage/export.md)：
 
 ```bash
 dlc submit pytorchjob \
@@ -90,13 +90,11 @@ dlc submit pytorchjob \
         pip install tzrec[cu130]==${TZREC_NIGHTLY_VERSION} -f http://tzrec.oss-accelerate.aliyuncs.com/release/nightly/repo.html --trusted-host tzrec.oss-accelerate.aliyuncs.com
         ODPS_ENDPOINT=http://service.<region>.maxcompute.aliyun-inc.com/api \
         USE_DISTRIBUTED_EMBEDDING=1 \
-        FEATUREDB_USERNAME=<FeatureDB 用户名> FEATUREDB_PASSWORD=<FeatureDB 密码> \
         torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
             --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
             -m tzrec.export \
             --pipeline_config_path /mnt/data/online/daily/${bizdate}/pipeline.config \
-            --export_dir /mnt/data/online/daily/${bizdate}/export \
-            --edit_config_json "{\"export_config.dynamic_embedding.feature_store_config.version\":\"ol_${bizdate}\"}"
+            --export_dir /mnt/data/online/daily/${bizdate}/export
         ' \
     --data_sources=<OSS 数据集 ID> \
     --workspace_id=<工作空间 ID> \
@@ -264,7 +262,7 @@ subprocess.run(cmd + ["modify", service_name, "-s", "service.json"], check=True)
 在线学习相关的 Processor 参数：
 
 - `distributed_embedding`：需为 `true`，增量 embedding 轮询依赖分布式 embedding。
-- `feature_store_embedding_polling`：从 FeatureDB 轮询增量 embedding。配置该块且不写 `mode` 时即为 `apply` 模式：服务启动时先从头扫描版本 `version` 中的全部数据，再增量更新。`feature_view_name` 与 `version` 必填，且需与训练写入的 FeatureView 和版本一致；同时需要 `access_key_id`、`access_key_secret`、`region`、`fs_project`、`featuredb_username`、`featuredb_password`。
+- `feature_store_embedding_polling`：从 FeatureDB 轮询增量 embedding。配置该块且不写 `mode` 时即为 `apply` 模式：服务启动时先从模型目录加载全量导出的 embedding，再从头扫描版本 `version` 中 stream_T 已上传的全部增量并叠加，之后持续增量更新；增量较多时可按需调大 `bootstrap_timeout_secs`（默认 1200 秒）。`feature_view_name` 与 `version` 必填，且需与训练写入的 FeatureView 和版本一致；同时需要 `access_key_id`、`access_key_secret`、`region`、`fs_project`、`featuredb_username`、`featuredb_password`。
 - `sparse_poll_interval_secs`（位于 `feature_store_embedding_polling` 内）：默认 0，即不做周期扫描，只在加载新的 dense 版本前拉取一次增量，sparse 随 dense 按 `paired_dump_interval_*` 的节奏更新。若训练配置了更细的 `sparse_dump_interval_*`，希望线上 embedding 更快生效，需将其设为正数（秒）。
 - `dense_hot_load`：`enable` 为 `true` 时轮询 `current_json`，默认每分钟一次（`dense_poll_interval_minutes`）。服务启动时会先加载 `current.json` 指向的版本；`current.json` 不存在时服务启动失败，deploy 执行时 stream_T 已经发布过版本，满足该条件。加载新版本前会先拉取一次增量 embedding 并按 `sparse_probes` 抽样校验，保证 dense 不会领先 sparse。
 
