@@ -19,7 +19,11 @@ import torch
 from parameterized import param, parameterized
 
 from tzrec.utils import npz_util, quant_util
-from tzrec.utils.dist_emb_predict_util import DistributedEmbeddingLookup
+from tzrec.utils.dist_emb_predict_util import (
+    DistributedEmbeddingLookup,
+    _encode_keys,
+    _key_tag,
+)
 from tzrec.utils.test_util import (
     make_test_dir,
     mark_ci_scope,
@@ -34,16 +38,18 @@ _MISS_KEY = 987654321
 class _Table:
     """One exported table and the float rows a lookup should return."""
 
-    def __init__(self, name, num_rows, dim, quant, dynamic, default=False):
+    def __init__(self, name, num_rows, dim, quant, dynamic, default=False, keys=None):
         rng = np.random.default_rng(len(name))
         self.name = name
         self.dim = dim
         values = rng.standard_normal((num_rows, dim)).astype(np.float32)
-        self.keys = (
-            rng.choice(1 << 40, num_rows, replace=False).astype(np.int64)
-            if dynamic
-            else np.arange(num_rows, dtype=np.int64)
-        )
+        if keys is not None:
+            self.keys = np.asarray(keys, dtype=np.int64)
+        elif dynamic:
+            # FG hashes dynamic ids into the full 63-bit range.
+            self.keys = rng.integers(0, (1 << 63) - 1, num_rows, dtype=np.int64)
+        else:
+            self.keys = np.arange(num_rows, dtype=np.int64)
         self.meta = {"dense": False, "is_dynamic": dynamic, "dimension": dim}
         self.meta["shape"] = [num_rows, dim]
         if quant:
@@ -112,6 +118,48 @@ def _write_export(export_dir, tables, features, dense_meta):
         json.dump(dense_meta, f)
 
 
+def _pooled(table, rows, mean, weights=None):
+    res = []
+    for i, r in enumerate(rows):
+        w = weights[i] if weights else [1.0] * len(r)
+        v = np.sum([wi * table.lookup(k) for k, wi in zip(r, w)], 0) if r else 0
+        if mean and r:
+            # weighted MEAN divides by the weight sum (1 if zero), as training does.
+            v = v / ((sum(w) or 1.0) if weights else len(r))
+        res.append(np.broadcast_to(v, (table.dim,)))
+    return np.stack(res).astype(np.float32)
+
+
+class FusedKeyTest(unittest.TestCase):
+    def test_encode_matches_processor(self) -> None:
+        # literals from TorchRecProcessor's encodeDynamicFusedKey (11 member bits).
+        keys = torch.tensor([0, 1, 42, (1 << 52) + 5, (1 << 63) - 2, -1, (1 << 63) - 1])
+        missing = (1 << 63) - 1
+        expected = {
+            0: [0x779B97F4A7C15, 0x779B97F4A7C14, 0x779B97F4A7C3F, 0x779B97F4A7C11],
+            1: [0x1EF372FE94F82A, 0x1EF372FE94F82B, 0x1EF372FE94F800, 0x1EF372FE94F82E],
+            2046: [
+                0x7FE65240D4962BEB,
+                0x7FE65240D4962BEA,
+                0x7FE65240D4962BC1,
+                0x7FE65240D4962BEF,
+            ],
+        }
+        last = {0: 0x8864680B58414, 1: 0x110C8D016B002B, 2046: 0x7FE9ADBF2B69D3EA}
+        for member, values in expected.items():
+            tags = torch.full_like(keys, _key_tag(member, 52))
+            self.assertEqual(
+                _encode_keys(keys, tags, 52).tolist(),
+                values + [last[member], missing, missing],
+            )
+
+    def test_member_keys_never_hit_miss_key(self) -> None:
+        for n in (1, 3, 4, 127, 2047):
+            payload_bits = 63 - n.bit_length()
+            largest = _key_tag(n - 1, payload_bits) | ((1 << payload_bits) - 1)
+            self.assertLess(largest, (1 << 63) - 1, n)
+
+
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 class DistributedEmbeddingLookupTest(unittest.TestCase):
@@ -121,6 +169,18 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.export_dir, ignore_errors=True)
 
+    @staticmethod
+    def _batch(bags, weights):
+        data = {"label": torch.zeros(3)}
+        for name, rows in bags.items():
+            data[f"{name}.values"] = torch.tensor(
+                [k for r in rows for k in r], dtype=torch.int64
+            )
+            data[f"{name}.lengths"] = torch.tensor([len(r) for r in rows])
+        for name, rows in weights.items():
+            data[f"{name}.weights"] = torch.tensor([w for r in rows for w in r])
+        return data
+
     @parameterized.expand(
         [
             param("quant", quant=True),
@@ -129,25 +189,44 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_lookup_matches_reference(self, _name, quant) -> None:
-        # dyn, dyn2 and static merge into one host table (same dtype, dim and
-        # default row); zch keeps its own for its default row, small for its dim.
+        # dyn and dyn2 fuse (same dtype, dim and default row); zch keeps its own
+        # group for its default row; static tables never fuse with dynamic ones.
         dyn = _Table("model.ebc.dyn", 50, 8, quant, dynamic=True)
         dyn2 = _Table("model.ebc.dyn2", 40, 8, quant, dynamic=True)
+        # the same raw key in two fused tables must keep both rows.
+        dyn2.keys[0] = dyn.keys[5]
         zch = _Table("model.ebc.zch", 30, 8, quant, dynamic=True, default=True)
         static = _Table("model.ebc.static", 20, 8, quant, dynamic=False)
         small = _Table("model.ebc.small", 10, 4, quant, dynamic=False)
         tables = [dyn, dyn2, zch, static, small]
+
+        def meta(table, pooling, use_weight=False):
+            return {
+                "embedding_name": table.name,
+                "pooling": pooling,
+                "use_weight": use_weight,
+            }
+
         features = {
-            "a__ebc": {"embedding_name": dyn.name, "pooling": "SUM"},
-            "b__ebc": {"embedding_name": zch.name, "pooling": "MEAN"},
-            "c__ebc": {"embedding_name": static.name, "pooling": "SUM"},
-            "d__ebc": {"embedding_name": dyn2.name, "pooling": "MEAN"},
-            "e__ebc": {"embedding_name": dyn.name, "pooling": "SUM"},
-            "f__ebc": {"embedding_name": small.name, "pooling": "SUM"},
-            "seq__ec": {"embedding_name": dyn.name, "pooling": "NONE"},
-            "seq2__ec": {"embedding_name": dyn2.name, "pooling": "NONE"},
+            "a__ebc": meta(dyn, "SUM"),
+            "b__ebc": meta(zch, "MEAN", use_weight=True),
+            "c__ebc": meta(static, "SUM", use_weight=True),
+            "d__ebc": meta(dyn2, "MEAN"),
+            "e@shared__ebc": meta(dyn, "SUM"),
+            "f__ebc": meta(small, "SUM"),
+            "g__ebc": meta(dyn2, "MEAN", use_weight=True),
+            "seq__ec": meta(dyn, "NONE"),
+            "seq2__ec": meta(dyn2, "NONE"),
         }
-        deep = ["a__ebc", "b__ebc", "c__ebc", "d__ebc", "e__ebc", "f__ebc"]
+        deep = [
+            "a__ebc",
+            "b__ebc",
+            "c__ebc",
+            "d__ebc",
+            "e@shared__ebc",
+            "f__ebc",
+            "g__ebc",
+        ]
         dense_meta = {
             "sequence__ec": ["seq__ec", "seq__lengths", "seq2__ec", "seq2__lengths"],
             "deep": deep,
@@ -160,75 +239,109 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             "c": ([0, 19], [5], [3, 3, 3]),
             # a key of dyn looked up in dyn2 must miss.
             "d": ([dyn2.keys[4], dyn.keys[4]], [dyn2.keys[0]], [-1]),
-            "e": ([dyn.keys[9]], [dyn.keys[9], dyn.keys[1]], []),
-            "f": ([1], [], [9, 0]),
-            "seq": ([dyn.keys[1], _MISS_KEY], [], [dyn.keys[2]]),
-            "seq2": ([dyn2.keys[1]], [dyn.keys[1], -1], [dyn2.keys[3]]),
+            "e": ([dyn.keys[9]], [dyn.keys[5], dyn.keys[1]], []),
+            "f": ([], [], []),
+            "g": ([dyn2.keys[2], dyn2.keys[3]], [dyn2.keys[0]], [dyn2.keys[1]]),
+            "seq": ([dyn.keys[1], _MISS_KEY], [], [dyn.keys[5]]),
+            "seq2": ([dyn2.keys[1]], [dyn.keys[1], -1], [dyn2.keys[0]]),
         }
-        # weighted features: "b" (MEAN divides the weighted sum by the bag length,
-        # as torchrec does) and "c" (SUM), each fused with unweighted features.
         weights = {
+            "a": ([9.0, 9.0, 9.0], [], [9.0, 9.0]),  # use_weight=false: ignored
             "b": ([0.5, 2.0], [3.0], []),
             "c": ([1.0, -1.0], [0.25], [2.0, 1.0, 0.5]),
+            "g": ([1.0, -1.0], [2.0], [0.0]),  # zero-sum bags divide by 1
         }
-        data = {"label": torch.zeros(3)}
-        for name, rows in bags.items():
-            data[f"{name}.values"] = torch.tensor(
-                [k for r in rows for k in r], dtype=torch.int64
-            )
-            data[f"{name}.lengths"] = torch.tensor([len(r) for r in rows])
-        for name, rows in weights.items():
-            data[f"{name}.weights"] = torch.tensor([w for r in rows for w in r])
+        data = self._batch(bags, weights)
 
         device = torch.device("cuda:0")
         lookup = DistributedEmbeddingLookup(self.export_dir, [device])
-        # merged dim-8 group (pooled + sequence), zch, small
+        # groups: dyn+dyn2, zch, static, small; sequences share their group layer.
         self.assertEqual(len(lookup._layers[device]), 4)
+        expected_deep = np.concatenate(
+            [
+                _pooled(dyn, bags["a"], False),
+                _pooled(zch, bags["b"], True, weights["b"]),
+                _pooled(static, bags["c"], False, weights["c"]),
+                _pooled(dyn2, bags["d"], True),
+                _pooled(dyn, bags["e"], False),
+                _pooled(small, bags["f"], False),
+                _pooled(dyn2, bags["g"], True, weights["g"]),
+            ],
+            axis=1,
+        )
+        tol = 2e-3 if quant else 1e-5
         for _ in range(2):
             out = lookup(data, device)
-
-            def pooled(table, rows, mean, row_weights=None):
-                res = []
-                for i, r in enumerate(rows):
-                    w = row_weights[i] if row_weights else [1.0] * len(r)
-                    embs = [wi * table.lookup(k) for k, wi in zip(r, w)]
-                    v = np.sum(embs, 0) if embs else np.zeros(table.dim)
-                    res.append(v / len(embs) if mean and embs else v)
-                return np.stack(res).astype(np.float32)
-
-            expected_deep = np.concatenate(
-                [
-                    pooled(dyn, bags["a"], False),
-                    pooled(zch, bags["b"], True, weights["b"]),
-                    pooled(static, bags["c"], False, weights["c"]),
-                    pooled(dyn2, bags["d"], True),
-                    pooled(dyn, bags["e"], False),
-                    pooled(small, bags["f"], False),
-                ],
-                axis=1,
-            )
-            tol = 2e-3 if quant else 1e-5
             self.assertEqual(out["deep"].device, device)
             self.assertEqual(out["deep"].dtype, torch.float32)
             np.testing.assert_allclose(
                 out["deep"].cpu().numpy(), expected_deep, rtol=tol, atol=tol
             )
-            expected_seq = np.stack([dyn.lookup(k) for r in bags["seq"] for k in r])
-            np.testing.assert_allclose(
-                out["seq"].cpu().numpy(), expected_seq, rtol=tol, atol=tol
-            )
-            expected_seq2 = np.stack([dyn2.lookup(k) for r in bags["seq2"] for k in r])
-            np.testing.assert_allclose(
-                out["seq2"].cpu().numpy(), expected_seq2, rtol=tol, atol=tol
-            )
+            for name, table in [("seq", dyn), ("seq2", dyn2)]:
+                expected = np.stack([table.lookup(k) for r in bags[name] for k in r])
+                np.testing.assert_allclose(
+                    out[name].cpu().numpy(), expected, rtol=tol, atol=tol
+                )
             self.assertEqual(out["seq__lengths"].dtype, torch.int32)
             self.assertEqual(out["seq__lengths"].tolist(), [2, 0, 1])
             self.assertEqual(out["label"].device, device)
 
+    def test_fold_collision_serves_table_unfused(self) -> None:
+        # a group of two tables folds keys to 61 bits; these two keys of one
+        # table fold to the same value.
+        key = (1 << 61) + 12345
+        dup = _Table(
+            "model.ebc.dup",
+            3,
+            8,
+            True,
+            dynamic=True,
+            keys=[key, key ^ (1 << 61) ^ 1, 7],
+        )
+        other = _Table("model.ebc.other", 20, 8, True, dynamic=True)
+        features = {
+            "a__ebc": {
+                "embedding_name": dup.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            },
+            "b__ebc": {
+                "embedding_name": other.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            },
+        }
+        _write_export(
+            self.export_dir,
+            [dup, other],
+            features,
+            {"sequence__ec": [], "deep": ["a__ebc", "b__ebc"]},
+        )
+        bags = {
+            "a": ([dup.keys[0]], [dup.keys[1]], [dup.keys[2], other.keys[0]]),
+            "b": ([other.keys[0]], [dup.keys[0]], [other.keys[1]]),
+        }
+        device = torch.device("cuda:0")
+        lookup = DistributedEmbeddingLookup(self.export_dir, [device])
+        self.assertEqual(len(lookup._layers[device]), 2)
+        out = lookup(self._batch(bags, {}), device)
+        expected = np.concatenate(
+            [_pooled(dup, bags["a"], False), _pooled(other, bags["b"], False)], axis=1
+        )
+        np.testing.assert_allclose(
+            out["deep"].cpu().numpy(), expected, rtol=2e-3, atol=2e-3
+        )
+
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
     def test_devices_share_tables(self) -> None:
         dyn = _Table("model.ebc.dyn", 50, 8, True, dynamic=True)
-        features = {"a__ebc": {"embedding_name": dyn.name, "pooling": "SUM"}}
+        features = {
+            "a__ebc": {
+                "embedding_name": dyn.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            }
+        }
         _write_export(
             self.export_dir, [dyn], features, {"sequence__ec": [], "deep": ["a__ebc"]}
         )
