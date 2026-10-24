@@ -1,6 +1,6 @@
 # 天级增量 + 流式训练的在线学习
 
-本文介绍基于 DataWorks、PAI-DLC、PAI-EAS 搭建在线学习链路的推荐方式：天级增量训练作为基线，每天基于天级模型启动一个流式训练任务；新的流式任务的消费进度接近旧任务后，旧任务自动退出，再由 DataWorks 把 EAS 服务切换到新任务的产出。
+本文介绍基于 [DataWorks](https://help.aliyun.com/zh/dataworks/product-overview/what-is-dataworks)、[PAI-DLC](https://help.aliyun.com/zh/pai/user-guide/what-is-dlc)、[PAI-EAS](https://help.aliyun.com/zh/pai/user-guide/eas-model-serving) 搭建在线学习链路的推荐方式：天级增量训练作为基线，每天基于天级模型启动一个流式训练任务；新的流式任务的消费进度接近旧任务后，旧任务自动退出，再由 DataWorks 把 EAS 服务切换到新任务的产出。
 
 ## 整体流程
 
