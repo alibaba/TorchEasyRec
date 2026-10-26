@@ -101,6 +101,7 @@ class FeatureStoreUploadSettings:
     feature_view_replication_count: int
     version: str
     upload_batch_size: int
+    max_workers: int
     max_retries: int
     retry_backoff_secs: int
     shutdown_timeout_secs: int
@@ -141,6 +142,7 @@ class FeatureStoreUploadSettings:
         positive_values = {
             "feature_view_ttl_secs": int(config.feature_view_ttl_secs),
             "upload_batch_size": int(config.upload_batch_size),
+            "max_workers": int(config.max_workers),
             "max_retries": int(config.max_retries),
             "shutdown_timeout_secs": int(config.shutdown_timeout_secs),
             "max_pending_steps": int(config.max_pending_steps),
@@ -186,6 +188,7 @@ class FeatureStoreUploadSettings:
             feature_view_replication_count=feature_view_replication_count,
             version=version,
             upload_batch_size=positive_values["upload_batch_size"],
+            max_workers=positive_values["max_workers"],
             max_retries=positive_values["max_retries"],
             retry_backoff_secs=int(config.retry_backoff_secs),
             shutdown_timeout_secs=positive_values["shutdown_timeout_secs"],
@@ -514,7 +517,8 @@ class FeatureStoreWriter:
         """
         if not self._manage_remote_view:
             view = project.get_dynamic_embedding_feature_view(
-                self.settings.feature_view_name
+                self.settings.feature_view_name,
+                max_workers=self.settings.max_workers,
             )
             if view is None:
                 view = self._wait_for_dynamic_embedding_view(project)
@@ -528,7 +532,8 @@ class FeatureStoreWriter:
             return view
         provisioned = False
         view = project.get_dynamic_embedding_feature_view(
-            self.settings.feature_view_name
+            self.settings.feature_view_name,
+            max_workers=self.settings.max_workers,
         )
         if view is None:
             create_error: Optional[Exception] = None
@@ -545,6 +550,7 @@ class FeatureStoreWriter:
                     ttl=self.settings.feature_view_ttl_secs,
                     shard_count=self.settings.feature_view_shard_count,
                     replication_count=self.settings.feature_view_replication_count,
+                    max_workers=self.settings.max_workers,
                     embedding_field_type=self._embedding_field_type,
                 )
                 provisioned = True
@@ -612,7 +618,8 @@ class FeatureStoreWriter:
         for attempt in range(1, self.settings.max_retries + 1):
             try:
                 view = project.get_dynamic_embedding_feature_view(
-                    self.settings.feature_view_name
+                    self.settings.feature_view_name,
+                    max_workers=self.settings.max_workers,
                 )
             except Exception as exc:
                 last_error = exc
