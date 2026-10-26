@@ -35,15 +35,9 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 ### 预测分布式 embedding 导出模型
 
-`USE_DISTRIBUTED_EMBEDDING=1` 导出的模型（`model_acc.json` 中 `DISTRIBUTED_EMBEDDING` 为 `"1"`）同样用上文的 `--scripted_model_path` 命令预测，会自动识别。此时 `scripted_model.pt` 只含 dense 部分，sparse embedding 由预测进程从导出目录的 `sparse/` 加载，并使用与在线服务相同的 NVIDIA NV-Embeddings（NVE）分层结构查表：每张表在 host 内存中保存一份全量（哈希表），每张 GPU 上各有一个 GPU cache。存储类型、维度和默认行都相同的表会合并为一张 host 表和一个 GPU cache（静态表与动态表不合并），同组同一池化方式的特征一次查表完成；NVE 每次查表都有固定开销，表或特征很多时合并可显著降低查表耗时。`DIST_QUANT=INT8` 导出的 INT8 表以量化格式加载，查表时反量化为 fp16，再转为 fp32 输入 dense 模型，与在线服务一致。
+`USE_DISTRIBUTED_EMBEDDING=1` 导出的模型同样用上文的 `--scripted_model_path` 命令预测，会根据 `model_acc.json` 自动识别。sparse embedding 从导出目录的 `sparse/` 加载，与在线服务一样使用 NVIDIA NV-Embeddings（NVE）查表：全量 embedding 保存在 host 内存中，每张 GPU 缓存其中一部分（见下文 `DIST_EMB_GPU_CACHE_RATIO`）。
 
-- 依赖 `pynve`（GPU 镜像已预装），仅支持 GPU 预测
-- 建议每台机器只启动一个预测进程（`--nproc-per-node=1`），该进程使用本机全部 GPU，所有 GPU 共享同一份 host 内存中的 embedding 表；每张 GPU 启动一个进程也能运行，但每个进程各加载一份 embedding 表，host 内存占用随进程数成倍增加，日志中会有对应告警
-- `--predict_threads` 默认不少于 GPU 数，预测线程按序号轮流分配到各 GPU
-- host 内存占用约为 `行数 x 向上对齐到 32 字节的行字节数` 加上 key 的开销；INT8 表每行为 `embedding_dim + 4` 字节（如 64 维为 68 字节，对齐后 96 字节；fp32 为 256 字节）
-- 查不到的 id（含 -1）返回全 0 向量；由零冲突 Hash（zch）转换而来的表返回导出的默认行，与在线服务一致
-- 合并表时，key 的高位为该表在组内的编号，低位为折叠并加盐后的原 key：不同表的 key 不会冲突；加载时检查每张动态表折叠后的 key，若有冲突则该表不参与合并、按原 key 单独查表，因此导出的每个 key 都能精确查到自己的行
-- 带权重的稀疏特征（`use_weight: true`）与训练一致按权重加权求和，MEAN 池化为加权和除以该样本权重之和（权重需非负，权重全为 0 或没有 id 的样本输出 0）；不带权重的 MEAN 池化为求和除以 id 个数
+- 建议每台机器只启动一个预测进程（`--nproc-per-node=1`），该进程使用本机全部 GPU，共享同一份 host 内存中的 embedding；每张 GPU 一个进程也能运行，但 host 内存占用随进程数成倍增加
 
 ```bash
 torchrun --master_addr=localhost --master_port=32555 \
@@ -87,4 +81,4 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_TABLE_LIFECYCLE: 自动创建的ODPS输出表的lifecycle
-- DIST_EMB_GPU_CACHE_RATIO: 预测分布式 embedding 导出模型时，每张 GPU 为每组合并后的 embedding 表缓存的比例（按表的存储字节数计算），取值 (0, 1\]，默认 1.0 即整表缓存到 GPU；GPU 显存不足时调小，未命中 GPU cache 的 id 会从 host 内存的全量表读取
+- DIST_EMB_GPU_CACHE_RATIO: 预测分布式 embedding 导出模型时，每张 GPU 缓存的 embedding 比例（按存储字节数计算），取值 (0, 1\]，默认 1.0 即全部缓存到 GPU；GPU 显存不足时调小，未缓存的 id 从 host 内存读取
