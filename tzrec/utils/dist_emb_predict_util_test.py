@@ -124,7 +124,7 @@ def _pooled(table, rows, mean, weights=None):
         w = weights[i] if weights else [1.0] * len(r)
         v = np.sum([wi * table.lookup(k) for k, wi in zip(r, w)], 0) if r else 0
         if mean and r:
-            # weighted MEAN divides by the weight sum (1 if zero), as training does.
+            # weighted MEAN divides by the weight sum; all-zero weights give zeros.
             v = v / ((sum(w) or 1.0) if weights else len(r))
         res.append(np.broadcast_to(v, (table.dim,)))
     return np.stack(res).astype(np.float32)
@@ -241,15 +241,15 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             "d": ([dyn2.keys[4], dyn.keys[4]], [dyn2.keys[0]], [-1]),
             "e": ([dyn.keys[9]], [dyn.keys[5], dyn.keys[1]], []),
             "f": ([], [], []),
-            "g": ([dyn2.keys[2], dyn2.keys[3]], [dyn2.keys[0]], [dyn2.keys[1]]),
+            "g": ([dyn2.keys[2], dyn2.keys[3]], [dyn2.keys[0], dyn2.keys[1]], []),
             "seq": ([dyn.keys[1], _MISS_KEY], [], [dyn.keys[5]]),
             "seq2": ([dyn2.keys[1]], [dyn.keys[1], -1], [dyn2.keys[0]]),
         }
         weights = {
             "a": ([9.0, 9.0, 9.0], [], [9.0, 9.0]),  # use_weight=false: ignored
             "b": ([0.5, 2.0], [3.0], []),
-            "c": ([1.0, -1.0], [0.25], [2.0, 1.0, 0.5]),
-            "g": ([1.0, -1.0], [2.0], [0.0]),  # zero-sum bags divide by 1
+            "c": ([1.0, 0.5], [0.25], [2.0, 1.0, 0.5]),
+            "g": ([1.0, 3.0], [0.0, 0.0], []),  # all-zero weights pool to zeros
         }
         data = self._batch(bags, weights)
 

@@ -266,16 +266,12 @@ class DistributedEmbeddingLookup:
                 f"gpu_cache_bytes={gpu_cache_size}."
             )
 
-        # features looked up together, per (group, pooling). A weighted MEAN is a
-        # SUM over weights normalized by their bag sum, as training does.
+        # features looked up together, per (group, pooling).
         self._buckets: Dict[Tuple[int, str], List[str]] = {}
         for feat in self._used_feats:
             meta = self._feat_meta[feat]
-            pooling = meta["pooling"]
-            if pooling == "MEAN" and meta["use_weight"]:
-                pooling = "SUM"
             group_idx, _ = self._table_group[meta["embedding_name"]]
-            self._buckets.setdefault((group_idx, pooling), []).append(feat)
+            self._buckets.setdefault((group_idx, meta["pooling"]), []).append(feat)
         self._tags: Dict[torch.device, Dict[Tuple[int, str], torch.Tensor]] = {}
         for device in devices:
             self._tags[device] = {
@@ -414,36 +410,18 @@ class DistributedEmbeddingLookup:
                     embs[feat] = e
                 continue
             lengths = [out[f"{n}.lengths"] for n in names]
-            lengths_cat = torch.cat(lengths)
-            offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths_cat)
-            if pooling == "MEAN":
-                emb = layer(keys, offsets, mode="mean").float()
-            else:
-                weights = None
-                if any(self._feat_meta[f]["use_weight"] for f in feats):
-                    weights = torch.cat(
-                        [
-                            out[f"{n}.weights"].float()
-                            if self._feat_meta[f]["use_weight"]
-                            else torch.ones(c, device=device)
-                            for f, n, c in zip(feats, names, counts)
-                        ]
-                    )
-                    mean_feats = [
-                        self._feat_meta[f]["pooling"] == "MEAN" for f in feats
+            offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(torch.cat(lengths))
+            weights = None
+            if any(self._feat_meta[f]["use_weight"] for f in feats):
+                weights = torch.cat(
+                    [
+                        out[f"{n}.weights"].float()
+                        if self._feat_meta[f]["use_weight"]
+                        else torch.ones(c, device=device)
+                        for f, n, c in zip(feats, names, counts)
                     ]
-                    if any(mean_feats):
-                        is_mean = torch.repeat_interleave(
-                            torch.tensor(mean_feats, device=device),
-                            torch.tensor(counts, device=device),
-                            output_size=weights.numel(),
-                        )
-                        weights = torch.where(
-                            is_mean,
-                            self._normalize_weights(weights, lengths_cat),
-                            weights,
-                        )
-                emb = layer(keys, offsets, weights).float()
+                )
+            emb = layer(keys, offsets, weights, mode=pooling.lower()).float()
             for feat, e in zip(feats, emb.split([x.numel() for x in lengths])):
                 embs[feat] = e
 
@@ -457,16 +435,3 @@ class DistributedEmbeddingLookup:
             else:
                 out[group] = torch.cat([embs[feat] for feat in feats], dim=1)
         return out
-
-    @staticmethod
-    def _normalize_weights(
-        weights: torch.Tensor, lengths: torch.Tensor
-    ) -> torch.Tensor:
-        """Divide weights by their bag's sum (1 for a zero sum), as training does."""
-        weight_sum = torch.segment_reduce(weights, "sum", lengths=lengths)
-        weight_sum = torch.where(
-            weight_sum == 0, torch.ones_like(weight_sum), weight_sum
-        )
-        return weights / torch.repeat_interleave(
-            weight_sum, lengths, output_size=weights.numel()
-        )

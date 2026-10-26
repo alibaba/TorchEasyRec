@@ -43,7 +43,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - host 内存占用约为 `行数 x 向上对齐到 32 字节的行字节数` 加上 key 的开销；INT8 表每行为 `embedding_dim + 4` 字节（如 64 维为 68 字节，对齐后 96 字节；fp32 为 256 字节）
 - 查不到的 id（含 -1）返回全 0 向量；由零冲突 Hash（zch）转换而来的表返回导出的默认行，与在线服务一致
 - 合并表时，key 的高位为该表在组内的编号，低位为折叠并加盐后的原 key：不同表的 key 不会冲突；加载时检查每张动态表折叠后的 key，若有冲突则该表不参与合并、按原 key 单独查表，因此导出的每个 key 都能精确查到自己的行
-- 带权重的稀疏特征（`use_weight: true`）与训练一致按权重加权求和，MEAN 池化为加权和除以该样本权重之和（权重和为 0 时除以 1）；不带权重的 MEAN 池化为求和除以 id 个数
+- 带权重的稀疏特征（`use_weight: true`）与训练一致按权重加权求和，MEAN 池化为加权和除以该样本权重之和（权重需非负，权重全为 0 或没有 id 的样本输出 0）；不带权重的 MEAN 池化为求和除以 id 个数
 
 ```bash
 torchrun --master_addr=localhost --master_port=32555 \
