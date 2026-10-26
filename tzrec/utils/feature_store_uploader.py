@@ -457,7 +457,15 @@ class FeatureStoreWriter:
         project = client.get_project(self.settings.project_name)
         if project is None:
             raise RuntimeError("configured FeatureStore project was not found")
-        view = self._get_or_create_view(project)
+        try:
+            view = self._get_or_create_view(project)
+        except TypeError as exc:
+            raise RuntimeError(
+                "failed to open or create configured DynamicEmbedding FeatureView: "
+                "ensure feature_store_py supports max_workers and "
+                "embedding_field_type; use feature_store_py >= 2.2.11 "
+                "as pinned in requirements/runtime.txt"
+            ) from exc
         self._view = view
         actual_fields = (view.pk_field, view.sk_field, view.embedding_field)
         expected_fields = (
@@ -481,7 +489,7 @@ class FeatureStoreWriter:
                     "feature_store_py without typed-embedding support), but the "
                     f"current upload requires {self._embedding_field_type!r}; "
                     "use FLOAT embeddings, or "
-                    "recreate the feature view with feature_store_py >= 2.2.10"
+                    "recreate the feature view with feature_store_py >= 2.2.11"
                 )
         elif actual_field_type != self._embedding_field_type:
             raise RuntimeError(
@@ -554,15 +562,8 @@ class FeatureStoreWriter:
                     embedding_field_type=self._embedding_field_type,
                 )
                 provisioned = True
-            except TypeError as exc:
-                # A signature TypeError is deterministic; the wait/retry loop
-                # cannot fix an SDK that lacks the embedding_field_type kwarg.
-                raise RuntimeError(
-                    "failed to create configured DynamicEmbedding FeatureView: "
-                    "the installed feature_store_py does not accept "
-                    "embedding_field_type; upgrade to feature_store_py >= 2.2.10 "
-                    "as pinned in requirements/runtime.txt"
-                ) from exc
+            except TypeError:
+                raise
             except Exception as exc:
                 create_error = exc
                 view = self._wait_for_dynamic_embedding_view(project)
@@ -621,6 +622,8 @@ class FeatureStoreWriter:
                     self.settings.feature_view_name,
                     max_workers=self.settings.max_workers,
                 )
+            except TypeError:
+                raise
             except Exception as exc:
                 last_error = exc
             else:

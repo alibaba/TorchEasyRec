@@ -645,25 +645,62 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self.assertEqual(len(factory.project.create_calls), 1)
         self.assertEqual(factory.project.entity_create_calls, [])
 
-    def test_create_type_error_reports_feature_store_py_version(self):
-        # An old feature_store_py rejects the embedding_field_type kwarg with a
-        # TypeError; the uploader must surface the pinned SDK version instead of
-        # burning the wait/retry loop and re-raising a generic failure.
+    @parameterized.expand(
+        [("embedding_field_type",), ("max_workers",)],
+        name_func=parameterized_name_func,
+    )
+    def test_create_type_error_reports_feature_store_py_version(self, keyword):
         factory = _FakeClientFactory(
             None,
             create_error=TypeError(
                 "create_dynamic_embedding_feature_view() got an unexpected "
-                "keyword argument 'embedding_field_type'"
+                f"keyword argument '{keyword}'"
             ),
         )
         uploader = self._uploader(client_factory=factory)
 
-        with self.assertRaisesRegex(RuntimeError, "feature_store_py.*2.2.10") as ctx:
+        with self.assertRaisesRegex(RuntimeError, r"feature_store_py.*2\.2\.11") as ctx:
             uploader.start()
 
+        self.assertIn(keyword, str(ctx.exception))
         self.assertIsInstance(ctx.exception.__cause__, TypeError)
         self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
         self.assertEqual(len(factory.project.create_calls), 1)
+
+    @parameterized.expand(
+        [(True, False), (False, False), (True, True), (False, True)],
+        name_func=parameterized_name_func,
+    )
+    def test_get_type_error_reports_feature_store_py_version(
+        self, manage_remote_view, during_wait
+    ):
+        factory = _FakeClientFactory(None, create_error=RuntimeError("already exists"))
+        uploader = self._uploader(
+            _feature_store_config(max_retries=3, retry_backoff_secs=1),
+            manage_remote_view=manage_remote_view,
+            client_factory=factory,
+        )
+        error = TypeError(
+            "get_dynamic_embedding_feature_view() got an unexpected "
+            "keyword argument 'max_workers'"
+        )
+        with (
+            mock.patch.object(
+                factory.project,
+                "get_dynamic_embedding_feature_view",
+                side_effect=[None] + [error] * 3 if during_wait else error,
+            ) as get_view,
+            mock.patch("tzrec.utils.feature_store_uploader.time.sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"feature_store_py.*2\.2\.11"
+            ) as ctx:
+                uploader.start()
+
+        self.assertIn("max_workers", str(ctx.exception))
+        self.assertIs(ctx.exception.__cause__, error)
+        self.assertEqual(get_view.call_count, 2 if during_wait else 1)
+        sleep.assert_not_called()
 
     def test_start_creates_default_entity_when_it_does_not_exist(self):
         created_view = _FakeView()
