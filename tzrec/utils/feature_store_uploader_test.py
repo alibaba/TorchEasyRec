@@ -218,8 +218,8 @@ class _FakeProject:
         self.entity_get_calls = []
         self.entity_create_calls = []
 
-    def get_dynamic_embedding_feature_view(self, name, max_workers=4):
-        self.dynamic_get_calls.append(name)
+    def get_dynamic_embedding_feature_view(self, name, max_workers=None):
+        self.dynamic_get_calls.append((name, max_workers))
         if self._view is not None:
             self._view._max_workers = max_workers
         return self._view
@@ -230,7 +230,7 @@ class _FakeProject:
             self._view = self._view_after_create_error
             raise self._create_error
         self._view = self._created_view or _FakeView()
-        self._view._max_workers = kwargs.get("max_workers", 4)
+        self._view._max_workers = kwargs.get("max_workers")
         # The created handle carries the created embedding_field_type.
         self._view.embedding_field_type = kwargs.get(
             "embedding_field_type", FEATURE_STORE_EMBEDDING_TYPE_FLOAT
@@ -411,7 +411,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         uploader.start()
         uploader.close()
 
-        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.dynamic_get_calls, [("shared_embeddings", 4)])
         self.assertEqual(factory.project.create_calls, [])
         self.assertEqual(view.closed, [True])
 
@@ -453,7 +453,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         uploader.start()
         uploader.close()
 
-        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.dynamic_get_calls, [("shared_embeddings", 8)])
         self.assertEqual(
             factory.project.create_calls,
             [
@@ -605,7 +605,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self.assertEqual(len(factory.project.create_calls), 1)
         self.assertEqual(
             factory.project.dynamic_get_calls,
-            ["shared_embeddings", "shared_embeddings"],
+            [("shared_embeddings", 8), ("shared_embeddings", 8)],
         )
         self.assertEqual(concurrent_view.closed, [True])
         self.assertEqual(uploader._writer.max_workers, 8)
@@ -664,7 +664,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
 
         self.assertIn(keyword, str(ctx.exception))
         self.assertIsInstance(ctx.exception.__cause__, TypeError)
-        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.dynamic_get_calls, [("shared_embeddings", 4)])
         self.assertEqual(len(factory.project.create_calls), 1)
 
     @parameterized.expand(
@@ -777,7 +777,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         uploader.submit(10, _delta_table([_row(10, 1, 7, [1.0, 2.0])]))
         uploader.close()
 
-        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.dynamic_get_calls, [("shared_embeddings", 8)])
         self.assertEqual(factory.project.create_calls, [])
         self.assertEqual(uploader._writer.max_workers, 8)
         self.assertEqual(len(view.calls), 1)
@@ -844,12 +844,13 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self, max_workers, expected_windows
     ):
         view = _FakeView()
+        factory = _FakeClientFactory(view)
         config = _feature_store_config(upload_batch_size=1)
         if max_workers is not None:
             config.max_workers = max_workers
         uploader = self._uploader(
             config,
-            client_factory=_FakeClientFactory(view),
+            client_factory=factory,
             clock_ms=lambda: 100,
         )
 
@@ -859,6 +860,10 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         )
         uploader.close()
 
+        self.assertEqual(
+            factory.project.dynamic_get_calls,
+            [("shared_embeddings", config.max_workers)],
+        )
         self.assertEqual([call["ts"] for call in view.calls], [100, 101, 102, 103, 104])
         self.assertEqual(view.flush_calls, expected_windows)
 
