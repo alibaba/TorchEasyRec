@@ -98,6 +98,8 @@ message FeatureStoreConfig {
     // FeatureDB public endpoint for the data plane, which stays reachable
     // when the default VPC endpoint is not.
     optional bool test_mode = 19 [default = false];
+    // Maximum concurrent SDK upload workers per rank.
+    optional uint32 max_workers = 20 [default = 4];
 }
 
 enum DeltaEmbeddingQuantType {

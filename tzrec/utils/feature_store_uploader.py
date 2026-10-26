@@ -101,6 +101,7 @@ class FeatureStoreUploadSettings:
     feature_view_replication_count: int
     version: str
     upload_batch_size: int
+    max_workers: int
     max_retries: int
     retry_backoff_secs: int
     shutdown_timeout_secs: int
@@ -141,6 +142,7 @@ class FeatureStoreUploadSettings:
         positive_values = {
             "feature_view_ttl_secs": int(config.feature_view_ttl_secs),
             "upload_batch_size": int(config.upload_batch_size),
+            "max_workers": int(config.max_workers),
             "max_retries": int(config.max_retries),
             "shutdown_timeout_secs": int(config.shutdown_timeout_secs),
             "max_pending_steps": int(config.max_pending_steps),
@@ -186,6 +188,7 @@ class FeatureStoreUploadSettings:
             feature_view_replication_count=feature_view_replication_count,
             version=version,
             upload_batch_size=positive_values["upload_batch_size"],
+            max_workers=positive_values["max_workers"],
             max_retries=positive_values["max_retries"],
             retry_backoff_secs=int(config.retry_backoff_secs),
             shutdown_timeout_secs=positive_values["shutdown_timeout_secs"],
@@ -454,7 +457,15 @@ class FeatureStoreWriter:
         project = client.get_project(self.settings.project_name)
         if project is None:
             raise RuntimeError("configured FeatureStore project was not found")
-        view = self._get_or_create_view(project)
+        try:
+            view = self._get_or_create_view(project)
+        except TypeError as exc:
+            raise RuntimeError(
+                "failed to open or create configured DynamicEmbedding FeatureView: "
+                "ensure feature_store_py supports max_workers and "
+                "embedding_field_type; use feature_store_py >= 2.2.11 "
+                "as pinned in requirements/runtime.txt"
+            ) from exc
         self._view = view
         actual_fields = (view.pk_field, view.sk_field, view.embedding_field)
         expected_fields = (
@@ -478,7 +489,7 @@ class FeatureStoreWriter:
                     "feature_store_py without typed-embedding support), but the "
                     f"current upload requires {self._embedding_field_type!r}; "
                     "use FLOAT embeddings, or "
-                    "recreate the feature view with feature_store_py >= 2.2.10"
+                    "recreate the feature view with feature_store_py >= 2.2.11"
                 )
         elif actual_field_type != self._embedding_field_type:
             raise RuntimeError(
@@ -514,7 +525,8 @@ class FeatureStoreWriter:
         """
         if not self._manage_remote_view:
             view = project.get_dynamic_embedding_feature_view(
-                self.settings.feature_view_name
+                self.settings.feature_view_name,
+                max_workers=self.settings.max_workers,
             )
             if view is None:
                 view = self._wait_for_dynamic_embedding_view(project)
@@ -528,7 +540,8 @@ class FeatureStoreWriter:
             return view
         provisioned = False
         view = project.get_dynamic_embedding_feature_view(
-            self.settings.feature_view_name
+            self.settings.feature_view_name,
+            max_workers=self.settings.max_workers,
         )
         if view is None:
             create_error: Optional[Exception] = None
@@ -545,18 +558,12 @@ class FeatureStoreWriter:
                     ttl=self.settings.feature_view_ttl_secs,
                     shard_count=self.settings.feature_view_shard_count,
                     replication_count=self.settings.feature_view_replication_count,
+                    max_workers=self.settings.max_workers,
                     embedding_field_type=self._embedding_field_type,
                 )
                 provisioned = True
-            except TypeError as exc:
-                # A signature TypeError is deterministic; the wait/retry loop
-                # cannot fix an SDK that lacks the embedding_field_type kwarg.
-                raise RuntimeError(
-                    "failed to create configured DynamicEmbedding FeatureView: "
-                    "the installed feature_store_py does not accept "
-                    "embedding_field_type; upgrade to feature_store_py >= 2.2.10 "
-                    "as pinned in requirements/runtime.txt"
-                ) from exc
+            except TypeError:
+                raise
             except Exception as exc:
                 create_error = exc
                 view = self._wait_for_dynamic_embedding_view(project)
@@ -612,8 +619,11 @@ class FeatureStoreWriter:
         for attempt in range(1, self.settings.max_retries + 1):
             try:
                 view = project.get_dynamic_embedding_feature_view(
-                    self.settings.feature_view_name
+                    self.settings.feature_view_name,
+                    max_workers=self.settings.max_workers,
                 )
+            except TypeError:
+                raise
             except Exception as exc:
                 last_error = exc
             else:
