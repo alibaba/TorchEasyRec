@@ -648,3 +648,28 @@ ______________________________________________________________________
 1. 检查历史 SID 和目标标签是否直接使用最终物品映射表的 `offset_codebook`，无需再次添加层偏移或 LM 词表偏移。
 1. `generated_sids` 输出每层从 0 开始的原始编码，非偏移后编码，检查sid检索时是否误用了偏移后编码。
 1. 历史、标签、物品映射及配置中的码本应对应同一代 SID 结果。配置了 `sid_space.manifest_path` 时，使用该代 [SID 冲突后处理工具](usage/sid_collision.md) 产出的完整 manifest，并核对其中的 `codebook` 和 `bundle_uuid`。
+
+______________________________________________________________________
+
+**Q25: 导出模型时写 OSS 挂载目录报错 File too large**
+
+**报错信息：**
+
+```
+  File "/opt/conda/lib/python3.11/site-packages/tzrec/utils/npz_util.py", line 115, in write
+    n = self._fp.write(data)
+        ^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 27] File too large
+```
+
+**原因：** 通过 ossfs 挂载的 OSS 目录采用分片上传写文件，单文件最大为分片大小 × 分片数上限（10000）。默认配置下单文件最大约 80GB，当导出的单个文件（如大规模 embedding 参数文件）超过该上限时会报此错误。
+
+**解决方法：** 在 DLC 数据集挂载的高级配置中调大 ossfs 上传分片大小，例如：
+
+```json
+{
+  "fs.ossfs.args": "-oupload_buffer_size=128M"
+}
+```
+
+分片大小设置为 128MB 后，单文件最大可支持 128MB × 10000 ≈ 1.2TB，可根据导出文件大小调整该值。
