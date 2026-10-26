@@ -131,8 +131,8 @@ def _pooled(table, rows, mean, weights=None):
 
 
 class FusedKeyTest(unittest.TestCase):
-    def test_encode_matches_processor(self) -> None:
-        # literals from TorchRecProcessor's encodeDynamicFusedKey (11 member bits).
+    def test_encode_golden_keys(self) -> None:
+        # encoded keys with 11 member bits, i.e. 52 payload bits.
         keys = torch.tensor([0, 1, 42, (1 << 52) + 5, (1 << 63) - 2, -1, (1 << 63) - 1])
         missing = (1 << 63) - 1
         expected = {

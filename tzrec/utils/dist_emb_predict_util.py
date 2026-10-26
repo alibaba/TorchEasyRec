@@ -14,25 +14,24 @@
 A distributed embedding export (``USE_DISTRIBUTED_EMBEDDING=1``) keeps the
 embedding tables out of ``scripted_model.pt``: ``sparse/`` holds the tables as
 npz shards, and the dense graph takes the looked-up embeddings as inputs, laid
-out by ``dense_meta.json``. The online processor serves the tables with NVIDIA
-NV-Embeddings (NVE) hierarchical layers; this module does the same lookup
-offline through pynve, so offline predict matches online serving, including
-rowwise INT8 (``DIST_QUANT=INT8``) tables, which NVE dequantizes on lookup.
+out by ``dense_meta.json``. This module looks the tables up offline with
+NVIDIA NV-Embeddings (NVE) hierarchical layers through pynve, as online serving
+does, including rowwise INT8 (``DIST_QUANT=INT8``) tables, which NVE dequantizes
+on lookup.
 
-Like the processor, tables with the same storage dtype, dim and default row are
-fused into one host parameter server (an nvhm hash table) and one NVE layer per
-GPU, and each (group, pooling) is looked up in one call, since every NVE lookup
-pays a fixed cost (a GPU cache probe plus a host round trip). Static and dynamic
-tables are never fused together. The host table is shared by every local GPU;
-each GPU only adds its own cache.
+Tables with the same storage dtype, dim and default row are fused into one host
+parameter server (an nvhm hash table) and one NVE layer per GPU, and each
+(group, pooling) is looked up in one call, since every NVE lookup pays a fixed
+cost (a GPU cache probe plus a host round trip). Static and dynamic tables are
+never fused together. The host table is shared by every local GPU; each GPU only
+adds its own cache.
 
-Fused keys follow the processor's encoding: the high ``B`` bits after the sign
-bit hold the table's member index in its group, and the low ``P = 63 - B`` bits
-hold the key folded to ``P`` bits and xor-ed with a per-member salt. ``B`` is the
-bit length of the group size, so ``INT64_MAX``, the miss key, is never a member
-key. Keys of different tables never collide; a table whose exported keys collide
-after folding is served on its own, with its raw keys, so every exported key
-resolves exactly.
+In a fused key, the high ``B`` bits after the sign bit hold the table's member
+index in its group, and the low ``P = 63 - B`` bits hold the key folded to ``P``
+bits and xor-ed with a per-member salt. ``B`` is the bit length of the group
+size, so ``INT64_MAX``, the miss key, is never a member key. Keys of different
+tables never collide; a table whose exported keys collide after folding is
+served on its own, with its raw keys, so every exported key resolves exactly.
 """
 
 import glob
@@ -47,7 +46,7 @@ from tzrec.utils import npz_util
 from tzrec.utils.logging_util import logger
 
 _LOAD_BATCH_ROWS = 1 << 20
-# NVE uses key -1 as its empty-slot marker; the processor serves it as a miss.
+# NVE uses key -1 as its empty-slot marker, so -1 ids look up this miss key.
 _MISSING_KEY = torch.iinfo(torch.int64).max
 _MIN_GPU_CACHE_BYTES = 1 << 20
 _MAX_GROUP_MEMBERS = (1 << 11) - 1
