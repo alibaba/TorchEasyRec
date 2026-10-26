@@ -272,6 +272,11 @@ class DistributedEmbeddingLookup:
             meta = self._feat_meta[feat]
             group_idx, _ = self._table_group[meta["embedding_name"]]
             self._buckets.setdefault((group_idx, meta["pooling"]), []).append(feat)
+        # per-feature use_weight of each bucket; None when no feature is weighted.
+        self._use_weight: Dict[Tuple[int, str], Optional[List[bool]]] = {}
+        for bucket, feats in self._buckets.items():
+            use_weight = [self._feat_meta[f]["use_weight"] for f in feats]
+            self._use_weight[bucket] = use_weight if any(use_weight) else None
         self._tags: Dict[torch.device, Dict[Tuple[int, str], torch.Tensor]] = {}
         for device in devices:
             self._tags[device] = {
@@ -412,13 +417,14 @@ class DistributedEmbeddingLookup:
             lengths = [out[f"{n}.lengths"] for n in names]
             offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(torch.cat(lengths))
             weights = None
-            if any(self._feat_meta[f]["use_weight"] for f in feats):
+            use_weight = self._use_weight[(group_idx, pooling)]
+            if use_weight is not None:
                 weights = torch.cat(
                     [
                         out[f"{n}.weights"].float()
-                        if self._feat_meta[f]["use_weight"]
+                        if w
                         else torch.ones(c, device=device)
-                        for f, n, c in zip(feats, names, counts)
+                        for w, n, c in zip(use_weight, names, counts)
                     ]
                 )
             emb = layer(keys, offsets, weights, mode=pooling.lower()).float()
