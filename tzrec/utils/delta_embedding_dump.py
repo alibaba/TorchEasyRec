@@ -473,6 +473,7 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                 module_fqn = self._clean_module_fqn(named_fqn)
             self.tracked_modules[module_fqn] = module
             wrapper, mc_modules = mc_modules_by_inner.get(id(module), (module, {}))
+            is_zch = wrapper is not module
             lookup_modules.append(wrapper)
 
             feature_to_fqn: Dict[str, str] = {}
@@ -482,7 +483,7 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                     raise ValueError(f"Duplicate embedding table FQN: {table_fqn}")
                 feature_names = list(config.feature_names)
                 self.fqn_to_feature_names[table_fqn] = feature_names
-                if wrapper is not module:
+                if is_zch:
                     for feature_name in feature_names:
                         if feature_name in feature_to_fqn:
                             raise ValueError(
@@ -494,7 +495,7 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                             )
                         feature_to_fqn[feature_name] = table_fqn
                     self._track_zch_table(table_fqn, table_name, mc_modules)
-            if wrapper is not module:
+            if is_zch:
                 self._feature_to_fqn_by_module[wrapper] = feature_to_fqn
             else:
                 self._register_kernel_trackers(module_fqn, module)
