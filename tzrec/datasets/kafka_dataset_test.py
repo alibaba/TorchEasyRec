@@ -1748,6 +1748,8 @@ class CoordinatorTest(unittest.TestCase):
 
     def test_pool_full_gates_input(self):
         coord = self._coordinator(dispatch_maxsize=1)
+        self.addCleanup(coord._input_q.close)
+        self.addCleanup(coord._input_q.cancel_join_thread)
         for _ in range(5):
             self._feed(coord, 32)
         t = threading.Thread(target=coord.run, daemon=True)
