@@ -9,13 +9,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+import time
 import unittest
 from types import SimpleNamespace
 from typing import Optional, Sequence
+from unittest import mock
 
 import torch
 from parameterized import parameterized
 from torch import nn
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.loss.loss_utils import ForCausalLMLoss
 
 from tzrec.datasets.utils import Batch
@@ -28,6 +33,7 @@ from tzrec.prompt.assembler import (
     PromptAssembler,
 )
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+from tzrec.utils.logging_util import logger
 from tzrec.utils.test_util import (
     GENREC_ANSWER_CODES,
     GENREC_HIST_CODES,
@@ -436,6 +442,250 @@ class LayoutInvarianceTest(unittest.TestCase):
         torch.testing.assert_close(packed["labels"], padded["labels"])
         torch.testing.assert_close(
             packed["logits"], padded["logits"], atol=1e-2, rtol=1e-2
+        )
+
+
+@mark_ci_scope("h20", "gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
+class MultiTargetTrainingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.model, self.compiled = create_genrec_test_model(
+            make_test_dir(), attn_kernel="sdpa", init_seed=17
+        )
+        config = self.model.lm.config
+        config.num_attention_heads = 2
+        config.num_key_value_heads = 1
+        config.head_dim = 16
+        self.model.lm = AutoModelForCausalLM.from_config(
+            config, attn_implementation="sdpa"
+        )
+        self.model = self.model.cuda().eval()
+        self.histories = [GENREC_HIST_CODES, GENREC_LONG_HIST_CODES]
+        self.answers = [
+            GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES,
+            GENREC_ANSWER_CODES,
+        ]
+
+    def _batch(self, histories=None, answers=None, predict=False):
+        histories = self.histories if histories is None else histories
+        answers = self.answers if answers is None else answers
+        parsed = {
+            "hist.values": torch.tensor([v for row in histories for v in row]),
+            "hist.lengths": torch.tensor([len(row) for row in histories]),
+        }
+        if not predict:
+            parsed.update(
+                {
+                    "answer.values": torch.tensor([v for row in answers for v in row]),
+                    "answer.lengths": torch.tensor([len(row) for row in answers]),
+                }
+            )
+        batch = Batch()
+        batch.additional_infos.update(
+            PromptAssembler(
+                self.compiled.prompt_plan,
+                self.compiled.sid_space,
+                include_response=not predict,
+            )(parsed)
+        )
+        return batch.to(torch.device("cuda"))
+
+    def _reference(self):
+        batch = self._batch(
+            [self.histories[0], self.histories[0], self.histories[1]],
+            [GENREC_ANSWER_CODES, _OTHERGENREC_ANSWER_CODES, GENREC_ANSWER_CODES],
+        )
+        predictions = self.model.predict(batch)
+        logits = predictions["logits"][:, :-1]
+        labels = predictions["labels"][:, 1:]
+        losses = (
+            nn.functional.cross_entropy(
+                logits.float().reshape(-1, logits.shape[-1]),
+                labels.reshape(-1),
+                reduction="none",
+            )
+            .reshape(3, 3)
+            .mean(-1)
+        )
+        return logits, labels, ((losses[0] + losses[1]) / 2 + losses[2]) / 2
+
+    def test_logits_loss_and_lm_gradients_match_independent_targets(self) -> None:
+        reference_logits, reference_labels, reference_loss = self._reference()
+        reference_loss.backward()
+        gradients = {
+            name: parameter.grad.clone()
+            for name, parameter in self.model.named_parameters()
+            if parameter.grad is not None
+        }
+        self.model.zero_grad(set_to_none=True)
+        batch = self._batch()
+        predictions = self.model.predict(batch)
+        loss = self.model.loss(predictions, batch)["ce_loss"]
+        torch.testing.assert_close(
+            predictions["logits"], reference_logits, atol=2e-5, rtol=2e-4
+        )
+        torch.testing.assert_close(predictions["labels"], reference_labels)
+        torch.testing.assert_close(loss, reference_loss, atol=2e-5, rtol=2e-4)
+        loss.backward()
+        for name, parameter in self.model.named_parameters():
+            if name in gradients:
+                torch.testing.assert_close(
+                    parameter.grad, gradients[name], atol=3e-5, rtol=3e-4, msg=name
+                )
+
+    def test_other_branch_and_other_parent_are_isolated(self) -> None:
+        baseline = self.model.predict(self._batch())["logits"].detach()
+        rewritten = self.model.predict(
+            self._batch(
+                answers=[
+                    _REWRITTENGENREC_HIST_CODES + _OTHERGENREC_ANSWER_CODES,
+                    GENREC_ANSWER_CODES,
+                ]
+            )
+        )["logits"]
+        torch.testing.assert_close(rewritten[1:], baseline[1:], atol=0, rtol=0)
+
+    def test_target_order_does_not_change_parent_loss(self) -> None:
+        batch = self._batch()
+        first = self.model.loss(self.model.predict(batch), batch)["ce_loss"]
+        batch = self._batch(
+            answers=[
+                _OTHERGENREC_ANSWER_CODES + GENREC_ANSWER_CODES,
+                GENREC_ANSWER_CODES,
+            ]
+        )
+        second = self.model.loss(self.model.predict(batch), batch)["ce_loss"]
+        torch.testing.assert_close(first, second)
+
+    def test_inference_and_checkpoint_structure_are_unchanged(self) -> None:
+        batch = self._batch(predict=True)
+        self.model.set_is_inference(True)
+        with torch.no_grad():
+            before = self.model.predict(batch)["generated_sids"]
+        state_shapes = {
+            name: value.shape for name, value in self.model.state_dict().items()
+        }
+        previous_attention = self.model.lm.config._attn_implementation
+        self.model.set_is_inference(False)
+        self.model.predict(self._batch())
+        self.assertEqual(self.model.lm.config._attn_implementation, previous_attention)
+        self.assertEqual(
+            state_shapes,
+            {name: value.shape for name, value in self.model.state_dict().items()},
+        )
+        self.model.set_is_inference(True)
+        with torch.no_grad():
+            after = self.model.predict(batch)["generated_sids"]
+        torch.testing.assert_close(after, before, atol=0, rtol=0)
+
+    def test_attention_backend_is_restored_after_forward_failure(self) -> None:
+        previous_attention = self.model.lm.config._attn_implementation
+        with mock.patch.object(
+            self.model.lm.base_model,
+            "forward",
+            side_effect=RuntimeError("test failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "test failure"):
+                self.model.predict(self._batch())
+        self.assertEqual(self.model.lm.config._attn_implementation, previous_attention)
+
+    def test_incomplete_sid_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "multiple of codebook levels"):
+            self.model.predict(self._batch(answers=[[0, 4, 8, 1], GENREC_ANSWER_CODES]))
+
+    def test_gradient_checkpointing_is_rejected_for_shared_training(self) -> None:
+        self.model.lm.gradient_checkpointing_enable()
+        with self.assertRaisesRegex(ValueError, "gradient checkpointing"):
+            self.model.predict(self._batch())
+
+    @unittest.skipUnless(
+        os.environ.get("TZREC_GENREC_BENCHMARK_BACKBONE"),
+        "Optional benchmark requires a local backbone configuration",
+    )
+    def test_shared_prefix_benchmark(self) -> None:
+        config = AutoConfig.from_pretrained(
+            os.environ["TZREC_GENREC_BENCHMARK_BACKBONE"]
+        )
+        self.model.lm = (
+            AutoModelForCausalLM.from_config(
+                config, attn_implementation="sdpa", dtype=torch.float32
+            )
+            .cuda()
+            .eval()
+        )
+        histories = [GENREC_HIST_CODES * 300 for _ in range(20)]
+        answers = [
+            GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES
+            if index < 6
+            else GENREC_ANSWER_CODES
+            for index in range(20)
+        ]
+        shared_batch = self._batch(histories, answers)
+        expanded_histories, expanded_answers, weights = [], [], []
+        for history, answer in zip(histories, answers):
+            count = len(answer) // 3
+            for start in range(0, len(answer), 3):
+                expanded_histories.append(history)
+                expanded_answers.append(answer[start : start + 3])
+                weights.append(1 / count / len(histories))
+        expanded_batch = self._batch(expanded_histories, expanded_answers)
+        weights = torch.tensor(weights, device="cuda")
+        torch.backends.cuda.enable_cudnn_sdp(False)
+
+        def step(batch, shared):
+            self.model.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                predictions = self.model.predict(batch)
+                if shared:
+                    loss = self.model.loss(predictions, batch)["ce_loss"]
+                else:
+                    logits = predictions["logits"][:, :-1]
+                    labels = predictions["labels"][:, 1:]
+                    target_loss = (
+                        nn.functional.cross_entropy(
+                            logits.float().reshape(-1, logits.shape[-1]),
+                            labels.reshape(-1),
+                            reduction="none",
+                        )
+                        .reshape(-1, 3)
+                        .mean(-1)
+                    )
+                    loss = (target_loss * weights).sum()
+            torch.cuda.synchronize()
+            forwarded = time.perf_counter()
+            loss.backward()
+            torch.cuda.synchronize()
+            finished = time.perf_counter()
+            return forwarded - started, finished - forwarded, float(loss.detach())
+
+        results = {}
+        for name, batch, shared, backend in (
+            ("expanded_sdpa", expanded_batch, False, "sdpa"),
+            ("expanded_flex", expanded_batch, False, "flex_attention"),
+            ("shared_flex", shared_batch, True, "sdpa"),
+        ):
+            self.model._attn_kernel = backend
+            self.model.lm.set_attn_implementation(backend)
+            cold_started = time.perf_counter()
+            for _ in range(2):
+                step(batch, shared)
+            warmup_seconds = time.perf_counter() - cold_started
+            torch.cuda.reset_peak_memory_stats()
+            samples = [step(batch, shared) for _ in range(5)]
+            results[name] = {
+                "warmup_seconds": warmup_seconds,
+                "forward_seconds": sum(sample[0] for sample in samples) / len(samples),
+                "backward_seconds": sum(sample[1] for sample in samples) / len(samples),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+                "loss": samples[-1][2],
+                "parents": 20,
+                "targets": 26,
+            }
+        logger.info("GENREC_MULTI_TARGET_BENCHMARK %s", json.dumps(results))
+        self.assertAlmostEqual(
+            results["expanded_sdpa"]["loss"], results["shared_flex"]["loss"], delta=0.03
         )
 
 
