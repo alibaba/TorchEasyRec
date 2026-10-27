@@ -44,9 +44,6 @@ from torchrec.distributed.embedding_lookup import (
 from torchrec.distributed.embedding_types import ShardedEmbeddingTable
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_tracker.delta_store import DeltaStoreTrec
-from torchrec.distributed.model_tracker.model_delta_tracker import (
-    ModelDeltaTracker as TorchRecModelDeltaTracker,
-)
 from torchrec.distributed.model_tracker.types import UniqueRows, UpdateMode
 from torchrec.distributed.types import ParameterSharding
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
@@ -413,10 +410,10 @@ def _embedding_table_fqn(
     return ".".join(filter(None, (module_fqn, table_segment, table_name)))
 
 
-class ModelDeltaTracker(TorchRecModelDeltaTracker):
+class ModelDeltaTracker:
     """Track touched embedding IDs by owner-qualified table FQN.
 
-    Plain collections are tracked per lookup kernel: the kernel callback
+    Plain collections are tracked per embedding lookup module: each callback
     receives its own GroupedEmbeddingConfig's feature slice, whose key order
     matches the config's flattened (table, feature) order, so a feature
     shared by several tables is attributed positionally to each table it
@@ -432,6 +429,8 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         delete_on_read: Whether to delete IDs after all consumers read them.
         auto_compact: Whether to compact tracked IDs during communication.
     """
+
+    DEFAULT_CONSUMER = "default"
 
     def __init__(
         self,
@@ -451,7 +450,7 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         self.zch_modules: Dict[str, MCHManagedCollisionModule] = {}
         self._zch_fqn_by_mc_module: Dict[int, str] = {}
         self._feature_to_fqn_by_module: Dict[nn.Module, Dict[str, str]] = {}
-        self._kernel_bindings: Dict[int, Tuple[List[str], List[str]]] = {}
+        self._lookup_bindings: Dict[int, Tuple[List[str], List[str]]] = {}
         self.store = DeltaStoreTrec(UpdateMode.NONE)
 
         lookup_modules: List[nn.Module] = []
@@ -498,11 +497,11 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
             if is_zch:
                 self._feature_to_fqn_by_module[wrapper] = feature_to_fqn
             else:
-                self._register_kernel_trackers(module_fqn, module)
+                self._register_plain_lookup_trackers(module_fqn, module)
 
         for wrapper in lookup_modules:
             if wrapper in self._feature_to_fqn_by_module:
-                wrapper.register_post_lookup_tracker_fn(self.record_lookup)
+                wrapper.register_post_lookup_tracker_fn(self.record_zch_lookup)
             if auto_compact:
                 wrapper.register_post_odist_tracker_fn(self.trigger_compaction)
         for mc_module in self.zch_modules.values():
@@ -521,12 +520,12 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         finally:
             self.pause_depth -= 1
 
-    def _register_kernel_trackers(
+    def _register_plain_lookup_trackers(
         self, module_fqn: str, module: _ShardedEmbeddingModule
     ) -> None:
-        """Bind each lookup kernel's feature positions to its tables' FQNs.
+        """Bind each embedding lookup module's feature positions to its tables' FQNs.
 
-        The per-kernel lookup callback receives one GroupedEmbeddingConfig's
+        Each plain lookup callback receives one GroupedEmbeddingConfig's
         feature slice, whose key order matches the config's flattened
         (table, feature) order -- a feature shared by several tables appears
         once per table, so positional attribution keeps each copy with its
@@ -540,17 +539,18 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
             module: Sharded embedding collection whose lookups to bind.
 
         Raises:
-            ValueError: if the lookup's configs and kernels differ in count.
+            ValueError: if the lookup's configs and embedding lookup modules
+                differ in count.
         """
         for lookup in _embedding_lookups(module):
             if len(lookup.grouped_configs) != len(lookup._emb_modules):
                 raise ValueError(
                     f"Embedding lookup under {module_fqn} has "
-                    f"{len(lookup._emb_modules)} kernels but "
+                    f"{len(lookup._emb_modules)} embedding lookup modules but "
                     f"{len(lookup.grouped_configs)} grouped configs."
                 )
             for config, emb_op in zip(lookup.grouped_configs, lookup._emb_modules):
-                self._kernel_bindings[id(emb_op)] = (
+                self._lookup_bindings[id(emb_op)] = (
                     config.feature_names(),
                     [
                         _embedding_table_fqn(module_fqn, module, table.name)
@@ -560,41 +560,42 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                 )
             if lookup.optim_state_tracker_fn is not None:
                 logger.warning(
-                    "Replacing an existing embedding kernel tracker under %s; "
+                    "Replacing an existing plain lookup tracker under %s; "
                     "the previous tracker will no longer receive lookups.",
                     module_fqn,
                 )
-            lookup.register_optim_state_tracker_fn(self.record_kernel_lookup)
+            lookup.register_optim_state_tracker_fn(self.record_plain_lookup)
 
-    def record_kernel_lookup(
+    def record_plain_lookup(
         self,
         kjt: KeyedJaggedTensor,
         states: torch.Tensor,
         emb_module: Optional[nn.Module] = None,
     ) -> None:
-        """Record touched IDs against the exact tables a lookup kernel served.
+        """Record IDs against the tables served by a plain embedding lookup module.
 
         Args:
-            kjt: The kernel's feature slice, keys in its config's flattened
-                (table, feature) order.
-            states: Kernel lookup output, unused in ID-only tracking mode.
-            emb_module: Embedding kernel that performed the lookup.
+            kjt: The embedding lookup module's feature slice, with keys in its
+                config's flattened (table, feature) order.
+            states: Lookup output, unused in ID-only tracking mode.
+            emb_module: Embedding lookup module that performed the lookup.
 
         Raises:
-            ValueError: if the kernel was not bound at tracker init, or its
-                feature slice disagrees with the bound table positions.
+            ValueError: if the embedding lookup module was not bound at tracker
+                init, or its feature slice disagrees with the bound table positions.
         """
         if self.pause_depth > 0:
             return
-        binding = self._kernel_bindings.get(id(emb_module))
+        binding = self._lookup_bindings.get(id(emb_module))
         if binding is None:
             raise ValueError(
-                f"Unrecognized embedding kernel for FQN delta tracking: {emb_module}"
+                "Unrecognized embedding lookup module for FQN delta tracking: "
+                f"{emb_module}"
             )
         expected_keys, table_fqns = binding
         if kjt.keys() != expected_keys:
             raise ValueError(
-                f"Embedding kernel {type(emb_module).__name__} looked up "
+                f"Embedding lookup module {type(emb_module).__name__} looked up "
                 f"feature keys {kjt.keys()}, expected {expected_keys} "
                 "in table-feature order."
             )
@@ -649,7 +650,7 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                 return fqn[len(prefix) :]
         return fqn
 
-    def record_lookup(
+    def record_zch_lookup(
         self,
         kjt: KeyedJaggedTensor,
         states: torch.Tensor,
@@ -660,8 +661,8 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
 
         Only managed collision wrappers fire this callback: their inner
         lookups see remapped rows, so the wrapper-level raw-id stream is the
-        only usable one for ZCH tables. Plain collections use the per-kernel
-        :meth:`record_kernel_lookup` instead, which resolves shared features
+        only usable one for ZCH tables. Plain collections use
+        :meth:`record_plain_lookup`, which resolves shared features
         to the table each lookup actually served.
 
         Args:

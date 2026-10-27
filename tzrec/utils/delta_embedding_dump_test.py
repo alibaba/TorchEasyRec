@@ -868,9 +868,9 @@ def _run_zch_lifecycle_delta_embedding_dump(
         torch.distributed.barrier()
 
 
-class ModelDeltaTrackerKernelTest(unittest.TestCase):
+class ModelDeltaTrackerPlainLookupTest(unittest.TestCase):
     def setUp(self):
-        self.kernel = nn.Module()
+        self.emb_module = nn.Module()
         self.config = GroupedEmbeddingConfig(
             data_type=DataType.FP32,
             pooling=PoolingType.SUM,
@@ -894,7 +894,7 @@ class ModelDeltaTrackerKernelTest(unittest.TestCase):
         )
         self.lookup = mock.Mock(spec=GroupedPooledEmbeddingsLookup)
         self.lookup.grouped_configs = [self.config]
-        self.lookup._emb_modules = [self.kernel]
+        self.lookup._emb_modules = [self.emb_module]
         self.lookup.optim_state_tracker_fn = None
         self.module = mock.Mock(spec=ShardedEmbeddingBagCollection)
         self.module._module_fqn = "ebc"
@@ -910,15 +910,15 @@ class ModelDeltaTrackerKernelTest(unittest.TestCase):
             lengths=torch.tensor([2, 1, 2]),
         )
 
-    def test_kernel_lookup_groups_ids_by_table(self):
+    def test_plain_lookup_groups_ids_by_table(self):
         tracker = ModelDeltaTracker(self.model)
         tracker.curr_batch_idx = 3
         tracker.store = mock.Mock()
 
-        tracker.record_kernel_lookup(self.features, torch.empty(0), self.kernel)
+        tracker.record_plain_lookup(self.features, torch.empty(0), self.emb_module)
 
         self.lookup.register_optim_state_tracker_fn.assert_called_once_with(
-            tracker.record_kernel_lookup
+            tracker.record_plain_lookup
         )
         self.assertEqual(tracker.store.append.call_count, 2)
         first, second = tracker.store.append.call_args_list
@@ -938,7 +938,7 @@ class ModelDeltaTrackerKernelTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_kernel_lookup_rejects_mismatched_keys(self, _, keys):
+    def test_plain_lookup_rejects_mismatched_keys(self, _, keys):
         tracker = ModelDeltaTracker(self.model)
         tracker.store = mock.Mock()
         features = KeyedJaggedTensor.from_lengths_sync(
@@ -948,41 +948,45 @@ class ModelDeltaTrackerKernelTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "feature keys .*expected"):
-            tracker.record_kernel_lookup(features, torch.empty(0), self.kernel)
+            tracker.record_plain_lookup(features, torch.empty(0), self.emb_module)
 
         tracker.store.append.assert_not_called()
 
-    def test_kernel_lookup_rejects_unbound_kernel(self):
+    def test_plain_lookup_rejects_unbound_module(self):
         tracker = ModelDeltaTracker(self.model)
         tracker.store = mock.Mock()
 
-        with self.assertRaisesRegex(ValueError, "Unrecognized embedding kernel"):
-            tracker.record_kernel_lookup(self.features, torch.empty(0), nn.Module())
+        with self.assertRaisesRegex(ValueError, "Unrecognized embedding lookup module"):
+            tracker.record_plain_lookup(self.features, torch.empty(0), nn.Module())
 
         tracker.store.append.assert_not_called()
 
     @parameterized.expand([(0, 1), (1, 0)], name_func=parameterized_name_func)
-    def test_init_rejects_config_kernel_count_mismatch(self, configs, kernels):
+    def test_init_rejects_config_lookup_module_count_mismatch(
+        self, configs, lookup_modules
+    ):
         self.lookup.grouped_configs = [self.config] * configs
-        self.lookup._emb_modules = [self.kernel] * kernels
+        self.lookup._emb_modules = [self.emb_module] * lookup_modules
 
-        with self.assertRaisesRegex(ValueError, "ebc has .*kernels but .*configs"):
+        with self.assertRaisesRegex(
+            ValueError, "ebc has .*embedding lookup modules but .*configs"
+        ):
             ModelDeltaTracker(self.model)
 
         self.lookup.register_optim_state_tracker_fn.assert_not_called()
 
-    def test_init_warns_when_replacing_kernel_tracker(self):
+    def test_init_warns_when_replacing_plain_lookup_tracker(self):
         first_tracker = ModelDeltaTracker(self.model)
-        self.lookup.optim_state_tracker_fn = first_tracker.record_kernel_lookup
+        self.lookup.optim_state_tracker_fn = first_tracker.record_plain_lookup
 
         with self.assertLogs(level="WARNING") as logs:
             second_tracker = ModelDeltaTracker(self.model)
 
         self.assertIn(
-            "Replacing an existing embedding kernel tracker under ebc", logs.output[0]
+            "Replacing an existing plain lookup tracker under ebc", logs.output[0]
         )
         self.lookup.register_optim_state_tracker_fn.assert_called_with(
-            second_tracker.record_kernel_lookup
+            second_tracker.record_plain_lookup
         )
 
     @parameterized.expand([(2,), (3,)], name_func=parameterized_name_func)
@@ -1024,7 +1028,7 @@ class ModelDeltaTrackerKernelTest(unittest.TestCase):
         wrapper.register_post_lookup_tracker_fn.assert_not_called()
         self.lookup.register_optim_state_tracker_fn.assert_not_called()
 
-    def test_pause_tracking_suppresses_kernel_lookups_and_resumes_after_error(self):
+    def test_pause_tracking_suppresses_plain_lookups_and_resumes_after_error(self):
         tracker = ModelDeltaTracker(self.model)
         tracker.store = mock.Mock()
         dumper = object.__new__(DeltaEmbeddingDumper)
@@ -1033,15 +1037,17 @@ class ModelDeltaTrackerKernelTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "paused forward failed"):
             with dumper.pause_tracking():
                 with dumper.pause_tracking():
-                    tracker.record_kernel_lookup(
-                        self.features, torch.empty(0), self.kernel
+                    tracker.record_plain_lookup(
+                        self.features, torch.empty(0), self.emb_module
                     )
-                tracker.record_kernel_lookup(self.features, torch.empty(0), self.kernel)
+                tracker.record_plain_lookup(
+                    self.features, torch.empty(0), self.emb_module
+                )
                 raise RuntimeError("paused forward failed")
 
         tracker.store.append.assert_not_called()
         self.assertEqual(tracker.pause_depth, 0)
-        tracker.record_kernel_lookup(self.features, torch.empty(0), self.kernel)
+        tracker.record_plain_lookup(self.features, torch.empty(0), self.emb_module)
         self.assertEqual(tracker.store.append.call_count, 2)
 
 
@@ -2161,7 +2167,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertIsNone(stepped._sparse_interval_secs)
         self.assertIsNone(stepped._next_sparse_time)
 
-    def test_model_delta_tracker_records_same_table_name_by_owner_fqn(self):
+    def test_zch_lookup_records_same_table_name_by_owner_fqn(self):
         tracker = object.__new__(ModelDeltaTracker)
         tracker.pause_depth = 0
         ebc_module = torch.nn.Module()
@@ -2189,8 +2195,8 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             values=torch.tensor([5, 6]),
             offsets=torch.tensor([0, 2]),
         )
-        tracker.record_lookup(ebc_features, torch.empty(0), ebc_module)
-        tracker.record_lookup(ec_features, torch.empty(0), ec_module)
+        tracker.record_zch_lookup(ebc_features, torch.empty(0), ebc_module)
+        tracker.record_zch_lookup(ec_features, torch.empty(0), ec_module)
 
         self.assertEqual(tracker.store.append.call_count, 2)
         ebc_call, ec_call = tracker.store.append.call_args_list
@@ -2579,7 +2585,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         self.assertEqual(table.schema, _DELTA_DUMP_SCHEMA)
         self.assertEqual(table["key_id"].to_pylist(), [7])
 
-    def test_pause_tracking_suppresses_post_lookup_recording(self):
+    def test_pause_tracking_suppresses_zch_lookup_recording(self):
         tracker = object.__new__(ModelDeltaTracker)
         tracker.pause_depth = 0
         tracker.curr_batch_idx = 0
@@ -2600,17 +2606,17 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._tracker = tracker
 
-        tracker.record_lookup(kjt, torch.empty(0), module)
+        tracker.record_zch_lookup(kjt, torch.empty(0), module)
         tracker.trigger_compaction()
         self.assertEqual(appended, ["user_emb", "compact"])
 
         with dumper.pause_tracking():
-            tracker.record_lookup(kjt, torch.empty(0), module)
+            tracker.record_zch_lookup(kjt, torch.empty(0), module)
             tracker.trigger_compaction()
         self.assertEqual(appended, ["user_emb", "compact"])
 
         tracker.curr_batch_idx = 1
-        tracker.record_lookup(kjt, torch.empty(0), module)
+        tracker.record_zch_lookup(kjt, torch.empty(0), module)
         self.assertEqual(appended, ["user_emb", "compact", "user_emb"])
 
     def test_collect_table_shard_infos_prefers_grouped_embedding_metadata(self):
@@ -3657,7 +3663,7 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
 
     @unittest.skipIf(torch.cuda.device_count() < 1, "test requires a GPU")
     @mark_ci_scope("gpu")
-    def test_shared_feature_tables_dump_from_one_kernel(self):
+    def test_shared_feature_tables_dump_from_one_lookup_module(self):
         tmp_dir = make_test_dir(prefix="tzrec_delta_shared_feature_")
         self.addCleanup(shutil.rmtree, tmp_dir)
         self._run_multi_process_test(
