@@ -241,6 +241,8 @@ _model_dir: Optional[str] = None
 _mode = ""
 _groups: List[Any] = []
 _monitor = None
+# Session metrics at the previous save: save_stats logs per-save deltas.
+_saved_metrics: Dict[str, float] = {}
 
 
 def open_session(model_dir: str, mode: str = "train"):
@@ -306,6 +308,7 @@ def close_session() -> None:
         shutil.rmtree(work, ignore_errors=True)
     _session = None
     _groups.clear()
+    _saved_metrics.clear()
     _monitor = None
 
 
@@ -499,12 +502,23 @@ def save_stats(seconds: float) -> None:
     m = stats["metrics"]
     props = stats["properties"]
     tick = stats["tickers"]
+    d = {
+        k: m.get(k, 0.0) - _saved_metrics.get(k, 0.0)
+        for k in (
+            "checkpoint_insert_seconds",
+            "checkpoint_insert_rows",
+            "dump_seconds",
+            "dump_rows",
+            "dump_bytes",
+        )
+    }
+    _saved_metrics.update(m)
     logger.info(
         f"RANK[{_rank()}] RocksDB checkpoint: {seconds:.2f}s total, cache flush "
-        f"{m.get('checkpoint_insert_seconds', 0.0):.2f}s "
-        f"({int(m.get('checkpoint_insert_rows', 0))} rows), logical export "
-        f"{m.get('dump_seconds', 0.0):.2f}s ({int(m.get('dump_rows', 0))} rows, "
-        f"{m.get('dump_bytes', 0.0) / (1 << 30):.2f}GiB written); cumulative "
+        f"{d['checkpoint_insert_seconds']:.2f}s "
+        f"({int(d['checkpoint_insert_rows'])} rows), logical export "
+        f"{d['dump_seconds']:.2f}s ({int(d['dump_rows'])} rows, "
+        f"{d['dump_bytes'] / (1 << 30):.2f}GiB written); cumulative "
         f"train writeback {int(m.get('train_insert_rows', 0))} rows, publish "
         f"writeback {int(m.get('publish_insert_rows', 0))} rows, evicted "
         f"{int(m.get('evict_rows', 0))} rows, index {stats['index']}; RocksDB "

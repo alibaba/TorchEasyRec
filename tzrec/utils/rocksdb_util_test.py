@@ -9,9 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import hashlib
 import json
 import os
+import re
 import unittest
 from unittest import mock
 
@@ -20,6 +22,7 @@ from torch import nn
 
 from tzrec.protos import train_pb2
 from tzrec.utils import checkpoint_util, rocksdb_util
+from tzrec.utils.logging_util import logger
 from tzrec.utils.test_util import make_test_dir, mark_ci_scope
 
 try:
@@ -224,6 +227,21 @@ class RocksDBCheckpointTest(unittest.TestCase):
             )
         db = rocksdb_util.session().db
         self.assertEqual(db.get_int_property("rocksdb.num-snapshots"), 0)
+
+    def test_save_stats_logs_each_save_alone(self):
+        model = self._model(["a"])
+        rocksdb_util.validate_model(model)
+        exported = []
+        for step in (5, 10):
+            self._train(model, step)
+            ckpt = self._logical_save(model, step)
+            with self.assertLogs(logger, "INFO") as cm:
+                rocksdb_util.save_stats(1.0)
+            line = [x for x in cm.output if "RocksDB checkpoint" in x][0]
+            exported.append(int(re.search(r"logical export \S+ \((\d+) rows", line)[1]))
+            keys = glob.glob(os.path.join(ckpt, "a_emb_keys*"))[0]
+            self.assertEqual(exported[-1], os.path.getsize(keys) // 8)
+        self.assertGreater(exported[1], exported[0])
 
     def test_step_boundary_evicts_to_capacity(self):
         # ~1024 cached rows, capacity 4000, ~8000 distinct ids.
