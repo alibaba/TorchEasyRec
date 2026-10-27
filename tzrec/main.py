@@ -13,6 +13,7 @@ import copy
 import itertools
 import json
 import os
+import socket
 from collections import OrderedDict
 from contextlib import nullcontext
 from queue import Queue
@@ -82,7 +83,7 @@ from tzrec.protos.feature_pb2 import FeatureConfig
 from tzrec.protos.model_pb2 import Kernel as KernelProto
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.protos.train_pb2 import TrainConfig
+from tzrec.protos.train_pb2 import ProfilerConfig, TrainConfig
 from tzrec.utils import (
     checkpoint_util,
     config_util,
@@ -105,6 +106,7 @@ from tzrec.utils.hf_export_util import export_hf_assets
 from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
+from tzrec.utils.online_learning_util import create_online_learning_handover
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
 
@@ -368,6 +370,39 @@ def _log_train(
                 summary_writer.add_scalar(f"metric/{k}", v, step)
 
 
+def _create_train_profiler(
+    profiler_config: ProfilerConfig, trace_dir: str
+) -> Optional[torch.profiler.profile]:
+    """Create the training profiler of the current rank.
+
+    Args:
+        profiler_config (ProfilerConfig): profiler schedule and collection options.
+        trace_dir (str): directory to write trace files into.
+
+    Returns:
+        profiler (torch.profiler.profile): the profiler, or None if the current
+            rank is not in profiler_config.ranks.
+    """
+    rank = int(os.environ.get("RANK", 0))
+    if profiler_config.ranks and rank not in profiler_config.ranks:
+        return None
+    return torch.profiler.profile(
+        schedule=torch.profiler.schedule(
+            skip_first=profiler_config.skip_first_steps,
+            wait=profiler_config.wait_steps,
+            warmup=profiler_config.warmup_steps,
+            active=profiler_config.active_steps,
+            repeat=profiler_config.repeat,
+        ),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            trace_dir, worker_name=f"rank{rank}_{socket.gethostname()}_{os.getpid()}"
+        ),
+        record_shapes=profiler_config.record_shapes,
+        profile_memory=profiler_config.profile_memory,
+        with_stack=profiler_config.with_stack,
+    )
+
+
 def _train_and_evaluate(
     model: nn.Module,
     optimizer: optim.Optimizer,
@@ -415,6 +450,15 @@ def _train_and_evaluate(
             logger.warning(
                 f"{epochs_completed} epochs already completed in the restored "
                 "checkpoint, no epochs left to train."
+            )
+        return
+    if use_step and restore_from_model_dir and skip_steps >= train_config.num_steps - 1:
+        # nothing left to train; the final save would rewrite the restored
+        # model.ckpt-{skip_steps} in place.
+        if is_local_rank_zero:
+            logger.warning(
+                f"restored checkpoint at step {skip_steps} already reaches "
+                f"num_steps={train_config.num_steps}, no steps left to train."
             )
         return
     epoch_iter = (
@@ -471,16 +515,11 @@ def _train_and_evaluate(
     if train_config.is_profiling:
         if is_rank_zero:
             logger.info(str(model))
-        prof = torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=10, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                os.path.join(model_dir, "train_eval_trace")
-            ),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
+        prof = _create_train_profiler(
+            train_config.profiler_config, os.path.join(model_dir, "train_eval_trace")
         )
-        prof.start()
+        if prof is not None:
+            prof.start()
 
     i_step = 0
     i_epoch = 0
@@ -546,6 +585,10 @@ def _train_and_evaluate(
             "dense export trigger and the FeatureStore upload watermark is the only "
             "publish gate."
         )
+    # A stream lineage retires itself once the next day's lineage has consumed
+    # data about as fresh; deployment of the successor follows its exit.
+    handover = create_online_learning_handover(model_dir, train_config)
+    handed_over = False
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
@@ -675,8 +718,22 @@ def _train_and_evaluate(
                     if delta_embedding_dumper is not None
                     else None
                 )
+                if (
+                    handover is not None
+                    and i_step % train_config.log_step_count_steps == 0
+                    and handover.update_and_check(i_step, data_timestamp)
+                ):
+                    logger.info(
+                        f"successor lineage {handover.successor_model_dir} caught "
+                        f"up at step {i_step}, handing over."
+                    )
+                    handed_over = True
+                    break
                 if prof is not None:
                     prof.step()
+
+            if handed_over:
+                break
 
             if not (use_step and i_step >= train_config.num_steps - 1):
                 for lr in lr_scheduler:
@@ -726,7 +783,8 @@ def _train_and_evaluate(
             summary_writer.close()
         if prof is not None:
             prof.stop()
-        if ckpt_manager.maybe_save(
+        # a retired lineage is never resumed, so skip its final checkpoint
+        if not handed_over and ckpt_manager.maybe_save(
             i_step,
             model,
             optimizer,
@@ -1185,6 +1243,7 @@ def export(
     asset_files: Optional[str] = None,
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     item_input_path: Optional[str] = None,
+    edit_config_json: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -1199,12 +1258,15 @@ def export(
         item_input_path (str, optional): override for the item tower's
             predict-mode dataloader input path. When set, the item tower
             reads from this path instead of ``train_input_path``.
+        edit_config_json (str, optional): edit pipeline config json str.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
     ensure_input_tile_for_distributed_embedding()
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+    if edit_config_json:
+        config_util.edit_config(pipeline_config, json.loads(edit_config_json))
     ori_pipeline_config = copy.copy(pipeline_config)
 
     # AOTI bakes allow_tf32 into Triton constexprs at trace time.

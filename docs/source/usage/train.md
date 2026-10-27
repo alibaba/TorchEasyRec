@@ -27,6 +27,8 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
 - CHECKPOINT_TAG: 给checkpoint打一个自定义标记，记录在`meta`中（见下面的checkpoint信息），便于外部调度识别是哪一次调度产出的checkpoint。默认为空，不做任何限制
+- ONLINE_LEARNING_SUCCESSOR_DIR: 在线学习中下一条流式链路的`model_dir`。设置后，本任务每隔`log_step_count_steps`步把已消费数据的事件时间（与checkpoint `meta`中`data_ts`的定义相同）写入`model_dir`下的`progress.json`，并读取下一条链路的`progress.json`；当下一条链路落后本任务不超过`ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS`时，本任务正常结束训练且不保存最终checkpoint。需使用带timestamp的数据源（如KafkaDataset），详见[在线学习](../best_practices/online_learning.md)
+- ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS: 交接时允许下一条链路落后的秒数，默认300。两条链路都追到Kafka最新数据后，各自的事件时间只在检查时更新，且不同分区的时间存在偏差，严格比较可能一直无法满足，因此需要容忍值
 
 ## Checkpoint信息与完成标记
 
@@ -108,7 +110,13 @@ LR策略可以支持按epoch更新或者按step更新
       torchrun --master_addr=localhost --master_port=32555 --nnodes=1 --nproc-per-node=1 --node_rank=0 convert.py
       ```
 - log_step_count_steps: 打印log和summary的步数间隔（如果打印时间间隔小于1s，会跳过打印）
-- is_profiling: 是否做训练性能分析，设置为true，会在模型目录下记录trace文件
+- is_profiling: 是否做训练性能分析，设置为true，会在模型目录的train_eval_trace子目录下记录trace文件，文件名以`rank<N>_`开头
+- profiler_config: is_profiling为true时的性能分析配置，不设置时默认在训练开始后等待1步、预热1步、记录10步，并记录shape、显存和调用栈
+  - skip_first_steps: 开始分析前跳过的步数，默认为0。训练初期dynamic embedding和数据缓存尚未稳定，可设置较大的值采集稳定阶段的trace，如`skip_first_steps: 2000, wait_steps: 0, warmup_steps: 2, active_steps: 5`
+  - wait_steps / warmup_steps / active_steps: 每个周期内的等待、预热和记录步数，默认分别为1、1、10
+  - repeat: 采集周期数，默认为1，设置为0表示一直重复到训练结束
+  - record_shapes / profile_memory / with_stack: 是否记录算子输入shape、显存分配和Python调用栈，默认均为true。profile_memory和with_stack开销较大，分析分布式训练耗时时建议关闭
+  - ranks: 需要做性能分析的rank，不设置时所有rank都会分析
 - use_tensorboard: 是否使用tensorboard，默认为true
 - tensorboard_summaries: 设置需要在tensorboard中展示的数据， 只在use_tensorboard为true时生效。 可选值为["loss", "learning_rate", "parameter", "global_gradient_norm", "gradient_norm", "gradient"], 默认值是["loss", "learning_rate"]。 在训练数据量大， 训练时长较长时， 酌情开启"parameter"、 "gradient"、"gradient_norm", 避免出现性能问题。
 - cudnn_allow_tf32: cudnn是否打开tf32精度训练，默认为true
@@ -174,6 +182,12 @@ export INTRA_NODE_BANDWIDTH=$(awk 'BEGIN {printf("%f", 30 * 1024 * 1024 * 1024 /
 
 ```bash
 export CROSS_NODE_BANDWIDTH=$(awk 'BEGIN {printf("%f", 3 * 1024 * 1024 * 1024 / 1000)}')
+```
+
+对于GPU之间既没有NVLink也不经过PCIe Switch的机型（`nvidia-smi topo -m`中GPU之间均显示为`PHB`或`SYS`，如`ml.gn9gc.64xlarge-erdma`），NCCL默认不启用GPU间P2P，而是经主机内存中转。建议设置`NCCL_P2P_LEVEL=PHB`，让同一NUMA节点内的GPU直接P2P通信，单机alltoall带宽可提升约30%~50%，两机all_reduce大消息带宽可提升约30%~40%
+
+```bash
+export NCCL_P2P_LEVEL=PHB
 ```
 
 如果遇到CUDA OOM（out of memory）的情况，可以调高`STORAGE_RESERVE_PERCENT`适当增加显存的预留比例，默认值为0.15。调高后TorchEasyRec会在新的显存限制下重新寻优最好的Embedding分片和并行计算的方式

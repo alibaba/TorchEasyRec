@@ -22,11 +22,12 @@ from unittest import mock
 
 import pyarrow as pa
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 
 from tzrec.datasets.utils import RecordBatchTensor
 from tzrec.main import (
     _create_model,
+    _create_train_profiler,
     _train_and_evaluate,
     predict,
     predict_checkpoint,
@@ -41,9 +42,14 @@ from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, TrainConfig
+from tzrec.protos.train_pb2 import (
+    DeltaEmbeddingDumpConfig,
+    ProfilerConfig,
+    TrainConfig,
+)
 from tzrec.utils import checkpoint_util, predict_util
 from tzrec.utils.delta_embedding_dump import DumpDecision
+from tzrec.utils.online_learning_util import OnlineLearningHandover
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
@@ -78,6 +84,17 @@ class MainTest(unittest.TestCase):
             runpy.run_module("tzrec.train_eval", run_name="__main__")
         train.assert_called_once()
         self.assertIs(train.call_args.kwargs["ignore_restore_lr_scheduler"], ignore)
+
+    def test_export_cli_edit_config_json(self):
+        edit = '{"export_config.dynamic_embedding.feature_store_config.version":"v1"}'
+        argv = ["tzrec.export", "--edit_config_json", edit]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch("tzrec.main.export", autospec=True) as export,
+        ):
+            runpy.run_module("tzrec.export", run_name="__main__")
+        export.assert_called_once()
+        self.assertEqual(export.call_args.kwargs["edit_config_json"], edit)
 
     def test_create_custom_model(self) -> None:
         """A custom model receives its unpacked protobuf configuration."""
@@ -530,6 +547,90 @@ class MainTest(unittest.TestCase):
             expected = [lr * 2 for lr in expected]
         torch.testing.assert_close(actual, expected)
 
+    @parameterized.expand(
+        [
+            param("fresh", num_steps=50, ckpt_step=None, fine_tune=False, start=0),
+            param("continue", num_steps=100, ckpt_step=49, fine_tune=False, start=50),
+            param("completed", num_steps=50, ckpt_step=49, fine_tune=False, start=50),
+            param("past_target", num_steps=50, ckpt_step=99, fine_tune=False, start=50),
+            param("fine_tune", num_steps=50, ckpt_step=49, fine_tune=True, start=0),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_step_resume(self, name, num_steps, ckpt_step, fine_tune, start):
+        """Resuming a reached num_steps target is a no-op without checkpoint writes.
+
+        Only a model_dir resume skips steps; a fine-tune checkpoint's step
+        belongs to the source job, so it trains (and saves) the full budget.
+        """
+        model_dir = os.path.join(self.test_dir, "model")
+        ckpt_path = None
+        if ckpt_step is not None:
+            ckpt_dir = os.path.join(self.test_dir, "source") if fine_tune else model_dir
+            ckpt_path = os.path.join(ckpt_dir, f"model.ckpt-{ckpt_step}")
+        restore_from_model_dir = ckpt_path is not None and not fine_tune
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        loader = mock.Mock()
+        loader.get_iterator.return_value = iter(range(num_steps))
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=-1.0)
+
+        def progress(iterator):
+            next(iterator)
+            return {"loss": torch.tensor(1.0)}, {}, batch
+
+        pipeline = mock.Mock()
+        pipeline.progress.side_effect = progress
+        writes = (
+            "save_model",
+            "save_lr_schedulers",
+            "save_dataloader_state",
+            "save_meta",
+            "save_success_marker",
+        )
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch(
+                "tzrec.main.OnlineDenseExportManager",
+                return_value=mock.Mock(enabled=False),
+            ),
+            mock.patch("tzrec.main._log_train") as log_train,
+            mock.patch("tzrec.utils.checkpoint_util.restore_model") as restore_model,
+            mock.patch.multiple(
+                "tzrec.utils.checkpoint_util", **{w: mock.DEFAULT for w in writes}
+            ) as write_mocks,
+        ):
+            _train_and_evaluate(
+                model,
+                mock.Mock(),
+                loader,
+                None,
+                [],
+                model_dir,
+                _train_config(num_steps=num_steps, log_step_count_steps=1),
+                EvalConfig(),
+                checkpoint_util.CheckpointManager(model_dir),
+                skip_steps=ckpt_step if restore_from_model_dir else -1,
+                ckpt_path=ckpt_path,
+                ignore_restore_optimizer=True,
+                restore_from_model_dir=restore_from_model_dir,
+            )
+        # the trailing _log_train call reports the final step after the loop
+        trained_steps = [call.args[0] for call in log_train.call_args_list[:-1]]
+        self.assertEqual(trained_steps, list(range(start, num_steps)))
+        if start >= num_steps:
+            for w in writes:
+                write_mocks[w].assert_not_called()
+            pipeline.progress.assert_not_called()
+            restore_model.assert_not_called()
+        else:
+            self.assertEqual(restore_model.call_count, int(ckpt_path is not None))
+            self.assertEqual(
+                [call.args[0] for call in write_mocks["save_model"].call_args_list],
+                [os.path.join(model_dir, f"model.ckpt-{num_steps - 1}")],
+            )
+
 
 class PredictionLifecycleTest(unittest.TestCase):
     """Tests for prediction lifecycle wiring."""
@@ -756,6 +857,147 @@ class TrainStepCounterMultiPassTest(unittest.TestCase):
         # mid-run data exhaustion and retry at step 6: no reset to 0 -> no
         # model.ckpt-{step} collision across passes.
         self.assertEqual(trained, list(range(num_steps)))
+
+
+class TrainProfilerTest(unittest.TestCase):
+    """Tests for the configurable training profiler."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    def _actions(self, prof, num_steps=16):
+        return [prof.schedule(i) for i in range(num_steps)]
+
+    def test_default_config_matches_legacy_profiler(self):
+        prof = _create_train_profiler(TrainConfig().profiler_config, self.test_dir)
+        legacy = torch.profiler.schedule(wait=1, warmup=1, active=10, repeat=1)
+        self.assertEqual(self._actions(prof), [legacy(i) for i in range(16)])
+        self.assertTrue(prof.record_shapes)
+        self.assertTrue(prof.profile_memory)
+        self.assertTrue(prof.with_stack)
+
+    def test_later_window_and_low_overhead(self):
+        config = ProfilerConfig(
+            skip_first_steps=5,
+            wait_steps=0,
+            warmup_steps=2,
+            active_steps=3,
+            profile_memory=False,
+            with_stack=False,
+        )
+        prof = _create_train_profiler(config, self.test_dir)
+        A = torch.profiler.ProfilerAction
+        self.assertEqual(
+            self._actions(prof, 12),
+            [A.NONE] * 5
+            + [A.WARMUP] * 2
+            + [A.RECORD] * 2
+            + [A.RECORD_AND_SAVE]
+            + [A.NONE] * 2,
+        )
+        self.assertFalse(prof.profile_memory)
+        self.assertFalse(prof.with_stack)
+
+    @parameterized.expand(
+        [([], True), ([0, 3], True), ([0, 1], False)],
+        name_func=parameterized_name_func,
+    )
+    def test_rank_filter(self, ranks, profiled):
+        with mock.patch.dict(os.environ, {"RANK": "3"}):
+            prof = _create_train_profiler(ProfilerConfig(ranks=ranks), self.test_dir)
+        self.assertEqual(prof is not None, profiled)
+
+    def test_trace_file_named_by_rank(self):
+        config = ProfilerConfig(wait_steps=0, warmup_steps=1, active_steps=1)
+        with mock.patch.dict(os.environ, {"RANK": "3"}):
+            prof = _create_train_profiler(config, self.test_dir)
+        prof.start()
+        for _ in range(3):
+            torch.ones(4).sum()
+            prof.step()
+        prof.stop()
+        traces = os.listdir(self.test_dir)
+        self.assertEqual(len(traces), 1)
+        self.assertTrue(traces[0].startswith("rank3_"), traces[0])
+
+
+class OnlineLearningHandoverTest(unittest.TestCase):
+    """Tests for the train loop retiring a stream lineage on hand-over."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    def test_train_loop_retires_on_handover(self) -> None:
+        """Hand-over leaves both loops, skips the epoch-end and final saves.
+
+        The successor check runs only at the log cadence after poll_publish;
+        once it passes, the trailing delta is still dumped, uploads drained
+        and the final publish finalized.
+        """
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()] * 10)
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=17.0)
+        pipeline = mock.Mock()
+        pipeline.progress.return_value = ({"loss": torch.tensor(1.0)}, {}, batch)
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        dumper = mock.Mock()
+        dumper.maybe_dump.return_value = DumpDecision.NONE
+        dumper.final_dump.return_value = 2
+        exporter = mock.Mock()
+        exporter.enabled = True
+        train_config = _train_config(num_steps=0, num_epochs=1, log_step_count_steps=2)
+        train_config.delta_embedding_dump_config.paired_dump_interval_steps = 1
+        train_config.delta_embedding_dump_config.feature_store_config.project_name = (
+            "project"
+        )
+        env = {
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "ONLINE_LEARNING_SUCCESSOR_DIR": os.path.join(self.test_dir, "successor"),
+        }
+
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch.object(
+                OnlineLearningHandover, "update_and_check", side_effect=[False, True]
+            ) as update_and_check,
+        ):
+            _train_and_evaluate(
+                model=model,
+                optimizer=optimizer,
+                train_dataloader=train_dataloader,
+                eval_dataloader=None,
+                lr_scheduler=[],
+                model_dir="unused",
+                train_config=train_config,
+                eval_config=EvalConfig(),
+                ckpt_manager=ckpt_manager,
+                delta_embedding_dumper=dumper,
+            )
+
+        self.assertEqual(
+            update_and_check.call_args_list,
+            [mock.call(0, 17.0), mock.call(2, 17.0)],
+        )
+        self.assertEqual(pipeline.progress.call_count, 3)
+        self.assertEqual(exporter.poll_publish.call_count, 3)
+        for call in ckpt_manager.maybe_save.call_args_list:
+            self.assertNotIn("epoch", call.kwargs)
+            self.assertFalse(call.kwargs.get("final", False))
+        self.assertTrue(model.module.model.on_train_end.called)
+        dumper.final_dump.assert_called_once_with(2)
+        dumper.close.assert_called_once()
+        exporter.finalize_publish.assert_called_once()
 
 
 if __name__ == "__main__":

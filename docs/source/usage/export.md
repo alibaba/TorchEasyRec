@@ -15,6 +15,7 @@ export_config {
 - best_exporter_metric: 当exporter_type为best的时候，确定最优导出模型的metric，注意该metric要在对应任务的metrics设置了才行。对于多任务模型则需要设置 {metric_name}\_{tower_name}。
 - metric_larger_is_better: 确定最优导出模型的metric是越大越好，还是越小越好，默认是越大越好
 - use_dense_ema: 是否使用稠密EMA参数导出模型。未配置时默认跟随`train_config.dense_optimizer.ema`是否启用；可显式配置为`true`或`false`覆盖默认行为，在线Dense导出同样使用该配置
+- dynamic_embedding: 分布式 embedding 导出时的 dynemb 读取块大小和可选 FeatureDB 全量上传配置，详见下文 [dynemb 流式导出与 FeatureDB 全量上传](#dynamic-embedding-full-export)
 
 ## 导出命令
 
@@ -29,6 +30,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - --pipeline_config_path: 导出用的配置文件
 - --checkpoint_path: 指定要导出的checkpoint, 默认导出model_dir下面最新的checkpoint
 - --export_dir: 导出到的模型目录，对于向量召回模型，导出命令会自动进行切图，分别放在user和item的子目录下
+- --edit_config_json: 命令行以json的方式动态修改配置文件，如{"export_config.dynamic_embedding.feature_store_config.version":"v1"}
 
 (export-env-vars)=
 
@@ -48,7 +50,9 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
 - USE_DISTRIBUTED_EMBEDDING: 开启分布式 embedding 导出模式，导出 dense graph 与分片 sparse embedding 参数；该模式会自动使用 `INPUT_TILE=3`
   - **USE_DISTRIBUTED_EMBEDDING=1**：启用分布式 embedding 导出
+  - 普通 sparse、ZCH 和原生 dynemb 模型使用统一导出流程；`dynamic_embedding` 仅调整 dynemb 读取和上传参数
   - 配置了 zch 的特征会自动转换为动态表导出，详见 [零冲突Hash Embedding](../feature/zch.md) 的分布式 Embedding 导出章节
+  - PYTORCH dense 图使用 CPU 导出，TRITON/CUTLASS dense 图需要 CUDA；导出目录保留 full/dense graph 调试文件，不再生成 `graph/gm_sparse.graph`
 - DIST_QUANT: 分布式 embedding 导出模式下的 sparse embedding 参数量化开关，默认关闭；当前仅支持 INT8，与普通导出的 `QUANT_EMB` / `QUANT_EC_EMB` 不同
   - **USE_DISTRIBUTED_EMBEDDING=1 DIST_QUANT=INT8**：启用分布式 sparse embedding INT8 量化
   - 未设置 **DIST_QUANT** 时，不启用分布式 sparse embedding 量化
@@ -56,7 +60,56 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（sparse 部分用 JIT，dense 部分用 AOTI）
   - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]
 
-(online-dense-export)=
+(dynamic-embedding-full-export)=
+
+## dynemb 流式导出与 FeatureDB 全量上传
+
+在 `USE_DISTRIBUTED_EMBEDDING=1` 下，dynemb 默认按块读取 checkpoint 并写入 NPZ，不需要将全部 dynemb 参数恢复到主机内存或显存。配置 `export_config.dynamic_embedding.feature_store_config` 后，同一批 dynemb 参数还会上传到 FeatureDB；不配置时只生成导出文件。该能力适用于原生 dynemb 参数。普通 sparse 和 ZCH 表仍按原有方式恢复到内存，其内存占用不受 dynemb 读取块预算限制。
+
+配置 `dynamic_embedding` 要求 `USE_DISTRIBUTED_EMBEDDING=1` 且非 RTP 导出，否则导出启动时会报错。
+
+### 配置
+
+在 `pipeline.config` 中添加以下必填配置，其他参数使用默认值，仅在需要调整时显式设置：
+
+```protobuf
+export_config {
+  dynamic_embedding {
+    feature_store_config {
+      region: "cn-beijing"
+      project_name: "recommendation"
+      feature_view_name: "model_embeddings"
+      version: "full_ckpt100000_run1"
+    }
+  }
+}
+```
+
+`feature_store_config` 复用 [FeatureStoreConfig](../proto.html#tzrec.protos.FeatureStoreConfig)，必填参数如下：
+
+| 配置项              | 导出时的含义                                                |
+| ------------------- | ----------------------------------------------------------- |
+| `region`            | FeatureStore 地域；显式为空时从 `ALIBABA_CLOUD_REGION` 获取 |
+| `project_name`      | 已存在的 FeatureStore 项目                                  |
+| `feature_view_name` | DynamicEmbedding FeatureView；不存在时按配置创建            |
+| `version`           | 每次导出使用新的、尚未用于线上服务的版本，不能为 `default`  |
+
+凭证沿用阿里云默认凭证链，以及运行环境中的 `FEATUREDB_USERNAME`、`FEATUREDB_PASSWORD`；不要将凭证写入 `pipeline.config`。
+
+### 执行导出
+
+从仓库根目录、依赖版本匹配的项目环境执行，显式指定一个已写入完成、导出期间不会再改变的 checkpoint，并使用新的导出目录：
+
+```bash
+PYTHONPATH=. USE_DISTRIBUTED_EMBEDDING=1 \
+torchrun --standalone --nnodes=1 --nproc-per-node=1 \
+    -m tzrec.export \
+    --pipeline_config_path /mnt/model/pipeline.config \
+    --checkpoint_path /mnt/model/model.ckpt-100000 \
+    --export_dir /mnt/model/export/full_ckpt100000_run1
+```
+
+未设置 `DIST_QUANT` 时，NPZ 和 FeatureDB 使用 FP32 values，FeatureView 类型必须为 `ARRAY<FLOAT>`。在命令前增加 `DIST_QUANT=INT8` 后，两处使用同一份 UINT8 行量化结果，包含每行 4 字节的 scale/offset；FeatureView 类型必须为 `ARRAY<UINT8>`，导出时会校验已存在的表类型。量化维度必须为偶数。
 
 ## 在线学习 dense 模型热导出
 

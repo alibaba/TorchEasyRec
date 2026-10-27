@@ -29,6 +29,27 @@ message GradClipping {
     optional bool enable_global_grad_clip = 4 [default = false];
 }
 
+message ProfilerConfig {
+    // number of steps skipped before the first profiling cycle
+    optional uint32 skip_first_steps = 1 [default = 0];
+    // number of idle steps at the start of each cycle
+    optional uint32 wait_steps = 2 [default = 1];
+    // number of warmup steps (traced but discarded) in each cycle
+    optional uint32 warmup_steps = 3 [default = 1];
+    // number of recorded steps in each cycle
+    optional uint32 active_steps = 4 [default = 10];
+    // number of cycles, 0 means repeat until training ends
+    optional uint32 repeat = 5 [default = 1];
+    // record input shapes of operators
+    optional bool record_shapes = 6 [default = true];
+    // record tensor memory allocation, adds notable overhead
+    optional bool profile_memory = 7 [default = true];
+    // record python call stacks, adds notable overhead
+    optional bool with_stack = 8 [default = true];
+    // global ranks to profile, empty means all ranks
+    repeated uint32 ranks = 9;
+}
+
 message FeatureStoreConfig {
     // Cloud credentials (AK/SK/STS) are resolved at runtime through the
     // Alibaba Cloud default credential provider chain (alibabacloud_credentials).
@@ -67,15 +88,18 @@ message FeatureStoreConfig {
     optional uint32 feature_view_replication_count = 15 [default = 1];
     reserved 4, 16, 17;
     reserved "feature_entity_name", "allow_custom_endpoint", "retain_local_dump";
-    // Wire format for delta upload. "ARROW" (default) streams a columnar Arrow
+    // Wire format for embedding upload. "ARROW" (default) streams a columnar Arrow
     // IPC batch through write_features_arrow(), avoiding the JSON path's per-row
     // dict construction and embedding deep-copy; "JSON" keeps the legacy
-    // write_features() per-row payload. Both paths use MERGE write_mode.
+    // write_features() per-row payload. Delta uploads use MERGE; full checkpoint
+    // exports use OVERWRITE within an explicit unpublished version.
     optional string upload_format = 18 [default = "ARROW"];
     // Local/dev testing outside the VPC: the FeatureStore SDK prefers the
     // FeatureDB public endpoint for the data plane, which stays reachable
     // when the default VPC endpoint is not.
     optional bool test_mode = 19 [default = false];
+    // Maximum concurrent SDK upload workers per rank.
+    optional uint32 max_workers = 20 [default = 4];
 }
 
 enum DeltaEmbeddingQuantType {
@@ -190,5 +214,7 @@ message TrainConfig {
     // training. Multi-GPU training writes one parquet shard per rank;
     // column-wise embedding sharding is not supported.
     optional DeltaEmbeddingDumpConfig delta_embedding_dump_config = 24;
+    // profiler schedule and collection options, used when is_profiling=true
+    optional ProfilerConfig profiler_config = 25;
     // TBD: qcomm config
 }

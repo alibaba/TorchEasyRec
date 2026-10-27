@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 500" width="1060" height="500" role="img" aria-labelledby="timeline-title timeline-desc" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Source Han Sans SC', sans-serif">
+  <title id="timeline-title">在线学习链路示意时间线</title>
+  <desc id="timeline-desc">以挂钟时间（T+1 日）为横轴的泳道图，共四条泳道。天级准备：01:30 样本就绪，03:30 天级训练完成，04:30 全量导出完成。新链路 stream_T：04:30 启动，从 Kafka 中 00:00 的数据开始消费积压，约 06:45 两条链路的消费进度差不超过容忍值（示意值，假设积压 4.5 小时、训练速度为数据产生速度的 3 倍，容忍值可使该时刻略早），之后持续训练与发布，部署期间及部署后继续运行。旧链路 stream_T-1：追赶期间继续训练与发布，下一次检查满足交接条件后，排空上传、完成本链路的最终发布并退出。EAS 服务：先服务旧链路；旧任务退出后触发 deploy，滚动更新期间旧实例保持旧链路最终版本，新实例逐步接管并服务新链路。</desc>
+
+  <defs>
+    <pattern id="hatch-amber" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#fef3c7"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#f59e0b" stroke-width="2.5"/>
+    </pattern>
+    <pattern id="hatch-gray" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#f1f5f9"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#94a3b8" stroke-width="2.5"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect width="1060" height="500" fill="#ffffff"/>
+
+  <!-- title and legend -->
+  <text x="20" y="36" font-size="19" font-weight="bold" fill="#0f172a">在线学习链路示意时间线</text>
+  <rect x="610" y="22" width="18" height="14" rx="3" fill="#fde68a" stroke="#d97706"/>
+  <text x="634" y="34" font-size="12.5" fill="#334155">旧链路 stream<tspan baseline-shift="sub" font-size="10">T-1</tspan></text>
+  <rect x="760" y="22" width="18" height="14" rx="3" fill="#5eead4" stroke="#0d9488"/>
+  <text x="784" y="34" font-size="12.5" fill="#334155">新链路 stream<tspan baseline-shift="sub" font-size="10">T</tspan></text>
+  <rect x="890" y="22" width="18" height="14" rx="3" fill="url(#hatch-gray)" stroke="#64748b"/>
+  <text x="914" y="34" font-size="12.5" fill="#334155">时长不定</text>
+
+  <!-- lane backgrounds -->
+  <rect x="0" y="100" width="1060" height="54" fill="#f8fafc"/>
+  <rect x="0" y="160" width="1060" height="106" fill="#ffffff"/>
+  <rect x="0" y="272" width="1060" height="74" fill="#f8fafc"/>
+  <rect x="0" y="352" width="1060" height="74" fill="#ffffff"/>
+  <line x1="0" y1="157" x2="1060" y2="157" stroke="#e2e8f0"/>
+  <line x1="0" y1="269" x2="1060" y2="269" stroke="#e2e8f0"/>
+  <line x1="0" y1="349" x2="1060" y2="349" stroke="#e2e8f0"/>
+  <line x1="0" y1="429" x2="1060" y2="429" stroke="#e2e8f0"/>
+
+  <!-- lane labels -->
+  <text x="20" y="90" font-size="12" fill="#64748b">挂钟时间（T+1 日）</text>
+  <text x="20" y="132" font-size="14" font-weight="bold" fill="#1e293b">天级准备</text>
+  <text x="20" y="208" font-size="14" font-weight="bold" fill="#1e293b">新链路</text>
+  <text x="20" y="228" font-size="13" fill="#334155">stream<tspan baseline-shift="sub" font-size="10">T</tspan></text>
+  <text x="20" y="302" font-size="14" font-weight="bold" fill="#1e293b">旧链路</text>
+  <text x="20" y="322" font-size="13" fill="#334155">stream<tspan baseline-shift="sub" font-size="10">T-1</tspan></text>
+  <text x="20" y="392" font-size="14" font-weight="bold" fill="#1e293b">EAS 服务</text>
+
+  <!-- time axis: to scale until 06:45, ordering only afterwards -->
+  <line x1="140" y1="88" x2="612" y2="88" stroke="#475569" stroke-width="1.5"/>
+  <line x1="612" y1="88" x2="1040" y2="88" stroke="#475569" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <g font-size="12.5" fill="#334155" text-anchor="middle">
+    <line x1="140" y1="83" x2="140" y2="93" stroke="#475569"/><text x="140" y="76">00:00</text>
+    <line x1="245" y1="83" x2="245" y2="93" stroke="#475569"/><text x="245" y="76">01:30</text>
+    <line x1="385" y1="83" x2="385" y2="93" stroke="#475569"/><text x="385" y="76">03:30</text>
+    <line x1="455" y1="83" x2="455" y2="93" stroke="#475569"/><text x="455" y="76">04:30</text>
+    <line x1="612" y1="83" x2="612" y2="93" stroke="#475569"/><text x="612" y="76">≈06:45</text>
+  </g>
+  <text x="826" y="76" font-size="12" fill="#64748b" text-anchor="middle">之后：时长不定，仅示意先后顺序</text>
+
+  <!-- vertical guides -->
+  <g stroke="#cbd5e1" stroke-dasharray="3 4">
+    <line x1="245" y1="94" x2="245" y2="428"/>
+    <line x1="385" y1="94" x2="385" y2="428"/>
+    <line x1="455" y1="94" x2="455" y2="428"/>
+  </g>
+  <line x1="612" y1="94" x2="612" y2="428" stroke="#0d9488" stroke-dasharray="4 4"/>
+
+  <!-- lane: daily preparation -->
+  <path d="M245,117 L253,125 L245,133 L237,125 z" fill="#6366f1"/>
+  <text x="231" y="130" font-size="12.5" fill="#1e293b" text-anchor="end">ds=T 样本就绪</text>
+  <rect x="253" y="111" width="132" height="28" rx="6" fill="#e0e7ff" stroke="#6366f1"/>
+  <text x="319" y="130" font-size="13" fill="#1e293b" text-anchor="middle">天级训练</text>
+  <rect x="385" y="111" width="70" height="28" rx="6" fill="#c7d2fe" stroke="#6366f1"/>
+  <text x="420" y="130" font-size="13" fill="#1e293b" text-anchor="middle">全量导出</text>
+
+  <!-- concurrency band across both streaming lanes -->
+  <rect x="455" y="203" width="335" height="125" rx="8" fill="#0d9488" fill-opacity="0.06" stroke="#64748b" stroke-dasharray="5 4"/>
+
+  <!-- lane: new lineage stream_T -->
+  <path d="M150,182 C 300,182 400,192 452,207" fill="none" stroke="#475569" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+  <text x="150" y="176" font-size="12" fill="#334155">起始位置：Kafka 中 00:00 的数据（数据时间，而非挂钟时间）</text>
+  <rect x="455" y="207" width="157" height="28" rx="6" fill="#ccfbf1" stroke="#0d9488" stroke-dasharray="4 3"/>
+  <text x="533" y="226" font-size="13" fill="#134e4a" text-anchor="middle">追赶积压</text>
+  <text x="612" y="200" font-size="12" fill="#0f766e" text-anchor="middle">≈ 消费进度差 ≤ 容忍值（示意）</text>
+  <rect x="612" y="207" width="418" height="28" rx="6" fill="#5eead4" stroke="#0d9488"/>
+  <path d="M1030,213 L1046,221 L1030,229 z" fill="#0d9488"/>
+  <text x="820" y="226" font-size="13" fill="#134e4a" text-anchor="middle">持续训练并发布（部署后继续运行）</text>
+  <text x="533" y="252" font-size="11.5" fill="#475569" text-anchor="middle">处理的数据时间：00:00 → ≈06:45</text>
+  <text x="701" y="260" font-size="12" font-weight="bold" fill="#334155" text-anchor="middle">① 两条流式任务并行</text>
+
+  <!-- lane: old lineage stream_T-1 -->
+  <rect x="140" y="290" width="472" height="28" rx="6" fill="#fde68a" stroke="#d97706"/>
+  <text x="376" y="309" font-size="13" fill="#78350f" text-anchor="middle">训练并发布（自 T 日起持续运行）</text>
+  <rect x="612" y="290" width="14" height="28" fill="#fef3c7" stroke="#d97706" stroke-dasharray="4 3"/>
+  <text x="619" y="337" font-size="11.5" fill="#475569" text-anchor="middle">至下次检查</text>
+  <text x="626" y="285" font-size="11.5" fill="#78350f" text-anchor="middle">下次检查满足交接条件</text>
+  <rect x="626" y="290" width="164" height="28" fill="url(#hatch-amber)" stroke="#d97706"/>
+  <rect x="659" y="296" width="98" height="16" rx="3" fill="#ffffff" fill-opacity="0.85"/>
+  <text x="708" y="308" font-size="11.5" fill="#78350f" text-anchor="middle">排空上传·最终发布</text>
+  <line x1="790" y1="284" x2="790" y2="324" stroke="#b45309" stroke-width="3"/>
+  <text x="796" y="285" font-size="11.5" font-weight="bold" fill="#b45309">退出</text>
+  <text x="810" y="309" font-size="12" fill="#94a3b8">已退出</text>
+
+  <!-- deploy trigger -->
+  <line x1="790" y1="326" x2="790" y2="370" stroke="#475569" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+  <text x="798" y="344" font-size="12" font-weight="bold" fill="#334155">② 旧任务退出后触发 deploy</text>
+
+  <!-- lane: EAS serving -->
+  <rect x="140" y="372" width="650" height="28" rx="6" fill="#fde68a" stroke="#d97706"/>
+  <text x="465" y="391" font-size="13" fill="#78350f" text-anchor="middle">服务旧链路 stream<tspan baseline-shift="sub" font-size="10">T-1</tspan>（随其发布持续更新）</text>
+  <rect x="790" y="372" width="120" height="28" fill="url(#hatch-gray)"/>
+  <polygon points="790,372 910,372 790,400" fill="#fde68a" fill-opacity="0.85"/>
+  <polygon points="910,372 910,400 790,400" fill="#5eead4" fill-opacity="0.85"/>
+  <rect x="790" y="372" width="120" height="28" fill="none" stroke="#64748b" stroke-dasharray="4 3"/>
+  <text x="850" y="367" font-size="11.5" fill="#334155" text-anchor="middle">滚动更新</text>
+  <rect x="910" y="372" width="120" height="28" rx="6" fill="#5eead4" stroke="#0d9488"/>
+  <text x="970" y="391" font-size="13" fill="#134e4a" text-anchor="middle">服务 stream<tspan baseline-shift="sub" font-size="10">T</tspan></text>
+  <text x="850" y="418" font-size="12" font-weight="bold" fill="#334155" text-anchor="middle">旧实例保持旧链路最终版本，新实例逐步接管</text>
+
+  <!-- notes -->
+  <g font-size="13" fill="#1e293b">
+    <text x="20" y="460">① 追赶期间，新旧两条流式任务同时运行，各自训练并发布。</text>
+    <text x="20" y="484">② deploy 等待旧任务 stream<tspan baseline-shift="sub" font-size="10">T-1</tspan> 退出后才更新 EAS；新任务 stream<tspan baseline-shift="sub" font-size="10">T</tspan> 不受影响，持续运行。</text>
+  </g>
+</svg>

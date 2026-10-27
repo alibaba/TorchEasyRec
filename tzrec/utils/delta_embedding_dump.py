@@ -54,7 +54,7 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, DeltaEmbeddingQuantType
-from tzrec.utils.feature_store_delta_uploader import (
+from tzrec.utils.feature_store_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
     FeatureStoreDeltaUploader,
@@ -1007,9 +1007,9 @@ class DeltaEmbeddingDumper:
 
     def _local_dump_decision(self, global_step: int) -> DumpDecision:
         """Return this step's decision level; the paired cadence wins ties."""
+        if global_step <= 0:
+            return DumpDecision.NONE
         if self._paired_interval_steps is not None:
-            if global_step <= 0:
-                return DumpDecision.NONE
             if global_step % self._paired_interval_steps == 0:
                 return DumpDecision.PAIRED
             if (

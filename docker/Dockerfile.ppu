@@ -1,9 +1,8 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
-RUN sed -i "s@http://archive.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/sources.list.d/ubuntu.sources && \
-    sed -i "s@http://security.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/sources.list.d/ubuntu.sources && \
-    sed -i "s@http://ports.ubuntu.com@http://mirrors.aliyun.com@g" /etc/apt/sources.list.d/ubuntu.sources && \
+# the vendor base may point apt at a mirror unreachable outside its network
+RUN sed -i -E "s@^URIs: .*@URIs: http://mirrors.aliyun.com/ubuntu/@" /etc/apt/sources.list.d/ubuntu.sources && \
     apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
@@ -17,12 +16,17 @@ RUN wget https://tzrec.oss-accelerate.aliyuncs.com/third_party/libidn11_1.33-2.2
 ARG PIP_MIRROR=mirrors.aliyun.com
 RUN mkdir -p /root/.config/pip && \
     printf '[global]\nindex-url = http://%s/pypi/simple\ntrusted-host = %s\ntimeout = 120\n' "${PIP_MIRROR}" "${PIP_MIRROR}" > /root/.config/pip/pip.conf
+# the vendor base sets PIP_INDEX_URL to its internal mirror, which beats pip.conf
+ENV PIP_INDEX_URL=http://${PIP_MIRROR}/pypi/simple PIP_TRUSTED_HOST=${PIP_MIRROR}
 
+# Only torch is installed here (the PPU build from the vendor index);
+# everything else is pinned in requirements/ppu.txt.
 ARG PPU_PIP_INDEX
-RUN pip install torch==2.13.0 triton==3.7.0 -i ${PPU_PIP_INDEX} && \
-    pip install fbgemm-gpu==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/fbgemm_gpu/ppu2.2.0-cu130/repo.html && \
-    pip install torchmetrics==1.0.3 tensordict && \
-    pip install torchrec==1.8.0 -f https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/repo.html && \
+RUN pip install torch==2.13.0 -i ${PPU_PIP_INDEX} && \
+    pip cache purge
+# the EIC base pins packaging 21.3 under setuptools 75, which breaks sdist
+# metadata generation for requirements deps the vendor index serves as source
+RUN pip install -U packaging && \
     pip cache purge
 
 ENV NVIDIA_VISIBLE_DEVICES all
@@ -31,10 +35,21 @@ ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
 ADD requirements /root/requirements
 ADD requirements.txt /root/requirements.txt
 ADD requirements-ppu.txt /root/requirements-ppu.txt
+# pip re-downloads every `name @ URL` requirement (no metadata sidecar) to
+# validate it, so tzrec re-installs in CI jobs would re-fetch wheels the
+# image already carries. Re-fetch the URL-pinned set after the purge to keep
+# the pip HTTP cache warm (the pins live in requirements/ppu.txt --
+# requirements-ppu.txt is only the include file). The build may pass a local
+# PIP_MIRROR for speed; reset pip.conf and the pip env to the canonical mirror so the
+# shipped image never points at it.
 RUN cd /root && \
     pip install -r requirements-ppu.txt --extra-index-url ${PPU_PIP_INDEX} && \
-    rm -rf requirements requirements.txt requirements-*.txt && \
-    pip cache purge
+    pip cache purge && \
+    grep -h ' @ ' requirements/ppu.txt requirements/runtime.txt > /tmp/urlpins.txt && \
+    pip download --no-deps -r /tmp/urlpins.txt -d /tmp/wheels && \
+    rm -rf /tmp/wheels /tmp/urlpins.txt requirements requirements.txt requirements-*.txt && \
+    printf '[global]\nindex-url = http://mirrors.aliyun.com/pypi/simple\ntrusted-host = mirrors.aliyun.com\ntimeout = 120\n' > /root/.config/pip/pip.conf
+ENV PIP_INDEX_URL=http://mirrors.aliyun.com/pypi/simple PIP_TRUSTED_HOST=mirrors.aliyun.com
 
 RUN mkdir -p /home/pai/bin && \
     wget -O /home/pai/bin/prepare_dlc_environment https://tzrec.oss-accelerate.aliyuncs.com/third_party/pai/prepare_dlc_environment.sh && \

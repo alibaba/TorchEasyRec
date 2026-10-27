@@ -9,9 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Locations and manifest for one generation of the SID bundle.
+"""Locations and manifest of one SID bundle.
 
-A bundle is the set of artifacts one resolve run publishes, plus a manifest that
+A bundle is the set of artifacts one generation publishes, plus a manifest that
 identifies them, locates them and describes the SID space they encode. The
 manifest is written last, so its presence is the completion marker.
 
@@ -30,11 +30,16 @@ to ``output_path``.
 
 import json
 import os
+import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
 from typing import Any, Dict, List, Optional, Tuple
 
+from odps import ODPS
+from torch import distributed as dist
+
+from tzrec.datasets.odps_dataset import _create_odps_account, _parse_table_path
 from tzrec.utils.logging_util import logger
 from tzrec.utils.path_util import is_odps_path
 
@@ -52,20 +57,6 @@ def artifact_location(root: str, generation: str, artifact: str) -> str:
     if is_odps_path(root):
         return f"{root.rstrip('/')}/generation={generation}/artifact={artifact}"
     return os.path.join(root, generation, artifact)
-
-
-def artifact_read_pattern(
-    root: str, generation: str, artifact: str, save_type: str
-) -> str:
-    """Return the reader path for one artifact of one generation.
-
-    A bare directory only globs to itself, so a derived read path needs the
-    ``part-*`` pattern the writers emit. An ODPS partition selects itself.
-    """
-    location = artifact_location(root, generation, artifact)
-    if is_odps_path(root):
-        return location
-    return os.path.join(location, f"part-*.{save_type}")
 
 
 def manifest_path(output_path: str, generation: str) -> str:
@@ -135,13 +126,6 @@ class BundleManifest:
         return cls(artifacts=entries, **payload)
 
 
-def write_manifest(path: str, manifest: BundleManifest) -> None:
-    """Write the manifest, creating its directory."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as handle:
-        handle.write(manifest.to_json())
-
-
 def read_manifest(path: str) -> BundleManifest:
     """Read a published manifest.
 
@@ -163,246 +147,260 @@ def read_manifest(path: str) -> BundleManifest:
         raise ValueError(f"the manifest at {path!r} is not readable: {err}") from err
 
 
-@dataclass(frozen=True)
-class BundleLayout:
-    """Every location one run reads and writes, resolved once.
+def _odps_generation(path: str) -> Tuple[ODPS, str, str]:
+    """Return an ODPS client, table name, and generation partition specification.
 
-    Binding the two roots and the generations here is what keeps the family rule
-    -- the serving set under ``output_path``, the item-to-SID set under
-    ``item_to_sid_root`` -- in this module instead of at each call site.
-    ``item_to_sid_root`` arrives already resolved, so its default is not this
-    class's concern.
+    Args:
+        path: ODPS output path ending in a generation partition.
     """
-
-    output_path: Optional[str]
-    item_to_sid_root: Optional[str]
-    generation: Optional[str]
-    from_generation: Optional[str]
-
-    def __post_init__(self) -> None:
-        if self.output_path is not None and is_odps_path(self.output_path):
-            raise ValueError(
-                "output_path holds sid_to_items and the manifest, which are "
-                f"always files; got {self.output_path!r}."
-            )
-
-    def root_for(self, artifact: str) -> str:
-        """Return the root that owns one artifact's family."""
-        root = (
-            self.item_to_sid_root
-            if artifact in ITEM_TO_SID_ARTIFACTS
-            else self.output_path
-        )
-        if root is None:
-            raise RuntimeError(f"no root is configured for {artifact}.")
-        return root
-
-    def write_path(self, artifact: str) -> str:
-        """Return where this generation writes one artifact."""
-        if self.generation is None:
-            raise RuntimeError("no generation is configured to write.")
-        return artifact_location(self.root_for(artifact), self.generation, artifact)
-
-    def read_path(self, artifact: str, save_type: str) -> str:
-        """Return where the appended-onto generation holds one artifact.
-
-        ``save_type`` comes from what that generation recorded it wrote, not from
-        this run's flags, so a chain does not depend on the reader type being
-        repeated.
-        """
-        if self.from_generation is None:
-            raise RuntimeError("no from_generation is configured to read.")
-        return artifact_read_pattern(
-            self.root_for(artifact), self.from_generation, artifact, save_type
-        )
-
-    def entry(
-        self, artifact: str, rows: int, writer_type: Optional[str]
-    ) -> ArtifactEntry:
-        """Describe where one artifact landed, for the manifest.
-
-        An ODPS root fixes ``save_type`` to ``odps``, so it cannot contradict
-        ``location``; the serving set can only be parquet because a root that
-        would make it otherwise is refused at construction, and the
-        item-to-SID set follows ``writer_type``.
-        """
-        if is_odps_path(self.root_for(artifact)):
-            save_type = "odps"
-        elif artifact in SID_TO_ITEMS_ARTIFACTS:
-            save_type = "parquet"
-        else:
-            save_type = "csv" if writer_type == "CsvWriter" else "parquet"
-        return ArtifactEntry(
-            save_type=save_type, rows=rows, location=self.write_path(artifact)
-        )
-
-    def write_manifest(self, manifest: "BundleManifest") -> str:
-        """Write this generation's manifest and return where it landed."""
-        if self.output_path is None or self.generation is None:
-            raise RuntimeError("no manifest location is configured.")
-        path = manifest_path(self.output_path, self.generation)
-        write_manifest(path, manifest)
-        return path
-
-    def prior_manifest_path(self) -> str:
-        """Return the manifest of the generation being appended onto."""
-        if self.output_path is None or self.from_generation is None:
-            raise RuntimeError("no prior manifest location is configured.")
-        return manifest_path(self.output_path, self.from_generation)
+    project, table_name, _, schema = _parse_table_path(path)
+    account, endpoint = _create_odps_account()
+    client = ODPS(account=account, project=project, endpoint=endpoint, schema=schema)
+    return client, table_name, path.split("/", 5)[5].replace("/", ",")
 
 
 class Bundle:
     """The generation a run publishes: where each artifact goes, and its manifest.
 
-    Artifact names live here rather than at the call site, so a caller says
-    which artifact it wrote rather than naming it. Only artifacts it is told
-    about reach the manifest, which is how a full resolve records that it
-    published no delta.
+    Binding the two roots and the generations here is what keeps the family rule
+    -- the serving set under ``output_path``, the item-to-SID set under
+    ``item_to_sid_root`` -- in this module instead of at each call site.
+    ``item_to_sid_root`` arrives already resolved, so its default is not this
+    class's concern. Only artifacts recorded in ``artifact_row_counts`` reach
+    the manifest, which is how a full resolve records that it published no delta.
+
+    Args:
+        output_path: Root of the serving set and the manifests.
+        item_to_sid_root: Root of the item-to-SID set.
+        generation: Generation this run writes.
+        from_generation: Generation this run appends onto, if any.
     """
 
-    def __init__(self, layout: BundleLayout) -> None:
-        self._layout = layout
-        self._rows: Dict[str, int] = {}
+    def __init__(
+        self,
+        output_path: Optional[str],
+        item_to_sid_root: Optional[str],
+        generation: Optional[str],
+        from_generation: Optional[str],
+    ) -> None:
+        if output_path is not None and is_odps_path(output_path):
+            raise ValueError(
+                "output_path holds sid_to_items and the manifest, which are "
+                f"always files; got {output_path!r}."
+            )
+        self._output_path = output_path
+        self._item_to_sid_root = item_to_sid_root
+        self._generation = generation
+        self._from_generation = from_generation
+        self.artifact_row_counts: Dict[str, int] = {}
+        self._created_generation_paths: List[str] = []
         self.uuid = uuid.uuid4().hex
 
-    @cached_property
-    def _prior(self) -> Optional[BundleManifest]:
-        """The manifest of the generation being appended onto, read once."""
-        if self._layout.from_generation is None:
-            return None
-        return read_manifest(self._layout.prior_manifest_path())
+    def prepare_generation(self, rank: int) -> None:
+        """Prepare output locations on rank 0, then synchronize all ranks.
 
-    def _prior_entry(self, artifact: str) -> ArtifactEntry:
-        """Return what the appended-onto generation recorded for one artifact."""
-        prior = self._prior
-        if prior is None:
-            raise RuntimeError("no prior generation is configured to read.")
-        entry = prior.artifacts.get(artifact)
+        Record this run's output locations for cleanup by the runner.
+        No existing generation is overwritten or removed.
+
+        Args:
+            rank: Current process rank; only rank 0 prepares output locations.
+        """
+        if rank == 0:
+            self._created_generation_paths.clear()
+            generation_paths = dict.fromkeys(
+                path if is_odps_path(path) else os.path.realpath(path)
+                for path in (
+                    os.path.dirname(self.artifact_path(SID_TO_ITEMS_ARTIFACT)),
+                    os.path.dirname(self.artifact_path(ITEM_TO_SID_ARTIFACT)),
+                )
+            )
+            for path in generation_paths:
+                if is_odps_path(path):
+                    client, table_name, partition_spec = _odps_generation(path)
+                    exists = False
+                    if client.exist_table(table_name):
+                        table = client.get_table(table_name)
+                        partitions = table.iterate_partitions(spec=partition_spec)
+                        exists = next(partitions, None) is not None
+                else:
+                    exists = os.path.lexists(path)
+
+                if exists:
+                    raise FileExistsError(
+                        f"generation already exists at {path!r}; use a new generation "
+                        "or remove the incomplete generation before retrying."
+                    )
+                if not is_odps_path(path):
+                    os.makedirs(path)
+                self._created_generation_paths.append(path)
+
+        if dist.is_initialized():
+            dist.barrier()
+
+    def remove_generation(self) -> None:
+        """Remove this run's generation, logging failures without raising them."""
+        for path in reversed(self._created_generation_paths):
+            try:
+                if is_odps_path(path):
+                    client, table_name, partition_spec = _odps_generation(path)
+                    if client.exist_table(table_name):
+                        table = client.get_table(table_name)
+                        for partition in list(
+                            table.iterate_partitions(spec=partition_spec)
+                        ):
+                            table.delete_partition(
+                                partition.partition_spec, if_exists=True
+                            )
+                else:
+                    shutil.rmtree(path)
+            except Exception:
+                logger.exception("failed to clean up generation at %s", path)
+        self._created_generation_paths.clear()
+
+    def _artifact_root(self, artifact: str) -> str:
+        """Return the root that owns one artifact's family."""
+        root = (
+            self._item_to_sid_root
+            if artifact in ITEM_TO_SID_ARTIFACTS
+            else self._output_path
+        )
+        if root is None:
+            raise RuntimeError(f"no root is configured for {artifact}.")
+        return root
+
+    def _manifest_path(self, generation: Optional[str]) -> str:
+        """Return where one generation's manifest lives, beside its serving set."""
+        if self._output_path is None or generation is None:
+            raise RuntimeError("no manifest location is configured.")
+        return manifest_path(self._output_path, generation)
+
+    @cached_property
+    def from_manifest(self) -> Optional[BundleManifest]:
+        """The manifest of the generation being appended onto, read once."""
+        if self._from_generation is None:
+            return None
+        return read_manifest(self._manifest_path(self._from_generation))
+
+    def artifact_path(self, artifact: str) -> str:
+        """Return where this generation writes one artifact."""
+        if self._generation is None:
+            raise RuntimeError("no generation is configured to write.")
+        return artifact_location(
+            self._artifact_root(artifact), self._generation, artifact
+        )
+
+    def from_artifact_path(self, artifact: str) -> str:
+        """Return the reader path of one artifact of the appended-onto generation.
+
+        A bare directory only globs to itself, so a file read path needs the
+        ``part-*`` pattern the writers emit, with the format that generation
+        recorded it wrote rather than one from this run's flags, so a chain does
+        not depend on the reader type being repeated. An ODPS partition selects
+        itself.
+        """
+        from_manifest = self.from_manifest
+        if from_manifest is None or self._from_generation is None:
+            raise RuntimeError("no from_generation is configured to read.")
+        entry = from_manifest.artifacts.get(artifact)
         if entry is None:
             raise ValueError(
-                f"generation {self._layout.from_generation!r} records no "
-                f"{artifact} in its manifest, so it cannot be appended onto."
+                f"generation {self._from_generation!r} records no {artifact} in its "
+                "manifest, so it cannot be appended onto."
             )
-        return entry
+        location = artifact_location(
+            self._artifact_root(artifact), self._from_generation, artifact
+        )
+        if is_odps_path(location):
+            return location
+        return os.path.join(location, f"part-*.{entry.save_type}")
 
-    @property
-    def item_to_sid_path(self) -> str:
-        """Where this generation's item_to_sid rows are written."""
-        return self._layout.write_path(ITEM_TO_SID_ARTIFACT)
-
-    @property
-    def delta_item_to_sid_path(self) -> str:
-        """Where this generation's added item rows are written."""
-        return self._layout.write_path(DELTA_ITEM_TO_SID_ARTIFACT)
-
-    @property
-    def sid_to_items_path(self) -> str:
-        """Where this generation's sid_to_items rows are written."""
-        return self._layout.write_path(SID_TO_ITEMS_ARTIFACT)
-
-    @property
-    def delta_sid_to_items_path(self) -> str:
-        """Where this generation's touched buckets are written."""
-        return self._layout.write_path(DELTA_SID_TO_ITEMS_ARTIFACT)
-
-    @property
-    def prior_item_to_sid_path(self) -> str:
-        """Where the appended-onto generation holds its item_to_sid rows."""
-        save_type = self._prior_entry(ITEM_TO_SID_ARTIFACT).save_type
-        return self._layout.read_path(ITEM_TO_SID_ARTIFACT, save_type)
-
-    @property
-    def prior_sid_to_items_path(self) -> str:
-        """Where the appended-onto generation holds its sid_to_items rows."""
-        return self._layout.read_path(SID_TO_ITEMS_ARTIFACT, "parquet")
-
-    def prior_locations(self) -> List[Tuple[str, str]]:
-        """Every published artifact an append reads, labelled for errors.
-
-        The manifest is not among them: resolving these paths is what reads it,
-        so its absence has already raised by the time this returns.
-        """
-        return [
-            (SID_TO_ITEMS_ARTIFACT, self.prior_sid_to_items_path),
-            (ITEM_TO_SID_ARTIFACT, self.prior_item_to_sid_path),
-        ]
-
-    def check_prior_compatible(self, codebook: List[int], capacity: int) -> None:
+    def validate_compatibility(self, codebook: List[int], capacity: int) -> None:
         """Reject an append whose SID space differs from the published corpus.
 
-        The codebook fixes how a SID packs into a bucket key and how its layers
+        The codebook fixes how a SID packs into a SID key and how its layers
         shift into one vocabulary, so appending under a different one re-keys
         every published SID and rewrites its ``offset_codebook``.
 
-        A differing ``capacity`` is only warned about: published buckets keep
+        A differing ``capacity`` is only warned about: published SIDs keep
         the occupancy they were published with.
 
         Raises:
             ValueError: If the codebook differs from the published generation's.
         """
-        prior = self._prior
-        if prior is None:
+        from_manifest = self.from_manifest
+        if from_manifest is None:
             return
-        if codebook != prior.codebook:
+        if codebook != from_manifest.codebook:
             raise ValueError(
-                f"--codebook {codebook} differs from the {prior.codebook} "
-                f"published at generation {self._layout.from_generation!r}; "
+                f"--codebook {codebook} differs from the {from_manifest.codebook} "
+                f"published at generation {self._from_generation!r}; "
                 "appending would re-key every published SID and rewrite its "
                 "offset_codebook. Append with the codebook the corpus was "
                 "built with."
             )
-        if capacity != prior.capacity:
+        if capacity != from_manifest.capacity:
             logger.warning(
                 "capacity is %d but generation %s was published with %d; already "
-                "published buckets keep the occupancy they have",
+                "published SIDs keep the occupancy they have",
                 capacity,
-                self._layout.from_generation,
-                prior.capacity,
+                self._from_generation,
+                from_manifest.capacity,
             )
 
-    def record_item_to_sid(self, rows: int) -> None:
-        """Record how many rows the merged item_to_sid holds."""
-        self._rows[ITEM_TO_SID_ARTIFACT] = rows
-
-    def record_delta_item_to_sid(self, rows: int) -> None:
-        """Record how many rows this run added to item_to_sid."""
-        self._rows[DELTA_ITEM_TO_SID_ARTIFACT] = rows
-
-    def record_sid_to_items(self, rows: int) -> None:
-        """Record how many buckets the merged sid_to_items holds."""
-        self._rows[SID_TO_ITEMS_ARTIFACT] = rows
-
-    def record_delta_sid_to_items(self, rows: int) -> None:
-        """Record how many buckets this run touched."""
-        self._rows[DELTA_SID_TO_ITEMS_ARTIFACT] = rows
-
-    def publish(
+    def write_manifest(
         self,
         codebook: List[int],
         capacity: int,
-        observed: int,
+        max_observed_items_per_sid: int,
         item_id_type: Optional[str],
         writer_type: Optional[str],
-    ) -> str:
-        """Write the manifest last and return where it landed.
+    ) -> None:
+        """Write the manifest atomically after all artifacts and log its location.
 
-        ``observed`` is carried forward as a running maximum: an append only
-        sees the buckets it touched, so the published ceiling is the larger of
-        this run's and the one it appended onto.
+        Its presence marks a completed generation, so write it after all artifacts.
+
+        ``max_observed_items_per_sid`` is carried forward as a running maximum.
+        An append only sees the SIDs of the prefixes it affects, so the published
+        ceiling is the larger of this run's and the one it appended onto.
+
+        An ODPS root fixes an artifact's ``save_type`` to ``odps``, so it cannot
+        contradict ``location``; the serving set can only be parquet because a
+        root that would make it otherwise is refused at construction, and the
+        item-to-SID set follows ``writer_type``.
         """
-        prior = self._prior
-        if prior is not None:
-            observed = max(observed, prior.max_observed_items_per_sid)
+        from_manifest = self.from_manifest
+        if from_manifest is not None:
+            max_observed_items_per_sid = max(
+                max_observed_items_per_sid, from_manifest.max_observed_items_per_sid
+            )
+        artifacts = {}
+        for artifact, row_count in self.artifact_row_counts.items():
+            if is_odps_path(self._artifact_root(artifact)):
+                save_type = "odps"
+            elif artifact in ITEM_TO_SID_ARTIFACTS and writer_type == "CsvWriter":
+                save_type = "csv"
+            else:
+                save_type = "parquet"
+            artifacts[artifact] = ArtifactEntry(
+                save_type=save_type,
+                rows=row_count,
+                location=self.artifact_path(artifact),
+            )
         manifest = BundleManifest(
             bundle_uuid=self.uuid,
-            since_bundle_uuid=prior.bundle_uuid if prior is not None else None,
+            since_bundle_uuid=from_manifest.bundle_uuid
+            if from_manifest is not None
+            else None,
             codebook=codebook,
             capacity=capacity,
-            max_observed_items_per_sid=observed,
+            max_observed_items_per_sid=max_observed_items_per_sid,
             item_id_type=item_id_type,
-            artifacts={
-                name: self._layout.entry(name, rows, writer_type)
-                for name, rows in self._rows.items()
-            },
+            artifacts=artifacts,
         )
-        return self._layout.write_manifest(manifest)
+        path = self._manifest_path(self._generation)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary_path = path + ".tmp"
+        with open(temporary_path, "w") as handle:
+            handle.write(manifest.to_json())
+        os.replace(temporary_path, path)
+        logger.info("wrote bundle %s manifest to %s", self.uuid, path)

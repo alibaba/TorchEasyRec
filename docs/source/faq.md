@@ -562,3 +562,114 @@ ValueError: Expected more than 1 value per channel when training, got input size
 **原因：** 样本表的行数恰好使得某一轮训练的最后一个batch只有1行。BatchNorm在训练模式下需要在batch内计算统计量，1行样本无法计算方差；batch内负采样、listwise loss等也要求batch内至少有2行样本。TorchEasyRec默认不丢弃任何样本，因此最后一个不足batch_size的batch会原样送入模型。
 
 **解决方法：** 在`data_config`中设置`min_batch_size: 2`，训练时行数小于2的最后一个batch会被丢弃，每个`proc`每轮最多丢弃1行样本；也可以设置`drop_remainder: true`丢弃所有不足batch_size的batch。两个参数都只在训练时生效，评估和预测不受影响。
+
+**Q22: KafkaDataset训练报列缺失或schema不兼容，如何查看Kafka消息的实际内容**
+
+**报错信息：**
+
+```
+AssertionError: feature <xxx> has no input: xxx
+```
+
+或
+
+```
+ValueError: kafka message schema is incompatible with the reader schema: missing column(s) [...]
+```
+
+**原因：** Kafka消息中的列与模型需要的列（特征输入、label、sample_weight等）不一致：
+
+- 使用带schema的格式（未配置`input_fields`）时，KafkaDataset在启动时读取分区0的最新一条消息推断schema。如果这条消息缺少模型需要的列，这些列不会被读取，训练读到第一个batch时FG报`has no input`。常见于上游在某一batch内某列全部为空时不写该列
+- 启动时推断的schema包含这些列，但之后的消息缺少，或列类型发生变化时，报`missing column(s)`或`changed column type(s)`
+- 序列化格式与`data_config`配置不匹配（带schema的消息却配置了`input_fields`，或反之），或单条消息包含多个record batch（只有第一个会被读取）
+
+**解决方法：** 使用如下工具反序列化消息，查看消息的实际schema和数据：
+
+```bash
+python -m tzrec.tools.inspect_kafka \
+    --input_path 'kafka://broker:9092/topic?group.id=consumer_group' \
+    --partition 0 --offset -1 --num_messages 1 --num_rows 2 \
+    --pipeline_config_path pipeline.config
+```
+
+- input_path: 与训练相同的Kafka URI。工具使用assign直接读取指定分区，不加入消费组、不提交offset，不影响正在运行的训练任务
+- partition: 读取的分区，默认`0`
+- offset: 起始offset，>=0为绝对offset，负数表示从最新消息倒数，默认`-1`即最后一条消息
+- num_messages: 打印的消息条数，默认`1`
+- num_rows: 每条消息打印的行数，默认`5`
+- columns: 只打印指定列，逗号分隔，默认打印所有列
+- input_fields_str: schema-less格式消息的schema，格式同`data_config.input_fields_str`
+- pipeline_config_path: 可选，设置后会以`data_config.input_fields`作为schema-less消息的schema，并打印模型需要但消息中缺失的列
+
+输出示例:
+
+```
+=== partition=0 offset=0 timestamp=1711929600000 (2024-04-01T00:00:00+00:00) size=568B format=ipc_stream batches=1 rows=3
+schema:
+user_id: int64
+tags: list<item: string>
+  child 0, item: string
+columns required by the model but missing: ['item_id', 'label']
+rows (first 2 of 3):
+{"user_id": 0, "tags": ["a", "b"]}
+{"user_id": 1, "tags": ["a", "b"]}
+```
+
+- format为`ipc_stream`表示带schema的格式，`schema_less`表示schema-less格式
+- 当单条消息包含多个record batch，或消息带schema但设置了`input_fields`（`data_config`或`--input_fields_str`）时，会打印WARNING
+
+______________________________________________________________________
+
+**Q23: GenRec 报错 SID tokens are already in the base tokenizer**
+
+**报错信息：**
+
+```
+SID tokens are already in the base tokenizer
+```
+
+**原因：** `prompt_config.tokenizer_path` 指定的 tokenizer 中已包含与 `sid_space.token_format` 重名的 SID token。`tokenizer_path` 需使用骨干模型配套的基础 tokenizer 文件，出现此错误可能使用了 GenRec 导出的 tokenizer，也可能是 SID token 格式与骨干词表中的已有 token 冲突。
+
+**解决方法：**
+
+- 若使用了 GenRec 导出的 tokenizer，改为 `hf_model_name_or_path` 对应骨干模型的基础 tokenizer。
+- 若骨干模型的基础 tokenizer 中已有同名 token，调整 `sid_space.token_format`，保留 `{i}` 占位符，并避免与已有 token 重名。
+
+______________________________________________________________________
+
+**Q24: GenRec 预测 SID 每层取值合法，但召回为空或物品错位**
+
+**问题描述：** `generated_sids` 的编码没有越界，但无法关联到物品，或关联出的物品与预期不符。
+
+**原因：** 输入、输出使用的 SID 编码格式或物品映射版本不一致。不同版本的映射可能使用相同的码本大小，因此取值范围合法也可能关联错误。
+
+**解决方法：**
+
+1. 检查历史 SID 和目标标签是否直接使用最终物品映射表的 `offset_codebook`，无需再次添加层偏移或 LM 词表偏移。
+1. `generated_sids` 输出每层从 0 开始的原始编码，非偏移后编码，检查sid检索时是否误用了偏移后编码。
+1. 历史、标签、物品映射及配置中的码本应对应同一代 SID 结果。配置了 `sid_space.manifest_path` 时，使用该代 [SID 冲突后处理工具](usage/sid_collision.md) 产出的完整 manifest，并核对其中的 `codebook` 和 `bundle_uuid`。
+
+______________________________________________________________________
+
+**Q25: 导出模型时写 OSS 挂载目录报错 File too large**
+
+**报错信息：**
+
+```
+  File "/opt/conda/lib/python3.11/site-packages/tzrec/utils/npz_util.py", line 115, in write
+    n = self._fp.write(data)
+        ^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 27] File too large
+```
+
+**原因：** 通过 ossfs 挂载的 OSS 目录采用分片上传写文件，单文件最大为分片大小 × 分片数上限（10000）。默认配置下单文件最大约 80GB，当导出的单个文件（如大规模 embedding 参数文件）超过该上限时会报此错误。
+
+**解决方法：** 在 DLC 数据集挂载的高级配置中调大 ossfs 上传分片大小，例如：
+
+```json
+{
+  "fs.ossfs.args": "-oupload_buffer_size=128M"
+}
+```
+
+分片大小设置为 128MB 后，单文件最大可支持 128MB × 10000 ≈ 1.2TB，可根据导出文件大小调整该值。

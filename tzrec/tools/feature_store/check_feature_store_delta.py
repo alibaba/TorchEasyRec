@@ -47,7 +47,7 @@ import pyarrow.parquet as pq
 
 from tzrec.utils import config_util
 from tzrec.utils.checkpoint_util import remap_input_tile_user_key
-from tzrec.utils.feature_store_delta_uploader import (
+from tzrec.utils.feature_store_uploader import (
     FEATURE_STORE_PK_FIELD,
     FEATURE_STORE_SK_FIELD,
     FEATURE_STORE_VALUE_FIELD,

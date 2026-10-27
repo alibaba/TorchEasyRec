@@ -25,6 +25,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from parameterized import parameterized
 from torch import nn
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharding_spec import EnumerableShardingSpec
@@ -108,12 +109,17 @@ from tzrec.utils.dynamicemb_util import (
     has_dynamicemb,
     set_auto_retain_evicted_keys,
 )
-from tzrec.utils.feature_store_delta_uploader import (
+from tzrec.utils.feature_store_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
 )
 from tzrec.utils.quant_util import dequantize_quint8_rowwise_f16
-from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
+from tzrec.utils.test_util import (
+    gpu_unavailable,
+    make_test_dir,
+    mark_ci_scope,
+    parameterized_name_func,
+)
 from tzrec.utils.zch_util import register_post_zch_event_tracker_fn
 
 _SHARDED_TABLE_NAME = "table_1"
@@ -1351,6 +1357,61 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             [step for step, level in expected if level != DumpDecision.NONE],
         )
         self.assertEqual(dumper._tracker.step.call_count, len(expected))
+
+    @parameterized.expand(
+        [
+            (1, 60.0, DumpDecision.PAIRED),
+            (1, 120.0, DumpDecision.SPARSE_ONLY),
+            (2, 60.0, DumpDecision.PAIRED),
+            (2, 120.0, DumpDecision.SPARSE_ONLY),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_timed_dump_defers_expired_deadline_at_step_zero(
+        self, world_size, paired_deadline, expected_decision
+    ):
+        dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._paired_interval_steps = None
+        dumper._sparse_interval_steps = None
+        dumper._paired_interval_secs = 60.0
+        dumper._sparse_interval_secs = 30.0
+        dumper._next_paired_time = paired_deadline
+        dumper._next_sparse_time = 30.0
+        dumper._last_dump_step = None
+        dumper._rank = 0
+        dumper._world_size = world_size
+        dumper._decision_group = object() if world_size > 1 else None
+        dumper._feature_store_enabled = False
+        dumper._uploader = None
+        dumper._tracker = mock.MagicMock()
+        with (
+            mock.patch.object(dumper, "dump") as dump_mock,
+            mock.patch("torch.distributed.broadcast") as broadcast_mock,
+            mock.patch(
+                "tzrec.utils.delta_embedding_dump.time.monotonic", return_value=100.0
+            ),
+        ):
+            self.assertEqual(dumper.maybe_dump(0), DumpDecision.NONE)
+            dump_mock.assert_not_called()
+            dumper._tracker.step.assert_called_once_with()
+            self.assertIsNone(dumper._last_dump_step)
+            self.assertEqual(dumper._next_paired_time, paired_deadline)
+            self.assertEqual(dumper._next_sparse_time, 30.0)
+
+            self.assertEqual(dumper.maybe_dump(1), expected_decision)
+            dump_mock.assert_called_once_with(1)
+
+        self.assertEqual(dumper._tracker.step.call_count, 2)
+        self.assertEqual(dumper._last_dump_step, 1)
+        self.assertEqual(dumper._next_paired_time, 120.0)
+        self.assertEqual(dumper._next_sparse_time, 120.0)
+        if world_size > 1:
+            self.assertEqual(
+                [int(call.args[0].item()) for call in broadcast_mock.call_args_list],
+                [DumpDecision.NONE, expected_decision],
+            )
+        else:
+            broadcast_mock.assert_not_called()
 
     def test_maybe_dump_uses_elapsed_time_with_fixed_rate_schedule(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
