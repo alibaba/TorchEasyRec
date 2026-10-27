@@ -407,6 +407,7 @@ def validate_model(model: nn.Module) -> Dict[str, Any]:
             set(storage.namespace_ids)
         ) != len(rocksdb_tables):
             raise RuntimeError(f"incomplete RocksDB namespace map for {m.table_names}")
+        storage.bind_cache(m.cache)
         cache_rows = m.cache._state.capacity if m.cache is not None else 0
         groups.append(
             {
