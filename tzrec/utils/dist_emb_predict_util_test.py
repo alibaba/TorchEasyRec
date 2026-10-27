@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -286,51 +287,103 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             self.assertEqual(out["seq__lengths"].tolist(), [2, 0, 1])
             self.assertEqual(out["label"].device, device)
 
-    def test_fold_collision_serves_table_unfused(self) -> None:
-        # a group of two tables folds keys to 61 bits; these two keys of one
-        # table fold to the same value.
-        key = (1 << 61) + 12345
-        dup = _Table(
-            "model.ebc.dup",
-            3,
-            8,
-            True,
-            dynamic=True,
-            keys=[key, key ^ (1 << 61) ^ 1, 7],
-        )
-        other = _Table("model.ebc.other", 20, 8, True, dynamic=True)
+    @parameterized.expand(
+        [
+            # 4 members fold to 60 bits; a retry of 2 folds to 61 bits. Groups
+            # are (members, member ids, payload bits); None serves raw keys.
+            param(
+                "first_round",
+                n=4,
+                collide={},
+                groups=[((0, 1, 2, 3), (0, 1, 2, 3), 60)],
+            ),
+            param(
+                "retry_success",
+                n=4,
+                collide={1: (60,), 2: (60,)},
+                groups=[((0, 3), (0, 3), 60), ((1, 2), (0, 1), 61)],
+            ),
+            param(
+                "second_round_failure",
+                n=4,
+                collide={1: (60, 61), 2: (60, 61)},
+                groups=[((0, 3), (0, 3), 60), ((1,), (0,), None), ((2,), (0,), None)],
+            ),
+            param(
+                "mixed",
+                n=4,
+                collide={1: (60,), 2: (60, 61)},
+                groups=[((0, 3), (0, 3), 60), ((1,), (0,), 61), ((2,), (0,), None)],
+            ),
+            param(
+                "singleton",
+                n=4,
+                collide={1: (60,)},
+                groups=[((0, 2, 3), (0, 2, 3), 60), ((1,), (0,), None)],
+            ),
+            # 3 members fold to 61 bits, and so would a retry of 2: skipped.
+            param(
+                "unchanged_width",
+                n=3,
+                collide={0: (61,), 1: (61,)},
+                groups=[((2,), (2,), 61), ((0,), (0,), None), ((1,), (0,), None)],
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_fold_collision_retry(self, _name, n, collide, groups):
+        # k and k ^ (1 << w) ^ 1, with bit w of k set, fold to the same value at
+        # w payload bits but not at w + 1.
+        tables = []
+        for t in range(n):
+            keys = []
+            for j, w in enumerate(collide.get(t, ())):
+                k = (1 << w) + 1000 * (j + 1)
+                keys += [k, k ^ (1 << w) ^ 1]
+            keys += [7 + 100 * t + i for i in range(4 - len(keys))]
+            tables.append(
+                _Table(f"model.ebc.t{t}", 4, 8, False, dynamic=True, keys=keys)
+            )
         features = {
-            "a__ebc": {
-                "embedding_name": dup.name,
+            f"f{t}__ebc": {
+                "embedding_name": table.name,
                 "pooling": "SUM",
                 "use_weight": False,
-            },
-            "b__ebc": {
-                "embedding_name": other.name,
-                "pooling": "SUM",
-                "use_weight": False,
-            },
+            }
+            for t, table in enumerate(tables)
         }
         _write_export(
             self.export_dir,
-            [dup, other],
+            tables,
             features,
-            {"sequence__ec": [], "deep": ["a__ebc", "b__ebc"]},
+            {"sequence__ec": [], "deep": list(features)},
         )
-        bags = {
-            "a": ([dup.keys[0]], [dup.keys[1]], [dup.keys[2], other.keys[0]]),
-            "b": ([other.keys[0]], [dup.keys[0]], [other.keys[1]]),
-        }
         device = torch.device("cuda:0")
-        lookup = DistributedEmbeddingLookup(self.export_dir, [device])
-        self.assertEqual(len(lookup._layers[device]), 2)
+        with mock.patch.object(
+            DistributedEmbeddingLookup,
+            "_has_fold_collision",
+            wraps=DistributedEmbeddingLookup._has_fold_collision,
+        ) as spy:
+            lookup = DistributedEmbeddingLookup(self.export_dir, [device])
+        checks = [c.args[0]["key_name"] for c in spy.call_args_list]
+        widths = 63 - n.bit_length(), 63 - len(collide).bit_length()
+        retried = len(collide) > 1 and widths[1] > widths[0]
+        for t, table in enumerate(tables):
+            expected_checks = 1 + (retried and t in collide)
+            self.assertEqual(checks.count(table.meta["key_name"]), expected_checks)
+
+        def layout(group):
+            members = tuple(int(m.rsplit("t", 1)[1]) for m in group.members)
+            return members, tuple(group.member_ids), group.payload_bits
+
+        self.assertCountEqual([layout(g) for g in lookup._groups], groups)
+        # every key resolves to its own row.
+        bags = {f"f{t}": tuple([k] for k in tb.keys) for t, tb in enumerate(tables)}
         out = lookup(self._batch(bags, {}), device)
         expected = np.concatenate(
-            [_pooled(dup, bags["a"], False), _pooled(other, bags["b"], False)], axis=1
+            [_pooled(tb, bags[f"f{t}"], False) for t, tb in enumerate(tables)], axis=1
         )
-        np.testing.assert_allclose(
-            out["deep"].cpu().numpy(), expected, rtol=2e-3, atol=2e-3
-        )
+        np.testing.assert_array_equal(out["deep"].cpu().numpy(), expected)
 
     @parameterized.expand(
         [

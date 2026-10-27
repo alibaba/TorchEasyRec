@@ -38,6 +38,7 @@ import contextlib
 import glob
 import json
 import os
+import time
 import zipfile
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -190,39 +191,37 @@ class DistributedEmbeddingLookup:
                 candidates.setdefault(key, []).append(emb_name)
 
             groups: List[_Group] = []
-            for (is_dynamic, dtype, dim, _), names in candidates.items():
+            for (_, dtype, dim, _), names in candidates.items():
                 for start in range(0, len(names), _MAX_GROUP_MEMBERS):
                     members = names[start : start + _MAX_GROUP_MEMBERS]
+                    default_row = default_rows[members[0]]
                     payload_bits = 63 - len(members).bit_length()
-                    fused, fused_ids = [], []
-                    for member_idx, name in enumerate(members):
-                        if is_dynamic and self._has_fold_collision(
-                            emb_meta[name],
-                            entries.get(emb_meta[name]["key_name"], []),
-                            payload_bits,
-                        ):
-                            logger.info(
-                                f"keys of dynamic embedding {name} collide after "
-                                f"folding to {payload_bits} bits, serve it unfused."
-                            )
-                            groups.append(
-                                _Group(
-                                    dtype, dim, default_rows[name], [name], [0], None
-                                )
-                            )
-                        else:
-                            fused.append(name)
-                            fused_ids.append(member_idx)
-                    if fused:
+                    failed = self._fuse_members(
+                        groups, members, payload_bits, emb_meta, entries, default_row
+                    )
+                    # a fold collision depends only on the payload width, so retry
+                    # once, together, only when fewer members leave a wider payload.
+                    retry_bits = 63 - len(failed).bit_length()
+                    if len(failed) > 1 and retry_bits > payload_bits:
+                        begin, retried = time.time(), len(failed)
+                        failed = self._fuse_members(
+                            groups, failed, retry_bits, emb_meta, entries, default_row
+                        )
+                        logger.info(
+                            f"retried fusing {retried} dynamic embeddings at "
+                            f"{retry_bits} bits: {retried - len(failed)} fused, "
+                            f"{len(failed)} unfused, in {time.time() - begin:.1f}s."
+                        )
+                    elif len(failed) > 1:
+                        logger.info(
+                            f"skip retrying {len(failed)} dynamic embeddings: "
+                            f"{retry_bits} payload bits are no wider than "
+                            f"{payload_bits}."
+                        )
+                    for name in failed:
+                        logger.info(f"serve dynamic embedding {name} unfused.")
                         groups.append(
-                            _Group(
-                                dtype,
-                                dim,
-                                default_rows[members[0]],
-                                fused,
-                                fused_ids,
-                                payload_bits,
-                            )
+                            _Group(dtype, dim, default_rows[name], [name], [0], None)
                         )
 
             ratio = _gpu_cache_ratio()
@@ -311,6 +310,52 @@ class DistributedEmbeddingLookup:
                 )
                 for bucket, feats in self._buckets.items()
             }
+
+    @classmethod
+    def _fuse_members(
+        cls,
+        groups: List[_Group],
+        members: List[str],
+        payload_bits: int,
+        emb_meta: Dict[str, Dict],
+        entries: Dict[str, List[zipfile.ZipFile]],
+        default_row: Optional[np.ndarray],
+    ) -> List[str]:
+        """Fuse ``members`` into one group at ``payload_bits`` and append it.
+
+        Members are numbered by their position in ``members``; those whose keys
+        collide after folding are left out, keeping the others' numbers.
+
+        Returns:
+            The members left out, in order.
+        """
+        meta0 = emb_meta[members[0]]
+        fused, fused_ids, failed = [], [], []
+        for member_idx, name in enumerate(members):
+            meta = emb_meta[name]
+            if meta["is_dynamic"] and cls._has_fold_collision(
+                meta, entries.get(meta["key_name"], []), payload_bits
+            ):
+                logger.info(
+                    f"keys of dynamic embedding {name} collide after folding to "
+                    f"{payload_bits} bits."
+                )
+                failed.append(name)
+            else:
+                fused.append(name)
+                fused_ids.append(member_idx)
+        if fused:
+            groups.append(
+                _Group(
+                    meta0["dtype"],
+                    meta0["dimension"],
+                    default_row,
+                    fused,
+                    fused_ids,
+                    payload_bits,
+                )
+            )
+        return failed
 
     @staticmethod
     def _has_fold_collision(
