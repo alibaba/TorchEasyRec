@@ -470,15 +470,24 @@ def step_boundary(step: int) -> Optional[str]:
     """
     if not _groups:
         return None
+    evict()
+    if _monitor is None:
+        return None
+    return _monitor.check(step, _save_need())
+
+
+def evict() -> int:
+    """Logically evict every RocksDB table above its capacity; returns the rows.
+
+    Call only with no lookup in flight (a completed update, or the end of a pass).
+    """
     t0 = time.perf_counter()
     evicted = 0
     for m in _groups:
         evicted += sum(m.tables.evict_to_capacity(m.cache).values())
     if evicted and _session is not None:
         _session.metrics.record("evict", time.perf_counter() - t0, rows=evicted)
-    if _monitor is None:
-        return None
-    return _monitor.check(step, _save_need())
+    return evicted
 
 
 def save_stats(seconds: float) -> None:
@@ -487,6 +496,7 @@ def save_stats(seconds: float) -> None:
         return
     stats = _session.stats()
     m = stats["metrics"]
+    props = stats["properties"]
     logger.info(
         f"RANK[{_rank()}] RocksDB checkpoint: {seconds:.2f}s total, cache flush "
         f"{m.get('checkpoint_insert_seconds', 0.0):.2f}s "
@@ -495,7 +505,11 @@ def save_stats(seconds: float) -> None:
         f"{m.get('dump_bytes', 0.0) / (1 << 30):.2f}GiB written); cumulative "
         f"train writeback {int(m.get('train_insert_rows', 0))} rows, publish "
         f"writeback {int(m.get('publish_insert_rows', 0))} rows, evicted "
-        f"{int(m.get('evict_rows', 0))} rows, index {stats['index']}"
+        f"{int(m.get('evict_rows', 0))} rows, index {stats['index']}; after "
+        f"release: live SST {props['rocksdb.live-sst-files-size']}, all SST "
+        f"{props['rocksdb.total-sst-files-size']}, obsolete SST "
+        f"{props['rocksdb.obsolete-sst-files-size']}, snapshots "
+        f"{props['rocksdb.num-snapshots']}"
     )
     prune_native_checkpoints()
 

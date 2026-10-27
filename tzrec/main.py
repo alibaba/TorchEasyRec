@@ -666,6 +666,9 @@ def _train_and_evaluate(
                     if delta_embedding_dumper is not None:
                         dump_decision = delta_embedding_dumper.maybe_dump(i_step)
                 except StopIteration:
+                    # The call that ran out of data may still have trained the
+                    # last queued batch; nothing is in flight now.
+                    rocksdb_util.evict()
                     # pass completed: later saves should record positions
                     # within the next pass, on top of the completed-pass count.
                     epochs_completed += 1

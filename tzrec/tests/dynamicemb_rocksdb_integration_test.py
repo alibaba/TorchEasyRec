@@ -40,6 +40,16 @@ def _logical_rows(ckpt, collection="*"):
     return rows
 
 
+# Mock ids of a dynamicemb feature are drawn below its max_capacity; training
+# id_3 with a smaller capacity than the data was generated for forces eviction.
+# The larger GPU cache keeps one batch's id_3 ids within its cache share, so
+# none sit in the cache's overflow region (which cannot be evicted).
+_SMALL_ID3_CAPACITY = {
+    "feature_configs[2].id_feature.dynamicemb.max_capacity": 2000,
+    "train_config.rocksdb_config.gpu_cache_value_bytes_per_rank": 157286400,
+}
+
+
 def _logs(log_dir):
     text = ""
     for path in glob.glob(os.path.join(log_dir, "**", "*.log"), recursive=True):
@@ -126,7 +136,9 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         self.success = True
 
     def test_resume_only_from_checkpoint_files(self):
-        edit = '{"train_config.save_checkpoints_steps":10}'
+        edit = json.dumps(
+            {"train_config.save_checkpoints_steps": 10, **_SMALL_ID3_CAPACITY}
+        )
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_dynamicemb_rocksdb_mock.config",
             self.test_dir,
@@ -137,11 +149,11 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         model_dir = os.path.join(self.test_dir, "train")
         ckpt, step = checkpoint_util.latest_checkpoint(model_dir, require_success=True)
         assert ckpt is not None
-        # STEP tables are evicted to their capacity (8000 over 2 shards); the
-        # sequence copy sees more distinct ids and fills it.
-        rows = _logical_rows(ckpt, "ec_dict.8")
-        self.assertEqual(rows["click_50_seq__id_3_emb"], 8000)
-        self.assertLessEqual(rows["id_3_emb"], 8000)
+        # The STEP table id_3 is evicted to its capacity (2000 over 2 shards).
+        rows = _logical_rows(ckpt, ".ebc")
+        self.assertLessEqual(rows["id_3_emb"], 2000)
+        log = _logs(os.path.join(self.test_dir, "log_train_eval"))
+        self.assertRegex(log, r"evicted [1-9]\d* rows")
         # A save that died before _SUCCESS, and no local RocksDB state at all.
         crashed = os.path.join(model_dir, f"model.ckpt-{step + 5}")
         shutil.copytree(ckpt, crashed)
@@ -165,6 +177,41 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
             model_dir, require_success=True
         )
         self.assertGreater(final_step, step)
+        self.success = True
+
+    def test_delta_publication_tombstones(self):
+        dump = "train_config.delta_embedding_dump_config"
+        edit = json.dumps(
+            {
+                f"{dump}.paired_dump_interval_steps": 3,
+                f"{dump}.dump_evicted_tombstones": True,
+                **_SMALL_ID3_CAPACITY,
+            }
+        )
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_dynamicemb_rocksdb_mock.config",
+            self.test_dir,
+            args_str=f"--edit_config_json '{edit}'",
+        )
+        self.assertTrue(self.success)
+        self.success = False
+        import pyarrow.parquet as pq
+
+        files = glob.glob(
+            os.path.join(
+                self.test_dir, "train", "delta_embedding_dump", "**", "*.parquet"
+            ),
+            recursive=True,
+        )
+        self.assertTrue(files)
+        table = pq.read_table(files).to_pandas()
+        tomb = table[table["source"] == "dynamicemb_evicted"]
+        # The STEP table id_3 at capacity 2000 logically evicts; deletions publish.
+        self.assertTrue(tomb["table_fqn"].str.contains("ebc.embedding_bags.id_3").any())
+        self.assertTrue(all(not any(e) for e in tomb["embedding"]))
+        # The LFU table never reaches its capacity: GPU-cache replacement only
+        # writes rows back and publishes no deletion.
+        self.assertFalse(tomb["table_fqn"].str.contains("id_2").any())
         self.success = True
 
     def test_relocate_tables_between_backends(self):

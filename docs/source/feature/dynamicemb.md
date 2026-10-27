@@ -161,7 +161,7 @@ feature_configs {
 
 - 支持 `STEP`、`TIMESTAMP`、`LFU` 和 `NO_EVICTION`。分数由 GPU cache 按 dynamicemb 的规则产生（STEP/TIMESTAMP 在访问时更新，LFU 累加访问次数，包括同一 batch 内的重复 Id 和 cache 命中），cache 淘汰时随行写回 RocksDB；从 RocksDB 读回的 LFU 行会带上本 batch 的频次，不会重复或漏计
 - STEP/TIMESTAMP/LFU 表在每个训练步结束时按 `max_capacity`（每个分片的容量）做逻辑淘汰：删除分数最低的、不在 GPU cache 中的行（含 embedding 和优化器状态），分数相同时按 Id 排序。这是每个分片内的全局最低分，与内存版 dynamicemb 在哈希桶内淘汰最低分的结果不完全相同。每步之间可能短暂超出容量（最多一个 batch 的新 Id）
-- 在 GPU cache 中的行不会被淘汰，因此 cache 写回不会让已淘汰的 Id 复活；被淘汰的 Id 再次出现时按新 Id 重新准入、初始化，优化器状态重置
+- 优先淘汰不在 GPU cache 中的行；只有这类行已全部淘汰仍超出容量时（同一融合组的表共享 GPU cache，某张表在 cache 中的行数可能超过它自己的容量），才淘汰 cache 中分数最低的行，并同时从 cache 中删除，因此 cache 写回不会让已淘汰的 Id 复活。如果一个 batch 中某张表的去重 Id 数超过它在 GPU cache 中的份额，超出部分存放在 dynamicemb cache 的 overflow 区域，无法淘汰，此时该表会高于 max_capacity 并打印告警，请调大 max_capacity 或 GPU cache 预算。被淘汰的 Id 再次出现时按新 Id 重新准入、初始化，优化器状态重置
 - 开启增量导出的 tombstone 时，逻辑淘汰的 Id 会像内存版一样发布 tombstone；GPU cache 的替换只是写回，不产生 tombstone。进程重启时尚未发布的淘汰 Id 不会保存（与内存版一致）
 - `NO_EVICTION` 表不淘汰，与内存版一样随新 Id 持续增长。`max_capacity` 只作为磁盘规划的声明上限，并不强制；请依赖下文的运行时磁盘监控
 - GPU cache 至少要能放下一个 batch 在每个融合组上的去重 Id 数，否则 dynamicemb 会报 `Outstanding prefetched keys ... exceed cache capacity`，需要调大 `gpu_cache_value_bytes_per_rank` 或减小 batch_size
