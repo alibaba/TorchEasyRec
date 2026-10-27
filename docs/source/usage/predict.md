@@ -35,7 +35,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 ### 预测分布式 embedding 导出模型
 
-`USE_DISTRIBUTED_EMBEDDING=1` 导出的模型同样用上文的 `--scripted_model_path` 命令预测，会根据 `model_acc.json` 自动识别。sparse embedding 从导出目录的 `sparse/` 加载，与在线服务一样使用 NVIDIA NV-Embeddings（NVE）查表：全量 embedding 保存在 host 内存中，每张 GPU 缓存其中一部分（见下文 `DIST_EMB_GPU_CACHE_RATIO`）。
+`USE_DISTRIBUTED_EMBEDDING=1` 导出的模型同样用上文的 `--scripted_model_path` 命令预测，会根据 `model_acc.json` 自动识别。
 
 - 建议每台机器只启动一个预测进程（`--nproc-per-node=1`），该进程使用本机全部 GPU，共享同一份 host 内存中的 embedding；每张 GPU 一个进程也能运行，但 host 内存占用随进程数成倍增加
 
