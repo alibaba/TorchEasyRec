@@ -193,6 +193,7 @@ feature_configs {
 - `set rocksdb_config.gpu_cache_value_bytes_per_rank > 0`: RocksDB 表需要 GPU cache
 - `disk_budget_bytes is not set` / `projected peak exceeds the budget` / `growth needs ... more than are free`: 磁盘预算不足或可用空间不足，日志 `RocksDB live storage` 中有分项明细；可以调大预算、换更大的存储、降低 `max_capacity`，或在 AUTO 下增加内存预算
 - `no placement fits`: 显存、内存和磁盘都放不下，错误信息列出每张表的去向和缺口
+- 训练出现 NaN，且规划日志有 `GPU cache share of ... rows may be smaller than one step's lookups`：dynamicemb `13a8055` 的 GPU cache 在一个 batch 中某张融合表的去重 Id 数超过该表的 cache 份额时会返回无效的行（内存版 CACHING 布局同样存在），请调大 `gpu_cache_value_bytes_per_rank`
 - `set rocksdb_config.storage_domain`: local_path 所在文件系统无法判断与谁共享容量
 - `stopped at step ...: RocksDB disk headroom fell below`: 运行时磁盘余量低于停止线
 - 训练变慢：日志中的 `RocksDB disk` 和保存日志给出 SST 大小、compaction 积压等指标，判断是读延迟、写入限流还是 compaction 积压

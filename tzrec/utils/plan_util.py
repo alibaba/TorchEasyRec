@@ -1236,6 +1236,16 @@ class RocksDBPlacement:
                 cache = _rocksdb_cache_hbm_bytes(
                     t.option.shards[0].size, t.option.tensor, ratio
                 )
+                rows = rocksdb_util.cache_rows(t.disk.rows, ratio)
+                if rows < min(t.disk.rows, t.lookups):
+                    # dynamicemb 13a8055 returns non-finite rows when one batch
+                    # brings a fused table more ids than its cache share.
+                    logger.warning(
+                        f"{t.fqn}: GPU cache share of {rows} rows may be smaller "
+                        f"than one step's lookups ({t.lookups:.0f}); if a batch "
+                        "touches more ids than that, dynamicemb's cache returns "
+                        "invalid rows. Raise gpu_cache_value_bytes_per_rank."
+                    )
                 est = (
                     f"rocksdb: cache HBM {cache}, disk logical {t.disk.logical_bytes} "
                     f"({t.disk.bound})"
