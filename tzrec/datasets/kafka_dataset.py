@@ -57,9 +57,11 @@ _DISPATCH_QUEUE_BATCHES_PER_WORKER = 2
 # coordinator loop wakeups per second while idle
 _LOOP_TICK_SECS = 0.1
 _WATCHDOG_TICK_SECS = 5.0
-# total budget for reaping reader processes on shutdown; the client's stop
-# timeout must comfortably exceed this
-_READER_STOP_BUDGET_SECS = 8.0
+# shutdown budget for reaping reader processes: a graceful phase then a
+# forced phase, each shared by all readers; the handle's stop timeout must
+# comfortably exceed the sum
+_READER_GRACEFUL_STOP_SECS = 6.0
+_READER_FORCED_STOP_SECS = 2.0
 _STATS_LOG_INTERVAL_SECS = 60.0
 
 _EARLIEST_RESETS = ("earliest", "smallest", "beginning")
@@ -566,10 +568,12 @@ def resolve_start_offsets(
     seeks to these offsets, so a mid-run rebalance replays data read since
     startup instead of re-interpreting latest.
 
-    Resolution order per partition: last completed checkpoint offset + 1,
-    then start.timestamp.ms, then auto.offset.reset (default latest). All
-    rules are resolved to concrete offsets once, here, with one temporary
-    consumer that is closed before returning.
+    Resolution order per partition: last completed checkpoint offset + 1
+    (no watermark checks, matching the BATCH path; librdkafka applies
+    auto.offset.reset if the offset is out of range), then
+    start.timestamp.ms, then auto.offset.reset (default latest). Timestamp
+    and reset starts are resolved to concrete offsets once, here, with one
+    temporary consumer that is closed before returning.
 
     Args:
         input_path: kafka URI.
@@ -582,8 +586,8 @@ def resolve_start_offsets(
         {partition: start offset}.
 
     Raises:
-        ValueError: when a start offset is no longer readable because of
-            the topic's retention policy.
+        ValueError: when a timestamp-resolved start offset is no longer
+            readable because of the topic's retention policy.
     """
     topic, params, start_timestamp_ms = _parse_kafka_uri(input_path)
     factory = consumer_factory or _default_consumer_factory
@@ -600,24 +604,17 @@ def resolve_start_offsets(
             source_key = f"{topic}:{p}"
             tp = TopicPartition(topic, p)
             if checkpoint_state and source_key in checkpoint_state:
-                low, _ = consumer.get_watermark_offsets(tp, timeout=60.0)
-                start = int(checkpoint_state[source_key]) + 1
+                # same as the BATCH path: resume at offset + 1 and leave any
+                # out-of-range value to librdkafka's auto.offset.reset
+                starts[p] = int(checkpoint_state[source_key]) + 1
             elif start_timestamp_ms is not None:
                 # watermarks are queried after resolution, where an unresolved
                 # timestamp also falls back to auto.offset.reset
                 ts_tps.append(tp)
-                continue
             else:
                 low, high = consumer.get_watermark_offsets(tp, timeout=60.0)
                 reset = params.get("auto.offset.reset", "latest").lower()
-                start = _resolve_reset_offset(reset, low, high, source_key)
-            if start < low:
-                raise ValueError(
-                    f"start offset {start} for {source_key} is no longer "
-                    f"readable (retention low watermark {low}); "
-                    "resume from an older checkpoint is not possible"
-                )
-            starts[p] = start
+                starts[p] = _resolve_reset_offset(reset, low, high, source_key)
         if ts_tps:
             # same tunables as the batch-shuffle path
             resolved = _offsets_for_times_batched(consumer, ts_tps, start_timestamp_ms)
@@ -1438,22 +1435,26 @@ class _Coordinator:
             self._shared_dispatch_queue.cancel_join_thread()
 
     def _shutdown_readers(self) -> None:
-        """Reap all readers within one shared time budget.
+        """Reap all readers: one shared graceful deadline, then a forced one.
 
         Readers watch the shared stop event (clean stop) or their parent pid
         (coordinator death), so nothing needs signaling here.
         """
-        deadline = time.monotonic() + _READER_STOP_BUDGET_SECS
+        deadline = time.monotonic() + _READER_GRACEFUL_STOP_SECS
         for p in self._readers:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             p.join(timeout=remaining)
+        deadline = time.monotonic() + _READER_FORCED_STOP_SECS
         for p in self._readers:
             if p.is_alive():
                 p.terminate()
         for p in self._readers:
-            p.join(timeout=1.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            p.join(timeout=remaining)
 
 
 def _coordinator_entry(**kwargs: Any) -> None:
@@ -1488,7 +1489,7 @@ class SampleShuffleHandle:
         checkpoint_state: Optional[Dict[str, Any]],
         consumer_factory: Optional[Any] = None,
     ) -> None:
-        validate_sample_shuffle_config(data_config, input_path)
+        validate_sample_shuffle_config(data_config)
         if dist.is_initialized():
             # rank 0 resolves and broadcasts the outcome; a failure on rank 0
             # must fail every rank, not leave the others waiting at the next
@@ -1638,18 +1639,17 @@ class SampleShuffleHandle:
             self._atexit_cleanup = None
 
 
-def validate_sample_shuffle_config(
-    data_config: data_pb2.DataConfig, input_path: str
-) -> None:
+def validate_sample_shuffle_config(data_config: data_pb2.DataConfig) -> None:
     """Validate Kafka-specific config for the sample-level shuffle path.
+
+    ``enable.auto.commit`` is passed through to librdkafka unchanged, same
+    as the BATCH path; only the fields the shared pool relies on are checked.
 
     Args:
         data_config: dataloader config.
-        input_path: kafka URI.
 
     Raises:
-        ValueError: on invalid capacity, an unsupported batch_cost_size, or
-            an explicit enable.auto.commit=true.
+        ValueError: on invalid capacity or an unsupported batch_cost_size.
     """
     if data_config.batch_size <= 0 or data_config.shuffle_buffer_size <= 0:
         raise ValueError(
@@ -1661,11 +1661,4 @@ def validate_sample_shuffle_config(
         raise ValueError(
             "sample-level shuffle always groups by batch_size and does not "
             "support batch_cost_size"
-        )
-    _, params, _ = _parse_kafka_uri(input_path)
-    if params.get("enable.auto.commit", "false").lower() == "true":
-        raise ValueError(
-            "sample-level shuffle manages offsets itself and requires "
-            "enable.auto.commit=false (the default); remove the explicit "
-            "enable.auto.commit=true from the kafka URI"
         )

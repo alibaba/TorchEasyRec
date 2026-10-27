@@ -1441,16 +1441,18 @@ class ValidateSampleShuffleConfigTest(unittest.TestCase):
     def test_invalid_configs(self, _name, **overrides):
         cfg = _data_config(**overrides)
         with self.assertRaises(ValueError):
-            validate_sample_shuffle_config(cfg, _fake_uri())
+            validate_sample_shuffle_config(cfg)
 
-    def test_auto_commit_true_rejected(self):
-        with self.assertRaises(ValueError):
-            validate_sample_shuffle_config(
-                _data_config(),
-                "kafka://fake:9092/topic?group.id=g&enable.auto.commit=true",
-            )
-        # default (absent) is fine
-        validate_sample_shuffle_config(_data_config(), _fake_uri())
+    def test_auto_commit_passthrough(self):
+        # same as BATCH: the default is injected, explicit values pass
+        # through to librdkafka untouched, and sample mode does not reject them
+        _, params, _ = _parse_kafka_uri(_fake_uri())
+        self.assertEqual(params["enable.auto.commit"], "false")
+        _, params, _ = _parse_kafka_uri(
+            "kafka://fake:9092/topic?group.id=g&enable.auto.commit=true"
+        )
+        self.assertEqual(params["enable.auto.commit"], "true")
+        validate_sample_shuffle_config(_data_config())
 
     def test_enabled_only_for_train_shuffle_sample_mode(self):
         from tzrec.datasets.dataset import sample_shuffle_enabled
@@ -1535,10 +1537,21 @@ class ResolveStartOffsetsTest(unittest.TestCase):
         )
         self.assertEqual(starts, {0: 0, 1: 0})
 
-    def test_retention_error(self):
-        # checkpoint offset 41 fell below the retention low watermark 100
+    def test_checkpoint_out_of_range_returned_as_is(self):
+        # matches the BATCH path: checkpoint + 1 without watermark checks;
+        # librdkafka applies auto.offset.reset for out-of-range offsets
+        starts = self._resolve(
+            _fake_uri(low_watermark=100, total_msgs=1000),
+            {"topic:0": 41, "topic:1": 5000},
+        )
+        self.assertEqual(starts, {0: 42, 1: 5001})
+
+    def test_timestamp_retention_error(self):
+        # the timestamp branch keeps its own retention check
         with self.assertRaises(ValueError):
-            self._resolve(_fake_uri(low_watermark=100), {"topic:0": 41})
+            self._resolve(
+                _fake_uri(low_watermark=100) + "&start.timestamp.ms=123456", None
+            )
 
 
 class ReaderDispatchTest(unittest.TestCase):
@@ -1708,10 +1721,14 @@ class CoordinatorTest(unittest.TestCase):
         coord = self._coordinator()
         self._feed(coord, 64)
         coord._service_input(1.0)
-        coord._emit_and_dispatch()
+        emitted = coord._emit_and_dispatch()
         payload = coord._shared_dispatch_queue.get(timeout=1.0)
         rb = pa.ipc.read_record_batch(payload, coord._input_table_schema)
         self.assertEqual(rb.num_rows, 8)
+        for _ in range(emitted - 1):
+            coord._shared_dispatch_queue.get(timeout=1.0)
+        coord._shared_dispatch_queue.close()
+        coord._shared_dispatch_queue.join_thread()
 
     def test_pending_sent_once_when_capacity_frees(self):
         coord = self._coordinator(dispatch_maxsize=1)
@@ -1774,6 +1791,34 @@ class CoordinatorTest(unittest.TestCase):
         coord._stop_event.set()
         t.join(timeout=10.0)
         self.assertFalse(t.is_alive())
+
+    def test_shutdown_budget_does_not_scale_with_reader_count(self):
+        clock = [0.0]
+
+        class _SlowReader:
+            def __init__(self):
+                self.terminated = False
+                self.alive = True
+
+            def join(self, timeout=None):
+                # never exits by itself; consume whatever budget it is given
+                clock[0] += timeout or 0.0
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.terminated = True
+
+        for n in (1, 6):
+            clock[0] = 0.0
+            coord = self._coordinator()
+            coord._readers = [_SlowReader() for _ in range(n)]
+            with mock.patch.object(kafka_dataset.time, "monotonic", lambda: clock[0]):
+                coord._shutdown_readers()
+            # one shared 6s graceful + 2s forced budget, regardless of n
+            self.assertAlmostEqual(clock[0], 8.0, places=6)
+            self.assertTrue(all(r.terminated for r in coord._readers))
 
     def test_idle_does_not_spin(self):
         coord = self._coordinator()

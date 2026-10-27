@@ -1365,12 +1365,19 @@ def _train_with_fake_kafka() -> None:
         runpy.run_module("tzrec.train_eval", run_name="__main__")
 
 
+@unittest.skipIf(*gpu_unavailable)
+@mark_ci_scope("h20", "gpu")
 class KafkaSampleShuffleIntegrationTest(unittest.TestCase):
     """Full torchrun training over the sample-shuffle path with fake Kafka."""
 
     def setUp(self):
+        self.success = False
         self.test_dir = make_test_dir()
-        self.addCleanup(shutil.rmtree, self.test_dir, True)
+
+    def tearDown(self):
+        # keep the directory on failure so log_train_eval.txt survives
+        if self.success:
+            shutil.rmtree(self.test_dir, True)
 
     def _write_config(self, num_steps):
         config_path = os.path.join(self.test_dir, f"pipeline_{num_steps}.config")
@@ -1445,6 +1452,7 @@ class KafkaSampleShuffleIntegrationTest(unittest.TestCase):
         state29 = self._read_state(ckpt29)
         for k in state19:
             self.assertGreaterEqual(state29[k], state19[k])
+        self.success = True
 
 
 if __name__ == "__main__":
