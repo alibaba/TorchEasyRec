@@ -48,6 +48,8 @@ from tzrec.utils.test_util import (
     GENREC_LONG_HIST_CODES,
     create_genrec_test_model,
     make_test_dir,
+    mark_ci_scope,
+    nv_gpu_unavailable,
     parameterized_name_func,
 )
 
@@ -288,6 +290,85 @@ class BaseGenRecModelTest(unittest.TestCase):
 
     def test_training_forward_survives_fx_tracing(self) -> None:
         torch.fx.symbolic_trace(TrainWrapper(self.model))
+
+    def test_multi_target_loss_gives_each_parent_equal_weight(self) -> None:
+        vocab_size = self.model.lm.config.vocab_size
+        logits = torch.zeros(3, 3, vocab_size, requires_grad=True)
+        predictions = {
+            "logits": logits,
+            "labels": torch.ones(3, 3, dtype=torch.int64),
+            "target_parents": torch.tensor([0, 0, 1]),
+            "target_counts": torch.tensor([2, 1]),
+        }
+        loss = self.model.loss(predictions, Batch())["ce_loss"]
+        torch.testing.assert_close(loss, torch.tensor(float(vocab_size)).log())
+        loss.backward()
+        torch.testing.assert_close(logits.grad[0], logits.grad[1])
+        torch.testing.assert_close(2 * logits.grad[0], logits.grad[2])
+
+    def test_multi_target_loss_excludes_empty_parents(self) -> None:
+        vocab_size = self.model.lm.config.vocab_size
+        logits = torch.zeros(2, 3, vocab_size)
+        predictions = {
+            "logits": logits,
+            "labels": torch.ones(2, 3, dtype=torch.int64),
+            "target_parents": torch.tensor([1, 1]),
+            "target_counts": torch.tensor([0, 2]),
+        }
+        loss = self.model.loss(predictions, Batch())["ce_loss"]
+        torch.testing.assert_close(loss, torch.tensor(float(vocab_size)).log())
+
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @mark_ci_scope("h20", "gpu")
+    def test_shared_prefix_projection_gradients_match_expansion(self) -> None:
+        model, _ = self._projected_model()
+        config = model.lm.config
+        config.num_attention_heads = 2
+        config.num_key_value_heads = 1
+        config.head_dim = 16
+        model.lm = AutoModelForCausalLM.from_config(config, attn_implementation="sdpa")
+        model = model.cuda().eval()
+        compiled = model._prompt
+
+        def make_batch(targets):
+            rows = len(targets)
+            return _batch(
+                compiled,
+                {
+                    "hist.values": torch.tensor(GENREC_HIST_CODES * rows).reshape(
+                        -1, 1
+                    ),
+                    "hist.lengths": torch.tensor([len(GENREC_HIST_CODES)] * rows),
+                    "answer.values": torch.tensor([v for row in targets for v in row]),
+                    "answer.lengths": torch.tensor([len(row) for row in targets]),
+                    "prof.values": torch.tensor([5, 9] * rows),
+                    "prof.lengths": torch.tensor([2] * rows),
+                },
+                sparse=KeyedJaggedTensor.from_lengths_sync(
+                    keys=["prof"],
+                    values=torch.tensor([5, 9] * rows),
+                    lengths=torch.tensor([2] * rows),
+                ),
+            ).to(torch.device("cuda"))
+
+        other_target = [2, 7, 8]
+        expanded = make_batch([GENREC_ANSWER_CODES, other_target])
+        model.loss(model.predict(expanded), expanded)["ce_loss"].backward()
+        gradients = {
+            name: parameter.grad.clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        model.zero_grad(set_to_none=True)
+        shared = make_batch([GENREC_ANSWER_CODES + other_target])
+        model.loss(model.predict(shared), shared)["ce_loss"].backward()
+        self.assertTrue(any("projections" in name for name in gradients))
+        self.assertTrue(any("embedding_group" in name for name in gradients))
+        for name, parameter in model.named_parameters():
+            if name in gradients:
+                torch.testing.assert_close(
+                    parameter.grad, gradients[name], atol=3e-5, rtol=3e-4, msg=name
+                )
 
 
 class GenRecFrontEndTest(unittest.TestCase):

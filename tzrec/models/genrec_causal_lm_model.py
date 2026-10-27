@@ -34,7 +34,7 @@ from tzrec.prompt.assembler import (
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
 )
-from tzrec.prompt.types import CompiledPrompt
+from tzrec.prompt.types import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 
@@ -124,8 +124,144 @@ class GenRecCausalLMModel(BaseGenRecModel):
         embeds = self.build_input(batch)
         if self.is_inference:
             return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
-        logits, labels = _fx_wrapped_forward(self, embeds, batch)
+        logits, labels, parents, counts = _fx_wrapped_forward(self, embeds, batch)
+        return {
+            "logits": logits,
+            "labels": labels,
+            "target_parents": parents,
+            "target_counts": counts,
+        }
+
+    def _training_predictions(
+        self, embeds: torch.Tensor, batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Select shared-prefix scoring for a response containing multiple SIDs.
+
+        Args:
+            embeds: assembled prompt and response embeddings.
+            batch: packed row boundaries and response lengths.
+
+        Returns:
+            Logits and labels, plus parent indices for a multi-target response.
+        """
+        response = self._prompt.prompt_plan.response_segments
+        levels = self._prompt.sid_space.num_levels
+        if len(response) == 1 and isinstance(response[0], SlotSeg):
+            lengths = batch.additional_infos[RESPONSE_LENGTHS].to(torch.int64)
+            if bool((lengths.remainder(levels) != 0).any()):
+                raise ValueError(
+                    "SID response length must be a multiple of codebook levels."
+                )
+            if bool((lengths > levels).any()):
+                return self._multi_target_predictions(embeds, batch)
+            logits, labels = self._forward(embeds, batch)
+            return {
+                "logits": logits,
+                "labels": labels,
+                "target_parents": torch.arange(lengths.numel(), device=embeds.device),
+                "target_counts": lengths // levels,
+            }
+        logits, labels = self._forward(embeds, batch)
         return {"logits": logits, "labels": labels}
+
+    def _multi_target_predictions(
+        self, embeds: torch.Tensor, batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Score independent SID branches over one differentiable prompt prefix.
+
+        Args:
+            embeds: packed embeddings, retaining one prefix per parent sample.
+            batch: existing assembler row boundaries and response lengths.
+
+        Returns:
+            Per-target logits, labels, parent indices and target counts.
+        """
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        levels = self._prompt.sid_space.num_levels
+        infos = batch.additional_infos
+        response_lengths = infos[RESPONSE_LENGTHS].to(torch.int64)
+        if self.lm.is_gradient_checkpointing:
+            raise ValueError(
+                "Shared SID training requires gradient checkpointing to be disabled."
+            )
+
+        padded, _ = self._left_pad(embeds, batch)
+        rows, width = padded.shape[:2]
+        lengths = torch.diff(infos[CU_SEQLENS]).to(torch.int64)
+        starts = width - lengths
+        prefix_ends = width - response_lengths
+        positions = torch.arange(width, device=embeds.device)
+        relative = positions[None, :] - prefix_ends[:, None]
+        position_ids = torch.where(
+            relative < 0,
+            positions[None, :] - starts[:, None],
+            prefix_ends[:, None] - starts[:, None] + relative.remainder(levels),
+        ).clamp(min=0)
+
+        def mask_mod(b, h, q, kv):
+            """Allow causal prefix attention and same-branch response attention."""
+            prefix_end = prefix_ends[b]
+            q_relative = q - prefix_end
+            kv_relative = kv - prefix_end
+            prefix_key = (kv < prefix_end) & (kv <= q)
+            branch_key = (
+                (q >= prefix_end)
+                & (kv >= prefix_end)
+                & (q_relative // levels == kv_relative // levels)
+                & (kv <= q)
+            )
+            return (
+                (q >= starts[b])
+                & (q < width)
+                & (kv >= starts[b])
+                & (kv < width)
+                & (prefix_key | branch_key)
+            )
+
+        block_mask = create_block_mask(
+            mask_mod, rows, None, width, width, device=embeds.device, _compile=True
+        )
+        previous_attention = self.lm.config._attn_implementation
+        try:
+            self.lm.set_attn_implementation("flex_attention")
+            hidden = self.lm.base_model(
+                inputs_embeds=padded,
+                attention_mask={"full_attention": block_mask},
+                position_ids=position_ids,
+                use_cache=False,
+            ).last_hidden_state
+        finally:
+            self.lm.set_attn_implementation(previous_attention)
+
+        counts = response_lengths // levels
+        parents = torch.repeat_interleave(
+            torch.arange(rows, device=embeds.device), counts
+        )
+        parent_starts = counts.cumsum(0) - counts
+        target_indices = torch.arange(parents.numel(), device=embeds.device)
+        target_starts = (
+            prefix_ends[parents] + (target_indices - parent_starts[parents]) * levels
+        )
+        offsets = torch.arange(levels, device=embeds.device)
+        score_positions = target_starts[:, None] + offsets[None, :] - 1
+        score_positions[:, 0] = prefix_ends[parents] - 1
+        score_indices = parents[:, None] * width + score_positions
+        unique_scores, inverse = score_indices.reshape(-1).unique(return_inverse=True)
+        logits = self.lm.get_output_embeddings()(
+            hidden.reshape(-1, hidden.shape[-1])[unique_scores]
+        )[inverse].reshape(parents.numel(), levels, -1)
+
+        input_ids, _ = self._left_pad(infos[INPUT_IDS].unsqueeze(-1), batch)
+        labels = input_ids.squeeze(-1)[
+            parents[:, None], target_starts[:, None] + offsets[None, :]
+        ]
+        return {
+            "logits": logits,
+            "labels": labels,
+            "target_parents": parents,
+            "target_counts": counts,
+        }
 
     def _forward(
         self, embeds: torch.Tensor, batch: Batch
@@ -287,7 +423,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
 @torch.fx.wrap
 def _fx_wrapped_forward(
     model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Hide the packed forward from FX.
 
     ``TrainPipelineSparseDist`` symbolically traces the model whenever a
@@ -299,9 +435,16 @@ def _fx_wrapped_forward(
         batch: the batch being scored.
 
     Returns:
-        The response-window logits and labels.
+        Training predictions and optional multi-target parent metadata.
     """
-    return model._forward(embeds, batch)
+    predictions = model._training_predictions(embeds, batch)
+    labels = predictions["labels"]
+    return (
+        predictions["logits"],
+        labels,
+        predictions.get("target_parents", labels.new_empty(0)),
+        predictions.get("target_counts", labels.new_empty(0)),
+    )
 
 
 @torch.fx.wrap
