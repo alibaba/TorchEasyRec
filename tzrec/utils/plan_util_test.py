@@ -35,6 +35,34 @@ from tzrec.utils.plan_util import DynamicProgrammingProposer, _sparse_dp_proposo
 from tzrec.utils.test_util import mark_ci_scope
 
 
+class HostMemoryTest(unittest.TestCase):
+    """The planner's host memory respects a container memory limit."""
+
+    def _run(self, limit_text):
+        files = {"/sys/fs/cgroup/memory.max": limit_text}
+
+        def fake_open(path, *args, **kwargs):
+            if path in files:
+                return mock.mock_open(read_data=files[path])()
+            raise OSError(path)
+
+        with (
+            mock.patch.object(
+                plan_util.psutil,
+                "virtual_memory",
+                return_value=SimpleNamespace(total=1 << 40),
+            ),
+            mock.patch("builtins.open", side_effect=fake_open),
+        ):
+            return plan_util.host_memory_bytes()
+
+    def test_cgroup_limit_caps_host_memory(self):
+        self.assertEqual(self._run(str(170 << 30)), 170 << 30)
+
+    def test_unlimited_cgroup_keeps_ram(self):
+        self.assertEqual(self._run("max"), 1 << 40)
+
+
 class PlanUtilTest(unittest.TestCase):
     def setUp(self):
         self.maxDiff = None

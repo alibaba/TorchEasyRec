@@ -93,6 +93,24 @@ from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 
+def host_memory_bytes() -> int:
+    """Host RAM this process may use: physical memory capped by the cgroup limit."""
+    total = psutil.virtual_memory().total
+    for path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        try:
+            with open(path) as f:
+                limit = f.read().strip()
+        except OSError:
+            continue
+        if limit.isdigit():
+            total = min(total, int(limit))
+        break
+    return total
+
+
 def create_planner(
     device: torch.device,
     batch_size: int,
@@ -109,7 +127,7 @@ def create_planner(
     if torch.cuda.is_available():
         topo_kwargs["hbm_cap"] = torch.cuda.get_device_properties(device).total_memory
 
-    ddr_cap_per_rank = int(float(psutil.virtual_memory().total) / local_world_size)
+    ddr_cap_per_rank = int(float(host_memory_bytes()) / local_world_size)
     topo_kwargs["ddr_cap"] = ddr_cap_per_rank
     if "INTRA_NODE_BANDWIDTH" in os.environ:
         topo_kwargs["intra_host_bw"] = float(os.environ["INTRA_NODE_BANDWIDTH"])
