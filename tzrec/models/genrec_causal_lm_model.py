@@ -33,6 +33,7 @@ from tzrec.prompt.assembler import (
     INPUT_IDS,
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
+    build_multi_target_layout,
 )
 from tzrec.prompt.types import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
@@ -180,7 +181,6 @@ class GenRecCausalLMModel(BaseGenRecModel):
 
         levels = self._prompt.sid_space.num_levels
         infos = batch.additional_infos
-        response_lengths = infos[RESPONSE_LENGTHS].to(torch.int64)
         if self.lm.is_gradient_checkpointing:
             raise ValueError(
                 "Shared SID training requires gradient checkpointing to be disabled."
@@ -188,39 +188,17 @@ class GenRecCausalLMModel(BaseGenRecModel):
 
         padded, _ = self._left_pad(embeds, batch)
         rows, width = padded.shape[:2]
-        lengths = torch.diff(infos[CU_SEQLENS]).to(torch.int64)
-        starts = width - lengths
-        prefix_ends = width - response_lengths
-        positions = torch.arange(width, device=embeds.device)
-        relative = positions[None, :] - prefix_ends[:, None]
-        position_ids = torch.where(
-            relative < 0,
-            positions[None, :] - starts[:, None],
-            prefix_ends[:, None] - starts[:, None] + relative.remainder(levels),
-        ).clamp(min=0)
-
-        def mask_mod(b, h, q, kv):
-            """Allow causal prefix attention and same-branch response attention."""
-            prefix_end = prefix_ends[b]
-            q_relative = q - prefix_end
-            kv_relative = kv - prefix_end
-            prefix_key = (kv < prefix_end) & (kv <= q)
-            branch_key = (
-                (q >= prefix_end)
-                & (kv >= prefix_end)
-                & (q_relative // levels == kv_relative // levels)
-                & (kv <= q)
-            )
-            return (
-                (q >= starts[b])
-                & (q < width)
-                & (kv >= starts[b])
-                & (kv < width)
-                & (prefix_key | branch_key)
-            )
-
+        layout = build_multi_target_layout(
+            infos[CU_SEQLENS], infos[RESPONSE_LENGTHS], width, levels
+        )
         block_mask = create_block_mask(
-            mask_mod, rows, None, width, width, device=embeds.device, _compile=True
+            layout.mask_mod,
+            rows,
+            None,
+            width,
+            width,
+            device=embeds.device,
+            _compile=True,
         )
         previous_attention = self.lm.config._attn_implementation
         try:
@@ -228,39 +206,20 @@ class GenRecCausalLMModel(BaseGenRecModel):
             hidden = self.lm.base_model(
                 inputs_embeds=padded,
                 attention_mask={"full_attention": block_mask},
-                position_ids=position_ids,
+                position_ids=layout.position_ids,
                 use_cache=False,
             ).last_hidden_state
         finally:
             self.lm.set_attn_implementation(previous_attention)
 
-        counts = response_lengths // levels
-        parents = torch.repeat_interleave(
-            torch.arange(rows, device=embeds.device), counts
-        )
-        parent_starts = counts.cumsum(0) - counts
-        target_indices = torch.arange(parents.numel(), device=embeds.device)
-        target_starts = (
-            prefix_ends[parents] + (target_indices - parent_starts[parents]) * levels
-        )
-        offsets = torch.arange(levels, device=embeds.device)
-        score_positions = target_starts[:, None] + offsets[None, :] - 1
-        score_positions[:, 0] = prefix_ends[parents] - 1
-        score_indices = parents[:, None] * width + score_positions
-        unique_scores, inverse = score_indices.reshape(-1).unique(return_inverse=True)
         logits = self.lm.get_output_embeddings()(
-            hidden.reshape(-1, hidden.shape[-1])[unique_scores]
-        )[inverse].reshape(parents.numel(), levels, -1)
-
-        input_ids, _ = self._left_pad(infos[INPUT_IDS].unsqueeze(-1), batch)
-        labels = input_ids.squeeze(-1)[
-            parents[:, None], target_starts[:, None] + offsets[None, :]
-        ]
+            hidden.reshape(-1, hidden.shape[-1])[layout.logit_indices]
+        )[layout.logit_inverse].reshape(layout.target_parents.numel(), levels, -1)
         return {
             "logits": logits,
-            "labels": labels,
-            "target_parents": parents,
-            "target_counts": counts,
+            "labels": infos[INPUT_IDS][layout.label_indices],
+            "target_parents": layout.target_parents,
+            "target_counts": layout.target_counts,
         }
 
     def _forward(

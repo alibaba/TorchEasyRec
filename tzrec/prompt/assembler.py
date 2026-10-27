@@ -19,7 +19,8 @@ The walk is prompt structure only; ``hole_keys.py`` folds the prefix-cache
 identity of each hole beside it.
 """
 
-from typing import Dict, Final, List, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, Final, List, Tuple
 
 import torch
 from torch import nn
@@ -356,3 +357,113 @@ class PromptAssembler(nn.Module):
             "response_lengths": response_lengths,
             "max_seqlen": max_seqlen,
         }
+
+
+@dataclass
+class MultiTargetLayout:
+    """Training-only SID branches over the assembler's existing packed stream.
+
+    Args:
+        position_ids: logical positions in left-padded rows, restarting per target.
+        target_parents: parent row of each target.
+        target_counts: target count of each parent row.
+        label_indices: packed input indices shaped ``(targets, levels)``.
+        logit_indices: unique scoring positions in flattened left-padded rows.
+        logit_inverse: gathers unique logits back into target-major order.
+        mask_mod: causal prefix and independent-branch attention predicate.
+    """
+
+    position_ids: torch.Tensor
+    target_parents: torch.Tensor
+    target_counts: torch.Tensor
+    label_indices: torch.Tensor
+    logit_indices: torch.Tensor
+    logit_inverse: torch.Tensor
+    mask_mod: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor,
+    ]
+
+
+def build_multi_target_layout(
+    cu_seqlens: torch.Tensor,
+    response_lengths: torch.Tensor,
+    width: int,
+    num_levels: int,
+) -> MultiTargetLayout:
+    """Map complete SID responses to independent shared-prefix training branches.
+
+    This consumes assembler metadata on its current device. It neither changes
+    the packed token stream nor adds fields to the exported prompt front-end.
+
+    Args:
+        cu_seqlens: packed row boundaries from the assembler.
+        response_lengths: supervised SID token count of each row.
+        width: left-padded row width used by the model.
+        num_levels: codebook levels per target SID.
+
+    Returns:
+        Position ids, branch visibility, supervision indices and parent mapping.
+    """
+    device = cu_seqlens.device
+    response_lengths = response_lengths.to(torch.int64)
+    row_lengths = torch.diff(cu_seqlens).to(torch.int64)
+    row_starts = width - row_lengths
+    prefix_ends = width - response_lengths
+    positions = torch.arange(width, device=device)
+    relative = positions[None, :] - prefix_ends[:, None]
+    position_ids = torch.where(
+        relative < 0,
+        positions[None, :] - row_starts[:, None],
+        prefix_ends[:, None] - row_starts[:, None] + relative.remainder(num_levels),
+    ).clamp(min=0)
+
+    def mask_mod(b, h, q, kv):
+        """Allow causal prefix attention and same-branch response attention."""
+        prefix_end = prefix_ends[b]
+        q_relative = q - prefix_end
+        kv_relative = kv - prefix_end
+        prefix_key = (kv < prefix_end) & (kv <= q)
+        branch_key = (
+            (q >= prefix_end)
+            & (kv >= prefix_end)
+            & (q_relative // num_levels == kv_relative // num_levels)
+            & (kv <= q)
+        )
+        return (
+            (q >= row_starts[b])
+            & (q < width)
+            & (kv >= row_starts[b])
+            & (kv < width)
+            & (prefix_key | branch_key)
+        )
+
+    counts = response_lengths // num_levels
+    parents = torch.repeat_interleave(
+        torch.arange(counts.numel(), device=device), counts
+    )
+    parent_starts = counts.cumsum(0) - counts
+    target_offsets = (
+        torch.arange(parents.numel(), device=device) - parent_starts[parents]
+    )
+    target_starts = prefix_ends[parents] + target_offsets * num_levels
+    offsets = torch.arange(num_levels, device=device)
+    score_positions = target_starts[:, None] + offsets[None, :] - 1
+    score_positions[:, 0] = prefix_ends[parents] - 1
+    score_indices = parents[:, None] * width + score_positions
+    logit_indices, logit_inverse = score_indices.reshape(-1).unique(return_inverse=True)
+    packed_response_starts = cu_seqlens[parents + 1] - response_lengths[parents]
+    label_indices = (
+        packed_response_starts[:, None]
+        + target_offsets[:, None] * num_levels
+        + offsets[None, :]
+    )
+    return MultiTargetLayout(
+        position_ids=position_ids,
+        target_parents=parents,
+        target_counts=counts,
+        label_indices=label_indices,
+        logit_indices=logit_indices,
+        logit_inverse=logit_inverse,
+        mask_mod=mask_mod,
+    )
