@@ -453,6 +453,135 @@ def _run_shared_table_fqn_delta_embedding_dump(
             )
 
 
+_SHARED_FEATURE_NAME = "shared_feature"
+_SHARED_FEATURE_BASE_TABLE_NAME = "shared_feature_base_table"
+_SHARED_FEATURE_DEEP_TABLE_NAME = "shared_feature_deep_table"
+_SHARED_FEATURE_NUM_EMBEDDINGS = 8
+_SHARED_FEATURE_EMBEDDING_DIM = 4
+_SHARED_FEATURE_IDS = [3, 1, 2, 3]
+
+
+class _SharedFeatureTwEBCModel(nn.Module):
+    """One feature feeding two tables of a single EBC.
+
+    Mirrors a feature used by several feature groups with different
+    embedding_name_suffix values: torchrec duplicates the feature once per
+    table at input dist, and under table-wise sharding the two tables land
+    on different ranks, so each rank's lookup belongs to its hosted table.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ebc = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    name=_SHARED_FEATURE_BASE_TABLE_NAME,
+                    num_embeddings=_SHARED_FEATURE_NUM_EMBEDDINGS,
+                    embedding_dim=_SHARED_FEATURE_EMBEDDING_DIM,
+                    feature_names=[_SHARED_FEATURE_NAME],
+                    pooling=PoolingType.SUM,
+                ),
+                EmbeddingBagConfig(
+                    name=_SHARED_FEATURE_DEEP_TABLE_NAME,
+                    num_embeddings=_SHARED_FEATURE_NUM_EMBEDDINGS,
+                    embedding_dim=_SHARED_FEATURE_EMBEDDING_DIM,
+                    feature_names=[_SHARED_FEATURE_NAME],
+                    pooling=PoolingType.SUM,
+                ),
+            ],
+            device=torch.device("meta"),
+        )
+
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        return self.ebc(features).values().sum()
+
+
+def _shared_feature_kjt(rank: int) -> KeyedJaggedTensor:
+    device = torch.device(f"cuda:{rank}")
+    return KeyedJaggedTensor.from_offsets_sync(
+        keys=[_SHARED_FEATURE_NAME],
+        values=torch.tensor(_SHARED_FEATURE_IDS, device=device, dtype=torch.int64),
+        offsets=torch.tensor([0, len(_SHARED_FEATURE_IDS)], device=device),
+    )
+
+
+def _run_shared_feature_tw_delta_embedding_dump(
+    rank: int, world_size: int, output_dir: str
+):
+    with MultiProcessContext(rank=rank, world_size=world_size, backend="nccl") as ctx:
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        model = _SharedFeatureTwEBCModel()
+        constraints = {
+            table_name: ParameterConstraints(
+                sharding_types=[ShardingType.TABLE_WISE.value],
+                compute_kernels=[EmbeddingComputeKernel.FUSED.value],
+                feature_names=[_SHARED_FEATURE_NAME],
+                pooling_factors=[1.0],
+            )
+            for table_name in (
+                _SHARED_FEATURE_BASE_TABLE_NAME,
+                _SHARED_FEATURE_DEEP_TABLE_NAME,
+            )
+        }
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(world_size, "cuda"),
+            constraints=constraints,
+        )
+        sharders = [EmbeddingBagCollectionSharder()]
+        plan = planner.collective_plan(model, sharders, ctx.pg)
+        sharded_model = DistributedModelParallel(
+            module=model,
+            device=device,
+            env=ShardingEnv.from_process_group(ctx.pg),
+            plan=plan,
+            sharders=sharders,
+        )
+        dumper = DeltaEmbeddingDumper(
+            sharded_model,
+            DeltaEmbeddingDumpConfig(
+                paired_dump_interval_steps=1,
+                output_dir=output_dir,
+                file_prefix="delta",
+            ),
+            output_dir,
+            device,
+        )
+
+        sharded_model(_shared_feature_kjt(rank)).backward()
+        output_path = dumper.dump(1)
+        testcase = unittest.TestCase()
+        testcase.assertIsNotNone(output_path)
+        table = pq.read_table(output_path)
+        # Each rank publishes exactly the tables it hosts: a feature-name
+        # mapping used to collapse the shared feature onto one table's FQN,
+        # so the rank not hosting it failed with KeyError at dump time and
+        # the hosting rank published nothing for its own table.
+        hosted_fqns = set(dumper._collect_table_weights())
+        testcase.assertTrue(hosted_fqns)
+        testcase.assertEqual(set(table["table_fqn"].to_pylist()), hosted_fqns)
+        expected_ids = sorted(set(_SHARED_FEATURE_IDS))
+        for table_fqn in hosted_fqns:
+            owner_rows = table.filter(pa.compute.equal(table["table_fqn"], table_fqn))
+            testcase.assertEqual(owner_rows["key_id"].to_pylist(), expected_ids)
+            testcase.assertEqual(
+                set(owner_rows["feature_name"].to_pylist()), {_SHARED_FEATURE_NAME}
+            )
+            expected_embeddings = (
+                dumper._collect_table_weights()[table_fqn]
+                .tensor[torch.tensor(expected_ids, device=device)]
+                .detach()
+                .cpu()
+                .to(torch.float32)
+                .tolist()
+            )
+            testcase.assertEqual(
+                owner_rows["embedding"].to_pylist(),
+                expected_embeddings,
+            )
+        torch.distributed.barrier()
+
+
 _ZCH_TABLE_NAME = "zch_table"
 _ZCH_FEATURE_NAME = "zch_feat"
 _ZCH_SIZE = 8
@@ -3300,6 +3429,26 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
             self._run_multi_process_test(
                 callable=_run_shared_table_fqn_delta_embedding_dump,
                 world_size=1,
+                output_dir=tmp_dir,
+            )
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
+    @mark_ci_scope("gpu")
+    def test_shared_feature_tw_tables_dump_under_hosting_ranks(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "NCCL_DEBUG": "WARN",
+                    "FORCED_NCCL_DEBUG": "WARN",
+                    "NCCL_DEBUG_SUBSYS": "",
+                },
+            ),
+        ):
+            self._run_multi_process_test(
+                callable=_run_shared_feature_tw_delta_embedding_dump,
+                world_size=self.world_size,
                 output_dir=tmp_dir,
             )
 
