@@ -11,9 +11,12 @@
 
 import json
 import os
+import runpy
+import shlex
 import shutil
 import sys
 import unittest
+from unittest.mock import patch
 
 import torch
 from pyarrow import dataset as ds
@@ -1319,9 +1322,14 @@ model_config {
 }
 """
 
-_FACTORY_ENV = (
-    "TZREC_KAFKA_CONSUMER_FACTORY=tzrec.datasets.kafka_dataset_test.FakeKafkaConsumer"
-)
+
+def _train_with_fake_kafka() -> None:
+    """Run the training CLI with fake Kafka consumers."""
+    from tzrec.datasets import kafka_dataset
+    from tzrec.datasets.kafka_dataset_test import FakeKafkaConsumer
+
+    with patch.object(kafka_dataset, "_default_consumer_factory", FakeKafkaConsumer):
+        runpy.run_module("tzrec.train_eval", run_name="__main__")
 
 
 class KafkaSampleShuffleIntegrationTest(unittest.TestCase):
@@ -1343,14 +1351,36 @@ class KafkaSampleShuffleIntegrationTest(unittest.TestCase):
     def _run(self, config_path, extra_args=""):
         torchrun = os.path.join(os.path.dirname(sys.executable), "torchrun")
         log_dir = os.path.join(self.test_dir, "log_train_eval")
-        cmd = (
-            f"{_FACTORY_ENV} PYTHONPATH=. {torchrun} --standalone "
-            f"--nnodes=1 --nproc-per-node=2 --log_dir {log_dir} "
-            f"-r 3 -t 3 tzrec/train_eval.py "
-            f"--pipeline_config_path {config_path} {extra_args}"
+        nproc = utils._get_nproc_per_node()
+        cmd = shlex.join(
+            [
+                torchrun,
+                "--standalone",
+                "--nnodes=1",
+                f"--nproc-per-node={nproc}",
+                "--log_dir",
+                log_dir,
+                "-r",
+                "3",
+                "-t",
+                "3",
+                "--no-python",
+                sys.executable,
+                "-u",
+                "-c",
+                (
+                    "from tzrec.tests.rank_integration_test import "
+                    "_train_with_fake_kafka; _train_with_fake_kafka()"
+                ),
+                "--pipeline_config_path",
+                config_path,
+                *shlex.split(extra_args),
+            ]
         )
         return misc_util.run_cmd(
-            cmd, os.path.join(self.test_dir, "log_train_eval.txt"), timeout=600
+            f"PYTHONPATH=. {cmd}",
+            os.path.join(self.test_dir, "log_train_eval.txt"),
+            timeout=600,
         )
 
     def _read_state(self, ckpt_dir):

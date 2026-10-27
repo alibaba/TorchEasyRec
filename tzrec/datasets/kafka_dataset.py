@@ -10,7 +10,7 @@
 # limitations under the License.
 
 
-import importlib
+import atexit
 import math
 import multiprocessing as mp
 import os
@@ -31,7 +31,11 @@ from confluent_kafka import (
 )
 
 from tzrec.constant import Mode
-from tzrec.datasets.dataset import BaseDataset, BaseReader
+from tzrec.datasets.dataset import (
+    BaseDataset,
+    BaseReader,
+    sample_shuffle_enabled,
+)
 from tzrec.datasets.utils import (
     CKPT_ROW_IDX,
     CKPT_SOURCE_ID,
@@ -44,6 +48,22 @@ from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.protos.data_pb2 import SAMPLE_ROLLING, SAMPLE_WINDOW
 from tzrec.utils.logging_util import logger
+
+# capacity of the reader -> coordinator input queue, in decoded tables
+_INPUT_QUEUE_TABLES_PER_READER = 2
+# capacity of the shared dispatch queue matches the DataLoader prefetch
+# depth (default 2 batches) times the worker count
+_DISPATCH_QUEUE_BATCHES_PER_WORKER = 2
+# coordinator loop wakeups per second while idle
+_LOOP_TICK_SECS = 0.1
+_WATCHDOG_TICK_SECS = 5.0
+# total budget for reaping reader processes on shutdown; the client's stop
+# timeout must comfortably exceed this
+_READER_STOP_BUDGET_SECS = 8.0
+_STATS_LOG_INTERVAL_SECS = 60.0
+
+_EARLIEST_RESETS = ("earliest", "smallest", "beginning")
+_LATEST_RESETS = ("latest", "largest", "end")
 
 
 def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any], Optional[int]]:
@@ -222,7 +242,7 @@ def _consume_decoded_tables(
     reader_schema: pa.Schema,
     log_prefix: str,
     orphan_pid: Optional[int] = None,
-) -> Iterator[Tuple[Optional[pa.Table], int, int]]:
+) -> Iterator[pa.Table]:
     """Shared consume loop with heartbeat pause/resume protection.
 
     A background heartbeat thread monitors idle time (time since the last
@@ -253,9 +273,12 @@ def _consume_decoded_tables(
             (the owning process died).
 
     Yields:
-        (table, num_msgs, num_rows) per consume round; table is None when no
-        message decoded to any row.
+        pa.Table: one decoded and projected table per consume round.
     """
+    # the heartbeat gets its own stop signal: the shared stop_event is only
+    # read here; setting it on exit would falsely signal a clean stop to
+    # workers after an abnormal reader death
+    hb_stop = threading.Event()
     consumer_lock = threading.RLock()
     is_paused = [False]
     last_consume_time = [time.monotonic()]
@@ -272,7 +295,7 @@ def _consume_decoded_tables(
 
     def _heartbeat() -> None:
         """Keep the consumer in its group while the caller is blocked."""
-        while not stop_event.is_set():
+        while not hb_stop.is_set():
             try:
                 elapsed = time.monotonic() - last_consume_time[0]
                 if elapsed > idle_threshold:
@@ -297,7 +320,7 @@ def _consume_decoded_tables(
                                 stolen_msgs.append(msg)
             except Exception:
                 logger.warning(f"{log_prefix} heartbeat error", exc_info=True)
-            stop_event.wait(1.0)
+            hb_stop.wait(1.0)
 
     heartbeat_thread = threading.Thread(
         target=_heartbeat, name=f"{log_prefix}-hb", daemon=True
@@ -306,9 +329,9 @@ def _consume_decoded_tables(
     # name-based projection per seen message schema, so an upstream schema
     # change costs one recompute rather than one per message.
     projections: Dict[pa.Schema, Optional[List[int]]] = {}
+    heartbeat_thread.start()
     try:
         consumer.subscribe([topic], on_assign=_on_assign)
-        heartbeat_thread.start()
         while not stop_event.is_set():
             if orphan_pid is not None and os.getppid() != orphan_pid:
                 logger.error(f"{log_prefix}: owner process gone, exiting")
@@ -354,12 +377,12 @@ def _consume_decoded_tables(
                     0.9 * batch_size_per_msg + 0.1 * num_rows / num_msgs
                 )
 
-            yield t, num_msgs, num_rows
+            yield t
     except Exception as e:
         logger.error(f"{log_prefix} exception: {e}")
         raise
     finally:
-        stop_event.set()
+        hb_stop.set()
         heartbeat_thread.join(timeout=5.0)
         if heartbeat_thread.is_alive():
             logger.warning(
@@ -430,9 +453,9 @@ def _offsets_for_times_batched(
     consumer: Consumer,
     ts_partitions: List[TopicPartition],
     start_timestamp_ms: int,
-    batch_size: int,
-    timeout: float,
-    max_retries: int,
+    batch_size: Optional[int] = None,
+    timeout: Optional[float] = None,
+    max_retries: Optional[int] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> Dict[Tuple[str, int], int]:
     """Resolve a start timestamp to offsets in chunks, with retry.
@@ -443,6 +466,10 @@ def _offsets_for_times_batched(
     A persistent failure re-raises rather than silently falling back, because
     this reader is shared with training, where falling back to
     ``auto.offset.reset`` would replay the whole topic.
+
+    ``batch_size``, ``timeout`` and ``max_retries`` default to the
+    ``TZREC_KAFKA_OFFSETS_FOR_TIMES_*`` environment variables, resolved at
+    call time so callers and tests can override them explicitly.
 
     Args:
         consumer (Consumer): the kafka consumer.
@@ -460,6 +487,14 @@ def _offsets_for_times_batched(
     Raises:
         KafkaException: if a chunk still fails after exhausting retries.
     """
+    if batch_size is None:
+        batch_size = max(
+            1, int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_BATCH_SIZE", "32"))
+        )
+    if timeout is None:
+        timeout = float(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT", "30.0"))
+    if max_retries is None:
+        max_retries = int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES", "2"))
     resolved_map: Dict[Tuple[str, int], int] = {}
     for i in range(0, len(ts_partitions), batch_size):
         chunk = ts_partitions[i : i + batch_size]
@@ -496,33 +531,34 @@ def _offsets_for_times_batched(
 # sample-level shuffle: shared per-rank pool, message ledger, coordination
 # ------------------------------------------------------------------------
 
-# capacity of the reader -> coordinator input queue, in decoded tables
-_INPUT_QUEUE_TABLES_PER_READER = 2
-# capacity of the shared dispatch queue matches the DataLoader prefetch
-# depth (default 2 batches) times the worker count
-_DISPATCH_QUEUE_BATCHES_PER_WORKER = 2
-# coordinator loop wakeups per second while idle
-_LOOP_TICK_SECS = 0.1
-_WATCHDOG_TICK_SECS = 5.0
-_STATS_LOG_INTERVAL_SECS = 60.0
+
+def _default_consumer_factory(
+    config: Dict[str, Any], reader_id: int = 0, num_readers: int = 1
+) -> Consumer:
+    """Build a real Kafka consumer; test doubles may use the reader context."""
+    return Consumer(config)
 
 
-def _get_consumer_factory() -> Any:
-    """Consumer factory; tests override it with an importable class path.
+def _resolve_reset_offset(reset: str, low: int, high: int, source_key: str) -> int:
+    """Resolve auto.offset.reset to a concrete offset, honoring all aliases.
 
-    An environment variable (rather than an argument) carries the override
-    so spawned coordinator processes resolve it identically.
+    librdkafka accepts earliest/smallest/beginning and latest/largest/end;
+    "error" must raise rather than silently pick either end.
     """
-    path = os.environ.get("TZREC_KAFKA_CONSUMER_FACTORY")
-    if not path:
-        return Consumer
-    module, _, name = path.rpartition(".")
-    return getattr(importlib.import_module(module), name)
+    if reset in _EARLIEST_RESETS:
+        return low
+    if reset in _LATEST_RESETS:
+        return high
+    raise ValueError(
+        f"unsupported auto.offset.reset {reset!r} for {source_key}; "
+        f"supported: {', '.join(_EARLIEST_RESETS + _LATEST_RESETS)}"
+    )
 
 
 def resolve_start_offsets(
     input_path: str,
     checkpoint_state: Optional[Dict[str, Any]] = None,
+    consumer_factory: Optional[Any] = None,
 ) -> Dict[int, int]:
     """Resolve this run's fixed per-partition start offsets R.
 
@@ -539,6 +575,8 @@ def resolve_start_offsets(
         input_path: kafka URI.
         checkpoint_state: trusted baseline from a previous checkpoint,
             {topic:partition: last completed offset}.
+        consumer_factory: consumer builder; tests inject a double, the
+            default builds a real consumer.
 
     Returns:
         {partition: start offset}.
@@ -548,7 +586,8 @@ def resolve_start_offsets(
             the topic's retention policy.
     """
     topic, params, start_timestamp_ms = _parse_kafka_uri(input_path)
-    consumer = _get_consumer_factory()(params)
+    factory = consumer_factory or _default_consumer_factory
+    consumer = factory(params)
     try:
         meta = consumer.list_topics(topic, timeout=60.0)
         if topic not in meta.topics or not meta.topics[topic].partitions:
@@ -560,15 +599,18 @@ def resolve_start_offsets(
         for p in partitions:
             source_key = f"{topic}:{p}"
             tp = TopicPartition(topic, p)
-            low, high = consumer.get_watermark_offsets(tp, timeout=60.0)
             if checkpoint_state and source_key in checkpoint_state:
+                low, _ = consumer.get_watermark_offsets(tp, timeout=60.0)
                 start = int(checkpoint_state[source_key]) + 1
             elif start_timestamp_ms is not None:
+                # watermarks are queried after resolution, where an unresolved
+                # timestamp also falls back to auto.offset.reset
                 ts_tps.append(tp)
                 continue
             else:
+                low, high = consumer.get_watermark_offsets(tp, timeout=60.0)
                 reset = params.get("auto.offset.reset", "latest").lower()
-                start = low if reset == "earliest" else high
+                start = _resolve_reset_offset(reset, low, high, source_key)
             if start < low:
                 raise ValueError(
                     f"start offset {start} for {source_key} is no longer "
@@ -578,31 +620,15 @@ def resolve_start_offsets(
             starts[p] = start
         if ts_tps:
             # same tunables as the batch-shuffle path
-            offt_batch_size = max(
-                1, int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_BATCH_SIZE", "32"))
-            )
-            offt_timeout = float(
-                os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT", "30.0")
-            )
-            offt_retries = int(
-                os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES", "2")
-            )
-            resolved = _offsets_for_times_batched(
-                consumer,
-                ts_tps,
-                start_timestamp_ms,
-                offt_batch_size,
-                offt_timeout,
-                offt_retries,
-            )
+            resolved = _offsets_for_times_batched(consumer, ts_tps, start_timestamp_ms)
             for tp in ts_tps:
                 low, high = consumer.get_watermark_offsets(tp, timeout=60.0)
                 offset = resolved.get((tp.topic, tp.partition))
-                if offset is None or offset < 0 or offset == OFFSET_INVALID:
-                    # same fallback as the batch-shuffle path: resolve
-                    # auto.offset.reset to a concrete offset now
+                if offset is None:
                     reset = params.get("auto.offset.reset", "latest").lower()
-                    offset = low if reset == "earliest" else high
+                    offset = _resolve_reset_offset(
+                        reset, low, high, f"{tp.topic}:{tp.partition}"
+                    )
                 if offset < low:
                     raise ValueError(
                         f"start offset {offset} for {tp.topic}:{tp.partition} "
@@ -663,7 +689,6 @@ class SamplePool:
         self._frozen_row: Optional[np.ndarray] = None
         self._frozen_pos = 0
         # stats
-        self.num_adds = 0
         self.num_emits = 0
         self.num_compactions = 0
         self.rows_in = 0
@@ -683,7 +708,6 @@ class SamplePool:
             [self._arena_row, np.arange(n, dtype=np.int32)]
         )
         self.total_rows += n
-        self.num_adds += 1
         self.rows_in += n
         # frozen-window rows are outside the arena; compaction only runs
         # when no window is frozen so their chunk positions stay valid
@@ -786,32 +810,29 @@ class SamplePool:
         live chunks only, so their size stays proportional to the number of
         live chunks rather than the number of tables ever received.
         """
-        live_by_chunk: Dict[int, List[int]] = {}
-        for cid, rid in zip(self._arena_chunk.tolist(), self._arena_row.tolist()):
-            live_by_chunk.setdefault(cid, []).append(rid)
+        # group arena entries by chunk without per-row python loops
+        order = np.argsort(self._arena_chunk, kind="stable")
+        arena_c = self._arena_chunk[order]
+        arena_r = self._arena_row[order]
+        uniq, starts, counts = np.unique(arena_c, return_index=True, return_counts=True)
         new_chunks: List[pa.RecordBatch] = []
-        id_map: Dict[int, int] = {}
-        sorted_rows: Dict[int, np.ndarray] = {}
-        for cid, rows in live_by_chunk.items():
-            rows_arr = np.asarray(sorted(rows), dtype=np.int64)
+        for u, st, c in zip(uniq, starts, counts):
+            cid = int(u)
+            rows = arena_r[st : st + c]
+            sorted_rows = np.sort(rows)
             chunk = self._chunks[cid]
-            if len(rows_arr) != chunk.num_rows:
-                chunk = chunk.take(pa.array(rows_arr))
-            id_map[cid] = len(new_chunks)
+            if len(rows) != chunk.num_rows:
+                chunk = chunk.take(pa.array(sorted_rows.astype(np.int64)))
+            id_map = len(new_chunks)
             new_chunks.append(chunk)
-            sorted_rows[cid] = rows_arr
-        # remap arena entries: an entry's new row id is its old id's rank in
-        # the chunk's sorted live rows
-        remap_chunk = np.empty(len(self._arena_chunk), dtype=np.int32)
-        remap_row = np.empty(len(self._arena_row), dtype=np.int32)
-        for i, (cid, rid) in enumerate(
-            zip(self._arena_chunk.tolist(), self._arena_row.tolist())
-        ):
-            remap_chunk[i] = id_map[cid]
-            remap_row[i] = np.searchsorted(sorted_rows[cid], rid)
+            # remap entries: new chunk id, and new row id = rank in sorted order
+            arena_c[st : st + c] = id_map
+            arena_r[st : st + c] = np.searchsorted(sorted_rows, rows)
+        # the arena feeds random sampling only, so the chunk-grouped order
+        # is fine as-is
         self._chunks = new_chunks
-        self._arena_chunk = remap_chunk
-        self._arena_row = remap_row
+        self._arena_chunk = arena_c
+        self._arena_row = arena_r
         self._dead_rows = 0
         self.num_compactions += 1
 
@@ -850,6 +871,51 @@ class KafkaDataset(BaseDataset):
             shuffle_buffer_size=self._data_config.shuffle_buffer_size,
             input_fields=input_fields if input_fields else None,
         )
+        # created in prepare_for_loading; forked worker copies inherit it, but
+        # only the trainer process starts and stops it
+        self._sample_shuffle: Optional[SampleShuffleHandle] = None
+
+    def prepare_for_loading(self, checkpoint_state: Optional[Dict[str, Any]]) -> None:
+        """In sample mode: create the handle and configure the reader.
+
+        The reader object is kept; it serves pre-shuffled batches from the
+        shared queue once configured. In batch mode this defers to the
+        default checkpoint handling.
+        """
+        if not sample_shuffle_enabled(self._data_config, self._mode):
+            super().prepare_for_loading(checkpoint_state)
+            return
+        kafka_reader = self._reader
+        # the reader captured the module default factory at construction
+        # time; pass it explicitly so spawned processes do not need the patch
+        handle = SampleShuffleHandle(
+            self._data_config,
+            self._input_path,
+            checkpoint_state,
+            consumer_factory=kafka_reader._consumer_factory,
+        )
+        kafka_reader._configure_sample_shuffle(
+            handle.shared_dispatch_queue,
+            handle.stop_event,
+            handle.fatal_event,
+        )
+        self._sample_shuffle = handle
+
+    def is_sample_shuffled(self) -> bool:
+        """Whether the sample-level shuffle path serves this dataset."""
+        return self._sample_shuffle is not None
+
+    def start_loading(self) -> None:
+        """Spawn the coordinator once the DataLoader workers exist."""
+        if self._sample_shuffle is not None:
+            reader = self._reader
+            assert isinstance(reader, KafkaReader)
+            self._sample_shuffle.start(reader)
+
+    def stop_loading(self) -> None:
+        """Stop the coordinator and its reader processes; idempotent."""
+        if self._sample_shuffle is not None:
+            self._sample_shuffle.stop()
 
 
 class KafkaReader(BaseReader):
@@ -864,6 +930,8 @@ class KafkaReader(BaseReader):
         shuffle (bool): shuffle data or not.
         shuffle_buffer_size (int): buffer size for shuffle.
         input_fields (list): list of pa.Field for schema definition.
+        consumer_factory: consumer builder; tests inject a double, the
+            default builds real consumers.
     """
 
     def __init__(
@@ -875,6 +943,7 @@ class KafkaReader(BaseReader):
         shuffle: bool = False,
         shuffle_buffer_size: int = 32,
         input_fields: Optional[List[pa.Field]] = None,
+        consumer_factory: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -886,7 +955,14 @@ class KafkaReader(BaseReader):
             shuffle_buffer_size,
         )
 
+        self._consumer_factory = consumer_factory or _default_consumer_factory
         self._has_embedded_schema = False
+        # bound by _configure_sample_shuffle when the shared-pool path serves
+        # this reader; the forked worker copies inherit the binding
+        self._sample_queue: Optional[Any] = None
+        self._sample_stop_event: Optional[Any] = None
+        self._sample_fatal_event: Optional[Any] = None
+        self._sample_table_schema: Optional[pa.Schema] = None
 
         if input_fields:
             self._full_schema = pa.schema(input_fields)
@@ -926,7 +1002,7 @@ class KafkaReader(BaseReader):
                 valid schema.
         """
         topic, config, _ = _parse_kafka_uri(self._input_path)
-        consumer = Consumer(config)
+        consumer = self._consumer_factory(config)
 
         try:
             # Directly assign partition 0 (no subscribe, no group coordination)
@@ -991,15 +1067,9 @@ class KafkaReader(BaseReader):
         """
         topic, config, start_timestamp_ms = _parse_kafka_uri(self._input_path)
         max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
-        # offsets_for_times tunables (chunk size / per-call timeout / retries).
-        offt_batch_size = max(
-            1, int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_BATCH_SIZE", "32"))
+        consumer = self._consumer_factory(
+            config, reader_id=worker_id, num_readers=num_workers
         )
-        offt_timeout = float(
-            os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT", "30.0")
-        )
-        offt_retries = int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES", "2"))
-        consumer = Consumer(config)
 
         # seek to the checkpointed offsets on every (re)assignment
         def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
@@ -1016,12 +1086,7 @@ class KafkaReader(BaseReader):
 
             if ts_partitions:
                 resolved_map = _offsets_for_times_batched(
-                    consumer,
-                    ts_partitions,
-                    start_timestamp_ms,
-                    offt_batch_size,
-                    offt_timeout,
-                    offt_retries,
+                    consumer, ts_partitions, start_timestamp_ms
                 )
                 for tp in ts_partitions:
                     res_offset = resolved_map.get((tp.topic, tp.partition))
@@ -1049,16 +1114,50 @@ class KafkaReader(BaseReader):
             f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}]",
         )
         try:
-            for t, _, _ in loop:
+            for t in loop:
                 for batch in t.to_batches():
                     yield batch
         finally:
             loop.close()
 
+    def _configure_sample_shuffle(
+        self,
+        shared_dispatch_queue: Any,
+        stop_event: Any,
+        fatal_event: Any,
+    ) -> None:
+        """Bind the shared-pool path's communication objects to this reader.
+
+        After this call ``to_batches`` consumes batches produced by the
+        per-rank coordinator instead of reading Kafka in the workers. The
+        dispatch schema is the reader schema plus the checkpoint metadata and
+        event-time columns that ride through the pool.
+
+        Args:
+            shared_dispatch_queue: the shared dispatch queue.
+            stop_event: shared clean-stop signal.
+            fatal_event: set when the coordinator died unexpectedly.
+        """
+        self._sample_queue = shared_dispatch_queue
+        self._sample_stop_event = stop_event
+        self._sample_fatal_event = fatal_event
+        self._sample_table_schema = pa.schema(
+            list(self._schema)
+            + [
+                pa.field(CKPT_SOURCE_ID, pa.string()),
+                pa.field(CKPT_ROW_IDX, pa.int64()),
+                pa.field(DATA_TIMESTAMP, pa.float64()),
+            ]
+        )
+
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator.
+
+        In BATCH mode this reads Kafka in the worker and shuffles whole
+        batches; when sample shuffle is configured it takes pre-shuffled
+        batches from the shared dispatch queue instead.
 
         Args:
             worker_id: Worker ID
@@ -1068,119 +1167,30 @@ class KafkaReader(BaseReader):
         Yields:
             Dict of column name to PyArrow Array
         """
-        reader = self._reader(worker_id, num_workers)
-        yield from self._arrow_reader_iter(reader)
+        if self._sample_queue is None:
+            reader = self._reader(worker_id, num_workers)
+            yield from self._arrow_reader_iter(reader)
+            return
+        yield from self._sample_batches(self._sample_queue)
 
-
-class SampleShuffleError(RuntimeError):
-    """Sample-level shuffle failure."""
-
-
-class SampleShuffleFatal(SampleShuffleError):
-    """Coordinator or communication failure; training must abort."""
-
-
-class SampleQueueReader:
-    """Worker-side reader: pulls shuffled raw batches from the dispatch queue.
-
-    Sample-level shuffle randomizes batch contents globally, so dispatch is
-    always through one shared queue regardless of ``in_order``.
-
-    Args:
-        shared_dispatch_queue: the shared dispatch queue.
-        fatal_event: set when the coordinator died unexpectedly.
-        reader_schema: feature columns schema, for BaseDataset.input_fields.
-        table_schema: schema of dispatched record batches (feature columns
-            plus the checkpoint metadata and event-time columns).
-    """
-
-    def __init__(
-        self,
-        shared_dispatch_queue: Any,
-        fatal_event: Any,
-        reader_schema: pa.Schema,
-        table_schema: pa.Schema,
-    ) -> None:
-        self._shared_dispatch_queue = shared_dispatch_queue
-        self._fatal_event = fatal_event
-        self._reader_schema = reader_schema
-        self._table_schema = table_schema
-
-    @property
-    def schema(self) -> pa.Schema:
-        """Feature columns schema."""
-        return self._reader_schema
-
-    def num_files(self) -> None:
-        """Kafka is a stream; no file count to bound workers with."""
-        return None
-
-    def to_batches(
-        self, worker_id: int, num_workers: int, world_size: int
-    ) -> Iterator[Dict[str, pa.Array]]:
-        """Yield raw batches from the shared dispatch queue.
-
-        Args:
-            worker_id: global worker id (rank * num_workers + local id).
-            num_workers: global worker count (num_workers * world_size).
-            world_size: total ranks.
-
-        Yields:
-            input_data: raw input columns including the checkpoint metadata
-            and DATA_TIMESTAMP columns, which _build_batch extracts before
-            feature parsing.
-        """
-        q = self._shared_dispatch_queue
+    def _sample_batches(self, q: Any) -> Iterator[Dict[str, pa.Array]]:
+        """Yield pre-batched raw columns from the shared dispatch queue."""
         while True:
             try:
                 payload = q.get(timeout=1.0)
             except queue.Empty:
-                if self._fatal_event.is_set():
-                    raise SampleShuffleFatal(
+                if self._sample_fatal_event.is_set():
+                    raise RuntimeError(
                         "sample-shuffle coordinator exited unexpectedly"
                     ) from None
+                if self._sample_stop_event.is_set():
+                    return
                 continue
-            rb = pa.ipc.read_record_batch(payload, self._table_schema)
+            if self._sample_stop_event.is_set():
+                # clean stop: end the pass
+                return
+            rb = pa.ipc.read_record_batch(payload, self._sample_table_schema)
             yield {name: rb.column(i) for i, name in enumerate(rb.schema.names)}
-
-
-class KafkaSampleShuffleDataset(KafkaDataset):
-    """KafkaDataset variant served by the per-rank sample-shuffle coordinator.
-
-    The constructor still builds a KafkaReader for schema resolution (its
-    consumers are short-lived), then replaces it with a queue-backed reader
-    fed by the coordinator.
-    """
-
-    def __init__(
-        self,
-        *args: Any,
-        shared_dispatch_queue: Any = None,
-        fatal_event: Any = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        kafka_reader = self._reader
-        self._reader_full_schema = kafka_reader._full_schema
-        self._reader_schema = kafka_reader.schema
-        self._has_embedded_schema = kafka_reader._has_embedded_schema
-        # one table schema serves both the reader -> coordinator and the
-        # coordinator -> worker direction: feature columns plus the
-        # checkpoint metadata and event-time columns
-        self._table_schema = pa.schema(
-            list(self._reader_schema)
-            + [
-                pa.field(CKPT_SOURCE_ID, pa.string()),
-                pa.field(CKPT_ROW_IDX, pa.int64()),
-                pa.field(DATA_TIMESTAMP, pa.float64()),
-            ]
-        )
-        self._reader = SampleQueueReader(
-            shared_dispatch_queue,
-            fatal_event,
-            self._reader_schema,
-            self._table_schema,
-        )
 
 
 def _reader_process_main(
@@ -1195,22 +1205,20 @@ def _reader_process_main(
     full_schema: pa.Schema,
     has_embedded_schema: bool,
     batch_size: int,
+    consumer_factory: Optional[Any] = None,
 ) -> None:
     """Reader process: one consumer, decode, send tables to the coordinator.
 
     Shares the consume loop (heartbeat pause/resume, decode, EMA sizing) with
     KafkaReader via ``_consume_decoded_tables``; only the assignment policy
     (fixed start offsets for this run) and the output sink differ.
+    ``consumer_factory`` is the test injection point; the default builds a
+    real consumer and ignores the reader context.
     """
     topic, config, _ = _parse_kafka_uri(input_path)
     max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
-    consumer_factory = _get_consumer_factory()
-    if consumer_factory is not Consumer:
-        # test-only hints for fake consumers: deterministic partition split;
-        # a real Consumer rejects unknown config keys at construction
-        config["fake.reader_id"] = str(reader_id)
-        config["fake.num_readers"] = str(num_readers)
-    consumer = consumer_factory(config)
+    factory = consumer_factory or _default_consumer_factory
+    consumer = factory(config, reader_id=reader_id, num_readers=num_readers)
 
     def _put(item: Tuple) -> None:
         # bounded queue: block as backpressure, but stay stoppable
@@ -1249,12 +1257,15 @@ def _reader_process_main(
         orphan_pid=coordinator_pid,
     )
     try:
-        for t, _, _ in loop:
+        for t in loop:
             if t.num_rows == 0:
                 continue
             payload = t.to_batches(max_chunksize=t.num_rows)[0].serialize().to_pybytes()
-            _put(("data", payload))
+            _put(payload)
     finally:
+        # the queue feeder thread may hold undelivered data; without this the
+        # interpreter would wait for the flush on exit and hang on a full pipe
+        input_q.cancel_join_thread()
         loop.close()
 
 
@@ -1265,9 +1276,8 @@ class _Coordinator:
         input_path: kafka URI.
         num_readers: number of reader processes to fork.
         start_offsets: resolved per-partition start offsets R.
-        input_q: bounded queue from readers, items are ("data", payload)
-            or ("error", message).
-        ctrl_q: control queue; ("stop",) shuts the coordinator down.
+        input_q: bounded queue from readers, items are payload bytes.
+        stop_event: shared stop signal; when set, the coordinator exits.
         shared_dispatch_queue: the one bounded queue to the workers.
         mode: SAMPLE_WINDOW or SAMPLE_ROLLING.
         capacity_rows: pool capacity in samples.
@@ -1278,6 +1288,8 @@ class _Coordinator:
         has_embedded_schema: whether messages embed an IPC stream schema.
         trainer_pid: trainer process pid; the coordinator exits when its
             parent changes (trainer died without stopping it).
+        consumer_factory: consumer builder for reader processes; tests inject
+            a double, the default builds real consumers.
     """
 
     def __init__(
@@ -1286,7 +1298,7 @@ class _Coordinator:
         num_readers: int,
         start_offsets: Dict[int, int],
         input_q: Any,
-        ctrl_q: Any,
+        stop_event: Any,
         shared_dispatch_queue: Any,
         mode: int,
         capacity_rows: int,
@@ -1296,30 +1308,30 @@ class _Coordinator:
         full_schema: pa.Schema,
         has_embedded_schema: bool,
         trainer_pid: int,
+        consumer_factory: Optional[Any] = None,
     ) -> None:
         self._trainer_pid = trainer_pid
         self._input_path = input_path
         self._num_readers = num_readers
         self._input_q = input_q
-        self._ctrl_q = ctrl_q
+        self._stop_event = stop_event
         self._shared_dispatch_queue = shared_dispatch_queue
         self._input_table_schema = input_table_schema
         self._reader_schema = reader_schema
         self._full_schema = full_schema
         self._has_embedded_schema = has_embedded_schema
+        self._consumer_factory = consumer_factory
         self._pool = SamplePool(capacity_rows, batch_size, mode)
         self._start_offsets = start_offsets
         self._batch_size = batch_size
         self._pending_dispatch: Optional[bytes] = None
         self._readers: List[Any] = []
-        self._stop_event = None
 
     def _start_readers(self) -> None:
         """Fork the reader processes."""
         # fork before the event loop starts: the coordinator is still
         # single-threaded and holds no consumer, so fork is safe
         ctx = mp.get_context("fork")
-        self._stop_event = ctx.Event()
         pid = os.getpid()
         for i in range(self._num_readers):
             p = ctx.Process(
@@ -1336,6 +1348,7 @@ class _Coordinator:
                     self._full_schema,
                     self._has_embedded_schema,
                     self._batch_size,
+                    self._consumer_factory,
                 ),
                 daemon=True,
                 name=f"tzrec-sample-reader-{i}",
@@ -1343,41 +1356,35 @@ class _Coordinator:
             p.start()
             self._readers.append(p)
 
-    def _service_ctrl(self) -> bool:
-        """Drain the control queue; returns True when asked to stop."""
-        while True:
-            try:
-                msg = self._ctrl_q.get_nowait()
-            except queue.Empty:
-                return False
-            if msg[0] == "stop":
-                return True
-
     def _emit_and_dispatch(self) -> int:
-        """Emit pool batches to dispatch queues; return how many dispatched."""
+        """Retry the pending dispatch, then emit and send pool batches.
+
+        At most one payload is in flight, so a blocked output never drains
+        the pool: the next batch is emitted only after the pending one was
+        accepted. Returns how many batches were dispatched this call,
+        including a pending payload that the output queue finally accepted.
+        """
         n = 0
-        while self._pending_dispatch is None:
-            out = self._pool.emit()
-            if out is None:
-                return n
-            payload = out.serialize().to_pybytes()
+        while True:
+            if self._pending_dispatch is None:
+                out = self._pool.emit()
+                if out is None:
+                    return n
+                self._pending_dispatch = out.serialize().to_pybytes()
             try:
-                self._shared_dispatch_queue.put_nowait(payload)
-                n += 1
+                self._shared_dispatch_queue.put_nowait(self._pending_dispatch)
             except queue.Full:
                 # keep servicing control while the output is blocked
-                self._pending_dispatch = payload
-        return n
+                return n
+            self._pending_dispatch = None
+            n += 1
 
     def _service_input(self, timeout: float) -> None:
         """Take one decoded table into the pool."""
         try:
-            item = self._input_q.get(timeout=timeout)
+            payload = self._input_q.get(timeout=timeout)
         except queue.Empty:
             return
-        if item[0] == "error":
-            raise RuntimeError(f"sample-shuffle reader failed: {item[1]}")
-        _, payload = item
         self._pool.add(pa.ipc.read_record_batch(payload, self._input_table_schema))
 
     def _check_readers(self) -> None:
@@ -1398,25 +1405,17 @@ class _Coordinator:
         )
 
     def run(self) -> None:
-        """Fork readers, then serve input/control until stopped."""
+        """Fork readers, then serve input until the shared stop event fires."""
         self._start_readers()
         last_watchdog = time.monotonic()
         last_stats = time.monotonic()
         try:
-            while True:
-                if self._service_ctrl():
-                    break
+            while not self._stop_event.is_set():
                 now = time.monotonic()
                 took_input = False
                 if self._pool.total_rows < self._pool.capacity_rows:
                     self._service_input(_LOOP_TICK_SECS)
                     took_input = True
-                if self._pending_dispatch is not None:
-                    try:
-                        self._shared_dispatch_queue.put_nowait(self._pending_dispatch)
-                        self._pending_dispatch = None
-                    except queue.Full:
-                        pass
                 emitted = self._emit_and_dispatch()
                 if not took_input and emitted == 0:
                     # pool full while the output is blocked: pace the loop
@@ -1433,11 +1432,28 @@ class _Coordinator:
                     last_stats = now
         finally:
             self._log_stats()
-            self._stop_event.set()
-            for p in self._readers:
-                p.join(timeout=5.0)
-                if p.is_alive():
-                    p.terminate()
+            self._shutdown_readers()
+            # drop undelivered dispatch payloads instead of hanging this
+            # process on a full queue's feeder thread
+            self._shared_dispatch_queue.cancel_join_thread()
+
+    def _shutdown_readers(self) -> None:
+        """Reap all readers within one shared time budget.
+
+        Readers watch the shared stop event (clean stop) or their parent pid
+        (coordinator death), so nothing needs signaling here.
+        """
+        deadline = time.monotonic() + _READER_STOP_BUDGET_SECS
+        for p in self._readers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            p.join(timeout=remaining)
+        for p in self._readers:
+            if p.is_alive():
+                p.terminate()
+        for p in self._readers:
+            p.join(timeout=1.0)
 
 
 def _coordinator_entry(**kwargs: Any) -> None:
@@ -1449,98 +1465,192 @@ def _coordinator_entry(**kwargs: Any) -> None:
         raise
 
 
-class SampleShuffleResources:
-    """Communication handles created before the DataLoader forks workers."""
+class SampleShuffleHandle:
+    """Owns the per-rank sample-shuffle background resources end to end.
 
-    def __init__(
-        self,
-        start_offsets: Dict[int, int],
-        input_q: Any,
-        ctrl_q: Any,
-        shared_dispatch_queue: Any,
-        fatal_event: Any,
-    ) -> None:
-        self.start_offsets = start_offsets
-        self.input_q = input_q
-        self.ctrl_q = ctrl_q
-        self.shared_dispatch_queue = shared_dispatch_queue
-        self.fatal_event = fatal_event
-
-
-def prepare_sample_shuffle(
-    data_config: data_pb2.DataConfig,
-    input_path: str,
-    checkpoint_state: Optional[Dict[str, Any]],
-) -> SampleShuffleResources:
-    """Validate config, resolve start offsets and create communication handles.
-
-    Start offsets are resolved once on rank 0 and broadcast so every rank
-    uses an identical mapping.
+    Created before the DataLoader forks its workers (the queues and events
+    are inherited by them); ``start()`` spawns the coordinator process after
+    the fork; ``stop()`` shuts everything down. The trainer interacts with
+    it only through ``KafkaDataset``'s loading lifecycle methods.
 
     Args:
         data_config: dataloader config.
         input_path: kafka URI.
         checkpoint_state: trusted baseline from a previous checkpoint.
-
-    Returns:
-        The resources to attach to the dataset and, after the eager
-        ``iter()``, to the coordinator process.
+        consumer_factory: consumer builder; tests inject a double, the
+            default builds real consumers.
     """
-    validate_sample_shuffle_config(data_config, input_path)
-    if dist.is_initialized():
-        if dist.get_rank() == 0:
-            start_offsets = resolve_start_offsets(input_path, checkpoint_state)
-        else:
+
+    def __init__(
+        self,
+        data_config: data_pb2.DataConfig,
+        input_path: str,
+        checkpoint_state: Optional[Dict[str, Any]],
+        consumer_factory: Optional[Any] = None,
+    ) -> None:
+        validate_sample_shuffle_config(data_config, input_path)
+        if dist.is_initialized():
+            # rank 0 resolves and broadcasts the outcome; a failure on rank 0
+            # must fail every rank, not leave the others waiting at the next
+            # collective
+            error = None
             start_offsets = None
-        obj_list = [start_offsets]
-        dist.broadcast_object_list(obj_list, src=0)
-        start_offsets = obj_list[0]
-    else:
-        start_offsets = resolve_start_offsets(input_path, checkpoint_state)
+            if dist.get_rank() == 0:
+                try:
+                    start_offsets = resolve_start_offsets(
+                        input_path, checkpoint_state, consumer_factory
+                    )
+                except Exception as e:
+                    error = f"{type(e).__name__}: {e}"
+            obj_list = [(start_offsets, error)]
+            dist.broadcast_object_list(obj_list, src=0)
+            start_offsets, error = obj_list[0]
+            if error is not None:
+                raise RuntimeError(f"failed to resolve kafka start offsets: {error}")
+        else:
+            start_offsets = resolve_start_offsets(
+                input_path, checkpoint_state, consumer_factory
+            )
 
-    ctx = mp.get_context("spawn")
-    num_workers = max(data_config.num_workers, 1)
-    # sample contents are already shuffled pool-wide, so dispatch always
-    # goes through one shared queue and in_order stays irrelevant
-    return SampleShuffleResources(
-        start_offsets=start_offsets,
-        input_q=ctx.Queue(maxsize=_INPUT_QUEUE_TABLES_PER_READER * num_workers),
-        ctrl_q=ctx.Queue(),
-        shared_dispatch_queue=ctx.Queue(
+        self.start_offsets = start_offsets
+        num_workers = max(data_config.num_workers, 1)
+        # workers need the dispatch queue and events before they fork, so
+        # they are created here; input_q is created in start() instead
+        self._ctx = mp.get_context("spawn")
+        self.input_q: Optional[Any] = None
+        # sample contents are shuffled pool-wide, so dispatch always goes
+        # through one shared queue and in_order stays irrelevant
+        self.shared_dispatch_queue = self._ctx.Queue(
             maxsize=_DISPATCH_QUEUE_BATCHES_PER_WORKER * num_workers
-        ),
-        fatal_event=ctx.Event(),
-    )
+        )
+        # stop_event: clean shutdown observed by coordinator, readers and
+        # workers; fatal_event: abnormal coordinator death, workers raise
+        self.stop_event = self._ctx.Event()
+        self.fatal_event = self._ctx.Event()
+        self._data_config = data_config
+        self._input_path = input_path
+        self._consumer_factory = consumer_factory
+        self._proc: Optional[Any] = None
+        self._atexit_cleanup = None
 
+    def start(self, reader: "KafkaReader") -> None:
+        """Spawn the coordinator; the DataLoader workers must already exist.
 
-def sample_shuffle_enabled(data_config: data_pb2.DataConfig, mode: Any) -> bool:
-    """Whether the sample-level shuffle path should serve this dataloader."""
-    return (
-        mode == Mode.TRAIN
-        and data_config.shuffle
-        and data_config.shuffle_mode != data_pb2.BATCH
-    )
+        Args:
+            reader: the dataset's Kafka reader, configured for shared
+                dispatch; the coordinator and its reader processes decode
+                with the schemas it carries.
+        """
+        if self._proc is not None:
+            return
+        table_schema = reader._sample_table_schema
+        assert table_schema is not None, "reader is not configured for sample shuffle"
+        num_workers = max(self._data_config.num_workers, 1)
+        capacity_rows = (
+            self._data_config.batch_size * self._data_config.shuffle_buffer_size
+        )
+        mode_name = data_pb2.ShuffleMode.Name(self._data_config.shuffle_mode)
+        logger.info(
+            f"sample-shuffle starting: mode={mode_name} "
+            f"pool capacity {capacity_rows} rows (batch_size "
+            f"{self._data_config.batch_size} x buffer "
+            f"{self._data_config.shuffle_buffer_size}), readers {num_workers}"
+        )
+        # created here (not in __init__) so a never-started handle holds no
+        # reader output buffer; the handle keeps it alive until the
+        # coordinator owns it
+        input_q = self._ctx.Queue(maxsize=_INPUT_QUEUE_TABLES_PER_READER * num_workers)
+        self.input_q = input_q
+        try:
+            proc = self._ctx.Process(
+                target=_coordinator_entry,
+                kwargs=dict(
+                    input_path=self._input_path,
+                    num_readers=num_workers,
+                    start_offsets=self.start_offsets,
+                    input_q=input_q,
+                    stop_event=self.stop_event,
+                    shared_dispatch_queue=self.shared_dispatch_queue,
+                    mode=self._data_config.shuffle_mode,
+                    capacity_rows=capacity_rows,
+                    batch_size=self._data_config.batch_size,
+                    input_table_schema=table_schema,
+                    reader_schema=reader.schema,
+                    full_schema=reader._full_schema,
+                    has_embedded_schema=reader._has_embedded_schema,
+                    trainer_pid=os.getpid(),
+                    consumer_factory=self._consumer_factory,
+                ),
+                # not daemon: daemonic processes cannot fork reader children;
+                # orphan self-exit is handled via trainer_pid checks instead
+                daemon=False,
+                name="tzrec-sample-shuffle-coordinator",
+            )
+            proc.start()
+        except Exception:
+            input_q.close()
+            input_q.join_thread()
+            self.input_q = None
+            raise
+
+        def _terminate_if_alive(p=proc):
+            if p.is_alive():
+                p.terminate()
+
+        # interpreters can exit without stop_loading() on training-init
+        # failures; this runs before multiprocessing joins the non-daemon
+        # child, so initialization failures cannot hang the exit
+        atexit.register(_terminate_if_alive)
+        self._atexit_cleanup = _terminate_if_alive
+        self._proc = proc
+        self._start_watchdog()
+
+    def _start_watchdog(self) -> None:
+        """Watch the coordinator; set fatal_event on unexpected exit."""
+        proc = self._proc
+
+        def _watch() -> None:
+            proc.join()
+            if self._proc is not None:
+                self.fatal_event.set()
+                logger.error(
+                    f"sample-shuffle coordinator exited unexpectedly "
+                    f"(code {proc.exitcode})"
+                )
+
+        threading.Thread(
+            target=_watch, name="sample-shuffle-watchdog", daemon=True
+        ).start()
+
+    def stop(self) -> None:
+        """Stop the coordinator and its readers; idempotent."""
+        if self._proc is None:
+            return
+        proc = self._proc
+        self._proc = None
+        self.stop_event.set()
+        proc.join(timeout=15.0)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5.0)
+        if self._atexit_cleanup is not None:
+            atexit.unregister(self._atexit_cleanup)
+            self._atexit_cleanup = None
 
 
 def validate_sample_shuffle_config(
     data_config: data_pb2.DataConfig, input_path: str
 ) -> None:
-    """Validate config for the sample-level shuffle path before resources start.
+    """Validate Kafka-specific config for the sample-level shuffle path.
 
     Args:
         data_config: dataloader config.
         input_path: kafka URI.
 
     Raises:
-        ValueError: on non-Kafka datasets, invalid capacity, an explicit
-            enable.auto.commit=true, or batch_cost_size.
+        ValueError: on invalid capacity, an unsupported batch_cost_size, or
+            an explicit enable.auto.commit=true.
     """
-    if data_config.dataset_type != data_pb2.KafkaDataset:
-        raise ValueError(
-            "sample-level shuffle (shuffle_mode=SAMPLE_WINDOW/SAMPLE_ROLLING) "
-            "only supports KafkaDataset, got "
-            f"{data_pb2.DatasetType.Name(data_config.dataset_type)}"
-        )
     if data_config.batch_size <= 0 or data_config.shuffle_buffer_size <= 0:
         raise ValueError(
             "sample-level shuffle requires batch_size > 0 and "
@@ -1559,90 +1669,3 @@ def validate_sample_shuffle_config(
             "enable.auto.commit=false (the default); remove the explicit "
             "enable.auto.commit=true from the kafka URI"
         )
-
-
-class SampleShuffleClient:
-    """Lifecycle handle of the per-rank sample-shuffle coordinator.
-
-    Args:
-        proc: the coordinator process.
-        resources: the communication handles shared with it.
-    """
-
-    def __init__(self, proc: Any, resources: SampleShuffleResources) -> None:
-        self._proc = proc
-        self._res = resources
-        self._stopped = False
-
-        def _watch() -> None:
-            proc.join()
-            if not self._stopped:
-                self._res.fatal_event.set()
-                logger.error(
-                    f"sample-shuffle coordinator exited unexpectedly "
-                    f"(code {proc.exitcode})"
-                )
-
-        self._watchdog = threading.Thread(
-            target=_watch, name="sample-shuffle-watchdog", daemon=True
-        )
-        self._watchdog.start()
-
-    def stop(self) -> None:
-        """Stop the coordinator and its readers."""
-        self._stopped = True
-        try:
-            self._res.ctrl_q.put(("stop",), timeout=2.0)
-        except Exception:
-            pass
-        self._proc.join(timeout=15.0)
-        if self._proc.is_alive():
-            self._proc.terminate()
-            self._proc.join(timeout=5.0)
-
-
-def start_sample_shuffle(
-    data_config: data_pb2.DataConfig,
-    input_path: str,
-    dataset: KafkaSampleShuffleDataset,
-    resources: SampleShuffleResources,
-) -> SampleShuffleClient:
-    """Spawn the coordinator after the DataLoader's eager iter() forked workers.
-
-    Returns:
-        The trainer-side client handle.
-    """
-    num_workers = max(data_config.num_workers, 1)
-    capacity_rows = data_config.batch_size * data_config.shuffle_buffer_size
-    mode_name = data_pb2.ShuffleMode.Name(data_config.shuffle_mode)
-    logger.info(
-        f"sample-shuffle starting: mode={mode_name} "
-        f"pool capacity {capacity_rows} rows (batch_size {data_config.batch_size} "
-        f"x buffer {data_config.shuffle_buffer_size}), readers {num_workers}"
-    )
-    ctx = mp.get_context("spawn")
-    proc = ctx.Process(
-        target=_coordinator_entry,
-        kwargs=dict(
-            input_path=input_path,
-            num_readers=num_workers,
-            start_offsets=resources.start_offsets,
-            input_q=resources.input_q,
-            ctrl_q=resources.ctrl_q,
-            shared_dispatch_queue=resources.shared_dispatch_queue,
-            mode=data_config.shuffle_mode,
-            capacity_rows=capacity_rows,
-            batch_size=data_config.batch_size,
-            input_table_schema=dataset._table_schema,
-            reader_schema=dataset._reader_schema,
-            full_schema=dataset._reader_full_schema,
-            has_embedded_schema=dataset._has_embedded_schema,
-            trainer_pid=os.getpid(),
-        ),
-        # not daemon: daemonic processes cannot fork reader children;
-        # orphan self-exit is handled via trainer_pid checks instead
-        daemon=False,
-        name="tzrec-sample-shuffle-coordinator",
-    )
-    proc.start()
-    return SampleShuffleClient(proc, resources)

@@ -47,7 +47,6 @@ from tzrec.datasets.dataset import (
     create_dataloader,
     create_writer,
 )
-from tzrec.datasets.kafka_dataset import SampleShuffleClient
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
     BaseFeature,
@@ -550,11 +549,6 @@ def _train_and_evaluate(
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
-    # sample-level shuffle: lifecycle handle of the per-rank coordinator
-    ss_client = getattr(train_dataloader, "sample_shuffle_client", None)
-    if not isinstance(ss_client, SampleShuffleClient):
-        ss_client = None
-
     try:
         for i_epoch in epoch_iter:
             pipeline = create_train_pipeline(
@@ -651,8 +645,8 @@ def _train_and_evaluate(
 
                 # Single entry point for step / epoch / event-time saves + dedupe;
                 # maybe_save reconciles this rank's event-time across ranks in lockstep.
-                if ss_client is not None:
-                    # shuffled batches are not time-ordered; keep max-so-far
+                if train_dataloader.dataset.is_sample_shuffled():
+                    # sample-shuffled batches are not time-ordered: keep max-so-far
                     data_timestamp = max(data_timestamp, batch.data_timestamp)
                 else:
                     data_timestamp = batch.data_timestamp
@@ -764,9 +758,8 @@ def _train_and_evaluate(
             else None
         )
     finally:
-        if ss_client is not None:
-            # stop the coordinator and its reader processes
-            ss_client.stop()
+        # stop background data loading (a no-op for paths without any)
+        train_dataloader.dataset.stop_loading()
         online_dense_exporter.close()
         ckpt_manager.close()
 

@@ -356,7 +356,7 @@ pipeline.global-job-parameters: |
 - 是否按dataloader任务提交顺序返回batch，默认为true；仅在`num_workers > 0`时生效
 - 设置为false时，先处理完的worker可以先返回batch，避免慢worker阻塞其他worker，但可能降低可复现性，并改变训练样本或预测结果的输出顺序
 - 对于样本分布不均衡的数据，设置为false可能使训练过程看到的数据分布产生偏差
-- 样本级打散模式（`shuffle_mode=SAMPLE_WINDOW`或`SAMPLE_ROLLING`）下该参数不生效：样本内容已在共享池中按样本级随机，batch始终经单个共享队列派发
+- 样本级打散模式（`shuffle_mode=SAMPLE_WINDOW`或`SAMPLE_ROLLING`）下该参数不生效：样本内容已在共享池中按样本级随机
 
 ### shuffle
 
@@ -365,21 +365,15 @@ pipeline.global-job-parameters: |
 ### shuffle_buffer_size
 
 - 最多缓存多少个batch用于打散数据，默认为32
-- 样本级打散模式（`shuffle_mode=SAMPLE_WINDOW`或`SAMPLE_ROLLING`）下，每rank的共享样本池容量为`batch_size * shuffle_buffer_size`条样本，不再乘worker数；调整`batch_size`会同步改变样本池容量
 
 ### shuffle_mode
 
 - 打散模式，默认为`BATCH`
-  - `BATCH`：每个读取worker各自缓存若干完整batch并随机输出（原有行为），batch内样本组合不变
+  - `BATCH`：每个读取worker各自缓存若干完整batch并随机输出，batch内样本组合不变
   - `SAMPLE_WINDOW`：样本级打散。同一rank内所有读取单元把原始样本汇入一个共享池，填满后冻结为一个窗口，窗口内样本全排列后连续切成完整batch输出；窗口输出期间到达的新样本进入下一窗口
   - `SAMPLE_ROLLING`：样本级打散。共享池填满后，每次随机抽取`batch_size`条样本输出并移出池，补满后再抽下一批
-- 仅支持`KafkaDataset`的训练；评估、预测及非Kafka数据源不生效（非Kafka数据源配置样本模式会在启动时报错）
-- 样本模式只输出完整batch（不足一个batch的样本保留在池中）；不支持`batch_cost_size`，同时配置会在启动时报错
-- 样本模式解决低流量场景下同一rank内各worker流量分散、各自攒不满shuffle buffer的问题，适合需要样本级打散的训练
-- 样本模式与原`BATCH`模式采用相同的最大offset恢复语义：每个batch训练完成后，按partition记录本批实际出现的最大offset并跨rank取最大值保存；由于样本在池中被打乱，恢复时可能跳过尚未训练的样本（已记录的较大offset覆盖了池内较小offset的未训样本），也可能重放部分样本
-- 样本模式要求`enable.auto.commit`保持默认的false；Kafka URI中显式设置`enable.auto.commit=true`会在启动时报错
-- 样本模式运行时每个rank会额外启动1个协调进程和`num_workers`个读取进程
-- 池未满时会等待填满才出批：低流量场景下首个batch的产出时间约为"填满池所需时间"，调小`shuffle_buffer_size`可让首个batch更快产出（混洗范围随之变小）
+- 仅支持`KafkaDataset`的训练；评估、预测及非Kafka数据源不生效
+- 样本模式通过训练 checkpoint 管理恢复位置，要求 enable.auto.commit=false（默认值），避免 Kafka 自动提交的读取进度与实际训练进度混淆；显式设置为 true 会在启动时报错。
 
 样本级打散配置示例：
 
@@ -395,12 +389,7 @@ data_config {
 
 - 此例中每个rank的样本池容量为 512 x 98 = 50176 条样本
 - `num_workers=0`时读取仍在后台执行单元进行，主进程直接领取组好的batch完成特征处理
-- 除样本池外，进程间输入缓冲、派发队列（容量约为 worker数×2 个batch，与DataLoader预取深度一致）、DataLoader预取及训练管道中的数据分别占用内存，容量估算时都需要计入；Kafka客户端自身缓存和单条大消息的解码内存另计
-- "实际混洗范围"指输出一个batch时池中可供随机抽取的样本数：始终在池容量附近
-- 观测与排障：
-  - 协调器每60秒输出一次统计日志（`sample-shuffle stats`），包含池内样本数、容量、累计输入/输出、打出次数与压实次数
-  - 协调进程或读取进程异常退出会使整个训练报错退出，从最近成功checkpoint恢复
-  - 训练运行期间不支持扩展Kafka partition数；发现新partition会报错退出。checkpoint起点已被Kafka保留策略回收时同样报错
+- 池未满时会等待填满才出批：低流量场景下首个batch的产出时间约为"填满池所需时间"，调小`shuffle_buffer_size`可让首个batch更快产出（混洗范围随之变小）
 
 ### fg_encoded_multival_sep
 
