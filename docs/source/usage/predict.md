@@ -81,4 +81,4 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_TABLE_LIFECYCLE: 自动创建的ODPS输出表的lifecycle
-- DIST_EMB_GPU_CACHE_RATIO: 预测分布式 embedding 导出模型时，每张 GPU 缓存的 embedding 比例（按存储字节数计算），取值 (0, 1\]，默认 1.0 即全部缓存到 GPU；GPU 显存不足时调小，未缓存的 id 从 host 内存读取
+- DIST_EMB_GPU_CACHE_RATIO: 预测分布式 embedding 导出模型时，每张 GPU 缓存的 embedding 比例（按存储字节数计算），默认 `auto`：按各 GPU 的空闲显存（预留 20% 显存给 dense 前向等）和 embedding 存储大小自动计算，日志会打印实际使用的比例（如 `DIST_EMB_GPU_CACHE_RATIO=auto resolved to 0.35`）；也可设置为 (0, 1\] 的数值手动指定。若显存不足（OOM），可设置比日志中更小的数值；未缓存的 id 从 host 内存读取

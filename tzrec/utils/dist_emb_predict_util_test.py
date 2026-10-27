@@ -23,8 +23,10 @@ from tzrec.utils import npz_util, quant_util
 from tzrec.utils.dist_emb_predict_util import (
     DistributedEmbeddingLookup,
     _encode_keys,
+    _gpu_cache_ratio,
     _key_tag,
 )
+from tzrec.utils.logging_util import logger
 from tzrec.utils.test_util import (
     make_test_dir,
     mark_ci_scope,
@@ -159,6 +161,78 @@ class FusedKeyTest(unittest.TestCase):
             payload_bits = 63 - n.bit_length()
             largest = _key_tag(n - 1, payload_bits) | ((1 << payload_bits) - 1)
             self.assertLess(largest, (1 << 63) - 1, n)
+
+
+_GiB = 1 << 30
+# a layer's overhead plus its minimum cache, as the auto budget counts them
+_LAYER = (96 << 20) + (1 << 20)
+
+
+def _mem_info(free_total):
+    """Mocked torch.cuda.mem_get_info returning (free, total) per device index."""
+    return mock.patch(
+        "torch.cuda.mem_get_info", side_effect=lambda d: free_total[d.index]
+    )
+
+
+class GpuCacheRatioTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            param("default", env={}, mem=[(60 * _GiB, 72 * _GiB)], expected=1.0),
+            param("auto", env={"DIST_EMB_GPU_CACHE_RATIO": "auto"},
+                  mem=[(60 * _GiB, 72 * _GiB)], expected=1.0),
+            # 10 GiB GPU: 2 GiB reserve and 2 layers leave 2 GiB for 8 GiB.
+            param("constrained", env={},
+                  mem=[(4 * _GiB + 2 * _LAYER, 10 * _GiB)], expected=0.25),
+            # the GPU with less free memory decides.
+            param("two_gpus", env={},
+                  mem=[(9 * _GiB, 10 * _GiB), (4 * _GiB + 2 * _LAYER, 10 * _GiB)],
+                  expected=0.25),
+            param("rounds_down", env={},
+                  mem=[(4 * _GiB + 2 * _LAYER + _GiB // 3, 10 * _GiB)],
+                  expected=0.2916),
+            param("no_room", env={}, mem=[(_GiB, 10 * _GiB)], expected=0.0),
+        ],
+        name_func=parameterized_name_func,
+    )  # fmt: skip
+    def test_auto(self, _name, env, mem, expected) -> None:
+        devices = [torch.device("cuda", i) for i in range(len(mem))]
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            _mem_info(mem),
+            self.assertLogs(logger, "INFO") as logs,
+        ):
+            ratio = _gpu_cache_ratio(devices, [4 * _GiB, 4 * _GiB])
+        self.assertEqual(ratio, expected)
+        self.assertTrue(
+            any(
+                f"DIST_EMB_GPU_CACHE_RATIO=auto resolved to {expected} " in line
+                for line in logs.output
+            ),
+            logs.output,
+        )
+        self.assertEqual(
+            any("no GPU memory left" in line for line in logs.output), expected == 0
+        )
+
+    def test_numeric_override(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"DIST_EMB_GPU_CACHE_RATIO": "0.35"}),
+            mock.patch("torch.cuda.mem_get_info") as mem_get_info,
+        ):
+            ratio = _gpu_cache_ratio([torch.device("cuda", 0)], [4 * _GiB])
+        self.assertEqual(ratio, 0.35)
+        mem_get_info.assert_not_called()
+
+    @parameterized.expand(
+        [param("zero", value="0"), param("above_one", value="1.5"),
+         param("text", value="half")],
+        name_func=parameterized_name_func,
+    )  # fmt: skip
+    def test_invalid_value_raises(self, _name, value) -> None:
+        with mock.patch.dict(os.environ, {"DIST_EMB_GPU_CACHE_RATIO": value}):
+            with self.assertRaises(ValueError):
+                _gpu_cache_ratio([torch.device("cuda", 0)], [4 * _GiB])
 
 
 @mark_ci_scope("gpu")
@@ -412,6 +486,43 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
     def test_no_devices_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires CUDA devices"):
             DistributedEmbeddingLookup(self.export_dir, [])
+
+    def test_auto_cache_ratio_is_the_allocated_one(self) -> None:
+        # one fp32 dim-8 table of 6.4 MB; the mocked GPU leaves room for half.
+        table = _Table("model.ebc.big", 200000, 8, False, dynamic=True)
+        features = {
+            "a__ebc": {
+                "embedding_name": table.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            }
+        }
+        _write_export(
+            self.export_dir, [table], features, {"sequence__ec": [], "deep": ["a__ebc"]}
+        )
+        storage = 200000 * 8 * 4
+        total = 10 * _GiB
+        mem = [(int(0.2 * total) + _LAYER + storage // 2, total)]
+        device = torch.device("cuda:0")
+        with (
+            mock.patch.dict(os.environ, {"DIST_EMB_GPU_CACHE_RATIO": "auto"}),
+            _mem_info(mem),
+            self.assertLogs(logger, "INFO") as logs,
+        ):
+            lookup = DistributedEmbeddingLookup(self.export_dir, [device])
+        text = "\n".join(logs.output)
+        self.assertIn("DIST_EMB_GPU_CACHE_RATIO=auto resolved to 0.5 ", text)
+        self.assertIn(f"gpu_cache_bytes={storage // 2}.", text)
+        out = lookup(
+            {
+                "a.values": torch.tensor(table.keys[:3], dtype=torch.int64),
+                "a.lengths": torch.tensor([3]),
+            },
+            device,
+        )
+        np.testing.assert_allclose(
+            out["deep"].cpu().numpy()[0], table.rows[:3].sum(0), rtol=1e-5, atol=1e-5
+        )
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
     def test_devices_share_tables(self) -> None:

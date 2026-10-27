@@ -37,6 +37,7 @@ served on its own, with its raw keys, so every exported key resolves exactly.
 import contextlib
 import glob
 import json
+import math
 import os
 import time
 import zipfile
@@ -52,15 +53,58 @@ _LOAD_BATCH_ROWS = 1 << 20
 # NVE uses key -1 as its empty-slot marker, so -1 ids look up this miss key.
 _MISSING_KEY = torch.iinfo(torch.int64).max
 _MIN_GPU_CACHE_BYTES = 1 << 20
+# GPU memory left to the dense forward, lookup scratch and the allocator; the
+# measured peak of a 561-feature MMoE predict was ~4% of a 72 GB GPU.
+_GPU_RESERVE_FRACTION = 0.2
+# NVE memory of a layer besides its cache: ~81 MiB measured on pynve 26.10 (the
+# modify buffer at the default max_modify_size) plus per-stream lookup buffers.
+_LAYER_OVERHEAD_BYTES = 96 << 20
 _MAX_GROUP_MEMBERS = (1 << 11) - 1
 _SALT_MULTIPLIER = 0x9E3779B97F4A7C15
 
 
-def _gpu_cache_ratio() -> float:
-    """Fraction of each table's stored bytes cached on every GPU."""
-    ratio = float(os.environ.get("DIST_EMB_GPU_CACHE_RATIO", "1.0"))
-    if not 0 < ratio <= 1:
-        raise ValueError(f"DIST_EMB_GPU_CACHE_RATIO must be in (0, 1], got {ratio}")
+def _gpu_cache_ratio(devices: List[torch.device], storage_bytes: List[int]) -> float:
+    """Fraction of each group's stored bytes cached on every GPU.
+
+    ``DIST_EMB_GPU_CACHE_RATIO`` unset or ``auto`` sizes the caches from the free
+    memory of the most constrained GPU, less a reserve for the dense forward and
+    the layers' own buffers, rounded down to 4 decimals; a number in (0, 1] is
+    used as is.
+
+    Args:
+        devices: the GPUs, each holding one cache per group.
+        storage_bytes: the stored bytes of each group.
+
+    Returns:
+        The ratio the caches are allocated with.
+    """
+    value = os.environ.get("DIST_EMB_GPU_CACHE_RATIO", "auto")
+    if value != "auto":
+        ratio = float(value)
+        if not 0 < ratio <= 1:
+            raise ValueError(
+                f"DIST_EMB_GPU_CACHE_RATIO must be auto or in (0, 1], got {value}"
+            )
+        return ratio
+    layer_bytes = len(storage_bytes) * (_LAYER_OVERHEAD_BYTES + _MIN_GPU_CACHE_BYTES)
+    budget = min(
+        free - _GPU_RESERVE_FRACTION * total - layer_bytes
+        for free, total in (torch.cuda.mem_get_info(d) for d in devices)
+    )
+    total_bytes = sum(storage_bytes)
+    ratio = min(1.0, max(budget, 0) / max(total_bytes, 1))
+    ratio = math.floor(ratio * 1e4) / 1e4
+    logger.info(
+        f"DIST_EMB_GPU_CACHE_RATIO=auto resolved to {ratio} (GPU cache budget "
+        f"{budget / 2**30:.2f} GiB on the most constrained of {len(devices)} GPUs, "
+        f"{total_bytes / 2**30:.2f} GiB of embeddings); set a lower "
+        "DIST_EMB_GPU_CACHE_RATIO if GPU memory runs out."
+    )
+    if ratio == 0:
+        logger.warning(
+            "no GPU memory left for embedding caches: each gets the "
+            f"{_MIN_GPU_CACHE_BYTES} bytes minimum and lookups read the host tables."
+        )
     return ratio
 
 
@@ -120,7 +164,7 @@ class DistributedEmbeddingLookup:
 
     def __init__(self, export_dir: str, devices: List[torch.device]) -> None:
         import pynve.nve as nve
-        from pynve.torch import nve_layers, nve_ps
+        from pynve.torch import nve_dtypes, nve_layers, nve_ps
 
         if not devices or any(d.type != "cuda" for d in devices):
             raise ValueError(
@@ -224,7 +268,14 @@ class DistributedEmbeddingLookup:
                             _Group(dtype, dim, default_rows[name], [name], [0], None)
                         )
 
-            ratio = _gpu_cache_ratio()
+            group_rows = [
+                sum(emb_meta[e]["shape"][0] for e in group.members) for group in groups
+            ]
+            storage_bytes = [
+                rows * nve_dtypes.stored_row_bytes(g.dim, storage_types[g.dtype])
+                for rows, g in zip(group_rows, groups)
+            ]
+            ratio = _gpu_cache_ratio(devices, storage_bytes)
             # table name -> (group index, member tag)
             self._table_group: Dict[str, Tuple[int, int]] = {}
             self._groups = groups
@@ -233,7 +284,7 @@ class DistributedEmbeddingLookup:
             }
             for group_idx, group in enumerate(groups):
                 storage_type = storage_types[group.dtype]
-                num_rows = sum(emb_meta[e]["shape"][0] for e in group.members)
+                num_rows = group_rows[group_idx]
                 ps = nve_ps.NVEParameterServer(
                     0, group.dim, storage_type, initial_size=max(num_rows, 1024)
                 )
@@ -261,7 +312,7 @@ class DistributedEmbeddingLookup:
                 if group.default_row is not None:
                     config["default_embedding"] = torch.from_numpy(group.default_row)
                 gpu_cache_size = max(
-                    int(ratio * num_rows * ps.row_bytes), _MIN_GPU_CACHE_BYTES
+                    int(ratio * storage_bytes[group_idx]), _MIN_GPU_CACHE_BYTES
                 )
                 for device in devices:
                     # SUM is the default mode; MEAN and NONE lookups pass their mode,
