@@ -1580,14 +1580,6 @@ def predict(
                 "embeddings, launch with --nproc_per_node=1 to share one copy "
                 "between all GPUs of a node."
             )
-        for d in forward_devices:
-            if d not in models:
-                models[d] = torch.jit.load(
-                    os.path.join(scripted_model_path, "scripted_model.pt"),
-                    map_location=d,
-                )
-                models[d].eval()
-        sparse_lookup = DistributedEmbeddingLookup(scripted_model_path, forward_devices)
 
     plogger = None
     if is_local_rank_zero:
@@ -1695,6 +1687,19 @@ def predict(
     pipeline_error: Optional[BaseException] = None
     i_step = 0
     try:
+        if is_dist_emb:
+            # loaded in the guarded scope: a failed load still reaches the commit
+            # rendezvous below, so other ranks fail fast instead of waiting.
+            for d in forward_devices:
+                if d not in models:
+                    models[d] = torch.jit.load(
+                        os.path.join(scripted_model_path, "scripted_model.pt"),
+                        map_location=d,
+                    )
+                    models[d].eval()
+            sparse_lookup = DistributedEmbeddingLookup(
+                scripted_model_path, forward_devices
+            )
         while True:
             try:
                 batch = next(infer_iterator)

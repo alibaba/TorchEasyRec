@@ -369,7 +369,8 @@ class NpzUtilTest(unittest.TestCase):
         arr = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
         path = self._path()
         npz_util.savez_streaming(path, {"other": np.ones(3), "emb.values": arr})
-        batches = list(npz_util.iter_npz_entry(path, "emb.values", batch_rows))
+        with zipfile.ZipFile(path) as zf:
+            batches = list(npz_util.iter_npz_entry(zf, "emb.values", batch_rows))
         self.assertTrue(all(len(b) <= batch_rows for b in batches))
         self.assertTrue(all(b.flags.writeable for b in batches))
         result = np.concatenate(batches) if batches else np.empty(shape, dtype)

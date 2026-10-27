@@ -34,9 +34,11 @@ tables never collide; a table whose exported keys collide after folding is
 served on its own, with its raw keys, so every exported key resolves exactly.
 """
 
+import contextlib
 import glob
 import json
 import os
+import zipfile
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
@@ -119,7 +121,7 @@ class DistributedEmbeddingLookup:
         import pynve.nve as nve
         from pynve.torch import nve_layers, nve_ps
 
-        if any(d.type != "cuda" for d in devices):
+        if not devices or any(d.type != "cuda" for d in devices):
             raise ValueError(
                 "predict of a distributed embedding export requires CUDA devices, "
                 f"got {devices}."
@@ -145,126 +147,146 @@ class DistributedEmbeddingLookup:
             "float16": torch.float16,
             "QUint8RowwiseF16": nve.DataType_t.QUint8RowwiseF16,
         }
-        static_npz = sorted(
-            glob.glob(os.path.join(sparse_dir, "sparse_embeddings-*-of-*.npz"))
-        )
-        dynamic_npz = sorted(
-            glob.glob(os.path.join(sparse_dir, "sparse_dynamic_embedding-*-of-*.npz"))
-        )
-
-        candidates: Dict[Tuple, List[str]] = {}
-        default_rows: Dict[str, Optional[np.ndarray]] = {}
-        for emb_name in sorted(
-            {self._feat_meta[f]["embedding_name"] for f in self._used_feats}
-        ):
-            meta = emb_meta[emb_name]
-            if meta["dtype"] not in storage_types:
-                raise ValueError(
-                    f"unsupported dtype {meta['dtype']} of embedding {emb_name}."
+        with contextlib.ExitStack() as stack:
+            # npz entry name -> the shards holding it; each shard is opened once.
+            entries: Dict[str, List[zipfile.ZipFile]] = {}
+            for path in sorted(
+                glob.glob(os.path.join(sparse_dir, "sparse_embeddings-*-of-*.npz"))
+                + glob.glob(
+                    os.path.join(sparse_dir, "sparse_dynamic_embedding-*-of-*.npz")
                 )
-            default_row = None
-            default_name = (
-                meta.get("default_value_name") if meta["is_dynamic"] else None
-            )
-            if default_name:
-                default_row = next(
-                    npz_util.iter_npz_entry(
-                        self._npz_with(dynamic_npz, default_name), default_name, 1
-                    )
-                )[0].copy()
-            default_rows[emb_name] = default_row
-            key = (
-                meta["is_dynamic"],
-                meta["dtype"],
-                meta["dimension"],
-                b"" if default_row is None else default_row.tobytes(),
-            )
-            candidates.setdefault(key, []).append(emb_name)
+            ):
+                zf = stack.enter_context(zipfile.ZipFile(path))
+                for name in zf.namelist():
+                    entries.setdefault(name[: -len(".npy")], []).append(zf)
 
-        groups: List[_Group] = []
-        for (is_dynamic, dtype, dim, _), names in candidates.items():
-            for start in range(0, len(names), _MAX_GROUP_MEMBERS):
-                members = names[start : start + _MAX_GROUP_MEMBERS]
-                payload_bits = 63 - len(members).bit_length()
-                fused, fused_ids = [], []
-                for member_idx, name in enumerate(members):
-                    if is_dynamic and self._has_fold_collision(
-                        emb_meta[name], dynamic_npz, payload_bits
-                    ):
-                        logger.info(
-                            f"keys of dynamic embedding {name} collide after "
-                            f"folding to {payload_bits} bits, serve it unfused."
+            candidates: Dict[Tuple, List[str]] = {}
+            default_rows: Dict[str, Optional[np.ndarray]] = {}
+            for emb_name in sorted(
+                {self._feat_meta[f]["embedding_name"] for f in self._used_feats}
+            ):
+                meta = emb_meta[emb_name]
+                if meta["dtype"] not in storage_types:
+                    raise ValueError(
+                        f"unsupported dtype {meta['dtype']} of embedding {emb_name}."
+                    )
+                default_row = None
+                default_name = (
+                    meta.get("default_value_name") if meta["is_dynamic"] else None
+                )
+                if default_name:
+                    default_row = next(
+                        npz_util.iter_npz_entry(
+                            entries[default_name][0], default_name, 1
                         )
+                    )[0].copy()
+                default_rows[emb_name] = default_row
+                key = (
+                    meta["is_dynamic"],
+                    meta["dtype"],
+                    meta["dimension"],
+                    b"" if default_row is None else default_row.tobytes(),
+                )
+                candidates.setdefault(key, []).append(emb_name)
+
+            groups: List[_Group] = []
+            for (is_dynamic, dtype, dim, _), names in candidates.items():
+                for start in range(0, len(names), _MAX_GROUP_MEMBERS):
+                    members = names[start : start + _MAX_GROUP_MEMBERS]
+                    payload_bits = 63 - len(members).bit_length()
+                    fused, fused_ids = [], []
+                    for member_idx, name in enumerate(members):
+                        if is_dynamic and self._has_fold_collision(
+                            emb_meta[name],
+                            entries.get(emb_meta[name]["key_name"], []),
+                            payload_bits,
+                        ):
+                            logger.info(
+                                f"keys of dynamic embedding {name} collide after "
+                                f"folding to {payload_bits} bits, serve it unfused."
+                            )
+                            groups.append(
+                                _Group(
+                                    dtype, dim, default_rows[name], [name], [0], None
+                                )
+                            )
+                        else:
+                            fused.append(name)
+                            fused_ids.append(member_idx)
+                    if fused:
                         groups.append(
-                            _Group(dtype, dim, default_rows[name], [name], [0], None)
+                            _Group(
+                                dtype,
+                                dim,
+                                default_rows[members[0]],
+                                fused,
+                                fused_ids,
+                                payload_bits,
+                            )
+                        )
+
+            ratio = _gpu_cache_ratio()
+            # table name -> (group index, member tag)
+            self._table_group: Dict[str, Tuple[int, int]] = {}
+            self._groups = groups
+            self._layers: Dict[torch.device, List[torch.nn.Module]] = {
+                d: [] for d in devices
+            }
+            for group_idx, group in enumerate(groups):
+                storage_type = storage_types[group.dtype]
+                num_rows = sum(emb_meta[e]["shape"][0] for e in group.members)
+                ps = nve_ps.NVEParameterServer(
+                    0, group.dim, storage_type, initial_size=max(num_rows, 1024)
+                )
+                for member_idx, emb_name in zip(group.member_ids, group.members):
+                    if group.payload_bits is None:
+                        tag = 0
+                    else:
+                        tag = _key_tag(member_idx, group.payload_bits)
+                    self._table_group[emb_name] = (group_idx, tag)
+                    if emb_meta[emb_name]["is_dynamic"]:
+                        rows = self._load_dynamic(
+                            ps, emb_meta[emb_name], entries, group, tag
                         )
                     else:
-                        fused.append(name)
-                        fused_ids.append(member_idx)
-                if fused:
-                    groups.append(
-                        _Group(
-                            dtype,
-                            dim,
-                            default_rows[members[0]],
-                            fused,
-                            fused_ids,
-                            payload_bits,
+                        rows = self._load_static(
+                            ps, entries.get(emb_name, []), emb_name, group, tag
+                        )
+                    if rows != emb_meta[emb_name]["shape"][0]:
+                        raise ValueError(
+                            f"{emb_name}: {rows} rows in the npz shards, but "
+                            "sparse_embedding.json declares "
+                            f"{emb_meta[emb_name]['shape'][0]}."
+                        )
+                config = {}
+                if group.default_row is not None:
+                    config["default_embedding"] = torch.from_numpy(group.default_row)
+                gpu_cache_size = max(
+                    int(ratio * num_rows * ps.row_bytes), _MIN_GPU_CACHE_BYTES
+                )
+                for device in devices:
+                    # SUM is the default mode; MEAN and NONE lookups pass their mode,
+                    # so one layer, with one GPU cache, serves every pooling.
+                    self._layers[device].append(
+                        nve_layers.NVEmbeddingBag(
+                            num_rows,
+                            group.dim,
+                            storage_type,
+                            nve_layers.LayerType.Hierarchical,
+                            "sum",
+                            gpu_cache_size=gpu_cache_size,
+                            storage=ps,
+                            optimize_for_training=False,
+                            device=device,
+                            config=dict(config),
                         )
                     )
-
-        ratio = _gpu_cache_ratio()
-        # table name -> (group index, member tag)
-        self._table_group: Dict[str, Tuple[int, int]] = {}
-        self._groups = groups
-        self._layers: Dict[torch.device, List[torch.nn.Module]] = {
-            d: [] for d in devices
-        }
-        for group_idx, group in enumerate(groups):
-            storage_type = storage_types[group.dtype]
-            num_rows = sum(emb_meta[e]["shape"][0] for e in group.members)
-            ps = nve_ps.NVEParameterServer(
-                0, group.dim, storage_type, initial_size=max(num_rows, 1024)
-            )
-            for member_idx, emb_name in zip(group.member_ids, group.members):
-                if group.payload_bits is None:
-                    tag = 0
-                else:
-                    tag = _key_tag(member_idx, group.payload_bits)
-                self._table_group[emb_name] = (group_idx, tag)
-                if emb_meta[emb_name]["is_dynamic"]:
-                    self._load_dynamic(ps, emb_meta[emb_name], dynamic_npz, group, tag)
-                else:
-                    self._load_static(ps, emb_name, static_npz, group, tag)
-            config = {}
-            if group.default_row is not None:
-                config["default_embedding"] = torch.from_numpy(group.default_row)
-            gpu_cache_size = max(
-                int(ratio * num_rows * ps.row_bytes), _MIN_GPU_CACHE_BYTES
-            )
-            for device in devices:
-                # SUM is the default mode; MEAN and NONE lookups pass their mode,
-                # so one layer, with one GPU cache, serves every pooling.
-                self._layers[device].append(
-                    nve_layers.NVEmbeddingBag(
-                        num_rows,
-                        group.dim,
-                        storage_type,
-                        nve_layers.LayerType.Hierarchical,
-                        "sum",
-                        gpu_cache_size=gpu_cache_size,
-                        storage=ps,
-                        optimize_for_training=False,
-                        device=device,
-                        config=dict(config),
-                    )
+                logger.info(
+                    f"loaded sparse embeddings {group.members}: rows={num_rows}, "
+                    f"dim={group.dim}, dtype={group.dtype}, "
+                    f"fused_key_payload_bits={group.payload_bits}, "
+                    f"gpu_cache_bytes={gpu_cache_size}."
                 )
-            logger.info(
-                f"loaded sparse embeddings {group.members}: rows={num_rows}, "
-                f"dim={group.dim}, dtype={group.dtype}, "
-                f"fused_key_payload_bits={group.payload_bits}, "
-                f"gpu_cache_bytes={gpu_cache_size}."
-            )
 
         # features looked up together, per (group, pooling).
         self._buckets: Dict[Tuple[int, str], List[str]] = {}
@@ -291,16 +313,8 @@ class DistributedEmbeddingLookup:
             }
 
     @staticmethod
-    def _npz_with(npz_files: List[str], name: str) -> str:
-        """Return the npz shard holding entry ``name``."""
-        for path in npz_files:
-            if npz_util.has_npz_entry(path, name):
-                return path
-        raise FileNotFoundError(f"npz entry {name} not found in {npz_files}.")
-
-    @staticmethod
     def _has_fold_collision(
-        meta: Dict, npz_files: List[str], payload_bits: int
+        meta: Dict, shards: List[zipfile.ZipFile], payload_bits: int
     ) -> bool:
         """Whether two exported keys of a dynamic table fold to the same value.
 
@@ -309,14 +323,15 @@ class DistributedEmbeddingLookup:
         """
         folded = np.empty(meta["shape"][0], dtype=np.int64)
         num_keys, max_key = 0, 0
-        for path in npz_files:
-            if not npz_util.has_npz_entry(path, meta["key_name"]):
-                continue
-            for keys in npz_util.iter_npz_entry(
-                path, meta["key_name"], _LOAD_BATCH_ROWS
-            ):
+        for zf in shards:
+            for keys in npz_util.iter_npz_entry(zf, meta["key_name"], _LOAD_BATCH_ROWS):
                 if len(keys) == 0:
                     continue
+                if num_keys + len(keys) > len(folded):
+                    raise ValueError(
+                        f"{meta['key_name']}: more keys in the npz shards than the "
+                        f"{len(folded)} rows sparse_embedding.json declares."
+                    )
                 max_key = max(max_key, int(keys.max()))
                 folded[num_keys : num_keys + len(keys)] = _fold_keys(
                     torch.from_numpy(keys), payload_bits
@@ -334,31 +349,42 @@ class DistributedEmbeddingLookup:
 
     @classmethod
     def _load_dynamic(
-        cls, ps: object, meta: Dict, npz_files: List[str], group: _Group, tag: int
-    ) -> None:
-        """Insert the key/value rows of a dynamic table from every shard."""
-        for path in npz_files:
-            if not npz_util.has_npz_entry(path, meta["key_name"]):
-                continue
+        cls,
+        ps: object,
+        meta: Dict,
+        entries: Dict[str, List[zipfile.ZipFile]],
+        group: _Group,
+        tag: int,
+    ) -> int:
+        """Insert the key/value rows of a dynamic table; return the row count."""
+        rows = 0
+        for zf in entries.get(meta["key_name"], []):
             for keys, values in zip(
-                npz_util.iter_npz_entry(path, meta["key_name"], _LOAD_BATCH_ROWS),
-                npz_util.iter_npz_entry(path, meta["value_name"], _LOAD_BATCH_ROWS),
+                npz_util.iter_npz_entry(zf, meta["key_name"], _LOAD_BATCH_ROWS),
+                npz_util.iter_npz_entry(zf, meta["value_name"], _LOAD_BATCH_ROWS),
+                strict=True,
             ):
                 ps.insert(cls._stored_keys(keys, group, tag), torch.from_numpy(values))
+                rows += len(keys)
+        return rows
 
     @classmethod
     def _load_static(
-        cls, ps: object, emb_name: str, npz_files: List[str], group: _Group, tag: int
-    ) -> None:
-        """Insert the rows of a static table keyed by their row index."""
+        cls,
+        ps: object,
+        shards: List[zipfile.ZipFile],
+        emb_name: str,
+        group: _Group,
+        tag: int,
+    ) -> int:
+        """Insert the rows of a static table keyed by row index; return the count."""
         offset = 0
-        for path in npz_files:
-            if not npz_util.has_npz_entry(path, emb_name):
-                continue
-            for values in npz_util.iter_npz_entry(path, emb_name, _LOAD_BATCH_ROWS):
+        for zf in shards:
+            for values in npz_util.iter_npz_entry(zf, emb_name, _LOAD_BATCH_ROWS):
                 keys = np.arange(offset, offset + len(values), dtype=np.int64)
                 ps.insert(cls._stored_keys(keys, group, tag), torch.from_numpy(values))
                 offset += len(values)
+        return offset
 
     @staticmethod
     def _stored_keys(keys: np.ndarray, group: _Group, tag: int) -> torch.Tensor:

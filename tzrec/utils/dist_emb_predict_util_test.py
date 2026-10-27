@@ -332,6 +332,34 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             out["deep"].cpu().numpy(), expected, rtol=2e-3, atol=2e-3
         )
 
+    @parameterized.expand(
+        [
+            param("dynamic", dynamic=True),
+            param("static", dynamic=False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_row_count_mismatch_raises(self, _name, dynamic) -> None:
+        table = _Table("model.ebc.t", 20, 8, True, dynamic=dynamic)
+        # sparse_embedding.json declares more rows than the shards hold.
+        table.meta["shape"] = [25, 8]
+        features = {
+            "a__ebc": {
+                "embedding_name": table.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            }
+        }
+        _write_export(
+            self.export_dir, [table], features, {"sequence__ec": [], "deep": ["a__ebc"]}
+        )
+        with self.assertRaisesRegex(ValueError, "20 rows in the npz shards"):
+            DistributedEmbeddingLookup(self.export_dir, [torch.device("cuda:0")])
+
+    def test_no_devices_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires CUDA devices"):
+            DistributedEmbeddingLookup(self.export_dir, [])
+
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
     def test_devices_share_tables(self) -> None:
         dyn = _Table("model.ebc.dyn", 50, 8, True, dynamic=True)
