@@ -451,7 +451,7 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         self.zch_modules: Dict[str, MCHManagedCollisionModule] = {}
         self._zch_fqn_by_mc_module: Dict[int, str] = {}
         self._feature_to_fqn_by_module: Dict[nn.Module, Dict[str, str]] = {}
-        self._kernel_table_fqns: Dict[int, List[str]] = {}
+        self._kernel_bindings: Dict[int, Tuple[List[str], List[str]]] = {}
         self.store = DeltaStoreTrec(UpdateMode.NONE)
 
         lookup_modules: List[nn.Module] = []
@@ -485,13 +485,12 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                 if wrapper is not module:
                     for feature_name in feature_names:
                         if feature_name in feature_to_fqn:
-                            logger.warning(
-                                "Feature %s is shared by several managed "
-                                "collision tables under %s; delta embedding "
-                                "dump attributes its lookups to table %s only.",
-                                feature_name,
-                                module_fqn,
-                                table_fqn,
+                            raise ValueError(
+                                "delta_embedding_dump_config does not support "
+                                f"feature {feature_name!r} shared by managed "
+                                "collision tables "
+                                f"{feature_to_fqn[feature_name]} and {table_fqn}; "
+                                "raw IDs cannot be attributed to a unique table."
                             )
                         feature_to_fqn[feature_name] = table_fqn
                     self._track_zch_table(table_fqn, table_name, mc_modules)
@@ -500,16 +499,8 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
             else:
                 self._register_kernel_trackers(module_fqn, module)
 
-        # Only managed collision wrappers keep the collection-level lookup
-        # callback: their inner lookups see remapped rows, while the wrapper
-        # sees the raw ids ZCH publishing needs. Plain collections are
-        # tracked per kernel instead, so a feature shared by their tables is
-        # not collapsed onto one table's FQN.
         for wrapper in lookup_modules:
-            is_mc_wrapper = any(
-                wrapper is mc_wrapper for mc_wrapper, _ in mc_modules_by_inner.values()
-            )
-            if is_mc_wrapper:
+            if wrapper in self._feature_to_fqn_by_module:
                 wrapper.register_post_lookup_tracker_fn(self.record_lookup)
             if auto_compact:
                 wrapper.register_post_odist_tracker_fn(self.trigger_compaction)
@@ -546,14 +537,32 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         Args:
             module_fqn: FQN of the owning sharded embedding collection.
             module: Sharded embedding collection whose lookups to bind.
+
+        Raises:
+            ValueError: if the lookup's configs and kernels differ in count.
         """
         for lookup in _embedding_lookups(module):
+            if len(lookup.grouped_configs) != len(lookup._emb_modules):
+                raise ValueError(
+                    f"Embedding lookup under {module_fqn} has "
+                    f"{len(lookup._emb_modules)} kernels but "
+                    f"{len(lookup.grouped_configs)} grouped configs."
+                )
             for config, emb_op in zip(lookup.grouped_configs, lookup._emb_modules):
-                self._kernel_table_fqns[id(emb_op)] = [
-                    _embedding_table_fqn(module_fqn, module, table.name)
-                    for table in config.embedding_tables
-                    for _ in table.feature_names
-                ]
+                self._kernel_bindings[id(emb_op)] = (
+                    config.feature_names(),
+                    [
+                        _embedding_table_fqn(module_fqn, module, table.name)
+                        for table in config.embedding_tables
+                        for _ in table.feature_names
+                    ],
+                )
+            if lookup.optim_state_tracker_fn is not None:
+                logger.warning(
+                    "Replacing an existing embedding kernel tracker under %s; "
+                    "the previous tracker will no longer receive lookups.",
+                    module_fqn,
+                )
             lookup.register_optim_state_tracker_fn(self.record_kernel_lookup)
 
     def record_kernel_lookup(
@@ -576,20 +585,21 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         """
         if self.pause_depth > 0:
             return
-        table_fqns = self._kernel_table_fqns.get(id(emb_module))
-        if table_fqns is None:
+        binding = self._kernel_bindings.get(id(emb_module))
+        if binding is None:
             raise ValueError(
                 f"Unrecognized embedding kernel for FQN delta tracking: {emb_module}"
+            )
+        expected_keys, table_fqns = binding
+        if kjt.keys() != expected_keys:
+            raise ValueError(
+                f"Embedding kernel {type(emb_module).__name__} looked up "
+                f"feature keys {kjt.keys()}, expected {expected_keys} "
+                "in table-feature order."
             )
         lengths = kjt.length_per_key()
         if torch.is_tensor(lengths):
             lengths = lengths.tolist()
-        if len(lengths) != len(table_fqns):
-            raise ValueError(
-                f"Embedding kernel {type(emb_module).__name__} looked up "
-                f"{len(lengths)} features but its config binds "
-                f"{len(table_fqns)} table-feature positions."
-            )
         ids_by_fqn: Dict[str, List[torch.Tensor]] = {}
         for table_fqn, ids in zip(table_fqns, torch.split(kjt.values(), lengths)):
             ids_by_fqn.setdefault(table_fqn, []).append(ids)
@@ -658,6 +668,9 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
             states: Lookup output, unused in ID-only tracking mode.
             emb_module: Managed collision wrapper that performed the lookup.
             raw_ids: Optional unprocessed IDs, unused by delta embedding dump.
+
+        Raises:
+            ValueError: if the owning module is missing or was not bound at init.
         """
         if self.pause_depth > 0:
             return
