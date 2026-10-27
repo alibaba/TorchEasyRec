@@ -13,6 +13,7 @@ import unittest
 
 import numpy as np
 import torch
+from parameterized import parameterized
 
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
@@ -22,6 +23,7 @@ from tzrec.prompt.assembler import (
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
     PromptAssembler,
+    build_multi_target_layout,
 )
 from tzrec.prompt.types import (
     FillMode,
@@ -33,6 +35,7 @@ from tzrec.prompt.types import (
     WidthKind,
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
+from tzrec.utils.test_util import parameterized_name_func
 
 _BASE_VOCAB_SIZE = 1000
 _SENTINEL = 1099
@@ -406,6 +409,86 @@ class PromptAssemblerTest(unittest.TestCase):
         scripted = torch.jit.script(module)
         for key, value in scripted(batch).items():
             self.assertTrue(torch.equal(eager[key], value), key)
+
+
+class MultiTargetLayoutTest(unittest.TestCase):
+    @parameterized.expand([[1], [3], [4]], name_func=parameterized_name_func)
+    def test_targets_reuse_prefix_scores_and_restart_positions(self, levels) -> None:
+        prefix_lengths = [2, 4, 3]
+        target_counts = [2, 1, 0]
+        row_lengths = [
+            prefix + count * levels
+            for prefix, count in zip(prefix_lengths, target_counts)
+        ]
+        boundaries = [0]
+        for length in row_lengths:
+            boundaries.append(boundaries[-1] + length)
+        width = max(row_lengths) + 2
+        layout = build_multi_target_layout(
+            torch.tensor(boundaries, dtype=torch.int32),
+            torch.tensor([count * levels for count in target_counts]),
+            width,
+            levels,
+        )
+
+        expected_labels, expected_scores = [], []
+        for row, (prefix, count, length) in enumerate(
+            zip(prefix_lengths, target_counts, row_lengths)
+        ):
+            padding = width - length
+            self.assertEqual(
+                layout.position_ids[row].tolist(),
+                [0] * padding
+                + list(range(prefix))
+                + list(range(prefix, prefix + levels)) * count,
+            )
+            for target in range(count):
+                label_start = boundaries[row] + prefix + target * levels
+                expected_labels.append(list(range(label_start, label_start + levels)))
+                prefix_last = row * width + padding + prefix - 1
+                branch_start = prefix_last + 1 + target * levels
+                expected_scores.append(
+                    [prefix_last] + list(range(branch_start, branch_start + levels - 1))
+                )
+
+        self.assertEqual(layout.target_counts.tolist(), target_counts)
+        self.assertEqual(layout.target_parents.tolist(), [0, 0, 1])
+        self.assertEqual(layout.label_indices.tolist(), expected_labels)
+        self.assertEqual(
+            layout.logit_indices[layout.logit_inverse].reshape(-1, levels).tolist(),
+            expected_scores,
+        )
+        self.assertEqual(layout.logit_indices.numel(), 3 * levels - 1)
+
+    def test_mask_excludes_padding_future_tokens_and_other_targets(self) -> None:
+        layout = build_multi_target_layout(
+            torch.tensor([0, 8, 15, 18], dtype=torch.int32),
+            torch.tensor([6, 3, 0]),
+            width=10,
+            num_levels=3,
+        )
+        positions = torch.arange(10)
+        for row, (padding, prefix_length, count) in enumerate(
+            [(2, 2, 2), (3, 4, 1), (7, 3, 0)]
+        ):
+            actual = layout.mask_mod(
+                torch.tensor(row),
+                torch.tensor(0),
+                positions[:, None],
+                positions[None, :],
+            )
+            expected = torch.zeros(10, 10, dtype=torch.bool)
+            prefix_end = padding + prefix_length
+            expected[padding:prefix_end, padding:prefix_end] = torch.ones(
+                prefix_length, prefix_length, dtype=torch.bool
+            ).tril()
+            for target in range(count):
+                start = prefix_end + target * 3
+                expected[start : start + 3, padding:prefix_end] = True
+                expected[start : start + 3, start : start + 3] = torch.ones(
+                    3, 3, dtype=torch.bool
+                ).tril()
+            torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":
