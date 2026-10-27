@@ -29,7 +29,25 @@ torchrun --master_addr=localhost --master_port=32555 \
 注：
 
 - 该预测方式预测的模型前向逻辑已经固化在导出模型中，预测结果不受模型代码的变更影响
-- 不支持DynamicEmb等无法被torch.jit.script导出的模型
+- DynamicEmb 等模型需用分布式 embedding 模式导出（`USE_DISTRIBUTED_EMBEDDING=1`）后预测，见下文 [预测分布式 embedding 导出模型](#predict-distributed-embedding)
+
+(predict-distributed-embedding)=
+
+### 预测分布式 embedding 导出模型
+
+`USE_DISTRIBUTED_EMBEDDING=1` 导出的模型同样用上文的 `--scripted_model_path` 命令预测，会根据 `model_acc.json` 自动识别。
+
+- 建议每台机器只启动一个预测进程（`--nproc-per-node=1`），该进程使用本机全部 GPU，共享同一份 host 内存中的 embedding；每张 GPU 一个进程也能运行，但 host 内存占用随进程数成倍增加
+
+```bash
+torchrun --master_addr=localhost --master_port=32555 \
+    --nnodes=1 --nproc-per-node=1 --node_rank=0 \
+    -m tzrec.predict \
+    --scripted_model_path experiments/dynamicemb/export \
+    --predict_input_path data/taobao_data_eval/\*.parquet \
+    --predict_output_path experiments/dynamicemb/predict_result \
+    --reserved_columns user_id,adgroup_id,clk
+```
 
 ### 预测Checkpoint
 
@@ -63,3 +81,4 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_TABLE_LIFECYCLE: 自动创建的ODPS输出表的lifecycle
+- DIST_EMB_GPU_CACHE_RATIO: 预测分布式 embedding 导出模型时，每张 GPU 缓存的 embedding 比例（按存储字节数计算），默认 `auto`：按各 GPU 的空闲显存（预留 20% 显存给 dense 前向等）和 embedding 存储大小自动计算，日志会打印实际使用的比例（如 `DIST_EMB_GPU_CACHE_RATIO=auto resolved to 0.35`）；也可设置为 (0, 1\] 的数值手动指定。若显存不足（OOM），可设置比日志中更小的数值；未缓存的 id 从 host 内存读取
