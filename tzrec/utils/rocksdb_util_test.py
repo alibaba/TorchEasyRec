@@ -62,7 +62,8 @@ class RocksDBBudgetTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             rocksdb_util.cache_ratio([100, 200])
         rocksdb_util.set_rocksdb_config(train_pb2.RocksDBConfig(local_path="x"))
-        self.assertEqual(rocksdb_util.cache_ratio([600]), 0.0)
+        with self.assertRaisesRegex(ValueError, "GPU cache"):
+            rocksdb_util.cache_ratio([600])
 
     def test_cache_rows_and_host_reserve(self):
         self.assertEqual(rocksdb_util.cache_rows(10**6, 0.0), 0)
@@ -95,10 +96,10 @@ class RocksDBBudgetTest(unittest.TestCase):
         path, step = checkpoint_util.latest_checkpoint(model_dir, require_success=True)
         self.assertEqual(step, 20)
         with mock.patch.dict(os.environ, {"RANK": "0"}):
-            rocksdb_util.quarantine_incomplete_checkpoints(model_dir, step)
-        self.assertFalse(os.path.exists(os.path.join(model_dir, "model.ckpt-30")))
-        names = os.listdir(model_dir)
-        self.assertTrue(any(n.startswith("incomplete.model.ckpt-30.") for n in names))
+            rocksdb_util.remove_incomplete_checkpoints(model_dir, step)
+        self.assertEqual(
+            sorted(os.listdir(model_dir)), ["model.ckpt-10", "model.ckpt-20"]
+        )
         self.assertEqual(checkpoint_util.latest_checkpoint(model_dir)[1], 20)
 
 
@@ -111,7 +112,7 @@ class _Model(nn.Module):
 @unittest.skipUnless(has_rocksdb, "tzrec_rocksdb and CUDA are required")
 @mark_ci_scope("gpu")
 class RocksDBCheckpointTest(unittest.TestCase):
-    """Native checkpoint save/restore around a real fused DynamicEmb module."""
+    """Logical save/restore and legacy native restore of a fused module."""
 
     def setUp(self):
         self.test_dir = make_test_dir()
@@ -119,6 +120,9 @@ class RocksDBCheckpointTest(unittest.TestCase):
         rocksdb_util.set_rocksdb_config(
             train_pb2.RocksDBConfig(
                 local_path=os.path.join(self.test_dir, "db"),
+                gpu_cache_value_bytes_per_rank=1 << 18,
+                disk_budget_bytes=1 << 40,
+                disk_reserve_bytes=0,
                 block_cache_bytes_per_rank=32 << 20,
                 write_buffer_bytes_per_rank=32 << 20,
                 staging_buffer_bytes_per_rank=1 << 20,
@@ -134,20 +138,20 @@ class RocksDBCheckpointTest(unittest.TestCase):
         rocksdb_util.set_rocksdb_config(None)
         self.env.stop()
 
-    def _model(self, names, caching=False):
-        factory = rocksdb_util.backend_config()
+    def _model(self, names, strategy="NO_EVICTION", capacity=1 << 16, hbm=1 << 18):
         from tzrec_rocksdb.storage import RocksDBStorageFactory
 
+        factory = rocksdb_util.backend_config()
         options = [
             DynamicEmbTableOptions(
                 dim=16,
-                max_capacity=1 << 16,
+                max_capacity=capacity,
                 index_type=torch.int64,
                 embedding_dtype=torch.float32,
                 device_id=0,
-                caching=caching,
-                local_hbm_for_values=(1 << 18) if caching else 0,
-                score_strategy=DynamicEmbScoreStrategy.NO_EVICTION,
+                caching=True,
+                local_hbm_for_values=hbm,
+                score_strategy=DynamicEmbScoreStrategy[strategy],
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.DEBUG
                 ),
@@ -165,16 +169,19 @@ class RocksDBCheckpointTest(unittest.TestCase):
         )
         return _Model(emb)
 
-    def _train(self, model, seed, steps=5):
+    def _train(self, model, seed, steps=5, batch=64):
         g = torch.Generator().manual_seed(seed)
         n = len(model.emb.table_names)
-        for _ in range(steps):
-            keys = torch.randint(0, 20000, (64 * n,), generator=g).cuda()
-            offsets = torch.arange(0, 64 * n + 1, 1).cuda()
+        for step in range(1, steps + 1):
+            keys = torch.randint(0, 20000, (batch * n,), generator=g).cuda()
+            offsets = torch.arange(0, batch * n + 1, 1).cuda()
             model.emb(keys, offsets).sum().backward()
+            torch.cuda.synchronize()
+            self.assertIsNone(rocksdb_util.step_boundary(step))
 
     def _rows(self, model):
-        model.emb.flush()
+        with rocksdb_util.writeback_scope("checkpoint"):
+            model.emb.flush()
         out = {}
         storage = model.emb.tables
         for t, ns in enumerate(storage.namespaces):
@@ -183,74 +190,145 @@ class RocksDBCheckpointTest(unittest.TestCase):
                     out[(ns, k)] = torch.cat([emb[i], opt[i]])
         return out
 
-    def _save(self, model, step):
-        ckpt = os.path.join(self.model_dir, f"model.ckpt-{step}")
-        os.makedirs(ckpt, exist_ok=True)
-        rocksdb_util.save_checkpoint(ckpt, step, model)
-        open(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME), "w")
+    def _logical_save(self, model, step):
+        """What save_model does for one module: DynamicEmbDump's module.dump."""
+        ckpt = os.path.join(self.model_dir, f"model.ckpt-{step}", "dynamicemb", "m")
+        os.makedirs(ckpt)
+        with rocksdb_util.writeback_scope("checkpoint"):
+            model.emb.dump(ckpt, optim=True, counter=True)
         return ckpt
 
-    def test_restore_rolls_back_and_keeps_checkpoint_immutable(self):
-        model = self._model(["a", "b"], caching=True)
+    def test_logical_restore_rebuilds_a_fresh_db(self):
+        model = self._model(["a", "b"], strategy="LFU", capacity=3000)
+        rocksdb_util.validate_model(model)
         self._train(model, 0)
         before = self._rows(model)
         opt_args = model.emb.optimizer.get_opt_args()
-        ckpt = self._save(model, 5)
-        with open(os.path.join(ckpt, "rocksdb", "rank_0.json")) as f:
-            native = json.load(f)["native_checkpoint"]
-        native_hash = _tree_hash(native)
+        old_work = rocksdb_util.session().work_dir
+        ckpt = self._logical_save(model, 5)
         self._train(model, 1)  # state after the checkpoint must be discarded
         self.assertNotEqual(self._rows(model), before)
-        rocksdb_util.restore_checkpoint(ckpt, model, load_optim=True)
+        rocksdb_util.reset_for_import(model)
+        self.assertFalse(os.path.exists(old_work))
+        model.emb.load(ckpt, optim=True, counter=True)
         after = self._rows(model)
         self.assertEqual(sorted(after), sorted(before))
         for k in before:
             torch.testing.assert_close(after[k], before[k], rtol=0, atol=0)
         self.assertEqual(model.emb.optimizer.get_opt_args(), opt_args)
-        self._train(model, 2)
-        self._rows(model)
-        self.assertEqual(_tree_hash(native), native_hash)
+        storage = model.emb.tables
+        for t in range(2):
+            self.assertEqual(
+                storage.logical_rows(t, None),
+                len([k for k in after if k[0] == storage.namespaces[t]]),
+            )
+        db = rocksdb_util.session().db
+        self.assertEqual(db.get_int_property("rocksdb.num-snapshots"), 0)
 
-    def test_reordered_group_restores_by_namespace(self):
-        model = self._model(["a", "b", "c"])
+    def test_step_boundary_evicts_to_capacity(self):
+        # ~1024 cached rows, capacity 4000, ~8000 distinct ids.
+        model = self._model(["a"], strategy="STEP", capacity=4000, hbm=1 << 16)
+        rocksdb_util.validate_model(model)
+        self._train(model, 0, steps=20, batch=512)
+        storage = model.emb.tables
+        self.assertLessEqual(storage.logical_rows(0, model.emb.cache), 4000)
+        self.assertGreater(
+            rocksdb_util.session().metrics.counters.get("evict_rows", 0), 0
+        )
+
+    def test_fused_opt_args_must_agree(self):
+        a, b = self._model(["a"]), self._model(["b"])
+        self._train(a, 0, steps=3)
+        self._train(b, 1, steps=5)
+        root = os.path.join(self.test_dir, "relocated")
+        for m in (a, b):
+            path = os.path.join(root, "m")
+            os.makedirs(path, exist_ok=True)
+            with rocksdb_util.writeback_scope("checkpoint"):
+                m.emb.dump(path, optim=True)
+        fused = self._model(["a", "b"])
+        with (
+            mock.patch(
+                "dynamicemb.dump_load.find_sharded_modules",
+                return_value=[("m", None, fused)],
+            ),
+            mock.patch(
+                "dynamicemb.dump_load.get_dynamic_emb_module",
+                return_value=[fused.emb],
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "different optimizer"):
+                rocksdb_util.check_fused_opt_args(root, fused)
+
+    def _legacy_save(self, model, step):
+        """A checkpoint in the native format written before logical saves."""
+        from tzrec_rocksdb.checkpoint import create_checkpoint
+
+        with rocksdb_util.writeback_scope("checkpoint"):
+            model.emb.flush()
+        ckpt = os.path.join(self.model_dir, f"model.ckpt-{step}")
+        os.makedirs(os.path.join(ckpt, "rocksdb"))
+        native = os.path.join(rocksdb_util.rank_dir(self.model_dir, 0), f"ckpt-{step}")
+        create_checkpoint(rocksdb_util.session(), native, {"step": step})
+        storage = model.emb.tables
+        layouts = {
+            ns: storage.table_layout(t) for t, ns in enumerate(storage.namespaces)
+        }
+        manifest = {
+            "format_version": rocksdb_util.FORMAT_VERSION,
+            "step": step,
+            "rank": 0,
+            "world_size": 1,
+            "native_checkpoint": native,
+            "groups": [
+                {
+                    "tables": list(model.emb.table_names),
+                    "namespaces": list(storage.namespaces),
+                    "layouts": layouts,
+                    "dist_types": [o.dist_type for o in model.emb._dynamicemb_options],
+                    "num_shards": 1,
+                    "shard_index": 0,
+                    "opt_args": model.emb.optimizer.get_opt_args(),
+                    "scores": dict(model.emb._scores),
+                }
+            ],
+        }
+        with open(os.path.join(ckpt, "rocksdb", "rank_0.json"), "w") as f:
+            json.dump(manifest, f)
+        open(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME), "w")
+        return ckpt, native
+
+    def test_legacy_native_checkpoint_restores_and_stays_immutable(self):
+        model = self._model(["a", "b"])
         self._train(model, 0)
         before = self._rows(model)
-        ckpt = self._save(model, 5)
-        reordered = self._model(["c", "a", "b"])
+        ckpt, native = self._legacy_save(model, 5)
+        native_hash = _tree_hash(native)
+        self._train(model, 1)
+        reordered = self._model(["b", "a"])
         rocksdb_util.restore_checkpoint(ckpt, reordered, load_optim=True)
         after = self._rows(reordered)
         self.assertEqual(sorted(after), sorted(before))
         for k in before:
             torch.testing.assert_close(after[k], before[k], rtol=0, atol=0)
-
-    def test_restore_rejects_incompatible_checkpoints(self):
-        model = self._model(["a", "b"])
-        self._train(model, 0)
-        ckpt = self._save(model, 5)
-        with self.assertRaisesRegex(ValueError, "fusion"):
-            rocksdb_util.restore_checkpoint(ckpt, self._model(["a"]), True)
-        os.remove(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME))
-        with self.assertRaisesRegex(RuntimeError, "incomplete"):
-            rocksdb_util.restore_checkpoint(ckpt, model, True)
-        open(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME), "w")
-        with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
-            with self.assertRaisesRegex(ValueError, "resharding"):
-                rocksdb_util.restore_checkpoint(ckpt, model, True)
-
-    def test_prune_follows_model_checkpoints(self):
-        model = self._model(["a"])
-        self._train(model, 0)
-        self._save(model, 1)
-        self._save(model, 2)
-        rank_dir = rocksdb_util.rank_dir(self.model_dir, 0)
-        self.assertTrue(os.path.isdir(os.path.join(rank_dir, "ckpt-1")))
+        self._train(reordered, 2)
+        self.assertEqual(_tree_hash(native), native_hash)
         os.rename(
-            os.path.join(self.model_dir, "model.ckpt-1"),
+            os.path.join(self.model_dir, "model.ckpt-5"),
             os.path.join(self.model_dir, "pruned"),
         )
         rocksdb_util.prune_native_checkpoints()
-        self.assertFalse(os.path.exists(os.path.join(rank_dir, "ckpt-1")))
-        self.assertTrue(os.path.isdir(os.path.join(rank_dir, "ckpt-2")))
+        self.assertFalse(os.path.exists(native))
+
+    def test_legacy_native_checkpoint_rejects_evicting_tables(self):
+        model = self._model(["a"])
+        self._train(model, 0)
+        ckpt, _ = self._legacy_save(model, 5)
+        with self.assertRaisesRegex(ValueError, "eviction index"):
+            rocksdb_util.restore_checkpoint(ckpt, self._model(["a"], "STEP"), True)
+        os.remove(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME))
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            rocksdb_util.restore_checkpoint(ckpt, model, True)
 
 
 if __name__ == "__main__":

@@ -95,11 +95,11 @@ message DynamicEmbProbabilisticAdmissionStrategy {
     optional DynamicEmbInitializerArgs initializer_args = 2;
 }
 
-// Keeps the full table in the rank's RocksDB store (train_config.rocksdb_config)
-// behind an optional GPU cache. The store never evicts: max_capacity stays the
-// declared logical size used for planning, not a disk quota or an exact limit
-// on admitted ids, and GPU cache eviction only writes rows back. Requires
-// score_strategy NO_EVICTION; cache_load_factor must be unset.
+// Places the table in the rank's RocksDB store (train_config.rocksdb_config)
+// behind a GPU cache, whatever the placement mode. STEP, TIMESTAMP and LFU
+// tables are logically evicted to max_capacity at training step boundaries;
+// NO_EVICTION tables keep every admitted id. cache_load_factor must be unset
+// and score_strategy must not be CUSTOMIZED.
 message DynamicEmbRocksDB {
 }
 

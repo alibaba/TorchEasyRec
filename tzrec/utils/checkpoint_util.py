@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import glob
 import json
 import math
@@ -18,6 +19,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import weakref
 from dataclasses import replace
 from typing import Any, Container, Dict, List, Optional, Set, Tuple, cast
@@ -1133,6 +1135,7 @@ def restore_model(
         from dynamicemb.dump_load import DynamicEmbLoad
 
         table_names = meta.get("dynamicemb_load_table_names", None)
+        dynamicemb_path = os.path.join(checkpoint_dir, "dynamicemb")
         if rocksdb_util.rocksdb_modules(model):
             if rocksdb_util.has_native_checkpoint(checkpoint_dir):
                 rocksdb_util.restore_checkpoint(
@@ -1148,10 +1151,14 @@ def restore_model(
                     }
                 table_names = builtin
             else:
-                # A checkpoint without RocksDB manifests (e.g. trained with the
-                # built-in store) is imported through RocksDBStorage.load.
+                # RocksDB tables load from the same dynamicemb files as every
+                # other table, into a fresh working DB, whichever backend the
+                # checkpointing run used.
                 rocksdb_util.reset_for_import(model)
-        dynamicemb_path = os.path.join(checkpoint_dir, "dynamicemb")
+        if rocksdb_util.get_rocksdb_config() is not None and os.path.exists(
+            dynamicemb_path
+        ):
+            rocksdb_util.check_fused_opt_args(dynamicemb_path, model)
         has_tables = table_names is None or any(table_names.values())
         if os.path.exists(dynamicemb_path) and has_tables:
             # Training never sets INPUT_TILE, but exporting with
@@ -1218,19 +1225,27 @@ def save_model(
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbDump
 
-        # RocksDB tables get a native checkpoint instead of a full dump.
-        table_names = rocksdb_util.builtin_dynamicemb_tables(model)
-        if table_names is None or any(table_names.values()):
-            DynamicEmbDump(
-                os.path.join(checkpoint_dir, "dynamicemb"),
-                model,
-                table_names=table_names,
-                optim=optimizer is not None,
-                counter=True,
-            )
-        rocksdb_util.save_checkpoint(
-            checkpoint_dir, _get_checkpoint_step(checkpoint_dir), model
-        )
+        t0 = time.perf_counter()
+        try:
+            # RocksDB tables stream into the same files as every other table,
+            # each from a frozen view of the rank's DB.
+            with rocksdb_util.writeback_scope("checkpoint"):
+                DynamicEmbDump(
+                    os.path.join(checkpoint_dir, "dynamicemb"),
+                    model,
+                    optim=optimizer is not None,
+                    counter=True,
+                )
+        except OSError as e:
+            if e.errno == errno.EFBIG:
+                raise OSError(
+                    e.errno,
+                    f"{e}: a dynamicemb checkpoint file exceeds the filesystem's "
+                    "file size limit; on an ossfs mount raise upload_buffer_size "
+                    "(see the File too large FAQ).",
+                ) from e
+            raise
+        rocksdb_util.save_stats(time.perf_counter() - t0)
     # save model plan
     if hasattr(model, "_plan") and model._plan is not None:
         if int(os.environ.get("RANK", 0)) == 0:

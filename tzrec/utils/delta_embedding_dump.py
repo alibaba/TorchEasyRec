@@ -1415,17 +1415,16 @@ class DeltaEmbeddingDumper:
         # backing-store rows; flush before the pop and the find so both see
         # the post-flush state.
         if id(dynamic_module) not in flushed_module_ids:
-            dynamic_module.flush()
+            # The flushed rows stay cached: not RocksDB eviction candidates.
+            with rocksdb_util.writeback_scope("publish"):
+                dynamic_module.flush()
             flushed_module_ids.add(id(dynamic_module))
         table_id = cast(List[str], dynamic_module.table_names).index(table_name)
         # pyre-ignore [29]
         emb_dim = dynamic_module._dynamicemb_options[table_id].dim
         ids = tracker_ids.cpu().to(torch.int64)
         evicted_ids: Optional[torch.Tensor] = None
-        # RocksDB tables never delete rows: their cache evictions are writebacks.
-        if dump_evicted_tombstones and not rocksdb_util.is_rocksdb_options(
-            dynamic_module._dynamicemb_options[table_id]  # pyre-ignore [29]
-        ):
+        if dump_evicted_tombstones:
             evicted = self._pop_evicted_key_ids(fqn, dynamic_module, table_name)
             if evicted is not None and evicted.numel() > 0:
                 evicted_ids = evicted.cpu().to(torch.int64)

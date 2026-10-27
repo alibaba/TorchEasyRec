@@ -10,11 +10,12 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import json
 import os
 from collections import OrderedDict
 from queue import Queue
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 import numpy as np
 import psutil
@@ -59,6 +60,7 @@ from torchrec.distributed.planner.storage_reservations import (
 )
 from torchrec.distributed.planner.types import (
     Enumerator,
+    PlannerError,
     Proposer,
     SharderData,
     SharderDataMap,
@@ -76,6 +78,7 @@ from torchrec.distributed.types import (
     KeyValueParams,
     ModuleSharder,
     PipelineType,
+    ShardingPlan,
     ShardingType,
 )
 from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
@@ -85,7 +88,7 @@ from torchrec.modules.embedding_modules import (
 )
 
 from tzrec.protos import feature_pb2
-from tzrec.utils import env_util, rocksdb_util
+from tzrec.utils import env_util, rocksdb_capacity, rocksdb_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -107,16 +110,6 @@ def create_planner(
         topo_kwargs["hbm_cap"] = torch.cuda.get_device_properties(device).total_memory
 
     ddr_cap_per_rank = int(float(psutil.virtual_memory().total) / local_world_size)
-    # RocksDB block cache, memtables and staging are shared by all of a rank's
-    # RocksDB tables, so they are reserved once here rather than per table.
-    rocksdb_reserve = rocksdb_util.host_reserve_bytes()
-    if rocksdb_reserve > 0:
-        if rocksdb_reserve >= ddr_cap_per_rank:
-            raise ValueError(
-                f"rocksdb_config host budgets ({rocksdb_reserve} bytes) exceed the "
-                f"host memory per rank ({ddr_cap_per_rank} bytes)."
-            )
-        ddr_cap_per_rank -= rocksdb_reserve
     topo_kwargs["ddr_cap"] = ddr_cap_per_rank
     if "INTRA_NODE_BANDWIDTH" in os.environ:
         topo_kwargs["intra_host_bw"] = float(os.environ["INTRA_NODE_BANDWIDTH"])
@@ -135,6 +128,20 @@ def create_planner(
     storage_reserve_percent = 0.15
     if "STORAGE_RESERVE_PERCENT" in os.environ:
         storage_reserve_percent = float(os.environ["STORAGE_RESERVE_PERCENT"])
+
+    # Every rank reports the storage behind rocksdb_config.local_path; only
+    # rank 0 plans, so the observations are gathered here.
+    placement = None
+    session = rocksdb_util.session()
+    if session is not None:
+        cfg = rocksdb_util.get_rocksdb_config()
+        assert cfg is not None
+        placement = RocksDBPlacement(
+            rocksdb_capacity.gather_observations(
+                cfg.local_path, os.path.dirname(session.work_dir)
+            ),
+            storage_reserve_percent,
+        )
     storage_reservation = HeuristicalStorageReservation(
         percentage=storage_reserve_percent
     )
@@ -189,7 +196,7 @@ def create_planner(
         )
 
     # build planner
-    planner = EmbeddingShardingPlanner(
+    planner = PlacementPlanner(
         topology=topology,
         batch_size=batch_size,
         enumerator=EmbeddingEnumerator(
@@ -197,6 +204,7 @@ def create_planner(
             batch_size=batch_size,
             fqn_constraints=fqn_constraints,
             global_constraints=global_constraints,
+            placement=placement,
         ),
         storage_reservation=storage_reservation,
         # DP bin counts are env-tunable; defaults match the proposer signature.
@@ -938,9 +946,9 @@ def _emit_dynamicemb_variants(
 def _pin_rocksdb_cache_ratio(sharding_options: List[ShardingOption]) -> None:
     """Give every RocksDB table the rank-wide GPU cache ratio.
 
-    A positive ratio selects DynamicEmb's CACHING_PS layout and zero its
-    HOST_PS layout; every RocksDB table of a rank gets the same ratio, so the
-    budget is split in proportion to each table's rank-local value bytes.
+    The ratio selects DynamicEmb's CACHING_PS layout; every RocksDB table of a
+    rank gets the same ratio, so the budget is split in proportion to each
+    table's rank-local value bytes. Only tables placed in RocksDB count.
     """
     from tzrec.utils.dynamicemb_util import rocksdb_table_value_bytes
 
@@ -957,7 +965,342 @@ def _pin_rocksdb_cache_ratio(sharding_options: List[ShardingOption]) -> None:
     )
     for o in options:
         o.cache_params = CacheParams(load_factor=ratio)
-        o.dynamicemb_options.caching = ratio > 0  # pyre-ignore [16]
+        o.dynamicemb_options.caching = True  # pyre-ignore [16]
+
+
+_MAX_PLACEMENT_RETRIES = 16
+# A table whose built-in footprint is below this share of the memory deficit
+# is not worth an extra storage group.
+_MIN_SPILL_SHARE = 0.01
+
+
+def _dynamicemb_state_dim(optimizer_class: Any, dim: int, dtype: torch.dtype) -> int:
+    """Optimizer-state elements per row as DynamicEmb stores them."""
+    from dynamicemb import DynamicEmbOptimType, EmbOptimType
+    from dynamicemb.optimizer import get_optimizer_state_dim
+    from torchrec.optim import optimizers as trec_optim
+
+    name = getattr(optimizer_class, "__name__", "")
+    opt_type = {
+        "Adam": EmbOptimType.ADAM,
+        "Adagrad": EmbOptimType.EXACT_ADAGRAD,
+        "RowWiseAdagrad": EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+        "FTRL": DynamicEmbOptimType.FTRL,
+    }.get(name)
+    if optimizer_class is None or opt_type is None:
+        assert optimizer_class in (None, torch.optim.SGD, trec_optim.SGD), name
+        return 0
+    return get_optimizer_state_dim(opt_type, dim, dtype)
+
+
+@dataclasses.dataclass
+class _TableInfo:
+    """Planning facts of one dynamicemb table on one rank."""
+
+    fqn: str
+    name: str
+    option: ShardingOption
+    need: int
+    value_bytes: int
+    lookups: float
+    fusion_class: Tuple[Any, ...]
+    explicit: bool
+    candidate: bool
+    disk: rocksdb_capacity.TableDisk
+
+
+class RocksDBPlacement:
+    """Chooses which dynamicemb tables live in RocksDB, and checks their disk.
+
+    ``rocksdb {}`` tables always do. With AUTO placement, other eligible
+    tables move only when GPU plus host memory cannot hold every table:
+    candidates go in ascending order of estimated lookups per step per byte
+    (fewest storage reads per byte of memory freed; a heuristic, not a
+    calibrated cost model), tables of a fusion class that already has a
+    RocksDB group first, and a candidate is skipped when the storage domain
+    could not hold it. Tables no longer needed to cover the deficit are taken
+    back. Memory is estimated per rank from the built-in footprint; the
+    planner then verifies the result and, if no plan fits, one more table
+    moves (:meth:`spill_more`).
+
+    Args:
+        observations (List[DomainObservation]): every rank's storage view.
+        hbm_reserve_percent (float): HBM share the planner keeps in reserve.
+    """
+
+    def __init__(
+        self,
+        observations: List[rocksdb_capacity.DomainObservation],
+        hbm_reserve_percent: float,
+    ) -> None:
+        self.observations = observations
+        self.hbm_reserve_percent = hbm_reserve_percent
+        self.extra = 0
+        self.selected: Set[str] = set()
+        self.domains: List[rocksdb_capacity.DomainPlan] = []
+        self._num_candidates = 0
+        self._ddr: Optional[List[int]] = None
+
+    def _infos(self, sharding_options: List[ShardingOption]) -> List[_TableInfo]:
+        from tzrec.utils.dynamicemb_util import (
+            _calculate_dynamicemb_table_storage_specific_size,
+            _get_optimizer_multipler,
+            rocksdb_table_value_bytes,
+        )
+
+        backend = rocksdb_util._import_backend()
+        firsts: Dict[str, ShardingOption] = {}
+        for o in sharding_options:
+            if getattr(o, "use_dynamicemb", False):
+                firsts.setdefault(o.fqn, o)
+        infos = []
+        for fqn, o in firsts.items():
+            opts = o.dynamicemb_options  # pyre-ignore [16]
+            explicit = rocksdb_util.is_rocksdb_options(opts)
+            candidate = not explicit and rocksdb_util.auto_candidate(o.name) is not None
+            size = o.shards[0].size
+            rows, dim = int(size[0]), int(size[1])
+            tensor = o.tensor
+            optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
+            elem = tensor.element_size()
+            state_dim = _dynamicemb_state_dim(optimizer_class, dim, tensor.dtype)
+            indexed = opts.score_strategy.name != "NO_EVICTION"
+            lookups = float(o.batch_size) * float(sum(o.input_lengths))
+            infos.append(
+                _TableInfo(
+                    fqn=fqn,
+                    name=o.name,
+                    option=o,
+                    need=_calculate_dynamicemb_table_storage_specific_size(
+                        [rows, dim],
+                        elem,
+                        _get_optimizer_multipler(optimizer_class, tensor.shape),
+                        1.0,
+                        is_hbm=True,
+                        bucket_capacity=opts.bucket_capacity,
+                    ),
+                    value_bytes=rocksdb_table_value_bytes(size, tensor),
+                    lookups=lookups,
+                    fusion_class=(
+                        opts.score_strategy.name,
+                        str(tensor.dtype),
+                        opts.bucket_capacity,
+                        type(opts.admit_strategy).__name__,
+                    ),
+                    explicit=explicit,
+                    candidate=candidate,
+                    disk=rocksdb_capacity.TableDisk(
+                        name=fqn,
+                        rows=rows,
+                        row_bytes=backend.logical_row_bytes(dim, state_dim, elem),
+                        index_bytes=backend.index_entry_bytes() if indexed else 0,
+                        bound="max_capacity per shard (enforced by eviction)"
+                        if indexed
+                        else "max_capacity per shard (declared horizon, NOT enforced)",
+                        cache_rows=0,
+                        overshoot_rows=int(lookups) if indexed else 0,
+                        value_file_bytes=rows * dim * elem,
+                    ),
+                )
+            )
+        return infos
+
+    def _disk(self, chosen: List[_TableInfo]) -> List[rocksdb_capacity.DomainPlan]:
+        cfg = rocksdb_util.get_rocksdb_config()
+        assert cfg is not None
+        ratio = rocksdb_util.cache_ratio([t.value_bytes for t in chosen])
+        tables = [
+            dataclasses.replace(
+                t.disk, cache_rows=rocksdb_util.cache_rows(t.disk.rows, ratio)
+            )
+            for t in chosen
+        ]
+        overheads = rocksdb_util._import_backend().disk_overheads(
+            rocksdb_util.backend_config()
+        )
+        return rocksdb_capacity.plan_domains(tables, self.observations, cfg, overheads)
+
+    def decide(
+        self, sharding_options: List[ShardingOption], topology: Topology
+    ) -> None:
+        """Select the RocksDB tables and reserve their shared host memory."""
+        from tzrec.utils.dynamicemb_util import _rocksdb_cache_hbm_bytes
+
+        infos = self._infos(sharding_options)
+        explicit = [t for t in infos if t.explicit]
+        candidates = [t for t in infos if t.candidate]
+        self._num_candidates = len(candidates)
+        movable = [t for t in infos if not t.explicit]
+        dev = topology.devices[0].storage
+        if self._ddr is None:
+            self._ddr = [d.storage.ddr for d in topology.devices]
+        hbm = int(dev.hbm * (1 - self.hbm_reserve_percent))
+        ddr = self._ddr[0]
+        need = sum(t.need for t in movable)
+        chosen = list(explicit)
+        report: Dict[str, str] = {t.fqn: "rocksdb {} (explicit)" for t in explicit}
+        cfg = rocksdb_util.get_rocksdb_config()
+        assert cfg is not None
+        # Using RocksDB at all costs its shared host budget and GPU cache.
+        rocksdb_cost = (
+            rocksdb_util.host_reserve_bytes() + cfg.gpu_cache_value_bytes_per_rank
+        )
+        deficit = need - (hbm + ddr) + (rocksdb_cost if explicit else 0)
+        if candidates and (deficit > 0 or self.extra > 0):
+            if not explicit:
+                deficit += rocksdb_cost
+            classes = {t.fusion_class for t in explicit}
+            order = sorted(
+                candidates,
+                key=lambda t: (
+                    t.fusion_class not in classes,
+                    t.lookups / max(t.need, 1),
+                    -t.need,
+                    t.fqn,
+                ),
+            )
+            extra = self.extra
+            initial = deficit
+            for t in order:
+                if deficit <= 0 and extra <= 0:
+                    break
+                if deficit <= 0:
+                    extra -= 1
+                elif t.need < _MIN_SPILL_SHARE * initial and extra <= 0:
+                    report[t.fqn] = "kept in memory: too small to cover the deficit"
+                    continue
+                trial = chosen + [t]
+                domains = self._disk(trial)
+                if not all(d.feasible for d in domains):
+                    report[t.fqn] = "kept in memory: its disk projection does not fit"
+                    continue
+                chosen = trial
+                deficit -= t.need
+                report[t.fqn] = (
+                    f"moved to RocksDB: memory deficit, {t.lookups:.0f} lookups/step "
+                    f"for {t.need} bytes"
+                )
+            moved = sorted(
+                (t for t in chosen if t.candidate), key=lambda t: (t.need, t.fqn)
+            )
+            for t in moved:
+                if self.extra == 0 and deficit + t.need <= 0:
+                    chosen.remove(t)
+                    deficit += t.need
+                    report[t.fqn] = "kept in memory: not needed for the deficit"
+            if deficit > 0:
+                raise rocksdb_capacity.DiskCapacityError(
+                    f"no placement fits: GPU+host memory is {deficit} bytes short per "
+                    "rank even with the RocksDB tables that fit the disk budget "
+                    f"({', '.join(f'{k}: {v}' for k, v in report.items())}); "
+                    + "; ".join(
+                        d.describe() for d in (self._disk(chosen) if chosen else [])
+                    )
+                )
+        self.selected = {t.fqn for t in chosen}
+        for t in infos:
+            report.setdefault(t.fqn, "built-in (fits GPU/host memory)")
+        reserve = rocksdb_util.host_reserve_bytes() if chosen else 0
+        if reserve >= ddr:
+            raise ValueError(
+                f"rocksdb_config host budgets ({reserve} bytes) exceed the host "
+                f"memory per rank ({ddr} bytes)."
+            )
+        for d, orig in zip(topology.devices, self._ddr):
+            d.storage.ddr = orig - reserve
+        self.domains = self._disk(chosen) if chosen else []
+        ratio = (
+            rocksdb_util.cache_ratio([t.value_bytes for t in chosen]) if chosen else 0
+        )
+        lines = []
+        for t in infos:
+            if t.fqn in self.selected:
+                cache = _rocksdb_cache_hbm_bytes(
+                    t.option.shards[0].size, t.option.tensor, ratio
+                )
+                est = (
+                    f"rocksdb: cache HBM {cache}, disk logical {t.disk.logical_bytes} "
+                    f"({t.disk.bound})"
+                )
+            else:
+                est = f"built-in: HBM+DRAM {t.need}"
+            lines.append(f"  {t.fqn}: {est}; {report[t.fqn]}")
+        logger.info(
+            "dynamicemb placement (per rank, bytes; "
+            f"{'AUTO' if rocksdb_util.is_auto() else 'EXPLICIT'}, memory budget "
+            f"HBM {hbm} + DRAM {ddr}, RocksDB host reserve {reserve}):\n"
+            + "\n".join(lines)
+        )
+        for d in self.domains:
+            logger.info(f"RocksDB live storage: {d.describe()}")
+        if any(not d.feasible for d in self.domains):
+            raise rocksdb_capacity.DiskCapacityError(
+                "RocksDB tables do not fit their live storage: "
+                + "; ".join(d.describe() for d in self.domains if not d.feasible)
+            )
+
+    def apply(self, sharding_options: List[ShardingOption]) -> List[ShardingOption]:
+        """Replace the built-in variants of moved tables by one RocksDB variant."""
+        out: List[ShardingOption] = []
+        moved: Set[str] = set()
+        for o in sharding_options:
+            if not getattr(o, "use_dynamicemb", False) or o.fqn not in self.selected:
+                out.append(o)
+                continue
+            if rocksdb_util.is_rocksdb_options(
+                o.dynamicemb_options
+            ):  # pyre-ignore [16]
+                out.append(o)
+                continue
+            if o.fqn in moved:
+                continue
+            moved.add(o.fqn)
+            opt = copy.deepcopy(o)
+            cfg = rocksdb_util.auto_candidate(o.name)
+            assert cfg is not None
+            opt.dynamicemb_options.external_storage = (
+                rocksdb_util.table_factory(  # pyre-ignore [16]
+                    cfg, o.name
+                )
+            )
+            opt.cache_params = None
+            out.append(opt)
+        return out
+
+    def spill_more(self) -> bool:
+        """Move one more AUTO candidate after a failed plan; False if none is left."""
+        if not rocksdb_util.is_auto() or self.extra >= self._num_candidates:
+            return False
+        self.extra += 1
+        return True
+
+
+class PlacementPlanner(EmbeddingShardingPlanner):
+    """EmbeddingShardingPlanner that first places dynamicemb tables in RocksDB.
+
+    The placement is decided before the storage reservation is computed,
+    since it changes the host memory left for the other tables. If no plan
+    fits, AUTO placement moves one more table and the planner tries again.
+    """
+
+    def plan(
+        self, module: nn.Module, sharders: List[ModuleSharder[nn.Module]]
+    ) -> ShardingPlan:
+        """Plan with the RocksDB placement decided first."""
+        enumerator = cast(EmbeddingEnumerator, self._enumerator)
+        placement = enumerator.placement
+        for _ in range(_MAX_PLACEMENT_RETRIES + 1):
+            if placement is not None:
+                enumerator.placement = None
+                options = enumerator.enumerate(module, sharders)
+                enumerator.placement = placement
+                placement.decide(options, self._topology)
+            try:
+                return super().plan(module, sharders)
+            except PlannerError:
+                if placement is None or not placement.spill_more():
+                    raise
+        raise PlannerError("no sharding plan after moving tables to RocksDB")
 
 
 class EmbeddingEnumerator(_EmbeddingEnumerator):
@@ -987,6 +1330,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         use_exact_enumerate_order: Optional[bool] = False,
         fqn_constraints: Optional[Dict[str, ParameterConstraints]] = None,
         global_constraints: Optional[ParameterConstraints] = None,
+        placement: Optional[RocksDBPlacement] = None,
     ) -> None:
         if not estimator:
             estimator = [
@@ -998,6 +1342,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         )
         self._fqn_constraints = fqn_constraints
         self._global_constraints = global_constraints
+        self.placement = placement
 
     def _get_constraints(
         self, child_path: str, name: str
@@ -1157,6 +1502,8 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
 
                 sharding_options.extend(sharding_options_per_table)
 
+        if self.placement is not None:
+            sharding_options = self.placement.apply(sharding_options)
         _pin_rocksdb_cache_ratio(sharding_options)
         self.populate_estimates(sharding_options)
 

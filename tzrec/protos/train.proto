@@ -156,17 +156,26 @@ message DeltaEmbeddingDumpConfig {
     optional uint32 sparse_dump_interval_minutes = 10;
 }
 
-// Rank-wide budgets of the RocksDB store behind `dynamicemb { rocksdb {} }`
-// tables. Each rank opens one database under local_path that serves all of
-// its RocksDB tables; the byte budgets are per rank, counted once.
+// Where dynamicemb tables may be placed when rocksdb_config is set.
+enum DynamicEmbPlacement {
+    // only tables with `dynamicemb { rocksdb {} }` use RocksDB.
+    EXPLICIT = 0;
+    // the planner moves dynamicemb tables to RocksDB only as far as GPU and
+    // host memory require and the live-storage budget allows.
+    AUTO = 1;
+}
+
+// RocksDB store for dynamicemb tables. Each rank opens one database under
+// local_path that serves all of its RocksDB tables; byte budgets marked
+// "per rank" are counted once per rank, disk budgets once per storage domain.
 message RocksDBConfig {
-    // root directory of the rank-local databases and native checkpoints. Use
-    // a dedicated local or high-IOPS persistent filesystem, not shared tmpfs.
+    // root directory of the rank-local live databases. Use a local or
+    // high-IOPS filesystem (NVMe, ESSD, Extreme NAS), never an OSS mount.
     required string local_path = 1;
     // GPU cache budget for embedding + optimizer-state values per rank, split
     // across RocksDB tables in proportion to their rank-local value bytes.
-    // 0 disables the GPU cache (every lookup reads RocksDB). Must be smaller
-    // than the total rank-local value bytes of the RocksDB tables.
+    // Must be > 0 and smaller than the total rank-local value bytes of the
+    // RocksDB tables.
     optional uint64 gpu_cache_value_bytes_per_rank = 2 [default = 0];
     // RocksDB block cache per rank.
     optional uint64 block_cache_bytes_per_rank = 3 [default = 8589934592];
@@ -179,6 +188,29 @@ message RocksDBConfig {
     optional uint32 io_threads = 6 [default = 16];
     // RocksDB flush and compaction threads per rank.
     optional uint32 max_background_jobs = 7 [default = 8];
+    // EXPLICIT or AUTO table placement.
+    optional DynamicEmbPlacement placement = 8 [default = EXPLICIT];
+    // bytes this job may occupy on the filesystem of local_path, for all of
+    // its ranks that share it (one budget per storage domain). Required once
+    // any table is placed in RocksDB.
+    optional uint64 disk_budget_bytes = 9;
+    // explicit identity of the shared storage behind local_path; ranks with
+    // the same value share disk_budget_bytes. Required when it cannot be
+    // discovered (FUSE or unknown filesystems).
+    optional string storage_domain = 10;
+    // safety reserve kept free on top of the projected peak.
+    optional uint64 disk_reserve_bytes = 11 [default = 17179869184];
+    // calibrated live-SST bytes per logical row byte. Unset uses a provisional
+    // 1.5 that is not a measured value.
+    optional float sst_space_factor = 12;
+    // training steps between disk headroom checks.
+    optional uint32 capacity_check_interval_steps = 13 [default = 100];
+    // warn when the headroom (min of free space - reserve and budget -
+    // occupancy) falls below this; default 10% of disk_budget_bytes.
+    optional uint64 disk_warn_headroom_bytes = 14;
+    // stop training at a step boundary when the headroom falls below this;
+    // default 5% of disk_budget_bytes.
+    optional uint64 disk_critical_headroom_bytes = 15;
 }
 
 message TrainConfig {

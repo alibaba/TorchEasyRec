@@ -463,9 +463,8 @@ class RocksDBTableTest(unittest.TestCase):
         dynamicemb_util.set_auto_retain_evicted_keys(False)
 
     def _options(self, **kwargs):
-        cfg = feature_pb2.DynamicEmbedding(
-            max_capacity=self.NUM_EMBEDDINGS, score_strategy="NO_EVICTION", **kwargs
-        )
+        kwargs.setdefault("score_strategy", "NO_EVICTION")
+        cfg = feature_pb2.DynamicEmbedding(max_capacity=self.NUM_EMBEDDINGS, **kwargs)
         cfg.rocksdb.SetInParent()
         return dynamicemb_util.build_dynamicemb_constraints(
             cfg,
@@ -477,18 +476,19 @@ class RocksDBTableTest(unittest.TestCase):
             ),
         ).dynamicemb_options
 
-    def test_factory_attached_without_retention(self):
+    def test_factory_attached_with_retention(self):
+        # Logical evictions of RocksDB tables publish tombstones like any other.
         dynamicemb_util.set_auto_retain_evicted_keys(True)
-        options = self._options()
+        options = self._options(score_strategy="LFU")
         self.assertTrue(rocksdb_util.is_rocksdb_options(options))
         self.assertEqual(options.external_storage.table_namespace, "dyn_table")
         from dynamicemb.dynamicemb_config import EvictedItemMode
 
-        self.assertNotIn(EvictedItemMode.RETAIN_KEY, options.evicted_item_mode)
+        self.assertIn(EvictedItemMode.RETAIN_KEY, options.evicted_item_mode)
 
     @parameterized.expand(
         [
-            param("timestamp_strategy", score_strategy="TIMESTAMP"),
+            param("customized_strategy", score_strategy="CUSTOMIZED"),
             param("cache_load_factor", cache_load_factor=0.5),
         ],
         name_func=parameterized_name_func,
@@ -509,6 +509,50 @@ class RocksDBTableTest(unittest.TestCase):
                     feature_names=["f"],
                 ),
             )
+
+    @parameterized.expand(
+        [
+            param("auto", placement="AUTO", expect=True),
+            param("explicit", placement="EXPLICIT", expect=False),
+            param(
+                "pinned_builtin",
+                placement="AUTO",
+                expect=False,
+                cache_load_factor=0.5,
+            ),
+            param(
+                "customized",
+                placement="AUTO",
+                expect=False,
+                score_strategy="CUSTOMIZED",
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_auto_candidates(self, _name, placement, expect, **kwargs):
+        rocksdb_util.set_rocksdb_config(
+            train_pb2.RocksDBConfig(
+                local_path="/tmp/unused",
+                gpu_cache_value_bytes_per_rank=1 << 20,
+                placement=train_pb2.DynamicEmbPlacement.Value(placement),
+            )
+        )
+        cfg = feature_pb2.DynamicEmbedding(
+            max_capacity=self.NUM_EMBEDDINGS, score_strategy="STEP"
+        )
+        cfg.MergeFrom(feature_pb2.DynamicEmbedding(**kwargs))
+        options = dynamicemb_util.build_dynamicemb_constraints(
+            cfg,
+            EmbeddingBagConfig(
+                name="auto_table",
+                num_embeddings=self.NUM_EMBEDDINGS,
+                embedding_dim=self.EMBEDDING_DIM,
+                feature_names=["f"],
+            ),
+        ).dynamicemb_options
+        # The planner attaches the factory only if it moves the table.
+        self.assertIsNone(options.external_storage)
+        self.assertEqual(rocksdb_util.auto_candidate("auto_table") is not None, expect)
 
     def test_missing_train_config_rejected(self):
         rocksdb_util.set_rocksdb_config(None)

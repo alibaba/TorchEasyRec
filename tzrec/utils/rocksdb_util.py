@@ -13,16 +13,20 @@
 
 Layout under ``rocksdb_config.local_path``::
 
-    <run_id>/rank_<r>/work-<attempt>/      writable working DB
-    <run_id>/rank_<r>/ckpt-<step>/         immutable native checkpoint
+    <run_id>/rank_<r>/<mode>-<ms>-<pid>/   writable working DB of one process
 
 ``run_id`` is derived from the model_dir, so restarts of one job share it and
-different jobs never collide. A checkpoint ``model.ckpt-<step>/rocksdb/``
-directory holds one ``rank_<r>.json`` manifest per rank (native checkpoint
-path, namespaces, fusion membership, optimizer arguments, scores, routing)
-and is complete only together with the checkpoint's ``_SUCCESS`` marker.
+different jobs never collide. The working DB is never a checkpoint: saves
+write RocksDB tables through ``DynamicEmbDump`` into the checkpoint's
+``dynamicemb/`` files like every other dynamicemb table, and a resume always
+rebuilds a fresh working DB from those files.
+
+Checkpoints written before this format carry ``model.ckpt-<step>/rocksdb/``
+manifests that point at native RocksDB checkpoints
+(``<run_id>/rank_<r>/ckpt-<step>/``); they are still restored by cloning.
 """
 
+import contextlib
 import dataclasses
 import glob
 import hashlib
@@ -31,9 +35,8 @@ import math
 import os
 import shutil
 import time
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, Iterator, List, Optional, cast
 
-import torch
 import torch.distributed as dist
 from torch import nn
 
@@ -41,6 +44,8 @@ from tzrec.protos import feature_pb2, train_pb2
 from tzrec.utils.logging_util import logger
 
 _rocksdb_config: Optional[train_pb2.RocksDBConfig] = None
+# dynamicemb tables AUTO placement may move to RocksDB, by table name.
+_auto_candidates: Dict[str, feature_pb2.DynamicEmbedding] = {}
 # Host memory a rank needs beyond the configured RocksDB budgets (table
 # readers, iterators, pinned blocks, allocator slack).
 _HOST_OVERHEAD_BYTES = 2 << 30
@@ -58,11 +63,20 @@ def set_rocksdb_config(config: Optional[train_pb2.RocksDBConfig]) -> None:
     """
     global _rocksdb_config
     _rocksdb_config = config
+    _auto_candidates.clear()
 
 
 def get_rocksdb_config() -> Optional[train_pb2.RocksDBConfig]:
     """Return the RocksDB config set for this process, if any."""
     return _rocksdb_config
+
+
+def is_auto() -> bool:
+    """Whether AUTO placement is enabled."""
+    return (
+        _rocksdb_config is not None
+        and _rocksdb_config.placement == train_pb2.DynamicEmbPlacement.AUTO
+    )
 
 
 def _import_backend():
@@ -71,7 +85,7 @@ def _import_backend():
         import tzrec_rocksdb.storage
     except ImportError as e:
         raise RuntimeError(
-            "dynamicemb tables with `rocksdb {}` need the tzrec-rocksdb wheel "
+            "dynamicemb tables placed in RocksDB need the tzrec-rocksdb wheel "
             "from TorchEasyRec-addons (pip install tzrec_rocksdb-*.whl)."
         ) from e
     return tzrec_rocksdb
@@ -104,16 +118,41 @@ def is_rocksdb_options(options: Any) -> bool:
     return isinstance(storage, RocksDBStorageFactory)
 
 
+def auto_eligible(dynamicemb_cfg: feature_pb2.DynamicEmbedding) -> bool:
+    """Whether AUTO placement may move a table without ``rocksdb {}`` to RocksDB.
+
+    ``cache_load_factor`` pins a built-in placement, and CUSTOMIZED scores
+    have no producer in TorchEasyRec.
+    """
+    return (
+        is_auto()
+        and not dynamicemb_cfg.HasField("cache_load_factor")
+        and dynamicemb_cfg.score_strategy != "CUSTOMIZED"
+    )
+
+
+def register_auto_candidate(
+    dynamicemb_cfg: feature_pb2.DynamicEmbedding, table_name: str
+) -> None:
+    """Record a table AUTO placement may move to RocksDB."""
+    _auto_candidates[table_name] = dynamicemb_cfg
+
+
+def auto_candidate(table_name: str) -> Optional[feature_pb2.DynamicEmbedding]:
+    """The config of an AUTO candidate table, or None."""
+    return _auto_candidates.get(table_name)
+
+
 def table_factory(dynamicemb_cfg: feature_pb2.DynamicEmbedding, table_name: str):
-    """Validate a ``rocksdb {}`` table config and return its storage factory.
+    """Validate a RocksDB table config and return its storage factory.
 
     The namespace is the table name here; planning replaces it with the
     table's module-qualified name once that is known.
     """
-    if dynamicemb_cfg.score_strategy != "NO_EVICTION":
+    if dynamicemb_cfg.score_strategy == "CUSTOMIZED":
         raise ValueError(
-            f"dynamicemb table {table_name} uses rocksdb, which never evicts; "
-            f'set score_strategy: "NO_EVICTION" (got {dynamicemb_cfg.score_strategy}).'
+            f"dynamicemb table {table_name} uses rocksdb, which does not support "
+            "score_strategy CUSTOMIZED (TorchEasyRec has no score producer for it)."
         )
     if dynamicemb_cfg.HasField("cache_load_factor"):
         raise ValueError(
@@ -149,15 +188,19 @@ def cache_ratio(value_bytes: List[int]) -> float:
     """GPU cache fraction shared by all RocksDB tables of a rank.
 
     The rank-wide value budget is split in proportion to each table's
-    rank-local value bytes, which is one common ratio. DynamicEmb ignores
-    external storage when a group's budget covers the whole group (HBM_ONLY),
-    so a budget at or above the total is rejected.
+    rank-local value bytes, which is one common ratio. RocksDB tables always
+    run behind the GPU cache, so the budget must be positive; DynamicEmb
+    ignores external storage when a group's budget covers the whole group
+    (HBM_ONLY), so a budget at or above the total is rejected.
     """
     cfg = _rocksdb_config
     budget = cfg.gpu_cache_value_bytes_per_rank if cfg is not None else 0
     total = sum(value_bytes)
     if budget == 0:
-        return 0.0
+        raise ValueError(
+            "RocksDB tables run behind DynamicEmb's GPU cache; set "
+            "rocksdb_config.gpu_cache_value_bytes_per_rank > 0."
+        )
     if budget >= total:
         raise ValueError(
             f"rocksdb_config.gpu_cache_value_bytes_per_rank={budget} must be smaller "
@@ -196,26 +239,29 @@ def rank_dir(model_dir: str, rank: int) -> str:
 _session = None
 _model_dir: Optional[str] = None
 _mode = ""
+_groups: List[Any] = []
+_monitor = None
 
 
 def open_session(model_dir: str, mode: str = "train"):
-    """Open this rank's RocksDB session before model construction.
+    """Register this rank's RocksDB session before model construction.
 
-    Every process start gets a fresh working directory: a working DB left by
-    an earlier attempt is never reopened, because only a complete checkpoint
-    may be resumed (and on network filesystems its lock cannot stop a stale
-    writer). A training start removes earlier ``train-*`` directories of its
-    rank; other modes remove only their own directory on close.
+    The database itself opens on first use, so a run whose plan keeps every
+    table in memory touches no disk. Every process start gets a fresh working
+    directory: a working DB left by an earlier attempt is never reopened,
+    because only a complete checkpoint may be resumed (and on network
+    filesystems its lock cannot stop a stale writer). A training start
+    removes earlier ``train-*`` directories of its rank; other modes remove
+    only their own directory on close.
 
     Returns:
-        the session, or None when the run has no rocksdb_config.
+        the session, or None when the run has no RocksDB tables.
     """
     global _session, _model_dir, _mode
-    if _rocksdb_config is None:
+    if _rocksdb_config is None or not _has_rocksdb_backend():
         return None
     backend = _import_backend()
     root = rank_dir(model_dir, _rank())
-    os.makedirs(root, exist_ok=True)
     if mode == "train":
         for stale in glob.glob(os.path.join(root, "train-*")):
             logger.info(f"removing stale RocksDB working directory {stale}")
@@ -226,16 +272,41 @@ def open_session(model_dir: str, mode: str = "train"):
     return _session
 
 
+def _has_rocksdb_backend() -> bool:
+    """Whether the backend is importable; AUTO without it keeps tables in memory."""
+    if not is_auto():
+        return True
+    try:
+        _import_backend()
+    except RuntimeError:
+        logger.warning(
+            "rocksdb_config placement AUTO without the tzrec-rocksdb wheel: every "
+            "dynamicemb table stays in GPU/host memory."
+        )
+        return False
+    return True
+
+
+def session():
+    """This rank's session, or None."""
+    return _session
+
+
 def close_session() -> None:
     """Close this rank's session (working data of non-train modes is removed)."""
     global _session
     if _session is None:
         return
+    global _monitor
+    if _monitor is not None:
+        _monitor.close()
     work = _session.work_dir
     _session.close()
     if _mode != "train":
         shutil.rmtree(work, ignore_errors=True)
     _session = None
+    _groups.clear()
+    _monitor = None
 
 
 def rocksdb_modules(model: nn.Module) -> List[Any]:
@@ -250,39 +321,68 @@ def rocksdb_modules(model: nn.Module) -> List[Any]:
     ]
 
 
-def builtin_dynamicemb_tables(model: nn.Module) -> Optional[Dict[str, List[str]]]:
-    """``DynamicEmbDump/Load`` table selection that skips RocksDB tables.
+def builtin_dynamicemb_tables(model: nn.Module) -> Dict[str, List[str]]:
+    """``DynamicEmbLoad`` table selection without RocksDB tables.
 
-    Returns None when the model has no RocksDB tables (select everything as
-    before). DynamicEmb treats a collection missing from the dict as "all
-    tables", so every collection is listed, with an empty list if needed.
+    Used after a legacy native restore. DynamicEmb treats a collection missing
+    from the dict as "all tables", so every collection is listed, with an
+    empty list if needed.
     """
-    if _rocksdb_config is None:
-        return None
     from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
     from tzrec_rocksdb.storage import RocksDBStorage
 
     selection: Dict[str, List[str]] = {}
-    has_rocksdb = False
     for path, _, collection in find_sharded_modules(model, ""):
         names = selection.setdefault(path, [])
         for m in get_dynamic_emb_module(collection):
-            if isinstance(m.tables, RocksDBStorage):
-                has_rocksdb = True
-            else:
+            if not isinstance(m.tables, RocksDBStorage):
                 names.extend(m.table_names)
-    return selection if has_rocksdb else None
+    return selection
+
+
+def check_fused_opt_args(dynamicemb_dir: str, model: nn.Module) -> None:
+    """Reject a load whose fused groups would mix different optimizer state.
+
+    A fused group shares one optimizer, whose scalar arguments (e.g. Adam's
+    iteration count) come from each table's ``*_opt_args.json``. A plan can
+    place tables in other groups than the checkpointing run (another backend
+    or budget); members of one new group must then agree on those arguments.
+    """
+    from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
+
+    for path, _, collection in find_sharded_modules(model, ""):
+        for m in cast(List[Any], get_dynamic_emb_module(collection)):
+            keys = set(m.optimizer.get_opt_args())
+            seen: Dict[str, Any] = {}
+            for name in m.table_names:
+                meta_path = os.path.join(dynamicemb_dir, path, f"{name}_opt_args.json")
+                if not os.path.exists(meta_path):
+                    continue
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                args = {k: meta[k] for k in sorted(keys) if k in meta}
+                for other, other_args in seen.items():
+                    if other_args != args:
+                        raise ValueError(
+                            f"dynamicemb tables {other} and {name} now share one "
+                            f"optimizer but were saved with different optimizer "
+                            f"arguments ({other_args} vs {args}); keep them in "
+                            "separate groups or restart their optimizer state."
+                        )
+                seen[name] = args
 
 
 def validate_model(model: nn.Module) -> Dict[str, Any]:
     """Check that constructed modules really use RocksDB; fail before training.
 
-    Every configured ``rocksdb {}`` table must sit in a CACHING_PS or HOST_PS
-    module whose storage is a RocksDBStorage with a complete namespace map.
+    Every table planned for RocksDB must sit in a CACHING_PS module whose
+    storage is a RocksDBStorage with a complete namespace map. Also starts the
+    disk headroom monitor of a training run.
 
     Returns:
         a fusion report: per group its tables, namespaces, layout, cache rows.
     """
+    global _monitor
     from dynamicemb.dump_load import get_dynamic_emb_module
     from tzrec_rocksdb.storage import RocksDBStorage
 
@@ -297,12 +397,9 @@ def validate_model(model: nn.Module) -> Dict[str, Any]:
             continue
         storage = m.tables
         layout = m._storage_layout.name
-        if not isinstance(storage, RocksDBStorage) or layout not in (
-            "CACHING_PS",
-            "HOST_PS",
-        ):
+        if not isinstance(storage, RocksDBStorage) or layout != "CACHING_PS":
             raise RuntimeError(
-                f"dynamicemb tables {m.table_names} are configured for RocksDB but "
+                f"dynamicemb tables {m.table_names} are planned for RocksDB but "
                 f"were built with {type(storage).__name__} in layout {layout}; "
                 "DynamicEmb ignores external storage in HBM_ONLY/HYBRID layouts."
             )
@@ -318,107 +415,89 @@ def validate_model(model: nn.Module) -> Dict[str, Any]:
                 "layout": layout,
                 "cache_rows": int(cache_rows),
                 "dims": [storage.embedding_dim(t) for t in range(len(m.table_names))],
+                "score_strategies": [
+                    o.score_strategy.name for o in m._dynamicemb_options
+                ],
+                "capacities": [int(o.max_capacity) for o in m._dynamicemb_options],
             }
         )
+    _groups[:] = rocksdb_modules(model)
     if groups and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"RocksDB dynamicemb groups: {json.dumps(groups)}")
+    if groups and _mode == "train" and _rocksdb_config is not None:
+        from tzrec.utils.rocksdb_capacity import CapacityMonitor
+
+        assert _model_dir is not None
+        _monitor = CapacityMonitor(
+            _rocksdb_config, rank_dir(_model_dir, _rank()), _session
+        )
     return {"groups": groups}
 
 
-def counter_paths(ckpt_dir: str, namespace: str, rank: int) -> Tuple[str, str]:
-    """Admission counter key/frequency files of one table in a checkpoint."""
-    base = os.path.join(ckpt_dir, MANIFEST_DIR, "counters")
-    return (
-        os.path.join(base, f"{namespace}.keys.rank_{rank}"),
-        os.path.join(base, f"{namespace}.frequencies.rank_{rank}"),
-    )
+@contextlib.contextmanager
+def writeback_scope(scope: str) -> Iterator[None]:
+    """Attribute RocksDB writes to ``scope`` ("checkpoint" or "publish").
 
-
-def _group_state(m: Any) -> Dict[str, Any]:
-    storage = m.tables
-    return {
-        "tables": list(m.table_names),
-        "namespaces": list(storage.namespaces),
-        "layouts": {
-            storage.namespaces[t]: storage.table_layout(t)
-            for t in range(len(m.table_names))
-        },
-        "dist_types": [o.dist_type for o in m._dynamicemb_options],
-        "num_shards": int(getattr(m, "_num_shards", _world_size())),
-        "shard_index": int(getattr(m, "_shard_index", _rank())),
-        "opt_args": m.optimizer.get_opt_args(),
-        "scores": dict(getattr(m, "_scores", {}) or {}),
-    }
-
-
-def save_checkpoint(ckpt_dir: str, step: int, model: nn.Module) -> None:
-    """Write this rank's native RocksDB checkpoint for ``model.ckpt-<step>``.
-
-    Runs inside ``save_model`` at a completed update, before the checkpoint's
-    ``_SUCCESS`` marker: flush every RocksDB group's GPU cache, fence the
-    writes, create one native checkpoint of the rank's DB, then write the
-    manifest. A crash anywhere before ``_SUCCESS`` leaves a checkpoint that
-    restore never selects.
+    GPU-cache flushes for a checkpoint or a publication leave the rows cached,
+    so their writes must not create eviction-index entries.
     """
-    groups = rocksdb_modules(model)
-    if not groups:
+    if _session is None:
+        yield
         return
-    from tzrec_rocksdb.checkpoint import create_checkpoint
+    with _session.writeback_scope(scope):
+        yield
 
-    assert _session is not None and _model_dir is not None
-    rank = _rank()
-    torch.cuda.synchronize()
+
+def _save_need() -> int:
+    """Disk bytes a save may add on this rank: overwritten cached rows."""
+    need = 0
+    for m in _groups:
+        storage = m.tables
+        rows = m.cache._state.capacity if m.cache is not None else 0
+        need += rows * max(storage.record_bytes(t) for t in range(len(m.table_names)))
+    return need
+
+
+def step_boundary(step: int) -> Optional[str]:
+    """Training step boundary: logical eviction, then the disk headroom check.
+
+    Call after an update completed and before any checkpoint or publication
+    of that step; no lookup is in flight then, so no cached or in-use row can
+    be a victim.
+
+    Returns:
+        the headroom action of :class:`CapacityMonitor` (None if healthy).
+    """
+    if not _groups:
+        return None
     t0 = time.perf_counter()
-    for m in groups:
-        m.flush()
-    torch.cuda.synchronize()
-    flush_s = time.perf_counter() - t0
-    prune_native_checkpoints()
-    native = os.path.join(rank_dir(_model_dir, rank), f"ckpt-{step}")
-    if os.path.exists(native):
-        # Left by an attempt that never published this step.
-        shutil.rmtree(native)
-    native_manifest = create_checkpoint(_session, native, {"step": step})
-    states = []
-    for m in groups:
-        state = _group_state(m)
-        counter = getattr(m, "_admission_counter", None)
-        if counter is not None:
-            for t, ns in enumerate(m.tables.namespaces):
-                paths = counter_paths(ckpt_dir, ns, rank)
-                os.makedirs(os.path.dirname(paths[0]), exist_ok=True)
-                counter.dump(*paths, t)
-            state["counter"] = True
-        states.append(state)
-    manifest = {
-        "format_version": FORMAT_VERSION,
-        "step": step,
-        "rank": rank,
-        "world_size": _world_size(),
-        "native_checkpoint": native,
-        "native_manifest": {
-            k: native_manifest[k]
-            for k in ("num_sst", "num_sst_hard_linked", "bytes", "files")
-        },
-        "flush_seconds": flush_s,
-        "checkpoint_seconds": native_manifest["create_seconds"],
-        "dynamicemb_version": _dynamicemb_version(),
-        "groups": states,
-        # Storage call latencies/bytes and RocksDB properties at this step.
-        "stats": _session.stats(),
-    }
-    out = os.path.join(ckpt_dir, MANIFEST_DIR)
-    os.makedirs(out, exist_ok=True)
-    path = os.path.join(out, f"rank_{rank}.json")
-    with open(path + ".tmp", "w") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-    os.replace(path + ".tmp", path)
+    evicted = 0
+    for m in _groups:
+        evicted += sum(m.tables.evict_to_capacity(m.cache).values())
+    if evicted and _session is not None:
+        _session.metrics.record("evict", time.perf_counter() - t0, rows=evicted)
+    if _monitor is None:
+        return None
+    return _monitor.check(step, _save_need())
+
+
+def save_stats(seconds: float) -> None:
+    """Log this rank's RocksDB costs of a checkpoint save."""
+    if _session is None or not _groups:
+        return
+    stats = _session.stats()
+    m = stats["metrics"]
     logger.info(
-        f"RANK[{rank}] RocksDB checkpoint step {step}: flush {flush_s:.2f}s, "
-        f"native {native_manifest['create_seconds']:.2f}s, "
-        f"{native_manifest['num_sst_hard_linked']}/{native_manifest['num_sst']} "
-        "SST hard-linked"
+        f"RANK[{_rank()}] RocksDB checkpoint: {seconds:.2f}s total, cache flush "
+        f"{m.get('checkpoint_insert_seconds', 0.0):.2f}s "
+        f"({int(m.get('checkpoint_insert_rows', 0))} rows), logical export "
+        f"{m.get('dump_seconds', 0.0):.2f}s ({int(m.get('dump_rows', 0))} rows, "
+        f"{m.get('dump_bytes', 0.0) / (1 << 30):.2f}GiB written); cumulative "
+        f"train writeback {int(m.get('train_insert_rows', 0))} rows, publish "
+        f"writeback {int(m.get('publish_insert_rows', 0))} rows, evicted "
+        f"{int(m.get('evict_rows', 0))} rows, index {stats['index']}"
     )
+    prune_native_checkpoints()
 
 
 def _dynamicemb_version() -> str:
@@ -428,7 +507,7 @@ def _dynamicemb_version() -> str:
 
 
 def has_native_checkpoint(ckpt_dir: str) -> bool:
-    """Whether a checkpoint directory carries RocksDB manifests."""
+    """Whether a checkpoint carries legacy native RocksDB manifests."""
     return os.path.isdir(os.path.join(ckpt_dir, MANIFEST_DIR))
 
 
@@ -502,12 +581,14 @@ def _validate_groups(
 
 
 def restore_checkpoint(ckpt_dir: str, model: nn.Module, load_optim: bool) -> None:
-    """Resume this rank's RocksDB tables from a complete checkpoint.
+    """Resume RocksDB tables from a legacy native-checkpoint ``ckpt_dir``.
 
     Validates the manifest against the model, empties every RocksDB GPU cache
     (rows touched before restore must not be written back), swaps the session
     to a fresh writable clone of the immutable native checkpoint, re-resolves
-    namespaces, and restores optimizer arguments, scores and counters.
+    namespaces, and restores optimizer arguments, scores and counters. Native
+    checkpoints predate the eviction index, so only NO_EVICTION tables can
+    resume from them; re-save such a run once to move it to the logical format.
     """
     from tzrec.utils.checkpoint_util import CKPT_SUCCESS_FILENAME
 
@@ -533,6 +614,19 @@ def restore_checkpoint(ckpt_dir: str, model: nn.Module, load_optim: bool) -> Non
             "not supported."
         )
     states = _validate_groups(manifest, groups)
+    for m in groups:
+        evicting = [
+            ns
+            for ns, o in zip(m.tables.namespaces, m._dynamicemb_options)
+            if o.score_strategy.name != "NO_EVICTION"
+        ]
+        if evicting:
+            raise ValueError(
+                f"legacy native checkpoint {ckpt_dir} has no eviction index for "
+                f"{evicting}; resume it with score_strategy NO_EVICTION and save "
+                "once to convert it to the logical format."
+            )
+    logger.info(f"restoring RocksDB tables from legacy native checkpoint {ckpt_dir}")
     if not manifest.get("exact_resume", True):
         logger.warning(
             f"{ckpt_dir} was imported without optimizer state; RocksDB tables "
@@ -559,7 +653,7 @@ def restore_checkpoint(ckpt_dir: str, model: nn.Module, load_optim: bool) -> Non
         if counter is not None and state.get("counter"):
             for t, ns in enumerate(m.tables.namespaces):
                 counter.load(
-                    *counter_paths(ckpt_dir, ns, rank),
+                    *_legacy_counter_paths(ckpt_dir, ns, rank),
                     t,
                     m._dynamicemb_options[t].dist_type,
                     shard_index=state["shard_index"],
@@ -571,8 +665,20 @@ def restore_checkpoint(ckpt_dir: str, model: nn.Module, load_optim: bool) -> Non
     )
 
 
+def _legacy_counter_paths(ckpt_dir: str, namespace: str, rank: int) -> List[str]:
+    base = os.path.join(ckpt_dir, MANIFEST_DIR, "counters")
+    return [
+        os.path.join(base, f"{namespace}.keys.rank_{rank}"),
+        os.path.join(base, f"{namespace}.frequencies.rank_{rank}"),
+    ]
+
+
 def reset_for_import(model: nn.Module) -> None:
-    """Start RocksDB tables from an empty DB before a legacy dynamicemb import."""
+    """Start RocksDB tables from a fresh empty DB before ``DynamicEmbLoad``.
+
+    Empties the GPU caches first: rows touched before the restore (the
+    optimizer warm-up step) must not be written back into the new DB.
+    """
     groups = rocksdb_modules(model)
     if not groups:
         return
@@ -587,10 +693,14 @@ def reset_for_import(model: nn.Module) -> None:
     )
     for m in groups:
         m.tables.refresh_namespaces()
+    logger.info(
+        f"RANK[{_rank()}] loading RocksDB tables into fresh working DB "
+        f"{_session.work_dir}"
+    )
 
 
 def prune_native_checkpoints() -> None:
-    """Delete this rank's native checkpoints whose model.ckpt dir is gone.
+    """Delete this rank's legacy native checkpoints whose model.ckpt dir is gone.
 
     Retention (keep_checkpoint_max, best and protected checkpoints) is decided
     for ``model.ckpt-*`` on rank 0; every rank follows it for its own disk.
@@ -603,11 +713,12 @@ def prune_native_checkpoints() -> None:
             shutil.rmtree(native, ignore_errors=True)
 
 
-def quarantine_incomplete_checkpoints(model_dir: str, after_step: int) -> None:
-    """Rename checkpoints newer than the resumed one that lack ``_SUCCESS``.
+def remove_incomplete_checkpoints(model_dir: str, after_step: int) -> None:
+    """Delete checkpoints newer than the resumed one that lack ``_SUCCESS``.
 
-    Resuming re-saves those steps; the rename keeps the evidence and keeps
-    them out of ``model.ckpt-*`` globs. Rank 0 only.
+    They can never be selected, the resumed run re-saves those steps (which
+    needs an empty directory), and on an OSS mount a rename would copy every
+    object. The deletion is logged with its size. Rank 0 only.
     """
     from tzrec.utils.checkpoint_util import CKPT_SUCCESS_FILENAME
 
@@ -621,18 +732,20 @@ def quarantine_incomplete_checkpoints(model_dir: str, after_step: int) -> None:
         if step > after_step and not os.path.exists(
             os.path.join(ckpt, CKPT_SUCCESS_FILENAME)
         ):
-            dst = os.path.join(
-                model_dir, f"incomplete.model.ckpt-{step}.{int(time.time())}"
+            files = [os.path.join(d, f) for d, _, fs in os.walk(ckpt) for f in fs]
+            size = sum(os.path.getsize(f) for f in files if os.path.isfile(f))
+            logger.warning(
+                f"deleting incomplete checkpoint {ckpt} ({len(files)} files, "
+                f"{size} bytes): it has no {CKPT_SUCCESS_FILENAME}"
             )
-            logger.warning(f"moving incomplete checkpoint {ckpt} to {dst}")
-            os.rename(ckpt, dst)
+            shutil.rmtree(ckpt)
 
 
 def start(train_config: train_pb2.TrainConfig, model_dir: str, mode: str) -> bool:
-    """Configure RocksDB tables for this process and open its session.
+    """Configure RocksDB tables for this process and register its session.
 
     Must run before features build their parameter constraints and before
-    the model is constructed. Returns whether RocksDB is enabled.
+    the model is constructed. Returns whether RocksDB may be used.
     """
     set_rocksdb_config(
         train_config.rocksdb_config if train_config.HasField("rocksdb_config") else None

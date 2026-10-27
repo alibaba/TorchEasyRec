@@ -401,11 +401,8 @@ def build_dynamicemb_constraints(
             "dynamicemb is not installed; required by features with "
             "`dynamicemb { }` set."
         )
-    # RocksDB tables never delete rows (cache eviction writes back), so they
-    # publish no tombstones and need no evicted-key retention.
     use_rocksdb = dynamicemb_cfg.HasField("rocksdb")
-    if not use_rocksdb:
-        _validate_eval_initializer_for_tombstones(dynamicemb_cfg, emb_config.name)
+    _validate_eval_initializer_for_tombstones(dynamicemb_cfg, emb_config.name)
     embedding_dim = emb_config.embedding_dim
     num_embeddings = emb_config.num_embeddings
 
@@ -459,12 +456,15 @@ def build_dynamicemb_constraints(
     demb_opt_kwargs = {}
     if dynamicemb_cfg.HasField("bucket_capacity"):
         demb_opt_kwargs["bucket_capacity"] = dynamicemb_cfg.bucket_capacity
-    if _auto_retain_evicted_keys and not use_rocksdb:
+    if _auto_retain_evicted_keys:
         _arm_evicted_key_retention(demb_opt_kwargs)
     if use_rocksdb:
         demb_opt_kwargs["external_storage"] = rocksdb_util.table_factory(
             dynamicemb_cfg, emb_config.name
         )
+    elif rocksdb_util.auto_eligible(dynamicemb_cfg):
+        # The planner decides whether this table moves to RocksDB.
+        rocksdb_util.register_auto_candidate(dynamicemb_cfg, emb_config.name)
 
     dynamicemb_options = dynamicemb.DynamicEmbTableOptions(
         max_capacity=dynamicemb_cfg.max_capacity,

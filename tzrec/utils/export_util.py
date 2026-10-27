@@ -175,9 +175,9 @@ def export_model(
         and (use_rtp or not use_dist_embedding)
     ):
         raise ValueError(
-            "checkpoints with RocksDB dynamicemb tables are exported only with "
+            "legacy native RocksDB checkpoints are exported only with "
             "USE_DISTRIBUTED_EMBEDDING=1 (non-RTP), which streams the tables "
-            "from the native checkpoint."
+            "from the native checkpoint; re-save the run to use any export."
         )
     if use_rtp:
         impl = export_rtp_model

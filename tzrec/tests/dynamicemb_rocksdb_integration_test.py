@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import glob
-import hashlib
 import json
 import os
 import shutil
@@ -20,7 +19,7 @@ import numpy as np
 import torch
 
 from tzrec.tests import utils
-from tzrec.utils import checkpoint_util, dynamicemb_util, misc_util
+from tzrec.utils import checkpoint_util, config_util, dynamicemb_util, misc_util
 from tzrec.utils.test_util import make_test_dir, mark_ci_scope
 
 try:
@@ -31,13 +30,22 @@ except ImportError:
     has_rocksdb = False
 
 
-def _tree_hash(path):
-    h = hashlib.sha256()
-    for root, _, files in sorted(os.walk(path)):
-        for f in sorted(files):
-            with open(os.path.join(root, f), "rb") as fh:
-                h.update(f.encode() + fh.read())
-    return h.hexdigest()
+def _logical_rows(ckpt, collection="*"):
+    """Rows per dynamicemb table in a checkpoint's logical files."""
+    rows = {}
+    pattern = os.path.join(ckpt, "dynamicemb", f"*{collection}", "*_emb_keys.rank_*")
+    for path in glob.glob(pattern):
+        table = os.path.basename(path).split("_emb_keys.")[0]
+        rows[table] = rows.get(table, 0) + os.path.getsize(path) // 8
+    return rows
+
+
+def _logs(log_dir):
+    text = ""
+    for path in glob.glob(os.path.join(log_dir, "**", "*.log"), recursive=True):
+        with open(path) as f:
+            text += f.read()
+    return text
 
 
 @unittest.skipIf(
@@ -48,7 +56,7 @@ def _tree_hash(path):
 )
 @mark_ci_scope("gpu")
 class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
-    """Training, recovery and export of RocksDB-backed dynamicemb tables."""
+    """Training, recovery, relocation and export of RocksDB dynamicemb tables."""
 
     def setUp(self):
         self.success = False
@@ -58,14 +66,20 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         if self.success:
             shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def _native_dirs(self, ckpt):
-        dirs = []
-        for path in sorted(glob.glob(os.path.join(ckpt, "rocksdb", "rank_*.json"))):
-            with open(path) as f:
-                dirs.append(json.load(f)["native_checkpoint"])
-        return dirs
+    def _resume(self, config_path, name, edit=None):
+        edit = edit or {"train_config.num_epochs": 2}
+        cmd = (
+            f"PYTHONPATH=. torchrun {utils._standalone()} --nnodes=1 "
+            f"--nproc-per-node={utils._get_nproc_per_node()} "
+            f"--log_dir {os.path.join(self.test_dir, name)} -r 3 -t 3 "
+            f"tzrec/train_eval.py --pipeline_config_path {config_path} "
+            f"--continue_train --edit_config_json '{json.dumps(edit)}'"
+        )
+        ok = misc_util.run_cmd(cmd, os.path.join(self.test_dir, f"{name}.txt"))
+        return ok, _logs(os.path.join(self.test_dir, name))
 
     def test_train_eval_export(self):
+        # AUTO placement with one rocksdb {} table and one table left in memory.
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_rocksdb_mock.config",
             self.test_dir,
@@ -88,23 +102,20 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
             os.path.join(self.test_dir, "train"), require_success=True
         )
         assert ckpt is not None
-        # RocksDB tables are checkpointed natively, never fully dumped.
-        self.assertFalse(
-            glob.glob(os.path.join(ckpt, "dynamicemb", "*", "*_emb_keys.rank_*"))
-        )
-        native_rows = 0
-        from tzrec_rocksdb.checkpoint import open_read_only
-
-        for native in self._native_dirs(ckpt):
-            db, manifest = open_read_only(native)
-            native_rows += sum(db.count(ns) for ns in manifest["namespaces"].values())
-            db.close()
-        self.assertGreater(native_rows, 0)
+        # RocksDB tables are saved in DynamicEmb's logical files like the
+        # in-memory ones; no native checkpoint manifests any more.
+        self.assertFalse(os.path.exists(os.path.join(ckpt, "rocksdb")))
+        rows = _logical_rows(ckpt)
+        self.assertGreater(rows.get("id_8_emb", 0), 0)
+        self.assertIn("user_id_emb", rows)
+        log = _logs(os.path.join(self.test_dir, "log_train_eval"))
+        self.assertRegex(log, r"id_8_emb: rocksdb: .*rocksdb \{\} \(explicit\)")
+        self.assertRegex(log, r"user_id_emb: built-in: .*fits GPU/host memory")
         sparse_dir = os.path.join(self.test_dir, "export", "sparse")
         with open(os.path.join(sparse_dir, "sparse_embedding.json")) as f:
             metadata = json.load(f)
         dynamic = [info for info in metadata.values() if info["is_dynamic"]]
-        self.assertEqual(sum(info["shape"][0] for info in dynamic), native_rows)
+        self.assertEqual(sum(info["shape"][0] for info in dynamic), sum(rows.values()))
         with np.load(
             os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
         ) as arrays:
@@ -114,7 +125,7 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
                 self.assertTrue(np.isfinite(values).all())
         self.success = True
 
-    def test_crash_left_checkpoint_is_not_resumed(self):
+    def test_resume_only_from_checkpoint_files(self):
         edit = '{"train_config.save_checkpoints_steps":10}'
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_dynamicemb_rocksdb_mock.config",
@@ -126,53 +137,69 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         model_dir = os.path.join(self.test_dir, "train")
         ckpt, step = checkpoint_util.latest_checkpoint(model_dir, require_success=True)
         assert ckpt is not None
-        native_hashes = [_tree_hash(d) for d in self._native_dirs(ckpt)]
-        # A save that died after its native checkpoint but before _SUCCESS.
+        # STEP tables are evicted to their capacity (8000 over 2 shards); the
+        # sequence copy sees more distinct ids and fills it.
+        rows = _logical_rows(ckpt, "ec_dict.8")
+        self.assertEqual(rows["click_50_seq__id_3_emb"], 8000)
+        self.assertLessEqual(rows["id_3_emb"], 8000)
+        # A save that died before _SUCCESS, and no local RocksDB state at all.
         crashed = os.path.join(model_dir, f"model.ckpt-{step + 5}")
         shutil.copytree(ckpt, crashed)
         os.remove(os.path.join(crashed, checkpoint_util.CKPT_SUCCESS_FILENAME))
-
-        config_path = os.path.join(self.test_dir, "pipeline.config")
-        cmd = (
-            f"PYTHONPATH=. torchrun {utils._standalone()} --nnodes=1 "
-            f"--nproc-per-node={utils._get_nproc_per_node()} "
-            f"--log_dir {os.path.join(self.test_dir, 'log_resume')} -r 3 -t 3 "
-            f"tzrec/train_eval.py --pipeline_config_path {config_path} "
-            "--continue_train --edit_config_json "
-            '\'{"train_config.num_epochs":2,"train_config.save_checkpoints_steps":10}\''
+        shutil.rmtree("tmp/tzrec_rocksdb_test", ignore_errors=True)
+        ok, log = self._resume(
+            os.path.join(self.test_dir, "pipeline.config"),
+            "log_resume",
+            {"train_config.num_epochs": 2, "train_config.save_checkpoints_steps": 10},
         )
-        self.assertTrue(
-            misc_util.run_cmd(cmd, os.path.join(self.test_dir, "log_resume.txt"))
-        )
-        log = ""
-        for path in glob.glob(
-            os.path.join(self.test_dir, "log_resume", "**", "*.log"), recursive=True
-        ):
-            with open(path) as f:
-                log += f.read()
-        self.assertIn("restored RocksDB tables from", log)
-        self.assertTrue(
-            glob.glob(os.path.join(model_dir, f"incomplete.model.ckpt-{step + 5}.*"))
-        )
-        # The resumed run may legitimately save this step again, completely.
+        self.assertTrue(ok)
+        self.assertIn("deleting incomplete checkpoint", log)
+        self.assertIn("loading RocksDB tables into fresh working DB", log)
         if os.path.exists(crashed):
             self.assertTrue(
                 os.path.exists(
                     os.path.join(crashed, checkpoint_util.CKPT_SUCCESS_FILENAME)
                 )
             )
-        # The resumed checkpoint is immutable under continued training.
-        self.assertEqual(
-            [_tree_hash(d) for d in self._native_dirs(ckpt)], native_hashes
-        )
-        final, final_step = checkpoint_util.latest_checkpoint(
+        _, final_step = checkpoint_util.latest_checkpoint(
             model_dir, require_success=True
         )
         self.assertGreater(final_step, step)
-        for native in self._native_dirs(final):
-            from tzrec_rocksdb.checkpoint import read_manifest
+        self.success = True
 
-            read_manifest(native)
+    def test_relocate_tables_between_backends(self):
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_dynamicemb_rocksdb_mock.config",
+            self.test_dir,
+        )
+        self.assertTrue(self.success)
+        self.success = False
+        config_path = os.path.join(self.test_dir, "pipeline.config")
+        config = config_util.load_pipeline_config(config_path)
+        # Resume with every table in GPU/host memory (no RocksDB at all).
+        builtin = os.path.join(self.test_dir, "builtin.config")
+        config.train_config.ClearField("rocksdb_config")
+        for fc in config.feature_configs:
+            for f in (
+                [fc.id_feature]
+                if fc.HasField("id_feature")
+                else list(fc.sequence_feature.features)
+                if fc.HasField("sequence_feature")
+                else []
+            ):
+                inner = f.id_feature if hasattr(f, "id_feature") else f
+                if inner.HasField("dynamicemb"):
+                    inner.dynamicemb.ClearField("rocksdb")
+        config_util.save_message(config, builtin)
+        ok, log = self._resume(builtin, "log_builtin")
+        self.assertTrue(ok)
+        self.assertNotIn("RocksDB dynamicemb groups", log)
+        # And back into RocksDB from the in-memory run's checkpoint.
+        ok, log = self._resume(
+            config_path, "log_rocksdb", {"train_config.num_epochs": 3}
+        )
+        self.assertTrue(ok)
+        self.assertIn("loading RocksDB tables into fresh working DB", log)
         self.success = True
 
 

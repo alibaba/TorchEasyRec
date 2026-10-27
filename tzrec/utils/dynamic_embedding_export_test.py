@@ -385,7 +385,9 @@ class NativeCheckpointExportTest(unittest.TestCase):
         rows = torch.zeros(len(keys), dim + state_dim, dtype=dtype)
         rows[:, :dim] = torch.from_numpy(values).to(dtype)
         session.db.write(
-            np.array([[ns, dim * elem, state_dim * elem, dim * elem]], dtype=np.int64),
+            np.array(
+                [[ns, dim * elem, state_dim * elem, dim * elem, 0]], dtype=np.int64
+            ),
             np.zeros(len(keys), dtype=np.int64),
             keys.astype(np.int64).view(np.uint64),
             rows.view(torch.uint8).numpy(),

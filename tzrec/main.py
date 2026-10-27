@@ -89,6 +89,7 @@ from tzrec.utils import (
     config_util,
     dynamicemb_util,
     predict_util,
+    rocksdb_capacity,
     rocksdb_util,
 )
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
@@ -640,6 +641,9 @@ def _train_and_evaluate(
                     checkpoint_util.update_dataloder_state(
                         dataloader_state, batch.checkpoint_info
                     )
+                    # RocksDB logical eviction and disk headroom, before this
+                    # step is published or checkpointed.
+                    capacity_action = rocksdb_util.step_boundary(i_step)
                     _model.update_train_metric(predictions, batch)
                     if i_step % train_config.log_step_count_steps == 0:
                         train_metrics = _model.compute_train_metric()
@@ -673,9 +677,31 @@ def _train_and_evaluate(
                     i_step -= 1
                     break
 
+                data_timestamp = batch.data_timestamp
+                if capacity_action in ("save_and_stop", "stop"):
+                    if capacity_action == "save_and_stop":
+                        ckpt_manager.maybe_save(
+                            i_step,
+                            model,
+                            optimizer,
+                            dataloader_state,
+                            dense_ema,
+                            data_timestamp=data_timestamp,
+                            final=True,
+                            lr_schedulers=lr_scheduler,
+                        )
+                    raise rocksdb_capacity.DiskCapacityError(
+                        f"stopped at step {i_step}: RocksDB disk headroom fell below "
+                        "rocksdb_config.disk_critical_headroom_bytes ("
+                        + (
+                            "saved a checkpoint first"
+                            if capacity_action == "save_and_stop"
+                            else "no room to save; resume from the last checkpoint"
+                        )
+                        + ")."
+                    )
                 # Single entry point for step / epoch / event-time saves + dedupe;
                 # maybe_save reconciles this rank's event-time across ranks in lockstep.
-                data_timestamp = batch.data_timestamp
                 if ckpt_manager.maybe_save(
                     i_step,
                     model,
@@ -876,7 +902,7 @@ def train_and_evaluate(
             require_success=use_rocksdb
         )
         if use_rocksdb:
-            rocksdb_util.quarantine_incomplete_checkpoints(
+            rocksdb_util.remove_incomplete_checkpoints(
                 pipeline_config.model_dir, skip_steps
             )
         if latest_ckpt_path:
