@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import unittest
+import zlib
 from unittest import mock
 
 import numpy as np
@@ -42,7 +43,7 @@ class _Table:
     """One exported table and the float rows a lookup should return."""
 
     def __init__(self, name, num_rows, dim, quant, dynamic, default=False, keys=None):
-        rng = np.random.default_rng(len(name))
+        rng = np.random.default_rng(zlib.crc32(name.encode()))
         self.name = name
         self.dim = dim
         values = rng.standard_normal((num_rows, dim)).astype(np.float32)
