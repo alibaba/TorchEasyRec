@@ -498,6 +498,7 @@ def save_stats(seconds: float) -> None:
     stats = _session.stats()
     m = stats["metrics"]
     props = stats["properties"]
+    tick = stats["tickers"]
     logger.info(
         f"RANK[{_rank()}] RocksDB checkpoint: {seconds:.2f}s total, cache flush "
         f"{m.get('checkpoint_insert_seconds', 0.0):.2f}s "
@@ -506,7 +507,10 @@ def save_stats(seconds: float) -> None:
         f"{m.get('dump_bytes', 0.0) / (1 << 30):.2f}GiB written); cumulative "
         f"train writeback {int(m.get('train_insert_rows', 0))} rows, publish "
         f"writeback {int(m.get('publish_insert_rows', 0))} rows, evicted "
-        f"{int(m.get('evict_rows', 0))} rows, index {stats['index']}; after "
+        f"{int(m.get('evict_rows', 0))} rows, index {stats['index']}; RocksDB "
+        f"cumulative flush {tick.get('rocksdb.flush.write.bytes', 0)} bytes, "
+        f"compaction {tick.get('rocksdb.compact.write.bytes', 0)} bytes written, "
+        f"stalls {tick.get('rocksdb.stall.micros', 0) / 1e6:.1f}s; after "
         f"release: live SST {props['rocksdb.live-sst-files-size']}, all SST "
         f"{props['rocksdb.total-sst-files-size']}, obsolete SST "
         f"{props['rocksdb.obsolete-sst-files-size']}, snapshots "
