@@ -577,6 +577,38 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             self.assertGreaterEqual(so.total_storage.hbm, 0)
             self.assertGreaterEqual(so.total_storage.ddr, 0)
 
+    def test_cache_load_factor_pins_the_ratio(self):
+        from tzrec.protos import feature_pb2 as feature_pb2_
+        from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
+        from tzrec.utils.plan_util import (
+            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
+        )
+        from tzrec.utils.plan_util import (
+            get_default_sharders as _tzrec_get_default_sharders,
+        )
+
+        config = EmbeddingBagConfig(
+            num_embeddings=4096,
+            embedding_dim=32,
+            name="table_de",
+            feature_names=["feat_de"],
+        )
+        constraint = build_dynamicemb_constraints(
+            feature_pb2_.DynamicEmbedding(max_capacity=4096, cache_load_factor=0.5),
+            config,
+        )
+        enumerator = _TzrecEmbeddingEnumerator(
+            topology=Topology(world_size=2, compute_device="cuda"),
+            batch_size=128,
+            fqn_constraints={"sparse.ebc.table_de": constraint},
+        )
+        search_space = enumerator.enumerate(
+            module=self._build_model(), sharders=_tzrec_get_default_sharders()
+        )
+        # One HYBRID and one CACHING variant, both at the configured factor.
+        self.assertEqual(len(search_space), 2)
+        self.assertEqual({so.cache_load_factor for so in search_space}, {0.5})
+
     def test_dp_proposer_picks_feasible_dynamicemb_plan(self):
         from tzrec.utils.plan_util import (
             EmbeddingEnumerator as _TzrecEmbeddingEnumerator,

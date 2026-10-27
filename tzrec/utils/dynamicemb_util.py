@@ -487,8 +487,8 @@ def build_dynamicemb_constraints(
     constraints_kwargs = {}
     if dynamicemb_cfg.HasField("cache_load_factor"):
         # for ShardingPlan estimator hdm storage
-        constraints_kwargs["cache_params"] = (
-            CacheParams(load_factor=dynamicemb_cfg.cache_load_factor),
+        constraints_kwargs["cache_params"] = CacheParams(
+            load_factor=dynamicemb_cfg.cache_load_factor
         )
 
     constraints = DynamicEmbParameterConstraints(
