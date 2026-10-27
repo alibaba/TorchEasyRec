@@ -218,8 +218,10 @@ class _FakeProject:
         self.entity_get_calls = []
         self.entity_create_calls = []
 
-    def get_dynamic_embedding_feature_view(self, name):
-        self.dynamic_get_calls.append(name)
+    def get_dynamic_embedding_feature_view(self, name, max_workers=None):
+        self.dynamic_get_calls.append((name, max_workers))
+        if self._view is not None:
+            self._view._max_workers = max_workers
         return self._view
 
     def create_dynamic_embedding_feature_view(self, **kwargs):
@@ -228,6 +230,7 @@ class _FakeProject:
             self._view = self._view_after_create_error
             raise self._create_error
         self._view = self._created_view or _FakeView()
+        self._view._max_workers = kwargs.get("max_workers")
         # The created handle carries the created embedding_field_type.
         self._view.embedding_field_type = kwargs.get(
             "embedding_field_type", FEATURE_STORE_EMBEDDING_TYPE_FLOAT
@@ -332,6 +335,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             "feature_view_replication_count",
             "upload_format",
             "test_mode",
+            "max_workers",
         ]
         fields = list(FeatureStoreConfig.DESCRIPTOR.fields)
 
@@ -352,7 +356,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         )
         self.assertEqual(
             [field.number for field in fields],
-            [1, 2, 3] + list(range(5, 16)) + [18, 19],
+            [1, 2, 3] + list(range(5, 16)) + [18, 19, 20],
         )
         for field_name in required_fields:
             with self.subTest(field_name=field_name):
@@ -382,7 +386,10 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"ALIBABA_CLOUD_REGION": "cn-env"}):
             settings = FeatureStoreUploadSettings.from_proto(config)
         self.assertEqual(settings.region, "cn-env")
+        self.assertEqual(settings.max_workers, 4)
 
+        with self.assertRaisesRegex(ValueError, "max_workers must be > 0"):
+            FeatureStoreUploadSettings.from_proto(_feature_store_config(max_workers=0))
         with self.assertRaisesRegex(ValueError, "must be <= 1000"):
             FeatureStoreUploadSettings.from_proto(
                 _feature_store_config(upload_batch_size=1001)
@@ -404,7 +411,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         uploader.start()
         uploader.close()
 
-        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.dynamic_get_calls, [("shared_embeddings", 4)])
         self.assertEqual(factory.project.create_calls, [])
         self.assertEqual(view.closed, [True])
 
@@ -439,12 +446,14 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
     def test_start_creates_missing_dynamic_embedding_feature_view(self):
         created_view = _FakeView()
         factory = _FakeClientFactory(None, created_view=created_view)
-        uploader = self._uploader(client_factory=factory)
+        uploader = self._uploader(
+            _feature_store_config(max_workers=8), client_factory=factory
+        )
 
         uploader.start()
         uploader.close()
 
-        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.dynamic_get_calls, [("shared_embeddings", 8)])
         self.assertEqual(
             factory.project.create_calls,
             [
@@ -459,6 +468,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
                     "ttl": 1296000,
                     "shard_count": 20,
                     "replication_count": 1,
+                    "max_workers": 8,
                     "embedding_field_type": FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
                 }
             ],
@@ -585,7 +595,9 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
             create_error=RuntimeError("already exists"),
             view_after_create_error=concurrent_view,
         )
-        uploader = self._uploader(client_factory=factory)
+        uploader = self._uploader(
+            _feature_store_config(max_workers=8), client_factory=factory
+        )
 
         uploader.start()
         uploader.close()
@@ -593,9 +605,10 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self.assertEqual(len(factory.project.create_calls), 1)
         self.assertEqual(
             factory.project.dynamic_get_calls,
-            ["shared_embeddings", "shared_embeddings"],
+            [("shared_embeddings", 8), ("shared_embeddings", 8)],
         )
         self.assertEqual(concurrent_view.closed, [True])
+        self.assertEqual(uploader._writer.max_workers, 8)
 
     def test_start_closes_new_feature_view_with_incompatible_schema(self):
         created_view = _FakeView()
@@ -632,25 +645,62 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self.assertEqual(len(factory.project.create_calls), 1)
         self.assertEqual(factory.project.entity_create_calls, [])
 
-    def test_create_type_error_reports_feature_store_py_version(self):
-        # An old feature_store_py rejects the embedding_field_type kwarg with a
-        # TypeError; the uploader must surface the pinned SDK version instead of
-        # burning the wait/retry loop and re-raising a generic failure.
+    @parameterized.expand(
+        [("embedding_field_type",), ("max_workers",)],
+        name_func=parameterized_name_func,
+    )
+    def test_create_type_error_reports_feature_store_py_version(self, keyword):
         factory = _FakeClientFactory(
             None,
             create_error=TypeError(
                 "create_dynamic_embedding_feature_view() got an unexpected "
-                "keyword argument 'embedding_field_type'"
+                f"keyword argument '{keyword}'"
             ),
         )
         uploader = self._uploader(client_factory=factory)
 
-        with self.assertRaisesRegex(RuntimeError, "feature_store_py.*2.2.10") as ctx:
+        with self.assertRaisesRegex(RuntimeError, r"feature_store_py.*2\.2\.11") as ctx:
             uploader.start()
 
+        self.assertIn(keyword, str(ctx.exception))
         self.assertIsInstance(ctx.exception.__cause__, TypeError)
-        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.dynamic_get_calls, [("shared_embeddings", 4)])
         self.assertEqual(len(factory.project.create_calls), 1)
+
+    @parameterized.expand(
+        [(True, False), (False, False), (True, True), (False, True)],
+        name_func=parameterized_name_func,
+    )
+    def test_get_type_error_reports_feature_store_py_version(
+        self, manage_remote_view, during_wait
+    ):
+        factory = _FakeClientFactory(None, create_error=RuntimeError("already exists"))
+        uploader = self._uploader(
+            _feature_store_config(max_retries=3, retry_backoff_secs=1),
+            manage_remote_view=manage_remote_view,
+            client_factory=factory,
+        )
+        error = TypeError(
+            "get_dynamic_embedding_feature_view() got an unexpected "
+            "keyword argument 'max_workers'"
+        )
+        with (
+            mock.patch.object(
+                factory.project,
+                "get_dynamic_embedding_feature_view",
+                side_effect=[None] + [error] * 3 if during_wait else error,
+            ) as get_view,
+            mock.patch("tzrec.utils.feature_store_uploader.time.sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"feature_store_py.*2\.2\.11"
+            ) as ctx:
+                uploader.start()
+
+        self.assertIn("max_workers", str(ctx.exception))
+        self.assertIs(ctx.exception.__cause__, error)
+        self.assertEqual(get_view.call_count, 2 if during_wait else 1)
+        sleep.assert_not_called()
 
     def test_start_creates_default_entity_when_it_does_not_exist(self):
         created_view = _FakeView()
@@ -716,6 +766,7 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         view = _FakeView()
         factory = _FakeClientFactory(view)
         uploader = self._uploader(
+            _feature_store_config(max_workers=8),
             rank=1,
             manage_remote_view=False,
             client_factory=factory,
@@ -726,8 +777,9 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         uploader.submit(10, _delta_table([_row(10, 1, 7, [1.0, 2.0])]))
         uploader.close()
 
-        self.assertEqual(factory.project.dynamic_get_calls, ["shared_embeddings"])
+        self.assertEqual(factory.project.dynamic_get_calls, [("shared_embeddings", 8)])
         self.assertEqual(factory.project.create_calls, [])
+        self.assertEqual(uploader._writer.max_workers, 8)
         self.assertEqual(len(view.calls), 1)
         self.assertEqual(view.calls[0]["data"][0]["key_id"], 7)
 
@@ -779,11 +831,26 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self.assertEqual(view.calls[1]["data"][0]["embedding"].tolist(), [0.0, 0.0])
         self.assertEqual(view.closed, [True])
 
-    def test_upload_uses_bounded_sdk_worker_windows(self):
-        view = _FakeView(max_workers=2)
+    @parameterized.expand(
+        [
+            (None, [[1, 1, 1, 1], [1]]),
+            (1, [[1], [1], [1], [1], [1]]),
+            (2, [[1, 1], [1, 1], [1]]),
+            (8, [[1, 1, 1, 1, 1]]),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_upload_uses_bounded_sdk_worker_windows(
+        self, max_workers, expected_windows
+    ):
+        view = _FakeView()
+        factory = _FakeClientFactory(view)
+        config = _feature_store_config(upload_batch_size=1)
+        if max_workers is not None:
+            config.max_workers = max_workers
         uploader = self._uploader(
-            _feature_store_config(upload_batch_size=1),
-            client_factory=_FakeClientFactory(view),
+            config,
+            client_factory=factory,
             clock_ms=lambda: 100,
         )
 
@@ -793,8 +860,12 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         )
         uploader.close()
 
+        self.assertEqual(
+            factory.project.dynamic_get_calls,
+            [("shared_embeddings", config.max_workers)],
+        )
         self.assertEqual([call["ts"] for call in view.calls], [100, 101, 102, 103, 104])
-        self.assertEqual(view.flush_calls, [[1, 1], [1, 1], [1]])
+        self.assertEqual(view.flush_calls, expected_windows)
 
     def test_first_positive_dump_step_is_not_filtered(self):
         view = _FakeView()

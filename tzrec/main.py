@@ -107,6 +107,7 @@ from tzrec.utils.hf_export_util import export_hf_assets
 from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
+from tzrec.utils.online_learning_util import create_online_learning_handover
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
 
@@ -585,6 +586,10 @@ def _train_and_evaluate(
             "dense export trigger and the FeatureStore upload watermark is the only "
             "publish gate."
         )
+    # A stream lineage retires itself once the next day's lineage has consumed
+    # data about as fresh; deployment of the successor follows its exit.
+    handover = create_online_learning_handover(model_dir, train_config)
+    handed_over = False
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
@@ -710,8 +715,22 @@ def _train_and_evaluate(
                     if delta_embedding_dumper is not None
                     else None
                 )
+                if (
+                    handover is not None
+                    and i_step % train_config.log_step_count_steps == 0
+                    and handover.update_and_check(i_step, data_timestamp)
+                ):
+                    logger.info(
+                        f"successor lineage {handover.successor_model_dir} caught "
+                        f"up at step {i_step}, handing over."
+                    )
+                    handed_over = True
+                    break
                 if prof is not None:
                     prof.step()
+
+            if handed_over:
+                break
 
             if not (use_step and i_step >= train_config.num_steps - 1):
                 for lr in lr_scheduler:
@@ -761,7 +780,8 @@ def _train_and_evaluate(
             summary_writer.close()
         if prof is not None:
             prof.stop()
-        if ckpt_manager.maybe_save(
+        # a retired lineage is never resumed, so skip its final checkpoint
+        if not handed_over and ckpt_manager.maybe_save(
             i_step,
             model,
             optimizer,
@@ -1218,6 +1238,7 @@ def export(
     asset_files: Optional[str] = None,
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     item_input_path: Optional[str] = None,
+    edit_config_json: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -1232,12 +1253,15 @@ def export(
         item_input_path (str, optional): override for the item tower's
             predict-mode dataloader input path. When set, the item tower
             reads from this path instead of ``train_input_path``.
+        edit_config_json (str, optional): edit pipeline config json str.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
     ensure_input_tile_for_distributed_embedding()
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+    if edit_config_json:
+        config_util.edit_config(pipeline_config, json.loads(edit_config_json))
     ori_pipeline_config = copy.copy(pipeline_config)
 
     # AOTI bakes allow_tf32 into Triton constexprs at trace time.

@@ -49,6 +49,7 @@ from tzrec.protos.train_pb2 import (
 )
 from tzrec.utils import checkpoint_util, predict_util
 from tzrec.utils.delta_embedding_dump import DumpDecision
+from tzrec.utils.online_learning_util import OnlineLearningHandover
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
@@ -83,6 +84,17 @@ class MainTest(unittest.TestCase):
             runpy.run_module("tzrec.train_eval", run_name="__main__")
         train.assert_called_once()
         self.assertIs(train.call_args.kwargs["ignore_restore_lr_scheduler"], ignore)
+
+    def test_export_cli_edit_config_json(self):
+        edit = '{"export_config.dynamic_embedding.feature_store_config.version":"v1"}'
+        argv = ["tzrec.export", "--edit_config_json", edit]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch("tzrec.main.export", autospec=True) as export,
+        ):
+            runpy.run_module("tzrec.export", run_name="__main__")
+        export.assert_called_once()
+        self.assertEqual(export.call_args.kwargs["edit_config_json"], edit)
 
     def test_create_custom_model(self) -> None:
         """A custom model receives its unpacked protobuf configuration."""
@@ -908,6 +920,84 @@ class TrainProfilerTest(unittest.TestCase):
         traces = os.listdir(self.test_dir)
         self.assertEqual(len(traces), 1)
         self.assertTrue(traces[0].startswith("rank3_"), traces[0])
+
+
+class OnlineLearningHandoverTest(unittest.TestCase):
+    """Tests for the train loop retiring a stream lineage on hand-over."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    def test_train_loop_retires_on_handover(self) -> None:
+        """Hand-over leaves both loops, skips the epoch-end and final saves.
+
+        The successor check runs only at the log cadence after poll_publish;
+        once it passes, the trailing delta is still dumped, uploads drained
+        and the final publish finalized.
+        """
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()] * 10)
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=17.0)
+        pipeline = mock.Mock()
+        pipeline.progress.return_value = ({"loss": torch.tensor(1.0)}, {}, batch)
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        dumper = mock.Mock()
+        dumper.maybe_dump.return_value = DumpDecision.NONE
+        dumper.final_dump.return_value = 2
+        exporter = mock.Mock()
+        exporter.enabled = True
+        train_config = _train_config(num_steps=0, num_epochs=1, log_step_count_steps=2)
+        train_config.delta_embedding_dump_config.paired_dump_interval_steps = 1
+        train_config.delta_embedding_dump_config.feature_store_config.project_name = (
+            "project"
+        )
+        env = {
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "ONLINE_LEARNING_SUCCESSOR_DIR": os.path.join(self.test_dir, "successor"),
+        }
+
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch.object(
+                OnlineLearningHandover, "update_and_check", side_effect=[False, True]
+            ) as update_and_check,
+        ):
+            _train_and_evaluate(
+                model=model,
+                optimizer=optimizer,
+                train_dataloader=train_dataloader,
+                eval_dataloader=None,
+                lr_scheduler=[],
+                model_dir="unused",
+                train_config=train_config,
+                eval_config=EvalConfig(),
+                ckpt_manager=ckpt_manager,
+                delta_embedding_dumper=dumper,
+            )
+
+        self.assertEqual(
+            update_and_check.call_args_list,
+            [mock.call(0, 17.0), mock.call(2, 17.0)],
+        )
+        self.assertEqual(pipeline.progress.call_count, 3)
+        self.assertEqual(exporter.poll_publish.call_count, 3)
+        for call in ckpt_manager.maybe_save.call_args_list:
+            self.assertNotIn("epoch", call.kwargs)
+            self.assertFalse(call.kwargs.get("final", False))
+        self.assertTrue(model.module.model.on_train_end.called)
+        dumper.final_dump.assert_called_once_with(2)
+        dumper.close.assert_called_once()
+        exporter.finalize_publish.assert_called_once()
 
 
 if __name__ == "__main__":

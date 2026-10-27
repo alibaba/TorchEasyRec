@@ -47,6 +47,12 @@ Welcome to TorchEasyRec's documentation!
    usage/convert_easyrec_config_to_tzrec_config
 
 .. toctree::
+   :maxdepth: 2
+   :caption: BEST PRACTICES
+
+   best_practices/online_learning
+
+.. toctree::
    :maxdepth: 1
    :caption: DEVELOP
 

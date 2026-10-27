@@ -1007,9 +1007,9 @@ class DeltaEmbeddingDumper:
 
     def _local_dump_decision(self, global_step: int) -> DumpDecision:
         """Return this step's decision level; the paired cadence wins ties."""
+        if global_step <= 0:
+            return DumpDecision.NONE
         if self._paired_interval_steps is not None:
-            if global_step <= 0:
-                return DumpDecision.NONE
             if global_step % self._paired_interval_steps == 0:
                 return DumpDecision.PAIRED
             if (
