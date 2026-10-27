@@ -59,6 +59,7 @@ _GPU_RESERVE_FRACTION = 0.2
 # NVE memory of a layer besides its cache: ~81 MiB measured on pynve 26.10 (the
 # modify buffer at the default max_modify_size) plus per-stream lookup buffers.
 _LAYER_OVERHEAD_BYTES = 96 << 20
+# NOTE: at most 11 member bits, so the payload never drops below 52 bits.
 _MAX_GROUP_MEMBERS = (1 << 11) - 1
 _SALT_MULTIPLIER = 0x9E3779B97F4A7C15
 
@@ -375,12 +376,21 @@ class DistributedEmbeddingLookup:
         """Fuse ``members`` into one group at ``payload_bits`` and append it.
 
         Members are numbered by their position in ``members``; those whose keys
-        collide after folding are left out, keeping the others' numbers.
+        collide after folding are left out, keeping the others' numbers. A lone
+        member keeps its raw keys and is not checked.
 
         Returns:
             The members left out, in order.
         """
         meta0 = emb_meta[members[0]]
+        if len(members) == 1:
+            # a lone table needs no member tag, so its raw keys are exact.
+            groups.append(
+                _Group(
+                    meta0["dtype"], meta0["dimension"], default_row, members, [0], None
+                )
+            )
+            return []
         fused, fused_ids, failed = [], [], []
         for member_idx, name in enumerate(members):
             meta = emb_meta[name]

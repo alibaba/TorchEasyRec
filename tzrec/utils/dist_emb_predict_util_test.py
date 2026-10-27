@@ -402,6 +402,8 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
                 collide={0: (61,), 1: (61,)},
                 groups=[((2,), (2,), 61), ((0,), (0,), None), ((1,), (0,), None)],
             ),
+            # a lone table keeps its raw keys unchecked, though they collide folded.
+            param("alone", n=1, collide={0: (62,)}, groups=[((0,), (0,), None)]),
         ],
         name_func=parameterized_name_func,
     )
@@ -443,7 +445,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         widths = 63 - n.bit_length(), 63 - len(collide).bit_length()
         retried = len(collide) > 1 and widths[1] > widths[0]
         for t, table in enumerate(tables):
-            expected_checks = 1 + (retried and t in collide)
+            expected_checks = (n > 1) + (retried and t in collide)
             self.assertEqual(checks.count(table.meta["key_name"]), expected_checks)
 
         def layout(group):
