@@ -2729,6 +2729,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             ("ordinary_int8", False, "INT8", ""),
             ("zch_only", False, "", ""),
             ("mixed_zch", False, "", ""),
+            ("mixed_zch_int8", False, "INT8", ""),
             ("mixed_zch_upload", True, "", ""),
             ("fp32_upload", True, "", ""),
             ("int8_upload", True, "INT8", ""),
@@ -2761,7 +2762,12 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             feature = self.pipeline_config.feature_configs[0].id_feature
             feature.ClearField("dynamicemb")
             feature.num_buckets = 8
-        if case_name in ("mixed_zch", "mixed_zch_upload", "zch_only"):
+        if case_name in (
+            "mixed_zch",
+            "mixed_zch_int8",
+            "mixed_zch_upload",
+            "zch_only",
+        ):
             self.pipeline_config.feature_configs[1].id_feature.zch.CopyFrom(
                 feature_pb2.ZeroCollisionHash(
                     zch_size=8,
@@ -3005,7 +3011,16 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         if expected_dynamic:
             part_outputs = [np.load(p) for p in dynamic_npz_files]
             try:
+                expected_val_dtype = np.dtype(np.uint8 if quant else np.float32)
                 for name, (keys, values, scores) in expected_dynamic.items():
+                    for out in part_outputs:
+                        self.assertEqual(out[f"{name}.keys"].dtype, np.dtype(np.int64))
+                        self.assertEqual(
+                            out[f"{name}.scores"].dtype, np.dtype(np.int64)
+                        )
+                        self.assertEqual(
+                            out[f"{name}.values"].dtype, expected_val_dtype
+                        )
                     actual_keys = np.concatenate(
                         [out[f"{name}.keys"] for out in part_outputs], axis=0
                     )
@@ -3041,7 +3056,17 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                         if f"{name}.default_value" in out
                     ]
                     self.assertEqual(len(default_parts), 1)
-                    np.testing.assert_array_equal(default_parts[0], default_value)
+                    if quant:
+                        self.assertEqual(default_parts[0].dtype, np.uint8)
+                        np.testing.assert_allclose(
+                            _dequant_quint8_rowwise_f16(
+                                default_parts[0], default_value.shape[1]
+                            ),
+                            default_value,
+                            atol=0.02,
+                        )
+                    else:
+                        np.testing.assert_array_equal(default_parts[0], default_value)
             finally:
                 for out in part_outputs:
                     out.close()
@@ -3177,6 +3202,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         [
             ("read_chunk_size_mb", "read_chunk_size_mb"),
             ("upload_max_in_flight_batches", "upload_max_in_flight_batches"),
+            ("max_num_parts", "max_num_parts"),
             ("missing_tables", "missing tables"),
         ],
         name_func=parameterized_name_func,
@@ -3248,6 +3274,11 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 "score_name": f"{table}.scores",
             }
         }
+        orphan = os.path.join(
+            sparse_dir, "sparse_dynamic_embedding-01-of-02.npz.part.deadbeef"
+        )
+        with open(orphan, "wb") as f:
+            f.write(b"orphan")
         with self.assertRaisesRegex(RuntimeError, "corrupted dynamic shard"):
             export_util._save_sharded_dynamic_embedding_npz(
                 sparse_dir,

@@ -416,6 +416,47 @@ class DynamicEmbeddingExportTest(unittest.TestCase):
             np.concatenate(loaded_values), expected_vals_order
         )
 
+    def test_sharded_dynamic_embedding_export_mixed_world_sizes(self) -> None:
+        table_b = "model.embedding_group.emb_impls.group.ebc.embedding_bags.table_b"
+        directory = os.path.join(self.test_dir, "dynamicemb", self.module)
+        os.makedirs(directory, exist_ok=True)
+        for rank in range(4):
+            self._write_shard(
+                rank,
+                np.array([rank * 10], dtype=np.int64),
+                np.full((1, 2), rank + 1.0, dtype=np.float32),
+                world_size=4,
+            )
+        # table_b has world_size=1, so only part 0 has rows and parts 1..3 have 0 rows.
+        for name, array in (
+            ("keys", np.array([99], dtype=np.int64)),
+            ("values", np.array([[5.0, 6.0]], dtype=np.float32)),
+            ("scores", np.array([199], dtype=np.int64)),
+        ):
+            array.tofile(
+                os.path.join(directory, f"table_b_emb_{name}.rank_0.world_size_1")
+            )
+
+        with mock.patch("os.cpu_count", return_value=4):
+            part_arrays, metadata = get_sharded_dynamic_embedding_export(
+                self.test_dir,
+                {self.table: 2, table_b: 2},
+                32,
+                quant_format="QUint8RowwiseF16",
+                max_num_parts=4,
+            )
+        self.assertEqual(len(part_arrays), 4)
+        self.assertEqual(metadata[self.table]["shape"], [4, 2])
+        self.assertEqual(metadata[table_b]["shape"], [1, 2])
+        self.assertEqual(part_arrays[0][f"{table_b}.values"].shape, (1, 6))
+        for part_idx in range(1, 4):
+            self.assertEqual(part_arrays[part_idx][f"{table_b}.keys"].shape, (0,))
+            self.assertEqual(part_arrays[part_idx][f"{table_b}.values"].shape, (0, 6))
+            self.assertEqual(
+                part_arrays[part_idx][f"{table_b}.values"].dtype, np.dtype(np.uint8)
+            )
+            self.assertEqual(part_arrays[part_idx][f"{table_b}.scores"].shape, (0,))
+
 
 if __name__ == "__main__":
     unittest.main()

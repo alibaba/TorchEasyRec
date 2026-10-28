@@ -34,6 +34,8 @@ import numpy as np
 from tzrec.utils import checkpoint_util, quant_util
 from tzrec.utils.npz_util import StreamingArray
 
+_DEFAULT_MAX_NUM_PARTS = 16
+
 
 @dataclass(frozen=True)
 class _CheckpointShard:
@@ -228,7 +230,13 @@ def _build_streaming_arrays(
     on_values: Optional[Callable[[str, np.ndarray, np.ndarray], None]],
     shard_filter: Optional[Callable[[_CheckpointShard], bool]] = None,
 ) -> Tuple[Dict[str, StreamingArray], Dict[str, Dict[str, Any]]]:
-    """Build StreamingArray descriptors and per-table metadata for selected shards."""
+    """Build StreamingArray descriptors and per-table metadata for selected shards.
+
+    When ``shard_filter`` is set, the returned ``StreamingArray`` descriptors
+    (``part_rows`` / ``part_shape``) cover only the filtered shards for that part,
+    while the per-table metadata ``shape``, ``storage_shape``, and ``memory``
+    remain global across all shards in ``shards_by_table``.
+    """
     arrays: Dict[str, StreamingArray] = {}
     metadata: Dict[str, Dict[str, Any]] = {}
     for name, all_shards in shards_by_table.items():
@@ -356,19 +364,24 @@ def get_sharded_dynamic_embedding_export(
 
     Training checkpoints already split each dynamic table across
     ``checkpoint_world_size`` shard files. Partitioning those shards across up to
-    ``max_num_parts`` output NPZ parts lets export stream and quantize multiple
-    ``sparse_dynamic_embedding-XX-of-YY.npz`` files in parallel while keeping
-    global per-table metadata in ``sparse_embedding.json``.
+    ``min(max_world_size, os.cpu_count(), max_num_parts)`` output NPZ parts lets
+    export stream and quantize multiple ``sparse_dynamic_embedding-XX-of-YY.npz``
+    files in parallel while keeping global per-table metadata in
+    ``sparse_embedding.json``.
 
     Args:
         checkpoint_path: Training checkpoint directory.
         embedding_dimensions: Normalized export table FQN to logical dimension.
         read_chunk_bytes: Maximum combined raw key/value bytes per block.
         quant_format: Distributed quantization format, or empty for FP32.
-        max_num_parts: Maximum number of output NPZ parts (0 uses CPU count).
+        max_num_parts: Maximum number of output NPZ parts (0 uses default cap of 16).
 
     Returns:
         List of per-part NPZ array descriptor dicts and global per-table metadata.
+
+    Raises:
+        FileNotFoundError: A checkpoint shard file is missing.
+        ValueError: The read budget, dimensions, or checkpoint shards are invalid.
     """
     if read_chunk_bytes <= 0:
         raise ValueError("read_chunk_bytes must be positive")
@@ -376,9 +389,10 @@ def get_sharded_dynamic_embedding_export(
     if not shards_by_table:
         return [], {}
     max_world_size = max(shards[0].world_size for shards in shards_by_table.values())
+    cpu_cap = os.cpu_count() or 1
     if max_num_parts <= 0:
-        max_num_parts = os.cpu_count() or 1
-    num_parts = max(1, min(max_world_size, max_num_parts))
+        max_num_parts = _DEFAULT_MAX_NUM_PARTS
+    num_parts = max(1, min(max_world_size, cpu_cap, max_num_parts))
     if num_parts == 1:
         arrays, metadata = _build_streaming_arrays(
             shards_by_table,

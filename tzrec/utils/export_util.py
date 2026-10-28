@@ -1574,6 +1574,8 @@ def export_distributed_embedding(
         raise ValueError("dynamic_embedding.read_chunk_size_mb must be > 0")
     if settings.upload_max_in_flight_batches <= 0:
         raise ValueError("dynamic_embedding.upload_max_in_flight_batches must be > 0")
+    if settings.max_num_parts <= 0:
+        raise ValueError("dynamic_embedding.max_num_parts must be > 0")
     infos = {**bag_infos, **embedding_infos}
     dimensions = {
         checkpoint_util.remap_input_tile_user_key(name): info.embedding_dim
@@ -1611,6 +1613,7 @@ def export_distributed_embedding(
             dimensions,
             read_chunk_bytes=read_chunk_bytes,
             quant_format=quant_format,
+            max_num_parts=int(settings.max_num_parts),
         )
         if len(part_arrays) > 1:
             sharded_dynamic_arrays = part_arrays
@@ -1719,14 +1722,27 @@ def export_distributed_embedding(
 def _write_dynamic_npz_worker(
     path: str,
     arrays: Dict[str, Any],
-    error_queue: Any,
+    error_queue: "mp.SimpleQueue[Tuple[str, str, str]]",
 ) -> None:
     """Write one dynamic embedding NPZ part in a forked child process."""
+    # NOTE: worker must stay CPU/NumPy-only; the parent may hold a live CUDA context.
     try:
         npz_util.savez_streaming(path, arrays)
     except BaseException as exc:
         error_queue.put((type(exc).__name__, str(exc), traceback.format_exc()))
         raise
+
+
+def _cleanup_dynamic_npz_artifacts(sparse_dir: str, paths: List[str]) -> None:
+    """Remove published dynamic NPZ shards and any orphaned staging files."""
+    candidates = list(paths) + glob.glob(
+        os.path.join(sparse_dir, "sparse_dynamic_embedding-*.npz.part.*")
+    )
+    for path in candidates:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _save_sharded_dynamic_embedding_npz(
@@ -1738,49 +1754,66 @@ def _save_sharded_dynamic_embedding_npz(
 ) -> None:
     """Write sharded dynamic embedding NPZ files in parallel across processes.
 
-    Part 0 carries ``dynamic_arrays`` (which includes any ZCH tables converted
-    in-memory plus part 0 of native dynamic tables). Parts 1..N-1 carry their
-    respective native dynamic table shards and 0-row placeholders for ZCH tables
-    so every ``sparse_dynamic_embedding-XX-of-YY.npz`` shard exposes the full
+    Native dynamic tables carry their respective checkpoint shard streams per
+    part, and in-memory ZCH tables are sliced evenly across all parts so every
+    ``sparse_dynamic_embedding-XX-of-YY.npz`` shard exposes the full
     key/value/score entry contract expected by the serving loader.
     """
     num_parts = len(sharded_dynamic_arrays)
-    zch_empty_entries: Dict[str, np.ndarray] = {}
+    part_dicts: List[Dict[str, Any]] = [
+        dict(sharded_dynamic_arrays[part_idx]) for part_idx in range(num_parts)
+    ]
     for name, meta in embedding_meta.items():
         if not meta.get("is_dynamic") or name in native_dynamic_names:
             continue
+        key_arr = dynamic_arrays[meta["key_name"]]
         val_arr = dynamic_arrays[meta["value_name"]]
-        val_dtype = (
-            val_arr.dtype
-            if isinstance(val_arr, np.ndarray)
-            else val_arr.detach().cpu().numpy().dtype
-        )
-        val_cols = int(val_arr.shape[1])
-        zch_empty_entries[meta["key_name"]] = np.empty((0,), dtype=np.int64)
-        zch_empty_entries[meta["value_name"]] = np.empty((0, val_cols), dtype=val_dtype)
-        zch_empty_entries[meta["score_name"]] = np.empty((0,), dtype=np.int64)
+        score_arr = dynamic_arrays[meta["score_name"]]
+        if not isinstance(key_arr, np.ndarray):
+            key_arr = key_arr.detach().cpu().numpy()
+        if not isinstance(val_arr, np.ndarray):
+            val_arr = val_arr.detach().cpu().numpy()
+        if not isinstance(score_arr, np.ndarray):
+            score_arr = score_arr.detach().cpu().numpy()
+        total_rows = int(key_arr.shape[0])
+        for part_idx in range(num_parts):
+            start = (total_rows * part_idx) // num_parts
+            end = (total_rows * (part_idx + 1)) // num_parts
+            part_dicts[part_idx][meta["key_name"]] = key_arr[start:end]
+            part_dicts[part_idx][meta["value_name"]] = val_arr[start:end]
+            part_dicts[part_idx][meta["score_name"]] = score_arr[start:end]
+        default_name = meta.get("default_value_name")
+        if default_name and default_name in dynamic_arrays:
+            default_arr = dynamic_arrays[default_name]
+            if not isinstance(default_arr, np.ndarray):
+                default_arr = default_arr.detach().cpu().numpy()
+            part_dicts[0][default_name] = default_arr
 
-    part_dicts: List[Dict[str, Any]] = [dynamic_arrays]
-    for part_idx in range(1, num_parts):
-        merged: Dict[str, Any] = dict(zch_empty_entries)
-        merged.update(sharded_dynamic_arrays[part_idx])
-        part_dicts.append(merged)
-
+    width = max(2, len(str(num_parts)))
     paths = [
         os.path.join(
             sparse_dir,
-            f"sparse_dynamic_embedding-{part_idx:02d}-of-{num_parts:02d}.npz",
+            f"sparse_dynamic_embedding-{part_idx:0{width}d}-of-{num_parts:0{width}d}.npz",
         )
         for part_idx in range(num_parts)
     ]
 
     if "fork" not in mp.get_all_start_methods():
-        for path, arrays in zip(paths, part_dicts):
-            npz_util.savez_streaming(path, arrays)
+        logger.info(
+            "Multiprocessing 'fork' start method unavailable; writing %s dynamic "
+            "NPZ parts sequentially.",
+            num_parts,
+        )
+        try:
+            for path, arrays in zip(paths, part_dicts):
+                npz_util.savez_streaming(path, arrays)
+        except BaseException:
+            _cleanup_dynamic_npz_artifacts(sparse_dir, paths)
+            raise
         return
 
     ctx = mp.get_context("fork")
-    error_queue = ctx.SimpleQueue()
+    error_queue: mp.SimpleQueue[Tuple[str, str, str]] = ctx.SimpleQueue()
     processes = []
     try:
         for path, arrays in zip(paths, part_dicts):
@@ -1798,16 +1831,12 @@ def _save_sharded_dynamic_embedding_npz(
                 proc.terminate()
         for proc in processes:
             proc.join()
+        _cleanup_dynamic_npz_artifacts(sparse_dir, paths)
         raise
 
     failed = [proc.exitcode for proc in processes if proc.exitcode != 0]
     if failed:
-        for path in paths:
-            if os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        _cleanup_dynamic_npz_artifacts(sparse_dir, paths)
         if not error_queue.empty():
             exc_type, exc_msg, exc_tb = error_queue.get()
             raise RuntimeError(
