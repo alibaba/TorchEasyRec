@@ -18,7 +18,7 @@ from torch import nn
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import Batch
-from tzrec.models.model import CombinedModelWrapper, packed_predict_model
+from tzrec.models.model import CombinedModelWrapper, batch_predict_model
 
 
 class _Sparse(nn.Module):
@@ -54,8 +54,9 @@ def _reload(module: nn.Module) -> torch.jit.ScriptModule:
     return torch.jit.load(buf)
 
 
-class PackedPredictModelTest(unittest.TestCase):
+class BatchPredictModelTest(unittest.TestCase):
     def _batch(self) -> Batch:
+        # a predict batch: no labels or sample weights.
         torch.manual_seed(0)
         lengths = torch.randint(0, 4, (3 * 5,), dtype=torch.int32)
         n = int(lengths.sum())
@@ -73,14 +74,14 @@ class PackedPredictModelTest(unittest.TestCase):
                     weights=torch.rand(n),
                 )
             },
-            labels={"clk": torch.rand(5)},
+            additional_infos={"info": torch.rand(5)},
         )
 
     def test_scripted_model(self):
         batch, device = self._batch(), torch.device("cpu")
         model = _reload(_Model())
         expected = model(batch.to_dict(sparse_dtype=torch.int64), device)
-        actual = packed_predict_model(model)(batch.to_packed(), device)
+        actual = batch_predict_model(model)(batch, None, device)
         self.assertEqual(list(actual), list(expected))
         for k, v in expected.items():
             torch.testing.assert_close(actual[k], v, rtol=0, atol=0, msg=k)
@@ -89,7 +90,7 @@ class PackedPredictModelTest(unittest.TestCase):
         batch, device = self._batch(), torch.device("cpu")
         model = CombinedModelWrapper(_reload(_Sparse()), _Dense())
         expected = model(batch.to_dict(sparse_dtype=torch.int64), device)
-        actual = packed_predict_model(model)(batch.to_packed(), device)
+        actual = batch_predict_model(model)(batch, None, device)
         torch.testing.assert_close(actual["p"], expected["p"], rtol=0, atol=0)
 
 

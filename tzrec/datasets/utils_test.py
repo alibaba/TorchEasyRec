@@ -24,12 +24,12 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, Keyed
 from tzrec.datasets.utils import (
     Batch,
     _normalize_type_str,
+    batch_to_dict,
     build_sampler_input,
     calc_remaining_intervals,
     calc_slice_intervals,
     combine_negs_to_candidate_sequence,
     get_input_fields_proto,
-    packed_to_dict,
     plan_rank_worker_intervals,
 )
 from tzrec.protos import data_pb2
@@ -881,19 +881,29 @@ class BatchToDictTest(unittest.TestCase):
         devices = [torch.device("cpu")]
         if torch.cuda.is_available():
             devices.append(torch.device("cuda"))
-        scripted = torch.jit.script(packed_to_dict)
+        scripted = torch.jit.script(batch_to_dict)
         for device in devices:
             batch = self._batch(weighted, batch_size, device)
             expected = _reference_to_dict(batch, sparse_dtype)
-            for actual in (
-                batch.to_dict(sparse_dtype=sparse_dtype),
-                scripted(batch.to_packed(), sparse_dtype),
-            ):
-                self.assertEqual(list(actual), list(expected))
-                for k, v in expected.items():
-                    self.assertEqual(actual[k].dtype, v.dtype, k)
-                    self.assertEqual(actual[k].device, v.device, k)
-                    torch.testing.assert_close(actual[k], v, rtol=0, atol=0, msg=k)
+            actual = batch.to_dict(sparse_dtype=sparse_dtype)
+            self.assertEqual(sorted(actual), sorted(expected))
+            # predict inputs: everything but labels and sample weights.
+            predict = scripted(
+                batch.dense_features,
+                batch.sparse_features,
+                batch.sequence_mulval_lengths,
+                batch.sequence_dense_features,
+                batch.additional_infos,
+                torch.tensor(batch.tile_size, dtype=torch.int64),
+                sparse_dtype,
+            )
+            labels = {"clk", "jl.values", "jl.lengths", "w"}
+            self.assertEqual(sorted(predict), sorted(set(expected) - labels))
+            for out in (actual, predict):
+                for k, v in out.items():
+                    self.assertEqual(v.dtype, expected[k].dtype, k)
+                    self.assertEqual(v.device, expected[k].device, k)
+                    torch.testing.assert_close(v, expected[k], rtol=0, atol=0, msg=k)
 
 
 if __name__ == "__main__":
