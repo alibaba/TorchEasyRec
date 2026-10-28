@@ -1603,7 +1603,27 @@ def predict(
         prof.start()
 
     if predict_threads is None:
-        predict_threads = max(data_config.num_workers, len(forward_devices))
+        # with a distributed embedding, each lookup stream holds its own NVE buffers.
+        predict_threads = (
+            len(forward_devices)
+            if is_dist_emb
+            else max(data_config.num_workers, len(forward_devices))
+        )
+    elif is_dist_emb and predict_threads > len(forward_devices):
+        logger.warning(
+            f"predict_threads={predict_threads} runs more than one lookup stream per "
+            "GPU; each holds its own NVE lookup buffers outside the GPU cache budget, "
+            "set a lower DIST_EMB_GPU_CACHE_RATIO if GPU memory runs out."
+        )
+    # NVE keeps one lookup context per CUDA stream, so each worker gets its own.
+    worker_streams = (
+        [
+            torch.cuda.Stream(forward_devices[i % len(forward_devices)])
+            for i in range(predict_threads)
+        ]
+        if is_dist_emb
+        else []
+    )
     data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
     pred_queue: Queue[Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]] = (
         Queue(maxsize=predict_threads * 2)
@@ -1655,10 +1675,9 @@ def predict(
     def _forward_loop(worker_id: int) -> None:
         stage = "forward"
         worker_device = forward_devices[worker_id % len(forward_devices)]
-        # NVE keeps one lookup context per CUDA stream, so give each worker its own.
         stream_ctx = (
-            torch.cuda.stream(torch.cuda.Stream(worker_device))
-            if sparse_lookup is not None
+            torch.cuda.stream(worker_streams[worker_id])
+            if worker_streams
             else nullcontext()
         )
         try:
@@ -1707,7 +1726,13 @@ def predict(
             try:
                 batch = next(infer_iterator)
                 if i_step == 0:
-                    predictions, reserves = _forward(batch)
+                    # on worker 0's stream, so it adds no lookup context of its own.
+                    with (
+                        torch.cuda.stream(worker_streams[0])
+                        if worker_streams
+                        else nullcontext()
+                    ):
+                        predictions, reserves = _forward(batch)
                     input_batches += 1
                     if output_cols is None:
                         output_cols = sorted(predictions.keys())
