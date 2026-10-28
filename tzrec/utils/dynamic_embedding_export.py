@@ -34,6 +34,8 @@ import numpy as np
 from tzrec.utils import checkpoint_util, quant_util
 from tzrec.utils.npz_util import StreamingArray
 
+_DEFAULT_MAX_NUM_PARTS = 16
+
 
 @dataclass(frozen=True)
 class _CheckpointShard:
@@ -220,6 +222,97 @@ def _find_shards(
     return dict(shards_by_table)
 
 
+def _build_streaming_arrays(
+    shards_by_table: Mapping[str, List[_CheckpointShard]],
+    embedding_dimensions: Mapping[str, int],
+    read_chunk_bytes: int,
+    quant_format: str,
+    on_values: Optional[Callable[[str, np.ndarray, np.ndarray], None]],
+    shard_filter: Optional[Callable[[_CheckpointShard], bool]] = None,
+) -> Tuple[Dict[str, StreamingArray], Dict[str, Dict[str, Any]]]:
+    """Build StreamingArray descriptors and per-table metadata for selected shards.
+
+    When ``shard_filter`` is set, the returned ``StreamingArray`` descriptors
+    (``part_rows`` / ``part_shape``) cover only the filtered shards for that part,
+    while the per-table metadata ``shape``, ``storage_shape``, and ``memory``
+    remain global across all shards in ``shards_by_table``.
+    """
+    arrays: Dict[str, StreamingArray] = {}
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for name, all_shards in shards_by_table.items():
+        dimension = embedding_dimensions[name]
+        chunk_rows = read_chunk_bytes // (8 + dimension * 4)
+        if chunk_rows == 0:
+            raise ValueError(
+                f"read_chunk_bytes={read_chunk_bytes} cannot fit one key/value "
+                f"row of {name} (requires {8 + dimension * 4} bytes)"
+            )
+        shards = (
+            [s for s in all_shards if shard_filter(s)]
+            if shard_filter is not None
+            else all_shards
+        )
+        total_rows = sum(shard.rows for shard in all_shards)
+        part_rows = sum(shard.rows for shard in shards)
+        shape = (total_rows, dimension)
+        part_shape = (part_rows, dimension)
+        dtype = np.dtype(np.float32)
+        table_meta: Dict[str, Any] = {
+            "dimension": dimension,
+            "dtype": "float32",
+            "shape": list(shape),
+            "dense": False,
+            "is_dynamic": True,
+            "key_dtype": "int64",
+            "score_dtype": "int64",
+            "key_name": f"{name}.keys",
+            "value_name": f"{name}.values",
+            "score_name": f"{name}.scores",
+        }
+        if quant_format:
+            empty_values = quant_util.distributed_quantize_embeddings(
+                np.empty((0, dimension), dtype=np.float32),
+                dimension,
+                name,
+                quant_format,
+            )
+            dtype = empty_values.dtype
+            shape = (total_rows, empty_values.shape[1])
+            part_shape = (part_rows, empty_values.shape[1])
+            table_meta.update(
+                {
+                    "dtype": quant_format,
+                    "storage_dtype": quant_util.DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
+                    "storage_shape": list(shape),
+                    "row_bytes": shape[1],
+                    "quant": {
+                        "enabled": True,
+                        "format": quant_format,
+                        "scale_offset_dtype": "float16",
+                        "output_dtype": "float16",
+                    },
+                }
+            )
+        table_meta["memory"] = total_rows * shape[1] * dtype.itemsize
+        arrays[f"{name}.keys"] = StreamingArray(
+            np.dtype(np.int64),
+            (part_rows,),
+            _iter_column(shards, "key_file", read_chunk_bytes // 8),
+        )
+        arrays[f"{name}.values"] = StreamingArray(
+            dtype,
+            part_shape,
+            _iter_values(shards, name, dimension, chunk_rows, quant_format, on_values),
+        )
+        arrays[f"{name}.scores"] = StreamingArray(
+            np.dtype(np.int64),
+            (part_rows,),
+            _iter_column(shards, "score_file", read_chunk_bytes // 8),
+        )
+        metadata[name] = table_meta
+    return arrays, metadata
+
+
 def get_dynamic_embedding_export(
     checkpoint_path: str,
     embedding_dimensions: Mapping[str, int],
@@ -250,69 +343,76 @@ def get_dynamic_embedding_export(
     """
     if read_chunk_bytes <= 0:
         raise ValueError("read_chunk_bytes must be positive")
-    arrays: Dict[str, StreamingArray] = {}
+    shards_by_table = _find_shards(checkpoint_path, embedding_dimensions)
+    return _build_streaming_arrays(
+        shards_by_table,
+        embedding_dimensions,
+        read_chunk_bytes,
+        quant_format,
+        on_values,
+    )
+
+
+def get_sharded_dynamic_embedding_export(
+    checkpoint_path: str,
+    embedding_dimensions: Mapping[str, int],
+    read_chunk_bytes: int,
+    quant_format: str = "",
+    max_num_parts: int = 0,
+) -> Tuple[List[Dict[str, StreamingArray]], Dict[str, Dict[str, Any]]]:
+    """Partition dynamic checkpoint shards into multiple NPZ part array dicts.
+
+    Training checkpoints already split each dynamic table across
+    ``checkpoint_world_size`` shard files. Partitioning those shards across up to
+    ``min(max_world_size, os.cpu_count(), max_num_parts)`` output NPZ parts lets
+    export stream and quantize multiple ``sparse_dynamic_embedding-XX-of-YY.npz``
+    files in parallel while keeping global per-table metadata in
+    ``sparse_embedding.json``.
+
+    Args:
+        checkpoint_path: Training checkpoint directory.
+        embedding_dimensions: Normalized export table FQN to logical dimension.
+        read_chunk_bytes: Maximum combined raw key/value bytes per block.
+        quant_format: Distributed quantization format, or empty for FP32.
+        max_num_parts: Maximum number of output NPZ parts (0 uses default cap of 16).
+
+    Returns:
+        List of per-part NPZ array descriptor dicts and global per-table metadata.
+
+    Raises:
+        FileNotFoundError: A checkpoint shard file is missing.
+        ValueError: The read budget, dimensions, or checkpoint shards are invalid.
+    """
+    if read_chunk_bytes <= 0:
+        raise ValueError("read_chunk_bytes must be positive")
+    shards_by_table = _find_shards(checkpoint_path, embedding_dimensions)
+    if not shards_by_table:
+        return [], {}
+    max_world_size = max(shards[0].world_size for shards in shards_by_table.values())
+    cpu_cap = os.cpu_count() or 1
+    if max_num_parts <= 0:
+        max_num_parts = _DEFAULT_MAX_NUM_PARTS
+    num_parts = max(1, min(max_world_size, cpu_cap, max_num_parts))
+    if num_parts == 1:
+        arrays, metadata = _build_streaming_arrays(
+            shards_by_table,
+            embedding_dimensions,
+            read_chunk_bytes,
+            quant_format,
+            on_values=None,
+        )
+        return [arrays], metadata
+
+    part_arrays: List[Dict[str, StreamingArray]] = []
     metadata: Dict[str, Dict[str, Any]] = {}
-    for name, shards in _find_shards(checkpoint_path, embedding_dimensions).items():
-        dimension = embedding_dimensions[name]
-        chunk_rows = read_chunk_bytes // (8 + dimension * 4)
-        if chunk_rows == 0:
-            raise ValueError(
-                f"read_chunk_bytes={read_chunk_bytes} cannot fit one key/value "
-                f"row of {name} (requires {8 + dimension * 4} bytes)"
-            )
-        rows = sum(shard.rows for shard in shards)
-        shape = (rows, dimension)
-        dtype = np.dtype(np.float32)
-        table_meta: Dict[str, Any] = {
-            "dimension": dimension,
-            "dtype": "float32",
-            "shape": list(shape),
-            "dense": False,
-            "is_dynamic": True,
-            "key_dtype": "int64",
-            "score_dtype": "int64",
-            "key_name": f"{name}.keys",
-            "value_name": f"{name}.values",
-            "score_name": f"{name}.scores",
-        }
-        if quant_format:
-            empty_values = quant_util.distributed_quantize_embeddings(
-                np.empty((0, dimension), dtype=np.float32),
-                dimension,
-                name,
-                quant_format,
-            )
-            dtype = empty_values.dtype
-            shape = (rows, empty_values.shape[1])
-            table_meta.update(
-                {
-                    "dtype": quant_format,
-                    "storage_dtype": quant_util.DISTRIBUTED_SPARSE_QUANT_STORAGE_DTYPE,
-                    "storage_shape": list(shape),
-                    "row_bytes": shape[1],
-                    "quant": {
-                        "enabled": True,
-                        "format": quant_format,
-                        "scale_offset_dtype": "float16",
-                        "output_dtype": "float16",
-                    },
-                }
-            )
-        table_meta["memory"] = rows * shape[1] * dtype.itemsize
-        arrays[f"{name}.keys"] = StreamingArray(
-            np.dtype(np.int64),
-            (rows,),
-            _iter_column(shards, "key_file", read_chunk_bytes // 8),
+    for part_idx in range(num_parts):
+        arrays, metadata = _build_streaming_arrays(
+            shards_by_table,
+            embedding_dimensions,
+            read_chunk_bytes,
+            quant_format,
+            on_values=None,
+            shard_filter=lambda shard, idx=part_idx: shard.rank % num_parts == idx,
         )
-        arrays[f"{name}.values"] = StreamingArray(
-            dtype,
-            shape,
-            _iter_values(shards, name, dimension, chunk_rows, quant_format, on_values),
-        )
-        arrays[f"{name}.scores"] = StreamingArray(
-            np.dtype(np.int64),
-            (rows,),
-            _iter_column(shards, "score_file", read_chunk_bytes // 8),
-        )
-        metadata[name] = table_meta
-    return arrays, metadata
+        part_arrays.append(arrays)
+    return part_arrays, metadata
