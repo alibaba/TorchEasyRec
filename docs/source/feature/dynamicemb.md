@@ -151,7 +151,7 @@ feature_configs {
   - disk_budget_bytes: 本任务在 local_path 所在存储上最多可以占用的字节数，有表放到 RocksDB 时必填。共享同一存储（同一 NAS 服务器、同一本地盘，或相同 storage_domain）的所有 rank 共用这一个预算
   - storage_domain: 显式指定存储域。NFS/CPFS 按服务器、本地块设备按“主机+设备”自动识别；FUSE 或无法识别的文件系统必须配置
   - disk_reserve_bytes: 预留的安全空间，默认 16GiB
-  - sst_space_factor: 校准过的“SST 文件大小 / 逻辑行字节数”系数。未配置时使用 1.5，这是一个临时估计值，不是实测值
+  - sst_space_factor: 校准过的“SST 文件大小 / 逻辑行字节数”系数。未配置时使用 1.5，这是一个临时估计值，不是实测值。在 ESSD PL3 云盘上用 STEP/LFU/TIMESTAMP 表（dim 32/64，Adam）持续训练、表满后持续淘汰时实测为 1.02-1.05；可先用默认值训练一段，再按保存日志中的 live SST 与导出字节数之比加少量余量配置
   - capacity_check_interval_steps: 训练中检查磁盘余量的间隔步数，默认 100
   - disk_warn_headroom_bytes / disk_critical_headroom_bytes: 余量告警线和停止线，默认分别为 disk_budget_bytes 的 10% 和 5%
 
@@ -184,7 +184,7 @@ feature_configs {
 - checkpoint 与放置方式无关：同一份 checkpoint 可以在内存版和 RocksDB 版之间恢复，也可以在调整预算后由 AUTO 选出不同的放置继续训练。若放置变化使原本不在同一融合组、优化器参数（例如 Adam 的迭代次数）不同的表融合到一起，恢复会报错。world size、维度或优化器类型的变化按 dynamicemb 自身的规则校验
 - 评估、导出时 RocksDB 表同样从 checkpoint 文件加载到一个新的临时数据库（会占用与表大小相当的磁盘）
 - 旧版本（原生 RocksDB checkpoint，`model.ckpt-<step>/rocksdb/rank_<r>.json`）的 checkpoint 仍可恢复（仅限 `NO_EVICTION` 表）和导出；恢复后保存一次即转换为新格式。旧的原生 checkpoint 在对应 `model.ckpt-<step>` 被清理后删除
-- 保存耗时与表大小成正比（全量写出），训练在保存期间暂停；日志 `RocksDB checkpoint` 给出本次保存的 cache 写回、导出行数和字节数，以及进程启动以来训练、发布的累计写回量、淘汰行数和 RocksDB flush/compaction 写入量
+- 保存耗时与表大小成正比（全量写出），训练在保存期间暂停（实测经 ossfs 写出约 125 GiB 需约 13 分钟，从 OSS 恢复约 6 分钟），请据此设置 `save_checkpoints_steps`；日志 `RocksDB checkpoint` 给出本次保存的 cache 写回、导出行数和字节数，以及进程启动以来训练、发布的累计写回量、淘汰行数和 RocksDB flush/compaction 写入量
 - 已知限制：恢复前框架会先用一个 batch 初始化优化器状态，此时 frequency admission 的 Counter 计数无法回滚
 
 ### 排障
