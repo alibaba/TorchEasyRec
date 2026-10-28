@@ -24,7 +24,7 @@ import pyarrow as pa
 import torch
 from parameterized import param, parameterized
 
-from tzrec.datasets.utils import RecordBatchTensor
+from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.main import (
     _create_model,
     _create_train_profiler,
@@ -635,12 +635,10 @@ class MainTest(unittest.TestCase):
 class PredictionLifecycleTest(unittest.TestCase):
     """Tests for prediction lifecycle wiring."""
 
-    def _batch(self, rows: int) -> mock.Mock:
-        batch = mock.Mock()
-        batch.reserves = RecordBatchTensor(pa.record_batch({"id": list(range(rows))}))
-        batch.to_dict.return_value = {}
-        batch.dummy = False
-        return batch
+    def _batch(self, rows: int) -> Batch:
+        return Batch(
+            reserves=RecordBatchTensor(pa.record_batch({"id": list(range(rows))}))
+        )
 
     def _pipeline_config(self) -> EasyRecConfig:
         return EasyRecConfig(
