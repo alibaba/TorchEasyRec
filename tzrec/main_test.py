@@ -674,6 +674,10 @@ class PredictionLifecycleTest(unittest.TestCase):
             mock.patch(
                 "tzrec.main.acc_utils.is_input_tile_predict", return_value=False
             ),
+            mock.patch(
+                "tzrec.main.acc_utils.is_distributed_embedding_predict",
+                return_value=False,
+            ),
             mock.patch("tzrec.main._create_features", return_value=[]),
             mock.patch("tzrec.main.create_dataloader", return_value=dataloader),
             mock.patch("tzrec.main.create_writer", return_value=writer),

@@ -11,6 +11,8 @@ message DynamicEmbeddingExportConfig {
     optional uint32 upload_max_in_flight_batches = 2 [default = 16];
     // Also upload to FeatureDB without activating the target version.
     optional FeatureStoreConfig feature_store_config = 3;
+    // Maximum number of sharded dynamic embedding NPZ parts written in parallel.
+    optional uint32 max_num_parts = 4 [default = 16];
 }
 
 message ExportConfig {
