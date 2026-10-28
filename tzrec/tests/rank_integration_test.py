@@ -1186,14 +1186,34 @@ class RankIntegrationTest(unittest.TestCase):
         self.assertEqual(
             sum(info["shape"][0] for info in dynamic_tables), checkpoint_rows
         )
-        with np.load(
-            os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
-        ) as arrays:
+        dynamic_npz_files = sorted(
+            glob.glob(os.path.join(sparse_dir, "sparse_dynamic_embedding-*.npz"))
+        )
+        self.assertEqual(
+            [os.path.basename(p) for p in dynamic_npz_files],
+            [
+                "sparse_dynamic_embedding-00-of-02.npz",
+                "sparse_dynamic_embedding-01-of-02.npz",
+            ],
+        )
+        part_arrays = [np.load(p) for p in dynamic_npz_files]
+        try:
             for info in dynamic_tables:
-                keys = arrays[info["key_name"]]
+                keys = np.concatenate(
+                    [arrays[info["key_name"]] for arrays in part_arrays], axis=0
+                )
+                values = np.concatenate(
+                    [arrays[info["value_name"]] for arrays in part_arrays], axis=0
+                )
+                scores = np.concatenate(
+                    [arrays[info["score_name"]] for arrays in part_arrays], axis=0
+                )
                 self.assertEqual(len(keys), info["shape"][0])
-                self.assertEqual(arrays[info["value_name"]].shape, tuple(info["shape"]))
-                self.assertEqual(len(arrays[info["score_name"]]), len(keys))
+                self.assertEqual(values.shape, tuple(info["shape"]))
+                self.assertEqual(len(scores), len(keys))
+        finally:
+            for arrays in part_arrays:
+                arrays.close()
         self.success = True
 
     # id_1 is a regular embedding table, the rest are dynamicemb, so one run

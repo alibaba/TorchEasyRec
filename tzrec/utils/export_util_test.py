@@ -11,6 +11,7 @@
 
 
 import copy
+import glob
 import json
 import os
 import shutil
@@ -2983,20 +2984,39 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         if upload:
             uploader.close.assert_called_once_with()
             self.assertEqual(set(uploaded), dynamic_names)
-        self.assertEqual(
-            os.path.exists(
-                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
-            ),
-            bool(expected_dynamic),
+        dynamic_npz_files = sorted(
+            glob.glob(os.path.join(sparse_dir, "sparse_dynamic_embedding-*.npz"))
         )
+        if not expected_dynamic:
+            self.assertEqual(dynamic_npz_files, [])
+        elif dynamic_names and not upload:
+            self.assertEqual(
+                [os.path.basename(p) for p in dynamic_npz_files],
+                [
+                    "sparse_dynamic_embedding-00-of-02.npz",
+                    "sparse_dynamic_embedding-01-of-02.npz",
+                ],
+            )
+        else:
+            self.assertEqual(
+                [os.path.basename(p) for p in dynamic_npz_files],
+                ["sparse_dynamic_embedding-00-of-01.npz"],
+            )
         if expected_dynamic:
-            with np.load(
-                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
-            ) as output:
+            part_outputs = [np.load(p) for p in dynamic_npz_files]
+            try:
                 for name, (keys, values, scores) in expected_dynamic.items():
-                    np.testing.assert_array_equal(output[f"{name}.keys"], keys)
-                    np.testing.assert_array_equal(output[f"{name}.scores"], scores)
-                    exported = output[f"{name}.values"]
+                    actual_keys = np.concatenate(
+                        [out[f"{name}.keys"] for out in part_outputs], axis=0
+                    )
+                    actual_scores = np.concatenate(
+                        [out[f"{name}.scores"] for out in part_outputs], axis=0
+                    )
+                    exported = np.concatenate(
+                        [out[f"{name}.values"] for out in part_outputs], axis=0
+                    )
+                    np.testing.assert_array_equal(actual_keys, keys)
+                    np.testing.assert_array_equal(actual_scores, scores)
                     if quant:
                         self.assertEqual(exported.dtype, np.uint8)
                         np.testing.assert_allclose(
@@ -3015,9 +3035,16 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                             exported,
                         )
                 for name, default_value in expected_defaults.items():
-                    np.testing.assert_array_equal(
-                        output[f"{name}.default_value"], default_value
-                    )
+                    default_parts = [
+                        out[f"{name}.default_value"]
+                        for out in part_outputs
+                        if f"{name}.default_value" in out
+                    ]
+                    self.assertEqual(len(default_parts), 1)
+                    np.testing.assert_array_equal(default_parts[0], default_value)
+            finally:
+                for out in part_outputs:
+                    out.close()
         with np.load(
             os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")
         ) as output:
@@ -3177,6 +3204,59 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         dense_export.assert_not_called()
         sparse_restore.assert_not_called()
         self.assertFalse(os.path.exists(self.export_dir))
+
+    def test_sharded_dynamic_npz_worker_failure_cleans_up_parts(self):
+        sparse_dir = os.path.join(self.export_dir, "sparse")
+        os.makedirs(sparse_dir, exist_ok=True)
+        table = "model.embedding_group.emb_impls.__BASE__.ebc.embedding_bags.cat_a_emb"
+
+        def bad_chunks():
+            raise ValueError("corrupted dynamic shard")
+            yield np.zeros((1,), dtype=np.int64)
+
+        part0 = {
+            f"{table}.keys": npz_util.StreamingArray(
+                np.dtype(np.int64), (1,), [np.array([1], dtype=np.int64)]
+            ),
+            f"{table}.values": npz_util.StreamingArray(
+                np.dtype(np.float32),
+                (1, 2),
+                [np.ones((1, 2), dtype=np.float32)],
+            ),
+            f"{table}.scores": npz_util.StreamingArray(
+                np.dtype(np.int64), (1,), [np.array([10], dtype=np.int64)]
+            ),
+        }
+        part1 = {
+            f"{table}.keys": npz_util.StreamingArray(
+                np.dtype(np.int64), (1,), bad_chunks()
+            ),
+            f"{table}.values": npz_util.StreamingArray(
+                np.dtype(np.float32),
+                (1, 2),
+                [np.ones((1, 2), dtype=np.float32)],
+            ),
+            f"{table}.scores": npz_util.StreamingArray(
+                np.dtype(np.int64), (1,), [np.array([20], dtype=np.int64)]
+            ),
+        }
+        embedding_meta = {
+            table: {
+                "is_dynamic": True,
+                "key_name": f"{table}.keys",
+                "value_name": f"{table}.values",
+                "score_name": f"{table}.scores",
+            }
+        }
+        with self.assertRaisesRegex(RuntimeError, "corrupted dynamic shard"):
+            export_util._save_sharded_dynamic_embedding_npz(
+                sparse_dir,
+                [part0, part1],
+                part0,
+                embedding_meta,
+                {table},
+            )
+        self.assertEqual(os.listdir(sparse_dir), [])
 
 
 if __name__ == "__main__":
