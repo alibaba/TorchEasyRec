@@ -398,6 +398,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         sequence_delim (str): separator for sequence feature.
         sequence_length (int): max sequence length.
         sequence_pk (str): sequence primary key name for serving.
+        sequence_entity (str, optional): FeatureStore entity for serving.
     """
 
     def __init__(
@@ -410,6 +411,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         sequence_delim: Optional[str] = None,
         sequence_length: Optional[int] = None,
         sequence_pk: Optional[str] = None,
+        sequence_entity: Optional[str] = None,
         **kwargs,
     ) -> None:
         fc_type = feature_config.WhichOneof("feature")
@@ -440,6 +442,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         self.sequence_delim: Optional[str] = None
         self.sequence_length: Optional[int] = None
         self.sequence_pk: Optional[str] = None
+        self.sequence_entity: Optional[str] = None
         if is_sequence:
             if sequence_name is None:
                 self.sequence_delim = self.config.sequence_delim
@@ -454,6 +457,11 @@ class BaseFeature(object, metaclass=_meta_cls):
                     self.sequence_pk = f"user:{sequence_name}"
                 else:
                     self.sequence_pk = sequence_pk
+                if sequence_entity == "":
+                    raise ValueError(
+                        f"sequence_entity for {sequence_name} must be non-empty."
+                    )
+                self.sequence_entity = sequence_entity
 
         # for fg encoded data
         self._fg_encoded_kwargs = {}
@@ -997,20 +1005,16 @@ class BaseFeature(object, metaclass=_meta_cls):
         if self._fg_op is None:
             cfgs = self.fg_json()
             if self._is_grouped_seq:
-                self._fg_op = pyfg.FgArrowHandler(
-                    {
-                        "features": [
-                            {
-                                "sequence_name": self.sequence_name,
-                                "sequence_length": self.sequence_length,
-                                "sequence_delim": self.sequence_delim,
-                                "sequence_pk": self.sequence_pk,
-                                "features": cfgs,
-                            }
-                        ]
-                    },
-                    1,
-                )
+                sequence_cfg = {
+                    "sequence_name": self.sequence_name,
+                    "sequence_length": self.sequence_length,
+                    "sequence_delim": self.sequence_delim,
+                    "sequence_pk": self.sequence_pk,
+                    "features": cfgs,
+                }
+                if self.sequence_entity is not None:
+                    sequence_cfg["sequence_entity"] = self.sequence_entity
+                self._fg_op = pyfg.FgArrowHandler({"features": [sequence_cfg]}, 1)
             else:
                 # pyre-ignore [16]
                 self._fg_op = pyfg.FgArrowHandler({"features": cfgs}, 1)
@@ -1217,6 +1221,11 @@ def create_features(
             sequence_delim = oneof_feat_config.sequence_delim
             sequence_length = oneof_feat_config.sequence_length
             sequence_pk = oneof_feat_config.sequence_pk
+            sequence_entity = (
+                oneof_feat_config.sequence_entity
+                if oneof_feat_config.HasField("sequence_entity")
+                else None
+            )
             for sub_feat_config in oneof_feat_config.features:
                 sub_feat_cls_name = config_util.which_msg(sub_feat_config, "feature")
                 # pyre-ignore [16]
@@ -1229,6 +1238,7 @@ def create_features(
                     sequence_delim=sequence_delim,
                     sequence_length=sequence_length,
                     sequence_pk=sequence_pk,
+                    sequence_entity=sequence_entity,
                 )
                 features.append(feature)
         else:
@@ -1435,6 +1445,8 @@ def create_fg_json(
                         "features": [],
                     }
                 )
+                if feature.sequence_entity is not None:
+                    results[-1]["sequence_entity"] = feature.sequence_entity
                 seq_to_idx[feature.sequence_name] = len(results) - 1
             idx = seq_to_idx[feature.sequence_name]
             results[idx]["features"].extend(fg_json)
@@ -1459,6 +1471,7 @@ def create_feature_configs(
                         sequence_length=feature.sequence_length,  # pyre-ignore [16]
                         sequence_delim=feature.sequence_delim,  # pyre-ignore [16]
                         sequence_pk=feature.sequence_pk,  # pyre-ignore [16]
+                        sequence_entity=feature.sequence_entity,
                     )
                 )
             results[feature.sequence_name].sequence_feature.features.append(
