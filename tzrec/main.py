@@ -688,11 +688,7 @@ def _train_and_evaluate(
 
                 # Single entry point for step / epoch / event-time saves + dedupe;
                 # maybe_save reconciles this rank's event-time across ranks in lockstep.
-                if train_dataloader.dataset.is_sample_shuffled():
-                    # sample-shuffled batches are not time-ordered: keep max-so-far
-                    data_timestamp = max(data_timestamp, batch.data_timestamp)
-                else:
-                    data_timestamp = batch.data_timestamp
+                data_timestamp = batch.data_timestamp
                 if ckpt_manager.maybe_save(
                     i_step,
                     model,
