@@ -48,7 +48,7 @@ from tzrec.datasets.dataset import (
     create_dataloader,
     create_writer,
 )
-from tzrec.datasets.utils import Batch, RecordBatchTensor
+from tzrec.datasets.utils import Batch, RecordBatchTensor, packed_to_dict
 from tzrec.features.feature import (
     BaseFeature,
     create_features,
@@ -66,6 +66,7 @@ from tzrec.models.model import (
     PredictWrapper,
     ScriptWrapper,
     TrainWrapper,
+    packed_predict_model,
 )
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
@@ -1568,6 +1569,7 @@ def predict(
     forward_devices = [device]
     models = {device: model}
     sparse_lookup = None
+    packed_model = packed_predict_model(model)
     if is_dist_emb:
         if int(os.environ.get("LOCAL_WORLD_SIZE", 1)) == 1:
             # one process per node: the local GPUs share one host copy of the tables.
@@ -1614,14 +1616,18 @@ def predict(
         batch: Batch, device: torch.device = device
     ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
-            parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
+            packed = batch.to_packed()
             if is_input_tile:
                 # when predicting with a model exported using INPUT_TILE,
                 #  we set the batch size tensor to 1 to disable tiling.
-                parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            if sparse_lookup is not None:
-                parsed_inputs = sparse_lookup(parsed_inputs, device)
-            predictions = models[device](parsed_inputs, device)
+                packed.tensors["batch_size"] = torch.tensor(1, dtype=torch.int64)
+            if sparse_lookup is None:
+                predictions = packed_model(packed, device)
+            else:
+                parsed_inputs = sparse_lookup(
+                    packed_to_dict(packed, torch.int64), device
+                )
+                predictions = models[device](parsed_inputs, device)
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves

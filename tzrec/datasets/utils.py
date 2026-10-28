@@ -12,7 +12,7 @@
 import glob
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -264,6 +264,96 @@ def get_input_fields_proto(
         return list(data_config.input_fields)
 
 
+def _split_lengths(lengths: torch.Tensor, num_keys: int) -> List[torch.Tensor]:
+    """Per-key rows of KJT lengths laid out key-major."""
+    return list(lengths.view(num_keys, lengths.numel() // max(num_keys, 1)).unbind(0))
+
+
+class PackedBatch(NamedTuple):
+    """The tensors of a Batch, packed per KeyedTensor / KeyedJaggedTensor.
+
+    ``packed_to_dict`` turns it into ``Batch.to_dict``'s per-feature dict, in
+    Python or inside TorchScript.
+    """
+
+    dense_keys: List[List[str]]
+    dense_values: List[torch.Tensor]
+    dense_length_per_key: List[List[int]]
+    dense_key_dim: List[int]
+    sparse_keys: List[List[str]]
+    sparse_values: List[torch.Tensor]
+    sparse_lengths: List[torch.Tensor]
+    sparse_weights: List[Optional[torch.Tensor]]
+    sparse_length_per_key: List[List[int]]
+    mulval_keys: List[List[str]]
+    mulval_values: List[torch.Tensor]
+    mulval_lengths: List[torch.Tensor]
+    mulval_length_per_key: List[List[int]]
+    tensors: Dict[str, torch.Tensor]
+
+
+def packed_to_dict(
+    packed: PackedBatch, sparse_dtype: Optional[torch.dtype] = None
+) -> Dict[str, torch.Tensor]:
+    """Split packed batch tensors into per-feature entries, one split per tensor.
+
+    Per-feature tensors created in Python hand the GIL over when they are freed,
+    which serializes multi-threaded predict on wide models; inside TorchScript
+    they never touch the GIL.
+
+    Args:
+        packed: from ``Batch.to_packed``.
+        sparse_dtype: dtype of sparse values and lengths, None keeps them.
+
+    Returns:
+        The same dict as ``Batch.to_dict``.
+    """
+    tensor_dict: Dict[str, torch.Tensor] = {}
+    for keys, values, length_per_key, key_dim in zip(
+        packed.dense_keys,
+        packed.dense_values,
+        packed.dense_length_per_key,
+        packed.dense_key_dim,
+    ):
+        for k, v in zip(keys, values.split(length_per_key, dim=key_dim)):
+            tensor_dict[k + ".values"] = v
+    for keys, values, lengths, weights, length_per_key in zip(
+        packed.sparse_keys,
+        packed.sparse_values,
+        packed.sparse_lengths,
+        packed.sparse_weights,
+        packed.sparse_length_per_key,
+    ):
+        if sparse_dtype is not None:
+            values, lengths = values.to(sparse_dtype), lengths.to(sparse_dtype)
+        split_values = values.split(length_per_key)
+        split_lengths = _split_lengths(lengths, len(keys))
+        split_weights: List[torch.Tensor] = []
+        if weights is not None:
+            split_weights = list(weights.split(length_per_key))
+        for i, k in enumerate(keys):
+            tensor_dict[k + ".values"] = split_values[i]
+            tensor_dict[k + ".lengths"] = split_lengths[i]
+            if weights is not None:
+                tensor_dict[k + ".weights"] = split_weights[i]
+    for keys, values, lengths, length_per_key in zip(
+        packed.mulval_keys,
+        packed.mulval_values,
+        packed.mulval_lengths,
+        packed.mulval_length_per_key,
+    ):
+        if sparse_dtype is not None:
+            values, lengths = values.to(sparse_dtype), lengths.to(sparse_dtype)
+        split_values = values.split(length_per_key)
+        split_lengths = _split_lengths(lengths, len(keys))
+        for i, k in enumerate(keys):
+            tensor_dict[k + ".key_lengths"] = split_values[i]
+            tensor_dict[k + ".lengths"] = split_lengths[i]
+    for k, v in packed.tensors.items():
+        tensor_dict[k] = v
+    return tensor_dict
+
+
 @dataclass
 class ParsedData:
     """Internal parsed data structure."""
@@ -498,54 +588,48 @@ class Batch(Pipelineable):
             data_timestamp=self.data_timestamp,
         )
 
+    def to_packed(self) -> PackedBatch:
+        """Collect the batch tensors packed per KeyedTensor / KeyedJaggedTensor."""
+        tensors: Dict[str, torch.Tensor] = {}
+        for k, v in self.sequence_dense_features.items():
+            tensors[f"{k}.values"] = v.values()
+            tensors[f"{k}.lengths"] = v.lengths()
+        for k, v in self.labels.items():
+            tensors[f"{k}"] = v
+        for k, v in self.jagged_labels.items():
+            tensors[f"{k}.values"] = v.values()
+            tensors[f"{k}.lengths"] = v.lengths()
+        for k, v in self.sample_weights.items():
+            tensors[f"{k}"] = v
+        if self.tile_size > 0:
+            tensors["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
+        for k, v in self.additional_infos.items():
+            tensors[f"{k}"] = v
+        dense = list(self.dense_features.values())
+        sparse = list(self.sparse_features.values())
+        mulval = list(self.sequence_mulval_lengths.values())
+        return PackedBatch(
+            dense_keys=[x.keys() for x in dense],
+            dense_values=[x.values() for x in dense],
+            dense_length_per_key=[x.length_per_key() for x in dense],
+            dense_key_dim=[x.key_dim() for x in dense],
+            sparse_keys=[x.keys() for x in sparse],
+            sparse_values=[x.values() for x in sparse],
+            sparse_lengths=[x.lengths() for x in sparse],
+            sparse_weights=[x.weights_or_none() for x in sparse],
+            sparse_length_per_key=[x.length_per_key() for x in sparse],
+            mulval_keys=[x.keys() for x in mulval],
+            mulval_values=[x.values() for x in mulval],
+            mulval_lengths=[x.lengths() for x in mulval],
+            mulval_length_per_key=[x.length_per_key() for x in mulval],
+            tensors=tensors,
+        )
+
     def to_dict(
         self, sparse_dtype: Optional[torch.dtype] = None
     ) -> Dict[str, torch.Tensor]:
         """Convert to feature tensor dict."""
-        tensor_dict = {}
-        for x in self.dense_features.values():
-            for k, v in x.to_dict().items():
-                tensor_dict[f"{k}.values"] = v
-        for x in self.sparse_features.values():
-            if sparse_dtype:
-                x = KeyedJaggedTensor(
-                    keys=x.keys(),
-                    values=x.values().to(sparse_dtype),
-                    lengths=x.lengths().to(sparse_dtype),
-                    weights=x.weights_or_none(),
-                )
-            for k, v in x.to_dict().items():
-                tensor_dict[f"{k}.values"] = v.values()
-                tensor_dict[f"{k}.lengths"] = v.lengths()
-                if v.weights_or_none() is not None:
-                    tensor_dict[f"{k}.weights"] = v.weights()
-        for x in self.sequence_mulval_lengths.values():
-            if sparse_dtype:
-                x = KeyedJaggedTensor(
-                    keys=x.keys(),
-                    values=x.values().to(sparse_dtype),
-                    lengths=x.lengths().to(sparse_dtype),
-                )
-            for k, v in x.to_dict().items():
-                tensor_dict[f"{k}.key_lengths"] = v.values()
-                tensor_dict[f"{k}.lengths"] = v.lengths()
-        for k, v in self.sequence_dense_features.items():
-            tensor_dict[f"{k}.values"] = v.values()
-            tensor_dict[f"{k}.lengths"] = v.lengths()
-        for k, v in self.labels.items():
-            tensor_dict[f"{k}"] = v
-        for k, v in self.jagged_labels.items():
-            tensor_dict[f"{k}.values"] = v.values()
-            tensor_dict[f"{k}.lengths"] = v.lengths()
-        for k, v in self.sample_weights.items():
-            tensor_dict[f"{k}"] = v
-        if self.tile_size > 0:
-            tensor_dict["batch_size"] = torch.tensor(self.tile_size, dtype=torch.int64)
-
-        for k, v in self.additional_infos.items():
-            tensor_dict[f"{k}"] = v
-
-        return tensor_dict
+        return packed_to_dict(self.to_packed(), sparse_dtype)
 
 
 def expand_tdm_sample(

@@ -13,9 +13,10 @@
 import threading
 from collections import OrderedDict
 from queue import Queue
-from typing import Any, Dict, Final, Iterable, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Final, Iterable, List, Optional, Tuple, cast
 
 import torch
+import torch.utils._pytree as pytree
 import torchmetrics
 from torch import nn
 from torchrec.modules.embedding_modules import (
@@ -26,7 +27,7 @@ from torchrec.modules.embedding_modules import (
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
-from tzrec.datasets.utils import Batch
+from tzrec.datasets.utils import Batch, PackedBatch, packed_to_dict
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.pe_mtl_loss import ParetoEfficientMultiTaskLoss
 from tzrec.modules.utils import BaseModule
@@ -577,6 +578,15 @@ class CombinedModelWrapper(nn.Module):
             predictions (dict): a dict of predicted result.
         """
         sparse_out, _ = self.sparse_model(data, device)
+        return self.dense_forward(sparse_out, device)
+
+    def dense_forward(
+        self,
+        sparse_out: Dict[str, torch.Tensor],
+        # pyre-ignore [9]
+        device: torch.device = "cuda:0",
+    ) -> Dict[str, torch.Tensor]:
+        """Run the dense model on the sparse model's outputs."""
         if self._dense_is_aoti:
             return self._locked_dense(sparse_out, device)
         return self.dense_model(sparse_out)
@@ -603,6 +613,12 @@ class UnifiedAOTIModelWrapper(nn.Module):
         # object.__setattr__ bypasses nn.Module's strict registration.
         object.__setattr__(self, "_lock", threading.Lock())
         object.__setattr__(self, "_key_order", None)
+        # AOTICompiledModel.__call__ reparses the call spec on every call.
+        object.__setattr__(
+            self,
+            "_out_spec",
+            pytree.treespec_loads(cast(Any, model).loader.get_call_spec()[1]),
+        )
 
     def forward(
         self,
@@ -623,8 +639,97 @@ class UnifiedAOTIModelWrapper(nn.Module):
         if key_order is None:
             key_order = sorted(data.keys())
             object.__setattr__(self, "_key_order", key_order)
-        data = OrderedDict((k, data[k]) for k in key_order)
         # Force CUDA primary context creation on worker threads.
         torch.cuda.set_device(device)
         with cast(Any, self._lock):
-            return self.model(data)
+            flat_outputs = cast(Any, self.model).loader.boxed_run(
+                [data[k] for k in key_order]
+            )
+        return pytree.tree_unflatten(flat_outputs, self._out_spec)
+
+
+class _PackedInputModel(nn.Module):
+    """Runs a scripted predict model on ``Batch.to_packed()`` inputs.
+
+    The per-feature dict is built inside TorchScript, so its tensors never become
+    Python objects, whose deallocation would hand the GIL over once per tensor.
+
+    Args:
+        model (nn.Module): scripted model taking ``Batch.to_dict()`` inputs.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self, packed: PackedBatch, device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Predict the model.
+
+        Args:
+            packed (PackedBatch): from ``Batch.to_packed()``.
+            device (torch.device): inference device.
+
+        Return:
+            predictions (dict): a dict of predicted result.
+        """
+        return self.model(packed_to_dict(packed, torch.int64), device)
+
+
+class _PackedSparseModel(nn.Module):
+    """Runs the scripted sparse stage of a two-stage AOT model on packed inputs.
+
+    Args:
+        model (nn.Module): scripted sparse model taking ``Batch.to_dict()`` inputs.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self, packed: PackedBatch, device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Run the sparse stage.
+
+        Args:
+            packed (PackedBatch): from ``Batch.to_packed()``.
+            device (torch.device): inference device.
+
+        Return:
+            sparse_out (dict): inputs of the dense stage.
+        """
+        sparse_out, _ = self.model(packed_to_dict(packed, torch.int64), device)
+        return sparse_out
+
+
+def packed_predict_model(
+    model: nn.Module,
+) -> Callable[[PackedBatch, torch.device], Dict[str, torch.Tensor]]:
+    """Wrap a loaded predict model to take ``Batch.to_packed()`` inputs.
+
+    Args:
+        model (nn.Module): a scripted model, CombinedModelWrapper or
+            UnifiedAOTIModelWrapper.
+
+    Return:
+        a callable of (packed batch, device) returning the predictions.
+    """
+    if isinstance(model, torch.jit.ScriptModule):
+        return torch.jit.script(_PackedInputModel(model))
+    if isinstance(model, CombinedModelWrapper):
+        sparse_model = torch.jit.script(_PackedSparseModel(model.sparse_model))
+
+        def _combined(
+            packed: PackedBatch, device: torch.device
+        ) -> Dict[str, torch.Tensor]:
+            return model.dense_forward(sparse_model(packed, device), device)
+
+        return _combined
+
+    # AOTI runs on a flat Python list of per-feature tensors.
+    def _unified(packed: PackedBatch, device: torch.device) -> Dict[str, torch.Tensor]:
+        return model(packed_to_dict(packed, torch.int64), device)
+
+    return _unified
