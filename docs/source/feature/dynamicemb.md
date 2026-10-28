@@ -100,6 +100,82 @@ feature_configs {
     --fine_tune_checkpoint {INIT_CKPT_PATH}/model.ckpt-0
     ```
 
+## RocksDB 存储
+
+当表的总参数（embedding + 优化器状态）超过 GPU 显存和主机内存时，可以把 DynamicEmbedding 表放到每个训练进程自带的 RocksDB 中（本地 NVMe、云盘或极速型 NAS），GPU 上只保留一个可选的热点 cache。需要额外安装 TorchEasyRec-addons 构建的 `tzrec-rocksdb` wheel（CPU-only，与 CUDA 版本无关；要求 dynamicemb 为 `13a8055` 版本）。
+
+```
+train_config {
+    rocksdb_config {
+        local_path: "/mnt/nvme/tzrec_rocksdb"
+        gpu_cache_value_bytes_per_rank: 8589934592
+        block_cache_bytes_per_rank: 34359738368
+        write_buffer_bytes_per_rank: 4294967296
+        staging_buffer_bytes_per_rank: 268435456
+        io_threads: 16
+    }
+}
+feature_configs {
+    id_feature {
+        feature_name: "user_id"
+        embedding_dim: 64
+        dynamicemb {
+            max_capacity: 10000000000
+            score_strategy: "NO_EVICTION"
+            rocksdb {}
+        }
+    }
+}
+```
+
+- **rocksdb_config**（train_config 中，每个 rank 一份预算，只计一次）
+
+  - local_path: 数据库与本地 checkpoint 的根目录，目录结构为 `<local_path>/<run_id>/rank_<r>/`，`run_id` 由 model_dir 计算，同一个 model_dir 的重启共享同一目录。不要使用 tmpfs（会占用主机内存）。使用 NAS 等共享存储时，节点故障后任务可在其它节点从 checkpoint 恢复；使用本地盘时，本地盘丢失后无法恢复（恢复时会明确报错，不会用空表继续训练）
+  - gpu_cache_value_bytes_per_rank: GPU cache 中 embedding + 优化器状态的显存预算，按各 RocksDB 表在本 rank 上的参数量等比例分配（所有表 cache 比例相同）。0 表示不使用 GPU cache，每次查表都读 RocksDB（适合验证，吞吐较低）。必须小于全部 RocksDB 表在本 rank 上的参数总量，否则报错（dynamicemb 在显存放得下全表时会忽略外部存储）
+  - block_cache_bytes_per_rank / write_buffer_bytes_per_rank / staging_buffer_bytes_per_rank: RocksDB block cache、memtable 和单次读写的 pinned 内存预算。三者之和加约 2GB 开销从规划器的主机内存容量中扣除一次
+  - io_threads: 一次批量查表拆分给多少个线程并发读，网络存储（NAS、云盘）建议调大
+  - max_background_jobs: RocksDB flush/compaction 线程数，默认 8
+
+- **dynamicemb.rocksdb {}**: 该表使用 RocksDB。要求 `score_strategy: "NO_EVICTION"`，且不能配置 `cache_load_factor`（cache 大小由 `gpu_cache_value_bytes_per_rank` 统一决定）
+
+### 容量与保留语义
+
+- RocksDB 不会淘汰任何 Id。GPU cache 满时淘汰的行会写回 RocksDB，而不是删除，因此增量导出（delta embedding dump）不会因为 cache 淘汰产生 tombstone，`dump_evicted_tombstones` 对 RocksDB 表不生效
+- `max_capacity` 只用于规划和 cache 大小计算，不是磁盘配额，也不是已准入 Id 数的精确上限。请通过 checkpoint 中的统计信息（`rocksdb/rank_<r>.json` 的 `stats`）和磁盘剩余空间监控实际行数与占用；磁盘写满或写入失败会使训练报错退出，不会生成不完整的 checkpoint
+- GPU cache 至少要能放下一个 batch 在每个融合组上的去重 Id 数，否则 dynamicemb 会报 `Outstanding prefetched keys ... exceed cache capacity`，需要调大 `gpu_cache_value_bytes_per_rank` 或减小 batch_size
+- 使用 frequency_admission_strategy 时，频次 Counter 仍在显存中，并随 checkpoint 一起保存
+- 同一 FeatureGroup 中兼容的 RocksDB 表仍会融合，每个 rank 只有一个数据库；每张表的数据以“模块路径.表名”作为持久命名空间，调整表的顺序不影响恢复，但改变融合关系、优化器、维度或 world size 需要迁移，恢复时会报错
+
+### Checkpoint 与恢复
+
+- 保存 checkpoint 时，RocksDB 表不会全量写到 `model.ckpt-<step>/dynamicemb/`：先把 GPU cache 写回 RocksDB，再在 `<local_path>/<run_id>/rank_<r>/ckpt-<step>/` 生成 RocksDB 原生 checkpoint（与工作库在同一文件系统时 SST 文件为硬链接，几乎不占额外空间），并在 `model.ckpt-<step>/rocksdb/rank_<r>.json` 记录清单，最后写入 `_SUCCESS`
+- 开启 RocksDB 后，`--continue_train`、评估、预测和导出只会选择带 `_SUCCESS` 的 checkpoint；比恢复点更新、但没有 `_SUCCESS` 的目录会被重命名为 `incomplete.model.ckpt-<step>.<时间戳>` 保留现场
+- 恢复时清空 GPU cache，从原生 checkpoint 复制出一份新的可写数据库继续训练，原 checkpoint 保持不变；进程崩溃后遗留的工作库不会被复用
+- 原生 checkpoint 跟随 `keep_checkpoint_max` 的保留策略清理：对应的 `model.ckpt-<step>` 被删除后，下次保存时各 rank 删除自己的原生 checkpoint
+- 已知限制：恢复前框架会先用一个 batch 初始化优化器状态，此时 frequency admission 的 Counter 计数无法回滚
+
+### 从内存版 DynamicEmbedding checkpoint 迁移
+
+已有的 `dynamicemb/` checkpoint 可以离线转换为 RocksDB checkpoint（CPU 执行，按块读取，不需要把整表加载到内存或显存，保持 world size 和 key 路由不变）：
+
+```bash
+python -m tzrec.tools.dynamicemb.import_rocksdb_checkpoint \
+    --pipeline_config_path {RocksDB 版本的训练配置} \
+    --checkpoint_path {旧 model_dir}/model.ckpt-100000 \
+    --output_model_dir {新 model_dir}
+```
+
+- 会复制 dense 参数、优化器、学习率和数据读取位置，并转换 embedding、优化器状态、score 和准入 Counter；之后用 `--fine_tune_checkpoint {新 model_dir}/model.ckpt-100000` 或在新 model_dir 上 `--continue_train` 继续训练
+- `--no_optim` 只转换 embedding，优化器状态重置（清单中 `exact_resume: false`，不是精确续训）
+- 训练配置中所有 DynamicEmbedding 表都需要配置 `rocksdb {}`；也可以不做离线转换，直接用旧 checkpoint 作为 `fine_tune_checkpoint`，会在恢复时逐块导入
+
+### 排障
+
+- `no RocksDB session is open`: 自定义入口没有调用 `rocksdb_util.start`
+- `tzrec-rocksdb wheel`: 未安装 tzrec-rocksdb
+- `refusing to resume RocksDB tables from an incomplete checkpoint` / `RocksDB checkpoint file ... missing or changed`: 指定的 checkpoint 不完整或原生 checkpoint 所在磁盘已丢失，请换用其它完整的 checkpoint
+- 训练变慢：查看 checkpoint 清单 `stats` 中 `find_p99_s`、`rocksdb.actual-delayed-write-rate`、`rocksdb.estimate-pending-compaction-bytes` 等指标，判断是读延迟、写入限流还是 compaction 积压
+
 ## 从ZCH训练好的模型迁移
 
 如果已有用 `zch{}` 训练好的模型，希望切换到 `dynamicemb{}` 继续训练，可以使用 `tzrec.tools.dynamicemb.zch_to_dynamicemb_convert` 将ZCH checkpoint 转换为 dynamicemb 格式的 checkpoint，下游训练任务直接通过 `--fine_tune_checkpoint` 热启动。

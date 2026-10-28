@@ -12,6 +12,7 @@
 """Stream dynamic embedding checkpoint arrays without restoring the tables."""
 
 import glob
+import json
 import os
 import re
 from collections import defaultdict
@@ -31,7 +32,7 @@ from typing import (
 
 import numpy as np
 
-from tzrec.utils import checkpoint_util, quant_util
+from tzrec.utils import checkpoint_util, quant_util, rocksdb_util
 from tzrec.utils.npz_util import StreamingArray
 
 
@@ -220,6 +221,115 @@ def _find_shards(
     return dict(shards_by_table)
 
 
+@dataclass(frozen=True)
+class _NativeShard:
+    """One rank's table inside a native RocksDB checkpoint."""
+
+    rank: int
+    world_size: int
+    native_dir: str
+    table: str
+    rows: int
+
+
+class _NativeReaders:
+    """Read-only handles of the native checkpoints, opened once per export."""
+
+    def __init__(self) -> None:
+        self._dbs: Dict[str, Any] = {}
+
+    def get(self, native_dir: str) -> Tuple[Any, Dict[str, Any]]:
+        """Open (once) and return ``(db, manifest)`` of a native checkpoint."""
+        if native_dir not in self._dbs:
+            from tzrec_rocksdb.checkpoint import open_read_only
+
+            self._dbs[native_dir] = open_read_only(native_dir, 32 << 20)
+        return self._dbs[native_dir]
+
+
+def _find_native_shards(
+    checkpoint_path: str,
+    embedding_dimensions: Mapping[str, int],
+    readers: _NativeReaders,
+) -> Dict[str, List[_NativeShard]]:
+    """Resolve RocksDB tables of a checkpoint from its per-rank manifests."""
+    manifests = sorted(
+        glob.glob(
+            os.path.join(checkpoint_path, rocksdb_util.MANIFEST_DIR, "rank_*.json")
+        )
+    )
+    shards_by_table: Dict[str, List[_NativeShard]] = defaultdict(list)
+    for path in manifests:
+        with open(path) as f:
+            manifest = json.load(f)
+        db, native = readers.get(manifest["native_checkpoint"])
+        for group in manifest["groups"]:
+            for namespace in group["namespaces"]:
+                module_fqn, table_name = namespace.rsplit(".", 1)
+                candidates = [
+                    checkpoint_util.remap_input_tile_user_key(
+                        f"{module_fqn}.{collection}.{table_name}"
+                    )
+                    for collection in ("embedding_bags", "embeddings")
+                ]
+                name = next((c for c in candidates if c in embedding_dimensions), None)
+                if name is None:
+                    continue
+                if group["layouts"][namespace]["dim"] != embedding_dimensions[name]:
+                    raise ValueError(f"RocksDB table {namespace} dimension mismatch")
+                shards_by_table[name].append(
+                    _NativeShard(
+                        manifest["rank"],
+                        manifest["world_size"],
+                        manifest["native_checkpoint"],
+                        namespace,
+                        db.count(native["namespaces"][namespace]),
+                    )
+                )
+    for name, shards in shards_by_table.items():
+        world = shards[0].world_size
+        if sorted(s.rank for s in shards) != list(range(world)):
+            raise ValueError(f"RocksDB table {name} lacks checkpoint ranks")
+        shards.sort(key=lambda s: s.rank)
+    return dict(shards_by_table)
+
+
+def _iter_native(
+    shards: List[_NativeShard],
+    readers: _NativeReaders,
+    field: str,
+    chunk_rows: int,
+    embedding_name: str = "",
+    quant_format: str = "",
+    on_values: Optional[Callable[[str, np.ndarray, np.ndarray], None]] = None,
+) -> Iterator[np.ndarray]:
+    """Stream keys, fp32 values or scores of one table in rank order."""
+    from tzrec_rocksdb.checkpoint import iter_checkpoint_table
+
+    for shard in shards:
+        db, manifest = readers.get(shard.native_dir)
+        rows = 0
+        for ids, scores, emb, _ in iter_checkpoint_table(
+            db, manifest, shard.table, chunk_rows
+        ):
+            rows += len(ids)
+            if field == "keys":
+                yield ids.view(np.int64)
+            elif field == "scores":
+                yield scores
+            else:
+                values = emb.float().numpy()
+                if quant_format:
+                    values = quant_util.distributed_quantize_embeddings(
+                        values, values.shape[1], embedding_name, quant_format
+                    )
+                if on_values is not None:
+                    on_values(embedding_name, ids.view(np.int64), values)
+                yield values
+        if rows != shard.rows:
+            raise ValueError(f"RocksDB table {shard.table} changed during export")
+
+
 def get_dynamic_embedding_export(
     checkpoint_path: str,
     embedding_dimensions: Mapping[str, int],
@@ -252,7 +362,15 @@ def get_dynamic_embedding_export(
         raise ValueError("read_chunk_bytes must be positive")
     arrays: Dict[str, StreamingArray] = {}
     metadata: Dict[str, Dict[str, Any]] = {}
-    for name, shards in _find_shards(checkpoint_path, embedding_dimensions).items():
+    readers = _NativeReaders()
+    file_shards = _find_shards(checkpoint_path, embedding_dimensions)
+    native_shards = _find_native_shards(checkpoint_path, embedding_dimensions, readers)
+    both = file_shards.keys() & native_shards.keys()
+    if both:
+        raise ValueError(f"tables in both dynamicemb files and RocksDB: {both}")
+    tables: Dict[str, Any] = {**file_shards, **native_shards}
+    for name, shards in tables.items():
+        native = name in native_shards
         dimension = embedding_dimensions[name]
         chunk_rows = read_chunk_bytes // (8 + dimension * 4)
         if chunk_rows == 0:
@@ -299,20 +417,22 @@ def get_dynamic_embedding_export(
                 }
             )
         table_meta["memory"] = rows * shape[1] * dtype.itemsize
-        arrays[f"{name}.keys"] = StreamingArray(
-            np.dtype(np.int64),
-            (rows,),
-            _iter_column(shards, "key_file", read_chunk_bytes // 8),
-        )
-        arrays[f"{name}.values"] = StreamingArray(
-            dtype,
-            shape,
-            _iter_values(shards, name, dimension, chunk_rows, quant_format, on_values),
-        )
-        arrays[f"{name}.scores"] = StreamingArray(
-            np.dtype(np.int64),
-            (rows,),
-            _iter_column(shards, "score_file", read_chunk_bytes // 8),
-        )
+        if native:
+            # A RocksDB scan returns whole records, so keys and scores are
+            # read in value-sized chunks as well.
+            keys = _iter_native(shards, readers, "keys", chunk_rows)
+            values = _iter_native(
+                shards, readers, "values", chunk_rows, name, quant_format, on_values
+            )
+            scores = _iter_native(shards, readers, "scores", chunk_rows)
+        else:
+            keys = _iter_column(shards, "key_file", read_chunk_bytes // 8)
+            values = _iter_values(
+                shards, name, dimension, chunk_rows, quant_format, on_values
+            )
+            scores = _iter_column(shards, "score_file", read_chunk_bytes // 8)
+        arrays[f"{name}.keys"] = StreamingArray(np.dtype(np.int64), (rows,), keys)
+        arrays[f"{name}.values"] = StreamingArray(dtype, shape, values)
+        arrays[f"{name}.scores"] = StreamingArray(np.dtype(np.int64), (rows,), scores)
         metadata[name] = table_meta
     return arrays, metadata

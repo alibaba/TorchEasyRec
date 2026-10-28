@@ -51,6 +51,7 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, DeltaEmbeddingQuantType
+from tzrec.utils import rocksdb_util
 from tzrec.utils.feature_store_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
@@ -1541,7 +1542,10 @@ class DeltaEmbeddingDumper:
         emb_dim = dynamic_module._dynamicemb_options[table_id].dim
         ids = tracker_ids.cpu().to(torch.int64)
         evicted_ids: Optional[torch.Tensor] = None
-        if dump_evicted_tombstones:
+        # RocksDB tables never delete rows: their cache evictions are writebacks.
+        if dump_evicted_tombstones and not rocksdb_util.is_rocksdb_options(
+            dynamic_module._dynamicemb_options[table_id]  # pyre-ignore [29]
+        ):
             evicted = self._pop_evicted_key_ids(fqn, dynamic_module, table_name)
             if evicted is not None and evicted.numel() > 0:
                 evicted_ids = evicted.cpu().to(torch.int64)

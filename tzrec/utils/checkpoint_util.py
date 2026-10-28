@@ -44,7 +44,7 @@ from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.optim.ema import DenseEMA
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.protos import export_pb2
-from tzrec.utils import env_util
+from tzrec.utils import env_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -239,7 +239,9 @@ def _get_checkpoint_step(ckpt_path: str) -> int:
     return ckpt_step
 
 
-def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
+def latest_checkpoint(
+    model_dir: str, require_success: bool = False
+) -> Tuple[Optional[str], int]:
     """Find latest checkpoint under a directory.
 
     A path that already names a checkpoint (contains ``model.ckpt-``) is returned
@@ -249,6 +251,9 @@ def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
 
     Args:
         model_dir: model directory
+        require_success: only consider ``model.ckpt-<step>`` directories whose
+            ``_SUCCESS`` marker was written (used when RocksDB tables must not
+            resume from an incomplete checkpoint).
 
     Return:
         latest_ckpt_path: latest checkpoint path.
@@ -258,6 +263,12 @@ def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
         # fsspec glob need endswith os.path.sep
         ckpt_metas = glob.glob(os.path.join(model_dir, "model.ckpt-*" + os.path.sep))
         ckpt_metas = list(map(lambda x: x.rstrip(os.path.sep), ckpt_metas))
+        if require_success:
+            ckpt_metas = [
+                x
+                for x in ckpt_metas
+                if os.path.exists(os.path.join(x, CKPT_SUCCESS_FILENAME))
+            ]
         if len(ckpt_metas) == 0:
             # a producer of exactly one checkpoint tends to drop the -<step>
             for ckpt_dir in (model_dir, os.path.join(model_dir, "model.ckpt")):
@@ -635,9 +646,11 @@ class CheckpointManager:
 
     # --- load / discovery (delegate to the module-level free functions) ---
 
-    def latest_checkpoint(self) -> Tuple[Optional[str], int]:
-        """Latest checkpoint under this manager's model_dir."""
-        return latest_checkpoint(self._model_dir)
+    def latest_checkpoint(
+        self, require_success: bool = False
+    ) -> Tuple[Optional[str], int]:
+        """Latest (optionally only complete) checkpoint under model_dir."""
+        return latest_checkpoint(self._model_dir, require_success)
 
     def best_checkpoint(self) -> Tuple[Optional[str], int]:
         """Best checkpoint under model_dir per the configured export metric."""
@@ -1119,8 +1132,28 @@ def restore_model(
     if has_dynamicemb and load_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbLoad
 
+        table_names = meta.get("dynamicemb_load_table_names", None)
+        if rocksdb_util.rocksdb_modules(model):
+            if rocksdb_util.has_native_checkpoint(checkpoint_dir):
+                rocksdb_util.restore_checkpoint(
+                    checkpoint_dir,
+                    model,
+                    meta.get("dynamicemb_load_optim", optimizer is not None),
+                )
+                builtin = rocksdb_util.builtin_dynamicemb_tables(model)
+                if table_names is not None:
+                    builtin = {
+                        k: [n for n in v if n in table_names.get(k, v)]
+                        for k, v in builtin.items()
+                    }
+                table_names = builtin
+            else:
+                # A checkpoint without RocksDB manifests (e.g. trained with the
+                # built-in store) is imported through RocksDBStorage.load.
+                rocksdb_util.reset_for_import(model)
         dynamicemb_path = os.path.join(checkpoint_dir, "dynamicemb")
-        if os.path.exists(dynamicemb_path):
+        has_tables = table_names is None or any(table_names.values())
+        if os.path.exists(dynamicemb_path) and has_tables:
             # Training never sets INPUT_TILE, but exporting with
             # INPUT_TILE=3 adds twin user-side modules (`ebc_user`,
             # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) that
@@ -1143,7 +1176,7 @@ def restore_model(
                 DynamicEmbLoad(
                     dynamicemb_load_path,
                     model,
-                    table_names=meta.get("dynamicemb_load_table_names", None),
+                    table_names=table_names,
                     optim=meta.get("dynamicemb_load_optim", optimizer is not None),
                     counter=True,
                 )
@@ -1185,11 +1218,18 @@ def save_model(
     if has_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbDump
 
-        DynamicEmbDump(
-            os.path.join(checkpoint_dir, "dynamicemb"),
-            model,
-            optim=optimizer is not None,
-            counter=True,
+        # RocksDB tables get a native checkpoint instead of a full dump.
+        table_names = rocksdb_util.builtin_dynamicemb_tables(model)
+        if table_names is None or any(table_names.values()):
+            DynamicEmbDump(
+                os.path.join(checkpoint_dir, "dynamicemb"),
+                model,
+                table_names=table_names,
+                optim=optimizer is not None,
+                counter=True,
+            )
+        rocksdb_util.save_checkpoint(
+            checkpoint_dir, _get_checkpoint_step(checkpoint_dir), model
         )
     # save model plan
     if hasattr(model, "_plan") and model._plan is not None:

@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import io
+import json
 import os
 import shutil
 import unittest
@@ -340,6 +341,119 @@ class DynamicEmbeddingExportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite"):
             list(arrays[f"{self.table}.values"].chunks)
         callback.assert_not_called()
+
+
+def _has_rocksdb() -> bool:
+    try:
+        import tzrec_rocksdb  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_has_rocksdb(), "tzrec_rocksdb is not installed")
+class NativeCheckpointExportTest(unittest.TestCase):
+    """Export streams RocksDB native checkpoints like dynamicemb dump files."""
+
+    def setUp(self) -> None:
+        self.test_dir = make_test_dir("dynamic_embedding_export_native_")
+        self.addCleanup(shutil.rmtree, self.test_dir)
+        self.namespace = "model.embedding_group.emb_impls.group.ebc.table"
+        self.table = "model.embedding_group.emb_impls.group.ebc.embedding_bags.table"
+
+    def _write_rank(self, rank, world, keys, values, dtype):
+        import torch
+        from tzrec_rocksdb import BackendConfig, open_session
+        from tzrec_rocksdb.checkpoint import create_checkpoint
+
+        root = os.path.join(self.test_dir, f"db{rank}")
+        session = open_session(
+            BackendConfig(root, 8 << 20, 8 << 20, 1 << 20, io_threads=0),
+            os.path.join(root, "work"),
+        )
+        dim, state_dim = values.shape[1], 2
+        elem = torch.empty(0, dtype=dtype).element_size()
+        layout = {
+            "dtype": str(dtype).replace("torch.", ""),
+            "dim": dim,
+            "state_dim": state_dim,
+            "opt_type": "adam",
+            "record_bytes": 8 + (dim + state_dim) * elem,
+        }
+        ns = session.namespace_ids([self.namespace])[self.namespace]
+        session.set_table_meta(self.namespace, layout)
+        rows = torch.zeros(len(keys), dim + state_dim, dtype=dtype)
+        rows[:, :dim] = torch.from_numpy(values).to(dtype)
+        session.db.write(
+            np.array([[ns, dim * elem, state_dim * elem, dim * elem]], dtype=np.int64),
+            np.zeros(len(keys), dtype=np.int64),
+            keys.astype(np.int64).view(np.uint64),
+            rows.view(torch.uint8).numpy(),
+            (keys + 100).astype(np.int64),
+            False,
+        )
+        native = os.path.join(root, "ckpt")
+        create_checkpoint(session, native)
+        session.close()
+        os.makedirs(os.path.join(self.test_dir, "rocksdb"), exist_ok=True)
+        manifest = {
+            "rank": rank,
+            "world_size": world,
+            "native_checkpoint": native,
+            "groups": [
+                {"namespaces": [self.namespace], "layouts": {self.namespace: layout}}
+            ],
+        }
+        with open(
+            os.path.join(self.test_dir, "rocksdb", f"rank_{rank}.json"), "w"
+        ) as f:
+            json.dump(manifest, f)
+
+    @parameterized.expand(
+        [("fp32", "float32"), ("bf16", "bfloat16")], name_func=parameterized_name_func
+    )
+    def test_native_npz_and_callback(self, _name, dtype_name) -> None:
+        import torch
+
+        dtype = getattr(torch, dtype_name)
+        keys = np.array([-3, 0, 5, 7, 2**62, 9], dtype=np.int64)
+        values = (np.arange(12, dtype=np.float32).reshape(6, 2) - 4) / 2
+        self._write_rank(1, 2, keys[3:], values[3:], dtype)
+        self._write_rank(0, 2, keys[:3], values[:3], dtype)
+        callback = mock.Mock()
+        arrays, metadata = get_dynamic_embedding_export(
+            self.test_dir, {self.table: 2}, 32, on_values=callback
+        )
+        self.assertEqual(metadata[self.table]["shape"], [6, 2])
+        callback.assert_not_called()
+        path = os.path.join(self.test_dir, "export.npz")
+        savez_streaming(path, arrays)
+        # RocksDB stores ids in unsigned key order within each rank.
+        order = np.concatenate(
+            [
+                np.argsort(keys[:3].view(np.uint64)),
+                3 + np.argsort(keys[3:].view(np.uint64)),
+            ]
+        )
+        with np.load(path) as actual:
+            np.testing.assert_array_equal(actual[f"{self.table}.keys"], keys[order])
+            np.testing.assert_array_equal(
+                actual[f"{self.table}.scores"], keys[order] + 100
+            )
+            np.testing.assert_array_equal(actual[f"{self.table}.values"], values[order])
+            self.assertEqual(actual[f"{self.table}.values"].dtype, np.float32)
+        sizes = [len(call.args[1]) for call in callback.call_args_list]
+        self.assertEqual(sum(sizes), 6)
+        self.assertLessEqual(max(sizes), 32 // (8 + 2 * 4))
+
+    def test_missing_rank_rejected(self) -> None:
+        import torch
+
+        self._write_rank(
+            0, 2, np.arange(3), np.zeros((3, 2), np.float32), torch.float32
+        )
+        with self.assertRaisesRegex(ValueError, "ranks"):
+            get_dynamic_embedding_export(self.test_dir, {self.table: 2}, 1 << 20)
 
 
 if __name__ == "__main__":
