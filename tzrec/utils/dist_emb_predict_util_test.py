@@ -19,7 +19,9 @@ from unittest import mock
 import numpy as np
 import torch
 from parameterized import param, parameterized
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from tzrec.datasets.utils import Batch
 from tzrec.utils import npz_util, quant_util
 from tzrec.utils.dist_emb_predict_util import (
     DistributedEmbeddingLookup,
@@ -95,7 +97,7 @@ class _Table:
         return self.rows[idx[0]] if len(idx) else self.miss
 
 
-def _write_export(export_dir, tables, features, dense_meta):
+def _write_export(export_dir, tables, features, dense_meta, extra_inputs=()):
     sparse_dir = os.path.join(export_dir, "sparse")
     os.makedirs(sparse_dir)
     static, dynamic = {}, {}
@@ -120,6 +122,17 @@ def _write_export(export_dir, tables, features, dense_meta):
         json.dump(features, f)
     with open(os.path.join(export_dir, "dense_meta.json"), "w") as f:
         json.dump(dense_meta, f)
+    # the dense graph reads its inputs as data['<name>'], as in gm_dense.code.
+    inputs = list(extra_inputs)
+    for group, feats in dense_meta.items():
+        if group != "sequence__ec":
+            inputs.append(group)
+            continue
+        for feat in feats:
+            inputs.append(feat if feat.endswith("__lengths") else feat[: -len("__ec")])
+    with open(os.path.join(export_dir, "gm_dense.code"), "w") as f:
+        f.write("def forward(self, data, device):\n")
+        f.writelines(f"    x{i} = data[{name!r}]\n" for i, name in enumerate(inputs))
 
 
 def _pooled(table, rows, mean, weights=None):
@@ -246,16 +259,26 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         shutil.rmtree(self.export_dir, ignore_errors=True)
 
     @staticmethod
-    def _batch(bags, weights):
-        data = {"label": torch.zeros(3)}
-        for name, rows in bags.items():
-            data[f"{name}.values"] = torch.tensor(
-                [k for r in rows for k in r], dtype=torch.int64
+    def _batch(bags, weights, kjts=None):
+        """Batch of ``bags``; ``kjts`` splits the features into KJTs."""
+        sparse = {}
+        for g, names in enumerate(kjts or [list(bags)]):
+            values, lengths, kjt_weights = [], [], []
+            for name in names:
+                rows = bags[name]
+                values += [k for r in rows for k in r]
+                lengths += [len(r) for r in rows]
+                w_rows = weights.get(name, [[1.0] * len(r) for r in rows])
+                kjt_weights += [w for r in w_rows for w in r]
+            sparse[f"g{g}"] = KeyedJaggedTensor(
+                keys=names,
+                values=torch.tensor(values, dtype=torch.int64),
+                lengths=torch.tensor(lengths),
+                weights=torch.tensor(kjt_weights)
+                if any(name in weights for name in names)
+                else None,
             )
-            data[f"{name}.lengths"] = torch.tensor([len(r) for r in rows])
-        for name, rows in weights.items():
-            data[f"{name}.weights"] = torch.tensor([w for r in rows for w in r])
-        return data
+        return Batch(sparse_features=sparse)
 
     @parameterized.expand(
         [
@@ -293,6 +316,8 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             "g__ebc": meta(dyn2, "MEAN", use_weight=True),
             "seq__ec": meta(dyn, "NONE"),
             "seq2__ec": meta(dyn2, "NONE"),
+            # reads input a again, from another table of the same group.
+            "a@other__ebc": meta(dyn2, "SUM"),
         }
         deep = [
             "a__ebc",
@@ -302,12 +327,13 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             "e@shared__ebc",
             "f__ebc",
             "g__ebc",
+            "a@other__ebc",
         ]
         dense_meta = {
             "sequence__ec": ["seq__ec", "seq__lengths", "seq2__ec", "seq2__lengths"],
             "deep": deep,
         }
-        _write_export(self.export_dir, tables, features, dense_meta)
+        _write_export(self.export_dir, tables, features, dense_meta, ["batch_size"])
 
         bags = {
             "a": ([dyn.keys[0], -1, dyn.keys[3]], [], [_MISS_KEY, dyn.keys[7]]),
@@ -327,7 +353,10 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             "c": ([1.0, 0.5], [0.25], [2.0, 1.0, 0.5]),
             "g": ([1.0, 3.0], [0.0, 0.0], []),  # all-zero weights pool to zeros
         }
-        data = self._batch(bags, weights)
+        # a and e share a lookup across two KJTs; only the first is weighted.
+        data = self._batch(
+            bags, weights, [["a", "b", "c", "d", "g"], ["e", "f", "seq", "seq2"]]
+        )
 
         device = torch.device("cuda:0")
         lookup = DistributedEmbeddingLookup(self.export_dir, [device])
@@ -342,12 +371,13 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
                 _pooled(dyn, bags["e"], False),
                 _pooled(small, bags["f"], False),
                 _pooled(dyn2, bags["g"], True, weights["g"]),
+                _pooled(dyn2, bags["a"], False),
             ],
             axis=1,
         )
         tol = 2e-3 if quant else 1e-5
         for _ in range(2):
-            out = lookup(data, device)
+            out = lookup(data, torch.tensor(1), device)
             self.assertEqual(out["deep"].device, device)
             self.assertEqual(out["deep"].dtype, torch.float32)
             np.testing.assert_allclose(
@@ -360,7 +390,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
                 )
             self.assertEqual(out["seq__lengths"].dtype, torch.int32)
             self.assertEqual(out["seq__lengths"].tolist(), [2, 0, 1])
-            self.assertEqual(out["label"].device, device)
+            self.assertEqual(out["batch_size"].device, device)
 
     @parameterized.expand(
         [
@@ -456,7 +486,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         self.assertCountEqual([layout(g) for g in lookup._groups], groups)
         # every key resolves to its own row.
         bags = {f"f{t}": tuple([k] for k in tb.keys) for t, tb in enumerate(tables)}
-        out = lookup(self._batch(bags, {}), device)
+        out = lookup(self._batch(bags, {}), None, device)
         expected = np.concatenate(
             [_pooled(tb, bags[f"f{t}"], False) for t, tb in enumerate(tables)], axis=1
         )
@@ -516,13 +546,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         text = "\n".join(logs.output)
         self.assertIn("DIST_EMB_GPU_CACHE_RATIO=auto resolved to 0.5 ", text)
         self.assertIn(f"gpu_cache_bytes={storage // 2}.", text)
-        out = lookup(
-            {
-                "a.values": torch.tensor(table.keys[:3], dtype=torch.int64),
-                "a.lengths": torch.tensor([3]),
-            },
-            device,
-        )
+        out = lookup(self._batch({"a": ([*table.keys[:3]],)}, {}), None, device)
         np.testing.assert_allclose(
             out["deep"].cpu().numpy()[0], table.rows[:3].sum(0), rtol=1e-5, atol=1e-5
         )
@@ -540,15 +564,33 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         _write_export(
             self.export_dir, [dyn], features, {"sequence__ec": [], "deep": ["a__ebc"]}
         )
-        data = {
-            "a.values": torch.tensor(dyn.keys[:4], dtype=torch.int64),
-            "a.lengths": torch.tensor([3, 1]),
-        }
+        data = self._batch({"a": ([*dyn.keys[:3]], [dyn.keys[3]])}, {})
         devices = [torch.device("cuda:0"), torch.device("cuda:1")]
         lookup = DistributedEmbeddingLookup(self.export_dir, devices)
-        outs = [lookup(data, d)["deep"] for d in devices]
+        outs = [lookup(data, None, d)["deep"] for d in devices]
         self.assertEqual(outs[1].device, devices[1])
         torch.testing.assert_close(outs[0].cpu(), outs[1].cpu())
+
+    def test_dense_input_not_produced_raises(self) -> None:
+        dyn = _Table("model.ebc.dyn", 10, 8, False, dynamic=True)
+        features = {
+            "a__ebc": {
+                "embedding_name": dyn.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            }
+        }
+        _write_export(
+            self.export_dir,
+            [dyn],
+            features,
+            {"sequence__ec": [], "deep": ["a__ebc"]},
+            ["b.values"],
+        )
+        device = torch.device("cuda:0")
+        lookup = DistributedEmbeddingLookup(self.export_dir, [device])
+        with self.assertRaisesRegex(ValueError, r"\['b.values'\]"):
+            lookup(self._batch({"a": ([dyn.keys[0]],)}, {}), None, device)
 
 
 if __name__ == "__main__":

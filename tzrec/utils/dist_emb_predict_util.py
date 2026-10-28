@@ -36,9 +36,11 @@ served on its own, with its raw keys, so every exported key resolves exactly.
 
 import contextlib
 import glob
+import itertools
 import json
 import math
 import os
+import re
 import time
 import zipfile
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -46,6 +48,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import numpy as np
 import torch
 
+from tzrec.datasets.utils import Batch, batch_to_dict
 from tzrec.utils import npz_util
 from tzrec.utils.logging_util import logger
 
@@ -154,6 +157,36 @@ class _Group(NamedTuple):
     payload_bits: Optional[int]
 
 
+class _Bucket(NamedTuple):
+    """One NVE lookup per batch: the features of a (group, pooling)."""
+
+    group_idx: int
+    pooling: str
+    # features in lookup order, grouped by the KJT they come from.
+    feats: List[str]
+    # (KJT index, first row in that KJT's permuted rows, number of rows)
+    segments: List[Tuple[int, int, int]]
+    tags: torch.Tensor
+    # per-feature use_weight; None when no feature is weighted.
+    use_weight: Optional[torch.Tensor]
+    all_weighted: bool
+
+
+class _Plan(NamedTuple):
+    """How batches of one KJT key layout are looked up on one device."""
+
+    # per KJT: the key index of each permuted row, and the same on the device.
+    permute_rows: List[List[int]]
+    permutes: List[torch.Tensor]
+    buckets: List[_Bucket]
+    # dense group -> its columns in the concatenated pooled lookups.
+    group_cols: Dict[str, torch.Tensor]
+    # sequence ``<feat>__lengths`` -> (KJT index, key index)
+    seq_lengths: Dict[str, Tuple[int, int]]
+    # other dense graph inputs taken from the batch as is.
+    batch_inputs: List[str]
+
+
 class DistributedEmbeddingLookup:
     """Looks up the sparse inputs of a distributed embedding export with NVE.
 
@@ -179,6 +212,15 @@ class DistributedEmbeddingLookup:
             emb_meta: Dict[str, Dict] = json.load(f)
         with open(os.path.join(sparse_dir, "sparse_features.json")) as f:
             self._feat_meta: Dict[str, Dict] = json.load(f)
+        with open(os.path.join(export_dir, "gm_dense.code")) as f:
+            # the dense graph reads its inputs as data['<name>'].
+            self._dense_inputs = list(
+                dict.fromkeys(
+                    m.group(2)
+                    for m in re.finditer(r"\bdata\[(['\"])(.+?)\1\]", f.read())
+                )
+            )
+        self._plans: Dict[Tuple[Tuple[Tuple[str, ...], ...], torch.device], _Plan] = {}
 
         used_feats = []
         for group, feats in self._dense_meta.items():
@@ -345,23 +387,6 @@ class DistributedEmbeddingLookup:
             meta = self._feat_meta[feat]
             group_idx, _ = self._table_group[meta["embedding_name"]]
             self._buckets.setdefault((group_idx, meta["pooling"]), []).append(feat)
-        # per-feature use_weight of each bucket; None when no feature is weighted.
-        self._use_weight: Dict[Tuple[int, str], Optional[List[bool]]] = {}
-        for bucket, feats in self._buckets.items():
-            use_weight = [self._feat_meta[f]["use_weight"] for f in feats]
-            self._use_weight[bucket] = use_weight if any(use_weight) else None
-        self._tags: Dict[torch.device, Dict[Tuple[int, str], torch.Tensor]] = {}
-        for device in devices:
-            self._tags[device] = {
-                bucket: torch.tensor(
-                    [
-                        self._table_group[self._feat_meta[f]["embedding_name"]][1]
-                        for f in feats
-                    ],
-                    device=device,
-                )
-                for bucket, feats in self._buckets.items()
-            }
 
     @classmethod
     def _fuse_members(
@@ -500,76 +525,228 @@ class DistributedEmbeddingLookup:
             return keys_t
         return _fold_keys(keys_t, group.payload_bits) ^ tag
 
-    def __call__(
-        self, data: Dict[str, torch.Tensor], device: torch.device
+    def _plan(
+        self, batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
+    ) -> _Plan:
+        """The lookup plan of the batch's KJT key layout on ``device``."""
+        layout = tuple(tuple(kjt.keys()) for kjt in batch.sparse_features.values())
+        plan = self._plans.get((layout, device))
+        if plan is not None:
+            return plan
+        where: Dict[str, Tuple[int, int]] = {}
+        for i, keys in enumerate(layout):
+            for j, key in enumerate(keys):
+                where.setdefault(key, (i, j))
+        missing = [f for f in self._used_feats if _input_name(f) not in where]
+        if missing:
+            raise ValueError(f"sparse inputs of {missing} are not in the batch.")
+
+        permute_rows: List[List[int]] = [[] for _ in layout]
+        buckets, cols = [], {}
+        pooled_cols = 0
+        for (group_idx, pooling), feats in self._buckets.items():
+            dim = self._groups[group_idx].dim
+            feats = sorted(feats, key=lambda f: where[_input_name(f)][0])
+            segments = []
+            for i, kjt_feats in itertools.groupby(
+                feats, key=lambda f: where[_input_name(f)][0]
+            ):
+                rows = [where[_input_name(f)][1] for f in kjt_feats]
+                segments.append((i, len(permute_rows[i]), len(rows)))
+                permute_rows[i].extend(rows)
+            use_weight = [self._feat_meta[f]["use_weight"] for f in feats]
+            tags = [
+                self._table_group[self._feat_meta[f]["embedding_name"]][1]
+                for f in feats
+            ]
+            buckets.append(
+                _Bucket(
+                    group_idx,
+                    pooling,
+                    feats,
+                    segments,
+                    torch.tensor(tags, device=device),
+                    torch.tensor(use_weight, device=device)
+                    if any(use_weight)
+                    else None,
+                    all(use_weight),
+                )
+            )
+            if pooling != "NONE":
+                for f in feats:
+                    cols[f] = range(pooled_cols, pooled_cols + dim)
+                    pooled_cols += dim
+
+        group_cols, seq_lengths, produced = {}, {}, set()
+        for group, feats in self._dense_meta.items():
+            if group != "sequence__ec":
+                group_cols[group] = torch.tensor(
+                    [c for f in feats for c in cols[f]], device=device
+                )
+                produced.add(group)
+                continue
+            for feat in feats:
+                if feat.endswith("__lengths"):
+                    seq_lengths[feat] = where[_input_name(feat)]
+                    produced.add(feat)
+                else:
+                    produced.add(_remove_suffix(feat))
+        rest = self._batch_inputs(batch, batch_size)
+        batch_inputs = [k for k in self._dense_inputs if k not in produced]
+        unknown = [k for k in batch_inputs if k not in rest]
+        if unknown:
+            raise ValueError(f"inputs {unknown} of the dense graph are not produced.")
+        plan = _Plan(
+            permute_rows,
+            [torch.tensor(r, dtype=torch.int32, device=device) for r in permute_rows],
+            buckets,
+            group_cols,
+            seq_lengths,
+            batch_inputs,
+        )
+        self._plans[(layout, device)] = plan
+        return plan
+
+    @staticmethod
+    def _batch_inputs(
+        batch: Batch, batch_size: Optional[torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Add the dense graph's embedding inputs to a parsed batch.
+        """The batch's model inputs other than its sparse features."""
+        return batch_to_dict(
+            batch.dense_features,
+            {},
+            batch.sequence_mulval_lengths,
+            batch.sequence_dense_features,
+            batch.additional_infos,
+            batch_size,
+            torch.int64,
+        )
+
+    def __call__(
+        self, batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Build the dense graph's inputs of a batch.
+
+        Every sparse KJT is copied to ``device`` once and permuted so that each
+        (group, pooling) is one slice; no per-feature tensor is built.
 
         Args:
-            data: parsed batch, as from ``Batch.to_dict(sparse_dtype=torch.int64)``.
+            batch: the batch to look up.
+            batch_size: the ``batch_size`` input of tiled models, None for none.
             device: the device to look up on, one of the constructor devices.
 
         Returns:
-            The batch moved to ``device``, plus one concatenated embedding tensor
-            per ``dense_meta`` group and ``<feat>`` / ``<feat>__lengths`` inputs
-            for every sequence feature.
+            The inputs the dense graph reads: one concatenated embedding tensor
+            per ``dense_meta`` group, ``<feat>`` / ``<feat>__lengths`` of every
+            sequence feature, and the other inputs taken from the batch.
         """
-        out = {k: v.to(device, non_blocking=True) for k, v in data.items()}
+        plan = self._plan(batch, batch_size, device)
         layers = self._layers[device]
-        embs: Dict[str, torch.Tensor] = {}
-        for (group_idx, pooling), feats in self._buckets.items():
-            names = [_input_name(f) for f in feats]
-            values = [out[f"{n}.values"] for n in names]
-            counts = [v.numel() for v in values]
-            values_cat = torch.cat(values) if len(values) > 1 else values[0]
-            if values_cat.numel() == 0:
-                # NVE rejects an empty lookup; every bag is empty, so zeros.
-                dim = self._groups[group_idx].dim
-                for feat, n in zip(feats, names):
-                    rows = 0 if pooling == "NONE" else out[f"{n}.lengths"].numel()
-                    embs[feat] = torch.zeros(rows, dim, device=device)
+        stride = 0
+        lengths, permuted = [], []
+        for kjt, rows, permute in zip(
+            batch.sparse_features.values(), plan.permute_rows, plan.permutes
+        ):
+            keys, weights = kjt.keys(), kjt.weights_or_none()
+            stride = kjt.lengths().numel() // max(len(keys), 1)
+            kjt_lengths = kjt.lengths().to(device, torch.int64, non_blocking=True)
+            kjt_lengths = kjt_lengths.view(len(keys), stride)
+            lengths.append(kjt_lengths)
+            if not rows:
+                permuted.append(None)
                 continue
-            payload_bits = self._groups[group_idx].payload_bits
-            if payload_bits is None:
-                keys = torch.where(values_cat == -1, _MISSING_KEY, values_cat)
+            length_per_key = kjt.length_per_key()
+            sizes = [length_per_key[j] for j in rows]
+            permuted.append(
+                torch.ops.fbgemm.permute_2D_sparse_data(
+                    permute,
+                    kjt_lengths,
+                    kjt.values().to(device, torch.int64, non_blocking=True),
+                    None
+                    if weights is None
+                    else weights.to(device, torch.float32, non_blocking=True),
+                    sum(sizes),
+                )
+                + ([0, *itertools.accumulate(sizes)],)
+            )
+
+        out: Dict[str, torch.Tensor] = {}
+        blocks = []
+        for bucket in plan.buckets:
+            group = self._groups[bucket.group_idx]
+            values, bucket_lengths, weights, counts = [], [], [], []
+            for i, row, num_rows in bucket.segments:
+                kjt_lengths, kjt_values, kjt_weights, value_offsets = permuted[i]
+                begin, end = value_offsets[row], value_offsets[row + num_rows]
+                values.append(kjt_values[begin:end])
+                bucket_lengths.append(kjt_lengths[row : row + num_rows])
+                weights.append(
+                    torch.ones(end - begin, device=device)
+                    if kjt_weights is None
+                    else kjt_weights[begin:end]
+                )
+                counts += [
+                    value_offsets[r + 1] - value_offsets[r]
+                    for r in range(row, row + num_rows)
+                ]
+            keys = torch.cat(values) if len(values) > 1 else values[0]
+            feat_lengths = torch.cat(bucket_lengths)
+            num_keys = sum(counts)
+            if num_keys == 0:
+                # NVE rejects an empty lookup; every bag is empty, so zeros.
+                if bucket.pooling == "NONE":
+                    for feat in bucket.feats:
+                        out[_remove_suffix(feat)] = torch.zeros(
+                            0, group.dim, device=device
+                        )
+                else:
+                    blocks.append(
+                        torch.zeros(
+                            stride, len(bucket.feats) * group.dim, device=device
+                        )
+                    )
+                continue
+            if group.payload_bits is None:
+                keys = torch.where(keys == -1, _MISSING_KEY, keys)
             else:
                 tags = torch.repeat_interleave(
-                    self._tags[device][(group_idx, pooling)],
-                    torch.tensor(counts, device=device),
-                    output_size=values_cat.numel(),
+                    bucket.tags, feat_lengths.sum(1), output_size=num_keys
                 )
-                keys = _encode_keys(values_cat, tags, payload_bits)
-            layer = layers[group_idx]
-            if pooling == "NONE":
+                keys = _encode_keys(keys, tags, group.payload_bits)
+            layer = layers[bucket.group_idx]
+            if bucket.pooling == "NONE":
                 # dequantized rows come back in fp16, the dense graph is fp32.
                 emb = layer(keys, mode="concat").float()
-                for feat, e in zip(feats, emb.split(counts)):
-                    embs[feat] = e
+                for feat, e in zip(bucket.feats, emb.split(counts)):
+                    out[_remove_suffix(feat)] = e
                 continue
-            lengths = [out[f"{n}.lengths"] for n in names]
-            offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(torch.cat(lengths))
-            weights = None
-            use_weight = self._use_weight[(group_idx, pooling)]
-            if use_weight is not None:
-                weights = torch.cat(
-                    [
-                        out[f"{n}.weights"].float()
-                        if w
-                        else torch.ones(c, device=device)
-                        for w, n, c in zip(use_weight, names, counts)
-                    ]
-                )
-            emb = layer(keys, offsets, weights, mode=pooling.lower()).float()
-            for feat, e in zip(feats, emb.split([x.numel() for x in lengths])):
-                embs[feat] = e
+            offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                feat_lengths.flatten()
+            )
+            bag_weights = None
+            if bucket.use_weight is not None:
+                bag_weights = torch.cat(weights) if len(weights) > 1 else weights[0]
+                if not bucket.all_weighted:
+                    weighted = torch.repeat_interleave(
+                        bucket.use_weight, feat_lengths.sum(1), output_size=num_keys
+                    )
+                    bag_weights = torch.where(weighted, bag_weights, 1.0)
+            emb = layer(keys, offsets, bag_weights, mode=bucket.pooling.lower()).float()
+            # bags are feature-major; lay them out as [batch, feature * dim].
+            blocks.append(
+                emb.view(len(bucket.feats), stride, group.dim)
+                .transpose(0, 1)
+                .reshape(stride, -1)
+            )
 
-        for group, feats in self._dense_meta.items():
-            if group == "sequence__ec":
-                for feat in feats:
-                    if feat.endswith("__lengths"):
-                        out[feat] = out[f"{_input_name(feat)}.lengths"].int()
-                    else:
-                        out[_remove_suffix(feat)] = embs[feat]
-            else:
-                out[group] = torch.cat([embs[feat] for feat in feats], dim=1)
+        if blocks:
+            pooled = torch.cat(blocks, dim=1) if len(blocks) > 1 else blocks[0]
+            for group, cols in plan.group_cols.items():
+                out[group] = pooled.index_select(1, cols)
+        for feat, (i, j) in plan.seq_lengths.items():
+            out[feat] = lengths[i][j].int()
+        if plan.batch_inputs:
+            rest = self._batch_inputs(batch, batch_size)
+            for k in plan.batch_inputs:
+                out[k] = rest[k].to(device, non_blocking=True)
         return out

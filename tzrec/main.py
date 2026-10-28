@@ -1622,11 +1622,8 @@ def predict(
             if sparse_lookup is None:
                 predictions = batch_model(batch, batch_size, device)
             else:
-                parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
-                if batch_size is not None:
-                    parsed_inputs["batch_size"] = batch_size
                 predictions = models[device](
-                    sparse_lookup(parsed_inputs, device), device
+                    sparse_lookup(batch, batch_size, device), device
                 )
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
