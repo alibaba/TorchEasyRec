@@ -389,7 +389,7 @@ class FeatureTest(unittest.TestCase):
         ]
 
     @parameterized.expand(
-        [(False, False), (True, False), (False, True)],
+        [(False, False), (True, False), (False, True), (True, True)],
         name_func=parameterized_name_func,
     )
     def test_sequence_entity_round_trip(self, remove_bucketizer, for_odps):

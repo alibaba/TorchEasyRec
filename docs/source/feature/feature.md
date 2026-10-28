@@ -930,7 +930,7 @@ feature_configs {
 - **sequence_length**: 序列特征最大长度
 - **sequence_delim**: 序列特征分隔符
 - **sequence_pk**: 序列特征主键，一般为ItemId列表，主要用于线上模型服务，线上模型服务会使用该ItemId列表从物品特征内存Cache中关联出物品属性子特征的序列，无需从请求中传递。而行为属性相关子序列（如行为时间序列`ts1;ts2;ts3`）跟用户相关，则仍需从请求从传递。
-- **sequence_entity**: 可选，指定该序列组在线上模型服务中关联的FeatureStore实体名，例如`sequence_entity: "app"`。实体名须匹配TorchRecProcessor的`fs_entity`配置。
+- **sequence_entity**: 可选，指定该序列组在线上模型服务中关联的FeatureStore实体名，例如`sequence_entity: "app"`。实体名须是 TorchEasyRec Processor fs_entity 配置中列出的实体之一。
 - **features**: 序列特征子特征，配置同对应的子特征类型的配置
   - **feature_name**: 子特征特征名，完整的子特征名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，子特征名列名应为`click_seq__item_id`
   - **expression**: 特征FG所依赖子特征字段来源名，由两部分组成`input_side`:`input_name`。
