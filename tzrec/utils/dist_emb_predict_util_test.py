@@ -567,6 +567,8 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         devices = [torch.device("cuda:0"), torch.device("cuda:1")]
         lookup = DistributedEmbeddingLookup(self.export_dir, devices)
         outs = [lookup(data, None, d)["deep"] for d in devices]
+        # one plan per KJT layout, with index tensors on every device.
+        self.assertEqual(len(lookup._plans), 1)
         self.assertEqual(outs[1].device, devices[1])
         torch.testing.assert_close(outs[0].cpu(), outs[1].cpu())
 

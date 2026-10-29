@@ -165,23 +165,32 @@ class _Bucket(NamedTuple):
     feats: List[str]
     # (KJT index, first row in that KJT's permuted rows, number of rows)
     segments: List[Tuple[int, int, int]]
-    tags: torch.Tensor
-    # per-feature use_weight; None when no feature is weighted.
-    use_weight: Optional[torch.Tensor]
-    all_weighted: bool
+    # per-feature member tag and use_weight.
+    tags: List[int]
+    use_weight: List[bool]
+
+
+class _PlanTensors(NamedTuple):
+    """A plan's index tensors on one device."""
+
+    # per KJT
+    permutes: List[torch.Tensor]
+    # per bucket; use_weight is None when no feature of the bucket is weighted.
+    tags: List[torch.Tensor]
+    use_weight: List[Optional[torch.Tensor]]
+    # dense group -> its columns in the concatenated pooled lookups.
+    group_cols: Dict[str, torch.Tensor]
 
 
 class _Plan(NamedTuple):
-    """How batches of one KJT key layout are looked up on one device."""
+    """How batches of one KJT key layout are looked up."""
 
-    # per KJT: the key index of each permuted row, and the same on the device.
+    # per KJT: the key index of each permuted row.
     permute_rows: List[List[int]]
-    permutes: List[torch.Tensor]
     buckets: List[_Bucket]
-    # dense group -> its columns in the concatenated pooled lookups.
-    group_cols: Dict[str, torch.Tensor]
     # sequence ``<feat>__lengths`` -> (KJT index, key index)
     seq_lengths: Dict[str, Tuple[int, int]]
+    tensors: Dict[torch.device, _PlanTensors]
 
 
 class DistributedEmbeddingLookup:
@@ -209,7 +218,7 @@ class DistributedEmbeddingLookup:
             emb_meta: Dict[str, Dict] = json.load(f)
         with open(os.path.join(sparse_dir, "sparse_features.json")) as f:
             self._feat_meta: Dict[str, Dict] = json.load(f)
-        self._plans: Dict[Tuple[Tuple[Tuple[str, ...], ...], torch.device], _Plan] = {}
+        self._plans: Dict[Tuple[Tuple[str, ...], ...], _Plan] = {}
 
         used_feats = []
         for group, feats in self._dense_meta.items():
@@ -514,10 +523,10 @@ class DistributedEmbeddingLookup:
             return keys_t
         return _fold_keys(keys_t, group.payload_bits) ^ tag
 
-    def _plan(self, batch: Batch, device: torch.device) -> _Plan:
-        """The lookup plan of the batch's KJT key layout on ``device``."""
+    def _plan(self, batch: Batch) -> _Plan:
+        """The lookup plan of the batch's KJT key layout."""
         layout = tuple(tuple(kjt.keys()) for kjt in batch.sparse_features.values())
-        plan = self._plans.get((layout, device))
+        plan = self._plans.get(layout)
         if plan is not None:
             return plan
         where: Dict[str, Tuple[int, int]] = {}
@@ -541,23 +550,13 @@ class DistributedEmbeddingLookup:
                 rows = [where[_input_name(f)][1] for f in kjt_feats]
                 segments.append((i, len(permute_rows[i]), len(rows)))
                 permute_rows[i].extend(rows)
-            use_weight = [self._feat_meta[f]["use_weight"] for f in feats]
             tags = [
                 self._table_group[self._feat_meta[f]["embedding_name"]][1]
                 for f in feats
             ]
+            use_weight = [self._feat_meta[f]["use_weight"] for f in feats]
             buckets.append(
-                _Bucket(
-                    group_idx,
-                    pooling,
-                    feats,
-                    segments,
-                    torch.tensor(tags, device=device),
-                    torch.tensor(use_weight, device=device)
-                    if any(use_weight)
-                    else None,
-                    all(use_weight),
-                )
+                _Bucket(group_idx, pooling, feats, segments, tags, use_weight)
             )
             if pooling != "NONE":
                 for f in feats:
@@ -567,21 +566,25 @@ class DistributedEmbeddingLookup:
         group_cols, seq_lengths = {}, {}
         for group, feats in self._dense_meta.items():
             if group != "sequence__ec":
-                group_cols[group] = torch.tensor(
-                    [c for f in feats for c in cols[f]], device=device
-                )
+                group_cols[group] = [c for f in feats for c in cols[f]]
                 continue
             for feat in feats:
                 if feat.endswith("__lengths"):
                     seq_lengths[feat] = where[_input_name(feat)]
-        plan = _Plan(
-            permute_rows,
-            [torch.tensor(r, dtype=torch.int32, device=device) for r in permute_rows],
-            buckets,
-            group_cols,
-            seq_lengths,
-        )
-        self._plans[(layout, device)] = plan
+        tensors = {
+            d: _PlanTensors(
+                [torch.tensor(r, dtype=torch.int32, device=d) for r in permute_rows],
+                [torch.tensor(b.tags, device=d) for b in buckets],
+                [
+                    torch.tensor(b.use_weight, device=d) if any(b.use_weight) else None
+                    for b in buckets
+                ],
+                {g: torch.tensor(c, device=d) for g, c in group_cols.items()},
+            )
+            for d in self._layers
+        }
+        plan = _Plan(permute_rows, buckets, seq_lengths, tensors)
+        self._plans[layout] = plan
         return plan
 
     def __call__(
@@ -604,12 +607,13 @@ class DistributedEmbeddingLookup:
             tensor per ``dense_meta`` group, ``<feat>`` / ``<feat>__lengths`` of
             every sequence feature, and the batch's non-sparse inputs.
         """
-        plan = self._plan(batch, device)
+        plan = self._plan(batch)
+        tensors = plan.tensors[device]
         layers = self._layers[device]
         stride = 0
         lengths, permuted = [], []
         for kjt, rows, permute in zip(
-            batch.sparse_features.values(), plan.permute_rows, plan.permutes
+            batch.sparse_features.values(), plan.permute_rows, tensors.permutes
         ):
             keys, weights = kjt.keys(), kjt.weights_or_none()
             stride = kjt.lengths().numel() // max(len(keys), 1)
@@ -636,7 +640,9 @@ class DistributedEmbeddingLookup:
 
         out: Dict[str, torch.Tensor] = {}
         blocks = []
-        for bucket in plan.buckets:
+        for bucket, tags, use_weight in zip(
+            plan.buckets, tensors.tags, tensors.use_weight
+        ):
             group = self._groups[bucket.group_idx]
             values, bucket_lengths, weights, counts = [], [], [], []
             for i, row, num_rows in bucket.segments:
@@ -673,10 +679,10 @@ class DistributedEmbeddingLookup:
             if group.payload_bits is None:
                 keys = torch.where(keys == -1, _MISSING_KEY, keys)
             else:
-                tags = torch.repeat_interleave(
-                    bucket.tags, feat_lengths.sum(1), output_size=num_keys
+                key_tags = torch.repeat_interleave(
+                    tags, feat_lengths.sum(1), output_size=num_keys
                 )
-                keys = _encode_keys(keys, tags, group.payload_bits)
+                keys = _encode_keys(keys, key_tags, group.payload_bits)
             layer = layers[bucket.group_idx]
             if bucket.pooling == "NONE":
                 # dequantized rows come back in fp16, the dense graph is fp32.
@@ -688,11 +694,11 @@ class DistributedEmbeddingLookup:
                 feat_lengths.flatten()
             )
             bag_weights = None
-            if bucket.use_weight is not None:
+            if use_weight is not None:
                 bag_weights = torch.cat(weights) if len(weights) > 1 else weights[0]
-                if not bucket.all_weighted:
+                if not all(bucket.use_weight):
                     weighted = torch.repeat_interleave(
-                        bucket.use_weight, feat_lengths.sum(1), output_size=num_keys
+                        use_weight, feat_lengths.sum(1), output_size=num_keys
                     )
                     bag_weights = torch.where(weighted, bag_weights, 1.0)
             emb = layer(keys, offsets, bag_weights, mode=bucket.pooling.lower()).float()
@@ -705,7 +711,7 @@ class DistributedEmbeddingLookup:
 
         if blocks:
             pooled = torch.cat(blocks, dim=1) if len(blocks) > 1 else blocks[0]
-            for group, cols in plan.group_cols.items():
+            for group, cols in tensors.group_cols.items():
                 out[group] = pooled.index_select(1, cols)
         for feat, (i, j) in plan.seq_lengths.items():
             out[feat] = lengths[i][j].int()
