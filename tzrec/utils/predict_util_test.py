@@ -1000,6 +1000,8 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
         torch.jit.script(_DenseSum()).save(
             os.path.join(self.export_dir, "scripted_model.pt")
         )
+        with open(os.path.join(self.export_dir, "model_acc.json"), "w") as f:
+            json.dump({"DISTRIBUTED_EMBEDDING": "1"}, f)
         bags = {"a": ([dyn.keys[0], dyn.keys[1]], [dyn.keys[2]], [])}
         batch = _lookup_batch(bags, {})
         dense = torch.rand(3, 2)
@@ -1011,7 +1013,8 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
             "sd": JaggedTensor(values=torch.rand(3, 4), lengths=sd_lengths)
         }
         device = torch.device("cuda:0")
-        model = DistributedEmbeddingModel(self.export_dir, [device])
+        model = load_predict_model(self.export_dir, [device], log_model=True)
+        self.assertIsInstance(model, DistributedEmbeddingModel)
         out = model(batch, torch.tensor(2), device)
         np.testing.assert_allclose(
             out["p"].cpu().numpy(),

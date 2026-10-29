@@ -1153,14 +1153,19 @@ class DistributedEmbeddingModel:
     Args:
         model_path: distributed embedding export directory.
         devices: CUDA devices to predict on.
+        log_model: log the dense model.
     """
 
-    def __init__(self, model_path: str, devices: List[torch.device]) -> None:
+    def __init__(
+        self, model_path: str, devices: List[torch.device], log_model: bool = False
+    ) -> None:
         self._lookup = DistributedEmbeddingLookup(model_path, devices)
         self._dense: Dict[torch.device, torch.jit.ScriptModule] = {}
         for device in devices:
             dense = _load_scripted_model(model_path, device)
             self._dense[device] = torch.jit.script(_DenseInputModel(dense))
+        if log_model:
+            logger.info(str(self._dense[devices[0]]))
 
     def __call__(
         self, batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
@@ -1374,7 +1379,7 @@ def load_predict_model(
         the predictions.
     """
     if acc_utils.is_distributed_embedding_predict(model_path):
-        return DistributedEmbeddingModel(model_path, devices)
+        return DistributedEmbeddingModel(model_path, devices, log_model)
     if acc_utils.is_aot_predict(model_path):
         model = aot_utils.load_model_aot(model_path, device=devices[0])
     else:
