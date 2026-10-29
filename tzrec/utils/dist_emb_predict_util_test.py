@@ -14,6 +14,7 @@ import os
 import shutil
 import unittest
 import zlib
+from typing import Dict
 from unittest import mock
 
 import numpy as np
@@ -25,6 +26,7 @@ from tzrec.datasets.utils import Batch
 from tzrec.utils import npz_util, quant_util
 from tzrec.utils.dist_emb_predict_util import (
     DistributedEmbeddingLookup,
+    DistributedEmbeddingModel,
     _encode_keys,
     _gpu_cache_ratio,
     _key_tag,
@@ -95,6 +97,13 @@ class _Table:
         """Expected embedding of one key."""
         idx = np.flatnonzero(self.keys == key)
         return self.rows[idx[0]] if len(idx) else self.miss
+
+
+class _DenseSum(torch.nn.Module):
+    def forward(
+        self, data: Dict[str, torch.Tensor], device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        return {"p": data["deep"].sum(1)}
 
 
 def _write_export(export_dir, tables, features, dense_meta, extra_inputs=()):
@@ -591,6 +600,32 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         lookup = DistributedEmbeddingLookup(self.export_dir, [device])
         with self.assertRaisesRegex(ValueError, r"\['b.values'\]"):
             lookup(self._batch({"a": ([dyn.keys[0]],)}, {}), None, device)
+
+    def test_model_runs_dense_on_lookup(self) -> None:
+        dyn = _Table("model.ebc.dyn", 10, 8, False, dynamic=True)
+        features = {
+            "a__ebc": {
+                "embedding_name": dyn.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            }
+        }
+        _write_export(
+            self.export_dir, [dyn], features, {"sequence__ec": [], "deep": ["a__ebc"]}
+        )
+        torch.jit.script(_DenseSum()).save(
+            os.path.join(self.export_dir, "scripted_model.pt")
+        )
+        bags = {"a": ([dyn.keys[0], dyn.keys[1]], [dyn.keys[2]], [])}
+        device = torch.device("cuda:0")
+        model = DistributedEmbeddingModel(self.export_dir, [device])
+        out = model(self._batch(bags, {}), None, device)
+        np.testing.assert_allclose(
+            out["p"].cpu().numpy(),
+            _pooled(dyn, bags["a"], False).sum(1),
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
 
 if __name__ == "__main__":

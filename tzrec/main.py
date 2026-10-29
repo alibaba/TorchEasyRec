@@ -92,7 +92,7 @@ from tzrec.utils import (
     predict_util,
 )
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
-from tzrec.utils.dist_emb_predict_util import DistributedEmbeddingLookup
+from tzrec.utils.dist_emb_predict_util import DistributedEmbeddingModel
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -1554,22 +1554,23 @@ def predict(
         quota_name=data_config.odps_data_quota_name,
     )
 
+    # a distributed embedding export is loaded with its sparse embeddings below.
+    model = None
     if is_aot:
         model = aot_utils.load_model_aot(scripted_model_path, device=device)
     else:
         # disable jit compile， as it compile too slow now.
         if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
             os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-        model = torch.jit.load(
-            os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
-        )
-        model.eval()
+        if not is_dist_emb:
+            model = torch.jit.load(
+                os.path.join(scripted_model_path, "scripted_model.pt"),
+                map_location=device,
+            )
+            model.eval()
 
-    # forward workers are spread over forward_devices, each with its own model.
+    # forward workers are spread over forward_devices.
     forward_devices = [device]
-    models = {device: model}
-    sparse_lookup = None
-    batch_model = batch_predict_model(model)
     if is_dist_emb:
         if int(os.environ.get("LOCAL_WORLD_SIZE", 1)) == 1:
             # one process per node: the local GPUs share one host copy of the tables.
@@ -1589,7 +1590,7 @@ def predict(
 
     prof = None
     if is_profiling:
-        if is_rank_zero:
+        if is_rank_zero and model is not None:
             logger.info(str(model))
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=10, repeat=1),
@@ -1639,12 +1640,7 @@ def predict(
             # when predicting with a model exported using INPUT_TILE,
             #  we set the batch size tensor to 1 to disable tiling.
             batch_size = torch.tensor(1, dtype=torch.int64) if is_input_tile else None
-            if sparse_lookup is None:
-                predictions = batch_model(batch, batch_size, device)
-            else:
-                predictions = models[device](
-                    sparse_lookup(batch, batch_size, device), device
-                )
+            predictions = batch_model(batch, batch_size, device)
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
@@ -1709,19 +1705,14 @@ def predict(
     pipeline_error: Optional[BaseException] = None
     i_step = 0
     try:
-        if is_dist_emb:
-            # loaded in the guarded scope: a failed load still reaches the commit
-            # rendezvous below, so other ranks fail fast instead of waiting.
-            for d in forward_devices:
-                if d not in models:
-                    models[d] = torch.jit.load(
-                        os.path.join(scripted_model_path, "scripted_model.pt"),
-                        map_location=d,
-                    )
-                    models[d].eval()
-            sparse_lookup = DistributedEmbeddingLookup(
+        # built in the guarded scope: a failed load still reaches the commit
+        # rendezvous below, so other ranks fail fast instead of waiting.
+        if model is None:
+            batch_model = DistributedEmbeddingModel(
                 scripted_model_path, forward_devices
             )
+        else:
+            batch_model = batch_predict_model(model)
         while True:
             try:
                 batch = next(infer_iterator)

@@ -750,3 +750,41 @@ class DistributedEmbeddingLookup:
             for k in plan.batch_inputs:
                 out[k] = rest[k].to(device, non_blocking=True)
         return out
+
+
+class DistributedEmbeddingModel:
+    """Predicts a distributed embedding export on a Batch.
+
+    The sparse features are looked up with ``DistributedEmbeddingLookup``, whose
+    host tables every device shares, and the dense ``scripted_model.pt`` runs on
+    the looked-up inputs, one replica per device.
+
+    Args:
+        export_dir: distributed embedding export directory.
+        devices: CUDA devices to predict on.
+    """
+
+    def __init__(self, export_dir: str, devices: List[torch.device]) -> None:
+        self._lookup = DistributedEmbeddingLookup(export_dir, devices)
+        self._dense: Dict[torch.device, torch.jit.ScriptModule] = {}
+        for device in devices:
+            dense = torch.jit.load(
+                os.path.join(export_dir, "scripted_model.pt"), map_location=device
+            )
+            dense.eval()
+            self._dense[device] = dense
+
+    def __call__(
+        self, batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Predict a batch.
+
+        Args:
+            batch: the batch to predict.
+            batch_size: the ``batch_size`` input of tiled models, None for none.
+            device: the device to predict on, one of the constructor devices.
+
+        Returns:
+            The dense model's predictions.
+        """
+        return self._dense[device](self._lookup(batch, batch_size, device), device)
