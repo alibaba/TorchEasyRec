@@ -155,6 +155,46 @@ class ExportUtilTest(unittest.TestCase):
             self.assertEqual(json.load(input_file)["CUSTOM_EXPORT"], "enabled")
         self.assertEqual(create_fg.call_count, 0 if supplied_fg else 1)
 
+    @parameterized.expand(
+        [(None,), ("item",), ("app",)],
+        name_func=parameterized_name_func,
+    )
+    def test_export_metadata_sequence_entity(self, entity):
+        save_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, save_dir, ignore_errors=True)
+        sequence = feature_pb2.SequenceFeature(
+            sequence_name="click_seq",
+            sequence_length=50,
+            sequence_delim=";",
+            sequence_pk="user:click_seq",
+            features=[
+                feature_pb2.SeqFeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="id",
+                        expression="item:id",
+                        num_buckets=100,
+                        embedding_dim=8,
+                    )
+                )
+            ],
+        )
+        if entity is not None:
+            sequence.sequence_entity = entity
+        config = EasyRecConfig(
+            feature_configs=[feature_pb2.FeatureConfig(sequence_feature=sequence)]
+        )
+        features = create_features(list(config.feature_configs))
+        export_util._write_export_metadata(config, features, save_dir, None, None)
+
+        with open(os.path.join(save_dir, "fg.json")) as input_file:
+            group = json.load(input_file)["features"][0]
+        self.assertEqual("sequence_entity" in group, entity is not None)
+        self.assertEqual(group.get("sequence_entity"), entity)
+        saved_config = config_util.load_pipeline_config(
+            os.path.join(save_dir, "pipeline.config")
+        )
+        self.assertEqual(saved_config.feature_configs[0].sequence_feature, sequence)
+
     def test_distributed_sparse_quant_env(self) -> None:
         old_env = {
             "DIST_QUANT": os.environ.get("DIST_QUANT"),
