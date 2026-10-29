@@ -814,6 +814,8 @@ def _train_and_evaluate(
             else None
         )
     finally:
+        # stop background data loading (a no-op for paths without any)
+        train_dataloader.dataset.stop_loading()
         online_dense_exporter.close()
         ckpt_manager.close()
 

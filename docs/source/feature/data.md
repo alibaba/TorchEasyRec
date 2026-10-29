@@ -356,6 +356,7 @@ pipeline.global-job-parameters: |
 - 是否按dataloader任务提交顺序返回batch，默认为true；仅在`num_workers > 0`时生效
 - 设置为false时，先处理完的worker可以先返回batch，避免慢worker阻塞其他worker，但可能降低可复现性，并改变训练样本或预测结果的输出顺序
 - 对于样本分布不均衡的数据，设置为false可能使训练过程看到的数据分布产生偏差
+- 样本级打散模式（`shuffle_mode=SAMPLE_WINDOW`或`SAMPLE_ROLLING`）下该参数不生效：样本内容已在共享池中按样本级随机
 
 ### prefetch_factor
 
@@ -370,6 +371,31 @@ pipeline.global-job-parameters: |
 ### shuffle_buffer_size
 
 - 最多缓存多少个batch用于打散数据，默认为32
+
+### shuffle_mode
+
+- 打散模式，默认为`BATCH`
+  - `BATCH`：每个读取worker各自缓存若干完整batch并随机输出，batch内样本组合不变
+  - `SAMPLE_WINDOW`：样本级打散。同一rank内所有读取单元把原始样本汇入一个共享池，填满后冻结为一个窗口，窗口内样本全排列后连续切成完整batch输出；窗口输出期间到达的新样本进入下一窗口
+  - `SAMPLE_ROLLING`：样本级打散。共享池填满后，每次随机抽取`batch_size`条样本输出并移出池，补满后再抽下一批
+- 仅支持`KafkaDataset`的训练；评估、预测及非Kafka数据源不生效
+- 样本模式通过训练 checkpoint 管理恢复位置，要求 enable.auto.commit=false（默认值），避免 Kafka 自动提交的读取进度与实际训练进度混淆；显式设置为 true 会在启动时报错。
+
+样本级打散配置示例：
+
+```protobuf
+data_config {
+    batch_size: 512
+    num_workers: 16
+    shuffle: true
+    shuffle_buffer_size: 98
+    shuffle_mode: SAMPLE_ROLLING
+}
+```
+
+- 此例中每个rank的样本池容量为 512 x 98 = 50176 条样本
+- `num_workers=0`时读取仍在后台执行单元进行，主进程直接领取组好的batch完成特征处理
+- 池未满时会等待填满才出批：低流量场景下首个batch的产出时间约为"填满池所需时间"，调小`shuffle_buffer_size`可让首个batch更快产出（混洗范围随之变小）
 
 ### fg_encoded_multival_sep
 

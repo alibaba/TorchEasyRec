@@ -24,7 +24,7 @@ from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
-from tzrec.datasets.dataset import BaseDataset, BaseReader
+from tzrec.datasets.dataset import BaseDataset, BaseReader, create_dataloader
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
     CAND_POS_LENGTHS,
@@ -172,6 +172,30 @@ class DatasetTest(unittest.TestCase):
         utils.SERVER_LAUNCHED = False
         del utils.STATS_DICT
         utils.STATS_DICT = []
+
+    def test_sample_shuffle_rejected_for_non_kafka(self):
+        data_config = data_pb2.DataConfig(
+            batch_size=4,
+            dataset_type=data_pb2.DatasetType.CsvDataset,
+            label_fields=["label"],
+            shuffle=True,
+            shuffle_mode=data_pb2.ShuffleMode.SAMPLE_ROLLING,
+            shuffle_buffer_size=2,
+        )
+        with self.assertRaisesRegex(ValueError, "only supports KafkaDataset"):
+            create_dataloader(data_config, [], "", mode=Mode.TRAIN)
+
+    def test_sample_shuffle_requires_shuffle_true(self):
+        data_config = data_pb2.DataConfig(
+            batch_size=4,
+            dataset_type=data_pb2.DatasetType.KafkaDataset,
+            label_fields=["label"],
+            shuffle=False,
+            shuffle_mode=data_pb2.ShuffleMode.SAMPLE_ROLLING,
+            shuffle_buffer_size=2,
+        )
+        with self.assertRaisesRegex(ValueError, "shuffle=true"):
+            create_dataloader(data_config, [], "", mode=Mode.TRAIN)
 
     @parameterized.expand([[False], [True]])
     def test_dataset(self, need_shuffle):

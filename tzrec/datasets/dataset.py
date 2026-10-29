@@ -328,6 +328,28 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         assert self._reader is not None
         self._reader.load_state_dict(state)
 
+    def prepare_for_loading(self, checkpoint_state: Optional[Dict[str, Any]]) -> None:
+        """Prepare data loading before the DataLoader forks its workers.
+
+        Datasets with background resources create their communication
+        handles here so that forked workers inherit them.
+
+        Args:
+            checkpoint_state: resume state, applied before workers start.
+        """
+        if checkpoint_state:
+            self.load_state_dict(dict(checkpoint_state))
+
+    def start_loading(self) -> None:
+        """Start background data loading after the eager ``iter()`` forked workers."""
+
+    def stop_loading(self) -> None:
+        """Stop background data loading; idempotent."""
+
+    def is_sample_shuffled(self) -> bool:
+        """Whether this dataset yields sample-level shuffled batches."""
+        return False
+
     def __iter__(self) -> Iterator[Batch]:
         if self._sampler is not None and not self._sampler_inited:
             self._sampler.init()
@@ -799,6 +821,16 @@ def create_writer(
     return writer
 
 
+def sample_shuffle_enabled(data_config: data_pb2.DataConfig, mode: Mode) -> bool:
+    """Whether the sample-level shuffle path should serve this dataloader."""
+    return (
+        mode == Mode.TRAIN
+        and data_config.shuffle
+        and data_config.shuffle_mode
+        in (data_pb2.ShuffleMode.SAMPLE_WINDOW, data_pb2.ShuffleMode.SAMPLE_ROLLING)
+    )
+
+
 def create_dataloader(
     data_config: data_pb2.DataConfig,
     features: List[BaseFeature],
@@ -830,6 +862,23 @@ def create_dataloader(
         dataloader (dataloader): a DataLoader.
     """
     dataset_name = data_pb2.DatasetType.Name(data_config.dataset_type)
+    if sample_shuffle_enabled(data_config, mode) and (
+        data_config.dataset_type != data_pb2.KafkaDataset
+    ):
+        raise ValueError(
+            "sample-level shuffle (shuffle_mode=SAMPLE_WINDOW/SAMPLE_ROLLING) "
+            f"only supports KafkaDataset, got {dataset_name}"
+        )
+    if (
+        mode == Mode.TRAIN
+        and not data_config.shuffle
+        and data_config.shuffle_mode
+        in (data_pb2.ShuffleMode.SAMPLE_WINDOW, data_pb2.ShuffleMode.SAMPLE_ROLLING)
+    ):
+        raise ValueError(
+            "shuffle_mode=SAMPLE_WINDOW/SAMPLE_ROLLING requires shuffle=true; "
+            "otherwise no shuffle happens at all"
+        )
     # pyre-ignore [16]
     dataset_cls = BaseDataset.create_class(dataset_name)
     dataset = dataset_cls(
@@ -841,8 +890,9 @@ def create_dataloader(
         debug_level=debug_level,
         compiled_prompt=compiled_prompt,
     )
-    if checkpoint_state:
-        dataset.load_state_dict(dict(checkpoint_state))
+    # background resources (e.g. kafka sample shuffle) prepare their
+    # communication handles here so forked workers inherit them
+    dataset.prepare_for_loading(checkpoint_state)
 
     kwargs = {}
     if data_config.num_workers < 1:
@@ -897,6 +947,9 @@ def create_dataloader(
     # beginning the training process to avoid potential CUDA-related issues following
     # model saving.
     first_iterator = iter(dataloader)
+    # start background loading after the eager iter() forked the workers, so
+    # consumers and reader processes never share state with them
+    dataset.start_loading()
 
     def get_iterator() -> Iterator[Batch]:
         # return the eager iterator first (keeps its prefetch), then fresh ones
