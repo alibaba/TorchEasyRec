@@ -46,6 +46,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import Batch, batch_to_dict
 from tzrec.utils import npz_util
@@ -588,25 +589,20 @@ class DistributedEmbeddingLookup:
         self._plans[layout] = plan
         return plan
 
-    def __call__(
-        self, batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
-    ) -> Dict[str, torch.Tensor]:
-        """Build the dense graph's inputs of a batch.
+    def __call__(self, batch: Batch, device: torch.device) -> Dict[str, torch.Tensor]:
+        """Look up the sparse features of a batch.
 
         Every sparse KJT is copied to ``device`` once and permuted so that each
-        (group, pooling) is one slice; no per-feature sparse tensor is built. The
-        dense graph never reads raw sparse inputs: export replaces the sparse
-        lookups with ``dense_meta`` inputs and drops what only fed them.
+        (group, pooling) is one slice; no per-feature sparse tensor is built.
 
         Args:
             batch: the batch to look up.
-            batch_size: the ``batch_size`` input of tiled models, None for none.
             device: the device to look up on, one of the constructor devices.
 
         Returns:
-            The dense graph's inputs on ``device``: one concatenated embedding
-            tensor per ``dense_meta`` group, ``<feat>`` / ``<feat>__lengths`` of
-            every sequence feature, and the batch's non-sparse inputs.
+            The dense graph's embedding inputs on ``device``: one concatenated
+            embedding tensor per ``dense_meta`` group and ``<feat>`` /
+            ``<feat>__lengths`` of every sequence feature.
         """
         plan = self._plan(batch)
         tensors = plan.tensors[device]
@@ -716,18 +712,69 @@ class DistributedEmbeddingLookup:
                 out[group] = pooled.index_select(1, cols)
         for feat, (i, j) in plan.seq_lengths.items():
             out[feat] = lengths[i][j].int()
-        rest = batch_to_dict(
-            batch.dense_features,
-            {},
-            batch.sequence_mulval_lengths,
-            batch.sequence_dense_features,
-            batch.additional_infos,
-            batch_size,
+        return out
+
+
+class _DenseInputModel(torch.nn.Module):
+    """Runs a distributed embedding export's dense model on a Batch.
+
+    The dense model gets the looked-up embeddings plus the batch's non-sparse
+    inputs. Those are copied to the device packed, one copy per KeyedTensor /
+    KeyedJaggedTensor / JaggedTensor, and split per feature inside TorchScript, so
+    the per-feature tensors never become Python objects (see batch_to_dict). It
+    never reads raw sparse inputs: export replaces the sparse lookups with
+    ``dense_meta`` inputs and drops what only fed them.
+
+    Args:
+        dense (nn.Module): the export's scripted dense model on one device.
+    """
+
+    def __init__(self, dense: torch.nn.Module) -> None:
+        super().__init__()
+        self.dense = dense
+
+    def forward(
+        self,
+        embeddings: Dict[str, torch.Tensor],
+        dense_features: Dict[str, KeyedTensor],
+        sequence_mulval_lengths: Dict[str, KeyedJaggedTensor],
+        sequence_dense_features: Dict[str, JaggedTensor],
+        additional_infos: Dict[str, torch.Tensor],
+        batch_size: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Predict a batch.
+
+        Args:
+            embeddings (dict): DistributedEmbeddingLookup's outputs.
+            dense_features (dict): Batch.dense_features.
+            sequence_mulval_lengths (dict): Batch.sequence_mulval_lengths.
+            sequence_dense_features (dict): Batch.sequence_dense_features.
+            additional_infos (dict): Batch.additional_infos.
+            batch_size (Tensor, optional): batch_size input of tiled models.
+            device (torch.device): the device of the dense model.
+
+        Return:
+            predictions (dict): the dense model's predictions.
+        """
+        inputs = batch_to_dict(
+            {k: v.to(device, non_blocking=True) for k, v in dense_features.items()},
+            torch.jit.annotate(Dict[str, KeyedJaggedTensor], {}),
+            {
+                k: v.to(device, non_blocking=True)
+                for k, v in sequence_mulval_lengths.items()
+            },
+            {
+                k: v.to(device, non_blocking=True)
+                for k, v in sequence_dense_features.items()
+            },
+            {k: v.to(device, non_blocking=True) for k, v in additional_infos.items()},
+            None if batch_size is None else batch_size.to(device, non_blocking=True),
             torch.int64,
         )
-        for k, v in rest.items():
-            out[k] = v.to(device, non_blocking=True)
-        return out
+        for k, v in inputs.items():
+            embeddings[k] = v
+        return self.dense(embeddings, device)
 
 
 class DistributedEmbeddingModel:
@@ -750,7 +797,7 @@ class DistributedEmbeddingModel:
                 os.path.join(export_dir, "scripted_model.pt"), map_location=device
             )
             dense.eval()
-            self._dense[device] = dense
+            self._dense[device] = torch.jit.script(_DenseInputModel(dense))
 
     def __call__(
         self, batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
@@ -765,4 +812,12 @@ class DistributedEmbeddingModel:
         Returns:
             The dense model's predictions.
         """
-        return self._dense[device](self._lookup(batch, batch_size, device), device)
+        return self._dense[device](
+            self._lookup(batch, device),
+            batch.dense_features,
+            batch.sequence_mulval_lengths,
+            batch.sequence_dense_features,
+            batch.additional_infos,
+            batch_size,
+            device,
+        )

@@ -20,7 +20,7 @@ from unittest import mock
 import numpy as np
 import torch
 from parameterized import param, parameterized
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import Batch
 from tzrec.utils import npz_util, quant_util
@@ -103,7 +103,8 @@ class _DenseSum(torch.nn.Module):
     def forward(
         self, data: Dict[str, torch.Tensor], device: torch.device
     ) -> Dict[str, torch.Tensor]:
-        return {"p": data["deep"].sum(1)}
+        p = data["deep"].sum(1) + data["x.values"].sum(1) + data["sd.lengths"]
+        return {"p": p * data["batch_size"]}
 
 
 def _write_export(export_dir, tables, features, dense_meta):
@@ -375,7 +376,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         )
         tol = 2e-3 if quant else 1e-5
         for _ in range(2):
-            out = lookup(data, torch.tensor(1), device)
+            out = lookup(data, device)
             self.assertEqual(out["deep"].device, device)
             self.assertEqual(out["deep"].dtype, torch.float32)
             np.testing.assert_allclose(
@@ -388,8 +389,10 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
                 )
             self.assertEqual(out["seq__lengths"].dtype, torch.int32)
             self.assertEqual(out["seq__lengths"].tolist(), [2, 0, 1])
-            self.assertEqual(out["batch_size"].device, device)
-            self.assertNotIn("a.values", out)
+            # only the embedding inputs; the dense model adds the batch's others.
+            self.assertEqual(
+                sorted(out), ["deep", "seq", "seq2", "seq2__lengths", "seq__lengths"]
+            )
 
     @parameterized.expand(
         [
@@ -485,7 +488,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         self.assertCountEqual([layout(g) for g in lookup._groups], groups)
         # every key resolves to its own row.
         bags = {f"f{t}": tuple([k] for k in tb.keys) for t, tb in enumerate(tables)}
-        out = lookup(self._batch(bags, {}), None, device)
+        out = lookup(self._batch(bags, {}), device)
         expected = np.concatenate(
             [_pooled(tb, bags[f"f{t}"], False) for t, tb in enumerate(tables)], axis=1
         )
@@ -545,7 +548,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         text = "\n".join(logs.output)
         self.assertIn("DIST_EMB_GPU_CACHE_RATIO=auto resolved to 0.5 ", text)
         self.assertIn(f"gpu_cache_bytes={storage // 2}.", text)
-        out = lookup(self._batch({"a": ([*table.keys[:3]],)}, {}), None, device)
+        out = lookup(self._batch({"a": ([*table.keys[:3]],)}, {}), device)
         np.testing.assert_allclose(
             out["deep"].cpu().numpy()[0], table.rows[:3].sum(0), rtol=1e-5, atol=1e-5
         )
@@ -566,7 +569,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         data = self._batch({"a": ([*dyn.keys[:3]], [dyn.keys[3]])}, {})
         devices = [torch.device("cuda:0"), torch.device("cuda:1")]
         lookup = DistributedEmbeddingLookup(self.export_dir, devices)
-        outs = [lookup(data, None, d)["deep"] for d in devices]
+        outs = [lookup(data, d)["deep"] for d in devices]
         # one plan per KJT layout, with index tensors on every device.
         self.assertEqual(len(lookup._plans), 1)
         self.assertEqual(outs[1].device, devices[1])
@@ -588,12 +591,26 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             os.path.join(self.export_dir, "scripted_model.pt")
         )
         bags = {"a": ([dyn.keys[0], dyn.keys[1]], [dyn.keys[2]], [])}
+        batch = self._batch(bags, {})
+        dense = torch.rand(3, 2)
+        batch.dense_features = {
+            "d": KeyedTensor(keys=["x"], length_per_key=[2], values=dense)
+        }
+        sd_lengths = torch.tensor([2, 0, 1])
+        batch.sequence_dense_features = {
+            "sd": JaggedTensor(values=torch.rand(3, 4), lengths=sd_lengths)
+        }
         device = torch.device("cuda:0")
         model = DistributedEmbeddingModel(self.export_dir, [device])
-        out = model(self._batch(bags, {}), None, device)
+        out = model(batch, torch.tensor(2), device)
         np.testing.assert_allclose(
             out["p"].cpu().numpy(),
-            _pooled(dyn, bags["a"], False).sum(1),
+            (
+                _pooled(dyn, bags["a"], False).sum(1)
+                + dense.sum(1).numpy()
+                + sd_lengths.numpy()
+            )
+            * 2,
             rtol=1e-5,
             atol=1e-5,
         )
