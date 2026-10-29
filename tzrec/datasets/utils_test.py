@@ -17,10 +17,14 @@ from typing import List, Tuple
 
 import numpy as np
 import pyarrow as pa
-from parameterized import parameterized
+import torch
+from parameterized import param, parameterized
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import (
+    Batch,
     _normalize_type_str,
+    batch_to_dict,
     build_sampler_input,
     calc_remaining_intervals,
     calc_slice_intervals,
@@ -771,6 +775,135 @@ class DatasetUtilsTest(unittest.TestCase):
         with self.assertRaises(ValueError) as context:
             get_input_fields_proto(data_config)
         self.assertIn("Unknown field type", str(context.exception))
+
+
+def _reference_to_dict(batch, sparse_dtype):
+    """Batch.to_dict as implemented on top of KeyedJaggedTensor.to_dict."""
+    out = {}
+    for x in batch.dense_features.values():
+        for k, v in x.to_dict().items():
+            out[f"{k}.values"] = v
+    for x in batch.sparse_features.values():
+        if sparse_dtype:
+            x = KeyedJaggedTensor(
+                keys=x.keys(),
+                values=x.values().to(sparse_dtype),
+                lengths=x.lengths().to(sparse_dtype),
+                weights=x.weights_or_none(),
+            )
+        for k, v in x.to_dict().items():
+            out[f"{k}.values"] = v.values()
+            out[f"{k}.lengths"] = v.lengths()
+            if v.weights_or_none() is not None:
+                out[f"{k}.weights"] = v.weights()
+    for x in batch.sequence_mulval_lengths.values():
+        if sparse_dtype:
+            x = KeyedJaggedTensor(
+                keys=x.keys(),
+                values=x.values().to(sparse_dtype),
+                lengths=x.lengths().to(sparse_dtype),
+            )
+        for k, v in x.to_dict().items():
+            out[f"{k}.key_lengths"] = v.values()
+            out[f"{k}.lengths"] = v.lengths()
+    for k, v in batch.sequence_dense_features.items():
+        out[f"{k}.values"] = v.values()
+        out[f"{k}.lengths"] = v.lengths()
+    for k, v in batch.labels.items():
+        out[k] = v
+    for k, v in batch.jagged_labels.items():
+        out[f"{k}.values"] = v.values()
+        out[f"{k}.lengths"] = v.lengths()
+    for k, v in batch.sample_weights.items():
+        out[k] = v
+    if batch.tile_size > 0:
+        out["batch_size"] = torch.tensor(batch.tile_size, dtype=torch.int64)
+    for k, v in batch.additional_infos.items():
+        out[k] = v
+    return out
+
+
+class BatchToDictTest(unittest.TestCase):
+    def _kjt(self, keys, batch_size, weighted, device):
+        lengths = torch.randint(0, 4, (len(keys) * batch_size,), dtype=torch.int32)
+        n = int(lengths.sum())
+        return KeyedJaggedTensor(
+            keys=keys,
+            values=torch.randint(0, 1000, (n,), dtype=torch.int32).to(device),
+            lengths=lengths.to(device),
+            weights=torch.rand(n).to(device) if weighted else None,
+        )
+
+    def _batch(self, weighted, batch_size, device):
+        torch.manual_seed(0)
+        jagged = JaggedTensor(
+            values=torch.rand(3, device=device),
+            lengths=torch.tensor([3] + [0] * max(batch_size - 1, 0), device=device)[
+                :batch_size
+            ],
+        )
+        return Batch(
+            dense_features={
+                "deep": KeyedTensor(
+                    keys=["x", "y"],
+                    length_per_key=[1, 3],
+                    values=torch.rand(batch_size, 4, device=device),
+                )
+            },
+            sparse_features={
+                "deep": self._kjt(["a", "b", "c"], batch_size, weighted, device),
+                "wide": self._kjt(["d"], batch_size, False, device),
+                "none": KeyedJaggedTensor.empty(device=device),
+            },
+            sequence_mulval_lengths={
+                "seq": self._kjt(["s"], batch_size, False, device),
+            },
+            sequence_dense_features={"sd": jagged},
+            labels={"clk": torch.rand(batch_size, device=device)},
+            jagged_labels={"jl": jagged},
+            sample_weights={"w": torch.rand(batch_size, device=device)},
+            tile_size=2,
+            additional_infos={"info": torch.rand(batch_size, device=device)},
+        )
+
+    @parameterized.expand(
+        [
+            param("unweighted", weighted=False, sparse_dtype=None, batch_size=5),
+            param("weighted", weighted=True, sparse_dtype=None, batch_size=5),
+            param("int64", weighted=True, sparse_dtype=torch.int64, batch_size=5),
+            param("empty_batch", weighted=True, sparse_dtype=torch.int64, batch_size=0),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_to_dict_matches_kjt_to_dict(
+        self, _name, weighted, sparse_dtype, batch_size
+    ):
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        scripted = torch.jit.script(batch_to_dict)
+        for device in devices:
+            batch = self._batch(weighted, batch_size, device)
+            expected = _reference_to_dict(batch, sparse_dtype)
+            actual = batch.to_dict(sparse_dtype=sparse_dtype)
+            self.assertEqual(sorted(actual), sorted(expected))
+            # predict inputs: everything but labels and sample weights.
+            predict = scripted(
+                batch.dense_features,
+                batch.sparse_features,
+                batch.sequence_mulval_lengths,
+                batch.sequence_dense_features,
+                batch.additional_infos,
+                torch.tensor(batch.tile_size, dtype=torch.int64),
+                sparse_dtype,
+            )
+            labels = {"clk", "jl.values", "jl.lengths", "w"}
+            self.assertEqual(sorted(predict), sorted(set(expected) - labels))
+            for out in (actual, predict):
+                for k, v in out.items():
+                    self.assertEqual(v.dtype, expected[k].dtype, k)
+                    self.assertEqual(v.device, expected[k].device, k)
+                    torch.testing.assert_close(v, expected[k], rtol=0, atol=0, msg=k)
 
 
 if __name__ == "__main__":
