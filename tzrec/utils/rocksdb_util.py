@@ -510,6 +510,8 @@ def save_stats(seconds: float) -> None:
             "dump_seconds",
             "dump_rows",
             "dump_bytes",
+            "export_pause_seconds",
+            "export_pause_memtable_bytes",
         )
     }
     _saved_metrics.update(m)
@@ -518,7 +520,10 @@ def save_stats(seconds: float) -> None:
         f"{d['checkpoint_insert_seconds']:.2f}s "
         f"({int(d['checkpoint_insert_rows'])} rows), logical export "
         f"{d['dump_seconds']:.2f}s ({int(d['dump_rows'])} rows, "
-        f"{d['dump_bytes'] / (1 << 30):.2f}GiB written); cumulative "
+        f"{d['dump_bytes'] / (1 << 30):.2f}GiB written, background-work pause wait "
+        f"{d['export_pause_seconds']:.2f}s, read from "
+        f"{d['export_pause_memtable_bytes'] / (1 << 20):.1f}MiB unflushed memtables); "
+        "cumulative "
         f"train writeback {int(m.get('train_insert_rows', 0))} rows, publish "
         f"writeback {int(m.get('publish_insert_rows', 0))} rows, evicted "
         f"{int(m.get('evict_rows', 0))} rows, index {stats['index']}; RocksDB "

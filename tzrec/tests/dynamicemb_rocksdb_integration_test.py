@@ -46,6 +46,57 @@ def _logical_rows(ckpt, collection="*"):
 _SMALL_ID3_CAPACITY = {"feature_configs[2].id_feature.dynamicemb.max_capacity": 4000}
 
 
+def _dcp_state(path):
+    """A DCP directory's tensors as a plain dict."""
+    from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
+
+    out = path.rstrip("/") + ".pt"
+    dcp_to_torch_save(path, out)
+    state = torch.load(out, weights_only=False)
+    os.remove(out)
+    return state
+
+
+def _dynamicemb_state(ckpt):
+    """Per table file: rows ordered by key, scores, optimizer args and counters."""
+    tables = {}
+    for key_path in glob.glob(os.path.join(ckpt, "dynamicemb", "*", "*_emb_keys.*")):
+        d = os.path.dirname(key_path)
+        table, suffix = os.path.basename(key_path).split("_emb_keys")
+        keys = np.fromfile(key_path, dtype=np.int64)
+        order = np.argsort(keys, kind="stable")
+        rows = {}
+        for kind, dtype in (
+            ("emb_values", np.uint8),
+            ("emb_opt_values", np.uint8),
+            ("emb_scores", np.int64),
+        ):
+            path = os.path.join(d, f"{table}_{kind}{suffix}")
+            if os.path.exists(path):
+                data = np.fromfile(path, dtype=dtype)
+                rows[kind] = data.reshape(len(keys), -1)[order] if len(keys) else data
+        counter_keys = os.path.join(d, f"{table}_counter_keys{suffix}")
+        counters = None
+        if os.path.exists(counter_keys):
+            ck = np.fromfile(counter_keys, dtype=np.int64)
+            freq = np.fromfile(
+                os.path.join(d, f"{table}_counter_frequencies{suffix}"), np.uint8
+            )
+            freq = freq.reshape(len(ck), -1) if len(ck) else freq
+            counters = {int(k): f.tobytes() for k, f in zip(ck, freq)}
+        with open(os.path.join(d, f"{table}_opt_args.json")) as f:
+            meta = json.load(f)
+        tables[f"{os.path.basename(d)}/{table}{suffix}"] = {
+            "keys": keys[order],
+            "values": rows.get("emb_values"),
+            "opt": rows.get("emb_opt_values"),
+            "scores": rows.get("emb_scores"),
+            "meta": meta,
+            "counters": counters,
+        }
+    return tables
+
+
 def _logs(log_dir):
     text = ""
     for path in glob.glob(os.path.join(log_dir, "**", "*.log"), recursive=True):
@@ -176,6 +227,126 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
             model_dir, require_success=True
         )
         self.assertGreater(final_step, step)
+        self.success = True
+
+    def _assert_same_state(self, got, ref, path):
+        if isinstance(ref, torch.Tensor):
+            torch.testing.assert_close(got, ref, rtol=0, atol=0, msg=path)
+        elif isinstance(ref, dict):
+            self.assertEqual(sorted(got), sorted(ref), path)
+            for k in ref:
+                self._assert_same_state(got[k], ref[k], f"{path}.{k}")
+        elif isinstance(ref, (list, tuple)):
+            self.assertEqual(len(got), len(ref), path)
+            for i, (g, r) in enumerate(zip(got, ref)):
+                self._assert_same_state(g, r, f"{path}[{i}]")
+        else:
+            self.assertEqual(got, ref, path)
+
+    def test_save_restore_round_trip_and_input_position(self):
+        # Fused GPU-cache groups with STEP/LFU/TIMESTAMP tables and admission
+        # counters, saving every 3 steps.
+        edit = {
+            "train_config.num_epochs": 2,
+            "train_config.save_checkpoints_steps": 3,
+            **_SMALL_ID3_CAPACITY,
+        }
+        self.success = utils.test_train_eval(
+            "tzrec/tests/configs/multi_tower_din_dynamicemb_rocksdb_mock.config",
+            self.test_dir,
+            args_str=f"--edit_config_json '{json.dumps(edit)}'",
+        )
+        self.assertTrue(self.success)
+        self.success = False
+        model_dir = os.path.join(self.test_dir, "train")
+        final, final_step = checkpoint_util.latest_checkpoint(
+            model_dir, require_success=True
+        )
+        assert final is not None
+        step = (final_step - 1) // 3 * 3
+        saved = os.path.join(model_dir, f"model.ckpt-{step}")
+        # Resume from step `step` only: no later checkpoint, no working DB.
+        resume_dir = os.path.join(self.test_dir, "resume")
+        os.makedirs(resume_dir)
+        shutil.copytree(saved, os.path.join(resume_dir, os.path.basename(saved)))
+        config = config_util.load_pipeline_config(
+            os.path.join(self.test_dir, "pipeline.config")
+        )
+        config.model_dir = resume_dir
+        config_path = os.path.join(self.test_dir, "resume.config")
+        config_util.save_message(config, config_path)
+        shutil.rmtree("tmp/tzrec_rocksdb_test", ignore_errors=True)
+
+        # Restore into a fresh DB, then save again before any training step.
+        resave_dir = os.path.join(self.test_dir, "resave")
+        cmd = (
+            f"PYTHONPATH=. RESAVE_MODEL_DIR={resave_dir} torchrun "
+            f"{utils._standalone()} --nnodes=1 "
+            f"--nproc-per-node={utils._get_nproc_per_node()} "
+            f"--log_dir {os.path.join(self.test_dir, 'log_resave')} -r 3 -t 3 "
+            f"tzrec/tests/resave_after_restore.py --pipeline_config_path "
+            f"{config_path} --continue_train --edit_config_json '{json.dumps(edit)}'"
+        )
+        self.assertTrue(
+            misc_util.run_cmd(cmd, os.path.join(self.test_dir, "log_resave.txt"))
+        )
+        resaved = os.path.join(resave_dir, f"model.ckpt-{step}")
+        self.assertTrue(
+            os.path.exists(os.path.join(resaved, checkpoint_util.CKPT_SUCCESS_FILENAME))
+        )
+        for part in ("model", "optimizer"):
+            self._assert_same_state(
+                _dcp_state(os.path.join(resaved, part)),
+                _dcp_state(os.path.join(saved, part)),
+                part,
+            )
+        for name in (
+            checkpoint_util.DATALOADER_CKPT_FILENAME,
+            checkpoint_util.LR_SCHEDULER_CKPT_FILENAME,
+        ):
+            with open(os.path.join(saved, name)) as fa:
+                with open(os.path.join(resaved, name)) as fb:
+                    self.assertEqual(json.load(fb), json.load(fa), name)
+        a, b = _dynamicemb_state(saved), _dynamicemb_state(resaved)
+        self.assertEqual(sorted(a), sorted(b))
+        self.assertTrue(any(t["counters"] for t in a.values()))
+        for name, ta in a.items():
+            tb = b[name]
+            for k in ("keys", "values", "opt"):
+                np.testing.assert_array_equal(tb[k], ta[k], err_msg=f"{name} {k}")
+            self.assertEqual(tb["meta"], ta["meta"], name)
+            if ta["counters"] is not None:
+                # NOTE: the restore's optimizer warm-up step also counts its
+                # batch's ids; counters are not cleared before DynamicEmbLoad.
+                restored = {k: tb["counters"].get(k) for k in ta["counters"]}
+                self.assertEqual(restored, ta["counters"], name)
+            if "click_50_seq__id_3" in name:
+                # Built-in NO_EVICTION: scores are row indices, not access scores.
+                continue
+            if "Lru" in ta["meta"]["evict_strategy"]:
+                # TIMESTAMP scores are saved as ages: rebased by one constant.
+                shift = tb["scores"] - ta["scores"]
+                self.assertTrue((shift == shift.flat[0]).all() if shift.size else True)
+            else:
+                np.testing.assert_array_equal(tb["scores"], ta["scores"], name)
+
+        # The input position: resuming from `step` with no local state ends
+        # where the uninterrupted run ended.
+        ok, log = self._resume(config_path, "log_resume", {**edit})
+        self.assertTrue(ok)
+        self.assertIn("loading RocksDB tables into fresh working DB", log)
+        resumed, resumed_step = checkpoint_util.latest_checkpoint(
+            resume_dir, require_success=True
+        )
+        assert resumed is not None
+        self.assertEqual(resumed_step, final_step)
+        for name in (
+            checkpoint_util.DATALOADER_CKPT_FILENAME,
+            checkpoint_util.CKPT_META_FILENAME,
+        ):
+            with open(os.path.join(final, name)) as fa:
+                with open(os.path.join(resumed, name)) as fb:
+                    self.assertEqual(fb.read(), fa.read(), name)
         self.success = True
 
     def test_delta_publication_tombstones(self):

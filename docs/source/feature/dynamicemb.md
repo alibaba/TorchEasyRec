@@ -177,14 +177,14 @@ feature_configs {
 
 ### Checkpoint 与恢复
 
-- RocksDB 表与内存版 DynamicEmbedding 表使用完全相同的 checkpoint 格式：保存时 `DynamicEmbDump` 先把 GPU cache 写回，再从冻结的数据库视图（刷盘、暂停后台 compaction、持有快照）按块流式写出 `model.ckpt-<step>/dynamicemb/` 下的 keys/values/scores/opt_values 文件，最后写 `_SUCCESS`。不会在训练盘上保留历史 checkpoint，也不会先在本地落一份完整导出
+- RocksDB 表与内存版 DynamicEmbedding 表使用完全相同的 checkpoint 格式：保存时 `DynamicEmbDump` 先把 GPU cache 写回，再从冻结的数据库视图（暂停后台 flush/compaction、持有快照，未落盘的 memtable 直接读取，不强制刷盘）按块流式写出 `model.ckpt-<step>/dynamicemb/` 下的 keys/values/scores/opt_values 文件，最后写 `_SUCCESS`。不会在训练盘上保留历史 checkpoint，也不会先在本地落一份完整导出
 - model_dir 可以是 OSS 挂载目录（如 DLC 的 ossfs 数据集），文件按顺序流式写入，由 ossfs 分片上传。单文件大小受 ossfs 分片大小 × 10000 限制，超过时报 `File too large`，请调大 `upload_buffer_size`（见 FAQ）
 - 开启 RocksDB 后，`--continue_train`、评估、预测和导出只会选择带 `_SUCCESS` 的 checkpoint；比恢复点更新、但没有 `_SUCCESS` 的 checkpoint 目录会被删除（日志中打印文件数和大小），在 OSS 上重命名等于全量复制
 - 恢复时先清空 GPU cache，再新建一个空的工作库，从 checkpoint 文件按块加载；上一次的工作库和崩溃遗留的数据不会被复用。因此只要 checkpoint 完整，本地盘丢失后也可以在其它节点恢复
 - checkpoint 与放置方式无关：同一份 checkpoint 可以在内存版和 RocksDB 版之间恢复，也可以在调整预算后由 AUTO 选出不同的放置继续训练。若放置变化使原本不在同一融合组、优化器参数（例如 Adam 的迭代次数）不同的表融合到一起，恢复会报错。world size、维度或优化器类型的变化按 dynamicemb 自身的规则校验
 - 评估、导出时 RocksDB 表同样从 checkpoint 文件加载到一个新的临时数据库（会占用与表大小相当的磁盘）
 - 旧版本（原生 RocksDB checkpoint，`model.ckpt-<step>/rocksdb/rank_<r>.json`）的 checkpoint 仍可恢复（仅限 `NO_EVICTION` 表）和导出；恢复后保存一次即转换为新格式。旧的原生 checkpoint 在对应 `model.ckpt-<step>` 被清理后删除
-- 保存耗时与表大小成正比（全量写出），训练在保存期间暂停（实测经 ossfs 写出约 125 GiB 需约 13 分钟，从 OSS 恢复约 6 分钟），请据此设置 `save_checkpoints_steps`；日志 `RocksDB checkpoint` 给出本次保存的 cache 写回、导出行数和字节数，以及进程启动以来训练、发布的累计写回量、淘汰行数和 RocksDB flush/compaction 写入量
+- 保存耗时与表大小成正比（全量写出），训练在保存期间暂停（实测经 ossfs 写出约 125 GiB 需约 13 分钟，从 OSS 恢复约 6 分钟），请据此设置 `save_checkpoints_steps`；日志 `RocksDB checkpoint` 给出本次保存的 cache 写回、导出行数和字节数、暂停后台任务的等待时间和读取的未落盘 memtable 大小，以及进程启动以来训练、发布的累计写回量、淘汰行数和 RocksDB flush/compaction 写入量
 - 已知限制：恢复前框架会先用一个 batch 初始化优化器状态，此时 frequency admission 的 Counter 计数无法回滚
 
 ### 排障

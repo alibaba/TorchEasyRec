@@ -241,6 +241,9 @@ class RocksDBCheckpointTest(unittest.TestCase):
             exported.append(int(re.search(r"logical export \S+ \((\d+) rows", line)[1]))
             keys = glob.glob(os.path.join(ckpt, "a_emb_keys*"))[0]
             self.assertEqual(exported[-1], os.path.getsize(keys) // 8)
+            # The save's cache write-back is read from the unflushed memtables.
+            held = re.search(r"read from (\S+)MiB unflushed memtables", line)[1]
+            self.assertGreater(float(held), 0)
         self.assertGreater(exported[1], exported[0])
 
     def test_step_boundary_evicts_to_capacity(self):
