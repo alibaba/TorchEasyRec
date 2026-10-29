@@ -34,7 +34,11 @@ from tzrec.datasets.utils import (
 )
 from tzrec.protos import data_pb2
 from tzrec.protos.data_pb2 import FieldType
-from tzrec.utils.test_util import parameterized_name_func
+from tzrec.utils.test_util import (
+    gpu_unavailable,
+    mark_ci_scope,
+    parameterized_name_func,
+)
 
 
 class DatasetUtilsTest(unittest.TestCase):
@@ -823,6 +827,14 @@ def _reference_to_dict(batch, sparse_dtype):
     return out
 
 
+_TO_DICT_CASES = [
+    param("unweighted", weighted=False, sparse_dtype=None, batch_size=5),
+    param("weighted", weighted=True, sparse_dtype=None, batch_size=5),
+    param("int64", weighted=True, sparse_dtype=torch.int64, batch_size=5),
+    param("empty_batch", weighted=True, sparse_dtype=torch.int64, batch_size=0),
+]
+
+
 class BatchToDictTest(unittest.TestCase):
     def _kjt(self, keys, batch_size, weighted, device):
         lengths = torch.randint(0, 4, (len(keys) * batch_size,), dtype=torch.int32)
@@ -866,44 +878,42 @@ class BatchToDictTest(unittest.TestCase):
             additional_infos={"info": torch.rand(batch_size, device=device)},
         )
 
-    @parameterized.expand(
-        [
-            param("unweighted", weighted=False, sparse_dtype=None, batch_size=5),
-            param("weighted", weighted=True, sparse_dtype=None, batch_size=5),
-            param("int64", weighted=True, sparse_dtype=torch.int64, batch_size=5),
-            param("empty_batch", weighted=True, sparse_dtype=torch.int64, batch_size=0),
-        ],
-        name_func=parameterized_name_func,
-    )
+    def _check_to_dict(self, device, weighted, sparse_dtype, batch_size):
+        batch = self._batch(weighted, batch_size, device)
+        expected = _reference_to_dict(batch, sparse_dtype)
+        actual = batch.to_dict(sparse_dtype=sparse_dtype)
+        self.assertEqual(sorted(actual), sorted(expected))
+        # predict inputs: everything but labels and sample weights.
+        predict = torch.jit.script(batch_to_dict)(
+            batch.dense_features,
+            batch.sparse_features,
+            batch.sequence_mulval_lengths,
+            batch.sequence_dense_features,
+            batch.additional_infos,
+            torch.tensor(batch.tile_size, dtype=torch.int64),
+            sparse_dtype,
+        )
+        labels = {"clk", "jl.values", "jl.lengths", "w"}
+        self.assertEqual(sorted(predict), sorted(set(expected) - labels))
+        for out in (actual, predict):
+            for k, v in out.items():
+                self.assertEqual(v.dtype, expected[k].dtype, k)
+                self.assertEqual(v.device, expected[k].device, k)
+                torch.testing.assert_close(v, expected[k], rtol=0, atol=0, msg=k)
+
+    @parameterized.expand(_TO_DICT_CASES, name_func=parameterized_name_func)
     def test_to_dict_matches_kjt_to_dict(
         self, _name, weighted, sparse_dtype, batch_size
     ):
-        devices = [torch.device("cpu")]
-        if torch.cuda.is_available():
-            devices.append(torch.device("cuda"))
-        scripted = torch.jit.script(batch_to_dict)
-        for device in devices:
-            batch = self._batch(weighted, batch_size, device)
-            expected = _reference_to_dict(batch, sparse_dtype)
-            actual = batch.to_dict(sparse_dtype=sparse_dtype)
-            self.assertEqual(sorted(actual), sorted(expected))
-            # predict inputs: everything but labels and sample weights.
-            predict = scripted(
-                batch.dense_features,
-                batch.sparse_features,
-                batch.sequence_mulval_lengths,
-                batch.sequence_dense_features,
-                batch.additional_infos,
-                torch.tensor(batch.tile_size, dtype=torch.int64),
-                sparse_dtype,
-            )
-            labels = {"clk", "jl.values", "jl.lengths", "w"}
-            self.assertEqual(sorted(predict), sorted(set(expected) - labels))
-            for out in (actual, predict):
-                for k, v in out.items():
-                    self.assertEqual(v.dtype, expected[k].dtype, k)
-                    self.assertEqual(v.device, expected[k].device, k)
-                    torch.testing.assert_close(v, expected[k], rtol=0, atol=0, msg=k)
+        self._check_to_dict(torch.device("cpu"), weighted, sparse_dtype, batch_size)
+
+    @parameterized.expand(_TO_DICT_CASES, name_func=parameterized_name_func)
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_to_dict_matches_kjt_to_dict_cuda(
+        self, _name, weighted, sparse_dtype, batch_size
+    ):
+        self._check_to_dict(torch.device("cuda"), weighted, sparse_dtype, batch_size)
 
 
 if __name__ == "__main__":
