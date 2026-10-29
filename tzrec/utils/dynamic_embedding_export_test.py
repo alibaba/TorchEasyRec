@@ -19,7 +19,10 @@ import numpy as np
 from parameterized import parameterized
 
 from tzrec.utils import dynamic_embedding_export, quant_util
-from tzrec.utils.dynamic_embedding_export import get_dynamic_embedding_export
+from tzrec.utils.dynamic_embedding_export import (
+    get_dynamic_embedding_export,
+    get_sharded_dynamic_embedding_export,
+)
 from tzrec.utils.npz_util import savez_streaming
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
@@ -340,6 +343,119 @@ class DynamicEmbeddingExportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite"):
             list(arrays[f"{self.table}.values"].chunks)
         callback.assert_not_called()
+
+    @parameterized.expand(
+        [
+            ("one_to_one_fp32", 4, 4, ""),
+            ("capped_parts_int8", 4, 2, "QUint8RowwiseF16"),
+            ("single_part", 4, 1, ""),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sharded_dynamic_embedding_export(
+        self, _name, world_size, max_num_parts, quant_format
+    ) -> None:
+        all_keys = []
+        all_values = []
+        for rank in range(world_size):
+            k = np.array([rank * 10, rank * 10 + 1], dtype=np.int64)
+            v = np.full((2, 2), rank + 1.0, dtype=np.float32)
+            self._write_shard(rank, k, v, world_size=world_size)
+            all_keys.append(k)
+            all_values.append(v)
+
+        part_arrays, metadata = get_sharded_dynamic_embedding_export(
+            self.test_dir,
+            {self.table: 2},
+            32,
+            quant_format=quant_format,
+            max_num_parts=max_num_parts,
+        )
+        expected_parts = min(world_size, max_num_parts)
+        self.assertEqual(len(part_arrays), expected_parts)
+        self.assertEqual(metadata[self.table]["shape"], [2 * world_size, 2])
+        if quant_format:
+            self.assertEqual(metadata[self.table]["storage_shape"], [2 * world_size, 6])
+
+        loaded_keys = []
+        loaded_scores = []
+        loaded_values = []
+        for idx, arrays in enumerate(part_arrays):
+            part_path = os.path.join(self.test_dir, f"part_{idx}.npz")
+            savez_streaming(part_path, arrays)
+            with np.load(part_path) as out:
+                loaded_keys.append(out[f"{self.table}.keys"])
+                loaded_scores.append(out[f"{self.table}.scores"])
+                loaded_values.append(out[f"{self.table}.values"])
+
+        expected_keys_order = np.concatenate(
+            [
+                all_keys[rank]
+                for part_idx in range(expected_parts)
+                for rank in range(world_size)
+                if rank % expected_parts == part_idx
+            ]
+        )
+        expected_vals_order = np.concatenate(
+            [
+                all_values[rank]
+                for part_idx in range(expected_parts)
+                for rank in range(world_size)
+                if rank % expected_parts == part_idx
+            ]
+        )
+        if quant_format:
+            expected_vals_order = quant_util.distributed_quantize_embeddings(
+                expected_vals_order, 2, self.table, quant_format
+            )
+        np.testing.assert_array_equal(np.concatenate(loaded_keys), expected_keys_order)
+        np.testing.assert_array_equal(
+            np.concatenate(loaded_scores), expected_keys_order + 100
+        )
+        np.testing.assert_array_equal(
+            np.concatenate(loaded_values), expected_vals_order
+        )
+
+    def test_sharded_dynamic_embedding_export_mixed_world_sizes(self) -> None:
+        table_b = "model.embedding_group.emb_impls.group.ebc.embedding_bags.table_b"
+        directory = os.path.join(self.test_dir, "dynamicemb", self.module)
+        os.makedirs(directory, exist_ok=True)
+        for rank in range(4):
+            self._write_shard(
+                rank,
+                np.array([rank * 10], dtype=np.int64),
+                np.full((1, 2), rank + 1.0, dtype=np.float32),
+                world_size=4,
+            )
+        # table_b has world_size=1, so only part 0 has rows and parts 1..3 have 0 rows.
+        for name, array in (
+            ("keys", np.array([99], dtype=np.int64)),
+            ("values", np.array([[5.0, 6.0]], dtype=np.float32)),
+            ("scores", np.array([199], dtype=np.int64)),
+        ):
+            array.tofile(
+                os.path.join(directory, f"table_b_emb_{name}.rank_0.world_size_1")
+            )
+
+        with mock.patch("os.cpu_count", return_value=4):
+            part_arrays, metadata = get_sharded_dynamic_embedding_export(
+                self.test_dir,
+                {self.table: 2, table_b: 2},
+                32,
+                quant_format="QUint8RowwiseF16",
+                max_num_parts=4,
+            )
+        self.assertEqual(len(part_arrays), 4)
+        self.assertEqual(metadata[self.table]["shape"], [4, 2])
+        self.assertEqual(metadata[table_b]["shape"], [1, 2])
+        self.assertEqual(part_arrays[0][f"{table_b}.values"].shape, (1, 6))
+        for part_idx in range(1, 4):
+            self.assertEqual(part_arrays[part_idx][f"{table_b}.keys"].shape, (0,))
+            self.assertEqual(part_arrays[part_idx][f"{table_b}.values"].shape, (0, 6))
+            self.assertEqual(
+                part_arrays[part_idx][f"{table_b}.values"].dtype, np.dtype(np.uint8)
+            )
+            self.assertEqual(part_arrays[part_idx][f"{table_b}.scores"].shape, (0,))
 
 
 if __name__ == "__main__":
