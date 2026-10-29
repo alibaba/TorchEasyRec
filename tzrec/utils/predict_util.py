@@ -1005,23 +1005,26 @@ class DistributedEmbeddingLookup:
         ):
             group = self._groups[bucket.group_idx]
             values, bucket_lengths, weights, counts = [], [], [], []
+            num_keys = 0
             for i, row, num_rows in bucket.segments:
                 kjt_lengths, kjt_values, kjt_weights, value_offsets = permuted[i]
                 begin, end = value_offsets[row], value_offsets[row + num_rows]
                 values.append(kjt_values[begin:end])
                 bucket_lengths.append(kjt_lengths[row : row + num_rows])
-                weights.append(
-                    torch.ones(end - begin, device=device)
-                    if kjt_weights is None
-                    else kjt_weights[begin:end]
-                )
-                counts += [
-                    value_offsets[r + 1] - value_offsets[r]
-                    for r in range(row, row + num_rows)
-                ]
+                num_keys += end - begin
+                if use_weight is not None:
+                    weights.append(
+                        torch.ones(end - begin, device=device)
+                        if kjt_weights is None
+                        else kjt_weights[begin:end]
+                    )
+                if bucket.pooling == "NONE":
+                    counts += [
+                        value_offsets[r + 1] - value_offsets[r]
+                        for r in range(row, row + num_rows)
+                    ]
             keys = torch.cat(values) if len(values) > 1 else values[0]
             feat_lengths = torch.cat(bucket_lengths)
-            num_keys = sum(counts)
             if num_keys == 0:
                 # NVE rejects an empty lookup; every bag is empty, so zeros.
                 if bucket.pooling == "NONE":

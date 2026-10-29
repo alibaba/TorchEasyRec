@@ -751,9 +751,10 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             "g": ([1.0, 3.0], [0.0, 0.0], []),  # all-zero weights pool to zeros
         }
         # a and e share a lookup across two KJTs; only the first is weighted.
-        data = _lookup_batch(
-            bags, weights, [["a", "b", "c", "d", "g"], ["e", "f", "seq", "seq2"]]
-        )
+        first = [["a", "b", "c", "d", "g"], ["e", "f", "seq", "seq2"]]
+        # another layout gets its own plan; unweighted d and weighted g now share
+        # a lookup from different KJTs, the unweighted one first.
+        second = [["e", "f", "seq", "seq2", "d"], ["g", "c", "b", "a"]]
 
         device = torch.device("cuda:0")
         lookup = DistributedEmbeddingLookup(self.export_dir, [device])
@@ -773,8 +774,8 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             axis=1,
         )
         tol = 2e-3 if quant else 1e-5
-        for _ in range(2):
-            out = lookup(data, device)
+        for kjts in (first, first, second):
+            out = lookup(_lookup_batch(bags, weights, kjts), device)
             self.assertEqual(out["deep"].device, device)
             self.assertEqual(out["deep"].dtype, torch.float32)
             np.testing.assert_allclose(
@@ -791,6 +792,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             self.assertEqual(
                 sorted(out), ["deep", "seq", "seq2", "seq2__lengths", "seq__lengths"]
             )
+        self.assertEqual(len(lookup._plans), 2)
 
     @parameterized.expand(
         [
