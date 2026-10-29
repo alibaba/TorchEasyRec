@@ -379,13 +379,6 @@ class DistributedEmbeddingLookup:
                     f"gpu_cache_bytes={gpu_cache_size}."
                 )
 
-        # features looked up together, per (group, pooling).
-        self._buckets: Dict[Tuple[int, str], List[str]] = {}
-        for feat in self._used_feats:
-            meta = self._feat_meta[feat]
-            group_idx, _ = self._table_group[meta["embedding_name"]]
-            self._buckets.setdefault((group_idx, meta["pooling"]), []).append(feat)
-
     @classmethod
     def _fuse_members(
         cls,
@@ -537,10 +530,16 @@ class DistributedEmbeddingLookup:
         if missing:
             raise ValueError(f"sparse inputs of {missing} are not in the batch.")
 
+        # features looked up together, per (group, pooling).
+        bucket_feats: Dict[Tuple[int, str], List[str]] = {}
+        for feat in self._used_feats:
+            meta = self._feat_meta[feat]
+            group_idx, _ = self._table_group[meta["embedding_name"]]
+            bucket_feats.setdefault((group_idx, meta["pooling"]), []).append(feat)
         permute_rows: List[List[int]] = [[] for _ in layout]
         buckets, cols = [], {}
         pooled_cols = 0
-        for (group_idx, pooling), feats in self._buckets.items():
+        for (group_idx, pooling), feats in bucket_feats.items():
             dim = self._groups[group_idx].dim
             feats = sorted(feats, key=lambda f: where[_input_name(f)][0])
             segments = []
