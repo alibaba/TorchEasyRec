@@ -1468,7 +1468,8 @@ def predict(
         debug_level (int, optional): debug level for debug parsed inputs etc.
         dataset_type (str, optional): dataset type, default use the type in pipeline.
         predict_threads (int, optional): predict threads num, default will
-            use num_workers in data_config.
+            use num_workers in data_config, or one per GPU for a distributed
+            embedding export.
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
         edit_config_json (str, optional): edit pipeline config json str.
