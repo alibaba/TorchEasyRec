@@ -35,7 +35,6 @@ from torchrec.optim.clipping import GradientClipping, GradientClippingOptimizer
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
-from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     TARGET_REPEAT_INTERLEAVE_KEY,
@@ -66,7 +65,6 @@ from tzrec.models.model import (
     PredictWrapper,
     ScriptWrapper,
     TrainWrapper,
-    batch_predict_model,
 )
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
@@ -92,7 +90,6 @@ from tzrec.utils import (
     predict_util,
 )
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
-from tzrec.utils.dist_emb_predict_util import DistributedEmbeddingModel
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -1505,7 +1502,6 @@ def predict(
     acc_utils.allow_tf32_for_export(pipeline_config)
 
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
-    is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
     is_dist_emb: bool = acc_utils.is_distributed_embedding_predict(scripted_model_path)
 
@@ -1554,21 +1550,6 @@ def predict(
         quota_name=data_config.odps_data_quota_name,
     )
 
-    # a distributed embedding export is loaded with its sparse embeddings below.
-    model = None
-    if is_aot:
-        model = aot_utils.load_model_aot(scripted_model_path, device=device)
-    else:
-        # disable jit compile， as it compile too slow now.
-        if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
-            os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-        if not is_dist_emb:
-            model = torch.jit.load(
-                os.path.join(scripted_model_path, "scripted_model.pt"),
-                map_location=device,
-            )
-            model.eval()
-
     # forward workers are spread over forward_devices.
     forward_devices = [device]
     if is_dist_emb:
@@ -1590,8 +1571,6 @@ def predict(
 
     prof = None
     if is_profiling:
-        if is_rank_zero and model is not None:
-            logger.info(str(model))
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=10, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
@@ -1633,14 +1612,15 @@ def predict(
     cancel_event: Event = Event()
     input_batches = 0
 
+    # when predicting with a model exported using INPUT_TILE,
+    #  we set the batch size tensor to 1 to disable tiling.
+    tile_batch_size = torch.tensor(1, dtype=torch.int64) if is_input_tile else None
+
     def _forward(
         batch: Batch, device: torch.device = device
     ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
-            # when predicting with a model exported using INPUT_TILE,
-            #  we set the batch size tensor to 1 to disable tiling.
-            batch_size = torch.tensor(1, dtype=torch.int64) if is_input_tile else None
-            predictions = batch_model(batch, batch_size, device)
+            predictions = batch_model(batch, tile_batch_size, device)
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
@@ -1705,14 +1685,13 @@ def predict(
     pipeline_error: Optional[BaseException] = None
     i_step = 0
     try:
-        # built in the guarded scope: a failed load still reaches the commit
+        # loaded in the guarded scope: a failed load still reaches the commit
         # rendezvous below, so other ranks fail fast instead of waiting.
-        if model is None:
-            batch_model = DistributedEmbeddingModel(
-                scripted_model_path, forward_devices
-            )
-        else:
-            batch_model = batch_predict_model(model)
+        batch_model = predict_util.load_predict_model(
+            scripted_model_path,
+            forward_devices,
+            log_model=is_profiling and is_rank_zero,
+        )
         while True:
             try:
                 batch = next(infer_iterator)
