@@ -40,7 +40,6 @@ import itertools
 import json
 import math
 import os
-import re
 import time
 import zipfile
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -183,8 +182,6 @@ class _Plan(NamedTuple):
     group_cols: Dict[str, torch.Tensor]
     # sequence ``<feat>__lengths`` -> (KJT index, key index)
     seq_lengths: Dict[str, Tuple[int, int]]
-    # other dense graph inputs taken from the batch as is.
-    batch_inputs: List[str]
 
 
 class DistributedEmbeddingLookup:
@@ -212,14 +209,6 @@ class DistributedEmbeddingLookup:
             emb_meta: Dict[str, Dict] = json.load(f)
         with open(os.path.join(sparse_dir, "sparse_features.json")) as f:
             self._feat_meta: Dict[str, Dict] = json.load(f)
-        with open(os.path.join(export_dir, "gm_dense.code")) as f:
-            # the dense graph reads its inputs as data['<name>'].
-            self._dense_inputs = list(
-                dict.fromkeys(
-                    m.group(2)
-                    for m in re.finditer(r"\bdata\[(['\"])(.+?)\1\]", f.read())
-                )
-            )
         self._plans: Dict[Tuple[Tuple[Tuple[str, ...], ...], torch.device], _Plan] = {}
 
         used_feats = []
@@ -525,9 +514,7 @@ class DistributedEmbeddingLookup:
             return keys_t
         return _fold_keys(keys_t, group.payload_bits) ^ tag
 
-    def _plan(
-        self, batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
-    ) -> _Plan:
+    def _plan(self, batch: Batch, device: torch.device) -> _Plan:
         """The lookup plan of the batch's KJT key layout on ``device``."""
         layout = tuple(tuple(kjt.keys()) for kjt in batch.sparse_features.values())
         plan = self._plans.get((layout, device))
@@ -577,50 +564,25 @@ class DistributedEmbeddingLookup:
                     cols[f] = range(pooled_cols, pooled_cols + dim)
                     pooled_cols += dim
 
-        group_cols, seq_lengths, produced = {}, {}, set()
+        group_cols, seq_lengths = {}, {}
         for group, feats in self._dense_meta.items():
             if group != "sequence__ec":
                 group_cols[group] = torch.tensor(
                     [c for f in feats for c in cols[f]], device=device
                 )
-                produced.add(group)
                 continue
             for feat in feats:
                 if feat.endswith("__lengths"):
                     seq_lengths[feat] = where[_input_name(feat)]
-                    produced.add(feat)
-                else:
-                    produced.add(_remove_suffix(feat))
-        rest = self._batch_inputs(batch, batch_size)
-        batch_inputs = [k for k in self._dense_inputs if k not in produced]
-        unknown = [k for k in batch_inputs if k not in rest]
-        if unknown:
-            raise ValueError(f"inputs {unknown} of the dense graph are not produced.")
         plan = _Plan(
             permute_rows,
             [torch.tensor(r, dtype=torch.int32, device=device) for r in permute_rows],
             buckets,
             group_cols,
             seq_lengths,
-            batch_inputs,
         )
         self._plans[(layout, device)] = plan
         return plan
-
-    @staticmethod
-    def _batch_inputs(
-        batch: Batch, batch_size: Optional[torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """The batch's model inputs other than its sparse features."""
-        return batch_to_dict(
-            batch.dense_features,
-            {},
-            batch.sequence_mulval_lengths,
-            batch.sequence_dense_features,
-            batch.additional_infos,
-            batch_size,
-            torch.int64,
-        )
 
     def __call__(
         self, batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
@@ -628,7 +590,9 @@ class DistributedEmbeddingLookup:
         """Build the dense graph's inputs of a batch.
 
         Every sparse KJT is copied to ``device`` once and permuted so that each
-        (group, pooling) is one slice; no per-feature tensor is built.
+        (group, pooling) is one slice; no per-feature sparse tensor is built. The
+        dense graph never reads raw sparse inputs: export replaces the sparse
+        lookups with ``dense_meta`` inputs and drops what only fed them.
 
         Args:
             batch: the batch to look up.
@@ -636,11 +600,11 @@ class DistributedEmbeddingLookup:
             device: the device to look up on, one of the constructor devices.
 
         Returns:
-            The inputs the dense graph reads: one concatenated embedding tensor
-            per ``dense_meta`` group, ``<feat>`` / ``<feat>__lengths`` of every
-            sequence feature, and the other inputs taken from the batch.
+            The dense graph's inputs on ``device``: one concatenated embedding
+            tensor per ``dense_meta`` group, ``<feat>`` / ``<feat>__lengths`` of
+            every sequence feature, and the batch's non-sparse inputs.
         """
-        plan = self._plan(batch, batch_size, device)
+        plan = self._plan(batch, device)
         layers = self._layers[device]
         stride = 0
         lengths, permuted = [], []
@@ -745,10 +709,17 @@ class DistributedEmbeddingLookup:
                 out[group] = pooled.index_select(1, cols)
         for feat, (i, j) in plan.seq_lengths.items():
             out[feat] = lengths[i][j].int()
-        if plan.batch_inputs:
-            rest = self._batch_inputs(batch, batch_size)
-            for k in plan.batch_inputs:
-                out[k] = rest[k].to(device, non_blocking=True)
+        rest = batch_to_dict(
+            batch.dense_features,
+            {},
+            batch.sequence_mulval_lengths,
+            batch.sequence_dense_features,
+            batch.additional_infos,
+            batch_size,
+            torch.int64,
+        )
+        for k, v in rest.items():
+            out[k] = v.to(device, non_blocking=True)
         return out
 
 

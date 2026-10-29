@@ -106,7 +106,7 @@ class _DenseSum(torch.nn.Module):
         return {"p": data["deep"].sum(1)}
 
 
-def _write_export(export_dir, tables, features, dense_meta, extra_inputs=()):
+def _write_export(export_dir, tables, features, dense_meta):
     sparse_dir = os.path.join(export_dir, "sparse")
     os.makedirs(sparse_dir)
     static, dynamic = {}, {}
@@ -131,17 +131,6 @@ def _write_export(export_dir, tables, features, dense_meta, extra_inputs=()):
         json.dump(features, f)
     with open(os.path.join(export_dir, "dense_meta.json"), "w") as f:
         json.dump(dense_meta, f)
-    # the dense graph reads its inputs as data['<name>'], as in gm_dense.code.
-    inputs = list(extra_inputs)
-    for group, feats in dense_meta.items():
-        if group != "sequence__ec":
-            inputs.append(group)
-            continue
-        for feat in feats:
-            inputs.append(feat if feat.endswith("__lengths") else feat[: -len("__ec")])
-    with open(os.path.join(export_dir, "gm_dense.code"), "w") as f:
-        f.write("def forward(self, data, device):\n")
-        f.writelines(f"    x{i} = data[{name!r}]\n" for i, name in enumerate(inputs))
 
 
 def _pooled(table, rows, mean, weights=None):
@@ -342,7 +331,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             "sequence__ec": ["seq__ec", "seq__lengths", "seq2__ec", "seq2__lengths"],
             "deep": deep,
         }
-        _write_export(self.export_dir, tables, features, dense_meta, ["batch_size"])
+        _write_export(self.export_dir, tables, features, dense_meta)
 
         bags = {
             "a": ([dyn.keys[0], -1, dyn.keys[3]], [], [_MISS_KEY, dyn.keys[7]]),
@@ -400,6 +389,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
             self.assertEqual(out["seq__lengths"].dtype, torch.int32)
             self.assertEqual(out["seq__lengths"].tolist(), [2, 0, 1])
             self.assertEqual(out["batch_size"].device, device)
+            self.assertNotIn("a.values", out)
 
     @parameterized.expand(
         [
@@ -579,27 +569,6 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         outs = [lookup(data, None, d)["deep"] for d in devices]
         self.assertEqual(outs[1].device, devices[1])
         torch.testing.assert_close(outs[0].cpu(), outs[1].cpu())
-
-    def test_dense_input_not_produced_raises(self) -> None:
-        dyn = _Table("model.ebc.dyn", 10, 8, False, dynamic=True)
-        features = {
-            "a__ebc": {
-                "embedding_name": dyn.name,
-                "pooling": "SUM",
-                "use_weight": False,
-            }
-        }
-        _write_export(
-            self.export_dir,
-            [dyn],
-            features,
-            {"sequence__ec": [], "deep": ["a__ebc"]},
-            ["b.values"],
-        )
-        device = torch.device("cuda:0")
-        lookup = DistributedEmbeddingLookup(self.export_dir, [device])
-        with self.assertRaisesRegex(ValueError, r"\['b.values'\]"):
-            lookup(self._batch({"a": ([dyn.keys[0]],)}, {}), None, device)
 
     def test_model_runs_dense_on_lookup(self) -> None:
         dyn = _Table("model.ebc.dyn", 10, 8, False, dynamic=True)
