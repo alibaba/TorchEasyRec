@@ -165,9 +165,8 @@ class _Bucket(NamedTuple):
     feats: List[str]
     # (KJT index, first row in that KJT's permuted rows, number of rows)
     segments: List[Tuple[int, int, int]]
-    # per-feature member tag and use_weight.
-    tags: List[int]
-    use_weight: List[bool]
+    # every feature is weighted; otherwise unweighted features get weight 1.
+    all_weighted: bool
 
 
 class _PlanTensors(NamedTuple):
@@ -537,7 +536,7 @@ class DistributedEmbeddingLookup:
             group_idx, _ = self._table_group[meta["embedding_name"]]
             bucket_feats.setdefault((group_idx, meta["pooling"]), []).append(feat)
         permute_rows: List[List[int]] = [[] for _ in layout]
-        buckets, cols = [], {}
+        buckets, bucket_tags, bucket_weights, cols = [], [], [], {}
         pooled_cols = 0
         for (group_idx, pooling), feats in bucket_feats.items():
             dim = self._groups[group_idx].dim
@@ -549,13 +548,16 @@ class DistributedEmbeddingLookup:
                 rows = [where[_input_name(f)][1] for f in kjt_feats]
                 segments.append((i, len(permute_rows[i]), len(rows)))
                 permute_rows[i].extend(rows)
-            tags = [
-                self._table_group[self._feat_meta[f]["embedding_name"]][1]
-                for f in feats
-            ]
+            bucket_tags.append(
+                [
+                    self._table_group[self._feat_meta[f]["embedding_name"]][1]
+                    for f in feats
+                ]
+            )
             use_weight = [self._feat_meta[f]["use_weight"] for f in feats]
+            bucket_weights.append(use_weight)
             buckets.append(
-                _Bucket(group_idx, pooling, feats, segments, tags, use_weight)
+                _Bucket(group_idx, pooling, feats, segments, all(use_weight))
             )
             if pooling != "NONE":
                 for f in feats:
@@ -573,10 +575,10 @@ class DistributedEmbeddingLookup:
         tensors = {
             d: _PlanTensors(
                 [torch.tensor(r, dtype=torch.int32, device=d) for r in permute_rows],
-                [torch.tensor(b.tags, device=d) for b in buckets],
+                [torch.tensor(tags, device=d) for tags in bucket_tags],
                 [
-                    torch.tensor(b.use_weight, device=d) if any(b.use_weight) else None
-                    for b in buckets
+                    torch.tensor(weights, device=d) if any(weights) else None
+                    for weights in bucket_weights
                 ],
                 {g: torch.tensor(c, device=d) for g, c in group_cols.items()},
             )
@@ -695,7 +697,7 @@ class DistributedEmbeddingLookup:
             bag_weights = None
             if use_weight is not None:
                 bag_weights = torch.cat(weights) if len(weights) > 1 else weights[0]
-                if not all(bucket.use_weight):
+                if not bucket.all_weighted:
                     weighted = torch.repeat_interleave(
                         use_weight, feat_lengths.sum(1), output_size=num_keys
                     )
