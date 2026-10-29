@@ -13,7 +13,7 @@
 import threading
 from collections import OrderedDict
 from queue import Queue
-from typing import Any, Callable, Dict, Final, Iterable, List, Optional, Tuple, cast
+from typing import Any, Dict, Final, Iterable, List, Optional, Tuple, cast
 
 import torch
 import torch.utils._pytree as pytree
@@ -23,12 +23,11 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollectionInterface,
     EmbeddingCollectionInterface,
 )
-from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
-from tzrec.datasets.utils import Batch, batch_to_dict
+from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.loss.pe_mtl_loss import ParetoEfficientMultiTaskLoss
 from tzrec.modules.utils import BaseModule
@@ -647,168 +646,3 @@ class UnifiedAOTIModelWrapper(nn.Module):
                 [data[k] for k in key_order]
             )
         return pytree.tree_unflatten(flat_outputs, self._out_spec)
-
-
-class _BatchInputModel(nn.Module):
-    """Runs a scripted predict model on Batch features.
-
-    The per-feature dict is built inside TorchScript, so its tensors never become
-    Python objects, whose deallocation would hand the GIL over once per tensor.
-
-    Args:
-        model (nn.Module): scripted model taking ``Batch.to_dict()`` inputs.
-    """
-
-    def __init__(self, model: nn.Module) -> None:
-        super().__init__()
-        self.model = model
-
-    def forward(
-        self,
-        dense_features: Dict[str, KeyedTensor],
-        sparse_features: Dict[str, KeyedJaggedTensor],
-        sequence_mulval_lengths: Dict[str, KeyedJaggedTensor],
-        sequence_dense_features: Dict[str, JaggedTensor],
-        additional_infos: Dict[str, torch.Tensor],
-        batch_size: Optional[torch.Tensor],
-        device: torch.device,
-    ) -> Dict[str, torch.Tensor]:
-        """Predict the model.
-
-        Args:
-            dense_features (dict): Batch.dense_features.
-            sparse_features (dict): Batch.sparse_features.
-            sequence_mulval_lengths (dict): Batch.sequence_mulval_lengths.
-            sequence_dense_features (dict): Batch.sequence_dense_features.
-            additional_infos (dict): Batch.additional_infos.
-            batch_size (Tensor, optional): batch_size input of tiled models.
-            device (torch.device): inference device.
-
-        Return:
-            predictions (dict): a dict of predicted result.
-        """
-        data = batch_to_dict(
-            dense_features,
-            sparse_features,
-            sequence_mulval_lengths,
-            sequence_dense_features,
-            additional_infos,
-            batch_size,
-            torch.int64,
-        )
-        return self.model(data, device)
-
-
-class _BatchSparseModel(nn.Module):
-    """Runs the scripted sparse stage of a two-stage AOT model on Batch features.
-
-    Args:
-        model (nn.Module): scripted sparse model taking ``Batch.to_dict()`` inputs.
-    """
-
-    def __init__(self, model: nn.Module) -> None:
-        super().__init__()
-        self.model = model
-
-    def forward(
-        self,
-        dense_features: Dict[str, KeyedTensor],
-        sparse_features: Dict[str, KeyedJaggedTensor],
-        sequence_mulval_lengths: Dict[str, KeyedJaggedTensor],
-        sequence_dense_features: Dict[str, JaggedTensor],
-        additional_infos: Dict[str, torch.Tensor],
-        batch_size: Optional[torch.Tensor],
-        device: torch.device,
-    ) -> Dict[str, torch.Tensor]:
-        """Run the sparse stage.
-
-        Args:
-            dense_features (dict): Batch.dense_features.
-            sparse_features (dict): Batch.sparse_features.
-            sequence_mulval_lengths (dict): Batch.sequence_mulval_lengths.
-            sequence_dense_features (dict): Batch.sequence_dense_features.
-            additional_infos (dict): Batch.additional_infos.
-            batch_size (Tensor, optional): batch_size input of tiled models.
-            device (torch.device): inference device.
-
-        Return:
-            sparse_out (dict): inputs of the dense stage.
-        """
-        data = batch_to_dict(
-            dense_features,
-            sparse_features,
-            sequence_mulval_lengths,
-            sequence_dense_features,
-            additional_infos,
-            batch_size,
-            torch.int64,
-        )
-        sparse_out, _ = self.model(data, device)
-        return sparse_out
-
-
-def batch_predict_model(
-    model: nn.Module,
-) -> Callable[[Batch, Optional[torch.Tensor], torch.device], Dict[str, torch.Tensor]]:
-    """Wrap a loaded predict model to take a Batch.
-
-    Args:
-        model (nn.Module): a scripted model, CombinedModelWrapper or
-            UnifiedAOTIModelWrapper.
-
-    Return:
-        a callable of (batch, batch_size input of tiled models, device) returning
-        the predictions.
-    """
-    if isinstance(model, torch.jit.ScriptModule):
-        scripted = torch.jit.script(_BatchInputModel(model))
-
-        def _scripted(
-            batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
-        ) -> Dict[str, torch.Tensor]:
-            return scripted(
-                batch.dense_features,
-                batch.sparse_features,
-                batch.sequence_mulval_lengths,
-                batch.sequence_dense_features,
-                batch.additional_infos,
-                batch_size,
-                device,
-            )
-
-        return _scripted
-    if isinstance(model, CombinedModelWrapper):
-        sparse_model = torch.jit.script(_BatchSparseModel(model.sparse_model))
-
-        def _combined(
-            batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
-        ) -> Dict[str, torch.Tensor]:
-            sparse_out = sparse_model(
-                batch.dense_features,
-                batch.sparse_features,
-                batch.sequence_mulval_lengths,
-                batch.sequence_dense_features,
-                batch.additional_infos,
-                batch_size,
-                device,
-            )
-            return model.dense_forward(sparse_out, device)
-
-        return _combined
-
-    # AOTI runs on a flat Python list of per-feature tensors.
-    def _unified(
-        batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
-    ) -> Dict[str, torch.Tensor]:
-        data = batch_to_dict(
-            batch.dense_features,
-            batch.sparse_features,
-            batch.sequence_mulval_lengths,
-            batch.sequence_dense_features,
-            batch.additional_infos,
-            batch_size,
-            torch.int64,
-        )
-        return model(data, device)
-
-    return _unified

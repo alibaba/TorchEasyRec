@@ -35,7 +35,6 @@ from torchrec.optim.clipping import GradientClipping, GradientClippingOptimizer
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
-from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     TARGET_REPEAT_INTERLEAVE_KEY,
@@ -66,7 +65,6 @@ from tzrec.models.model import (
     PredictWrapper,
     ScriptWrapper,
     TrainWrapper,
-    batch_predict_model,
 )
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import EmbeddingGroup
@@ -92,7 +90,6 @@ from tzrec.utils import (
     predict_util,
 )
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
-from tzrec.utils.dist_emb_predict_util import DistributedEmbeddingLookup
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -1471,7 +1468,8 @@ def predict(
         debug_level (int, optional): debug level for debug parsed inputs etc.
         dataset_type (str, optional): dataset type, default use the type in pipeline.
         predict_threads (int, optional): predict threads num, default will
-            use num_workers in data_config.
+            use num_workers in data_config, or one per GPU for a distributed
+            embedding export.
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
         edit_config_json (str, optional): edit pipeline config json str.
@@ -1505,7 +1503,6 @@ def predict(
     acc_utils.allow_tf32_for_export(pipeline_config)
 
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
-    is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
     is_dist_emb: bool = acc_utils.is_distributed_embedding_predict(scripted_model_path)
 
@@ -1554,22 +1551,8 @@ def predict(
         quota_name=data_config.odps_data_quota_name,
     )
 
-    if is_aot:
-        model = aot_utils.load_model_aot(scripted_model_path, device=device)
-    else:
-        # disable jit compile， as it compile too slow now.
-        if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
-            os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-        model = torch.jit.load(
-            os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
-        )
-        model.eval()
-
-    # forward workers are spread over forward_devices, each with its own model.
+    # forward workers are spread over forward_devices.
     forward_devices = [device]
-    models = {device: model}
-    sparse_lookup = None
-    batch_model = batch_predict_model(model)
     if is_dist_emb:
         if int(os.environ.get("LOCAL_WORLD_SIZE", 1)) == 1:
             # one process per node: the local GPUs share one host copy of the tables.
@@ -1589,8 +1572,6 @@ def predict(
 
     prof = None
     if is_profiling:
-        if is_rank_zero:
-            logger.info(str(model))
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=10, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
@@ -1603,7 +1584,27 @@ def predict(
         prof.start()
 
     if predict_threads is None:
-        predict_threads = max(data_config.num_workers, len(forward_devices))
+        # with a distributed embedding, each lookup stream holds its own NVE buffers.
+        predict_threads = (
+            len(forward_devices)
+            if is_dist_emb
+            else max(data_config.num_workers, len(forward_devices))
+        )
+    elif is_dist_emb and predict_threads > len(forward_devices):
+        logger.warning(
+            f"predict_threads={predict_threads} runs more than one lookup stream per "
+            "GPU; each holds its own NVE lookup buffers outside the GPU cache budget, "
+            "set a lower DIST_EMB_GPU_CACHE_RATIO if GPU memory runs out."
+        )
+    # NVE keeps one lookup context per CUDA stream, so each worker gets its own.
+    worker_streams = (
+        [
+            torch.cuda.Stream(forward_devices[i % len(forward_devices)])
+            for i in range(predict_threads)
+        ]
+        if is_dist_emb
+        else []
+    )
     data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
     pred_queue: Queue[Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]] = (
         Queue(maxsize=predict_threads * 2)
@@ -1612,22 +1613,15 @@ def predict(
     cancel_event: Event = Event()
     input_batches = 0
 
+    # when predicting with a model exported using INPUT_TILE,
+    #  we set the batch size tensor to 1 to disable tiling.
+    tile_batch_size = torch.tensor(1, dtype=torch.int64) if is_input_tile else None
+
     def _forward(
         batch: Batch, device: torch.device = device
     ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
-            # when predicting with a model exported using INPUT_TILE,
-            #  we set the batch size tensor to 1 to disable tiling.
-            batch_size = torch.tensor(1, dtype=torch.int64) if is_input_tile else None
-            if sparse_lookup is None:
-                predictions = batch_model(batch, batch_size, device)
-            else:
-                parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
-                if batch_size is not None:
-                    parsed_inputs["batch_size"] = batch_size
-                predictions = models[device](
-                    sparse_lookup(parsed_inputs, device), device
-                )
+            predictions = batch_model(batch, tile_batch_size, device)
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
@@ -1658,10 +1652,9 @@ def predict(
     def _forward_loop(worker_id: int) -> None:
         stage = "forward"
         worker_device = forward_devices[worker_id % len(forward_devices)]
-        # NVE keeps one lookup context per CUDA stream, so give each worker its own.
         stream_ctx = (
-            torch.cuda.stream(torch.cuda.Stream(worker_device))
-            if sparse_lookup is not None
+            torch.cuda.stream(worker_streams[worker_id])
+            if worker_streams
             else nullcontext()
         )
         try:
@@ -1693,24 +1686,24 @@ def predict(
     pipeline_error: Optional[BaseException] = None
     i_step = 0
     try:
-        if is_dist_emb:
-            # loaded in the guarded scope: a failed load still reaches the commit
-            # rendezvous below, so other ranks fail fast instead of waiting.
-            for d in forward_devices:
-                if d not in models:
-                    models[d] = torch.jit.load(
-                        os.path.join(scripted_model_path, "scripted_model.pt"),
-                        map_location=d,
-                    )
-                    models[d].eval()
-            sparse_lookup = DistributedEmbeddingLookup(
-                scripted_model_path, forward_devices
-            )
+        # loaded in the guarded scope: a failed load still reaches the commit
+        # rendezvous below, so other ranks fail fast instead of waiting.
+        batch_model = predict_util.load_predict_model(
+            scripted_model_path,
+            forward_devices,
+            log_model=is_profiling and is_rank_zero,
+        )
         while True:
             try:
                 batch = next(infer_iterator)
                 if i_step == 0:
-                    predictions, reserves = _forward(batch)
+                    # on worker 0's stream, so it adds no lookup context of its own.
+                    with (
+                        torch.cuda.stream(worker_streams[0])
+                        if worker_streams
+                        else nullcontext()
+                    ):
+                        predictions, reserves = _forward(batch)
                     input_batches += 1
                     if output_cols is None:
                         output_cols = sorted(predictions.keys())
