@@ -22,6 +22,7 @@ import inspect
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 import torchmetrics
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -58,6 +59,51 @@ _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
     "get_input_embeddings",
     "resize_token_embeddings",
 )
+
+
+@torch.fx.wrap
+def _fx_wrapped_genrec_loss(
+    model: "BaseGenRecModel", predictions: Dict[str, torch.Tensor]
+) -> torch.Tensor:
+    """Keep data-dependent parent normalization outside symbolic tracing.
+
+    Args:
+        model: model owning the LM loss and ignore index.
+        predictions: single-response or independent multi-target predictions.
+
+    Returns:
+        Scalar cross entropy, averaging targets within each parent first.
+    """
+    if "target_counts" not in predictions or predictions["target_counts"].numel() == 0:
+        return model.lm.loss_function(
+            logits=predictions["logits"],
+            labels=predictions["labels"],
+            vocab_size=model.lm.config.vocab_size,
+            ignore_index=model._ignore_index,
+        )
+    labels = predictions["labels"]
+    if labels.shape[-1] != model._prompt.sid_space.num_levels:
+        labels = nn.functional.pad(labels, (0, 1), value=model._ignore_index)[..., 1:]
+    target_loss = (
+        nn.functional.cross_entropy(
+            predictions["logits"].float().reshape(-1, model.lm.config.vocab_size),
+            labels.reshape(-1),
+            ignore_index=model._ignore_index,
+            reduction="none",
+        )
+        .view_as(labels)
+        .sum(dim=-1)
+    ) / labels.ne(model._ignore_index).sum(dim=-1).clamp(min=1)
+    counts = predictions["target_counts"]
+    parent_loss = target_loss.new_zeros(counts.shape).index_add(
+        0, predictions["target_parents"], target_loss
+    ) / counts.clamp(min=1)
+    normalizer = (counts > 0).sum().to(target_loss.dtype)
+    world_size = 1
+    if dist.is_initialized():
+        dist.all_reduce(normalizer)
+        world_size = dist.get_world_size()
+    return parent_loss.sum() * world_size / normalizer
 
 
 class BaseGenRecModel(BaseModel):
@@ -254,23 +300,16 @@ class BaseGenRecModel(BaseModel):
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        """Score the response window with the backbone's own causal-LM loss.
+        """Score single responses or average independent SID losses per parent.
 
         Args:
-            predictions: the response-window logits and labels.
+            predictions: logits, labels and optional multi-target parent metadata.
             batch: the batch, unused.
 
         Returns:
             The named loss.
         """
-        return {
-            "ce_loss": self.lm.loss_function(
-                logits=predictions["logits"],
-                labels=predictions["labels"],
-                vocab_size=self.lm.config.vocab_size,
-                ignore_index=self._ignore_index,
-            )
-        }
+        return {"ce_loss": _fx_wrapped_genrec_loss(self, predictions)}
 
     def init_metric(self) -> None:
         """Register a mean-CE metric for the eval loop."""
