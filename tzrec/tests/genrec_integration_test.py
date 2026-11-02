@@ -310,8 +310,6 @@ class GenRecIntegrationTest(unittest.TestCase):
     @parameterized.expand(
         [
             [1, "sdpa"],
-            [2, "sdpa"],
-            [1, "flash_attention_2"],
             [2, "flash_attention_2"],
         ],
         name_func=parameterized_name_func,

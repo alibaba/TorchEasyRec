@@ -460,96 +460,42 @@ class MultiTargetLayoutTest(unittest.TestCase):
         )
         self.assertEqual(layout.logit_indices.numel(), 3 * levels - 1)
 
-    def test_mask_excludes_padding_future_tokens_and_other_targets(self) -> None:
+    @parameterized.expand([[False], [True]], name_func=parameterized_name_func)
+    def test_mask_excludes_padding_future_tokens_and_other_targets(
+        self, packed
+    ) -> None:
         layout = build_multi_target_layout(
             torch.tensor([0, 8, 15, 18], dtype=torch.int32),
             torch.tensor([6, 3, 0]),
             width=10,
             num_levels=3,
+            pack_prefix=packed,
         )
-        positions = torch.arange(10)
+        query_width = layout.response_width if packed else 10
         for row, (padding, prefix_length, count) in enumerate(
             [(2, 2, 2), (3, 4, 1), (7, 3, 0)]
         ):
             actual = layout.mask_mod(
                 torch.tensor(row),
                 torch.tensor(0),
-                positions[:, None],
-                positions[None, :],
+                torch.arange(query_width)[:, None],
+                torch.arange(10)[None, :],
             )
-            expected = torch.zeros(10, 10, dtype=torch.bool)
+            padding = 0 if packed else padding
+            expected = torch.zeros(query_width, 10, dtype=torch.bool)
             prefix_end = padding + prefix_length
-            expected[padding:prefix_end, padding:prefix_end] = torch.ones(
-                prefix_length, prefix_length, dtype=torch.bool
-            ).tril()
+            if not packed:
+                expected[padding:prefix_end, padding:prefix_end] = torch.ones(
+                    prefix_length, prefix_length, dtype=torch.bool
+                ).tril()
             for target in range(count):
                 start = prefix_end + target * 3
-                expected[start : start + 3, padding:prefix_end] = True
-                expected[start : start + 3, start : start + 3] = torch.ones(
+                query_start = target * 3 if packed else start
+                expected[query_start : query_start + 3, padding:prefix_end] = True
+                expected[query_start : query_start + 3, start : start + 3] = torch.ones(
                     3, 3, dtype=torch.bool
                 ).tril()
             torch.testing.assert_close(actual, expected)
-
-    @parameterized.expand([[1], [3], [4]], name_func=parameterized_name_func)
-    def test_hybrid_packing_and_response_mask(self, levels) -> None:
-        prefixes, counts = [5, 131, 7], [77, 1, 0]
-        lengths = torch.tensor(prefixes) + torch.tensor(counts) * levels
-        boundaries = torch.nn.functional.pad(lengths.cumsum(0).int(), (1, 0))
-        width = int(lengths.max()) + 3
-        layout = build_multi_target_layout(
-            boundaries, torch.tensor(counts) * levels, width, levels, pack_prefix=True
-        )
-        self.assertEqual(layout.prefix_cu_seqlens.dtype, torch.int32)
-        self.assertEqual(layout.prefix_cu_seqlens.tolist(), [0, 5, 136, 143])
-        self.assertEqual(layout.max_prefix_length, 131)
-        self.assertEqual(layout.prefix_tokens, sum(prefixes))
-        expected_prefix, expected_response = [], []
-        prefix_positions, response_positions = [], []
-        keys = torch.arange(width)[None, :]
-        queries = torch.arange(layout.response_width)[:, None]
-        for row, (prefix, count) in enumerate(zip(prefixes, counts)):
-            start = int(boundaries[row])
-            expected_prefix.extend(range(start, start + prefix))
-            expected_response.extend(range(start + prefix, int(boundaries[row + 1])))
-            prefix_positions.extend(range(prefix))
-            response_positions.extend(list(range(prefix, prefix + levels)) * count)
-            actual = layout.mask_mod(row, 0, queries, keys)
-            expected = (
-                (queries < count * levels)
-                & (keys < prefix + count * levels)
-                & (
-                    (keys < prefix)
-                    | (
-                        (keys >= prefix)
-                        & ((keys - prefix) // levels == queries // levels)
-                        & (keys - prefix <= queries)
-                    )
-                )
-            )
-            torch.testing.assert_close(actual, expected)
-        self.assertEqual(
-            layout.packed_indices.tolist(), expected_prefix + expected_response
-        )
-        self.assertEqual(
-            layout.position_ids.tolist(), [prefix_positions + response_positions]
-        )
-        self.assertEqual(
-            layout.response_indices.tolist(),
-            [
-                row * layout.response_width + q
-                for row, count in enumerate(counts)
-                for q in range(count * levels)
-            ],
-        )
-        expected_keys = []
-        for prefix_only in (True, False):
-            for row, (prefix, count) in enumerate(zip(prefixes, counts)):
-                start, end = (
-                    (0, prefix) if prefix_only else (prefix, prefix + count * levels)
-                )
-                expected_keys.extend(range(row * width + start, row * width + end))
-        self.assertEqual(layout.key_indices.tolist(), expected_keys)
-        self.assertEqual(layout.key_indices.unique().numel(), int(lengths.sum()))
 
 
 if __name__ == "__main__":

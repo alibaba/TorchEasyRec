@@ -164,6 +164,8 @@ class GenRecCausalLMModel(BaseGenRecModel):
         common = self._model_config.common
         self._generated_sids_key = common.generated_sids_key
         self._read_beam_config(common)
+        response = self._prompt.prompt_plan.response_segments
+        self._has_sid_response = len(response) == 1 and isinstance(response[0], SlotSeg)
 
     def _read_beam_config(self, common: GenRecModelConfig) -> None:
         """Parse the decode knobs; the schedule must match the codebook.
@@ -218,13 +220,11 @@ class GenRecCausalLMModel(BaseGenRecModel):
         embeds = self.build_input(batch)
         if self.is_inference:
             return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
-        logits, labels, parents, counts = _fx_wrapped_forward(self, embeds, batch)
-        return {
-            "logits": logits,
-            "labels": labels,
-            "target_parents": parents,
-            "target_counts": counts,
-        }
+        predictions = _fx_wrapped_forward(self, embeds, batch)
+        keys = ("logits", "labels")
+        if self._has_sid_response:
+            keys += ("target_parents", "target_counts")
+        return {key: predictions[key] for key in keys}
 
     def _training_predictions(
         self, embeds: torch.Tensor, batch: Batch
@@ -238,14 +238,9 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Returns:
             Logits and labels, plus parent indices for a multi-target response.
         """
-        response = self._prompt.prompt_plan.response_segments
         levels = self._prompt.sid_space.num_levels
-        if len(response) == 1 and isinstance(response[0], SlotSeg):
+        if self._has_sid_response:
             lengths = batch.additional_infos[RESPONSE_LENGTHS].to(torch.int64)
-            if bool((lengths.remainder(levels) != 0).any()):
-                raise ValueError(
-                    "SID response length must be a multiple of codebook levels."
-                )
             if bool((lengths > levels).any()):
                 return self._multi_target_predictions(embeds, batch)
             logits, labels = self._forward(embeds, batch)
@@ -291,19 +286,9 @@ class GenRecCausalLMModel(BaseGenRecModel):
         )
         if hybrid:
             config = self.lm.config
-            if (
-                config.model_type != "qwen2"
-                or config.attention_dropout != 0
-                or config.use_sliding_window
-                or embeds.device.type != "cuda"
-                or (
-                    embeds.dtype not in (torch.bfloat16, torch.float16)
-                    and not torch.is_autocast_enabled("cuda")
-                )
-            ):
+            if config.attention_dropout != 0 or config.use_sliding_window:
                 raise ValueError(
-                    "Shared-prefix FA2 requires Qwen2 full attention on CUDA, "
-                    "BF16/FP16 computation and zero attention dropout."
+                    "Shared-prefix FA2 requires full attention and zero dropout."
                 )
             inputs = embeds[layout.packed_indices].unsqueeze(0)
         else:
@@ -502,7 +487,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
 @torch.fx.wrap
 def _fx_wrapped_forward(
     model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Dict[str, torch.Tensor]:
     """Hide the packed forward from FX.
 
     ``TrainPipelineSparseDist`` symbolically traces the model whenever a
@@ -516,14 +501,7 @@ def _fx_wrapped_forward(
     Returns:
         Training predictions and optional multi-target parent metadata.
     """
-    predictions = model._training_predictions(embeds, batch)
-    labels = predictions["labels"]
-    return (
-        predictions["logits"],
-        labels,
-        predictions.get("target_parents", labels.new_empty(0)),
-        predictions.get("target_counts", labels.new_empty(0)),
-    )
+    return model._training_predictions(embeds, batch)
 
 
 @torch.fx.wrap

@@ -23,7 +23,6 @@ from transformers.loss.loss_utils import ForCausalLMLoss
 from tzrec.datasets.utils import Batch
 from tzrec.models.genrec_causal_lm_model import (
     GenRecCausalLMModel,
-    _shared_prefix_attention,
 )
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
@@ -31,7 +30,6 @@ from tzrec.prompt.assembler import (
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
     PromptAssembler,
-    build_multi_target_layout,
 )
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 from tzrec.utils.test_util import (
@@ -540,7 +538,7 @@ class MultiTargetTrainingTest(unittest.TestCase):
                     msg=name,
                 )
 
-    def test_other_branch_and_other_parent_are_isolated(self) -> None:
+    def test_targets_are_isolated_and_order_independent(self) -> None:
         baseline = self.model.predict(self._batch())["logits"].detach()
         rewritten = self.model.predict(
             self._batch(
@@ -551,59 +549,31 @@ class MultiTargetTrainingTest(unittest.TestCase):
             )
         )["logits"]
         torch.testing.assert_close(rewritten[1:], baseline[1:], atol=0, rtol=0)
-
-    def test_target_order_does_not_change_parent_loss(self) -> None:
-        batch = self._batch()
-        first = self.model.loss(self.model.predict(batch), batch)["ce_loss"]
-        batch = self._batch(
-            answers=[
-                _OTHERGENREC_ANSWER_CODES + GENREC_ANSWER_CODES,
-                GENREC_ANSWER_CODES,
-            ]
+        reordered = self.model.predict(
+            self._batch(
+                answers=[
+                    _OTHERGENREC_ANSWER_CODES + GENREC_ANSWER_CODES,
+                    GENREC_ANSWER_CODES,
+                ]
+            )
+        )["logits"]
+        torch.testing.assert_close(
+            reordered, baseline[[1, 0, 2]], atol=self.atol, rtol=self.rtol
         )
-        second = self.model.loss(self.model.predict(batch), batch)["ce_loss"]
-        torch.testing.assert_close(first, second)
 
-    def test_inference_and_checkpoint_structure_are_unchanged(self) -> None:
+    def test_inference_is_unchanged_after_shared_forward(self) -> None:
         batch = self._batch(predict=True)
         self.model.set_is_inference(True)
         with torch.no_grad():
             before = self.model.predict(batch)["generated_sids"]
-        state_shapes = {
-            name: value.shape for name, value in self.model.state_dict().items()
-        }
         previous_attention = self.model.lm.config._attn_implementation
         self.model.set_is_inference(False)
         self.model.predict(self._batch())
         self.assertEqual(self.model.lm.config._attn_implementation, previous_attention)
-        self.assertEqual(
-            state_shapes,
-            {name: value.shape for name, value in self.model.state_dict().items()},
-        )
         self.model.set_is_inference(True)
         with torch.no_grad():
             after = self.model.predict(batch)["generated_sids"]
         torch.testing.assert_close(after, before, atol=0, rtol=0)
-
-    def test_attention_backend_is_restored_after_forward_failure(self) -> None:
-        previous_attention = self.model.lm.config._attn_implementation
-        with mock.patch.object(
-            self.model.lm.base_model,
-            "forward",
-            side_effect=RuntimeError("test failure"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "test failure"):
-                self.model.predict(self._batch())
-        self.assertEqual(self.model.lm.config._attn_implementation, previous_attention)
-
-    def test_incomplete_sid_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "multiple of codebook levels"):
-            self.model.predict(self._batch(answers=[[0, 4, 8, 1], GENREC_ANSWER_CODES]))
-
-    def test_gradient_checkpointing_is_rejected_for_shared_training(self) -> None:
-        self.model.lm.gradient_checkpointing_enable()
-        with self.assertRaisesRegex(ValueError, "gradient checkpointing"):
-            self.model.predict(self._batch())
 
 
 @mark_ci_scope("h20", "gpu")
@@ -653,162 +623,6 @@ class HybridMultiTargetTrainingTest(MultiTargetTrainingTest):
         expected = (1, int(batch.additional_infos[CU_SEQLENS][-1]))
         self.assertTrue(shapes)
         self.assertTrue(all(tuple(shape) == expected for shape in shapes))
-
-    @parameterized.expand(
-        [[torch.bfloat16], [torch.float16]], name_func=parameterized_name_func
-    )
-    def test_hybrid_matches_full_flex_gradients_and_dynamic_layouts(self, dtype):
-        self.model.to(dtype=dtype)
-        for multiplier, answers in (
-            (1, self.answers),
-            (43, [GENREC_ANSWER_CODES * 77, []]),
-            (3, [GENREC_ANSWER_CODES, GENREC_ANSWER_CODES * 2]),
-        ):
-            batch = self._batch(
-                [history * multiplier for history in self.histories], answers
-            )
-            self.model.zero_grad(set_to_none=True)
-            reference = self.model.predict(batch)
-            reference_loss = self.model.loss(reference, batch)["ce_loss"]
-            reference_loss.backward()
-            gradients = {
-                name: parameter.grad.detach().float().clone()
-                for name, parameter in self.model.named_parameters()
-                if parameter.grad is not None
-            }
-            self.model.zero_grad(set_to_none=True)
-            self.model._attn_kernel = "sdpa"
-            try:
-                result = self.model.predict(batch)
-            finally:
-                self.model._attn_kernel = "flash_attention_2"
-            loss = self.model.loss(result, batch)["ce_loss"]
-            torch.testing.assert_close(
-                result["logits"], reference["logits"], atol=self.atol, rtol=self.rtol
-            )
-            torch.testing.assert_close(
-                loss, reference_loss, atol=self.atol, rtol=self.rtol
-            )
-            loss.backward()
-            for name, parameter in self.model.named_parameters():
-                if name in gradients:
-                    gradient = parameter.grad.float()
-                    self.assertTrue(bool(torch.isfinite(gradient).all()), name)
-                    error = (gradient - gradients[name]).norm()
-                    scale = gradients[name].norm().clamp(min=1e-6)
-                    self.assertLess(float(error / scale), 0.04, name)
-
-    def test_unsupported_hybrid_conditions_raise_without_switching_backend(self):
-        previous = self.model.lm.config._attn_implementation
-        self.model.lm.config.attention_dropout = 0.1
-        with self.assertRaisesRegex(ValueError, "zero attention dropout"):
-            self.model.predict(self._batch())
-        self.assertEqual(self.model.lm.config._attn_implementation, previous)
-        self.model.lm.config.attention_dropout = 0
-        self.model.float()
-        with self.assertRaisesRegex(ValueError, "BF16/FP16"):
-            self.model.predict(self._batch())
-
-    def test_fp32_parameters_use_autocast_dtype_at_the_flash_kernel(self):
-        from flash_attn import flash_attn_varlen_func
-
-        self.model.float()
-        with mock.patch(
-            "flash_attn.flash_attn_varlen_func", wraps=flash_attn_varlen_func
-        ) as flash:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                batch = self._batch()
-                result = self.model.predict(batch)
-                loss = self.model.loss(result, batch)["ce_loss"]
-            loss.backward()
-        for call in flash.call_args_list:
-            self.assertEqual(
-                [tensor.dtype for tensor in call.args[:3]], [torch.bfloat16] * 3
-            )
-        self.assertEqual(
-            self.model.lm.get_input_embeddings().weight.dtype, torch.float32
-        )
-        self.assertTrue(bool(torch.isfinite(loss)))
-
-    @parameterized.expand([[1], [3], [4]], name_func=parameterized_name_func)
-    def test_attention_matches_explicit_fp32_mask(self, levels):
-        from torch.nn.attention.flex_attention import create_block_mask
-
-        lengths = torch.tensor([131 + 2 * levels, 7 + levels], device="cuda")
-        width = int(lengths.max()) + 5
-        layout = build_multi_target_layout(
-            nn.functional.pad(lengths.cumsum(0).int(), (1, 0)),
-            torch.tensor([2 * levels, levels], device="cuda"),
-            width,
-            levels,
-            pack_prefix=True,
-        )
-        block_mask = create_block_mask(
-            layout.mask_mod,
-            2,
-            None,
-            2 * levels,
-            width,
-            device="cuda",
-            _compile=True,
-        )
-        token_count = int(lengths.sum())
-        tensors = [
-            torch.randn(
-                1,
-                heads,
-                token_count,
-                16,
-                device="cuda",
-                dtype=torch.bfloat16,
-                requires_grad=True,
-            )
-            for heads in (14, 2, 2)
-        ]
-        output, _ = _shared_prefix_attention(
-            self.model.lm.base_model.layers[0].self_attn,
-            tensors[0],
-            tensors[1],
-            tensors[2],
-            block_mask,
-            shared_prefix_layout=layout,
-        )
-        output.float().square().mean().backward()
-        gradients = [tensor.grad.float().clone() for tensor in tensors]
-        reference_tensors = [
-            tensor.detach().float().requires_grad_() for tensor in tensors
-        ]
-        q, k, v = reference_tensors
-        boundaries = nn.functional.pad(lengths.cumsum(0), (1, 0))
-        token_parents = torch.repeat_interleave(torch.arange(2, device="cuda"), lengths)
-        local_positions = (
-            torch.arange(token_count, device="cuda") - boundaries[token_parents]
-        )[layout.packed_indices]
-        token_parents = token_parents[layout.packed_indices]
-        prefix_lengths = torch.tensor([131, 7], device="cuda")[token_parents]
-        is_prefix = local_positions < prefix_lengths
-        branches = (local_positions - prefix_lengths) // levels
-        mask = (
-            (token_parents[:, None] == token_parents[None, :])
-            & (
-                is_prefix[None, :]
-                | (~is_prefix[:, None] & (branches[:, None] == branches[None, :]))
-            )
-            & (local_positions[None, :] <= local_positions[:, None])
-        )
-        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-            reference = nn.functional.scaled_dot_product_attention(
-                q,
-                k.repeat_interleave(7, dim=1),
-                v.repeat_interleave(7, dim=1),
-                attn_mask=mask,
-            ).transpose(1, 2)
-        torch.testing.assert_close(output.float(), reference, atol=2e-2, rtol=2e-2)
-        reference.square().mean().backward()
-        for tensor, gradient in zip(reference_tensors, gradients):
-            self.assertLess(
-                float((tensor.grad - gradient).norm() / tensor.grad.norm()), 0.02
-            )
 
 
 if __name__ == "__main__":

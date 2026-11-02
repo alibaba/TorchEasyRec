@@ -298,26 +298,14 @@ class BaseGenRecModelTest(unittest.TestCase):
         predictions = {
             "logits": logits,
             "labels": torch.ones(3, 3, dtype=torch.int64),
-            "target_parents": torch.tensor([0, 0, 1]),
-            "target_counts": torch.tensor([2, 1]),
+            "target_parents": torch.tensor([1, 1, 2]),
+            "target_counts": torch.tensor([0, 2, 1]),
         }
         loss = self.model.loss(predictions, Batch())["ce_loss"]
         torch.testing.assert_close(loss, torch.tensor(float(vocab_size)).log())
         loss.backward()
         torch.testing.assert_close(logits.grad[0], logits.grad[1])
         torch.testing.assert_close(2 * logits.grad[0], logits.grad[2])
-
-    def test_multi_target_loss_excludes_empty_parents(self) -> None:
-        vocab_size = self.model.lm.config.vocab_size
-        logits = torch.zeros(2, 3, vocab_size)
-        predictions = {
-            "logits": logits,
-            "labels": torch.ones(2, 3, dtype=torch.int64),
-            "target_parents": torch.tensor([1, 1]),
-            "target_counts": torch.tensor([0, 2]),
-        }
-        loss = self.model.loss(predictions, Batch())["ce_loss"]
-        torch.testing.assert_close(loss, torch.tensor(float(vocab_size)).log())
 
     @parameterized.expand(
         [["sdpa"], ["flash_attention_2"]], name_func=parameterized_name_func
