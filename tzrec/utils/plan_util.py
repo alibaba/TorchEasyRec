@@ -473,6 +473,7 @@ class DynamicProgrammingProposer(Proposer):
             self._sharding_options_by_fqn[fqn].append(sharding_option)
 
     def _reset(self) -> None:
+        self._inited = False
         self._sharding_options_by_fqn = OrderedDict()
         self._proposal_list = []
         self._current_proposal = -1
@@ -986,7 +987,6 @@ def _pin_rocksdb_cache_ratio(sharding_options: List[ShardingOption]) -> None:
         o.dynamicemb_options.caching = True  # pyre-ignore [16]
 
 
-_MAX_PLACEMENT_RETRIES = 16
 # A table whose built-in footprint is below this share of the memory deficit
 # is not worth an extra storage group.
 _MIN_SPILL_SHARE = 0.01
@@ -1317,7 +1317,7 @@ class PlacementPlanner(EmbeddingShardingPlanner):
         """Plan with the RocksDB placement decided first."""
         enumerator = cast(EmbeddingEnumerator, self._enumerator)
         placement = enumerator.placement
-        for _ in range(_MAX_PLACEMENT_RETRIES + 1):
+        while True:
             if placement is not None:
                 enumerator.placement = None
                 options = enumerator.enumerate(module, sharders)
@@ -1328,7 +1328,6 @@ class PlacementPlanner(EmbeddingShardingPlanner):
             except PlannerError:
                 if placement is None or not placement.spill_more():
                     raise
-        raise PlannerError("no sharding plan after moving tables to RocksDB")
 
 
 class EmbeddingEnumerator(_EmbeddingEnumerator):

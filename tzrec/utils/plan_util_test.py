@@ -22,7 +22,10 @@ from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
-from torchrec.distributed.planner.proposers import GridSearchProposer
+from torchrec.distributed.planner.proposers import GridSearchProposer, UniformProposer
+from torchrec.distributed.planner.storage_reservations import (
+    HeuristicalStorageReservation,
+)
 from torchrec.distributed.planner.types import PlannerError, Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
 from torchrec.distributed.types import ShardingType
@@ -361,6 +364,22 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         # Best plan must be the CACHING option (perf=10).
         best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
         self.assertEqual(best[0].total_perf, 10.0)
+
+    def test_reload_runs_the_dp_again(self):
+        topology = _make_topology(
+            num_devices=1, hbm_per_device=2000, ddr_per_device=2000
+        )
+        proposer = DynamicProgrammingProposer()
+        proposer.load([_FakeShardingOption("table_a", hbm=100, ddr=0, perf=1.0)])
+        proposer.propose()
+        proposer.feedback(partitionable=False, storage_constraint=topology)
+
+        fits = _FakeShardingOption("table_a", hbm=200, ddr=0, perf=2.0)
+        oversized = _FakeShardingOption("table_a", hbm=100, ddr=9000, perf=3.0)
+        proposer.load([oversized, fits])
+        proposer.propose()
+        proposer.feedback(partitionable=False, storage_constraint=topology)
+        self.assertEqual(proposer.propose(), [fits])
 
     def test_caching_rejected_when_ddr_is_tight(self):
         # Host budget is only 950 — CACHING (ddr=1000) cannot fit; HYBRID can.
@@ -1025,6 +1044,74 @@ class RocksDBPlacementTest(unittest.TestCase):
         self.assertTrue(p.spill_more())
         _, rocksdb_after, _ = self._place_again(p, tables)
         self.assertEqual(len(rocksdb_after), 1)
+
+    def test_failed_plan_is_retried_by_the_dp_proposer(self):
+        # Host memory covers every table, but their metadata and smallest
+        # cache exceed the GPU: only moving a table and planning again fits.
+        plan = self._plan({n: self.BIG for n in "abc"}, hbm_gib=2, ddr_gib=64)
+        kinds = [p.compute_kernel for m in plan.plan.values() for p in m.values()]
+        self.assertEqual(kinds, [EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value] * 3)
+        self.assertEqual(
+            sum(
+                rocksdb_util.is_rocksdb_options(p.dynamicemb_options)
+                for m in plan.plan.values()
+                for p in m.values()
+            ),
+            1,
+        )
+
+    def test_exhausted_plan_reports_the_planner_error(self):
+        with self.assertRaisesRegex(PlannerError, "insufficient storage"):
+            self._plan({n: self.BIG for n in "abc"}, hbm_gib=0.01, ddr_gib=64)
+
+    def _plan(self, tables, hbm_gib, ddr_gib):
+        from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
+
+        rocksdb_util.set_rocksdb_config(
+            train_pb2.RocksDBConfig(
+                local_path="/unused",
+                gpu_cache_value_bytes_per_rank=GIB // 16,
+                placement=train_pb2.DynamicEmbPlacement.Value("AUTO"),
+                disk_budget_bytes=GIB << 10,
+                block_cache_bytes_per_rank=GIB,
+                write_buffer_bytes_per_rank=GIB // 4,
+                staging_buffer_bytes_per_rank=GIB // 16,
+            )
+        )
+        configs, constraints = [], {}
+        for name, (rows, dim, fields) in tables.items():
+            cfg = feature_pb2.DynamicEmbedding(max_capacity=rows, **fields)
+            config = EmbeddingBagConfig(
+                num_embeddings=rows,
+                embedding_dim=dim,
+                name=name,
+                feature_names=[f"f_{name}"],
+            )
+            configs.append(config)
+            constraints[f"sparse.ebc.{name}"] = build_dynamicemb_constraints(
+                cfg, config
+            )
+        model = TestSparseNN(tables=configs, sparse_device=torch.device("meta"))
+        topology = Topology(
+            world_size=1,
+            compute_device="cuda",
+            hbm_cap=int(hbm_gib * GIB),
+            ddr_cap=int(ddr_gib * GIB),
+        )
+        enumerator = plan_util.EmbeddingEnumerator(
+            topology=topology,
+            batch_size=128,
+            fqn_constraints=constraints,
+            placement=plan_util.RocksDBPlacement([_obs()], 0.15),
+        )
+        planner = plan_util.PlacementPlanner(
+            topology=topology,
+            batch_size=128,
+            enumerator=enumerator,
+            storage_reservation=HeuristicalStorageReservation(percentage=0.15),
+            proposer=[DynamicProgrammingProposer(), UniformProposer()],
+        )
+        return planner.plan(model, plan_util.get_default_sharders())
 
     def _place_again(self, placement, tables):
         from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
