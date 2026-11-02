@@ -155,6 +155,64 @@ class StorageFormulaTest(unittest.TestCase):
             )
             self.assertGreater(with_meta, without_meta)
 
+    @parameterized.expand(
+        [
+            param(
+                f"{name}_{dtype}_{dim}",
+                optimizer_class=optimizer_class,
+                runtime_class=runtime_class,
+                dtype=dtype,
+                dim=dim,
+            )
+            for name, optimizer_class, runtime_class in (
+                ("sgd", optimizers.SGD, "SGDDynamicEmbeddingOptimizer"),
+                ("adam", optimizers.Adam, "AdamDynamicEmbeddingOptimizer"),
+                ("adagrad", optimizers.Adagrad, "AdaGradDynamicEmbeddingOptimizer"),
+                (
+                    "rowwise_adagrad",
+                    rowwise_adagrad.RowWiseAdagrad,
+                    "RowWiseAdaGradDynamicEmbeddingOptimizer",
+                ),
+                ("ftrl", FTRL, "FTRLDynamicEmbeddingOptimizer"),
+            )
+            for dtype in (torch.float32, torch.float16, torch.bfloat16)
+            for dim in (63, 64)
+        ],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required.")
+    def test_value_storage_matches_runtime(
+        self, _name, optimizer_class, runtime_class, dtype, dim
+    ):
+        from dynamicemb import DynamicEmbTableOptions, optimizer
+        from dynamicemb.key_value_table import DynamicEmbStorage
+
+        args = optimizer.OptimizerArgs()
+        runtime_optimizer = (
+            getattr(optimizer, runtime_class)(args, dtype)
+            if optimizer_class is rowwise_adagrad.RowWiseAdagrad
+            else getattr(optimizer, runtime_class)(args)
+        )
+        storage = DynamicEmbStorage(
+            [
+                DynamicEmbTableOptions(
+                    dim=dim,
+                    max_capacity=self.ROWS,
+                    init_capacity=self.ROWS,
+                    embedding_dtype=dtype,
+                    index_type=torch.int64,
+                    local_hbm_for_values=1,
+                )
+            ],
+            runtime_optimizer,
+        )
+        tensor = torch.empty(self.ROWS, dim, dtype=dtype, device="meta")
+        tensor._optimizer_classes = [optimizer_class]
+        _, ddr = dynamicemb_util._calculate_dynamicemb_storage_specific_sizes(
+            tensor, [[self.ROWS, dim]], cache_ratio=0.5, caching=True
+        )
+        self.assertEqual(ddr, [storage.tables[0].tables[0].num_bytes()])
+
 
 class OptimizerMultiplerTest(unittest.TestCase):
     """Per-element optimizer state width used to size dynamicemb values."""
@@ -167,7 +225,7 @@ class OptimizerMultiplerTest(unittest.TestCase):
             param(
                 "rowwise_adagrad",
                 optimizer_class=rowwise_adagrad.RowWiseAdagrad,
-                expected=1 / 16,
+                expected=4 / 16,
             ),
             param("ftrl", optimizer_class=FTRL, expected=2.0),
         ],
@@ -176,7 +234,7 @@ class OptimizerMultiplerTest(unittest.TestCase):
     def test_multipler(self, _name, optimizer_class, expected):
         self.assertAlmostEqual(
             dynamicemb_util._get_optimizer_multipler(
-                optimizer_class, torch.Size([1024, 16])
+                optimizer_class, torch.Size([1024, 16]), torch.float32
             ),
             expected,
         )
@@ -195,7 +253,7 @@ class OptimizerMultiplerTest(unittest.TestCase):
 
         self.assertAlmostEqual(
             dynamicemb_util._get_optimizer_multipler(
-                trec_optim.FTRL, torch.Size([1024, 16])
+                trec_optim.FTRL, torch.Size([1024, 16]), torch.float32
             ),
             2.0,
         )
