@@ -97,27 +97,23 @@ def _shared_prefix_attention(
         causal=True,
     )
     rows = layout.prefix_cu_seqlens.numel() - 1
-    response_query = query.new_zeros(rows * layout.response_width, heads, head_dim)
-    response_query = (
-        response_query.index_copy(
-            0, layout.response_indices, flat_query[prefix_tokens:]
-        )
-        .reshape(rows, layout.response_width, heads, head_dim)
+    response_tokens = flat_query[prefix_tokens:]
+    response_query, padded_key, padded_value = (
+        tokens.new_zeros(rows * width, tokens.shape[1], head_dim)
+        .index_copy(0, indices, tokens)
+        .reshape(rows, width, tokens.shape[1], head_dim)
         .transpose(1, 2)
+        for tokens, width, indices in (
+            (response_tokens, layout.response_width, layout.response_indices),
+            (flat_key, layout.key_width, layout.key_indices),
+            (flat_value, layout.key_width, layout.key_indices),
+        )
     )
-    padded_key = key.new_zeros(rows * layout.key_width, key.shape[1], head_dim)
-    padded_key = padded_key.index_copy(0, layout.key_indices, flat_key)
-    padded_value = value.new_zeros(rows * layout.key_width, value.shape[1], head_dim)
-    padded_value = padded_value.index_copy(0, layout.key_indices, flat_value)
     response_output, _ = flex_attention_forward(
         module,
         response_query,
-        padded_key.reshape(rows, layout.key_width, key.shape[1], head_dim).transpose(
-            1, 2
-        ),
-        padded_value.reshape(
-            rows, layout.key_width, value.shape[1], head_dim
-        ).transpose(1, 2),
+        padded_key,
+        padded_value,
         attention_mask,
         scaling=scaling,
         **kwargs,

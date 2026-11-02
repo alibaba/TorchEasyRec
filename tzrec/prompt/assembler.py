@@ -435,18 +435,20 @@ def build_multi_target_layout(
         torch.arange(parents.numel(), device=device) - parent_starts[parents]
     )
     offsets = torch.arange(num_levels, device=device)
-    label_indices = (
-        (cu_seqlens[parents + 1] - response_lengths[parents])[:, None]
-        + target_offsets[:, None] * num_levels
-        + offsets[None, :]
-    )
-    positions = torch.arange(width, device=device)
+    target_positions = target_offsets[:, None] * num_levels + offsets[None, :]
+    label_indices = (cu_seqlens[parents + 1] - response_lengths[parents])[
+        :, None
+    ] + target_positions
+    row_starts = torch.zeros_like(row_lengths) if pack_prefix else width - row_lengths
+    prefix_ends = row_starts + prefix_lengths
+    row_ends = row_starts + row_lengths
 
     if pack_prefix:
         token_parents = torch.repeat_interleave(row_ids, row_lengths)
         token_positions = torch.arange(token_parents.numel(), device=device)
         local_positions = token_positions - cu_seqlens[token_parents]
-        is_prefix = local_positions < prefix_lengths[token_parents]
+        token_prefix_lengths = prefix_lengths[token_parents]
+        is_prefix = local_positions < token_prefix_lengths
         prefix_indices = is_prefix.nonzero().flatten()
         responses = (~is_prefix).nonzero().flatten()
         packed_indices = torch.cat((prefix_indices, responses))
@@ -454,87 +456,56 @@ def build_multi_target_layout(
         prefix_cu_seqlens = torch.nn.functional.pad(
             prefix_lengths.cumsum(0, dtype=torch.int32), (1, 0)
         )
-        response_cu_seqlens = torch.nn.functional.pad(
-            response_lengths.cumsum(0), (1, 0)
-        )
-        position_ids = torch.cat(
-            (
-                local_positions[prefix_indices],
-                prefix_lengths[token_parents[responses]]
-                + (
-                    local_positions[responses]
-                    - prefix_lengths[token_parents[responses]]
-                ).remainder(num_levels),
-            )
-        ).unsqueeze(0)
+        response_starts = response_lengths.cumsum(0) - response_lengths
+        position_ids = torch.where(
+            is_prefix,
+            local_positions,
+            token_prefix_lengths
+            + (local_positions - token_prefix_lengths).remainder(num_levels),
+        )[packed_indices].unsqueeze(0)
         response_width = int(response_lengths.max())
-        query_positions = torch.arange(response_width, device=device)
         response_indices = (
-            (query_positions[None, :] < response_lengths[:, None])
-            .reshape(-1)
-            .nonzero()
-            .flatten()
-        )
+            parents[:, None] * response_width + target_positions
+        ).flatten()
         key_indices = (token_parents * width + local_positions)[packed_indices]
         max_prefix_length = int(prefix_lengths.max())
-        target_starts = (
-            prefix_tokens + response_cu_seqlens[parents] + target_offsets * num_levels
+        score_indices = (
+            prefix_tokens + response_starts[parents, None] + target_positions - 1
         )
-        score_indices = target_starts[:, None] + offsets[None, :] - 1
         score_indices[:, 0] = prefix_cu_seqlens[parents + 1] - 1
-
-        def mask_mod(b, h, q, kv):
-            """Expose the shared prefix and this target's causal response keys."""
-            kv_relative = kv - prefix_lengths[b]
-            return (
-                (q < response_lengths[b])
-                & (kv < row_lengths[b])
-                & (
-                    (kv < prefix_lengths[b])
-                    | (
-                        (kv_relative >= 0)
-                        & (kv_relative // num_levels == q // num_levels)
-                        & (kv_relative <= q)
-                    )
-                )
-            )
     else:
-        row_starts = width - row_lengths
-        prefix_ends = width - response_lengths
+        positions = torch.arange(width, device=device)
         relative = positions[None, :] - prefix_ends[:, None]
         position_ids = torch.where(
             relative < 0,
             positions[None, :] - row_starts[:, None],
             prefix_lengths[:, None] + relative.remainder(num_levels),
         ).clamp(min=0)
-        target_starts = prefix_ends[parents] + target_offsets * num_levels
-        score_positions = target_starts[:, None] + offsets[None, :] - 1
-        score_positions[:, 0] = prefix_ends[parents] - 1
-        score_indices = parents[:, None] * width + score_positions
+        score_indices = (
+            parents[:, None] * width + prefix_ends[parents, None] + target_positions - 1
+        )
+        score_indices[:, 0] = parents * width + prefix_ends[parents] - 1
         packed_indices = torch.empty(0, dtype=torch.int64, device=device)
         prefix_cu_seqlens = torch.empty(0, dtype=torch.int32, device=device)
         response_indices = key_indices = packed_indices
         prefix_tokens = max_prefix_length = response_width = 0
 
-        def mask_mod(b, h, q, kv):
-            """Allow causal prefix attention and same-branch response attention."""
-            prefix_end = prefix_ends[b]
-            q_relative = q - prefix_end
-            kv_relative = kv - prefix_end
-            prefix_key = (kv < prefix_end) & (kv <= q)
-            branch_key = (
-                (q >= prefix_end)
-                & (kv >= prefix_end)
-                & (q_relative // num_levels == kv_relative // num_levels)
-                & (kv <= q)
+    def mask_mod(b, h, q, kv):
+        """Use row coordinates for causal prefix and isolated target attention."""
+        query_position = q + prefix_ends[b] if pack_prefix else q
+        query_relative = query_position - prefix_ends[b]
+        key_relative = kv - prefix_ends[b]
+        return (
+            (query_position >= row_starts[b])
+            & (query_position < row_ends[b])
+            & (kv >= row_starts[b])
+            & (kv < row_ends[b])
+            & (kv <= query_position)
+            & (
+                (key_relative < 0)
+                | (query_relative // num_levels == key_relative // num_levels)
             )
-            return (
-                (q >= row_starts[b])
-                & (q < width)
-                & (kv >= row_starts[b])
-                & (kv < width)
-                & (prefix_key | branch_key)
-            )
+        )
 
     logit_indices, logit_inverse = score_indices.reshape(-1).unique(return_inverse=True)
     return MultiTargetLayout(

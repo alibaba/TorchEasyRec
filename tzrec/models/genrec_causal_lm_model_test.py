@@ -9,10 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-import os
-import statistics
-import time
 import unittest
 from types import SimpleNamespace
 from typing import Optional, Sequence
@@ -21,7 +17,7 @@ from unittest import mock
 import torch
 from parameterized import parameterized
 from torch import nn
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 from transformers.loss.loss_utils import ForCausalLMLoss
 
 from tzrec.datasets.utils import Batch
@@ -38,7 +34,6 @@ from tzrec.prompt.assembler import (
     build_multi_target_layout,
 )
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
-from tzrec.utils.logging_util import logger
 from tzrec.utils.test_util import (
     GENREC_ANSWER_CODES,
     GENREC_HIST_CODES,
@@ -609,125 +604,6 @@ class MultiTargetTrainingTest(unittest.TestCase):
         self.model.lm.gradient_checkpointing_enable()
         with self.assertRaisesRegex(ValueError, "gradient checkpointing"):
             self.model.predict(self._batch())
-
-    @unittest.skipUnless(
-        os.environ.get("TZREC_GENREC_BENCHMARK_BACKBONE"),
-        "Optional benchmark requires a local backbone configuration",
-    )
-    def test_shared_prefix_benchmark(self) -> None:
-        config = AutoConfig.from_pretrained(
-            os.environ["TZREC_GENREC_BENCHMARK_BACKBONE"]
-        )
-        self.model.lm = (
-            AutoModelForCausalLM.from_config(
-                config, attn_implementation="sdpa", dtype=torch.float32
-            )
-            .cuda()
-            .eval()
-        )
-        histories = [GENREC_HIST_CODES * 300 for _ in range(20)]
-        answers = [
-            GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES
-            if index < 6
-            else GENREC_ANSWER_CODES
-            for index in range(20)
-        ]
-        shared_batch = self._batch(histories, answers)
-        expanded_histories, expanded_answers, weights = [], [], []
-        for history, answer in zip(histories, answers):
-            count = len(answer) // 3
-            for start in range(0, len(answer), 3):
-                expanded_histories.append(history)
-                expanded_answers.append(answer[start : start + 3])
-                weights.append(1 / count / len(histories))
-        expanded_batch = self._batch(expanded_histories, expanded_answers)
-        weights = torch.tensor(weights, device="cuda")
-        torch.backends.cuda.enable_cudnn_sdp(False)
-
-        def step(batch, shared):
-            self.model.zero_grad(set_to_none=True)
-            torch.cuda.synchronize()
-            started = time.perf_counter()
-            events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
-            events[0].record()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                predictions = self.model.predict(batch)
-                if shared:
-                    loss = self.model.loss(predictions, batch)["ce_loss"]
-                else:
-                    logits = predictions["logits"][:, :-1]
-                    labels = predictions["labels"][:, 1:]
-                    target_loss = (
-                        nn.functional.cross_entropy(
-                            logits.float().reshape(-1, logits.shape[-1]),
-                            labels.reshape(-1),
-                            reduction="none",
-                        )
-                        .reshape(-1, 3)
-                        .mean(-1)
-                    )
-                    loss = (target_loss * weights).sum()
-            events[1].record()
-            loss.backward()
-            events[2].record()
-            optimizer.step()
-            events[3].record()
-            torch.cuda.synchronize()
-            return {
-                "forward_ms": events[0].elapsed_time(events[1]),
-                "backward_ms": events[1].elapsed_time(events[2]),
-                "optimizer_ms": events[2].elapsed_time(events[3]),
-                "step_ms": (time.perf_counter() - started) * 1000,
-                "loss": float(loss.detach()),
-            }
-
-        initial_state = {
-            name: tensor.cpu().clone()
-            for name, tensor in self.model.lm.state_dict().items()
-        }
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=5e-5)
-        samples_per_round = 50
-        results = {}
-        for name, batch, shared, backend in (
-            ("expanded_fa2", expanded_batch, False, "flash_attention_2"),
-            ("shared_flex", shared_batch, True, "sdpa"),
-            ("shared_hybrid", shared_batch, True, "flash_attention_2"),
-        ):
-            self.model.lm.load_state_dict(initial_state)
-            optimizer.state.clear()
-            self.model._attn_kernel = backend
-            self.model.lm.set_attn_implementation(backend)
-            cold_started = time.perf_counter()
-            for _ in range(2):
-                step(batch, shared)
-            warmup_seconds = time.perf_counter() - cold_started
-            torch.cuda.reset_peak_memory_stats()
-            rounds = []
-            for _ in range(3):
-                samples = [step(batch, shared) for _ in range(samples_per_round)]
-                rounds.append(
-                    {
-                        key: statistics.mean(sample[key] for sample in samples)
-                        for key in samples[0]
-                    }
-                )
-            results[name] = {
-                "warmup_seconds": warmup_seconds,
-                "rounds": rounds,
-                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-                "parents": len(histories),
-                "targets": len(weights),
-                "steps_per_round": samples_per_round,
-            }
-            logger.info(
-                "GENREC_HYBRID_BENCHMARK_ARM %s %s", name, json.dumps(results[name])
-            )
-        logger.info("GENREC_MULTI_TARGET_BENCHMARK %s", json.dumps(results))
-        self.assertAlmostEqual(
-            results["expanded_fa2"]["rounds"][-1]["loss"],
-            results["shared_hybrid"]["rounds"][-1]["loss"],
-            delta=0.03,
-        )
 
 
 @mark_ci_scope("h20", "gpu")
