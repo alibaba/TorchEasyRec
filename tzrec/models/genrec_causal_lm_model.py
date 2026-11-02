@@ -23,6 +23,7 @@ not supported; Qwen2.5/Qwen3 are what CI covers.
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
+from transformers import AttentionInterface
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -33,11 +34,107 @@ from tzrec.prompt.assembler import (
     INPUT_IDS,
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
+    MultiTargetLayout,
     build_multi_target_layout,
 )
 from tzrec.prompt.types import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+
+
+def _shared_prefix_attention(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Any,
+    scaling: Optional[float] = None,
+    *,
+    shared_prefix_layout: MultiTargetLayout,
+    **kwargs: Any,
+) -> Tuple[torch.Tensor, None]:
+    """Run packed causal prefix FA2 followed by isolated response FlexAttention.
+
+    Args:
+        module: backbone attention module after projection and rotary embedding.
+        query: packed queries shaped (1, query heads, total tokens, head dim).
+        key: packed keys, retaining the backbone's grouped KV heads.
+        value: packed values with the same layout as keys.
+        attention_mask: response-only BlockMask over gathered per-parent keys.
+        scaling: backbone attention scale.
+        shared_prefix_layout: batch-local packing and scatter indices.
+        **kwargs: backbone attention options forwarded to the Flex adapter.
+
+    Returns:
+        Packed attention output and no attention weights.
+    """
+    from flash_attn import flash_attn_varlen_func
+    from transformers.integrations.flex_attention import flex_attention_forward
+
+    layout = shared_prefix_layout
+    if query.dtype == torch.float32:
+        dtype = (
+            torch.get_autocast_dtype("cuda")
+            if torch.is_autocast_enabled("cuda")
+            else module.q_proj.weight.dtype
+        )
+        query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+    _, heads, _, head_dim = query.shape
+    flat_query = query[0].transpose(0, 1)
+    flat_key = key[0].transpose(0, 1)
+    flat_value = value[0].transpose(0, 1)
+    prefix_tokens = layout.prefix_tokens
+    prefix_output = flash_attn_varlen_func(
+        flat_query[:prefix_tokens],
+        flat_key[:prefix_tokens],
+        flat_value[:prefix_tokens],
+        cu_seqlens_q=layout.prefix_cu_seqlens,
+        cu_seqlens_k=layout.prefix_cu_seqlens,
+        max_seqlen_q=layout.max_prefix_length,
+        max_seqlen_k=layout.max_prefix_length,
+        dropout_p=0.0,
+        softmax_scale=scaling,
+        causal=True,
+    )
+    rows = layout.prefix_cu_seqlens.numel() - 1
+    response_query = query.new_zeros(rows * layout.response_width, heads, head_dim)
+    response_query = (
+        response_query.index_copy(
+            0, layout.response_indices, flat_query[prefix_tokens:]
+        )
+        .reshape(rows, layout.response_width, heads, head_dim)
+        .transpose(1, 2)
+    )
+    padded_key = key.new_zeros(rows * layout.key_width, key.shape[1], head_dim)
+    padded_key = padded_key.index_copy(0, layout.key_indices, flat_key)
+    padded_value = value.new_zeros(rows * layout.key_width, value.shape[1], head_dim)
+    padded_value = padded_value.index_copy(0, layout.key_indices, flat_value)
+    response_output, _ = flex_attention_forward(
+        module,
+        response_query,
+        padded_key.reshape(rows, layout.key_width, key.shape[1], head_dim).transpose(
+            1, 2
+        ),
+        padded_value.reshape(
+            rows, layout.key_width, value.shape[1], head_dim
+        ).transpose(1, 2),
+        attention_mask,
+        scaling=scaling,
+        **kwargs,
+    )
+    output = torch.cat(
+        (
+            prefix_output,
+            response_output.reshape(-1, heads, head_dim).index_select(
+                0, layout.response_indices
+            ),
+        )
+    )
+    return output.unsqueeze(0), None
+
+
+_SHARED_PREFIX_ATTENTION = "genrec_shared_prefix_fa2_flex"
+AttentionInterface.register(_SHARED_PREFIX_ATTENTION, _shared_prefix_attention)
 
 
 class GenRecCausalLMModel(BaseGenRecModel):
@@ -186,28 +283,55 @@ class GenRecCausalLMModel(BaseGenRecModel):
                 "Shared SID training requires gradient checkpointing to be disabled."
             )
 
-        padded, _ = self._left_pad(embeds, batch)
-        rows, width = padded.shape[:2]
+        hybrid = self._attn_kernel == "flash_attention_2"
+        rows = infos[RESPONSE_LENGTHS].numel()
+        width = int(infos[MAX_SEQLEN])
         layout = build_multi_target_layout(
-            infos[CU_SEQLENS], infos[RESPONSE_LENGTHS], width, levels
+            infos[CU_SEQLENS],
+            infos[RESPONSE_LENGTHS],
+            width,
+            levels,
+            pack_prefix=hybrid,
         )
+        if hybrid:
+            config = self.lm.config
+            if (
+                config.model_type != "qwen2"
+                or config.attention_dropout != 0
+                or config.use_sliding_window
+                or embeds.device.type != "cuda"
+                or (
+                    embeds.dtype not in (torch.bfloat16, torch.float16)
+                    and not torch.is_autocast_enabled("cuda")
+                )
+            ):
+                raise ValueError(
+                    "Shared-prefix FA2 requires Qwen2 full attention on CUDA, "
+                    "BF16/FP16 computation and zero attention dropout."
+                )
+            inputs = embeds[layout.packed_indices].unsqueeze(0)
+        else:
+            inputs, _ = self._left_pad(embeds, batch)
         block_mask = create_block_mask(
             layout.mask_mod,
             rows,
             None,
-            width,
+            layout.response_width if hybrid else width,
             width,
             device=embeds.device,
             _compile=True,
         )
         previous_attention = self.lm.config._attn_implementation
         try:
-            self.lm.set_attn_implementation("flex_attention")
+            self.lm.set_attn_implementation(
+                _SHARED_PREFIX_ATTENTION if hybrid else "flex_attention"
+            )
             hidden = self.lm.base_model(
-                inputs_embeds=padded,
+                inputs_embeds=inputs,
                 attention_mask={"full_attention": block_mask},
                 position_ids=layout.position_ids,
                 use_cache=False,
+                **({"shared_prefix_layout": layout} if hybrid else {}),
             ).last_hidden_state
         finally:
             self.lm.set_attn_implementation(previous_attention)

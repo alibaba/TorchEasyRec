@@ -11,6 +11,7 @@
 
 import json
 import os
+import statistics
 import time
 import unittest
 from types import SimpleNamespace
@@ -24,13 +25,17 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.loss.loss_utils import ForCausalLMLoss
 
 from tzrec.datasets.utils import Batch
-from tzrec.models.genrec_causal_lm_model import GenRecCausalLMModel
+from tzrec.models.genrec_causal_lm_model import (
+    GenRecCausalLMModel,
+    _shared_prefix_attention,
+)
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
     INPUT_IDS,
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
     PromptAssembler,
+    build_multi_target_layout,
 )
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 from tzrec.utils.logging_util import logger
@@ -448,6 +453,9 @@ class LayoutInvarianceTest(unittest.TestCase):
 @mark_ci_scope("h20", "gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 class MultiTargetTrainingTest(unittest.TestCase):
+    atol = 3e-5
+    rtol = 3e-4
+
     def setUp(self) -> None:
         self.model, self.compiled = create_genrec_test_model(
             make_test_dir(), attn_kernel="sdpa", init_seed=17
@@ -522,15 +530,19 @@ class MultiTargetTrainingTest(unittest.TestCase):
         predictions = self.model.predict(batch)
         loss = self.model.loss(predictions, batch)["ce_loss"]
         torch.testing.assert_close(
-            predictions["logits"], reference_logits, atol=2e-5, rtol=2e-4
+            predictions["logits"], reference_logits, atol=self.atol, rtol=self.rtol
         )
         torch.testing.assert_close(predictions["labels"], reference_labels)
-        torch.testing.assert_close(loss, reference_loss, atol=2e-5, rtol=2e-4)
+        torch.testing.assert_close(loss, reference_loss, atol=self.atol, rtol=self.rtol)
         loss.backward()
         for name, parameter in self.model.named_parameters():
             if name in gradients:
                 torch.testing.assert_close(
-                    parameter.grad, gradients[name], atol=3e-5, rtol=3e-4, msg=name
+                    parameter.grad,
+                    gradients[name],
+                    atol=self.atol,
+                    rtol=self.rtol,
+                    msg=name,
                 )
 
     def test_other_branch_and_other_parent_are_isolated(self) -> None:
@@ -636,6 +648,8 @@ class MultiTargetTrainingTest(unittest.TestCase):
             self.model.zero_grad(set_to_none=True)
             torch.cuda.synchronize()
             started = time.perf_counter()
+            events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            events[0].record()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 predictions = self.model.predict(batch)
                 if shared:
@@ -653,19 +667,34 @@ class MultiTargetTrainingTest(unittest.TestCase):
                         .mean(-1)
                     )
                     loss = (target_loss * weights).sum()
-            torch.cuda.synchronize()
-            forwarded = time.perf_counter()
+            events[1].record()
             loss.backward()
+            events[2].record()
+            optimizer.step()
+            events[3].record()
             torch.cuda.synchronize()
-            finished = time.perf_counter()
-            return forwarded - started, finished - forwarded, float(loss.detach())
+            return {
+                "forward_ms": events[0].elapsed_time(events[1]),
+                "backward_ms": events[1].elapsed_time(events[2]),
+                "optimizer_ms": events[2].elapsed_time(events[3]),
+                "step_ms": (time.perf_counter() - started) * 1000,
+                "loss": float(loss.detach()),
+            }
 
+        initial_state = {
+            name: tensor.cpu().clone()
+            for name, tensor in self.model.lm.state_dict().items()
+        }
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=5e-5)
+        samples_per_round = 50
         results = {}
         for name, batch, shared, backend in (
-            ("expanded_sdpa", expanded_batch, False, "sdpa"),
-            ("expanded_flex", expanded_batch, False, "flex_attention"),
+            ("expanded_fa2", expanded_batch, False, "flash_attention_2"),
             ("shared_flex", shared_batch, True, "sdpa"),
+            ("shared_hybrid", shared_batch, True, "flash_attention_2"),
         ):
+            self.model.lm.load_state_dict(initial_state)
+            optimizer.state.clear()
             self.model._attn_kernel = backend
             self.model.lm.set_attn_implementation(backend)
             cold_started = time.perf_counter()
@@ -673,20 +702,237 @@ class MultiTargetTrainingTest(unittest.TestCase):
                 step(batch, shared)
             warmup_seconds = time.perf_counter() - cold_started
             torch.cuda.reset_peak_memory_stats()
-            samples = [step(batch, shared) for _ in range(5)]
+            rounds = []
+            for _ in range(3):
+                samples = [step(batch, shared) for _ in range(samples_per_round)]
+                rounds.append(
+                    {
+                        key: statistics.mean(sample[key] for sample in samples)
+                        for key in samples[0]
+                    }
+                )
             results[name] = {
                 "warmup_seconds": warmup_seconds,
-                "forward_seconds": sum(sample[0] for sample in samples) / len(samples),
-                "backward_seconds": sum(sample[1] for sample in samples) / len(samples),
+                "rounds": rounds,
                 "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-                "loss": samples[-1][2],
-                "parents": 20,
-                "targets": 26,
+                "parents": len(histories),
+                "targets": len(weights),
+                "steps_per_round": samples_per_round,
             }
+            logger.info(
+                "GENREC_HYBRID_BENCHMARK_ARM %s %s", name, json.dumps(results[name])
+            )
         logger.info("GENREC_MULTI_TARGET_BENCHMARK %s", json.dumps(results))
         self.assertAlmostEqual(
-            results["expanded_sdpa"]["loss"], results["shared_flex"]["loss"], delta=0.03
+            results["expanded_fa2"]["rounds"][-1]["loss"],
+            results["shared_hybrid"]["rounds"][-1]["loss"],
+            delta=0.03,
         )
+
+
+@mark_ci_scope("h20", "gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_unavailable)
+class HybridMultiTargetTrainingTest(MultiTargetTrainingTest):
+    atol = 8e-3
+    rtol = 3e-2
+
+    def setUp(self) -> None:
+        super().setUp()
+        config = self.model.lm.config
+        config.hidden_size = 224
+        config.intermediate_size = 448
+        config.num_attention_heads = 14
+        config.num_key_value_heads = 2
+        self.model.lm = (
+            AutoModelForCausalLM.from_config(
+                config,
+                attn_implementation="flash_attention_2",
+                torch_dtype=torch.bfloat16,
+            )
+            .cuda()
+            .eval()
+        )
+        self.model._attn_kernel = "flash_attention_2"
+
+    def test_backbone_and_prefix_stay_packed(self):
+        batch = self._batch()
+        shapes = []
+        handles = []
+        for layer in self.model.lm.base_model.layers:
+            for module in (layer.self_attn.q_proj, layer.mlp):
+                handles.append(
+                    module.register_forward_pre_hook(
+                        lambda module, inputs: shapes.append(inputs[0].shape[:2])
+                    )
+                )
+        try:
+            with mock.patch.object(
+                self.model, "_left_pad", side_effect=AssertionError("padded backbone")
+            ):
+                self.model.predict(batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+        expected = (1, int(batch.additional_infos[CU_SEQLENS][-1]))
+        self.assertTrue(shapes)
+        self.assertTrue(all(tuple(shape) == expected for shape in shapes))
+
+    @parameterized.expand(
+        [[torch.bfloat16], [torch.float16]], name_func=parameterized_name_func
+    )
+    def test_hybrid_matches_full_flex_gradients_and_dynamic_layouts(self, dtype):
+        self.model.to(dtype=dtype)
+        for multiplier, answers in (
+            (1, self.answers),
+            (43, [GENREC_ANSWER_CODES * 77, []]),
+            (3, [GENREC_ANSWER_CODES, GENREC_ANSWER_CODES * 2]),
+        ):
+            batch = self._batch(
+                [history * multiplier for history in self.histories], answers
+            )
+            self.model.zero_grad(set_to_none=True)
+            reference = self.model.predict(batch)
+            reference_loss = self.model.loss(reference, batch)["ce_loss"]
+            reference_loss.backward()
+            gradients = {
+                name: parameter.grad.detach().float().clone()
+                for name, parameter in self.model.named_parameters()
+                if parameter.grad is not None
+            }
+            self.model.zero_grad(set_to_none=True)
+            self.model._attn_kernel = "sdpa"
+            try:
+                result = self.model.predict(batch)
+            finally:
+                self.model._attn_kernel = "flash_attention_2"
+            loss = self.model.loss(result, batch)["ce_loss"]
+            torch.testing.assert_close(
+                result["logits"], reference["logits"], atol=self.atol, rtol=self.rtol
+            )
+            torch.testing.assert_close(
+                loss, reference_loss, atol=self.atol, rtol=self.rtol
+            )
+            loss.backward()
+            for name, parameter in self.model.named_parameters():
+                if name in gradients:
+                    gradient = parameter.grad.float()
+                    self.assertTrue(bool(torch.isfinite(gradient).all()), name)
+                    error = (gradient - gradients[name]).norm()
+                    scale = gradients[name].norm().clamp(min=1e-6)
+                    self.assertLess(float(error / scale), 0.04, name)
+
+    def test_unsupported_hybrid_conditions_raise_without_switching_backend(self):
+        previous = self.model.lm.config._attn_implementation
+        self.model.lm.config.attention_dropout = 0.1
+        with self.assertRaisesRegex(ValueError, "zero attention dropout"):
+            self.model.predict(self._batch())
+        self.assertEqual(self.model.lm.config._attn_implementation, previous)
+        self.model.lm.config.attention_dropout = 0
+        self.model.float()
+        with self.assertRaisesRegex(ValueError, "BF16/FP16"):
+            self.model.predict(self._batch())
+
+    def test_fp32_parameters_use_autocast_dtype_at_the_flash_kernel(self):
+        from flash_attn import flash_attn_varlen_func
+
+        self.model.float()
+        with mock.patch(
+            "flash_attn.flash_attn_varlen_func", wraps=flash_attn_varlen_func
+        ) as flash:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                batch = self._batch()
+                result = self.model.predict(batch)
+                loss = self.model.loss(result, batch)["ce_loss"]
+            loss.backward()
+        for call in flash.call_args_list:
+            self.assertEqual(
+                [tensor.dtype for tensor in call.args[:3]], [torch.bfloat16] * 3
+            )
+        self.assertEqual(
+            self.model.lm.get_input_embeddings().weight.dtype, torch.float32
+        )
+        self.assertTrue(bool(torch.isfinite(loss)))
+
+    @parameterized.expand([[1], [3], [4]], name_func=parameterized_name_func)
+    def test_attention_matches_explicit_fp32_mask(self, levels):
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        lengths = torch.tensor([131 + 2 * levels, 7 + levels], device="cuda")
+        width = int(lengths.max()) + 5
+        layout = build_multi_target_layout(
+            nn.functional.pad(lengths.cumsum(0).int(), (1, 0)),
+            torch.tensor([2 * levels, levels], device="cuda"),
+            width,
+            levels,
+            pack_prefix=True,
+        )
+        block_mask = create_block_mask(
+            layout.mask_mod,
+            2,
+            None,
+            2 * levels,
+            width,
+            device="cuda",
+            _compile=True,
+        )
+        token_count = int(lengths.sum())
+        tensors = [
+            torch.randn(
+                1,
+                heads,
+                token_count,
+                16,
+                device="cuda",
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            for heads in (14, 2, 2)
+        ]
+        output, _ = _shared_prefix_attention(
+            self.model.lm.base_model.layers[0].self_attn,
+            tensors[0],
+            tensors[1],
+            tensors[2],
+            block_mask,
+            shared_prefix_layout=layout,
+        )
+        output.float().square().mean().backward()
+        gradients = [tensor.grad.float().clone() for tensor in tensors]
+        reference_tensors = [
+            tensor.detach().float().requires_grad_() for tensor in tensors
+        ]
+        q, k, v = reference_tensors
+        boundaries = nn.functional.pad(lengths.cumsum(0), (1, 0))
+        token_parents = torch.repeat_interleave(torch.arange(2, device="cuda"), lengths)
+        local_positions = (
+            torch.arange(token_count, device="cuda") - boundaries[token_parents]
+        )[layout.packed_indices]
+        token_parents = token_parents[layout.packed_indices]
+        prefix_lengths = torch.tensor([131, 7], device="cuda")[token_parents]
+        is_prefix = local_positions < prefix_lengths
+        branches = (local_positions - prefix_lengths) // levels
+        mask = (
+            (token_parents[:, None] == token_parents[None, :])
+            & (
+                is_prefix[None, :]
+                | (~is_prefix[:, None] & (branches[:, None] == branches[None, :]))
+            )
+            & (local_positions[None, :] <= local_positions[:, None])
+        )
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            reference = nn.functional.scaled_dot_product_attention(
+                q,
+                k.repeat_interleave(7, dim=1),
+                v.repeat_interleave(7, dim=1),
+                attn_mask=mask,
+            ).transpose(1, 2)
+        torch.testing.assert_close(output.float(), reference, atol=2e-2, rtol=2e-2)
+        reference.square().mean().backward()
+        for tensor, gradient in zip(reference_tensors, gradients):
+            self.assertLess(
+                float((tensor.grad - gradient).norm() / tensor.grad.norm()), 0.02
+            )
 
 
 if __name__ == "__main__":
