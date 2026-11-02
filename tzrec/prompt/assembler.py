@@ -361,16 +361,28 @@ class PromptAssembler(nn.Module):
 
 @dataclass
 class MultiTargetLayout:
-    """Training-only SID branches over the assembler's existing packed stream.
+    """Training-only SID branches over packed or left-padded model inputs.
+
+    Packing fields are empty for the full-Flex layout. In the hybrid layout,
+    all prefixes precede all responses, and only the response attention uses
+    rectangular queries and keys.
 
     Args:
-        position_ids: logical positions in left-padded rows, restarting per target.
+        position_ids: logical token positions, restarting for each target.
         target_parents: parent row of each target.
         target_counts: target count of each parent row.
-        label_indices: packed input indices shaped ``(targets, levels)``.
-        logit_indices: unique scoring positions in flattened left-padded rows.
+        label_indices: original packed input indices, shaped (targets, levels).
+        logit_indices: unique scoring positions in the chosen model layout.
         logit_inverse: gathers unique logits back into target-major order.
-        mask_mod: causal prefix and independent-branch attention predicate.
+        mask_mod: attention predicate for full rows or response-only queries.
+        packed_indices: reorders original tokens to prefixes then responses.
+        prefix_cu_seqlens: int32 boundaries for packed prefix attention.
+        prefix_tokens: total prefix tokens, used to slice each layer's Q/K/V.
+        max_prefix_length: longest valid prefix in this batch.
+        response_indices: unique rectangular positions of valid response queries.
+        response_width: maximum response tokens per parent.
+        key_indices: unique rectangular key positions for every packed token.
+        key_width: maximum complete row length.
     """
 
     position_ids: torch.Tensor
@@ -380,9 +392,16 @@ class MultiTargetLayout:
     logit_indices: torch.Tensor
     logit_inverse: torch.Tensor
     mask_mod: Callable[
-        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        torch.Tensor,
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
     ]
+    packed_indices: torch.Tensor
+    prefix_cu_seqlens: torch.Tensor
+    prefix_tokens: int
+    max_prefix_length: int
+    response_indices: torch.Tensor
+    response_width: int
+    key_indices: torch.Tensor
+    key_width: int
 
 
 def build_multi_target_layout(
@@ -390,74 +409,105 @@ def build_multi_target_layout(
     response_lengths: torch.Tensor,
     width: int,
     num_levels: int,
+    pack_prefix: bool = False,
 ) -> MultiTargetLayout:
-    """Map complete SID responses to independent shared-prefix training branches.
-
-    This consumes assembler metadata on its current device. It neither changes
-    the packed token stream nor adds fields to the exported prompt front-end.
+    """Map complete SID responses to independent shared-prefix branches.
 
     Args:
-        cu_seqlens: packed row boundaries from the assembler.
+        cu_seqlens: original packed row boundaries from the assembler.
         response_lengths: supervised SID token count of each row.
-        width: left-padded row width used by the model.
+        width: longest complete row, used only for rectangular attention.
         num_levels: codebook levels per target SID.
+        pack_prefix: keep the backbone packed and pad only response attention.
 
     Returns:
-        Position ids, branch visibility, supervision indices and parent mapping.
+        Logical positions, attention visibility and scoring/packing indices.
     """
     device = cu_seqlens.device
     response_lengths = response_lengths.to(torch.int64)
     row_lengths = torch.diff(cu_seqlens).to(torch.int64)
-    row_starts = width - row_lengths
-    prefix_ends = width - response_lengths
-    positions = torch.arange(width, device=device)
-    relative = positions[None, :] - prefix_ends[:, None]
-    position_ids = torch.where(
-        relative < 0,
-        positions[None, :] - row_starts[:, None],
-        prefix_ends[:, None] - row_starts[:, None] + relative.remainder(num_levels),
-    ).clamp(min=0)
-
-    def mask_mod(b, h, q, kv):
-        """Allow causal prefix attention and same-branch response attention."""
-        prefix_end = prefix_ends[b]
-        q_relative = q - prefix_end
-        kv_relative = kv - prefix_end
-        prefix_key = (kv < prefix_end) & (kv <= q)
-        branch_key = (
-            (q >= prefix_end)
-            & (kv >= prefix_end)
-            & (q_relative // num_levels == kv_relative // num_levels)
-            & (kv <= q)
-        )
-        return (
-            (q >= row_starts[b])
-            & (q < width)
-            & (kv >= row_starts[b])
-            & (kv < width)
-            & (prefix_key | branch_key)
-        )
-
+    prefix_lengths = row_lengths - response_lengths
     counts = response_lengths // num_levels
-    parents = torch.repeat_interleave(
-        torch.arange(counts.numel(), device=device), counts
-    )
+    row_ids = torch.arange(counts.numel(), device=device)
+    parents = torch.repeat_interleave(row_ids, counts)
     parent_starts = counts.cumsum(0) - counts
     target_offsets = (
         torch.arange(parents.numel(), device=device) - parent_starts[parents]
     )
-    target_starts = prefix_ends[parents] + target_offsets * num_levels
     offsets = torch.arange(num_levels, device=device)
-    score_positions = target_starts[:, None] + offsets[None, :] - 1
-    score_positions[:, 0] = prefix_ends[parents] - 1
-    score_indices = parents[:, None] * width + score_positions
+    target_positions = target_offsets[:, None] * num_levels + offsets[None, :]
+    label_indices = (cu_seqlens[parents + 1] - response_lengths[parents])[
+        :, None
+    ] + target_positions
+    row_starts = torch.zeros_like(row_lengths) if pack_prefix else width - row_lengths
+    prefix_ends = row_starts + prefix_lengths
+    row_ends = row_starts + row_lengths
+
+    if pack_prefix:
+        token_parents = torch.repeat_interleave(row_ids, row_lengths)
+        token_positions = torch.arange(token_parents.numel(), device=device)
+        local_positions = token_positions - cu_seqlens[token_parents]
+        token_prefix_lengths = prefix_lengths[token_parents]
+        is_prefix = local_positions < token_prefix_lengths
+        prefix_indices = is_prefix.nonzero().flatten()
+        responses = (~is_prefix).nonzero().flatten()
+        packed_indices = torch.cat((prefix_indices, responses))
+        prefix_tokens = prefix_indices.numel()
+        prefix_cu_seqlens = torch.nn.functional.pad(
+            prefix_lengths.cumsum(0, dtype=torch.int32), (1, 0)
+        )
+        response_starts = response_lengths.cumsum(0) - response_lengths
+        position_ids = torch.where(
+            is_prefix,
+            local_positions,
+            token_prefix_lengths
+            + (local_positions - token_prefix_lengths).remainder(num_levels),
+        )[packed_indices].unsqueeze(0)
+        response_width = int(response_lengths.max())
+        response_indices = (
+            parents[:, None] * response_width + target_positions
+        ).flatten()
+        key_indices = (token_parents * width + local_positions)[packed_indices]
+        max_prefix_length = int(prefix_lengths.max())
+        score_indices = (
+            prefix_tokens + response_starts[parents, None] + target_positions - 1
+        )
+        score_indices[:, 0] = prefix_cu_seqlens[parents + 1] - 1
+    else:
+        positions = torch.arange(width, device=device)
+        relative = positions[None, :] - prefix_ends[:, None]
+        position_ids = torch.where(
+            relative < 0,
+            positions[None, :] - row_starts[:, None],
+            prefix_lengths[:, None] + relative.remainder(num_levels),
+        ).clamp(min=0)
+        score_indices = (
+            parents[:, None] * width + prefix_ends[parents, None] + target_positions - 1
+        )
+        score_indices[:, 0] = parents * width + prefix_ends[parents] - 1
+        packed_indices = torch.empty(0, dtype=torch.int64, device=device)
+        prefix_cu_seqlens = torch.empty(0, dtype=torch.int32, device=device)
+        response_indices = key_indices = packed_indices
+        prefix_tokens = max_prefix_length = response_width = 0
+
+    def mask_mod(b, h, q, kv):
+        """Use row coordinates for causal prefix and isolated target attention."""
+        query_position = q + prefix_ends[b] if pack_prefix else q
+        query_relative = query_position - prefix_ends[b]
+        key_relative = kv - prefix_ends[b]
+        return (
+            (query_position >= row_starts[b])
+            & (query_position < row_ends[b])
+            & (kv >= row_starts[b])
+            & (kv < row_ends[b])
+            & (kv <= query_position)
+            & (
+                (key_relative < 0)
+                | (query_relative // num_levels == key_relative // num_levels)
+            )
+        )
+
     logit_indices, logit_inverse = score_indices.reshape(-1).unique(return_inverse=True)
-    packed_response_starts = cu_seqlens[parents + 1] - response_lengths[parents]
-    label_indices = (
-        packed_response_starts[:, None]
-        + target_offsets[:, None] * num_levels
-        + offsets[None, :]
-    )
     return MultiTargetLayout(
         position_ids=position_ids,
         target_parents=parents,
@@ -466,4 +516,12 @@ def build_multi_target_layout(
         logit_indices=logit_indices,
         logit_inverse=logit_inverse,
         mask_mod=mask_mod,
+        packed_indices=packed_indices,
+        prefix_cu_seqlens=prefix_cu_seqlens,
+        prefix_tokens=prefix_tokens,
+        max_prefix_length=max_prefix_length,
+        response_indices=response_indices,
+        response_width=response_width,
+        key_indices=key_indices,
+        key_width=width,
     )

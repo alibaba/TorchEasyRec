@@ -307,16 +307,24 @@ class GenRecIntegrationTest(unittest.TestCase):
             for beam in row:
                 self.assertTrue(all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam)
 
-    @parameterized.expand([[1], [2]], name_func=parameterized_name_func)
+    @parameterized.expand(
+        [
+            [1, "sdpa"],
+            [2, "flash_attention_2"],
+        ],
+        name_func=parameterized_name_func,
+    )
     @unittest.skipIf(*nv_gpu_unavailable)
     @mark_ci_scope("h20", "gpu")
-    def test_genrec_multi_target_train_eval_export(self, world_size):
+    def test_genrec_multi_target_train_eval_export(self, world_size, attn_kernel):
         if torch.cuda.device_count() < world_size:
             self.skipTest("Requires two GPUs for distributed parent normalization")
         patcher = mock.patch.dict(os.environ, {"TEST_NPROC_PER_NODE": str(world_size)})
         patcher.start()
         self.addCleanup(patcher.stop)
-        config_path = self._prepare_config()
+        if attn_kernel == "flash_attention_2" and flash_attn_unavailable[0]:
+            self.skipTest(flash_attn_unavailable[1])
+        config_path = self._prepare_config(attn_kernel)
         config = config_util.load_pipeline_config(config_path)
         backbone = config.model_config.genrec_causal_lm_model.hf_model_name_or_path
         backbone_config = AutoConfig.from_pretrained(backbone)
@@ -324,7 +332,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         backbone_config.num_key_value_heads = 1
         backbone_config.head_dim = 16
         AutoModelForCausalLM.from_config(backbone_config).save_pretrained(backbone)
-        for path in glob.glob(self.data_glob):
+        for file_index, path in enumerate(sorted(glob.glob(self.data_glob))):
             table = pq.read_table(path)
             targets = table.column("answer").to_pylist()
             targets = [
@@ -333,7 +341,7 @@ class GenRecIntegrationTest(unittest.TestCase):
                     ((code - offset + 1) % 4) + offset
                     for code, offset in zip(target, (0, 4, 8))
                 ]
-                if index < len(targets) // 2
+                if file_index == 0 and index < len(targets) // 2
                 else target
                 for index, target in enumerate(targets)
             ]
@@ -342,6 +350,7 @@ class GenRecIntegrationTest(unittest.TestCase):
                 "answer",
                 pa.array(targets, type=pa.list_(pa.int64())),
             )
+            table = pa.concat_tables([table] * 32)
             pq.write_table(table, path)
         config.train_config.num_steps = 5
         config.train_config.num_epochs = 0
@@ -349,13 +358,29 @@ class GenRecIntegrationTest(unittest.TestCase):
         config.train_config.save_checkpoints_steps = 5
         config.train_config.log_step_count_steps = 1
         config.train_config.gradient_accumulation_steps = 2
+        if attn_kernel == "flash_attention_2":
+            config.train_config.mixed_precision = "BF16"
         config_util.save_message(config, config_path)
-        self.success = utils.test_train_eval(config_path, self.test_dir)
+        pythonpath = os.environ.get("PYTHONPATH", ".")
+        self.success = utils.test_train_eval(
+            config_path, self.test_dir, pythonpath=pythonpath
+        )
         self.assertTrue(self.success)
         trained = os.path.join(self.test_dir, "pipeline.config")
-        self.success = utils.test_eval(trained, self.test_dir)
+        config.train_config.num_steps = 6
+        config_util.save_message(config, config_path)
+        self.success = utils.test_train_eval(
+            config_path,
+            self.test_dir,
+            args_str="--continue_train",
+            pythonpath=pythonpath,
+        )
         self.assertTrue(self.success)
-        self.success = utils.test_export(trained, self.test_dir, env_str="QUANT_EMB=0")
+        self.success = utils.test_eval(trained, self.test_dir, pythonpath=pythonpath)
+        self.assertTrue(self.success)
+        self.success = utils.test_export(
+            trained, self.test_dir, env_str="QUANT_EMB=0", pythonpath=pythonpath
+        )
         self.assertTrue(self.success)
         front_end = torch.jit.load(
             os.path.join(self.test_dir, "export/scripted_model.pt")

@@ -28,6 +28,13 @@ def use_distributed_embedding() -> bool:
     return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
 
 
+def is_distributed_embedding_predict(model_path: str) -> bool:
+    """Judge is the model exported in distributed embedding mode in predict."""
+    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+    return data.get("DISTRIBUTED_EMBEDDING") == "1"
+
+
 def is_input_tile() -> bool:
     """Judge is input file or not."""
     input_tile = os.environ.get("INPUT_TILE")

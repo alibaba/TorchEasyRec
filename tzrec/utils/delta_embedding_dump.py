@@ -44,9 +44,6 @@ from torchrec.distributed.embedding_lookup import (
 from torchrec.distributed.embedding_types import ShardedEmbeddingTable
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_tracker.delta_store import DeltaStoreTrec
-from torchrec.distributed.model_tracker.model_delta_tracker import (
-    ModelDeltaTracker as TorchRecModelDeltaTracker,
-)
 from torchrec.distributed.model_tracker.types import UniqueRows, UpdateMode
 from torchrec.distributed.types import ParameterSharding
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
@@ -413,13 +410,18 @@ def _embedding_table_fqn(
     return ".".join(filter(None, (module_fqn, table_segment, table_name)))
 
 
-class ModelDeltaTracker(TorchRecModelDeltaTracker):
+class ModelDeltaTracker:
     """Track touched embedding IDs by owner-qualified table FQN.
 
-    The lookup callback's owning module keeps same-named tables in different
-    sharded modules independent. A ZCH table is tracked through its managed
-    collision wrapper, which sees raw ids rather than the remapped rows its
-    inner collection sees, and its ZCH modules also report admits and evicts.
+    Plain collections are tracked per embedding lookup module: each callback
+    receives its own GroupedEmbeddingConfig's feature slice, whose key order
+    matches the config's flattened (table, feature) order, so a feature
+    shared by several tables is attributed positionally to each table it
+    was looked up in. Same-named tables in different sharded modules stay
+    independent through the owning module's FQN. A ZCH table is tracked
+    through its managed collision wrapper, which sees raw ids rather than
+    the remapped rows its inner collection sees, and its ZCH modules also
+    report admits and evicts.
 
     Args:
         model: Sharded model whose sparse lookups should be tracked.
@@ -427,6 +429,8 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         delete_on_read: Whether to delete IDs after all consumers read them.
         auto_compact: Whether to compact tracked IDs during communication.
     """
+
+    DEFAULT_CONSUMER = "default"
 
     def __init__(
         self,
@@ -446,6 +450,7 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
         self.zch_modules: Dict[str, MCHManagedCollisionModule] = {}
         self._zch_fqn_by_mc_module: Dict[int, str] = {}
         self._feature_to_fqn_by_module: Dict[nn.Module, Dict[str, str]] = {}
+        self._lookup_bindings: Dict[int, Tuple[List[str], List[str]]] = {}
         self.store = DeltaStoreTrec(UpdateMode.NONE)
 
         lookup_modules: List[nn.Module] = []
@@ -467,6 +472,7 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                 module_fqn = self._clean_module_fqn(named_fqn)
             self.tracked_modules[module_fqn] = module
             wrapper, mc_modules = mc_modules_by_inner.get(id(module), (module, {}))
+            is_zch = wrapper is not module
             lookup_modules.append(wrapper)
 
             feature_to_fqn: Dict[str, str] = {}
@@ -476,16 +482,28 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                     raise ValueError(f"Duplicate embedding table FQN: {table_fqn}")
                 feature_names = list(config.feature_names)
                 self.fqn_to_feature_names[table_fqn] = feature_names
-                for feature_name in feature_names:
-                    feature_to_fqn[feature_name] = table_fqn
-                if wrapper is not module:
+                if is_zch:
+                    for feature_name in feature_names:
+                        if feature_name in feature_to_fqn:
+                            raise ValueError(
+                                "delta_embedding_dump_config does not support "
+                                f"feature {feature_name!r} shared by managed "
+                                "collision tables "
+                                f"{feature_to_fqn[feature_name]} and {table_fqn}; "
+                                "raw IDs cannot be attributed to a unique table."
+                            )
+                        feature_to_fqn[feature_name] = table_fqn
                     self._track_zch_table(table_fqn, table_name, mc_modules)
-            self._feature_to_fqn_by_module[wrapper] = feature_to_fqn
+            if is_zch:
+                self._feature_to_fqn_by_module[wrapper] = feature_to_fqn
+            else:
+                self._register_plain_lookup_trackers(module_fqn, module)
 
-        for module in lookup_modules:
-            module.register_post_lookup_tracker_fn(self.record_lookup)
+        for wrapper in lookup_modules:
+            if wrapper in self._feature_to_fqn_by_module:
+                wrapper.register_post_lookup_tracker_fn(self.record_zch_lookup)
             if auto_compact:
-                module.register_post_odist_tracker_fn(self.trigger_compaction)
+                wrapper.register_post_odist_tracker_fn(self.trigger_compaction)
         for mc_module in self.zch_modules.values():
             register_post_zch_event_tracker_fn(mc_module, self.record_zch_event)
 
@@ -501,6 +519,99 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
             yield
         finally:
             self.pause_depth -= 1
+
+    def _register_plain_lookup_trackers(
+        self, module_fqn: str, module: _ShardedEmbeddingModule
+    ) -> None:
+        """Bind each embedding lookup module's feature positions to its tables' FQNs.
+
+        Each plain lookup callback receives one GroupedEmbeddingConfig's
+        feature slice, whose key order matches the config's flattened
+        (table, feature) order -- a feature shared by several tables appears
+        once per table, so positional attribution keeps each copy with its
+        own table. A feature-name map cannot do this: it would collapse a
+        shared feature onto one table and attribute the other tables'
+        lookups to it, which crashes the dump on ranks that do not host
+        that table.
+
+        Args:
+            module_fqn: FQN of the owning sharded embedding collection.
+            module: Sharded embedding collection whose lookups to bind.
+
+        Raises:
+            ValueError: if the lookup's configs and embedding lookup modules
+                differ in count.
+        """
+        for lookup in _embedding_lookups(module):
+            if len(lookup.grouped_configs) != len(lookup._emb_modules):
+                raise ValueError(
+                    f"Embedding lookup under {module_fqn} has "
+                    f"{len(lookup._emb_modules)} embedding lookup modules but "
+                    f"{len(lookup.grouped_configs)} grouped configs."
+                )
+            for config, emb_op in zip(lookup.grouped_configs, lookup._emb_modules):
+                self._lookup_bindings[id(emb_op)] = (
+                    config.feature_names(),
+                    [
+                        _embedding_table_fqn(module_fqn, module, table.name)
+                        for table in config.embedding_tables
+                        for _ in table.feature_names
+                    ],
+                )
+            if lookup.optim_state_tracker_fn is not None:
+                logger.warning(
+                    "Replacing an existing plain lookup tracker under %s; "
+                    "the previous tracker will no longer receive lookups.",
+                    module_fqn,
+                )
+            lookup.register_optim_state_tracker_fn(self.record_plain_lookup)
+
+    def record_plain_lookup(
+        self,
+        kjt: KeyedJaggedTensor,
+        states: torch.Tensor,
+        emb_module: Optional[nn.Module] = None,
+    ) -> None:
+        """Record IDs against the tables served by a plain embedding lookup module.
+
+        Args:
+            kjt: The embedding lookup module's feature slice, with keys in its
+                config's flattened (table, feature) order.
+            states: Lookup output, unused in ID-only tracking mode.
+            emb_module: Embedding lookup module that performed the lookup.
+
+        Raises:
+            ValueError: if the embedding lookup module was not bound at tracker
+                init, or its feature slice disagrees with the bound table positions.
+        """
+        if self.pause_depth > 0:
+            return
+        binding = self._lookup_bindings.get(id(emb_module))
+        if binding is None:
+            raise ValueError(
+                "Unrecognized embedding lookup module for FQN delta tracking: "
+                f"{emb_module}"
+            )
+        expected_keys, table_fqns = binding
+        if kjt.keys() != expected_keys:
+            raise ValueError(
+                f"Embedding lookup module {type(emb_module).__name__} looked up "
+                f"feature keys {kjt.keys()}, expected {expected_keys} "
+                "in table-feature order."
+            )
+        lengths = kjt.length_per_key()
+        if torch.is_tensor(lengths):
+            lengths = lengths.tolist()
+        ids_by_fqn: Dict[str, List[torch.Tensor]] = {}
+        for table_fqn, ids in zip(table_fqns, torch.split(kjt.values(), lengths)):
+            ids_by_fqn.setdefault(table_fqn, []).append(ids)
+        for table_fqn, ids in ids_by_fqn.items():
+            self.store.append(
+                batch_idx=self.curr_batch_idx,
+                fqn=table_fqn,
+                ids=torch.cat(ids),
+                states=None,
+            )
 
     def _track_zch_table(
         self, table_fqn: str, table_name: str, mc_modules: Dict[str, nn.Module]
@@ -539,20 +650,29 @@ class ModelDeltaTracker(TorchRecModelDeltaTracker):
                 return fqn[len(prefix) :]
         return fqn
 
-    def record_lookup(
+    def record_zch_lookup(
         self,
         kjt: KeyedJaggedTensor,
         states: torch.Tensor,
         emb_module: Optional[nn.Module] = None,
         raw_ids: Optional[torch.Tensor] = None,
     ) -> None:
-        """Record touched IDs using the owning module's table FQNs.
+        """Record raw IDs of a managed collision wrapper's lookup by table FQN.
+
+        Only managed collision wrappers fire this callback: their inner
+        lookups see remapped rows, so the wrapper-level raw-id stream is the
+        only usable one for ZCH tables. Plain collections use
+        :meth:`record_plain_lookup`, which resolves shared features
+        to the table each lookup actually served.
 
         Args:
             kjt: Sparse features used by the lookup.
             states: Lookup output, unused in ID-only tracking mode.
-            emb_module: Sharded module that performed the lookup.
+            emb_module: Managed collision wrapper that performed the lookup.
             raw_ids: Optional unprocessed IDs, unused by delta embedding dump.
+
+        Raises:
+            ValueError: if the owning module is missing or was not bound at init.
         """
         if self.pause_depth > 0:
             return

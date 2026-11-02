@@ -1097,6 +1097,8 @@ message SequenceFeature {
     optional string sequence_pk = 4;
     // sub feature config
     repeated SeqFeatureConfig features = 5;
+    // FeatureStore entity for serving; unset preserves legacy entity resolution
+    optional string sequence_entity = 6;
 }
 
 message FeatureConfig {

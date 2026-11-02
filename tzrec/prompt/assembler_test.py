@@ -460,32 +460,39 @@ class MultiTargetLayoutTest(unittest.TestCase):
         )
         self.assertEqual(layout.logit_indices.numel(), 3 * levels - 1)
 
-    def test_mask_excludes_padding_future_tokens_and_other_targets(self) -> None:
+    @parameterized.expand([[False], [True]], name_func=parameterized_name_func)
+    def test_mask_excludes_padding_future_tokens_and_other_targets(
+        self, packed
+    ) -> None:
         layout = build_multi_target_layout(
             torch.tensor([0, 8, 15, 18], dtype=torch.int32),
             torch.tensor([6, 3, 0]),
             width=10,
             num_levels=3,
+            pack_prefix=packed,
         )
-        positions = torch.arange(10)
+        query_width = layout.response_width if packed else 10
         for row, (padding, prefix_length, count) in enumerate(
             [(2, 2, 2), (3, 4, 1), (7, 3, 0)]
         ):
             actual = layout.mask_mod(
                 torch.tensor(row),
                 torch.tensor(0),
-                positions[:, None],
-                positions[None, :],
+                torch.arange(query_width)[:, None],
+                torch.arange(10)[None, :],
             )
-            expected = torch.zeros(10, 10, dtype=torch.bool)
+            padding = 0 if packed else padding
+            expected = torch.zeros(query_width, 10, dtype=torch.bool)
             prefix_end = padding + prefix_length
-            expected[padding:prefix_end, padding:prefix_end] = torch.ones(
-                prefix_length, prefix_length, dtype=torch.bool
-            ).tril()
+            if not packed:
+                expected[padding:prefix_end, padding:prefix_end] = torch.ones(
+                    prefix_length, prefix_length, dtype=torch.bool
+                ).tril()
             for target in range(count):
                 start = prefix_end + target * 3
-                expected[start : start + 3, padding:prefix_end] = True
-                expected[start : start + 3, start : start + 3] = torch.ones(
+                query_start = target * 3 if packed else start
+                expected[query_start : query_start + 3, padding:prefix_end] = True
+                expected[query_start : query_start + 3, start : start + 3] = torch.ones(
                     3, 3, dtype=torch.bool
                 ).tril()
             torch.testing.assert_close(actual, expected)

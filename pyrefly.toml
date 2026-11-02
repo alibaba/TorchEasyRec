@@ -19,6 +19,7 @@ ignore-missing-imports = [
     "torch_fx_tool.*",
     "feature_store_py.*",
     "dynamicemb.*",
+    "pynve.*",
     "hstu.*",
     "easy_rec.*",
     "pangudfs_client.*",

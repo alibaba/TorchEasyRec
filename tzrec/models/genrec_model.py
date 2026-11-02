@@ -74,7 +74,7 @@ def _fx_wrapped_genrec_loss(
     Returns:
         Scalar cross entropy, averaging targets within each parent first.
     """
-    if "target_counts" not in predictions or predictions["target_counts"].numel() == 0:
+    if "target_counts" not in predictions:
         return model.lm.loss_function(
             logits=predictions["logits"],
             labels=predictions["labels"],
