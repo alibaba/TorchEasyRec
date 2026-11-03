@@ -929,7 +929,8 @@ def _emit_dynamicemb_variants(
 ) -> List[ShardingOption]:
     """Expand a dynamicemb ShardingOption into HYBRID + CACHING variants.
 
-    Sweeps both placement modes (``caching=False`` and ``caching=True``) and,
+    Sweeps both placement modes (``caching=False`` and ``caching=True``; only
+    CACHING under AUTO placement) and,
     when ``base_option.cache_params`` is unset, ten cache_load_factor values
     (0.1, 0.2, ..., 1.0). The downstream 2D DP proposer picks per table the
     best (mode, ratio) that fits both HBM and host topology budgets.
@@ -952,7 +953,10 @@ def _emit_dynamicemb_variants(
         load_factors = [base_option.cache_params.load_factor]
         stats = base_option.cache_params.stats
     variants: List[ShardingOption] = []
-    for caching_mode in (False, True):
+    # HybridStorage re-splits rows between its tiers on load, so a near-capacity
+    # table overflows hash buckets and loses rows on every restore.
+    caching_modes = (True,) if rocksdb_util.is_auto() else (False, True)
+    for caching_mode in caching_modes:
         for load_factor in load_factors:
             opt = copy.deepcopy(base_option)
             opt.cache_params = CacheParams(load_factor=load_factor, stats=stats)

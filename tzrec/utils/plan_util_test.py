@@ -17,7 +17,7 @@ from unittest import mock
 
 import numpy as np
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
@@ -35,7 +35,7 @@ from tzrec.protos import feature_pb2, train_pb2
 from tzrec.utils import plan_util, rocksdb_capacity, rocksdb_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.plan_util import DynamicProgrammingProposer, _sparse_dp_proposor_numpy
-from tzrec.utils.test_util import mark_ci_scope
+from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
 
 
 class HostMemoryTest(unittest.TestCase):
@@ -875,6 +875,28 @@ class RocksDBPlacementTest(unittest.TestCase):
 
     def tearDown(self):
         rocksdb_util.set_rocksdb_config(None)
+
+    @parameterized.expand(
+        [
+            param("auto", placement="AUTO", modes={True}),
+            param("explicit", placement="EXPLICIT", modes={False, True}),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_memory_table_layouts(self, _, placement, modes):
+        # AUTO keeps a table in memory only where every restore preserves it.
+        rocksdb_util.set_rocksdb_config(
+            train_pb2.RocksDBConfig(
+                local_path="/unused",
+                placement=train_pb2.DynamicEmbPlacement.Value(placement),
+            )
+        )
+        base = SimpleNamespace(
+            dynamicemb_options=SimpleNamespace(caching=False, external_storage=None),
+            cache_params=None,
+        )
+        variants = plan_util._emit_dynamicemb_variants(base)
+        self.assertEqual({v.dynamicemb_options.caching for v in variants}, modes)
 
     def _place(
         self,

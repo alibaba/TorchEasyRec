@@ -133,6 +133,7 @@ feature_configs {
 
 - **placement: EXPLICIT**（默认）: 只有配置了 `dynamicemb { rocksdb {} }` 的表使用 RocksDB，其它表与原来一样
 - **placement: AUTO**: 不需要逐表配置 `rocksdb {}`。规划器先估算全部 DynamicEmbedding 表放在 GPU/主机内存所需的空间，只有放不下时才把一部分表移到 RocksDB：按“每步查表次数 / 表大小”从小到大挑选（同一融合组已在 RocksDB 的优先），跳过磁盘放不下的表，最后把不再需要的表移回内存。这是基于容量的确定性规则，不代表性能最优（没有使用访问统计）。规划后再由 TorchRec 规划器校验，如果仍放不下会再多移一张表重试；仍然无解时报错并给出显存/内存和磁盘的缺口
+- AUTO 下留在内存的表只使用 CACHING 布局（GPU cache 加完整的主机表），不使用 HYBRID：HYBRID 每次加载都会重新划分 GPU 和主机两层，接近 `max_capacity` 的表会溢出哈希 bucket，恢复时丢失行
 - 显式覆盖：`rocksdb {}` 的表总是使用 RocksDB；配置了 `cache_load_factor` 的表总是留在内存；`score_strategy: "CUSTOMIZED"` 的表不会放到 RocksDB（TorchEasyRec 没有 CUSTOMIZED 分数的生产者）
 - 没有配置 rocksdb_config 时不会使用磁盘，也不需要安装 tzrec-rocksdb；AUTO 未选中任何表时不会打开数据库，也不会预留 RocksDB 的主机内存
 - 训练日志中的 `dynamicemb placement` 列出每张表的去向、原因和估算的显存/内存/磁盘，`RocksDB live storage` 给出磁盘估算的分项明细
@@ -182,6 +183,7 @@ feature_configs {
 - 开启 RocksDB 后，`--continue_train`、评估、预测和导出只会选择带 `_SUCCESS` 的 checkpoint；比恢复点更新、但没有 `_SUCCESS` 的 checkpoint 目录会被删除（日志中打印文件数和大小），在 OSS 上重命名等于全量复制
 - 恢复时先清空 GPU cache，再新建一个空的工作库，从 checkpoint 文件按块加载；上一次的工作库和崩溃遗留的数据不会被复用。因此只要 checkpoint 完整，本地盘丢失后也可以在其它节点恢复
 - checkpoint 与放置方式无关：同一份 checkpoint 可以在内存版和 RocksDB 版之间恢复，也可以在调整预算后由 AUTO 选出不同的放置继续训练。若放置变化使原本不在同一融合组、优化器参数（例如 Adam 的迭代次数）不同的表融合到一起，恢复会报错。world size、维度或优化器类型的变化按 dynamicemb 自身的规则校验
+- 内存表接近 `max_capacity` 时，改变 world size 恢复会让 key 落到新的哈希 bucket，装不下的 bucket 按淘汰策略丢弃其中分数最低的行（装填率约 97% 时，`bucket_capacity` 为 128 约丢失 2.3%，为 1024 约丢失 0.3%）。RocksDB 表没有 bucket，不受影响；world size 不变时恢复也不会丢行
 - 评估、导出时 RocksDB 表同样从 checkpoint 文件加载到一个新的临时数据库（会占用与表大小相当的磁盘）
 - 旧版本（原生 RocksDB checkpoint，`model.ckpt-<step>/rocksdb/rank_<r>.json`）的 checkpoint 仍可恢复（仅限 `NO_EVICTION` 表）和导出；恢复后保存一次即转换为新格式。旧的原生 checkpoint 在对应 `model.ckpt-<step>` 被清理后删除
 - 保存耗时与表大小成正比（全量写出），训练在保存期间暂停（实测经 ossfs 写出约 125 GiB 需约 13 分钟，从 OSS 恢复约 6 分钟），请据此设置 `save_checkpoints_steps`；日志 `RocksDB checkpoint` 给出本次保存的 cache 写回、导出行数和字节数、暂停后台任务的等待时间和读取的未落盘 memtable 大小，以及进程启动以来训练、发布的累计写回量、淘汰行数和 RocksDB flush/compaction 写入量
