@@ -35,7 +35,6 @@ from torchrec.optim.clipping import GradientClipping, GradientClippingOptimizer
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
-from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     TARGET_REPEAT_INTERLEAVE_KEY,
@@ -108,6 +107,7 @@ from tzrec.utils.hf_export_util import export_hf_assets
 from tzrec.utils.load_class import import_class
 from tzrec.utils.logging_util import ProgressLogger, logger
 from tzrec.utils.online_dense_export_util import OnlineDenseExportManager
+from tzrec.utils.online_learning_util import create_online_learning_handover
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 from tzrec.version import __version__ as tzrec_version
 
@@ -453,6 +453,15 @@ def _train_and_evaluate(
                 "checkpoint, no epochs left to train."
             )
         return
+    if use_step and restore_from_model_dir and skip_steps >= train_config.num_steps - 1:
+        # nothing left to train; the final save would rewrite the restored
+        # model.ckpt-{skip_steps} in place.
+        if is_local_rank_zero:
+            logger.warning(
+                f"restored checkpoint at step {skip_steps} already reaches "
+                f"num_steps={train_config.num_steps}, no steps left to train."
+            )
+        return
     epoch_iter = (
         range(epochs_completed, train_config.num_epochs)
         if use_epoch
@@ -577,6 +586,10 @@ def _train_and_evaluate(
             "dense export trigger and the FeatureStore upload watermark is the only "
             "publish gate."
         )
+    # A stream lineage retires itself once the next day's lineage has consumed
+    # data about as fresh; deployment of the successor follows its exit.
+    handover = create_online_learning_handover(model_dir, train_config)
+    handed_over = False
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
@@ -730,8 +743,22 @@ def _train_and_evaluate(
                     if delta_embedding_dumper is not None
                     else None
                 )
+                if (
+                    handover is not None
+                    and i_step % train_config.log_step_count_steps == 0
+                    and handover.update_and_check(i_step, data_timestamp)
+                ):
+                    logger.info(
+                        f"successor lineage {handover.successor_model_dir} caught "
+                        f"up at step {i_step}, handing over."
+                    )
+                    handed_over = True
+                    break
                 if prof is not None:
                     prof.step()
+
+            if handed_over:
+                break
 
             if not (use_step and i_step >= train_config.num_steps - 1):
                 for lr in lr_scheduler:
@@ -781,7 +808,8 @@ def _train_and_evaluate(
             summary_writer.close()
         if prof is not None:
             prof.stop()
-        if ckpt_manager.maybe_save(
+        # a retired lineage is never resumed, so skip its final checkpoint
+        if not handed_over and ckpt_manager.maybe_save(
             i_step,
             model,
             optimizer,
@@ -1257,6 +1285,7 @@ def export(
     asset_files: Optional[str] = None,
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     item_input_path: Optional[str] = None,
+    edit_config_json: Optional[str] = None,
 ) -> None:
     """Export a EasyRec model.
 
@@ -1271,12 +1300,15 @@ def export(
         item_input_path (str, optional): override for the item tower's
             predict-mode dataloader input path. When set, the item tower
             reads from this path instead of ``train_input_path``.
+        edit_config_json (str, optional): edit pipeline config json str.
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
     ensure_input_tile_for_distributed_embedding()
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+    if edit_config_json:
+        config_util.edit_config(pipeline_config, json.loads(edit_config_json))
     ori_pipeline_config = copy.copy(pipeline_config)
 
     # AOTI bakes allow_tf32 into Triton constexprs at trace time.
@@ -1491,7 +1523,8 @@ def predict(
         debug_level (int, optional): debug level for debug parsed inputs etc.
         dataset_type (str, optional): dataset type, default use the type in pipeline.
         predict_threads (int, optional): predict threads num, default will
-            use num_workers in data_config.
+            use num_workers in data_config, or one per GPU for a distributed
+            embedding export.
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
         edit_config_json (str, optional): edit pipeline config json str.
@@ -1525,8 +1558,8 @@ def predict(
     acc_utils.allow_tf32_for_export(pipeline_config)
 
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
-    is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
+    is_dist_emb: bool = acc_utils.is_distributed_embedding_predict(scripted_model_path)
 
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
@@ -1573,16 +1606,20 @@ def predict(
         quota_name=data_config.odps_data_quota_name,
     )
 
-    if is_aot:
-        model = aot_utils.load_model_aot(scripted_model_path, device=device)
-    else:
-        # disable jit compile， as it compile too slow now.
-        if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
-            os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-        model = torch.jit.load(
-            os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
-        )
-        model.eval()
+    # forward workers are spread over forward_devices.
+    forward_devices = [device]
+    if is_dist_emb:
+        if int(os.environ.get("LOCAL_WORLD_SIZE", 1)) == 1:
+            # one process per node: the local GPUs share one host copy of the tables.
+            forward_devices = [
+                torch.device("cuda", i) for i in range(torch.cuda.device_count())
+            ]
+        else:
+            logger.warning(
+                "each predict process loads its own host copy of the sparse "
+                "embeddings, launch with --nproc_per_node=1 to share one copy "
+                "between all GPUs of a node."
+            )
 
     plogger = None
     if is_local_rank_zero:
@@ -1590,8 +1627,6 @@ def predict(
 
     prof = None
     if is_profiling:
-        if is_rank_zero:
-            logger.info(str(model))
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=10, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
@@ -1604,7 +1639,27 @@ def predict(
         prof.start()
 
     if predict_threads is None:
-        predict_threads = max(data_config.num_workers, 1)
+        # with a distributed embedding, each lookup stream holds its own NVE buffers.
+        predict_threads = (
+            len(forward_devices)
+            if is_dist_emb
+            else max(data_config.num_workers, len(forward_devices))
+        )
+    elif is_dist_emb and predict_threads > len(forward_devices):
+        logger.warning(
+            f"predict_threads={predict_threads} runs more than one lookup stream per "
+            "GPU; each holds its own NVE lookup buffers outside the GPU cache budget, "
+            "set a lower DIST_EMB_GPU_CACHE_RATIO if GPU memory runs out."
+        )
+    # NVE keeps one lookup context per CUDA stream, so each worker gets its own.
+    worker_streams = (
+        [
+            torch.cuda.Stream(forward_devices[i % len(forward_devices)])
+            for i in range(predict_threads)
+        ]
+        if is_dist_emb
+        else []
+    )
     data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
     pred_queue: Queue[Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]] = (
         Queue(maxsize=predict_threads * 2)
@@ -1613,16 +1668,15 @@ def predict(
     cancel_event: Event = Event()
     input_batches = 0
 
+    # when predicting with a model exported using INPUT_TILE,
+    #  we set the batch size tensor to 1 to disable tiling.
+    tile_batch_size = torch.tensor(1, dtype=torch.int64) if is_input_tile else None
+
     def _forward(
-        batch: Batch,
+        batch: Batch, device: torch.device = device
     ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
-            parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
-            if is_input_tile:
-                # when predicting with a model exported using INPUT_TILE,
-                #  we set the batch size tensor to 1 to disable tiling.
-                parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            predictions = model(parsed_inputs, device)
+            predictions = batch_model(batch, tile_batch_size, device)
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
@@ -1652,22 +1706,29 @@ def predict(
 
     def _forward_loop(worker_id: int) -> None:
         stage = "forward"
+        worker_device = forward_devices[worker_id % len(forward_devices)]
+        stream_ctx = (
+            torch.cuda.stream(worker_streams[worker_id])
+            if worker_streams
+            else nullcontext()
+        )
         try:
-            while True:
-                batch = predict_util.queue_get_interruptibly(
-                    data_queue,
-                    cancel_event,
-                    f"{stage}[{worker_id}] input",
-                )
-                if batch is None:
-                    return
-                pred = _forward(batch)
-                predict_util.queue_put_interruptibly(
-                    pred_queue,
-                    pred,
-                    cancel_event,
-                    f"{stage}[{worker_id}] output",
-                )
+            with stream_ctx:
+                while True:
+                    batch = predict_util.queue_get_interruptibly(
+                        data_queue,
+                        cancel_event,
+                        f"{stage}[{worker_id}] input",
+                    )
+                    if batch is None:
+                        return
+                    pred = _forward(batch, worker_device)
+                    predict_util.queue_put_interruptibly(
+                        pred_queue,
+                        pred,
+                        cancel_event,
+                        f"{stage}[{worker_id}] output",
+                    )
         except predict_util.PredictPipelineCancelled:
             return
         except BaseException as error:
@@ -1680,11 +1741,24 @@ def predict(
     pipeline_error: Optional[BaseException] = None
     i_step = 0
     try:
+        # loaded in the guarded scope: a failed load still reaches the commit
+        # rendezvous below, so other ranks fail fast instead of waiting.
+        batch_model = predict_util.load_predict_model(
+            scripted_model_path,
+            forward_devices,
+            log_model=is_profiling and is_rank_zero,
+        )
         while True:
             try:
                 batch = next(infer_iterator)
                 if i_step == 0:
-                    predictions, reserves = _forward(batch)
+                    # on worker 0's stream, so it adds no lookup context of its own.
+                    with (
+                        torch.cuda.stream(worker_streams[0])
+                        if worker_streams
+                        else nullcontext()
+                    ):
+                        predictions, reserves = _forward(batch)
                     input_batches += 1
                     if output_cols is None:
                         output_cols = sorted(predictions.keys())

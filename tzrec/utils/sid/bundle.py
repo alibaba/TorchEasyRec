@@ -37,6 +37,7 @@ from functools import cached_property
 from typing import Any, Dict, List, Optional, Tuple
 
 from odps import ODPS
+from torch import distributed as dist
 
 from tzrec.datasets.odps_dataset import _create_odps_account, _parse_table_path
 from tzrec.utils.logging_util import logger
@@ -195,39 +196,46 @@ class Bundle:
         self._created_generation_paths: List[str] = []
         self.uuid = uuid.uuid4().hex
 
-    def prepare_generation(self) -> None:
-        """Check output locations and create this generation's local directories.
+    def prepare_generation(self, rank: int) -> None:
+        """Prepare output locations on rank 0, then synchronize all ranks.
 
         Record this run's output locations for cleanup by the runner.
         No existing generation is overwritten or removed.
-        """
-        self._created_generation_paths.clear()
-        generation_paths = dict.fromkeys(
-            path if is_odps_path(path) else os.path.realpath(path)
-            for path in (
-                os.path.dirname(self.artifact_path(SID_TO_ITEMS_ARTIFACT)),
-                os.path.dirname(self.artifact_path(ITEM_TO_SID_ARTIFACT)),
-            )
-        )
-        for path in generation_paths:
-            if is_odps_path(path):
-                client, table_name, partition_spec = _odps_generation(path)
-                exists = False
-                if client.exist_table(table_name):
-                    table = client.get_table(table_name)
-                    partitions = table.iterate_partitions(spec=partition_spec)
-                    exists = next(partitions, None) is not None
-            else:
-                exists = os.path.lexists(path)
 
-            if exists:
-                raise FileExistsError(
-                    f"generation already exists at {path!r}; use a new generation "
-                    "or remove the incomplete generation before retrying."
+        Args:
+            rank: Current process rank; only rank 0 prepares output locations.
+        """
+        if rank == 0:
+            self._created_generation_paths.clear()
+            generation_paths = dict.fromkeys(
+                path if is_odps_path(path) else os.path.realpath(path)
+                for path in (
+                    os.path.dirname(self.artifact_path(SID_TO_ITEMS_ARTIFACT)),
+                    os.path.dirname(self.artifact_path(ITEM_TO_SID_ARTIFACT)),
                 )
-            if not is_odps_path(path):
-                os.makedirs(path)
-            self._created_generation_paths.append(path)
+            )
+            for path in generation_paths:
+                if is_odps_path(path):
+                    client, table_name, partition_spec = _odps_generation(path)
+                    exists = False
+                    if client.exist_table(table_name):
+                        table = client.get_table(table_name)
+                        partitions = table.iterate_partitions(spec=partition_spec)
+                        exists = next(partitions, None) is not None
+                else:
+                    exists = os.path.lexists(path)
+
+                if exists:
+                    raise FileExistsError(
+                        f"generation already exists at {path!r}; use a new generation "
+                        "or remove the incomplete generation before retrying."
+                    )
+                if not is_odps_path(path):
+                    os.makedirs(path)
+                self._created_generation_paths.append(path)
+
+        if dist.is_initialized():
+            dist.barrier()
 
     def remove_generation(self) -> None:
         """Remove this run's generation, logging failures without raising them."""

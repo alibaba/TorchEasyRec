@@ -27,6 +27,8 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ODPS_ENDPOINT: 在PAI-DLC/PAI-DSW环境，数据为MaxCompute表的情况下需设置，详见[文档](../feature/data.md)的OdpsDataset章节
 - ODPS_CONFIG_FILE_PATH: 在本地环境，数据为MaxCompute表的情况下需设置为odps_conf的路径，详见[文档](../feature/data.md)的OdpsDataset章节
 - CHECKPOINT_TAG: 给checkpoint打一个自定义标记，记录在`meta`中（见下面的checkpoint信息），便于外部调度识别是哪一次调度产出的checkpoint。默认为空，不做任何限制
+- ONLINE_LEARNING_SUCCESSOR_DIR: 在线学习中下一条流式链路的`model_dir`。设置后，本任务每隔`log_step_count_steps`步把已消费数据的事件时间（与checkpoint `meta`中`data_ts`的定义相同）写入`model_dir`下的`progress.json`，并读取下一条链路的`progress.json`；当下一条链路落后本任务不超过`ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS`时，本任务正常结束训练且不保存最终checkpoint。需使用带timestamp的数据源（如KafkaDataset），详见[在线学习](../best_practices/online_learning.md)
+- ONLINE_LEARNING_HANDOVER_TOLERANCE_SECS: 交接时允许下一条链路落后的秒数，默认300。两条链路都追到Kafka最新数据后，各自的事件时间只在检查时更新，且不同分区的时间存在偏差，严格比较可能一直无法满足，因此需要容忍值
 
 ## Checkpoint信息与完成标记
 
@@ -223,3 +225,40 @@ train_config {
 - 该表由dense_optimizer更新，sparse_optimizer中配置的优化器类型和LR策略对它不生效，它跟随dense_optimizer的LR策略
 - 该表的参数会参与`dense_optimizer.part_optimizers`的`regex_pattern`匹配，也会被`dense_optimizer.ema`纳入
 - 如需让所有Embedding都由sparse_optimizer管理，可以在`sharding_types`中排除`data_parallel`
+
+(pooling-factor)=
+
+### pooling_factor 与 unique_id_factor
+
+每个特征可以在`embedding_constraints`中配置两个从训练数据测量的参数来使得EmbeddingPlanner根据数据分布更合理地进行规划：
+
+- `pooling_factor`：一个样本通过该特征查这张表的平均原始Id位置数（含重复），最小为1。规划器用它估算每步查表量、输入输出张量大小和通信量
+- `unique_id_factor`：单个样本通过共用这张表的所有特征查表的去重Id数的最大值（注意与`pooling_factor`不同，它不是平均值，而是最重的一个样本的去重数）。`batch_size * unique_id_factor`是这张表保守的cache工作集估计（例如dynamicemb GPU cache需要容纳它）
+
+```
+feature_configs {
+    id_feature {
+        feature_name: "tag"
+        embedding_dim: 8
+        embedding_constraints {
+            # 平均每个样本36.3个原始Id；最重的一个样本41个去重Id
+            # batch_size=1024时，该表单个batch的去重工作集估计为1024*41=41984
+            pooling_factor: 36.3
+            unique_id_factor: 41
+        }
+    }
+}
+```
+
+这两个值用工具从训练数据中测量并写入一个新配置文件（不修改原配置）：
+
+```bash
+python -m tzrec.tools.add_pooling_factor_to_config \
+    --pipeline_config_path pipeline.config \
+    --output_path pipeline_measured.config \
+    --num_batches 100
+```
+
+- 表的划分从配置的`feature_groups`解析（与模型构建一致，含ZCH表），不构建模型；遵循标准`feature_groups`语义的自定义模型无需导入模型类即可使用。ZCH表的去重计数基于原始Id，不代表碰撞后的行工作集
+
+注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据

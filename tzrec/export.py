@@ -57,6 +57,13 @@ if __name__ == "__main__":
         "(a one-row-per-item table matching the scalar export view) "
         "instead of `train_input_path`.",
     )
+    parser.add_argument(
+        "--edit_config_json",
+        type=str,
+        default=None,
+        help='edit pipeline config str, example: {"model_dir":"experiments/",'
+        '"feature_configs[0].raw_feature.boundaries":[4,5,6,7]}',
+    )
     args, extra_args = parser.parse_known_args()
 
     additional_export_config = (
@@ -72,4 +79,5 @@ if __name__ == "__main__":
         asset_files=args.asset_files,
         additional_export_config=additional_export_config,
         item_input_path=args.item_input_path,
+        edit_config_json=args.edit_config_json,
     )

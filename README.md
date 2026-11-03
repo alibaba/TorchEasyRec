@@ -100,6 +100,7 @@ TorchEasyRec implements state-of-the-art deep learning models for recommendation
 | [DLRM-HSTU-OneRank](docs/source/models/dlrm_hstu_onerank.md) | Transformer-native multi-task ranking head (task-private channels) on top of DLRM-HSTU |
 | [ULTRA-HSTU](docs/source/models/ultra_hstu.md)               | HSTU with Semi-Local Attention, Attention Truncation, and Mixture of Transducers       |
 | [HSTU-Match](docs/source/models/hstu_match.md)               | HSTU-based two-tower retrieval model                                                   |
+| [GenRec](docs/source/models/genrec.md)                       | LLM-based generative retrieval with semantic IDs                                       |
 
 ### Semantic ID (SID) Generation
 

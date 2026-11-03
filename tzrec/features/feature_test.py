@@ -30,7 +30,12 @@ from tzrec.features import (
 from tzrec.features import feature as feature_lib
 from tzrec.features.feature import FgMode
 from tzrec.protos import feature_pb2
-from tzrec.utils.test_util import make_test_dir, parameterized_name_func
+from tzrec.utils import dynamicemb_util
+from tzrec.utils.test_util import (
+    make_test_dir,
+    mark_ci_scope,
+    parameterized_name_func,
+)
 
 _VOCAB_CONTENT = "a 1\nb 2\n"
 _VOCAB_ASSET_NAME = f"custom_vocab_{hashlib.md5(_VOCAB_CONTENT.encode()).hexdigest()}"
@@ -387,6 +392,84 @@ class FeatureTest(unittest.TestCase):
                 )
             ),
         ]
+
+    @parameterized.expand(
+        [(False, False), (True, False), (False, True), (True, True)],
+        name_func=parameterized_name_func,
+    )
+    def test_sequence_entity_round_trip(self, remove_bucketizer, for_odps):
+        feature_cfgs = []
+        entities = [None, "item", "app"]
+        for i, entity in enumerate(entities):
+            config = self._create_test_feature_cfgs()[-1]
+            sequence = config.sequence_feature
+            sequence.sequence_name = f"click_seq_{i}"
+            sequence.sequence_pk = f"user:click_seq_{i}"
+            if entity is not None:
+                sequence.sequence_entity = entity
+            feature_cfgs.append(config)
+
+        features = feature_lib.create_features(feature_cfgs)
+        self.assertEqual(
+            [feature.sequence_entity for feature in features],
+            [entity for entity in entities for _ in range(2)],
+        )
+        fg_json = feature_lib.create_fg_json(
+            features, remove_bucketizer=remove_bucketizer, for_odps=for_odps
+        )
+        self.assertEqual(len(fg_json["features"]), len(entities))
+        for group, entity in zip(fg_json["features"], entities):
+            self.assertEqual("sequence_entity" in group, entity is not None)
+            self.assertEqual(group.get("sequence_entity"), entity)
+            self.assertEqual(len(group["features"]), 2)
+            for sub_feature in group["features"]:
+                self.assertNotIn("sequence_entity", sub_feature)
+                self.assertTrue(sub_feature["expression"].startswith("item:"))
+        restored = feature_lib.create_feature_configs(features)
+        self.assertEqual(restored, feature_cfgs)
+        self.assertFalse(restored[0].sequence_feature.HasField("sequence_entity"))
+
+    @parameterized.expand(
+        [(FgMode.FG_NORMAL,), (FgMode.FG_DAG,)],
+        name_func=parameterized_name_func,
+    )
+    def test_sequence_entity_fg_parse(self, fg_mode):
+        from tzrec.datasets.data_parser import DataParser
+
+        config = feature_pb2.FeatureConfig(
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="click_seq",
+                sequence_length=2,
+                sequence_delim=";",
+                sequence_entity="app",
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="id",
+                            expression="item:id",
+                            num_buckets=100,
+                            embedding_dim=8,
+                        )
+                    )
+                ],
+            )
+        )
+        features = feature_lib.create_features([config], fg_mode=fg_mode)
+        parser = DataParser(features)
+        self.assertEqual(parser.feature_input_names, {"click_seq__id"})
+        handler = (
+            features[0]._fg_op if fg_mode == FgMode.FG_NORMAL else parser._fg_handler
+        )
+        self.assertEqual(handler.sequence_feature_entities(), {"click_seq": "app"})
+        parsed = parser.parse({"click_seq__id": pa.array(["1;2;3", "4"])})
+        np.testing.assert_array_equal(parsed["click_seq__id.values"], [1, 2, 4])
+        np.testing.assert_array_equal(parsed["click_seq__id.lengths"], [2, 1])
+
+    def test_sequence_entity_empty(self):
+        config = self._create_test_feature_cfgs()[-1]
+        config.sequence_feature.sequence_entity = ""
+        with self.assertRaisesRegex(ValueError, "sequence_entity.*must be non-empty"):
+            feature_lib.create_features([config])
 
     @parameterized.expand([[False], [True]])
     def test_create_fg_json(self, with_asset_dir=False):
@@ -1044,6 +1127,81 @@ class FeatureTest(unittest.TestCase):
         features, asset_dir = self._create_custom_features(with_cxx11abi0_file=False)
         with self.assertRaisesRegex(ValueError, "operator_lib_cxx11abi0_file"):
             feature_lib.create_fg_json(features, asset_dir=asset_dir, for_odps=True)
+
+    @staticmethod
+    def _id_feature(pooling_factor=None, unique_id_factor=None, **dynamicemb):
+        feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="cat_a", embedding_dim=8, num_buckets=100
+            )
+        )
+        for k, v in dynamicemb.items():
+            setattr(feat_cfg.id_feature.dynamicemb, k, v)
+        constraints = feat_cfg.id_feature.embedding_constraints
+        if pooling_factor is not None:
+            constraints.pooling_factor = pooling_factor
+        if unique_id_factor is not None:
+            constraints.unique_id_factor = unique_id_factor
+        return id_feature.IdFeature(feat_cfg)
+
+    @parameterized.expand(
+        [
+            param("configured", pooling_factor=3.5, unique_id_factor=7.0),
+            param("below_one", pooling_factor=0.5, unique_id_factor=0.25),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_feature_statistics_populate_constraints(
+        self, name, pooling_factor=None, unique_id_factor=None
+    ):
+        feature = self._id_feature(
+            pooling_factor=pooling_factor, unique_id_factor=unique_id_factor
+        )
+        const = feature.parameter_constraints(feature.emb_bag_config)
+        self.assertEqual(const.pooling_factors, [pooling_factor])
+        self.assertEqual(const.unique_id_factor, unique_id_factor)
+        self.assertEqual(const.feature_names, ["cat_a"])
+
+    def test_a_feature_without_constraints_has_none(self):
+        feature = self._id_feature()
+        self.assertIsNone(feature.parameter_constraints(feature.emb_bag_config))
+
+    @unittest.skipUnless(
+        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+    )
+    @mark_ci_scope("gpu")
+    def test_dynamicemb_takes_factors_from_embedding_constraints(self):
+        feature = self._id_feature(
+            pooling_factor=36.3, unique_id_factor=41.0, max_capacity=100_000
+        )
+        const = feature.parameter_constraints(feature.emb_bag_config)
+        self.assertTrue(const.use_dynamicemb)
+        self.assertAlmostEqual(const.pooling_factors[0], 36.3, places=5)
+        self.assertAlmostEqual(const.unique_id_factor, 41.0, places=3)
+        self.assertEqual(const.feature_names, ["cat_a"])
+
+    @unittest.skipUnless(
+        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+    )
+    @mark_ci_scope("gpu")
+    def test_dynamicemb_without_factors_keeps_the_defaults(self):
+        feature = self._id_feature(max_capacity=100_000)
+        const = feature.parameter_constraints(feature.emb_bag_config)
+        self.assertTrue(const.use_dynamicemb)
+        self.assertEqual(const.pooling_factors, [1.0])
+        self.assertIsNone(getattr(const, "unique_id_factor", None))
+
+    @unittest.skipUnless(
+        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+    )
+    @mark_ci_scope("gpu")
+    def test_dynamicemb_rejects_other_embedding_constraints(self):
+        feature = self._id_feature(max_capacity=100_000)
+        feature.config.embedding_constraints.sharding_types.append("table_wise")
+        with self.assertRaisesRegex(
+            ValueError, "only pooling_factor and unique_id_factor"
+        ):
+            feature.parameter_constraints(feature.emb_bag_config)
 
 
 class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):

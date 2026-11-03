@@ -12,7 +12,7 @@
 """Masked InfoNCE contrastive loss with distributed all-gather support."""
 
 import math
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -35,8 +35,9 @@ class SidContrastiveLoss(_Loss):
     against each other and against their originals (``embed_a_ori`` /
     ``embed_b_ori``) with three symmetric InfoNCE terms (self/ori/cl). In a mixed
     batch, non-pair rows (``pair_mask=False``) must not contribute and must not
-    serve as negatives; row/column masks achieve this without data-dependent
-    branching (``torch.compile``-friendly).
+    serve as negatives. Cross-entropy ignores non-pair queries, and column masks
+    exclude non-pair candidates and false negatives identified by equal original
+    embeddings while preserving each query's designated positive.
 
     ``forward`` takes the four ``(B, dim)`` view embeddings plus the ``(B,)`` pair
     mask and returns the scalar mean of the three contrastive terms. The three
@@ -46,7 +47,7 @@ class SidContrastiveLoss(_Loss):
 
     def __init__(self) -> None:
         super().__init__()
-        self.labels: Optional[torch.Tensor] = None
+        self.label_index: Optional[torch.Tensor] = None
         self.last_local_batch_size: Optional[int] = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         # Learnable contrastive temperatures, one per group (self / ori / cl);
@@ -91,30 +92,73 @@ class SidContrastiveLoss(_Loss):
         dist.all_gather(mask_list, mask)
         return torch.cat(mask_list, dim=0)
 
+    @staticmethod
+    @torch.no_grad()
+    def _duplicate_masks(
+        embed_a_all_ori: torch.Tensor,
+        embed_b_all_ori: torch.Tensor,
+        label_index: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Mask false negatives using exact equality of original embeddings.
+
+        Exclude three kinds of false negatives:
+        1. Duplicate positives: for A -> B, mask other copies of B.
+        2. The query itself: when A is the query, mask copies of A.
+        3. Other explicit pairs: if A -> B and A -> C both occur, mask C
+           when computing A -> B. Apply the same rule in the reverse direction.
+        Always preserve each row's designated positive.
+
+        Args:
+            embed_a_all_ori: (B_global, dim) original view-a embeddings.
+            embed_b_all_ori: (B_global, dim) original view-b embeddings.
+            label_index: (B,) local rows' positions in the global batch.
+
+        Returns:
+            Four (B, B_global) masks for cross-view a/b and own-view a/b.
+        """
+        _, unique_emb_ids = torch.unique(
+            torch.cat([embed_a_all_ori, embed_b_all_ori]),
+            dim=0,
+            return_inverse=True,
+        )
+        all_a_ids, all_b_ids = unique_emb_ids.chunk(2)
+        local_a_ids = all_a_ids[label_index].unsqueeze(1)
+        local_b_ids = all_b_ids[label_index].unsqueeze(1)
+        a_matches_a = local_a_ids == all_a_ids
+        b_matches_b = local_b_ids == all_b_ids
+        a_matches_b = local_a_ids == all_b_ids
+        b_matches_a = local_b_ids == all_a_ids
+
+        cross_a_mask = a_matches_a | b_matches_b | a_matches_b  # A queries global B.
+        cross_b_mask = a_matches_a | b_matches_b | b_matches_a  # B queries global A.
+        own_a_mask = a_matches_a | b_matches_a  # A queries global A.
+        own_b_mask = b_matches_b | a_matches_b  # B queries global B.
+        masks = (cross_a_mask, cross_b_mask, own_a_mask, own_b_mask)
+        for mask in masks:
+            mask.scatter_(1, label_index.unsqueeze(1), False)
+        return masks
+
     def _masked_cross_entropy(
         self,
         logits_a: torch.Tensor,
         logits_b: torch.Tensor,
-        safe_labels: torch.Tensor,
-        pair_mask_f: torch.Tensor,
+        label_index: torch.Tensor,
         n_valid: torch.Tensor,
     ) -> torch.Tensor:
-        """Masked cross-entropy on column-masked logits, row-masked average.
+        """Average bidirectional cross-entropy over valid pair rows.
 
         Args:
             logits_a: (B, B_global) column-masked logits (view-a branch).
             logits_b: (B, B_global) column-masked logits (view-b branch).
-            safe_labels: (B,) labels with non-pair rows fallback to a safe col.
-            pair_mask_f: (B,) float pair mask (1.0 = pair row).
+            label_index: (B,) positive column indices; -100 ignores non-pair rows.
             n_valid: scalar pair-row count, clamped to >= 1.
-        """
-        ce_a = F.cross_entropy(logits_a, safe_labels, reduction="none")
-        ce_b = F.cross_entropy(logits_b, safe_labels, reduction="none")
-        # Backstop against a non-finite upstream logit (e.g. overflowed scale).
-        ce_a = torch.nan_to_num(ce_a, nan=0.0)
-        ce_b = torch.nan_to_num(ce_b, nan=0.0)
 
-        return ((ce_a + ce_b) * pair_mask_f).sum() / (2 * n_valid)
+        Returns:
+            Scalar mean loss over both directions and valid pair rows.
+        """
+        ce_a = F.cross_entropy(logits_a, label_index, reduction="none")
+        ce_b = F.cross_entropy(logits_b, label_index, reduction="none")
+        return (ce_a + ce_b).sum() / (2 * n_valid)
 
     def forward(
         self,
@@ -144,7 +188,7 @@ class SidContrastiveLoss(_Loss):
 
         # Labels carry the cross-rank offset, so refresh them on batch-size change.
         if local_batch_size != self.last_local_batch_size:
-            self.labels = local_batch_size * self._rank + torch.arange(
+            self.label_index = local_batch_size * self._rank + torch.arange(
                 local_batch_size, device=embed_a.device
             )
             self.last_local_batch_size = local_batch_size
@@ -160,36 +204,35 @@ class SidContrastiveLoss(_Loss):
         pair_mask_all = self._gather_bool_mask(pair_mask)
         col_mask = (~pair_mask_all).unsqueeze(0)  # (1, B_global)
 
-        labels = self.labels
-        assert labels is not None
-        fallback = pair_mask.long().argmax()  # first pair sample index
-        safe_labels = torch.where(pair_mask, labels, fallback.expand_as(labels))
-        pair_mask_f = pair_mask.float()
-        n_valid = pair_mask_f.sum().clamp(min=1)
+        label_index = self.label_index
+        assert label_index is not None
+        cross_a, cross_b, own_a, own_b = self._duplicate_masks(
+            embed_a_all_ori, embed_b_all_ori, label_index
+        )
+        for mask in (cross_a, cross_b, own_a, own_b):
+            mask |= col_mask
+        label_index = label_index.masked_fill(~pair_mask, -100)
+        n_valid = pair_mask.sum().clamp(min=1)
 
         # Three symmetric contrastive groups, each (scale, a-target, b-target):
         #   self: recon-a vs recon-b              (vs the other recon view)
         #   ori:  recon vs the counterpart original
         #   cl:   recon vs its own-view original
         groups = (
-            (logit_scale_self, embed_b_all, embed_a_all),
-            (logit_scale_ori, embed_b_all_ori, embed_a_all_ori),
-            (logit_scale_cl, embed_a_all_ori, embed_b_all_ori),
+            (logit_scale_self, embed_b_all, embed_a_all, cross_a, cross_b),
+            (logit_scale_ori, embed_b_all_ori, embed_a_all_ori, cross_a, cross_b),
+            (logit_scale_cl, embed_a_all_ori, embed_b_all_ori, own_a, own_b),
         )
         loss = embed_a.new_zeros(())
-        for scale, a_target, b_target in groups:
+        for scale, a_target, b_target, mask_a, mask_b in groups:
             logits_a = scale * embed_a @ a_target.t()
             logits_b = scale * embed_b @ b_target.t()
-            # Fill masked columns with the LOGITS dtype's most negative finite
-            # value: below any real logit (masks like -inf) but finite, so an
-            # all-non-pair row yields a finite CE/grad instead of 0*NaN. Derive
-            # it from the logits dtype, not the embeddings': under autocast the
-            # matmul casts to bf16/fp16 and finfo(embed.dtype=fp32).min would
-            # overflow masked_fill on the lower-precision logits.
+            # Keep fully masked rows' backward finite; use the logits dtype to
+            # avoid fill-value overflow under autocast.
             neg_fill = torch.finfo(logits_a.dtype).min
-            logits_a = logits_a.masked_fill(col_mask, neg_fill)
-            logits_b = logits_b.masked_fill(col_mask, neg_fill)
+            logits_a = logits_a.masked_fill(mask_a, neg_fill)
+            logits_b = logits_b.masked_fill(mask_b, neg_fill)
             loss = loss + self._masked_cross_entropy(
-                logits_a, logits_b, safe_labels, pair_mask_f, n_valid
+                logits_a, logits_b, label_index, n_valid
             )
         return loss / 3

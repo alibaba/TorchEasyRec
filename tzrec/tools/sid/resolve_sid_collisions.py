@@ -11,45 +11,55 @@
 
 r"""Offline best-effort SID collision resolution with TorchEasyRec-native I/O.
 
+The input is a Semantic-ID table from ``tzrec.predict``: an ``item_id`` column,
+a ``codes`` ``list<int>`` column and, for ``--strategy greedy`` or
+``iterative``, a flat ``candidate_codes`` ``list<int>`` column holding
+``topk * n_layers`` codes per item, split by the ``--codebook`` length. CSV
+encodes each SID and candidate column as comma-separated codes because Arrow's
+CSV writer cannot serialize list columns.
+
 Item IDs are expected to be unique in the upstream prediction output. To avoid
 blocking a large job on rare upstream violations, this tool does not perform a
 full-input uniqueness check or remove duplicate rows. Duplicate rows remain
-independent items in collision accounting and outputs. When candidate-strategy
+independent items in collision accounting and outputs. When candidate-based
 overflow rows share an item ID, they reuse one candidate list matched for that
 ID. Duplicate data should still be fixed upstream.
 
-The runner retains the first capacity items in each SID, attempts to
-relocate overflow items using fixed-width last-layer candidates, delegates
-placement to the pure NumPy core, and writes the ``item_to_sid`` and
-``sid_to_items`` artifacts through TorchEasyRec readers and writers. CSV encodes
-each SID/candidate column as comma-separated codes because Arrow's CSV writer
-cannot serialize list columns; ``candidate_codes`` is a flat ``topk * n_layers``
-run split by the ``--codebook`` length. ``sid_to_items`` is always parquet, so
-it keeps native list columns whatever ``--item_to_sid_writer_type`` says.
+The runner retains the first capacity items in each SID and relocates
+overflow items within their SID prefix through the pure NumPy core:
 
-The random strategy intentionally preserves the legacy deterministic baseline:
-it draws with replacement from the full last-layer space. An item's origin SID
-is already full; origin draws and duplicate draws are not replaced.
+- ``greedy`` (the default) moves each item to its first model candidate
+  with room.
+- ``iterative`` places the same candidates in synchronous rounds that give a
+  contested SID to the item ranking it earliest, so it can leave more items
+  unresolved than ``greedy``.
+- ``uniform`` reads no candidates and spreads the items over the least-loaded
+  last-layer codes of their prefix, so a prefix with room leaves nothing over
+  capacity.
+
+It writes the ``item_to_sid`` and ``sid_to_items`` artifacts through
+TorchEasyRec readers and writers; ``tzrec/utils/sid/bundle.py`` describes where
+they land. ``sid_to_items`` is always parquet, so it keeps native list columns
+whatever ``--item_to_sid_writer_type`` says.
 
 Both item_to_sid and sid_to_items carry an ``offset_codebook`` column
 alongside ``codebook``: the same SID with each layer shifted into one
 contiguous vocabulary, so layer ``i`` is offset by ``sum(codebook[:i])``. With
 ``--codebook 64,64,64`` the SID ``[1, 2, 3]`` is written as ``[1, 66, 131]``.
-It is derived from the emitted SID, so a relocated item's offset SID follows
+It is derived from the resolved SID, so a relocated item's offset SID follows
 where it landed, not what the model predicted.
 
-It is a single-process tool -- launch it with ``python -m`` (no torchrun /
-process group). The input is a Semantic-ID table from ``tzrec.predict`` (an
-``item_id`` column, a ``codes`` ``list<int>`` column, and -- for the default
-``--strategy candidate`` -- a flat ``candidate_codes`` ``list<int>`` column
-(``topk * n_layers`` codes per item)).
+Launch with ``torchrun --nproc_per_node`` to assign complete SID prefix ranges
+to ranks. Each rank writes its own part files, and rank 0 publishes one manifest
+after all ranks finish. All ranks must see the same input and output locations.
 
 Example::
 
-    python -m tzrec.tools.sid.resolve_sid_collisions \
+    torchrun --standalone --nproc_per_node=8 \
+        -m tzrec.tools.sid.resolve_sid_collisions \
         --input_path 'sid_predict_output/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
-        --strategy candidate \
+        --strategy greedy \
         --output_path sid_collision \
         --generation v1
 
@@ -69,15 +79,16 @@ plan, so they cannot be re-ranked; they are read only to be copied into the
 merged outputs. A new item continues its SID's slot numbering from the
 published occupancy instead of restarting at one::
 
-    python -m tzrec.tools.sid.resolve_sid_collisions \
+    torchrun --standalone --nproc_per_node=8 \
+        -m tzrec.tools.sid.resolve_sid_collisions \
         --input_path 'sid_predict_new_20260731/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
-        --strategy candidate \
+        --strategy greedy \
         --output_path sid_collision \
         --generation v2 --from_generation v1
 
 An append also writes ``delta_item_to_sid`` and ``delta_sid_to_items``, holding
-this run's rows and every SID it touched. Both corpus outputs stay complete,
+this run's rows and every SID that gained them. Both corpus outputs stay complete,
 so generation *n* is exactly what generation *n+1* reads at
 ``--from_generation``.
 
@@ -87,14 +98,16 @@ from __future__ import annotations
 
 import argparse
 import glob
+import math
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import cached_property
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Type
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+from torch import distributed as dist
 
 from tzrec.datasets.dataset import (
     BaseReader,
@@ -125,9 +138,15 @@ from tzrec.utils.sid.collision import (
     get_same_value_start_indices,
     prepare_collision_plan,
 )
-from tzrec.utils.sid.knn_collision import KnnCollisionResolver
-from tzrec.utils.sid.random_collision import RandomCollisionResolver
+from tzrec.utils.sid.greedy_collision import GreedyCollisionResolver
+from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
+from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 
+_RESOLVERS: Dict[str, Type[CollisionResolver]] = {
+    "greedy": GreedyCollisionResolver,
+    "iterative": IterativeCollisionResolver,
+    "uniform": UniformCollisionResolver,
+}
 _INT32_MAX = int(np.iinfo(np.int32).max)
 
 
@@ -138,19 +157,6 @@ def _is_list_column(values: pa.Array) -> bool:
         or pa.types.is_large_list(values.type)
         or pa.types.is_fixed_size_list(values.type)
     )
-
-
-def _require_single_process() -> None:
-    """Reject multi-process launches; the tool writes one complete corpus itself."""
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    if world_size != 1 or rank != 0:
-        raise RuntimeError(
-            "resolve_sid_collisions is single-process; launch it with `python -m` "
-            f"(not torchrun): got WORLD_SIZE={world_size}, RANK={rank}. Under "
-            "multiple ranks every rank reprocesses the full input and emits "
-            "duplicate shards (local) or racing overwrite sessions (ODPS)."
-        )
 
 
 class _ItemIdLookup:
@@ -210,7 +216,6 @@ class ResolveSidCollisionsConfig:
     codebook: Tuple[int, ...]
     max_items_per_codebook: int
     strategy: str
-    random_num_candidates: int
     rate_only: bool
     odps_data_quota_name: str
     from_generation: Optional[str] = None
@@ -218,10 +223,6 @@ class ResolveSidCollisionsConfig:
     def __post_init__(self) -> None:
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}.")
-        if self.random_num_candidates < 1:
-            raise ValueError(
-                f"random_num_candidates must be >= 1, got {self.random_num_candidates}."
-            )
         if not self.rate_only and not self.generation:
             raise ValueError("generation is required unless rate_only is set.")
         if not self.output_path and (not self.rate_only or self.is_append):
@@ -281,7 +282,6 @@ class ResolveSidCollisionsConfig:
             codebook=codebook,
             max_items_per_codebook=args.max_items_per_codebook,
             strategy=args.strategy,
-            random_num_candidates=args.random_num_candidates,
             rate_only=args.rate_only,
             odps_data_quota_name=args.odps_data_quota_name,
         )
@@ -313,19 +313,15 @@ class CollisionResolutionRunner:
         config: ResolveSidCollisionsConfig,
     ) -> None:
         self._config = config
-        self._resolver: CollisionResolver
-        if self._config.strategy == "random":
-            self._resolver = RandomCollisionResolver(
-                self._config.random_num_candidates,
-                progress_interval=self._config.progress_interval,
-            )
-        else:
-            self._resolver = KnnCollisionResolver(
-                progress_interval=self._config.progress_interval
-            )
+        self._resolver = _RESOLVERS[config.strategy](
+            progress_interval=config.progress_interval
+        )
         self._resolved_writer_type: Optional[str] = None
         self._item_id_type: Optional[pa.DataType] = None
         self._bundle = config.bundle
+        self._rank = dist.get_rank() if dist.is_initialized() else 0
+        self._world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self._prefix_start, self._prefix_stop = self._get_current_rank_prefix_range()
         self._check_input_locations()
         self._bundle.validate_compatibility(
             list(config.codebook), config.max_items_per_codebook
@@ -333,17 +329,17 @@ class CollisionResolutionRunner:
 
     def run(self) -> CollisionResolutionStats:
         """Read, resolve collisions, and publish the resulting generation."""
-        _require_single_process()
         try:
             if not self._config.rate_only:
-                self._bundle.prepare_generation()
+                self._bundle.prepare_generation(self._rank)
             stats = self._resolve_and_write()
         except BaseException:
-            if not self._config.rate_only:
+            if not self._config.rate_only and self._rank == 0:
                 self._bundle.remove_generation()
             raise
 
-        logger.info("SID collision resolution finished: %s", stats)
+        if self._rank == 0:
+            logger.info("SID collision resolution finished: %s", stats)
         return stats
 
     def _resolve_and_write(self) -> CollisionResolutionStats:
@@ -358,35 +354,80 @@ class CollisionResolutionRunner:
             self._config.collision_config,
             existing_sid_occupancy=existing_sid_occupancy,
         )
-        candidate_last_codes = None
-        if plan.overflow_rows.size and self._config.strategy == "candidate":
-            candidate_last_codes = self._load_candidate_last_codes(
-                plan.overflow_item_ids
-            )
+        has_overflow = bool(plan.overflow_rows.size)
+        if self._world_size > 1 and self._resolver.requires_candidates():
+            overflow_by_rank = [None] * self._world_size
+            dist.all_gather_object(overflow_by_rank, has_overflow)
+            has_overflow = any(overflow_by_rank)
         result = self._resolver.resolve(
             plan,
-            candidate_last_codes,
+            (lambda: self._load_candidate_last_codes(plan.overflow_item_ids))
+            if has_overflow and self._resolver.requires_candidates()
+            else None,
             collect_sid_metadata=not self._config.rate_only
             and bool(plan.overflow_rows.size),
         )
-        del candidate_last_codes
 
-        stats = result.stats
         if self._config.rate_only:
             logger.info("rate_only: skipping item_to_sid and sid_to_items writes")
-            return stats
+            del plan
+        else:
+            self._write_sid_to_items_outputs(item_ids, plan, result)
+            del plan
+            self._write_item_to_sid(item_ids, codes, result, existing_item_count)
+        stats = self._gather_stats(result.stats)
+        if not self._config.rate_only and self._rank == 0:
+            self._bundle.write_manifest(
+                codebook=list(self._config.codebook),
+                capacity=self._config.max_items_per_codebook,
+                max_observed_items_per_sid=stats.max_final_items_per_sid,
+                item_id_type=str(self._item_id_type),
+                writer_type=self._resolved_writer_type,
+            )
 
-        self._write_sid_to_items_outputs(item_ids, plan, result)
-        del plan
-        self._write_item_to_sid(item_ids, codes, result, existing_item_count)
-        self._bundle.write_manifest(
-            codebook=list(self._config.codebook),
-            capacity=self._config.max_items_per_codebook,
-            max_observed_items_per_sid=stats.max_final_items_per_sid,
-            item_id_type=str(self._item_id_type),
-            writer_type=self._resolved_writer_type,
-        )
         return stats
+
+    def _get_current_rank_prefix_range(self) -> Tuple[int, int]:
+        """Return this rank's prefix ID range as ``[start, stop)``."""
+        prefixes_per_rank = (
+            math.prod(self._config.codebook[:-1]) + self._world_size - 1
+        ) // self._world_size
+        prefix_start = self._rank * prefixes_per_rank
+        return prefix_start, prefix_start + prefixes_per_rank
+
+    def _get_prefix_mask(self, codes: np.ndarray) -> np.ndarray:
+        """Return a boolean mask for rows in this rank's SID prefix range."""
+        if self._world_size == 1:
+            return np.ones(codes.shape[0], dtype=bool)
+        prefixes = self._config.collision_config.prefix_ids(codes)
+        # NOTE: Keep invalid prefixes so the core can reject out-of-range codes.
+        prefixes = np.clip(prefixes, 0, math.prod(self._config.codebook[:-1]) - 1)
+        return (prefixes >= self._prefix_start) & (prefixes < self._prefix_stop)
+
+    def _gather_stats(
+        self, stats: CollisionResolutionStats
+    ) -> CollisionResolutionStats:
+        """Gather statistics and artifact row counts after every rank closes writers."""
+        if self._world_size == 1:
+            return stats
+        summaries: List[Any] = [None] * self._world_size
+        dist.all_gather_object(
+            summaries, (asdict(stats), self._bundle.artifact_row_counts)
+        )
+        self._bundle.artifact_row_counts = {
+            artifact: sum(
+                artifact_row_counts[artifact] for _, artifact_row_counts in summaries
+            )
+            for artifact in self._bundle.artifact_row_counts
+        }
+        merged_stats = {}
+        for name in asdict(stats):
+            values = [summary[name] for summary, _ in summaries]
+            if name == "max_final_items_per_sid":
+                merged_stats[name] = max(values)
+            else:
+                merged_stats[name] = sum(values)
+        return CollisionResolutionStats(**merged_stats)
 
     def _check_input_locations(self) -> None:
         """Reject a run whose inputs are not all present, before any pass runs."""
@@ -438,36 +479,51 @@ class CollisionResolutionRunner:
         return reader
 
     def _iter_batches(
-        self, reader: BaseReader, description: str
+        self,
+        reader: BaseReader,
+        description: str,
+        code_field: Optional[str] = None,
+        keep_empty: bool = False,
     ) -> Iterator[Dict[str, pa.Array]]:
-        """Stream nonempty input batches and log the number of rows read."""
+        """Stream batches, optionally selecting this rank's SID prefixes.
+
+        ``keep_empty`` retains batches made empty by prefix selection so idle
+        ranks can initialize input types. Empty source batches are skipped.
+        """
         progress = ProgressLogger(
             description, start_n=0, miniters=self._config.progress_interval
         )
         scanned = 0
         for batch in reader.to_batches():
             batch_size = len(next(iter(batch.values())))
-            if batch_size:
+            if batch_size == 0:
+                continue
+            if code_field is not None and self._world_size > 1:
+                codes = self._convert_codes_to_numpy(batch[code_field])
+                prefix_mask = self._get_prefix_mask(codes)
+                keep = pa.array(prefix_mask)
+                batch = {name: values.filter(keep) for name, values in batch.items()}
+            if keep_empty or len(next(iter(batch.values()))):
                 yield batch
-                scanned += batch_size
-                progress.log(scanned)
+            scanned += batch_size
+            progress.log(scanned)
 
     @staticmethod
     def _convert_codes_to_numpy(values: pa.Array) -> np.ndarray:
-        """Decode an SID column into an ``(N, n_layers)`` int64 matrix."""
+        """Decode an SID column into an ``(N, n_layers)`` int32 matrix."""
         if _is_list_column(values):
             row_count = len(values)
-            flat = pc.cast(values.flatten(), pa.int64()).to_numpy(zero_copy_only=False)
+            flat = pc.cast(values.flatten(), pa.int32()).to_numpy(zero_copy_only=False)
         elif pa.types.is_integer(values.type):
             return (
-                pc.cast(values, pa.int64())
+                pc.cast(values, pa.int32())
                 .to_numpy(zero_copy_only=False)
                 .reshape(-1, 1)
             )
         else:
             parts = pc.split_pattern(values, ",")
             row_count = len(parts)
-            flat = pc.cast(parts.flatten(), pa.int64()).to_numpy(zero_copy_only=False)
+            flat = pc.cast(parts.flatten(), pa.int32()).to_numpy(zero_copy_only=False)
 
         layer_count = flat.shape[0] // row_count
         if flat.shape[0] != row_count * layer_count:
@@ -511,12 +567,16 @@ class CollisionResolutionRunner:
         for batch in self._iter_batches(
             reader,
             "Reading SID input",
+            self._config.code_field,
+            keep_empty=True,
         ):
             item_ids = batch[self._config.item_id_field]
             self._validate_item_ids(item_ids)
             id_batches.append(item_ids.to_numpy(zero_copy_only=False))
             code_batches.append(
                 self._convert_codes_to_numpy(batch[self._config.code_field])
+                if len(item_ids)
+                else np.empty((0, len(self._config.codebook)), dtype=np.int32)
             )
 
         if not id_batches:
@@ -561,10 +621,13 @@ class CollisionResolutionRunner:
     def _load_candidate_last_codes(self, overflow_item_ids: np.ndarray) -> np.ndarray:
         """Load fixed-width candidates aligned to ``overflow_item_ids``."""
         columns = [self._config.item_id_field, self._config.candidate_codes_field]
+        # NOTE: Duplicate IDs in other ranks' prefixes must not supply candidates.
+        if self._world_size > 1:
+            columns.append(self._config.code_field)
         reader = self._make_reader(self._config.input_path, columns)
         item_count = overflow_item_ids.shape[0]
         if item_count == 0:
-            return np.empty((0, 0), dtype=np.int64)
+            return np.empty((0, 0), dtype=np.int32)
         item_lookup = _ItemIdLookup(overflow_item_ids)
         candidates: Optional[np.ndarray] = None
         seen = np.zeros(item_count, dtype=bool)
@@ -574,6 +637,19 @@ class CollisionResolutionRunner:
             if matching_batch_indices.size == 0:
                 continue
 
+            if self._world_size > 1:
+                codes = self._convert_codes_to_numpy(
+                    pc.take(
+                        batch[self._config.code_field],
+                        pa.array(matching_batch_indices, type=pa.int64()),
+                    )
+                )
+                keep = self._get_prefix_mask(codes)
+                matching_batch_indices = matching_batch_indices[keep]
+                overflow_item_indices = overflow_item_indices[keep]
+                if matching_batch_indices.size == 0:
+                    continue
+
             batch_candidates = self._candidate_last_matrix(
                 pc.take(
                     batch[self._config.candidate_codes_field],
@@ -582,7 +658,7 @@ class CollisionResolutionRunner:
             )
             if candidates is None:
                 candidates = np.empty(
-                    (item_count, batch_candidates.shape[1]), dtype=np.int64
+                    (item_count, batch_candidates.shape[1]), dtype=np.int32
                 )
             elif candidates.shape[1] != batch_candidates.shape[1]:
                 raise ValueError(
@@ -650,7 +726,7 @@ class CollisionResolutionRunner:
 
         Returns:
             Existing SID keys and item counts in the affected prefixes, and the
-            number of existing items in the published generation.
+            number of existing items assigned to this rank.
         """
         if not self._config.is_append:
             logger.info("full-resolve mode: no published generation supplied")
@@ -684,7 +760,7 @@ class CollisionResolutionRunner:
                 .to_numpy(zero_copy_only=False)
                 .astype(np.int64, copy=False)
             )
-            existing_item_count += int(item_counts.sum())
+            existing_item_count += int(item_counts[self._get_prefix_mask(codes)].sum())
             flat_ids = pc.cast(batch["itemids"].flatten(), self._item_id_type)
             if len(flat_ids):
                 overlap = pc.is_in(flat_ids, value_set=new_id_values)
@@ -729,12 +805,20 @@ class CollisionResolutionRunner:
         self, output_path: str, writer_type: Optional[str] = None
     ) -> BaseWriter:
         """Create a repository writer, defaulting to the resolved writer type."""
-        return create_writer(
+        writer_type = writer_type or self._resolved_writer_type
+        writer = create_writer(
             output_path,
-            writer_type=writer_type or self._resolved_writer_type,
+            writer_type=writer_type,
             quota_name=self._config.odps_data_quota_name,
-            world_size=1,
+            world_size=self._world_size,
         )
+        if self._world_size > 1 and not is_odps_path(output_path):
+            # NOTE: Reader globs must visit rank files in SID prefix order.
+            suffix = os.path.splitext(writer._output_path)[1]
+            writer._output_path = os.path.join(
+                output_path, f"part-{self._rank:05d}{suffix}"
+            )
+        return writer
 
     def _item_id_array(self, values: np.ndarray) -> pa.Array:
         """Encode item IDs with the input Arrow type preserved."""
@@ -772,7 +856,9 @@ class CollisionResolutionRunner:
         )
         writer_type = self._resolved_writer_type
         written = 0
-        for batch in self._iter_batches(reader, "Copying published item_to_sid"):
+        for batch in self._iter_batches(
+            reader, "Copying published item_to_sid", "codebook"
+        ):
             item_id_column = batch["item_id"]
             self._check_prior_item_id_type(item_id_column)
             writer.write(
@@ -810,8 +896,8 @@ class CollisionResolutionRunner:
             item_ids: Input item IDs in original row order.
             origin_codes: Their SID matrix before relocation.
             result: Resolved last-layer codes and slots of those rows.
-            existing_item_count: Total item count of the published generation,
-                which the copied item_to_sid rows must match.
+            existing_item_count: Number of existing items in this rank's prefix
+                range, which the copied item_to_sid rows must match.
 
         Raises:
             ValueError: If the published item_to_sid and sid_to_items disagree.
@@ -880,7 +966,7 @@ class CollisionResolutionRunner:
         """Write one sid_to_items row per SID key, with its SID from the key."""
         codes = np.stack(
             np.unravel_index(sid_keys, self._config.codebook), axis=1
-        ).astype(np.int64)
+        ).astype(np.int32)
         writer.write(
             {
                 "codebook": self._codes_column(codes, "ParquetWriter"),
@@ -903,8 +989,8 @@ class CollisionResolutionRunner:
         Args:
             item_ids: Input item IDs in original row order.
             sid_item_row_index: Input row indices ordered by resolved SID and slot.
-            existing_sid_occupancy: Published SIDs in the affected prefixes,
-                including every published SID a new SID can share a key with.
+            existing_sid_occupancy: Published SIDs of the affected prefixes, including
+                every published SID a new SID can share a key with.
         """
         writer = self._make_writer(
             self._bundle.artifact_path(SID_TO_ITEMS_ARTIFACT), "ParquetWriter"
@@ -936,7 +1022,9 @@ class CollisionResolutionRunner:
         )
         cursor = 0
         existing_sid_count = 0
-        for batch in self._iter_batches(reader, "Writing merged sid_to_items"):
+        for batch in self._iter_batches(
+            reader, "Writing merged sid_to_items", "codebook"
+        ):
             codes = self._convert_codes_to_numpy(batch["codebook"])
             sid_keys = self._config.collision_config.convert_codes_to_sid_keys(codes)
             existing_sid_count += sid_keys.shape[0]
@@ -1148,15 +1236,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_items_per_codebook", type=int, required=True)
     parser.add_argument(
         "--strategy",
-        choices=["candidate", "random"],
-        default="candidate",
-        help="Use model candidates or deterministic legacy random draws.",
-    )
-    parser.add_argument(
-        "--random_num_candidates",
-        type=int,
-        default=64,
-        help="Full-space random draws per overflow item for random strategy.",
+        choices=list(_RESOLVERS),
+        default="greedy",
+        help=(
+            "Place overflow items greedily from model candidates (greedy), "
+            "from model candidates by deterministic multi-round arbitration "
+            "(iterative), or evenly over the least-loaded codes of their SID "
+            "prefix without candidates (uniform)."
+        ),
     )
     parser.add_argument(
         "--rate_only",
@@ -1169,8 +1256,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     """Run SID collision resolution from command-line arguments."""
-    config = ResolveSidCollisionsConfig.from_namespace(build_parser().parse_args())
-    CollisionResolutionRunner(config).run()
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        dist.init_process_group(backend="gloo")
+    CollisionResolutionRunner(
+        ResolveSidCollisionsConfig.from_namespace(build_parser().parse_args())
+    ).run()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

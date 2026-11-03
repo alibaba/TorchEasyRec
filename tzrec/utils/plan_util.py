@@ -119,6 +119,15 @@ def create_planner(
     model: Optional[nn.Module] = None,
 ) -> EmbeddingShardingPlanner:
     """Create EmbeddingShardingPlanner."""
+    if global_constraints_cfg is not None and (
+        global_constraints_cfg.HasField("pooling_factor")
+        or global_constraints_cfg.HasField("unique_id_factor")
+    ):
+        raise ValueError(
+            "global_embedding_constraints cannot set pooling_factor or "
+            "unique_id_factor; the ids a sample looks up differ per feature, "
+            "set them on each feature's embedding_constraints."
+        )
     local_world_size = get_local_size()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
@@ -193,14 +202,28 @@ def create_planner(
                         # So that, we add constraints for params with data_parallel
                         # plan in ckpt.
                         fqn = f"{module_path}.{param_name}"
-                        if fqn not in fqn_constraints:
+                        # a table's own constraint entry outranks the saved
+                        # plan; entries that do not restrict sharding (such as
+                        # measured pooling factors) let the pin through
+                        const = fqn_constraints.get(fqn)
+                        if const is None or const.sharding_types is None:
                             if is_rank_zero:
                                 logger.info(
                                     f"add ParameterConstraints[sharding_types=['{param_sharding['sharding_type']}']] for param[{fqn}] from checkpoint plan."  # NOQA
                                 )
-                            fqn_constraints[fqn] = ParameterConstraints(
-                                sharding_types=[param_sharding["sharding_type"]]
-                            )
+                            if const is None:
+                                fqn_constraints[fqn] = ParameterConstraints(
+                                    sharding_types=[param_sharding["sharding_type"]]
+                                )
+                            else:
+                                # the entries are the model's own constraint
+                                # objects; pin a copy so a later replan of the
+                                # same model does not inherit this pin
+                                pinned = copy.copy(const)
+                                pinned.sharding_types = [
+                                    param_sharding["sharding_type"]
+                                ]
+                                fqn_constraints[fqn] = pinned
 
     global_constraints = None
     if global_constraints_cfg is not None:
@@ -1382,7 +1405,20 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
             constraint_key = child_path + "." + name
             # pyre-ignore [58]
             if constraint_key in self._fqn_constraints:
-                return self._fqn_constraints, constraint_key
+                constraint = self._fqn_constraints[constraint_key]
+                if self._global_constraints is not None:
+                    # an entry that does not restrict a field falls back to
+                    # the global constraint for that field, so statistics-only
+                    # entries keep the global lists applied
+                    merged = copy.copy(constraint)
+                    if merged.sharding_types is None:
+                        merged.sharding_types = self._global_constraints.sharding_types
+                    if merged.compute_kernels is None:
+                        merged.compute_kernels = (
+                            self._global_constraints.compute_kernels
+                        )
+                    constraint = merged
+                return {constraint_key: constraint}, constraint_key
         if self._global_constraints is not None:
             return {"__GLOBAL__": self._global_constraints}, "__GLOBAL__"
         return self._constraints, name

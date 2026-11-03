@@ -19,7 +19,7 @@ from tzrec.utils.sid.collision import (
     build_origin_sid_item_row_index,
     build_resolved_sid_item_row_index,
 )
-from tzrec.utils.sid.knn_collision import KnnCollisionResolver
+from tzrec.utils.sid.greedy_collision import GreedyCollisionResolver
 from tzrec.utils.sid.test_util import (
     create_collision_plan,
     create_existing_sid_occupancy,
@@ -27,8 +27,8 @@ from tzrec.utils.sid.test_util import (
 from tzrec.utils.test_util import parameterized_name_func
 
 
-class KnnCollisionResolverTest(unittest.TestCase):
-    def test_golden_candidate_resolution(self) -> None:
+class GreedyCollisionResolverTest(unittest.TestCase):
+    def test_golden_greedy_resolution(self) -> None:
         item_ids = np.arange(10, dtype=np.int64)
         # 4 items in SID (0,0), 1 in (0,1), 2 in (0,2), 3 in (1,0).
         codes = np.asarray(
@@ -36,7 +36,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
         )
         plan = create_collision_plan((2, 4), 2, item_ids, codes)
         candidates = np.asarray([[0, 1, 2], [1, 2, 3], [0, 1, 2]], dtype=np.int64)
-        result = KnnCollisionResolver().resolve(plan, candidates)
+        result = GreedyCollisionResolver().resolve(plan, candidates)
 
         np.testing.assert_array_equal(
             result.resolved_last_codes, [0, 1, 0, 3, 1, 2, 2, 0, 1, 0]
@@ -66,7 +66,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
     ) -> None:
         item_ids = np.array([2, 9, 4, 11])[order]
         plan = create_collision_plan((3,), 1, item_ids, [[0]] * 4)
-        result = KnnCollisionResolver().resolve(
+        result = GreedyCollisionResolver().resolve(
             plan, np.array([[1, 2]] * 3, dtype=np.int32)
         )
 
@@ -93,7 +93,9 @@ class KnnCollisionResolverTest(unittest.TestCase):
 
     def test_keep_origin_over_capacity(self) -> None:
         plan = create_collision_plan((2,), 1, [0, 1], [[0], [0]])
-        result = KnnCollisionResolver().resolve(plan, np.asarray([[0]], dtype=np.int64))
+        result = GreedyCollisionResolver().resolve(
+            plan, np.asarray([[0]], dtype=np.int64)
+        )
 
         np.testing.assert_array_equal(result.resolved_last_codes, [0, 0])
         np.testing.assert_array_equal(result.slot_indices, [1, 2])
@@ -120,7 +122,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
         np.testing.assert_array_equal(plan.overflow_prefix_ids, [2])
         np.testing.assert_array_equal(plan.in_overflow_prefix, [False, True, False])
 
-        result = KnnCollisionResolver().resolve(
+        result = GreedyCollisionResolver().resolve(
             plan, np.asarray([[1, 2, 3]], dtype=np.int64)
         )
 
@@ -149,7 +151,9 @@ class KnnCollisionResolverTest(unittest.TestCase):
             [[0, 0]],
             existing_sid_occupancy=create_existing_sid_occupancy([0], [3]),
         )
-        result = KnnCollisionResolver().resolve(plan, np.asarray([[0]], dtype=np.int64))
+        result = GreedyCollisionResolver().resolve(
+            plan, np.asarray([[0]], dtype=np.int64)
+        )
         self.assertEqual(result.stats.unresolved_count, 1)
         self.assertEqual(int(result.slot_indices[0]), 4)
 
@@ -163,7 +167,7 @@ class KnnCollisionResolverTest(unittest.TestCase):
             [[0, 0]],
             existing_sid_occupancy=create_existing_sid_occupancy([0, 1], [1, 1]),
         )
-        result = KnnCollisionResolver().resolve(
+        result = GreedyCollisionResolver().resolve(
             plan, np.asarray([[1, 2]], dtype=np.int64)
         )
         self.assertEqual(result.stats.relocated_count, 1)

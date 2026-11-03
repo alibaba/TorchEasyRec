@@ -13,6 +13,9 @@ fbgemm_gpu_hstu @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/hstu/cu1
 flash_attn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/flash_attn/cu130/flash_attn-2.8.3%2B20261010.cu130.torch214.sm80.90.100.120.g060c9188beec-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
 flash_attn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/flash_attn/cu130/flash_attn-2.8.3%2B20261010.cu130.torch214.sm80.90.100.120.g060c9188beec-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
 flash_attn @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/flash_attn/cu130/flash_attn-2.8.3%2B20261010.cu130.torch214.sm80.90.100.120.g060c9188beec-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
+pynve @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pynve/cu130/pynve-26.10.0%2B20261027.1c68f5a.cu130-cp310-cp310-linux_x86_64.whl ; python_version=="3.10"
+pynve @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pynve/cu130/pynve-26.10.0%2B20261027.1c68f5a.cu130-cp311-cp311-linux_x86_64.whl ; python_version=="3.11"
+pynve @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pynve/cu130/pynve-26.10.0%2B20261027.1c68f5a.cu130-cp312-cp312-linux_x86_64.whl ; python_version=="3.12"
 torch==2.14.0
 torch-tensorrt==2.14.0
 torchrec @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/torchrec/torchrec-1.9.0%2Btzrec-py3-none-any.whl

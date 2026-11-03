@@ -214,24 +214,31 @@ def _log_dynamicemb_table_plan(
 
 
 def _get_optimizer_multipler(
-    optimizer_class: Optional[Type[torch.optim.Optimizer]], shape: torch.Size
+    optimizer_class: Optional[Type[torch.optim.Optimizer]],
+    shape: torch.Size,
+    dtype: torch.dtype,
 ) -> float:
-    """Optimizer state size per embedding element, including dynamicemb's FTRL.
+    """Optimizer state size per embedding element in DynamicEmb's value layout.
 
-    torchrec's table maps any class it does not know to 1, and FTRL keeps a
-    linear and an accumulator term per element, so its rows are ``2 * dim`` wide
-    like Adam's.
+    torchrec's table maps any class it does not know to 1 and counts row-wise
+    Adagrad as a single element per row. DynamicEmb reserves a 16-byte state slot
+    per row for row-wise Adagrad, and FTRL keeps a linear and an accumulator term
+    per element, so its state is twice the embedding width.
 
     Args:
         optimizer_class (type, optional): in-backward optimizer class of the
             table, None when the table is not trained.
         shape (torch.Size): unsharded table shape, used by row-wise optimizers.
+        dtype (torch.dtype): embedding dtype, which DynamicEmb also stores
+            optimizer state in.
 
     Returns:
         the multiplier applied to the embedding width.
     """
     if optimizer_class is FTRL:
         return 2.0
+    if optimizer_class is trec_optim.RowWiseAdagrad:
+        return 16 / (shape[-1] * dtype.itemsize)
     return shard_estimators._get_optimizer_multipler(optimizer_class, shape)
 
 
@@ -535,9 +542,6 @@ if has_dynamicemb:
     # pyrefly: ignore[unbound-name]
     DynamicEmbeddingCollectionSharder.compute_kernels = _ec_compute_kernels
 
-    def _round_up(a: int, b: int) -> int:
-        return int((a + b - 1) // b) * b
-
     def _calculate_dynamicemb_table_storage_specific_size(
         size: List[int],
         element_size: int,
@@ -552,7 +556,7 @@ if has_dynamicemb:
 
         Byte budget (single shard, rows x dim):
 
-            value_bytes_per_row = round_up16(dim * (1 + opt_mult) * element)
+            value_bytes_per_row = (dim + round(dim * opt_mult)) * element
             total_value_memory  = align(rows) * value_bytes_per_row
             num_buckets         = align(rows) / bucket_capacity
 
@@ -579,10 +583,8 @@ if has_dynamicemb:
         return math.ceil(
             align_to_table_size(size[0])
             * (
-                _round_up(
-                    math.ceil(size[1] * (1 + optimizer_multipler) * element_size),
-                    16,
-                )
+                (size[1] + round(size[1] * optimizer_multipler))
+                * element_size
                 * value_ratio
                 + (8 + 8 + 1 + 4 / bucket_capacity) * (is_hbm and not only_values)
             )
@@ -634,7 +636,7 @@ if has_dynamicemb:
                 optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
                 optimizer_kwargs = getattr(tensor, "_optimizer_kwargs", [{}])[0]
                 optimizer_multipler = _get_optimizer_multipler(
-                    optimizer_class, tensor.shape
+                    optimizer_class, tensor.shape, tensor.dtype
                 )
                 dynamicemb_options.training = optimizer_class is not None
                 dynamicemb_options.local_hbm_for_values = (
@@ -826,7 +828,7 @@ if has_dynamicemb:
         optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
         if not is_inference:
             optimizer_multipler = _get_optimizer_multipler(
-                optimizer_class, tensor.shape
+                optimizer_class, tensor.shape, tensor.dtype
             )
 
         hdm_value_sizes = [

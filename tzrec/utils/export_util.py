@@ -12,10 +12,12 @@
 import copy
 import glob
 import json
+import multiprocessing as mp
 import operator
 import os
 import re
 import shutil
+import traceback
 from collections import OrderedDict, defaultdict
 from queue import Queue
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
@@ -70,7 +72,10 @@ from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util, env_util, npz_util, quant_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
-from tzrec.utils.dynamic_embedding_export import get_dynamic_embedding_export
+from tzrec.utils.dynamic_embedding_export import (
+    get_dynamic_embedding_export,
+    get_sharded_dynamic_embedding_export,
+)
 from tzrec.utils.feature_store_uploader import FeatureStoreFullUploader
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
@@ -1569,6 +1574,8 @@ def export_distributed_embedding(
         raise ValueError("dynamic_embedding.read_chunk_size_mb must be > 0")
     if settings.upload_max_in_flight_batches <= 0:
         raise ValueError("dynamic_embedding.upload_max_in_flight_batches must be > 0")
+    if settings.max_num_parts <= 0:
+        raise ValueError("dynamic_embedding.max_num_parts must be > 0")
     infos = {**bag_infos, **embedding_infos}
     dimensions = {
         checkpoint_util.remap_input_tile_user_key(name): info.embedding_dim
@@ -1589,13 +1596,30 @@ def export_distributed_embedding(
             else "ARRAY<FLOAT>",
             max_in_flight_batches=settings.upload_max_in_flight_batches,
         )
-    dynamic_export = get_dynamic_embedding_export(
-        checkpoint_path,
-        dimensions,
-        read_chunk_bytes=int(settings.read_chunk_size_mb) * 1024 * 1024,
-        quant_format=acc_utils.distributed_sparse_quant_format(),
-        on_values=uploader.write if uploader is not None else None,
-    )
+    read_chunk_bytes = int(settings.read_chunk_size_mb) * 1024 * 1024
+    quant_format = acc_utils.distributed_sparse_quant_format()
+    sharded_dynamic_arrays: Optional[List[Dict[str, npz_util.StreamingArray]]] = None
+    if uploader is not None:
+        dynamic_export = get_dynamic_embedding_export(
+            checkpoint_path,
+            dimensions,
+            read_chunk_bytes=read_chunk_bytes,
+            quant_format=quant_format,
+            on_values=uploader.write,
+        )
+    else:
+        part_arrays, dynamic_meta = get_sharded_dynamic_embedding_export(
+            checkpoint_path,
+            dimensions,
+            read_chunk_bytes=read_chunk_bytes,
+            quant_format=quant_format,
+            max_num_parts=int(settings.max_num_parts),
+        )
+        if len(part_arrays) > 1:
+            sharded_dynamic_arrays = part_arrays
+            dynamic_export = (part_arrays[0], dynamic_meta)
+        else:
+            dynamic_export = (part_arrays[0] if part_arrays else {}, dynamic_meta)
     missing_tables = expected_dynamic - dynamic_export[1].keys()
     if missing_tables:
         raise ValueError(
@@ -1659,7 +1683,15 @@ def export_distributed_embedding(
                     ", ".join(sorted(zch_tables)),
                 )
             uploader.start(total_records=total_records)
-        if dynamic_arrays:
+        if sharded_dynamic_arrays is not None:
+            _save_sharded_dynamic_embedding_npz(
+                sparse_dir,
+                sharded_dynamic_arrays,
+                dynamic_arrays,
+                embedding_meta,
+                set(dynamic_export[1]),
+            )
+        elif dynamic_arrays:
             npz_util.savez_streaming(
                 os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz"),
                 dynamic_arrays,
@@ -1685,6 +1717,135 @@ def export_distributed_embedding(
         additional_export_config,
     )
     logger.info("Completed distributed embedding export to %s", save_dir)
+
+
+def _write_dynamic_npz_worker(
+    path: str,
+    arrays: Dict[str, Any],
+    error_queue: "mp.SimpleQueue[Tuple[str, str, str]]",
+) -> None:
+    """Write one dynamic embedding NPZ part in a forked child process."""
+    # NOTE: worker must stay CPU/NumPy-only; the parent may hold a live CUDA context.
+    try:
+        npz_util.savez_streaming(path, arrays)
+    except BaseException as exc:
+        error_queue.put((type(exc).__name__, str(exc), traceback.format_exc()))
+        raise
+
+
+def _cleanup_dynamic_npz_artifacts(sparse_dir: str, paths: List[str]) -> None:
+    """Remove published dynamic NPZ shards and any orphaned staging files."""
+    candidates = list(paths) + glob.glob(
+        os.path.join(sparse_dir, "sparse_dynamic_embedding-*.npz.part.*")
+    )
+    for path in candidates:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _save_sharded_dynamic_embedding_npz(
+    sparse_dir: str,
+    sharded_dynamic_arrays: List[Dict[str, npz_util.StreamingArray]],
+    dynamic_arrays: Dict[str, Any],
+    embedding_meta: Dict[str, Any],
+    native_dynamic_names: Set[str],
+) -> None:
+    """Write sharded dynamic embedding NPZ files in parallel across processes.
+
+    Native dynamic tables carry their respective checkpoint shard streams per
+    part, and in-memory ZCH tables are sliced evenly across all parts so every
+    ``sparse_dynamic_embedding-XX-of-YY.npz`` shard exposes the full
+    key/value/score entry contract expected by the serving loader.
+    """
+    num_parts = len(sharded_dynamic_arrays)
+    part_dicts: List[Dict[str, Any]] = [
+        dict(sharded_dynamic_arrays[part_idx]) for part_idx in range(num_parts)
+    ]
+    for name, meta in embedding_meta.items():
+        if not meta.get("is_dynamic") or name in native_dynamic_names:
+            continue
+        key_arr = dynamic_arrays[meta["key_name"]]
+        val_arr = dynamic_arrays[meta["value_name"]]
+        score_arr = dynamic_arrays[meta["score_name"]]
+        if not isinstance(key_arr, np.ndarray):
+            key_arr = key_arr.detach().cpu().numpy()
+        if not isinstance(val_arr, np.ndarray):
+            val_arr = val_arr.detach().cpu().numpy()
+        if not isinstance(score_arr, np.ndarray):
+            score_arr = score_arr.detach().cpu().numpy()
+        total_rows = int(key_arr.shape[0])
+        for part_idx in range(num_parts):
+            start = (total_rows * part_idx) // num_parts
+            end = (total_rows * (part_idx + 1)) // num_parts
+            part_dicts[part_idx][meta["key_name"]] = key_arr[start:end]
+            part_dicts[part_idx][meta["value_name"]] = val_arr[start:end]
+            part_dicts[part_idx][meta["score_name"]] = score_arr[start:end]
+        default_name = meta.get("default_value_name")
+        if default_name and default_name in dynamic_arrays:
+            default_arr = dynamic_arrays[default_name]
+            if not isinstance(default_arr, np.ndarray):
+                default_arr = default_arr.detach().cpu().numpy()
+            part_dicts[0][default_name] = default_arr
+
+    width = max(2, len(str(num_parts)))
+    paths = [
+        os.path.join(
+            sparse_dir,
+            f"sparse_dynamic_embedding-{part_idx:0{width}d}-of-{num_parts:0{width}d}.npz",
+        )
+        for part_idx in range(num_parts)
+    ]
+
+    if "fork" not in mp.get_all_start_methods():
+        logger.info(
+            "Multiprocessing 'fork' start method unavailable; writing %s dynamic "
+            "NPZ parts sequentially.",
+            num_parts,
+        )
+        try:
+            for path, arrays in zip(paths, part_dicts):
+                npz_util.savez_streaming(path, arrays)
+        except BaseException:
+            _cleanup_dynamic_npz_artifacts(sparse_dir, paths)
+            raise
+        return
+
+    ctx = mp.get_context("fork")
+    error_queue: mp.SimpleQueue[Tuple[str, str, str]] = ctx.SimpleQueue()
+    processes = []
+    try:
+        for path, arrays in zip(paths, part_dicts):
+            proc = ctx.Process(
+                target=_write_dynamic_npz_worker,
+                args=(path, arrays, error_queue),
+            )
+            proc.start()
+            processes.append(proc)
+        for proc in processes:
+            proc.join()
+    except BaseException:
+        for proc in processes:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in processes:
+            proc.join()
+        _cleanup_dynamic_npz_artifacts(sparse_dir, paths)
+        raise
+
+    failed = [proc.exitcode for proc in processes if proc.exitcode != 0]
+    if failed:
+        _cleanup_dynamic_npz_artifacts(sparse_dir, paths)
+        if not error_queue.empty():
+            exc_type, exc_msg, exc_tb = error_queue.get()
+            raise RuntimeError(
+                f"Dynamic embedding NPZ worker failed with {exc_type}: {exc_msg}\n"
+                f"{exc_tb}"
+            )
+        raise RuntimeError(
+            f"Dynamic embedding NPZ worker exited with non-zero code: {failed[0]}"
+        )
 
 
 def _restore_export_sparse_state(
@@ -2401,7 +2562,10 @@ def _get_sparse_embedding_tensor(
         dynamic_out: streaming dynamic checkpoint arrays and in-memory ZCH
             keys/values/scores, plus a default value entry per ZCH table.
         emb_meta: per-table meta (shape/dtype/memory) for ALL sparse tables.
-        feat_meta: feature -> embedding_name / pooling / use_weight mapping.
+        feat_meta: feat_name_impl -> embedding_name / pooling / use_weight
+            mapping (`<feature>__ebc/__ec`, or `<feature>@<table_name>__ebc/__ec`
+            when shared across multiple tables of the same collection type,
+            matching `dense_meta.json`).
     """
     emb_name_to_emb_dim: Dict[str, int] = dict()
     name_to_feature = {feature.name: feature for feature in features}
@@ -2411,21 +2575,34 @@ def _get_sparse_embedding_tensor(
     feat_name_impl_to_emb_name = dict()
     emb_name_to_feat_name_impl = dict()
 
+    def _shared_feature_names(
+        table_infos: Dict[str, BaseEmbeddingConfig],
+    ) -> Set[str]:
+        table_names_by_feat: Dict[str, Set[str]] = defaultdict(set)
+        for table_fqn, emb_info in table_infos.items():
+            export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
+            for feat_name in emb_info.feature_names:
+                table_names_by_feat[feat_name].add(export_emb_name)
+        return {
+            feat_name
+            for feat_name, table_names in table_names_by_feat.items()
+            if len(table_names) > 1
+        }
+
+    shared_ec_features = _shared_feature_names(embedding_infos)
+    shared_ebc_features = _shared_feature_names(embedding_bag_info)
+
     for table_fqn, emb_info in embedding_infos.items():
         export_emb_name = checkpoint_util.remap_input_tile_user_key(table_fqn)
         emb_name_to_emb_dim.setdefault(export_emb_name, emb_info.embedding_dim)
         feat_name_impl_list = emb_name_to_feat_name_impl.setdefault(export_emb_name, [])
         for feat_name in emb_info.feature_names:
-            feat_name_impl = feat_name + "__ec"
-            existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
-            if existing_emb_name is not None and existing_emb_name != export_emb_name:
-                raise ValueError(
-                    f"sparse feature [{feat_name}] maps to multiple embedding "
-                    f"tables [{existing_emb_name}] and [{export_emb_name}] in "
-                    "distributed embedding export. Use distinct feature_name "
-                    "values per group (with the same input expression if needed), "
-                    "or keep the feature in only one group."
-                )
+            feat_key = (
+                f"{feat_name}@{emb_info.name}"
+                if feat_name in shared_ec_features
+                else feat_name
+            )
+            feat_name_impl = feat_key + "__ec"
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name
@@ -2442,16 +2619,12 @@ def _get_sparse_embedding_tensor(
                     f"sparse feature [{feat_name}] in embedding table "
                     f"[{export_emb_name}] is not found in model features."
                 )
-            feat_name_impl = feat_name + "__ebc"
-            existing_emb_name = feat_name_impl_to_emb_name.get(feat_name_impl)
-            if existing_emb_name is not None and existing_emb_name != export_emb_name:
-                raise ValueError(
-                    f"sparse feature [{feat_name}] maps to multiple embedding "
-                    f"tables [{existing_emb_name}] and [{export_emb_name}] in "
-                    "distributed embedding export. Use distinct feature_name "
-                    "values per group (with the same input expression if needed), "
-                    "or keep the feature in only one group."
-                )
+            feat_key = (
+                f"{feat_name}@{emb_info.name}"
+                if feat_name in shared_ebc_features
+                else feat_name
+            )
+            feat_name_impl = feat_key + "__ebc"
             if feat_name_impl not in feat_name_impl_list:
                 feat_name_impl_list.append(feat_name_impl)
             feat_name_impl_to_emb_name[feat_name_impl] = export_emb_name

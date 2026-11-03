@@ -34,12 +34,16 @@ fi
 
 bash scripts/gen_proto.sh
 python setup.py sdist bdist_wheel
+wheel_file=`ls dist/ | grep .whl`
+wheel_path="dist/$wheel_file"
+echo "wheel path: $(realpath ${wheel_path})"
 
 if [[ "${release_type}" == *"nightly-oss"* ]]; then
   OSS_UTIL="ossutil -e oss-accelerate.aliyuncs.com "
   if [[ -n "${ALIBABA_CLOUD_ECS_METADATA}" ]]; then
     OSS_UTIL="${OSS_UTIL} --mode EcsRamRole --ecs-role-name ${ALIBABA_CLOUD_ECS_METADATA} "
   fi
+  url_prefix="https://tzrec.oss-accelerate.aliyuncs.com/release/nightly/"
   whls=`${OSS_UTIL} ls oss://tzrec/release/nightly/ -s | grep ".whl"`
 
   # check whl exist
@@ -48,16 +52,16 @@ if [[ "${release_type}" == *"nightly-oss"* ]]; then
     if [[ $whl =~ $git_rev ]]
     then
         oss_exist=1
+        echo "wheel already exists, skip upload. wheel url: ${url_prefix}$(url_encode `basename ${whl}`)"
     fi
   done
 
   if [[ $oss_exist == 0 ]]
   then
     # update wheel
-    wheel_file=`ls dist/ | grep .whl`
-    wheel_path="dist/$wheel_file"
     ${OSS_UTIL} cp -f ${wheel_path} oss://tzrec/release/nightly/
     ${OSS_UTIL} set-acl oss://tzrec/release/nightly/${wheel_file} public-read
+    echo "wheel url: ${url_prefix}$(url_encode ${wheel_file})"
 
     # update repo.html
     whls=`${OSS_UTIL} ls oss://tzrec/release/nightly/ -s| grep ".whl"`

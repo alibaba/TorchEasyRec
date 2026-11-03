@@ -23,7 +23,11 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import torch
 
-from tzrec.acc.utils import is_aot_predict, is_trt_predict
+from tzrec.acc.utils import (
+    is_aot_predict,
+    is_distributed_embedding_predict,
+    is_trt_predict,
+)
 from tzrec.datasets.dataset import create_reader, create_writer
 from tzrec.datasets.odps_dataset import _type_pa_to_table
 from tzrec.features.combo_feature import ComboFeature
@@ -1227,6 +1231,9 @@ def test_predict(
     is_aot = is_aot_predict(scripted_model_path)
     if is_trt or is_aot:
         # trt script and aoti model don't support device,default is cuda:0
+        nproc_per_node = 1
+    elif is_distributed_embedding_predict(scripted_model_path):
+        # one process uses all local GPUs, sharing one host copy of the tables
         nproc_per_node = 1
     else:
         nproc_per_node = 2

@@ -11,6 +11,7 @@
 
 
 import copy
+import glob
 import json
 import os
 import shutil
@@ -153,6 +154,46 @@ class ExportUtilTest(unittest.TestCase):
         with open(os.path.join(save_dir, "model_acc.json")) as input_file:
             self.assertEqual(json.load(input_file)["CUSTOM_EXPORT"], "enabled")
         self.assertEqual(create_fg.call_count, 0 if supplied_fg else 1)
+
+    @parameterized.expand(
+        [(None,), ("item",), ("app",)],
+        name_func=parameterized_name_func,
+    )
+    def test_export_metadata_sequence_entity(self, entity):
+        save_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, save_dir, ignore_errors=True)
+        sequence = feature_pb2.SequenceFeature(
+            sequence_name="click_seq",
+            sequence_length=50,
+            sequence_delim=";",
+            sequence_pk="user:click_seq",
+            features=[
+                feature_pb2.SeqFeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="id",
+                        expression="item:id",
+                        num_buckets=100,
+                        embedding_dim=8,
+                    )
+                )
+            ],
+        )
+        if entity is not None:
+            sequence.sequence_entity = entity
+        config = EasyRecConfig(
+            feature_configs=[feature_pb2.FeatureConfig(sequence_feature=sequence)]
+        )
+        features = create_features(list(config.feature_configs))
+        export_util._write_export_metadata(config, features, save_dir, None, None)
+
+        with open(os.path.join(save_dir, "fg.json")) as input_file:
+            group = json.load(input_file)["features"][0]
+        self.assertEqual("sequence_entity" in group, entity is not None)
+        self.assertEqual(group.get("sequence_entity"), entity)
+        saved_config = config_util.load_pipeline_config(
+            os.path.join(save_dir, "pipeline.config")
+        )
+        self.assertEqual(saved_config.feature_configs[0].sequence_feature, sequence)
 
     def test_distributed_sparse_quant_env(self) -> None:
         old_env = {
@@ -722,7 +763,7 @@ class ExportUtilTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_sparse_export_rejects_missing_or_conflicting_feature_tables(
+    def test_sparse_export_shared_feature_across_multiple_tables(
         self, name, group_type, embedding_name_suffix
     ) -> None:
         test_dir = make_test_dir()
@@ -735,6 +776,9 @@ class ExportUtilTest(unittest.TestCase):
                         expression="user:user_id",
                         embedding_dim=4,
                         num_buckets=8,
+                        pooling="mean",
+                        weighted=True,
+                        use_weight=True,
                     )
                 )
             ]
@@ -759,39 +803,87 @@ class ExportUtilTest(unittest.TestCase):
         embedding_bag_info, embedding_info = (
             export_util._get_sparse_table_to_embedding_info(model)
         )
-        with self.assertRaisesRegex(
-            ValueError,
-            "maps to multiple embedding tables.*distinct feature_name values per group",
-        ):
-            _get_sparse_embedding_tensor(
-                model, test_dir, embedding_info, embedding_bag_info, features
-            )
+        _, _, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+            model, test_dir, embedding_info, embedding_bag_info, features
+        )
+        other_table_name = (
+            "user_id_emb_wide"
+            if group_type == model_pb2.FeatureGroupType.WIDE
+            else f"user_id_emb_{embedding_name_suffix}"
+        )
+        deep_fqn = "ebc.embedding_bags.user_id_emb"
+        other_fqn = f"ebc.embedding_bags.{other_table_name}"
+        self.assertEqual(
+            emb_meta[deep_fqn]["feat_name_impl"],
+            ["user_id@user_id_emb__ebc"],
+        )
+        self.assertEqual(
+            emb_meta[other_fqn]["feat_name_impl"],
+            [f"user_id@{other_table_name}__ebc"],
+        )
+        self.assertEqual(
+            feat_meta,
+            {
+                "user_id@user_id_emb__ebc": {
+                    "embedding_name": deep_fqn,
+                    "pooling": "MEAN",
+                    "use_weight": True,
+                },
+                f"user_id@{other_table_name}__ebc": {
+                    "embedding_name": other_fqn,
+                    "pooling": "MEAN",
+                    "use_weight": True,
+                },
+            },
+        )
         with self.assertRaisesRegex(ValueError, "not found in model features"):
             _get_sparse_embedding_tensor(
                 model, test_dir, embedding_info, embedding_bag_info, []
             )
 
-    def test_sparse_export_rejects_conflicting_ec_feature_tables(self) -> None:
+    def test_sparse_export_shared_ec_feature_across_multiple_tables(self) -> None:
         test_dir = make_test_dir()
         self.addCleanup(shutil.rmtree, test_dir)
-        embedding_infos = {
-            f"ec.embeddings.{name}": EmbeddingConfig(
+        tables = [
+            EmbeddingConfig(
                 name=name,
                 embedding_dim=4,
                 num_embeddings=8,
                 feature_names=["seq_feat"],
             )
             for name in ("first_emb", "second_emb")
-        }
-        with self.assertRaisesRegex(
-            ValueError,
-            r"sparse feature \[seq_feat\] maps to multiple embedding tables "
-            r"\[ec.embeddings.first_emb\] and \[ec.embeddings.second_emb\].*"
-            "distinct feature_name values per group",
-        ):
-            _get_sparse_embedding_tensor(
-                torch.nn.Module(), test_dir, embedding_infos, {}, []
-            )
+        ]
+        model = torch.nn.Module()
+        model.ec = EmbeddingCollection(tables, device=torch.device("cpu"))
+        embedding_bag_info, embedding_infos = (
+            export_util._get_sparse_table_to_embedding_info(model)
+        )
+        _, _, emb_meta, feat_meta = _get_sparse_embedding_tensor(
+            model, test_dir, embedding_infos, embedding_bag_info, []
+        )
+        self.assertEqual(
+            emb_meta["ec.embeddings.first_emb"]["feat_name_impl"],
+            ["seq_feat@first_emb__ec"],
+        )
+        self.assertEqual(
+            emb_meta["ec.embeddings.second_emb"]["feat_name_impl"],
+            ["seq_feat@second_emb__ec"],
+        )
+        self.assertEqual(
+            feat_meta,
+            {
+                "seq_feat@first_emb__ec": {
+                    "embedding_name": "ec.embeddings.first_emb",
+                    "pooling": "NONE",
+                    "use_weight": False,
+                },
+                "seq_feat@second_emb__ec": {
+                    "embedding_name": "ec.embeddings.second_emb",
+                    "pooling": "NONE",
+                    "use_weight": False,
+                },
+            },
+        )
 
     def test_sparse_dynamic_embedding_export_concats_training_shards(self) -> None:
         """Single-rank export must not drop multi-GPU dynamicemb checkpoint shards."""
@@ -2578,23 +2670,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 ),
                 feature_pb2.FeatureConfig(
                     id_feature=feature_pb2.IdFeature(
-                        feature_name="cat_a_wide",
-                        expression="item:cat_a",
-                        embedding_dim=16,
-                        dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=2**36),
-                    )
-                ),
-                feature_pb2.FeatureConfig(
-                    id_feature=feature_pb2.IdFeature(
                         feature_name="cat_b",
-                        expression="item:cat_b",
-                        embedding_dim=16,
-                        num_buckets=8,
-                    )
-                ),
-                feature_pb2.FeatureConfig(
-                    id_feature=feature_pb2.IdFeature(
-                        feature_name="cat_b_wide",
                         expression="item:cat_b",
                         embedding_dim=16,
                         num_buckets=8,
@@ -2610,7 +2686,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 feature_groups=[
                     model_pb2.FeatureGroupConfig(
                         group_name="wide",
-                        feature_names=["cat_a_wide", "cat_b_wide"],
+                        feature_names=["cat_a", "cat_b"],
                         group_type=model_pb2.FeatureGroupType.WIDE,
                     ),
                     model_pb2.FeatureGroupConfig(
@@ -2639,9 +2715,8 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
     def _build_model(self, dynamic=True):
         feature_configs = copy.deepcopy(self.pipeline_config.feature_configs)
         if not dynamic:
-            for index in (0, 1):
-                feature_configs[index].id_feature.ClearField("dynamicemb")
-                feature_configs[index].id_feature.num_buckets = 8
+            feature_configs[0].id_feature.ClearField("dynamicemb")
+            feature_configs[0].id_feature.num_buckets = 8
         with mock.patch(
             "tzrec.utils.dynamicemb_util.build_dynamicemb_constraints",
             return_value=None,
@@ -2694,6 +2769,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             ("ordinary_int8", False, "INT8", ""),
             ("zch_only", False, "", ""),
             ("mixed_zch", False, "", ""),
+            ("mixed_zch_int8", False, "INT8", ""),
             ("mixed_zch_upload", True, "", ""),
             ("fp32_upload", True, "", ""),
             ("int8_upload", True, "INT8", ""),
@@ -2723,19 +2799,22 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             not case_name.startswith("ordinary") and case_name != "zch_only"
         )
         if not has_dynamic_tables:
-            for index in (0, 1):
-                feature = self.pipeline_config.feature_configs[index].id_feature
-                feature.ClearField("dynamicemb")
-                feature.num_buckets = 8
-        if case_name in ("mixed_zch", "mixed_zch_upload", "zch_only"):
-            for index in (2, 3):
-                self.pipeline_config.feature_configs[index].id_feature.zch.CopyFrom(
-                    feature_pb2.ZeroCollisionHash(
-                        zch_size=8,
-                        eviction_interval=5,
-                        lfu=feature_pb2.LFU_EvictionPolicy(),
-                    )
+            feature = self.pipeline_config.feature_configs[0].id_feature
+            feature.ClearField("dynamicemb")
+            feature.num_buckets = 8
+        if case_name in (
+            "mixed_zch",
+            "mixed_zch_int8",
+            "mixed_zch_upload",
+            "zch_only",
+        ):
+            self.pipeline_config.feature_configs[1].id_feature.zch.CopyFrom(
+                feature_pb2.ZeroCollisionHash(
+                    zch_size=8,
+                    eviction_interval=5,
+                    lfu=feature_pb2.LFU_EvictionPolicy(),
                 )
+            )
         model = self._build_model()
         table_infos, _ = export_util._get_sparse_table_to_embedding_info(model)
         dynamic_names = {
@@ -2805,9 +2884,9 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             },
             sparse_features={
                 BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
-                    keys=["cat_a", "cat_a_wide", "cat_b", "cat_b_wide"],
-                    values=torch.tensor([2**60 + 1, -7, 2**60 + 1, -7, 3, 4, 3, 4]),
-                    lengths=torch.tensor([1, 1, 1, 1, 1, 1, 1, 1]),
+                    keys=["cat_a", "cat_b"],
+                    values=torch.tensor([2**60 + 1, -7, 3, 4]),
+                    lengths=torch.tensor([1, 1, 1, 1]),
                 )
             },
             labels={},
@@ -2951,20 +3030,48 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         if upload:
             uploader.close.assert_called_once_with()
             self.assertEqual(set(uploaded), dynamic_names)
-        self.assertEqual(
-            os.path.exists(
-                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
-            ),
-            bool(expected_dynamic),
+        dynamic_npz_files = sorted(
+            glob.glob(os.path.join(sparse_dir, "sparse_dynamic_embedding-*.npz"))
         )
+        if not expected_dynamic:
+            self.assertEqual(dynamic_npz_files, [])
+        elif dynamic_names and not upload:
+            self.assertEqual(
+                [os.path.basename(p) for p in dynamic_npz_files],
+                [
+                    "sparse_dynamic_embedding-00-of-02.npz",
+                    "sparse_dynamic_embedding-01-of-02.npz",
+                ],
+            )
+        else:
+            self.assertEqual(
+                [os.path.basename(p) for p in dynamic_npz_files],
+                ["sparse_dynamic_embedding-00-of-01.npz"],
+            )
         if expected_dynamic:
-            with np.load(
-                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
-            ) as output:
+            part_outputs = [np.load(p) for p in dynamic_npz_files]
+            try:
+                expected_val_dtype = np.dtype(np.uint8 if quant else np.float32)
                 for name, (keys, values, scores) in expected_dynamic.items():
-                    np.testing.assert_array_equal(output[f"{name}.keys"], keys)
-                    np.testing.assert_array_equal(output[f"{name}.scores"], scores)
-                    exported = output[f"{name}.values"]
+                    for out in part_outputs:
+                        self.assertEqual(out[f"{name}.keys"].dtype, np.dtype(np.int64))
+                        self.assertEqual(
+                            out[f"{name}.scores"].dtype, np.dtype(np.int64)
+                        )
+                        self.assertEqual(
+                            out[f"{name}.values"].dtype, expected_val_dtype
+                        )
+                    actual_keys = np.concatenate(
+                        [out[f"{name}.keys"] for out in part_outputs], axis=0
+                    )
+                    actual_scores = np.concatenate(
+                        [out[f"{name}.scores"] for out in part_outputs], axis=0
+                    )
+                    exported = np.concatenate(
+                        [out[f"{name}.values"] for out in part_outputs], axis=0
+                    )
+                    np.testing.assert_array_equal(actual_keys, keys)
+                    np.testing.assert_array_equal(actual_scores, scores)
                     if quant:
                         self.assertEqual(exported.dtype, np.uint8)
                         np.testing.assert_allclose(
@@ -2983,9 +3090,26 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                             exported,
                         )
                 for name, default_value in expected_defaults.items():
-                    np.testing.assert_array_equal(
-                        output[f"{name}.default_value"], default_value
-                    )
+                    default_parts = [
+                        out[f"{name}.default_value"]
+                        for out in part_outputs
+                        if f"{name}.default_value" in out
+                    ]
+                    self.assertEqual(len(default_parts), 1)
+                    if quant:
+                        self.assertEqual(default_parts[0].dtype, np.uint8)
+                        np.testing.assert_allclose(
+                            _dequant_quint8_rowwise_f16(
+                                default_parts[0], default_value.shape[1]
+                            ),
+                            default_value,
+                            atol=0.02,
+                        )
+                    else:
+                        np.testing.assert_array_equal(default_parts[0], default_value)
+            finally:
+                for out in part_outputs:
+                    out.close()
         with np.load(
             os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")
         ) as output:
@@ -3006,6 +3130,18 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 metadata[name]["shape"], [len(keys), table_infos[name].embedding_dim]
             )
             self.assertTrue(metadata[name]["is_dynamic"])
+        with open(os.path.join(sparse_dir, "sparse_features.json")) as input_file:
+            feature_metadata = json.load(input_file)
+        with open(os.path.join(self.export_dir, "dense_meta.json")) as input_file:
+            dense_metadata = json.load(input_file)
+        for dense_features in dense_metadata.values():
+            for feat_name_impl in dense_features:
+                if feat_name_impl.endswith("__lengths"):
+                    continue
+                self.assertIn(feat_name_impl, feature_metadata)
+                self.assertIn(
+                    feature_metadata[feat_name_impl]["embedding_name"], metadata
+                )
         with open(os.path.join(self.export_dir, "fg.json")) as input_file:
             self.assertEqual(json.load(input_file), {"custom_asset": True})
         with open(os.path.join(self.export_dir, "model_acc.json")) as input_file:
@@ -3106,6 +3242,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         [
             ("read_chunk_size_mb", "read_chunk_size_mb"),
             ("upload_max_in_flight_batches", "upload_max_in_flight_batches"),
+            ("max_num_parts", "max_num_parts"),
             ("missing_tables", "missing tables"),
         ],
         name_func=parameterized_name_func,
@@ -3133,6 +3270,64 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         dense_export.assert_not_called()
         sparse_restore.assert_not_called()
         self.assertFalse(os.path.exists(self.export_dir))
+
+    def test_sharded_dynamic_npz_worker_failure_cleans_up_parts(self):
+        sparse_dir = os.path.join(self.export_dir, "sparse")
+        os.makedirs(sparse_dir, exist_ok=True)
+        table = "model.embedding_group.emb_impls.__BASE__.ebc.embedding_bags.cat_a_emb"
+
+        def bad_chunks():
+            raise ValueError("corrupted dynamic shard")
+            yield np.zeros((1,), dtype=np.int64)
+
+        part0 = {
+            f"{table}.keys": npz_util.StreamingArray(
+                np.dtype(np.int64), (1,), [np.array([1], dtype=np.int64)]
+            ),
+            f"{table}.values": npz_util.StreamingArray(
+                np.dtype(np.float32),
+                (1, 2),
+                [np.ones((1, 2), dtype=np.float32)],
+            ),
+            f"{table}.scores": npz_util.StreamingArray(
+                np.dtype(np.int64), (1,), [np.array([10], dtype=np.int64)]
+            ),
+        }
+        part1 = {
+            f"{table}.keys": npz_util.StreamingArray(
+                np.dtype(np.int64), (1,), bad_chunks()
+            ),
+            f"{table}.values": npz_util.StreamingArray(
+                np.dtype(np.float32),
+                (1, 2),
+                [np.ones((1, 2), dtype=np.float32)],
+            ),
+            f"{table}.scores": npz_util.StreamingArray(
+                np.dtype(np.int64), (1,), [np.array([20], dtype=np.int64)]
+            ),
+        }
+        embedding_meta = {
+            table: {
+                "is_dynamic": True,
+                "key_name": f"{table}.keys",
+                "value_name": f"{table}.values",
+                "score_name": f"{table}.scores",
+            }
+        }
+        orphan = os.path.join(
+            sparse_dir, "sparse_dynamic_embedding-01-of-02.npz.part.deadbeef"
+        )
+        with open(orphan, "wb") as f:
+            f.write(b"orphan")
+        with self.assertRaisesRegex(RuntimeError, "corrupted dynamic shard"):
+            export_util._save_sharded_dynamic_embedding_npz(
+                sparse_dir,
+                [part0, part1],
+                part0,
+                embedding_meta,
+                {table},
+            )
+        self.assertEqual(os.listdir(sparse_dir), [])
 
 
 if __name__ == "__main__":
