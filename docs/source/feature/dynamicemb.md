@@ -102,19 +102,12 @@ feature_configs {
 
 ## RocksDB 存储
 
-当表的总参数（embedding + 优化器状态）超过 GPU 显存和主机内存时，可以把 DynamicEmbedding 表放到每个训练进程自带的 RocksDB 中（本地 NVMe、ESSD 云盘或极速型 NAS），GPU 上保留一个热点 cache。需要额外安装 TorchEasyRec-addons 构建的 `tzrec-rocksdb` wheel（CPU-only，与 CUDA 版本无关；要求 dynamicemb 为 `13a8055` 版本）。
+当 DynamicEmbedding 表的总参数（embedding + 优化器状态）超过 GPU 显存和主机内存时，规划器可以把一部分表放到每个训练进程自带的 RocksDB 中（本地 NVMe、ESSD 云盘或极速型 NAS），GPU 上保留一个热点 cache。需要额外安装 TorchEasyRec-addons 构建的 `tzrec-rocksdb` wheel（CPU-only，与 CUDA 版本无关；要求 dynamicemb 为 `13a8055` 版本）。
 
 ```
 train_config {
     rocksdb_config {
-        local_path: "/mnt/nvme/tzrec_rocksdb"
-        placement: AUTO
-        gpu_cache_value_bytes_per_rank: 8589934592
-        block_cache_bytes_per_rank: 34359738368
-        write_buffer_bytes_per_rank: 4294967296
-        staging_buffer_bytes_per_rank: 268435456
-        io_threads: 16
-        disk_budget_bytes: 4398046511104
+        root_dir: "/mnt/nvme/tzrec_rocksdb"
     }
 }
 feature_configs {
@@ -129,73 +122,64 @@ feature_configs {
 }
 ```
 
-### 表放在哪里
-
-- **placement: EXPLICIT**（默认）: 只有配置了 `dynamicemb { rocksdb {} }` 的表使用 RocksDB，其它表与原来一样
-- **placement: AUTO**: 不需要逐表配置 `rocksdb {}`。规划器先估算全部 DynamicEmbedding 表放在 GPU/主机内存所需的空间，只有放不下时才把一部分表移到 RocksDB：按“每步查表次数 / 表大小”从小到大挑选（同一融合组已在 RocksDB 的优先），跳过磁盘放不下的表，最后把不再需要的表移回内存。这是基于容量的确定性规则，不代表性能最优（没有使用访问统计）。规划后再由 TorchRec 规划器校验，如果仍放不下会再多移一张表重试；仍然无解时报错并给出显存/内存和磁盘的缺口
-- AUTO 下留在内存的表只使用 CACHING 布局（GPU cache 加完整的主机表），不使用 HYBRID：HYBRID 每次加载都会重新划分 GPU 和主机两层，接近 `max_capacity` 的表会溢出哈希 bucket，恢复时丢失行
-- 显式覆盖：`rocksdb {}` 的表总是使用 RocksDB；配置了 `cache_load_factor` 的表总是留在内存；`score_strategy: "CUSTOMIZED"` 的表不会放到 RocksDB（TorchEasyRec 没有 CUSTOMIZED 分数的生产者）
-- 没有配置 rocksdb_config 时不会使用磁盘，也不需要安装 tzrec-rocksdb；AUTO 未选中任何表时不会打开数据库，也不会预留 RocksDB 的主机内存
-- 训练日志中的 `dynamicemb placement` 列出每张表的去向、原因和估算的显存/内存/磁盘，`RocksDB live storage` 给出磁盘估算的分项明细
-- 同一份 checkpoint 可以在预算改变后用不同的放置方式继续训练（内存版与 RocksDB 版之间可以互相迁移），见下文“Checkpoint 与恢复”
-
 ### 配置项
 
-- **rocksdb_config**（train_config 中；内存类预算按 rank 计一次，磁盘预算按存储域计）
+- **rocksdb_config**（train_config 中）
+  - root_dir: 工作数据库的根目录，使用本地盘、ESSD 或极速型 NAS 等 NFS 类文件系统，不要使用 OSS 等 FUSE 挂载目录（会报错）。每个进程使用 `<root_dir>/<model_dir 标识>/rank_<rank>/<模式>-<时间>-<pid>`，不同任务、rank 和进程互不冲突
+  - disk_budget_bytes: 可选，本任务在 root_dir 所在文件系统上最多可以占用的字节数，共享同一磁盘池的所有 rank 共用。不配置时只受文件系统可用空间限制
+- GPU cache、block cache、memtable、pinned staging 的大小、线程数以及恢复导入的内存都由规划器决定，不需要配置
 
-  - local_path: 在线数据库的根目录，目录结构为 `<local_path>/<run_id>/rank_<r>/`，`run_id` 由 model_dir 计算。使用本地盘、ESSD 或极速型 NAS，不要使用 tmpfs，也不要使用 OSS 挂载目录
-  - placement: EXPLICIT 或 AUTO
-  - gpu_cache_value_bytes_per_rank: RocksDB 表 GPU cache 中 embedding + 优化器状态的显存预算，按各 RocksDB 表在本 rank 上的参数量等比例分配。必须大于 0（RocksDB 表总是在 GPU cache 之后），且小于全部 RocksDB 表在本 rank 上的参数总量（dynamicemb 在显存放得下全表时会忽略外部存储）
-  - block_cache_bytes_per_rank / write_buffer_bytes_per_rank / staging_buffer_bytes_per_rank: RocksDB block cache、memtable 和单次读写的 pinned 内存预算。有表放到 RocksDB 时，三者之和加约 2GB 开销从规划器的主机内存容量中扣除一次。恢复导入时 block cache 和 memtable 还用不到，导入用这两项的预算缓存待排序的行
-  - io_threads: 一次批量查表拆分给多少个线程并发读，也是恢复时并发读取 checkpoint 文件、写 SST 文件的线程数；网络存储（NAS、OSS、云盘）建议调大
-  - max_background_jobs: RocksDB flush/compaction 线程数，默认 8
-  - disk_budget_bytes: 本任务在 local_path 所在存储上最多可以占用的字节数，有表放到 RocksDB 时必填。共享同一存储（同一 NAS 服务器、同一本地盘，或相同 storage_domain）的所有 rank 共用这一个预算
-  - storage_domain: 显式指定存储域。NFS/CPFS 按服务器、本地块设备按“主机+设备”自动识别；FUSE 或无法识别的文件系统必须配置
-  - disk_reserve_bytes: 预留的安全空间，默认 16GiB
-  - sst_space_factor: 校准过的“SST 文件大小 / 逻辑行字节数”系数。未配置时使用 1.5，这是一个临时估计值，不是实测值。在 ESSD PL3 云盘上用 STEP/LFU/TIMESTAMP 表（dim 32/64，Adam）持续训练、表满后持续淘汰时实测为 1.02-1.05；可先用默认值训练一段，再按保存日志中的 live SST 与导出字节数之比加少量余量配置
-  - capacity_check_interval_steps: 训练中检查磁盘余量的间隔步数，默认 100
-  - disk_warn_headroom_bytes / disk_critical_headroom_bytes: 余量告警线和停止线，默认分别为 disk_budget_bytes 的 10% 和 5%
+### 资源限制
 
-- **dynamicemb.rocksdb {}**: 该表总是使用 RocksDB。不能配置 `cache_load_factor`（cache 大小由 `gpu_cache_value_bytes_per_rank` 统一决定），`score_strategy` 不能为 `CUSTOMIZED`
+- 规划器使用的主机内存为容器内存上限（cgroup）扣除 `HOST_MEMORY_RESERVE_PERCENT`（环境变量，默认 0.15，给数据加载、运行时等非 embedding 用途）后按本机 rank 数均分；显存同样扣除 `STORAGE_RESERVE_PERCENT`（默认 0.15）。这两个比例对所有任务生效，不只是使用 RocksDB 的任务
+- 数据加载进程较多、内存占用较大时，请调大 `HOST_MEMORY_RESERVE_PERCENT`
+
+### 表放在哪里
+
+- 规划器先在不使用 RocksDB 的前提下规划；只有 GPU 和主机内存放不下全部表时，才允许把表放到 RocksDB，并且此时才扣除 RocksDB 自身的固定主机内存（memtable、staging、block cache 数据部分和约 2GB 开销，每 rank 约 4.25GB）
+- 允许使用 RocksDB 时，每张可以放到 RocksDB 的表除了内存中的各种 cache 比例外，还会得到多个“RocksDB + GPU cache”选项（cache 比例 0.0001、0.001、0.01、0.1 ~ 0.9）。TorchRec 的动态规划（显存 × 内存 × 磁盘）在满足显存、内存和磁盘容量的前提下按估算性能选择每张表的位置和 cache 比例：RocksDB 表的 cache 未命中按磁盘带宽估算，所以能放进内存的表仍留在内存
+- 只有 cache 比例相同的 RocksDB 表会融合到一起（dynamicemb 对一个融合组只使用一个 cache 比例），因此规划的每表 cache 行数与实际分配一致
+- cache 至少要容纳一个 batch 估算的查表 Id 数（batch_size × 每个样本的 Id 数，序列特征按 `sequence_length`、多个特征共用一张表时相加），更小的比例不会被选用。这只是估算（按查表次数而非去重 Id 数），运行时每一步都会按实际的去重 Id 数检查，见下文“排障”
+- 配置了 `cache_load_factor` 的表总是留在内存；`score_strategy: "CUSTOMIZED"` 的表不会放到 RocksDB（TorchEasyRec 没有 CUSTOMIZED 分数的生产者）
+- 配置 rocksdb_config 时，留在内存的表只使用 CACHING 布局（GPU cache 加完整的主机表），不使用 HYBRID：HYBRID 每次加载都会重新划分 GPU 和主机两层，接近 `max_capacity` 的表会溢出哈希 bucket，恢复时丢失行
+- 没有配置 rocksdb_config 时不会使用磁盘，也不需要安装 tzrec-rocksdb；规划没有选择 RocksDB 时不会打开数据库
+- 训练日志 `dynamicemb tables offloaded to RocksDB` 列出放到 RocksDB 的表、cache 比例和行数，以及规划出的 RocksDB 配置；`RocksDB disk pool` 给出磁盘估算的分项明细
+- 同一份 checkpoint 可以在内存版与 RocksDB 版之间互相迁移，见下文“Checkpoint 与恢复”
 
 ### 淘汰策略与容量
 
 - 支持 `STEP`、`TIMESTAMP`、`LFU` 和 `NO_EVICTION`。分数由 GPU cache 按 dynamicemb 的规则产生（STEP/TIMESTAMP 在访问时更新，LFU 累加访问次数，包括同一 batch 内的重复 Id 和 cache 命中），cache 淘汰时随行写回 RocksDB；从 RocksDB 读回的 LFU 行会带上本 batch 的频次，不会重复或漏计
 - STEP/TIMESTAMP/LFU 表在每个训练步结束时按 `max_capacity`（每个分片的容量）做逻辑淘汰：删除分数最低的、不在 GPU cache 中的行（含 embedding 和优化器状态），分数相同时按 Id 排序。这是每个分片内的全局最低分，与内存版 dynamicemb 在哈希桶内淘汰最低分的结果不完全相同。每步之间可能短暂超出容量（最多一个 batch 的新 Id）
-- 优先淘汰不在 GPU cache 中的行；只有这类行已全部淘汰仍超出容量时（同一融合组的表共享 GPU cache，某张表在 cache 中的行数可能超过它自己的容量），才淘汰 cache 中分数最低的行，并同时从 cache 中删除，因此 cache 写回不会让已淘汰的 Id 复活。如果一个 batch 中某张表的去重 Id 数超过它在 GPU cache 中的份额，超出部分存放在 dynamicemb cache 的 overflow 区域，无法淘汰，此时该表会高于 max_capacity 并打印告警，请调大 max_capacity 或 GPU cache 预算。被淘汰的 Id 再次出现时按新 Id 重新准入、初始化，优化器状态重置
+- 优先淘汰不在 GPU cache 中的行；只有这类行已全部淘汰仍超出容量时，才淘汰 cache 中分数最低的行，并同时从 cache 中删除，因此 cache 写回不会让已淘汰的 Id 复活。被淘汰的 Id 再次出现时按新 Id 重新准入、初始化，优化器状态重置
 - 开启增量导出的 tombstone 时，逻辑淘汰的 Id 会像内存版一样发布 tombstone；GPU cache 的替换只是写回，不产生 tombstone。进程重启时尚未发布的淘汰 Id 不会保存（与内存版一致）
 - `NO_EVICTION` 表不淘汰，与内存版一样随新 Id 持续增长。`max_capacity` 只作为磁盘规划的声明上限，并不强制；请依赖下文的运行时磁盘监控
-- GPU cache 至少要能放下一个 batch 在每个融合组上的去重 Id 数，否则 dynamicemb 会报 `Outstanding prefetched keys ... exceed cache capacity`，需要调大 `gpu_cache_value_bytes_per_rank` 或减小 batch_size
 - 使用 frequency_admission_strategy 时，频次 Counter 仍在显存中，并随 checkpoint 一起保存
-- 同一 FeatureGroup 中兼容的 RocksDB 表仍会融合，每个 rank 只有一个数据库；每张表的数据以“模块路径.表名”作为持久命名空间，与放置方式和表的顺序无关
+- 每张表的数据以“模块路径.表名”作为持久命名空间，与放置方式和表的顺序无关
 
 ### 磁盘规划与监控
 
-- 规划时每个 rank 上报 local_path 所在的文件系统（挂载源、类型、可用空间、本任务已占用空间），按存储域汇总后估算峰值占用：逻辑行字节数（key、分数、embedding、优化器状态以及淘汰索引，按表自身的维度和 dtype 计算）× `sst_space_factor` + compaction 临时输出 + MANIFEST/日志等文件 + 一个 batch 的新 Id + 预留空间；分别估算训练、保存（cache 全量写回产生的旧版本）和恢复（另加最大一张表的临时 spill 文件）三个场景，取最大值，不相加
-- 峰值必须同时满足：不超过 `disk_budget_bytes`；新增占用（峰值减去本任务已占用的空间）不超过文件系统当前可用空间。NAS 的配额通常无法查询，此时以 `disk_budget_bytes` 为准，日志中会注明
-- 训练中每 `capacity_check_interval_steps` 步各 rank 交换一次采样（可用空间、本任务占用、SST 大小、compaction 积压），余量 = min(可用空间 - 预留, 预算 - 占用)。低于告警线时打印告警和按增长速度估算的剩余时间；低于停止线时在该步结束后停止训练：如果余量还够一次保存，先保存 checkpoint 再停止，否则直接停止（上一个完整的 checkpoint 不受影响），抛出 `DiskCapacityError`。不会为了腾空间删除 Id、快照或其它文件
+- 规划时每个 rank 上报 root_dir 所在磁盘池（NFS 类文件系统按服务器、本地盘按“主机+设备”，同一池的 rank 共享可用空间和 disk_budget_bytes）的可用空间和本任务已占用空间。每张 RocksDB 表占用的磁盘（逻辑行字节数 × 1.1 的 SST 系数，加一个 batch 的新 Id 和保存时 cache 写回的旧版本）作为动态规划的第三个维度；compaction 临时输出、MANIFEST/日志、恢复时最大一张表的临时 spill 文件和 16GiB 预留按池固定扣除
+- 训练中每 100 步各 rank 交换一次采样（可用空间、本任务占用、SST 大小、compaction 积压），余量 = 可用空间 - 预留（配置了预算时再与“预算 - 占用”取小）。余量低于磁盘池容量的 5% 时在该步结束后停止训练：如果余量还够一次保存，先保存 checkpoint 再停止，否则直接停止（上一个完整的 checkpoint 不受影响），抛出 `DiskCapacityError`。不会为了腾空间删除 Id、快照或其它文件
 - `estimate-pending-compaction-bytes` 表示待重写的数据量，不是需要额外预留的空间，日志中单独列出；如果它在连续多次检查中持续增长，日志会标记 compaction 不稳定
 
 ### Checkpoint 与恢复
 
 - RocksDB 表与内存版 DynamicEmbedding 表使用完全相同的 checkpoint 格式：保存时 `DynamicEmbDump` 先把 GPU cache 写回，再从冻结的数据库视图（暂停后台 flush/compaction、持有快照，未落盘的 memtable 直接读取，不强制刷盘）按块流式写出 `model.ckpt-<step>/dynamicemb/` 下的 keys/values/scores/opt_values 文件，最后写 `_SUCCESS`。不会在训练盘上保留历史 checkpoint，也不会先在本地落一份完整导出
 - model_dir 可以是 OSS 挂载目录（如 DLC 的 ossfs 数据集），文件按顺序流式写入，由 ossfs 分片上传。单文件大小受 ossfs 分片大小 × 10000 限制，超过时报 `File too large`，请调大 `upload_buffer_size`（见 FAQ）
-- 开启 RocksDB 后，`--continue_train`、评估、预测和导出只会选择带 `_SUCCESS` 的 checkpoint；比恢复点更新、但没有 `_SUCCESS` 的 checkpoint 目录会被删除（日志中打印文件数和大小），在 OSS 上重命名等于全量复制
-- 恢复时先清空 GPU cache，再新建一个空的工作库，按表并发读取 checkpoint 文件、只保留本 rank 的 id，排序后直接写成 SST 文件导入最底层，不经过 memtable 和 compaction；一张表在上述内存预算内放不下时按 id 区间分几轮导入，文件仍只读一遍：第一个区间边读边转换，其余区间原样写到工作库旁的 `.spill` 目录，再逐个区间导入，导入完即删除。上一次的工作库和崩溃遗留的数据不会被复用。因此只要 checkpoint 完整，本地盘丢失后也可以在其它节点恢复
-- checkpoint 与放置方式无关：同一份 checkpoint 可以在内存版和 RocksDB 版之间恢复，也可以在调整预算后由 AUTO 选出不同的放置继续训练。若放置变化使原本不在同一融合组、优化器参数（例如 Adam 的迭代次数）不同的表融合到一起，恢复会报错。world size、维度或优化器类型的变化按 dynamicemb 自身的规则校验
+- 开启 RocksDB 后，`--continue_train`、评估、预测和导出只会选择带 `_SUCCESS` 的 checkpoint，不完整的 checkpoint 会被忽略而不会被删除；只有恢复后的训练再次保存同一步时，才会替换该步不完整的目录（DynamicEmbDump 要求空目录）
+- 恢复时先清空 GPU cache，再新建一个空的工作库导入 checkpoint 文件：每个线程顺序读取一个分片的一段（每个文件只打开一次，OSS 等远程挂载可以预读），只保留本 rank 的 id，排序后直接写成 SST 文件导入最底层，不经过 memtable 和 compaction。导入使用的主机内存由规划器给出（恢复时 block cache 和 memtable 还没有使用，内存版表已经分配），与表的大小无关：一张表放不下时，先扫描 key 采样划分 id 区间，第一个区间边读边转换，其余区间原样写到工作库旁的 `.spill` 目录再逐个导入，导入完即删除。上一次的工作库和崩溃遗留的数据不会被复用，因此只要 checkpoint 完整，本地盘丢失后也可以在其它节点恢复
+- checkpoint 与放置方式无关：同一份 checkpoint 可以在内存版和 RocksDB 版之间恢复，也可以在资源变化后由规划器选出不同的放置继续训练。world size、维度或优化器类型的变化按 dynamicemb 自身的规则校验
 - 内存表接近 `max_capacity` 时，改变 world size 恢复会让 key 落到新的哈希 bucket，装不下的 bucket 按淘汰策略丢弃其中分数最低的行（装填率约 97% 时，`bucket_capacity` 为 128 约丢失 2.3%，为 1024 约丢失 0.3%）。RocksDB 表没有 bucket，不受影响；world size 不变时恢复也不会丢行
-- 评估、导出时 RocksDB 表同样从 checkpoint 文件加载到一个新的临时数据库（会占用与表大小相当的磁盘）
-- 保存耗时与表大小成正比（全量写出），训练在保存期间暂停（实测经 ossfs 写出约 125 GiB 需约 13 分钟，从 OSS 恢复约 6 分钟），请据此设置 `save_checkpoints_steps`；日志 `RocksDB checkpoint` 给出本次保存的 cache 写回、导出行数和字节数、暂停后台任务的等待时间和读取的未落盘 memtable 大小，以及进程启动以来训练、发布的累计写回量、淘汰行数和 RocksDB flush/compaction 写入量
+- 评估、预测、导出时如果规划选择了 RocksDB，表同样从 checkpoint 文件加载到一个新的临时数据库（会占用与表大小相当的磁盘），进程结束（包括出错退出）时删除
+- 保存耗时与表大小成正比（全量写出），训练在保存期间暂停，请据此设置 `save_checkpoints_steps`；日志 `RocksDB checkpoint` 给出本次保存的 cache 写回、导出行数和字节数、暂停后台任务的等待时间和读取的未落盘 memtable 大小，以及进程启动以来训练、发布的累计写回量、淘汰行数和 RocksDB flush/compaction 写入量
 - 已知限制：恢复前框架会先用一个 batch 初始化优化器状态，此时 frequency admission 的 Counter 计数无法回滚
 
 ### 排障
 
-- `tzrec-rocksdb wheel`: 未安装 tzrec-rocksdb
-- `set rocksdb_config.gpu_cache_value_bytes_per_rank > 0`: RocksDB 表需要 GPU cache
-- `disk_budget_bytes is not set` / `projected peak exceeds the budget` / `growth needs ... more than are free`: 磁盘预算不足或可用空间不足，日志 `RocksDB live storage` 中有分项明细；可以调大预算、换更大的存储、降低 `max_capacity`，或在 AUTO 下增加内存预算
-- `no placement fits`: 显存、内存和磁盘都放不下，错误信息列出每张表的去向和缺口
-- 训练出现 NaN，且规划日志有 `GPU cache share of ... rows may be smaller than one step's lookups`：dynamicemb `13a8055` 的 GPU cache 在一个 batch 中某张融合表的去重 Id 数超过该表的 cache 份额时会返回无效的行（内存版 CACHING 布局同样存在），请调大 `gpu_cache_value_bytes_per_rank`
-- `set rocksdb_config.storage_domain`: local_path 所在文件系统无法判断与谁共享容量
+- `tzrec-rocksdb wheel`: 未安装 tzrec-rocksdb（此时所有表留在内存，打印告警）
+- `RocksDB tables need a local disk or an NFS-like filesystem`: root_dir 在 FUSE 或无法识别的文件系统上
+- `Unable to find a plan for this model`: 显存、内存和磁盘都放不下；日志中有每个选项的显存/内存估算，磁盘不足时为 `RocksDB tables need ... bytes of disk`。可以换更大的磁盘、调大 disk_budget_bytes、降低 `max_capacity`，或减少 `HOST_MEMORY_RESERVE_PERCENT` / `STORAGE_RESERVE_PERCENT`
+- `one step brings N unique ids to <表>, whose GPU cache holds M rows`: 一个 batch 中这张表的去重 Id 数超过了它的 GPU cache（dynamicemb 的 cache 放不下时会返回无效的行，所以在查表前报错）。请减小 batch_size，或给显存更多空间（减小 `STORAGE_RESERVE_PERCENT`）以选出更大的 cache 比例；序列或多值特征请确认 `sequence_length` 等配置反映了实际长度
 - `stopped at step ...: RocksDB disk headroom fell below`: 运行时磁盘余量低于停止线
 - 训练变慢：日志中的 `RocksDB disk` 和保存日志给出 SST 大小、compaction 积压等指标，判断是读延迟、写入限流还是 compaction 积压
 

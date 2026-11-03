@@ -9,10 +9,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import glob
 import os
 import re
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -40,42 +42,92 @@ except ImportError:
     has_rocksdb = False
 
 
-class RocksDBBudgetTest(unittest.TestCase):
-    """Rank-wide budget split and checkpoint selection helpers."""
+def _backend_config():
+    from tzrec_rocksdb import BackendConfig
 
-    def tearDown(self):
-        rocksdb_util.set_rocksdb_config(None)
+    return BackendConfig(32 << 20, 32 << 20, 1 << 20, 64 << 20, io_threads=2)
 
-    def test_cache_ratio(self):
-        rocksdb_util.set_rocksdb_config(
-            train_pb2.RocksDBConfig(local_path="x", gpu_cache_value_bytes_per_rank=300)
+
+class RocksDBRuntimeTest(unittest.TestCase):
+    """Lifecycle of the per-process RocksDB runtime."""
+
+    def setUp(self):
+        try:
+            import tzrec_rocksdb  # noqa: F401
+        except ImportError:
+            self.skipTest("tzrec_rocksdb is not installed")
+        self.test_dir = make_test_dir()
+        self.train_config = train_pb2.TrainConfig(
+            rocksdb_config=train_pb2.RocksDBConfig(
+                root_dir=os.path.join(self.test_dir, "db")
+            )
         )
-        self.assertAlmostEqual(rocksdb_util.cache_ratio([600, 400]), 0.3)
-        with self.assertRaises(ValueError):
-            rocksdb_util.cache_ratio([100, 200])
-        rocksdb_util.set_rocksdb_config(train_pb2.RocksDBConfig(local_path="x"))
-        with self.assertRaisesRegex(ValueError, "GPU cache"):
-            rocksdb_util.cache_ratio([600])
 
-    def test_cache_rows_and_host_reserve(self):
+    def test_no_config_no_runtime(self):
+        with rocksdb_util.open_runtime(train_pb2.TrainConfig(), "m", "eval") as rt:
+            self.assertIsNone(rt)
+
+    def test_cache_rows(self):
         self.assertEqual(rocksdb_util.cache_rows(10**6, 0.0), 0)
         self.assertEqual(rocksdb_util.cache_rows(10**6, 0.001), 1024)
         self.assertEqual(rocksdb_util.cache_rows(10**6, 0.01), 10240)
-        self.assertEqual(rocksdb_util.host_reserve_bytes(), 0)
-        rocksdb_util.set_rocksdb_config(
-            train_pb2.RocksDBConfig(
-                local_path="x",
-                block_cache_bytes_per_rank=1 << 30,
-                write_buffer_bytes_per_rank=1 << 29,
-                staging_buffer_bytes_per_rank=1 << 28,
-            )
-        )
-        self.assertEqual(
-            rocksdb_util.host_reserve_bytes(),
-            (1 << 30) + (1 << 29) + (1 << 28) + rocksdb_util._HOST_OVERHEAD_BYTES,
-        )
 
-    def test_incomplete_checkpoints(self):
+    def test_bind_opens_one_session_per_rank(self):
+        from tzrec_rocksdb.storage import RocksDBStorageFactory
+
+        config = _backend_config()
+        options = [
+            SimpleNamespace(
+                external_storage=RocksDBStorageFactory(config, f"m.{n}", 0.1)
+            )
+            for n in "ab"
+        ]
+        plan = SimpleNamespace(
+            plan={
+                "m": {
+                    n: SimpleNamespace(dynamicemb_options=o)
+                    for n, o in zip("ab", options)
+                }
+            }
+        )
+        with rocksdb_util.open_runtime(self.train_config, "model", "eval") as rt:
+            rt.bind(plan)
+            self.assertEqual(rt.session.config, config)
+            self.assertTrue(
+                rt.session.work_dir.startswith(os.path.realpath(rt.rank_dir))
+            )
+            for o in options:
+                self.assertIs(o.external_storage.session, rt.session)
+            rt.bind(plan)  # the same plan again keeps the session
+            other = dataclasses.replace(config, block_cache_bytes=1)
+            options[0].external_storage = RocksDBStorageFactory(other, "m.a", 0.1)
+            with self.assertRaisesRegex(RuntimeError, "config"):
+                rt.bind(plan)
+
+    def test_close_releases_the_working_db_on_errors(self):
+        from tzrec_rocksdb import RocksDBSession
+
+        with self.assertRaisesRegex(ValueError, "boom"):
+            with rocksdb_util.open_runtime(self.train_config, "model", "eval") as rt:
+                rt.session = RocksDBSession(_backend_config(), rt._new_work_dir())
+                self.assertTrue(rt.session.namespace_ids(["t"]))
+                work = rt.session.work_dir
+                self.assertTrue(os.path.isdir(work))
+                raise ValueError("boom")
+        self.assertIsNone(rt.session)
+        self.assertFalse(os.path.exists(work))
+
+    def test_train_removes_stale_working_dbs(self):
+        rt = rocksdb_util.RocksDBRuntime(
+            self.train_config.rocksdb_config, "model", "eval"
+        )
+        stale = [os.path.join(rt.rank_dir, d) for d in ("train-1-2", "eval-1-2")]
+        for d in stale:
+            os.makedirs(d)
+        rocksdb_util.RocksDBRuntime(self.train_config.rocksdb_config, "model", "train")
+        self.assertEqual(os.listdir(rt.rank_dir), ["eval-1-2"])
+
+    def test_incomplete_checkpoints_are_never_selected(self):
         model_dir = make_test_dir()
         for step, done in ((10, True), (20, True), (30, False)):
             ckpt = os.path.join(model_dir, f"model.ckpt-{step}")
@@ -85,14 +137,8 @@ class RocksDBBudgetTest(unittest.TestCase):
         self.assertTrue(
             checkpoint_util.latest_checkpoint(model_dir)[0].endswith("model.ckpt-30")
         )
-        path, step = checkpoint_util.latest_checkpoint(model_dir, require_success=True)
+        _, step = checkpoint_util.latest_checkpoint(model_dir, require_success=True)
         self.assertEqual(step, 20)
-        with mock.patch.dict(os.environ, {"RANK": "0"}):
-            rocksdb_util.remove_incomplete_checkpoints(model_dir, step)
-        self.assertEqual(
-            sorted(os.listdir(model_dir)), ["model.ckpt-10", "model.ckpt-20"]
-        )
-        self.assertEqual(checkpoint_util.latest_checkpoint(model_dir)[1], 20)
 
 
 class _Model(nn.Module):
@@ -107,33 +153,27 @@ class RocksDBCheckpointTest(unittest.TestCase):
     """Logical save/restore of a fused module."""
 
     def setUp(self):
+        from tzrec_rocksdb import RocksDBSession
+
         self.test_dir = make_test_dir()
         self.model_dir = os.path.join(self.test_dir, "model")
-        rocksdb_util.set_rocksdb_config(
-            train_pb2.RocksDBConfig(
-                local_path=os.path.join(self.test_dir, "db"),
-                gpu_cache_value_bytes_per_rank=1 << 18,
-                disk_budget_bytes=1 << 40,
-                disk_reserve_bytes=0,
-                block_cache_bytes_per_rank=32 << 20,
-                write_buffer_bytes_per_rank=32 << 20,
-                staging_buffer_bytes_per_rank=1 << 20,
-                io_threads=2,
-            )
-        )
         self.env = mock.patch.dict(os.environ, {"RANK": "0", "WORLD_SIZE": "1"})
         self.env.start()
-        rocksdb_util.open_session(self.model_dir)
+        self.rt = rocksdb_util.RocksDBRuntime(
+            train_pb2.RocksDBConfig(root_dir=os.path.join(self.test_dir, "db")),
+            self.model_dir,
+            "train",
+        )
+        self.rt.session = RocksDBSession(_backend_config(), self.rt._new_work_dir())
 
     def tearDown(self):
-        rocksdb_util.close_session()
-        rocksdb_util.set_rocksdb_config(None)
+        self.rt.close()
         self.env.stop()
 
     def _model(self, names, strategy="NO_EVICTION", capacity=1 << 16, hbm=1 << 18):
         from tzrec_rocksdb.storage import RocksDBStorageFactory
 
-        factory = rocksdb_util.backend_config()
+        session = self.rt.session
         options = [
             DynamicEmbTableOptions(
                 dim=16,
@@ -147,7 +187,9 @@ class RocksDBCheckpointTest(unittest.TestCase):
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.DEBUG
                 ),
-                external_storage=RocksDBStorageFactory(factory, f"m.{n}"),
+                external_storage=RocksDBStorageFactory(
+                    session.config, f"m.{n}", session=session
+                ),
             )
             for n in names
         ]
@@ -169,10 +211,10 @@ class RocksDBCheckpointTest(unittest.TestCase):
             offsets = torch.arange(0, batch * n + 1, 1).cuda()
             model.emb(keys, offsets).sum().backward()
             torch.cuda.synchronize()
-            self.assertIsNone(rocksdb_util.step_boundary(step))
+            self.assertIsNone(self.rt.step_boundary(step))
 
     def _rows(self, model):
-        with rocksdb_util.writeback_scope("checkpoint"):
+        with self.rt.writeback_scope("checkpoint"):
             model.emb.flush()
         out = {}
         storage = model.emb.tables
@@ -186,21 +228,21 @@ class RocksDBCheckpointTest(unittest.TestCase):
         """What save_model does for one module: DynamicEmbDump's module.dump."""
         ckpt = os.path.join(self.model_dir, f"model.ckpt-{step}", "dynamicemb", "m")
         os.makedirs(ckpt)
-        with rocksdb_util.writeback_scope("checkpoint"):
+        with self.rt.writeback_scope("checkpoint"):
             model.emb.dump(ckpt, optim=True, counter=True)
         return ckpt
 
     def test_logical_restore_rebuilds_a_fresh_db(self):
         model = self._model(["a", "b"], strategy="LFU", capacity=3000)
-        rocksdb_util.validate_model(model)
+        self.rt.attach(model)
         self._train(model, 0)
         before = self._rows(model)
         opt_args = model.emb.optimizer.get_opt_args()
-        old_work = rocksdb_util.session().work_dir
+        old_work = self.rt.session.work_dir
         ckpt = self._logical_save(model, 5)
         self._train(model, 1)  # state after the checkpoint must be discarded
         self.assertNotEqual(self._rows(model), before)
-        rocksdb_util.reset_for_import(model)
+        self.rt.reset_for_import(model)
         self.assertFalse(os.path.exists(old_work))
         model.emb.load(ckpt, optim=True, counter=True)
         after = self._rows(model)
@@ -214,18 +256,18 @@ class RocksDBCheckpointTest(unittest.TestCase):
                 storage.logical_rows(t, None),
                 len([k for k in after if k[0] == storage.namespaces[t]]),
             )
-        db = rocksdb_util.session().db
+        db = self.rt.session.db
         self.assertEqual(db.get_int_property("rocksdb.num-snapshots"), 0)
 
     def test_save_stats_logs_each_save_alone(self):
         model = self._model(["a"])
-        rocksdb_util.validate_model(model)
+        self.rt.attach(model)
         exported = []
         for step in (5, 10):
             self._train(model, step)
             ckpt = self._logical_save(model, step)
             with self.assertLogs(logger, "INFO") as cm:
-                rocksdb_util.save_stats(1.0)
+                self.rt.save_stats(1.0)
             line = [x for x in cm.output if "RocksDB checkpoint" in x][0]
             exported.append(int(re.search(r"logical export \S+ \((\d+) rows", line)[1]))
             keys = glob.glob(os.path.join(ckpt, "a_emb_keys*"))[0]
@@ -238,37 +280,11 @@ class RocksDBCheckpointTest(unittest.TestCase):
     def test_step_boundary_evicts_to_capacity(self):
         # ~1024 cached rows, capacity 4000, ~8000 distinct ids.
         model = self._model(["a"], strategy="STEP", capacity=4000, hbm=1 << 16)
-        rocksdb_util.validate_model(model)
+        self.rt.attach(model)
         self._train(model, 0, steps=20, batch=512)
         storage = model.emb.tables
         self.assertLessEqual(storage.logical_rows(0, model.emb.cache), 4000)
-        self.assertGreater(
-            rocksdb_util.session().metrics.counters.get("evict_rows", 0), 0
-        )
-
-    def test_fused_opt_args_must_agree(self):
-        a, b = self._model(["a"]), self._model(["b"])
-        self._train(a, 0, steps=3)
-        self._train(b, 1, steps=5)
-        root = os.path.join(self.test_dir, "relocated")
-        for m in (a, b):
-            path = os.path.join(root, "m")
-            os.makedirs(path, exist_ok=True)
-            with rocksdb_util.writeback_scope("checkpoint"):
-                m.emb.dump(path, optim=True)
-        fused = self._model(["a", "b"])
-        with (
-            mock.patch(
-                "dynamicemb.dump_load.find_sharded_modules",
-                return_value=[("m", None, fused)],
-            ),
-            mock.patch(
-                "dynamicemb.dump_load.get_dynamic_emb_module",
-                return_value=[fused.emb],
-            ),
-        ):
-            with self.assertRaisesRegex(ValueError, "different optimizer"):
-                rocksdb_util.check_fused_opt_args(root, fused)
+        self.assertGreater(self.rt.session.metrics.counters.get("evict_rows", 0), 0)
 
 
 if __name__ == "__main__":

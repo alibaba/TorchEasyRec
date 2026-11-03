@@ -12,6 +12,7 @@
 import glob
 import json
 import os
+import re
 import shutil
 import unittest
 
@@ -19,7 +20,13 @@ import numpy as np
 import torch
 
 from tzrec.tests import utils
-from tzrec.utils import checkpoint_util, config_util, dynamicemb_util, misc_util
+from tzrec.utils import (
+    checkpoint_util,
+    config_util,
+    dynamicemb_util,
+    misc_util,
+    rocksdb_util,
+)
 from tzrec.utils.test_util import make_test_dir, mark_ci_scope
 
 try:
@@ -44,6 +51,23 @@ def _logical_rows(ckpt, collection="*"):
 # id_3 with a smaller capacity than the data was generated for forces eviction;
 # one batch still fits its GPU cache share.
 _SMALL_ID3_CAPACITY = {"feature_configs[2].id_feature.dynamicemb.max_capacity": 4000}
+
+
+def _offload_env():
+    """Planner limits under which the 10^8-row tables must be offloaded.
+
+    A rank gets RocksDB's fixed host memory plus 1 GiB, enough for the small
+    dynamicemb tables but not for a 10^8-row one, and 4 GiB of GPU memory (a
+    10^8-row table's admission counter alone takes 0.85 GiB per rank); set
+    from this machine's memory so that the plan does not depend on it.
+    """
+    nproc = utils._get_nproc_per_node()
+    host = (rocksdb_util.fixed_host_bytes() + (1 << 30)) * nproc
+    hbm = torch.cuda.get_device_properties(0).total_memory
+    return (
+        f"HOST_MEMORY_RESERVE_PERCENT={1 - host / misc_util.host_memory_bytes()} "
+        f"STORAGE_RESERVE_PERCENT={1 - (4 << 30) / hbm}"
+    )
 
 
 def _dcp_state(path):
@@ -97,6 +121,12 @@ def _dynamicemb_state(ckpt):
     return tables
 
 
+def _offloaded(log):
+    """Names of the tables the planner offloaded to RocksDB."""
+    line = re.search(r"offloaded to RocksDB \(per rank\): .*", log)
+    return set(re.findall(r"\.(\w+) cache ratio", line.group(0))) if line else set()
+
+
 def _logs(log_dir):
     text = ""
     for path in glob.glob(os.path.join(log_dir, "**", "*.log"), recursive=True):
@@ -118,14 +148,16 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False
         self.test_dir = make_test_dir()
+        self.env = _offload_env()
 
     def tearDown(self):
         if self.success:
             shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def _resume(self, config_path, name, edit=None):
+    def _resume(self, config_path, name, edit=None, env=None):
         edit = edit or {"train_config.num_epochs": 2}
         cmd = (
+            f"{self.env if env is None else env} "
             f"PYTHONPATH=. torchrun {utils._standalone()} --nnodes=1 "
             f"--nproc-per-node={utils._get_nproc_per_node()} "
             f"--log_dir {os.path.join(self.test_dir, name)} -r 3 -t 3 "
@@ -136,22 +168,24 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         return ok, _logs(os.path.join(self.test_dir, name))
 
     def test_train_eval_export(self):
-        # AUTO placement with one rocksdb {} table and one table left in memory.
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_rocksdb_mock.config",
             self.test_dir,
             user_id="user_id",
             item_id="item_id",
+            env_str=self.env,
         )
         if self.success:
             self.success = utils.test_eval(
-                os.path.join(self.test_dir, "pipeline.config"), self.test_dir
+                os.path.join(self.test_dir, "pipeline.config"),
+                self.test_dir,
+                env_str=self.env,
             )
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="USE_DISTRIBUTED_EMBEDDING=1",
+                env_str=f"{self.env} USE_DISTRIBUTED_EMBEDDING=1",
             )
         self.assertTrue(self.success)
         self.success = False
@@ -167,20 +201,27 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         self.assertIn("user_id_emb", rows)
         log = _logs(os.path.join(self.test_dir, "log_train_eval"))
         self.assertNotIn("total_loss: nan", log)
-        self.assertRegex(log, r"id_8_emb: rocksdb: .*rocksdb \{\} \(explicit\)")
-        self.assertRegex(log, r"user_id_emb: built-in: .*fits GPU/host memory")
+        # Host memory holds the small table, not the 10^8-row one.
+        self.assertEqual(_offloaded(log), {"id_8_emb"})
         sparse_dir = os.path.join(self.test_dir, "export", "sparse")
         with open(os.path.join(sparse_dir, "sparse_embedding.json")) as f:
             metadata = json.load(f)
         dynamic = [info for info in metadata.values() if info["is_dynamic"]]
         self.assertEqual(sum(info["shape"][0] for info in dynamic), sum(rows.values()))
-        with np.load(
-            os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz")
-        ) as arrays:
+        parts = sorted(
+            glob.glob(os.path.join(sparse_dir, "sparse_dynamic_embedding-*.npz"))
+        )
+        part_arrays = [np.load(p) for p in parts]
+        try:
             for info in dynamic:
-                values = arrays[info["value_name"]]
+                values = np.concatenate(
+                    [arrays[info["value_name"]] for arrays in part_arrays], axis=0
+                )
                 self.assertEqual(values.shape, tuple(info["shape"]))
                 self.assertTrue(np.isfinite(values).all())
+        finally:
+            for arrays in part_arrays:
+                arrays.close()
         self.success = True
 
     def test_resume_only_from_checkpoint_files(self):
@@ -191,20 +232,23 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_dynamicemb_rocksdb_mock.config",
             self.test_dir,
             args_str=f"--edit_config_json '{edit}'",
+            env_str=self.env,
         )
         self.assertTrue(self.success)
         self.success = False
         model_dir = os.path.join(self.test_dir, "train")
         ckpt, step = checkpoint_util.latest_checkpoint(model_dir, require_success=True)
         assert ckpt is not None
-        # The STEP table id_3 is evicted to its capacity (4000 over all shards).
+        # The STEP table id_3 is evicted to its capacity: 4000 over two shards,
+        # each rounded up to 128-row hash buckets in memory.
         rows = _logical_rows(ckpt, ".ebc")
-        self.assertLessEqual(rows["id_3_emb"], 4000)
+        self.assertLessEqual(rows["id_3_emb"], 2 * 2048)
         log = _logs(os.path.join(self.test_dir, "log_train_eval"))
         self.assertNotIn("total_loss: nan", log)
-        self.assertRegex(log, r"evicted [1-9]\d* rows")
-        # A save that died before _SUCCESS, and no local RocksDB state at all.
-        crashed = os.path.join(model_dir, f"model.ckpt-{step + 5}")
+        self.assertIn("id_2_emb", _offloaded(log))
+        # A save that died before _SUCCESS at the next save step, and no local
+        # RocksDB state at all.
+        crashed = os.path.join(model_dir, f"model.ckpt-{(step // 10 + 1) * 10}")
         shutil.copytree(ckpt, crashed)
         os.remove(os.path.join(crashed, checkpoint_util.CKPT_SUCCESS_FILENAME))
         shutil.rmtree("tmp/tzrec_rocksdb_test", ignore_errors=True)
@@ -214,15 +258,13 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
             {"train_config.num_epochs": 2, "train_config.save_checkpoints_steps": 10},
         )
         self.assertTrue(ok)
-        self.assertIn("deleting incomplete checkpoint", log)
+        # Never resumed from; replaced when the run saves that step again.
+        self.assertIn("replacing incomplete checkpoint", log)
         self.assertIn("loading RocksDB tables into fresh working DB", log)
         self.assertNotIn("total_loss: nan", log)
-        if os.path.exists(crashed):
-            self.assertTrue(
-                os.path.exists(
-                    os.path.join(crashed, checkpoint_util.CKPT_SUCCESS_FILENAME)
-                )
-            )
+        self.assertTrue(
+            os.path.exists(os.path.join(crashed, checkpoint_util.CKPT_SUCCESS_FILENAME))
+        )
         _, final_step = checkpoint_util.latest_checkpoint(
             model_dir, require_success=True
         )
@@ -255,6 +297,7 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_dynamicemb_rocksdb_mock.config",
             self.test_dir,
             args_str=f"--edit_config_json '{json.dumps(edit)}'",
+            env_str=self.env,
         )
         self.assertTrue(self.success)
         self.success = False
@@ -280,7 +323,7 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         # Restore into a fresh DB, then save again before any training step.
         resave_dir = os.path.join(self.test_dir, "resave")
         cmd = (
-            f"PYTHONPATH=. RESAVE_MODEL_DIR={resave_dir} torchrun "
+            f"{self.env} PYTHONPATH=. RESAVE_MODEL_DIR={resave_dir} torchrun "
             f"{utils._standalone()} --nnodes=1 "
             f"--nproc-per-node={utils._get_nproc_per_node()} "
             f"--log_dir {os.path.join(self.test_dir, 'log_resave')} -r 3 -t 3 "
@@ -310,8 +353,22 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         a, b = _dynamicemb_state(saved), _dynamicemb_state(resaved)
         self.assertEqual(sorted(a), sorted(b))
         self.assertTrue(any(t["counters"] for t in a.values()))
+        offloaded = _offloaded(_logs(os.path.join(self.test_dir, "log_train_eval")))
+        self.assertIn("id_2_emb", offloaded)
         for name, ta in a.items():
             tb = b[name]
+            if name.split("/")[1].split(".rank_")[0] not in offloaded:
+                # A table kept in memory is reloaded into DynamicEmb's hash
+                # table at its initial capacity, whose full buckets may drop
+                # their lowest-score rows; every row kept must be identical.
+                kept = np.isin(ta["keys"], tb["keys"])
+                self.assertTrue(np.isin(tb["keys"], ta["keys"]).all(), name)
+                ta = {
+                    k: v[kept]
+                    if k in ("keys", "values", "opt", "scores") and v is not None
+                    else v
+                    for k, v in ta.items()
+                }
             for k in ("keys", "values", "opt"):
                 np.testing.assert_array_equal(tb[k], ta[k], err_msg=f"{name} {k}")
             self.assertEqual(tb["meta"], ta["meta"], name)
@@ -362,6 +419,7 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
             "tzrec/tests/configs/multi_tower_din_dynamicemb_rocksdb_mock.config",
             self.test_dir,
             args_str=f"--edit_config_json '{edit}'",
+            env_str=self.env,
         )
         self.assertTrue(self.success)
         self.success = False
@@ -376,11 +434,11 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         self.assertTrue(files)
         table = pq.read_table(files).to_pandas()
         tomb = table[table["source"] == "dynamicemb_evicted"]
-        # The STEP table id_3 at capacity 4000 logically evicts; deletions publish.
+        # The STEP table id_3 at capacity 4000 evicts; deletions publish.
         self.assertTrue(tomb["table_fqn"].str.contains("ebc.embedding_bags.id_3").any())
         self.assertTrue(all(not any(e) for e in tomb["embedding"]))
-        # The LFU table never reaches its capacity: GPU-cache replacement only
-        # writes rows back and publishes no deletion.
+        # The LFU table id_2, in RocksDB, never reaches its capacity: GPU-cache
+        # replacement only writes rows back and publishes no deletion.
         self.assertFalse(tomb["table_fqn"].str.contains("id_2").any())
         self.success = True
 
@@ -388,6 +446,7 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_dynamicemb_rocksdb_mock.config",
             self.test_dir,
+            env_str=self.env,
         )
         self.assertTrue(self.success)
         self.success = False
@@ -396,19 +455,8 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         # Resume with every table in GPU/host memory (no RocksDB at all).
         builtin = os.path.join(self.test_dir, "builtin.config")
         config.train_config.ClearField("rocksdb_config")
-        for fc in config.feature_configs:
-            for f in (
-                [fc.id_feature]
-                if fc.HasField("id_feature")
-                else list(fc.sequence_feature.features)
-                if fc.HasField("sequence_feature")
-                else []
-            ):
-                inner = f.id_feature if hasattr(f, "id_feature") else f
-                if inner.HasField("dynamicemb"):
-                    inner.dynamicemb.ClearField("rocksdb")
         config_util.save_message(config, builtin)
-        ok, log = self._resume(builtin, "log_builtin")
+        ok, log = self._resume(builtin, "log_builtin", env="")
         self.assertTrue(ok)
         self.assertNotIn("RocksDB dynamicemb groups", log)
         # And back into RocksDB from the in-memory run's checkpoint.

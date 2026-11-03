@@ -9,17 +9,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TorchEasyRec lifecycle and checkpoint coordination for RocksDB dynamicemb tables.
+"""TorchEasyRec lifecycle of dynamicemb tables offloaded to RocksDB.
 
-Layout under ``rocksdb_config.local_path``::
+Layout under ``rocksdb_config.root_dir``::
 
-    <run_id>/rank_<r>/<mode>-<ms>-<pid>/   writable working DB of one process
+    <run_id>/rank_<r>/<mode>-<ms>-<pid>/   working DB of one process
 
 ``run_id`` is derived from the model_dir, so restarts of one job share it and
-different jobs never collide. The working DB is never a checkpoint: saves
-write RocksDB tables through ``DynamicEmbDump`` into the checkpoint's
-``dynamicemb/`` files like every other dynamicemb table, and a resume always
-rebuilds a fresh working DB from those files.
+different jobs never collide; ``rank_<r>`` separates ranks on a shared disk and
+``<mode>-<ms>-<pid>`` concurrent processes. The working DB is never a
+checkpoint: saves write RocksDB tables through ``DynamicEmbDump`` into the
+checkpoint's ``dynamicemb/`` files like every other dynamicemb table, and a
+restore always imports them into a fresh working DB.
 """
 
 import contextlib
@@ -36,40 +37,33 @@ from typing import Any, Dict, Iterator, List, Optional, cast
 import torch.distributed as dist
 from torch import nn
 
-from tzrec.protos import feature_pb2, train_pb2
+from tzrec.protos import train_pb2
 from tzrec.utils.logging_util import logger
 
-_rocksdb_config: Optional[train_pb2.RocksDBConfig] = None
-# dynamicemb tables AUTO placement may move to RocksDB, by table name.
-_auto_candidates: Dict[str, feature_pb2.DynamicEmbedding] = {}
-# Host memory a rank needs beyond the configured RocksDB budgets (table
-# readers, iterators, pinned blocks, allocator slack).
+# Host memory a rank needs beyond the planned RocksDB budgets (table readers,
+# iterators, pinned blocks, allocator slack).
 _HOST_OVERHEAD_BYTES = 2 << 30
-# DynamicEmb sizes GPU caches in buckets of this many rows.
+# Planned host budgets that do not depend on the tables: the memtables, the
+# pinned staging of one storage call (larger calls are split) and the data
+# share of the block cache (other data blocks are left to the page cache).
+WRITE_BUFFER_BYTES = 1 << 30
+STAGING_BUFFER_BYTES = 256 << 20
+BLOCK_CACHE_DATA_BYTES = 1 << 30
+# DynamicEmb sizes GPU caches in buckets of this many rows, beside an overflow
+# area of three buckets per table.
 CACHE_BUCKET_ROWS = 1024
+CACHE_OVERFLOW_ROWS = 3 * CACHE_BUCKET_ROWS
+# GPU cache shares of its value bytes the planner offers a RocksDB table.
+CACHE_RATIOS = (0.0001, 0.001, 0.01) + tuple(i / 10 for i in range(1, 10))
 
 
-def set_rocksdb_config(config: Optional[train_pb2.RocksDBConfig]) -> None:
-    """Set the RocksDB config used by tables planned and built afterwards.
-
-    Constraint building and planning cannot see the train config, so it is
-    handed over here (same pattern as ``set_auto_retain_evicted_keys``).
-    """
-    global _rocksdb_config
-    _rocksdb_config = config
-    _auto_candidates.clear()
-
-
-def get_rocksdb_config() -> Optional[train_pb2.RocksDBConfig]:
-    """Return the RocksDB config set for this process, if any."""
-    return _rocksdb_config
-
-
-def is_auto() -> bool:
-    """Whether AUTO placement is enabled."""
+def fixed_host_bytes() -> int:
+    """Host memory a rank spends on RocksDB once any table is offloaded."""
     return (
-        _rocksdb_config is not None
-        and _rocksdb_config.placement == train_pb2.DynamicEmbPlacement.AUTO
+        WRITE_BUFFER_BYTES
+        + STAGING_BUFFER_BYTES
+        + BLOCK_CACHE_DATA_BYTES
+        + _HOST_OVERHEAD_BYTES
     )
 
 
@@ -85,23 +79,6 @@ def _import_backend():
     return tzrec_rocksdb
 
 
-def backend_config():
-    """Backend config shared by every RocksDB table factory of this run."""
-    cfg = _rocksdb_config
-    if cfg is None:
-        raise ValueError(
-            "dynamicemb `rocksdb {}` requires train_config.rocksdb_config."
-        )
-    return _import_backend().BackendConfig(
-        local_path=cfg.local_path,
-        block_cache_bytes=cfg.block_cache_bytes_per_rank,
-        write_buffer_bytes=cfg.write_buffer_bytes_per_rank,
-        staging_buffer_bytes=cfg.staging_buffer_bytes_per_rank,
-        io_threads=cfg.io_threads,
-        max_background_jobs=cfg.max_background_jobs,
-    )
-
-
 def is_rocksdb_options(options: Any) -> bool:
     """Whether DynamicEmbTableOptions are backed by a RocksDB factory."""
     storage = getattr(options, "external_storage", None)
@@ -110,98 +87,6 @@ def is_rocksdb_options(options: Any) -> bool:
     from tzrec_rocksdb.storage import RocksDBStorageFactory
 
     return isinstance(storage, RocksDBStorageFactory)
-
-
-def auto_eligible(dynamicemb_cfg: feature_pb2.DynamicEmbedding) -> bool:
-    """Whether AUTO placement may move a table without ``rocksdb {}`` to RocksDB.
-
-    ``cache_load_factor`` pins a built-in placement, and CUSTOMIZED scores
-    have no producer in TorchEasyRec.
-    """
-    return (
-        is_auto()
-        and not dynamicemb_cfg.HasField("cache_load_factor")
-        and dynamicemb_cfg.score_strategy != "CUSTOMIZED"
-    )
-
-
-def register_auto_candidate(
-    dynamicemb_cfg: feature_pb2.DynamicEmbedding, table_name: str
-) -> None:
-    """Record a table AUTO placement may move to RocksDB."""
-    _auto_candidates[table_name] = dynamicemb_cfg
-
-
-def auto_candidate(table_name: str) -> Optional[feature_pb2.DynamicEmbedding]:
-    """The config of an AUTO candidate table, or None."""
-    return _auto_candidates.get(table_name)
-
-
-def table_factory(dynamicemb_cfg: feature_pb2.DynamicEmbedding, table_name: str):
-    """Validate a RocksDB table config and return its storage factory.
-
-    The namespace is the table name here; planning replaces it with the
-    table's module-qualified name once that is known.
-    """
-    if dynamicemb_cfg.score_strategy == "CUSTOMIZED":
-        raise ValueError(
-            f"dynamicemb table {table_name} uses rocksdb, which does not support "
-            "score_strategy CUSTOMIZED (TorchEasyRec has no score producer for it)."
-        )
-    if dynamicemb_cfg.HasField("cache_load_factor"):
-        raise ValueError(
-            f"dynamicemb table {table_name} uses rocksdb; its GPU cache comes from "
-            "train_config.rocksdb_config.gpu_cache_value_bytes_per_rank, so "
-            "cache_load_factor must be unset."
-        )
-    factory_cls = _import_backend().storage.RocksDBStorageFactory
-    return factory_cls(backend_config(), table_name)
-
-
-def with_namespace(options: Any, namespace: str) -> None:
-    """Give a planned table's factory its persistent namespace."""
-    options.external_storage = dataclasses.replace(
-        options.external_storage, table_namespace=namespace
-    )
-
-
-def host_reserve_bytes() -> int:
-    """Host memory a rank reserves once for its RocksDB store (0 if unused)."""
-    cfg = _rocksdb_config
-    if cfg is None:
-        return 0
-    return (
-        cfg.block_cache_bytes_per_rank
-        + cfg.write_buffer_bytes_per_rank
-        + cfg.staging_buffer_bytes_per_rank
-        + _HOST_OVERHEAD_BYTES
-    )
-
-
-def cache_ratio(value_bytes: List[int]) -> float:
-    """GPU cache fraction shared by all RocksDB tables of a rank.
-
-    The rank-wide value budget is split in proportion to each table's
-    rank-local value bytes, which is one common ratio. RocksDB tables always
-    run behind the GPU cache, so the budget must be positive; DynamicEmb
-    ignores external storage when a group's budget covers the whole group
-    (HBM_ONLY), so a budget at or above the total is rejected.
-    """
-    cfg = _rocksdb_config
-    budget = cfg.gpu_cache_value_bytes_per_rank if cfg is not None else 0
-    total = sum(value_bytes)
-    if budget == 0:
-        raise ValueError(
-            "RocksDB tables run behind DynamicEmb's GPU cache; set "
-            "rocksdb_config.gpu_cache_value_bytes_per_rank > 0."
-        )
-    if budget >= total:
-        raise ValueError(
-            f"rocksdb_config.gpu_cache_value_bytes_per_rank={budget} must be smaller "
-            f"than the rank-local value bytes of all rocksdb tables ({total}); "
-            "otherwise DynamicEmb keeps the tables in HBM and ignores RocksDB."
-        )
-    return budget / total
 
 
 def cache_rows(rows: int, ratio: float) -> int:
@@ -216,100 +101,8 @@ def _rank() -> int:
     return dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", 0))
 
 
-def _world_size() -> int:
-    if dist.is_initialized():
-        return dist.get_world_size()
-    return int(os.environ.get("WORLD_SIZE", 1))
-
-
-def rank_dir(model_dir: str, rank: int) -> str:
-    """Rank directory of a run under rocksdb_config.local_path."""
-    cfg = _rocksdb_config
-    assert cfg is not None
-    run_id = hashlib.sha1(os.path.realpath(model_dir).encode()).hexdigest()[:12]
-    return os.path.join(cfg.local_path, run_id, f"rank_{rank}")
-
-
-_session = None
-_model_dir: Optional[str] = None
-_mode = ""
-_groups: List[Any] = []
-_monitor = None
-# Session metrics at the previous save: save_stats logs per-save deltas.
-_saved_metrics: Dict[str, float] = {}
-
-
-def open_session(model_dir: str, mode: str = "train"):
-    """Register this rank's RocksDB session before model construction.
-
-    The database itself opens on first use, so a run whose plan keeps every
-    table in memory touches no disk. Every process start gets a fresh working
-    directory: a working DB left by an earlier attempt is never reopened,
-    because only a complete checkpoint may be resumed (and on network
-    filesystems its lock cannot stop a stale writer). A training start
-    removes earlier ``train-*`` directories of its rank; other modes remove
-    only their own directory on close.
-
-    Returns:
-        the session, or None when the run has no RocksDB tables.
-    """
-    global _session, _model_dir, _mode
-    if _rocksdb_config is None or not _has_rocksdb_backend():
-        return None
-    backend = _import_backend()
-    root = rank_dir(model_dir, _rank())
-    if mode == "train":
-        for stale in glob.glob(os.path.join(root, "train-*")):
-            logger.info(f"removing stale RocksDB working directory {stale}")
-            shutil.rmtree(stale, ignore_errors=True)
-    work = os.path.join(root, f"{mode}-{int(time.time() * 1000)}-{os.getpid()}")
-    _session = backend.open_session(backend_config(), work)
-    _model_dir, _mode = model_dir, mode
-    return _session
-
-
-def _has_rocksdb_backend() -> bool:
-    """Whether the backend is importable; AUTO without it keeps tables in memory."""
-    if not is_auto():
-        return True
-    try:
-        _import_backend()
-    except RuntimeError:
-        logger.warning(
-            "rocksdb_config placement AUTO without the tzrec-rocksdb wheel: every "
-            "dynamicemb table stays in GPU/host memory."
-        )
-        return False
-    return True
-
-
-def session():
-    """This rank's session, or None."""
-    return _session
-
-
-def close_session() -> None:
-    """Close this rank's session (working data of non-train modes is removed)."""
-    global _session
-    if _session is None:
-        return
-    global _monitor
-    if _monitor is not None:
-        _monitor.close()
-    work = _session.work_dir
-    _session.close()
-    if _mode != "train":
-        shutil.rmtree(work, ignore_errors=True)
-    _session = None
-    _groups.clear()
-    _saved_metrics.clear()
-    _monitor = None
-
-
 def rocksdb_modules(model: nn.Module) -> List[Any]:
     """Return the fused DynamicEmb modules of ``model`` stored in RocksDB."""
-    if _rocksdb_config is None:
-        return []
     from dynamicemb.dump_load import get_dynamic_emb_module
     from tzrec_rocksdb.storage import RocksDBStorage
 
@@ -318,266 +111,275 @@ def rocksdb_modules(model: nn.Module) -> List[Any]:
     ]
 
 
-def check_fused_opt_args(dynamicemb_dir: str, model: nn.Module) -> None:
-    """Reject a load whose fused groups would mix different optimizer state.
+class RocksDBRuntime:
+    """RocksDB state of one train/eval/export/predict process on this rank.
 
-    A fused group shares one optimizer, whose scalar arguments (e.g. Adam's
-    iteration count) come from each table's ``*_opt_args.json``. A plan can
-    place tables in other groups than the checkpointing run (another backend
-    or budget); members of one new group must then agree on those arguments.
+    Owns the working DB session, opened once the sharding plan is known
+    (:meth:`bind`), the fused RocksDB groups of the built model and, in
+    training, the disk headroom monitor (:meth:`attach`). Created by
+    :func:`open_runtime`, which closes it however the run ends.
+
+    Args:
+        config (RocksDBConfig): the job's RocksDB config.
+        model_dir (str): the job's model_dir; it names the run's directory.
+        mode (str): "train", "eval", "export" or "predict".
     """
-    from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 
-    for path, _, collection in find_sharded_modules(model, ""):
-        for m in cast(List[Any], get_dynamic_emb_module(collection)):
-            keys = set(m.optimizer.get_opt_args())
-            seen: Dict[str, Any] = {}
-            for name in m.table_names:
-                meta_path = os.path.join(dynamicemb_dir, path, f"{name}_opt_args.json")
-                if not os.path.exists(meta_path):
-                    continue
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                args = {k: meta[k] for k in sorted(keys) if k in meta}
-                for other, other_args in seen.items():
-                    if other_args != args:
-                        raise ValueError(
-                            f"dynamicemb tables {other} and {name} now share one "
-                            f"optimizer but were saved with different optimizer "
-                            f"arguments ({other_args} vs {args}); keep them in "
-                            "separate groups or restart their optimizer state."
-                        )
-                seen[name] = args
+    def __init__(
+        self, config: train_pb2.RocksDBConfig, model_dir: str, mode: str
+    ) -> None:
+        self.config = config
+        self.mode = mode
+        run_id = hashlib.sha1(os.path.realpath(model_dir).encode()).hexdigest()[:12]
+        self.rank_dir = os.path.join(config.root_dir, run_id, f"rank_{_rank()}")
+        if mode == "train":
+            # Only a complete checkpoint is ever resumed, so a working DB left
+            # by an earlier attempt of this rank is stale.
+            for stale in glob.glob(os.path.join(self.rank_dir, "train-*")):
+                logger.info(f"removing stale RocksDB working directory {stale}")
+                shutil.rmtree(stale, ignore_errors=True)
+        self.session: Any = None
+        self.groups: List[Any] = []
+        self._monitor: Any = None
+        # Session metrics at the previous save: save_stats logs per-save deltas.
+        self._saved_metrics: Dict[str, float] = {}
 
+    def _new_work_dir(self) -> str:
+        return os.path.join(
+            self.rank_dir, f"{self.mode}-{int(time.time() * 1000)}-{os.getpid()}"
+        )
 
-def validate_model(model: nn.Module) -> Dict[str, Any]:
-    """Check that constructed modules really use RocksDB; fail before training.
+    def bind(self, plan: Any) -> None:
+        """Open this rank's working DB and bind the plan's RocksDB tables to it.
 
-    Every table planned for RocksDB must sit in a CACHING_PS module whose
-    storage is a RocksDBStorage with a complete namespace map. Also starts the
-    disk headroom monitor of a training run.
-
-    Returns:
-        a fusion report: per group its tables, namespaces, layout, cache rows.
-    """
-    global _monitor
-    from dynamicemb.dump_load import get_dynamic_emb_module
-    from tzrec_rocksdb.storage import RocksDBStorage
-
-    groups = []
-    for m in cast(List[Any], get_dynamic_emb_module(model)):
-        rocksdb_tables = [
-            o.external_storage.table_namespace
-            for o in m._dynamicemb_options
-            if is_rocksdb_options(o)
+        The plan crosses ranks without sessions; every rank opens its own with
+        the backend config the planner chose, before the model is sharded.
+        """
+        options = [
+            o
+            for module_plan in plan.plan.values()
+            for sharding in module_plan.values()
+            if is_rocksdb_options(o := getattr(sharding, "dynamicemb_options", None))
         ]
-        if not rocksdb_tables:
-            continue
-        storage = m.tables
-        layout = m._storage_layout.name
-        if not isinstance(storage, RocksDBStorage) or layout != "CACHING_PS":
-            raise RuntimeError(
-                f"dynamicemb tables {m.table_names} are planned for RocksDB but "
-                f"were built with {type(storage).__name__} in layout {layout}; "
-                "DynamicEmb ignores external storage in HBM_ONLY/HYBRID layouts."
+        if not options:
+            return
+        config = options[0].external_storage.backend_config
+        if self.session is None:
+            backend = _import_backend()
+            self.session = backend.RocksDBSession(config, self._new_work_dir())
+        elif self.session.config != config:
+            raise RuntimeError("a second plan changed this run's RocksDB config")
+        for o in options:
+            o.external_storage = dataclasses.replace(
+                o.external_storage, session=self.session
             )
-        if storage.namespaces != rocksdb_tables or len(
-            set(storage.namespace_ids)
-        ) != len(rocksdb_tables):
-            raise RuntimeError(f"incomplete RocksDB namespace map for {m.table_names}")
-        storage.bind_cache(m.cache)
-        cache_rows = m.cache._state.capacity if m.cache is not None else 0
-        groups.append(
-            {
-                "tables": list(m.table_names),
-                "namespaces": dict(zip(storage.namespaces, storage.namespace_ids)),
-                "layout": layout,
-                "cache_rows": int(cache_rows),
-                "dims": [storage.embedding_dim(t) for t in range(len(m.table_names))],
-                "score_strategies": [
-                    o.score_strategy.name for o in m._dynamicemb_options
-                ],
-                "capacities": [int(o.max_capacity) for o in m._dynamicemb_options],
-            }
-        )
-    _groups[:] = rocksdb_modules(model)
-    if groups and int(os.environ.get("LOCAL_RANK", 0)) == 0:
-        logger.info(f"RocksDB dynamicemb groups: {json.dumps(groups)}")
-    if groups and _mode == "train" and _rocksdb_config is not None:
-        from tzrec.utils.rocksdb_capacity import CapacityMonitor
 
-        assert _model_dir is not None
-        _monitor = CapacityMonitor(
-            _rocksdb_config, rank_dir(_model_dir, _rank()), _session
+    def attach(self, model: nn.Module) -> None:
+        """Check the built RocksDB groups and start a training run's monitor.
+
+        Every table planned for RocksDB must sit in a CACHING_PS module whose
+        storage is a RocksDBStorage with a complete namespace map.
+        """
+        from dynamicemb.dump_load import get_dynamic_emb_module
+        from tzrec_rocksdb.storage import RocksDBStorage
+
+        report = []
+        for m in cast(List[Any], get_dynamic_emb_module(model)):
+            tables = [
+                o.external_storage.table_namespace
+                for o in m._dynamicemb_options
+                if is_rocksdb_options(o)
+            ]
+            if not tables:
+                continue
+            storage = m.tables
+            layout = m._storage_layout.name
+            if not isinstance(storage, RocksDBStorage) or layout != "CACHING_PS":
+                raise RuntimeError(
+                    f"dynamicemb tables {m.table_names} are planned for RocksDB but "
+                    f"were built with {type(storage).__name__} in layout {layout}; "
+                    "DynamicEmb ignores external storage in HBM_ONLY/HYBRID layouts."
+                )
+            if storage.namespaces != tables or len(set(storage.namespace_ids)) != len(
+                tables
+            ):
+                raise RuntimeError(
+                    f"incomplete RocksDB namespace map for {m.table_names}"
+                )
+            storage.bind_cache(m.cache)
+            self.groups.append(m)
+            report.append(
+                {
+                    "tables": list(m.table_names),
+                    "namespaces": dict(zip(storage.namespaces, storage.namespace_ids)),
+                    "cache_rows": list(
+                        m.cache._state.key_index_map.per_table_capacity_
+                    ),
+                    "dims": [storage.embedding_dim(t) for t in range(len(tables))],
+                    "score_strategies": [
+                        o.score_strategy.name for o in m._dynamicemb_options
+                    ],
+                    "capacities": [int(o.max_capacity) for o in m._dynamicemb_options],
+                }
+            )
+        if report and int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            logger.info(f"RocksDB dynamicemb groups: {json.dumps(report)}")
+        if self.groups and self.mode == "train":
+            from tzrec.utils.rocksdb_capacity import CapacityMonitor
+
+            self._monitor = CapacityMonitor(self.config, self.rank_dir, self.session)
+
+    @contextlib.contextmanager
+    def writeback_scope(self, scope: str) -> Iterator[None]:
+        """Attribute RocksDB writes to ``scope`` ("checkpoint" or "publish").
+
+        GPU-cache flushes for a checkpoint or a publication leave the rows
+        cached, so their writes must not create eviction-index entries.
+        """
+        if self.session is None:
+            yield
+            return
+        with self.session.writeback_scope(scope):
+            yield
+
+    def _save_need(self) -> int:
+        """Disk bytes a save may add on this rank: overwritten cached rows."""
+        need = 0
+        for m in self.groups:
+            storage = m.tables
+            need += m.cache._state.capacity * max(
+                storage.record_bytes(t) for t in range(len(m.table_names))
+            )
+        return need
+
+    def step_boundary(self, step: int) -> Optional[str]:
+        """Training step boundary: logical eviction, then the disk headroom check.
+
+        Call after an update completed and before any checkpoint or publication
+        of that step; no lookup is in flight then, so no cached or in-use row
+        can be a victim.
+
+        Returns:
+            the headroom action of :class:`CapacityMonitor` (None if healthy).
+        """
+        if not self.groups:
+            return None
+        self.evict()
+        if self._monitor is None:
+            return None
+        return self._monitor.check(step, self._save_need())
+
+    def evict(self) -> int:
+        """Evict every RocksDB table above its capacity; returns the rows.
+
+        Call only with no lookup in flight (a completed update, or the end of
+        a pass).
+        """
+        t0 = time.perf_counter()
+        evicted = 0
+        for m in self.groups:
+            evicted += sum(m.tables.evict_to_capacity(m.cache).values())
+        if evicted:
+            self.session.metrics.record("evict", time.perf_counter() - t0, rows=evicted)
+        return evicted
+
+    def save_stats(self, seconds: float) -> None:
+        """Log this rank's RocksDB costs of a checkpoint save."""
+        if not self.groups:
+            return
+        stats = self.session.stats()
+        m = stats["metrics"]
+        props = stats["properties"]
+        tick = stats["tickers"]
+        d = {
+            k: m.get(k, 0.0) - self._saved_metrics.get(k, 0.0)
+            for k in (
+                "checkpoint_insert_seconds",
+                "checkpoint_insert_rows",
+                "dump_seconds",
+                "dump_rows",
+                "dump_bytes",
+                "export_pause_seconds",
+                "export_pause_memtable_bytes",
+            )
+        }
+        self._saved_metrics.update(m)
+        logger.info(
+            f"RANK[{_rank()}] RocksDB checkpoint: {seconds:.2f}s total, cache flush "
+            f"{d['checkpoint_insert_seconds']:.2f}s "
+            f"({int(d['checkpoint_insert_rows'])} rows), logical export "
+            f"{d['dump_seconds']:.2f}s ({int(d['dump_rows'])} rows, "
+            f"{d['dump_bytes'] / (1 << 30):.2f}GiB written, background-work pause "
+            f"wait {d['export_pause_seconds']:.2f}s, read from "
+            f"{d['export_pause_memtable_bytes'] / (1 << 20):.1f}MiB unflushed "
+            "memtables); cumulative "
+            f"train writeback {int(m.get('train_insert_rows', 0))} rows, publish "
+            f"writeback {int(m.get('publish_insert_rows', 0))} rows, evicted "
+            f"{int(m.get('evict_rows', 0))} rows, index {stats['index']}; RocksDB "
+            f"cumulative flush {tick.get('rocksdb.flush.write.bytes', 0)} bytes, "
+            f"compaction {tick.get('rocksdb.compact.write.bytes', 0)} bytes "
+            f"written, stalls {tick.get('rocksdb.stall.micros', 0) / 1e6:.1f}s; "
+            f"after release: live SST {props['rocksdb.live-sst-files-size']}, all "
+            f"SST {props['rocksdb.total-sst-files-size']}, obsolete SST "
+            f"{props['rocksdb.obsolete-sst-files-size']}, snapshots "
+            f"{props['rocksdb.num-snapshots']}"
         )
-    return {"groups": groups}
+
+    def reset_for_import(self, model: nn.Module) -> None:
+        """Start RocksDB tables from a fresh empty DB before ``DynamicEmbLoad``.
+
+        Empties the GPU caches first: rows touched before the restore (the
+        optimizer warm-up step) must not be written back into the new DB.
+        """
+        groups = rocksdb_modules(model)
+        if not groups:
+            return
+        for m in groups:
+            m.reset_cache_states()
+        self.session.swap_working_db(self._new_work_dir())
+        for m in groups:
+            m.tables.refresh_namespaces()
+        logger.info(
+            f"RANK[{_rank()}] loading RocksDB tables into fresh working DB "
+            f"{self.session.work_dir}"
+        )
+
+    def close(self) -> None:
+        """Stop the monitor, close the working DB and delete its directory."""
+        if self._monitor is not None:
+            self._monitor.close()
+            self._monitor = None
+        if self.session is not None:
+            work = self.session.work_dir
+            self.session.close()
+            self.session = None
+            shutil.rmtree(work, ignore_errors=True)
+        self.groups = []
 
 
 @contextlib.contextmanager
-def writeback_scope(scope: str) -> Iterator[None]:
-    """Attribute RocksDB writes to ``scope`` ("checkpoint" or "publish").
+def open_runtime(
+    train_config: train_pb2.TrainConfig, model_dir: str, mode: str
+) -> Iterator[Optional[RocksDBRuntime]]:
+    """The run's RocksDB runtime, or None when RocksDB is not configured.
 
-    GPU-cache flushes for a checkpoint or a publication leave the rows cached,
-    so their writes must not create eviction-index entries.
+    Open it before the model is planned and keep it until the process is done
+    with the model; it is closed when the block exits, normally or not.
     """
-    if _session is None:
-        yield
+    if not train_config.HasField("rocksdb_config"):
+        yield None
         return
-    with _session.writeback_scope(scope):
-        yield
-
-
-def _save_need() -> int:
-    """Disk bytes a save may add on this rank: overwritten cached rows."""
-    need = 0
-    for m in _groups:
-        storage = m.tables
-        rows = m.cache._state.capacity if m.cache is not None else 0
-        need += rows * max(storage.record_bytes(t) for t in range(len(m.table_names)))
-    return need
-
-
-def step_boundary(step: int) -> Optional[str]:
-    """Training step boundary: logical eviction, then the disk headroom check.
-
-    Call after an update completed and before any checkpoint or publication
-    of that step; no lookup is in flight then, so no cached or in-use row can
-    be a victim.
-
-    Returns:
-        the headroom action of :class:`CapacityMonitor` (None if healthy).
-    """
-    if not _groups:
-        return None
-    evict()
-    if _monitor is None:
-        return None
-    return _monitor.check(step, _save_need())
-
-
-def evict() -> int:
-    """Logically evict every RocksDB table above its capacity; returns the rows.
-
-    Call only with no lookup in flight (a completed update, or the end of a pass).
-    """
-    t0 = time.perf_counter()
-    evicted = 0
-    for m in _groups:
-        evicted += sum(m.tables.evict_to_capacity(m.cache).values())
-    if evicted and _session is not None:
-        _session.metrics.record("evict", time.perf_counter() - t0, rows=evicted)
-    return evicted
-
-
-def save_stats(seconds: float) -> None:
-    """Log this rank's RocksDB costs of a checkpoint save."""
-    if _session is None or not _groups:
-        return
-    stats = _session.stats()
-    m = stats["metrics"]
-    props = stats["properties"]
-    tick = stats["tickers"]
-    d = {
-        k: m.get(k, 0.0) - _saved_metrics.get(k, 0.0)
-        for k in (
-            "checkpoint_insert_seconds",
-            "checkpoint_insert_rows",
-            "dump_seconds",
-            "dump_rows",
-            "dump_bytes",
-            "export_pause_seconds",
-            "export_pause_memtable_bytes",
+    try:
+        _import_backend()
+    except RuntimeError:
+        logger.warning(
+            "rocksdb_config without the tzrec-rocksdb wheel: every dynamicemb "
+            "table stays in GPU/host memory."
         )
-    }
-    _saved_metrics.update(m)
-    logger.info(
-        f"RANK[{_rank()}] RocksDB checkpoint: {seconds:.2f}s total, cache flush "
-        f"{d['checkpoint_insert_seconds']:.2f}s "
-        f"({int(d['checkpoint_insert_rows'])} rows), logical export "
-        f"{d['dump_seconds']:.2f}s ({int(d['dump_rows'])} rows, "
-        f"{d['dump_bytes'] / (1 << 30):.2f}GiB written, background-work pause wait "
-        f"{d['export_pause_seconds']:.2f}s, read from "
-        f"{d['export_pause_memtable_bytes'] / (1 << 20):.1f}MiB unflushed memtables); "
-        "cumulative "
-        f"train writeback {int(m.get('train_insert_rows', 0))} rows, publish "
-        f"writeback {int(m.get('publish_insert_rows', 0))} rows, evicted "
-        f"{int(m.get('evict_rows', 0))} rows, index {stats['index']}; RocksDB "
-        f"cumulative flush {tick.get('rocksdb.flush.write.bytes', 0)} bytes, "
-        f"compaction {tick.get('rocksdb.compact.write.bytes', 0)} bytes written, "
-        f"stalls {tick.get('rocksdb.stall.micros', 0) / 1e6:.1f}s; after "
-        f"release: live SST {props['rocksdb.live-sst-files-size']}, all SST "
-        f"{props['rocksdb.total-sst-files-size']}, obsolete SST "
-        f"{props['rocksdb.obsolete-sst-files-size']}, snapshots "
-        f"{props['rocksdb.num-snapshots']}"
-    )
-
-
-def reset_for_import(model: nn.Module) -> None:
-    """Start RocksDB tables from a fresh empty DB before ``DynamicEmbLoad``.
-
-    Empties the GPU caches first: rows touched before the restore (the
-    optimizer warm-up step) must not be written back into the new DB.
-    """
-    groups = rocksdb_modules(model)
-    if not groups:
+        yield None
         return
-    assert _session is not None and _model_dir is not None
-    for m in groups:
-        m.reset_cache_states()
-    _session.swap_working_db(
-        os.path.join(
-            rank_dir(_model_dir, _rank()),
-            f"{_mode}-{int(time.time() * 1000)}-{os.getpid()}",
-        )
-    )
-    for m in groups:
-        m.tables.refresh_namespaces()
-    logger.info(
-        f"RANK[{_rank()}] loading RocksDB tables into fresh working DB "
-        f"{_session.work_dir}"
-    )
-
-
-def remove_incomplete_checkpoints(model_dir: str, after_step: int) -> None:
-    """Delete checkpoints newer than the resumed one that lack ``_SUCCESS``.
-
-    They can never be selected, the resumed run re-saves those steps (which
-    needs an empty directory), and on an OSS mount a rename would copy every
-    object. The deletion is logged with its size. Rank 0 only.
-    """
-    from tzrec.utils.checkpoint_util import CKPT_SUCCESS_FILENAME
-
-    if _rank() != 0:
-        return
-    for ckpt in glob.glob(os.path.join(model_dir, "model.ckpt-*")):
-        try:
-            step = int(ckpt.rsplit("-", 1)[-1])
-        except ValueError:
-            continue
-        if step > after_step and not os.path.exists(
-            os.path.join(ckpt, CKPT_SUCCESS_FILENAME)
-        ):
-            files = [os.path.join(d, f) for d, _, fs in os.walk(ckpt) for f in fs]
-            size = sum(os.path.getsize(f) for f in files if os.path.isfile(f))
-            logger.warning(
-                f"deleting incomplete checkpoint {ckpt} ({len(files)} files, "
-                f"{size} bytes): it has no {CKPT_SUCCESS_FILENAME}"
-            )
-            shutil.rmtree(ckpt)
-
-
-def start(train_config: train_pb2.TrainConfig, model_dir: str, mode: str) -> bool:
-    """Configure RocksDB tables for this process and register its session.
-
-    Must run before features build their parameter constraints and before
-    the model is constructed. Returns whether RocksDB may be used.
-    """
-    set_rocksdb_config(
-        train_config.rocksdb_config if train_config.HasField("rocksdb_config") else None
-    )
-    return open_session(model_dir, mode) is not None
-
-
-def stop() -> None:
-    """Close this process's RocksDB session, if any."""
-    close_session()
+    runtime = RocksDBRuntime(train_config.rocksdb_config, model_dir, mode)
+    try:
+        yield runtime
+    finally:
+        runtime.close()

@@ -16,6 +16,7 @@ import string
 import subprocess
 from datetime import datetime
 
+import psutil
 from alibabacloud_credentials.provider import EcsRamRoleCredentialsProvider
 
 RUN_CMD_RETRY_NUM = 3
@@ -73,6 +74,29 @@ def run_cmd(cmd_str, log_file, env=None, timeout=None):
             )
             return False
     return False
+
+
+def host_memory_bytes() -> int:
+    """Host RAM this process may use: physical memory capped by the cgroup limit.
+
+    Inside a container psutil reports the node's RAM, not the container's
+    limit, so a plan sized by it can place more host memory than the
+    container may use.
+    """
+    total = psutil.virtual_memory().total
+    for path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        try:
+            with open(path) as f:
+                limit = f.read().strip()
+        except OSError:
+            continue
+        if limit.isdigit():
+            total = min(total, int(limit))
+        break
+    return total
 
 
 def get_free_port(host: str = "127.0.0.1") -> int:

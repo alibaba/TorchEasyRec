@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import errno
 import glob
 import json
@@ -46,7 +47,7 @@ from tzrec.constant import TRAIN_EVAL_RESULT_FILENAME
 from tzrec.optim.ema import DenseEMA
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.protos import export_pb2
-from tzrec.utils import env_util, rocksdb_util
+from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -370,6 +371,8 @@ class CheckpointManager:
             (by eval metric) is always retained even if older than the kept window.
         eval_result_filename: eval result file (relative to ``model_dir``) used to
             locate the best checkpoint.
+        rocksdb: the run's RocksDB runtime (``rocksdb_util.RocksDBRuntime``),
+            whose dynamicemb tables restores import and saves export.
     """
 
     def __init__(
@@ -378,8 +381,10 @@ class CheckpointManager:
         keep_checkpoint_max: int = 0,
         export_config: Optional[export_pb2.ExportConfig] = None,
         eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
+        rocksdb: Optional[Any] = None,
     ) -> None:
         self._model_dir = model_dir
+        self._rocksdb = rocksdb
         self._keep_checkpoint_max = keep_checkpoint_max
         self._export_config = export_config
         self._eval_result_filename = eval_result_filename
@@ -415,7 +420,19 @@ class CheckpointManager:
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
-        save_model(ckpt_dir, model, optimizer, dense_ema)
+        if self._rocksdb is not None:
+            # A resumed run saves again at the step where an earlier attempt
+            # left an incomplete checkpoint, and DynamicEmbDump needs an empty
+            # directory; recovery never selects such a checkpoint anyway.
+            if int(os.environ.get("RANK", 0)) == 0 and (
+                os.path.isdir(ckpt_dir)
+                and not os.path.exists(os.path.join(ckpt_dir, CKPT_SUCCESS_FILENAME))
+            ):
+                logger.warning(f"replacing incomplete checkpoint {ckpt_dir}")
+                shutil.rmtree(ckpt_dir)
+            if dist.is_initialized():
+                dist.barrier()
+        save_model(ckpt_dir, model, optimizer, dense_ema, rocksdb=self._rocksdb)
         if lr_schedulers is not None:
             save_lr_schedulers(ckpt_dir, lr_schedulers)
         if dataloader_state is not None:
@@ -678,6 +695,7 @@ class CheckpointManager:
             ckpt_param_map_path,
             dense_ema=dense_ema,
             use_dense_ema=use_dense_ema,
+            rocksdb=self._rocksdb,
         )
         if lr_schedulers is not None:
             restore_lr_schedulers(ckpt_path, lr_schedulers)
@@ -1011,6 +1029,7 @@ def restore_model(
     dense_ema: Optional[DenseEMA] = None,
     use_dense_ema: bool = False,
     load_dynamicemb: bool = True,
+    rocksdb: Optional[Any] = None,
 ) -> None:
     """Restore model state.
 
@@ -1025,6 +1044,8 @@ def restore_model(
         dense_ema: Dense EMA state to restore for continued training.
         use_dense_ema: Overlay Dense EMA parameters onto the restored model.
         load_dynamicemb: Restore native dynamic tables from the checkpoint.
+        rocksdb: the run's RocksDB runtime; its tables import into a fresh
+            working DB.
     """
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
@@ -1138,12 +1159,8 @@ def restore_model(
         # RocksDB tables load from the same dynamicemb files as every other
         # table, into a fresh working DB, whichever backend the checkpointing
         # run used.
-        if rocksdb_util.rocksdb_modules(model):
-            rocksdb_util.reset_for_import(model)
-        if rocksdb_util.get_rocksdb_config() is not None and os.path.exists(
-            dynamicemb_path
-        ):
-            rocksdb_util.check_fused_opt_args(dynamicemb_path, model)
+        if rocksdb is not None:
+            rocksdb.reset_for_import(model)
         if os.path.exists(dynamicemb_path):
             # Training never sets INPUT_TILE, but exporting with
             # INPUT_TILE=3 adds twin user-side modules (`ebc_user`,
@@ -1184,6 +1201,7 @@ def save_model(
     model: nn.Module,
     optimizer: Optional[optim.Optimizer] = None,
     dense_ema: Optional[DenseEMA] = None,
+    rocksdb: Optional[Any] = None,
 ) -> None:
     """Save model state.
 
@@ -1192,6 +1210,7 @@ def save_model(
         model (nn.Module): a EasyRec model.
         optimizer (optim.Optimizer, optional): a optimizer.
         dense_ema: Dense EMA state to save.
+        rocksdb: the run's RocksDB runtime, whose tables are saved too.
     """
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"Saving checkpoint to {checkpoint_dir}...")
@@ -1213,7 +1232,11 @@ def save_model(
         try:
             # RocksDB tables stream into the same files as every other table,
             # each from a frozen view of the rank's DB.
-            with rocksdb_util.writeback_scope("checkpoint"):
+            with (
+                rocksdb.writeback_scope("checkpoint")
+                if rocksdb is not None
+                else contextlib.nullcontext()
+            ):
                 DynamicEmbDump(
                     os.path.join(checkpoint_dir, "dynamicemb"),
                     model,
@@ -1229,7 +1252,8 @@ def save_model(
                     "(see the File too large FAQ).",
                 ) from e
             raise
-        rocksdb_util.save_stats(time.perf_counter() - t0)
+        if rocksdb is not None:
+            rocksdb.save_stats(time.perf_counter() - t0)
     # save model plan
     if hasattr(model, "_plan") and model._plan is not None:
         if int(os.environ.get("RANK", 0)) == 0:

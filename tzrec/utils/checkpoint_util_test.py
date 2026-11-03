@@ -850,6 +850,25 @@ class CheckpointUtilTest(unittest.TestCase):
             checkpoint_util.remap_input_tile_user_key(fqn, {target}), target
         )
 
+    def test_save_replaces_only_its_incomplete_checkpoint(self):
+        # A RocksDB run saves again at the step an earlier attempt left
+        # incomplete; other incomplete checkpoints are ignored, not deleted.
+        for step in (3, 9):
+            os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}", "stale"))
+        runtime = object()
+        manager = checkpoint_util.CheckpointManager(self.test_dir, rocksdb=runtime)
+        self.addCleanup(manager.close)
+        with mock.patch("tzrec.utils.checkpoint_util.save_model") as save:
+            ckpt = manager.save(3, nn.Linear(1, 1))
+        self.assertFalse(os.path.exists(os.path.join(ckpt, "stale")))
+        self.assertTrue(
+            os.path.exists(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME))
+        )
+        self.assertTrue(
+            os.path.isdir(os.path.join(self.test_dir, "model.ckpt-9", "stale"))
+        )
+        self.assertIs(save.call_args.kwargs["rocksdb"], runtime)
+
     def test_round_trip(self):
         original = [_lr_scheduler(0.01), _lr_scheduler(0.01, by_epoch=True)]
         for scheduler, step in zip(original, (4, 7)):

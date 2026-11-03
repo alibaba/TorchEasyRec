@@ -144,11 +144,14 @@ def export_model(
     assets: Optional[List[str]] = None,
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
+    rocksdb: Optional[Any] = None,
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig.
 
     `data_input_path` (optional): override for the predict-mode dataloader
     input path; falls back to `pipeline_config.train_input_path` when None.
+    `rocksdb` (optional): the run's RocksDB runtime, for an export that plans
+    and restores a sharded model.
     """
     model_type = pipeline_config.model_config.WhichOneof("model")
     if model_type in ("dlrm_hstu", "ultra_hstu") and (
@@ -189,6 +192,7 @@ def export_model(
         use_local_cache_dir=use_local_cache_dir,
         additional_export_config=additional_export_config,
         data_input_path=data_input_path,
+        rocksdb=rocksdb,
     )
     if use_local_cache_dir and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"uploading {local_path} to {save_dir}.")
@@ -1032,6 +1036,7 @@ def export_rtp_model(
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
     data_input_path: Optional[str] = None,
+    rocksdb: Optional[Any] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on RTP."""
@@ -1099,6 +1104,7 @@ def export_rtp_model(
         if train_config.HasField("global_embedding_constraints")
         else None,
         model=model,
+        rocksdb=rocksdb,
     )
     sharders = get_default_sharders()
     plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
@@ -1113,6 +1119,8 @@ def export_rtp_model(
         init_parameters=False,
         init_data_parallel=False,
     )
+    if rocksdb is not None:
+        rocksdb.attach(dmp_model)
     dmp_model.eval()
 
     # Trace Sharded Model
@@ -1200,7 +1208,7 @@ def export_rtp_model(
         plan=plan,
     )
     sparse_model.eval()
-    checkpoint_util.restore_model(checkpoint_path, sparse_model)
+    checkpoint_util.restore_model(checkpoint_path, sparse_model, rocksdb=rocksdb)
     sparse_output, sparse_attrs = sparse_model(data, device=device)
     # Save Sparse Parameters
     logger.info("saving sparse parameters...")

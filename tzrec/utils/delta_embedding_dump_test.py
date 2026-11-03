@@ -3102,6 +3102,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
 
     def _eviction_dumper(self, quant_type=None):
         dumper = object.__new__(DeltaEmbeddingDumper)
+        dumper._rocksdb = None
         dumper._rank = 0
         dumper._world_size = 1
         dumper._quant_type = (

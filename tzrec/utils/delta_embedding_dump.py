@@ -11,7 +11,7 @@
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import (
@@ -51,7 +51,6 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, DeltaEmbeddingQuantType
-from tzrec.utils import rocksdb_util
 from tzrec.utils.feature_store_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
@@ -833,6 +832,7 @@ class DeltaEmbeddingDumper:
         config: Configuration for delta embedding dump behavior.
         model_dir: Base directory for model outputs; used as default output location.
         device: Training device; validated to be CUDA.
+        rocksdb: The run's RocksDB runtime (``rocksdb_util.RocksDBRuntime``).
     """
 
     def __init__(
@@ -841,9 +841,11 @@ class DeltaEmbeddingDumper:
         config: DeltaEmbeddingDumpConfig,
         model_dir: str,
         device: torch.device,
+        rocksdb: Optional[Any] = None,
     ) -> None:
         validate_delta_embedding_dump_config(config, device)
         self._model = model
+        self._rocksdb = rocksdb
         self._config = config
         self._quant_type = config.quant_type
         self._dump_evicted_tombstones = bool(config.dump_evicted_tombstones)
@@ -1536,7 +1538,11 @@ class DeltaEmbeddingDumper:
         # the post-flush state.
         if id(dynamic_module) not in flushed_module_ids:
             # The flushed rows stay cached: not RocksDB eviction candidates.
-            with rocksdb_util.writeback_scope("publish"):
+            with (
+                self._rocksdb.writeback_scope("publish")
+                if self._rocksdb is not None
+                else nullcontext()
+            ):
                 dynamic_module.flush()
             flushed_module_ids.add(id(dynamic_module))
         table_id = cast(List[str], dynamic_module.table_names).index(table_name)
