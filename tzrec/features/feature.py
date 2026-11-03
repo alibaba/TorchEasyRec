@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import hashlib
+import math
 import os
 import shutil
 from collections import OrderedDict
@@ -366,6 +367,16 @@ def _dtype_str_to_data_type(data_type_str: str) -> DataType:
     return data_type
 
 
+def _validate_factor(name: str, value: float) -> None:
+    """Reject a factor below 1 or non-finite."""
+    if not math.isfinite(value) or value < 1.0:
+        raise ValueError(
+            f"embedding_constraints.{name} must be a finite value of at least "
+            f"1, got {value} on feature constraints; measure it with "
+            "tzrec.tools.add_pooling_factor_to_config."
+        )
+
+
 def build_embedding_constraints(
     constraints_cfg: feature_pb2.ParameterConstraints,
 ) -> ParameterConstraints:
@@ -378,8 +389,12 @@ def build_embedding_constraints(
         if len(constraints_cfg.compute_kernels) > 0
         else None,
     )
-    if constraints_cfg.pooling_factor > 0:
+    if constraints_cfg.HasField("pooling_factor"):
+        _validate_factor("pooling_factor", constraints_cfg.pooling_factor)
         constraints.pooling_factors = [constraints_cfg.pooling_factor]
+    if constraints_cfg.HasField("unique_id_factor"):
+        _validate_factor("unique_id_factor", constraints_cfg.unique_id_factor)
+        constraints.unique_id_factor = constraints_cfg.unique_id_factor
     return constraints
 
 
@@ -877,6 +892,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         const = None
         if self.config.HasField("embedding_constraints"):
             const = build_embedding_constraints(self.config.embedding_constraints)
+            const.feature_names = [self.config.feature_name]
         if not (
             hasattr(self.config, "dynamicemb") and self.config.HasField("dynamicemb")
         ):
@@ -885,17 +901,20 @@ class BaseFeature(object, metaclass=_meta_cls):
             raise ValueError(
                 f"feature [{self.name}] uses dynamicemb, which fixes its "
                 "sharding type and compute kernel; of embedding_constraints "
-                "only pooling_factor may be set."
+                "only pooling_factor and unique_id_factor may be set."
             )
         emb_config = emb_config if emb_config is not None else self.emb_config
         assert emb_config is not None
         const = dynamicemb_util.build_dynamicemb_constraints(
             self.config.dynamicemb, emb_config
         )
-        if self.config.HasField("embedding_constraints") and (
-            self.config.embedding_constraints.pooling_factor > 0
-        ):
-            const.pooling_factors = [self.config.embedding_constraints.pooling_factor]
+        if self.config.HasField("embedding_constraints"):
+            constraints_cfg = self.config.embedding_constraints
+            if constraints_cfg.HasField("pooling_factor"):
+                const.pooling_factors = [constraints_cfg.pooling_factor]
+            if constraints_cfg.HasField("unique_id_factor"):
+                const.unique_id_factor = constraints_cfg.unique_id_factor
+        const.feature_names = [self.config.feature_name]
         return const
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:

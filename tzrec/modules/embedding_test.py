@@ -258,10 +258,10 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["wide"].size(), (2, 8))
         self.assertEqual(result["deep"].size(), (2, 25))
 
-    def test_parameter_constraints_sum_a_shared_table(self):
-        # Features sharing a table add their ids per sample up; a feature that
-        # sets nothing contributes the default of one id per sample.
-        def _feature(name, pooling_factor=0.0):
+    def _shared_table_constraints(self, feature_specs, feature_names):
+        """Constraints of one table fed by the given (name, factors) specs."""
+
+        def _feature(name, pooling_factor=0.0, unique_id_factor=0.0):
             feat_cfg = feature_pb2.FeatureConfig(
                 id_feature=feature_pb2.IdFeature(
                     feature_name=name,
@@ -270,38 +270,74 @@ class EmbeddingGroupTest(unittest.TestCase):
                     num_buckets=100,
                 )
             )
+            constraints = feat_cfg.id_feature.embedding_constraints
             if pooling_factor:
-                feat_cfg.id_feature.embedding_constraints.pooling_factor = (
-                    pooling_factor
-                )
+                constraints.pooling_factor = pooling_factor
+            if unique_id_factor:
+                constraints.unique_id_factor = unique_id_factor
             return feat_cfg
 
-        for pooling_factors, expected in [
-            ([2.5, 1.5], [4.0]),
-            ([2.5, 0.0], [3.5]),
-            ([0.0, 2.5], [3.5]),
-            ([0.0, 0.0], [1.0]),
+        features = create_features([_feature(*spec) for spec in feature_specs])
+        embedding_group = EmbeddingGroupImpl(
+            features,
+            [
+                model_pb2.FeatureGroupConfig(
+                    group_name="deep",
+                    feature_names=feature_names,
+                    group_type=model_pb2.FeatureGroupType.DEEP,
+                )
+            ],
+            device=torch.device("cpu"),
+        )
+        return embedding_group.parameter_constraints()["ebc.shared"]
+
+    def test_shared_table_keeps_one_entry_per_feature(self):
+        # one raw id factor per input feature, in group order, unset 1.0
+        for specs, feature_names, expected in [
+            ([("cat_a", 2.5), ("cat_b", 1.5)], ["cat_a", "cat_b"], [2.5, 1.5]),
+            ([("cat_b", 1.5), ("cat_a", 2.5)], ["cat_b", "cat_a"], [1.5, 2.5]),
+            ([("cat_a", 2.5), ("cat_b", 0.0)], ["cat_a", "cat_b"], [2.5, 1.0]),
         ]:
-            with self.subTest(pooling_factors=pooling_factors):
-                features = create_features(
-                    [
-                        _feature("cat_a", pooling_factors[0]),
-                        _feature("cat_b", pooling_factors[1]),
-                    ]
-                )
-                embedding_group = EmbeddingGroupImpl(
-                    features,
-                    [
-                        model_pb2.FeatureGroupConfig(
-                            group_name="deep",
-                            feature_names=["cat_a", "cat_b"],
-                            group_type=model_pb2.FeatureGroupType.DEEP,
-                        )
-                    ],
-                    device=torch.device("cpu"),
-                )
-                const = embedding_group.parameter_constraints()["ebc.shared"]
+            with self.subTest(feature_names=feature_names):
+                const = self._shared_table_constraints(specs, feature_names)
                 self.assertEqual(const.pooling_factors, expected)
+                self.assertEqual(const.feature_names, feature_names)
+
+    def test_shared_table_counts_a_reused_feature_once(self):
+        # the same feature referenced twice by one group is one input
+        const = self._shared_table_constraints(
+            [("cat_a", 2.5), ("cat_b", 1.5)], ["cat_a", "cat_b", "cat_a"]
+        )
+        self.assertEqual(const.pooling_factors, [2.5, 1.5])
+        self.assertEqual(const.feature_names, ["cat_a", "cat_b"])
+
+    def test_shared_table_unique_id_factor_takes_the_max(self):
+        const = self._shared_table_constraints(
+            [("cat_a", 1.0, 20.0), ("cat_b", 1.0, 30.0)], ["cat_a", "cat_b"]
+        )
+        self.assertEqual(const.unique_id_factor, 30.0)
+        self.assertFalse(const.unique_id_partial)
+
+    def test_shared_table_unique_id_factor_falls_back_to_raw_ids(self):
+        # a member without a measured value: the raw id factors bound the union
+        const = self._shared_table_constraints(
+            [("cat_a", 2.5, 20.0), ("cat_b", 5.0)], ["cat_a", "cat_b"]
+        )
+        self.assertEqual(const.unique_id_factor, 20.0)
+        self.assertTrue(const.unique_id_partial)
+
+        const = self._shared_table_constraints(
+            [("cat_a", 2.5, 3.0), ("cat_b", 5.0)], ["cat_a", "cat_b"]
+        )
+        # max(3.0, 2.5 + 5.0): the unset member may add ids beyond the measure
+        self.assertEqual(const.unique_id_factor, 7.5)
+        self.assertTrue(const.unique_id_partial)
+
+        const = self._shared_table_constraints(
+            [("cat_a", 2.5), ("cat_b", 5.0)], ["cat_a", "cat_b"]
+        )
+        self.assertEqual(const.unique_id_factor, 7.5)
+        self.assertTrue(const.unique_id_partial)
 
     @parameterized.expand(
         [

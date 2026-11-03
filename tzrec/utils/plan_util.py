@@ -98,11 +98,14 @@ def create_planner(
     model: Optional[nn.Module] = None,
 ) -> EmbeddingShardingPlanner:
     """Create EmbeddingShardingPlanner."""
-    if global_constraints_cfg is not None and global_constraints_cfg.pooling_factor > 0:
+    if global_constraints_cfg is not None and (
+        global_constraints_cfg.HasField("pooling_factor")
+        or global_constraints_cfg.HasField("unique_id_factor")
+    ):
         raise ValueError(
-            "global_embedding_constraints cannot set pooling_factor; the "
-            "ids a sample looks up differ per feature, set it on each "
-            "feature's embedding_constraints."
+            "global_embedding_constraints cannot set pooling_factor or "
+            "unique_id_factor; the ids a sample looks up differ per feature, "
+            "set them on each feature's embedding_constraints."
         )
     local_world_size = get_local_size()
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0

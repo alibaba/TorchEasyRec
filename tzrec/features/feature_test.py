@@ -1202,14 +1202,13 @@ class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):
             feature_lib.project_grouped_sequence_feature_to_scalar(features[0])
 
 
-@unittest.skipUnless(
-    dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
-)
-@mark_ci_scope("gpu")
-class EmbeddingConstraintsTest(unittest.TestCase):
-    """Forwarding of embedding_constraints into parameter constraints."""
+FACTOR_FIELDS = ("pooling_factor", "unique_id_factor")
 
-    def _id_feature(self, pooling_factor=0.0, **dynamicemb):
+
+class EmbeddingConstraintsTest(unittest.TestCase):
+    """Forwarding and validation of embedding_constraints."""
+
+    def _id_feature(self, pooling_factor=0.0, unique_id_factor=0.0, **dynamicemb):
         feat_cfg = feature_pb2.FeatureConfig(
             id_feature=feature_pb2.IdFeature(
                 feature_name="cat_a", embedding_dim=8, num_buckets=100
@@ -1217,35 +1216,78 @@ class EmbeddingConstraintsTest(unittest.TestCase):
         )
         for k, v in dynamicemb.items():
             setattr(feat_cfg.id_feature.dynamicemb, k, v)
-        if pooling_factor:
-            feat_cfg.id_feature.embedding_constraints.pooling_factor = pooling_factor
+        if pooling_factor or unique_id_factor:
+            constraints = feat_cfg.id_feature.embedding_constraints
+            constraints.pooling_factor = pooling_factor
+            constraints.unique_id_factor = unique_id_factor
         return id_feature.IdFeature(feat_cfg)
 
-    def test_pooling_factor_is_forwarded(self):
-        feature = self._id_feature(pooling_factor=3.5)
+    def test_factors_are_forwarded_with_the_feature_name(self):
+        feature = self._id_feature(pooling_factor=3.5, unique_id_factor=7.0)
         const = feature.parameter_constraints(feature.emb_bag_config)
         self.assertEqual(const.pooling_factors, [3.5])
+        self.assertEqual(const.unique_id_factor, 7.0)
+        self.assertEqual(const.feature_names, ["cat_a"])
 
     def test_a_feature_without_constraints_has_none(self):
         feature = self._id_feature()
         self.assertIsNone(feature.parameter_constraints(feature.emb_bag_config))
 
-    def test_dynamicemb_takes_pooling_factor_from_embedding_constraints(self):
-        feature = self._id_feature(pooling_factor=36.3, max_capacity=100_000)
+    @parameterized.expand(
+        [
+            param("pooling_factor", field="pooling_factor"),
+            param("unique_id_factor", field="unique_id_factor"),
+        ]
+    )
+    def test_factors_below_one_are_rejected(self, _name, field):
+        feature = self._id_feature(**{field: 0.5})
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            feature.parameter_constraints(feature.emb_bag_config)
+
+    @parameterized.expand(
+        [param("inf", field=f, value=float("inf")) for f in FACTOR_FIELDS]
+        + [param("nan", field=f, value=float("nan")) for f in FACTOR_FIELDS]
+    )
+    def test_non_finite_factors_are_rejected(self, _name, field, value):
+        feature = self._id_feature(**{field: value})
+        with self.assertRaisesRegex(ValueError, "finite"):
+            feature.parameter_constraints(feature.emb_bag_config)
+
+    @unittest.skipUnless(
+        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+    )
+    @mark_ci_scope("gpu")
+    def test_dynamicemb_takes_factors_from_embedding_constraints(self):
+        feature = self._id_feature(
+            pooling_factor=36.3, unique_id_factor=37166.0, max_capacity=100_000
+        )
         const = feature.parameter_constraints(feature.emb_bag_config)
         self.assertTrue(const.use_dynamicemb)
         self.assertAlmostEqual(const.pooling_factors[0], 36.3, places=5)
+        self.assertAlmostEqual(const.unique_id_factor, 37166.0, places=3)
+        self.assertEqual(const.feature_names, ["cat_a"])
 
-    def test_dynamicemb_without_pooling_factor_keeps_the_default(self):
+    @unittest.skipUnless(
+        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+    )
+    @mark_ci_scope("gpu")
+    def test_dynamicemb_without_factors_keeps_the_defaults(self):
         feature = self._id_feature(max_capacity=100_000)
         const = feature.parameter_constraints(feature.emb_bag_config)
         self.assertTrue(const.use_dynamicemb)
         self.assertEqual(const.pooling_factors, [1.0])
+        self.assertIsNone(getattr(const, "unique_id_factor", None))
 
+    @unittest.skipUnless(
+        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+    )
+    @mark_ci_scope("gpu")
     def test_dynamicemb_rejects_other_embedding_constraints(self):
         feature = self._id_feature(max_capacity=100_000)
         feature.config.embedding_constraints.sharding_types.append("table_wise")
-        with self.assertRaisesRegex(ValueError, "only pooling_factor may be set"):
+        with self.assertRaisesRegex(
+            ValueError, "only pooling_factor and unique_id_factor"
+        ):
             feature.parameter_constraints(feature.emb_bag_config)
 
 

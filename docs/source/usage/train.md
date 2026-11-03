@@ -228,9 +228,12 @@ train_config {
 
 (pooling-factor)=
 
-### pooling_factor
+### pooling_factor 与 unique_id_factor
 
-每个特征可以在`embedding_constraints`中配置`pooling_factor`，表示一个样本通过该特征查这张表带来的平均Id数。规划器用它估算每步的查表量、输入输出张量大小和dynamicemb GPU cache；不配置的特征按每个样本1个Id估算。多个特征共用一张表（相同的`embedding_name`）时，它们的`pooling_factor`会相加
+每个特征可以在`embedding_constraints`中配置两个从训练数据测量的参数：
+
+- `pooling_factor`：一个样本通过该特征查这张表的平均原始Id位置数（含重复），最小为1。规划器用它估算每步查表量、输入输出张量大小和通信量
+- `unique_id_factor`：一个样本通过共用这张表的所有特征查表的去重Id数的最大值。`batch_size * unique_id_factor`是这张表保守的cache工作集估计（例如dynamicemb GPU cache需要容纳它）
 
 ```
 feature_configs {
@@ -239,12 +242,19 @@ feature_configs {
         embedding_dim: 8
         embedding_constraints {
             pooling_factor: 36.3
+            unique_id_factor: 37166
         }
     }
 }
 ```
 
-该值通常不从数据里人工估计，用工具从训练数据中测量并写入一个新配置文件（不修改原配置）：
+- 共用一张表（相同的`embedding_name`）的特征各保留自己的`pooling_factor`，一张表一个输入一项，按配置顺序；未配置的特征按每个样本1个Id计
+- `unique_id_factor`是表级的测量值，写在每个成员特征上，合并时取最大值；部分成员未配置时保守地退化为各成员`pooling_factor`之和（任意并集的上界），不会因为缺少测量而低估共用表
+- 配置了dynamicemb的特征只能通过`embedding_constraints`设置这两个字段，同时设置`sharding_types`或`compute_kernels`会报错（dynamicemb的分片方式和计算内核是固定的）
+- `train_config.global_embedding_constraints`不支持这两个字段（各特征的查表量不同），配置了会报错
+- 显式配置小于1或非有限的值会报错
+
+这两个值用工具从训练数据中测量并写入一个新配置文件（不修改原配置）：
 
 ```bash
 python -m tzrec.tools.add_pooling_factor_to_config \
@@ -253,7 +263,7 @@ python -m tzrec.tools.add_pooling_factor_to_config \
     --num_batches 100
 ```
 
-- 工具通过训练数据的dataloader读取`num_batches`个batch（走FG流程，无需模型和GPU），dynamicemb特征统计去重后的Id数（与查表一致），其它表统计全部Id；写入的是每batch最大Id数除以`batch_size`，向上取整
-- 配置了dynamicemb的特征只能通过`embedding_constraints`设置`pooling_factor`，同时设置`sharding_types`或`compute_kernels`会报错（dynamicemb的分片方式和计算内核是固定的）
-- `train_config.global_embedding_constraints`不支持`pooling_factor`（各特征的查表量不同），配置了会报错
-- 数据分布变化后请重新测量；配置了`pooling_factor`后规划器对显存和性能的估算会变化，规划结果可能与之前不同
+- 工具通过训练数据的dataloader读取`num_batches`个batch（走FG流程，无需模型和GPU），按实际样本数计算，包含不完整的尾batch
+- `pooling_factor`是全部读到的原始Id数除以实际样本数，最小为1；`unique_id_factor`是每个batch内按样本、对共用一张表的所有特征取Id并集后的去重个数，取所有样本的最大值
+- 同一张表的两个值写在每个成员特征上；一个特征接入多张物理表（如input-tile复制出的user侧表）时取这些表测量值的最大值
+- 数据分布变化后请重新测量；测量值不保证覆盖未来的数据，运行时仍有容量检查兜底。配置后规划器对显存和性能的估算会变化，规划结果可能与之前不同

@@ -130,6 +130,71 @@ class PlanUtilTest(unittest.TestCase):
         finally:
             dist.destroy_process_group()
 
+    def test_shared_table_factors_keep_one_entry_per_input(self) -> None:
+        # a table shared by two features keeps one entry per input, aligned
+        # with num_poolings and batch_sizes, and each input contributes one
+        # pooled output row per batch
+        from torchrec.distributed.planner.shard_estimators import (
+            _calculate_tw_shard_io_sizes,
+            get_num_poolings,
+        )
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        topology = Topology(world_size=1, compute_device="cpu")
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=8,
+                name="table_shared",
+                feature_names=["feature_a", "feature_b"],
+            )
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        constraint = ParameterConstraints(
+            pooling_factors=[1.0, 20.0],
+            feature_names=["feature_a", "feature_b"],
+        )
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=16,
+            fqn_constraints={"sparse.ebc.table_shared": constraint},
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=get_default_sharders()
+        )
+        self.assertTrue(search_space)
+        for sharding_option in search_space:
+            self.assertEqual(sharding_option.input_lengths, [1.0, 20.0])
+            self.assertEqual(sharding_option.num_inputs, 2)
+            num_poolings = get_num_poolings(
+                {"sparse.ebc.table_shared": constraint}, sharding_option
+            )
+            self.assertEqual(len(num_poolings), sharding_option.num_inputs)
+        input_sizes, output_sizes = _calculate_tw_shard_io_sizes(
+            batch_sizes=[16, 16],
+            world_size=1,
+            input_lengths=[1.0, 20.0],
+            emb_dim=8,
+            input_data_type_size=4,
+            output_data_type_size=4,
+            num_poolings=[1.0, 1.0],
+            is_pooled=True,
+        )
+        self.assertEqual(input_sizes[0], (1.0 + 20.0) * 16 * 4)
+        self.assertEqual(output_sizes[0], 2 * 16 * 8 * 4)
+        # an unpooled (EmbeddingCollection) table outputs every position
+        input_sizes, output_sizes = _calculate_tw_shard_io_sizes(
+            batch_sizes=[16, 16],
+            world_size=1,
+            input_lengths=[1.0, 20.0],
+            emb_dim=8,
+            input_data_type_size=4,
+            output_data_type_size=4,
+            num_poolings=[1.0, 1.0],
+            is_pooled=False,
+        )
+        self.assertEqual(output_sizes[0], (1.0 + 20.0) * 16 * 8 * 4)
+
     def test_pooling_factor_reaches_sharding_options(self) -> None:
         from torchrec.distributed.planner.types import ParameterConstraints
 

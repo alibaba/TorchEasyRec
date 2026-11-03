@@ -620,28 +620,74 @@ def _is_weighted(emb_bag_configs: Dict[str, EmbeddingBagConfig]) -> bool:
 def _add_constraints(
     store: Dict[str, ParameterConstraints],
     name: str,
+    feature_name: str,
     const: Optional[ParameterConstraints],
 ) -> None:
-    """Record a table's constraints, adding up its features' ids per sample.
+    """Record a table's constraints, one entry per input feature.
 
-    Features sharing a table add their lookups up. A feature that sets no
-    pooling_factor still looks up its sample's ids, so beside the factors that
-    are set each unset feature contributes the default of one id per sample;
-    a table whose features set none keeps that default.
+    pooling_factors keeps one raw id factor per feature that feeds the table,
+    in the order the features appear in the final embedding config; a feature
+    reused by several groups of one table is counted once, and a feature that
+    sets no pooling_factor contributes the default of one id per sample.
+    unique_id_factor aggregates the features' values with max, and falls back
+    to the sum of the pooling factors - an upper bound of any per-sample
+    union - whenever a feature does not carry one, so a shared table is never
+    silently underestimated.
 
     Args:
         store(Dict[str, ParameterConstraints]): a dict of table constraints.
         name(str): embedding table name.
+        feature_name(str): the feature the constraints come from.
         const(Optional[ParameterConstraints]): the feature's parameter
             constraints, or None when it has none.
     """
-    const = const if const is not None else ParameterConstraints()
+    const = (
+        const
+        if const is not None
+        else ParameterConstraints(pooling_factors=[1.0], feature_names=[feature_name])
+    )
     old = store.get(name)
-    if old is not None and (
-        old.pooling_factors != [1.0] or const.pooling_factors != [1.0]
-    ):
-        const.pooling_factors = [sum(old.pooling_factors) + sum(const.pooling_factors)]
-    store[name] = const
+    if old is None:
+        _init_unique_id_factor(const)
+        store[name] = const
+        return
+    if const.feature_names[0] in (old.feature_names or []):
+        return
+    old.feature_names = list(old.feature_names or []) + list(const.feature_names or [])
+    old.pooling_factors = list(old.pooling_factors) + list(const.pooling_factors)
+    if const.sharding_types is not None:
+        old.sharding_types = const.sharding_types
+    if const.compute_kernels is not None:
+        old.compute_kernels = const.compute_kernels
+    _merge_unique_id_factor(old, const)
+
+
+def _init_unique_id_factor(const: ParameterConstraints) -> None:
+    """Start a table's unique-id estimate from its first feature's entry."""
+    value = getattr(const, "unique_id_factor", None)
+    if value is None:
+        # no measured value: the raw per-sample ids bound the union
+        const.unique_id_factor = sum(const.pooling_factors)
+        const.unique_id_partial = True
+    else:
+        const.unique_id_partial = False
+
+
+def _merge_unique_id_factor(
+    old: ParameterConstraints, const: ParameterConstraints
+) -> None:
+    """Fold one more feature's entry into the table's unique-id estimate."""
+    value = getattr(const, "unique_id_factor", None)
+    old.unique_id_partial = bool(
+        getattr(old, "unique_id_partial", False) or value is None
+    )
+    if value is not None:
+        old.unique_id_factor = max(getattr(old, "unique_id_factor", 0.0), float(value))
+    if old.unique_id_partial:
+        # some feature carries no value; the raw ids bound the union
+        old.unique_id_factor = max(
+            getattr(old, "unique_id_factor", 0.0), sum(old.pooling_factors)
+        )
 
 
 def _add_embedding_config(
@@ -850,6 +896,7 @@ class EmbeddingGroupImpl(nn.Module):
                             _add_constraints(
                                 self._emb_bag_constraints_user,
                                 emb_bag_config.name,
+                                name,
                                 const,
                             )
                     else:
@@ -866,7 +913,10 @@ class EmbeddingGroupImpl(nn.Module):
                         else:
                             self.has_sparse = True
                             _add_constraints(
-                                self._emb_bag_constraints, emb_bag_config.name, const
+                                self._emb_bag_constraints,
+                                emb_bag_config.name,
+                                name,
+                                const,
                             )
 
                     if shared_feature_flag[name]:
@@ -1180,6 +1230,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             _add_constraints(
                                 self._dim_to_emb_constraints_user[embedding_dim],
                                 emb_config.name,
+                                name,
                                 const,
                             )
                         if feature.is_sequence and feature.value_dim != 1:
@@ -1207,6 +1258,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             _add_constraints(
                                 self._dim_to_emb_constraints[embedding_dim],
                                 emb_config.name,
+                                name,
                                 const,
                             )
                         if feature.is_sequence and feature.value_dim != 1:
