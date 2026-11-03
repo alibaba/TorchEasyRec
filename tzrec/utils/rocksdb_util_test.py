@@ -10,8 +10,6 @@
 # limitations under the License.
 
 import glob
-import hashlib
-import json
 import os
 import re
 import unittest
@@ -40,15 +38,6 @@ try:
     has_rocksdb = torch.cuda.is_available()
 except ImportError:
     has_rocksdb = False
-
-
-def _tree_hash(path):
-    h = hashlib.sha256()
-    for root, _, files in sorted(os.walk(path)):
-        for f in sorted(files):
-            with open(os.path.join(root, f), "rb") as fh:
-                h.update(f.encode() + fh.read())
-    return h.hexdigest()
 
 
 class RocksDBBudgetTest(unittest.TestCase):
@@ -115,7 +104,7 @@ class _Model(nn.Module):
 @unittest.skipUnless(has_rocksdb, "tzrec_rocksdb and CUDA are required")
 @mark_ci_scope("gpu")
 class RocksDBCheckpointTest(unittest.TestCase):
-    """Logical save/restore and legacy native restore of a fused module."""
+    """Logical save/restore of a fused module."""
 
     def setUp(self):
         self.test_dir = make_test_dir()
@@ -280,76 +269,6 @@ class RocksDBCheckpointTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "different optimizer"):
                 rocksdb_util.check_fused_opt_args(root, fused)
-
-    def _legacy_save(self, model, step):
-        """A checkpoint in the native format written before logical saves."""
-        from tzrec_rocksdb.checkpoint import create_checkpoint
-
-        with rocksdb_util.writeback_scope("checkpoint"):
-            model.emb.flush()
-        ckpt = os.path.join(self.model_dir, f"model.ckpt-{step}")
-        os.makedirs(os.path.join(ckpt, "rocksdb"))
-        native = os.path.join(rocksdb_util.rank_dir(self.model_dir, 0), f"ckpt-{step}")
-        create_checkpoint(rocksdb_util.session(), native, {"step": step})
-        storage = model.emb.tables
-        layouts = {
-            ns: storage.table_layout(t) for t, ns in enumerate(storage.namespaces)
-        }
-        manifest = {
-            "format_version": rocksdb_util.FORMAT_VERSION,
-            "step": step,
-            "rank": 0,
-            "world_size": 1,
-            "native_checkpoint": native,
-            "groups": [
-                {
-                    "tables": list(model.emb.table_names),
-                    "namespaces": list(storage.namespaces),
-                    "layouts": layouts,
-                    "dist_types": [o.dist_type for o in model.emb._dynamicemb_options],
-                    "num_shards": 1,
-                    "shard_index": 0,
-                    "opt_args": model.emb.optimizer.get_opt_args(),
-                    "scores": dict(model.emb._scores),
-                }
-            ],
-        }
-        with open(os.path.join(ckpt, "rocksdb", "rank_0.json"), "w") as f:
-            json.dump(manifest, f)
-        open(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME), "w")
-        return ckpt, native
-
-    def test_legacy_native_checkpoint_restores_and_stays_immutable(self):
-        model = self._model(["a", "b"])
-        self._train(model, 0)
-        before = self._rows(model)
-        ckpt, native = self._legacy_save(model, 5)
-        native_hash = _tree_hash(native)
-        self._train(model, 1)
-        reordered = self._model(["b", "a"])
-        rocksdb_util.restore_checkpoint(ckpt, reordered, load_optim=True)
-        after = self._rows(reordered)
-        self.assertEqual(sorted(after), sorted(before))
-        for k in before:
-            torch.testing.assert_close(after[k], before[k], rtol=0, atol=0)
-        self._train(reordered, 2)
-        self.assertEqual(_tree_hash(native), native_hash)
-        os.rename(
-            os.path.join(self.model_dir, "model.ckpt-5"),
-            os.path.join(self.model_dir, "pruned"),
-        )
-        rocksdb_util.prune_native_checkpoints()
-        self.assertFalse(os.path.exists(native))
-
-    def test_legacy_native_checkpoint_rejects_evicting_tables(self):
-        model = self._model(["a"])
-        self._train(model, 0)
-        ckpt, _ = self._legacy_save(model, 5)
-        with self.assertRaisesRegex(ValueError, "eviction index"):
-            rocksdb_util.restore_checkpoint(ckpt, self._model(["a"], "STEP"), True)
-        os.remove(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME))
-        with self.assertRaisesRegex(RuntimeError, "incomplete"):
-            rocksdb_util.restore_checkpoint(ckpt, model, True)
 
 
 if __name__ == "__main__":

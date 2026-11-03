@@ -1134,33 +1134,17 @@ def restore_model(
     if has_dynamicemb and load_dynamicemb:
         from dynamicemb.dump_load import DynamicEmbLoad
 
-        table_names = meta.get("dynamicemb_load_table_names", None)
         dynamicemb_path = os.path.join(checkpoint_dir, "dynamicemb")
+        # RocksDB tables load from the same dynamicemb files as every other
+        # table, into a fresh working DB, whichever backend the checkpointing
+        # run used.
         if rocksdb_util.rocksdb_modules(model):
-            if rocksdb_util.has_native_checkpoint(checkpoint_dir):
-                rocksdb_util.restore_checkpoint(
-                    checkpoint_dir,
-                    model,
-                    meta.get("dynamicemb_load_optim", optimizer is not None),
-                )
-                builtin = rocksdb_util.builtin_dynamicemb_tables(model)
-                if table_names is not None:
-                    builtin = {
-                        k: [n for n in v if n in table_names.get(k, v)]
-                        for k, v in builtin.items()
-                    }
-                table_names = builtin
-            else:
-                # RocksDB tables load from the same dynamicemb files as every
-                # other table, into a fresh working DB, whichever backend the
-                # checkpointing run used.
-                rocksdb_util.reset_for_import(model)
+            rocksdb_util.reset_for_import(model)
         if rocksdb_util.get_rocksdb_config() is not None and os.path.exists(
             dynamicemb_path
         ):
             rocksdb_util.check_fused_opt_args(dynamicemb_path, model)
-        has_tables = table_names is None or any(table_names.values())
-        if os.path.exists(dynamicemb_path) and has_tables:
+        if os.path.exists(dynamicemb_path):
             # Training never sets INPUT_TILE, but exporting with
             # INPUT_TILE=3 adds twin user-side modules (`ebc_user`,
             # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) that
@@ -1183,7 +1167,7 @@ def restore_model(
                 DynamicEmbLoad(
                     dynamicemb_load_path,
                     model,
-                    table_names=table_names,
+                    table_names=meta.get("dynamicemb_load_table_names", None),
                     optim=meta.get("dynamicemb_load_optim", optimizer is not None),
                     counter=True,
                 )

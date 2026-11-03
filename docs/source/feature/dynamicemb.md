@@ -185,7 +185,6 @@ feature_configs {
 - checkpoint 与放置方式无关：同一份 checkpoint 可以在内存版和 RocksDB 版之间恢复，也可以在调整预算后由 AUTO 选出不同的放置继续训练。若放置变化使原本不在同一融合组、优化器参数（例如 Adam 的迭代次数）不同的表融合到一起，恢复会报错。world size、维度或优化器类型的变化按 dynamicemb 自身的规则校验
 - 内存表接近 `max_capacity` 时，改变 world size 恢复会让 key 落到新的哈希 bucket，装不下的 bucket 按淘汰策略丢弃其中分数最低的行（装填率约 97% 时，`bucket_capacity` 为 128 约丢失 2.3%，为 1024 约丢失 0.3%）。RocksDB 表没有 bucket，不受影响；world size 不变时恢复也不会丢行
 - 评估、导出时 RocksDB 表同样从 checkpoint 文件加载到一个新的临时数据库（会占用与表大小相当的磁盘）
-- 旧版本（原生 RocksDB checkpoint，`model.ckpt-<step>/rocksdb/rank_<r>.json`）的 checkpoint 仍可恢复（仅限 `NO_EVICTION` 表）和导出；恢复后保存一次即转换为新格式。旧的原生 checkpoint 在对应 `model.ckpt-<step>` 被清理后删除
 - 保存耗时与表大小成正比（全量写出），训练在保存期间暂停（实测经 ossfs 写出约 125 GiB 需约 13 分钟，从 OSS 恢复约 6 分钟），请据此设置 `save_checkpoints_steps`；日志 `RocksDB checkpoint` 给出本次保存的 cache 写回、导出行数和字节数、暂停后台任务的等待时间和读取的未落盘 memtable 大小，以及进程启动以来训练、发布的累计写回量、淘汰行数和 RocksDB flush/compaction 写入量
 - 已知限制：恢复前框架会先用一个 batch 初始化优化器状态，此时 frequency admission 的 Counter 计数无法回滚
 

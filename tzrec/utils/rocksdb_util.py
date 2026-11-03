@@ -20,10 +20,6 @@ different jobs never collide. The working DB is never a checkpoint: saves
 write RocksDB tables through ``DynamicEmbDump`` into the checkpoint's
 ``dynamicemb/`` files like every other dynamicemb table, and a resume always
 rebuilds a fresh working DB from those files.
-
-Checkpoints written before this format carry ``model.ckpt-<step>/rocksdb/``
-manifests that point at native RocksDB checkpoints
-(``<run_id>/rank_<r>/ckpt-<step>/``); they are still restored by cloning.
 """
 
 import contextlib
@@ -51,8 +47,6 @@ _auto_candidates: Dict[str, feature_pb2.DynamicEmbedding] = {}
 _HOST_OVERHEAD_BYTES = 2 << 30
 # DynamicEmb sizes GPU caches in buckets of this many rows.
 CACHE_BUCKET_ROWS = 1024
-MANIFEST_DIR = "rocksdb"
-FORMAT_VERSION = 1
 
 
 def set_rocksdb_config(config: Optional[train_pb2.RocksDBConfig]) -> None:
@@ -324,25 +318,6 @@ def rocksdb_modules(model: nn.Module) -> List[Any]:
     ]
 
 
-def builtin_dynamicemb_tables(model: nn.Module) -> Dict[str, List[str]]:
-    """``DynamicEmbLoad`` table selection without RocksDB tables.
-
-    Used after a legacy native restore. DynamicEmb treats a collection missing
-    from the dict as "all tables", so every collection is listed, with an
-    empty list if needed.
-    """
-    from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-    from tzrec_rocksdb.storage import RocksDBStorage
-
-    selection: Dict[str, List[str]] = {}
-    for path, _, collection in find_sharded_modules(model, ""):
-        names = selection.setdefault(path, [])
-        for m in get_dynamic_emb_module(collection):
-            if not isinstance(m.tables, RocksDBStorage):
-                names.extend(m.table_names)
-    return selection
-
-
 def check_fused_opt_args(dynamicemb_dir: str, model: nn.Module) -> None:
     """Reject a load whose fused groups would mix different optimizer state.
 
@@ -535,180 +510,6 @@ def save_stats(seconds: float) -> None:
         f"{props['rocksdb.obsolete-sst-files-size']}, snapshots "
         f"{props['rocksdb.num-snapshots']}"
     )
-    prune_native_checkpoints()
-
-
-def _dynamicemb_version() -> str:
-    from importlib.metadata import version
-
-    return version("dynamicemb")
-
-
-def has_native_checkpoint(ckpt_dir: str) -> bool:
-    """Whether a checkpoint carries legacy native RocksDB manifests."""
-    return os.path.isdir(os.path.join(ckpt_dir, MANIFEST_DIR))
-
-
-def _validate_groups(
-    manifest: Dict[str, Any], groups: List[Any]
-) -> List[Dict[str, Any]]:
-    """Match each RocksDB module to its checkpoint state.
-
-    A training checkpoint must keep its fusion membership (order may change).
-    An imported checkpoint records one entry per table, since the importer
-    cannot know the runtime fusion; its tables must then agree on optimizer
-    arguments within each runtime group.
-    """
-    if manifest.get("imported"):
-        by_ns = {s["namespaces"][0]: s for s in manifest["groups"]}
-        matched: List[Dict[str, Any]] = []
-        for m in groups:
-            members = [by_ns.get(ns) for ns in m.tables.namespaces]
-            if any(x is None for x in members):
-                raise ValueError(f"imported checkpoint lacks tables of {m.table_names}")
-            if any(x["opt_args"] != members[0]["opt_args"] for x in members):
-                raise ValueError(
-                    f"imported optimizer args differ within {m.table_names}"
-                )
-            matched.append(
-                {
-                    "namespaces": list(m.tables.namespaces),
-                    "layouts": {k: v for x in members for k, v in x["layouts"].items()},
-                    "dist_types": [x["dist_types"][0] for x in members],
-                    "opt_args": members[0]["opt_args"],
-                    "scores": {k: v for x in members for k, v in x["scores"].items()},
-                    "counter": all(x.get("counter") for x in members),
-                    "num_shards": members[0]["num_shards"],
-                    "shard_index": members[0]["shard_index"],
-                }
-            )
-        if sum(len(x["namespaces"]) for x in matched) != len(by_ns):
-            raise ValueError("the model lacks RocksDB tables present in the checkpoint")
-    else:
-        by_members = {frozenset(s["namespaces"]): s for s in manifest["groups"]}
-        matched: List[Dict[str, Any]] = []
-        for m in groups:
-            state = by_members.get(frozenset(m.tables.namespaces))
-            if state is None:
-                known = [s["namespaces"] for s in manifest["groups"]]
-                raise ValueError(
-                    f"RocksDB group {m.tables.namespaces} is not a fusion group of "
-                    f"the checkpoint ({known}); changing fusion membership "
-                    "requires a migration."
-                )
-            matched.append(state)
-        if len(matched) != len(manifest["groups"]):
-            raise ValueError("the model lacks RocksDB groups present in the checkpoint")
-    for m, state in zip(groups, matched):
-        storage = m.tables
-        training = all(o.training for o in m._dynamicemb_options)
-        for t, ns in enumerate(storage.namespaces):
-            want, have = state["layouts"][ns], storage.table_layout(t)
-            if not training:
-                # Without an optimizer only the embedding part is read.
-                want = {k: want[k] for k in ("dtype", "dim")}
-                have = {k: have[k] for k in ("dtype", "dim")}
-            if want != have:
-                raise ValueError(
-                    f"table {ns} layout {have} differs from checkpoint {want}"
-                )
-            dist_type = state["dist_types"][state["namespaces"].index(ns)]
-            if m._dynamicemb_options[t].dist_type != dist_type:
-                raise ValueError(f"key routing of {ns} changed ({dist_type})")
-    return matched
-
-
-def restore_checkpoint(ckpt_dir: str, model: nn.Module, load_optim: bool) -> None:
-    """Resume RocksDB tables from a legacy native-checkpoint ``ckpt_dir``.
-
-    Validates the manifest against the model, empties every RocksDB GPU cache
-    (rows touched before restore must not be written back), swaps the session
-    to a fresh writable clone of the immutable native checkpoint, re-resolves
-    namespaces, and restores optimizer arguments, scores and counters. Native
-    checkpoints predate the eviction index, so only NO_EVICTION tables can
-    resume from them; re-save such a run once to move it to the logical format.
-    """
-    from tzrec.utils.checkpoint_util import CKPT_SUCCESS_FILENAME
-
-    groups = rocksdb_modules(model)
-    if not groups:
-        return
-    from tzrec_rocksdb.checkpoint import clone_checkpoint
-
-    if not os.path.exists(os.path.join(ckpt_dir, CKPT_SUCCESS_FILENAME)):
-        raise RuntimeError(
-            f"{ckpt_dir} has no {CKPT_SUCCESS_FILENAME}; refusing to resume RocksDB "
-            "tables from an incomplete checkpoint."
-        )
-    rank = _rank()
-    with open(os.path.join(ckpt_dir, MANIFEST_DIR, f"rank_{rank}.json")) as f:
-        manifest = json.load(f)
-    if manifest["format_version"] != FORMAT_VERSION:
-        raise ValueError(f"unsupported RocksDB manifest format in {ckpt_dir}")
-    if manifest["world_size"] != _world_size() or manifest["rank"] != rank:
-        raise ValueError(
-            f"RocksDB checkpoint was written by rank {manifest['rank']} of "
-            f"{manifest['world_size']}; resharding to {rank} of {_world_size()} is "
-            "not supported."
-        )
-    states = _validate_groups(manifest, groups)
-    for m in groups:
-        evicting = [
-            ns
-            for ns, o in zip(m.tables.namespaces, m._dynamicemb_options)
-            if o.score_strategy.name != "NO_EVICTION"
-        ]
-        if evicting:
-            raise ValueError(
-                f"legacy native checkpoint {ckpt_dir} has no eviction index for "
-                f"{evicting}; resume it with score_strategy NO_EVICTION and save "
-                "once to convert it to the logical format."
-            )
-    logger.info(f"restoring RocksDB tables from legacy native checkpoint {ckpt_dir}")
-    if not manifest.get("exact_resume", True):
-        logger.warning(
-            f"{ckpt_dir} was imported without optimizer state; RocksDB tables "
-            "start with reset optimizer state (not an exact resume)."
-        )
-    assert _session is not None and _model_dir is not None
-    t0 = time.perf_counter()
-    for m in groups:
-        m.reset_cache_states()
-    clone = os.path.join(
-        rank_dir(_model_dir, rank), f"{_mode}-{int(time.time() * 1000)}-{os.getpid()}"
-    )
-    stats = clone_checkpoint(manifest["native_checkpoint"], clone)
-    _session.swap_working_db(clone)
-    for m, state in zip(groups, states):
-        m.tables.refresh_namespaces()
-        if load_optim:
-            m.optimizer.set_opt_args(state["opt_args"])
-        if getattr(m, "_scores", None) is not None:
-            for name, score in state["scores"].items():
-                if name in m._scores:
-                    m._scores[name] = score
-        counter = getattr(m, "_admission_counter", None)
-        if counter is not None and state.get("counter"):
-            for t, ns in enumerate(m.tables.namespaces):
-                counter.load(
-                    *_legacy_counter_paths(ckpt_dir, ns, rank),
-                    t,
-                    m._dynamicemb_options[t].dist_type,
-                    shard_index=state["shard_index"],
-                    num_shards=state["num_shards"],
-                )
-    logger.info(
-        f"RANK[{rank}] restored RocksDB tables from {manifest['native_checkpoint']} "
-        f"in {time.perf_counter() - t0:.2f}s ({stats})"
-    )
-
-
-def _legacy_counter_paths(ckpt_dir: str, namespace: str, rank: int) -> List[str]:
-    base = os.path.join(ckpt_dir, MANIFEST_DIR, "counters")
-    return [
-        os.path.join(base, f"{namespace}.keys.rank_{rank}"),
-        os.path.join(base, f"{namespace}.frequencies.rank_{rank}"),
-    ]
 
 
 def reset_for_import(model: nn.Module) -> None:
@@ -735,20 +536,6 @@ def reset_for_import(model: nn.Module) -> None:
         f"RANK[{_rank()}] loading RocksDB tables into fresh working DB "
         f"{_session.work_dir}"
     )
-
-
-def prune_native_checkpoints() -> None:
-    """Delete this rank's legacy native checkpoints whose model.ckpt dir is gone.
-
-    Retention (keep_checkpoint_max, best and protected checkpoints) is decided
-    for ``model.ckpt-*`` on rank 0; every rank follows it for its own disk.
-    """
-    if _session is None or _model_dir is None:
-        return
-    for native in glob.glob(os.path.join(rank_dir(_model_dir, _rank()), "ckpt-*")):
-        step = native.rsplit("-", 1)[-1]
-        if not os.path.isdir(os.path.join(_model_dir, f"model.ckpt-{step}")):
-            shutil.rmtree(native, ignore_errors=True)
 
 
 def remove_incomplete_checkpoints(model_dir: str, after_step: int) -> None:

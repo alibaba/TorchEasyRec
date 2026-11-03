@@ -95,8 +95,6 @@ export_config {
 
 凭证沿用阿里云默认凭证链，以及运行环境中的 `FEATUREDB_USERNAME`、`FEATUREDB_PASSWORD`；不要将凭证写入 `pipeline.config`。
 
-RocksDB 存储的 dynemb 表（见 [Dynamic Embedding](../feature/dynamicemb.md) 的 RocksDB 存储章节）的 checkpoint 与普通 dynemb 表格式相同，按同样的方式导出。旧版本的原生 RocksDB checkpoint（含 `rocksdb/rank_<r>.json`）需要原生 checkpoint 目录仍然存在，且只支持 `USE_DISTRIBUTED_EMBEDDING=1` 的非 RTP 导出。
-
 ### 执行导出
 
 从仓库根目录、依赖版本匹配的项目环境执行，显式指定一个已写入完成、导出期间不会再改变的 checkpoint，并使用新的导出目录：

@@ -68,14 +68,7 @@ from tzrec.features.feature import (
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import (
-    checkpoint_util,
-    config_util,
-    env_util,
-    npz_util,
-    quant_util,
-    rocksdb_util,
-)
+from tzrec.utils import checkpoint_util, config_util, env_util, npz_util, quant_util
 from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.dynamic_embedding_export import get_dynamic_embedding_export
 from tzrec.utils.feature_store_uploader import FeatureStoreFullUploader
@@ -169,16 +162,6 @@ def export_model(
                 "dynamic_embedding requires "
                 "USE_DISTRIBUTED_EMBEDDING=1 and a non-RTP export"
             )
-    if (
-        checkpoint_path
-        and rocksdb_util.has_native_checkpoint(checkpoint_path)
-        and (use_rtp or not use_dist_embedding)
-    ):
-        raise ValueError(
-            "legacy native RocksDB checkpoints are exported only with "
-            "USE_DISTRIBUTED_EMBEDDING=1 (non-RTP), which streams the tables "
-            "from the native checkpoint; re-save the run to use any export."
-        )
     if use_rtp:
         impl = export_rtp_model
     elif use_dist_embedding:

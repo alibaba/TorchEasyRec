@@ -103,9 +103,8 @@ def _mount_entry(path: str) -> Tuple[str, str, str]:
 def allocated_bytes(root: str) -> int:
     """Filesystem allocation of the files under ``root``, each inode once.
 
-    Hard links (for example SSTs shared with a native checkpoint) are counted
-    once; the allocation is ``st_blocks * 512``, which on NFS is the server's
-    report and may differ from quota accounting.
+    Hard links are counted once; the allocation is ``st_blocks * 512``, which
+    on NFS is the server's report and may differ from quota accounting.
     """
     seen = set()
     total = 0
