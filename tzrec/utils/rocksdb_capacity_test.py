@@ -137,6 +137,7 @@ class DiskPlanTest(unittest.TestCase):
             p.training_peak,
             p.sst_bytes + 10 * GIB + GIB + int(1000 * 120 * 1.5),
         )
+        self.assertEqual(p.restore_peak, p.sst_bytes + 10 * GIB + GIB + 10**8 * 100)
         # Scenarios are alternatives: the peak is their max plus the reserve.
         self.assertEqual(
             p.projected_peak, max(p.training_peak, p.save_peak, p.restore_peak) + GIB

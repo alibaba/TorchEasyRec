@@ -290,13 +290,15 @@ def plan_domains(
     training (live SSTs, compaction output, other files, one step of
     overshoot), save (training plus the overwritten versions a full cache
     flush leaves until compaction; background work is paused while the export
-    reads, so a snapshot pins nothing) and restore (a fresh DB bulk-loaded from
-    the logical checkpoint, compacting while it loads).
+    reads, so a snapshot pins nothing) and restore (a fresh DB ingested from
+    the logical checkpoint as sorted files, plus the local spill of a table
+    too large to sort at once, bounded by the largest table).
     """
     factor, source = sst_factor(cfg)
     logical = sum(t.logical_bytes for t in tables)
     overshoot = sum(t.overshoot_rows * (t.row_bytes + t.index_bytes) for t in tables)
     flush = sum(t.cache_rows * t.row_bytes for t in tables)
+    spill = max((t.rows * t.row_bytes for t in tables), default=0)
     by_domain: Dict[str, List[DomainObservation]] = {}
     for obs in observations:
         by_domain.setdefault(domain_key(obs, cfg.storage_domain), []).append(obs)
@@ -311,7 +313,7 @@ def plan_domains(
         save_extra = flush * n
         reserve = cfg.disk_reserve_bytes
         save = training + save_extra
-        restore = sst + headroom + other
+        restore = sst + headroom + other + spill * n
         peak = max(training, save, restore) + reserve
         existing = sum(o.job_bytes for o in members)
         free = min(o.free_bytes for o in members)
