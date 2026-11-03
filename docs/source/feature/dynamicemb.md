@@ -146,8 +146,8 @@ feature_configs {
   - local_path: 在线数据库的根目录，目录结构为 `<local_path>/<run_id>/rank_<r>/`，`run_id` 由 model_dir 计算。使用本地盘、ESSD 或极速型 NAS，不要使用 tmpfs，也不要使用 OSS 挂载目录
   - placement: EXPLICIT 或 AUTO
   - gpu_cache_value_bytes_per_rank: RocksDB 表 GPU cache 中 embedding + 优化器状态的显存预算，按各 RocksDB 表在本 rank 上的参数量等比例分配。必须大于 0（RocksDB 表总是在 GPU cache 之后），且小于全部 RocksDB 表在本 rank 上的参数总量（dynamicemb 在显存放得下全表时会忽略外部存储）
-  - block_cache_bytes_per_rank / write_buffer_bytes_per_rank / staging_buffer_bytes_per_rank: RocksDB block cache、memtable 和单次读写的 pinned 内存预算。有表放到 RocksDB 时，三者之和加约 2GB 开销从规划器的主机内存容量中扣除一次
-  - io_threads: 一次批量查表拆分给多少个线程并发读，网络存储（NAS、云盘）建议调大
+  - block_cache_bytes_per_rank / write_buffer_bytes_per_rank / staging_buffer_bytes_per_rank: RocksDB block cache、memtable 和单次读写的 pinned 内存预算。有表放到 RocksDB 时，三者之和加约 2GB 开销从规划器的主机内存容量中扣除一次。恢复导入时 block cache 和 memtable 还用不到，导入用这两项的预算缓存待排序的行
+  - io_threads: 一次批量查表拆分给多少个线程并发读，也是恢复时并发读取 checkpoint 文件、写 SST 文件的线程数；网络存储（NAS、OSS、云盘）建议调大
   - max_background_jobs: RocksDB flush/compaction 线程数，默认 8
   - disk_budget_bytes: 本任务在 local_path 所在存储上最多可以占用的字节数，有表放到 RocksDB 时必填。共享同一存储（同一 NAS 服务器、同一本地盘，或相同 storage_domain）的所有 rank 共用这一个预算
   - storage_domain: 显式指定存储域。NFS/CPFS 按服务器、本地块设备按“主机+设备”自动识别；FUSE 或无法识别的文件系统必须配置
@@ -181,7 +181,7 @@ feature_configs {
 - RocksDB 表与内存版 DynamicEmbedding 表使用完全相同的 checkpoint 格式：保存时 `DynamicEmbDump` 先把 GPU cache 写回，再从冻结的数据库视图（暂停后台 flush/compaction、持有快照，未落盘的 memtable 直接读取，不强制刷盘）按块流式写出 `model.ckpt-<step>/dynamicemb/` 下的 keys/values/scores/opt_values 文件，最后写 `_SUCCESS`。不会在训练盘上保留历史 checkpoint，也不会先在本地落一份完整导出
 - model_dir 可以是 OSS 挂载目录（如 DLC 的 ossfs 数据集），文件按顺序流式写入，由 ossfs 分片上传。单文件大小受 ossfs 分片大小 × 10000 限制，超过时报 `File too large`，请调大 `upload_buffer_size`（见 FAQ）
 - 开启 RocksDB 后，`--continue_train`、评估、预测和导出只会选择带 `_SUCCESS` 的 checkpoint；比恢复点更新、但没有 `_SUCCESS` 的 checkpoint 目录会被删除（日志中打印文件数和大小），在 OSS 上重命名等于全量复制
-- 恢复时先清空 GPU cache，再新建一个空的工作库，从 checkpoint 文件按块加载；上一次的工作库和崩溃遗留的数据不会被复用。因此只要 checkpoint 完整，本地盘丢失后也可以在其它节点恢复
+- 恢复时先清空 GPU cache，再新建一个空的工作库，按表并发读取 checkpoint 文件、只保留本 rank 的 id，排序后直接写成 SST 文件导入最底层，不经过 memtable 和 compaction；一张表在上述内存预算内放不下时，按 id 区间分几轮导入（每轮重新读一遍该表的文件）。上一次的工作库和崩溃遗留的数据不会被复用。因此只要 checkpoint 完整，本地盘丢失后也可以在其它节点恢复
 - checkpoint 与放置方式无关：同一份 checkpoint 可以在内存版和 RocksDB 版之间恢复，也可以在调整预算后由 AUTO 选出不同的放置继续训练。若放置变化使原本不在同一融合组、优化器参数（例如 Adam 的迭代次数）不同的表融合到一起，恢复会报错。world size、维度或优化器类型的变化按 dynamicemb 自身的规则校验
 - 内存表接近 `max_capacity` 时，改变 world size 恢复会让 key 落到新的哈希 bucket，装不下的 bucket 按淘汰策略丢弃其中分数最低的行（装填率约 97% 时，`bucket_capacity` 为 128 约丢失 2.3%，为 1024 约丢失 0.3%）。RocksDB 表没有 bucket，不受影响；world size 不变时恢复也不会丢行
 - 评估、导出时 RocksDB 表同样从 checkpoint 文件加载到一个新的临时数据库（会占用与表大小相当的磁盘）

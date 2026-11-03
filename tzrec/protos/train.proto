@@ -183,8 +183,9 @@ message RocksDBConfig {
     optional uint64 write_buffer_bytes_per_rank = 4 [default = 1073741824];
     // pinned host staging buffer per storage call; larger batches are chunked.
     optional uint64 staging_buffer_bytes_per_rank = 5 [default = 268435456];
-    // native threads one batched lookup is split across (hides filesystem
-    // read latency; raise for network filesystems).
+    // native threads one batched lookup is split across, and the concurrent
+    // checkpoint reads and SST writes of a restore (hides filesystem read
+    // latency; raise for network filesystems).
     optional uint32 io_threads = 6 [default = 16];
     // RocksDB flush and compaction threads per rank.
     optional uint32 max_background_jobs = 7 [default = 8];
