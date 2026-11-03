@@ -219,14 +219,17 @@ def _get_optimizer_multipler(
 ) -> float:
     """Optimizer state size per embedding element in DynamicEmb's value layout.
 
-    Row-wise Adagrad reserves a 16-byte state slot per row. FTRL keeps a linear
-    and an accumulator term per element, so its state is twice the embedding width.
+    torchrec's table maps any class it does not know to 1 and counts row-wise
+    Adagrad as a single element per row. DynamicEmb reserves a 16-byte state slot
+    per row for row-wise Adagrad, and FTRL keeps a linear and an accumulator term
+    per element, so its state is twice the embedding width.
 
     Args:
         optimizer_class (type, optional): in-backward optimizer class of the
             table, None when the table is not trained.
         shape (torch.Size): unsharded table shape, used by row-wise optimizers.
-        dtype (torch.dtype): embedding dtype, also used for the value buffer.
+        dtype (torch.dtype): embedding dtype, which DynamicEmb also stores
+            optimizer state in.
 
     Returns:
         the multiplier applied to the embedding width.

@@ -184,6 +184,7 @@ class StorageFormulaTest(unittest.TestCase):
     def test_value_storage_matches_runtime(
         self, _name, optimizer_class, runtime_class, dtype, dim
     ):
+        """Planner value bytes equal DynamicEmb's allocated value buffer."""
         from dynamicemb import DynamicEmbTableOptions, optimizer
         from dynamicemb.key_value_table import DynamicEmbStorage
 
@@ -227,14 +228,20 @@ class OptimizerMultiplerTest(unittest.TestCase):
                 optimizer_class=rowwise_adagrad.RowWiseAdagrad,
                 expected=4 / 16,
             ),
+            param(
+                "rowwise_adagrad_fp16",
+                optimizer_class=rowwise_adagrad.RowWiseAdagrad,
+                dtype=torch.float16,
+                expected=8 / 16,
+            ),
             param("ftrl", optimizer_class=FTRL, expected=2.0),
         ],
         name_func=parameterized_name_func,
     )
-    def test_multipler(self, _name, optimizer_class, expected):
+    def test_multipler(self, _name, optimizer_class, expected, dtype=torch.float32):
         self.assertAlmostEqual(
             dynamicemb_util._get_optimizer_multipler(
-                optimizer_class, torch.Size([1024, 16]), torch.float32
+                optimizer_class, torch.Size([1024, 16]), dtype
             ),
             expected,
         )
