@@ -30,7 +30,12 @@ from tzrec.features import (
 from tzrec.features import feature as feature_lib
 from tzrec.features.feature import FgMode
 from tzrec.protos import feature_pb2
-from tzrec.utils.test_util import make_test_dir, parameterized_name_func
+from tzrec.utils import dynamicemb_util
+from tzrec.utils.test_util import (
+    make_test_dir,
+    mark_ci_scope,
+    parameterized_name_func,
+)
 
 _VOCAB_CONTENT = "a 1\nb 2\n"
 _VOCAB_ASSET_NAME = f"custom_vocab_{hashlib.md5(_VOCAB_CONTENT.encode()).hexdigest()}"
@@ -1195,6 +1200,53 @@ class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):
         features = feature_lib.create_features(feature_cfgs)
         with self.assertRaisesRegex(ValueError, "is_grouped_sequence=False"):
             feature_lib.project_grouped_sequence_feature_to_scalar(features[0])
+
+
+@unittest.skipUnless(
+    dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+)
+@mark_ci_scope("gpu")
+class EmbeddingConstraintsTest(unittest.TestCase):
+    """Forwarding of embedding_constraints into parameter constraints."""
+
+    def _id_feature(self, pooling_factor=0.0, **dynamicemb):
+        feat_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="cat_a", embedding_dim=8, num_buckets=100
+            )
+        )
+        for k, v in dynamicemb.items():
+            setattr(feat_cfg.id_feature.dynamicemb, k, v)
+        if pooling_factor:
+            feat_cfg.id_feature.embedding_constraints.pooling_factor = pooling_factor
+        return id_feature.IdFeature(feat_cfg)
+
+    def test_pooling_factor_is_forwarded(self):
+        feature = self._id_feature(pooling_factor=3.5)
+        const = feature.parameter_constraints(feature.emb_bag_config)
+        self.assertEqual(const.pooling_factors, [3.5])
+
+    def test_a_feature_without_constraints_has_none(self):
+        feature = self._id_feature()
+        self.assertIsNone(feature.parameter_constraints(feature.emb_bag_config))
+
+    def test_dynamicemb_takes_pooling_factor_from_embedding_constraints(self):
+        feature = self._id_feature(pooling_factor=36.3, max_capacity=100_000)
+        const = feature.parameter_constraints(feature.emb_bag_config)
+        self.assertTrue(const.use_dynamicemb)
+        self.assertAlmostEqual(const.pooling_factors[0], 36.3, places=5)
+
+    def test_dynamicemb_without_pooling_factor_keeps_the_default(self):
+        feature = self._id_feature(max_capacity=100_000)
+        const = feature.parameter_constraints(feature.emb_bag_config)
+        self.assertTrue(const.use_dynamicemb)
+        self.assertEqual(const.pooling_factors, [1.0])
+
+    def test_dynamicemb_rejects_other_embedding_constraints(self):
+        feature = self._id_feature(max_capacity=100_000)
+        feature.config.embedding_constraints.sharding_types.append("table_wise")
+        with self.assertRaisesRegex(ValueError, "only pooling_factor may be set"):
+            feature.parameter_constraints(feature.emb_bag_config)
 
 
 if __name__ == "__main__":

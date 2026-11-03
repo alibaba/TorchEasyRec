@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import random
 import unittest
 from types import SimpleNamespace
@@ -19,7 +20,6 @@ import torch
 from parameterized import parameterized
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
-from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
 from torchrec.distributed.planner.proposers import GridSearchProposer
 from torchrec.distributed.planner.types import PlannerError, Topology
@@ -27,8 +27,14 @@ from torchrec.distributed.test_utils.test_model import TestSparseNN
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
+from tzrec.protos import feature_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.plan_util import DynamicProgrammingProposer, _sparse_dp_proposor_numpy
+from tzrec.utils.plan_util import (
+    DynamicProgrammingProposer,
+    EmbeddingEnumerator,
+    _sparse_dp_proposor_numpy,
+    create_planner,
+)
 from tzrec.utils.test_util import mark_ci_scope
 
 
@@ -96,6 +102,60 @@ class PlanUtilTest(unittest.TestCase):
         self.assertAlmostEqual(best_dp_perf, best_grid_perf)
         for k, v in best_grid_proposal.items():
             self.assertEqual(str(v), str(best_dp_proposal[k]))
+
+    def test_global_pooling_factor_is_rejected(self) -> None:
+        # ids per sample differ per feature, so a global value means nothing.
+        import torch.distributed as dist
+
+        for k, v in (
+            ("RANK", "0"),
+            ("WORLD_SIZE", "1"),
+            ("MASTER_ADDR", "127.0.0.1"),
+            ("MASTER_PORT", "29711"),
+        ):
+            os.environ[k] = v
+        if not dist.is_initialized():
+            dist.init_process_group(backend="gloo")
+        try:
+            global_cfg = feature_pb2.ParameterConstraints()
+            global_cfg.pooling_factor = 2.0
+            with self.assertRaisesRegex(
+                ValueError, "global_embedding_constraints cannot set pooling_factor"
+            ):
+                create_planner(
+                    device=torch.device("cpu"),
+                    batch_size=32,
+                    global_constraints_cfg=global_cfg,
+                )
+        finally:
+            dist.destroy_process_group()
+
+    def test_pooling_factor_reaches_sharding_options(self) -> None:
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        topology = Topology(world_size=1, compute_device="cpu")
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=8,
+                name="table_a",
+                feature_names=["feature_a"],
+            )
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=16,
+            fqn_constraints={
+                "sparse.ebc.table_a": ParameterConstraints(pooling_factors=[3.0])
+            },
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=get_default_sharders()
+        )
+        self.assertTrue(search_space)
+        for sharding_option in search_space:
+            self.assertEqual(sharding_option.input_lengths, [3.0])
 
     def test_dp_proposer_with_prune(self) -> None:
         topology = Topology(

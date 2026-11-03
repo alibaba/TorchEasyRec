@@ -225,3 +225,35 @@ train_config {
 - 该表由dense_optimizer更新，sparse_optimizer中配置的优化器类型和LR策略对它不生效，它跟随dense_optimizer的LR策略
 - 该表的参数会参与`dense_optimizer.part_optimizers`的`regex_pattern`匹配，也会被`dense_optimizer.ema`纳入
 - 如需让所有Embedding都由sparse_optimizer管理，可以在`sharding_types`中排除`data_parallel`
+
+(pooling-factor)=
+
+### pooling_factor
+
+每个特征可以在`embedding_constraints`中配置`pooling_factor`，表示一个样本通过该特征查这张表带来的平均Id数。规划器用它估算每步的查表量、输入输出张量大小和dynamicemb GPU cache；不配置的特征按每个样本1个Id估算。多个特征共用一张表（相同的`embedding_name`）时，它们的`pooling_factor`会相加
+
+```
+feature_configs {
+    id_feature {
+        feature_name: "tag"
+        embedding_dim: 8
+        embedding_constraints {
+            pooling_factor: 36.3
+        }
+    }
+}
+```
+
+该值通常不从数据里人工估计，用工具从训练数据中测量并写入一个新配置文件（不修改原配置）：
+
+```bash
+python -m tzrec.tools.add_pooling_factor_to_config \
+    --pipeline_config_path pipeline.config \
+    --output_path pipeline_measured.config \
+    --num_batches 100
+```
+
+- 工具通过训练数据的dataloader读取`num_batches`个batch（走FG流程，无需模型和GPU），dynamicemb特征统计去重后的Id数（与查表一致），其它表统计全部Id；写入的是每batch最大Id数除以`batch_size`，向上取整
+- 配置了dynamicemb的特征只能通过`embedding_constraints`设置`pooling_factor`，同时设置`sharding_types`或`compute_kernels`会报错（dynamicemb的分片方式和计算内核是固定的）
+- `train_config.global_embedding_constraints`不支持`pooling_factor`（各特征的查表量不同），配置了会报错
+- 数据分布变化后请重新测量；配置了`pooling_factor`后规划器对显存和性能的估算会变化，规划结果可能与之前不同

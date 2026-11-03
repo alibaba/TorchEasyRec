@@ -258,6 +258,51 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["wide"].size(), (2, 8))
         self.assertEqual(result["deep"].size(), (2, 25))
 
+    def test_parameter_constraints_sum_a_shared_table(self):
+        # Features sharing a table add their ids per sample up; a feature that
+        # sets nothing contributes the default of one id per sample.
+        def _feature(name, pooling_factor=0.0):
+            feat_cfg = feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name=name,
+                    embedding_name="shared",
+                    embedding_dim=4,
+                    num_buckets=100,
+                )
+            )
+            if pooling_factor:
+                feat_cfg.id_feature.embedding_constraints.pooling_factor = (
+                    pooling_factor
+                )
+            return feat_cfg
+
+        for pooling_factors, expected in [
+            ([2.5, 1.5], [4.0]),
+            ([2.5, 0.0], [3.5]),
+            ([0.0, 2.5], [3.5]),
+            ([0.0, 0.0], [1.0]),
+        ]:
+            with self.subTest(pooling_factors=pooling_factors):
+                features = create_features(
+                    [
+                        _feature("cat_a", pooling_factors[0]),
+                        _feature("cat_b", pooling_factors[1]),
+                    ]
+                )
+                embedding_group = EmbeddingGroupImpl(
+                    features,
+                    [
+                        model_pb2.FeatureGroupConfig(
+                            group_name="deep",
+                            feature_names=["cat_a", "cat_b"],
+                            group_type=model_pb2.FeatureGroupType.DEEP,
+                        )
+                    ],
+                    device=torch.device("cpu"),
+                )
+                const = embedding_group.parameter_constraints()["ebc.shared"]
+                self.assertEqual(const.pooling_factors, expected)
+
     @parameterized.expand(
         [
             param("use_weight", use_weight=True),

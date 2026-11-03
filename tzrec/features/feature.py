@@ -378,6 +378,8 @@ def build_embedding_constraints(
         if len(constraints_cfg.compute_kernels) > 0
         else None,
     )
+    if constraints_cfg.pooling_factor > 0:
+        constraints.pooling_factors = [constraints_cfg.pooling_factor]
     return constraints
 
 
@@ -872,16 +874,29 @@ class BaseFeature(object, metaclass=_meta_cls):
         self, emb_config: Optional[BaseEmbeddingConfig]
     ) -> Optional[ParameterConstraints]:
         """Embedding parameter constraints."""
+        const = None
         if self.config.HasField("embedding_constraints"):
-            return build_embedding_constraints(self.config.embedding_constraints)
-        elif hasattr(self.config, "dynamicemb") and self.config.HasField("dynamicemb"):
-            emb_config = emb_config if emb_config is not None else self.emb_config
-            assert emb_config is not None
-            return dynamicemb_util.build_dynamicemb_constraints(
-                self.config.dynamicemb, emb_config
+            const = build_embedding_constraints(self.config.embedding_constraints)
+        if not (
+            hasattr(self.config, "dynamicemb") and self.config.HasField("dynamicemb")
+        ):
+            return const
+        if const is not None and (const.sharding_types or const.compute_kernels):
+            raise ValueError(
+                f"feature [{self.name}] uses dynamicemb, which fixes its "
+                "sharding type and compute kernel; of embedding_constraints "
+                "only pooling_factor may be set."
             )
-        else:
-            return None
+        emb_config = emb_config if emb_config is not None else self.emb_config
+        assert emb_config is not None
+        const = dynamicemb_util.build_dynamicemb_constraints(
+            self.config.dynamicemb, emb_config
+        )
+        if self.config.HasField("embedding_constraints") and (
+            self.config.embedding_constraints.pooling_factor > 0
+        ):
+            const.pooling_factors = [self.config.embedding_constraints.pooling_factor]
+        return const
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:
         """Build input field names with side."""

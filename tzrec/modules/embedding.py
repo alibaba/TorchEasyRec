@@ -617,6 +617,33 @@ def _is_weighted(emb_bag_configs: Dict[str, EmbeddingBagConfig]) -> bool:
     return any(x.is_weighted for x in emb_bag_configs.values())
 
 
+def _add_constraints(
+    store: Dict[str, ParameterConstraints],
+    name: str,
+    const: Optional[ParameterConstraints],
+) -> None:
+    """Record a table's constraints, adding up its features' ids per sample.
+
+    Features sharing a table add their lookups up. A feature that sets no
+    pooling_factor still looks up its sample's ids, so beside the factors that
+    are set each unset feature contributes the default of one id per sample;
+    a table whose features set none keeps that default.
+
+    Args:
+        store(Dict[str, ParameterConstraints]): a dict of table constraints.
+        name(str): embedding table name.
+        const(Optional[ParameterConstraints]): the feature's parameter
+            constraints, or None when it has none.
+    """
+    const = const if const is not None else ParameterConstraints()
+    old = store.get(name)
+    if old is not None and (
+        old.pooling_factors != [1.0] or const.pooling_factors != [1.0]
+    ):
+        const.pooling_factors = [sum(old.pooling_factors) + sum(const.pooling_factors)]
+    store[name] = const
+
+
 def _add_embedding_config(
     emb_configs: Dict[str, EmbeddingConfig], emb_config: EmbeddingConfig
 ) -> None:
@@ -820,10 +847,11 @@ class EmbeddingGroupImpl(nn.Module):
                             # mc module not support const now
                         else:
                             self.has_sparse_user = True
-                            if const is not None:
-                                self._emb_bag_constraints_user[emb_bag_config.name] = (
-                                    const
-                                )
+                            _add_constraints(
+                                self._emb_bag_constraints_user,
+                                emb_bag_config.name,
+                                const,
+                            )
                     else:
                         _add_embedding_bag_config(
                             emb_bag_configs=mc_emb_bag_configs
@@ -837,8 +865,9 @@ class EmbeddingGroupImpl(nn.Module):
                             # mc module not support const now
                         else:
                             self.has_sparse = True
-                            if const is not None:
-                                self._emb_bag_constraints[emb_bag_config.name] = const
+                            _add_constraints(
+                                self._emb_bag_constraints, emb_bag_config.name, const
+                            )
 
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + emb_bag_config.name
@@ -1148,10 +1177,11 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             # mc module not support const now
                         else:
                             self.has_sparse_user = True
-                            if const is not None:
-                                self._dim_to_emb_constraints_user[embedding_dim][
-                                    emb_config.name
-                                ] = const
+                            _add_constraints(
+                                self._dim_to_emb_constraints_user[embedding_dim],
+                                emb_config.name,
+                                const,
+                            )
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq_user = True
                     else:
@@ -1174,10 +1204,11 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             # mc module not support const now
                         else:
                             self.has_sparse = True
-                            if const is not None:
-                                self._dim_to_emb_constraints[embedding_dim][
-                                    emb_config.name
-                                ] = const
+                            _add_constraints(
+                                self._dim_to_emb_constraints[embedding_dim],
+                                emb_config.name,
+                                const,
+                            )
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq = True
                 else:
