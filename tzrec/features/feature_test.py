@@ -1243,12 +1243,12 @@ class EmbeddingConstraintsTest(unittest.TestCase):
     @mark_ci_scope("gpu")
     def test_dynamicemb_takes_factors_from_embedding_constraints(self):
         feature = self._id_feature(
-            pooling_factor=36.3, unique_id_factor=37166.0, max_capacity=100_000
+            pooling_factor=36.3, unique_id_factor=41.0, max_capacity=100_000
         )
         const = feature.parameter_constraints(feature.emb_bag_config)
         self.assertTrue(const.use_dynamicemb)
         self.assertAlmostEqual(const.pooling_factors[0], 36.3, places=5)
-        self.assertAlmostEqual(const.unique_id_factor, 37166.0, places=3)
+        self.assertAlmostEqual(const.unique_id_factor, 41.0, places=3)
         self.assertEqual(const.feature_names, ["cat_a"])
 
     @unittest.skipUnless(

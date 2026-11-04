@@ -233,7 +233,7 @@ train_config {
 每个特征可以在`embedding_constraints`中配置两个从训练数据测量的参数：
 
 - `pooling_factor`：一个样本通过该特征查这张表的平均原始Id位置数（含重复），最小为1。规划器用它估算每步查表量、输入输出张量大小和通信量
-- `unique_id_factor`：一个样本通过共用这张表的所有特征查表的去重Id数的最大值。`batch_size * unique_id_factor`是这张表保守的cache工作集估计（例如dynamicemb GPU cache需要容纳它）
+- `unique_id_factor`：单个样本通过共用这张表的所有特征查表的去重Id数的最大值（注意与`pooling_factor`不同，它不是平均值，而是最重的一个样本的去重数）。`batch_size * unique_id_factor`是这张表保守的cache工作集估计（例如dynamicemb GPU cache需要容纳它）
 
 ```
 feature_configs {
@@ -241,17 +241,14 @@ feature_configs {
         feature_name: "tag"
         embedding_dim: 8
         embedding_constraints {
+            # 平均每个样本36.3个原始Id；最重的一个样本41个去重Id
+            # batch_size=1024时，该表单个batch的去重工作集估计为1024*41=42064
             pooling_factor: 36.3
-            unique_id_factor: 37166
+            unique_id_factor: 41
         }
     }
 }
 ```
-
-- 共用一张表（相同的`embedding_name`）的特征各保留自己的`pooling_factor`，一张表一个输入一项，按配置顺序；未配置的特征按每个样本1个Id计
-- `unique_id_factor`是表级的测量值，写在每个成员特征上，合并时对已配置的值取最大值；未配置的成员不参与，全部未配置时表级值为空（原始的平均长度不能约束最大的去重工作集，因此不虚构任何替代值）
-- 配置了dynamicemb的特征只能通过`embedding_constraints`设置这两个字段，同时设置`sharding_types`或`compute_kernels`会报错（dynamicemb的分片方式和计算内核是固定的）
-- `train_config.global_embedding_constraints`不支持这两个字段（各特征的查表量不同），配置了会报错
 
 这两个值用工具从训练数据中测量并写入一个新配置文件（不修改原配置）：
 
