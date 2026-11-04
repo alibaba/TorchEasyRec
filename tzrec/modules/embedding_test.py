@@ -334,7 +334,7 @@ class EmbeddingGroupTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_shared_table_keeps_one_entry_per_feature(
+    def test_shared_table_preserves_feature_order_and_pooling_factors(
         self,
         name,
         pooling_a=None,
@@ -383,7 +383,7 @@ class EmbeddingGroupTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_shared_table_unique_id_factor_takes_the_max(
+    def test_shared_table_unique_id_factor_aggregation(
         self,
         name,
         pooling_a=None,
@@ -409,7 +409,7 @@ class EmbeddingGroupTest(unittest.TestCase):
         else:
             self.assertEqual(const.unique_id_factor, expected)
 
-    def test_sequence_groups_with_same_subfeature_name_stay_apart(self) -> None:
+    def test_shared_table_preserves_sequence_feature_identity(self) -> None:
         # two sequence groups whose sub-features share the bare config name
         # and one table are two inputs; the constraint identity is the batch
         # name, so neither collapses into the other

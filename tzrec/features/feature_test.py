@@ -1151,7 +1151,7 @@ class FeatureTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_factors_are_forwarded_with_the_feature_name(
+    def test_feature_statistics_populate_constraints(
         self, name, pooling_factor=None, unique_id_factor=None
     ):
         feature = self._id_feature(

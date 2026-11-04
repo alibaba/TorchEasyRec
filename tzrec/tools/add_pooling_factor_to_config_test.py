@@ -191,7 +191,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         ).measure(cfg, features, [("ebc.id_a_emb", ["id_a"])])
         self.assertEqual(factors["id_a"][0], 2.6)
 
-    def test_a_missing_table_member_measures_no_union(self):
+    def test_incomplete_shared_table_has_no_unique_id_estimate(self):
         # a missing member is not an empty one: its table keeps no union
         # measurement, while the member that did appear is still measured
         test_dir = make_test_dir()
@@ -202,7 +202,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         )
         self.assertEqual(factors["id_a"], (1.0, 0.0))
 
-    def test_an_empty_table_member_measures_its_union(self):
+    def test_shared_table_union_handles_empty_samples(self):
         # an observed feature with no ids is a member like any other: the
         # union is measured over every sample
         test_dir = make_test_dir()
@@ -215,7 +215,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         self.assertEqual(factors["id_a"], (1.0, 2.0))
         self.assertEqual(factors["sparse_c"], (1.0, 2.0))
 
-    def test_get_embedding_table_features_resolves_physical_tables(self):
+    def test_table_feature_mapping_preserves_sharing_and_separation(self):
         cfg = _config("unused.parquet")
         from tzrec.datasets.utils import BASE_DATA_GROUP
         from tzrec.main import _create_features
@@ -312,7 +312,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
             9.0,
         )
 
-    def test_rejects_a_zero_batch_count_and_the_input_path(self):
+    def test_invalid_tool_arguments_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "num_batches"):
             AddPoolingFactorToConfig("in.config", "out.config", 0)
         with self.assertRaisesRegex(ValueError, "output_path"):

@@ -138,7 +138,7 @@ class PlanUtilTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_pooling_factors_reach_sharding_options(
+    def test_pooling_factors_affect_shared_table_storage_estimates(
         self, name, table_name, feature_names, pooling_factors
     ) -> None:
         # one entry per input feature survives enumeration; the estimation
@@ -304,7 +304,7 @@ class PlanUtilTest(unittest.TestCase):
         torch.cuda.is_available(), "CUDA is required for create_planner."
     )
     @mark_ci_scope("gpu")
-    def test_saved_plan_pins_sharding_behind_statistics_only_constraints(self):
+    def test_checkpoint_sharding_applies_with_statistics_only_constraints(self):
         # every sparse table now carries a constraint entry (measured pooling
         # factors); an entry that does not restrict sharding must not disable
         # the data_parallel pin that resume depends on
@@ -322,7 +322,7 @@ class PlanUtilTest(unittest.TestCase):
         torch.cuda.is_available(), "CUDA is required for create_planner."
     )
     @mark_ci_scope("gpu")
-    def test_own_sharding_types_outrank_the_saved_plan(self):
+    def test_explicit_sharding_overrides_checkpoint_plan(self):
         from torchrec.distributed.planner.types import ParameterConstraints
 
         constraint = ParameterConstraints(
