@@ -259,8 +259,5 @@ python -m tzrec.tools.add_pooling_factor_to_config \
     --num_batches 100
 ```
 
-- 工具通过训练数据的dataloader读取`num_batches`个batch（走FG流程，无需模型和GPU），按实际样本数计算，包含不完整的尾batch
-- `pooling_factor`是全部读到的原始Id数除以实际样本数，最小为1；`unique_id_factor`是每个batch内按样本、对共用一张表的所有特征取Id并集后的去重个数，取所有样本的最大值
-- 同一张表的两个值写在每个成员特征上；一个特征接入多张物理表（如input-tile复制出的user侧表）时取这些表测量值的最大值
 - 数据分布变化后请重新测量；测量值不保证覆盖未来的数据
 - `pooling_factor`参与规划器对输入输出张量和通信量的估算，配置后规划结果可能与之前不同；`unique_id_factor`当前不参与规划，用于按`batch_size * unique_id_factor`估算一张表单个batch的去重工作集，以便自行设置`max_capacity`/`init_capacity_per_rank`等容量（见[DynamicEmbedding使用说明](../feature/dynamicemb.md)）
