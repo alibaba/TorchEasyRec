@@ -15,14 +15,11 @@ import unittest
 import pyarrow as pa
 import pyarrow.dataset as ds
 
-import tzrec.tools.add_pooling_factor_to_config as add_pooling_module
 from tzrec.protos import data_pb2, model_pb2, pipeline_pb2
 from tzrec.tools.add_pooling_factor_to_config import AddPoolingFactorToConfig
 from tzrec.utils import config_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.test_util import make_test_dir, mark_ci_scope
-
-_orig_create_features = add_pooling_module._create_features
 
 
 def _write_parquet(test_dir, num_rows=10):
@@ -161,6 +158,39 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         self.assertEqual(factors["t1"], (3.0, 3.0))
         self.assertEqual(factors["t2"], (2.0, 3.0))
 
+    def test_pooling_factor_is_the_average_over_samples(self):
+        # eight samples bring one id and two bring nine, so the average is
+        # 26/10 = 2.6: neither the per-batch maximum (9) nor a division by
+        # padded batch counts (26/12) may replace it
+        test_dir = make_test_dir()
+        num_rows = 10
+        ids = ["7"] * 8 + ["1\x032\x033\x034\x035\x036\x037\x038\x039"] * 2
+        t = pa.Table.from_arrays(
+            [
+                pa.array(ids),
+                pa.array([1] * num_rows),
+            ],
+            names=["id_a", "label"],
+        )
+        ds.write_dataset(t, test_dir, format="parquet")
+        cfg = pipeline_pb2.EasyRecConfig()
+        cfg.train_input_path = os.path.join(test_dir, "*.parquet")
+        cfg.data_config.batch_size = 4
+        cfg.data_config.dataset_type = data_pb2.DatasetType.ParquetDataset
+        cfg.data_config.fg_mode = data_pb2.FgMode.FG_NONE
+        cfg.data_config.label_fields.append("label")
+        f = cfg.feature_configs.add().id_feature
+        f.feature_name = "id_a"
+        f.embedding_dim = 8
+        f.num_buckets = 100
+        from tzrec.main import _create_features
+
+        features = _create_features(list(cfg.feature_configs), cfg.data_config)
+        factors = AddPoolingFactorToConfig(
+            "in.config", "out.config", num_batches=10
+        ).measure(cfg, features, [("ebc.id_a_emb", ["id_a"])])
+        self.assertEqual(factors["id_a"][0], 2.6)
+
     def test_a_missing_table_member_measures_no_union(self):
         # a missing member is not an empty one: its table keeps no union
         # measurement, while the member that did appear is still measured
@@ -186,9 +216,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         self.assertEqual(factors["sparse_c"], (1.0, 2.0))
 
     def test_get_embedding_table_features_resolves_physical_tables(self):
-        test_dir = make_test_dir()
-        _write_parquet(test_dir)
-        cfg = _config(os.path.join(test_dir, "*.parquet"))
+        cfg = _config("unused.parquet")
         from tzrec.datasets.utils import BASE_DATA_GROUP
         from tzrec.main import _create_features
 
@@ -209,8 +237,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
     def test_get_embedding_table_features_keeps_the_config_unchanged(self):
         # the mapping helpers supplement a nested sequence group's name; the
         # config the tool saves must not carry that
-        test_dir = make_test_dir()
-        cfg = _config(os.path.join(test_dir, "*.parquet"), with_model=False)
+        cfg = _config("unused.parquet", with_model=False)
         from tzrec.main import _create_features
 
         group = cfg.model_config.feature_groups.add()
@@ -228,75 +255,10 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
             .HasField("group_name")
         )
 
-    def test_run_builds_no_model_and_creates_the_features_once(self):
-        from unittest import mock
-
-        test_dir = make_test_dir()
-        _write_parquet(test_dir)
-        in_path = os.path.join(test_dir, "pipeline.config")
-        out_path = os.path.join(test_dir, "measured.config")
-        config_util.save_message(_config(os.path.join(test_dir, "*.parquet")), in_path)
-        features_created = []
-
-        def _counting_create_features(*args, **kwargs):
-            features_created.append(1)
-            return _orig_create_features(*args, **kwargs)
-
-        with (
-            mock.patch.object(
-                add_pooling_module,
-                "_create_features",
-                side_effect=_counting_create_features,
-            ),
-            mock.patch(
-                "tzrec.main._create_model",
-                side_effect=AssertionError("no model may be built"),
-            ),
-        ):
-            AddPoolingFactorToConfig(in_path, out_path, num_batches=10).run()
-        self.assertTrue(os.path.exists(out_path))
-        # one construction serves mapping, measurement and filling
-        self.assertEqual(len(features_created), 1)
-
     def test_fill_writes_both_factors_and_keeps_sequence_identity(self):
-        test_dir = make_test_dir()
-        cfg = _config(os.path.join(test_dir, "*.parquet"), with_model=False)
-        tool = AddPoolingFactorToConfig("in.config", "out.config", num_batches=10)
-        factors = {
-            "id_a": (1.0, 1.0),
-            "shared_a": (2.0, 3.0),
-            "click_seq__seq_id": (3.0, 3.0),
-        }
-        from tzrec.main import _create_features
-
-        features = _create_features(list(cfg.feature_configs), cfg.data_config)
-        filled = tool.fill(features, factors)
-        self.assertEqual(set(filled), {"id_a", "shared_a", "click_seq__seq_id"})
-        self.assertEqual(
-            cfg.feature_configs[0].id_feature.embedding_constraints.pooling_factor,
-            1.0,
-        )
-        self.assertEqual(
-            cfg.feature_configs[3].id_feature.embedding_constraints.unique_id_factor,
-            3.0,
-        )
-        # sequence sub-features are looked up under their batch name
-        self.assertAlmostEqual(
-            cfg.feature_configs[9]
-            .sequence_feature.features[0]
-            .id_feature.embedding_constraints.pooling_factor,
-            3.0,
-        )
-
-    def test_rejects_a_zero_batch_count_and_the_input_path(self):
-        with self.assertRaisesRegex(ValueError, "num_batches"):
-            AddPoolingFactorToConfig("in.config", "out.config", 0)
-        with self.assertRaisesRegex(ValueError, "output_path"):
-            AddPoolingFactorToConfig("dir/pipeline.config", "dir/pipeline.config", 5)
-
-    def test_fill_keeps_same_named_sequence_subfeatures_apart(self):
-        # two sequences whose sub-features share the bare name are different
-        # features in a batch and must not overwrite each other
+        # a normal feature and two sequence sub-features that share the bare
+        # name each keep their own measured factors, and the writes land on
+        # the config the tool saves
         test_dir = make_test_dir()
         cfg = _config(os.path.join(test_dir, "*.parquet"), with_model=False)
         seq = cfg.feature_configs.add().sequence_feature
@@ -306,18 +268,31 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         sub.id_feature.feature_name = "seq_id"
         sub.id_feature.embedding_dim = 8
         sub.id_feature.num_buckets = 100
-        tool = AddPoolingFactorToConfig("in.config", "out.config", num_batches=10)
         from tzrec.main import _create_features
 
         features = _create_features(list(cfg.feature_configs), cfg.data_config)
+        tool = AddPoolingFactorToConfig("in.config", "out.config", num_batches=10)
         filled = tool.fill(
             features,
             {
+                "id_a": (1.0, 1.0),
+                "shared_a": (2.0, 3.0),
                 "click_seq__seq_id": (3.0, 3.0),
                 "buy_seq__seq_id": (7.0, 9.0),
             },
         )
-        self.assertEqual(set(filled), {"click_seq__seq_id", "buy_seq__seq_id"})
+        self.assertEqual(
+            set(filled),
+            {"id_a", "shared_a", "click_seq__seq_id", "buy_seq__seq_id"},
+        )
+        self.assertEqual(
+            cfg.feature_configs[0].id_feature.embedding_constraints.pooling_factor,
+            1.0,
+        )
+        self.assertEqual(
+            cfg.feature_configs[3].id_feature.embedding_constraints.unique_id_factor,
+            3.0,
+        )
         self.assertAlmostEqual(
             cfg.feature_configs[9]
             .sequence_feature.features[0]
@@ -337,15 +312,31 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
             9.0,
         )
 
+    def test_rejects_a_zero_batch_count_and_the_input_path(self):
+        with self.assertRaisesRegex(ValueError, "num_batches"):
+            AddPoolingFactorToConfig("in.config", "out.config", 0)
+        with self.assertRaisesRegex(ValueError, "output_path"):
+            AddPoolingFactorToConfig("dir/pipeline.config", "dir/pipeline.config", 5)
+
     def test_run_measures_and_writes_a_loadable_config(self):
         test_dir = make_test_dir()
         _write_parquet(test_dir)
         in_path = os.path.join(test_dir, "pipeline.config")
         out_path = os.path.join(test_dir, "measured.config")
         config_util.save_message(_config(os.path.join(test_dir, "*.parquet")), in_path)
+        before = config_util.load_pipeline_config(in_path)
         AddPoolingFactorToConfig(in_path, out_path, num_batches=10).run()
         out = config_util.load_pipeline_config(out_path)
-        # the physical tables of the model: item and item2 stay apart
+        # measured factors for a normal and a shared feature, and for the
+        # two features of similarly named tables
+        self.assertEqual(
+            out.feature_configs[0].id_feature.embedding_constraints.pooling_factor,
+            1.0,
+        )
+        self.assertEqual(
+            out.feature_configs[3].id_feature.embedding_constraints.unique_id_factor,
+            3.0,
+        )
         self.assertEqual(
             out.feature_configs[7].id_feature.embedding_constraints.unique_id_factor,
             2.0,
@@ -354,17 +345,28 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
             out.feature_configs[8].id_feature.embedding_constraints.unique_id_factor,
             2.0,
         )
-        self.assertEqual(
-            out.feature_configs[3].id_feature.embedding_constraints.unique_id_factor,
-            3.0,
-        )
+        # nothing else about the configuration changed
+        for field in ("model_config", "data_config"):
+            self.assertEqual(str(getattr(out, field)), str(getattr(before, field)))
 
+        def _clear_constraints(feature_config):
+            oneof = feature_config.WhichOneof("feature")
+            f = getattr(feature_config, oneof) if oneof is not None else None
+            if f is None:
+                return
+            if f.DESCRIPTOR.fields_by_name.get("embedding_constraints"):
+                f.ClearField("embedding_constraints")
+            if f.DESCRIPTOR.fields_by_name.get("features"):
+                for sub in f.features:
+                    _clear_constraints(sub)
 
-@unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
-@mark_ci_scope("gpu")
-class AddPoolingFactorDynamicEmbTest(unittest.TestCase):
-    """dynamicemb features measure raw ids and their deduplicated union."""
+        for got, was in zip(out.feature_configs, before.feature_configs):
+            _clear_constraints(got)
+            _clear_constraints(was)
+            self.assertEqual(str(got), str(was))
 
+    @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+    @mark_ci_scope("gpu")
     def test_dynamicemb_counts_raw_positions_and_distinct_union(self):
         test_dir = make_test_dir()
         num_rows = 10

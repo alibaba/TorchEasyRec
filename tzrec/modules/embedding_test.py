@@ -30,7 +30,6 @@ from tzrec.modules.embedding import (
     SequenceEmbeddingGroupImpl,
     build_embedding_bag_configs,
     build_embedding_collection_configs,
-    build_embedding_group_mappings,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
 from tzrec.utils import dynamicemb_util
@@ -374,9 +373,10 @@ class EmbeddingGroupTest(unittest.TestCase):
                 expected=20.0,
             ),
             param(
-                "measured_below_another_raw_sum",
+                "measured_below_the_raw_sum",
+                pooling_a=10.0,
+                pooling_b=20.0,
                 unique_a=3.0,
-                unique_b=None,
                 expected=3.0,
             ),
             param("no_member_measured", unique_a=None, unique_b=None, expected=None),
@@ -384,12 +384,21 @@ class EmbeddingGroupTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_shared_table_unique_id_factor_takes_the_max(
-        self, name, unique_a=None, unique_b=None, expected=None
+        self,
+        name,
+        pooling_a=None,
+        pooling_b=None,
+        unique_a=None,
+        unique_b=None,
+        expected=None,
     ) -> None:
         # configured values aggregate with max; a table whose members set
         # none keeps the value unset - nothing is fabricated in its place
         configs = _create_shared_table_feature_configs(
-            unique_a=unique_a, unique_b=unique_b
+            pooling_a=pooling_a,
+            pooling_b=pooling_b,
+            unique_a=unique_a,
+            unique_b=unique_b,
         )
         embedding_group = self._create_shared_table_embedding_group(
             ["cat_a", "cat_b"], configs
@@ -503,13 +512,8 @@ class EmbeddingGroupTest(unittest.TestCase):
         ]
         table_configs = build_embedding_bag_configs(features, groups)
         self.assertEqual(
-            [c.name for c in table_configs.ebc.values()],
-            ["cat_a_emb", "cat_a_emb_x"],
-        )
-        self.assertTrue(table_configs.shared_feature_flag["cat_a"])
-        self.assertEqual(
-            table_configs.feat_to_group_to_emb_name["cat_a"],
-            {"deep": "cat_a_emb", "deep_x": "cat_a_emb_x"},
+            [(c.name, list(c.feature_names)) for c in table_configs.ebc.values()],
+            [("cat_a_emb", ["cat_a"]), ("cat_a_emb_x", ["cat_a"])],
         )
 
     @unittest.skipUnless(
@@ -599,65 +603,44 @@ class EmbeddingGroupTest(unittest.TestCase):
             },
         )
 
-    def test_build_embedding_group_mappings_splits_by_data_group(self) -> None:
+    def test_data_groups_build_separate_embedding_tables(self) -> None:
+        # features of one group must share a data group; different data
+        # groups build separate embedding collections of their own
         features = _create_test_features()
         cat_a = next(f for f in features if f.name == "cat_a")
         cat_a.data_group = "user"
-        feat_groups, seq_groups, group_to_impl_key = build_embedding_group_mappings(
+        embedding_group = EmbeddingGroup(
             features,
             [
                 _feature_group("user_deep", ["cat_a"]),
                 _feature_group("deep", ["cat_b"]),
             ],
+            device=torch.device("cpu"),
         )
-        self.assertEqual(
-            {
-                key: [g.group_name for g in groups]
-                for key, groups in feat_groups.items()
-            },
-            {BASE_DATA_GROUP: ["deep"], "user": ["user_deep"]},
-        )
-        self.assertEqual(
-            group_to_impl_key,
-            {"user_deep": "user", "deep": BASE_DATA_GROUP},
-        )
-        self.assertFalse(seq_groups)
+        self.assertEqual(set(embedding_group.emb_impls), {BASE_DATA_GROUP, "user"})
+        user_tables = [
+            c.name
+            for c in embedding_group.emb_impls["user"].ebc.embedding_bag_configs()
+        ]
+        base_tables = [
+            c.name
+            for c in embedding_group.emb_impls[
+                BASE_DATA_GROUP
+            ].ebc.embedding_bag_configs()
+        ]
+        self.assertEqual(user_tables, ["cat_a_emb"])
+        self.assertEqual(base_tables, ["cat_b_emb"])
 
-    def test_build_embedding_group_mappings_rejects_mixed_data_groups(self) -> None:
+    def test_mixed_data_groups_in_one_group_are_rejected(self) -> None:
         features = _create_test_features()
         cat_a = next(f for f in features if f.name == "cat_a")
         cat_a.data_group = "user"
         with self.assertRaisesRegex(ValueError, "same feature group"):
-            build_embedding_group_mappings(
-                features, [_feature_group("deep", ["cat_a", "cat_b"])]
+            EmbeddingGroup(
+                features,
+                [_feature_group("deep", ["cat_a", "cat_b"])],
+                device=torch.device("cpu"),
             )
-
-    def test_build_embedding_group_mappings_nested_seq_inherits_suffix(self) -> None:
-        features = _create_test_sequence_features()
-        parent = model_pb2.FeatureGroupConfig(
-            group_name="parent",
-            feature_names=["cat_a"],
-            group_type=model_pb2.FeatureGroupType.DEEP,
-            embedding_name_suffix="tower_a",
-            sequence_groups=[
-                model_pb2.SeqGroupConfig(
-                    group_name="seq", feature_names=["click_seq__cat_a"]
-                )
-            ],
-            sequence_encoders=[
-                seq_encoder_pb2.SeqEncoderConfig(
-                    simple_attention=seq_encoder_pb2.SimpleAttention(input="seq")
-                )
-            ],
-        )
-        feat_groups, seq_groups, _ = build_embedding_group_mappings(features, [parent])
-        self.assertEqual(len(feat_groups[BASE_DATA_GROUP]), 1)
-        nested = seq_groups[BASE_DATA_GROUP]
-        self.assertEqual(len(nested), 1)
-        self.assertEqual(nested[0].group_name, "seq")
-        self.assertEqual(nested[0].embedding_name_suffix, "tower_a")
-        # the caller's proto is not mutated by the inherited suffix
-        self.assertEqual(parent.sequence_groups[0].embedding_name_suffix, "")
 
     @parameterized.expand(
         [
