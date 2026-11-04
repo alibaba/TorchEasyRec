@@ -1202,9 +1202,6 @@ class ProjectGroupedSequenceFeatureToScalarTest(unittest.TestCase):
             feature_lib.project_grouped_sequence_feature_to_scalar(features[0])
 
 
-FACTOR_FIELDS = ("pooling_factor", "unique_id_factor")
-
-
 class EmbeddingConstraintsTest(unittest.TestCase):
     """Forwarding and validation of embedding_constraints."""
 
@@ -1228,30 +1225,15 @@ class EmbeddingConstraintsTest(unittest.TestCase):
         self.assertEqual(const.pooling_factors, [3.5])
         self.assertEqual(const.unique_id_factor, 7.0)
         self.assertEqual(const.feature_names, ["cat_a"])
+        # measured values below one are honored, not clamped
+        feature = self._id_feature(pooling_factor=0.5, unique_id_factor=0.25)
+        const = feature.parameter_constraints(feature.emb_bag_config)
+        self.assertEqual(const.pooling_factors, [0.5])
+        self.assertEqual(const.unique_id_factor, 0.25)
 
     def test_a_feature_without_constraints_has_none(self):
         feature = self._id_feature()
         self.assertIsNone(feature.parameter_constraints(feature.emb_bag_config))
-
-    @parameterized.expand(
-        [
-            param("pooling_factor", field="pooling_factor"),
-            param("unique_id_factor", field="unique_id_factor"),
-        ]
-    )
-    def test_factors_below_one_are_rejected(self, _name, field):
-        feature = self._id_feature(**{field: 0.5})
-        with self.assertRaisesRegex(ValueError, "at least 1"):
-            feature.parameter_constraints(feature.emb_bag_config)
-
-    @parameterized.expand(
-        [param("inf", field=f, value=float("inf")) for f in FACTOR_FIELDS]
-        + [param("nan", field=f, value=float("nan")) for f in FACTOR_FIELDS]
-    )
-    def test_non_finite_factors_are_rejected(self, _name, field, value):
-        feature = self._id_feature(**{field: value})
-        with self.assertRaisesRegex(ValueError, "finite"):
-            feature.parameter_constraints(feature.emb_bag_config)
 
     @unittest.skipUnless(
         dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."

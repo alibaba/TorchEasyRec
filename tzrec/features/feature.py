@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import hashlib
-import math
 import os
 import shutil
 from collections import OrderedDict
@@ -367,16 +366,6 @@ def _dtype_str_to_data_type(data_type_str: str) -> DataType:
     return data_type
 
 
-def _validate_factor(name: str, value: float) -> None:
-    """Reject a factor below 1 or non-finite."""
-    if not math.isfinite(value) or value < 1.0:
-        raise ValueError(
-            f"embedding_constraints.{name} must be a finite value of at least "
-            f"1, got {value} on feature constraints; measure it with "
-            "tzrec.tools.add_pooling_factor_to_config."
-        )
-
-
 def build_embedding_constraints(
     constraints_cfg: feature_pb2.ParameterConstraints,
 ) -> ParameterConstraints:
@@ -390,10 +379,8 @@ def build_embedding_constraints(
         else None,
     )
     if constraints_cfg.HasField("pooling_factor"):
-        _validate_factor("pooling_factor", constraints_cfg.pooling_factor)
         constraints.pooling_factors = [constraints_cfg.pooling_factor]
     if constraints_cfg.HasField("unique_id_factor"):
-        _validate_factor("unique_id_factor", constraints_cfg.unique_id_factor)
         constraints.unique_id_factor = constraints_cfg.unique_id_factor
     return constraints
 

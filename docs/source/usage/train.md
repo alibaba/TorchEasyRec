@@ -252,7 +252,6 @@ feature_configs {
 - `unique_id_factor`是表级的测量值，写在每个成员特征上，合并时取最大值；部分成员未配置时保守地退化为各成员`pooling_factor`之和（任意并集的上界），不会因为缺少测量而低估共用表
 - 配置了dynamicemb的特征只能通过`embedding_constraints`设置这两个字段，同时设置`sharding_types`或`compute_kernels`会报错（dynamicemb的分片方式和计算内核是固定的）
 - `train_config.global_embedding_constraints`不支持这两个字段（各特征的查表量不同），配置了会报错
-- 显式配置小于1或非有限的值会报错
 
 这两个值用工具从训练数据中测量并写入一个新配置文件（不修改原配置）：
 
