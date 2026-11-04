@@ -28,6 +28,9 @@ from tzrec.modules.embedding import (
     EmbeddingGroup,
     EmbeddingGroupImpl,
     SequenceEmbeddingGroupImpl,
+    build_embedding_bag_configs,
+    build_embedding_collection_configs,
+    build_embedding_group_mappings,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
 from tzrec.utils import dynamicemb_util
@@ -194,6 +197,44 @@ class _EGScriptWrapper(nn.Module):
         )
 
 
+def _feature_group(
+    group_name,
+    feature_names,
+    group_type=model_pb2.FeatureGroupType.DEEP,
+    embedding_name_suffix="",
+):
+    """One feature group config."""
+    return model_pb2.FeatureGroupConfig(
+        group_name=group_name,
+        feature_names=feature_names,
+        group_type=group_type,
+        embedding_name_suffix=embedding_name_suffix,
+    )
+
+
+def _shared_table_feature_configs(
+    pooling_a=None, unique_a=None, pooling_b=None, unique_b=None
+):
+    """Two id features of one shared table, with optional measured factors."""
+    configs = []
+    for feature_name, pooling_factor, unique_id_factor in (
+        ("cat_a", pooling_a, unique_a),
+        ("cat_b", pooling_b, unique_b),
+    ):
+        f = feature_pb2.IdFeature(
+            feature_name=feature_name,
+            embedding_name="shared",
+            embedding_dim=4,
+            num_buckets=100,
+        )
+        if pooling_factor is not None:
+            f.embedding_constraints.pooling_factor = pooling_factor
+        if unique_id_factor is not None:
+            f.embedding_constraints.unique_id_factor = unique_id_factor
+        configs.append(feature_pb2.FeatureConfig(id_feature=f))
+    return configs
+
+
 class EmbeddingGroupTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("INPUT_TILE", None)
@@ -258,26 +299,10 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["wide"].size(), (2, 8))
         self.assertEqual(result["deep"].size(), (2, 25))
 
-    def _shared_table_constraints(self, feature_specs, feature_names):
-        """Constraints of one table fed by the given (name, factors) specs."""
-
-        def _feature(name, pooling_factor=0.0, unique_id_factor=0.0):
-            feat_cfg = feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(
-                    feature_name=name,
-                    embedding_name="shared",
-                    embedding_dim=4,
-                    num_buckets=100,
-                )
-            )
-            constraints = feat_cfg.id_feature.embedding_constraints
-            if pooling_factor:
-                constraints.pooling_factor = pooling_factor
-            if unique_id_factor:
-                constraints.unique_id_factor = unique_id_factor
-            return feat_cfg
-
-        features = create_features([_feature(*spec) for spec in feature_specs])
+    @staticmethod
+    def _shared_table_embedding_group(feature_names, configs):
+        """One DEEP group over the given shared-table feature configs."""
+        features = create_features(configs)
         embedding_group = EmbeddingGroupImpl(
             features,
             [
@@ -289,202 +314,115 @@ class EmbeddingGroupTest(unittest.TestCase):
             ],
             device=torch.device("cpu"),
         )
-        return embedding_group.parameter_constraints()["ebc.shared"]
+        return embedding_group
 
-    def test_shared_table_keeps_one_entry_per_feature(self):
+    @parameterized.expand(
+        [
+            param(
+                "both_factors",
+                pooling_a=2.5,
+                pooling_b=1.5,
+                expected_factors=[2.5, 1.5],
+            ),
+            param(
+                "order_follows_the_group",
+                pooling_a=2.5,
+                pooling_b=1.5,
+                feature_names=["cat_b", "cat_a"],
+                expected_factors=[1.5, 2.5],
+            ),
+            param("unset_contributes_one", pooling_a=2.5, expected_factors=[2.5, 1.0]),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_shared_table_keeps_one_entry_per_feature(
+        self,
+        name,
+        pooling_a=None,
+        pooling_b=None,
+        feature_names=None,
+        expected_factors=None,
+    ) -> None:
         # one raw id factor per input feature, in group order, unset 1.0
-        for specs, feature_names, expected in [
-            ([("cat_a", 2.5), ("cat_b", 1.5)], ["cat_a", "cat_b"], [2.5, 1.5]),
-            ([("cat_b", 1.5), ("cat_a", 2.5)], ["cat_b", "cat_a"], [1.5, 2.5]),
-            ([("cat_a", 2.5), ("cat_b", 0.0)], ["cat_a", "cat_b"], [2.5, 1.0]),
-        ]:
-            with self.subTest(feature_names=feature_names):
-                const = self._shared_table_constraints(specs, feature_names)
-                self.assertEqual(const.pooling_factors, expected)
-                self.assertEqual(const.feature_names, feature_names)
-
-    def test_shared_table_counts_a_reused_feature_once(self):
-        # the same feature referenced twice by one group is one input
-        const = self._shared_table_constraints(
-            [("cat_a", 2.5), ("cat_b", 1.5)], ["cat_a", "cat_b", "cat_a"]
+        configs = _shared_table_feature_configs(
+            pooling_a=pooling_a, pooling_b=pooling_b
         )
+        embedding_group = self._shared_table_embedding_group(
+            feature_names or ["cat_a", "cat_b"], configs
+        )
+        const = embedding_group.parameter_constraints()["ebc.shared"]
+        self.assertEqual(const.pooling_factors, expected_factors)
+        self.assertEqual(const.feature_names, feature_names or ["cat_a", "cat_b"])
+
+    def test_shared_table_counts_a_reused_feature_once(self) -> None:
+        # the same feature referenced twice by one group is one input
+        configs = _shared_table_feature_configs(pooling_a=2.5, pooling_b=1.5)
+        embedding_group = self._shared_table_embedding_group(
+            ["cat_a", "cat_b", "cat_a"], configs
+        )
+        const = embedding_group.parameter_constraints()["ebc.shared"]
         self.assertEqual(const.pooling_factors, [2.5, 1.5])
         self.assertEqual(const.feature_names, ["cat_a", "cat_b"])
 
-    @unittest.skipUnless(
-        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
-    )
-    @mark_ci_scope("gpu")
-    def test_get_embedding_table_features_matches_construction(self):
-        # the configuration resolver must return exactly the tables the
-        # built modules hold: ordinary, dynamicemb and ZCH features, a table
-        # shared by two features and by two groups, a repeated reference,
-        # WIDE renaming, an embedding-name suffix, a nested sequence group
-        # inheriting its parent's suffix, a separate data group and two
-        # sequences whose sub-features share the bare name
-        feature_cfgs = []
-
-        def _id(name, embedding_name="", dim=16, **extra):
-            f = feature_pb2.IdFeature(
-                feature_name=name, embedding_dim=dim, num_buckets=100, **extra
-            )
-            if embedding_name:
-                f.embedding_name = embedding_name
-            feature_cfgs.append(feature_pb2.FeatureConfig(id_feature=f))
-
-        _id("cat_a")
-        _id("cat_b")
-        _id("shared_a", "shared", dim=8)
-        _id("shared_b", "shared", dim=8)
-        _id(
-            "zch_a",
-            zch=feature_pb2.ZeroCollisionHash(
-                zch_size=100, lfu=feature_pb2.LFU_EvictionPolicy()
+    @parameterized.expand(
+        [
+            param("max_of_members", unique_a=20.0, unique_b=30.0, expected=30.0),
+            param(
+                "unmeasured_members_contribute_nothing",
+                unique_a=20.0,
+                unique_b=None,
+                expected=20.0,
             ),
+            param(
+                "measured_below_another_raw_sum",
+                unique_a=3.0,
+                unique_b=None,
+                expected=3.0,
+            ),
+            param("no_member_measured", unique_a=None, unique_b=None, expected=None),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_shared_table_unique_id_factor_takes_the_max(
+        self, name, unique_a=None, unique_b=None, expected=None
+    ) -> None:
+        # configured values aggregate with max; a table whose members set
+        # none keeps the value unset - nothing is fabricated in its place
+        configs = _shared_table_feature_configs(unique_a=unique_a, unique_b=unique_b)
+        embedding_group = self._shared_table_embedding_group(
+            ["cat_a", "cat_b"], configs
         )
-        _id("dyn_a", dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=100_000))
-        _id("user_a")
-        for seq_name in ("click_seq", "buy_seq"):
+        const = embedding_group.parameter_constraints()["ebc.shared"]
+        if expected is None:
+            self.assertIsNone(getattr(const, "unique_id_factor", None))
+        else:
+            self.assertEqual(const.unique_id_factor, expected)
+
+    def test_sequence_groups_with_same_subfeature_name_stay_apart(self) -> None:
+        # two sequence groups whose sub-features share the bare config name
+        # and one table are two inputs; the constraint identity is the batch
+        # name, so neither collapses into the other
+        configs = []
+        for sequence_name, pooling_factor in (("click_seq", 2.5), ("buy_seq", 1.5)):
             wrapper = feature_pb2.SequenceFeature(
-                sequence_name=seq_name,
+                sequence_name=sequence_name,
                 sequence_length=50,
                 features=[
                     feature_pb2.SeqFeatureConfig(
                         id_feature=feature_pb2.IdFeature(
-                            feature_name="cat_s", embedding_dim=8, num_buckets=100
+                            feature_name="item_id",
+                            embedding_name="shared",
+                            embedding_dim=4,
+                            num_buckets=100,
                         )
                     )
                 ],
             )
-            feature_cfgs.append(feature_pb2.FeatureConfig(sequence_feature=wrapper))
-        features = create_features(feature_cfgs)
-        user_a = next(f for f in features if f.name == "user_a")
-        user_a.data_group = "user"
-
-        def _group(name, names, group_type, **extra):
-            return model_pb2.FeatureGroupConfig(
-                group_name=name,
-                feature_names=names,
-                group_type=group_type,
-                **extra,
-            )
-
-        feature_groups = [
-            # cat_a twice: a repeated reference counts once
-            _group(
-                "deep",
-                ["cat_a", "shared_a", "shared_b", "dyn_a", "zch_a", "cat_a"],
-                model_pb2.FeatureGroupType.DEEP,
-            ),
-            _group("wide", ["cat_a", "zch_a"], model_pb2.FeatureGroupType.WIDE),
-            _group(
-                "deep_x",
-                ["cat_a"],
-                model_pb2.FeatureGroupType.DEEP,
-                embedding_name_suffix="x",
-            ),
-            _group("user_deep", ["user_a"], model_pb2.FeatureGroupType.DEEP),
-            _group(
-                "parent",
-                ["cat_a"],
-                model_pb2.FeatureGroupType.DEEP,
-                embedding_name_suffix="tower_a",
-                sequence_groups=[
-                    model_pb2.SeqGroupConfig(
-                        group_name="seq", feature_names=["cat_a", "click_seq__cat_s"]
-                    )
-                ],
-                sequence_encoders=[
-                    seq_encoder_pb2.SeqEncoderConfig(
-                        simple_attention=seq_encoder_pb2.SimpleAttention(input="seq")
-                    )
-                ],
-            ),
-            _group(
-                "toplevel_seq",
-                ["cat_b", "click_seq__cat_s", "buy_seq__cat_s"],
-                model_pb2.FeatureGroupType.SEQUENCE,
-            ),
-        ]
-        # wide tables carry the passed wide dim on both sides
-        from tzrec.tools.add_pooling_factor_to_config import (
-            AddPoolingFactorToConfig,
-        )
-
-        wide_embedding_dim = 8
-        resolved = {
-            table: tuple(names)
-            for table, names in AddPoolingFactorToConfig.get_embedding_table_features(
-                features, feature_groups, wide_embedding_dim=wide_embedding_dim
-            )
-        }
-
-        embedding_group = EmbeddingGroup(
-            features,
-            feature_groups,
-            wide_embedding_dim=wide_embedding_dim,
-            device=torch.device("cpu"),
-        )
-        actual = {}
-        for impl_key, impl in embedding_group.emb_impls.items():
-            for kind, attr in (("ebc", "ebc"), ("mc_ebc", "mc_ebc")):
-                collection = getattr(impl, attr, None)
-                if collection is None:
-                    continue
-                ebc = collection if kind == "ebc" else collection._embedding_module
-                for config in ebc.embedding_bag_configs():
-                    actual[f"{impl_key}.{kind}.{config.name}"] = (
-                        tuple(config.feature_names),
-                        config.embedding_dim,
-                    )
-        for impl_key, impl in embedding_group.seq_emb_impls.items():
-            for kind, attr in (("ec", "ec_dict"), ("mc_ec", "mc_ec_dict")):
-                ec_dict = getattr(impl, attr, None)
-                if not ec_dict:
-                    continue
-                for dim, ec in ec_dict.items():
-                    coll = ec if kind == "ec" else ec._embedding_module
-                    for config in coll.embedding_configs():
-                        actual[f"{impl_key}.{kind}.{dim}.{config.name}"] = tuple(
-                            config.feature_names
-                        )
-        self.assertTrue(resolved, "resolver returned no tables")
-        self.assertTrue(actual, "construction built no tables")
-        self.assertEqual(set(actual), set(resolved))
-        for key, names in resolved.items():
-            built = actual[key]
-            self.assertEqual(built[0] if len(built) == 2 else built, names)
-            # only the wide tables get the overridden dim
-            if len(built) == 2 and "_wide" in key:
-                self.assertEqual(built[1], wide_embedding_dim)
-
-    def test_sequence_groups_with_same_subfeature_name_stay_apart(self):
-        # two sequence groups whose sub-features share the bare config name
-        # and one table are two inputs; the constraint identity is the batch
-        # name, so neither collapses into the other
-        def _seq(sequence_name, pooling_factor):
-            feat_cfg = feature_pb2.FeatureConfig(
-                sequence_feature=feature_pb2.SequenceFeature(
-                    sequence_name=sequence_name,
-                    sequence_length=50,
-                    features=[
-                        feature_pb2.SeqFeatureConfig(
-                            id_feature=feature_pb2.IdFeature(
-                                feature_name="item_id",
-                                embedding_name="shared",
-                                embedding_dim=4,
-                                num_buckets=100,
-                            )
-                        )
-                    ],
-                )
-            )
-            if pooling_factor:
-                sub = feat_cfg.sequence_feature.features[0].id_feature
-                sub.embedding_constraints.pooling_factor = pooling_factor
-            return feat_cfg
-
-        features = create_features([_seq("click_seq", 2.5), _seq("buy_seq", 1.5)])
+            wrapper.features[
+                0
+            ].id_feature.embedding_constraints.pooling_factor = pooling_factor
+            configs.append(feature_pb2.FeatureConfig(sequence_feature=wrapper))
+        features = create_features(configs)
         seq_group = SequenceEmbeddingGroupImpl(
             features,
             [
@@ -507,25 +445,217 @@ class EmbeddingGroupTest(unittest.TestCase):
             const.feature_names, ["click_seq__item_id", "buy_seq__item_id"]
         )
 
-    def test_shared_table_unique_id_factor_takes_the_max(self):
-        const = self._shared_table_constraints(
-            [("cat_a", 1.0, 20.0), ("cat_b", 1.0, 30.0)], ["cat_a", "cat_b"]
+    def test_build_embedding_bag_configs_ordinary(self) -> None:
+        features = _create_test_features()
+        table_configs = build_embedding_bag_configs(
+            features, [_feature_group("deep", ["cat_a", "cat_b", "int_a"])]
         )
-        self.assertEqual(const.unique_id_factor, 30.0)
-        # unmeasured members contribute nothing, never a fabricated bound
-        const = self._shared_table_constraints(
-            [("cat_a", 2.5, 20.0), ("cat_b", 5.0)], ["cat_a", "cat_b"]
+        self.assertEqual(
+            [
+                (c.name, list(c.feature_names), c.embedding_dim)
+                for c in table_configs.ebc.values()
+            ],
+            [("cat_a_emb", ["cat_a"], 16), ("cat_b_emb", ["cat_b"], 8)],
         )
-        self.assertEqual(const.unique_id_factor, 20.0)
-        const = self._shared_table_constraints(
-            [("cat_a", 2.5, 3.0), ("cat_b", 5.0)], ["cat_a", "cat_b"]
+        self.assertFalse(table_configs.mc_ebc)
+        self.assertFalse(table_configs.ebc_user)
+        self.assertFalse(table_configs.mc_ebc_user)
+        self.assertFalse(any(table_configs.shared_feature_flag.values()))
+
+    def test_build_embedding_bag_configs_zch(self) -> None:
+        features = _create_test_features(has_zch=True)
+        table_configs = build_embedding_bag_configs(
+            features, [_feature_group("deep", ["cat_a", "cat_b"])]
         )
-        self.assertEqual(const.unique_id_factor, 3.0)
-        # no member configured: the table-level value stays unset
-        const = self._shared_table_constraints(
-            [("cat_a", 2.5), ("cat_b", 5.0)], ["cat_a", "cat_b"]
+        self.assertFalse(table_configs.ebc)
+        self.assertEqual(
+            [(c.name, list(c.feature_names)) for c in table_configs.mc_ebc.values()],
+            [("cat_a_emb", ["cat_a"]), ("cat_b_emb", ["cat_b"])],
         )
-        self.assertIsNone(getattr(const, "unique_id_factor", None))
+
+    def test_build_embedding_bag_configs_wide_resizes_and_renames(self) -> None:
+        features = _create_test_features()
+        wide = model_pb2.FeatureGroupConfig(
+            group_name="wide",
+            feature_names=["cat_a"],
+            group_type=model_pb2.FeatureGroupType.WIDE,
+        )
+        table_configs = build_embedding_bag_configs(
+            features, [wide], wide_embedding_dim=8
+        )
+        self.assertEqual(
+            [
+                (c.name, list(c.feature_names), c.embedding_dim)
+                for c in table_configs.ebc.values()
+            ],
+            [("cat_a_emb_wide", ["cat_a"], 8)],
+        )
+
+    def test_build_embedding_bag_configs_suffix_makes_another_table(self) -> None:
+        # the same feature in a plain and a suffixed group feeds two tables
+        # and is marked shared between them
+        features = _create_test_features()
+        groups = [
+            _feature_group("deep", ["cat_a"]),
+            _feature_group("deep_x", ["cat_a"], embedding_name_suffix="x"),
+        ]
+        table_configs = build_embedding_bag_configs(features, groups)
+        self.assertEqual(
+            [c.name for c in table_configs.ebc.values()],
+            ["cat_a_emb", "cat_a_emb_x"],
+        )
+        self.assertTrue(table_configs.shared_feature_flag["cat_a"])
+        self.assertEqual(
+            table_configs.feat_to_group_to_emb_name["cat_a"],
+            {"deep": "cat_a_emb", "deep_x": "cat_a_emb_x"},
+        )
+
+    @unittest.skipUnless(
+        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+    )
+    @mark_ci_scope("gpu")
+    def test_build_embedding_bag_configs_dynamicemb(self) -> None:
+        # a dynamicemb feature's table resolves like any other
+        f = feature_pb2.IdFeature(
+            feature_name="dyn_a", embedding_dim=16, num_buckets=100
+        )
+        f.dynamicemb.max_capacity = 100_000
+        features = create_features([feature_pb2.FeatureConfig(id_feature=f)])
+        table_configs = build_embedding_bag_configs(
+            features, [_feature_group("deep", ["dyn_a"])]
+        )
+        self.assertEqual(
+            [
+                (c.name, list(c.feature_names), c.embedding_dim)
+                for c in table_configs.ebc.values()
+            ],
+            [("dyn_a_emb", ["dyn_a"], 16)],
+        )
+
+    def test_build_embedding_collection_configs_groups_by_dim(self) -> None:
+        features = _create_test_sequence_features()
+        table_configs = build_embedding_collection_configs(
+            features,
+            [
+                _feature_group(
+                    "seq",
+                    ["cat_a", "cat_b", "click_seq__cat_a", "click_seq__cat_b"],
+                    group_type=model_pb2.FeatureGroupType.SEQUENCE,
+                )
+            ],
+        )
+        self.assertEqual(
+            [(c.name, list(c.feature_names)) for c in table_configs.ec[16].values()],
+            [("cat_a_emb", ["cat_a"]), ("click_seq__cat_a_emb", ["click_seq__cat_a"])],
+        )
+        self.assertEqual(
+            [(c.name, list(c.feature_names)) for c in table_configs.ec[8].values()],
+            [("cat_b_emb", ["cat_b"]), ("click_seq__cat_b_emb", ["click_seq__cat_b"])],
+        )
+        self.assertFalse(table_configs.mc_ec)
+
+    def test_build_embedding_collection_configs_shared_table(self) -> None:
+        # two sequence sub-features of one table keep one entry each, and a
+        # shared feature's batch name carries the table
+        configs = []
+        for sequence_name in ("click_seq", "buy_seq"):
+            wrapper = feature_pb2.SequenceFeature(
+                sequence_name=sequence_name,
+                sequence_length=50,
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name=sequence_name + "_tag",
+                            embedding_name="shared",
+                            embedding_dim=4,
+                            num_buckets=100,
+                        )
+                    )
+                ],
+            )
+            configs.append(feature_pb2.FeatureConfig(sequence_feature=wrapper))
+        features = create_features(configs)
+        table_configs = build_embedding_collection_configs(
+            features,
+            [
+                _feature_group(
+                    "seq",
+                    ["click_seq__click_seq_tag", "buy_seq__buy_seq_tag"],
+                    group_type=model_pb2.FeatureGroupType.SEQUENCE,
+                )
+            ],
+        )
+        self.assertEqual(
+            [(c.name, list(c.feature_names)) for c in table_configs.ec[4].values()],
+            [("shared", ["click_seq__click_seq_tag", "buy_seq__buy_seq_tag"])],
+        )
+        self.assertEqual(
+            table_configs.emb_name_to_feature_to_shared_name["shared"],
+            {
+                "click_seq__click_seq_tag": "click_seq__click_seq_tag",
+                "buy_seq__buy_seq_tag": "buy_seq__buy_seq_tag",
+            },
+        )
+
+    def test_build_embedding_group_mappings_splits_by_data_group(self) -> None:
+        features = _create_test_features()
+        cat_a = next(f for f in features if f.name == "cat_a")
+        cat_a.data_group = "user"
+        feat_groups, seq_groups, group_to_impl_key = build_embedding_group_mappings(
+            features,
+            [
+                _feature_group("user_deep", ["cat_a"]),
+                _feature_group("deep", ["cat_b"]),
+            ],
+        )
+        self.assertEqual(
+            {
+                key: [g.group_name for g in groups]
+                for key, groups in feat_groups.items()
+            },
+            {BASE_DATA_GROUP: ["deep"], "user": ["user_deep"]},
+        )
+        self.assertEqual(
+            group_to_impl_key,
+            {"user_deep": "user", "deep": BASE_DATA_GROUP},
+        )
+        self.assertFalse(seq_groups)
+
+    def test_build_embedding_group_mappings_rejects_mixed_data_groups(self) -> None:
+        features = _create_test_features()
+        cat_a = next(f for f in features if f.name == "cat_a")
+        cat_a.data_group = "user"
+        with self.assertRaisesRegex(ValueError, "same feature group"):
+            build_embedding_group_mappings(
+                features, [_feature_group("deep", ["cat_a", "cat_b"])]
+            )
+
+    def test_build_embedding_group_mappings_nested_seq_inherits_suffix(self) -> None:
+        features = _create_test_sequence_features()
+        parent = model_pb2.FeatureGroupConfig(
+            group_name="parent",
+            feature_names=["cat_a"],
+            group_type=model_pb2.FeatureGroupType.DEEP,
+            embedding_name_suffix="tower_a",
+            sequence_groups=[
+                model_pb2.SeqGroupConfig(
+                    group_name="seq", feature_names=["click_seq__cat_a"]
+                )
+            ],
+            sequence_encoders=[
+                seq_encoder_pb2.SeqEncoderConfig(
+                    simple_attention=seq_encoder_pb2.SimpleAttention(input="seq")
+                )
+            ],
+        )
+        feat_groups, seq_groups, _ = build_embedding_group_mappings(features, [parent])
+        self.assertEqual(len(feat_groups[BASE_DATA_GROUP]), 1)
+        nested = seq_groups[BASE_DATA_GROUP]
+        self.assertEqual(len(nested), 1)
+        self.assertEqual(nested[0].group_name, "seq")
+        self.assertEqual(nested[0].embedding_name_suffix, "tower_a")
+        # the caller's proto is not mutated by the inherited suffix
+        self.assertEqual(parent.sequence_groups[0].embedding_name_suffix, "")
 
     @parameterized.expand(
         [

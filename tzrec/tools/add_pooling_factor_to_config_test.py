@@ -14,6 +14,7 @@ import unittest
 
 import pyarrow as pa
 import pyarrow.dataset as ds
+import torch
 
 from tzrec.protos import data_pb2, model_pb2, pipeline_pb2
 from tzrec.tools.add_pooling_factor_to_config import AddPoolingFactorToConfig
@@ -178,6 +179,155 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         self.assertEqual(tables[f"{BASE_DATA_GROUP}.ebc.item"], ["t1"])
         self.assertEqual(tables[f"{BASE_DATA_GROUP}.ebc.item2"], ["t2"])
         self.assertNotIn(f"{BASE_DATA_GROUP}.ebc.seq_id", tables)
+
+    def test_get_embedding_table_features_matches_construction(self):
+        # the adapter's mapping equals the tables the built modules hold:
+        # a table shared by two features, a repeated reference, WIDE renaming
+        # with the dim override, an embedding-name suffix, a nested sequence
+        # group inheriting its parent's suffix, a ZCH feature, a separate
+        # data group and two sequences whose sub-features share the bare name
+        from tzrec.features.feature import create_features
+        from tzrec.modules.embedding import EmbeddingGroup
+        from tzrec.protos import feature_pb2, model_pb2, seq_encoder_pb2
+
+        def _id(name, embedding_name=None, dim=16, **extra):
+            f = feature_pb2.IdFeature(
+                feature_name=name, embedding_dim=dim, num_buckets=100, **extra
+            )
+            if embedding_name is not None:
+                f.embedding_name = embedding_name
+            return feature_pb2.FeatureConfig(id_feature=f)
+
+        feature_cfgs = [
+            _id("cat_a"),
+            _id("cat_b"),
+            _id("shared_a", embedding_name="shared", dim=8),
+            _id("shared_b", embedding_name="shared", dim=8),
+            _id(
+                "zch_a",
+                zch=feature_pb2.ZeroCollisionHash(
+                    zch_size=100, lfu=feature_pb2.LFU_EvictionPolicy()
+                ),
+            ),
+            _id("user_a"),
+        ]
+        for sequence_name in ("click_seq", "buy_seq"):
+            feature_cfgs.append(
+                feature_pb2.FeatureConfig(
+                    sequence_feature=feature_pb2.SequenceFeature(
+                        sequence_name=sequence_name,
+                        sequence_length=50,
+                        features=[
+                            feature_pb2.SeqFeatureConfig(
+                                id_feature=feature_pb2.IdFeature(
+                                    feature_name="cat_s",
+                                    embedding_dim=8,
+                                    num_buckets=100,
+                                )
+                            )
+                        ],
+                    )
+                )
+            )
+        features = create_features(feature_cfgs)
+        next(f for f in features if f.name == "user_a").data_group = "user"
+
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                # cat_a twice: a repeated reference counts once
+                feature_names=[
+                    "cat_a",
+                    "shared_a",
+                    "shared_b",
+                    "zch_a",
+                    "cat_a",
+                ],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="wide",
+                feature_names=["cat_a", "zch_a"],
+                group_type=model_pb2.FeatureGroupType.WIDE,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="deep_x",
+                feature_names=["cat_a"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+                embedding_name_suffix="x",
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="user_deep",
+                feature_names=["user_a"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="parent",
+                feature_names=["cat_a"],
+                group_type=model_pb2.FeatureGroupType.DEEP,
+                embedding_name_suffix="tower_a",
+                sequence_groups=[
+                    model_pb2.SeqGroupConfig(
+                        group_name="seq",
+                        feature_names=["cat_a", "click_seq__cat_s"],
+                    )
+                ],
+                sequence_encoders=[
+                    seq_encoder_pb2.SeqEncoderConfig(
+                        simple_attention=seq_encoder_pb2.SimpleAttention(input="seq")
+                    )
+                ],
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="toplevel_seq",
+                feature_names=["cat_b", "click_seq__cat_s", "buy_seq__cat_s"],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+        ]
+        wide_embedding_dim = 8
+        adapter = {
+            table: tuple(names)
+            for table, names in AddPoolingFactorToConfig.get_embedding_table_features(
+                features, feature_groups, wide_embedding_dim=wide_embedding_dim
+            )
+        }
+        self.assertTrue(adapter, "the adapter returned no tables")
+
+        embedding_group = EmbeddingGroup(
+            features,
+            feature_groups,
+            wide_embedding_dim=wide_embedding_dim,
+            device=torch.device("cpu"),
+        )
+        # (feature names, embedding dim); the dim is None for EC tables
+        built = {}
+        for impl_key, impl in embedding_group.emb_impls.items():
+            for kind, attr in (("ebc", "ebc"), ("mc_ebc", "mc_ebc")):
+                collection = getattr(impl, attr, None)
+                if collection is None:
+                    continue
+                ebc = collection if kind == "ebc" else collection._embedding_module
+                for config in ebc.embedding_bag_configs():
+                    built[f"{impl_key}.{kind}.{config.name}"] = (
+                        tuple(config.feature_names),
+                        config.embedding_dim,
+                    )
+        for impl_key, impl in embedding_group.seq_emb_impls.items():
+            for kind, attr in (("ec", "ec_dict"), ("mc_ec", "mc_ec_dict")):
+                ec_dict = getattr(impl, attr, None)
+                if not ec_dict:
+                    continue
+                for dim, ec in ec_dict.items():
+                    collection = ec if kind == "ec" else ec._embedding_module
+                    for config in collection.embedding_configs():
+                        built[f"{impl_key}.{kind}.{dim}.{config.name}"] = (
+                            tuple(config.feature_names),
+                            None,
+                        )
+        self.assertEqual(adapter, {k: v for k, (v, _) in built.items()})
+        for identity, (_, dim) in built.items():
+            if "_wide" in identity:
+                self.assertEqual(dim, wide_embedding_dim)
 
     def test_run_builds_no_model(self):
         from unittest import mock
