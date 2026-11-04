@@ -230,7 +230,7 @@ train_config {
 
 ### pooling_factor 与 unique_id_factor
 
-每个特征可以在`embedding_constraints`中配置两个从训练数据测量的参数：
+每个特征可以在`embedding_constraints`中配置两个从训练数据测量的参数来使得EmbeddingPlanner根据数据分布更合理地进行规划：
 
 - `pooling_factor`：一个样本通过该特征查这张表的平均原始Id位置数（含重复），最小为1。规划器用它估算每步查表量、输入输出张量大小和通信量
 - `unique_id_factor`：单个样本通过共用这张表的所有特征查表的去重Id数的最大值（注意与`pooling_factor`不同，它不是平均值，而是最重的一个样本的去重数）。`batch_size * unique_id_factor`是这张表保守的cache工作集估计（例如dynamicemb GPU cache需要容纳它）
