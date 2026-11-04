@@ -790,14 +790,16 @@ def _is_zch_feature(feature: BaseFeature) -> bool:
 def _build_feature_table_mappings(
     name_to_feature: Dict[str, BaseFeature],
     feature_groups: List[FeatureGroupConfig],
-    wide_name: bool,
+    append_wide_suffix: bool,
     config_name: Callable[[BaseFeature], str],
 ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, bool]]:
     """Final table name per feature and group, and the shared-feature flag.
 
-    A table name carries the WIDE mark and the group's embedding_name_suffix;
-    a feature that reaches more than one final name is shared across those
-    tables. Naming runs over every group before any config is touched, so a
+    A table name carries the group's embedding_name_suffix, and the "_wide"
+    suffix for WIDE groups when ``append_wide_suffix`` is set (EBC groups;
+    sequence groups have no wide tables); a feature that reaches more than
+    one final name is shared across those tables. Naming runs over every
+    group before any config is touched, so a
     shared feature's later names never build on an already renamed table.
     """
     feat_to_group_to_emb_name: Dict[str, Dict[str, str]] = defaultdict(dict)
@@ -811,7 +813,7 @@ def _build_feature_table_mappings(
             if not feature.is_sparse:
                 continue
             emb_name = config_name(feature)
-            if wide_name and feature_group.group_type == model_pb2.WIDE:
+            if append_wide_suffix and feature_group.group_type == model_pb2.WIDE:
                 emb_name = emb_name + "_wide"
             if feature_group.embedding_name_suffix:
                 emb_name = emb_name + "_" + feature_group.embedding_name_suffix
@@ -870,7 +872,7 @@ def build_embedding_bag_configs(
     feat_to_group_to_emb_name, shared_feature_flag = _build_feature_table_mappings(
         name_to_feature,
         feature_groups,
-        wide_name=True,
+        append_wide_suffix=True,
         config_name=lambda feature: feature.emb_bag_config.name,  # pyre-ignore[16]
     )
     tables = EmbeddingBagTableConfigs(
@@ -955,7 +957,7 @@ def build_embedding_collection_configs(
     feat_to_group_to_emb_name, shared_feature_flag = _build_feature_table_mappings(
         name_to_feature,
         feature_groups,
-        wide_name=False,
+        append_wide_suffix=False,
         config_name=lambda feature: feature.emb_config.name,  # pyre-ignore[16]
     )
     dim_to_emb_configs: Dict[int, "OrderedDict[str, EmbeddingConfig]"] = defaultdict(
