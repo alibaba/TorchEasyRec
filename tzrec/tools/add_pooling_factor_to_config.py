@@ -23,16 +23,18 @@ measured feature of a copy of the config:
                     communication estimates.
   unique_id_factor  largest number of distinct ids one sample looks up in a
                     table through all the features that share it: the
-                    per-sample union, measured jointly, never the max of
-                    independently measured features. The table's conservative
-                    cache working-set estimate is batch_size * the factor.
-                    The same table-level value is written on each member
-                    feature; a feature feeding several physical tables keeps
-                    the maximum of their measured factors.
+                    per-sample union, measured jointly over every member
+                    feature, never the max of independently measured
+                    features. The table's conservative cache working-set
+                    estimate is batch_size * the factor. The same table-level
+                    value is written on each member feature; a feature
+                    feeding several physical tables keeps the maximum of
+                    their measured factors.
 
-Both values are measured in one pass. Features missing from the sampled
-batches are left unset; the constraint builder aggregates only configured
-values and leaves a table-level value unset when no member carries one.
+Both values are measured in one pass. A feature missing from the sampled
+batches is left unchanged. A shared table's union is only measured when
+every member feature appears in the batch - a missing member is not an
+empty one, and no partial union is written as the table's measurement.
 
 Tables are resolved from the pipeline configuration's feature groups, the
 same resolution model construction uses; no model is built. Any model that
@@ -50,17 +52,19 @@ Usage: python -m tzrec.tools.add_pooling_factor_to_config
 import argparse
 import math
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
 from tzrec.datasets.dataset import create_dataloader
+from tzrec.features.feature import BaseFeature
 from tzrec.main import _create_features
 from tzrec.modules.embedding import (
     build_embedding_bag_configs,
     build_embedding_collection_configs,
     build_embedding_group_mappings,
 )
+from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util
 from tzrec.utils.logging_util import logger
@@ -94,37 +98,34 @@ class AddPoolingFactorToConfig(object):
         """Measure the train input and write the filled config."""
         cfg = config_util.load_pipeline_config(self._pipeline_config_path)
         features = _create_features(list(cfg.feature_configs), cfg.data_config)
-        tables = self.table_features(cfg, features)
-        factors = self.measure(cfg, tables)
-        filled = self.fill(cfg, factors)
+        tables = self.get_embedding_table_features(cfg, features)
+        factors = self.measure(cfg, features, tables)
+        filled = self.fill(features, factors)
         config_util.save_message(cfg, self._output_path)
+        measured_pooling = sum(1 for p, _ in factors.values() if p)
+        measured_unique = sum(1 for _, u in factors.values() if u)
         logger.info(
-            f"wrote pooling_factor for "
-            f"{sum(1 for p, _ in factors.values() if p)} features and "
-            f"unique_id_factor for {sum(1 for _, u in factors.values() if u)} "
-            f"to {self._output_path}, {len(filled)} features filled"
+            f"wrote pooling_factor for {measured_pooling} features and "
+            f"unique_id_factor for {measured_unique} to {self._output_path}, "
+            f"{len(filled)} features filled"
         )
 
     @staticmethod
     def get_embedding_table_features(
-        features: List[Any],
-        feature_groups: List[Any],
-        wide_embedding_dim: Optional[int] = None,
-        wide_init_fn: Optional[str] = None,
+        cfg: EasyRecConfig, features: List[BaseFeature]
     ) -> List[Tuple[str, List[str]]]:
         """(collection-qualified table, feature names) of every embedding table.
 
         Calls the configuration rules model construction uses - group
         classification, table naming, suffixes, ZCH separation, feature
         sharing - and extracts each table's identity and input features from
-        the built configs.
+        the built configs. The feature groups are copied first: the mapping
+        helpers may supplement a nested sequence group's name, and the config
+        the tool saves must not carry that.
 
         Args:
+            cfg (EasyRecConfig): the pipeline config.
             features (list): the config's features.
-            feature_groups (list): list of feature group config.
-            wide_embedding_dim (int, optional): wide group feature embedding
-                dim.
-            wide_init_fn (str, optional): wide embedding table init function.
 
         Returns:
             (table, feature names) pairs, the table identified by data group,
@@ -132,13 +133,27 @@ class AddPoolingFactorToConfig(object):
             in a batch (grouped sequence features carry their sequence
             prefix).
         """
+        model_oneof = cfg.model_config.WhichOneof("model")
+        model_cfg = (
+            getattr(cfg.model_config, model_oneof) if model_oneof is not None else None
+        )
+        if isinstance(model_cfg, str):
+            model_cfg = None
+        feature_groups = []
+        for group in cfg.model_config.feature_groups:
+            group_copy = model_pb2.FeatureGroupConfig()
+            group_copy.CopyFrom(group)
+            feature_groups.append(group_copy)
         impl_key_to_feat_groups, impl_key_to_seq_groups, _ = (
             build_embedding_group_mappings(features, feature_groups)
         )
         tables: List[Tuple[str, List[str]]] = []
         for impl_key, groups in impl_key_to_feat_groups.items():
             table_configs = build_embedding_bag_configs(
-                features, groups, wide_embedding_dim, wide_init_fn
+                features,
+                groups,
+                getattr(model_cfg, "wide_embedding_dim", None),
+                getattr(model_cfg, "wide_init_fn", None),
             )
             for kind, configs in (
                 ("ebc", table_configs.ebc),
@@ -171,55 +186,24 @@ class AddPoolingFactorToConfig(object):
                         )
         return tables
 
-    @staticmethod
-    def table_features(
-        cfg: EasyRecConfig, features: List[Any]
-    ) -> List[Tuple[str, List[str]]]:
-        """Physical tables of the config and the features that feed each.
-
-        Resolution walks the pipeline configuration's feature groups exactly
-        like model construction - wide renaming, embedding-name suffixes,
-        input-tile user collections, managed-collision (ZCH) collections and
-        data-group separation included - without building any module.
-
-        Args:
-            cfg (EasyRecConfig): the pipeline config.
-            features (list): the config's features.
-
-        Returns:
-            (table, feature names) pairs, the table identified by data
-            group, collection, embedding dim and name; feature names as
-            they appear in a batch (grouped sequence features carry their
-            sequence prefix).
-        """
-        model_oneof = cfg.model_config.WhichOneof("model")
-        model_cfg = (
-            getattr(cfg.model_config, model_oneof) if model_oneof is not None else None
-        )
-        if isinstance(model_cfg, str):
-            model_cfg = None
-        return AddPoolingFactorToConfig.get_embedding_table_features(
-            features,
-            list(cfg.model_config.feature_groups),
-            wide_embedding_dim=getattr(model_cfg, "wide_embedding_dim", None),
-            wide_init_fn=getattr(model_cfg, "wide_init_fn", None),
-        )
-
     def measure(
-        self, cfg: EasyRecConfig, tables: List[Tuple[str, List[str]]]
+        self,
+        cfg: EasyRecConfig,
+        features: List[BaseFeature],
+        tables: List[Tuple[str, List[str]]],
     ) -> Dict[str, Tuple[float, float]]:
         """Sample batches and measure both factors.
 
         Args:
             cfg (EasyRecConfig): the pipeline config to measure.
+            features (list): the config's features.
             tables (List[Tuple[str, List[str]]]): physical tables and their
-                features, from :meth:`table_features`.
+                features, from :meth:`get_embedding_table_features`.
 
         Returns:
             feature name -> (pooling_factor, unique_id_factor); the second is
             0.0 for features whose tables were never looked up.
         """
-        features = _create_features(list(cfg.feature_configs), cfg.data_config)
         dataloader = create_dataloader(cfg.data_config, features, cfg.train_input_path)
         raw_ids: Dict[str, int] = {}
         table_max: Dict[str, int] = {}
@@ -238,21 +222,27 @@ class AddPoolingFactorToConfig(object):
                         jt.values().detach().cpu().numpy(),
                         jt.lengths().detach().cpu().numpy(),
                     )
-            if per_feature:
-                samples += int(next(iter(per_feature.values()))[1].shape[0])
-            elif getattr(batch, "labels", None):
+            if getattr(batch, "labels", None):
                 samples += int(next(iter(batch.labels.values())).shape[0])
+            elif per_feature:
+                samples += int(next(iter(per_feature.values()))[1].shape[0])
             for key, (values, _) in per_feature.items():
                 raw_ids[key] = raw_ids.get(key, 0) + values.size
             for table, names in tables:
-                feats = [per_feature[n] for n in names if n in per_feature]
-                if feats:
-                    table_max[table] = max(
-                        table_max.get(table, 0), _max_distinct_union(feats)
-                    )
+                # a missing member is not an empty one: no partial unions
+                if any(name not in per_feature for name in names):
+                    continue
+                feats = [per_feature[name] for name in names]
+                if len({lengths.shape[0] for _, lengths in feats}) > 1:
+                    # not sample-aligned, e.g. a tiled user view
+                    continue
+                union = _max_distinct_union(feats)
+                table_max[table] = (
+                    union if table not in table_max else max(table_max[table], union)
+                )
             if got >= self._num_batches:
                 break
-        pooling = (
+        pooling: Dict[str, float] = (
             {
                 name: max(1.0, math.ceil(count / samples * 10000) / 10000)
                 for name, count in raw_ids.items()
@@ -277,12 +267,16 @@ class AddPoolingFactorToConfig(object):
         return factors
 
     def fill(
-        self, cfg: EasyRecConfig, factors: Dict[str, Tuple[float, float]]
+        self, features: List[BaseFeature], factors: Dict[str, Tuple[float, float]]
     ) -> List[str]:
         """Write measured factors into the config, in place.
 
+        The features hold the config's own messages, so setting through them
+        fills the config that is saved, and same-named sequence sub-features
+        of different sequences stay apart.
+
         Args:
-            cfg (EasyRecConfig): the config to fill, modified in place.
+            features (list): the config's features.
             factors (Dict[str, Tuple[float, float]]): feature name ->
                 (pooling_factor, unique_id_factor), keyed like measure()
                 returns them.
@@ -291,10 +285,6 @@ class AddPoolingFactorToConfig(object):
             the names of the features that got a factor.
         """
         filled = []
-        # the features hold the config's own messages, so setting through them
-        # fills the config in place, and same-named sequence sub-features of
-        # different sequences stay apart
-        features = _create_features(list(cfg.feature_configs), cfg.data_config)
         for feature in features:
             pooling_factor, unique_id_factor = factors.get(feature.name, (0.0, 0.0))
             if not pooling_factor and not unique_id_factor:
@@ -303,7 +293,7 @@ class AddPoolingFactorToConfig(object):
                 feature.config.embedding_constraints.pooling_factor = pooling_factor
             if unique_id_factor:
                 feature.config.embedding_constraints.unique_id_factor = unique_id_factor
-            filled.append(feature.config.feature_name)
+            filled.append(feature.name)
         return filled
 
 

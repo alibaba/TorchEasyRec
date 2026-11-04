@@ -14,13 +14,15 @@ import unittest
 
 import pyarrow as pa
 import pyarrow.dataset as ds
-import torch
 
+import tzrec.tools.add_pooling_factor_to_config as add_pooling_module
 from tzrec.protos import data_pb2, model_pb2, pipeline_pb2
 from tzrec.tools.add_pooling_factor_to_config import AddPoolingFactorToConfig
 from tzrec.utils import config_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.test_util import make_test_dir, mark_ci_scope
+
+_orig_create_features = add_pooling_module._create_features
 
 
 def _write_parquet(test_dir, num_rows=10):
@@ -119,9 +121,12 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
 
     @staticmethod
     def _measure(test_dir, tables, **kwargs):
+        from tzrec.main import _create_features
+
         cfg = _config(os.path.join(test_dir, "*.parquet"), **kwargs)
+        features = _create_features(list(cfg.feature_configs), cfg.data_config)
         tool = AddPoolingFactorToConfig("in.config", "out.config", num_batches=10)
-        return cfg, tool.measure(cfg, tables)
+        return cfg, tool.measure(cfg, features, tables)
 
     def test_measures_raw_average_and_joint_union(self):
         test_dir = make_test_dir()
@@ -156,7 +161,31 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         self.assertEqual(factors["t1"], (3.0, 3.0))
         self.assertEqual(factors["t2"], (2.0, 3.0))
 
-    def test_table_features_resolves_physical_tables(self):
+    def test_a_missing_table_member_measures_no_union(self):
+        # a missing member is not an empty one: its table keeps no union
+        # measurement, while the member that did appear is still measured
+        test_dir = make_test_dir()
+        _write_parquet(test_dir)
+        cfg, factors = self._measure(
+            test_dir,
+            [("ebc.partial", ["id_a", "absent_from_batches"])],
+        )
+        self.assertEqual(factors["id_a"], (1.0, 0.0))
+
+    def test_an_empty_table_member_measures_its_union(self):
+        # an observed feature with no ids is a member like any other: the
+        # union is measured over every sample
+        test_dir = make_test_dir()
+        _write_parquet(test_dir)
+        cfg, factors = self._measure(
+            test_dir,
+            [("ebc.sparse_union", ["id_a", "sparse_c"])],
+        )
+        # id_a holds 7 in every sample, sparse_c adds 5 in the even ones
+        self.assertEqual(factors["id_a"], (1.0, 2.0))
+        self.assertEqual(factors["sparse_c"], (1.0, 2.0))
+
+    def test_get_embedding_table_features_resolves_physical_tables(self):
         test_dir = make_test_dir()
         _write_parquet(test_dir)
         cfg = _config(os.path.join(test_dir, "*.parquet"))
@@ -164,13 +193,10 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         from tzrec.main import _create_features
 
         features = _create_features(list(cfg.feature_configs), cfg.data_config)
-        table_list = AddPoolingFactorToConfig.table_features(cfg, features)
-        tables = dict(table_list)
-        # the adapter behind table_features, called directly
-        direct = AddPoolingFactorToConfig.get_embedding_table_features(
-            features, list(cfg.model_config.feature_groups)
+        table_list = AddPoolingFactorToConfig.get_embedding_table_features(
+            cfg, features
         )
-        self.assertEqual(sorted(direct), sorted(table_list))
+        tables = dict(table_list)
         self.assertEqual(tables[f"{BASE_DATA_GROUP}.ebc.id_a_emb"], ["id_a"])
         self.assertEqual(
             tables[f"{BASE_DATA_GROUP}.ebc.shared"], ["shared_a", "shared_b"]
@@ -180,156 +206,29 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         self.assertEqual(tables[f"{BASE_DATA_GROUP}.ebc.item2"], ["t2"])
         self.assertNotIn(f"{BASE_DATA_GROUP}.ebc.seq_id", tables)
 
-    def test_get_embedding_table_features_matches_construction(self):
-        # the adapter's mapping equals the tables the built modules hold:
-        # a table shared by two features, a repeated reference, WIDE renaming
-        # with the dim override, an embedding-name suffix, a nested sequence
-        # group inheriting its parent's suffix, a ZCH feature, a separate
-        # data group and two sequences whose sub-features share the bare name
-        from tzrec.features.feature import create_features
-        from tzrec.modules.embedding import EmbeddingGroup
-        from tzrec.protos import feature_pb2, model_pb2, seq_encoder_pb2
+    def test_get_embedding_table_features_keeps_the_config_unchanged(self):
+        # the mapping helpers supplement a nested sequence group's name; the
+        # config the tool saves must not carry that
+        test_dir = make_test_dir()
+        cfg = _config(os.path.join(test_dir, "*.parquet"), with_model=False)
+        from tzrec.main import _create_features
 
-        def _id(name, embedding_name=None, dim=16, **extra):
-            f = feature_pb2.IdFeature(
-                feature_name=name, embedding_dim=dim, num_buckets=100, **extra
-            )
-            if embedding_name is not None:
-                f.embedding_name = embedding_name
-            return feature_pb2.FeatureConfig(id_feature=f)
-
-        feature_cfgs = [
-            _id("cat_a"),
-            _id("cat_b"),
-            _id("shared_a", embedding_name="shared", dim=8),
-            _id("shared_b", embedding_name="shared", dim=8),
-            _id(
-                "zch_a",
-                zch=feature_pb2.ZeroCollisionHash(
-                    zch_size=100, lfu=feature_pb2.LFU_EvictionPolicy()
-                ),
-            ),
-            _id("user_a"),
-        ]
-        for sequence_name in ("click_seq", "buy_seq"):
-            feature_cfgs.append(
-                feature_pb2.FeatureConfig(
-                    sequence_feature=feature_pb2.SequenceFeature(
-                        sequence_name=sequence_name,
-                        sequence_length=50,
-                        features=[
-                            feature_pb2.SeqFeatureConfig(
-                                id_feature=feature_pb2.IdFeature(
-                                    feature_name="cat_s",
-                                    embedding_dim=8,
-                                    num_buckets=100,
-                                )
-                            )
-                        ],
-                    )
-                )
-            )
-        features = create_features(feature_cfgs)
-        next(f for f in features if f.name == "user_a").data_group = "user"
-
-        feature_groups = [
-            model_pb2.FeatureGroupConfig(
-                group_name="deep",
-                # cat_a twice: a repeated reference counts once
-                feature_names=[
-                    "cat_a",
-                    "shared_a",
-                    "shared_b",
-                    "zch_a",
-                    "cat_a",
-                ],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="wide",
-                feature_names=["cat_a", "zch_a"],
-                group_type=model_pb2.FeatureGroupType.WIDE,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="deep_x",
-                feature_names=["cat_a"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-                embedding_name_suffix="x",
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="user_deep",
-                feature_names=["user_a"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="parent",
-                feature_names=["cat_a"],
-                group_type=model_pb2.FeatureGroupType.DEEP,
-                embedding_name_suffix="tower_a",
-                sequence_groups=[
-                    model_pb2.SeqGroupConfig(
-                        group_name="seq",
-                        feature_names=["cat_a", "click_seq__cat_s"],
-                    )
-                ],
-                sequence_encoders=[
-                    seq_encoder_pb2.SeqEncoderConfig(
-                        simple_attention=seq_encoder_pb2.SimpleAttention(input="seq")
-                    )
-                ],
-            ),
-            model_pb2.FeatureGroupConfig(
-                group_name="toplevel_seq",
-                feature_names=["cat_b", "click_seq__cat_s", "buy_seq__cat_s"],
-                group_type=model_pb2.FeatureGroupType.SEQUENCE,
-            ),
-        ]
-        wide_embedding_dim = 8
-        adapter = {
-            table: tuple(names)
-            for table, names in AddPoolingFactorToConfig.get_embedding_table_features(
-                features, feature_groups, wide_embedding_dim=wide_embedding_dim
-            )
-        }
-        self.assertTrue(adapter, "the adapter returned no tables")
-
-        embedding_group = EmbeddingGroup(
-            features,
-            feature_groups,
-            wide_embedding_dim=wide_embedding_dim,
-            device=torch.device("cpu"),
+        group = cfg.model_config.feature_groups.add()
+        group.group_name = "deep"
+        group.feature_names.append("id_a")
+        group.sequence_groups.add().feature_names.extend(["click_seq__seq_id"])
+        group.sequence_encoders.add().simple_attention.SetInParent()
+        before = str(cfg)
+        features = _create_features(list(cfg.feature_configs), cfg.data_config)
+        AddPoolingFactorToConfig.get_embedding_table_features(cfg, features)
+        self.assertEqual(str(cfg), before)
+        self.assertFalse(
+            cfg.model_config.feature_groups[-1]
+            .sequence_groups[0]
+            .HasField("group_name")
         )
-        # (feature names, embedding dim); the dim is None for EC tables
-        built = {}
-        for impl_key, impl in embedding_group.emb_impls.items():
-            for kind, attr in (("ebc", "ebc"), ("mc_ebc", "mc_ebc")):
-                collection = getattr(impl, attr, None)
-                if collection is None:
-                    continue
-                ebc = collection if kind == "ebc" else collection._embedding_module
-                for config in ebc.embedding_bag_configs():
-                    built[f"{impl_key}.{kind}.{config.name}"] = (
-                        tuple(config.feature_names),
-                        config.embedding_dim,
-                    )
-        for impl_key, impl in embedding_group.seq_emb_impls.items():
-            for kind, attr in (("ec", "ec_dict"), ("mc_ec", "mc_ec_dict")):
-                ec_dict = getattr(impl, attr, None)
-                if not ec_dict:
-                    continue
-                for dim, ec in ec_dict.items():
-                    collection = ec if kind == "ec" else ec._embedding_module
-                    for config in collection.embedding_configs():
-                        built[f"{impl_key}.{kind}.{dim}.{config.name}"] = (
-                            tuple(config.feature_names),
-                            None,
-                        )
-        self.assertEqual(adapter, {k: v for k, (v, _) in built.items()})
-        for identity, (_, dim) in built.items():
-            if "_wide" in identity:
-                self.assertEqual(dim, wide_embedding_dim)
 
-    def test_run_builds_no_model(self):
+    def test_run_builds_no_model_and_creates_the_features_once(self):
         from unittest import mock
 
         test_dir = make_test_dir()
@@ -337,12 +236,27 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         in_path = os.path.join(test_dir, "pipeline.config")
         out_path = os.path.join(test_dir, "measured.config")
         config_util.save_message(_config(os.path.join(test_dir, "*.parquet")), in_path)
-        with mock.patch(
-            "tzrec.main._create_model",
-            side_effect=AssertionError("no model may be built"),
+        features_created = []
+
+        def _counting_create_features(*args, **kwargs):
+            features_created.append(1)
+            return _orig_create_features(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                add_pooling_module,
+                "_create_features",
+                side_effect=_counting_create_features,
+            ),
+            mock.patch(
+                "tzrec.main._create_model",
+                side_effect=AssertionError("no model may be built"),
+            ),
         ):
             AddPoolingFactorToConfig(in_path, out_path, num_batches=10).run()
         self.assertTrue(os.path.exists(out_path))
+        # one construction serves mapping, measurement and filling
+        self.assertEqual(len(features_created), 1)
 
     def test_fill_writes_both_factors_and_keeps_sequence_identity(self):
         test_dir = make_test_dir()
@@ -353,8 +267,11 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
             "shared_a": (2.0, 3.0),
             "click_seq__seq_id": (3.0, 3.0),
         }
-        filled = tool.fill(cfg, factors)
-        self.assertEqual(set(filled), {"id_a", "shared_a", "seq_id"})
+        from tzrec.main import _create_features
+
+        features = _create_features(list(cfg.feature_configs), cfg.data_config)
+        filled = tool.fill(features, factors)
+        self.assertEqual(set(filled), {"id_a", "shared_a", "click_seq__seq_id"})
         self.assertEqual(
             cfg.feature_configs[0].id_feature.embedding_constraints.pooling_factor,
             1.0,
@@ -390,14 +307,17 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         sub.id_feature.embedding_dim = 8
         sub.id_feature.num_buckets = 100
         tool = AddPoolingFactorToConfig("in.config", "out.config", num_batches=10)
+        from tzrec.main import _create_features
+
+        features = _create_features(list(cfg.feature_configs), cfg.data_config)
         filled = tool.fill(
-            cfg,
+            features,
             {
                 "click_seq__seq_id": (3.0, 3.0),
                 "buy_seq__seq_id": (7.0, 9.0),
             },
         )
-        self.assertEqual(set(filled), {"seq_id"})
+        self.assertEqual(set(filled), {"click_seq__seq_id", "buy_seq__seq_id"})
         self.assertAlmostEqual(
             cfg.feature_configs[9]
             .sequence_feature.features[0]
@@ -466,9 +386,12 @@ class AddPoolingFactorDynamicEmbTest(unittest.TestCase):
         f.feature_name = "id_a"
         f.embedding_dim = 8
         f.dynamicemb.max_capacity = 100_000
+        from tzrec.main import _create_features
+
+        features = _create_features(list(cfg.feature_configs), cfg.data_config)
         factors = AddPoolingFactorToConfig(
             "in.config", "out.config", num_batches=10
-        ).measure(cfg, [("ebc.id_a_emb", ["id_a"])])
+        ).measure(cfg, features, [("ebc.id_a_emb", ["id_a"])])
         # raw positions include the duplicate 7; the union does not
         self.assertEqual(factors["id_a"], (3.0, 2.0))
 
