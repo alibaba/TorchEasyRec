@@ -260,5 +260,3 @@ python -m tzrec.tools.add_pooling_factor_to_config \
 ```
 
 注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据
-
-- `pooling_factor`参与规划器对输入输出张量和通信量的估算，配置后规划结果可能与之前不同；`unique_id_factor`当前不参与规划，用于按`batch_size * unique_id_factor`估算一张表单个batch的去重工作集，以便自行设置`max_capacity`/`init_capacity_per_rank`等容量（见[DynamicEmbedding使用说明](../feature/dynamicemb.md)）
