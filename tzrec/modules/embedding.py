@@ -625,14 +625,10 @@ def _add_constraints(
 ) -> None:
     """Record a table's constraints, one entry per input feature.
 
-    pooling_factors keeps one raw id factor per feature that feeds the table,
-    in the order the features appear in the final embedding config; a feature
-    reused by several groups of one table is counted once, and a feature that
-    sets no pooling_factor contributes the default of one id per sample.
-    unique_id_factor is the table-level measured value carried by the member
-    features: configured values aggregate with max, and a table whose members
-    set none keeps it unset - raw average lengths do not bound the maximum
-    unique working set, so nothing is fabricated in its place.
+    pooling_factors keeps one raw id factor per feature of the table, in
+    config order, unset features contributing one id per sample;
+    unique_id_factor aggregates the members' configured values with max and
+    stays unset when none is configured.
 
     Args:
         store(Dict[str, ParameterConstraints]): a dict of table constraints.
