@@ -14,6 +14,7 @@ import io
 import os
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import pyarrow as pa
@@ -29,6 +30,7 @@ from torch.utils.data import DataLoader
 from tzrec.constant import Mode
 from tzrec.datasets.kafka_dataset import (
     KafkaDataset,
+    KafkaReader,
     _build_projection,
     _offsets_for_times_batched,
     _parse_kafka_uri,
@@ -38,6 +40,7 @@ from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import random_name
+from tzrec.utils.test_util import parameterized_name_func
 
 
 class ParseKafkaUriTest(unittest.TestCase):
@@ -81,6 +84,136 @@ def _resolved(partition, offset, topic="t"):
     tp = TopicPartition(topic, partition)
     tp.offset = offset
     return tp
+
+
+def _msg(partition, offset, value, rows=1, error=None):
+    batch = pa.record_batch({"x": pa.array([value] * rows, type=pa.int64())})
+    return mock.Mock(
+        **{
+            "error.return_value": error,
+            "value.return_value": batch.serialize(),
+            "partition.return_value": partition,
+            "offset.return_value": offset,
+            "timestamp.return_value": (0, 1000),
+        }
+    )
+
+
+class KafkaReaderRoundRobinTest(unittest.TestCase):
+    """Round-robin reading with mocked consumers."""
+
+    def _make_reader(self, consumers, partitions=(0, 1)):
+        consumers[0].list_topics.return_value = SimpleNamespace(
+            topics={
+                "topic": SimpleNamespace(
+                    partitions={partition: None for partition in partitions}, error=None
+                )
+            }
+        )
+        self.enterContext(
+            mock.patch("tzrec.datasets.kafka_dataset.Consumer", side_effect=consumers)
+        )
+        return KafkaReader(
+            "kafka://broker:9092/topic?group.id=g1",
+            1,
+            input_fields=[pa.field("x", pa.int64())],
+            kafka_partition_round_robin=True,
+        )
+
+    @parameterized.expand(
+        [
+            param("messages", 1, [1, 3, 2, 4]),
+            param("zero_rows", 0, [3, 2, 4]),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_round_robin_waits_for_valid_message(self, _name, rows, expected):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.side_effect = [
+            [_msg(0, 0, 1, rows=rows)],
+            [_msg(0, 1, 2)],
+        ]
+        consumers[1].consume.side_effect = [
+            [],
+            [_msg(1, 0, 0, error="boom")],
+            [_msg(1, 0, 3)],
+            [_msg(1, 1, 4)],
+        ]
+        gen = self._make_reader(consumers)._reader(0, 1)
+        self.addCleanup(gen.close)
+        observed = [next(gen).column("x")[0].as_py() for _ in expected]
+        self.assertEqual(observed, expected)
+        self.assertEqual(
+            consumers[0].consume.call_args_list, [mock.call(1, timeout=1.0)] * 2
+        )
+        self.assertEqual(
+            consumers[1].consume.call_args_list, [mock.call(1, timeout=1.0)] * 4
+        )
+
+    @parameterized.expand(
+        [
+            param("two_workers", [[1, 4], [3, 7]]),
+            param("three_workers", [[1, 7], [3], [4]]),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_partition_split(self, _name, owned_per_worker):
+        for worker_id, owned in enumerate(owned_per_worker):
+            consumers = [mock.Mock() for _ in owned]
+            consumers[0].consume.return_value = [_msg(owned[0], 0, 1)]
+            reader = self._make_reader(consumers, partitions=[7, 1, 4, 3])
+            gen = reader._reader(worker_id, len(owned_per_worker))
+            self.addCleanup(gen.close)
+            next(gen)
+            self.assertEqual(
+                [
+                    [tp.partition for tp in consumer.assign.call_args.args[0]]
+                    for consumer in consumers
+                ],
+                [[partition] for partition in owned],
+            )
+            gen.close()
+
+    def test_insufficient_partitions_raises(self):
+        consumer = mock.Mock()
+        gen = self._make_reader([consumer])._reader(0, 3)
+        self.addCleanup(gen.close)
+        with self.assertRaisesRegex(ValueError, "fewer than the 3"):
+            next(gen)
+        consumer.close.assert_called_once()
+
+    def test_initialization_failure_closes_consumers(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[1].assign.side_effect = RuntimeError("assign failed")
+        gen = self._make_reader(consumers)._reader(0, 1)
+        self.addCleanup(gen.close)
+        with self.assertRaisesRegex(RuntimeError, "assign failed"):
+            next(gen)
+        for consumer in consumers:
+            consumer.close.assert_called_once()
+
+    def test_decode_failure_closes_consumers(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        message = _msg(0, 0, 1)
+        message.value.return_value = b"not-arrow"
+        consumers[0].consume.return_value = [message]
+        gen = self._make_reader(consumers)._reader(0, 1)
+        self.addCleanup(gen.close)
+        with self.assertRaises(pa.ArrowInvalid):
+            next(gen)
+        for consumer in consumers:
+            consumer.close.assert_called_once()
+
+    def test_to_batches_close_failure_still_closes_others(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.return_value = [_msg(0, 0, 5)]
+        consumers[1].close.side_effect = RuntimeError("close failed")
+        iterator = self._make_reader(consumers).to_batches(0, 1)
+        self.addCleanup(iterator.close)
+        self.assertEqual(next(iterator)["x"].to_pylist(), [5])
+        iterator.close()
+        for consumer in consumers:
+            consumer.close.assert_called_once()
 
 
 class OffsetsForTimesBatchedTest(unittest.TestCase):
@@ -302,9 +435,24 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         [
             param("train", mode=Mode.TRAIN, expected_shuffle=True),
             param("eval", mode=Mode.EVAL, expected_shuffle=False),
-        ]
+            param(
+                "round_robin_train",
+                mode=Mode.TRAIN,
+                expected_shuffle=True,
+                round_robin=True,
+            ),
+            param(
+                "round_robin_eval",
+                mode=Mode.EVAL,
+                expected_shuffle=False,
+                round_robin=True,
+            ),
+        ],
+        name_func=parameterized_name_func,
     )
-    def test_shuffle_config_reaches_reader(self, _name, mode, expected_shuffle):
+    def test_reader_config_reaches_reader(
+        self, _name, mode, expected_shuffle, round_robin=None
+    ):
         data_config = data_pb2.DataConfig(
             batch_size=4,
             dataset_type=data_pb2.DatasetType.KafkaDataset,
@@ -317,6 +465,8 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
             ],
         )
+        if round_robin is not None:
+            data_config.kafka_partition_round_robin = round_robin
         features = create_features(
             [
                 feature_pb2.FeatureConfig(
@@ -332,6 +482,9 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         )
         self.assertEqual(dataset._reader._shuffle, expected_shuffle)
         self.assertEqual(dataset._reader._shuffle_buffer_size, 64)
+        self.assertEqual(
+            dataset._reader._kafka_partition_round_robin, bool(round_robin)
+        )
 
 
 class KafkaDatasetTest(unittest.TestCase):

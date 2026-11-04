@@ -163,6 +163,9 @@ message DataConfig {
     // number of batches each dataloader worker prepares in advance
     optional uint32 prefetch_factor = 30 [default = 2];
 
+    // whether to read Kafka partitions in round-robin order per worker
+    optional bool kafka_partition_round_robin = 31 [default = false];
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;
