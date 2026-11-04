@@ -212,7 +212,7 @@ def _feature_group(
     )
 
 
-def _shared_table_feature_configs(
+def _create_shared_table_feature_configs(
     pooling_a=None, unique_a=None, pooling_b=None, unique_b=None
 ):
     """Two id features of one shared table, with optional measured factors."""
@@ -300,7 +300,7 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["deep"].size(), (2, 25))
 
     @staticmethod
-    def _shared_table_embedding_group(feature_names, configs):
+    def _create_shared_table_embedding_group(feature_names, configs):
         """One DEEP group over the given shared-table feature configs."""
         features = create_features(configs)
         embedding_group = EmbeddingGroupImpl(
@@ -344,10 +344,10 @@ class EmbeddingGroupTest(unittest.TestCase):
         expected_factors=None,
     ) -> None:
         # one raw id factor per input feature, in group order, unset 1.0
-        configs = _shared_table_feature_configs(
+        configs = _create_shared_table_feature_configs(
             pooling_a=pooling_a, pooling_b=pooling_b
         )
-        embedding_group = self._shared_table_embedding_group(
+        embedding_group = self._create_shared_table_embedding_group(
             feature_names or ["cat_a", "cat_b"], configs
         )
         const = embedding_group.parameter_constraints()["ebc.shared"]
@@ -356,8 +356,8 @@ class EmbeddingGroupTest(unittest.TestCase):
 
     def test_shared_table_counts_a_reused_feature_once(self) -> None:
         # the same feature referenced twice by one group is one input
-        configs = _shared_table_feature_configs(pooling_a=2.5, pooling_b=1.5)
-        embedding_group = self._shared_table_embedding_group(
+        configs = _create_shared_table_feature_configs(pooling_a=2.5, pooling_b=1.5)
+        embedding_group = self._create_shared_table_embedding_group(
             ["cat_a", "cat_b", "cat_a"], configs
         )
         const = embedding_group.parameter_constraints()["ebc.shared"]
@@ -388,8 +388,10 @@ class EmbeddingGroupTest(unittest.TestCase):
     ) -> None:
         # configured values aggregate with max; a table whose members set
         # none keeps the value unset - nothing is fabricated in its place
-        configs = _shared_table_feature_configs(unique_a=unique_a, unique_b=unique_b)
-        embedding_group = self._shared_table_embedding_group(
+        configs = _create_shared_table_feature_configs(
+            unique_a=unique_a, unique_b=unique_b
+        )
+        embedding_group = self._create_shared_table_embedding_group(
             ["cat_a", "cat_b"], configs
         )
         const = embedding_group.parameter_constraints()["ebc.shared"]
