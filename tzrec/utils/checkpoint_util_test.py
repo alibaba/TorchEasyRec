@@ -260,9 +260,17 @@ class CheckpointUtilTest(unittest.TestCase):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
+    def _complete(self, *steps: int) -> None:
+        """Mark checkpoint directories complete."""
+        for step in steps:
+            path = os.path.join(self.test_dir, f"model.ckpt-{step}")
+            with open(os.path.join(path, checkpoint_util.CKPT_SUCCESS_FILENAME), "w"):
+                pass
+
     def test_latest_checkpoint_with_model_dir(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-0"))
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-10"))
+        self._complete(0, 10)
         ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-10"))
         self.assertEqual(step, 10)
@@ -272,10 +280,62 @@ class CheckpointUtilTest(unittest.TestCase):
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-0"))
         self.assertEqual(step, 0)
 
+    def test_discovery_skips_unfinished_saves(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-10"))
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-20"))
+        self._complete(10)
+        # ckpt-20 was interrupted mid-write: it is newer but never selected
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertEqual(step, 10)
+
+    def test_discovery_raises_when_every_save_is_unfinished(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-10"))
+        with self.assertRaisesRegex(RuntimeError, "no complete checkpoint"):
+            checkpoint_util.latest_checkpoint(self.test_dir)
+        with self.assertRaisesRegex(RuntimeError, "model.ckpt-10"):
+            checkpoint_util.latest_checkpoint(self.test_dir)
+        with self.assertRaisesRegex(RuntimeError, "touch"):
+            checkpoint_util.latest_checkpoint(self.test_dir)
+
+    def test_bypass_admits_legacy_checkpoints(self):
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-10"))
+        # the documented bypass for checkpoints that predate the marker
+        ckpt_path, step = checkpoint_util.latest_checkpoint(
+            self.test_dir, require_success=False
+        )
+        self.assertEqual(step, 10)
+        explicit = os.path.join(self.test_dir, "model.ckpt-10")
+        ckpt_path, step = checkpoint_util.latest_checkpoint(
+            explicit, require_success=False
+        )
+        self.assertEqual(ckpt_path, explicit)
+
+    def test_explicit_checkpoint_paths_are_validated(self):
+        missing = os.path.join(self.test_dir, "model.ckpt-3")
+        with self.assertRaisesRegex(RuntimeError, "not exists"):
+            checkpoint_util.latest_checkpoint(missing)
+        os.makedirs(missing)
+        with self.assertRaisesRegex(RuntimeError, "touch"):
+            checkpoint_util.latest_checkpoint(missing)
+        checkpoint_util.validate_checkpoint(missing, require_success=False)
+
+    def test_unnumbered_checkpoint_needs_the_marker_too(self):
+        os.makedirs(os.path.join(self.test_dir, "model"))
+        with self.assertRaisesRegex(RuntimeError, "no complete checkpoint"):
+            checkpoint_util.latest_checkpoint(self.test_dir)
+        with open(
+            os.path.join(self.test_dir, checkpoint_util.CKPT_SUCCESS_FILENAME), "w"
+        ):
+            pass
+        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        self.assertEqual(ckpt_path, self.test_dir)
+        self.assertEqual(step, 0)
+
     def test_best_checkpoint_model_dir(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-0"))
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-10"))
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-20"))
+        self._complete(0, 10, 20)
         with open(os.path.join(self.test_dir, TRAIN_EVAL_RESULT_FILENAME), "w+") as f:
             f.write('{"global_step":0, "auc": 0.633, "grouped_auc": 0.565}\n')
             f.write('{"global_step":10, "auc": 0.632, "grouped_auc": 0.570}\n')
@@ -292,21 +352,25 @@ class CheckpointUtilTest(unittest.TestCase):
     def test_latest_checkpoint_with_custom_dir(self):
         os.makedirs(os.path.join(self.test_dir, "custom/model"))
         ckpt_path, step = checkpoint_util.latest_checkpoint(
-            os.path.join(self.test_dir, "custom")
+            os.path.join(self.test_dir, "custom"), require_success=False
         )
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "custom"))
         self.assertEqual(step, 0)
 
     def test_latest_checkpoint_with_unsuffixed_ckpt(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
-        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        ckpt_path, step = checkpoint_util.latest_checkpoint(
+            self.test_dir, require_success=False
+        )
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt"))
         self.assertEqual(step, 0)
 
     def test_latest_checkpoint_prefers_stepped_over_unsuffixed(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-10/model"))
-        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        ckpt_path, step = checkpoint_util.latest_checkpoint(
+            self.test_dir, require_success=False
+        )
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt-10"))
         self.assertEqual(step, 10)
 
@@ -319,17 +383,138 @@ class CheckpointUtilTest(unittest.TestCase):
     def test_latest_checkpoint_prefers_dir_itself_over_unsuffixed(self):
         os.makedirs(os.path.join(self.test_dir, "model"))
         os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
-        ckpt_path, step = checkpoint_util.latest_checkpoint(self.test_dir)
+        ckpt_path, step = checkpoint_util.latest_checkpoint(
+            self.test_dir, require_success=False
+        )
         self.assertEqual(ckpt_path, self.test_dir)
         self.assertEqual(step, 0)
 
     def test_latest_checkpoint_on_unsuffixed_ckpt_path(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt/model"))
         ckpt_path, step = checkpoint_util.latest_checkpoint(
-            os.path.join(self.test_dir, "model.ckpt")
+            os.path.join(self.test_dir, "model.ckpt"), require_success=False
         )
         self.assertEqual(ckpt_path, os.path.join(self.test_dir, "model.ckpt"))
         self.assertEqual(step, 0)
+
+    def _save_with(self, step, **kwargs):
+        """A manager save with the heavy writes mocked away."""
+        manager = checkpoint_util.CheckpointManager(self.test_dir)
+        self.addCleanup(manager.close)
+        with (
+            mock.patch("tzrec.utils.checkpoint_util.save_model"),
+            mock.patch("tzrec.utils.checkpoint_util.save_dataloader_state"),
+        ):
+            with mock.patch.dict(os.environ, {"RANK": "0"}):
+                return manager.save(step, nn.Linear(1, 1), **kwargs)
+
+    def _in_progress(self, step):
+        return os.path.exists(
+            os.path.join(
+                self.test_dir,
+                f"model.ckpt-{step}",
+                checkpoint_util.CKPT_IN_PROGRESS_FILENAME,
+            )
+        )
+
+    def test_save_claims_and_releases_the_checkpoint(self):
+        ckpt = self._save_with(10)
+        self.assertTrue(
+            os.path.exists(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME))
+        )
+        self.assertFalse(self._in_progress(10))
+
+    def test_save_replaces_an_interrupted_save(self):
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-10")
+        os.makedirs(ckpt_dir)
+        with open(os.path.join(ckpt_dir, "stale.distcp"), "w") as f:
+            f.write("x")
+        with open(
+            os.path.join(ckpt_dir, checkpoint_util.CKPT_IN_PROGRESS_FILENAME), "w"
+        ):
+            pass
+        ckpt = self._save_with(10)
+        self.assertFalse(os.path.exists(os.path.join(ckpt_dir, "stale.distcp")))
+        self.assertTrue(
+            os.path.exists(os.path.join(ckpt, checkpoint_util.CKPT_SUCCESS_FILENAME))
+        )
+        self.assertFalse(self._in_progress(10))
+
+    def test_save_refuses_to_delete_a_complete_checkpoint(self):
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-10")
+        os.makedirs(ckpt_dir)
+        with open(os.path.join(ckpt_dir, checkpoint_util.CKPT_SUCCESS_FILENAME), "w"):
+            pass
+        with open(os.path.join(ckpt_dir, "precious.distcp"), "w") as f:
+            f.write("x")
+        with self.assertRaisesRegex(RuntimeError, "complete checkpoint"):
+            self._save_with(10)
+        self.assertTrue(os.path.exists(os.path.join(ckpt_dir, "precious.distcp")))
+
+    def test_save_refuses_to_delete_an_unknown_checkpoint(self):
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-10")
+        os.makedirs(ckpt_dir)
+        with open(os.path.join(ckpt_dir, "imported.distcp"), "w") as f:
+            f.write("x")
+        with self.assertRaisesRegex(RuntimeError, "not written by this trainer"):
+            self._save_with(10)
+        self.assertTrue(os.path.exists(os.path.join(ckpt_dir, "imported.distcp")))
+
+    def test_save_removes_an_empty_leftover_directory(self):
+        # a crash between creating the directory and writing the marker
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-10")
+        os.makedirs(ckpt_dir)
+        ckpt = self._save_with(10)
+        self.assertEqual(ckpt, ckpt_dir)
+        self.assertFalse(self._in_progress(10))
+
+    def test_interrupted_marker_survives_between_begin_and_success(self):
+        # _begin_checkpoint writes _IN_PROGRESS before any file; only
+        # save_success_marker removes it, so a crash in between is recognized
+        seen = {}
+
+        def _record_begin(*args):
+            seen["begin"] = os.path.exists(
+                os.path.join(args[0], checkpoint_util.CKPT_IN_PROGRESS_FILENAME)
+            )
+            raise SystemExit(0)
+
+        manager = checkpoint_util.CheckpointManager(self.test_dir)
+        self.addCleanup(manager.close)
+        with (
+            mock.patch(
+                "tzrec.utils.checkpoint_util.save_model", side_effect=_record_begin
+            ),
+            mock.patch.dict(os.environ, {"RANK": "0"}),
+        ):
+            with self.assertRaises(SystemExit):
+                manager.save(10, nn.Linear(1, 1))
+        self.assertTrue(seen["begin"])
+        self.assertTrue(self._in_progress(10))
+
+    def test_rank0_cleanup_failure_raises_on_every_rank(self):
+        # a preparation that fails on rank 0 must raise everywhere instead of
+        # leaving the other ranks hanging in the save collectives
+        import torch.distributed as dist
+
+        os.environ.update(
+            RANK="0", WORLD_SIZE="1", MASTER_ADDR="127.0.0.1", MASTER_PORT="29717"
+        )
+        if not dist.is_initialized():
+            dist.init_process_group(backend="gloo")
+        try:
+            ckpt_dir = os.path.join(self.test_dir, "model.ckpt-10")
+            os.makedirs(ckpt_dir)
+            with open(os.path.join(ckpt_dir, "imported.distcp"), "w") as f:
+                f.write("x")
+            with self.assertRaisesRegex(RuntimeError, "not written by this trainer"):
+                self._save_with(10)
+        finally:
+            dist.destroy_process_group()
+            os.environ.pop("RANK", None)
+            os.environ.pop("WORLD_SIZE", None)
+            os.environ.pop("MASTER_ADDR", None)
+            os.environ.pop("MASTER_PORT", None)
 
     def _remaining_ckpt_steps(self):
         return sorted(
@@ -437,6 +622,7 @@ class CheckpointUtilTest(unittest.TestCase):
     def test_checkpoint_manager_discovery(self):
         for step in [0, 10, 20]:
             os.makedirs(os.path.join(self.test_dir, f"model.ckpt-{step}"))
+        self._complete(0, 10, 20)
         with open(os.path.join(self.test_dir, TRAIN_EVAL_RESULT_FILENAME), "w") as f:
             f.write('{"global_step":0, "auc":0.6}\n')
             f.write('{"global_step":10, "auc":0.7}\n')  # best
@@ -458,6 +644,19 @@ class CheckpointUtilTest(unittest.TestCase):
             checkpoint_util.best_checkpoint(self.test_dir, export_config),
         )
         self.assertEqual(manager.best_checkpoint()[1], 10)
+
+    def test_best_checkpoint_must_be_complete(self):
+        # the metric names a step whose save was interrupted: not selectable
+        os.makedirs(os.path.join(self.test_dir, "model.ckpt-10"))
+        with open(os.path.join(self.test_dir, TRAIN_EVAL_RESULT_FILENAME), "w") as f:
+            f.write('{"global_step":10, "auc":0.7}\n')
+        export_config = ExportConfig(
+            exporter_type="best",
+            best_exporter_metric="auc",
+            metric_larger_is_better=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "touch"):
+            checkpoint_util.best_checkpoint(self.test_dir, export_config)
 
     def test_dist_report_ts_agrees_across_ranks(self):
         """Ranks at different event-times record the same one on the checkpoint.

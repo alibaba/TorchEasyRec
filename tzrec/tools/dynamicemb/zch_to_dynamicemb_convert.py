@@ -727,6 +727,9 @@ def convert(
     with open(os.path.join(out_dir, "meta"), "w") as f:
         json.dump(meta, f, indent=2)
 
+    # the converted checkpoint is complete; the marker lets a fine-tune select it
+    with open(os.path.join(out_dir, checkpoint_util.CKPT_SUCCESS_FILENAME), "w"):
+        pass
     logger.info(f"Conversion complete. Output: {out_dir}.")
 
 

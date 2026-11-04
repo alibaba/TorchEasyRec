@@ -635,6 +635,10 @@ class MainTest(unittest.TestCase):
 class PredictionLifecycleTest(unittest.TestCase):
     """Tests for prediction lifecycle wiring."""
 
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
+
     def _batch(self, rows: int) -> Batch:
         return Batch(
             reserves=RecordBatchTensor(pa.record_batch({"id": list(range(rows))}))
@@ -692,6 +696,10 @@ class PredictionLifecycleTest(unittest.TestCase):
             )
 
     def _run_predict_checkpoint(self, pipeline: mock.Mock, writer: mock.Mock) -> None:
+        ckpt_dir = os.path.join(self.test_dir, "model.ckpt-0")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(os.path.join(ckpt_dir, checkpoint_util.CKPT_SUCCESS_FILENAME), "w"):
+            pass
         dataloader = mock.Mock()
         dataloader.dataset.sampled_batch_size = 2
         dataloader.get_iterator.return_value = iter([])
@@ -735,7 +743,7 @@ class PredictionLifecycleTest(unittest.TestCase):
                 "pipeline.config",
                 "input",
                 "output",
-                checkpoint_path="checkpoint",
+                checkpoint_path=ckpt_dir,
                 reserved_columns="id",
                 writer_type="MockWriter",
                 predict_steps=2,

@@ -30,7 +30,7 @@ from tzrec.datasets.dataset import BaseReader, create_reader
 from tzrec.features.feature import MAX_HASH_BUCKET_SIZE
 from tzrec.main import _create_features, _create_model
 from tzrec.models.model import TrainWrapper
-from tzrec.utils import config_util
+from tzrec.utils import checkpoint_util, config_util
 from tzrec.utils.logging_util import logger
 
 
@@ -373,3 +373,6 @@ if __name__ == "__main__":
             },
             f,
         )
+    # the init checkpoint is complete; the marker lets a fine-tune select it
+    with open(os.path.join(ckpt_dir, checkpoint_util.CKPT_SUCCESS_FILENAME), "w"):
+        pass

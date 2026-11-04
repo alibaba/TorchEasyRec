@@ -239,38 +239,112 @@ def _get_checkpoint_step(ckpt_path: str) -> int:
     return ckpt_step
 
 
-def latest_checkpoint(model_dir: str) -> Tuple[Optional[str], int]:
-    """Find latest checkpoint under a directory.
+def checkpoint_complete(ckpt_dir: str) -> bool:
+    """Whether a checkpoint directory carries its success marker."""
+    return os.path.exists(os.path.join(ckpt_dir, CKPT_SUCCESS_FILENAME))
 
-    A path that already names a checkpoint (contains ``model.ckpt-``) is returned
-    as given, without checking that it exists. Otherwise the directory is searched,
-    preferring the newest ``model.ckpt-<step>`` in it, then the directory itself,
-    then a ``model.ckpt`` in it. The last two carry no step, so they report 0.
+
+def _marker_hint(ckpt_path: str) -> str:
+    """The documented way to load a checkpoint that predates the marker."""
+    return (
+        f"if {ckpt_path} is known to be complete (written before tzrec marked "
+        "checkpoints, or produced by an external tool), declare it with "
+        f"`touch {os.path.join(ckpt_path, CKPT_SUCCESS_FILENAME)}`"
+    )
+
+
+def validate_checkpoint(ckpt_path: str, require_success: bool = True) -> None:
+    """Raise unless a checkpoint directory exists, and is complete when strict.
 
     Args:
-        model_dir: model directory
+        ckpt_path: a checkpoint directory.
+        require_success: when False, skip the completeness check -- the
+            documented bypass for a legacy or converted checkpoint that
+            legitimately carries no ``_SUCCESS`` marker.
+    """
+    if not os.path.exists(ckpt_path):
+        raise RuntimeError(f"checkpoint[{ckpt_path}] not exists.")
+    if require_success and not checkpoint_complete(ckpt_path):
+        raise RuntimeError(
+            f"checkpoint[{ckpt_path}] has no {CKPT_SUCCESS_FILENAME} marker, so "
+            "an interrupted save cannot be told from a complete one; "
+            + _marker_hint(ckpt_path)
+        )
+
+
+def _unnumbered_checkpoint(model_dir: str, require_success: bool) -> Optional[str]:
+    """model_dir itself or ``model.ckpt`` in it, when one holds a checkpoint."""
+    for ckpt_dir in (model_dir, os.path.join(model_dir, "model.ckpt")):
+        if not (
+            os.path.exists(os.path.join(ckpt_dir, "model"))
+            or os.path.exists(os.path.join(ckpt_dir, "optimizer"))
+        ):
+            continue
+        if require_success and not checkpoint_complete(ckpt_dir):
+            continue
+        return ckpt_dir
+    return None
+
+
+def latest_checkpoint(
+    model_dir: str, require_success: bool = True
+) -> Tuple[Optional[str], int]:
+    """Find the latest complete checkpoint under a directory.
+
+    A path that already names a checkpoint (contains ``model.ckpt-``) is
+    validated for existence and completeness, then returned. A directory is
+    searched for the newest complete ``model.ckpt-<step>`` in it, then for an
+    unnumbered checkpoint (the directory itself, or a ``model.ckpt`` in it,
+    which report step 0). A save that was interrupted mid-write has no
+    ``_SUCCESS`` marker and is never selected.
+
+    Args:
+        model_dir: model directory.
+        require_success: when False, drop the completeness check everywhere
+            -- the documented bypass for a legacy or converted checkpoint.
 
     Return:
-        latest_ckpt_path: latest checkpoint path.
-        latest_step: step of the latest checkpoint
+        latest_ckpt_path: latest checkpoint path, or None when the directory
+            holds no checkpoint at all.
+        latest_step: step of the latest checkpoint.
+
+    Raises:
+        RuntimeError: the directory holds only checkpoints without the
+            ``_SUCCESS`` marker (interrupted saves or legacy imports), or a
+            returned checkpoint path failed validation.
     """
-    if "model.ckpt-" not in model_dir:
-        # fsspec glob need endswith os.path.sep
-        ckpt_metas = glob.glob(os.path.join(model_dir, "model.ckpt-*" + os.path.sep))
-        ckpt_metas = list(map(lambda x: x.rstrip(os.path.sep), ckpt_metas))
-        if len(ckpt_metas) == 0:
-            # a producer of exactly one checkpoint tends to drop the -<step>
-            for ckpt_dir in (model_dir, os.path.join(model_dir, "model.ckpt")):
-                model_ckpt_dir = os.path.join(ckpt_dir, "model")
-                optim_ckpt_dir = os.path.join(ckpt_dir, "optimizer")
-                if os.path.exists(model_ckpt_dir) or os.path.exists(optim_ckpt_dir):
-                    return ckpt_dir, 0
-            return None, -1
-        if len(ckpt_metas) > 1:
-            ckpt_metas.sort(key=lambda x: _get_checkpoint_step(x))
-        latest_ckpt_path = ckpt_metas[-1]
-    else:
-        latest_ckpt_path = model_dir
+    if "model.ckpt-" in model_dir:
+        validate_checkpoint(model_dir, require_success)
+        return model_dir, _get_checkpoint_step(model_dir)
+    # fsspec glob need endswith os.path.sep
+    ckpt_metas = glob.glob(os.path.join(model_dir, "model.ckpt-*" + os.path.sep))
+    ckpt_metas = list(map(lambda x: x.rstrip(os.path.sep), ckpt_metas))
+    skipped: List[str] = []
+    if require_success:
+        skipped = [x for x in ckpt_metas if not checkpoint_complete(x)]
+        ckpt_metas = [x for x in ckpt_metas if checkpoint_complete(x)]
+    if len(ckpt_metas) == 0:
+        unnumbered = _unnumbered_checkpoint(model_dir, require_success)
+        if unnumbered is not None:
+            return unnumbered, 0
+        # what strict mode refused: interrupted saves and markerless imports
+        markerless = list(skipped) + [
+            d
+            for d in (model_dir, os.path.join(model_dir, "model.ckpt"))
+            if _unnumbered_checkpoint(model_dir, False) == d
+        ]
+        if require_success and markerless:
+            raise RuntimeError(
+                f"model_dir[{model_dir}] holds no complete checkpoint; without "
+                f"a {CKPT_SUCCESS_FILENAME} marker: "
+                + ", ".join(sorted(markerless))
+                + "; "
+                + _marker_hint(markerless[0])
+            )
+        return None, -1
+    if len(ckpt_metas) > 1:
+        ckpt_metas.sort(key=lambda x: _get_checkpoint_step(x))
+    latest_ckpt_path = ckpt_metas[-1]
     return latest_ckpt_path, _get_checkpoint_step(latest_ckpt_path)
 
 
@@ -278,13 +352,19 @@ def best_checkpoint(
     model_dir: str,
     export_config: export_pb2.ExportConfig,
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
+    require_success: bool = True,
 ) -> Tuple[Optional[str], int]:
     """Find best checkpoint under a directory.
+
+    The checkpoint the best metric names must be complete, exactly like an
+    automatically discovered one.
 
     Args:
         model_dir: model directory
         export_config: export_pb2.ExportConfig
         eval_result_filename: evaluation result filename
+        require_success: when False, drop the completeness check -- the
+            documented bypass for a legacy or converted checkpoint.
 
     Return:
         latest_ckpt_path: latest checkpoint path.
@@ -327,17 +407,17 @@ def best_checkpoint(
             )
         max_metric_step = sorted_mertic[0][0]
         best_ckpt_path = os.path.join(model_dir, f"model.ckpt-{max_metric_step}")
-        if os.path.exists(best_ckpt_path):
-            logger.info(f"find best checkpoint is {best_ckpt_path}")
-            return best_ckpt_path, max_metric_step
-        else:
+        if not os.path.exists(best_ckpt_path):
             raise ValueError(
                 f"find best metric is {max_metric_step} step,"
                 f"but not find {best_ckpt_path}."
             )
+        validate_checkpoint(best_ckpt_path, require_success)
+        logger.info(f"find best checkpoint is {best_ckpt_path}")
+        return best_ckpt_path, max_metric_step
     else:
         logger.info(f"not find {eval_result_filename}, will search latest checkpoint")
-        return latest_checkpoint(model_dir)
+        return latest_checkpoint(model_dir, require_success)
 
 
 class CheckpointManager:
@@ -402,6 +482,7 @@ class CheckpointManager:
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
+        _begin_checkpoint(ckpt_dir)
         save_model(ckpt_dir, model, optimizer, dense_ema)
         if lr_schedulers is not None:
             save_lr_schedulers(ckpt_dir, lr_schedulers)
@@ -635,14 +716,21 @@ class CheckpointManager:
 
     # --- load / discovery (delegate to the module-level free functions) ---
 
-    def latest_checkpoint(self) -> Tuple[Optional[str], int]:
-        """Latest checkpoint under this manager's model_dir."""
-        return latest_checkpoint(self._model_dir)
+    def latest_checkpoint(
+        self, require_success: bool = True
+    ) -> Tuple[Optional[str], int]:
+        """Latest complete checkpoint under this manager's model_dir."""
+        return latest_checkpoint(self._model_dir, require_success)
 
-    def best_checkpoint(self) -> Tuple[Optional[str], int]:
+    def best_checkpoint(
+        self, require_success: bool = True
+    ) -> Tuple[Optional[str], int]:
         """Best checkpoint under model_dir per the configured export metric."""
         return best_checkpoint(
-            self._model_dir, self._export_config, self._eval_result_filename
+            self._model_dir,
+            self._export_config,
+            self._eval_result_filename,
+            require_success,
         )
 
     def restore(
@@ -734,8 +822,13 @@ class CheckpointManager:
             self._export_config is not None
             and self._export_config.exporter_type == "best"
         ):
+            # retention protects the best checkpoint whether or not it
+            # carries a marker; completeness is a selection concern
             best_ckpt_path, _ = best_checkpoint(
-                self._model_dir, self._export_config, self._eval_result_filename
+                self._model_dir,
+                self._export_config,
+                self._eval_result_filename,
+                require_success=False,
             )
             if best_ckpt_path is not None:
                 protected.add(self._canonical_checkpoint_path(best_ckpt_path))
@@ -1209,6 +1302,9 @@ def save_model(
 
 DATALOADER_CKPT_FILENAME = "dataloader_state.json"
 CKPT_SUCCESS_FILENAME = "_SUCCESS"
+# written by rank 0 before any checkpoint file, removed when _SUCCESS lands;
+# its presence alone means a managed save was interrupted
+CKPT_IN_PROGRESS_FILENAME = "_IN_PROGRESS"
 CKPT_META_FILENAME = "meta"
 # reserved dataloader_state key: last checkpoint's event-time watermark (seconds);
 # no ":" so per-source consumers skip it.
@@ -1316,14 +1412,66 @@ def save_meta(
             json.dump(meta, f)
 
 
+def _begin_checkpoint(ckpt_dir: str) -> None:
+    """Rank 0 prepares a checkpoint directory for a save; every rank waits.
+
+    A directory left by an interrupted save of this protocol still holds
+    ``_IN_PROGRESS``; it is the only thing removed, so the save can be retried
+    at the same step. A complete checkpoint, a directory the protocol never
+    wrote (no marker at all, e.g. an imported checkpoint) and a failure of
+    the cleanup all raise -- nothing else is ever deleted. Rank 0 then
+    (re)creates the directory and writes ``_IN_PROGRESS`` before any file of
+    the checkpoint may land in it, and every rank proceeds only once rank 0
+    finished, so a failed preparation raises on all of them instead of
+    hanging the collective save.
+
+    Args:
+        ckpt_dir: directory of the checkpoint to prepare.
+    """
+    error: Optional[str] = None
+    if int(os.environ.get("RANK", 0)) == 0:
+        try:
+            if os.path.isdir(ckpt_dir):
+                if os.path.exists(os.path.join(ckpt_dir, CKPT_IN_PROGRESS_FILENAME)):
+                    logger.warning(f"replacing interrupted checkpoint {ckpt_dir}")
+                    shutil.rmtree(ckpt_dir)
+                elif checkpoint_complete(ckpt_dir):
+                    raise RuntimeError(
+                        f"complete checkpoint {ckpt_dir} already exists; delete it "
+                        "yourself before saving this step again"
+                    )
+                elif os.listdir(ckpt_dir):
+                    raise RuntimeError(
+                        f"{ckpt_dir} already exists with neither "
+                        f"{CKPT_SUCCESS_FILENAME} nor "
+                        f"{CKPT_IN_PROGRESS_FILENAME} and is not empty; not "
+                        "written by this trainer, so not removed"
+                    )
+                else:
+                    shutil.rmtree(ckpt_dir)
+            os.makedirs(ckpt_dir, exist_ok=True)
+            with open(os.path.join(ckpt_dir, CKPT_IN_PROGRESS_FILENAME), "w"):
+                pass
+        except Exception as e:  # noqa: BLE001
+            error = f"{type(e).__name__}: {e}"
+    if dist.is_initialized():
+        errors: List[Optional[str]] = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, error)
+        error = next((e for e in errors if e is not None), None)
+    if error is not None:
+        raise RuntimeError(f"cannot prepare checkpoint {ckpt_dir}: {error}")
+
+
 def save_success_marker(checkpoint_dir: str) -> None:
-    """Mark a checkpoint as completely written.
+    """Mark a checkpoint as completely written and close its save.
 
     Schedulers that poll a model directory need to tell a finished checkpoint
     from one still being written. The marker is empty and written last, after
     every rank has finished its shards and after every other file in the
     checkpoint, so its presence alone means the whole checkpoint is readable --
-    do not write anything into it, and do not move this call earlier.
+    do not write anything into it, and do not move this call earlier. Writing
+    it also removes the ``_IN_PROGRESS`` marker that claimed the directory,
+    so an interrupted save is recognized by that marker alone.
 
     Args:
         checkpoint_dir: directory of the checkpoint to mark.
@@ -1336,6 +1484,10 @@ def save_success_marker(checkpoint_dir: str) -> None:
         with open(marker_path, "w"):
             pass
         logger.info(f"Saved checkpoint success marker to {marker_path}")
+        try:
+            os.remove(os.path.join(checkpoint_dir, CKPT_IN_PROGRESS_FILENAME))
+        except FileNotFoundError:
+            pass
 
 
 def save_dataloader_state(
