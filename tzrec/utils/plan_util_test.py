@@ -300,9 +300,6 @@ class PlanUtilTest(unittest.TestCase):
             os.environ.clear()
             os.environ.update(env)
 
-    @unittest.skipUnless(
-        torch.cuda.is_available(), "CUDA is required for create_planner."
-    )
     def test_global_constraints_apply_behind_statistics_only_entries(self) -> None:
         # a parameter entry that only carries measured factors keeps the
         # global sharding and kernel lists applied to its table
@@ -356,6 +353,9 @@ class PlanUtilTest(unittest.TestCase):
             {option.sharding_type for option in search_space}, {"table_wise"}
         )
 
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "CUDA is required for create_planner."
+    )
     @mark_ci_scope("gpu")
     def test_checkpoint_sharding_applies_with_statistics_only_constraints(self):
         # every sparse table now carries a constraint entry (measured pooling
