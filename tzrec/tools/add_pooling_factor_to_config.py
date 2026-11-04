@@ -31,8 +31,8 @@ measured feature of a copy of the config:
                     the maximum of their measured factors.
 
 Both values are measured in one pass. Features missing from the sampled
-batches are left unset; the constraint builder falls back to the raw id
-factors for them, so a shared table is never silently underestimated.
+batches are left unset; the constraint builder aggregates only configured
+values and leaves a table-level value unset when no member carries one.
 
 Usage: python -m tzrec.tools.add_pooling_factor_to_config
     --pipeline_config_path pipeline.config --output_path pipeline_measured.config
@@ -41,6 +41,7 @@ Usage: python -m tzrec.tools.add_pooling_factor_to_config
 
 import argparse
 import math
+import os
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -66,6 +67,13 @@ class AddPoolingFactorToConfig(object):
     def __init__(
         self, pipeline_config_path: str, output_path: str, num_batches: int
     ) -> None:
+        if num_batches < 1:
+            raise ValueError(f"num_batches must be at least 1, got {num_batches}")
+        if os.path.realpath(output_path) == os.path.realpath(pipeline_config_path):
+            raise ValueError(
+                "output_path must differ from pipeline_config_path; the tool "
+                "writes a new config and never modifies its input"
+            )
         self._pipeline_config_path = pipeline_config_path
         self._output_path = output_path
         self._num_batches = num_batches
@@ -159,9 +167,10 @@ class AddPoolingFactorToConfig(object):
                     if key in per_feature:
                         # input-tile duplicates read the same column
                         continue
+                    jt = kjt[key]
                     per_feature[key] = (
-                        kjt[key].values().detach().cpu().numpy().astype(np.int64),
-                        kjt[key].lengths().detach().cpu().numpy(),
+                        jt.values().detach().cpu().numpy(),
+                        jt.lengths().detach().cpu().numpy(),
                     )
             if per_feature:
                 samples += int(next(iter(per_feature.values()))[1].shape[0])
@@ -215,43 +224,31 @@ class AddPoolingFactorToConfig(object):
         Returns:
             the names of the features that got a factor.
         """
-        names = {
-            f.config.feature_name: f.name
-            for f in _create_features(list(cfg.feature_configs), cfg.data_config)
-        }
         filled = []
-        for feat_config in cfg.feature_configs:
-            oneof = feat_config.WhichOneof("feature")
-            if oneof is None:
+        # the features hold the config's own messages, so setting through them
+        # fills the config in place, and same-named sequence sub-features of
+        # different sequences stay apart
+        features = _create_features(list(cfg.feature_configs), cfg.data_config)
+        for feature in features:
+            pooling_factor, unique_id_factor = factors.get(feature.name, (0.0, 0.0))
+            if not pooling_factor and not unique_id_factor:
                 continue
-            if oneof.startswith("sequence_"):
-                sub_configs = list(getattr(feat_config, oneof).features)
-            else:
-                sub_configs = [feat_config]
-            for sub_config in sub_configs:
-                sub_oneof = sub_config.WhichOneof("feature")
-                if sub_oneof is None:
-                    continue
-                f = getattr(sub_config, sub_oneof)
-                pooling_factor, unique_id_factor = factors.get(
-                    names.get(f.feature_name, f.feature_name), (0.0, 0.0)
-                )
-                if not pooling_factor and not unique_id_factor:
-                    continue
-                if pooling_factor:
-                    f.embedding_constraints.pooling_factor = pooling_factor
-                if unique_id_factor:
-                    f.embedding_constraints.unique_id_factor = unique_id_factor
-                filled.append(f.feature_name)
+            if pooling_factor:
+                feature.config.embedding_constraints.pooling_factor = pooling_factor
+            if unique_id_factor:
+                feature.config.embedding_constraints.unique_id_factor = unique_id_factor
+            filled.append(feature.config.feature_name)
         return filled
 
 
 def _max_distinct_union(feats: List[Tuple[np.ndarray, np.ndarray]]) -> int:
     """Largest per-sample number of distinct ids across the given features.
 
-    The ids of all features are laid out in one padded row per sample and
-    sorted; the number of value changes in the filled part of a row is its
-    distinct count. Padding is a value above every id, so it sorts last.
+    The ids of all features are concatenated with the index of their sample
+    and lexsorted by (sample, id); a position starts a new distinct run when
+    either index changes, and the runs are counted per sample. Cost and memory
+    scale with the number of ids, not with the longest sample, and every int64
+    id value is safe.
 
     Args:
         feats (List[Tuple[np.ndarray, np.ndarray]]): (ids, lengths per sample)
@@ -261,30 +258,17 @@ def _max_distinct_union(feats: List[Tuple[np.ndarray, np.ndarray]]) -> int:
         the maximum distinct count over the samples.
     """
     num_samples = int(feats[0][1].shape[0])
-    row_total = np.zeros(num_samples, dtype=np.int64)
-    max_id = 0
-    for values, lengths in feats:
-        row_total += lengths
-        if values.size:
-            max_id = max(max_id, int(values.max()))
-    width = int(row_total.max()) if num_samples else 0
-    if width == 0:
+    ids = np.concatenate([values for values, _ in feats])
+    if ids.size == 0:
         return 0
-    rows = np.full((num_samples, width), max_id + 1, dtype=np.int64)
-    cursor = np.zeros(num_samples, dtype=np.int64)
-    for values, lengths in feats:
-        if not values.size:
-            continue
-        starts = np.cumsum(lengths) - lengths
-        row_idx = np.repeat(np.arange(num_samples), lengths)
-        col_idx = np.arange(values.size) - np.repeat(starts, lengths) + cursor[row_idx]
-        rows[row_idx, col_idx] = values
-        cursor += lengths
-    sorted_rows = np.sort(rows, axis=1)
-    changes = np.ones(sorted_rows.shape, dtype=bool)
-    changes[:, 1:] = sorted_rows[:, 1:] != sorted_rows[:, :-1]
-    distinct = (changes & (sorted_rows != max_id + 1)).sum(axis=1)
-    return int(distinct.max())
+    rows = np.concatenate(
+        [np.repeat(np.arange(num_samples), lengths) for _, lengths in feats]
+    )
+    order = np.lexsort((ids, rows))
+    ids, rows = ids[order], rows[order]
+    starts = np.ones(ids.size, dtype=bool)
+    starts[1:] = (rows[1:] != rows[:-1]) | (ids[1:] != ids[:-1])
+    return int(np.bincount(rows[starts], minlength=num_samples).max())
 
 
 def main() -> None:

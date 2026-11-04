@@ -249,7 +249,7 @@ feature_configs {
 ```
 
 - 共用一张表（相同的`embedding_name`）的特征各保留自己的`pooling_factor`，一张表一个输入一项，按配置顺序；未配置的特征按每个样本1个Id计
-- `unique_id_factor`是表级的测量值，写在每个成员特征上，合并时取最大值；部分成员未配置时保守地退化为各成员`pooling_factor`之和（任意并集的上界），不会因为缺少测量而低估共用表
+- `unique_id_factor`是表级的测量值，写在每个成员特征上，合并时对已配置的值取最大值；未配置的成员不参与，全部未配置时表级值为空（原始的平均长度不能约束最大的去重工作集，因此不虚构任何替代值）
 - 配置了dynamicemb的特征只能通过`embedding_constraints`设置这两个字段，同时设置`sharding_types`或`compute_kernels`会报错（dynamicemb的分片方式和计算内核是固定的）
 - `train_config.global_embedding_constraints`不支持这两个字段（各特征的查表量不同），配置了会报错
 
@@ -265,4 +265,5 @@ python -m tzrec.tools.add_pooling_factor_to_config \
 - 工具通过训练数据的dataloader读取`num_batches`个batch（走FG流程，无需模型和GPU），按实际样本数计算，包含不完整的尾batch
 - `pooling_factor`是全部读到的原始Id数除以实际样本数，最小为1；`unique_id_factor`是每个batch内按样本、对共用一张表的所有特征取Id并集后的去重个数，取所有样本的最大值
 - 同一张表的两个值写在每个成员特征上；一个特征接入多张物理表（如input-tile复制出的user侧表）时取这些表测量值的最大值
-- 数据分布变化后请重新测量；测量值不保证覆盖未来的数据，运行时仍有容量检查兜底。配置后规划器对显存和性能的估算会变化，规划结果可能与之前不同
+- 数据分布变化后请重新测量；测量值不保证覆盖未来的数据
+- `pooling_factor`参与规划器对输入输出张量和通信量的估算，配置后规划结果可能与之前不同；`unique_id_factor`当前不参与规划，用于按`batch_size * unique_id_factor`估算一张表单个batch的去重工作集，以便自行设置`max_capacity`/`init_capacity_per_rank`等容量（见[DynamicEmbedding使用说明](../feature/dynamicemb.md)）

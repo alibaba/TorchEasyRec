@@ -119,7 +119,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
     @staticmethod
     def _measure(test_dir, tables, **kwargs):
         cfg = _config(os.path.join(test_dir, "*.parquet"), **kwargs)
-        tool = AddPoolingFactorToConfig("", "", num_batches=10)
+        tool = AddPoolingFactorToConfig("in.config", "out.config", num_batches=10)
         return cfg, tool.measure(cfg, tables)
 
     def test_measures_raw_average_and_joint_union(self):
@@ -170,7 +170,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
     def test_fill_writes_both_factors_and_keeps_sequence_identity(self):
         test_dir = make_test_dir()
         cfg = _config(os.path.join(test_dir, "*.parquet"), with_model=False)
-        tool = AddPoolingFactorToConfig("", "", num_batches=10)
+        tool = AddPoolingFactorToConfig("in.config", "out.config", num_batches=10)
         factors = {
             "id_a": (1.0, 1.0),
             "shared_a": (2.0, 3.0),
@@ -192,6 +192,52 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
             .sequence_feature.features[0]
             .id_feature.embedding_constraints.pooling_factor,
             3.0,
+        )
+
+    def test_rejects_a_zero_batch_count_and_the_input_path(self):
+        with self.assertRaisesRegex(ValueError, "num_batches"):
+            AddPoolingFactorToConfig("in.config", "out.config", 0)
+        with self.assertRaisesRegex(ValueError, "output_path"):
+            AddPoolingFactorToConfig("dir/pipeline.config", "dir/pipeline.config", 5)
+
+    def test_fill_keeps_same_named_sequence_subfeatures_apart(self):
+        # two sequences whose sub-features share the bare name are different
+        # features in a batch and must not overwrite each other
+        test_dir = make_test_dir()
+        cfg = _config(os.path.join(test_dir, "*.parquet"), with_model=False)
+        seq = cfg.feature_configs.add().sequence_feature
+        seq.sequence_name = "buy_seq"
+        seq.sequence_length = 50
+        sub = seq.features.add()
+        sub.id_feature.feature_name = "seq_id"
+        sub.id_feature.embedding_dim = 8
+        sub.id_feature.num_buckets = 100
+        tool = AddPoolingFactorToConfig("in.config", "out.config", num_batches=10)
+        filled = tool.fill(
+            cfg,
+            {
+                "click_seq__seq_id": (3.0, 3.0),
+                "buy_seq__seq_id": (7.0, 9.0),
+            },
+        )
+        self.assertEqual(set(filled), {"seq_id"})
+        self.assertAlmostEqual(
+            cfg.feature_configs[9]
+            .sequence_feature.features[0]
+            .id_feature.embedding_constraints.pooling_factor,
+            3.0,
+        )
+        self.assertAlmostEqual(
+            cfg.feature_configs[10]
+            .sequence_feature.features[0]
+            .id_feature.embedding_constraints.pooling_factor,
+            7.0,
+        )
+        self.assertAlmostEqual(
+            cfg.feature_configs[10]
+            .sequence_feature.features[0]
+            .id_feature.embedding_constraints.unique_id_factor,
+            9.0,
         )
 
     def test_run_measures_and_writes_a_loadable_config(self):
@@ -243,9 +289,9 @@ class AddPoolingFactorDynamicEmbTest(unittest.TestCase):
         f.feature_name = "id_a"
         f.embedding_dim = 8
         f.dynamicemb.max_capacity = 100_000
-        factors = AddPoolingFactorToConfig("", "", num_batches=10).measure(
-            cfg, [("ebc.id_a_emb", ["id_a"])]
-        )
+        factors = AddPoolingFactorToConfig(
+            "in.config", "out.config", num_batches=10
+        ).measure(cfg, [("ebc.id_a_emb", ["id_a"])])
         # raw positions include the duplicate 7; the union does not
         self.assertEqual(factors["id_a"], (3.0, 2.0))
 

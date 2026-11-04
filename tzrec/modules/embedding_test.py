@@ -311,33 +311,74 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(const.pooling_factors, [2.5, 1.5])
         self.assertEqual(const.feature_names, ["cat_a", "cat_b"])
 
+    def test_sequence_groups_with_same_subfeature_name_stay_apart(self):
+        # two sequence groups whose sub-features share the bare config name
+        # and one table are two inputs; the constraint identity is the batch
+        # name, so neither collapses into the other
+        def _seq(sequence_name, pooling_factor):
+            feat_cfg = feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name=sequence_name,
+                    sequence_length=50,
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="item_id",
+                                embedding_name="shared",
+                                embedding_dim=4,
+                                num_buckets=100,
+                            )
+                        )
+                    ],
+                )
+            )
+            if pooling_factor:
+                sub = feat_cfg.sequence_feature.features[0].id_feature
+                sub.embedding_constraints.pooling_factor = pooling_factor
+            return feat_cfg
+
+        features = create_features([_seq("click_seq", 2.5), _seq("buy_seq", 1.5)])
+        seq_group = SequenceEmbeddingGroupImpl(
+            features,
+            [
+                model_pb2.FeatureGroupConfig(
+                    group_name="click",
+                    feature_names=["click_seq__item_id"],
+                    group_type=model_pb2.FeatureGroupType.SEQUENCE,
+                ),
+                model_pb2.FeatureGroupConfig(
+                    group_name="buy",
+                    feature_names=["buy_seq__item_id"],
+                    group_type=model_pb2.FeatureGroupType.SEQUENCE,
+                ),
+            ],
+            device=torch.device("cpu"),
+        )
+        const = seq_group.parameter_constraints()["ec_dict.4.shared"]
+        self.assertEqual(const.pooling_factors, [2.5, 1.5])
+        self.assertEqual(
+            const.feature_names, ["click_seq__item_id", "buy_seq__item_id"]
+        )
+
     def test_shared_table_unique_id_factor_takes_the_max(self):
         const = self._shared_table_constraints(
             [("cat_a", 1.0, 20.0), ("cat_b", 1.0, 30.0)], ["cat_a", "cat_b"]
         )
         self.assertEqual(const.unique_id_factor, 30.0)
-        self.assertFalse(const.unique_id_partial)
-
-    def test_shared_table_unique_id_factor_falls_back_to_raw_ids(self):
-        # a member without a measured value: the raw id factors bound the union
+        # unmeasured members contribute nothing, never a fabricated bound
         const = self._shared_table_constraints(
             [("cat_a", 2.5, 20.0), ("cat_b", 5.0)], ["cat_a", "cat_b"]
         )
         self.assertEqual(const.unique_id_factor, 20.0)
-        self.assertTrue(const.unique_id_partial)
-
         const = self._shared_table_constraints(
             [("cat_a", 2.5, 3.0), ("cat_b", 5.0)], ["cat_a", "cat_b"]
         )
-        # max(3.0, 2.5 + 5.0): the unset member may add ids beyond the measure
-        self.assertEqual(const.unique_id_factor, 7.5)
-        self.assertTrue(const.unique_id_partial)
-
+        self.assertEqual(const.unique_id_factor, 3.0)
+        # no member configured: the table-level value stays unset
         const = self._shared_table_constraints(
             [("cat_a", 2.5), ("cat_b", 5.0)], ["cat_a", "cat_b"]
         )
-        self.assertEqual(const.unique_id_factor, 7.5)
-        self.assertTrue(const.unique_id_partial)
+        self.assertIsNone(getattr(const, "unique_id_factor", None))
 
     @parameterized.expand(
         [

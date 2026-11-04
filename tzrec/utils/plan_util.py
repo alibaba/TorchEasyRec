@@ -167,14 +167,21 @@ def create_planner(
                         # So that, we add constraints for params with data_parallel
                         # plan in ckpt.
                         fqn = f"{module_path}.{param_name}"
-                        if fqn not in fqn_constraints:
+                        # a table's own constraint entry outranks the saved
+                        # plan; entries that do not restrict sharding (such as
+                        # measured pooling factors) let the pin through
+                        const = fqn_constraints.get(fqn)
+                        if const is None or const.sharding_types is None:
                             if is_rank_zero:
                                 logger.info(
                                     f"add ParameterConstraints[sharding_types=['{param_sharding['sharding_type']}']] for param[{fqn}] from checkpoint plan."  # NOQA
                                 )
-                            fqn_constraints[fqn] = ParameterConstraints(
-                                sharding_types=[param_sharding["sharding_type"]]
-                            )
+                            if const is None:
+                                fqn_constraints[fqn] = ParameterConstraints(
+                                    sharding_types=[param_sharding["sharding_type"]]
+                                )
+                            else:
+                                const.sharding_types = [param_sharding["sharding_type"]]
 
     global_constraints = None
     if global_constraints_cfg is not None:

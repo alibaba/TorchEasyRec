@@ -879,7 +879,8 @@ class BaseFeature(object, metaclass=_meta_cls):
         const = None
         if self.config.HasField("embedding_constraints"):
             const = build_embedding_constraints(self.config.embedding_constraints)
-            const.feature_names = [self.config.feature_name]
+            # the batch name, like the table config's own feature list
+            const.feature_names = [self.name]
         if not (
             hasattr(self.config, "dynamicemb") and self.config.HasField("dynamicemb")
         ):
@@ -901,7 +902,7 @@ class BaseFeature(object, metaclass=_meta_cls):
                 const.pooling_factors = [constraints_cfg.pooling_factor]
             if constraints_cfg.HasField("unique_id_factor"):
                 const.unique_id_factor = constraints_cfg.unique_id_factor
-        const.feature_names = [self.config.feature_name]
+        const.feature_names = [self.name]
         return const
 
     def _build_side_inputs(self) -> Optional[List[Tuple[str, str]]]:

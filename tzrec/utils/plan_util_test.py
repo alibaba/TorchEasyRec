@@ -11,6 +11,7 @@
 
 import os
 import random
+import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import List, Tuple
@@ -566,6 +567,100 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         proposer.feedback(partitionable=True, storage_constraint=topology)
         # After feedback, no proposals are available.
         self.assertIsNone(proposer.propose())
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for create_planner.")
+@mark_ci_scope("gpu")
+class CkptPlanConstraintsTest(unittest.TestCase):
+    """The saved plan's sharding pin behind a table's own constraints."""
+
+    def _create(self, test_dir, constraint):
+        import json as _json
+
+        import torch.distributed as dist
+
+        for k, v in (
+            ("RANK", "0"),
+            ("WORLD_SIZE", "1"),
+            ("MASTER_ADDR", "127.0.0.1"),
+            ("MASTER_PORT", "29713"),
+        ):
+            os.environ[k] = v
+        if not dist.is_initialized():
+            dist.init_process_group(backend="gloo")
+
+        class _SparseNN(TestSparseNN):
+            def parameter_constraints(self, prefix: str = ""):
+                return {f"{prefix}sparse.ebc.table_a": constraint}
+
+        model = _SparseNN(
+            tables=[
+                EmbeddingBagConfig(
+                    num_embeddings=100,
+                    embedding_dim=8,
+                    name="table_a",
+                    feature_names=["feature_a"],
+                )
+            ],
+            sparse_device=torch.device("meta"),
+        )
+        plan_path = os.path.join(test_dir, "plan.json")
+        with open(plan_path, "w") as f:
+            _json.dump(
+                {"sparse": {"ebc.table_a": {"sharding_type": "data_parallel"}}}, f
+            )
+        planner = create_planner(
+            device=torch.device("cuda"),
+            batch_size=16,
+            ckpt_plan_path=plan_path,
+            model=model,
+        )
+        return planner, model
+
+    def tearDown(self):
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        os.environ.pop("FORCE_LOAD_SHARDING_PLAN", None)
+
+    def test_pin_applies_behind_pooling_only_constraints(self):
+        # every sparse table now carries a constraint entry (measured
+        # pooling factors); an entry that does not restrict sharding must not
+        # disable the data_parallel pin that resume depends on
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        constraint = ParameterConstraints(
+            pooling_factors=[2.0], feature_names=["feature_a"]
+        )
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            with self.assertLogs("tzrec", level="INFO") as logs:
+                planner, model = self._create(test_dir, constraint)
+            self.assertTrue(
+                any(
+                    "from checkpoint plan" in line and "sparse.ebc.table_a" in line
+                    for line in logs.output
+                ),
+                logs.output,
+            )
+            # the pin is the only sharding option left, so the plan must be DP
+            plan = planner.plan(model, get_default_sharders())
+            self.assertEqual(
+                plan.plan["sparse.ebc"]["table_a"].sharding_type, "data_parallel"
+            )
+
+    def test_own_sharding_types_outrank_the_saved_plan(self):
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        constraint = ParameterConstraints(
+            sharding_types=["row_wise"], feature_names=["feature_a"]
+        )
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            planner, model = self._create(test_dir, constraint)
+            plan = planner.plan(model, get_default_sharders())
+            self.assertEqual(
+                plan.plan["sparse.ebc"]["table_a"].sharding_type, "row_wise"
+            )
 
 
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")

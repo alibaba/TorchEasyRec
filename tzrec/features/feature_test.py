@@ -1213,10 +1213,12 @@ class EmbeddingConstraintsTest(unittest.TestCase):
         )
         for k, v in dynamicemb.items():
             setattr(feat_cfg.id_feature.dynamicemb, k, v)
-        if pooling_factor or unique_id_factor:
-            constraints = feat_cfg.id_feature.embedding_constraints
-            constraints.pooling_factor = pooling_factor
-            constraints.unique_id_factor = unique_id_factor
+        if pooling_factor:
+            feat_cfg.id_feature.embedding_constraints.pooling_factor = pooling_factor
+        if unique_id_factor:
+            feat_cfg.id_feature.embedding_constraints.unique_id_factor = (
+                unique_id_factor
+            )
         return id_feature.IdFeature(feat_cfg)
 
     def test_factors_are_forwarded_with_the_feature_name(self):

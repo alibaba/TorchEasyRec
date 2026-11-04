@@ -629,10 +629,10 @@ def _add_constraints(
     in the order the features appear in the final embedding config; a feature
     reused by several groups of one table is counted once, and a feature that
     sets no pooling_factor contributes the default of one id per sample.
-    unique_id_factor aggregates the features' values with max, and falls back
-    to the sum of the pooling factors - an upper bound of any per-sample
-    union - whenever a feature does not carry one, so a shared table is never
-    silently underestimated.
+    unique_id_factor is the table-level measured value carried by the member
+    features: configured values aggregate with max, and a table whose members
+    set none keeps it unset - raw average lengths do not bound the maximum
+    unique working set, so nothing is fabricated in its place.
 
     Args:
         store(Dict[str, ParameterConstraints]): a dict of table constraints.
@@ -648,7 +648,6 @@ def _add_constraints(
     )
     old = store.get(name)
     if old is None:
-        _init_unique_id_factor(const)
         store[name] = const
         return
     if const.feature_names[0] in (old.feature_names or []):
@@ -659,35 +658,10 @@ def _add_constraints(
         old.sharding_types = const.sharding_types
     if const.compute_kernels is not None:
         old.compute_kernels = const.compute_kernels
-    _merge_unique_id_factor(old, const)
-
-
-def _init_unique_id_factor(const: ParameterConstraints) -> None:
-    """Start a table's unique-id estimate from its first feature's entry."""
     value = getattr(const, "unique_id_factor", None)
-    if value is None:
-        # no measured value: the raw per-sample ids bound the union
-        const.unique_id_factor = sum(const.pooling_factors)
-        const.unique_id_partial = True
-    else:
-        const.unique_id_partial = False
-
-
-def _merge_unique_id_factor(
-    old: ParameterConstraints, const: ParameterConstraints
-) -> None:
-    """Fold one more feature's entry into the table's unique-id estimate."""
-    value = getattr(const, "unique_id_factor", None)
-    old.unique_id_partial = bool(
-        getattr(old, "unique_id_partial", False) or value is None
-    )
     if value is not None:
-        old.unique_id_factor = max(getattr(old, "unique_id_factor", 0.0), float(value))
-    if old.unique_id_partial:
-        # some feature carries no value; the raw ids bound the union
-        old.unique_id_factor = max(
-            getattr(old, "unique_id_factor", 0.0), sum(old.pooling_factors)
-        )
+        old_value = getattr(old, "unique_id_factor", None)
+        old.unique_id_factor = value if old_value is None else max(old_value, value)
 
 
 def _add_embedding_config(
