@@ -163,7 +163,13 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         from tzrec.main import _create_features
 
         features = _create_features(list(cfg.feature_configs), cfg.data_config)
-        tables = dict(AddPoolingFactorToConfig.table_features(cfg, features))
+        table_list = AddPoolingFactorToConfig.table_features(cfg, features)
+        tables = dict(table_list)
+        # the adapter behind table_features, called directly
+        direct = AddPoolingFactorToConfig.get_embedding_table_features(
+            features, list(cfg.model_config.feature_groups)
+        )
+        self.assertEqual(sorted(direct), sorted(table_list))
         self.assertEqual(tables[f"{BASE_DATA_GROUP}.ebc.id_a_emb"], ["id_a"])
         self.assertEqual(
             tables[f"{BASE_DATA_GROUP}.ebc.shared"], ["shared_a", "shared_b"]

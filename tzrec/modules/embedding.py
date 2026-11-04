@@ -206,7 +206,7 @@ class EmbeddingGroup(nn.Module):
             self._impl_key_to_feat_groups,
             self._impl_key_to_seq_groups,
             self._group_name_to_impl_key,
-        ) = resolve_impl_groups(features, feature_groups)
+        ) = build_embedding_group_mappings(features, feature_groups)
         for feature_group in feature_groups:
             group_name = feature_group.group_name
             if feature_group.group_type in (
@@ -514,7 +514,7 @@ def _is_weighted(emb_bag_configs: Dict[str, EmbeddingBagConfig]) -> bool:
     return any(x.is_weighted for x in emb_bag_configs.values())
 
 
-def _add_constraints(
+def _merge_embedding_constraints(
     store: Dict[str, ParameterConstraints],
     name: str,
     feature_name: str,
@@ -635,7 +635,7 @@ def _ec_output_key_to_shared_name(
     return feat_list
 
 
-def _inspect_and_supplement_feature_group(
+def _validate_and_complete_feature_group(
     feature_group: FeatureGroupConfig, seq_group_names: List[str]
 ) -> None:
     """Inspect feature group sequence_groups and sequence_encoders."""
@@ -708,7 +708,7 @@ def _inspect_and_supplement_feature_group(
             )
 
 
-def resolve_impl_groups(
+def build_embedding_group_mappings(
     features: List[BaseFeature],
     feature_groups: List[FeatureGroupConfig],
 ) -> Tuple[
@@ -740,7 +740,7 @@ def resolve_impl_groups(
     group_name_to_impl_key: Dict[str, str] = dict()
     for feature_group in feature_groups:
         group_name = feature_group.group_name
-        _inspect_and_supplement_feature_group(feature_group, seq_group_names)
+        _validate_and_complete_feature_group(feature_group, seq_group_names)
         features_data_group: Dict[str, List[str]] = defaultdict(list)
         for feature_name in feature_group.feature_names:
             feature = name_to_feature[feature_name]
@@ -782,12 +782,12 @@ def resolve_impl_groups(
     return impl_key_to_feat_groups, impl_key_to_seq_groups, group_name_to_impl_key
 
 
-def _is_mc_feature(feature: BaseFeature) -> bool:
+def _is_zch_feature(feature: BaseFeature) -> bool:
     """Whether the feature's table is managed-collision (ZCH), from config."""
     return hasattr(feature.config, "zch") and feature.config.HasField("zch")
 
 
-def _resolve_feature_table_names(
+def _build_feature_table_mappings(
     name_to_feature: Dict[str, BaseFeature],
     feature_groups: List[FeatureGroupConfig],
     wide_name: bool,
@@ -825,7 +825,7 @@ def _resolve_feature_table_names(
 
 
 @dataclass
-class ResolvedEmbeddingBagTables:
+class EmbeddingBagTableConfigs:
     """Final EBC table configs of one embedding implementation.
 
     Attributes:
@@ -846,12 +846,12 @@ class ResolvedEmbeddingBagTables:
     shared_feature_flag: Dict[str, bool]
 
 
-def resolve_embedding_bag_tables(
+def build_embedding_bag_configs(
     features: List[BaseFeature],
     feature_groups: List[FeatureGroupConfig],
     wide_embedding_dim: Optional[int] = None,
     wide_init_fn: Optional[str] = None,
-) -> ResolvedEmbeddingBagTables:
+) -> EmbeddingBagTableConfigs:
     """Resolve the EBC tables of feature groups from configuration.
 
     Walks the groups the way model construction does: WIDE groups rename and
@@ -867,13 +867,13 @@ def resolve_embedding_bag_tables(
     """
     name_to_feature = {x.name: x for x in features}
     need_input_tile_emb = is_input_tile_emb()
-    feat_to_group_to_emb_name, shared_feature_flag = _resolve_feature_table_names(
+    feat_to_group_to_emb_name, shared_feature_flag = _build_feature_table_mappings(
         name_to_feature,
         feature_groups,
         wide_name=True,
         config_name=lambda feature: feature.emb_bag_config.name,  # pyre-ignore[16]
     )
-    tables = ResolvedEmbeddingBagTables(
+    tables = EmbeddingBagTableConfigs(
         OrderedDict(),
         OrderedDict(),
         OrderedDict(),
@@ -897,11 +897,11 @@ def resolve_embedding_bag_tables(
             emb_bag_config.name = feat_to_group_to_emb_name[name][group_name]
             if need_input_tile_emb and feature.is_user_feat:
                 emb_bag_configs = (
-                    tables.mc_ebc_user if _is_mc_feature(feature) else tables.ebc_user
+                    tables.mc_ebc_user if _is_zch_feature(feature) else tables.ebc_user
                 )
             else:
                 emb_bag_configs = (
-                    tables.mc_ebc if _is_mc_feature(feature) else tables.ebc
+                    tables.mc_ebc if _is_zch_feature(feature) else tables.ebc
                 )
             _add_embedding_bag_config(
                 emb_bag_configs=emb_bag_configs, emb_bag_config=emb_bag_config
@@ -910,7 +910,7 @@ def resolve_embedding_bag_tables(
 
 
 @dataclass
-class ResolvedEmbeddingCollectionTables:
+class EmbeddingCollectionTableConfigs:
     """Final EC table configs of one sequence embedding implementation.
 
     Attributes:
@@ -934,10 +934,10 @@ class ResolvedEmbeddingCollectionTables:
     emb_name_to_feature_to_shared_name: Dict[str, Dict[str, str]]
 
 
-def resolve_embedding_collection_tables(
+def build_embedding_collection_configs(
     features: List[BaseFeature],
     feature_groups: List[Union[FeatureGroupConfig, SeqGroupConfig]],
-) -> ResolvedEmbeddingCollectionTables:
+) -> EmbeddingCollectionTableConfigs:
     """Resolve the EC tables of sequence feature groups from configuration.
 
     Walks the groups the way model construction does: tables are collected
@@ -952,7 +952,7 @@ def resolve_embedding_collection_tables(
     """
     name_to_feature = {x.name: x for x in features}
     need_input_tile_emb = is_input_tile_emb()
-    feat_to_group_to_emb_name, shared_feature_flag = _resolve_feature_table_names(
+    feat_to_group_to_emb_name, shared_feature_flag = _build_feature_table_mappings(
         name_to_feature,
         feature_groups,
         wide_name=False,
@@ -987,17 +987,17 @@ def resolve_embedding_collection_tables(
             if need_input_tile_emb and feature.is_user_feat:
                 emb_configs = (
                     dim_to_mc_emb_configs_user[emb_config.embedding_dim]
-                    if _is_mc_feature(feature)
+                    if _is_zch_feature(feature)
                     else dim_to_emb_configs_user[emb_config.embedding_dim]
                 )
             else:
                 emb_configs = (
                     dim_to_mc_emb_configs[emb_config.embedding_dim]
-                    if _is_mc_feature(feature)
+                    if _is_zch_feature(feature)
                     else dim_to_emb_configs[emb_config.embedding_dim]
                 )
             _add_embedding_config(emb_configs=emb_configs, emb_config=emb_config)
-    return ResolvedEmbeddingCollectionTables(
+    return EmbeddingCollectionTableConfigs(
         dim_to_emb_configs,
         dim_to_mc_emb_configs,
         dim_to_emb_configs_user,
@@ -1006,63 +1006,6 @@ def resolve_embedding_collection_tables(
         shared_feature_flag,
         emb_name_to_feature_to_shared_name,
     )
-
-
-def resolve_embedding_tables(
-    features: List[BaseFeature],
-    feature_groups: List[FeatureGroupConfig],
-    wide_embedding_dim: Optional[int] = None,
-    wide_init_fn: Optional[str] = None,
-) -> List[Tuple[str, List[str]]]:
-    """(collection-qualified table, feature names) of every embedding table.
-
-    The identity is ``<data group>.<kind>[.<embedding dim>].<table name>``,
-    kind one of ebc, mc_ebc, ebc_user, mc_ebc_user, ec, mc_ec, ec_user and
-    mc_ec_user. Tables of different data groups never share an identity, and
-    feature groups of one data group that use the same table name are the
-    same table. Builds no module.
-
-    Args:
-        features (list): list of features.
-        feature_groups (list): list of feature group config.
-        wide_embedding_dim (int, optional): wide group feature embedding dim.
-        wide_init_fn (str, optional): wide embedding table init function.
-    """
-    impl_key_to_feat_groups, impl_key_to_seq_groups, _ = resolve_impl_groups(
-        features, feature_groups
-    )
-    tables: List[Tuple[str, List[str]]] = []
-    for impl_key, groups in impl_key_to_feat_groups.items():
-        resolved = resolve_embedding_bag_tables(
-            features, groups, wide_embedding_dim, wide_init_fn
-        )
-        for kind, configs in (
-            ("ebc", resolved.ebc),
-            ("mc_ebc", resolved.mc_ebc),
-            ("ebc_user", resolved.ebc_user),
-            ("mc_ebc_user", resolved.mc_ebc_user),
-        ):
-            for name, emb_bag_config in configs.items():
-                tables.append(
-                    (f"{impl_key}.{kind}.{name}", list(emb_bag_config.feature_names))
-                )
-    for impl_key, groups in impl_key_to_seq_groups.items():
-        resolved = resolve_embedding_collection_tables(features, groups)
-        for kind, dim_to_configs in (
-            ("ec", resolved.ec),
-            ("mc_ec", resolved.mc_ec),
-            ("ec_user", resolved.ec_user),
-            ("mc_ec_user", resolved.mc_ec_user),
-        ):
-            for embedding_dim, configs in dim_to_configs.items():
-                for name, emb_config in configs.items():
-                    tables.append(
-                        (
-                            f"{impl_key}.{kind}.{embedding_dim}.{name}",
-                            list(emb_config.feature_names),
-                        )
-                    )
-    return tables
 
 
 class EmbeddingGroupImpl(nn.Module):
@@ -1091,15 +1034,15 @@ class EmbeddingGroupImpl(nn.Module):
 
         need_input_tile_emb = is_input_tile_emb()
 
-        resolved = resolve_embedding_bag_tables(
+        table_configs = build_embedding_bag_configs(
             features, feature_groups, wide_embedding_dim, wide_init_fn
         )
-        emb_bag_configs = resolved.ebc
-        mc_emb_bag_configs = resolved.mc_ebc
-        emb_bag_configs_user = resolved.ebc_user
-        mc_emb_bag_configs_user = resolved.mc_ebc_user
-        feat_to_group_to_emb_name = resolved.feat_to_group_to_emb_name
-        shared_feature_flag = resolved.shared_feature_flag
+        emb_bag_configs = table_configs.ebc
+        mc_emb_bag_configs = table_configs.mc_ebc
+        emb_bag_configs_user = table_configs.ebc_user
+        mc_emb_bag_configs_user = table_configs.mc_ebc_user
+        feat_to_group_to_emb_name = table_configs.feat_to_group_to_emb_name
+        shared_feature_flag = table_configs.shared_feature_flag
 
         mc_modules = OrderedDict()
         mc_modules_user = OrderedDict()
@@ -1140,7 +1083,7 @@ class EmbeddingGroupImpl(nn.Module):
                         (wide_embedding_dim or 4) if is_wide else feature.output_dim
                     )
                     mc_module = (
-                        feature.mc_module(device) if _is_mc_feature(feature) else None
+                        feature.mc_module(device) if _is_zch_feature(feature) else None
                     )
                     const = feature.parameter_constraints(emb_bag_config)
 
@@ -1149,7 +1092,7 @@ class EmbeddingGroupImpl(nn.Module):
                             _add_mc_module(mc_modules_user, table_name, mc_module)
                             # mc module not support const now
                         else:
-                            _add_constraints(
+                            _merge_embedding_constraints(
                                 self._emb_bag_constraints_user, table_name, name, const
                             )
                     else:
@@ -1157,7 +1100,7 @@ class EmbeddingGroupImpl(nn.Module):
                             _add_mc_module(mc_modules, table_name, mc_module)
                             # mc module not support const now
                         else:
-                            _add_constraints(
+                            _merge_embedding_constraints(
                                 self._emb_bag_constraints, table_name, name, const
                             )
 
@@ -1383,14 +1326,16 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         self._group_to_is_jagged = dict()
         self._group_to_sequence_length = OrderedDict()
 
-        resolved = resolve_embedding_collection_tables(features, feature_groups)
-        dim_to_emb_configs = resolved.ec
-        dim_to_mc_emb_configs = resolved.mc_ec
-        dim_to_emb_configs_user = resolved.ec_user
-        dim_to_mc_emb_configs_user = resolved.mc_ec_user
-        feat_to_group_to_emb_name = resolved.feat_to_group_to_emb_name
-        shared_feature_flag = resolved.shared_feature_flag
-        emb_name_to_feature_to_shared_name = resolved.emb_name_to_feature_to_shared_name
+        ec_table_configs = build_embedding_collection_configs(features, feature_groups)
+        dim_to_emb_configs = ec_table_configs.ec
+        dim_to_mc_emb_configs = ec_table_configs.mc_ec
+        dim_to_emb_configs_user = ec_table_configs.ec_user
+        dim_to_mc_emb_configs_user = ec_table_configs.mc_ec_user
+        feat_to_group_to_emb_name = ec_table_configs.feat_to_group_to_emb_name
+        shared_feature_flag = ec_table_configs.shared_feature_flag
+        emb_name_to_feature_to_shared_name = (
+            ec_table_configs.emb_name_to_feature_to_shared_name
+        )
         self.has_sparse = bool(dim_to_emb_configs)
         self.has_mc_sparse = bool(dim_to_mc_emb_configs)
         self.has_sparse_user = bool(dim_to_emb_configs_user)
@@ -1425,7 +1370,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     assert emb_config is not None
                     table_name = feat_to_group_to_emb_name[name][group_name]
                     mc_module = (
-                        feature.mc_module(device) if _is_mc_feature(feature) else None
+                        feature.mc_module(device) if _is_zch_feature(feature) else None
                     )
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + table_name
@@ -1441,7 +1386,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             )
                             # mc module not support const now
                         else:
-                            _add_constraints(
+                            _merge_embedding_constraints(
                                 self._dim_to_emb_constraints_user[embedding_dim],
                                 table_name,
                                 name,
@@ -1458,7 +1403,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                             )
                             # mc module not support const now
                         else:
-                            _add_constraints(
+                            _merge_embedding_constraints(
                                 self._dim_to_emb_constraints[embedding_dim],
                                 table_name,
                                 name,

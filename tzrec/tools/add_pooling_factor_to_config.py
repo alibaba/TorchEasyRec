@@ -50,13 +50,17 @@ Usage: python -m tzrec.tools.add_pooling_factor_to_config
 import argparse
 import math
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.main import _create_features
-from tzrec.modules.embedding import resolve_embedding_tables
+from tzrec.modules.embedding import (
+    build_embedding_bag_configs,
+    build_embedding_collection_configs,
+    build_embedding_group_mappings,
+)
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util
 from tzrec.utils.logging_util import logger
@@ -102,6 +106,72 @@ class AddPoolingFactorToConfig(object):
         )
 
     @staticmethod
+    def get_embedding_table_features(
+        features: List[Any],
+        feature_groups: List[Any],
+        wide_embedding_dim: Optional[int] = None,
+        wide_init_fn: Optional[str] = None,
+    ) -> List[Tuple[str, List[str]]]:
+        """(collection-qualified table, feature names) of every embedding table.
+
+        Calls the configuration rules model construction uses - group
+        classification, table naming, suffixes, ZCH separation, feature
+        sharing - and extracts each table's identity and input features from
+        the built configs.
+
+        Args:
+            features (list): the config's features.
+            feature_groups (list): list of feature group config.
+            wide_embedding_dim (int, optional): wide group feature embedding
+                dim.
+            wide_init_fn (str, optional): wide embedding table init function.
+
+        Returns:
+            (table, feature names) pairs, the table identified by data group,
+            collection, embedding dim and name; feature names as they appear
+            in a batch (grouped sequence features carry their sequence
+            prefix).
+        """
+        impl_key_to_feat_groups, impl_key_to_seq_groups, _ = (
+            build_embedding_group_mappings(features, feature_groups)
+        )
+        tables: List[Tuple[str, List[str]]] = []
+        for impl_key, groups in impl_key_to_feat_groups.items():
+            table_configs = build_embedding_bag_configs(
+                features, groups, wide_embedding_dim, wide_init_fn
+            )
+            for kind, configs in (
+                ("ebc", table_configs.ebc),
+                ("mc_ebc", table_configs.mc_ebc),
+                ("ebc_user", table_configs.ebc_user),
+                ("mc_ebc_user", table_configs.mc_ebc_user),
+            ):
+                for name, emb_bag_config in configs.items():
+                    tables.append(
+                        (
+                            f"{impl_key}.{kind}.{name}",
+                            list(emb_bag_config.feature_names),
+                        )
+                    )
+        for impl_key, groups in impl_key_to_seq_groups.items():
+            ec_table_configs = build_embedding_collection_configs(features, groups)
+            for kind, dim_to_configs in (
+                ("ec", ec_table_configs.ec),
+                ("mc_ec", ec_table_configs.mc_ec),
+                ("ec_user", ec_table_configs.ec_user),
+                ("mc_ec_user", ec_table_configs.mc_ec_user),
+            ):
+                for embedding_dim, configs in dim_to_configs.items():
+                    for name, emb_config in configs.items():
+                        tables.append(
+                            (
+                                f"{impl_key}.{kind}.{embedding_dim}.{name}",
+                                list(emb_config.feature_names),
+                            )
+                        )
+        return tables
+
+    @staticmethod
     def table_features(
         cfg: EasyRecConfig, features: List[Any]
     ) -> List[Tuple[str, List[str]]]:
@@ -128,7 +198,7 @@ class AddPoolingFactorToConfig(object):
         )
         if isinstance(model_cfg, str):
             model_cfg = None
-        return resolve_embedding_tables(
+        return AddPoolingFactorToConfig.get_embedding_table_features(
             features,
             list(cfg.model_config.feature_groups),
             wide_embedding_dim=getattr(model_cfg, "wide_embedding_dim", None),

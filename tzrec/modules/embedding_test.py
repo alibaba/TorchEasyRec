@@ -28,7 +28,6 @@ from tzrec.modules.embedding import (
     EmbeddingGroup,
     EmbeddingGroupImpl,
     SequenceEmbeddingGroupImpl,
-    resolve_embedding_tables,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
 from tzrec.utils import dynamicemb_util
@@ -316,7 +315,7 @@ class EmbeddingGroupTest(unittest.TestCase):
         dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
     )
     @mark_ci_scope("gpu")
-    def test_resolve_embedding_tables_matches_construction(self):
+    def test_get_embedding_table_features_matches_construction(self):
         # the configuration resolver must return exactly the tables the
         # built modules hold: ordinary, dynamicemb and ZCH features, a table
         # shared by two features and by two groups, a repeated reference,
@@ -408,10 +407,14 @@ class EmbeddingGroupTest(unittest.TestCase):
             ),
         ]
         # wide tables carry the passed wide dim on both sides
+        from tzrec.tools.add_pooling_factor_to_config import (
+            AddPoolingFactorToConfig,
+        )
+
         wide_embedding_dim = 8
         resolved = {
             table: tuple(names)
-            for table, names in resolve_embedding_tables(
+            for table, names in AddPoolingFactorToConfig.get_embedding_table_features(
                 features, feature_groups, wide_embedding_dim=wide_embedding_dim
             )
         }
