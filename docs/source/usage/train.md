@@ -242,7 +242,7 @@ feature_configs {
         embedding_dim: 8
         embedding_constraints {
             # 平均每个样本36.3个原始Id；最重的一个样本41个去重Id
-            # batch_size=1024时，该表单个batch的去重工作集估计为1024*41=42064
+            # batch_size=1024时，该表单个batch的去重工作集估计为1024*41=41984
             pooling_factor: 36.3
             unique_id_factor: 41
         }

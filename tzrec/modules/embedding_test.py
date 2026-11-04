@@ -484,6 +484,36 @@ class EmbeddingGroupTest(unittest.TestCase):
             [("cat_a_emb", ["cat_a"]), ("cat_b_emb", ["cat_b"])],
         )
 
+    @unittest.skipUnless(
+        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+    )
+    @mark_ci_scope("gpu")
+    def test_dynamicemb_constraint_sees_the_wide_table(self) -> None:
+        # the constraint is built from the table config the builder resized
+        # and renamed, not from a fresh feature config
+        f = feature_pb2.IdFeature(
+            feature_name="cat_a", embedding_dim=16, num_buckets=100
+        )
+        f.dynamicemb.max_capacity = 100_000
+        # NORMAL's default std_dev comes from the table's dim, so the mode
+        # makes the wide resize observable
+        f.dynamicemb.initializer_args.mode = "NORMAL"
+        features = create_features([feature_pb2.FeatureConfig(id_feature=f)])
+        wide = model_pb2.FeatureGroupConfig(
+            group_name="wide",
+            feature_names=["cat_a"],
+            group_type=model_pb2.FeatureGroupType.WIDE,
+        )
+        embedding_group = EmbeddingGroupImpl(
+            features, [wide], wide_embedding_dim=4, device=torch.device("cpu")
+        )
+        const = embedding_group.parameter_constraints()["ebc.cat_a_emb_wide"]
+        self.assertTrue(const.use_dynamicemb)
+        # default initialization is uniform with bounds from the table dim
+        initializer_args = const.dynamicemb_options.initializer_args
+        self.assertEqual(str(initializer_args.mode), "DynamicEmbInitializerMode.NORMAL")
+        self.assertAlmostEqual(initializer_args.std_dev, 1.0 / (4**0.5), places=6)
+
     def test_build_embedding_bag_configs_wide_resizes_and_renames(self) -> None:
         features = _create_test_features()
         wide = model_pb2.FeatureGroupConfig(

@@ -214,9 +214,6 @@ class AddPoolingFactorToConfig(object):
             per_feature: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
             for kjt in batch.sparse_features.values():
                 for key in kjt.keys():
-                    if key in per_feature:
-                        # input-tile duplicates read the same column
-                        continue
                     jt = kjt[key]
                     per_feature[key] = (
                         jt.values().detach().cpu().numpy(),

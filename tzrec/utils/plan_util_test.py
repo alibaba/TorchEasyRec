@@ -303,6 +303,59 @@ class PlanUtilTest(unittest.TestCase):
     @unittest.skipUnless(
         torch.cuda.is_available(), "CUDA is required for create_planner."
     )
+    def test_global_constraints_apply_behind_statistics_only_entries(self) -> None:
+        # a parameter entry that only carries measured factors keeps the
+        # global sharding and kernel lists applied to its table
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        topology = Topology(world_size=1, compute_device="cpu")
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=8,
+                name="table_a",
+                feature_names=["feature_a"],
+            )
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        global_constraints = ParameterConstraints(
+            sharding_types=["table_wise", "row_wise"]
+        )
+        statistics_only = ParameterConstraints(
+            pooling_factors=[2.0], feature_names=["feature_a"]
+        )
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=16,
+            fqn_constraints={"sparse.ebc.table_a": statistics_only},
+            global_constraints=global_constraints,
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=get_default_sharders()
+        )
+        self.assertTrue(search_space)
+        # the global list restricts the table; data_parallel is gone
+        self.assertNotIn(
+            "data_parallel", {option.sharding_type for option in search_space}
+        )
+        # an entry that restricts sharding itself still outranks the global
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=16,
+            fqn_constraints={
+                "sparse.ebc.table_a": ParameterConstraints(
+                    sharding_types=["table_wise"]
+                )
+            },
+            global_constraints=global_constraints,
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=get_default_sharders()
+        )
+        self.assertEqual(
+            {option.sharding_type for option in search_space}, {"table_wise"}
+        )
+
     @mark_ci_scope("gpu")
     def test_checkpoint_sharding_applies_with_statistics_only_constraints(self):
         # every sparse table now carries a constraint entry (measured pooling
@@ -317,6 +370,8 @@ class PlanUtilTest(unittest.TestCase):
         self.assertEqual(
             plan.plan["sparse.ebc"]["table_a"].sharding_type, "data_parallel"
         )
+        # planning must not mutate the model's own constraint objects
+        self.assertIsNone(constraint.sharding_types)
 
     @unittest.skipUnless(
         torch.cuda.is_available(), "CUDA is required for create_planner."

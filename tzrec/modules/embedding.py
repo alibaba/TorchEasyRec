@@ -1078,12 +1078,20 @@ class EmbeddingGroupImpl(nn.Module):
                 feature = name_to_feature[name]
 
                 if feature.is_sparse:
-                    emb_bag_config = feature.emb_bag_config
-                    assert emb_bag_config is not None
                     table_name = feat_to_group_to_emb_name[name][group_name]
-                    output_dim = (
-                        (wide_embedding_dim or 4) if is_wide else feature.output_dim
-                    )
+                    is_user = need_input_tile_emb and feature.is_user_feat
+                    # the table config the builder already renamed and, for
+                    # wide tables, resized; the constraint must see that one
+                    emb_bag_config = (
+                        table_configs.mc_ebc_user
+                        if is_user and _is_zch_feature(feature)
+                        else table_configs.ebc_user
+                        if is_user
+                        else table_configs.mc_ebc
+                        if _is_zch_feature(feature)
+                        else table_configs.ebc
+                    )[table_name]
+                    output_dim = emb_bag_config.embedding_dim
                     mc_module = (
                         feature.mc_module(device) if _is_zch_feature(feature) else None
                     )
@@ -1368,15 +1376,25 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
                 if feature.is_sparse:
                     output_dim = feature.output_dim
-                    emb_config = feature.emb_config
-                    assert emb_config is not None
                     table_name = feat_to_group_to_emb_name[name][group_name]
+                    is_user = need_input_tile_emb and feature.is_user_feat
+                    embedding_dim = feature.emb_config.embedding_dim
+                    # the table config the builder already renamed; the
+                    # constraint must see that one
+                    emb_config = (
+                        ec_table_configs.mc_ec_user
+                        if is_user and _is_zch_feature(feature)
+                        else ec_table_configs.ec_user
+                        if is_user
+                        else ec_table_configs.mc_ec
+                        if _is_zch_feature(feature)
+                        else ec_table_configs.ec
+                    )[embedding_dim][table_name]
                     mc_module = (
                         feature.mc_module(device) if _is_zch_feature(feature) else None
                     )
                     if shared_feature_flag[name]:
                         shared_name = shared_name + "@" + table_name
-                    embedding_dim = emb_config.embedding_dim
                     const = feature.parameter_constraints(emb_config)
 
                     if need_input_tile_emb and feature.is_user_feat:
