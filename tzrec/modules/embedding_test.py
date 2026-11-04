@@ -28,6 +28,7 @@ from tzrec.modules.embedding import (
     EmbeddingGroup,
     EmbeddingGroupImpl,
     SequenceEmbeddingGroupImpl,
+    resolve_embedding_tables,
 )
 from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
 from tzrec.utils import dynamicemb_util
@@ -310,6 +311,149 @@ class EmbeddingGroupTest(unittest.TestCase):
         )
         self.assertEqual(const.pooling_factors, [2.5, 1.5])
         self.assertEqual(const.feature_names, ["cat_a", "cat_b"])
+
+    @unittest.skipUnless(
+        dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+    )
+    @mark_ci_scope("gpu")
+    def test_resolve_embedding_tables_matches_construction(self):
+        # the configuration resolver must return exactly the tables the
+        # built modules hold: ordinary, dynamicemb and ZCH features, a table
+        # shared by two features and by two groups, a repeated reference,
+        # WIDE renaming, an embedding-name suffix, a nested sequence group
+        # inheriting its parent's suffix, a separate data group and two
+        # sequences whose sub-features share the bare name
+        feature_cfgs = []
+
+        def _id(name, embedding_name="", dim=16, **extra):
+            f = feature_pb2.IdFeature(
+                feature_name=name, embedding_dim=dim, num_buckets=100, **extra
+            )
+            if embedding_name:
+                f.embedding_name = embedding_name
+            feature_cfgs.append(feature_pb2.FeatureConfig(id_feature=f))
+
+        _id("cat_a")
+        _id("cat_b")
+        _id("shared_a", "shared", dim=8)
+        _id("shared_b", "shared", dim=8)
+        _id(
+            "zch_a",
+            zch=feature_pb2.ZeroCollisionHash(
+                zch_size=100, lfu=feature_pb2.LFU_EvictionPolicy()
+            ),
+        )
+        _id("dyn_a", dynamicemb=feature_pb2.DynamicEmbedding(max_capacity=100_000))
+        _id("user_a")
+        for seq_name in ("click_seq", "buy_seq"):
+            wrapper = feature_pb2.SequenceFeature(
+                sequence_name=seq_name,
+                sequence_length=50,
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="cat_s", embedding_dim=8, num_buckets=100
+                        )
+                    )
+                ],
+            )
+            feature_cfgs.append(feature_pb2.FeatureConfig(sequence_feature=wrapper))
+        features = create_features(feature_cfgs)
+        user_a = next(f for f in features if f.name == "user_a")
+        user_a.data_group = "user"
+
+        def _group(name, names, group_type, **extra):
+            return model_pb2.FeatureGroupConfig(
+                group_name=name,
+                feature_names=names,
+                group_type=group_type,
+                **extra,
+            )
+
+        feature_groups = [
+            # cat_a twice: a repeated reference counts once
+            _group(
+                "deep",
+                ["cat_a", "shared_a", "shared_b", "dyn_a", "zch_a", "cat_a"],
+                model_pb2.FeatureGroupType.DEEP,
+            ),
+            _group("wide", ["cat_a", "zch_a"], model_pb2.FeatureGroupType.WIDE),
+            _group(
+                "deep_x",
+                ["cat_a"],
+                model_pb2.FeatureGroupType.DEEP,
+                embedding_name_suffix="x",
+            ),
+            _group("user_deep", ["user_a"], model_pb2.FeatureGroupType.DEEP),
+            _group(
+                "parent",
+                ["cat_a"],
+                model_pb2.FeatureGroupType.DEEP,
+                embedding_name_suffix="tower_a",
+                sequence_groups=[
+                    model_pb2.SeqGroupConfig(
+                        group_name="seq", feature_names=["cat_a", "click_seq__cat_s"]
+                    )
+                ],
+                sequence_encoders=[
+                    seq_encoder_pb2.SeqEncoderConfig(
+                        simple_attention=seq_encoder_pb2.SimpleAttention(input="seq")
+                    )
+                ],
+            ),
+            _group(
+                "toplevel_seq",
+                ["cat_b", "click_seq__cat_s", "buy_seq__cat_s"],
+                model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+        ]
+        # wide tables carry the passed wide dim on both sides
+        wide_embedding_dim = 8
+        resolved = {
+            table: tuple(names)
+            for table, names in resolve_embedding_tables(
+                features, feature_groups, wide_embedding_dim=wide_embedding_dim
+            )
+        }
+
+        embedding_group = EmbeddingGroup(
+            features,
+            feature_groups,
+            wide_embedding_dim=wide_embedding_dim,
+            device=torch.device("cpu"),
+        )
+        actual = {}
+        for impl_key, impl in embedding_group.emb_impls.items():
+            for kind, attr in (("ebc", "ebc"), ("mc_ebc", "mc_ebc")):
+                collection = getattr(impl, attr, None)
+                if collection is None:
+                    continue
+                ebc = collection if kind == "ebc" else collection._embedding_module
+                for config in ebc.embedding_bag_configs():
+                    actual[f"{impl_key}.{kind}.{config.name}"] = (
+                        tuple(config.feature_names),
+                        config.embedding_dim,
+                    )
+        for impl_key, impl in embedding_group.seq_emb_impls.items():
+            for kind, attr in (("ec", "ec_dict"), ("mc_ec", "mc_ec_dict")):
+                ec_dict = getattr(impl, attr, None)
+                if not ec_dict:
+                    continue
+                for dim, ec in ec_dict.items():
+                    coll = ec if kind == "ec" else ec._embedding_module
+                    for config in coll.embedding_configs():
+                        actual[f"{impl_key}.{kind}.{dim}.{config.name}"] = tuple(
+                            config.feature_names
+                        )
+        self.assertTrue(resolved, "resolver returned no tables")
+        self.assertTrue(actual, "construction built no tables")
+        self.assertEqual(set(actual), set(resolved))
+        for key, names in resolved.items():
+            built = actual[key]
+            self.assertEqual(built[0] if len(built) == 2 else built, names)
+            # only the wide tables get the overridden dim
+            if len(built) == 2 and "_wide" in key:
+                self.assertEqual(built[1], wide_embedding_dim)
 
     def test_sequence_groups_with_same_subfeature_name_stay_apart(self):
         # two sequence groups whose sub-features share the bare config name

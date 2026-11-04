@@ -34,6 +34,14 @@ Both values are measured in one pass. Features missing from the sampled
 batches are left unset; the constraint builder aggregates only configured
 values and leaves a table-level value unset when no member carries one.
 
+Tables are resolved from the pipeline configuration's feature groups, the
+same resolution model construction uses; no model is built. Any model that
+follows the standard feature_groups semantics is supported without importing
+its class; a custom model that decides table sharing in its own constructor
+is outside this mapping. Managed-collision (ZCH) tables are resolved as
+tables; the deduplicated count is over raw ids and does not measure ZCH's
+post-collision embedding-row working set.
+
 Usage: python -m tzrec.tools.add_pooling_factor_to_config
     --pipeline_config_path pipeline.config --output_path pipeline_measured.config
     [--num_batches 100]
@@ -47,8 +55,8 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 
 from tzrec.datasets.dataset import create_dataloader
-from tzrec.main import _create_features, _create_model
-from tzrec.modules.embedding import EmbeddingGroupImpl, SequenceEmbeddingGroupImpl
+from tzrec.main import _create_features
+from tzrec.modules.embedding import resolve_embedding_tables
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util
 from tzrec.utils.logging_util import logger
@@ -81,8 +89,8 @@ class AddPoolingFactorToConfig(object):
     def run(self) -> None:
         """Measure the train input and write the filled config."""
         cfg = config_util.load_pipeline_config(self._pipeline_config_path)
-        model = self.build_model(cfg)
-        tables = self.table_features(model)
+        features = _create_features(list(cfg.feature_configs), cfg.data_config)
+        tables = self.table_features(cfg, features)
         factors = self.measure(cfg, tables)
         filled = self.fill(cfg, factors)
         config_util.save_message(cfg, self._output_path)
@@ -94,50 +102,38 @@ class AddPoolingFactorToConfig(object):
         )
 
     @staticmethod
-    def build_model(cfg: EasyRecConfig) -> Any:
-        """Build the config's model, meta device, for its table mapping."""
-        features = _create_features(list(cfg.feature_configs), cfg.data_config)
-        return _create_model(
-            cfg.model_config,
-            features,
-            list(cfg.data_config.label_fields),
-            sample_weights=list(cfg.data_config.sample_weight_fields),
-        )
+    def table_features(
+        cfg: EasyRecConfig, features: List[Any]
+    ) -> List[Tuple[str, List[str]]]:
+        """Physical tables of the config and the features that feed each.
 
-    @staticmethod
-    def table_features(model: Any) -> List[Tuple[str, List[str]]]:
-        """Physical tables of the model and the features that feed each.
+        Resolution walks the pipeline configuration's feature groups exactly
+        like model construction - wide renaming, embedding-name suffixes,
+        input-tile user collections, managed-collision (ZCH) collections and
+        data-group separation included - without building any module.
 
-        Tables are identified by collection and name, so embedding-name
-        suffixes, wide renaming and input-tile user collections keep apart
-        tables that a bare embedding_name would merge.
+        Args:
+            cfg (EasyRecConfig): the pipeline config.
+            features (list): the config's features.
 
         Returns:
-            (table, feature names) pairs; feature names as they appear in a
-            batch (grouped sequence features carry their sequence prefix).
+            (table, feature names) pairs, the table identified by data
+            group, collection, embedding dim and name; feature names as
+            they appear in a batch (grouped sequence features carry their
+            sequence prefix).
         """
-        tables = []
-        for m in model.modules():
-            if isinstance(m, EmbeddingGroupImpl):
-                for attr in ("ebc", "ebc_user"):
-                    ebc = getattr(m, attr, None)
-                    if ebc is None:
-                        continue
-                    for config in ebc.embedding_bag_configs():
-                        tables.append(
-                            (f"{attr}.{config.name}", list(config.feature_names))
-                        )
-            elif isinstance(m, SequenceEmbeddingGroupImpl):
-                for attr in ("ec_dict", "ec_dict_user"):
-                    ec_dict = getattr(m, attr, None)
-                    if not ec_dict:
-                        continue
-                    for ec in ec_dict.values():
-                        for config in ec.embedding_configs():
-                            tables.append(
-                                (f"{attr}.{config.name}", list(config.feature_names))
-                            )
-        return tables
+        model_oneof = cfg.model_config.WhichOneof("model")
+        model_cfg = (
+            getattr(cfg.model_config, model_oneof) if model_oneof is not None else None
+        )
+        if isinstance(model_cfg, str):
+            model_cfg = None
+        return resolve_embedding_tables(
+            features,
+            list(cfg.model_config.feature_groups),
+            wide_embedding_dim=getattr(model_cfg, "wide_embedding_dim", None),
+            wide_init_fn=getattr(model_cfg, "wide_init_fn", None),
+        )
 
     def measure(
         self, cfg: EasyRecConfig, tables: List[Tuple[str, List[str]]]

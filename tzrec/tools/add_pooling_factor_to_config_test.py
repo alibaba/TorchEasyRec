@@ -159,13 +159,34 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         test_dir = make_test_dir()
         _write_parquet(test_dir)
         cfg = _config(os.path.join(test_dir, "*.parquet"))
-        model = AddPoolingFactorToConfig.build_model(cfg)
-        tables = dict(AddPoolingFactorToConfig.table_features(model))
-        self.assertEqual(tables["ebc.id_a_emb"], ["id_a"])
-        self.assertEqual(tables["ebc.shared"], ["shared_a", "shared_b"])
-        self.assertEqual(tables["ebc.item"], ["t1"])
-        self.assertEqual(tables["ebc.item2"], ["t2"])
-        self.assertNotIn("ebc.seq_id", tables)
+        from tzrec.datasets.utils import BASE_DATA_GROUP
+        from tzrec.main import _create_features
+
+        features = _create_features(list(cfg.feature_configs), cfg.data_config)
+        tables = dict(AddPoolingFactorToConfig.table_features(cfg, features))
+        self.assertEqual(tables[f"{BASE_DATA_GROUP}.ebc.id_a_emb"], ["id_a"])
+        self.assertEqual(
+            tables[f"{BASE_DATA_GROUP}.ebc.shared"], ["shared_a", "shared_b"]
+        )
+        # similarly named tables stay apart
+        self.assertEqual(tables[f"{BASE_DATA_GROUP}.ebc.item"], ["t1"])
+        self.assertEqual(tables[f"{BASE_DATA_GROUP}.ebc.item2"], ["t2"])
+        self.assertNotIn(f"{BASE_DATA_GROUP}.ebc.seq_id", tables)
+
+    def test_run_builds_no_model(self):
+        from unittest import mock
+
+        test_dir = make_test_dir()
+        _write_parquet(test_dir)
+        in_path = os.path.join(test_dir, "pipeline.config")
+        out_path = os.path.join(test_dir, "measured.config")
+        config_util.save_message(_config(os.path.join(test_dir, "*.parquet")), in_path)
+        with mock.patch(
+            "tzrec.main._create_model",
+            side_effect=AssertionError("no model may be built"),
+        ):
+            AddPoolingFactorToConfig(in_path, out_path, num_batches=10).run()
+        self.assertTrue(os.path.exists(out_path))
 
     def test_fill_writes_both_factors_and_keeps_sequence_identity(self):
         test_dir = make_test_dir()
