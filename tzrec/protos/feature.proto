@@ -10,6 +10,19 @@ message ParameterConstraints {
     // embedding compute kernel constraints
     // dense | fused | fused_uvm | fused_uvm_caching | key_value
     repeated string compute_kernels = 2;
+    // average number of embedding id positions one sample looks up in this
+    // table through this feature, duplicates included. features that share
+    // a table keep one entry each; a feature that sets none contributes the
+    // default of 1. use
+    // tzrec.tools.add_pooling_factor_to_config to measure it from training
+    // data. the planner uses it for input, output and communication estimates.
+    optional float pooling_factor = 3;
+    // largest number of distinct ids one sample looks up in this table
+    // through all the features that share it (their per-sample union). a
+    // conservative cache working-set estimate of the table is
+    // batch_size * unique_id_factor. measured jointly for the sharing
+    // features and aggregated with max; unset below means not measured.
+    optional float unique_id_factor = 4;
 }
 
 // LFU: evict_score = access_cnt

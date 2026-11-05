@@ -110,6 +110,7 @@ LR策略可以支持按epoch更新或者按step更新
       torchrun --master_addr=localhost --master_port=32555 --nnodes=1 --nproc-per-node=1 --node_rank=0 convert.py
       ```
 - log_step_count_steps: 打印log和summary的步数间隔（如果打印时间间隔小于1s，会跳过打印）
+  - 使用带timestamp的数据源时，loss日志会附加`data_timestamp`，表示当前rank处理的batch内最大数据时间戳，以UTC显示并保留毫秒，例如`2026-11-05T10:00:00.123+00:00`
 - is_profiling: 是否做训练性能分析，设置为true，会在模型目录的train_eval_trace子目录下记录trace文件，文件名以`rank<N>_`开头
 - profiler_config: is_profiling为true时的性能分析配置，不设置时默认在训练开始后等待1步、预热1步、记录10步，并记录shape、显存和调用栈
   - skip_first_steps: 开始分析前跳过的步数，默认为0。训练初期dynamic embedding和数据缓存尚未稳定，可设置较大的值采集稳定阶段的trace，如`skip_first_steps: 2000, wait_steps: 0, warmup_steps: 2, active_steps: 5`
@@ -225,3 +226,40 @@ train_config {
 - 该表由dense_optimizer更新，sparse_optimizer中配置的优化器类型和LR策略对它不生效，它跟随dense_optimizer的LR策略
 - 该表的参数会参与`dense_optimizer.part_optimizers`的`regex_pattern`匹配，也会被`dense_optimizer.ema`纳入
 - 如需让所有Embedding都由sparse_optimizer管理，可以在`sharding_types`中排除`data_parallel`
+
+(pooling-factor)=
+
+### pooling_factor 与 unique_id_factor
+
+每个特征可以在`embedding_constraints`中配置两个从训练数据测量的参数来使得EmbeddingPlanner根据数据分布更合理地进行规划：
+
+- `pooling_factor`：一个样本通过该特征查这张表的平均原始Id位置数（含重复），最小为1。规划器用它估算每步查表量、输入输出张量大小和通信量
+- `unique_id_factor`：单个样本通过共用这张表的所有特征查表的去重Id数的最大值（注意与`pooling_factor`不同，它不是平均值，而是最重的一个样本的去重数）。`batch_size * unique_id_factor`是这张表保守的cache工作集估计（例如dynamicemb GPU cache需要容纳它）
+
+```
+feature_configs {
+    id_feature {
+        feature_name: "tag"
+        embedding_dim: 8
+        embedding_constraints {
+            # 平均每个样本36.3个原始Id；最重的一个样本41个去重Id
+            # batch_size=1024时，该表单个batch的去重工作集估计为1024*41=41984
+            pooling_factor: 36.3
+            unique_id_factor: 41
+        }
+    }
+}
+```
+
+这两个值用工具从训练数据中测量并写入一个新配置文件（不修改原配置）：
+
+```bash
+python -m tzrec.tools.add_pooling_factor_to_config \
+    --pipeline_config_path pipeline.config \
+    --output_path pipeline_measured.config \
+    --num_batches 100
+```
+
+- 表的划分从配置的`feature_groups`解析（与模型构建一致，含ZCH表），不构建模型；遵循标准`feature_groups`语义的自定义模型无需导入模型类即可使用。ZCH表的去重计数基于原始Id，不代表碰撞后的行工作集
+
+注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据
