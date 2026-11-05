@@ -1476,7 +1476,7 @@ def predict(
         dataset_type (str, optional): dataset type, default use the type in pipeline.
         predict_threads (int, optional): predict threads num, default will
             use num_workers in data_config, or one per GPU for a distributed
-            embedding export.
+            embedding or GenRec export.
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
         edit_config_json (str, optional): edit pipeline config json str.
@@ -1512,8 +1512,8 @@ def predict(
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
     is_dist_emb: bool = acc_utils.is_distributed_embedding_predict(scripted_model_path)
-    is_genrec: bool = issubclass(
-        _get_model_class(pipeline_config.model_config), BaseGenRecModel
+    is_genrec: bool = (
+        pipeline_config.model_config.WhichOneof("model") == "genrec_causal_lm_model"
     )
 
     if dataset_type:
@@ -1605,6 +1605,11 @@ def predict(
             f"predict_threads={predict_threads} runs more than one lookup stream per "
             "GPU; each holds its own NVE lookup buffers outside the GPU cache budget, "
             "set a lower DIST_EMB_GPU_CACHE_RATIO if GPU memory runs out."
+        )
+    elif is_genrec and predict_threads > len(forward_devices):
+        logger.warning(
+            f"predict_threads={predict_threads} runs more than one decode per GPU; "
+            "each holds its own beam KV cache, lower it if GPU memory runs out."
         )
     # NVE keeps one lookup context per CUDA stream, so each worker gets its own.
     worker_streams = (
@@ -1698,14 +1703,18 @@ def predict(
     try:
         # loaded in the guarded scope: a failed load still reaches the commit
         # rendezvous below, so other ranks fail fast instead of waiting.
-        batch_model = predict_util.load_predict_model(
-            scripted_model_path,
-            forward_devices,
-            log_model=is_profiling and is_rank_zero,
-        )
         if is_genrec:
             batch_model = predict_util.GenRecExportModel(
-                batch_model, scripted_model_path, forward_devices, pipeline_config
+                scripted_model_path,
+                forward_devices,
+                pipeline_config,
+                log_model=is_profiling and is_rank_zero,
+            )
+        else:
+            batch_model = predict_util.load_predict_model(
+                scripted_model_path,
+                forward_devices,
+                log_model=is_profiling and is_rank_zero,
             )
         while True:
             try:

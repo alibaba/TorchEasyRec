@@ -220,20 +220,27 @@ class GenerateCodesTest(unittest.TestCase):
         bands = [(100, 103), (104, 107), (108, 111)]
         local_codes = torch.tensor([[0, 1, 3], [3, 0, 2], [1, 3, 0], [2, 2, 1]])
         tokens = local_codes + torch.tensor([lo for lo, _ in bands])
+        lm = nn.Identity()
         with mock.patch(
             "tzrec.models.genrec_causal_lm_model.dynamic_beam_search",
             return_value=tokens,
-        ):
+        ) as beam_search:
             codes = generate_codes(
-                nn.Identity(),
+                lm,
                 torch.zeros(5, 4),
                 torch.tensor([0, 2, 5]),
                 3,
-                [2, 2, 2],
+                [2, 3, 4],
                 bands,
                 1,
             )
         self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1)[:, :1].tolist())
+        searched_lm, padded, mask, widths, searched_bands = beam_search.call_args.args
+        self.assertIs(searched_lm, lm)
+        self.assertEqual(padded.shape, (2, 3, 4))
+        self.assertEqual(mask.tolist(), [[0, 1, 1], [1, 1, 1]])
+        self.assertEqual(widths, [2, 3, 4])
+        self.assertEqual(searched_bands, bands)
 
 
 class GenRecCausalLMModelTest(unittest.TestCase):
@@ -267,6 +274,14 @@ class GenRecCausalLMModelTest(unittest.TestCase):
         self.assertEqual(model._capped_widths, expected)
         space = self.compiled_prompt.sid_space
         self.assertEqual(model._bands, list(zip(space.band_lo, space.band_hi)))
+
+    def test_requires_a_beam_schedule(self) -> None:
+        with self.assertRaisesRegex(ValueError, "beam_widths is required"):
+            self._beam_model(beam_widths=())
+
+    def test_rejects_fewer_than_one_returned_sequence(self) -> None:
+        with self.assertRaisesRegex(ValueError, "num_return_sequences must be >= 1"):
+            self._beam_model(num_return_sequences=0)
 
     def test_rejects_a_schedule_that_does_not_match_the_codebook(self) -> None:
         with self.assertRaisesRegex(ValueError, "entries but the codebook has"):

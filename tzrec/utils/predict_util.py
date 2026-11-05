@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import contextlib
+import copy
 import glob
 import itertools
 import json
@@ -1373,28 +1374,30 @@ def _load_scripted_model(model_path: str, device: torch.device) -> nn.Module:
 class GenRecExportModel:
     """Predicts a GenRec export on a Batch: its front-end, then its HF LM.
 
+    The front-end is loaded by ``load_predict_model``, scripted or with a
+    distributed embedding, and runs as exported: TorchScript applies no
+    autocast, so its slot projections stay FP32, and it assembles the prompt on
+    the forward thread.
+
     The LM is built as ``BaseGenRecModel.init_backbone`` builds it and run
-    under ``export_config.mixed_precision`` autocast, as checkpoint predict
-    runs it; ``config.json``'s ``dtype`` is the instruction for an LLM engine.
+    under ``export_config.mixed_precision`` autocast, the precision the export
+    records as ``config.json``'s ``dtype``; checkpoint predict autocasts with
+    ``train_config.mixed_precision`` instead.
 
     Args:
-        model: the export as ``load_predict_model`` loads it; its
-            ``GenRecFrontEnd`` predicts the packed prompt streams of a Batch.
         model_path: the export directory.
         devices: devices to predict on, one LM replica each.
         pipeline_config: the export's pipeline config, after any edits.
+        log_model: log the front-end model.
     """
 
     def __init__(
         self,
-        model: Callable[
-            [Batch, Optional[torch.Tensor], torch.device], Dict[str, torch.Tensor]
-        ],
         model_path: str,
         devices: List[torch.device],
         pipeline_config: EasyRecConfig,
+        log_model: bool = False,
     ) -> None:
-        self._model = model
         with open(os.path.join(model_path, "config.json")) as f:
             hf_config = json.load(f)
         sid_space = hf_config.get("sid_space")
@@ -1413,14 +1416,19 @@ class GenRecExportModel:
         )
         self._generated_sids_key = common.generated_sids_key
         self._mixed_dtype = acc_utils.mixed_precision_to_dtype(
-            pipeline_config.export_config.mixed_precision
+            acc_utils.mixed_precision_for_export(pipeline_config)
         )
         # transformers does not register the composite config's model_type
         backbone_config = AutoConfig.for_model(**hf_config["text_config"])
-        self._lm: Dict[torch.device, nn.Module] = {}
-        for device in devices:
-            lm = self._load_backbone(model_path, backbone_config, common)
-            self._lm[device] = lm.to(device).eval()
+        lm = self._load_backbone(model_path, backbone_config, common).eval()
+        # copied while on the host, then the host LM becomes the first replica
+        self._lm: Dict[torch.device, nn.Module] = {
+            device: copy.deepcopy(lm).to(device) for device in devices[1:]
+        }
+        self._lm[devices[0]] = lm.to(devices[0])
+        # after the LM replicas, so a distributed embedding sizes its GPU cache
+        # with them already resident
+        self._model = load_predict_model(model_path, devices, log_model)
 
     @staticmethod
     def _load_backbone(
