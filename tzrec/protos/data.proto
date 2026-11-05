@@ -59,6 +59,17 @@ enum FgMode {
     FG_BUCKETIZE = 4;
 }
 
+enum ShuffleMode {
+    // shuffle whole batches in each read worker (default behavior)
+    BATCH = 1;
+    // sample-level shuffle in a per-rank shared pool with fixed windows,
+    // KafkaDataset training only
+    SAMPLE_WINDOW = 2;
+    // sample-level shuffle in a per-rank shared rolling pool,
+    // KafkaDataset training only
+    SAMPLE_ROLLING = 3;
+}
+
 message Field {
     required string input_name = 1;
     // only need specify it when use CsvDataset and
@@ -139,6 +150,12 @@ message DataConfig {
     // it is suggested to do full data shuffle before training
     // especially when the performance of models is not good.
     optional uint32 shuffle_buffer_size  = 23 [default = 32];
+
+    // shuffle mode. For SAMPLE_WINDOW and SAMPLE_ROLLING, raw samples are
+    // gathered into a per-rank shared pool of
+    // batch_size * shuffle_buffer_size samples, shuffled at sample level,
+    // then grouped into batches. KafkaDataset training only.
+    optional ShuffleMode shuffle_mode = 21 [default = BATCH];
 
     // maxcompute storage api data compression type, LZ4_FRAME | ZSTD | UNCOMPRESSED
     optional string odps_data_compression = 24 [default = "LZ4_FRAME"];
