@@ -30,12 +30,19 @@ from torch import distributed as dist
 from torch import nn
 from torch.distributed import ReduceOp
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
+from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 
 from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import PREDICT_QUEUE_TIMEOUT
 from tzrec.datasets.utils import Batch, batch_to_dict
+from tzrec.models.genrec_causal_lm_model import generate_codes, resolve_beam_config
+from tzrec.models.genrec_model import _PARAM_DTYPE, SLOT_EMBEDS
 from tzrec.models.model import CombinedModelWrapper
+from tzrec.prompt.assembler import CU_SEQLENS, HOLE_POSITIONS, INPUT_IDS
+from tzrec.prompt.compile import sid_bands
+from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import npz_util
 from tzrec.utils.logging_util import logger
 
@@ -1361,6 +1368,129 @@ def _load_scripted_model(model_path: str, device: torch.device) -> nn.Module:
     )
     model.eval()
     return model
+
+
+class GenRecExportModel:
+    """Predicts a GenRec export on a Batch: its front-end, then its HF LM.
+
+    The LM is built as ``BaseGenRecModel.init_backbone`` builds it and run
+    under ``export_config.mixed_precision`` autocast, as checkpoint predict
+    runs it; ``config.json``'s ``dtype`` is the instruction for an LLM engine.
+
+    Args:
+        model: the export as ``load_predict_model`` loads it; its
+            ``GenRecFrontEnd`` predicts the packed prompt streams of a Batch.
+        model_path: the export directory.
+        devices: devices to predict on, one LM replica each.
+        pipeline_config: the export's pipeline config, after any edits.
+    """
+
+    def __init__(
+        self,
+        model: Callable[
+            [Batch, Optional[torch.Tensor], torch.device], Dict[str, torch.Tensor]
+        ],
+        model_path: str,
+        devices: List[torch.device],
+        pipeline_config: EasyRecConfig,
+    ) -> None:
+        self._model = model
+        with open(os.path.join(model_path, "config.json")) as f:
+            hf_config = json.load(f)
+        sid_space = hf_config.get("sid_space")
+        if sid_space is None:
+            raise ValueError(
+                f"GenRec export [{model_path}] has no sid_space in config.json; "
+                "re-export it with a tzrec that records one."
+            )
+        _, band_lo, band_hi = sid_bands(
+            sid_space["codebook"], sid_space["base_vocab_size"]
+        )
+        self._bands = list(zip(band_lo, band_hi))
+        common = pipeline_config.model_config.genrec_causal_lm_model.common
+        self._capped_widths, self._num_return_sequences = resolve_beam_config(
+            common, self._bands
+        )
+        self._generated_sids_key = common.generated_sids_key
+        self._mixed_dtype = acc_utils.mixed_precision_to_dtype(
+            pipeline_config.export_config.mixed_precision
+        )
+        # transformers does not register the composite config's model_type
+        backbone_config = AutoConfig.for_model(**hf_config["text_config"])
+        self._lm: Dict[torch.device, nn.Module] = {}
+        for device in devices:
+            lm = self._load_backbone(model_path, backbone_config, common)
+            self._lm[device] = lm.to(device).eval()
+
+    @staticmethod
+    def _load_backbone(
+        model_path: str, backbone_config: PretrainedConfig, common: GenRecModelConfig
+    ) -> nn.Module:
+        """Load the export's LM in ``lm_parameter_dtype`` with ``attn_kernel``.
+
+        Args:
+            model_path: the export directory.
+            backbone_config: the backbone config, from ``config.json``.
+            common: the shared model config.
+
+        Returns:
+            The LM, every weight read from the export's safetensors.
+        """
+        lm, info = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=backbone_config,
+            attn_implementation=common.attn_kernel,
+            dtype=_PARAM_DTYPE[common.lm_parameter_dtype],
+            output_loading_info=True,
+        )
+        unloaded = {
+            k: info[k]
+            for k in ("missing_keys", "unexpected_keys", "mismatched_keys")
+            if info[k]
+        }
+        if unloaded:
+            raise RuntimeError(
+                f"GenRec export [{model_path}] does not load cleanly: {unloaded}."
+            )
+        return lm
+
+    def __call__(
+        self, batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Predict a batch.
+
+        Args:
+            batch: the batch to predict.
+            batch_size: the ``batch_size`` input of tiled models, None for none.
+            device: the device to predict on, one of the constructor devices.
+
+        Returns:
+            ``generated_sids_key``: ``(B, num_return_sequences, num_levels)``
+            local codes, best first.
+        """
+        streams = self._model(batch, batch_size, device)
+        lm = self._lm[device]
+        cu_seqlens = streams[CU_SEQLENS]
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=self._mixed_dtype,
+            enabled=self._mixed_dtype is not None,
+        ):
+            embeds = lm.get_input_embeddings()(streams[INPUT_IDS])
+            if streams[SLOT_EMBEDS].numel() > 0:
+                embeds.index_copy_(
+                    0, streams[HOLE_POSITIONS], streams[SLOT_EMBEDS].to(embeds.dtype)
+                )
+            codes = generate_codes(
+                lm,
+                embeds,
+                cu_seqlens,
+                int(torch.diff(cu_seqlens).max()),
+                self._capped_widths,
+                self._bands,
+                self._num_return_sequences,
+            )
+        return {self._generated_sids_key: codes}
 
 
 def load_predict_model(

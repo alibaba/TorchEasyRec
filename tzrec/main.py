@@ -1512,6 +1512,9 @@ def predict(
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
     is_dist_emb: bool = acc_utils.is_distributed_embedding_predict(scripted_model_path)
+    is_genrec: bool = issubclass(
+        _get_model_class(pipeline_config.model_config), BaseGenRecModel
+    )
 
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
@@ -1535,15 +1538,14 @@ def predict(
     data_config.drop_remainder = False
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
-    compiled_prompt = _compile_prompt(pipeline_config, features)
 
+    # an export assembles its own prompt, so predicting it needs no tokenizer
     infer_dataloader = create_dataloader(
         data_config,
         features,
         predict_input_path,
         reserved_columns=reserved_cols,
         mode=Mode.PREDICT,
-        compiled_prompt=compiled_prompt,
         debug_level=debug_level,
     )
     infer_iterator = infer_dataloader.get_iterator()  # pyre-ignore[16]
@@ -1591,10 +1593,11 @@ def predict(
         prof.start()
 
     if predict_threads is None:
-        # with a distributed embedding, each lookup stream holds its own NVE buffers.
+        # with a distributed embedding, each lookup stream holds its own NVE buffers;
+        # with a genrec export, each decode holds its own KV cache.
         predict_threads = (
             len(forward_devices)
-            if is_dist_emb
+            if is_dist_emb or is_genrec
             else max(data_config.num_workers, len(forward_devices))
         )
     elif is_dist_emb and predict_threads > len(forward_devices):
@@ -1700,6 +1703,10 @@ def predict(
             forward_devices,
             log_model=is_profiling and is_rank_zero,
         )
+        if is_genrec:
+            batch_model = predict_util.GenRecExportModel(
+                batch_model, scripted_model_path, forward_devices, pipeline_config
+            )
         while True:
             try:
                 batch = next(infer_iterator)
