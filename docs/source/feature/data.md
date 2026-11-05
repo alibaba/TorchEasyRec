@@ -371,8 +371,8 @@ pipeline.global-job-parameters: |
 
 ### kafka_partition_round_robin
 
-- 仅对KafkaDataset生效，默认为false；开启后每个worker为自己负责的分区各创建一个consumer，按分区编号升序、每次一条Kafka消息严格轮流读取，当前分区没有消息时持续等待
-- 分区按固定的rank/worker编号划分，有效全局worker数为`world_size * max(data_config.num_workers, 1)`
+- 仅对KafkaDataset生效，默认为false；开启后启动时按leader排序分区并分发到各worker（有效全局worker数为`world_size * max(data_config.num_workers, 1)`），每个worker为自己负责的分区各创建一个consumer，每次一条Kafka消息，轮流分区读取，当前分区没有消息时持续等待
+- 分区归属依据启动时的leader排序，运行期间固定；每个worker的consumer数量等于其负责的分区数
 
 ### shuffle
 

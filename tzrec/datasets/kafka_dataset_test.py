@@ -102,16 +102,31 @@ def _msg(partition, offset, value, rows=1, error=None):
 class KafkaReaderRoundRobinTest(unittest.TestCase):
     """Round-robin reading with mocked consumers."""
 
-    def _make_reader(self, consumers, partitions=(0, 1)):
-        consumers[0].list_topics.return_value = SimpleNamespace(
+    def _make_reader(self, consumers, partitions=(0, 1), leaders=None):
+        leaders = leaders or {partition: 0 for partition in partitions}
+        query_consumer = mock.Mock()
+        query_consumer.list_topics.return_value = SimpleNamespace(
             topics={
                 "topic": SimpleNamespace(
-                    partitions={partition: None for partition in partitions}, error=None
+                    partitions={
+                        partition: SimpleNamespace(leader=leaders[partition])
+                        for partition in partitions
+                    },
+                    error=None,
                 )
             }
         )
         self.enterContext(
-            mock.patch("tzrec.datasets.kafka_dataset.Consumer", side_effect=consumers)
+            mock.patch(
+                "tzrec.datasets.kafka_dataset.Consumer",
+                side_effect=[query_consumer] + consumers,
+            )
+        )
+        self.enterContext(
+            mock.patch(
+                "tzrec.datasets.kafka_dataset.dist.is_initialized",
+                return_value=False,
+            )
         )
         return KafkaReader(
             "kafka://broker:9092/topic?group.id=g1",
@@ -152,17 +167,27 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            param("two_workers", [[1, 4], [3, 7]]),
-            param("three_workers", [[1, 7], [3], [4]]),
+            param(
+                "multiple_brokers_non_contiguous_uneven",
+                leaders={7: 0, 1: 1, 4: 0, 3: 2, 9: 1, 6: 2, 12: 0, 10: 2},
+                expected=[[1, 4, 6], [7, 9, 10], [3, 12]],
+            ),
+            param(
+                "leader_unavailable",
+                leaders={0: -1, 1: 0, 2: 0},
+                expected=[[0, 2], [1]],
+            ),
         ],
         name_func=parameterized_name_func,
     )
-    def test_partition_split(self, _name, owned_per_worker):
-        for worker_id, owned in enumerate(owned_per_worker):
+    def test_partition_split(self, _name, leaders, expected):
+        for worker_id, owned in enumerate(expected):
             consumers = [mock.Mock() for _ in owned]
             consumers[0].consume.return_value = [_msg(owned[0], 0, 1)]
-            reader = self._make_reader(consumers, partitions=[7, 1, 4, 3])
-            gen = reader._reader(worker_id, len(owned_per_worker))
+            reader = self._make_reader(
+                consumers, partitions=list(leaders), leaders=leaders
+            )
+            gen = reader._reader(worker_id, len(expected))
             self.addCleanup(gen.close)
             next(gen)
             self.assertEqual(
@@ -175,12 +200,11 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             gen.close()
 
     def test_insufficient_partitions_raises(self):
-        consumer = mock.Mock()
-        gen = self._make_reader([consumer])._reader(0, 3)
+        reader = self._make_reader([], partitions=(0, 1))
+        gen = reader._reader(0, 3)
         self.addCleanup(gen.close)
         with self.assertRaisesRegex(ValueError, "fewer than the 3"):
             next(gen)
-        consumer.close.assert_called_once()
 
     def test_initialization_failure_closes_consumers(self):
         consumers = [mock.Mock(), mock.Mock()]
@@ -214,6 +238,78 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         iterator.close()
         for consumer in consumers:
             consumer.close.assert_called_once()
+
+    def _construct_with_dist(self, rank, consumer_cls, broadcast):
+        with (
+            mock.patch.multiple(
+                "tzrec.datasets.kafka_dataset.dist",
+                is_initialized=mock.Mock(return_value=True),
+                get_world_size=mock.Mock(return_value=2),
+                get_rank=mock.Mock(return_value=rank),
+                broadcast_object_list=broadcast,
+            ),
+            mock.patch("tzrec.datasets.kafka_dataset.Consumer", new=consumer_cls),
+        ):
+            return KafkaReader(
+                "kafka://broker:9092/topic?group.id=g1",
+                1,
+                input_fields=[pa.field("x", pa.int64())],
+                kafka_partition_round_robin=True,
+            )
+
+    def test_partition_order_broadcasts_between_ranks(self):
+        query_consumer = mock.Mock()
+        query_consumer.list_topics.return_value = SimpleNamespace(
+            topics={
+                "topic": SimpleNamespace(
+                    partitions={
+                        0: SimpleNamespace(leader=1),
+                        1: SimpleNamespace(leader=0),
+                        2: SimpleNamespace(leader=1),
+                    },
+                    error=None,
+                )
+            }
+        )
+        consumer_cls = mock.Mock(return_value=query_consumer)
+        broadcast = mock.Mock()
+        rank0_reader = self._construct_with_dist(0, consumer_cls, broadcast)
+        broadcast.assert_called_once_with([None, [1, 0, 2]])
+        payload = broadcast.call_args.args[0]
+        self.assertEqual(rank0_reader._round_robin_partition_order, [1, 0, 2])
+        query_consumer.close.assert_called_once()
+
+        def _broadcast(object_list):
+            object_list[:] = payload
+
+        rank1_consumer_cls = mock.Mock()
+        rank1_reader = self._construct_with_dist(1, rank1_consumer_cls, _broadcast)
+        rank1_consumer_cls.assert_not_called()
+        self.assertEqual(
+            rank1_reader._round_robin_partition_order,
+            rank0_reader._round_robin_partition_order,
+        )
+
+    def test_partition_order_query_failure_propagates(self):
+        query_consumer = mock.Mock()
+        query_consumer.list_topics.return_value = SimpleNamespace(
+            topics={"topic": SimpleNamespace(partitions={}, error="unknown topic")}
+        )
+        consumer_cls = mock.Mock(return_value=query_consumer)
+        broadcast = mock.Mock()
+        with self.assertRaisesRegex(ValueError, "unknown topic"):
+            self._construct_with_dist(0, consumer_cls, broadcast)
+        payload = broadcast.call_args.args[0]
+        self.assertIn("unknown topic", payload[0])
+        query_consumer.close.assert_called_once()
+
+        def _broadcast(object_list):
+            object_list[:] = payload
+
+        consumer_cls.reset_mock()
+        with self.assertRaisesRegex(ValueError, "unknown topic"):
+            self._construct_with_dist(1, consumer_cls, _broadcast)
+        consumer_cls.assert_not_called()
 
 
 class OffsetsForTimesBatchedTest(unittest.TestCase):
@@ -474,12 +570,15 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 )
             ]
         )
-        dataset = KafkaDataset(
-            data_config=data_config,
-            features=features,
-            input_path="kafka://broker:9092/topic?group.id=tzrec_test_group",
-            mode=mode,
-        )
+        with mock.patch.object(
+            KafkaReader, "_get_round_robin_partition_order", return_value=[0, 1]
+        ):
+            dataset = KafkaDataset(
+                data_config=data_config,
+                features=features,
+                input_path="kafka://broker:9092/topic?group.id=tzrec_test_group",
+                mode=mode,
+            )
         self.assertEqual(dataset._reader._shuffle, expected_shuffle)
         self.assertEqual(dataset._reader._shuffle_buffer_size, 64)
         self.assertEqual(

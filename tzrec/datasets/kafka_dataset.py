@@ -25,6 +25,7 @@ from confluent_kafka import (
     Message,
     TopicPartition,
 )
+from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader
@@ -294,6 +295,11 @@ class KafkaReader(BaseReader):
 
         self._has_embedded_schema = False
         self._kafka_partition_round_robin = kafka_partition_round_robin
+        self._round_robin_partition_order: List[int] = (
+            self._get_round_robin_partition_order()
+            if kafka_partition_round_robin
+            else []
+        )
 
         if input_fields:
             self._full_schema = pa.schema(input_fields)
@@ -375,6 +381,60 @@ class KafkaReader(BaseReader):
             ) from e
         finally:
             consumer.close()
+
+    def _get_round_robin_partition_order(self) -> List[int]:
+        """Query partition ids ordered by leader and partition id.
+
+        Rank 0 queries the topic metadata and broadcasts the order so that all
+        ranks and dataloader workers agree on partition ownership.
+
+        Returns:
+            partition ids sorted by (leader, partition id).
+
+        Raises:
+            ValueError: if topic metadata cannot be read.
+        """
+        topic, config, _ = _parse_kafka_uri(self._input_path)
+        distributed = dist.is_initialized() and dist.get_world_size() > 1
+        rank = dist.get_rank() if distributed else 0
+        result: List[Any] = [None, None]
+        if rank == 0:
+            try:
+                consumer = Consumer(config)
+                try:
+                    metadata = consumer.list_topics(topic, timeout=30.0)
+                    topic_metadata = metadata.topics.get(topic)
+                    if topic_metadata is None or topic_metadata.error is not None:
+                        error = (
+                            topic_metadata.error
+                            if topic_metadata is not None
+                            else "no metadata"
+                        )
+                        raise ValueError(
+                            f"Failed to get metadata for kafka topic {topic}: {error}"
+                        )
+                    partitions = topic_metadata.partitions
+                    result = [
+                        None,
+                        sorted(
+                            partitions,
+                            key=lambda p: (partitions[p].leader, p),
+                        ),
+                    ]
+                finally:
+                    consumer.close()
+            except Exception as e:
+                result = [f"{type(e).__name__}: {e}", None]
+
+        if distributed:
+            dist.broadcast_object_list(result)
+
+        error, partition_order = result
+        if error is not None:
+            raise ValueError(
+                f"Failed to get kafka partition order for topic {topic}: {error}"
+            )
+        return partition_order
 
     def _set_start_offsets(
         self,
@@ -686,9 +746,10 @@ class KafkaReader(BaseReader):
     ) -> Generator[pa.RecordBatch, None, None]:
         """Read this worker's partitions strictly in round-robin order.
 
-        Each owned partition gets its own consumer, assigned up front, so the
-        worker reads one message from each partition in ascending partition
-        order and never prefetches past a partition waiting for data.
+        Partitions are sliced from the leader-ordered list resolved at reader
+        construction, then read in ascending partition order.  Each owned
+        partition gets its own consumer, assigned up front.  The rotation
+        cursor does not advance while the current partition has no valid message.
 
         Args:
             topic (str): kafka topic name.
@@ -701,37 +762,27 @@ class KafkaReader(BaseReader):
             PyArrow RecordBatch
 
         Raises:
-            ValueError: if topic metadata cannot be read or the topic has fewer
-                partitions than the total number of workers.
+            ValueError: if the topic has fewer partitions than the total number
+                of workers.
         """
         consumers: List[Consumer] = []
         try:
-            consumer = Consumer(config)
-            consumers.append(consumer)
-            metadata = consumer.list_topics(topic, timeout=30.0)
-            topic_metadata = metadata.topics.get(topic)
-            if topic_metadata is None or topic_metadata.error is not None:
-                error = (
-                    topic_metadata.error
-                    if topic_metadata is not None
-                    else "no metadata"
-                )
+            if len(self._round_robin_partition_order) < num_workers:
                 raise ValueError(
-                    f"Failed to get metadata for kafka topic {topic}: {error}"
-                )
-            partitions = sorted(topic_metadata.partitions)
-            if len(partitions) < num_workers:
-                raise ValueError(
-                    f"kafka topic {topic} has {len(partitions)} partition(s), "
+                    f"kafka topic {topic} has "
+                    f"{len(self._round_robin_partition_order)} partition(s), "
                     f"fewer than the {num_workers} dataloader workers; "
                     "kafka_partition_round_robin requires at least one partition "
                     "per worker."
                 )
-
             owned_partitions = [
                 TopicPartition(topic, partition)
-                for partition in partitions[worker_id::num_workers]
+                for partition in sorted(
+                    self._round_robin_partition_order[worker_id::num_workers]
+                )
             ]
+            consumer = Consumer(config)
+            consumers.append(consumer)
             self._set_start_offsets(consumer, owned_partitions, start_timestamp_ms)
             consumer.assign([owned_partitions[0]])
             for tp in owned_partitions[1:]:
