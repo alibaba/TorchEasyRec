@@ -554,9 +554,7 @@ class RocksDBTableTest(unittest.TestCase):
 
         rows, ratio = self.NUM_EMBEDDINGS // 2, 0.01
         options = self._constraints(score_strategy=strategy).dynamicemb_options
-        options.external_storage = RocksDBStorageFactory(
-            BackendConfig(0, 0, 0, 0), "", ratio
-        )
+        options.external_storage = RocksDBStorageFactory(BackendConfig(0, 0, 0, 0), "")
         storages = dynamicemb_util.dynamicemb_calculate_shard_storages(
             sharder_data=None,
             sharding_type=ShardingType.ROW_WISE.value,
@@ -625,9 +623,7 @@ class RocksDBTableTest(unittest.TestCase):
                 # what the sharding plan sets for an Adam table (2 x dim state)
                 local_hbm_for_values=math.ceil(ratio * rows * 3 * dim * 4),
                 score_strategy=DynamicEmbScoreStrategy.STEP,
-                external_storage=RocksDBStorageFactory(
-                    config, f"m.t{i}", ratio, session
-                ),
+                external_storage=RocksDBStorageFactory(config, f"m.t{i}", session),
             )
             for i, (rows, dim) in enumerate(tables)
         ]

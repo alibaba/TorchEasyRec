@@ -1198,14 +1198,12 @@ class RocksDBOffloadPlannerTest(unittest.TestCase):
         self.assertGreater(config.import_budget_bytes, 0)
         for name, o in offloaded.items():
             factory = o.external_storage
-            self.assertIn(factory.cache_ratio, rocksdb_util.CACHE_RATIOS)
             self.assertEqual(factory.table_namespace, f"sparse.ebc.{name}")
             # DynamicEmb sizes a fused group's cache with its budget over its
-            # value bytes, which must give back the planned ratio.
-            self.assertEqual(
-                o.local_hbm_for_values,
-                math.ceil(factory.cache_ratio * o.max_capacity * o.dim * 4),
-            )
+            # value bytes: the budget must be exactly a planned ratio's bytes.
+            per_row = o.max_capacity * o.dim * 4
+            budgets = {math.ceil(r * per_row) for r in rocksdb_util.CACHE_RATIOS}
+            self.assertIn(o.local_hbm_for_values, budgets)
         self.assertEqual(planner._topology.devices[0].storage.ddr, int(4.75 * GIB))
 
     def test_overrides_stay_in_memory(self):

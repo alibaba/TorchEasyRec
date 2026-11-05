@@ -77,9 +77,7 @@ class RocksDBRuntimeTest(unittest.TestCase):
 
         config = _backend_config()
         options = [
-            SimpleNamespace(
-                external_storage=RocksDBStorageFactory(config, f"m.{n}", 0.1)
-            )
+            SimpleNamespace(external_storage=RocksDBStorageFactory(config, f"m.{n}"))
             for n in "ab"
         ]
         plan = SimpleNamespace(
@@ -100,7 +98,7 @@ class RocksDBRuntimeTest(unittest.TestCase):
                 self.assertIs(o.external_storage.session, rt.session)
             rt.bind(plan)  # the same plan again keeps the session
             other = dataclasses.replace(config, block_cache_bytes=1)
-            options[0].external_storage = RocksDBStorageFactory(other, "m.a", 0.1)
+            options[0].external_storage = RocksDBStorageFactory(other, "m.a")
             with self.assertRaisesRegex(RuntimeError, "config"):
                 rt.bind(plan)
 
@@ -253,7 +251,7 @@ class RocksDBCheckpointTest(unittest.TestCase):
         storage = model.emb.tables
         for t in range(2):
             self.assertEqual(
-                storage.logical_rows(t, None),
+                storage.index_rows(t),
                 len([k for k in after if k[0] == storage.namespaces[t]]),
             )
         db = self.rt.session.db
@@ -283,7 +281,7 @@ class RocksDBCheckpointTest(unittest.TestCase):
         self.rt.attach(model)
         self._train(model, 0, steps=20, batch=512)
         storage = model.emb.tables
-        self.assertLessEqual(storage.logical_rows(0, model.emb.cache), 4000)
+        self.assertLessEqual(storage.logical_rows(0), 4000)
         self.assertGreater(self.rt.session.metrics.counters.get("evict_rows", 0), 0)
 
 

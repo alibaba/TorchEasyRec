@@ -278,7 +278,7 @@ class RocksDBRuntime:
         t0 = time.perf_counter()
         evicted = 0
         for m in self.groups:
-            evicted += sum(m.tables.evict_to_capacity(m.cache).values())
+            evicted += sum(m.tables.evict_to_capacity().values())
         if evicted:
             self.session.metrics.record("evict", time.perf_counter() - t0, rows=evicted)
         return evicted

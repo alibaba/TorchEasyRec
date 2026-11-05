@@ -1063,7 +1063,7 @@ def _rocksdb_variants(base_option: ShardingOption) -> List[ShardingOption]:
             continue
         opt = copy.deepcopy(base_option)
         opt.dynamicemb_options.external_storage = (  # pyre-ignore [16]
-            backend.storage.RocksDBStorageFactory(None, "", ratio)
+            backend.storage.RocksDBStorageFactory(None, "")
         )
         opt.dynamicemb_options.caching = True  # pyre-ignore [16]
         opt.cache_params = CacheParams(load_factor=ratio)
