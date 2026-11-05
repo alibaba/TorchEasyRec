@@ -261,6 +261,12 @@ class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):
         # Never resumed from; replaced when the run saves that step again.
         self.assertIn("replacing incomplete checkpoint", log)
         self.assertIn("loading RocksDB tables into fresh working DB", log)
+        # The coordinator owns the restore's INFO output: its completion
+        # carries the elapsed wall time, and the extension's per-table and
+        # DB-open lines stay at DEBUG, out of the operator's log.
+        self.assertIn("restore dynamic embedding finished in ", log)
+        self.assertNotIn(" pass(es),", log)
+        self.assertNotIn("opened RocksDB working database", log)
         self.assertNotIn("total_loss: nan", log)
         self.assertTrue(
             os.path.exists(os.path.join(crashed, checkpoint_util.CKPT_SUCCESS_FILENAME))

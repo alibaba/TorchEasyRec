@@ -1180,6 +1180,10 @@ def restore_model(
             logger.info(
                 f"RANK[{os.environ.get('RANK', 0)}] restoring dynamic embedding..."
             )
+            # One blocking call carries the whole load; the coordinator sees no
+            # per-table completion, so long restores report no intermediate
+            # progress (per-table timings stay at DEBUG in the extension).
+            started = time.monotonic()
             try:
                 DynamicEmbLoad(
                     dynamicemb_load_path,
@@ -1192,7 +1196,8 @@ def restore_model(
                 if dynamicemb_view is not None:
                     dynamicemb_view.cleanup()
             logger.info(
-                f"RANK[{os.environ.get('RANK', 0)}] restore dynamic embedding finished."
+                f"RANK[{os.environ.get('RANK', 0)}] restore dynamic embedding "
+                f"finished in {time.monotonic() - started:.1f}s (rank-local)."
             )
 
 
