@@ -110,6 +110,7 @@ LR策略可以支持按epoch更新或者按step更新
       torchrun --master_addr=localhost --master_port=32555 --nnodes=1 --nproc-per-node=1 --node_rank=0 convert.py
       ```
 - log_step_count_steps: 打印log和summary的步数间隔（如果打印时间间隔小于1s，会跳过打印）
+  - 使用带timestamp的数据源时，loss日志会附加`data_timestamp`，表示当前rank处理的batch内最大数据时间戳，以UTC显示并保留毫秒，例如`2026-11-05T10:00:00.123+00:00`
 - is_profiling: 是否做训练性能分析，设置为true，会在模型目录的train_eval_trace子目录下记录trace文件，文件名以`rank<N>_`开头
 - profiler_config: is_profiling为true时的性能分析配置，不设置时默认在训练开始后等待1步、预热1步、记录10步，并记录shape、显存和调用栈
   - skip_first_steps: 开始分析前跳过的步数，默认为0。训练初期dynamic embedding和数据缓存尚未稳定，可设置较大的值采集稳定阶段的trace，如`skip_first_steps: 2000, wait_steps: 0, warmup_steps: 2, active_steps: 5`

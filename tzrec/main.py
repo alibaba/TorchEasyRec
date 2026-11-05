@@ -16,6 +16,7 @@ import os
 import socket
 from collections import OrderedDict
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from queue import Queue
 from threading import Event, Thread
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -290,6 +291,7 @@ def _log_train(
     plogger: Optional[ProgressLogger] = None,
     summary_writer: Optional[SummaryWriter] = None,
     train_metrics: Optional[Dict[str, torch.Tensor]] = None,
+    data_timestamp: float = -1.0,
 ) -> None:
     """Logging current training step."""
     if plogger is not None:
@@ -308,6 +310,9 @@ def _log_train(
             for k, v in train_metrics.items():
                 metric_strs.append(f"{k}:{v:.5f}")
             suffix += f" {' '.join(metric_strs)}"
+        if data_timestamp >= 0:
+            data_time = datetime.fromtimestamp(data_timestamp, timezone.utc)
+            suffix += f" data_timestamp:{data_time.isoformat(timespec='milliseconds')}"
         plogger.log(step, suffix)
     if summary_writer is not None:
         total_loss = sum(losses.values())
@@ -664,6 +669,7 @@ def _train_and_evaluate(
                             plogger=plogger,
                             summary_writer=summary_writer,
                             train_metrics=train_metrics,
+                            data_timestamp=batch.data_timestamp,
                         )
 
                     for lr in lr_scheduler:
@@ -773,6 +779,7 @@ def _train_and_evaluate(
             tb_summaries=tb_summaries,
             plogger=plogger,
             summary_writer=summary_writer,
+            data_timestamp=data_timestamp,
         )
         if summary_writer is not None:
             summary_writer.close()
