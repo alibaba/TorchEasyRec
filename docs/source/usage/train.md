@@ -91,13 +91,32 @@ dense_optimizer {
 LR策略可以支持按epoch更新或者按step更新
 
 - num_steps: 训练的步数，不能跟num_epochs同时设置
+
 - num_epochs: 训练的epoch数
+
 - save_checkpoints_steps: 保存模型的步数间隔，保存模型后会做一次评估
+
 - save_checkpoints_epochs: 保存模型的Epoch数间隔，保存模型后会做一次评估，与save_checkpoints_steps不能同时设置
+
 - save_checkpoints_timestamp_interval: 按数据时间（如Kafka消息的timestamp）保存模型的间隔秒数，每当已消费数据的事件时间跨过一个间隔边界时保存一次。默认0表示关闭。仅对带timestamp的数据源（如KafkaDataset）生效
+
 - save_checkpoints_timestamps: 按数据时间保存模型的绝对时间点列表（单位为秒的 Unix 时间戳），已消费数据的事件时间每跨过一个时间点保存一次，默认为空表示关闭
+
 - save_checkpoints_timestamp_quorum: 分布式训练下各rank消费的分区不同，事件时间也不同；当至少该比例（取值(0,1\]，默认0.5）的rank已消费越过边界/时间点时才触发保存。1.0表示所有rank都越过才保存（最保守），越小越激进（最小可仅需一个rank）；默认值对单个异常/超前的timestamp具有鲁棒性
+
 - keep_checkpoint_max: 最多保留的最近checkpoint数量，超出后会异步删除最旧的checkpoint，默认0表示全部保留；当exporter_type为best时，会额外保留指标最优的checkpoint
+
+- **checkpoint完整性**：训练写checkpoint时先在目录中放置空的`_IN_PROGRESS`文件，全部rank写完模型、优化器、调度器、输入位置和meta之后，最后由rank 0写入空的`_SUCCESS`并删除`_IN_PROGRESS`。因此`_SUCCESS`存在即代表该checkpoint完整可读
+
+- 自动选择checkpoint（续训恢复、评估、预测、导出，包括best导出）只选择带`_SUCCESS`的checkpoint，未写完的保存会被跳过；若目录里只有未写完的checkpoint会直接报错并列出它们。旧版本或外部工具生成的checkpoint没有`_SUCCESS`，如确认完整可手动声明后再使用：
+
+```bash
+touch model.ckpt-N/_SUCCESS   # 单个checkpoint
+find model_dir -maxdepth 1 -type d -name 'model.ckpt-*' -exec touch {}/_SUCCESS \;
+```
+
+重新保存某个已经带`_SUCCESS`的步数，或目录里存在协议不认识的非空目录时，保存会报错而不是删除它；只有上一次中断的保存（目录中还留有`_IN_PROGRESS`）会在重试该步时被自动替换
+
 - fine_tune_checkpoint: 增量训练的checkpoint路径，也可以设置checkpoint目录，将会使用目录下最新的checkpoint
 - fine_tune_ckpt_var_map: 需要restore的参数列表文件路径，文件的每一行是{variable_name in current model}\\t{variable name in old model ckpt}
   - 需要设置fine_tune_ckpt_var_map的情形:

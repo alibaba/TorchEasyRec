@@ -1217,6 +1217,8 @@ def evaluate(
     )
 
     ckpt_manager = checkpoint_util.CheckpointManager(pipeline_config.model_dir)
+    if checkpoint_path:
+        checkpoint_util.validate_checkpoint(checkpoint_path)
     global_step = None
     if not checkpoint_path:
         checkpoint_path, global_step = ckpt_manager.latest_checkpoint()
@@ -1321,6 +1323,8 @@ def export(
     ckpt_manager = checkpoint_util.CheckpointManager(
         pipeline_config.model_dir, export_config=pipeline_config.export_config
     )
+    if checkpoint_path:
+        checkpoint_util.validate_checkpoint(checkpoint_path)
     if not checkpoint_path:
         if (
             pipeline_config.HasField("export_config")
@@ -1929,6 +1933,8 @@ def predict_checkpoint(
     )
 
     ckpt_manager = checkpoint_util.CheckpointManager(pipeline_config.model_dir)
+    if checkpoint_path:
+        checkpoint_util.validate_checkpoint(checkpoint_path)
     global_step = None
     if not checkpoint_path:
         checkpoint_path, global_step = ckpt_manager.latest_checkpoint()

@@ -102,7 +102,7 @@ feature_configs {
 
 ## 从ZCH训练好的模型迁移
 
-如果已有用 `zch{}` 训练好的模型，希望切换到 `dynamicemb{}` 继续训练，可以使用 `tzrec.tools.dynamicemb.zch_to_dynamicemb_convert` 将ZCH checkpoint 转换为 dynamicemb 格式的 checkpoint，下游训练任务直接通过 `--fine_tune_checkpoint` 热启动。
+如果已有用 `zch{}` 训练好的模型，希望切换到 `dynamicemb{}` 继续训练，可以使用 `tzrec.tools.dynamicemb.zch_to_dynamicemb_convert` 将ZCH checkpoint 转换为 dynamicemb 格式的 checkpoint（转换完成后会写入`_SUCCESS`标记），下游训练任务直接通过 `--fine_tune_checkpoint` 热启动。
 
 ```bash
 python -m tzrec.tools.dynamicemb.zch_to_dynamicemb_convert \
