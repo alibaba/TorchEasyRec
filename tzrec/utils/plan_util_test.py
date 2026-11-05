@@ -9,25 +9,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import random
 import unittest
 from types import SimpleNamespace
 from typing import List, Tuple
+from unittest import mock
 
 import numpy as np
 import torch
 from parameterized import param, parameterized
+from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
 from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
-from torchrec.distributed.planner.proposers import GridSearchProposer
+from torchrec.distributed.planner.proposers import GridSearchProposer, UniformProposer
+from torchrec.distributed.planner.storage_reservations import (
+    HeuristicalStorageReservation,
+)
 from torchrec.distributed.planner.types import PlannerError, Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
-from tzrec.protos import feature_pb2
+from tzrec.protos import feature_pb2, train_pb2
+from tzrec.utils import plan_util, rocksdb_capacity, rocksdb_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.plan_util import (
     DynamicProgrammingProposer,
@@ -40,6 +47,31 @@ from tzrec.utils.test_util import (
     mark_ci_scope,
     parameterized_name_func,
 )
+
+
+class PlannerHostMemoryTest(unittest.TestCase):
+    """The planner holds back HOST_MEMORY_RESERVE_PERCENT of host memory."""
+
+    @parameterized.expand(
+        [param("default", env=None, share=0.85), param("set", env="0.5", share=0.5)],
+        name_func=parameterized_name_func,
+    )
+    def test_reserve(self, _, env, share):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        environ = dict(os.environ)
+        environ.pop("HOST_MEMORY_RESERVE_PERCENT", None)
+        if env is not None:
+            environ["HOST_MEMORY_RESERVE_PERCENT"] = env
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(plan_util, "host_memory_bytes", return_value=100 << 30),
+            mock.patch.object(plan_util, "get_local_size", return_value=1),
+            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
+        ):
+            planner = plan_util.create_planner(device, batch_size=8, model=nn.Module())
+        self.assertEqual(
+            planner._topology.devices[0].storage.ddr, int((100 << 30) * share)
+        )
 
 
 class PlanUtilTest(unittest.TestCase):
@@ -620,6 +652,22 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
         self.assertEqual(best[0].total_perf, 10.0)
 
+    def test_reload_runs_the_dp_again(self):
+        topology = _make_topology(
+            num_devices=1, hbm_per_device=2000, ddr_per_device=2000
+        )
+        proposer = DynamicProgrammingProposer()
+        proposer.load([_FakeShardingOption("table_a", hbm=100, ddr=0, perf=1.0)])
+        proposer.propose()
+        proposer.feedback(partitionable=False, storage_constraint=topology)
+
+        fits = _FakeShardingOption("table_a", hbm=200, ddr=0, perf=2.0)
+        oversized = _FakeShardingOption("table_a", hbm=100, ddr=9000, perf=3.0)
+        proposer.load([oversized, fits])
+        proposer.propose()
+        proposer.feedback(partitionable=False, storage_constraint=topology)
+        self.assertEqual(proposer.propose(), [fits])
+
     def test_caching_rejected_when_ddr_is_tight(self):
         # Host budget is only 950 — CACHING (ddr=1000) cannot fit; HYBRID can.
         opts = [
@@ -822,6 +870,38 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             self.assertGreaterEqual(so.total_storage.hbm, 0)
             self.assertGreaterEqual(so.total_storage.ddr, 0)
 
+    def test_cache_load_factor_pins_the_ratio(self):
+        from tzrec.protos import feature_pb2 as feature_pb2_
+        from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
+        from tzrec.utils.plan_util import (
+            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
+        )
+        from tzrec.utils.plan_util import (
+            get_default_sharders as _tzrec_get_default_sharders,
+        )
+
+        config = EmbeddingBagConfig(
+            num_embeddings=4096,
+            embedding_dim=32,
+            name="table_de",
+            feature_names=["feat_de"],
+        )
+        constraint = build_dynamicemb_constraints(
+            feature_pb2_.DynamicEmbedding(max_capacity=4096, cache_load_factor=0.5),
+            config,
+        )
+        enumerator = _TzrecEmbeddingEnumerator(
+            topology=Topology(world_size=2, compute_device="cuda"),
+            batch_size=128,
+            fqn_constraints={"sparse.ebc.table_de": constraint},
+        )
+        search_space = enumerator.enumerate(
+            module=self._build_model(), sharders=_tzrec_get_default_sharders()
+        )
+        # One HYBRID and one CACHING variant, both at the configured factor.
+        self.assertEqual(len(search_space), 2)
+        self.assertEqual({so.cache_load_factor for so in search_space}, {0.5})
+
     def test_dp_proposer_picks_feasible_dynamicemb_plan(self):
         from tzrec.utils.plan_util import (
             EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
@@ -997,6 +1077,213 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
                     planners.to_sharding_plan([sharding_option], topology)
             else:
                 planners.to_sharding_plan([sharding_option], topology)
+
+
+GIB = 1 << 30
+
+
+def _view(rank=0, free=10 << 40, job=0, pool="net:nas.example"):
+    return rocksdb_capacity.DiskView(
+        rank=rank, pool=pool, free_bytes=free, job_bytes=job
+    )
+
+
+def _model_and_constraints(tables):
+    """tables: name -> (rows, dim, DynamicEmbedding fields[, pooling factor])."""
+    from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
+
+    configs, constraints = [], {}
+    for name, (rows, dim, fields, *pooling) in tables.items():
+        config = EmbeddingBagConfig(
+            num_embeddings=rows,
+            embedding_dim=dim,
+            name=name,
+            feature_names=[f"f_{name}"],
+        )
+        configs.append(config)
+        constraints[f"sparse.ebc.{name}"] = build_dynamicemb_constraints(
+            feature_pb2.DynamicEmbedding(max_capacity=rows, **fields),
+            config,
+            *pooling,
+        )
+    return TestSparseNN(tables=configs, sparse_device=torch.device("meta")), constraints
+
+
+@unittest.skipUnless(has_dynamicemb, "dynamicemb is required")
+@mark_ci_scope("gpu")
+class RocksDBOffloadPlannerTest(unittest.TestCase):
+    """The DP proposer chooses offloaded tables, cache ratios, host and disk."""
+
+    # 2^24 x 64 fp32 with SGD: 4 GiB of values per table.
+    BIG = (1 << 24, 64, {})
+
+    def setUp(self):
+        try:
+            import tzrec_ext.rocksdb  # noqa: F401
+        except ImportError:
+            self.skipTest("tzrec_ext.rocksdb is not installed")
+
+    def _planner(self, tables, hbm_gib, ddr_gib, budget=None, views=None):
+        model, constraints = _model_and_constraints(tables)
+        topology = Topology(
+            world_size=1,
+            compute_device="cuda",
+            hbm_cap=int(hbm_gib * GIB),
+            ddr_cap=int(ddr_gib * GIB),
+        )
+        cfg = train_pb2.RocksDBConfig(root_dir="/unused")
+        if budget is not None:
+            cfg.disk_budget_bytes = budget
+        planner = plan_util.RocksDBOffloadPlanner(
+            rocksdb=SimpleNamespace(config=cfg),
+            views=views or [_view()],
+            topology=topology,
+            batch_size=128,
+            enumerator=plan_util.EmbeddingEnumerator(
+                topology=topology,
+                batch_size=128,
+                fqn_constraints=constraints,
+                rocksdb=True,
+            ),
+            storage_reservation=HeuristicalStorageReservation(percentage=0.15),
+            proposer=[DynamicProgrammingProposer(), UniformProposer()],
+        )
+        return planner, model
+
+    def _plan(self, tables, hbm_gib, ddr_gib, **kwargs):
+        planner, model = self._planner(tables, hbm_gib, ddr_gib, **kwargs)
+        plan = planner.plan(model, plan_util.get_default_sharders())
+        offloaded = {
+            name: p.dynamicemb_options
+            for m in plan.plan.values()
+            for name, p in m.items()
+            if rocksdb_util.is_rocksdb_options(p.dynamicemb_options)
+        }
+        return plan, offloaded, planner
+
+    @parameterized.expand(
+        [
+            param("rocksdb", rocksdb=True, modes={True}),
+            param("builtin", rocksdb=False, modes={False, True}),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_memory_table_layouts(self, _, rocksdb, modes):
+        # With RocksDB configured, a table stays in memory only in a layout
+        # every restore preserves.
+        base = SimpleNamespace(
+            dynamicemb_options=SimpleNamespace(caching=False, external_storage=None),
+            cache_params=None,
+        )
+        variants = plan_util._emit_dynamicemb_variants(base, rocksdb)
+        self.assertEqual({v.dynamicemb_options.caching for v in variants}, modes)
+
+    def test_all_in_memory(self):
+        _, offloaded, planner = self._plan({"a": self.BIG, "b": self.BIG}, 80, 64)
+        self.assertEqual(offloaded, {})
+        # RocksDB's fixed host memory is charged only to an offloading plan.
+        self.assertEqual(planner._topology.devices[0].storage.ddr, 64 * GIB)
+
+    def test_offload_when_memory_is_short(self):
+        tables = {"a": self.BIG, "b": self.BIG, "c": (1 << 20, 64, {})}
+        _, offloaded, planner = self._plan(tables, 4, 4.75)
+        self.assertTrue(offloaded)
+        self.assertNotIn("c", offloaded)
+        configs = {o.external_storage.backend_config for o in offloaded.values()}
+        self.assertEqual(len(configs), 1)
+        (config,) = configs
+        self.assertGreater(
+            config.block_cache_bytes, rocksdb_util.BLOCK_CACHE_DATA_BYTES
+        )
+        self.assertGreater(config.import_budget_bytes, 0)
+        for name, o in offloaded.items():
+            factory = o.external_storage
+            self.assertEqual(factory.table_namespace, f"sparse.ebc.{name}")
+            # DynamicEmb sizes a fused group's cache with its budget over its
+            # value bytes: the budget must be exactly a planned ratio's bytes.
+            per_row = o.max_capacity * o.dim * 4
+            budgets = {math.ceil(r * per_row) for r in rocksdb_util.CACHE_RATIOS}
+            self.assertIn(o.local_hbm_for_values, budgets)
+        self.assertEqual(planner._topology.devices[0].storage.ddr, int(4.75 * GIB))
+
+    def test_overrides_stay_in_memory(self):
+        tables = {
+            "b": (1 << 24, 64, {"cache_load_factor": 0.5}),
+            "c": (1 << 24, 64, {"score_strategy": "CUSTOMIZED"}),
+            "d": (1 << 24, 64, {}),
+        }
+        _, offloaded, _ = self._plan(tables, 4, 16)
+        self.assertEqual(set(offloaded), {"d"})
+
+    def test_cache_holds_the_batch_estimate(self):
+        # 128 samples x 1000 ids: ratios whose cache is below 128k rows of a
+        # 16M-row table (0.0001, 0.001) are not offered.
+        planner, model = self._planner({"a": (1 << 24, 64, {}, 1000.0)}, 4, 4)
+        enumerator = planner._enumerator
+        enumerator.offload = True
+        options = enumerator.enumerate(model, plan_util.get_default_sharders())
+        ratios = sorted(
+            o.cache_params.load_factor
+            for o in options
+            if rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
+        )
+        self.assertEqual(ratios, list(rocksdb_util.CACHE_RATIOS[2:]))
+
+    def test_rocksdb_misses_cost_disk_bandwidth(self):
+        planner, model = self._planner({"a": self.BIG}, 4, 4)
+        planner._enumerator.offload = True
+        options = planner._enumerator.enumerate(model, plan_util.get_default_sharders())
+        perf = {}
+        for o in options:
+            rocksdb = rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
+            perf[(rocksdb, o.cache_load_factor)] = o.total_perf
+        for ratio in (0.1, 0.5, 0.9):
+            self.assertGreater(perf[(True, ratio)], perf[(False, ratio)])
+
+    def test_disk_axis_picks_the_table_that_fits(self):
+        # Offloading "a" or "b" (4 GiB of values each) covers the GPU deficit;
+        # "a" is cheaper (100x fewer lookups) but only "b" fits the disk.
+        tables = {
+            "a": (1 << 25, 32, {}, 1.0),
+            "b": (1 << 24, 64, {}, 100.0),
+            "c": (1 << 20, 64, {}),
+        }
+        _, offloaded, planner = self._plan(tables, 1.76, 12)
+        self.assertEqual(set(offloaded), {"a"})
+        backend = rocksdb_util._import_backend()
+        overheads = backend.disk_overheads(
+            planner._backend_config(block_cache_bytes=0, import_budget_bytes=0)
+        )
+
+        def growth(rows, dim, ratio, lookups):
+            return rocksdb_capacity.TableDisk(
+                "t",
+                rows,
+                backend.logical_row_bytes(dim, 0, 4),
+                backend.index_entry_bytes(),
+                "",
+                rocksdb_util.cache_rows(rows, ratio),
+                lookups,
+            ).growth_bytes
+
+        # Room for "b" at its smallest cache ratio, and for "a" at none.
+        room = (
+            growth(1 << 24, 64, 0.001, 12800) + growth(1 << 25, 32, 0.0001, 128)
+        ) // 2
+        budget = (
+            room
+            + rocksdb_capacity.DISK_RESERVE_BYTES
+            + rocksdb_capacity.pool_fixed_bytes(
+                overheads, (1 << 25) * backend.logical_row_bytes(32, 0, 4)
+            )
+        )
+        _, offloaded, _ = self._plan(tables, 1.76, 12, budget=budget)
+        self.assertEqual(set(offloaded), {"b"})
+
+    def test_no_plan_fits(self):
+        tables = {"a": (1 << 26, 64, {}), "b": (1 << 26, 64, {})}
+        with self.assertRaises(PlannerError):
+            self._plan(tables, 4, 4.75, budget=40 * GIB)
 
 
 if __name__ == "__main__":

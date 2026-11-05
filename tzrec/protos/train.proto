@@ -158,6 +158,20 @@ message DeltaEmbeddingDumpConfig {
     optional uint32 sparse_dump_interval_minutes = 10;
 }
 
+// Lets the planner offload dynamicemb tables to RocksDB when GPU and host
+// memory cannot hold them all. Each rank keeps one working database under
+// root_dir for all of its offloaded tables; cache sizes, buffers and threads
+// are planned. A table with cache_load_factor stays in memory.
+message RocksDBConfig {
+    // storage root of the working databases on a local disk or an NFS-like
+    // filesystem (NVMe, ESSD, Extreme NAS), never an OSS mount. Each rank
+    // uses <root_dir>/<model_dir id>/rank_<rank>/<mode>-<time>-<pid>.
+    required string root_dir = 1;
+    // bytes this job may occupy on the filesystem of root_dir, for all of its
+    // ranks that share it. Unset: only the observed free space limits it.
+    optional uint64 disk_budget_bytes = 2;
+}
+
 message TrainConfig {
     // embedding part optimizer
     required SparseOptimizer sparse_optimizer = 1;
@@ -216,5 +230,7 @@ message TrainConfig {
     optional DeltaEmbeddingDumpConfig delta_embedding_dump_config = 24;
     // profiler schedule and collection options, used when is_profiling=true
     optional ProfilerConfig profiler_config = 25;
+    // allows offloading dynamicemb tables to RocksDB.
+    optional RocksDBConfig rocksdb_config = 26;
     // TBD: qcomm config
 }

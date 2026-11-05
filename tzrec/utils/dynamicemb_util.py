@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import dataclasses
 import math
 import os
@@ -52,6 +53,7 @@ from tzrec.optim.optimizer import (
     sparse_init_accumulator_value,
 )
 from tzrec.protos import feature_pb2
+from tzrec.utils import rocksdb_util
 from tzrec.utils.logging_util import logger
 
 _DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
@@ -399,9 +401,19 @@ def _build_dynamicemb_initializer(
 
 
 def build_dynamicemb_constraints(
-    dynamicemb_cfg: feature_pb2.DynamicEmbedding, emb_config: BaseEmbeddingConfig
+    dynamicemb_cfg: feature_pb2.DynamicEmbedding,
+    emb_config: BaseEmbeddingConfig,
+    pooling_factor: float = 1.0,
 ) -> ParameterConstraints:
-    """Build ParameterConstraints for DynamicEmbedding."""
+    """Build ParameterConstraints for DynamicEmbedding.
+
+    Args:
+        dynamicemb_cfg (DynamicEmbedding): the feature's dynamicemb config.
+        emb_config (BaseEmbeddingConfig): the table's embedding config.
+        pooling_factor (float): ids one sample brings the table through this
+            feature, as far as the config tells (a sequence's max length);
+            the planner estimates a step's lookups from it.
+    """
     if not has_dynamicemb:
         raise RuntimeError(
             "dynamicemb is not installed; required by features with "
@@ -485,12 +497,13 @@ def build_dynamicemb_constraints(
     constraints_kwargs = {}
     if dynamicemb_cfg.HasField("cache_load_factor"):
         # for ShardingPlan estimator hdm storage
-        constraints_kwargs["cache_params"] = (
-            CacheParams(load_factor=dynamicemb_cfg.cache_load_factor),
+        constraints_kwargs["cache_params"] = CacheParams(
+            load_factor=dynamicemb_cfg.cache_load_factor
         )
 
     constraints = DynamicEmbParameterConstraints(
         use_dynamicemb=True,
+        pooling_factors=[pooling_factor],
         sharding_types=[ShardingType.ROW_WISE.value],
         compute_kernels=[EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value],
         dynamicemb_options=dynamicemb_options,
@@ -630,17 +643,33 @@ if has_dynamicemb:
                     optimizer_class, tensor.shape, tensor.dtype
                 )
                 dynamicemb_options.training = optimizer_class is not None
-                dynamicemb_options.local_hbm_for_values = (
-                    _calculate_dynamicemb_table_storage_specific_size(
-                        shards[0].size,
-                        tensor.element_size(),
-                        optimizer_multipler,
-                        sharding_option.cache_load_factor,
-                        is_hbm=True,
-                        only_values=True,
-                        bucket_capacity=dynamicemb_options.bucket_capacity,
+                rows, dim = shards[0].size
+                if rocksdb_util.is_rocksdb_options(dynamicemb_options):
+                    # DynamicEmb's own formula: a fused group's cache ratio is
+                    # its budget over its tables' value bytes, which then
+                    # equals the planned ratio of every RocksDB member.
+                    dynamicemb_options.local_hbm_for_values = math.ceil(
+                        sharding_option.cache_load_factor
+                        * rows
+                        * (dim + round(dim * optimizer_multipler))
+                        * tensor.element_size()
                     )
-                )
+                    dynamicemb_options.external_storage = dataclasses.replace(
+                        dynamicemb_options.external_storage,
+                        table_namespace=f"{sharding_option.path}.{sharding_option.name}",
+                    )
+                else:
+                    dynamicemb_options.local_hbm_for_values = (
+                        _calculate_dynamicemb_table_storage_specific_size(
+                            shards[0].size,
+                            tensor.element_size(),
+                            optimizer_multipler,
+                            sharding_option.cache_load_factor,
+                            is_hbm=True,
+                            only_values=True,
+                            bucket_capacity=dynamicemb_options.bucket_capacity,
+                        )
+                    )
                 # Fill in per-shard fields that used to be populated by
                 # dynamicemb's internal ``_get_dynamicemb_options_per_table``.
                 # After the fused-storage refactor (NVIDIA recsys-examples
@@ -762,9 +791,13 @@ if has_dynamicemb:
         whose ``load_factor`` is the empirically-fitted x_eff for the
         (mode, cache_load_factor) combination. Restored before returning so
         the (separately invoked) storage estimator still sees the un-boosted
-        ratio.
+        ratio. A table stored in RocksDB misses to disk, not to host memory:
+        its estimate sees the topology's SSD bandwidth as the host link.
         """
         dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
+        if rocksdb_util.is_rocksdb_options(dynamicemb_options):
+            topology = copy.copy(topology)
+            topology._hbm_to_ddr_mem_bw = topology.ssd_mem_bw
         original_cache_params = sharding_option.cache_params
         if dynamicemb_options is not None:
             caching = bool(getattr(dynamicemb_options, "caching", False))
@@ -921,16 +954,50 @@ if has_dynamicemb:
             is_pooled=is_pooled,
         )
 
-        hbm_specific_sizes, ddr_specific_sizes = (
-            _calculate_dynamicemb_storage_specific_sizes(
-                tensor=tensor,
-                shard_sizes=shard_sizes,
-                cache_ratio=caching_ratio if caching_ratio else 1.0,
-                is_inference=is_inference,
-                bucket_capacity=dynamicemb_options.bucket_capacity,
-                caching=bool(getattr(dynamicemb_options, "caching", False)),
+        if rocksdb_util.is_rocksdb_options(dynamicemb_options):
+            # The GPU cache (cached rows and DynamicEmb's overflow area, with
+            # their metadata) and the block cache's share for the table's
+            # filters and index; the table itself is on disk.
+            backend = rocksdb_util._import_backend()
+            optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
+            mult = _get_optimizer_multipler(optimizer_class, tensor.shape, tensor.dtype)
+            indexed = dynamicemb_options.score_strategy.name != "NO_EVICTION"
+            hbm_specific_sizes = [
+                _calculate_dynamicemb_table_storage_specific_size(
+                    [
+                        rocksdb_util.cache_rows(size[0], caching_ratio)
+                        + rocksdb_util.CACHE_OVERFLOW_ROWS,
+                        size[1],
+                    ],
+                    tensor.element_size(),
+                    mult,
+                    1.0,
+                    is_hbm=True,
+                    bucket_capacity=rocksdb_util.CACHE_BUCKET_ROWS,
+                )
+                for size in shard_sizes
+            ]
+            ddr_specific_sizes = [
+                backend.metadata_cache_bytes(
+                    size[0],
+                    backend.logical_row_bytes(
+                        size[1], round(size[1] * mult), tensor.element_size()
+                    ),
+                    indexed,
+                )
+                for size in shard_sizes
+            ]
+        else:
+            hbm_specific_sizes, ddr_specific_sizes = (
+                _calculate_dynamicemb_storage_specific_sizes(
+                    tensor=tensor,
+                    shard_sizes=shard_sizes,
+                    cache_ratio=caching_ratio if caching_ratio else 1.0,
+                    is_inference=is_inference,
+                    bucket_capacity=dynamicemb_options.bucket_capacity,
+                    caching=bool(getattr(dynamicemb_options, "caching", False)),
+                )
             )
-        )
         # The counter belongs to the strategy that counts with it; a
         # probabilistic admitter keeps no state, so it costs nothing.
         counter_hbm_specific_size = 0
