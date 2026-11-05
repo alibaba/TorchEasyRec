@@ -19,7 +19,8 @@ The walk is prompt structure only; ``hole_keys.py`` folds the prefix-cache
 identity of each hole beside it.
 """
 
-from typing import Dict, Final, List, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, Final, List, Tuple
 
 import torch
 from torch import nn
@@ -356,3 +357,143 @@ class PromptAssembler(nn.Module):
             "response_lengths": response_lengths,
             "max_seqlen": max_seqlen,
         }
+
+
+@dataclass
+class MultiTargetLayout:
+    """Training-only SID branches that share each row's packed prompt prefix.
+
+    Tokens keep the assembler's packed order. Every prefix and every target is
+    one attention segment; a target's keys are its row's prefix followed by its
+    own tokens, so causal attention aligned to the last key isolates targets.
+
+    Args:
+        position_ids: packed positions, restarting after the prefix per target.
+        cu_seqlens_q: int32 query boundaries of the prefix and target segments.
+        cu_seqlens_k: int32 key boundaries of the same segments.
+        key_indices: packed token behind every segment key.
+        max_seqlen: upper bound of any segment's query or key length.
+        label_indices: packed indices of target tokens, shaped (targets, levels).
+        score_indices: packed indices whose logits predict those labels.
+        target_weights: inverse target count of each target's row.
+        mask_mod: the same visibility as a FlexAttention predicate over tokens.
+    """
+
+    position_ids: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    key_indices: torch.Tensor
+    max_seqlen: int
+    label_indices: torch.Tensor
+    score_indices: torch.Tensor
+    target_weights: torch.Tensor
+    mask_mod: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
+    ]
+
+
+def build_multi_target_layout(
+    cu_seqlens: torch.Tensor, response_lengths: torch.Tensor, num_levels: int
+) -> MultiTargetLayout:
+    """Split each packed row into its shared prefix and independent SID targets.
+
+    Args:
+        cu_seqlens: packed row boundaries from the assembler.
+        response_lengths: supervised SID token count of each row.
+        num_levels: codebook levels per target SID.
+
+    Returns:
+        Positions, attention segments and scoring indices over packed tokens.
+    """
+    device = cu_seqlens.device
+    cu_seqlens = cu_seqlens.to(torch.int64)
+    response_lengths = response_lengths.to(torch.int64)
+    row_lengths = torch.diff(cu_seqlens)
+    prefix_lengths = row_lengths - response_lengths
+    target_counts = response_lengths // num_levels
+    segment_counts = target_counts + 1
+    # one host read sizes every repeat below
+    num_tokens, num_targets, num_keys, max_seqlen = torch.stack(
+        (
+            cu_seqlens[-1],
+            target_counts.sum(),
+            (prefix_lengths * segment_counts + response_lengths).sum(),
+            row_lengths.max(),
+        )
+    ).tolist()
+    row_ids = torch.arange(row_lengths.numel(), device=device)
+
+    token_rows = torch.repeat_interleave(row_ids, row_lengths, output_size=num_tokens)
+    token_offsets = torch.arange(num_tokens, device=device) - cu_seqlens[token_rows]
+    token_prefix_lengths = prefix_lengths[token_rows]
+    response_offsets = token_offsets - token_prefix_lengths
+    in_prefix = response_offsets < 0
+    position_ids = torch.where(
+        in_prefix,
+        token_offsets,
+        token_prefix_lengths + response_offsets.remainder(num_levels),
+    )
+    token_targets = torch.where(
+        in_prefix,
+        -1,
+        (target_counts.cumsum(0) - target_counts)[token_rows]
+        + response_offsets.div(num_levels, rounding_mode="floor"),
+    )
+
+    num_segments = row_ids.numel() + num_targets
+    segment_ids = torch.arange(num_segments, device=device)
+    segment_rows = torch.repeat_interleave(
+        row_ids, segment_counts, output_size=num_segments
+    )
+    # 0 for a row's prefix, i for its i-th target
+    segment_ranks = (
+        segment_ids - (segment_counts.cumsum(0) - segment_counts)[segment_rows]
+    )
+    segment_prefix_lengths = prefix_lengths[segment_rows]
+    query_lengths = torch.where(segment_ranks > 0, num_levels, segment_prefix_lengths)
+    key_lengths = segment_prefix_lengths + num_levels * (segment_ranks > 0)
+    cu_seqlens_q = nn.functional.pad(query_lengths.cumsum(0), (1, 0))
+    cu_seqlens_k = nn.functional.pad(key_lengths.cumsum(0), (1, 0))
+    key_segments = torch.repeat_interleave(
+        segment_ids, key_lengths, output_size=num_keys
+    )
+    key_offsets = torch.arange(num_keys, device=device) - cu_seqlens_k[key_segments]
+    key_rows = segment_rows[key_segments]
+    # past the prefix, a target's own keys skip the row's earlier targets
+    key_indices = (
+        cu_seqlens[key_rows]
+        + key_offsets
+        + (key_offsets >= prefix_lengths[key_rows])
+        * (segment_ranks[key_segments] - 1)
+        * num_levels
+    )
+
+    target_rows = torch.repeat_interleave(
+        row_ids, target_counts, output_size=num_targets
+    )
+    target_segments = torch.arange(num_targets, device=device) + target_rows + 1
+    label_indices = cu_seqlens_q[target_segments, None] + torch.arange(
+        num_levels, device=device
+    )
+    score_indices = label_indices - 1
+    score_indices[:, 0] = cu_seqlens[target_rows] + prefix_lengths[target_rows] - 1
+
+    def mask_mod(b, h, q, kv):
+        """Keep causal prefix attention and isolate every target branch."""
+        return (
+            (token_rows[q] == token_rows[kv])
+            & (kv <= q)
+            & ((token_targets[kv] < 0) | (token_targets[kv] == token_targets[q]))
+        )
+
+    return MultiTargetLayout(
+        position_ids=position_ids,
+        cu_seqlens_q=cu_seqlens_q.to(torch.int32),
+        cu_seqlens_k=cu_seqlens_k.to(torch.int32),
+        key_indices=key_indices,
+        max_seqlen=max_seqlen,
+        label_indices=label_indices,
+        score_indices=score_indices,
+        target_weights=target_counts[target_rows].float().reciprocal(),
+        mask_mod=mask_mod,
+    )

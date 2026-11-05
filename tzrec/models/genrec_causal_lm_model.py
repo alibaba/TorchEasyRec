@@ -23,6 +23,7 @@ not supported; Qwen2.5/Qwen3 are what CI covers.
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
+from transformers import AttentionInterface
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -33,10 +34,70 @@ from tzrec.prompt.assembler import (
     INPUT_IDS,
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
+    MultiTargetLayout,
+    build_multi_target_layout,
 )
-from tzrec.prompt.types import CompiledPrompt
+from tzrec.prompt.types import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+
+
+def _shared_prefix_attention(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Any,
+    scaling: Optional[float] = None,
+    *,
+    multi_target_layout: MultiTargetLayout,
+    **kwargs: Any,
+) -> Tuple[torch.Tensor, None]:
+    """Run one FA2 varlen call over the prefix and target segments.
+
+    Every target segment reads its row's prefix keys before its own, so the
+    causal mask, aligned to the last key, hides the row's other targets.
+
+    Args:
+        module: backbone attention module after projection and rotary embedding.
+        query: packed queries shaped (1, query heads, total tokens, head dim).
+        key: packed keys, retaining the backbone's grouped KV heads.
+        value: packed values with the same layout as keys.
+        attention_mask: unused; the segments carry the visibility.
+        scaling: backbone attention scale.
+        multi_target_layout: batch-local segments and key gather indices.
+        **kwargs: unused backbone attention options.
+
+    Returns:
+        Packed attention output and no attention weights.
+    """
+    from flash_attn import flash_attn_varlen_func
+
+    layout = multi_target_layout
+    if query.dtype == torch.float32:
+        dtype = (
+            torch.get_autocast_dtype("cuda")
+            if torch.is_autocast_enabled("cuda")
+            else module.q_proj.weight.dtype
+        )
+        query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+    output = flash_attn_varlen_func(
+        query[0].transpose(0, 1),
+        key[0].transpose(0, 1).index_select(0, layout.key_indices),
+        value[0].transpose(0, 1).index_select(0, layout.key_indices),
+        cu_seqlens_q=layout.cu_seqlens_q,
+        cu_seqlens_k=layout.cu_seqlens_k,
+        max_seqlen_q=layout.max_seqlen,
+        max_seqlen_k=layout.max_seqlen,
+        dropout_p=0.0,
+        softmax_scale=scaling,
+        causal=True,
+    )
+    return output.unsqueeze(0), None
+
+
+_SHARED_PREFIX_ATTENTION = "genrec_shared_prefix_fa2"
+AttentionInterface.register(_SHARED_PREFIX_ATTENTION, _shared_prefix_attention)
 
 
 class GenRecCausalLMModel(BaseGenRecModel):
@@ -70,6 +131,8 @@ class GenRecCausalLMModel(BaseGenRecModel):
         common = self._model_config.common
         self._generated_sids_key = common.generated_sids_key
         self._read_beam_config(common)
+        response = self._prompt.prompt_plan.response_segments
+        self._has_sid_response = len(response) == 1 and isinstance(response[0], SlotSeg)
 
     def _read_beam_config(self, common: GenRecModelConfig) -> None:
         """Parse the decode knobs; the schedule must match the codebook.
@@ -124,8 +187,97 @@ class GenRecCausalLMModel(BaseGenRecModel):
         embeds = self.build_input(batch)
         if self.is_inference:
             return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
-        logits, labels = _fx_wrapped_forward(self, embeds, batch)
-        return {"logits": logits, "labels": labels}
+        predictions = _fx_wrapped_forward(self, embeds, batch)
+        keys = ("logits", "labels")
+        if self._has_sid_response:
+            keys += ("target_weights",)
+        return {key: predictions[key] for key in keys}
+
+    def _training_predictions(
+        self, embeds: torch.Tensor, batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Select shared-prefix scoring for a response containing multiple SIDs.
+
+        Args:
+            embeds: assembled prompt and response embeddings.
+            batch: packed row boundaries and response lengths.
+
+        Returns:
+            Logits and labels, plus per-target row weights for a SID response.
+        """
+        if not self._has_sid_response:
+            logits, labels = self._forward(embeds, batch)
+            return {"logits": logits, "labels": labels}
+        lengths = batch.additional_infos[RESPONSE_LENGTHS]
+        if int(lengths.max()) > self._prompt.sid_space.num_levels:
+            return self._multi_target_predictions(embeds, batch)
+        logits, labels = self._forward(embeds, batch)
+        return {
+            "logits": logits,
+            "labels": labels,
+            "target_weights": (lengths > 0).float(),
+        }
+
+    def _multi_target_predictions(
+        self, embeds: torch.Tensor, batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Score independent SID branches over one packed prompt per row.
+
+        Args:
+            embeds: packed embeddings, retaining one prefix per row.
+            batch: existing assembler row boundaries and response lengths.
+
+        Returns:
+            Per-target logits and labels, and each target's row weight.
+        """
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        if self.lm.is_gradient_checkpointing:
+            raise ValueError(
+                "Shared SID training requires gradient checkpointing to be disabled."
+            )
+        infos = batch.additional_infos
+        layout = build_multi_target_layout(
+            infos[CU_SEQLENS],
+            infos[RESPONSE_LENGTHS],
+            self._prompt.sid_space.num_levels,
+        )
+        if self._attn_kernel == "flash_attention_2":
+            config = self.lm.config
+            if config.attention_dropout != 0 or config.use_sliding_window:
+                raise ValueError(
+                    "Shared-prefix FA2 requires full attention and zero dropout."
+                )
+            attention, attention_mask = _SHARED_PREFIX_ATTENTION, None
+        else:
+            num_tokens = embeds.shape[0]
+            attention = "flex_attention"
+            attention_mask = create_block_mask(
+                layout.mask_mod,
+                1,
+                None,
+                num_tokens,
+                num_tokens,
+                device=embeds.device,
+                _compile=True,
+            )
+        previous_attention = self.lm.config._attn_implementation
+        try:
+            self.lm.set_attn_implementation(attention)
+            hidden = self.lm.base_model(
+                inputs_embeds=embeds.unsqueeze(0),
+                attention_mask={"full_attention": attention_mask},
+                position_ids=layout.position_ids.unsqueeze(0),
+                use_cache=False,
+                multi_target_layout=layout,
+            ).last_hidden_state
+        finally:
+            self.lm.set_attn_implementation(previous_attention)
+        return {
+            "logits": self.lm.get_output_embeddings()(hidden[0][layout.score_indices]),
+            "labels": infos[INPUT_IDS][layout.label_indices],
+            "target_weights": layout.target_weights,
+        }
 
     def _forward(
         self, embeds: torch.Tensor, batch: Batch
@@ -287,7 +439,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
 @torch.fx.wrap
 def _fx_wrapped_forward(
     model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Dict[str, torch.Tensor]:
     """Hide the packed forward from FX.
 
     ``TrainPipelineSparseDist`` symbolically traces the model whenever a
@@ -299,9 +451,9 @@ def _fx_wrapped_forward(
         batch: the batch being scored.
 
     Returns:
-        The response-window logits and labels.
+        Training predictions and optional multi-target parent metadata.
     """
-    return model._forward(embeds, batch)
+    return model._training_predictions(embeds, batch)
 
 
 @torch.fx.wrap

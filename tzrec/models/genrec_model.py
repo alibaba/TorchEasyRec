@@ -60,6 +60,45 @@ _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
 )
 
 
+@torch.fx.wrap
+def _fx_wrapped_genrec_loss(
+    model: "BaseGenRecModel", predictions: Dict[str, torch.Tensor]
+) -> torch.Tensor:
+    """Keep the shape-dependent SID target loss outside symbolic tracing.
+
+    Args:
+        model: model owning the LM loss and ignore index.
+        predictions: logits and labels, plus per-target row weights for a SID
+            response.
+
+    Returns:
+        Scalar cross entropy, averaging targets within each row first.
+    """
+    if "target_weights" not in predictions:
+        return model.lm.loss_function(
+            logits=predictions["logits"],
+            labels=predictions["labels"],
+            vocab_size=model.lm.config.vocab_size,
+            ignore_index=model._ignore_index,
+        )
+    logits, labels = predictions["logits"], predictions["labels"]
+    if labels.shape[-1] != model._prompt.sid_space.num_levels:
+        # a single-target window starts at the token before the response
+        logits, labels = logits[:, :-1], labels[:, 1:]
+    target_loss = (
+        nn.functional.cross_entropy(
+            logits.float().flatten(0, 1),
+            labels.flatten(),
+            ignore_index=model._ignore_index,
+            reduction="none",
+        )
+        .view_as(labels)
+        .mean(dim=-1)
+    )
+    weights = predictions["target_weights"]
+    return (target_loss * weights).sum() / weights.sum()
+
+
 class BaseGenRecModel(BaseModel):
     """An HF backbone driven by a compiled prompt.
 
@@ -254,23 +293,16 @@ class BaseGenRecModel(BaseModel):
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        """Score the response window with the backbone's own causal-LM loss.
+        """Score single responses or average independent SID losses per parent.
 
         Args:
-            predictions: the response-window logits and labels.
+            predictions: logits, labels and optional multi-target parent metadata.
             batch: the batch, unused.
 
         Returns:
             The named loss.
         """
-        return {
-            "ce_loss": self.lm.loss_function(
-                logits=predictions["logits"],
-                labels=predictions["labels"],
-                vocab_size=self.lm.config.vocab_size,
-                ignore_index=self._ignore_index,
-            )
-        }
+        return {"ce_loss": _fx_wrapped_genrec_loss(self, predictions)}
 
     def init_metric(self) -> None:
         """Register a mean-CE metric for the eval loop."""

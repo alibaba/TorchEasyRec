@@ -12,14 +12,18 @@
 import unittest
 from types import SimpleNamespace
 from typing import Optional, Sequence
+from unittest import mock
 
 import torch
 from parameterized import parameterized
 from torch import nn
+from transformers import AutoModelForCausalLM
 from transformers.loss.loss_utils import ForCausalLMLoss
 
 from tzrec.datasets.utils import Batch
-from tzrec.models.genrec_causal_lm_model import GenRecCausalLMModel
+from tzrec.models.genrec_causal_lm_model import (
+    GenRecCausalLMModel,
+)
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
     INPUT_IDS,
@@ -437,6 +441,188 @@ class LayoutInvarianceTest(unittest.TestCase):
         torch.testing.assert_close(
             packed["logits"], padded["logits"], atol=1e-2, rtol=1e-2
         )
+
+
+@mark_ci_scope("h20", "gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
+class MultiTargetTrainingTest(unittest.TestCase):
+    atol = 3e-5
+    rtol = 3e-4
+
+    def setUp(self) -> None:
+        self.model, self.compiled = create_genrec_test_model(
+            make_test_dir(), attn_kernel="sdpa", init_seed=17
+        )
+        config = self.model.lm.config
+        config.num_attention_heads = 2
+        config.num_key_value_heads = 1
+        config.head_dim = 16
+        self.model.lm = AutoModelForCausalLM.from_config(
+            config, attn_implementation="sdpa"
+        )
+        self.model = self.model.cuda().eval()
+        self.histories = [GENREC_HIST_CODES, GENREC_LONG_HIST_CODES]
+        self.answers = [
+            GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES,
+            GENREC_ANSWER_CODES,
+        ]
+
+    def _batch(self, histories=None, answers=None, predict=False):
+        histories = self.histories if histories is None else histories
+        answers = self.answers if answers is None else answers
+        parsed = {
+            "hist.values": torch.tensor([v for row in histories for v in row]),
+            "hist.lengths": torch.tensor([len(row) for row in histories]),
+        }
+        if not predict:
+            parsed.update(
+                {
+                    "answer.values": torch.tensor([v for row in answers for v in row]),
+                    "answer.lengths": torch.tensor([len(row) for row in answers]),
+                }
+            )
+        batch = Batch()
+        batch.additional_infos.update(
+            PromptAssembler(
+                self.compiled.prompt_plan,
+                self.compiled.sid_space,
+                include_response=not predict,
+            )(parsed)
+        )
+        return batch.to(torch.device("cuda"))
+
+    def _reference(self):
+        batch = self._batch(
+            [self.histories[0], self.histories[0], self.histories[1]],
+            [GENREC_ANSWER_CODES, _OTHERGENREC_ANSWER_CODES, GENREC_ANSWER_CODES],
+        )
+        predictions = self.model.predict(batch)
+        logits = predictions["logits"][:, :-1]
+        labels = predictions["labels"][:, 1:]
+        losses = (
+            nn.functional.cross_entropy(
+                logits.float().reshape(-1, logits.shape[-1]),
+                labels.reshape(-1),
+                reduction="none",
+            )
+            .reshape(3, 3)
+            .mean(-1)
+        )
+        return logits, labels, ((losses[0] + losses[1]) / 2 + losses[2]) / 2
+
+    def test_logits_loss_and_lm_gradients_match_independent_targets(self) -> None:
+        reference_logits, reference_labels, reference_loss = self._reference()
+        reference_loss.backward()
+        gradients = {
+            name: parameter.grad.clone()
+            for name, parameter in self.model.named_parameters()
+            if parameter.grad is not None
+        }
+        self.model.zero_grad(set_to_none=True)
+        batch = self._batch()
+        predictions = self.model.predict(batch)
+        loss = self.model.loss(predictions, batch)["ce_loss"]
+        torch.testing.assert_close(
+            predictions["logits"], reference_logits, atol=self.atol, rtol=self.rtol
+        )
+        torch.testing.assert_close(predictions["labels"], reference_labels)
+        torch.testing.assert_close(loss, reference_loss, atol=self.atol, rtol=self.rtol)
+        loss.backward()
+        for name, parameter in self.model.named_parameters():
+            if name in gradients:
+                torch.testing.assert_close(
+                    parameter.grad,
+                    gradients[name],
+                    atol=self.atol,
+                    rtol=self.rtol,
+                    msg=name,
+                )
+
+    def test_targets_are_isolated_and_order_independent(self) -> None:
+        baseline = self.model.predict(self._batch())["logits"].detach()
+        rewritten = self.model.predict(
+            self._batch(
+                answers=[
+                    _REWRITTENGENREC_HIST_CODES + _OTHERGENREC_ANSWER_CODES,
+                    GENREC_ANSWER_CODES,
+                ]
+            )
+        )["logits"]
+        torch.testing.assert_close(rewritten[1:], baseline[1:], atol=0, rtol=0)
+        reordered = self.model.predict(
+            self._batch(
+                answers=[
+                    _OTHERGENREC_ANSWER_CODES + GENREC_ANSWER_CODES,
+                    GENREC_ANSWER_CODES,
+                ]
+            )
+        )["logits"]
+        torch.testing.assert_close(
+            reordered, baseline[[1, 0, 2]], atol=self.atol, rtol=self.rtol
+        )
+
+    def test_inference_is_unchanged_after_shared_forward(self) -> None:
+        batch = self._batch(predict=True)
+        self.model.set_is_inference(True)
+        with torch.no_grad():
+            before = self.model.predict(batch)["generated_sids"]
+        previous_attention = self.model.lm.config._attn_implementation
+        self.model.set_is_inference(False)
+        self.model.predict(self._batch())
+        self.assertEqual(self.model.lm.config._attn_implementation, previous_attention)
+        self.model.set_is_inference(True)
+        with torch.no_grad():
+            after = self.model.predict(batch)["generated_sids"]
+        torch.testing.assert_close(after, before, atol=0, rtol=0)
+
+    def test_backbone_and_prefix_stay_packed(self):
+        batch = self._batch()
+        shapes = []
+        handles = []
+        for layer in self.model.lm.base_model.layers:
+            for module in (layer.self_attn.q_proj, layer.mlp):
+                handles.append(
+                    module.register_forward_pre_hook(
+                        lambda module, inputs: shapes.append(inputs[0].shape[:2])
+                    )
+                )
+        try:
+            with mock.patch.object(
+                self.model, "_left_pad", side_effect=AssertionError("padded backbone")
+            ):
+                self.model.predict(batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+        expected = (1, int(batch.additional_infos[CU_SEQLENS][-1]))
+        self.assertTrue(shapes)
+        self.assertTrue(all(tuple(shape) == expected for shape in shapes))
+
+
+@mark_ci_scope("h20", "gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_unavailable)
+class FlashMultiTargetTrainingTest(MultiTargetTrainingTest):
+    atol = 8e-3
+    rtol = 3e-2
+
+    def setUp(self) -> None:
+        super().setUp()
+        config = self.model.lm.config
+        config.hidden_size = 224
+        config.intermediate_size = 448
+        config.num_attention_heads = 14
+        config.num_key_value_heads = 2
+        self.model.lm = (
+            AutoModelForCausalLM.from_config(
+                config,
+                attn_implementation="flash_attention_2",
+                torch_dtype=torch.bfloat16,
+            )
+            .cuda()
+            .eval()
+        )
+        self.model._attn_kernel = "flash_attention_2"
 
 
 if __name__ == "__main__":
