@@ -575,32 +575,6 @@ class MultiTargetTrainingTest(unittest.TestCase):
             after = self.model.predict(batch)["generated_sids"]
         torch.testing.assert_close(after, before, atol=0, rtol=0)
 
-
-@mark_ci_scope("h20", "gpu")
-@unittest.skipIf(*nv_gpu_unavailable)
-@unittest.skipIf(*flash_attn_unavailable)
-class HybridMultiTargetTrainingTest(MultiTargetTrainingTest):
-    atol = 8e-3
-    rtol = 3e-2
-
-    def setUp(self) -> None:
-        super().setUp()
-        config = self.model.lm.config
-        config.hidden_size = 224
-        config.intermediate_size = 448
-        config.num_attention_heads = 14
-        config.num_key_value_heads = 2
-        self.model.lm = (
-            AutoModelForCausalLM.from_config(
-                config,
-                attn_implementation="flash_attention_2",
-                torch_dtype=torch.bfloat16,
-            )
-            .cuda()
-            .eval()
-        )
-        self.model._attn_kernel = "flash_attention_2"
-
     def test_backbone_and_prefix_stay_packed(self):
         batch = self._batch()
         shapes = []
@@ -623,6 +597,32 @@ class HybridMultiTargetTrainingTest(MultiTargetTrainingTest):
         expected = (1, int(batch.additional_infos[CU_SEQLENS][-1]))
         self.assertTrue(shapes)
         self.assertTrue(all(tuple(shape) == expected for shape in shapes))
+
+
+@mark_ci_scope("h20", "gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_unavailable)
+class FlashMultiTargetTrainingTest(MultiTargetTrainingTest):
+    atol = 8e-3
+    rtol = 3e-2
+
+    def setUp(self) -> None:
+        super().setUp()
+        config = self.model.lm.config
+        config.hidden_size = 224
+        config.intermediate_size = 448
+        config.num_attention_heads = 14
+        config.num_key_value_heads = 2
+        self.model.lm = (
+            AutoModelForCausalLM.from_config(
+                config,
+                attn_implementation="flash_attention_2",
+                torch_dtype=torch.bfloat16,
+            )
+            .cuda()
+            .eval()
+        )
+        self.model._attn_kernel = "flash_attention_2"
 
 
 if __name__ == "__main__":

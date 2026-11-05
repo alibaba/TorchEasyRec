@@ -50,28 +50,30 @@ def _shared_prefix_attention(
     attention_mask: Any,
     scaling: Optional[float] = None,
     *,
-    shared_prefix_layout: MultiTargetLayout,
+    multi_target_layout: MultiTargetLayout,
     **kwargs: Any,
 ) -> Tuple[torch.Tensor, None]:
-    """Run packed causal prefix FA2 followed by isolated response FlexAttention.
+    """Run one FA2 varlen call over the prefix and target segments.
+
+    Every target segment reads its row's prefix keys before its own, so the
+    causal mask, aligned to the last key, hides the row's other targets.
 
     Args:
         module: backbone attention module after projection and rotary embedding.
         query: packed queries shaped (1, query heads, total tokens, head dim).
         key: packed keys, retaining the backbone's grouped KV heads.
         value: packed values with the same layout as keys.
-        attention_mask: response-only BlockMask over gathered per-parent keys.
+        attention_mask: unused; the segments carry the visibility.
         scaling: backbone attention scale.
-        shared_prefix_layout: batch-local packing and scatter indices.
-        **kwargs: backbone attention options forwarded to the Flex adapter.
+        multi_target_layout: batch-local segments and key gather indices.
+        **kwargs: unused backbone attention options.
 
     Returns:
         Packed attention output and no attention weights.
     """
     from flash_attn import flash_attn_varlen_func
-    from transformers.integrations.flex_attention import flex_attention_forward
 
-    layout = shared_prefix_layout
+    layout = multi_target_layout
     if query.dtype == torch.float32:
         dtype = (
             torch.get_autocast_dtype("cuda")
@@ -79,57 +81,22 @@ def _shared_prefix_attention(
             else module.q_proj.weight.dtype
         )
         query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
-    _, heads, _, head_dim = query.shape
-    flat_query = query[0].transpose(0, 1)
-    flat_key = key[0].transpose(0, 1)
-    flat_value = value[0].transpose(0, 1)
-    prefix_tokens = layout.prefix_tokens
-    prefix_output = flash_attn_varlen_func(
-        flat_query[:prefix_tokens],
-        flat_key[:prefix_tokens],
-        flat_value[:prefix_tokens],
-        cu_seqlens_q=layout.prefix_cu_seqlens,
-        cu_seqlens_k=layout.prefix_cu_seqlens,
-        max_seqlen_q=layout.max_prefix_length,
-        max_seqlen_k=layout.max_prefix_length,
+    output = flash_attn_varlen_func(
+        query[0].transpose(0, 1),
+        key[0].transpose(0, 1).index_select(0, layout.key_indices),
+        value[0].transpose(0, 1).index_select(0, layout.key_indices),
+        cu_seqlens_q=layout.cu_seqlens_q,
+        cu_seqlens_k=layout.cu_seqlens_k,
+        max_seqlen_q=layout.max_seqlen,
+        max_seqlen_k=layout.max_seqlen,
         dropout_p=0.0,
         softmax_scale=scaling,
         causal=True,
     )
-    rows = layout.prefix_cu_seqlens.numel() - 1
-    response_tokens = flat_query[prefix_tokens:]
-    response_query, padded_key, padded_value = (
-        tokens.new_zeros(rows * width, tokens.shape[1], head_dim)
-        .index_copy(0, indices, tokens)
-        .reshape(rows, width, tokens.shape[1], head_dim)
-        .transpose(1, 2)
-        for tokens, width, indices in (
-            (response_tokens, layout.response_width, layout.response_indices),
-            (flat_key, layout.key_width, layout.key_indices),
-            (flat_value, layout.key_width, layout.key_indices),
-        )
-    )
-    response_output, _ = flex_attention_forward(
-        module,
-        response_query,
-        padded_key,
-        padded_value,
-        attention_mask,
-        scaling=scaling,
-        **kwargs,
-    )
-    output = torch.cat(
-        (
-            prefix_output,
-            response_output.reshape(-1, heads, head_dim).index_select(
-                0, layout.response_indices
-            ),
-        )
-    )
     return output.unsqueeze(0), None
 
 
-_SHARED_PREFIX_ATTENTION = "genrec_shared_prefix_fa2_flex"
+_SHARED_PREFIX_ATTENTION = "genrec_shared_prefix_fa2"
 AttentionInterface.register(_SHARED_PREFIX_ATTENTION, _shared_prefix_attention)
 
 
@@ -223,7 +190,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         predictions = _fx_wrapped_forward(self, embeds, batch)
         keys = ("logits", "labels")
         if self._has_sid_response:
-            keys += ("target_parents", "target_counts")
+            keys += ("target_weights",)
         return {key: predictions[key] for key in keys}
 
     def _training_predictions(
@@ -236,95 +203,80 @@ class GenRecCausalLMModel(BaseGenRecModel):
             batch: packed row boundaries and response lengths.
 
         Returns:
-            Logits and labels, plus parent indices for a multi-target response.
+            Logits and labels, plus per-target row weights for a SID response.
         """
-        levels = self._prompt.sid_space.num_levels
-        if self._has_sid_response:
-            lengths = batch.additional_infos[RESPONSE_LENGTHS].to(torch.int64)
-            if bool((lengths > levels).any()):
-                return self._multi_target_predictions(embeds, batch)
+        if not self._has_sid_response:
             logits, labels = self._forward(embeds, batch)
-            return {
-                "logits": logits,
-                "labels": labels,
-                "target_parents": torch.arange(lengths.numel(), device=embeds.device),
-                "target_counts": lengths // levels,
-            }
+            return {"logits": logits, "labels": labels}
+        lengths = batch.additional_infos[RESPONSE_LENGTHS]
+        if int(lengths.max()) > self._prompt.sid_space.num_levels:
+            return self._multi_target_predictions(embeds, batch)
         logits, labels = self._forward(embeds, batch)
-        return {"logits": logits, "labels": labels}
+        return {
+            "logits": logits,
+            "labels": labels,
+            "target_weights": (lengths > 0).float(),
+        }
 
     def _multi_target_predictions(
         self, embeds: torch.Tensor, batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        """Score independent SID branches over one differentiable prompt prefix.
+        """Score independent SID branches over one packed prompt per row.
 
         Args:
-            embeds: packed embeddings, retaining one prefix per parent sample.
+            embeds: packed embeddings, retaining one prefix per row.
             batch: existing assembler row boundaries and response lengths.
 
         Returns:
-            Per-target logits, labels, parent indices and target counts.
+            Per-target logits and labels, and each target's row weight.
         """
         from torch.nn.attention.flex_attention import create_block_mask
 
-        levels = self._prompt.sid_space.num_levels
-        infos = batch.additional_infos
         if self.lm.is_gradient_checkpointing:
             raise ValueError(
                 "Shared SID training requires gradient checkpointing to be disabled."
             )
-
-        hybrid = self._attn_kernel == "flash_attention_2"
-        rows = infos[RESPONSE_LENGTHS].numel()
-        width = int(infos[MAX_SEQLEN])
+        infos = batch.additional_infos
         layout = build_multi_target_layout(
             infos[CU_SEQLENS],
             infos[RESPONSE_LENGTHS],
-            width,
-            levels,
-            pack_prefix=hybrid,
+            self._prompt.sid_space.num_levels,
         )
-        if hybrid:
+        if self._attn_kernel == "flash_attention_2":
             config = self.lm.config
             if config.attention_dropout != 0 or config.use_sliding_window:
                 raise ValueError(
                     "Shared-prefix FA2 requires full attention and zero dropout."
                 )
-            inputs = embeds[layout.packed_indices].unsqueeze(0)
+            attention, attention_mask = _SHARED_PREFIX_ATTENTION, None
         else:
-            inputs, _ = self._left_pad(embeds, batch)
-        block_mask = create_block_mask(
-            layout.mask_mod,
-            rows,
-            None,
-            layout.response_width if hybrid else width,
-            width,
-            device=embeds.device,
-            _compile=True,
-        )
+            num_tokens = embeds.shape[0]
+            attention = "flex_attention"
+            attention_mask = create_block_mask(
+                layout.mask_mod,
+                1,
+                None,
+                num_tokens,
+                num_tokens,
+                device=embeds.device,
+                _compile=True,
+            )
         previous_attention = self.lm.config._attn_implementation
         try:
-            self.lm.set_attn_implementation(
-                _SHARED_PREFIX_ATTENTION if hybrid else "flex_attention"
-            )
+            self.lm.set_attn_implementation(attention)
             hidden = self.lm.base_model(
-                inputs_embeds=inputs,
-                attention_mask={"full_attention": block_mask},
-                position_ids=layout.position_ids,
+                inputs_embeds=embeds.unsqueeze(0),
+                attention_mask={"full_attention": attention_mask},
+                position_ids=layout.position_ids.unsqueeze(0),
                 use_cache=False,
-                **({"shared_prefix_layout": layout} if hybrid else {}),
+                multi_target_layout=layout,
             ).last_hidden_state
         finally:
             self.lm.set_attn_implementation(previous_attention)
-
-        logits = self.lm.get_output_embeddings()(
-            hidden.reshape(-1, hidden.shape[-1])[layout.logit_indices]
-        )[layout.logit_inverse].reshape(layout.target_parents.numel(), levels, -1)
         return {
-            "logits": logits,
+            "logits": self.lm.get_output_embeddings()(hidden[0][layout.score_indices]),
             "labels": infos[INPUT_IDS][layout.label_indices],
-            "target_parents": layout.target_parents,
-            "target_counts": layout.target_counts,
+            "target_weights": layout.target_weights,
         }
 
     def _forward(

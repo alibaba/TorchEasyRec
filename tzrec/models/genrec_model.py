@@ -22,7 +22,6 @@ import inspect
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
-import torch.distributed as dist
 import torchmetrics
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -65,45 +64,39 @@ _REQUIRED_LM_ATTRS: Tuple[str, ...] = (
 def _fx_wrapped_genrec_loss(
     model: "BaseGenRecModel", predictions: Dict[str, torch.Tensor]
 ) -> torch.Tensor:
-    """Keep data-dependent parent normalization outside symbolic tracing.
+    """Keep the shape-dependent SID target loss outside symbolic tracing.
 
     Args:
         model: model owning the LM loss and ignore index.
-        predictions: single-response or independent multi-target predictions.
+        predictions: logits and labels, plus per-target row weights for a SID
+            response.
 
     Returns:
-        Scalar cross entropy, averaging targets within each parent first.
+        Scalar cross entropy, averaging targets within each row first.
     """
-    if "target_counts" not in predictions:
+    if "target_weights" not in predictions:
         return model.lm.loss_function(
             logits=predictions["logits"],
             labels=predictions["labels"],
             vocab_size=model.lm.config.vocab_size,
             ignore_index=model._ignore_index,
         )
-    labels = predictions["labels"]
+    logits, labels = predictions["logits"], predictions["labels"]
     if labels.shape[-1] != model._prompt.sid_space.num_levels:
-        labels = nn.functional.pad(labels, (0, 1), value=model._ignore_index)[..., 1:]
+        # a single-target window starts at the token before the response
+        logits, labels = logits[:, :-1], labels[:, 1:]
     target_loss = (
         nn.functional.cross_entropy(
-            predictions["logits"].float().reshape(-1, model.lm.config.vocab_size),
-            labels.reshape(-1),
+            logits.float().flatten(0, 1),
+            labels.flatten(),
             ignore_index=model._ignore_index,
             reduction="none",
         )
         .view_as(labels)
-        .sum(dim=-1)
-    ) / labels.ne(model._ignore_index).sum(dim=-1).clamp(min=1)
-    counts = predictions["target_counts"]
-    parent_loss = target_loss.new_zeros(counts.shape).index_add(
-        0, predictions["target_parents"], target_loss
-    ) / counts.clamp(min=1)
-    normalizer = (counts > 0).sum().to(target_loss.dtype)
-    world_size = 1
-    if dist.is_initialized():
-        dist.all_reduce(normalizer)
-        world_size = dist.get_world_size()
-    return parent_loss.sum() * world_size / normalizer
+        .mean(dim=-1)
+    )
+    weights = predictions["target_weights"]
+    return (target_loss * weights).sum() / weights.sum()
 
 
 class BaseGenRecModel(BaseModel):

@@ -423,79 +423,77 @@ class MultiTargetLayoutTest(unittest.TestCase):
         boundaries = [0]
         for length in row_lengths:
             boundaries.append(boundaries[-1] + length)
-        width = max(row_lengths) + 2
         layout = build_multi_target_layout(
             torch.tensor(boundaries, dtype=torch.int32),
             torch.tensor([count * levels for count in target_counts]),
-            width,
             levels,
         )
 
-        expected_labels, expected_scores = [], []
-        for row, (prefix, count, length) in enumerate(
-            zip(prefix_lengths, target_counts, row_lengths)
-        ):
-            padding = width - length
-            self.assertEqual(
-                layout.position_ids[row].tolist(),
-                [0] * padding
-                + list(range(prefix))
-                + list(range(prefix, prefix + levels)) * count,
+        expected_positions, expected_labels, expected_scores = [], [], []
+        for row, (prefix, count) in enumerate(zip(prefix_lengths, target_counts)):
+            expected_positions += (
+                list(range(prefix)) + list(range(prefix, prefix + levels)) * count
             )
             for target in range(count):
                 label_start = boundaries[row] + prefix + target * levels
                 expected_labels.append(list(range(label_start, label_start + levels)))
-                prefix_last = row * width + padding + prefix - 1
-                branch_start = prefix_last + 1 + target * levels
                 expected_scores.append(
-                    [prefix_last] + list(range(branch_start, branch_start + levels - 1))
+                    [boundaries[row] + prefix - 1]
+                    + list(range(label_start, label_start + levels - 1))
                 )
 
-        self.assertEqual(layout.target_counts.tolist(), target_counts)
-        self.assertEqual(layout.target_parents.tolist(), [0, 0, 1])
+        self.assertEqual(layout.position_ids.tolist(), expected_positions)
         self.assertEqual(layout.label_indices.tolist(), expected_labels)
-        self.assertEqual(
-            layout.logit_indices[layout.logit_inverse].reshape(-1, levels).tolist(),
-            expected_scores,
-        )
-        self.assertEqual(layout.logit_indices.numel(), 3 * levels - 1)
+        self.assertEqual(layout.score_indices.tolist(), expected_scores)
+        self.assertEqual(layout.target_weights.tolist(), [0.5, 0.5, 1.0])
+        self.assertEqual(layout.max_seqlen, max(row_lengths))
 
-    @parameterized.expand([[False], [True]], name_func=parameterized_name_func)
-    def test_mask_excludes_padding_future_tokens_and_other_targets(
-        self, packed
-    ) -> None:
+    def test_segments_and_mask_isolate_targets(self) -> None:
         layout = build_multi_target_layout(
             torch.tensor([0, 8, 15, 18], dtype=torch.int32),
             torch.tensor([6, 3, 0]),
-            width=10,
             num_levels=3,
-            pack_prefix=packed,
         )
-        query_width = layout.response_width if packed else 10
-        for row, (padding, prefix_length, count) in enumerate(
-            [(2, 2, 2), (3, 4, 1), (7, 3, 0)]
-        ):
-            actual = layout.mask_mod(
-                torch.tensor(row),
-                torch.tensor(0),
-                torch.arange(query_width)[:, None],
-                torch.arange(10)[None, :],
-            )
-            padding = 0 if packed else padding
-            expected = torch.zeros(query_width, 10, dtype=torch.bool)
-            prefix_end = padding + prefix_length
-            if not packed:
-                expected[padding:prefix_end, padding:prefix_end] = torch.ones(
-                    prefix_length, prefix_length, dtype=torch.bool
-                ).tril()
+        self.assertEqual(layout.cu_seqlens_q.tolist(), [0, 2, 5, 8, 12, 15, 18])
+        self.assertEqual(layout.cu_seqlens_k.tolist(), [0, 2, 7, 12, 16, 23, 26])
+        self.assertEqual(
+            layout.key_indices.tolist(),
+            [0, 1, 0, 1, 2, 3, 4, 0, 1, 5, 6, 7]
+            + [8, 9, 10, 11, 8, 9, 10, 11, 12, 13, 14]
+            + [15, 16, 17],
+        )
+        # row-local blocks: causal prefix, then each target sees the prefix
+        # and its own earlier tokens only
+        expected = torch.zeros(18, 18, dtype=torch.bool)
+        for start, prefix_length, count in [(0, 2, 2), (8, 4, 1), (15, 3, 0)]:
+            prefix_end = start + prefix_length
+            expected[start:prefix_end, start:prefix_end] = torch.ones(
+                prefix_length, prefix_length, dtype=torch.bool
+            ).tril()
             for target in range(count):
-                start = prefix_end + target * 3
-                query_start = target * 3 if packed else start
-                expected[query_start : query_start + 3, padding:prefix_end] = True
-                expected[query_start : query_start + 3, start : start + 3] = torch.ones(
-                    3, 3, dtype=torch.bool
-                ).tril()
-            torch.testing.assert_close(actual, expected)
+                target_start = prefix_end + target * 3
+                expected[target_start : target_start + 3, start:prefix_end] = True
+                expected[
+                    target_start : target_start + 3, target_start : target_start + 3
+                ] = torch.ones(3, 3, dtype=torch.bool).tril()
+        actual = layout.mask_mod(
+            torch.tensor(0),
+            torch.tensor(0),
+            torch.arange(18)[:, None],
+            torch.arange(18)[None, :],
+        )
+        torch.testing.assert_close(actual, expected)
+        # the FA2 segments, causal from the last key, give the same visibility
+        from_segments = torch.zeros(18, 18, dtype=torch.bool)
+        cu_q = layout.cu_seqlens_q.tolist()
+        cu_k = layout.cu_seqlens_k.tolist()
+        for segment in range(len(cu_q) - 1):
+            keys = layout.key_indices[cu_k[segment] : cu_k[segment + 1]]
+            queries = cu_q[segment + 1] - cu_q[segment]
+            for row in range(queries):
+                visible = keys[: keys.numel() - queries + row + 1]
+                from_segments[cu_q[segment] + row, visible] = True
+        torch.testing.assert_close(from_segments, expected)
 
 
 if __name__ == "__main__":

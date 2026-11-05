@@ -298,8 +298,7 @@ class BaseGenRecModelTest(unittest.TestCase):
         predictions = {
             "logits": logits,
             "labels": torch.ones(3, 3, dtype=torch.int64),
-            "target_parents": torch.tensor([1, 1, 2]),
-            "target_counts": torch.tensor([0, 2, 1]),
+            "target_weights": torch.tensor([0.5, 0.5, 1.0]),
         }
         loss = self.model.loss(predictions, Batch())["ce_loss"]
         torch.testing.assert_close(loss, torch.tensor(float(vocab_size)).log())
