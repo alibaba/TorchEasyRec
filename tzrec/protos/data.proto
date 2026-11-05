@@ -166,6 +166,10 @@ message DataConfig {
     // whether to read Kafka partitions in round-robin order per worker
     optional bool kafka_partition_round_robin = 31 [default = false];
 
+    // enable Kafka logs when > 0: workers log every N decoded messages and
+    // main ranks log cumulative offset progress every log_step_count_steps
+    optional uint32 kafka_log_every_n_messages = 32 [default = 0];
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;

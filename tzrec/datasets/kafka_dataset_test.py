@@ -99,10 +99,18 @@ def _msg(partition, offset, value, rows=1, error=None):
     )
 
 
+def _decoded_logs(mock_logger):
+    return [
+        call.args[0]
+        for call in mock_logger.info.call_args_list
+        if "decoded_messages=" in call.args[0]
+    ]
+
+
 class KafkaReaderRoundRobinTest(unittest.TestCase):
     """Round-robin reading with mocked consumers."""
 
-    def _make_reader(self, consumers, partitions=(0, 1), leaders=None):
+    def _make_reader(self, consumers, partitions=(0, 1), leaders=None, **kwargs):
         leaders = leaders or {partition: 0 for partition in partitions}
         query_consumer = mock.Mock()
         query_consumer.list_topics.return_value = SimpleNamespace(
@@ -133,6 +141,7 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             1,
             input_fields=[pa.field("x", pa.int64())],
             kafka_partition_round_robin=True,
+            **kwargs,
         )
 
     @parameterized.expand(
@@ -215,6 +224,30 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             next(gen)
         for consumer in consumers:
             consumer.close.assert_called_once()
+
+    def test_logs_decoded_messages(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.return_value = [_msg(0, 0, 1)]
+        consumers[1].consume.return_value = [_msg(1, 0, 2)]
+        reader = self._make_reader(consumers, kafka_log_every_n_messages=1)
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0"}),
+            mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger,
+        ):
+            gen = reader._reader(0, 1)
+            self.addCleanup(gen.close)
+            next(gen)
+            next(gen)
+            logs = _decoded_logs(mock_logger)
+        self.assertEqual(
+            logs,
+            [
+                "KafkaReader[rank-0|worker-0] decoded_messages=1 "
+                "partitions={'topic:0': 1}",
+                "KafkaReader[rank-0|worker-0] decoded_messages=2 "
+                "partitions={'topic:0': 1, 'topic:1': 1}",
+            ],
+        )
 
     def test_decode_failure_closes_consumers(self):
         consumers = [mock.Mock(), mock.Mock()]
@@ -310,6 +343,95 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown topic"):
             self._construct_with_dist(1, consumer_cls, _broadcast)
         consumer_cls.assert_not_called()
+
+
+class KafkaReaderDecodedMessageLogTest(unittest.TestCase):
+    """Decoded-message counting and periodic logging in normal consumption."""
+
+    def _make_reader(self, consumer, **kwargs):
+        self.enterContext(
+            mock.patch("tzrec.datasets.kafka_dataset.Consumer", return_value=consumer)
+        )
+        return KafkaReader(
+            "kafka://broker:9092/topic?group.id=g1",
+            1,
+            input_fields=[pa.field("x", pa.int64())],
+            **kwargs,
+        )
+
+    def test_counts_decoded_messages_per_partition(self):
+        consumer = mock.Mock()
+        consumer.consume.side_effect = [
+            [_msg(0, 0, 1, rows=2)],
+            [_msg(1, 0, 2, error="boom"), _msg(0, 1, 3, rows=0)],
+            [_msg(1, 1, 4), _msg(1, 2, 5)],
+        ]
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0"}),
+            mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger,
+        ):
+            gen = self._make_reader(consumer, kafka_log_every_n_messages=2)._reader(
+                1, 2
+            )
+            self.addCleanup(gen.close)
+            # The zero-row message yields no batch, so the second next()
+            # runs through the next consume() call as well.
+            for _ in range(2):
+                next(gen)
+            logs = _decoded_logs(mock_logger)
+        self.assertEqual(
+            logs,
+            [
+                "KafkaReader[rank-0|worker-1] decoded_messages=2 "
+                "partitions={'topic:0': 2}",
+                "KafkaReader[rank-0|worker-1] decoded_messages=4 "
+                "partitions={'topic:0': 2, 'topic:1': 2}",
+            ],
+        )
+
+    @parameterized.expand(
+        [
+            param("unset", {}),
+            param("zero", {"kafka_log_every_n_messages": 0}),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_logging_disabled(self, _name, reader_kwargs):
+        consumer = mock.Mock()
+        consumer.consume.return_value = [_msg(0, 0, 1), _msg(1, 0, 2)]
+        reader = self._make_reader(consumer, **reader_kwargs)
+        with mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger:
+            gen = reader._reader(0, 1)
+            self.addCleanup(gen.close)
+            next(gen)
+            self.assertEqual(_decoded_logs(mock_logger), [])
+
+    def test_counter_resets_per_reader_iteration(self):
+        consumer = mock.Mock()
+        consumer.consume.return_value = [_msg(0, 0, 1)]
+        reader = self._make_reader(consumer, kafka_log_every_n_messages=100)
+        for _ in range(2):
+            gen = reader._reader(0, 1)
+            self.addCleanup(gen.close)
+            next(gen)
+            self.assertEqual(reader._decoded_message_count, 1)
+            self.assertEqual(reader._decoded_partition_counts, {"topic:0": 1})
+            gen.close()
+
+    def test_rebalance_preserves_counters(self):
+        consumer = mock.Mock()
+        consumer.consume.return_value = [_msg(0, 0, 1)]
+        reader = self._make_reader(consumer, kafka_log_every_n_messages=100)
+        gen = reader._reader(0, 1)
+        self.addCleanup(gen.close)
+        next(gen)
+        on_assign = consumer.subscribe.call_args.kwargs["on_assign"]
+        on_assign(consumer, [TopicPartition("topic", 0)])
+        self.assertEqual(reader._decoded_message_count, 1)
+        self.assertEqual(reader._decoded_partition_counts, {"topic:0": 1})
+        next(gen)
+        self.assertEqual(reader._decoded_message_count, 2)
+        self.assertEqual(reader._decoded_partition_counts, {"topic:0": 2})
 
 
 class OffsetsForTimesBatchedTest(unittest.TestCase):
@@ -542,12 +664,18 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 mode=Mode.EVAL,
                 expected_shuffle=False,
                 round_robin=True,
+                log_every_n_messages=1000,
             ),
         ],
         name_func=parameterized_name_func,
     )
     def test_reader_config_reaches_reader(
-        self, _name, mode, expected_shuffle, round_robin=None
+        self,
+        _name,
+        mode,
+        expected_shuffle,
+        round_robin=None,
+        log_every_n_messages=None,
     ):
         data_config = data_pb2.DataConfig(
             batch_size=4,
@@ -563,6 +691,8 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         )
         if round_robin is not None:
             data_config.kafka_partition_round_robin = round_robin
+        if log_every_n_messages is not None:
+            data_config.kafka_log_every_n_messages = log_every_n_messages
         features = create_features(
             [
                 feature_pb2.FeatureConfig(
@@ -583,6 +713,9 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         self.assertEqual(dataset._reader._shuffle_buffer_size, 64)
         self.assertEqual(
             dataset._reader._kafka_partition_round_robin, bool(round_robin)
+        )
+        self.assertEqual(
+            dataset._reader._log_every_n_messages, log_every_n_messages or 0
         )
 
 

@@ -120,6 +120,8 @@ data_config {
 
   - 如需按分区严格轮询读取，可设置`data_config.kafka_partition_round_robin: true`，默认为false
 
+  - 如需观察各worker的读取量，可设置`data_config.kafka_log_every_n_messages`，默认为0
+
 - 注意:
 
   - 默认模式下，Kafka 分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜；开启`kafka_partition_round_robin`后，只要求分片数不少于有效全局worker数（`world_size * max(data_config.num_workers, 1)`），不要求整除
@@ -373,6 +375,11 @@ pipeline.global-job-parameters: |
 
 - 仅对KafkaDataset生效，默认为false；开启后启动时按leader排序分区并分发到各worker（有效全局worker数为`world_size * max(data_config.num_workers, 1)`），每个worker为自己负责的分区各创建一个consumer，每次一条Kafka消息，轮流分区读取，当前分区没有消息时持续等待
 - 分区归属依据启动时的leader排序，运行期间固定；每个worker的consumer数量等于其负责的分区数
+
+### kafka_log_every_n_messages
+
+- 仅对KafkaDataset生效，默认为0，关闭worker解码计数与训练日志中的累计位点推进量两类日志；设置为N时，每个worker每成功解码N条Kafka消息，打印一次该worker按分区的累计解码消息数，例如`KafkaReader[rank-0|worker-1] decoded_messages=1000 partitions={'topic:1': 600, 'topic:3': 400}`；同时各rank的训练日志每隔`train_config.log_step_count_steps`步输出一次累计位点推进量
+- 一条消息计1条，包含零行消息和已解码但尚未训练的预取数据，不包含错误消息和解码失败的消息
 
 ### shuffle
 

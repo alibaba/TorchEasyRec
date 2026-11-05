@@ -35,7 +35,7 @@ from tzrec.main import (
 from tzrec.models.model import BaseModel
 from tzrec.optim.ema import DenseEMA
 from tzrec.optim.lr_scheduler import ExponentialDecayLR, LinearDecayLR
-from tzrec.protos.data_pb2 import DataConfig
+from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.model_pb2 import ModelConfig
@@ -630,6 +630,186 @@ class MainTest(unittest.TestCase):
                 [call.args[0] for call in write_mocks["save_model"].call_args_list],
                 [os.path.join(model_dir, f"model.ckpt-{num_steps - 1}")],
             )
+
+
+class KafkaOffsetLogTest(unittest.TestCase):
+    """Cumulative Kafka offset logging from trained batches."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    @staticmethod
+    def _batch(checkpoint_info):
+        return SimpleNamespace(checkpoint_info=checkpoint_info, data_timestamp=-1.0)
+
+    def _run(
+        self,
+        batches,
+        log_step_count_steps,
+        rank="0",
+        local_rank="0",
+        kafka_dataset=True,
+        log_every_n_messages=None,
+        initial_state=None,
+    ):
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        loader = mock.Mock()
+        loader.get_iterator.return_value = iter(batches)
+        data_config = DataConfig(
+            dataset_type=(
+                DatasetType.KafkaDataset
+                if kafka_dataset
+                else DatasetType.ParquetDataset
+            )
+        )
+        if log_every_n_messages is not None:
+            data_config.kafka_log_every_n_messages = log_every_n_messages
+        loader.dataset._data_config = data_config
+
+        pipeline = mock.Mock()
+
+        def progress(iterator):
+            return {"loss": torch.tensor(1.0)}, {}, next(iterator)
+
+        pipeline.progress.side_effect = progress
+        writes = (
+            "save_model",
+            "save_lr_schedulers",
+            "save_dataloader_state",
+            "save_meta",
+            "save_success_marker",
+        )
+        num_steps = len(batches)
+        model_dir = os.path.join(self.test_dir, f"model-{rank}-{num_steps}")
+        dataloader_state = dict(initial_state or {})
+        with (
+            mock.patch.dict(os.environ, {"RANK": rank, "LOCAL_RANK": local_rank}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch(
+                "tzrec.main.OnlineDenseExportManager",
+                return_value=mock.Mock(enabled=False),
+            ),
+            mock.patch("tzrec.main._log_train"),
+            mock.patch("tzrec.main.logger") as mock_logger,
+            mock.patch.multiple(
+                "tzrec.utils.checkpoint_util", **{w: mock.DEFAULT for w in writes}
+            ),
+        ):
+            _train_and_evaluate(
+                model,
+                mock.Mock(),
+                loader,
+                None,
+                [],
+                model_dir,
+                _train_config(
+                    num_steps=num_steps,
+                    log_step_count_steps=log_step_count_steps,
+                ),
+                EvalConfig(),
+                checkpoint_util.CheckpointManager(model_dir),
+                dataloader_state=dataloader_state,
+            )
+        return (
+            [
+                call.args[0]
+                for call in mock_logger.info.call_args_list
+                if "KafkaTrain" in call.args[0]
+            ],
+            dataloader_state,
+        )
+
+    @parameterized.expand(
+        [
+            param(
+                "final_snapshot",
+                [
+                    {"topic:0": 1000},
+                    {"topic:0": 1400},
+                    {"topic:0": 1600, "topic:1": 50},
+                    {"topic:0": 1800, "topic:1": 70},
+                ],
+                [
+                    "KafkaTrain[rank-3] step=0 cumulative_offset_deltas={'topic:0': 0}",
+                    "KafkaTrain[rank-3] step=2 cumulative_offset_deltas="
+                    "{'topic:0': 600, 'topic:1': 0}",
+                    "KafkaTrain[rank-3] step=3 cumulative_offset_deltas="
+                    "{'topic:0': 800, 'topic:1': 20}",
+                ],
+            ),
+            param(
+                "final_step_deduplicated",
+                [
+                    {"topic:0": 1000},
+                    {"topic:0": 1400},
+                    {"topic:0": 1600, "topic:1": 50},
+                    {"topic:0": 1800, "topic:1": 70},
+                    {"topic:0": 2000, "topic:1": 90},
+                ],
+                [
+                    "KafkaTrain[rank-3] step=0 cumulative_offset_deltas={'topic:0': 0}",
+                    "KafkaTrain[rank-3] step=2 cumulative_offset_deltas="
+                    "{'topic:0': 600, 'topic:1': 0}",
+                    "KafkaTrain[rank-3] step=4 cumulative_offset_deltas="
+                    "{'topic:0': 1000, 'topic:1': 40}",
+                ],
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_logs_cumulative_offsets(self, _name, checkpoint_infos, expected_logs):
+        batches = [self._batch(info) for info in checkpoint_infos]
+        logs, _ = self._run(
+            batches,
+            log_step_count_steps=2,
+            rank="3",
+            local_rank="3",
+            log_every_n_messages=1000,
+        )
+        self.assertEqual(logs, expected_logs)
+
+    def test_checkpoint_baseline(self):
+        batches = [
+            self._batch({"topic:0": 1200}),
+            self._batch({"topic:0": 1500}),
+        ]
+        logs, _ = self._run(
+            batches,
+            log_step_count_steps=2,
+            log_every_n_messages=1000,
+            initial_state={"topic:0": 1099},
+        )
+        self.assertEqual(
+            logs,
+            [
+                "KafkaTrain[rank-0] step=0 cumulative_offset_deltas={'topic:0': 0}",
+                "KafkaTrain[rank-0] step=1 cumulative_offset_deltas={'topic:0': 300}",
+            ],
+        )
+
+    @parameterized.expand(
+        [
+            param("unset", True, None),
+            param("zero", True, 0),
+            param("non_kafka", False, 1000),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_logging_disabled_keeps_checkpoint_state(self, _name, kafka_dataset, value):
+        batches = [
+            self._batch({"topic:0": 100, "topic:1": 50}),
+            self._batch({"topic:0": 200}),
+        ]
+        logs, state = self._run(
+            batches,
+            log_step_count_steps=2,
+            kafka_dataset=kafka_dataset,
+            log_every_n_messages=value,
+        )
+        self.assertEqual(logs, [])
+        self.assertEqual(state, {"topic:0": 200, "topic:1": 50})
 
 
 class PredictionLifecycleTest(unittest.TestCase):

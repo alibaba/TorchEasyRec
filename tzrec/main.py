@@ -374,6 +374,25 @@ def _log_train(
                 summary_writer.add_scalar(f"metric/{k}", v, step)
 
 
+def _log_kafka_offsets(
+    step: int,
+    baseline_offsets: Dict[str, int],
+    dataloader_state: Dict[str, Any],
+) -> None:
+    """Log cumulative Kafka offset progress for trained partitions."""
+    deltas = {
+        key: dataloader_state[key] - baseline_offsets[key]
+        for key in sorted(baseline_offsets)
+        if key in dataloader_state
+    }
+    if not deltas:
+        return
+    logger.info(
+        f"KafkaTrain[rank-{os.environ.get('RANK', 0)}] step={step} "
+        f"cumulative_offset_deltas={deltas}"
+    )
+
+
 def _create_train_profiler(
     profiler_config: ProfilerConfig, trace_dir: str
 ) -> Optional[torch.profiler.profile]:
@@ -439,6 +458,14 @@ def _train_and_evaluate(
     # Initialize dataloader checkpoint state
     if dataloader_state is None:
         dataloader_state = {}
+    # This rank's first trained max offset per Kafka partition.
+    kafka_baseline_offsets: Dict[str, int] = {}
+    # pyre-ignore [16]
+    dataset_config = train_dataloader.dataset._data_config
+    kafka_log_enabled = (
+        dataset_config.dataset_type == DatasetType.KafkaDataset
+        and dataset_config.kafka_log_every_n_messages > 0
+    )
 
     assert train_config.num_steps ^ train_config.num_epochs, (
         "train_config.num_epochs or train_config.num_steps should be set, "
@@ -657,6 +684,11 @@ def _train_and_evaluate(
                     checkpoint_util.update_dataloder_state(
                         dataloader_state, batch.checkpoint_info
                     )
+                    if kafka_log_enabled:
+                        for key in batch.checkpoint_info or {}:
+                            kafka_baseline_offsets.setdefault(
+                                key, dataloader_state[key]
+                            )
                     _model.update_train_metric(predictions, batch)
                     if i_step % train_config.log_step_count_steps == 0:
                         train_metrics = _model.compute_train_metric()
@@ -671,6 +703,10 @@ def _train_and_evaluate(
                             train_metrics=train_metrics,
                             data_timestamp=batch.data_timestamp,
                         )
+                        if kafka_log_enabled:
+                            _log_kafka_offsets(
+                                i_step, kafka_baseline_offsets, dataloader_state
+                            )
 
                     for lr in lr_scheduler:
                         if not lr.by_epoch:
@@ -781,6 +817,8 @@ def _train_and_evaluate(
             summary_writer=summary_writer,
             data_timestamp=data_timestamp,
         )
+        if kafka_log_enabled and i_step % train_config.log_step_count_steps != 0:
+            _log_kafka_offsets(i_step, kafka_baseline_offsets, dataloader_state)
         if summary_writer is not None:
             summary_writer.close()
         if prof is not None:

@@ -253,6 +253,7 @@ class KafkaDataset(BaseDataset):
             shuffle_buffer_size=self._data_config.shuffle_buffer_size,
             input_fields=input_fields if input_fields else None,
             kafka_partition_round_robin=self._data_config.kafka_partition_round_robin,
+            kafka_log_every_n_messages=self._data_config.kafka_log_every_n_messages,
         )
 
 
@@ -270,6 +271,8 @@ class KafkaReader(BaseReader):
         input_fields (list): list of pa.Field for schema definition.
         kafka_partition_round_robin (bool): whether to read the partitions owned
             by each worker in strict round-robin order.
+        kafka_log_every_n_messages (int): log per-worker decoded message counts
+            every N messages, 0 disables.
     """
 
     def __init__(
@@ -282,6 +285,7 @@ class KafkaReader(BaseReader):
         shuffle_buffer_size: int = 32,
         input_fields: Optional[List[pa.Field]] = None,
         kafka_partition_round_robin: bool = False,
+        kafka_log_every_n_messages: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -295,6 +299,7 @@ class KafkaReader(BaseReader):
 
         self._has_embedded_schema = False
         self._kafka_partition_round_robin = kafka_partition_round_robin
+        self._log_every_n_messages = kafka_log_every_n_messages
         self._round_robin_partition_order: List[int] = (
             self._get_round_robin_partition_order()
             if kafka_partition_round_robin
@@ -574,6 +579,19 @@ class KafkaReader(BaseReader):
             ts_s = ts_ms / 1000.0 if ts_ms >= 0 else -1.0
             timestamps.extend([ts_s] * batch_len)
 
+            if self._log_every_n_messages > 0:
+                self._decoded_partition_counts[source_id] = (
+                    self._decoded_partition_counts.get(source_id, 0) + 1
+                )
+                self._decoded_message_count += 1
+                if self._decoded_message_count % self._log_every_n_messages == 0:
+                    logger.info(
+                        f"KafkaReader[rank-{os.environ.get('RANK', 0)}"
+                        f"|worker-{self._worker_id}] "
+                        f"decoded_messages={self._decoded_message_count} "
+                        f"partitions={self._decoded_partition_counts}"
+                    )
+
         if not record_batchs:
             return None, 0
 
@@ -610,6 +628,10 @@ class KafkaReader(BaseReader):
         Yields:
             PyArrow RecordBatch
         """
+        self._worker_id = worker_id
+        self._decoded_message_count = 0
+        self._decoded_partition_counts: Dict[str, int] = {}
+
         topic, config, start_timestamp_ms = _parse_kafka_uri(self._input_path)
         if self._kafka_partition_round_robin:
             yield from self._round_robin_reader(
