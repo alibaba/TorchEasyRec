@@ -1119,9 +1119,9 @@ class RocksDBOffloadPlannerTest(unittest.TestCase):
 
     def setUp(self):
         try:
-            import tzrec_rocksdb  # noqa: F401
+            import tzrec_ext.rocksdb  # noqa: F401
         except ImportError:
-            self.skipTest("tzrec_rocksdb is not installed")
+            self.skipTest("tzrec_ext.rocksdb is not installed")
 
     def _planner(self, tables, hbm_gib, ddr_gib, budget=None, views=None):
         model, constraints = _model_and_constraints(tables)

@@ -507,13 +507,13 @@ class AdmissionStrategyTest(unittest.TestCase):
 
 def _has_rocksdb() -> bool:
     try:
-        import tzrec_rocksdb  # noqa: F401
+        import tzrec_ext.rocksdb  # noqa: F401
     except ImportError:
         return False
     return dynamicemb_util.has_dynamicemb
 
 
-@unittest.skipUnless(_has_rocksdb(), "tzrec_rocksdb is not installed; skipping.")
+@unittest.skipUnless(_has_rocksdb(), "tzrec_ext.rocksdb is not installed; skipping.")
 @mark_ci_scope("gpu")
 class RocksDBTableTest(unittest.TestCase):
     """Constraints and storage estimates of tables the planner may offload."""
@@ -545,8 +545,12 @@ class RocksDBTableTest(unittest.TestCase):
 
     @parameterized.expand([("indexed", "STEP"), ("not_indexed", "NO_EVICTION")])
     def test_storage_estimate(self, _name, strategy):
-        from tzrec_rocksdb import BackendConfig, logical_row_bytes, metadata_cache_bytes
-        from tzrec_rocksdb.storage import RocksDBStorageFactory
+        from tzrec_ext.rocksdb import (
+            BackendConfig,
+            logical_row_bytes,
+            metadata_cache_bytes,
+        )
+        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
 
         rows, ratio = self.NUM_EMBEDDINGS // 2, 0.01
         options = self._constraints(score_strategy=strategy).dynamicemb_options
@@ -603,8 +607,8 @@ class RocksDBTableTest(unittest.TestCase):
         from dynamicemb.batched_dynamicemb_tables import (
             BatchedDynamicEmbeddingTablesV2,
         )
-        from tzrec_rocksdb import BackendConfig, RocksDBSession
-        from tzrec_rocksdb.storage import RocksDBStorageFactory
+        from tzrec_ext.rocksdb import BackendConfig, RocksDBSession
+        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
 
         test_dir = make_test_dir()
         config = BackendConfig(32 << 20, 32 << 20, 1 << 20, 64 << 20, io_threads=2)

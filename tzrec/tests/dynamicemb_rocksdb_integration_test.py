@@ -30,7 +30,7 @@ from tzrec.utils import (
 from tzrec.utils.test_util import make_test_dir, mark_ci_scope
 
 try:
-    import tzrec_rocksdb  # noqa: F401
+    import tzrec_ext.rocksdb  # noqa: F401
 
     has_rocksdb = True
 except ImportError:
@@ -139,7 +139,7 @@ def _logs(log_dir):
     not torch.cuda.is_available()
     or not dynamicemb_util.has_dynamicemb
     or not has_rocksdb,
-    "CUDA, dynamicemb and tzrec_rocksdb are required.",
+    "CUDA, dynamicemb and tzrec_ext.rocksdb are required.",
 )
 @mark_ci_scope("gpu")
 class DynamicEmbRocksDBIntegrationTest(unittest.TestCase):

@@ -102,12 +102,12 @@ feature_configs {
 
 ## RocksDB 存储
 
-当 DynamicEmbedding 表的总参数（embedding + 优化器状态）超过 GPU 显存和主机内存时，规划器可以把一部分表放到每个训练进程自带的 RocksDB 中（本地 NVMe、ESSD 云盘或极速型 NAS），GPU 上保留一个热点 cache。需要额外安装 TorchEasyRec-addons 构建的 `tzrec-rocksdb` wheel（CPU-only，与 CUDA 版本无关；要求 dynamicemb 为 `13a8055` 版本）。
+当 DynamicEmbedding 表的总参数（embedding + 优化器状态）超过 GPU 显存和主机内存时，规划器可以把一部分表放到每个训练进程自带的 RocksDB 中（本地 NVMe、ESSD 云盘或极速型 NAS），GPU 上保留一个热点 cache。需要额外安装 TorchEasyRec-addons 构建的 `tzrec-ext` wheel（CPU-only，与 CUDA 版本无关；在 dynamicemb `13a8055` 上验证）。
 
 ```
 train_config {
     rocksdb_config {
-        root_dir: "/mnt/nvme/tzrec_rocksdb"
+        root_dir: "/mnt/nvme/tzrec_ext.rocksdb"
     }
 }
 feature_configs {
@@ -142,7 +142,7 @@ feature_configs {
 - cache 至少要容纳一个 batch 估算的查表 Id 数（batch_size × 每个样本的 Id 数，序列特征按 `sequence_length`、多个特征共用一张表时相加），更小的比例不会被选用。这只是估算（按查表次数而非去重 Id 数），运行时每一步都会按实际的去重 Id 数检查，见下文“排障”
 - 配置了 `cache_load_factor` 的表总是留在内存；`score_strategy: "CUSTOMIZED"` 的表不会放到 RocksDB（TorchEasyRec 没有 CUSTOMIZED 分数的生产者）
 - 配置 rocksdb_config 时，留在内存的表只使用 CACHING 布局（GPU cache 加完整的主机表），不使用 HYBRID：HYBRID 每次加载都会重新划分 GPU 和主机两层，接近 `max_capacity` 的表会溢出哈希 bucket，恢复时丢失行
-- 没有配置 rocksdb_config 时不会使用磁盘，也不需要安装 tzrec-rocksdb；规划没有选择 RocksDB 时不会打开数据库
+- 没有配置 rocksdb_config 时不会使用磁盘，也不需要安装 tzrec-ext；规划没有选择 RocksDB 时不会打开数据库
 - 训练日志 `dynamicemb tables offloaded to RocksDB` 列出放到 RocksDB 的表、cache 比例和行数，以及规划出的 RocksDB 配置；`RocksDB disk pool` 给出磁盘估算的分项明细
 - 同一份 checkpoint 可以在内存版与 RocksDB 版之间互相迁移，见下文“Checkpoint 与恢复”
 
@@ -176,7 +176,7 @@ feature_configs {
 
 ### 排障
 
-- `tzrec-rocksdb wheel`: 未安装 tzrec-rocksdb（此时所有表留在内存，打印告警）
+- `tzrec-ext wheel`: 未安装 tzrec-ext（此时所有表留在内存，打印告警）
 - `RocksDB tables need a local disk or an NFS-like filesystem`: root_dir 在 FUSE 或无法识别的文件系统上
 - `Unable to find a plan for this model`: 显存、内存和磁盘都放不下；日志中有每个选项的显存/内存估算，磁盘不足时为 `RocksDB tables need ... bytes of disk`。可以换更大的磁盘、调大 disk_budget_bytes、降低 `max_capacity`，或减少 `HOST_MEMORY_RESERVE_PERCENT` / `STORAGE_RESERVE_PERCENT`
 - `one step brings N unique ids to <表>, whose GPU cache holds M rows`: 一个 batch 中这张表的去重 Id 数超过了它的 GPU cache（dynamicemb 的 cache 放不下时会返回无效的行，所以在查表前报错）。请减小 batch_size，或给显存更多空间（减小 `STORAGE_RESERVE_PERCENT`）以选出更大的 cache 比例；序列或多值特征请确认 `sequence_length` 等配置反映了实际长度

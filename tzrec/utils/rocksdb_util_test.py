@@ -26,7 +26,7 @@ from tzrec.utils.logging_util import logger
 from tzrec.utils.test_util import make_test_dir, mark_ci_scope
 
 try:
-    import tzrec_rocksdb  # noqa: F401
+    import tzrec_ext.rocksdb  # noqa: F401
     from dynamicemb import (
         DynamicEmbInitializerArgs,
         DynamicEmbInitializerMode,
@@ -43,7 +43,7 @@ except ImportError:
 
 
 def _backend_config():
-    from tzrec_rocksdb import BackendConfig
+    from tzrec_ext.rocksdb import BackendConfig
 
     return BackendConfig(32 << 20, 32 << 20, 1 << 20, 64 << 20, io_threads=2)
 
@@ -53,9 +53,9 @@ class RocksDBRuntimeTest(unittest.TestCase):
 
     def setUp(self):
         try:
-            import tzrec_rocksdb  # noqa: F401
+            import tzrec_ext.rocksdb  # noqa: F401
         except ImportError:
-            self.skipTest("tzrec_rocksdb is not installed")
+            self.skipTest("tzrec_ext.rocksdb is not installed")
         self.test_dir = make_test_dir()
         self.train_config = train_pb2.TrainConfig(
             rocksdb_config=train_pb2.RocksDBConfig(
@@ -73,7 +73,7 @@ class RocksDBRuntimeTest(unittest.TestCase):
         self.assertEqual(rocksdb_util.cache_rows(10**6, 0.01), 10240)
 
     def test_bind_opens_one_session_per_rank(self):
-        from tzrec_rocksdb.storage import RocksDBStorageFactory
+        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
 
         config = _backend_config()
         options = [
@@ -105,7 +105,7 @@ class RocksDBRuntimeTest(unittest.TestCase):
                 rt.bind(plan)
 
     def test_close_releases_the_working_db_on_errors(self):
-        from tzrec_rocksdb import RocksDBSession
+        from tzrec_ext.rocksdb import RocksDBSession
 
         with self.assertRaisesRegex(ValueError, "boom"):
             with rocksdb_util.open_runtime(self.train_config, "model", "eval") as rt:
@@ -147,13 +147,13 @@ class _Model(nn.Module):
         self.emb = emb
 
 
-@unittest.skipUnless(has_rocksdb, "tzrec_rocksdb and CUDA are required")
+@unittest.skipUnless(has_rocksdb, "tzrec_ext.rocksdb and CUDA are required")
 @mark_ci_scope("gpu")
 class RocksDBCheckpointTest(unittest.TestCase):
     """Logical save/restore of a fused module."""
 
     def setUp(self):
-        from tzrec_rocksdb import RocksDBSession
+        from tzrec_ext.rocksdb import RocksDBSession
 
         self.test_dir = make_test_dir()
         self.model_dir = os.path.join(self.test_dir, "model")
@@ -171,7 +171,7 @@ class RocksDBCheckpointTest(unittest.TestCase):
         self.env.stop()
 
     def _model(self, names, strategy="NO_EVICTION", capacity=1 << 16, hbm=1 << 18):
-        from tzrec_rocksdb.storage import RocksDBStorageFactory
+        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
 
         session = self.rt.session
         options = [

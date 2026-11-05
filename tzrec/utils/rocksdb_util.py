@@ -69,14 +69,14 @@ def fixed_host_bytes() -> int:
 
 def _import_backend():
     try:
-        import tzrec_rocksdb
-        import tzrec_rocksdb.storage
+        import tzrec_ext.rocksdb
+        import tzrec_ext.rocksdb.storage
     except ImportError as e:
         raise RuntimeError(
-            "dynamicemb tables placed in RocksDB need the tzrec-rocksdb wheel "
-            "from TorchEasyRec-addons (pip install tzrec_rocksdb-*.whl)."
+            "dynamicemb tables placed in RocksDB need the tzrec-ext wheel "
+            "from TorchEasyRec-addons (pip install tzrec_ext-*.whl)."
         ) from e
-    return tzrec_rocksdb
+    return tzrec_ext.rocksdb
 
 
 def is_rocksdb_options(options: Any) -> bool:
@@ -84,7 +84,7 @@ def is_rocksdb_options(options: Any) -> bool:
     storage = getattr(options, "external_storage", None)
     if storage is None:
         return False
-    from tzrec_rocksdb.storage import RocksDBStorageFactory
+    from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
 
     return isinstance(storage, RocksDBStorageFactory)
 
@@ -104,7 +104,7 @@ def _rank() -> int:
 def rocksdb_modules(model: nn.Module) -> List[Any]:
     """Return the fused DynamicEmb modules of ``model`` stored in RocksDB."""
     from dynamicemb.dump_load import get_dynamic_emb_module
-    from tzrec_rocksdb.storage import RocksDBStorage
+    from tzrec_ext.rocksdb.storage import RocksDBStorage
 
     return [
         m for m in get_dynamic_emb_module(model) if isinstance(m.tables, RocksDBStorage)
@@ -181,7 +181,7 @@ class RocksDBRuntime:
         storage is a RocksDBStorage with a complete namespace map.
         """
         from dynamicemb.dump_load import get_dynamic_emb_module
-        from tzrec_rocksdb.storage import RocksDBStorage
+        from tzrec_ext.rocksdb.storage import RocksDBStorage
 
         report = []
         for m in cast(List[Any], get_dynamic_emb_module(model)):
@@ -373,7 +373,7 @@ def open_runtime(
         _import_backend()
     except RuntimeError:
         logger.warning(
-            "rocksdb_config without the tzrec-rocksdb wheel: every dynamicemb "
+            "rocksdb_config without the tzrec-ext wheel: every dynamicemb "
             "table stays in GPU/host memory."
         )
         yield None
