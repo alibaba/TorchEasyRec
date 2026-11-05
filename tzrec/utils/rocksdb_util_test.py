@@ -108,7 +108,7 @@ class RocksDBRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "boom"):
             with rocksdb_util.open_runtime(self.train_config, "model", "eval") as rt:
                 rt.session = RocksDBSession(_backend_config(), rt._new_work_dir())
-                self.assertTrue(rt.session.namespace_ids(["t"]))
+                self.assertTrue(rt.session.get_or_create_namespace_ids(["t"]))
                 work = rt.session.work_dir
                 self.assertTrue(os.path.isdir(work))
                 raise ValueError("boom")

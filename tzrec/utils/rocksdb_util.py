@@ -338,7 +338,7 @@ class RocksDBRuntime:
             m.reset_cache_states()
         self.session.swap_working_db(self._new_work_dir())
         for m in groups:
-            m.tables.refresh_namespaces()
+            m.tables.reset_for_new_working_db()
         logger.info(
             f"RANK[{_rank()}] loading RocksDB tables into fresh working DB "
             f"{self.session.work_dir}"
