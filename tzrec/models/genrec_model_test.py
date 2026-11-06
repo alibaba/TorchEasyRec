@@ -104,22 +104,6 @@ class BaseGenRecModelTest(unittest.TestCase):
         self.test_dir = make_test_dir()
         self.model, self.compiled_prompt = create_genrec_test_model(self.test_dir)
 
-    def test_tokens_to_local_codes_undoes_shifts_and_groups_beams(self) -> None:
-        space = self.compiled_prompt.sid_space
-        local_codes = torch.tensor(
-            [
-                [0, 1, 3],
-                [3, 0, 2],
-                [1, 3, 0],
-                [2, 2, 1],
-            ]
-        )
-        tokens = local_codes + torch.tensor(space.level_offsets) + space.base_vocab_size
-        codes = self.model._tokens_to_local_codes(tokens, batch_size=2)
-
-        self.assertEqual(codes.shape, (2, 2, space.num_levels))
-        self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1).tolist())
-
     def test_rejects_a_model_built_without_a_prompt(self) -> None:
         model_config = ModelConfig()
         model_config.genrec_causal_lm_model.hf_model_name_or_path = os.path.join(

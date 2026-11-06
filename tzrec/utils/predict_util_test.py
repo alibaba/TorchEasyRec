@@ -24,16 +24,23 @@ from unittest import mock
 import numpy as np
 import torch
 from parameterized import param, parameterized
+from safetensors.torch import load_file, save_file
 from torch import nn
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 from tzrec.datasets.utils import Batch
+from tzrec.models.genrec_causal_lm_model import generate_codes, resolve_beam_config
+from tzrec.models.genrec_model import SLOT_EMBEDS
 from tzrec.models.model import CombinedModelWrapper
+from tzrec.prompt.assembler import CU_SEQLENS, HOLE_POSITIONS, INPUT_IDS
+from tzrec.prompt.compile import sid_bands
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import npz_util, predict_util, quant_util
 from tzrec.utils.logging_util import logger
 from tzrec.utils.predict_util import (
     DistributedEmbeddingLookup,
     DistributedEmbeddingModel,
+    GenRecExportModel,
     _encode_keys,
     _gpu_cache_ratio,
     _key_tag,
@@ -41,6 +48,7 @@ from tzrec.utils.predict_util import (
     load_predict_model,
 )
 from tzrec.utils.test_util import (
+    create_tiny_causal_lm,
     make_test_dir,
     mark_ci_scope,
     nv_gpu_unavailable,
@@ -1013,7 +1021,9 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
             "sd": JaggedTensor(values=torch.rand(3, 4), lengths=sd_lengths)
         }
         device = torch.device("cuda:0")
-        model = load_predict_model(self.export_dir, [device], log_model=True)
+        model = load_predict_model(
+            self.export_dir, [device], EasyRecConfig(), log_model=True
+        )
         self.assertIsInstance(model, DistributedEmbeddingModel)
         out = model(batch, torch.tensor(2), device)
         np.testing.assert_allclose(
@@ -1027,6 +1037,90 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+class GenRecExportModelTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.export_dir = make_test_dir()
+        # a [4, 4, 4] codebook above 40 base tokens: SID tokens 40..51 of 64
+        self.lm = create_tiny_causal_lm(64, tie_word_embeddings=True)
+        self.lm.save_pretrained(self.export_dir)
+        self._write_config(sid_space={"codebook": [4, 4, 4], "base_vocab_size": 40})
+        self.pipeline_config = EasyRecConfig()
+        self.common = self.pipeline_config.model_config.genrec_causal_lm_model.common
+        self.common.beam_widths.extend([2, 2, 2])
+        self.common.num_return_sequences = 2
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.export_dir, ignore_errors=True)
+
+    def _write_config(self, **extra) -> None:
+        text_config = json.loads(self.lm.config.to_json_string())
+        with open(os.path.join(self.export_dir, "config.json"), "w") as f:
+            json.dump({"text_config": text_config, **extra}, f)
+
+    def _model(self, streams: Dict[str, torch.Tensor]) -> GenRecExportModel:
+        with mock.patch.object(
+            predict_util, "_load_batch_model", return_value=lambda *_: streams
+        ):
+            model = load_predict_model(
+                self.export_dir, [torch.device("cpu")], self.pipeline_config
+            )
+        self.assertIsInstance(model, GenRecExportModel)
+        return model
+
+    def _streams(self, with_slots: bool) -> Dict[str, torch.Tensor]:
+        if with_slots:
+            hole_positions = torch.tensor([1, 5])
+            slot_embeds = torch.randn(2, self.lm.config.hidden_size)
+        else:
+            hole_positions = torch.zeros(0, dtype=torch.int64)
+            slot_embeds = torch.zeros(0, 0)
+        return {
+            INPUT_IDS: torch.tensor([3, 7, 1, 5, 9, 2, 8, 4]),
+            CU_SEQLENS: torch.tensor([0, 3, 8]),
+            HOLE_POSITIONS: hole_positions,
+            SLOT_EMBEDS: slot_embeds,
+        }
+
+    @parameterized.expand([[False], [True]], name_func=parameterized_name_func)
+    def test_decodes_like_generate_codes(self, with_slots) -> None:
+        streams = self._streams(with_slots)
+        model = self._model(streams)
+        _, band_lo, band_hi = sid_bands([4, 4, 4], 40)
+        bands = list(zip(band_lo, band_hi))
+        widths, num_return_sequences = resolve_beam_config(self.common, bands)
+        with torch.no_grad():
+            out = model(Batch(), None, torch.device("cpu"))
+            embeds = self.lm.get_input_embeddings()(streams[INPUT_IDS])
+            if with_slots:
+                embeds = embeds.index_copy(
+                    0, streams[HOLE_POSITIONS], streams[SLOT_EMBEDS]
+                )
+            expected = generate_codes(
+                self.lm,
+                embeds,
+                streams[CU_SEQLENS],
+                5,
+                widths,
+                bands,
+                num_return_sequences,
+            )
+        self.assertEqual(out["generated_sids"].shape, (2, 2, 3))
+        self.assertTrue(torch.equal(out["generated_sids"], expected))
+
+    def test_needs_the_sid_space(self) -> None:
+        self._write_config()
+        with self.assertRaisesRegex(ValueError, "no sid_space"):
+            self._model(self._streams(False))
+
+    def test_refuses_an_lm_that_does_not_load_cleanly(self) -> None:
+        path = os.path.join(self.export_dir, "model.safetensors")
+        tensors = load_file(path)
+        del tensors["model.norm.weight"]
+        save_file(tensors, path, metadata={"format": "pt"})
+        with self.assertRaisesRegex(RuntimeError, "does not load cleanly"):
+            self._model(self._streams(False))
 
 
 class _Sparse(nn.Module):
@@ -1118,7 +1212,8 @@ class LoadPredictModelTest(unittest.TestCase):
             json.dump({}, f)
         batch, device = _predict_batch(), torch.device("cpu")
         expected = _reload(_Model())(batch.to_dict(sparse_dtype=torch.int64), device)
-        actual = load_predict_model(self.model_dir, [device])(batch, None, device)
+        model = load_predict_model(self.model_dir, [device], EasyRecConfig())
+        actual = model(batch, None, device)
         self.assertEqual(list(actual), list(expected))
         for k, v in expected.items():
             torch.testing.assert_close(actual[k], v, rtol=0, atol=0, msg=k)
