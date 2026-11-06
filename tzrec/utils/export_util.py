@@ -373,8 +373,8 @@ def export_model_normal(
 
 def _validate_hard_search_fg_asset(
     features: List[BaseFeature], asset: str, save_dir: str
-) -> None:
-    """Reject custom FG definitions that change hard-search serving inputs.
+) -> bytes:
+    """Validate custom FG definitions and return the exact bytes to export.
 
     With hard search, the graph's candidate/user split depends on the generated
     feature definitions. Compare those definitions directly so custom raw inputs,
@@ -388,10 +388,11 @@ def _validate_hard_search_fg_asset(
             hard_search_nodes.append(node)
         return node
 
-    with open(asset) as input_file:
-        supplied_fg = json.load(input_file, object_hook=collect_hard_search_nodes)
+    with open(asset, "rb") as input_file:
+        content = input_file.read()
+    supplied_fg = json.loads(content, object_hook=collect_hard_search_nodes)
     if not hard_search_nodes and not any(f.is_hard_search_feat for f in features):
-        return
+        return content
     supplied_features = (
         supplied_fg.get("features") if isinstance(supplied_fg, dict) else None
     )
@@ -420,6 +421,7 @@ def _validate_hard_search_fg_asset(
             "keys, or raw-input mappings). Regenerate the asset from the export "
             "feature configuration."
         )
+    return content
 
 
 def _write_export_metadata(
@@ -430,9 +432,11 @@ def _write_export_metadata(
     additional_export_config: Optional[Dict[str, Union[bool, str]]],
 ) -> None:
     """Write serving metadata and assets without mutating the training config."""
-    for asset in assets or []:
-        if asset.endswith("fg.json"):
-            _validate_hard_search_fg_asset(features, asset, save_dir)
+    fg_assets = {
+        asset: _validate_hard_search_fg_asset(features, asset, save_dir)
+        for asset in assets or []
+        if asset.endswith("fg.json")
+    }
     feature_configs = create_feature_configs(features, asset_dir=save_dir)
     export_config = copy.deepcopy(pipeline_config)
     export_config.ClearField("feature_configs")
@@ -446,11 +450,13 @@ def _write_export_metadata(
             output,
             indent=4,
         )
-    has_fg_asset = False
     for asset in assets or []:
-        has_fg_asset = has_fg_asset or asset.endswith("fg.json")
-        shutil.copy(asset, save_dir)
-    if not has_fg_asset:
+        if asset in fg_assets:
+            with open(os.path.join(save_dir, os.path.basename(asset)), "wb") as output:
+                output.write(fg_assets[asset])
+        else:
+            shutil.copy(asset, save_dir)
+    if not fg_assets:
         logger.info("saving fg json...")
         with open(os.path.join(save_dir, "fg.json"), "w") as output:
             json.dump(create_fg_json(features, asset_dir=save_dir), output, indent=4)

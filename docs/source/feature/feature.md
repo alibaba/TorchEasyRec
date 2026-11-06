@@ -929,8 +929,8 @@ feature_configs {
 - **sequence_name**: 序列特征名
 - **sequence_length**: 序列特征最大长度
 - **sequence_delim**: 序列元素之间的分隔符，默认为`;`，不是逗号。它与子特征元素内部的多值分隔符`separator`不同，后者在FG中的默认值为`\x1d`。hard-search序列当前必须使用`;`。
-- **sequence_pk**: 序列特征主键输入名，未配置时为`user:${sequence_name}`。普通分组序列在线上通过该字段传入历史ItemId列表，用于关联物品属性；行为属性子序列仍需从请求传入。它不是hard-search查询使用的用户ID字段。
-- **sequence_entity**: 可选，指定该序列组在线上模型服务中关联的FeatureStore实体名，例如`sequence_entity: "app"`。实体名须是TorchEasyRec Processor的`fs_entity`配置中列出的实体之一；hard-search序列当前仅支持主实体，即`fs_entity`中的第一个实体。
+- **sequence_pk**: 序列特征主键输入名，未配置时为`user:${sequence_name}`。普通分组序列在线上通过该字段传入历史ItemId列表，用于关联物品属性；行为属性子序列仍需从请求传入。它不是hard-search查询使用的用户ID字段。hard-search组的PK去掉`user:`等侧前缀后，不能与任何特征的原始输入列名或其他序列组的PK同名，冲突时创建特征会报错。
+- **sequence_entity**: 可选，指定该序列组在线上模型服务中关联的FeatureStore实体名，例如`sequence_entity: "app"`。实体名须是TorchEasyRec Processor的`fs_entity`配置中列出的实体之一；hard-search序列当前仅支持主实体，即`fs_entity`中的第一个实体，该限制由Processor校验。
 - **hard_search_key**: 可选字符串，仅在分组`sequence_feature`上配置，格式为`item:<field>`，表示用于查询候选相关历史的候选物品字段，例如`item:cate`。未配置时保留原有序列行为，配置示例及使用限制见下文。
 - **features**: 序列特征子特征，配置同对应的子特征类型的配置
   - **feature_name**: 子特征特征名，完整的子特征名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，子特征名列名应为`click_seq__item_id`
@@ -982,7 +982,7 @@ feature_configs {
 - **INPUT_TILE**：hard-search组内的稀疏、稠密序列及依赖这些输入的派生特征均按候选侧处理，每个候选保留一行，即B个候选对应B行；组内序列字段来源为`user:`或`context:`时也适用。普通用户特征和普通用户历史仍在tile前保留一行并继续共享，无需全局关闭`INPUT_TILE`。支持`INPUT_TILE=2/3`和`INPUT_TILE=3`下的`INPUT_TILE_3_ONLINE=1`；distributed embedding导出继续使用`INPUT_TILE=3`，hard-search序列保持B行。
 - **组内输入限制**：hard-search组内的原始输入必须是带`${sequence_name}__`前缀的序列字段，不支持组内非序列原始输入。例如组内Lookup配置`map: "user:shared_map"`、`key: "item:raw_id"`时，默认非序列输入`shared_map`没有序列名前缀，该配置不支持。可将派生Lookup放在hard-search组外，通过`feature:<序列名>__<子特征名>`引用历史输出；共享的`user:shared_map`仍按用户侧tile，派生输出按候选侧处理。
 - **组合限制**：使用hard-search历史时，同一`SEQUENCE`组或`sequence_groups`子组的所有历史序列轴特征必须来自同一份hard-search历史并逐事件对齐，不能混用普通历史或不同hard-search序列组，即使`hard_search_key`相同且长度恰好一致也不支持。不同历史应使用独立的`sequence_groups`。不同hard-search来源的自动检查仅覆盖直接声明的序列组，派生特征的来源与事件对齐需自行确认。模型query部分仍允许混用用户侧和候选侧特征，这不代表hard-search组内允许非序列原始输入。`JAGGED_SEQUENCE`组不能包含任何hard-search特征，因此当前HSTU不支持该配置。
-- **重新导出**：新增或修改`hard_search_key`配置后，必须重新导出模型及FG产物，使模型输入分类与Processor一致。若通过导出assets提供自定义`fg.json`，其特征定义（包括hard-search标记、原始输入映射和序列配置）必须与建图配置一致，冲突时导出会报错；不包含hard-search的旧资产流程保持原样。上述支持范围为FX/TorchScript及distributed embedding导出，AOT/TRT路径尚未验证。
+- **重新导出**：新增或修改`hard_search_key`配置后，必须重新导出模型及FG产物，使模型输入分类与Processor一致。若通过导出assets提供自定义`fg.json`，其特征定义（包括hard-search标记、原始输入映射和序列配置）必须与建图配置一致，冲突时导出会报错；不包含hard-search的旧资产流程保持原样。上述支持范围为FX/TorchScript及distributed embedding导出；`USE_RTP=1`不支持hard-search，创建特征时会报错；AOT/TRT路径尚未验证。
 
 ### 普通序列特征
 

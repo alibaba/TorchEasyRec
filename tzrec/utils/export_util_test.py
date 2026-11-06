@@ -226,6 +226,10 @@ class HardSearchExportTest(unittest.TestCase):
             ("missing_subfeature", None, None),
             ("extra_subfeature", None, None),
             ("duplicate_subfeature", None, None),
+            ("missing_features_array", None, None),
+            ("invalid_features_array", None, None),
+            ("nondict_feature", None, None),
+            ("subfeature_hard_search_key", None, None),
         ],
         name_func=parameterized_name_func,
     )
@@ -266,6 +270,14 @@ class HardSearchExportTest(unittest.TestCase):
             asset_fg["features"].append(extra)
         elif case == "missing_subfeature":
             group["features"].pop()
+        elif case == "missing_features_array":
+            asset_fg = {"custom_asset": True}
+        elif case == "invalid_features_array":
+            asset_fg["features"] = {}
+        elif case == "nondict_feature":
+            asset_fg["features"].append("invalid")
+        elif case == "subfeature_hard_search_key":
+            group["features"][0]["hard_search_key"] = group.pop("hard_search_key")
         else:
             extra = copy.deepcopy(group["features"][-1])
             if case == "extra_subfeature":
@@ -288,6 +300,7 @@ class HardSearchExportTest(unittest.TestCase):
                 self.assertEqual(input_file.read(), source)
             self.assertEqual(os.stat(self.asset_path).st_mtime_ns, source_mtime)
             self.assertEqual(config, original_config)
+            self.assertEqual(os.listdir(self.save_dir), [])
 
     @parameterized.expand(
         [("matching", False), ("reordered", True)],
@@ -326,6 +339,33 @@ class HardSearchExportTest(unittest.TestCase):
         self.assertEqual(saved_config, original_config)
         with open(os.path.join(self.save_dir, "model_acc.json")) as input_file:
             self.assertEqual(json.load(input_file)["CUSTOM_EXPORT"], "hsk")
+
+    def test_export_metadata_writes_validated_fg_bytes(self):
+        config = _create_hard_search_export_config()
+        features = create_features(list(config.feature_configs))
+        fg_json = export_util.create_fg_json(features)
+        validated = ("\n" + json.dumps(fg_json, indent=2) + "\n").encode()
+        with open(self.asset_path, "wb") as output:
+            output.write(validated)
+        fg_json["features"][-1]["hard_search_key"] = "item:changed"
+        replacement = json.dumps(fg_json).encode()
+        create_configs = export_util.create_feature_configs
+
+        def regenerate_source(*args, **kwargs):
+            with open(self.asset_path, "wb") as output:
+                output.write(replacement)
+            return create_configs(*args, **kwargs)
+
+        with mock.patch.object(
+            export_util, "create_feature_configs", side_effect=regenerate_source
+        ):
+            export_util._write_export_metadata(
+                config, features, self.save_dir, [self.asset_path], None
+            )
+        with open(self.asset_path, "rb") as input_file:
+            self.assertEqual(input_file.read(), replacement)
+        with open(os.path.join(self.save_dir, "fg.json"), "rb") as input_file:
+            self.assertEqual(input_file.read(), validated)
 
     @parameterized.expand(
         [("opaque_asset", False), ("unmarked_sequence_drift", True)],

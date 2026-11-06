@@ -452,6 +452,8 @@ class BaseFeature(object, metaclass=_meta_cls):
         self.sequence_entity: Optional[str] = None
         self.hard_search_key = hard_search_key
         if hard_search_key is not None:
+            if env_util.use_rtp():
+                raise ValueError("hard_search_key is not supported with USE_RTP=1.")
             if not is_sequence or not sequence_name:
                 raise ValueError(
                     "hard_search_key is only supported on a sequence group."
@@ -1267,6 +1269,7 @@ def get_hard_search_inputs(
     raw_inputs = {name: set() for name in sequence_names}
     for name, sequence in fg_handler.sequence_feature_to_name().items():
         if sequence in sequence_names:
+            # get_inputs() returns <side>__<name>; preserve prefixes in <name>.
             raw_inputs[sequence].update(
                 value.split("__", 1)[1] for value in fg_handler.get_inputs(name)
             )
@@ -1414,12 +1417,16 @@ def create_features(
             for feature in features
             if feature.is_grouped_sequence
         }
-        raw_inputs = {
-            name
-            for feature in features
-            for side, name in feature.side_inputs
-            if side not in ("feature", "const")
-        }
+        raw_inputs = set()
+        for feature in features:
+            try:
+                raw_inputs.update(
+                    name
+                    for side, name in feature.side_inputs
+                    if side not in ("feature", "const")
+                )
+            except InvalidFgInputError:
+                pass
         for feature in features:
             if feature.hard_search_key is None:
                 continue

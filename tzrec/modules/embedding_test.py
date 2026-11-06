@@ -34,6 +34,7 @@ from tzrec.modules.embedding import (
     EmbeddingGroup,
     EmbeddingGroupImpl,
     SequenceEmbeddingGroupImpl,
+    _pool_sequence_values,
     build_embedding_bag_configs,
     build_embedding_collection_configs,
 )
@@ -247,6 +248,30 @@ def _create_shared_table_feature_configs(
             f.embedding_constraints.unique_id_factor = unique_id_factor
         configs.append(feature_pb2.FeatureConfig(id_feature=f))
     return configs
+
+
+class SequencePoolingTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            (pooling, values, lengths, expected)
+            for pooling in ("sum", "mean")
+            for values, lengths, expected in (
+                ([], [], []),
+                ([], [0], [[0.0, 0.0]]),
+                ([[2.0, 4.0]], [0, 1, 0], [[0.0, 0.0], [2.0, 4.0], [0.0, 0.0]]),
+            )
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_empty_sequence_and_query_segments(
+        self, pooling, values, lengths, expected
+    ):
+        values = torch.tensor(values, dtype=torch.float32).reshape(-1, 2)
+        lengths = torch.tensor(lengths, dtype=torch.int64)
+        expected = torch.tensor(expected, dtype=torch.float32).reshape(-1, 2)
+        result = _pool_sequence_values(values, lengths, pooling)
+        torch.testing.assert_close(result, expected)
+        self.assertTrue(torch.isfinite(result).all())
 
 
 class EmbeddingGroupTest(unittest.TestCase):

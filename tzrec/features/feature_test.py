@@ -15,10 +15,12 @@ import os
 import shutil
 import unittest
 from collections import OrderedDict
+from unittest import mock
 
 import numpy as np
 import pyarrow as pa
 import pyfg
+from google.protobuf import struct_pb2
 from parameterized import param, parameterized
 
 from tzrec.features import (
@@ -514,6 +516,70 @@ class FeatureTest(unittest.TestCase):
             if expected:
                 feature.is_user_feat = True
                 self.assertFalse(feature.is_user_feat)
+
+    @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
+    def test_input_free_custom_feature_with_hard_search(self, hard_search):
+        group = feature_pb2.SequenceFeature(
+            sequence_name="hist",
+            sequence_length=3,
+            sequence_delim=";",
+            features=[
+                feature_pb2.SeqFeatureConfig(
+                    raw_feature=feature_pb2.RawFeature(
+                        feature_name="value", expression="item:value"
+                    )
+                )
+            ],
+        )
+        if hard_search:
+            group.hard_search_key = "item:cate"
+        configs = [
+            feature_pb2.FeatureConfig(
+                custom_feature=feature_pb2.CustomFeature(
+                    feature_name="constant",
+                    operator_name="SeqExpr",
+                    operator_lib_file="pyfg/lib/libseq_expr.so",
+                    operator_params=struct_pb2.Struct(
+                        fields={"formula": struct_pb2.Value(string_value="7")}
+                    ),
+                    default_value="7",
+                )
+            ),
+            feature_pb2.FeatureConfig(sequence_feature=group),
+        ]
+        features = feature_lib.create_features(configs, fg_mode=FgMode.FG_DAG)
+        self.assertFalse(features[0].is_hard_search_feat)
+        self.assertEqual(features[1].is_hard_search_feat, hard_search)
+        handler = pyfg.FgArrowHandler(feature_lib.create_fg_json(features), 1)
+        try:
+            self.assertEqual(handler.get_inputs("constant"), set())
+            output, status = handler.process_arrow(
+                {"hist__value": pa.array(["2;3", "4"])}
+            )
+            self.assertTrue(status.ok(), status.message())
+            np.testing.assert_allclose(output["constant"].dense_values, [[7.0]])
+            np.testing.assert_allclose(
+                output["hist__value"].dense_values, [[2.0], [3.0], [4.0]]
+            )
+            np.testing.assert_array_equal(output["hist__value"].np_lengths, [2, 1])
+        finally:
+            handler.reset_executor()
+
+    @parameterized.expand(
+        [(mode,) for mode in (FgMode.FG_DAG, FgMode.FG_NORMAL, FgMode.FG_NONE)],
+        name_func=parameterized_name_func,
+    )
+    def test_hard_search_rejects_rtp(self, fg_mode):
+        config = self._create_test_feature_cfgs()[-1]
+        with mock.patch.dict(
+            os.environ, {"USE_RTP": "1", "USE_FARM_HASH_TO_BUCKETIZE": "true"}
+        ):
+            features = feature_lib.create_features([config], fg_mode=fg_mode)
+            self.assertEqual(features[0].name, "click_seq_cat_a")
+            self.assertFalse(features[0].is_hard_search_feat)
+            config.sequence_feature.hard_search_key = "item:cate"
+            with self.assertRaisesRegex(ValueError, "hard_search_key.*USE_RTP=1"):
+                feature_lib.create_features([config], fg_mode=fg_mode)
 
     @parameterized.expand(
         [
