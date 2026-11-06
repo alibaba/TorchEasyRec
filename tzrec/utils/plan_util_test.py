@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import random
 import unittest
 from types import SimpleNamespace
@@ -16,10 +17,9 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
-from parameterized import parameterized
+from parameterized import param, parameterized
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
-from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
 from torchrec.distributed.planner.proposers import GridSearchProposer
 from torchrec.distributed.planner.types import PlannerError, Topology
@@ -27,9 +27,19 @@ from torchrec.distributed.test_utils.test_model import TestSparseNN
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
+from tzrec.protos import feature_pb2
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.plan_util import DynamicProgrammingProposer, _sparse_dp_proposor_numpy
-from tzrec.utils.test_util import mark_ci_scope
+from tzrec.utils.plan_util import (
+    DynamicProgrammingProposer,
+    EmbeddingEnumerator,
+    _sparse_dp_proposor_numpy,
+    create_planner,
+)
+from tzrec.utils.test_util import (
+    make_test_dir,
+    mark_ci_scope,
+    parameterized_name_func,
+)
 
 
 class PlanUtilTest(unittest.TestCase):
@@ -96,6 +106,285 @@ class PlanUtilTest(unittest.TestCase):
         self.assertAlmostEqual(best_dp_perf, best_grid_perf)
         for k, v in best_grid_proposal.items():
             self.assertEqual(str(v), str(best_dp_proposal[k]))
+
+    def test_global_pooling_factor_is_rejected(self) -> None:
+        # ids per sample differ per feature, so a global value means nothing;
+        # the check runs before any distributed setup
+        global_cfg = feature_pb2.ParameterConstraints()
+        global_cfg.pooling_factor = 2.0
+        with self.assertRaisesRegex(
+            ValueError, "global_embedding_constraints cannot set pooling_factor"
+        ):
+            create_planner(
+                device=torch.device("cpu"),
+                batch_size=32,
+                global_constraints_cfg=global_cfg,
+            )
+
+    @parameterized.expand(
+        [
+            param(
+                "single_input",
+                table_name="table_a",
+                feature_names=["feature_a"],
+                pooling_factors=[3.0],
+            ),
+            param(
+                "shared_inputs",
+                table_name="table_shared",
+                feature_names=["feature_a", "feature_b"],
+                pooling_factors=[1.0, 20.0],
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_pooling_factors_affect_shared_table_storage_estimates(
+        self, name, table_name, feature_names, pooling_factors
+    ) -> None:
+        # one entry per input feature survives enumeration; the estimation
+        # path then prices a shared pooled bag one output row per input,
+        # while an unpooled collection keeps every position
+        from torchrec.distributed.planner.shard_estimators import (
+            calculate_shard_storages,
+            get_num_poolings,
+        )
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        topology = Topology(world_size=1, compute_device="cpu")
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=8,
+                name=table_name,
+                feature_names=feature_names,
+            )
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        constraint = ParameterConstraints(
+            pooling_factors=pooling_factors, feature_names=feature_names
+        )
+        fqn = f"sparse.ebc.{table_name}"
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=16,
+            fqn_constraints={fqn: constraint},
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=get_default_sharders()
+        )
+        self.assertTrue(search_space)
+        for option in search_space:
+            self.assertEqual(option.input_lengths, pooling_factors)
+            self.assertEqual(option.num_inputs, len(feature_names))
+        table_wise = [
+            option
+            for option in search_space
+            if option.sharding_type == ShardingType.TABLE_WISE.value
+        ][0]
+        self.assertEqual(
+            get_num_poolings({fqn: constraint}, table_wise),
+            [1.0] * len(feature_names),
+        )
+        # the estimation the planner runs: batch sizes and poolings straight
+        # off the enumerated option
+        from torchrec.distributed.planner.types import (
+            SharderData,
+            StorageUsageType,
+        )
+
+        sharder_data = SharderData(
+            fused_params={},
+            qcomm_dtype_sizes={},
+            storage_usage_type=StorageUsageType.DEFAULT,
+        )
+        batch_sizes = [table_wise.batch_size] * table_wise.num_inputs
+        kwargs = dict(
+            sharder_data=sharder_data,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            tensor=torch.zeros((100, 8)),
+            compute_device="cpu",
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shard_sizes=[[100, 8]],
+            batch_sizes=batch_sizes,
+            world_size=1,
+            local_world_size=1,
+            num_poolings=[1.0] * table_wise.num_inputs,
+            caching_ratio=1.0,
+            input_data_type_size=4,
+            output_data_type_size=4,
+        )
+
+        def _total(storages):
+            return storages[0].hbm + storages[0].ddr + storages[0].ssd
+
+        shared = calculate_shard_storages(
+            input_lengths=pooling_factors, is_pooled=True, **kwargs
+        )
+        collapsed = calculate_shard_storages(
+            input_lengths=[sum(pooling_factors)], is_pooled=True, **kwargs
+        )
+        # a pooled bag outputs one row per input: len(features) rows, where a
+        # single summed factor would have collapsed them to one
+        self.assertEqual(
+            _total(shared) - _total(collapsed),
+            (len(pooling_factors) - 1) * 16 * 8 * 4,
+        )
+        # an unpooled collection outputs every position
+        unpooled = calculate_shard_storages(
+            input_lengths=pooling_factors, is_pooled=False, **kwargs
+        )
+        self.assertEqual(
+            _total(unpooled) - _total(shared),
+            (sum(pooling_factors) - len(pooling_factors)) * 16 * 8 * 4,
+        )
+
+    def _planner_with_saved_dp_plan(self, test_dir, constraint):
+        """A planner over one table whose saved plan pinned it data_parallel.
+
+        Sets up the single-process environment create_planner needs; the
+        caller restores it in a finally block.
+        """
+        import json as _json
+
+        import torch.distributed as dist
+
+        os.environ.update(
+            RANK="0",
+            WORLD_SIZE="1",
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT="29713",
+        )
+        if not dist.is_initialized():
+            dist.init_process_group(backend="gloo")
+
+        class _SparseNN(TestSparseNN):
+            def parameter_constraints(self, prefix: str = ""):
+                return {f"{prefix}sparse.ebc.table_a": constraint}
+
+        model = _SparseNN(
+            tables=[
+                EmbeddingBagConfig(
+                    num_embeddings=100,
+                    embedding_dim=8,
+                    name="table_a",
+                    feature_names=["feature_a"],
+                )
+            ],
+            sparse_device=torch.device("meta"),
+        )
+        plan_path = os.path.join(test_dir, "plan.json")
+        with open(plan_path, "w") as f:
+            _json.dump(
+                {"sparse": {"ebc.table_a": {"sharding_type": "data_parallel"}}}, f
+            )
+        planner = create_planner(
+            device=torch.device("cuda"),
+            batch_size=16,
+            ckpt_plan_path=plan_path,
+            model=model,
+        )
+        return planner, model
+
+    def _run_with_saved_dp_plan(self, constraint):
+        """Plan one table whose saved plan pinned it data_parallel."""
+        import torch.distributed as dist
+
+        env = dict(os.environ)
+        test_dir = make_test_dir()
+        try:
+            planner, model = self._planner_with_saved_dp_plan(test_dir, constraint)
+            return planner.plan(model, get_default_sharders())
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            os.environ.clear()
+            os.environ.update(env)
+
+    def test_global_constraints_apply_behind_statistics_only_entries(self) -> None:
+        # a parameter entry that only carries measured factors keeps the
+        # global sharding and kernel lists applied to its table
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        topology = Topology(world_size=1, compute_device="cpu")
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=8,
+                name="table_a",
+                feature_names=["feature_a"],
+            )
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        global_constraints = ParameterConstraints(
+            sharding_types=["table_wise", "row_wise"]
+        )
+        statistics_only = ParameterConstraints(
+            pooling_factors=[2.0], feature_names=["feature_a"]
+        )
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=16,
+            fqn_constraints={"sparse.ebc.table_a": statistics_only},
+            global_constraints=global_constraints,
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=get_default_sharders()
+        )
+        self.assertTrue(search_space)
+        # the global list restricts the table; data_parallel is gone
+        self.assertNotIn(
+            "data_parallel", {option.sharding_type for option in search_space}
+        )
+        # an entry that restricts sharding itself still outranks the global
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=16,
+            fqn_constraints={
+                "sparse.ebc.table_a": ParameterConstraints(
+                    sharding_types=["table_wise"]
+                )
+            },
+            global_constraints=global_constraints,
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=get_default_sharders()
+        )
+        self.assertEqual(
+            {option.sharding_type for option in search_space}, {"table_wise"}
+        )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "CUDA is required for create_planner."
+    )
+    @mark_ci_scope("gpu")
+    def test_checkpoint_sharding_applies_with_statistics_only_constraints(self):
+        # every sparse table now carries a constraint entry (measured pooling
+        # factors); an entry that does not restrict sharding must not disable
+        # the data_parallel pin that resume depends on
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        constraint = ParameterConstraints(
+            pooling_factors=[2.0], feature_names=["feature_a"]
+        )
+        plan = self._run_with_saved_dp_plan(constraint)
+        self.assertEqual(
+            plan.plan["sparse.ebc"]["table_a"].sharding_type, "data_parallel"
+        )
+        # planning must not mutate the model's own constraint objects
+        self.assertIsNone(constraint.sharding_types)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "CUDA is required for create_planner."
+    )
+    @mark_ci_scope("gpu")
+    def test_explicit_sharding_overrides_checkpoint_plan(self):
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        constraint = ParameterConstraints(
+            sharding_types=["row_wise"], feature_names=["feature_a"]
+        )
+        plan = self._run_with_saved_dp_plan(constraint)
+        self.assertEqual(plan.plan["sparse.ebc"]["table_a"].sharding_type, "row_wise")
 
     def test_dp_proposer_with_prune(self) -> None:
         topology = Topology(

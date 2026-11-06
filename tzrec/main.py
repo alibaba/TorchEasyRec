@@ -16,6 +16,7 @@ import os
 import socket
 from collections import OrderedDict
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from queue import Queue
 from threading import Event, Thread
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -35,7 +36,6 @@ from torchrec.optim.clipping import GradientClipping, GradientClippingOptimizer
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
-from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     TARGET_REPEAT_INTERLEAVE_KEY,
@@ -91,7 +91,6 @@ from tzrec.utils import (
     predict_util,
 )
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
-from tzrec.utils.dist_emb_predict_util import DistributedEmbeddingLookup
 from tzrec.utils.dist_util import (
     DistributedModelParallel,
     PredictPipelineSparseDist,
@@ -292,6 +291,7 @@ def _log_train(
     plogger: Optional[ProgressLogger] = None,
     summary_writer: Optional[SummaryWriter] = None,
     train_metrics: Optional[Dict[str, torch.Tensor]] = None,
+    data_timestamp: float = -1.0,
 ) -> None:
     """Logging current training step."""
     if plogger is not None:
@@ -310,6 +310,9 @@ def _log_train(
             for k, v in train_metrics.items():
                 metric_strs.append(f"{k}:{v:.5f}")
             suffix += f" {' '.join(metric_strs)}"
+        if data_timestamp >= 0:
+            data_time = datetime.fromtimestamp(data_timestamp, timezone.utc)
+            suffix += f" data_timestamp:{data_time.isoformat(timespec='milliseconds')}"
         plogger.log(step, suffix)
     if summary_writer is not None:
         total_loss = sum(losses.values())
@@ -369,6 +372,25 @@ def _log_train(
         if train_metrics:
             for k, v in train_metrics.items():
                 summary_writer.add_scalar(f"metric/{k}", v, step)
+
+
+def _log_kafka_offsets(
+    step: int,
+    baseline_offsets: Dict[str, int],
+    dataloader_state: Dict[str, Any],
+) -> None:
+    """Log cumulative Kafka offset progress for trained partitions."""
+    deltas = {
+        key: dataloader_state[key] - baseline_offsets[key]
+        for key in sorted(baseline_offsets)
+        if key in dataloader_state
+    }
+    if not deltas:
+        return
+    logger.info(
+        f"KafkaTrain[rank-{os.environ.get('RANK', 0)}] step={step} "
+        f"cumulative_offset_deltas={deltas}"
+    )
 
 
 def _create_train_profiler(
@@ -436,6 +458,14 @@ def _train_and_evaluate(
     # Initialize dataloader checkpoint state
     if dataloader_state is None:
         dataloader_state = {}
+    # This rank's first trained max offset per Kafka partition.
+    kafka_baseline_offsets: Dict[str, int] = {}
+    # pyre-ignore [16]
+    dataset_config = train_dataloader.dataset._data_config
+    kafka_log_enabled = (
+        dataset_config.dataset_type == DatasetType.KafkaDataset
+        and dataset_config.kafka_log_every_n_messages > 0
+    )
 
     assert train_config.num_steps ^ train_config.num_epochs, (
         "train_config.num_epochs or train_config.num_steps should be set, "
@@ -654,6 +684,11 @@ def _train_and_evaluate(
                     checkpoint_util.update_dataloder_state(
                         dataloader_state, batch.checkpoint_info
                     )
+                    if kafka_log_enabled:
+                        for key in batch.checkpoint_info or {}:
+                            kafka_baseline_offsets.setdefault(
+                                key, dataloader_state[key]
+                            )
                     _model.update_train_metric(predictions, batch)
                     if i_step % train_config.log_step_count_steps == 0:
                         train_metrics = _model.compute_train_metric()
@@ -666,7 +701,12 @@ def _train_and_evaluate(
                             plogger=plogger,
                             summary_writer=summary_writer,
                             train_metrics=train_metrics,
+                            data_timestamp=batch.data_timestamp,
                         )
+                        if kafka_log_enabled:
+                            _log_kafka_offsets(
+                                i_step, kafka_baseline_offsets, dataloader_state
+                            )
 
                     for lr in lr_scheduler:
                         if not lr.by_epoch:
@@ -775,7 +815,10 @@ def _train_and_evaluate(
             tb_summaries=tb_summaries,
             plogger=plogger,
             summary_writer=summary_writer,
+            data_timestamp=data_timestamp,
         )
+        if kafka_log_enabled and i_step % train_config.log_step_count_steps != 0:
+            _log_kafka_offsets(i_step, kafka_baseline_offsets, dataloader_state)
         if summary_writer is not None:
             summary_writer.close()
         if prof is not None:
@@ -1472,7 +1515,8 @@ def predict(
         debug_level (int, optional): debug level for debug parsed inputs etc.
         dataset_type (str, optional): dataset type, default use the type in pipeline.
         predict_threads (int, optional): predict threads num, default will
-            use num_workers in data_config.
+            use num_workers in data_config, or one per GPU for a distributed
+            embedding export.
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
         edit_config_json (str, optional): edit pipeline config json str.
@@ -1506,7 +1550,6 @@ def predict(
     acc_utils.allow_tf32_for_export(pipeline_config)
 
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
-    is_aot: bool = acc_utils.is_aot_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
     is_dist_emb: bool = acc_utils.is_distributed_embedding_predict(scripted_model_path)
 
@@ -1555,21 +1598,8 @@ def predict(
         quota_name=data_config.odps_data_quota_name,
     )
 
-    if is_aot:
-        model = aot_utils.load_model_aot(scripted_model_path, device=device)
-    else:
-        # disable jit compile， as it compile too slow now.
-        if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
-            os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
-        model = torch.jit.load(
-            os.path.join(scripted_model_path, "scripted_model.pt"), map_location=device
-        )
-        model.eval()
-
-    # forward workers are spread over forward_devices, each with its own model.
+    # forward workers are spread over forward_devices.
     forward_devices = [device]
-    models = {device: model}
-    sparse_lookup = None
     if is_dist_emb:
         if int(os.environ.get("LOCAL_WORLD_SIZE", 1)) == 1:
             # one process per node: the local GPUs share one host copy of the tables.
@@ -1589,8 +1619,6 @@ def predict(
 
     prof = None
     if is_profiling:
-        if is_rank_zero:
-            logger.info(str(model))
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=10, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
@@ -1603,7 +1631,27 @@ def predict(
         prof.start()
 
     if predict_threads is None:
-        predict_threads = max(data_config.num_workers, len(forward_devices))
+        # with a distributed embedding, each lookup stream holds its own NVE buffers.
+        predict_threads = (
+            len(forward_devices)
+            if is_dist_emb
+            else max(data_config.num_workers, len(forward_devices))
+        )
+    elif is_dist_emb and predict_threads > len(forward_devices):
+        logger.warning(
+            f"predict_threads={predict_threads} runs more than one lookup stream per "
+            "GPU; each holds its own NVE lookup buffers outside the GPU cache budget, "
+            "set a lower DIST_EMB_GPU_CACHE_RATIO if GPU memory runs out."
+        )
+    # NVE keeps one lookup context per CUDA stream, so each worker gets its own.
+    worker_streams = (
+        [
+            torch.cuda.Stream(forward_devices[i % len(forward_devices)])
+            for i in range(predict_threads)
+        ]
+        if is_dist_emb
+        else []
+    )
     data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
     pred_queue: Queue[Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]] = (
         Queue(maxsize=predict_threads * 2)
@@ -1612,18 +1660,15 @@ def predict(
     cancel_event: Event = Event()
     input_batches = 0
 
+    # when predicting with a model exported using INPUT_TILE,
+    #  we set the batch size tensor to 1 to disable tiling.
+    tile_batch_size = torch.tensor(1, dtype=torch.int64) if is_input_tile else None
+
     def _forward(
         batch: Batch, device: torch.device = device
     ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
         with torch.no_grad():
-            parsed_inputs = batch.to_dict(sparse_dtype=torch.int64)
-            if is_input_tile:
-                # when predicting with a model exported using INPUT_TILE,
-                #  we set the batch size tensor to 1 to disable tiling.
-                parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            if sparse_lookup is not None:
-                parsed_inputs = sparse_lookup(parsed_inputs, device)
-            predictions = models[device](parsed_inputs, device)
+            predictions = batch_model(batch, tile_batch_size, device)
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves
@@ -1654,10 +1699,9 @@ def predict(
     def _forward_loop(worker_id: int) -> None:
         stage = "forward"
         worker_device = forward_devices[worker_id % len(forward_devices)]
-        # NVE keeps one lookup context per CUDA stream, so give each worker its own.
         stream_ctx = (
-            torch.cuda.stream(torch.cuda.Stream(worker_device))
-            if sparse_lookup is not None
+            torch.cuda.stream(worker_streams[worker_id])
+            if worker_streams
             else nullcontext()
         )
         try:
@@ -1689,24 +1733,24 @@ def predict(
     pipeline_error: Optional[BaseException] = None
     i_step = 0
     try:
-        if is_dist_emb:
-            # loaded in the guarded scope: a failed load still reaches the commit
-            # rendezvous below, so other ranks fail fast instead of waiting.
-            for d in forward_devices:
-                if d not in models:
-                    models[d] = torch.jit.load(
-                        os.path.join(scripted_model_path, "scripted_model.pt"),
-                        map_location=d,
-                    )
-                    models[d].eval()
-            sparse_lookup = DistributedEmbeddingLookup(
-                scripted_model_path, forward_devices
-            )
+        # loaded in the guarded scope: a failed load still reaches the commit
+        # rendezvous below, so other ranks fail fast instead of waiting.
+        batch_model = predict_util.load_predict_model(
+            scripted_model_path,
+            forward_devices,
+            log_model=is_profiling and is_rank_zero,
+        )
         while True:
             try:
                 batch = next(infer_iterator)
                 if i_step == 0:
-                    predictions, reserves = _forward(batch)
+                    # on worker 0's stream, so it adds no lookup context of its own.
+                    with (
+                        torch.cuda.stream(worker_streams[0])
+                        if worker_streams
+                        else nullcontext()
+                    ):
+                        predictions, reserves = _forward(batch)
                     input_batches += 1
                     if output_cols is None:
                         output_cols = sorted(predictions.keys())

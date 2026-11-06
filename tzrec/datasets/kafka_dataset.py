@@ -17,7 +17,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
 import numpy as np
@@ -27,6 +27,7 @@ from confluent_kafka import (
     OFFSET_INVALID,
     Consumer,
     KafkaException,
+    Message,
     TopicPartition,
 )
 
@@ -133,6 +134,7 @@ def _decode_kafka_messages(
     schema: pa.Schema,
     projections: Dict[pa.Schema, Optional[List[int]]],
     topic: str,
+    on_decoded: Optional[Callable[[str], None]] = None,
 ) -> Tuple[Optional[pa.Table], int, int]:
     """Decode kafka messages into one table with checkpoint metadata columns.
 
@@ -143,6 +145,7 @@ def _decode_kafka_messages(
         schema: reader schema to project and cast to.
         projections: per-message-schema projection cache, mutated in place.
         topic: topic name for checkpoint source ids.
+        on_decoded: optional callback for each successfully decoded source id.
 
     Returns:
         table: one table with the reader columns plus CKPT_SOURCE_ID,
@@ -218,6 +221,9 @@ def _decode_kafka_messages(
         ts_s = ts_ms / 1000.0 if ts_ms >= 0 else -1.0
         timestamps.extend([ts_s] * batch_len)
 
+        if on_decoded is not None:
+            on_decoded(source_id)
+
     if not record_batchs:
         return None, num_msgs, num_rows
 
@@ -244,6 +250,7 @@ def _consume_decoded_tables(
     reader_schema: pa.Schema,
     log_prefix: str,
     orphan_pid: Optional[int] = None,
+    on_decoded: Optional[Callable[[str], None]] = None,
 ) -> Iterator[pa.Table]:
     """Shared consume loop with heartbeat pause/resume protection.
 
@@ -273,6 +280,7 @@ def _consume_decoded_tables(
         log_prefix: log line prefix identifying this reader.
         orphan_pid: when set, the loop exits once its parent pid changes
             (the owning process died).
+        on_decoded: optional callback for each successfully decoded source id.
 
     Yields:
         pa.Table: one decoded and projected table per consume round.
@@ -367,6 +375,7 @@ def _consume_decoded_tables(
                 reader_schema,
                 projections,
                 topic,
+                on_decoded,
             )
             if t is None:
                 continue
@@ -867,6 +876,8 @@ class KafkaDataset(BaseDataset):
             shuffle=self._data_config.shuffle and self._mode == Mode.TRAIN,
             shuffle_buffer_size=self._data_config.shuffle_buffer_size,
             input_fields=input_fields if input_fields else None,
+            kafka_partition_round_robin=self._data_config.kafka_partition_round_robin,
+            kafka_log_every_n_messages=self._data_config.kafka_log_every_n_messages,
         )
         # created in prepare_for_loading; forked worker copies inherit it, but
         # only the trainer process starts and stops it
@@ -929,6 +940,10 @@ class KafkaReader(BaseReader):
         input_fields (list): list of pa.Field for schema definition.
         consumer_factory: consumer builder; tests inject a double, the
             default builds real consumers.
+        kafka_partition_round_robin (bool): whether to read the partitions owned
+            by each worker in strict round-robin order.
+        kafka_log_every_n_messages (int): log per-worker decoded message counts
+            every N messages, 0 disables.
     """
 
     def __init__(
@@ -941,6 +956,8 @@ class KafkaReader(BaseReader):
         shuffle_buffer_size: int = 32,
         input_fields: Optional[List[pa.Field]] = None,
         consumer_factory: Optional[Any] = None,
+        kafka_partition_round_robin: bool = False,
+        kafka_log_every_n_messages: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -960,6 +977,13 @@ class KafkaReader(BaseReader):
         self._sample_stop_event: Optional[Any] = None
         self._sample_fatal_event: Optional[Any] = None
         self._sample_table_schema: Optional[pa.Schema] = None
+        self._kafka_partition_round_robin = kafka_partition_round_robin
+        self._log_every_n_messages = kafka_log_every_n_messages
+        self._round_robin_partition_order: List[int] = (
+            self._get_round_robin_partition_order()
+            if kafka_partition_round_robin
+            else []
+        )
 
         if input_fields:
             self._full_schema = pa.schema(input_fields)
@@ -1042,18 +1066,165 @@ class KafkaReader(BaseReader):
         finally:
             consumer.close()
 
+    def _get_round_robin_partition_order(self) -> List[int]:
+        """Query partition ids ordered by leader and partition id.
+
+        Rank 0 queries the topic metadata and broadcasts the order so that all
+        ranks and dataloader workers agree on partition ownership.
+
+        Returns:
+            partition ids sorted by (leader, partition id).
+
+        Raises:
+            ValueError: if topic metadata cannot be read.
+        """
+        topic, config, _ = _parse_kafka_uri(self._input_path)
+        distributed = dist.is_initialized() and dist.get_world_size() > 1
+        rank = dist.get_rank() if distributed else 0
+        result: List[Any] = [None, None]
+        if rank == 0:
+            try:
+                consumer = self._consumer_factory(config)
+                try:
+                    metadata = consumer.list_topics(topic, timeout=30.0)
+                    topic_metadata = metadata.topics.get(topic)
+                    if topic_metadata is None or topic_metadata.error is not None:
+                        error = (
+                            topic_metadata.error
+                            if topic_metadata is not None
+                            else "no metadata"
+                        )
+                        raise ValueError(
+                            f"Failed to get metadata for kafka topic {topic}: {error}"
+                        )
+                    partitions = topic_metadata.partitions
+                    result = [
+                        None,
+                        sorted(
+                            partitions,
+                            key=lambda p: (partitions[p].leader, p),
+                        ),
+                    ]
+                finally:
+                    consumer.close()
+            except Exception as e:
+                result = [f"{type(e).__name__}: {e}", None]
+
+        if distributed:
+            dist.broadcast_object_list(result)
+
+        error, partition_order = result
+        if error is not None:
+            raise ValueError(
+                f"Failed to get kafka partition order for topic {topic}: {error}"
+            )
+        return partition_order
+
+    def _set_start_offsets(
+        self,
+        consumer: Consumer,
+        partitions: List[TopicPartition],
+        start_timestamp_ms: Optional[int],
+    ) -> None:
+        """Set start offsets on partitions from checkpoint or start timestamp.
+
+        Args:
+            consumer (Consumer): the kafka consumer used for offset lookups.
+            partitions (list): partitions whose offsets are modified in place.
+            start_timestamp_ms (int, optional): start timestamp in milliseconds.
+        """
+        ts_partitions = []
+        for tp in partitions:
+            source_key = f"{tp.topic}:{tp.partition}"
+            if self._checkpoint_state and source_key in self._checkpoint_state:
+                # Resume after last consumed offset
+                tp.offset = self._checkpoint_state[source_key] + 1
+            elif start_timestamp_ms is not None:
+                ts_partitions.append(tp)
+            else:
+                tp.offset = OFFSET_INVALID
+
+        if ts_partitions:
+            assert start_timestamp_ms is not None
+            resolved_map = _offsets_for_times_batched(
+                consumer,
+                ts_partitions,
+                start_timestamp_ms,
+            )
+            for tp in ts_partitions:
+                res_offset = resolved_map.get((tp.topic, tp.partition))
+                if res_offset is not None and res_offset >= 0:
+                    tp.offset = res_offset
+                else:
+                    logger.warning(
+                        f"No offset found for timestamp "
+                        f"{start_timestamp_ms} on "
+                        f"{tp.topic}:{tp.partition}, "
+                        f"falling back to auto.offset.reset"
+                    )
+                    tp.offset = OFFSET_INVALID
+
+    def _decode_messages(
+        self,
+        messages: List[Message],
+        topic: str,
+        projections: Dict[pa.Schema, Optional[List[int]]],
+    ) -> Tuple[Optional[pa.Table], int]:
+        """Decode Kafka messages and record per-worker message counts.
+
+        Args:
+            messages: Kafka messages to decode.
+            topic: topic name for checkpoint source ids.
+            projections: schema projection cache reused across calls.
+
+        Returns:
+            table: combined table, or None when no message was decoded.
+            num_decoded: successfully decoded messages, including zero-row messages.
+        """
+        table, num_decoded, _ = _decode_kafka_messages(
+            messages,
+            self._has_embedded_schema,
+            self._full_schema,
+            self._schema,
+            projections,
+            topic,
+            self._record_decoded_message if self._log_every_n_messages > 0 else None,
+        )
+        return table, num_decoded
+
+    def _record_decoded_message(self, source_id: str) -> None:
+        """Count one decoded message and log at the configured interval.
+
+        Args:
+            source_id: topic and partition of the decoded message.
+        """
+        self._decoded_partition_counts[source_id] = (
+            self._decoded_partition_counts.get(source_id, 0) + 1
+        )
+        self._decoded_message_count += 1
+        if self._decoded_message_count % self._log_every_n_messages == 0:
+            logger.info(
+                f"KafkaReader[rank-{os.environ.get('RANK', 0)}"
+                f"|worker-{self._worker_id}] "
+                f"decoded_messages={self._decoded_message_count} "
+                f"partitions={self._decoded_partition_counts}"
+            )
+
     def _reader(
         self, worker_id: int = 0, num_workers: int = 1
-    ) -> Iterator[pa.RecordBatch]:
+    ) -> Generator[pa.RecordBatch, None, None]:
         """Read Arrow batches from Kafka.
 
-        A background heartbeat thread monitors idle time (time since the last
-        ``consume()`` call).  When the generator is blocked at ``yield`` for
-        longer than 80% of ``max.poll.interval.ms``, the heartbeat thread
-        pauses all partitions and calls ``consumer.poll(0)`` periodically to
-        reset the application poll timer and keep the consumer in its group.
-        This prevents ``MAX_POLL_EXCEEDED`` errors during long downstream
-        pauses (checkpoint saves, evaluation, compilation warmup, etc.).
+        When partition round-robin is enabled the partitions owned by this
+        worker are read strictly in turn by :meth:`_round_robin_reader`.
+        Otherwise a background heartbeat thread monitors idle time (time since
+        the last ``consume()`` call).  When the generator is blocked at
+        ``yield`` for longer than 80% of ``max.poll.interval.ms``, the
+        heartbeat thread pauses all partitions and calls ``consumer.poll(0)``
+        periodically to reset the application poll timer and keep the consumer
+        in its group.  This prevents ``MAX_POLL_EXCEEDED`` errors during long
+        downstream pauses (checkpoint saves, evaluation, compilation warmup,
+        etc.).
 
         Args:
             worker_id: Worker ID
@@ -1062,41 +1233,25 @@ class KafkaReader(BaseReader):
         Yields:
             PyArrow RecordBatch
         """
+        self._worker_id = worker_id
+        self._decoded_message_count = 0
+        self._decoded_partition_counts: Dict[str, int] = {}
+
         topic, config, start_timestamp_ms = _parse_kafka_uri(self._input_path)
+        if self._kafka_partition_round_robin:
+            yield from self._round_robin_reader(
+                topic, config, start_timestamp_ms, worker_id, num_workers
+            )
+            return
+
         max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
         consumer = self._consumer_factory(
             config, reader_id=worker_id, num_readers=num_workers
         )
 
-        # seek to the checkpointed offsets on every (re)assignment
         def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
-            ts_partitions = []
-            for tp in partitions:
-                source_key = f"{tp.topic}:{tp.partition}"
-                if self._checkpoint_state and source_key in self._checkpoint_state:
-                    # Resume after last consumed offset
-                    tp.offset = self._checkpoint_state[source_key] + 1
-                elif start_timestamp_ms is not None:
-                    ts_partitions.append(tp)
-                else:
-                    tp.offset = OFFSET_INVALID
-
-            if ts_partitions:
-                resolved_map = _offsets_for_times_batched(
-                    consumer, ts_partitions, start_timestamp_ms
-                )
-                for tp in ts_partitions:
-                    res_offset = resolved_map.get((tp.topic, tp.partition))
-                    if res_offset is not None and res_offset >= 0:
-                        tp.offset = res_offset
-                    else:
-                        logger.warning(
-                            f"No offset found for timestamp "
-                            f"{start_timestamp_ms} on "
-                            f"{tp.topic}:{tp.partition}, "
-                            f"falling back to auto.offset.reset"
-                        )
-                        tp.offset = OFFSET_INVALID
+            """Resolve offsets for this worker's assigned partitions."""
+            self._set_start_offsets(consumer, partitions, start_timestamp_ms)
 
         loop = _consume_decoded_tables(
             consumer,
@@ -1109,6 +1264,9 @@ class KafkaReader(BaseReader):
             self._full_schema,
             self._schema,
             f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}]",
+            on_decoded=(
+                self._record_decoded_message if self._log_every_n_messages > 0 else None
+            ),
         )
         try:
             for t in loop:
@@ -1147,6 +1305,88 @@ class KafkaReader(BaseReader):
             ]
         )
 
+    def _round_robin_reader(
+        self,
+        topic: str,
+        config: Dict[str, Any],
+        start_timestamp_ms: Optional[int],
+        worker_id: int,
+        num_workers: int,
+    ) -> Generator[pa.RecordBatch, None, None]:
+        """Read this worker's partitions strictly in round-robin order.
+
+        Partitions are sliced from the leader-ordered list resolved at reader
+        construction, then read in ascending partition order.  Each owned
+        partition gets its own consumer, assigned up front.  The rotation
+        cursor does not advance while the current partition has no valid message.
+
+        Args:
+            topic (str): kafka topic name.
+            config (dict): kafka consumer configuration.
+            start_timestamp_ms (int, optional): start timestamp in milliseconds.
+            worker_id (int): global worker ID.
+            num_workers (int): total number of global workers.
+
+        Yields:
+            PyArrow RecordBatch
+
+        Raises:
+            ValueError: if the topic has fewer partitions than the total number
+                of workers.
+        """
+        consumers: List[Consumer] = []
+        try:
+            if len(self._round_robin_partition_order) < num_workers:
+                raise ValueError(
+                    f"kafka topic {topic} has "
+                    f"{len(self._round_robin_partition_order)} partition(s), "
+                    f"fewer than the {num_workers} dataloader workers; "
+                    "kafka_partition_round_robin requires at least one partition "
+                    "per worker."
+                )
+            owned_partitions = [
+                TopicPartition(topic, partition)
+                for partition in sorted(
+                    self._round_robin_partition_order[worker_id::num_workers]
+                )
+            ]
+            consumer = self._consumer_factory(config)
+            consumers.append(consumer)
+            self._set_start_offsets(consumer, owned_partitions, start_timestamp_ms)
+            consumer.assign([owned_partitions[0]])
+            for tp in owned_partitions[1:]:
+                consumer = self._consumer_factory(config)
+                consumers.append(consumer)
+                consumer.assign([tp])
+            logger.info(
+                f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}] "
+                f"assignment: {owned_partitions}"
+            )
+
+            projections: Dict[pa.Schema, Optional[List[int]]] = {}
+            idx = 0
+            while True:
+                messages = consumers[idx].consume(1, timeout=1.0)
+                if not messages:
+                    continue
+                t, _ = self._decode_messages(messages, topic, projections)
+                if t is None:
+                    continue
+                # A zero-row message advances the rotation even though it
+                # yields no record batch.
+                for batch in t.to_batches():
+                    yield batch
+                idx = (idx + 1) % len(consumers)
+        except Exception as e:
+            logger.error(f"KafkaReader exception: {e}")
+            raise e
+        finally:
+            for consumer in reversed(consumers):
+                try:
+                    consumer.close()
+                except Exception as e:
+                    logger.warning(f"consumer.close() failed: {e}")
+
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
@@ -1166,7 +1406,10 @@ class KafkaReader(BaseReader):
         """
         if self._sample_queue is None:
             reader = self._reader(worker_id, num_workers)
-            yield from self._arrow_reader_iter(reader)
+            try:
+                yield from self._arrow_reader_iter(reader)
+            finally:
+                reader.close()
             return
         yield from self._sample_batches(self._sample_queue)
 

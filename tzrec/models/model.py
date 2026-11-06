@@ -16,6 +16,7 @@ from queue import Queue
 from typing import Any, Dict, Final, Iterable, List, Optional, Tuple, cast
 
 import torch
+import torch.utils._pytree as pytree
 import torchmetrics
 from torch import nn
 from torchrec.modules.embedding_modules import (
@@ -577,6 +578,15 @@ class CombinedModelWrapper(nn.Module):
             predictions (dict): a dict of predicted result.
         """
         sparse_out, _ = self.sparse_model(data, device)
+        return self.dense_forward(sparse_out, device)
+
+    def dense_forward(
+        self,
+        sparse_out: Dict[str, torch.Tensor],
+        # pyre-ignore [9]
+        device: torch.device = "cuda:0",
+    ) -> Dict[str, torch.Tensor]:
+        """Run the dense model on the sparse model's outputs."""
         if self._dense_is_aoti:
             return self._locked_dense(sparse_out, device)
         return self.dense_model(sparse_out)
@@ -603,6 +613,12 @@ class UnifiedAOTIModelWrapper(nn.Module):
         # object.__setattr__ bypasses nn.Module's strict registration.
         object.__setattr__(self, "_lock", threading.Lock())
         object.__setattr__(self, "_key_order", None)
+        # AOTICompiledModel.__call__ reparses the call spec on every call.
+        object.__setattr__(
+            self,
+            "_out_spec",
+            pytree.treespec_loads(cast(Any, model).loader.get_call_spec()[1]),
+        )
 
     def forward(
         self,
@@ -623,8 +639,10 @@ class UnifiedAOTIModelWrapper(nn.Module):
         if key_order is None:
             key_order = sorted(data.keys())
             object.__setattr__(self, "_key_order", key_order)
-        data = OrderedDict((k, data[k]) for k in key_order)
         # Force CUDA primary context creation on worker threads.
         torch.cuda.set_device(device)
         with cast(Any, self._lock):
-            return self.model(data)
+            flat_outputs = cast(Any, self.model).loader.boxed_run(
+                [data[k] for k in key_order]
+            )
+        return pytree.tree_unflatten(flat_outputs, self._out_spec)
