@@ -403,6 +403,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         sequence_length (int): max sequence length.
         sequence_pk (str): sequence primary key name for serving.
         sequence_entity (str, optional): FeatureStore entity for serving.
+        hard_search_key (str, optional): Candidate item field for sequence filtering.
     """
 
     def __init__(
@@ -416,6 +417,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         sequence_length: Optional[int] = None,
         sequence_pk: Optional[str] = None,
         sequence_entity: Optional[str] = None,
+        hard_search_key: Optional[str] = None,
         **kwargs,
     ) -> None:
         fc_type = feature_config.WhichOneof("feature")
@@ -431,6 +433,7 @@ class BaseFeature(object, metaclass=_meta_cls):
         self._use_weight = False
         self._in_weighted_group = False
         self._is_user_feat = None
+        self._is_hard_search_feat = hard_search_key is not None
         self._data_group = BASE_DATA_GROUP
         self._inputs = None
         self._side_inputs = None
@@ -447,6 +450,30 @@ class BaseFeature(object, metaclass=_meta_cls):
         self.sequence_length: Optional[int] = None
         self.sequence_pk: Optional[str] = None
         self.sequence_entity: Optional[str] = None
+        self.hard_search_key = hard_search_key
+        if hard_search_key is not None:
+            if not is_sequence or not sequence_name:
+                raise ValueError(
+                    "hard_search_key is only supported on a sequence group."
+                )
+            if (
+                not hard_search_key.startswith("item:")
+                or not hard_search_key[5:]
+                or ":" in hard_search_key[5:]
+                or any(char.isspace() for char in hard_search_key)
+            ):
+                raise ValueError(
+                    f"hard_search_key for {sequence_name} must be item:<field>."
+                )
+            if sequence_delim != ";":
+                raise ValueError(
+                    f"hard-search sequence {sequence_name} requires sequence_delim=';'."
+                )
+            if sequence_length is None or not 0 < sequence_length <= 2**31 - 1:
+                raise ValueError(
+                    f"hard-search sequence {sequence_name} requires a positive int32 "
+                    "sequence_length."
+                )
         if is_sequence:
             if sequence_name is None:
                 self.sequence_delim = self.config.sequence_delim
@@ -529,8 +556,15 @@ class BaseFeature(object, metaclass=_meta_cls):
         self.config = getattr(self._feature_config, fc_type)
 
     @property
+    def is_hard_search_feat(self) -> bool:
+        """Whether the feature depends on a candidate-specific hard-search sequence."""
+        return self._is_hard_search_feat
+
+    @property
     def is_user_feat(self) -> bool:
         """Feature is user side or not."""
+        if self.is_hard_search_feat:
+            return False
         if self._is_user_feat is None:
             # legacy without dag, we may not set is_user_feat
             if self.is_grouped_sequence:
@@ -1038,6 +1072,8 @@ class BaseFeature(object, metaclass=_meta_cls):
                 }
                 if self.sequence_entity is not None:
                     sequence_cfg["sequence_entity"] = self.sequence_entity
+                if self.hard_search_key is not None:
+                    sequence_cfg["hard_search_key"] = self.hard_search_key
                 self._fg_op = pyfg.FgArrowHandler({"features": [sequence_cfg]}, 1)
             else:
                 # pyre-ignore [16]
@@ -1215,6 +1251,71 @@ class BaseFeature(object, metaclass=_meta_cls):
             self._fg_op.reset_executor()
 
 
+def get_hard_search_inputs(
+    features: List[BaseFeature], fg_handler: pyfg.FgArrowHandler
+) -> Set[str]:
+    """Return raw hard-search sequence columns in the FG input namespace.
+
+    Intersect sequence inputs with direct raw inputs to exclude feature edges.
+    Processor requires all returned columns to carry their sequence prefix.
+    """
+    sequence_names = {
+        feature.sequence_name
+        for feature in features
+        if feature.hard_search_key is not None
+    }
+    raw_inputs = {name: set() for name in sequence_names}
+    for name, sequence in fg_handler.sequence_feature_to_name().items():
+        if sequence in sequence_names:
+            raw_inputs[sequence].update(
+                value.split("__", 1)[1] for value in fg_handler.get_inputs(name)
+            )
+    inputs = set()
+    for name, values in fg_handler.sequence_feature_inputs().items():
+        if name in sequence_names:
+            sequence_inputs = values & raw_inputs[name]
+            invalid_inputs = sorted(
+                value for value in sequence_inputs if not value.startswith(f"{name}__")
+            )
+            if invalid_inputs:
+                raise ValueError(
+                    f"hard-search sequence {name} requires sequence-prefixed raw "
+                    f"inputs, got {invalid_inputs}."
+                )
+            inputs.update(sequence_inputs)
+    return inputs
+
+
+def _set_hard_search_features(
+    features: List[BaseFeature], fg_handler: pyfg.FgArrowHandler
+) -> None:
+    """Mark hard-search features and their downstream feature dependencies."""
+    inputs = get_hard_search_inputs(features, fg_handler)
+    candidates = {feature.name for feature in features if feature.is_hard_search_feat}
+    dependencies = {}
+    for feature in features:
+        if any(
+            value.split("__", 1)[1] in inputs
+            for value in fg_handler.get_inputs(feature.name)
+        ):
+            candidates.add(feature.name)
+        try:
+            dependencies[feature.name] = {
+                name for side, name in feature.side_inputs if side == "feature"
+            }
+        except InvalidFgInputError:
+            dependencies[feature.name] = set()
+    while True:
+        derived = {
+            name for name, sources in dependencies.items() if sources & candidates
+        } - candidates
+        if not derived:
+            break
+        candidates.update(derived)
+    for feature in features:
+        feature._is_hard_search_feat = feature.name in candidates
+
+
 def create_features(
     feature_configs: List[FeatureConfig],
     fg_mode: FgMode = FgMode.FG_NONE,
@@ -1250,6 +1351,15 @@ def create_features(
                 if oneof_feat_config.HasField("sequence_entity")
                 else None
             )
+            hard_search_key = (
+                oneof_feat_config.hard_search_key
+                if oneof_feat_config.HasField("hard_search_key")
+                else None
+            )
+            if hard_search_key is not None and not oneof_feat_config.features:
+                raise ValueError(
+                    f"hard-search sequence {sequence_name} requires sub-features."
+                )
             for sub_feat_config in oneof_feat_config.features:
                 sub_feat_cls_name = config_util.which_msg(sub_feat_config, "feature")
                 # pyre-ignore [16]
@@ -1263,6 +1373,7 @@ def create_features(
                     sequence_length=sequence_length,
                     sequence_pk=sequence_pk,
                     sequence_entity=sequence_entity,
+                    hard_search_key=hard_search_key,
                 )
                 features.append(feature)
         else:
@@ -1296,15 +1407,43 @@ def create_features(
     for feature in features:
         feature._in_weighted_group = feature.data_group in weighted_data_groups
 
-    if has_dag:
+    has_hard_search = any(feature.hard_search_key is not None for feature in features)
+    if has_hard_search:
+        sequence_pks = {
+            feature.sequence_name: feature.sequence_pk.split(":", 1)[-1]
+            for feature in features
+            if feature.is_grouped_sequence
+        }
+        raw_inputs = {
+            name
+            for feature in features
+            for side, name in feature.side_inputs
+            if side not in ("feature", "const")
+        }
+        for feature in features:
+            if feature.hard_search_key is None:
+                continue
+            pk = sequence_pks[feature.sequence_name]
+            if pk in raw_inputs or any(
+                other != feature.sequence_name and other_pk == pk
+                for other, other_pk in sequence_pks.items()
+            ):
+                raise ValueError(
+                    f"hard-search sequence {feature.sequence_name} has conflicting "
+                    f"sequence_pk {pk}."
+                )
+    if has_dag or has_hard_search:
         fg_json = create_fg_json(features)
         # pyre-ignore [16]
         fg_handler = pyfg.FgArrowHandler(fg_json, 1)
-        user_feats = fg_handler.user_features() | set(
-            fg_handler.sequence_feature_to_name().keys()
-        )
-        for feature in features:
-            feature.is_user_feat = feature.name in user_feats
+        if has_dag:
+            user_feats = fg_handler.user_features() | set(
+                fg_handler.sequence_feature_to_name().keys()
+            )
+            for feature in features:
+                feature.is_user_feat = feature.name in user_feats
+        if has_hard_search:
+            _set_hard_search_features(features, fg_handler)
 
     return features
 
@@ -1471,6 +1610,8 @@ def create_fg_json(
                 )
                 if feature.sequence_entity is not None:
                     results[-1]["sequence_entity"] = feature.sequence_entity
+                if feature.hard_search_key is not None:
+                    results[-1]["hard_search_key"] = feature.hard_search_key
                 seq_to_idx[feature.sequence_name] = len(results) - 1
             idx = seq_to_idx[feature.sequence_name]
             results[idx]["features"].extend(fg_json)
@@ -1496,6 +1637,7 @@ def create_feature_configs(
                         sequence_delim=feature.sequence_delim,  # pyre-ignore [16]
                         sequence_pk=feature.sequence_pk,  # pyre-ignore [16]
                         sequence_entity=feature.sequence_entity,
+                        hard_search_key=feature.hard_search_key,
                     )
                 )
             results[feature.sequence_name].sequence_feature.features.append(

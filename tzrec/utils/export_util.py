@@ -371,6 +371,57 @@ def export_model_normal(
         )
 
 
+def _validate_hard_search_fg_asset(
+    features: List[BaseFeature], asset: str, save_dir: str
+) -> None:
+    """Reject custom FG definitions that change hard-search serving inputs.
+
+    With hard search, the graph's candidate/user split depends on the generated
+    feature definitions. Compare those definitions directly so custom raw inputs,
+    DAG edges, or sequence metadata cannot silently change that split.
+    """
+    hard_search_nodes = []
+
+    def collect_hard_search_nodes(node: Dict[str, Any]) -> Dict[str, Any]:
+        """Record hard-search annotations while the JSON decoder builds objects."""
+        if "hard_search_key" in node:
+            hard_search_nodes.append(node)
+        return node
+
+    with open(asset) as input_file:
+        supplied_fg = json.load(input_file, object_hook=collect_hard_search_nodes)
+    if not hard_search_nodes and not any(f.is_hard_search_feat for f in features):
+        return
+    supplied_features = (
+        supplied_fg.get("features") if isinstance(supplied_fg, dict) else None
+    )
+    if not isinstance(supplied_features, list) or not all(
+        isinstance(feature, dict) for feature in supplied_features
+    ):
+        raise ValueError(
+            f"Custom fg.json [{asset}] with hard_search_key requires a features array."
+        )
+    generated_fg = create_fg_json(features, asset_dir=save_dir)
+    for fg_json in (supplied_fg, generated_fg):
+        for feature in fg_json["features"]:
+            if isinstance(feature.get("features"), list):
+                feature["features"].sort(key=lambda f: json.dumps(f, sort_keys=True))
+    # Comparing all definitions also covers raw-input mappings outside HSK groups.
+    if (
+        len(hard_search_nodes)
+        != sum("hard_search_key" in f for f in generated_fg["features"])
+        or sorted(json.dumps(f, sort_keys=True) for f in supplied_features)
+        != sorted(json.dumps(f, sort_keys=True) for f in generated_fg["features"])
+        or supplied_fg.get("input_alias", {}) != generated_fg.get("input_alias", {})
+    ):
+        raise ValueError(
+            f"Custom fg.json [{asset}] hard_search_key feature definitions do not "
+            "match the export graph (sequence groups, lengths, delimiters, primary "
+            "keys, or raw-input mappings). Regenerate the asset from the export "
+            "feature configuration."
+        )
+
+
 def _write_export_metadata(
     pipeline_config: EasyRecConfig,
     features: List[BaseFeature],
@@ -379,6 +430,9 @@ def _write_export_metadata(
     additional_export_config: Optional[Dict[str, Union[bool, str]]],
 ) -> None:
     """Write serving metadata and assets without mutating the training config."""
+    for asset in assets or []:
+        if asset.endswith("fg.json"):
+            _validate_hard_search_fg_asset(features, asset, save_dir)
     feature_configs = create_feature_configs(features, asset_dir=save_dir)
     export_config = copy.deepcopy(pipeline_config)
     export_config.ClearField("feature_configs")

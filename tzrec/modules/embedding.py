@@ -154,6 +154,19 @@ def _tile_and_combine_dense_kt(
 
 
 @torch.fx.wrap
+def _pool_sequence_values(
+    values: torch.Tensor, lengths: torch.Tensor, pooling: str
+) -> torch.Tensor:
+    """Pool sequence steps, including a batch with no steps at all."""
+    if lengths.numel() == 0:
+        return values[:0]
+    pooled = torch.segment_reduce(values, pooling, lengths=lengths)
+    if pooling == "mean":
+        pooled = torch.nan_to_num(pooled, nan=0.0)
+    return pooled
+
+
+@torch.fx.wrap
 def _dense_to_jt(t: torch.Tensor) -> JaggedTensor:
     return JaggedTensor(
         values=t,
@@ -975,6 +988,38 @@ def build_embedding_collection_configs(
     emb_name_to_feature_to_shared_name: Dict[str, Dict[str, str]] = defaultdict(dict)
     for feature_group in feature_groups:
         group_name = feature_group.group_name
+        group_features = [name_to_feature[name] for name in feature_group.feature_names]
+        if any(feature.is_hard_search_feat for feature in group_features):
+            if (
+                isinstance(feature_group, FeatureGroupConfig)
+                and feature_group.group_type == model_pb2.JAGGED_SEQUENCE
+            ):
+                raise ValueError(
+                    f"Feature group {group_name!r}: hard_search_key is not supported "
+                    "with JAGGED_SEQUENCE (including HSTU)."
+                )
+            sequence_kinds = {
+                feature.is_hard_search_feat
+                for feature in group_features
+                if feature.is_sequence
+            }
+            if len(sequence_kinds) > 1:
+                raise ValueError(
+                    f"Feature group {group_name!r} mixes hard-search and ordinary "
+                    "history features on the same sequence axis; use separate "
+                    "sequence groups. Query features may be mixed."
+                )
+            hard_search_sequences = {
+                feature.sequence_name
+                for feature in group_features
+                if feature.is_sequence and feature.hard_search_key is not None
+            }
+            if len(hard_search_sequences) > 1:
+                raise ValueError(
+                    f"Feature group {group_name!r} combines different hard-search "
+                    "sequence groups on the same sequence axis; use separate "
+                    "sequence groups."
+                )
         for name in feature_group.feature_names:
             feature = name_to_feature[name]
             if not feature.is_sparse:
@@ -1633,11 +1678,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     length_jt = seq_mulval_length_jt_dict[info.raw_name]
                     # length_jt.values is sequence key_lengths
                     # length_jt.lengths is sequence seq_lengths
-                    jt_values = torch.segment_reduce(
-                        jt.values(), info.pooling, lengths=length_jt.values()
+                    jt_values = _pool_sequence_values(
+                        jt.values(), length_jt.values(), info.pooling
                     )
-                    if info.pooling == "mean":
-                        jt_values = torch.nan_to_num(jt_values, nan=0.0)
                     jt = JaggedTensor(
                         values=jt_values,
                         lengths=length_jt.lengths(),
@@ -1707,11 +1750,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                         query_t = jt_dict[info.name].to_padded_dense(1).squeeze(1)
                     else:
                         # for multi-value id feature
-                        query_t = torch.segment_reduce(
-                            query_jt.values(), info.pooling, lengths=query_jt.lengths()
+                        query_t = _pool_sequence_values(
+                            query_jt.values(), query_jt.lengths(), info.pooling
                         )
-                        if info.pooling == "mean":
-                            query_t = torch.nan_to_num(query_t, nan=0.0)
                     if info.is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
                     sparse_query_cache[info.name] = query_t

@@ -18,6 +18,7 @@ from collections import OrderedDict
 
 import numpy as np
 import pyarrow as pa
+import pyfg
 from parameterized import param, parameterized
 
 from tzrec.features import (
@@ -470,6 +471,198 @@ class FeatureTest(unittest.TestCase):
         config.sequence_feature.sequence_entity = ""
         with self.assertRaisesRegex(ValueError, "sequence_entity.*must be non-empty"):
             feature_lib.create_features([config])
+
+    @parameterized.expand(
+        [
+            (mode, remove, odps)
+            for mode in (
+                FgMode.FG_DAG,
+                FgMode.FG_NORMAL,
+                FgMode.FG_NONE,
+                FgMode.FG_BUCKETIZE,
+            )
+            for remove, odps in ((False, False), (True, False), (False, True))
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_hard_search_round_trip(self, fg_mode, remove_bucketizer, for_odps):
+        configs = []
+        for name, key in (("legacy", None), ("hist", "item:cate_id")):
+            config = self._create_test_feature_cfgs()[-1]
+            group = config.sequence_feature
+            group.sequence_name = name
+            group.sequence_pk = f"user:{name}"
+            if key is not None:
+                group.hard_search_key = key
+            configs.append(config)
+        features = feature_lib.create_features(configs, fg_mode=fg_mode)
+        self.assertEqual(feature_lib.create_feature_configs(features), configs)
+        fg_json = feature_lib.create_fg_json(
+            features, remove_bucketizer=remove_bucketizer, for_odps=for_odps
+        )
+        self.assertNotIn("hard_search_key", fg_json["features"][0])
+        self.assertEqual(fg_json["features"][1]["hard_search_key"], "item:cate_id")
+        handler = pyfg.FgArrowHandler(feature_lib.create_fg_json(features), 1)
+        self.assertNotIn("cate_id", handler.item_inputs())
+        for group in fg_json["features"]:
+            for sub_feature in group["features"]:
+                self.assertNotIn("hard_search_key", sub_feature)
+        for feature in features:
+            expected = feature.sequence_name == "hist"
+            self.assertEqual(feature.is_hard_search_feat, expected)
+            self.assertEqual(feature.is_user_feat, not expected)
+            if expected:
+                feature.is_user_feat = True
+                self.assertFalse(feature.is_user_feat)
+
+    @parameterized.expand(
+        [
+            ("",),
+            ("user:cate",),
+            ("item:",),
+            ("item:a:b",),
+            ("item:cate ",),
+            (" item:cate",),
+            ("item:ca\tte",),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_hard_search_invalid_key(self, key):
+        config = self._create_test_feature_cfgs()[-1]
+        config.sequence_feature.hard_search_key = key
+        with self.assertRaisesRegex(ValueError, "hard_search_key.*item:<field>"):
+            feature_lib.create_features([config])
+
+    @parameterized.expand(
+        [("sequence_delim", "|"), ("sequence_length", 0), ("sequence_length", 2**31)],
+        name_func=parameterized_name_func,
+    )
+    def test_hard_search_invalid_sequence(self, field, value):
+        config = self._create_test_feature_cfgs()[-1]
+        config.sequence_feature.hard_search_key = "item:cate"
+        setattr(config.sequence_feature, field, value)
+        with self.assertRaisesRegex(ValueError, field):
+            feature_lib.create_features([config])
+
+    def test_hard_search_empty_group(self):
+        config = self._create_test_feature_cfgs()[-1]
+        config.sequence_feature.hard_search_key = "item:cate"
+        config.sequence_feature.ClearField("features")
+        with self.assertRaisesRegex(ValueError, "requires sub-features"):
+            feature_lib.create_features([config])
+
+    def test_hard_search_rejects_nonsequence_raw_input(self):
+        config = feature_pb2.FeatureConfig(
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="hist",
+                sequence_length=3,
+                sequence_delim=";",
+                hard_search_key="item:cate",
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        lookup_feature=feature_pb2.LookupFeature(
+                            feature_name="lookup",
+                            map="user:shared_map",
+                            key="item:raw_id",
+                            num_buckets=100,
+                            embedding_dim=4,
+                        )
+                    )
+                ],
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "sequence-prefixed.*shared_map"):
+            feature_lib.create_features([config], fg_mode=FgMode.FG_DAG)
+
+    @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
+    def test_hard_search_pk_collision(self, shared_pk):
+        config = self._create_test_feature_cfgs()[-1]
+        group = config.sequence_feature
+        group.hard_search_key = "item:cate"
+        configs = [config]
+        if shared_pk:
+            other = self._create_test_feature_cfgs()[-1]
+            other.sequence_feature.sequence_name = "other"
+            other.sequence_feature.sequence_pk = group.sequence_pk
+            configs.append(other)
+        else:
+            group.sequence_pk = f"user:{group.sequence_name}__cat_a"
+        with self.assertRaisesRegex(ValueError, "conflicting sequence_pk"):
+            feature_lib.create_features(configs, fg_mode=FgMode.FG_DAG)
+
+    @parameterized.expand(
+        [(FgMode.FG_DAG,), (FgMode.FG_NONE,), (FgMode.FG_BUCKETIZE,)],
+        name_func=parameterized_name_func,
+    )
+    def test_hard_search_dependency_classification(self, fg_mode):
+        configs = self._create_test_dag_feature_cfgs(grouped=True, stub_type=True)
+        group = configs[0].sequence_feature
+        group.hard_search_key = "item:cate"
+        group.features[0].id_feature.expression = "user:raw_id"
+        configs.extend(
+            [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="last",
+                        expression="feature:middle",
+                        num_buckets=1000,
+                        embedding_dim=4,
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="middle",
+                        expression="feature:click_seq__cat_a",
+                        num_buckets=1000,
+                        embedding_dim=4,
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="direct",
+                        expression="user:click_seq__raw_id",
+                        num_buckets=1000,
+                        embedding_dim=4,
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    lookup_feature=feature_pb2.LookupFeature(
+                        feature_name="lookup",
+                        map="user:shared_map",
+                        key="feature:middle",
+                        num_buckets=1000,
+                        embedding_dim=4,
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    lookup_feature=feature_pb2.LookupFeature(
+                        feature_name="user_lookup",
+                        map="user:shared_map",
+                        key="user:key",
+                        num_buckets=1000,
+                        embedding_dim=4,
+                    )
+                ),
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="user_token",
+                        expression="user:shared_token",
+                        num_buckets=1000,
+                        embedding_dim=4,
+                    )
+                ),
+            ]
+        )
+        features = feature_lib.create_features(configs, fg_mode=fg_mode)
+        handler = pyfg.FgArrowHandler(feature_lib.create_fg_json(features), 1)
+        raw_inputs = feature_lib.get_hard_search_inputs(features, handler)
+        self.assertEqual(raw_inputs, {"click_seq__raw_id", "click_seq__cat_b"})
+        user_names = {"user_lookup", "user_token"}
+        for feature in features:
+            self.assertEqual(feature.is_user_feat, feature.name in user_names)
+            self.assertEqual(
+                feature.is_hard_search_feat, feature.name not in user_names
+            )
 
     @parameterized.expand([[False], [True]])
     def test_create_fg_json(self, with_asset_dir=False):

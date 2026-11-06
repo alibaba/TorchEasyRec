@@ -38,7 +38,12 @@ from tzrec.datasets.utils import (
     SequenceSparseData,
     SparseData,
 )
-from tzrec.features.feature import BaseFeature, FgMode, create_fg_json
+from tzrec.features.feature import (
+    BaseFeature,
+    FgMode,
+    create_fg_json,
+    get_hard_search_inputs,
+)
 from tzrec.utils import env_util
 from tzrec.utils.logging_util import logger
 
@@ -185,9 +190,14 @@ class DataParser:
         self.user_feats = set()
         if is_input_tile():
             self._init_fg_hander()
-            self.user_inputs = self._fg_handler.user_inputs() | set(
-                self._fg_handler.sequence_input_to_name().keys()
-            )
+            self.user_inputs = {
+                self._to_real_input_name(x)
+                for x in self._fg_handler.user_inputs()
+                | set(self._fg_handler.sequence_input_to_name().keys())
+            } - {
+                self._to_real_input_name(x)
+                for x in get_hard_search_inputs(self._features, self._fg_handler)
+            }
             self.user_feats = set([x.name for x in self._features if x.is_user_feat])
             is_rank_zero = os.environ.get("RANK", "0") == "0"
             if is_rank_zero:
@@ -226,7 +236,10 @@ class DataParser:
                 # embedding.py. Setting tile_size to 1 would result in an incorrect
                 # output shape of [1, sum(seq_len), dim]. so we use v.take([0])
                 # instead of setting tile_size to 1
-                flag = False
+                # User inputs may already have one row, regardless of column order.
+                output_data["batch_size"] = torch.tensor(
+                    max(len(v) for v in input_data.values())
+                )
                 for k, v in input_data.items():
                     if self._fg_mode in (FgMode.FG_NONE, FgMode.FG_BUCKETIZE):
                         if k in self.user_feats:
@@ -234,9 +247,6 @@ class DataParser:
                     else:
                         if k in self.user_inputs:
                             input_data[k] = v.take([0])
-                    if not flag:
-                        output_data["batch_size"] = torch.tensor(v.__len__())
-                        flag = True
             else:
                 # For offline predict, len(data) is batch_size, tile_size need set to 1.
                 output_data["batch_size"] = torch.tensor(1)
