@@ -74,7 +74,7 @@ def _import_backend():
     except ImportError as e:
         raise RuntimeError(
             "dynamicemb tables placed in RocksDB need the tzrec-ext wheel "
-            "from TorchEasyRec-addons (pip install tzrec_ext-*.whl)."
+            "from tzrec's runtime requirements."
         ) from e
     return tzrec_ext.rocksdb
 

@@ -102,7 +102,7 @@ feature_configs {
 
 ## RocksDB 存储
 
-当 DynamicEmbedding 表的总参数（embedding + 优化器状态）超过 GPU 显存和主机内存时，规划器可以把一部分表放到每个训练进程自带的 RocksDB 中（本地 NVMe、ESSD 云盘或极速型 NAS），GPU 上保留一个热点 cache。需要额外安装 TorchEasyRec-addons 构建的 `tzrec-ext` wheel（CPU-only，与 CUDA 版本无关；在 dynamicemb `13a8055` 上验证）。
+当 DynamicEmbedding 表的总参数（embedding + 优化器状态）超过 GPU 显存和主机内存时，规划器可以把一部分表放到每个训练进程自带的 RocksDB 中（本地 NVMe、ESSD 云盘或极速型 NAS），GPU 上保留一个热点 cache。
 
 ```
 train_config {
