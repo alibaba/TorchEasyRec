@@ -1734,6 +1734,369 @@ class DataParserTest(unittest.TestCase):
         )
         torch.testing.assert_close(batch.labels["label"], expected_label)
 
+    @parameterized.expand(
+        [
+            (fg_mode, tile, online)
+            for fg_mode in (
+                FgMode.FG_DAG,
+                FgMode.FG_NORMAL,
+                FgMode.FG_NONE,
+                FgMode.FG_BUCKETIZE,
+            )
+            for tile in ("2", "3")
+            for online in (False, True)
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_parse_hard_search_input_tile(self, fg_mode, tile, online):
+        os.environ["INPUT_TILE"] = tile
+        os.environ["INPUT_TILE_3_ONLINE"] = "1" if online else "0"
+        feature_cfgs = self._create_test_fg_feature_cfgs(tag_b_seq=True)
+        user_seq = feature_pb2.FeatureConfig()
+        user_seq.CopyFrom(feature_cfgs[-1])
+        user_seq.sequence_feature.sequence_name = "user_seq"
+        feature_cfgs[-1].sequence_feature.hard_search_key = "item:cat_a"
+        feature_cfgs[-1].sequence_feature.sequence_length = 3
+        feature_cfgs.append(user_seq)
+        data_parser = DataParser(create_features(feature_cfgs, fg_mode=fg_mode))
+        input_data = {
+            "f_tag_b": pa.array([["4", "5"], [], ["6"]]),
+            "f_cat_a": pa.array([["1"], ["2"], ["3"]]),
+            "f_int_a": pa.array([7, 8, 9], pa.float32()),
+            "f_int_b": pa.array([[27, 37], [28, 38], [29, 39]], pa.list_(pa.float32())),
+            "f_lookup_a": pa.array([0.1, 0.0, 0.2], pa.float32()),
+            "click_seq__f_cat_a": pa.array([["10", "11", "12"], ["13"], ["0"]]),
+            "click_seq__f_int_a": pa.array(
+                [[14, 15, 16], [17], [0]], pa.list_(pa.float32())
+            ),
+            "click_seq__f_tag_b": pa.array(
+                [[["17", "18"], ["19"], ["20", "21"]], [["22"]], [["0"]]]
+            ),
+            "user_seq__f_cat_a": pa.array([["30", "31"], ["32"], ["33", "34", "35"]]),
+            "user_seq__f_int_a": pa.array(
+                [[40, 41], [42], [43, 44, 45]], pa.list_(pa.float32())
+            ),
+            "user_seq__f_tag_b": pa.array(
+                [[["50", "51"], ["52"]], [["53"]], [["54"], ["55", "56"], ["57"]]]
+            ),
+        }
+        if online:
+            input_data["f_tag_b"] = input_data["f_tag_b"].take([0])
+        if fg_mode in (FgMode.FG_DAG, FgMode.FG_NORMAL):
+            input_data = {
+                name.replace("__f_", "__").removeprefix("f_"): value
+                for name, value in input_data.items()
+                if name != "f_lookup_a"
+            }
+            input_data["map_a"] = pa.array(["1:0.1\x1d3:0.2", "", "1:0.1\x1d3:0.2"])
+            self.assertEqual(
+                data_parser.user_inputs & data_parser.feature_input_names,
+                {
+                    "tag_b",
+                    "int_a",
+                    "map_a",
+                    "user_seq__cat_a",
+                    "user_seq__int_a",
+                    "user_seq__tag_b",
+                },
+            )
+        self.assertEqual(
+            data_parser.user_feats,
+            {
+                "f_tag_b",
+                "f_int_a",
+                "user_seq__f_cat_a",
+                "user_seq__f_int_a",
+                "user_seq__f_tag_b",
+            },
+        )
+
+        data = data_parser.parse(input_data)
+        batch = data_parser.to_batch(data)
+
+        expected = {
+            "f_cat_a.values": torch.tensor([1, 2, 3]),
+            "f_cat_a.lengths": torch.tensor([1, 1, 1], dtype=torch.int32),
+            "f_tag_b.values": torch.tensor([4, 5] if online else [4, 5, 6]),
+            "f_tag_b.lengths": torch.tensor(
+                [2] if online else [2, 0, 1], dtype=torch.int32
+            ),
+            "f_int_a.values": torch.tensor(
+                [[7]] if online else [[7], [8], [9]], dtype=torch.float32
+            ),
+            "f_int_b.values": torch.tensor(
+                [[27, 37], [28, 38], [29, 39]], dtype=torch.float32
+            ),
+            "f_lookup_a.values": torch.tensor(
+                [[0.1], [0.0], [0.2]], dtype=torch.float32
+            ),
+            "click_seq__f_cat_a.values": torch.tensor([10, 11, 12, 13, 0]),
+            "click_seq__f_cat_a.lengths": torch.tensor([3, 1, 1], dtype=torch.int32),
+            "click_seq__f_int_a.values": torch.tensor(
+                [[14], [15], [16], [17], [0]], dtype=torch.float32
+            ),
+            "click_seq__f_int_a.lengths": torch.tensor([3, 1, 1], dtype=torch.int32),
+            "click_seq__f_tag_b.values": torch.tensor([17, 18, 19, 20, 21, 22, 0]),
+            "click_seq__f_tag_b.lengths": torch.tensor([3, 1, 1], dtype=torch.int32),
+            "click_seq__f_tag_b.key_lengths": torch.tensor(
+                [2, 1, 2, 1, 1], dtype=torch.int32
+            ),
+            "user_seq__f_cat_a.values": torch.tensor(
+                [30, 31] if online else [30, 31, 32, 33, 34, 35]
+            ),
+            "user_seq__f_cat_a.lengths": torch.tensor(
+                [2] if online else [2, 1, 3], dtype=torch.int32
+            ),
+            "user_seq__f_int_a.values": torch.tensor(
+                [[40], [41]] if online else [[40], [41], [42], [43], [44], [45]],
+                dtype=torch.float32,
+            ),
+            "user_seq__f_int_a.lengths": torch.tensor(
+                [2] if online else [2, 1, 3], dtype=torch.int32
+            ),
+            "user_seq__f_tag_b.values": torch.tensor(
+                [50, 51, 52] if online else [50, 51, 52, 53, 54, 55, 56, 57]
+            ),
+            "user_seq__f_tag_b.lengths": torch.tensor(
+                [2] if online else [2, 1, 3], dtype=torch.int32
+            ),
+            "user_seq__f_tag_b.key_lengths": torch.tensor(
+                [2, 1] if online else [2, 1, 1, 1, 2, 1], dtype=torch.int32
+            ),
+            "batch_size": torch.tensor(3 if online else 1),
+        }
+        self.assertEqual(set(data), set(expected))
+        for name, value in expected.items():
+            with self.subTest(tensor=name):
+                torch.testing.assert_close(data[name], value)
+        self.assertEqual(batch.tile_size, 3 if online else 1)
+        self.assertEqual(set(batch.dense_features), {"__BASE__", "__BASE___user"})
+        self.assertEqual(
+            batch.dense_features["__BASE__"].keys(), ["f_int_b", "f_lookup_a"]
+        )
+        torch.testing.assert_close(
+            batch.dense_features["__BASE__"].values(),
+            torch.tensor([[27, 37, 0.1], [28, 38, 0.0], [29, 39, 0.2]]),
+        )
+        self.assertEqual(batch.dense_features["__BASE___user"].keys(), ["f_int_a"])
+        torch.testing.assert_close(
+            batch.dense_features["__BASE___user"].values(), expected["f_int_a.values"]
+        )
+        sparse_groups = {
+            "__BASE__": ["f_cat_a", "click_seq__f_cat_a", "click_seq__f_tag_b"],
+            "__BASE___user": ["f_tag_b", "user_seq__f_cat_a", "user_seq__f_tag_b"],
+        }
+        if tile == "2":
+            sparse_groups = {"__BASE__": data_parser.sparse_keys["__BASE__"]}
+        self.assertEqual(set(batch.sparse_features), set(sparse_groups))
+        for group, keys in sparse_groups.items():
+            self.assertEqual(batch.sparse_features[group].keys(), keys)
+            self.assertEqual(
+                batch.sparse_features[group].stride(),
+                1 if online and group.endswith("_user") else 3,
+            )
+            for key in keys:
+                repeat = (
+                    3 if tile == "2" and online and key in data_parser.user_feats else 1
+                )
+                lengths = expected[f"{key}.lengths"]
+                if key.endswith("__f_tag_b"):
+                    lengths = torch.tensor(
+                        [5, 1, 1]
+                        if key.startswith("click_seq")
+                        else ([3] if online else [3, 1, 4]),
+                        dtype=torch.int32,
+                    )
+                with self.subTest(group=group, feature=key):
+                    torch.testing.assert_close(
+                        batch.sparse_features[group][key].values(),
+                        expected[f"{key}.values"].repeat(repeat),
+                    )
+                    torch.testing.assert_close(
+                        batch.sparse_features[group][key].lengths(),
+                        lengths.repeat(repeat),
+                    )
+        self.assertEqual(set(batch.sequence_mulval_lengths), set(sparse_groups))
+        for group, keys in sparse_groups.items():
+            mulval_keys = [key for key in keys if key.endswith("__f_tag_b")]
+            self.assertEqual(batch.sequence_mulval_lengths[group].keys(), mulval_keys)
+            for key in mulval_keys:
+                repeat = (
+                    3 if tile == "2" and online and key.startswith("user_seq") else 1
+                )
+                torch.testing.assert_close(
+                    batch.sequence_mulval_lengths[group][key].values(),
+                    expected[f"{key}.key_lengths"].repeat(repeat),
+                )
+                torch.testing.assert_close(
+                    batch.sequence_mulval_lengths[group][key].lengths(),
+                    expected[f"{key}.lengths"].repeat(repeat),
+                )
+        self.assertEqual(
+            set(batch.sequence_dense_features),
+            {"click_seq__f_int_a", "user_seq__f_int_a"},
+        )
+        for key, sequence in batch.sequence_dense_features.items():
+            torch.testing.assert_close(sequence.values(), expected[f"{key}.values"])
+            torch.testing.assert_close(sequence.lengths(), expected[f"{key}.lengths"])
+
+    @parameterized.expand(
+        [
+            (fg_mode, tile)
+            for fg_mode in (FgMode.FG_DAG, FgMode.FG_NONE, FgMode.FG_BUCKETIZE)
+            for tile in ("2", "3")
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_parse_hard_search_derived_dependencies(self, fg_mode, tile):
+        os.environ["INPUT_TILE"] = tile
+        os.environ["INPUT_TILE_3_ONLINE"] = "1"
+        feature_cfgs = self._create_test_fg_feature_cfgs()
+        group = feature_cfgs[-1].sequence_feature
+        group.hard_search_key = "item:cat_a"
+        group.sequence_length = 3
+        group.features[0].id_feature.expression = "user:raw_id"
+        feature_cfgs.extend(
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name=name,
+                    expression=expression,
+                    num_buckets=1000,
+                    embedding_dim=4,
+                    separator=";" if name == "direct" else "\x1d",
+                )
+            )
+            for name, expression in (
+                ("last", "feature:middle"),
+                ("middle", "feature:direct"),
+                ("direct", "user:click_seq__raw_id"),
+                ("user_token", "user:shared_token"),
+            )
+        )
+        feature_cfgs.extend(
+            feature_pb2.FeatureConfig(
+                lookup_feature=feature_pb2.LookupFeature(
+                    feature_name=name,
+                    map="user:shared_map",
+                    key=key,
+                    num_buckets=1000,
+                    embedding_dim=4,
+                )
+            )
+            for name, key in (
+                ("lookup", "feature:middle"),
+                ("user_lookup", "user:shared_key"),
+            )
+        )
+        data_parser = DataParser(create_features(feature_cfgs, fg_mode=fg_mode))
+        if fg_mode == FgMode.FG_DAG:
+            input_data = {
+                "shared_token": pa.array(["60"]),
+                "cat_a": pa.array([1, 2, 3]),
+                "tag_b": pa.array(["4\x1d5", "6", "7"]),
+                "int_a": pa.array([7, 8, 9], pa.float32()),
+                "int_b": pa.array(["27\x1d37", "28\x1d38", "29\x1d39"]),
+                "map_a": pa.array(["1:0.1\x1d3:0.2"] * 3),
+                "click_seq__raw_id": pa.array(["10;11;12", "13", "0"]),
+                "click_seq__int_a": pa.array(["14;15;16", "17", "0"]),
+                "shared_map": pa.array(
+                    [
+                        "10:110\x1d11:111\x1d12:112\x1d13:113\x1d0:100\x1d1:70",
+                        "13:213\x1d2:80",
+                        "0:200\x1d3:90",
+                    ]
+                ),
+                "shared_key": pa.array([1, 2, 3]),
+            }
+            self.assertNotIn("click_seq__raw_id", data_parser.user_inputs)
+            self.assertTrue(
+                {"shared_map", "shared_key", "shared_token"} <= data_parser.user_inputs
+            )
+        else:
+            input_data = {
+                "user_token": pa.array([["60"]]),
+                "f_cat_a": pa.array([["1"], ["2"], ["3"]]),
+                "f_tag_b": pa.array([["4", "5"], ["6"], ["7"]]),
+                "f_int_a": pa.array([7, 8, 9], pa.float32()),
+                "f_int_b": pa.array(
+                    [[27, 37], [28, 38], [29, 39]], pa.list_(pa.float32())
+                ),
+                "f_lookup_a": pa.array([0.1, 0.0, 0.2], pa.float32()),
+                "click_seq__f_cat_a": pa.array([["10", "11", "12"], ["13"], ["0"]]),
+                "click_seq__f_int_a": pa.array(
+                    [[14, 15, 16], [17], [0]], pa.list_(pa.float32())
+                ),
+                "user_lookup": pa.array([["70"], ["80"], ["90"]]),
+                "lookup": pa.array([["110", "111", "112"], ["113"], ["100"]]),
+            }
+            for name in ("last", "middle", "direct"):
+                input_data[name] = pa.array([["10", "11", "12"], ["13"], ["0"]])
+        self.assertEqual(
+            data_parser.user_feats, {"f_tag_b", "f_int_a", "user_lookup", "user_token"}
+        )
+
+        data = data_parser.parse(input_data)
+        batch = data_parser.to_batch(data)
+
+        torch.testing.assert_close(data["batch_size"], torch.tensor(3))
+        self.assertEqual(batch.tile_size, 3)
+        candidate_values = {
+            "click_seq__f_cat_a": [10, 11, 12, 13, 0],
+            "direct": [10, 11, 12, 13, 0],
+            "middle": [10, 11, 12, 13, 0],
+            "last": [10, 11, 12, 13, 0],
+            "lookup": [110, 111, 112, 113, 100],
+        }
+        for name, values in candidate_values.items():
+            with self.subTest(feature=name):
+                torch.testing.assert_close(data[f"{name}.values"], torch.tensor(values))
+                torch.testing.assert_close(
+                    data[f"{name}.lengths"], torch.tensor([3, 1, 1], dtype=torch.int32)
+                )
+                torch.testing.assert_close(
+                    batch.sparse_features["__BASE__"][name].values(),
+                    torch.tensor(values),
+                )
+                torch.testing.assert_close(
+                    batch.sparse_features["__BASE__"][name].lengths(),
+                    torch.tensor([3, 1, 1], dtype=torch.int32),
+                )
+        user_group = "__BASE___user" if tile == "3" else "__BASE__"
+        expected_groups = {"__BASE__", "__BASE___user"} if tile == "3" else {"__BASE__"}
+        self.assertEqual(set(batch.sparse_features), expected_groups)
+        self.assertEqual(batch.sparse_features["__BASE__"].stride(), 3)
+        if tile == "3":
+            self.assertEqual(batch.sparse_features[user_group].stride(), 1)
+            self.assertEqual(
+                batch.sparse_features[user_group].keys(),
+                ["f_tag_b", "user_token", "user_lookup"],
+            )
+            self.assertEqual(
+                set(batch.sparse_features["__BASE__"].keys()),
+                {"f_cat_a", *candidate_values},
+            )
+        repeat = 1 if tile == "3" else 3
+        for name, values in (
+            ("f_tag_b", [4, 5]),
+            ("user_token", [60]),
+            ("user_lookup", [70]),
+        ):
+            torch.testing.assert_close(data[f"{name}.values"], torch.tensor(values))
+            torch.testing.assert_close(
+                data[f"{name}.lengths"], torch.tensor([len(values)], dtype=torch.int32)
+            )
+            torch.testing.assert_close(
+                batch.sparse_features[user_group][name].values(),
+                torch.tensor(values).repeat(repeat),
+            )
+            torch.testing.assert_close(
+                batch.sparse_features[user_group][name].lengths(),
+                torch.tensor([len(values)], dtype=torch.int32).repeat(repeat),
+            )
+        torch.testing.assert_close(
+            batch.dense_features["__BASE___user"].values(), torch.tensor([[7.0]])
+        )
+
     def test_dump_parsed_inputs(self):
         feature_cfgs = self._create_test_fg_feature_cfgs(
             tag_b_weighted=True, tag_b_seq=True

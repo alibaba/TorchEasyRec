@@ -15,6 +15,8 @@ import glob
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -57,8 +59,8 @@ from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingCollection,
     MLPDenseEmbeddingConfig,
 )
-from tzrec.modules.embedding import EmbeddingGroupImpl
-from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
+from tzrec.modules.embedding import EmbeddingGroup, EmbeddingGroupImpl
+from tzrec.protos import data_pb2, feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util, config_util, export_util, misc_util, npz_util
@@ -103,6 +105,517 @@ def _dequant_quint8_rowwise_f16(values: np.ndarray, emb_dim: int) -> np.ndarray:
     dequant = q * scale.astype(np.float32).reshape(-1, 1)
     dequant += offset.astype(np.float32).reshape(-1, 1)
     return dequant.astype(np.float16).astype(np.float32)
+
+
+def _create_hard_search_export_config(hard_search=True):
+    sequence = feature_pb2.SequenceFeature(
+        sequence_name="click_seq",
+        sequence_length=3,
+        sequence_delim=";",
+        sequence_pk="user:click_seq_pk",
+        sequence_entity="item",
+        features=[
+            feature_pb2.SeqFeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="id",
+                    expression="item:event_id",
+                    embedding_dim=2,
+                    num_buckets=8,
+                )
+            ),
+            feature_pb2.SeqFeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="score", expression="item:event_score"
+                )
+            ),
+        ],
+    )
+    if hard_search:
+        sequence.hard_search_key = "item:item_id"
+    return EasyRecConfig(
+        train_input_path="training-input",
+        data_config=data_pb2.DataConfig(fg_mode=data_pb2.FG_NONE),
+        feature_configs=[
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="item_id",
+                    expression="item:item_id",
+                    embedding_dim=2,
+                    num_buckets=8,
+                    value_dim=1,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="user_id",
+                    expression="user:user_id",
+                    embedding_dim=2,
+                    num_buckets=8,
+                    value_dim=1,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="user_score", expression="user:user_score"
+                )
+            ),
+            feature_pb2.FeatureConfig(sequence_feature=sequence),
+        ],
+        model_config=model_pb2.ModelConfig(
+            feature_groups=[
+                model_pb2.FeatureGroupConfig(
+                    group_name="deep",
+                    feature_names=["item_id", "user_id", "user_score"],
+                    group_type=model_pb2.DEEP,
+                ),
+                model_pb2.FeatureGroupConfig(
+                    group_name="hsk",
+                    feature_names=["click_seq__id", "click_seq__score"],
+                    group_type=model_pb2.SEQUENCE,
+                ),
+            ],
+            kernel=model_pb2.PYTORCH,
+        ),
+    )
+
+
+def _hard_search_export_inputs(lengths):
+    count = sum(lengths)
+    return {
+        "item_id.values": torch.arange(1, len(lengths) + 1, dtype=torch.int64),
+        "item_id.lengths": torch.ones(len(lengths), dtype=torch.int64),
+        "user_id.values": torch.tensor([2], dtype=torch.int64),
+        "user_id.lengths": torch.tensor([1], dtype=torch.int64),
+        "user_score.values": torch.tensor([[0.75]]),
+        "click_seq__id.values": torch.arange(count, dtype=torch.int64) % 7 + 1,
+        "click_seq__id.lengths": torch.tensor(lengths, dtype=torch.int64),
+        "click_seq__score.values": torch.arange(1, count + 1).float().view(-1, 1) / 2,
+        "click_seq__score.lengths": torch.tensor(lengths, dtype=torch.int64),
+        "batch_size": torch.tensor(len(lengths)),
+    }
+
+
+@mark_ci_scope("gpu")
+class HardSearchExportTest(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
+        self.save_dir = os.path.join(self.test_dir, "export")
+        os.mkdir(self.save_dir)
+        self.asset_path = os.path.join(self.test_dir, "fg.json")
+
+    @parameterized.expand(
+        [
+            ("missing_hard_search_key", "hard_search_key", None),
+            ("changed_hard_search_key", "hard_search_key", "item:other_id"),
+            ("asset_adds_hard_search_key", "hard_search_key", "item:item_id"),
+            ("sequence_name", "sequence_name", "renamed_seq"),
+            ("sequence_length", "sequence_length", 4),
+            ("sequence_delim", "sequence_delim", "|"),
+            ("sequence_pk", "sequence_pk", "user:other_pk"),
+            ("sequence_entity", "sequence_entity", "app"),
+            ("missing_sequence_entity", "sequence_entity", None),
+            ("id_expression", "id.expression", "item:other_event_id"),
+            ("raw_expression", "score.expression", "item:other_event_score"),
+            ("id_subfeature_name", "id.feature_name", "renamed_id"),
+            ("raw_subfeature_name", "score.feature_name", "renamed_score"),
+            ("swapped_raw_mapping", None, None),
+            ("missing_sequence_group", None, None),
+            ("extra_sequence_group", None, None),
+            ("duplicate_sequence_group", None, None),
+            ("missing_subfeature", None, None),
+            ("extra_subfeature", None, None),
+            ("duplicate_subfeature", None, None),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_export_metadata_rejects_hard_search_asset_drift(self, case, field, value):
+        config = _create_hard_search_export_config(
+            hard_search=case != "asset_adds_hard_search_key"
+        )
+        original_config = copy.deepcopy(config)
+        features = create_features(list(config.feature_configs))
+        asset_fg = export_util.create_fg_json(features)
+        group = asset_fg["features"][-1]
+        if field is not None:
+            target = group
+            if "." in field:
+                name, field = field.split(".")
+                target = next(
+                    feature
+                    for feature in group["features"]
+                    if feature["feature_name"] == name
+                )
+            if value is None:
+                target.pop(field)
+            else:
+                target[field] = value
+        elif case == "swapped_raw_mapping":
+            first, second = group["features"]
+            first["expression"], second["expression"] = (
+                second["expression"],
+                first["expression"],
+            )
+        elif case == "missing_sequence_group":
+            asset_fg["features"].pop()
+        elif case in ("extra_sequence_group", "duplicate_sequence_group"):
+            extra = copy.deepcopy(group)
+            if case == "extra_sequence_group":
+                extra["sequence_name"] = "extra_seq"
+                extra["sequence_pk"] = "user:extra_seq_pk"
+            asset_fg["features"].append(extra)
+        elif case == "missing_subfeature":
+            group["features"].pop()
+        else:
+            extra = copy.deepcopy(group["features"][-1])
+            if case == "extra_subfeature":
+                extra["feature_name"] = "extra_score"
+            group["features"].append(extra)
+        source = ("\n" + json.dumps(asset_fg, indent=2) + "\n").encode()
+        with open(self.asset_path, "wb") as output:
+            output.write(source)
+        source_mtime = os.stat(self.asset_path).st_mtime_ns
+
+        try:
+            with self.assertRaisesRegex(
+                ValueError, r"(?i)(hard.search|hard_search_key|HSK)"
+            ):
+                export_util._write_export_metadata(
+                    config, features, self.save_dir, [self.asset_path], None
+                )
+        finally:
+            with open(self.asset_path, "rb") as input_file:
+                self.assertEqual(input_file.read(), source)
+            self.assertEqual(os.stat(self.asset_path).st_mtime_ns, source_mtime)
+            self.assertEqual(config, original_config)
+
+    @parameterized.expand(
+        [("matching", False), ("reordered", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_export_metadata_preserves_matching_hard_search_asset(self, _name, reorder):
+        config = _create_hard_search_export_config()
+        original_config = copy.deepcopy(config)
+        features = create_features(list(config.feature_configs))
+        asset_fg = export_util.create_fg_json(features)
+        asset_fg["custom_asset"] = "preserve this formatting and metadata"
+        if reorder:
+            asset_fg["features"][-1]["features"].reverse()
+            asset_fg["features"].reverse()
+        source = ("\n" + json.dumps(asset_fg, indent=2) + "\n").encode()
+        with open(self.asset_path, "wb") as output:
+            output.write(source)
+        source_mtime = os.stat(self.asset_path).st_mtime_ns
+
+        export_util._write_export_metadata(
+            config,
+            features,
+            self.save_dir,
+            [self.asset_path],
+            {"CUSTOM_EXPORT": "hsk"},
+        )
+
+        for path in (self.asset_path, os.path.join(self.save_dir, "fg.json")):
+            with open(path, "rb") as input_file:
+                self.assertEqual(input_file.read(), source)
+        self.assertEqual(os.stat(self.asset_path).st_mtime_ns, source_mtime)
+        self.assertEqual(config, original_config)
+        saved_config = config_util.load_pipeline_config(
+            os.path.join(self.save_dir, "pipeline.config")
+        )
+        self.assertEqual(saved_config, original_config)
+        with open(os.path.join(self.save_dir, "model_acc.json")) as input_file:
+            self.assertEqual(json.load(input_file)["CUSTOM_EXPORT"], "hsk")
+
+    @parameterized.expand(
+        [("opaque_asset", False), ("unmarked_sequence_drift", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_export_metadata_preserves_legacy_asset_without_hard_search(
+        self, _name, sequence_drift
+    ):
+        config = _create_hard_search_export_config(hard_search=False)
+        features = create_features(list(config.feature_configs))
+        asset_fg = {"custom_asset": True}
+        if sequence_drift:
+            asset_fg = export_util.create_fg_json(features)
+            group = asset_fg["features"][-1]
+            group["sequence_length"] = 99
+            group["features"][-1]["expression"] = "item:legacy_score"
+        source = json.dumps(asset_fg, indent=2).encode()
+        with open(self.asset_path, "wb") as output:
+            output.write(source)
+        source_mtime = os.stat(self.asset_path).st_mtime_ns
+
+        export_util._write_export_metadata(
+            config, features, self.save_dir, [self.asset_path], None
+        )
+
+        for path in (self.asset_path, os.path.join(self.save_dir, "fg.json")):
+            with open(path, "rb") as input_file:
+                self.assertEqual(input_file.read(), source)
+        self.assertEqual(os.stat(self.asset_path).st_mtime_ns, source_mtime)
+        saved_config = config_util.load_pipeline_config(
+            os.path.join(self.save_dir, "pipeline.config")
+        )
+        self.assertEqual(saved_config, config)
+        self.assertFalse(
+            saved_config.feature_configs[-1].sequence_feature.HasField(
+                "hard_search_key"
+            )
+        )
+
+    @parameterized.expand(
+        [
+            ("normal_tile2", "2", False),
+            ("normal_tile3", "3", False),
+            ("distributed_forces_tile3", "2", True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_hard_search_input_tile_export_numerics(self, _name, tile, distributed):
+        if os.environ.get("TZREC_HSK_EXPORT_TEST") != self._testMethodName:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "unittest",
+                    "tzrec.utils.export_util_test."
+                    f"{type(self).__name__}.{self._testMethodName}",
+                ],
+                env=dict(os.environ, TZREC_HSK_EXPORT_TEST=self._testMethodName),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=180,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            return
+
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "RANK": "0",
+                "LOCAL_RANK": "0",
+                "WORLD_SIZE": "1",
+                "LOCAL_WORLD_SIZE": "1",
+                "INPUT_TILE": tile,
+                "INPUT_TILE_3_ONLINE": "0",
+                "USE_DISTRIBUTED_EMBEDDING": "1" if distributed else "0",
+                "USE_RTP": "0",
+                "QUANT_EMB": "0",
+                "QUANT_EC_EMB": "0",
+                "DIST_QUANT": "0",
+                "ENABLE_AOT": "0",
+                "UNIFIED_AOT": "0",
+                "ENABLE_TRT": "0",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        export_util.ensure_input_tile_for_distributed_embedding()
+        self.assertEqual(os.environ["INPUT_TILE"], "3" if distributed else tile)
+        config = _create_hard_search_export_config()
+        original_config = copy.deepcopy(config)
+        features = create_features(list(config.feature_configs))
+        expected_fg = export_util.create_fg_json(features)
+        name_to_feature = {feature.name: feature for feature in features}
+        self.assertFalse(name_to_feature["click_seq__id"].is_user_feat)
+        self.assertFalse(name_to_feature["click_seq__score"].is_user_feat)
+        self.assertTrue(name_to_feature["user_id"].is_user_feat)
+        self.assertTrue(name_to_feature["user_score"].is_user_feat)
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.features = features
+                self.feature_groups = list(config.model_config.feature_groups)
+                self.embedding_group = EmbeddingGroup(
+                    features, self.feature_groups, device=torch.device("cpu")
+                )
+                self.scale = torch.nn.Parameter(torch.tensor(2.0))
+                with torch.no_grad():
+                    for module in self.embedding_group.modules():
+                        if isinstance(module, EmbeddingBagCollection):
+                            tables = module.embedding_bags.values()
+                        elif isinstance(module, EmbeddingCollection):
+                            tables = module.embeddings.values()
+                        else:
+                            continue
+                        for table in tables:
+                            table.weight.copy_(
+                                torch.arange(8).float().view(-1, 1)
+                                + torch.tensor([0.0, 0.25])
+                            )
+
+            def predict(self, batch):
+                grouped = self.embedding_group(batch)
+                return {
+                    "score": self.scale
+                    * (
+                        grouped["deep"].sum(dim=1)
+                        + grouped["hsk.sequence"].sum(dim=(1, 2))
+                    ),
+                    "lengths": grouped["hsk.sequence_length"],
+                }
+
+        model = ScriptWrapper(TinyModel()).eval()
+        checkpoint_state = {
+            name: value.detach().clone() for name, value in model.state_dict().items()
+        }
+        fx_model = export_util.symbolic_trace(model)
+        lengths_cases = ([2, 0, 1], [0], [3, 1], [0, 0])
+        expected_outputs = []
+        for lengths in lengths_cases:
+            data = _hard_search_export_inputs(lengths)
+            scores = []
+            offset = 0
+            for index, length in enumerate(lengths):
+                sequence_sum = sum(
+                    2 * ((position % 7) + 1) + 0.25 + (position + 1) / 2
+                    for position in range(offset, offset + length)
+                )
+                scores.append(2 * (2 * (index + 1) + 0.25 + 4.25 + 0.75 + sequence_sum))
+                offset += length
+            expected = {"score": torch.tensor(scores), "lengths": torch.tensor(lengths)}
+            expected_outputs.append(expected)
+            self.assertEqual(data["click_seq__id.lengths"].numel(), len(lengths))
+            self.assertEqual(data["user_id.lengths"].numel(), 1)
+            self.assertEqual(data["user_score.values"].shape, (1, 1))
+            torch.testing.assert_close(model(data), expected)
+            torch.testing.assert_close(fx_model(data), expected)
+
+        data = _hard_search_export_inputs(lengths_cases[0])
+        batch = model._data_parser.to_batch(data, force_no_tile=True)
+
+        class ExportDataloader:
+            def __iter__(self):
+                return iter([batch])
+
+            def get_iterator(self):
+                return iter(self)
+
+        def restore_model(checkpoint_path, module, **kwargs):
+            module.load_state_dict(
+                {name: checkpoint_state[name] for name in module.state_dict()},
+                strict=True,
+            )
+
+        def load_sparse(state_dict, **kwargs):
+            with torch.no_grad():
+                for name, value in state_dict.items():
+                    value.copy_(checkpoint_state[name])
+
+        if not distributed:
+            port = misc_util.get_free_port()
+            dist.init_process_group(
+                "gloo", init_method=f"tcp://127.0.0.1:{port}", world_size=1, rank=0
+            )
+            self.addCleanup(dist.destroy_process_group)
+        checkpoint_path = os.path.join(self.test_dir, "checkpoint")
+        os.mkdir(checkpoint_path)
+        with (
+            mock.patch.object(
+                export_util, "create_dataloader", return_value=ExportDataloader()
+            ),
+            mock.patch.object(
+                checkpoint_util, "restore_model", side_effect=restore_model
+            ),
+            mock.patch.object(checkpoint_util, "load", side_effect=load_sparse),
+        ):
+            export_util.export_model(config, model, checkpoint_path, self.save_dir)
+
+        self.assertEqual(config, original_config)
+        saved_config = config_util.load_pipeline_config(
+            os.path.join(self.save_dir, "pipeline.config")
+        )
+        self.assertEqual(saved_config, original_config)
+        with open(os.path.join(self.save_dir, "fg.json")) as input_file:
+            self.assertEqual(json.load(input_file), expected_fg)
+        with open(os.path.join(self.save_dir, "model_acc.json")) as input_file:
+            model_acc = json.load(input_file)
+        self.assertEqual(model_acc["INPUT_TILE"], "3" if distributed else tile)
+        self.assertEqual(
+            model_acc.get("DISTRIBUTED_EMBEDDING", "0"), "1" if distributed else "0"
+        )
+        self.assertEqual(model_acc["SPARSE_INT64"], "1")
+        scripted = torch.jit.load(
+            os.path.join(self.save_dir, "scripted_model.pt"), map_location="cpu"
+        )
+        if not distributed:
+            for lengths, expected in zip(lengths_cases, expected_outputs):
+                with self.subTest(lengths=lengths):
+                    torch.testing.assert_close(
+                        scripted(_hard_search_export_inputs(lengths)), expected
+                    )
+            return
+
+        with open(os.path.join(self.save_dir, "dense_meta.json")) as input_file:
+            dense_meta = json.load(input_file)
+        self.assertEqual(
+            dense_meta,
+            {
+                "deep__ebc": ["item_id__ebc"],
+                "deep__ebc_user": ["user_id__ebc"],
+                "sequence__ec": ["click_seq__id__ec", "click_seq__id__lengths"],
+            },
+        )
+        sparse_dir = os.path.join(self.save_dir, "sparse")
+        with open(os.path.join(sparse_dir, "sparse_features.json")) as input_file:
+            sparse_features = json.load(input_file)
+        self.assertEqual(
+            set(sparse_features), {"item_id__ebc", "user_id__ebc", "click_seq__id__ec"}
+        )
+        with np.load(
+            os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")
+        ) as output:
+            weights = {
+                name: torch.from_numpy(output[name].copy()) for name in output.files
+            }
+        training_state = {
+            checkpoint_util.remap_input_tile_user_key(name): value
+            for name, value in checkpoint_state.items()
+        }
+        for feature_name, metadata in sparse_features.items():
+            table = metadata["embedding_name"]
+            self.assertEqual(
+                metadata["pooling"], "NONE" if feature_name.endswith("__ec") else "SUM"
+            )
+            self.assertFalse(metadata["use_weight"])
+            torch.testing.assert_close(
+                weights[table], training_state[table + ".weight"]
+            )
+        for lengths, expected in zip(lengths_cases, expected_outputs):
+            with self.subTest(lengths=lengths):
+                data = _hard_search_export_inputs(lengths)
+                serving_data = dict(data)
+                for group_name, feature_names in dense_meta.items():
+                    if group_name == "sequence__ec":
+                        for feature_name in feature_names:
+                            if feature_name.endswith("__lengths"):
+                                name = feature_name[: -len("__lengths")]
+                                serving_data[feature_name] = data[name + ".lengths"]
+                            else:
+                                name = feature_name[: -len("__ec")]
+                                table = sparse_features[feature_name]["embedding_name"]
+                                serving_data[name] = weights[table][
+                                    data[name + ".values"]
+                                ]
+                    else:
+                        serving_data[group_name] = torch.cat(
+                            [
+                                weights[sparse_features[name]["embedding_name"]][
+                                    data[name[: -len("__ebc")] + ".values"]
+                                ]
+                                for name in feature_names
+                            ],
+                            dim=1,
+                        )
+                self.assertEqual(serving_data["deep__ebc_user"].shape, (1, 2))
+                self.assertEqual(
+                    serving_data["click_seq__id__lengths"].numel(), len(lengths)
+                )
+                torch.testing.assert_close(scripted(serving_data), expected)
 
 
 class ExportUtilTest(unittest.TestCase):
