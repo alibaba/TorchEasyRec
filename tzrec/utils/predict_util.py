@@ -1374,10 +1374,9 @@ def _load_scripted_model(model_path: str, device: torch.device) -> nn.Module:
 class GenRecExportModel:
     """Predicts a GenRec export on a Batch: its front-end, then its HF LM.
 
-    The front-end is loaded by ``load_predict_model``, scripted or with a
-    distributed embedding, and runs as exported: TorchScript applies no
-    autocast, so its slot projections stay FP32, and it assembles the prompt on
-    the forward thread.
+    The front-end, scripted or with a distributed embedding, runs as exported:
+    TorchScript applies no autocast, so its slot projections stay FP32, and it
+    assembles the prompt on the forward thread.
 
     The LM is built as ``BaseGenRecModel.init_backbone`` builds it and run
     under ``export_config.mixed_precision`` autocast, the precision the export
@@ -1428,7 +1427,7 @@ class GenRecExportModel:
         self._lm[devices[0]] = lm.to(devices[0])
         # after the LM replicas, so a distributed embedding sizes its GPU cache
         # with them already resident
-        self._model = load_predict_model(model_path, devices, log_model)
+        self._frontend = _load_batch_model(model_path, devices, log_model)
 
     @staticmethod
     def _load_backbone(
@@ -1476,18 +1475,20 @@ class GenRecExportModel:
             ``generated_sids_key``: ``(B, num_return_sequences, num_levels)``
             local codes, best first.
         """
-        streams = self._model(batch, batch_size, device)
+        frontend_outputs = self._frontend(batch, batch_size, device)
         lm = self._lm[device]
-        cu_seqlens = streams[CU_SEQLENS]
+        cu_seqlens = frontend_outputs[CU_SEQLENS]
         with torch.amp.autocast(
             device_type=device.type,
             dtype=self._mixed_dtype,
             enabled=self._mixed_dtype is not None,
         ):
-            embeds = lm.get_input_embeddings()(streams[INPUT_IDS])
-            if streams[SLOT_EMBEDS].numel() > 0:
+            embeds = lm.get_input_embeddings()(frontend_outputs[INPUT_IDS])
+            if frontend_outputs[SLOT_EMBEDS].numel() > 0:
                 embeds.index_copy_(
-                    0, streams[HOLE_POSITIONS], streams[SLOT_EMBEDS].to(embeds.dtype)
+                    0,
+                    frontend_outputs[HOLE_POSITIONS],
+                    frontend_outputs[SLOT_EMBEDS].to(embeds.dtype),
                 )
             codes = generate_codes(
                 lm,
@@ -1501,10 +1502,12 @@ class GenRecExportModel:
         return {self._generated_sids_key: codes}
 
 
-def load_predict_model(
+def _load_batch_model(
     model_path: str, devices: List[torch.device], log_model: bool = False
 ) -> Callable[[Batch, Optional[torch.Tensor], torch.device], Dict[str, torch.Tensor]]:
-    """Load an export for predict.
+    """Load an export's scripted, AOT or distributed embedding model.
+
+    For a GenRec export this is its front-end.
 
     Args:
         model_path (str): export directory.
@@ -1514,7 +1517,7 @@ def load_predict_model(
 
     Return:
         a callable of (batch, batch_size input of tiled models, device) returning
-        the predictions.
+        the model outputs.
     """
     if acc_utils.is_distributed_embedding_predict(model_path):
         return DistributedEmbeddingModel(model_path, devices, log_model)
@@ -1525,3 +1528,29 @@ def load_predict_model(
     if log_model:
         logger.info(str(model))
     return _wrap_batch_predict_model(model)
+
+
+def load_predict_model(
+    model_path: str,
+    devices: List[torch.device],
+    pipeline_config: EasyRecConfig,
+    log_model: bool = False,
+) -> Callable[[Batch, Optional[torch.Tensor], torch.device], Dict[str, torch.Tensor]]:
+    """Load an export for predict.
+
+    Args:
+        model_path (str): export directory.
+        devices (list): devices to predict on; a distributed embedding export shares
+            its sparse tables across them and a GenRec export keeps an LM replica on
+            each, other exports use only the first.
+        pipeline_config (EasyRecConfig): the export's pipeline config, after any
+            edits; a GenRec export decodes with its beam settings.
+        log_model (bool): log the loaded model.
+
+    Return:
+        a callable of (batch, batch_size input of tiled models, device) returning
+        the predictions, the decoded SIDs for a GenRec export.
+    """
+    if pipeline_config.model_config.WhichOneof("model") == "genrec_causal_lm_model":
+        return GenRecExportModel(model_path, devices, pipeline_config, log_model)
+    return _load_batch_model(model_path, devices, log_model)

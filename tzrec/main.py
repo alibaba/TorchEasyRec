@@ -1703,19 +1703,12 @@ def predict(
     try:
         # loaded in the guarded scope: a failed load still reaches the commit
         # rendezvous below, so other ranks fail fast instead of waiting.
-        if is_genrec:
-            batch_model = predict_util.GenRecExportModel(
-                scripted_model_path,
-                forward_devices,
-                pipeline_config,
-                log_model=is_profiling and is_rank_zero,
-            )
-        else:
-            batch_model = predict_util.load_predict_model(
-                scripted_model_path,
-                forward_devices,
-                log_model=is_profiling and is_rank_zero,
-            )
+        batch_model = predict_util.load_predict_model(
+            scripted_model_path,
+            forward_devices,
+            pipeline_config,
+            log_model=is_profiling and is_rank_zero,
+        )
         while True:
             try:
                 batch = next(infer_iterator)

@@ -1021,7 +1021,9 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
             "sd": JaggedTensor(values=torch.rand(3, 4), lengths=sd_lengths)
         }
         device = torch.device("cuda:0")
-        model = load_predict_model(self.export_dir, [device], log_model=True)
+        model = load_predict_model(
+            self.export_dir, [device], EasyRecConfig(), log_model=True
+        )
         self.assertIsInstance(model, DistributedEmbeddingModel)
         out = model(batch, torch.tensor(2), device)
         np.testing.assert_allclose(
@@ -1059,11 +1061,13 @@ class GenRecExportModelTest(unittest.TestCase):
 
     def _model(self, streams: Dict[str, torch.Tensor]) -> GenRecExportModel:
         with mock.patch.object(
-            predict_util, "load_predict_model", return_value=lambda *_: streams
+            predict_util, "_load_batch_model", return_value=lambda *_: streams
         ):
-            return GenRecExportModel(
+            model = load_predict_model(
                 self.export_dir, [torch.device("cpu")], self.pipeline_config
             )
+        self.assertIsInstance(model, GenRecExportModel)
+        return model
 
     def _streams(self, with_slots: bool) -> Dict[str, torch.Tensor]:
         if with_slots:
@@ -1208,7 +1212,8 @@ class LoadPredictModelTest(unittest.TestCase):
             json.dump({}, f)
         batch, device = _predict_batch(), torch.device("cpu")
         expected = _reload(_Model())(batch.to_dict(sparse_dtype=torch.int64), device)
-        actual = load_predict_model(self.model_dir, [device])(batch, None, device)
+        model = load_predict_model(self.model_dir, [device], EasyRecConfig())
+        actual = model(batch, None, device)
         self.assertEqual(list(actual), list(expected))
         for k, v in expected.items():
             torch.testing.assert_close(actual[k], v, rtol=0, atol=0, msg=k)
