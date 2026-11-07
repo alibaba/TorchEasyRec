@@ -17,7 +17,9 @@ import runpy
 import shutil
 import sys
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
+from typing import Optional
 from unittest import mock
 
 import pyarrow as pa
@@ -31,6 +33,7 @@ from tzrec.main import (
     _train_and_evaluate,
     predict,
     predict_checkpoint,
+    train_and_evaluate,
 )
 from tzrec.models.model import BaseModel
 from tzrec.optim.ema import DenseEMA
@@ -63,6 +66,20 @@ def _train_config(**overrides) -> TrainConfig:
     )
     fields.update(overrides)
     return TrainConfig(**fields)
+
+
+class _FakeSummaryWriter:
+    """SummaryWriter stand-in: a context manager that closes itself on exit."""
+
+    def __init__(self) -> None:
+        self.flush = mock.Mock()
+        self.close = mock.Mock()
+
+    def __enter__(self) -> "_FakeSummaryWriter":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
 
 
 class MainTest(unittest.TestCase):
@@ -125,13 +142,13 @@ class MainTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must inherit BaseModel"):
             _create_model(model_config, [], [])
 
-    def test_train_and_evaluate_closes_exporter_and_ckpt_on_exception(self) -> None:
-        """A training exception must still drain the exporter and ckpt manager.
+    def test_train_and_evaluate_closes_exporter_not_ckpt_on_exception(self) -> None:
+        """A training exception releases loop-owned resources only.
 
-        Before wrapping the training body in try/finally, a raise inside the
-        loop skipped the happy-path close() calls; the daemon export worker
-        outlived the function (keeping the manager reachable so its finalizer
-        never fired), leaked the protected checkpoint, and could publish late.
+        The exporter worker is drained by the loop's resource stack; the
+        CheckpointManager is borrowed from the training entry, which owns its
+        lifetime, so the loop must not close it. The collective
+        finalize_publish must not run on an exception path.
         """
         ckpt_manager = mock.Mock()
         ckpt_manager.maybe_save.return_value = False
@@ -165,10 +182,175 @@ class MainTest(unittest.TestCase):
                     eval_config=eval_config,
                     ckpt_manager=ckpt_manager,
                 )
-        self.assertTrue(exporter.close.called)
-        self.assertTrue(ckpt_manager.close.called)
+        exporter.close.assert_called_once()
+        ckpt_manager.close.assert_not_called()
         # a collective; missing ranks would hang it on exception paths
         exporter.finalize_publish.assert_not_called()
+
+    def test_train_profiler_stops_once_on_exception(self) -> None:
+        """An exception stops the profiler exactly once, without masking it.
+
+        A stop failure while handling the training error is logged locally;
+        the original training error still reaches the launcher and no
+        collective final publication runs.
+        """
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        exporter = mock.Mock()
+        exporter.enabled = False
+        prof = mock.Mock()
+        prof.stop.side_effect = RuntimeError("stop boom")
+        model = mock.Mock()
+        optimizer = mock.Mock()
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()])
+        pipeline = mock.Mock()
+        pipeline.progress.side_effect = RuntimeError("boom")
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch("tzrec.main._create_train_profiler", return_value=prof),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                _train_and_evaluate(
+                    model=model,
+                    optimizer=optimizer,
+                    train_dataloader=train_dataloader,
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir=self.test_dir,
+                    train_config=_train_config(
+                        log_step_count_steps=1, is_profiling=True
+                    ),
+                    eval_config=EvalConfig(),
+                    ckpt_manager=ckpt_manager,
+                )
+        prof.start.assert_called_once()
+        prof.stop.assert_called_once()
+        exporter.close.assert_called_once()
+        exporter.finalize_publish.assert_not_called()
+
+    def test_train_profiler_stop_failure_prevents_final_publish(self) -> None:
+        """A profiler stop failure on the success path aborts the final tail.
+
+        The stop defines the trace boundary; if it fails after training, the
+        final checkpoint save and the collective publish must not proceed.
+        """
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()])
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=-1.0)
+        pipeline = mock.Mock()
+        pipeline.progress.return_value = ({"loss": torch.tensor(1.0)}, {}, batch)
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        exporter = mock.Mock()
+        exporter.enabled = False
+        prof = mock.Mock()
+        prof.stop.side_effect = RuntimeError("stop boom")
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch("tzrec.main._create_train_profiler", return_value=prof),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop boom"):
+                _train_and_evaluate(
+                    model=model,
+                    optimizer=optimizer,
+                    train_dataloader=train_dataloader,
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir=self.test_dir,
+                    train_config=_train_config(
+                        log_step_count_steps=10, is_profiling=True
+                    ),
+                    eval_config=EvalConfig(),
+                    ckpt_manager=ckpt_manager,
+                )
+        prof.stop.assert_called_once()
+        exporter.finalize_publish.assert_not_called()
+        exporter.close.assert_called_once()
+        for call in ckpt_manager.maybe_save.call_args_list:
+            self.assertFalse(call.kwargs.get("final", False))
+
+    def test_second_writer_failure_closes_first_writer(self) -> None:
+        """A failure after the first writer registration still closes it."""
+        first_writer = _FakeSummaryWriter()
+        exporter = mock.Mock()
+        exporter.enabled = False
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch(
+                "tzrec.main.SummaryWriter",
+                side_effect=[first_writer, RuntimeError("second writer boom")],
+            ),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "second writer boom"):
+                _train_and_evaluate(
+                    model=mock.Mock(),
+                    optimizer=mock.Mock(),
+                    train_dataloader=mock.Mock(),
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir="unused",
+                    train_config=_train_config(use_tensorboard=True),
+                    eval_config=EvalConfig(),
+                    ckpt_manager=mock.Mock(),
+                )
+        first_writer.close.assert_called_once()
+        # the exporter was never constructed, so the stack holds nothing of it
+        exporter.close.assert_not_called()
+
+    def test_handover_failure_closes_exporter_writers_and_profiler(self) -> None:
+        """A handover setup failure releases everything acquired above it.
+
+        The exporter is registered before validation and handover setup, the
+        writers before it, and started tracing stops exactly once; no final
+        publication is initiated.
+        """
+        prof = mock.Mock()
+        writers = [_FakeSummaryWriter(), _FakeSummaryWriter()]
+        exporter = mock.Mock()
+        exporter.enabled = False
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.SummaryWriter", side_effect=writers),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch("tzrec.main._create_train_profiler", return_value=prof),
+            mock.patch(
+                "tzrec.main.create_online_learning_handover",
+                side_effect=RuntimeError("handover boom"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "handover boom"):
+                _train_and_evaluate(
+                    model=mock.Mock(),
+                    optimizer=mock.Mock(),
+                    train_dataloader=mock.Mock(),
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir="unused",
+                    train_config=_train_config(use_tensorboard=True, is_profiling=True),
+                    eval_config=EvalConfig(),
+                    ckpt_manager=mock.Mock(),
+                )
+        prof.start.assert_called_once()
+        prof.stop.assert_called_once()
+        exporter.close.assert_called_once()
+        exporter.finalize_publish.assert_not_called()
+        for writer in writers:
+            writer.close.assert_called_once()
 
     def test_train_eval_uses_ema_and_restores_training_parameters(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([2.0]))
@@ -1180,6 +1362,142 @@ class OnlineLearningHandoverTest(unittest.TestCase):
         dumper.final_dump.assert_called_once_with(2)
         dumper.close.assert_called_once()
         exporter.finalize_publish.assert_called_once()
+
+
+class TrainEntryLifecycleTest(unittest.TestCase):
+    """The training entry owns the checkpoint manager and the sparse uploader."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    def _run_train_entry(
+        self,
+        manager: mock.Mock,
+        train_loop: mock.Mock,
+        dumper: Optional[mock.Mock] = None,
+        dump_enabled: bool = True,
+    ) -> None:
+        """Run a fully mocked train_and_evaluate with the given train loop."""
+        config = EasyRecConfig(
+            model_dir=self.test_dir, train_input_path="train", eval_input_path=""
+        )
+        config.train_config.num_steps = 1
+        if dump_enabled:
+            config.train_config.delta_embedding_dump_config.CopyFrom(
+                DeltaEmbeddingDumpConfig(paired_dump_interval_steps=1)
+            )
+        train_dataloader = mock.Mock()
+        wrapped_model = mock.Mock()
+        wrapped_model.model.sparse_parameters.return_value = ([], [])
+        dmp_model = mock.Mock()
+        dmp_model.named_parameters.return_value = []
+        optimizer_builder = mock.Mock()
+        optimizer_builder.create_sparse_optimizer.return_value = (torch.optim.SGD, {})
+        optimizer_builder.create_dense_optimizer.return_value = (torch.optim.SGD, {})
+        optimizer_builder.create_part_optimizer.return_value = (torch.optim.SGD, {}, [])
+        optimizer_builder.group_param_by_regex_pattern.return_value = ({}, {})
+        optimizer_builder.build_part_optimizers.return_value = ([], [])
+        optimizer_builder.create_part_optim_schedulers.return_value = []
+        patches = [
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config", return_value=config
+            ),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32"),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch(
+                "tzrec.main.checkpoint_util.CheckpointManager", return_value=manager
+            ),
+            mock.patch("tzrec.main.create_dataloader", return_value=train_dataloader),
+            mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+            mock.patch("tzrec.main.TrainWrapper", return_value=wrapped_model),
+            mock.patch("tzrec.main.apply_optimizer_in_backward"),
+            mock.patch("tzrec.main.create_planner", return_value=mock.Mock()),
+            mock.patch("tzrec.main.get_default_sharders", return_value=[]),
+            mock.patch("torch.distributed.barrier"),
+            mock.patch("tzrec.main.config_util.save_message"),
+            mock.patch("tzrec.main.DistributedModelParallel", return_value=dmp_model),
+            mock.patch("tzrec.main.DeltaEmbeddingDumper", return_value=dumper),
+            mock.patch("tzrec.main.optimizer_builder", optimizer_builder),
+            mock.patch("tzrec.main.KeyedOptimizerWrapper", return_value=mock.Mock()),
+            mock.patch("tzrec.main.CombinedOptimizer", return_value=mock.Mock()),
+            mock.patch("tzrec.main.TZRecOptimizer", return_value=mock.Mock()),
+            mock.patch("tzrec.main._train_and_evaluate", side_effect=train_loop),
+        ]
+        with ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            train_and_evaluate("pipeline.config")
+
+    def test_success_drains_dumper_and_closes_manager(self) -> None:
+        """A normal return drains the started uploader and closes the manager.
+
+        The no-work return of the loop takes this same path: the entry, not
+        the loop, owns both.
+        """
+        dumper = mock.Mock()
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+
+        self._run_train_entry(manager, mock.Mock(), dumper=dumper)
+
+        dumper.start.assert_called_once()
+        dumper.close.assert_called_once_with()
+        manager.close.assert_called_once()
+
+    def test_train_failure_requests_non_draining_abort(self) -> None:
+        """A training failure asks the uploader to abort without draining.
+
+        The restarted run re-dumps from the latest checkpoint, so pending
+        in-memory deltas are dropped, and the manager is still closed.
+        """
+        dumper = mock.Mock()
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "train boom"):
+            self._run_train_entry(
+                manager,
+                mock.Mock(side_effect=RuntimeError("train boom")),
+                dumper=dumper,
+            )
+
+        dumper.close.assert_called_once_with(raise_on_error=False, drain=False)
+        manager.close.assert_called_once()
+
+    def test_abort_failure_does_not_mask_training_error(self) -> None:
+        """A secondary abort failure is logged; the training error wins."""
+        dumper = mock.Mock()
+        dumper.close.side_effect = RuntimeError("abort boom")
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "train boom"):
+            self._run_train_entry(
+                manager,
+                mock.Mock(side_effect=RuntimeError("train boom")),
+                dumper=dumper,
+            )
+
+        dumper.close.assert_called_once_with(raise_on_error=False, drain=False)
+        manager.close.assert_called_once()
+
+    def test_without_dumper_still_closes_manager(self) -> None:
+        """Delta-dump disabled training still closes the manager on success."""
+        dumper = mock.Mock()
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+
+        self._run_train_entry(manager, mock.Mock(), dumper=dumper, dump_enabled=False)
+
+        dumper.start.assert_not_called()
+        dumper.close.assert_not_called()
+        manager.close.assert_called_once()
 
 
 if __name__ == "__main__":
