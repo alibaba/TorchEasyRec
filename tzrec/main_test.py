@@ -29,6 +29,7 @@ from tzrec.main import (
     _create_model,
     _create_train_profiler,
     _train_and_evaluate,
+    evaluate,
     predict,
     predict_checkpoint,
 )
@@ -63,6 +64,20 @@ def _train_config(**overrides) -> TrainConfig:
     )
     fields.update(overrides)
     return TrainConfig(**fields)
+
+
+class _FakeSummaryWriter:
+    """SummaryWriter stand-in: a context manager that closes itself on exit."""
+
+    def __init__(self) -> None:
+        self.flush = mock.Mock()
+        self.close = mock.Mock()
+
+    def __enter__(self) -> "_FakeSummaryWriter":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
 
 
 class MainTest(unittest.TestCase):
@@ -1180,6 +1195,63 @@ class OnlineLearningHandoverTest(unittest.TestCase):
         dumper.final_dump.assert_called_once_with(2)
         dumper.close.assert_called_once()
         exporter.finalize_publish.assert_called_once()
+
+
+class EvaluateLifecycleTest(unittest.TestCase):
+    """The standalone evaluate entry scopes its TensorBoard writer."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    def _run_evaluate(self, rank: str):
+        config = EasyRecConfig(model_dir=self.test_dir, eval_input_path="eval")
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = ("ckpt", 5)
+        writer = _FakeSummaryWriter()
+        writer_cls = mock.Mock(return_value=writer)
+        with (
+            mock.patch.dict(os.environ, {"RANK": rank, "LOCAL_RANK": rank}),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config", return_value=config
+            ),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32"),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch("tzrec.main.create_dataloader", return_value=mock.Mock()),
+            mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+            mock.patch("tzrec.main.TrainWrapper", return_value=mock.Mock()),
+            mock.patch(
+                "tzrec.main.checkpoint_util.CheckpointManager", return_value=manager
+            ),
+            mock.patch("tzrec.main.create_planner", return_value=mock.Mock()),
+            mock.patch("tzrec.main.get_default_sharders", return_value=[]),
+            mock.patch("tzrec.main.DistributedModelParallel", return_value=mock.Mock()),
+            mock.patch("tzrec.main.config_util.use_dense_ema", return_value=False),
+            mock.patch("tzrec.main.SummaryWriter", writer_cls),
+            mock.patch("tzrec.main._evaluate") as run_eval,
+        ):
+            evaluate("pipeline.config")
+        return writer, writer_cls, run_eval
+
+    def test_rank_zero_writer_closes_after_evaluate(self) -> None:
+        """Rank zero's writer is closed when the evaluation call exits."""
+        writer, writer_cls, run_eval = self._run_evaluate("0")
+
+        writer_cls.assert_called_once_with(os.path.join(self.test_dir, "eval"))
+        self.assertIs(run_eval.call_args.kwargs["eval_summary_writer"], writer)
+        writer.close.assert_called_once()
+
+    def test_non_zero_rank_passes_no_writer(self) -> None:
+        """Other ranks construct no writer and evaluate without one."""
+        writer, writer_cls, run_eval = self._run_evaluate("1")
+
+        writer_cls.assert_not_called()
+        self.assertIsNone(run_eval.call_args.kwargs["eval_summary_writer"])
+        writer.close.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1268,23 +1268,24 @@ def evaluate(
     else:
         raise ValueError("Eval checkpoint path should be specified.")
 
-    summary_writer = None
-    if is_rank_zero:
-        summary_writer = SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
-
     # when slice batch by sample cost, data on all workers may not be balanced
     check_all_workers_data_status = data_config.HasField("batch_cost_size")
-    _evaluate(
-        model,
-        eval_dataloader,
-        eval_config=pipeline_config.eval_config,
-        eval_result_filename=os.path.join(
-            pipeline_config.model_dir, eval_result_filename
-        ),
-        global_step=global_step,
-        eval_summary_writer=summary_writer,
-        check_all_workers_data_status=check_all_workers_data_status,
-    )
+    with (
+        SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
+        if is_rank_zero
+        else nullcontext(None)
+    ) as summary_writer:
+        _evaluate(
+            model,
+            eval_dataloader,
+            eval_config=pipeline_config.eval_config,
+            eval_result_filename=os.path.join(
+                pipeline_config.model_dir, eval_result_filename
+            ),
+            global_step=global_step,
+            eval_summary_writer=summary_writer,
+            check_all_workers_data_status=check_all_workers_data_status,
+        )
     if is_local_rank_zero:
         logger.info("Evaluate Finished.")
 
