@@ -624,6 +624,72 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             self.assertFalse(mgr._worker.is_alive())
             self.assertFalse(mgr._finalizer.alive)
 
+    def test_init_failure_after_worker_start_drains_worker(self) -> None:
+        """A post-start setup failure must not leak the live export worker.
+
+        No caller-side guard can clean up a constructor that fails after
+        starting the worker, so __init__ drains it locally before re-raising.
+        """
+        real_close = OnlineDenseExportManager.close
+        closed_workers: List[Any] = []
+
+        def recording_close(self: OnlineDenseExportManager) -> None:
+            closed_workers.append(self._worker)
+            real_close(self)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager, "_build_export_graph", return_value=[]
+                ),
+                mock.patch.object(OnlineDenseExportManager, "close", recording_close),
+                mock.patch(
+                    "tzrec.utils.online_dense_export_util.weakref.finalize",
+                    side_effect=RuntimeError("finalize boom"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "finalize boom"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+        self.assertEqual(len(closed_workers), 1)
+        self.assertIsNotNone(closed_workers[0])
+        self.assertFalse(closed_workers[0].is_alive())
+
+    def test_init_failure_before_worker_start_skips_local_close(self) -> None:
+        """A failure before the worker starts must not attempt a local close.
+
+        The guard begins only after a successful worker start: closing here
+        would join an unstarted thread.
+        """
+        real_close = OnlineDenseExportManager.close
+        close_calls: List[Any] = []
+
+        def recording_close(self: OnlineDenseExportManager) -> None:
+            close_calls.append(self)
+            real_close(self)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch.object(
+                    OnlineDenseExportManager,
+                    "_build_export_graph",
+                    side_effect=RuntimeError("graph boom"),
+                ),
+                mock.patch.object(OnlineDenseExportManager, "close", recording_close),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "graph boom"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+        self.assertEqual(close_calls, [])
+
     # --- trigger decisions ---
 
     def test_maybe_export_fires_on_force_and_dedupes(self) -> None:
