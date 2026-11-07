@@ -32,13 +32,15 @@ import math
 import os
 import shutil
 import time
-from typing import Any, Dict, Iterator, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, cast
 
-import torch.distributed as dist
 from torch import nn
 
 from tzrec.protos import train_pb2
 from tzrec.utils.logging_util import logger
+
+if TYPE_CHECKING:
+    from dynamicemb import DynamicEmbTableOptions
 
 # Host memory a rank needs beyond the planned RocksDB budgets (table readers,
 # iterators, pinned blocks, allocator slack).
@@ -67,26 +69,13 @@ def fixed_host_bytes() -> int:
     )
 
 
-def _import_backend():
-    try:
-        import tzrec_ext.rocksdb
-        import tzrec_ext.rocksdb.storage
-    except ImportError as e:
-        raise RuntimeError(
-            "dynamicemb tables placed in RocksDB need the tzrec-ext wheel "
-            "from tzrec's runtime requirements."
-        ) from e
-    return tzrec_ext.rocksdb
-
-
-def is_rocksdb_options(options: Any) -> bool:
+def is_rocksdb_options(options: Optional["DynamicEmbTableOptions"]) -> bool:
     """Whether DynamicEmbTableOptions are backed by a RocksDB factory."""
-    storage = getattr(options, "external_storage", None)
-    if storage is None:
+    if options is None or options.external_storage is None:
         return False
     from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
 
-    return isinstance(storage, RocksDBStorageFactory)
+    return isinstance(options.external_storage, RocksDBStorageFactory)
 
 
 def cache_rows(rows: int, ratio: float) -> int:
@@ -95,10 +84,6 @@ def cache_rows(rows: int, ratio: float) -> int:
         return 0
     rows = max(1, int(rows * ratio))
     return int(math.ceil(rows / CACHE_BUCKET_ROWS) * CACHE_BUCKET_ROWS)
-
-
-def _rank() -> int:
-    return dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", 0))
 
 
 def rocksdb_modules(model: nn.Module) -> List[Any]:
@@ -130,8 +115,9 @@ class RocksDBRuntime:
     ) -> None:
         self.config = config
         self.mode = mode
+        self._rank = int(os.environ.get("RANK", 0))
         run_id = hashlib.sha1(os.path.realpath(model_dir).encode()).hexdigest()[:12]
-        self.rank_dir = os.path.join(config.root_dir, run_id, f"rank_{_rank()}")
+        self.rank_dir = os.path.join(config.root_dir, run_id, f"rank_{self._rank}")
         if mode == "train":
             # Only a complete checkpoint is ever resumed, so a working DB left
             # by an earlier attempt of this rank is stale.
@@ -165,8 +151,9 @@ class RocksDBRuntime:
             return
         config = options[0].external_storage.backend_config
         if self.session is None:
-            backend = _import_backend()
-            self.session = backend.RocksDBSession(config, self._new_work_dir())
+            from tzrec_ext.rocksdb.session import RocksDBSession
+
+            self.session = RocksDBSession(config, self._new_work_dir())
         elif self.session.config != config:
             raise RuntimeError("a second plan changed this run's RocksDB config")
         for o in options:
@@ -305,7 +292,7 @@ class RocksDBRuntime:
         }
         self._saved_metrics.update(m)
         logger.info(
-            f"RANK[{_rank()}] RocksDB checkpoint: {seconds:.2f}s total, cache flush "
+            f"RANK[{self._rank}] RocksDB checkpoint: {seconds:.2f}s total, cache flush "
             f"{d['checkpoint_insert_seconds']:.2f}s "
             f"({int(d['checkpoint_insert_rows'])} rows), logical export "
             f"{d['dump_seconds']:.2f}s ({int(d['dump_rows'])} rows, "
@@ -340,7 +327,7 @@ class RocksDBRuntime:
         for m in groups:
             m.tables.reset_for_new_working_db()
         logger.info(
-            f"RANK[{_rank()}] loading RocksDB tables into fresh working DB "
+            f"RANK[{self._rank}] loading RocksDB tables into fresh working DB "
             f"{self.session.work_dir}"
         )
 
@@ -370,8 +357,10 @@ def open_runtime(
         yield None
         return
     try:
-        _import_backend()
-    except RuntimeError:
+        import tzrec_ext  # noqa: F401
+    except ModuleNotFoundError as e:
+        if e.name != "tzrec_ext":
+            raise
         logger.warning(
             "rocksdb_config without the tzrec-ext wheel: every dynamicemb "
             "table stays in GPU/host memory."

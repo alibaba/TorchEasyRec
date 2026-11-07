@@ -958,7 +958,8 @@ if has_dynamicemb:
             # The GPU cache (cached rows and DynamicEmb's overflow area, with
             # their metadata) and the block cache's share for the table's
             # filters and index; the table itself is on disk.
-            backend = rocksdb_util._import_backend()
+            from tzrec_ext.rocksdb import logical_row_bytes, metadata_cache_bytes
+
             optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
             mult = _get_optimizer_multipler(optimizer_class, tensor.shape, tensor.dtype)
             indexed = dynamicemb_options.score_strategy.name != "NO_EVICTION"
@@ -978,9 +979,9 @@ if has_dynamicemb:
                 for size in shard_sizes
             ]
             ddr_specific_sizes = [
-                backend.metadata_cache_bytes(
+                metadata_cache_bytes(
                     size[0],
-                    backend.logical_row_bytes(
+                    logical_row_bytes(
                         size[1], round(size[1] * mult), tensor.element_size()
                     ),
                     indexed,

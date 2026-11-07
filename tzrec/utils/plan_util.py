@@ -1043,9 +1043,11 @@ def _rocksdb_variants(base_option: ShardingOption) -> List[ShardingOption]:
     would hold the whole table. Each variant records the disk its table adds
     per rank, for the DP's disk axis.
     """
+    from tzrec_ext.rocksdb import index_entry_bytes, logical_row_bytes
+    from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+
     from tzrec.utils.dynamicemb_util import _get_optimizer_multipler
 
-    backend = rocksdb_util._import_backend()
     tensor = base_option.tensor
     rows, dim = int(base_option.shards[0].size[0]), int(base_option.shards[0].size[1])
     optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
@@ -1063,15 +1065,15 @@ def _rocksdb_variants(base_option: ShardingOption) -> List[ShardingOption]:
             continue
         opt = copy.deepcopy(base_option)
         opt.dynamicemb_options.external_storage = (  # pyre-ignore [16]
-            backend.storage.RocksDBStorageFactory(None, "")
+            RocksDBStorageFactory(None, "")
         )
         opt.dynamicemb_options.caching = True  # pyre-ignore [16]
         opt.cache_params = CacheParams(load_factor=ratio)
         table = rocksdb_capacity.TableDisk(
             name=base_option.fqn,
             rows=rows,
-            row_bytes=backend.logical_row_bytes(dim, state_dim, tensor.element_size()),
-            index_bytes=backend.index_entry_bytes() if indexed else 0,
+            row_bytes=logical_row_bytes(dim, state_dim, tensor.element_size()),
+            index_bytes=index_entry_bytes() if indexed else 0,
             bound="max_capacity per shard (enforced by eviction)"
             if indexed
             else "max_capacity per shard (declared horizon, NOT enforced)",
@@ -1141,8 +1143,10 @@ class RocksDBOffloadPlanner(EmbeddingShardingPlanner):
         self._views = views
 
     def _backend_config(self, **budgets: int) -> Any:
+        from tzrec_ext.rocksdb import BackendConfig
+
         cpus = max(1, len(os.sched_getaffinity(0)) // self._topology.local_world_size)
-        return rocksdb_util._import_backend().BackendConfig(
+        return BackendConfig(
             write_buffer_bytes=rocksdb_util.WRITE_BUFFER_BYTES,
             staging_buffer_bytes=rocksdb_util.STAGING_BUFFER_BYTES,
             io_threads=max(4, cpus),
@@ -1161,7 +1165,9 @@ class RocksDBOffloadPlanner(EmbeddingShardingPlanner):
         enumerator = cast(EmbeddingEnumerator, self._enumerator)
         cfg = self._rocksdb.config
         budget = cfg.disk_budget_bytes if cfg.HasField("disk_budget_bytes") else None
-        overheads = rocksdb_util._import_backend().disk_overheads(
+        from tzrec_ext.rocksdb import disk_overheads
+
+        overheads = disk_overheads(
             self._backend_config(block_cache_bytes=0, import_budget_bytes=0)
         )
         ddr = [d.storage.ddr for d in self._topology.devices]
@@ -1204,7 +1210,8 @@ class RocksDBOffloadPlanner(EmbeddingShardingPlanner):
         overheads: Dict[str, int],
     ) -> None:
         """Derive the backend config of the chosen plan, check and log its disk."""
-        backend = rocksdb_util._import_backend()
+        from tzrec_ext.rocksdb import metadata_cache_bytes
+
         selected = self.get_selected_options()
         offloaded = [o for o in selected if hasattr(o, "rocksdb_table")]
         if not offloaded:
@@ -1221,7 +1228,7 @@ class RocksDBOffloadPlanner(EmbeddingShardingPlanner):
         config = self._backend_config(
             block_cache_bytes=rocksdb_util.BLOCK_CACHE_DATA_BYTES
             + sum(
-                backend.metadata_cache_bytes(t.rows, t.row_bytes, t.index_bytes > 0)
+                metadata_cache_bytes(t.rows, t.row_bytes, t.index_bytes > 0)
                 for t in tables
             ),
             import_budget_bytes=min(d - b for d, b in zip(ddr, builtin))

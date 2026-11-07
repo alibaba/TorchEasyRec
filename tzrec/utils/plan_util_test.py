@@ -1250,8 +1250,13 @@ class RocksDBOffloadPlannerTest(unittest.TestCase):
         }
         _, offloaded, planner = self._plan(tables, 1.76, 12)
         self.assertEqual(set(offloaded), {"a"})
-        backend = rocksdb_util._import_backend()
-        overheads = backend.disk_overheads(
+        from tzrec_ext.rocksdb import (
+            disk_overheads,
+            index_entry_bytes,
+            logical_row_bytes,
+        )
+
+        overheads = disk_overheads(
             planner._backend_config(block_cache_bytes=0, import_budget_bytes=0)
         )
 
@@ -1259,8 +1264,8 @@ class RocksDBOffloadPlannerTest(unittest.TestCase):
             return rocksdb_capacity.TableDisk(
                 "t",
                 rows,
-                backend.logical_row_bytes(dim, 0, 4),
-                backend.index_entry_bytes(),
+                logical_row_bytes(dim, 0, 4),
+                index_entry_bytes(),
                 "",
                 rocksdb_util.cache_rows(rows, ratio),
                 lookups,
@@ -1274,7 +1279,7 @@ class RocksDBOffloadPlannerTest(unittest.TestCase):
             room
             + rocksdb_capacity.DISK_RESERVE_BYTES
             + rocksdb_capacity.pool_fixed_bytes(
-                overheads, (1 << 25) * backend.logical_row_bytes(32, 0, 4)
+                overheads, (1 << 25) * logical_row_bytes(32, 0, 4)
             )
         )
         _, offloaded, _ = self._plan(tables, 1.76, 12, budget=budget)
