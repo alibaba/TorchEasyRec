@@ -357,6 +357,8 @@ class CheckpointManager:
             (by eval metric) is always retained even if older than the kept window.
         eval_result_filename: eval result file (relative to ``model_dir``) used to
             locate the best checkpoint.
+        rocksdb: the run's RocksDB runtime (``rocksdb_util.RocksDBRuntime``);
+            restores import its dynamicemb tables into a fresh working DB.
     """
 
     def __init__(
@@ -365,8 +367,10 @@ class CheckpointManager:
         keep_checkpoint_max: int = 0,
         export_config: Optional[export_pb2.ExportConfig] = None,
         eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
+        rocksdb: Optional[Any] = None,
     ) -> None:
         self._model_dir = model_dir
+        self._rocksdb = rocksdb
         self._keep_checkpoint_max = keep_checkpoint_max
         self._export_config = export_config
         self._eval_result_filename = eval_result_filename
@@ -663,6 +667,7 @@ class CheckpointManager:
             ckpt_param_map_path,
             dense_ema=dense_ema,
             use_dense_ema=use_dense_ema,
+            rocksdb=self._rocksdb,
         )
         if lr_schedulers is not None:
             restore_lr_schedulers(ckpt_path, lr_schedulers)
@@ -996,6 +1001,7 @@ def restore_model(
     dense_ema: Optional[DenseEMA] = None,
     use_dense_ema: bool = False,
     load_dynamicemb: bool = True,
+    rocksdb: Optional[Any] = None,
 ) -> None:
     """Restore model state.
 
@@ -1010,6 +1016,8 @@ def restore_model(
         dense_ema: Dense EMA state to restore for continued training.
         use_dense_ema: Overlay Dense EMA parameters onto the restored model.
         load_dynamicemb: Restore native dynamic tables from the checkpoint.
+        rocksdb: the run's RocksDB runtime; its tables import into a fresh
+            working DB.
     """
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
@@ -1121,6 +1129,11 @@ def restore_model(
 
         dynamicemb_path = os.path.join(checkpoint_dir, "dynamicemb")
         if os.path.exists(dynamicemb_path):
+            # RocksDB tables load from the same dynamicemb files as every
+            # other table, into a fresh working DB, whichever backend the
+            # checkpointing run used.
+            if rocksdb is not None:
+                rocksdb.reset_for_import(model)
             # Training never sets INPUT_TILE, but exporting with
             # INPUT_TILE=3 adds twin user-side modules (`ebc_user`,
             # `mc_ebc_user`, `ec_dict_user`, `mc_ec_dict_user`) that
