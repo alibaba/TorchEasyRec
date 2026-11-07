@@ -1301,23 +1301,24 @@ def evaluate(
     else:
         raise ValueError("Eval checkpoint path should be specified.")
 
-    summary_writer = None
-    if is_rank_zero:
-        summary_writer = SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
-
     # when slice batch by sample cost, data on all workers may not be balanced
     check_all_workers_data_status = data_config.HasField("batch_cost_size")
-    _evaluate(
-        model,
-        eval_dataloader,
-        eval_config=pipeline_config.eval_config,
-        eval_result_filename=os.path.join(
-            pipeline_config.model_dir, eval_result_filename
-        ),
-        global_step=global_step,
-        eval_summary_writer=summary_writer,
-        check_all_workers_data_status=check_all_workers_data_status,
-    )
+    with (
+        SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
+        if is_rank_zero
+        else nullcontext(None)
+    ) as summary_writer:
+        _evaluate(
+            model,
+            eval_dataloader,
+            eval_config=pipeline_config.eval_config,
+            eval_result_filename=os.path.join(
+                pipeline_config.model_dir, eval_result_filename
+            ),
+            global_step=global_step,
+            eval_summary_writer=summary_writer,
+            check_all_workers_data_status=check_all_workers_data_status,
+        )
     if is_local_rank_zero:
         logger.info("Evaluate Finished.")
 
@@ -1676,190 +1677,202 @@ def predict(
         )
         prof.start()
 
-    if predict_threads is None:
-        # with a distributed embedding, each lookup stream holds its own NVE buffers.
-        predict_threads = (
-            len(forward_devices)
-            if is_dist_emb
-            else max(data_config.num_workers, len(forward_devices))
-        )
-    elif is_dist_emb and predict_threads > len(forward_devices):
-        logger.warning(
-            f"predict_threads={predict_threads} runs more than one lookup stream per "
-            "GPU; each holds its own NVE lookup buffers outside the GPU cache budget, "
-            "set a lower DIST_EMB_GPU_CACHE_RATIO if GPU memory runs out."
-        )
-    # NVE keeps one lookup context per CUDA stream, so each worker gets its own.
-    worker_streams = (
-        [
-            torch.cuda.Stream(forward_devices[i % len(forward_devices)])
-            for i in range(predict_threads)
-        ]
-        if is_dist_emb
-        else []
-    )
-    data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
-    pred_queue: Queue[Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]] = (
-        Queue(maxsize=predict_threads * 2)
-    )
-    failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
-    cancel_event: Event = Event()
-    input_batches = 0
-
-    # when predicting with a model exported using INPUT_TILE,
-    #  we set the batch size tensor to 1 to disable tiling.
-    tile_batch_size = torch.tensor(1, dtype=torch.int64) if is_input_tile else None
-
-    def _forward(
-        batch: Batch, device: torch.device = device
-    ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
-        with torch.no_grad():
-            predictions = batch_model(batch, tile_batch_size, device)
-            if device.type == "cuda":
-                predictions = {k: v.to("cpu") for k, v in predictions.items()}
-            return predictions, batch.reserves
-
-    def _write(
-        predictions: Dict[str, torch.Tensor],
-        reserves: RecordBatchTensor,
-        output_cols: List[str],
-    ) -> None:
-        _write_predictions(writer, predictions, reserves, output_cols)
-
-    def _write_loop(output_cols: List[str]) -> None:
-        stage = "writer"
-        try:
-            while True:
-                pred = predict_util.queue_get_interruptibly(
-                    pred_queue, cancel_event, f"{stage} input"
-                )
-                if pred is None:
-                    return
-                predictions, reserves = pred
-                _write(predictions, reserves, output_cols)
-        except predict_util.PredictPipelineCancelled:
-            return
-        except BaseException as error:
-            predict_util.report_failure(failure_queue, cancel_event, stage, None, error)
-
-    def _forward_loop(worker_id: int) -> None:
-        stage = "forward"
-        worker_device = forward_devices[worker_id % len(forward_devices)]
-        stream_ctx = (
-            torch.cuda.stream(worker_streams[worker_id])
-            if worker_streams
-            else nullcontext()
-        )
-        try:
-            with stream_ctx:
-                while True:
-                    batch = predict_util.queue_get_interruptibly(
-                        data_queue,
-                        cancel_event,
-                        f"{stage}[{worker_id}] input",
-                    )
-                    if batch is None:
-                        return
-                    pred = _forward(batch, worker_device)
-                    predict_util.queue_put_interruptibly(
-                        pred_queue,
-                        pred,
-                        cancel_event,
-                        f"{stage}[{worker_id}] output",
-                    )
-        except predict_util.PredictPipelineCancelled:
-            return
-        except BaseException as error:
-            predict_util.report_failure(
-                failure_queue, cancel_event, stage, worker_id, error
-            )
-
-    forward_t_list: List[Thread] = []
-    write_t: Optional[Thread] = None
-    pipeline_error: Optional[BaseException] = None
-    i_step = 0
+    # Covers stream/queue setup too: a failure before the pipeline threads
+    # exist still stops the profiler and must not reach the commit rendezvous.
     try:
-        # loaded in the guarded scope: a failed load still reaches the commit
-        # rendezvous below, so other ranks fail fast instead of waiting.
-        batch_model = predict_util.load_predict_model(
-            scripted_model_path,
-            forward_devices,
-            log_model=is_profiling and is_rank_zero,
+        if predict_threads is None:
+            # with a distributed embedding, each lookup stream holds its own
+            # NVE buffers.
+            predict_threads = (
+                len(forward_devices)
+                if is_dist_emb
+                else max(data_config.num_workers, len(forward_devices))
+            )
+        elif is_dist_emb and predict_threads > len(forward_devices):
+            logger.warning(
+                f"predict_threads={predict_threads} runs more than one lookup "
+                "stream per GPU; each holds its own NVE lookup buffers outside "
+                "the GPU cache budget, "
+                "set a lower DIST_EMB_GPU_CACHE_RATIO if GPU memory runs out."
+            )
+        # NVE keeps one lookup context per CUDA stream, so each worker gets its own.
+        worker_streams = (
+            [
+                torch.cuda.Stream(forward_devices[i % len(forward_devices)])
+                for i in range(predict_threads)
+            ]
+            if is_dist_emb
+            else []
         )
-        while True:
+        data_queue: Queue[Optional[Batch]] = Queue(maxsize=predict_threads * 2)
+        pred_queue: Queue[
+            Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]
+        ] = Queue(maxsize=predict_threads * 2)
+        failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
+        cancel_event: Event = Event()
+        input_batches = 0
+
+        # when predicting with a model exported using INPUT_TILE,
+        #  we set the batch size tensor to 1 to disable tiling.
+        tile_batch_size = torch.tensor(1, dtype=torch.int64) if is_input_tile else None
+
+        def _forward(
+            batch: Batch, device: torch.device = device
+        ) -> Tuple[Dict[str, torch.Tensor], RecordBatchTensor]:
+            with torch.no_grad():
+                predictions = batch_model(batch, tile_batch_size, device)
+                if device.type == "cuda":
+                    predictions = {k: v.to("cpu") for k, v in predictions.items()}
+                return predictions, batch.reserves
+
+        def _write(
+            predictions: Dict[str, torch.Tensor],
+            reserves: RecordBatchTensor,
+            output_cols: List[str],
+        ) -> None:
+            _write_predictions(writer, predictions, reserves, output_cols)
+
+        def _write_loop(output_cols: List[str]) -> None:
+            stage = "writer"
             try:
-                batch = next(infer_iterator)
-                if i_step == 0:
-                    # on worker 0's stream, so it adds no lookup context of its own.
-                    with (
-                        torch.cuda.stream(worker_streams[0])
-                        if worker_streams
-                        else nullcontext()
-                    ):
-                        predictions, reserves = _forward(batch)
-                    input_batches += 1
-                    if output_cols is None:
-                        output_cols = sorted(predictions.keys())
+                while True:
+                    pred = predict_util.queue_get_interruptibly(
+                        pred_queue, cancel_event, f"{stage} input"
+                    )
+                    if pred is None:
+                        return
+                    predictions, reserves = pred
                     _write(predictions, reserves, output_cols)
-                    for worker_id in range(predict_threads):
+            except predict_util.PredictPipelineCancelled:
+                return
+            except BaseException as error:
+                predict_util.report_failure(
+                    failure_queue, cancel_event, stage, None, error
+                )
+
+        def _forward_loop(worker_id: int) -> None:
+            stage = "forward"
+            worker_device = forward_devices[worker_id % len(forward_devices)]
+            stream_ctx = (
+                torch.cuda.stream(worker_streams[worker_id])
+                if worker_streams
+                else nullcontext()
+            )
+            try:
+                with stream_ctx:
+                    while True:
+                        batch = predict_util.queue_get_interruptibly(
+                            data_queue,
+                            cancel_event,
+                            f"{stage}[{worker_id}] input",
+                        )
+                        if batch is None:
+                            return
+                        pred = _forward(batch, worker_device)
+                        predict_util.queue_put_interruptibly(
+                            pred_queue,
+                            pred,
+                            cancel_event,
+                            f"{stage}[{worker_id}] output",
+                        )
+            except predict_util.PredictPipelineCancelled:
+                return
+            except BaseException as error:
+                predict_util.report_failure(
+                    failure_queue, cancel_event, stage, worker_id, error
+                )
+
+        forward_t_list: List[Thread] = []
+        write_t: Optional[Thread] = None
+        pipeline_error: Optional[BaseException] = None
+        i_step = 0
+        try:
+            # loaded in the guarded scope: a failed load still reaches the commit
+            # rendezvous below, so other ranks fail fast instead of waiting.
+            batch_model = predict_util.load_predict_model(
+                scripted_model_path,
+                forward_devices,
+                log_model=is_profiling and is_rank_zero,
+            )
+            while True:
+                try:
+                    batch = next(infer_iterator)
+                    if i_step == 0:
+                        # on worker 0's stream, so it adds no lookup context of its own.
+                        with (
+                            torch.cuda.stream(worker_streams[0])
+                            if worker_streams
+                            else nullcontext()
+                        ):
+                            predictions, reserves = _forward(batch)
+                        input_batches += 1
+                        if output_cols is None:
+                            output_cols = sorted(predictions.keys())
+                        _write(predictions, reserves, output_cols)
+                        for worker_id in range(predict_threads):
+                            t = Thread(
+                                target=_forward_loop,
+                                args=(worker_id,),
+                                name=f"predict-forward-{worker_id}",
+                                daemon=True,
+                            )
+                            t.start()
+                            forward_t_list.append(t)
                         t = Thread(
-                            target=_forward_loop,
-                            args=(worker_id,),
-                            name=f"predict-forward-{worker_id}",
+                            target=_write_loop,
+                            args=(output_cols,),
+                            name="predict-writer",
                             daemon=True,
                         )
                         t.start()
-                        forward_t_list.append(t)
-                    t = Thread(
-                        target=_write_loop,
-                        args=(output_cols,),
-                        name="predict-writer",
-                        daemon=True,
-                    )
-                    t.start()
-                    write_t = t
-                else:
-                    predict_util.queue_put_interruptibly(
-                        data_queue,
-                        batch,
-                        cancel_event,
-                        "input producer",
-                    )
-                    input_batches += 1
+                        write_t = t
+                    else:
+                        predict_util.queue_put_interruptibly(
+                            data_queue,
+                            batch,
+                            cancel_event,
+                            "input producer",
+                        )
+                        input_batches += 1
 
-                if plogger is not None:
-                    plogger.log(i_step)
-                if prof is not None:
-                    prof.step()
-                i_step += 1
-                if predict_steps is not None and i_step >= predict_steps:
+                    if plogger is not None:
+                        plogger.log(i_step)
+                    if prof is not None:
+                        prof.step()
+                    i_step += 1
+                    if predict_steps is not None and i_step >= predict_steps:
+                        break
+                except StopIteration:
                     break
-            except StopIteration:
-                break
 
-        for _ in range(len(forward_t_list)):
-            predict_util.queue_put_interruptibly(
-                data_queue,
-                None,
-                cancel_event,
-                "input completion",
+            for _ in range(len(forward_t_list)):
+                predict_util.queue_put_interruptibly(
+                    data_queue,
+                    None,
+                    cancel_event,
+                    "input completion",
+                )
+            predict_util.wait_for_pipeline(
+                [], forward_t_list, failure_queue, cancel_event
             )
-        predict_util.wait_for_pipeline([], forward_t_list, failure_queue, cancel_event)
-        if write_t is not None:
-            predict_util.queue_put_interruptibly(
-                pred_queue,
-                None,
-                cancel_event,
-                "writer completion",
-            )
-            predict_util.wait_for_pipeline([], [write_t], failure_queue, cancel_event)
-    except Exception as error:
-        pipeline_error = predict_util.resolve_pipeline_error(error, failure_queue)
+            if write_t is not None:
+                predict_util.queue_put_interruptibly(
+                    pred_queue,
+                    None,
+                    cancel_event,
+                    "writer completion",
+                )
+                predict_util.wait_for_pipeline(
+                    [], [write_t], failure_queue, cancel_event
+                )
+        except Exception as error:
+            pipeline_error = predict_util.resolve_pipeline_error(error, failure_queue)
+        finally:
+            pipeline_threads = [*forward_t_list]
+            if write_t is not None:
+                pipeline_threads.append(write_t)
+            predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
     finally:
-        pipeline_threads = [*forward_t_list]
-        if write_t is not None:
-            pipeline_threads.append(write_t)
-        predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
         if prof is not None:
             # nothing here may raise, or this rank skips the commit rendezvous.
             try:
