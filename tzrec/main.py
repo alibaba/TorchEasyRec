@@ -89,6 +89,7 @@ from tzrec.utils import (
     config_util,
     dynamicemb_util,
     predict_util,
+    rocksdb_util,
 )
 from tzrec.utils.delta_embedding_dump import DeltaEmbeddingDumper, DumpDecision
 from tzrec.utils.dist_util import (
@@ -448,6 +449,7 @@ def _train_and_evaluate(
     dense_ema: Optional[DenseEMA] = None,
     export_config: Optional[ExportConfig] = None,
     ignore_restore_lr_scheduler: bool = False,
+    rocksdb: Optional[rocksdb_util.RocksDBRuntime] = None,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -689,6 +691,10 @@ def _train_and_evaluate(
                             kafka_baseline_offsets.setdefault(
                                 key, dataloader_state[key]
                             )
+                    # RocksDB logical eviction, before this step is
+                    # published or checkpointed.
+                    if rocksdb is not None:
+                        rocksdb.evict()
                     _model.update_train_metric(predictions, batch)
                     if i_step % train_config.log_step_count_steps == 0:
                         train_metrics = _model.compute_train_metric()
@@ -716,6 +722,10 @@ def _train_and_evaluate(
                     if delta_embedding_dumper is not None:
                         dump_decision = delta_embedding_dumper.maybe_dump(i_step)
                 except StopIteration:
+                    # The call that ran out of data may still have trained
+                    # the last queued batch; nothing is in flight now.
+                    if rocksdb is not None:
+                        rocksdb.evict()
                     # pass completed: later saves should record positions
                     # within the next pass, on top of the completed-pass count.
                     epochs_completed += 1
@@ -915,253 +925,266 @@ def train_and_evaluate(
         and train_config.delta_embedding_dump_config.dump_evicted_tombstones
     )
 
-    data_config = pipeline_config.data_config
-    # Build feature
-    features = _create_features(list(pipeline_config.feature_configs), data_config)
-    compiled_prompt = _compile_prompt(pipeline_config, features)
+    with rocksdb_util.open_runtime(
+        train_config, pipeline_config.model_dir, "train"
+    ) as rocksdb:
+        data_config = pipeline_config.data_config
+        # Build feature
+        features = _create_features(list(pipeline_config.feature_configs), data_config)
+        compiled_prompt = _compile_prompt(pipeline_config, features)
 
-    ckpt_manager = checkpoint_util.CheckpointManager(
-        pipeline_config.model_dir,
-        keep_checkpoint_max=train_config.keep_checkpoint_max,
-        export_config=pipeline_config.export_config,
-    )
-
-    # Get Restore Ckpt Path
-    ckpt_path = None
-    skip_steps = -1
-    if pipeline_config.train_config.fine_tune_checkpoint:
-        # fine_tune_checkpoint is an external dir, outside the manager's model_dir.
-        ckpt_path, _ = checkpoint_util.latest_checkpoint(
-            pipeline_config.train_config.fine_tune_checkpoint
+        ckpt_manager = checkpoint_util.CheckpointManager(
+            pipeline_config.model_dir,
+            keep_checkpoint_max=train_config.keep_checkpoint_max,
+            export_config=pipeline_config.export_config,
+            rocksdb=rocksdb,
         )
-        if ckpt_path is None or not os.path.exists(ckpt_path):
-            raise RuntimeError(
-                "fine_tune_checkpoint"
-                f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
+
+        # Get Restore Ckpt Path
+        ckpt_path = None
+        skip_steps = -1
+        if pipeline_config.train_config.fine_tune_checkpoint:
+            # fine_tune_checkpoint is an external dir, outside the manager's model_dir.
+            ckpt_path, _ = checkpoint_util.latest_checkpoint(
+                pipeline_config.train_config.fine_tune_checkpoint
             )
-    restore_from_model_dir = False
-    if os.path.exists(pipeline_config.model_dir):
-        # Find the latest checkpoint in model_dir when continuing training
-        latest_ckpt_path, skip_steps = ckpt_manager.latest_checkpoint()
-        if latest_ckpt_path:
-            if continue_train:
-                ckpt_path = latest_ckpt_path
-                restore_from_model_dir = True
-            else:
+            if ckpt_path is None or not os.path.exists(ckpt_path):
                 raise RuntimeError(
-                    f"model_dir[{pipeline_config.model_dir}] already exists "
-                    "and not empty(if you want to continue train on current "
-                    "model_dir please delete dir model_dir or specify "
-                    "--continue_train)"
+                    "fine_tune_checkpoint"
+                    f"[{pipeline_config.train_config.fine_tune_checkpoint}] not exists."
                 )
+        restore_from_model_dir = False
+        if os.path.exists(pipeline_config.model_dir):
+            # Find the latest checkpoint in model_dir when continuing training
+            latest_ckpt_path, skip_steps = ckpt_manager.latest_checkpoint()
+            if latest_ckpt_path:
+                if continue_train:
+                    ckpt_path = latest_ckpt_path
+                    restore_from_model_dir = True
+                else:
+                    raise RuntimeError(
+                        f"model_dir[{pipeline_config.model_dir}] already exists "
+                        "and not empty(if you want to continue train on current "
+                        "model_dir please delete dir model_dir or specify "
+                        "--continue_train)"
+                    )
 
-    # Restore dataloader state before create_dataloader starts its workers
-    dataloader_state: Optional[Dict[str, Any]] = None
-    if ckpt_path and continue_train:
-        dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
-        if dataloader_state and not restore_from_model_dir:
-            # fine-tune checkpoints do not carry this job's epoch budget
-            dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
+        # Restore dataloader state before create_dataloader starts its workers
+        dataloader_state: Optional[Dict[str, Any]] = None
+        if ckpt_path and continue_train:
+            dataloader_state = ckpt_manager.restore_dataloader_state(ckpt_path)
+            if dataloader_state and not restore_from_model_dir:
+                # fine-tune checkpoints do not carry this job's epoch budget
+                dataloader_state.pop(checkpoint_util.EPOCHS_COMPLETED, None)
 
-    # Build dataloader
-    train_dataloader = create_dataloader(
-        data_config,
-        features,
-        pipeline_config.train_input_path,
-        mode=Mode.TRAIN,
-        compiled_prompt=compiled_prompt,
-        checkpoint_state=dataloader_state,
-    )
-    eval_dataloader = None
-    if pipeline_config.eval_input_path:
-        # pyre-ignore [16]
-        gl_cluster = train_dataloader.dataset.get_sampler_cluster()
-        eval_dataloader = create_dataloader(
+        # Build dataloader
+        train_dataloader = create_dataloader(
             data_config,
             features,
-            pipeline_config.eval_input_path,
-            mode=Mode.EVAL,
+            pipeline_config.train_input_path,
+            mode=Mode.TRAIN,
             compiled_prompt=compiled_prompt,
-            gl_cluster=gl_cluster,
+            checkpoint_state=dataloader_state,
+        )
+        eval_dataloader = None
+        if pipeline_config.eval_input_path:
+            # pyre-ignore [16]
+            gl_cluster = train_dataloader.dataset.get_sampler_cluster()
+            eval_dataloader = create_dataloader(
+                data_config,
+                features,
+                pipeline_config.eval_input_path,
+                mode=Mode.EVAL,
+                compiled_prompt=compiled_prompt,
+                gl_cluster=gl_cluster,
+            )
+
+        sampler_type = _get_sampler_type(data_config)
+
+        # Build model
+        model = _create_model(
+            pipeline_config.model_config,
+            features,
+            list(data_config.label_fields),
+            sample_weights=list(data_config.sample_weight_fields),
+            sampler_type=sampler_type,
+            compiled_prompt=compiled_prompt,
+        )
+        # Cold start only; a resumed or fine-tuned run gets its weights from DCP.
+        if ckpt_path is None:
+            model.init_from_pretrained()
+        model = TrainWrapper(
+            model, device=device, mixed_precision=train_config.mixed_precision
         )
 
-    sampler_type = _get_sampler_type(data_config)
+        sparse_optim_cls, sparse_optim_kwargs = (
+            optimizer_builder.create_sparse_optimizer(train_config.sparse_optimizer)
+        )
+        trainable_params, frozen_params = model.model.sparse_parameters()
+        apply_optimizer_in_backward(
+            sparse_optim_cls, trainable_params, sparse_optim_kwargs
+        )
+        if len(frozen_params) > 0:
+            # SGD and lr=0 for using fused kernel and freezing params
+            apply_optimizer_in_backward(SGD, frozen_params, {"lr": 0.0})
 
-    # Build model
-    model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(data_config.label_fields),
-        sample_weights=list(data_config.sample_weight_fields),
-        sampler_type=sampler_type,
-        compiled_prompt=compiled_prompt,
-    )
-    # Cold start only; a resumed or fine-tuned run gets its weights from DCP.
-    if ckpt_path is None:
-        model.init_from_pretrained()
-    model = TrainWrapper(
-        model, device=device, mixed_precision=train_config.mixed_precision
-    )
+        planner = create_planner(
+            device=device,
+            # pyre-ignore [16]
+            batch_size=train_dataloader.dataset.sampled_batch_size,
+            ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
+            global_constraints_cfg=train_config.global_embedding_constraints
+            if train_config.HasField("global_embedding_constraints")
+            else None,
+            model=model,
+            rocksdb=rocksdb,
+        )
 
-    sparse_optim_cls, sparse_optim_kwargs = optimizer_builder.create_sparse_optimizer(
-        train_config.sparse_optimizer
-    )
-    trainable_params, frozen_params = model.model.sparse_parameters()
-    apply_optimizer_in_backward(sparse_optim_cls, trainable_params, sparse_optim_kwargs)
-    if len(frozen_params) > 0:
-        # SGD and lr=0 for using fused kernel and freezing params
-        apply_optimizer_in_backward(SGD, frozen_params, {"lr": 0.0})
+        sharders = get_default_sharders()
+        plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
+        if is_rank_zero:
+            logger.info(str(plan))
 
-    planner = create_planner(
-        device=device,
-        # pyre-ignore [16]
-        batch_size=train_dataloader.dataset.sampled_batch_size,
-        ckpt_plan_path=os.path.join(ckpt_path, "plan") if ckpt_path else None,
-        global_constraints_cfg=train_config.global_embedding_constraints
-        if train_config.HasField("global_embedding_constraints")
-        else None,
-        model=model,
-    )
+        model = DistributedModelParallel(
+            module=model,
+            device=device,
+            sharders=sharders,
+            plan=plan,
+        )
+        if rocksdb is not None:
+            rocksdb.attach(model)
+        delta_embedding_dumper = None
+        if enable_delta_embedding_dump:
+            delta_embedding_dumper = DeltaEmbeddingDumper(
+                model,
+                train_config.delta_embedding_dump_config,
+                pipeline_config.model_dir,
+                device,
+            )
 
-    sharders = get_default_sharders()
-    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
-    if is_rank_zero:
-        logger.info(str(plan))
+        dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
+            train_config.dense_optimizer
+        )
+        part_optim_cls, part_optim_kwargs, part_optim_regex_patterns = (
+            optimizer_builder.create_part_optimizer(train_config.dense_optimizer)
+        )
+        dense_params = dict(in_backward_optimizer_filter(model.named_parameters()))
+        remaining_params, part_optim_params = (
+            optimizer_builder.group_param_by_regex_pattern(
+                dense_params,
+                part_optim_regex_patterns,
+            )
+        )
+        dense_ema = None
+        if train_config.dense_optimizer.HasField("ema"):
+            dense_ema = DenseEMA(
+                dense_params,
+                train_config.dense_optimizer.ema.decay,
+            )
+        dense_optimizer = KeyedOptimizerWrapper(
+            remaining_params,
+            lambda params: dense_optim_cls(params, **dense_optim_kwargs),
+        )
+        # it is necessary to know the index that can match the parameter part_optimizer
+        # for lr scheduler use
+        part_optimizers, part_optim_indices = optimizer_builder.build_part_optimizers(
+            part_optim_cls, part_optim_kwargs, part_optim_params
+        )
+        grad_scaler = None
+        if train_config.HasField("grad_scaler"):
+            grad_scaler = GradScaler(
+                device=device.type,
+                **config_util.config_to_kwargs(train_config.grad_scaler),
+            )
+        combined_optimizer = CombinedOptimizer(
+            [model.fused_optimizer, dense_optimizer, *part_optimizers]
+        )
+        # Apply gradient clipping for dense parameters if configured
+        if train_config.HasField("grad_clipping"):
+            gc_config = train_config.grad_clipping
+            valid_clipping_types = set(GradientClipping.__members__.keys())
+            clipping_type_str = gc_config.clipping_type.upper()
+            if clipping_type_str not in valid_clipping_types:
+                raise ValueError(
+                    f"Invalid clipping_type '{gc_config.clipping_type}'. Valid "
+                    f"values are: {', '.join(t.lower() for t in valid_clipping_types)}"
+                )
+            clipping_type = GradientClipping[clipping_type_str]
+            if clipping_type != GradientClipping.NONE:
+                combined_optimizer = GradientClippingOptimizer(
+                    optimizer=combined_optimizer,
+                    clipping=clipping_type,
+                    max_gradient=gc_config.max_gradient,
+                    norm_type=gc_config.norm_type,
+                    enable_global_grad_clip=gc_config.enable_global_grad_clip,
+                )
+        if dense_ema is not None:
+            combined_optimizer = EMAOptimizer(combined_optimizer, dense_ema)
+        optimizer = TZRecOptimizer(
+            combined_optimizer,
+            grad_scaler=grad_scaler,
+            gradient_accumulation_steps=train_config.gradient_accumulation_steps,
+        )
+        sparse_lr = optimizer_builder.create_scheduler(
+            model.fused_optimizer, train_config.sparse_optimizer
+        )
+        dense_lr = optimizer_builder.create_scheduler(
+            dense_optimizer, train_config.dense_optimizer
+        )
+        part_lrs = optimizer_builder.create_part_optim_schedulers(
+            part_optimizers, train_config.dense_optimizer, part_optim_indices
+        )
 
-    model = DistributedModelParallel(
-        module=model,
-        device=device,
-        sharders=sharders,
-        plan=plan,
-    )
-    delta_embedding_dumper = None
-    if enable_delta_embedding_dump:
-        delta_embedding_dumper = DeltaEmbeddingDumper(
+        # use barrier to sync all workers, prevent rank zero save_message and create
+        # model_dir first, other slow rank find model_dir already exists and
+        # do continue train improperly.
+        dist.barrier()
+
+        if is_rank_zero:
+            config_util.save_message(
+                pipeline_config,
+                os.path.join(pipeline_config.model_dir, "pipeline.config"),
+            )
+            with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
+                f.write(tzrec_version + "\n")
+
+        if delta_embedding_dumper is not None:
+            delta_embedding_dumper.start()
+        # when slice batch by sample cost, data on all workers may not be balanced
+        check_all_workers_data_status = data_config.HasField("batch_cost_size")
+        _train_and_evaluate(
             model,
-            train_config.delta_embedding_dump_config,
+            optimizer,
+            train_dataloader,
+            eval_dataloader,
+            [sparse_lr, dense_lr, *part_lrs],
             pipeline_config.model_dir,
-            device,
+            train_config=train_config,
+            eval_config=pipeline_config.eval_config,
+            ckpt_manager=ckpt_manager,
+            skip_steps=skip_steps,
+            ckpt_path=ckpt_path,
+            check_all_workers_data_status=check_all_workers_data_status,
+            ignore_restore_optimizer=ignore_restore_optimizer,
+            ignore_restore_lr_scheduler=ignore_restore_lr_scheduler,
+            restore_from_model_dir=restore_from_model_dir,
+            dataloader_state=dataloader_state,
+            delta_embedding_dumper=delta_embedding_dumper,
+            pipeline_config_path=os.path.join(
+                pipeline_config.model_dir, "pipeline.config"
+            ),
+            dense_ema=dense_ema,
+            export_config=pipeline_config.export_config,
+            rocksdb=rocksdb,
         )
-
-    dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
-        train_config.dense_optimizer
-    )
-    part_optim_cls, part_optim_kwargs, part_optim_regex_patterns = (
-        optimizer_builder.create_part_optimizer(train_config.dense_optimizer)
-    )
-    dense_params = dict(in_backward_optimizer_filter(model.named_parameters()))
-    remaining_params, part_optim_params = (
-        optimizer_builder.group_param_by_regex_pattern(
-            dense_params,
-            part_optim_regex_patterns,
-        )
-    )
-    dense_ema = None
-    if train_config.dense_optimizer.HasField("ema"):
-        dense_ema = DenseEMA(
-            dense_params,
-            train_config.dense_optimizer.ema.decay,
-        )
-    dense_optimizer = KeyedOptimizerWrapper(
-        remaining_params,
-        lambda params: dense_optim_cls(params, **dense_optim_kwargs),
-    )
-    # it is necessary to know the index that can match the parameter part_optimizer
-    # for lr scheduler use
-    part_optimizers, part_optim_indices = optimizer_builder.build_part_optimizers(
-        part_optim_cls, part_optim_kwargs, part_optim_params
-    )
-    grad_scaler = None
-    if train_config.HasField("grad_scaler"):
-        grad_scaler = GradScaler(
-            device=device.type,
-            **config_util.config_to_kwargs(train_config.grad_scaler),
-        )
-    combined_optimizer = CombinedOptimizer(
-        [model.fused_optimizer, dense_optimizer, *part_optimizers]
-    )
-    # Apply gradient clipping for dense parameters if configured
-    if train_config.HasField("grad_clipping"):
-        gc_config = train_config.grad_clipping
-        valid_clipping_types = set(GradientClipping.__members__.keys())
-        clipping_type_str = gc_config.clipping_type.upper()
-        if clipping_type_str not in valid_clipping_types:
-            raise ValueError(
-                f"Invalid clipping_type '{gc_config.clipping_type}'. Valid "
-                f"values are: {', '.join(t.lower() for t in valid_clipping_types)}"
-            )
-        clipping_type = GradientClipping[clipping_type_str]
-        if clipping_type != GradientClipping.NONE:
-            combined_optimizer = GradientClippingOptimizer(
-                optimizer=combined_optimizer,
-                clipping=clipping_type,
-                max_gradient=gc_config.max_gradient,
-                norm_type=gc_config.norm_type,
-                enable_global_grad_clip=gc_config.enable_global_grad_clip,
-            )
-    if dense_ema is not None:
-        combined_optimizer = EMAOptimizer(combined_optimizer, dense_ema)
-    optimizer = TZRecOptimizer(
-        combined_optimizer,
-        grad_scaler=grad_scaler,
-        gradient_accumulation_steps=train_config.gradient_accumulation_steps,
-    )
-    sparse_lr = optimizer_builder.create_scheduler(
-        model.fused_optimizer, train_config.sparse_optimizer
-    )
-    dense_lr = optimizer_builder.create_scheduler(
-        dense_optimizer, train_config.dense_optimizer
-    )
-    part_lrs = optimizer_builder.create_part_optim_schedulers(
-        part_optimizers, train_config.dense_optimizer, part_optim_indices
-    )
-
-    # use barrier to sync all workers, prevent rank zero save_message and create
-    # model_dir first, other slow rank find model_dir already exists and
-    # do continue train improperly.
-    dist.barrier()
-
-    if is_rank_zero:
-        config_util.save_message(
-            pipeline_config, os.path.join(pipeline_config.model_dir, "pipeline.config")
-        )
-        with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
-            f.write(tzrec_version + "\n")
-
-    if delta_embedding_dumper is not None:
-        delta_embedding_dumper.start()
-    # when slice batch by sample cost, data on all workers may not be balanced
-    check_all_workers_data_status = data_config.HasField("batch_cost_size")
-    _train_and_evaluate(
-        model,
-        optimizer,
-        train_dataloader,
-        eval_dataloader,
-        [sparse_lr, dense_lr, *part_lrs],
-        pipeline_config.model_dir,
-        train_config=train_config,
-        eval_config=pipeline_config.eval_config,
-        ckpt_manager=ckpt_manager,
-        skip_steps=skip_steps,
-        ckpt_path=ckpt_path,
-        check_all_workers_data_status=check_all_workers_data_status,
-        ignore_restore_optimizer=ignore_restore_optimizer,
-        ignore_restore_lr_scheduler=ignore_restore_lr_scheduler,
-        restore_from_model_dir=restore_from_model_dir,
-        dataloader_state=dataloader_state,
-        delta_embedding_dumper=delta_embedding_dumper,
-        pipeline_config_path=os.path.join(pipeline_config.model_dir, "pipeline.config"),
-        dense_ema=dense_ema,
-        export_config=pipeline_config.export_config,
-    )
-    # Drain background uploads only after training succeeds. A training failure
-    # terminates the whole job (torchrun tears down every rank) and pending
-    # in-memory deltas are intentionally abandoned: the restarted run re-dumps
-    # from the latest checkpoint, so there is nothing to roll back or undo.
-    if delta_embedding_dumper is not None:
-        delta_embedding_dumper.close()
-    if is_local_rank_zero:
-        logger.info("Train and Evaluate Finished.")
+        # Drain background uploads only after training succeeds. A training failure
+        # terminates the whole job (torchrun tears down every rank) and pending
+        # in-memory deltas are intentionally abandoned: the restarted run re-dumps
+        # from the latest checkpoint, so there is nothing to roll back or undo.
+        if delta_embedding_dumper is not None:
+            delta_embedding_dumper.close()
+        if is_local_rank_zero:
+            logger.info("Train and Evaluate Finished.")
 
 
 def evaluate(
@@ -1188,90 +1211,100 @@ def evaluate(
     train_config = pipeline_config.train_config
     acc_utils.allow_tf32(train_config)
 
-    data_config = pipeline_config.data_config
-    # Build feature
-    features = _create_features(list(pipeline_config.feature_configs), data_config)
-    compiled_prompt = _compile_prompt(pipeline_config, features)
+    with rocksdb_util.open_runtime(
+        train_config, pipeline_config.model_dir, "eval"
+    ) as rocksdb:
+        data_config = pipeline_config.data_config
+        # Build feature
+        features = _create_features(list(pipeline_config.feature_configs), data_config)
+        compiled_prompt = _compile_prompt(pipeline_config, features)
 
-    eval_dataloader = create_dataloader(
-        data_config,
-        features,
-        eval_input_path or pipeline_config.eval_input_path,
-        mode=Mode.EVAL,
-        compiled_prompt=compiled_prompt,
-    )
-
-    sampler_type = _get_sampler_type(data_config)
-
-    # Build model
-    model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(data_config.label_fields),
-        sample_weights=list(data_config.sample_weight_fields),
-        sampler_type=sampler_type,
-        compiled_prompt=compiled_prompt,
-    )
-    model = TrainWrapper(
-        model, device=device, mixed_precision=train_config.mixed_precision
-    )
-
-    ckpt_manager = checkpoint_util.CheckpointManager(pipeline_config.model_dir)
-    global_step = None
-    if not checkpoint_path:
-        checkpoint_path, global_step = ckpt_manager.latest_checkpoint()
-    planner = create_planner(
-        device=device,
-        # pyre-ignore [16]
-        batch_size=eval_dataloader.dataset.sampled_batch_size,
-        ckpt_plan_path=os.path.join(checkpoint_path, "plan")
-        if checkpoint_path
-        else None,
-        global_constraints_cfg=train_config.global_embedding_constraints
-        if train_config.HasField("global_embedding_constraints")
-        else None,
-        model=model,
-    )
-    sharders = get_default_sharders()
-    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
-    if is_rank_zero:
-        logger.info(str(plan))
-
-    model = DistributedModelParallel(
-        module=model, sharders=sharders, device=device, plan=plan
-    )
-
-    if checkpoint_path:
-        ckpt_manager.restore(
-            checkpoint_path,
-            model,
-            use_dense_ema=config_util.use_dense_ema(
-                pipeline_config.eval_config,
-                train_config,
-            ),
+        eval_dataloader = create_dataloader(
+            data_config,
+            features,
+            eval_input_path or pipeline_config.eval_input_path,
+            mode=Mode.EVAL,
+            compiled_prompt=compiled_prompt,
         )
-    else:
-        raise ValueError("Eval checkpoint path should be specified.")
 
-    summary_writer = None
-    if is_rank_zero:
-        summary_writer = SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
+        sampler_type = _get_sampler_type(data_config)
 
-    # when slice batch by sample cost, data on all workers may not be balanced
-    check_all_workers_data_status = data_config.HasField("batch_cost_size")
-    _evaluate(
-        model,
-        eval_dataloader,
-        eval_config=pipeline_config.eval_config,
-        eval_result_filename=os.path.join(
-            pipeline_config.model_dir, eval_result_filename
-        ),
-        global_step=global_step,
-        eval_summary_writer=summary_writer,
-        check_all_workers_data_status=check_all_workers_data_status,
-    )
-    if is_local_rank_zero:
-        logger.info("Evaluate Finished.")
+        # Build model
+        model = _create_model(
+            pipeline_config.model_config,
+            features,
+            list(data_config.label_fields),
+            sample_weights=list(data_config.sample_weight_fields),
+            sampler_type=sampler_type,
+            compiled_prompt=compiled_prompt,
+        )
+        model = TrainWrapper(
+            model, device=device, mixed_precision=train_config.mixed_precision
+        )
+
+        ckpt_manager = checkpoint_util.CheckpointManager(
+            pipeline_config.model_dir, rocksdb=rocksdb
+        )
+        global_step = None
+        if not checkpoint_path:
+            checkpoint_path, global_step = ckpt_manager.latest_checkpoint()
+        planner = create_planner(
+            device=device,
+            # pyre-ignore [16]
+            batch_size=eval_dataloader.dataset.sampled_batch_size,
+            ckpt_plan_path=os.path.join(checkpoint_path, "plan")
+            if checkpoint_path
+            else None,
+            global_constraints_cfg=train_config.global_embedding_constraints
+            if train_config.HasField("global_embedding_constraints")
+            else None,
+            model=model,
+            rocksdb=rocksdb,
+        )
+        sharders = get_default_sharders()
+        plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
+        if is_rank_zero:
+            logger.info(str(plan))
+
+        model = DistributedModelParallel(
+            module=model, sharders=sharders, device=device, plan=plan
+        )
+        if rocksdb is not None:
+            rocksdb.attach(model)
+
+        if checkpoint_path:
+            ckpt_manager.restore(
+                checkpoint_path,
+                model,
+                use_dense_ema=config_util.use_dense_ema(
+                    pipeline_config.eval_config,
+                    train_config,
+                ),
+            )
+        else:
+            raise ValueError("Eval checkpoint path should be specified.")
+
+        summary_writer = None
+        if is_rank_zero:
+            summary_writer = SummaryWriter(
+                os.path.join(pipeline_config.model_dir, "eval")
+            )
+
+        # when slice batch by sample cost, data on all workers may not be balanced
+        check_all_workers_data_status = data_config.HasField("batch_cost_size")
+        _evaluate(
+            model,
+            eval_dataloader,
+            eval_config=pipeline_config.eval_config,
+            eval_result_filename=os.path.join(
+                pipeline_config.model_dir, eval_result_filename
+            ),
+            global_step=global_step,
+            eval_summary_writer=summary_writer,
+            check_all_workers_data_status=check_all_workers_data_status,
+        )
+        if is_local_rank_zero:
+            logger.info("Evaluate Finished.")
 
 
 def export(
@@ -1318,132 +1351,146 @@ def export(
     if asset_files:
         assets = asset_files.split(",")
 
-    ckpt_manager = checkpoint_util.CheckpointManager(
-        pipeline_config.model_dir, export_config=pipeline_config.export_config
-    )
-    if not checkpoint_path:
-        if (
-            pipeline_config.HasField("export_config")
-            and pipeline_config.export_config.exporter_type == "best"
-        ):
-            checkpoint_path, _ = ckpt_manager.best_checkpoint()
-        else:
-            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
-
-    data_config = pipeline_config.data_config
-
-    # Build feature
-    features = _create_features(list(pipeline_config.feature_configs), data_config)
-
-    compiled_prompt = _compile_prompt(pipeline_config, features)
-
-    # Build model
-    model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(data_config.label_fields),
-        sampler_type=None,
-        compiled_prompt=compiled_prompt,
-    )
-    InferWrapper = ScriptWrapper
-    # Flip to inference *before* wrapping so view-dependent state
-    # (e.g. HSTUMatchItemTower's lazy properties, wrapper EmbeddingGroups)
-    # is snapshot from the scalar view.
-    model.set_is_inference(True)
-    model = InferWrapper(model)
-
-    if isinstance(model.model, MatchModel):
-        for name, module in model.model.named_children():
-            if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
-                wrapper = (
-                    TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
-                )
-                tower = InferWrapper(wrapper(module, name))
-                tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
-                # item-tower-only; user tower falls back to `train_input_path`.
-                tower_data_input_path = (
-                    item_input_path if name == "item_tower" else None
-                )
-                export_model(
-                    ori_pipeline_config,
-                    tower,
-                    checkpoint_path,
-                    tower_export_dir,
-                    assets=assets,
-                    additional_export_config=additional_export_config,
-                    data_input_path=tower_data_input_path,
-                )
-    elif isinstance(model.model, TDM):
-        for name, module in model.model.named_children():
-            if isinstance(module, EmbeddingGroup):
-                emb_module = InferWrapper(TDMEmbedding(module, name))
-                export_model(
-                    ori_pipeline_config,
-                    emb_module,
-                    checkpoint_path,
-                    os.path.join(export_dir, "embedding"),
-                )
-                break
-        export_model(
-            ori_pipeline_config,
-            model,
-            checkpoint_path,
-            os.path.join(export_dir, "model"),
-            assets=assets,
+    with rocksdb_util.open_runtime(
+        pipeline_config.train_config, pipeline_config.model_dir, "export"
+    ) as rocksdb:
+        ckpt_manager = checkpoint_util.CheckpointManager(
+            pipeline_config.model_dir,
+            export_config=pipeline_config.export_config,
+            rocksdb=rocksdb,
         )
-    elif isinstance(model.model, BaseGenRecModel):
-        # tzrec serves the prompt front-end; the LM rides beside it as
-        # HuggingFace weights for the engine that decodes
-        if config_util.use_dense_ema(
-            pipeline_config.export_config, pipeline_config.train_config
-        ):
-            raise ValueError(
-                "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
-                "serve Dense EMA parameters. Set export_config.use_dense_ema to "
-                "false to export the raw weights."
-            )
         if not checkpoint_path:
-            raise ValueError("HF export: no checkpoint found to convert.")
-        front_end = InferWrapper(GenRecFrontEnd(model.model))
-        # the front-end carries no backbone: the engine serves the LM from the
-        # HuggingFace weights, so the copy built here is dead weight on every
-        # rank once its config is read
-        lm = model.model.lm
-        backbone_config = lm.config
-        # the engine runs the LM at the export precision, not in the parameter
-        # dtype training kept its weights in
-        export_dtype = acc_utils.mixed_precision_to_dtype(
-            pipeline_config.export_config.mixed_precision
+            if (
+                pipeline_config.HasField("export_config")
+                and pipeline_config.export_config.exporter_type == "best"
+            ):
+                checkpoint_path, _ = ckpt_manager.best_checkpoint()
+            else:
+                checkpoint_path, _ = ckpt_manager.latest_checkpoint()
+
+        data_config = pipeline_config.data_config
+
+        # Build feature
+        features = _create_features(list(pipeline_config.feature_configs), data_config)
+
+        compiled_prompt = _compile_prompt(pipeline_config, features)
+
+        # Build model
+        model = _create_model(
+            pipeline_config.model_config,
+            features,
+            list(data_config.label_fields),
+            sampler_type=None,
+            compiled_prompt=compiled_prompt,
         )
-        if export_dtype is not None:
-            backbone_config.dtype = export_dtype
-        generation_config = getattr(lm, "generation_config", None)
-        del model.model.lm, lm
-        export_model(
-            ori_pipeline_config,
-            front_end,
-            checkpoint_path,
-            export_dir,
-            assets=assets,
-            additional_export_config=additional_export_config,
-        )
-        if is_rank_zero:
-            export_hf_assets(
+        InferWrapper = ScriptWrapper
+        # Flip to inference *before* wrapping so view-dependent state
+        # (e.g. HSTUMatchItemTower's lazy properties, wrapper EmbeddingGroups)
+        # is snapshot from the scalar view.
+        model.set_is_inference(True)
+        model = InferWrapper(model)
+
+        if isinstance(model.model, MatchModel):
+            for name, module in model.model.named_children():
+                if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
+                    wrapper = (
+                        TowerWrapper
+                        if isinstance(module, MatchTower)
+                        else TowerWoEGWrapper
+                    )
+                    tower = InferWrapper(wrapper(module, name))
+                    tower_export_dir = os.path.join(
+                        export_dir, name.replace("_tower", "")
+                    )
+                    # item-tower-only; user tower falls back to `train_input_path`.
+                    tower_data_input_path = (
+                        item_input_path if name == "item_tower" else None
+                    )
+                    export_model(
+                        ori_pipeline_config,
+                        tower,
+                        checkpoint_path,
+                        tower_export_dir,
+                        assets=assets,
+                        additional_export_config=additional_export_config,
+                        data_input_path=tower_data_input_path,
+                        rocksdb=rocksdb,
+                    )
+        elif isinstance(model.model, TDM):
+            for name, module in model.model.named_children():
+                if isinstance(module, EmbeddingGroup):
+                    emb_module = InferWrapper(TDMEmbedding(module, name))
+                    export_model(
+                        ori_pipeline_config,
+                        emb_module,
+                        checkpoint_path,
+                        os.path.join(export_dir, "embedding"),
+                        rocksdb=rocksdb,
+                    )
+                    break
+            export_model(
+                ori_pipeline_config,
+                model,
+                checkpoint_path,
+                os.path.join(export_dir, "model"),
+                assets=assets,
+                rocksdb=rocksdb,
+            )
+        elif isinstance(model.model, BaseGenRecModel):
+            # tzrec serves the prompt front-end; the LM rides beside it as
+            # HuggingFace weights for the engine that decodes
+            if config_util.use_dense_ema(
+                pipeline_config.export_config, pipeline_config.train_config
+            ):
+                raise ValueError(
+                    "HF export: dcp_to_hf reads <checkpoint>/model, so it cannot "
+                    "serve Dense EMA parameters. Set export_config.use_dense_ema to "
+                    "false to export the raw weights."
+                )
+            if not checkpoint_path:
+                raise ValueError("HF export: no checkpoint found to convert.")
+            front_end = InferWrapper(GenRecFrontEnd(model.model))
+            # the front-end carries no backbone: the engine serves the LM from the
+            # HuggingFace weights, so the copy built here is dead weight on every
+            # rank once its config is read
+            lm = model.model.lm
+            backbone_config = lm.config
+            # the engine runs the LM at the export precision, not in the parameter
+            # dtype training kept its weights in
+            export_dtype = acc_utils.mixed_precision_to_dtype(
+                pipeline_config.export_config.mixed_precision
+            )
+            if export_dtype is not None:
+                backbone_config.dtype = export_dtype
+            generation_config = getattr(lm, "generation_config", None)
+            del model.model.lm, lm
+            export_model(
+                ori_pipeline_config,
+                front_end,
                 checkpoint_path,
                 export_dir,
-                compiled_prompt,
-                backbone_config,
-                generation_config,
+                assets=assets,
+                additional_export_config=additional_export_config,
+                rocksdb=rocksdb,
             )
-    else:
-        export_model(
-            ori_pipeline_config,
-            model,
-            checkpoint_path,
-            export_dir,
-            assets=assets,
-            additional_export_config=additional_export_config,
-        )
+            if is_rank_zero:
+                export_hf_assets(
+                    checkpoint_path,
+                    export_dir,
+                    compiled_prompt,
+                    backbone_config,
+                    generation_config,
+                )
+        else:
+            export_model(
+                ori_pipeline_config,
+                model,
+                checkpoint_path,
+                export_dir,
+                assets=assets,
+                additional_export_config=additional_export_config,
+                rocksdb=rocksdb,
+            )
 
 
 def _write_predictions(
@@ -1886,183 +1933,197 @@ def predict_checkpoint(
     train_config = pipeline_config.train_config
     acc_utils.allow_tf32(train_config)
 
-    data_config = pipeline_config.data_config
-    # Build feature
-    features = _create_features(list(pipeline_config.feature_configs), data_config)
-    compiled_prompt = _compile_prompt(pipeline_config, features)
+    with rocksdb_util.open_runtime(
+        train_config, pipeline_config.model_dir, "predict"
+    ) as rocksdb:
+        data_config = pipeline_config.data_config
+        # Build feature
+        features = _create_features(list(pipeline_config.feature_configs), data_config)
+        compiled_prompt = _compile_prompt(pipeline_config, features)
 
-    # Build dataloader
-    predict_dataloader = create_dataloader(
-        data_config,
-        features,
-        predict_input_path,
-        reserved_columns=reserved_cols,
-        mode=Mode.PREDICT,
-        compiled_prompt=compiled_prompt,
-        debug_level=debug_level,
-    )
-
-    # Build writer
-    if writer_type is None:
-        writer_type = DatasetType.Name(data_config.dataset_type).replace(
-            "Dataset", "Writer"
+        # Build dataloader
+        predict_dataloader = create_dataloader(
+            data_config,
+            features,
+            predict_input_path,
+            reserved_columns=reserved_cols,
+            mode=Mode.PREDICT,
+            compiled_prompt=compiled_prompt,
+            debug_level=debug_level,
         )
-    writer: BaseWriter = create_writer(
-        predict_output_path,
-        writer_type,
-        quota_name=data_config.odps_data_quota_name,
-    )
 
-    # Build model
-    model = _create_model(
-        pipeline_config.model_config,
-        features,
-        [],
-        compiled_prompt=compiled_prompt,
-    )
-    model.set_is_inference(True)
-    model = PredictWrapper(
-        model,
-        device=device,
-        mixed_precision=train_config.mixed_precision,
-        output_cols=output_cols,
-    )
+        # Build writer
+        if writer_type is None:
+            writer_type = DatasetType.Name(data_config.dataset_type).replace(
+                "Dataset", "Writer"
+            )
+        writer: BaseWriter = create_writer(
+            predict_output_path,
+            writer_type,
+            quota_name=data_config.odps_data_quota_name,
+        )
 
-    ckpt_manager = checkpoint_util.CheckpointManager(pipeline_config.model_dir)
-    global_step = None
-    if not checkpoint_path:
-        checkpoint_path, global_step = ckpt_manager.latest_checkpoint()
-    planner = create_planner(
-        device=device,
-        # pyre-ignore [16]
-        batch_size=predict_dataloader.dataset.sampled_batch_size,
-        ckpt_plan_path=os.path.join(checkpoint_path, "plan")
-        if checkpoint_path
-        else None,
-        global_constraints_cfg=train_config.global_embedding_constraints
-        if train_config.HasField("global_embedding_constraints")
-        else None,
-        model=model,
-    )
-    sharders = get_default_sharders()
-    plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
-    if is_rank_zero:
-        logger.info(str(plan))
-    model = DistributedModelParallel(
-        module=model, sharders=sharders, device=device, plan=plan
-    )
-    model.eval()
-
-    if checkpoint_path:
-        ckpt_manager.restore(
-            checkpoint_path,
+        # Build model
+        model = _create_model(
+            pipeline_config.model_config,
+            features,
+            [],
+            compiled_prompt=compiled_prompt,
+        )
+        model.set_is_inference(True)
+        model = PredictWrapper(
             model,
-            use_dense_ema=config_util.use_dense_ema(
-                pipeline_config.export_config,
-                train_config,
-            ),
+            device=device,
+            mixed_precision=train_config.mixed_precision,
+            output_cols=output_cols,
         )
-    else:
-        raise ValueError("Predict checkpoint path should be specified.")
 
-    pred_queue: Queue[Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]] = (
-        Queue(maxsize=3)
-    )
-    failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
-    cancel_event: Event = Event()
-    input_batches = 0
+        ckpt_manager = checkpoint_util.CheckpointManager(
+            pipeline_config.model_dir, rocksdb=rocksdb
+        )
+        global_step = None
+        if not checkpoint_path:
+            checkpoint_path, global_step = ckpt_manager.latest_checkpoint()
+        planner = create_planner(
+            device=device,
+            # pyre-ignore [16]
+            batch_size=predict_dataloader.dataset.sampled_batch_size,
+            ckpt_plan_path=os.path.join(checkpoint_path, "plan")
+            if checkpoint_path
+            else None,
+            global_constraints_cfg=train_config.global_embedding_constraints
+            if train_config.HasField("global_embedding_constraints")
+            else None,
+            model=model,
+            rocksdb=rocksdb,
+        )
+        sharders = get_default_sharders()
+        plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
+        if is_rank_zero:
+            logger.info(str(plan))
+        model = DistributedModelParallel(
+            module=model, sharders=sharders, device=device, plan=plan
+        )
+        if rocksdb is not None:
+            rocksdb.attach(model)
+        model.eval()
 
-    def _write(
-        predictions: Dict[str, torch.Tensor],
-        reserves: RecordBatchTensor,
-        output_cols: List[str],
-    ) -> None:
-        _write_predictions(writer, predictions, reserves, output_cols)
+        if checkpoint_path:
+            ckpt_manager.restore(
+                checkpoint_path,
+                model,
+                use_dense_ema=config_util.use_dense_ema(
+                    pipeline_config.export_config,
+                    train_config,
+                ),
+            )
+        else:
+            raise ValueError("Predict checkpoint path should be specified.")
 
-    def _write_loop(output_cols: List[str]) -> None:
-        stage = "writer"
-        try:
-            while True:
-                pred = predict_util.queue_get_interruptibly(
-                    pred_queue, cancel_event, f"{stage} input"
+        pred_queue: Queue[
+            Optional[Tuple[Dict[str, torch.Tensor], RecordBatchTensor]]
+        ] = Queue(maxsize=3)
+        failure_queue: Queue[predict_util.PredictPipelineFailure] = Queue()
+        cancel_event: Event = Event()
+        input_batches = 0
+
+        def _write(
+            predictions: Dict[str, torch.Tensor],
+            reserves: RecordBatchTensor,
+            output_cols: List[str],
+        ) -> None:
+            _write_predictions(writer, predictions, reserves, output_cols)
+
+        def _write_loop(output_cols: List[str]) -> None:
+            stage = "writer"
+            try:
+                while True:
+                    pred = predict_util.queue_get_interruptibly(
+                        pred_queue, cancel_event, f"{stage} input"
+                    )
+                    if pred is None:
+                        return
+                    predictions, reserves = pred
+                    _write(predictions, reserves, output_cols)
+            except predict_util.PredictPipelineCancelled:
+                return
+            except BaseException as error:
+                predict_util.report_failure(
+                    failure_queue, cancel_event, stage, None, error
                 )
-                if pred is None:
-                    return
-                predictions, reserves = pred
-                _write(predictions, reserves, output_cols)
-        except predict_util.PredictPipelineCancelled:
-            return
-        except BaseException as error:
-            predict_util.report_failure(failure_queue, cancel_event, stage, None, error)
 
-    pipeline = PredictPipelineSparseDist(
-        model,
-        None,
-        model.device,
-        execute_all_batches=True,
-    )
-    iterator = predict_dataloader.get_iterator()  # pyre-ignore[16]
-    step_iter = range(predict_steps) if predict_steps else itertools.count(0)
+        pipeline = PredictPipelineSparseDist(
+            model,
+            None,
+            model.device,
+            execute_all_batches=True,
+        )
+        iterator = predict_dataloader.get_iterator()  # pyre-ignore[16]
+        step_iter = range(predict_steps) if predict_steps else itertools.count(0)
 
-    desc_suffix = ""
-    if global_step is not None:
-        desc_suffix += f" model-{global_step}"
-    plogger = None
-    if is_local_rank_zero:
-        plogger = ProgressLogger(desc=f"Predicting{desc_suffix}")
+        desc_suffix = ""
+        if global_step is not None:
+            desc_suffix += f" model-{global_step}"
+        plogger = None
+        if is_local_rank_zero:
+            plogger = ProgressLogger(desc=f"Predicting{desc_suffix}")
 
-    write_t: Optional[Thread] = None
-    pipeline_error: Optional[BaseException] = None
-    with torch.no_grad():
-        i_step = 0
-        try:
-            for i_step in step_iter:
-                try:
-                    predictions, batch = pipeline.progress(iterator)
-                    if device.type == "cuda":
-                        torch.cuda.synchronize()
-                    if i_step == 0:
-                        output_cols = sorted(predictions.keys())
-                        input_batches += 1
-                        _write(predictions, batch.reserves, output_cols)
-                        t = Thread(
-                            target=_write_loop,
-                            args=(output_cols,),
-                            name="checkpoint-predict-writer",
-                            daemon=True,
-                        )
-                        t.start()
-                        write_t = t
-                    elif not batch.dummy:
-                        predict_util.queue_put_interruptibly(
-                            pred_queue,
-                            (predictions, batch.reserves),
-                            cancel_event,
-                            "checkpoint output",
-                        )
-                        input_batches += 1
-                    if plogger and i_step % 100 == 0:
-                        plogger.log(i_step)
-                except StopIteration:
-                    break
-            if plogger is not None:
-                plogger.log(i_step)
-            if write_t is not None:
-                predict_util.queue_put_interruptibly(
-                    pred_queue,
-                    None,
-                    cancel_event,
-                    "checkpoint writer completion",
+        write_t: Optional[Thread] = None
+        pipeline_error: Optional[BaseException] = None
+        with torch.no_grad():
+            i_step = 0
+            try:
+                for i_step in step_iter:
+                    try:
+                        predictions, batch = pipeline.progress(iterator)
+                        if device.type == "cuda":
+                            torch.cuda.synchronize()
+                        if i_step == 0:
+                            output_cols = sorted(predictions.keys())
+                            input_batches += 1
+                            _write(predictions, batch.reserves, output_cols)
+                            t = Thread(
+                                target=_write_loop,
+                                args=(output_cols,),
+                                name="checkpoint-predict-writer",
+                                daemon=True,
+                            )
+                            t.start()
+                            write_t = t
+                        elif not batch.dummy:
+                            predict_util.queue_put_interruptibly(
+                                pred_queue,
+                                (predictions, batch.reserves),
+                                cancel_event,
+                                "checkpoint output",
+                            )
+                            input_batches += 1
+                        if plogger and i_step % 100 == 0:
+                            plogger.log(i_step)
+                    except StopIteration:
+                        break
+                if plogger is not None:
+                    plogger.log(i_step)
+                if write_t is not None:
+                    predict_util.queue_put_interruptibly(
+                        pred_queue,
+                        None,
+                        cancel_event,
+                        "checkpoint writer completion",
+                    )
+                    predict_util.wait_for_pipeline(
+                        [], [write_t], failure_queue, cancel_event
+                    )
+            except Exception as error:
+                pipeline_error = predict_util.resolve_pipeline_error(
+                    error, failure_queue
                 )
-                predict_util.wait_for_pipeline(
-                    [], [write_t], failure_queue, cancel_event
-                )
-        except Exception as error:
-            pipeline_error = predict_util.resolve_pipeline_error(error, failure_queue)
-        finally:
-            pipeline_threads = [] if write_t is None else [write_t]
-            predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
+            finally:
+                pipeline_threads = [] if write_t is None else [write_t]
+                predict_util.cleanup_pipeline([], pipeline_threads, [], cancel_event)
 
-    predict_util.commit_prediction_output(writer, pipeline_error, input_batches, device)
+        predict_util.commit_prediction_output(
+            writer, pipeline_error, input_batches, device
+        )
 
-    logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")
+        logger.info(f"Predict worker-{os.environ.get('RANK', '0')} Finished.")

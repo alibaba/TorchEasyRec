@@ -893,8 +893,10 @@ class BaseFeature(object, metaclass=_meta_cls):
             )
         emb_config = emb_config if emb_config is not None else self.emb_config
         assert emb_config is not None
+        # sequence_length is the default ids per sample through this feature;
+        # an explicit embedding_constraints factor replaces it
         const = dynamicemb_util.build_dynamicemb_constraints(
-            self.config.dynamicemb, emb_config
+            self.config.dynamicemb, emb_config, float(self.sequence_length or 1)
         )
         if self.config.HasField("embedding_constraints"):
             constraints_cfg = self.config.embedding_constraints
