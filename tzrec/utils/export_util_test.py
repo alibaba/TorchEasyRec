@@ -61,7 +61,16 @@ from tzrec.modules.embedding import EmbeddingGroupImpl
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import checkpoint_util, config_util, export_util, misc_util, npz_util
+from tzrec.utils import (
+    checkpoint_util,
+    config_util,
+    export_util,
+    misc_util,
+    npz_util,
+)
+from tzrec.utils import (
+    runtime as runtime_util,
+)
 from tzrec.utils.export_util import (
     _add_module_by_dotted_path,
     _dedup_key_files_by_realpath,
@@ -2961,7 +2970,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 checkpoint_util, "restore_model", wraps=checkpoint_util.restore_model
             ) as restore,
             mock.patch.object(
-                export_util,
+                runtime_util,
                 "DistributedModelParallel",
                 side_effect=AssertionError("dynamic tables must not be materialized"),
             ),
