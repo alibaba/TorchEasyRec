@@ -1088,18 +1088,12 @@ def export_rtp_model(
 
     # Build Sharded Model
     with ShardedModelRuntime.open(pipeline_config, mode="export") as runtime:
-        plan, sharders = runtime.plan(
+        dmp_model = runtime.shard(
             model,
             device=device,
             # pyre-ignore [16]
             batch_size=dataloader.dataset.sampled_batch_size,
             checkpoint_path=checkpoint_path,
-        )
-        dmp_model = runtime.apply_plan(
-            model,
-            device=device,
-            plan=plan,
-            sharders=sharders,
             init_parameters=False,
             init_data_parallel=False,
         )
@@ -1186,9 +1180,12 @@ def export_rtp_model(
         if is_rank_zero:
             with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
                 f.write(str(gm.graph))
-        sparse_model = runtime.apply_plan(
-            gm, device=device, plan=plan, sharders=sharders
-        )
+        # The pruned sparse graph needs no sharding of its own: one sharded
+        # trace DMP above already carries the plan. Materialize the pruned
+        # module's parameters on the device, then restore the checkpoint
+        # into this plain module.
+        init_parameters(gm, device)
+        sparse_model = gm.to(device)
         sparse_model.eval()
         runtime.checkpoints.restore(checkpoint_path, sparse_model)
         sparse_output, sparse_attrs = sparse_model(data, device=device)

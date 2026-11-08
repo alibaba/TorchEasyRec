@@ -13,7 +13,7 @@
 
 import os
 from contextlib import closing, contextmanager
-from typing import Iterator, List, Literal, Optional, Tuple
+from typing import Iterator, Literal, Optional
 
 import torch
 from torch import distributed as dist
@@ -21,7 +21,6 @@ from torch import nn
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel as _DistributedModelParallel,
 )
-from torchrec.distributed.types import ModuleSharder, ShardingPlan
 
 from tzrec.protos.feature_pb2 import ParameterConstraints
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -102,32 +101,37 @@ class ShardedModelRuntime:
             )
             yield cls(manager, constraints)
 
-    def plan(
+    def shard(
         self,
         model: nn.Module,
         *,
         device: torch.device,
         batch_size: int,
         checkpoint_path: Optional[str],
-    ) -> Tuple[ShardingPlan, List[ModuleSharder[nn.Module]]]:
-        """Run collective planning once, returning the plan and its sharders.
+        init_parameters: bool = True,
+        init_data_parallel: bool = True,
+    ) -> _DistributedModelParallel:
+        """Collectively plan and shard one model, returning the DMP model.
 
         Uses the caller's device, sampled batch size and optional saved
-        plan, with the constraints captured at open time. The returned
-        plan and sharders are passed explicitly to :meth:`apply_plan`;
-        the runtime does not retain them, so one plan can be applied to
-        several graphs (RTP traces the full model, then applies the same
-        plan to the derived sparse graph).
+        plan, with the constraints captured at open time. Keeps the DMP
+        defaults; RTP's FX tracing passes False for both flags to trace
+        the unsharded view. Does not initialize a process group, create
+        features, change the train/eval mode or restore weights; restore
+        belongs to the caller via ``self.checkpoints``.
 
         Args:
-            model: the wrapped model to plan for.
-            device: the local device to plan onto.
+            model: the wrapped model to shard.
+            device: the local device to shard onto.
             batch_size: the dataloader's sampled batch size.
             checkpoint_path: the checkpoint whose saved plan should be
                 reused, or None to plan from scratch.
+            init_parameters: whether DMP initializes module parameters.
+            init_data_parallel: whether DMP wraps the module in data
+                parallel.
 
         Returns:
-            The collective sharding plan and the sharders that apply it.
+            The ``DistributedModelParallel`` sharded model.
         """
         planner = create_planner(
             device=device,
@@ -142,37 +146,6 @@ class ShardedModelRuntime:
         plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
         if int(os.environ.get("RANK", 0)) == 0:
             logger.info(str(plan))
-        return plan, sharders
-
-    def apply_plan(
-        self,
-        model: nn.Module,
-        *,
-        device: torch.device,
-        plan: ShardingPlan,
-        sharders: List[ModuleSharder[nn.Module]],
-        init_parameters: bool = True,
-        init_data_parallel: bool = True,
-    ) -> _DistributedModelParallel:
-        """Construct the DMP model from an existing plan, without replanning.
-
-        Keeps the DMP defaults; RTP's FX tracing passes
-        ``init_parameters=False, init_data_parallel=False`` for the
-        unsharded trace view and reuses the same plan with the defaults
-        on the derived sparse graph.
-
-        Args:
-            model: the module to shard with the plan.
-            device: the local device to construct the DMP model on.
-            plan: an existing collective sharding plan.
-            sharders: the sharders that produced the plan.
-            init_parameters: whether DMP initializes module parameters.
-            init_data_parallel: whether DMP wraps the module in data
-                parallel.
-
-        Returns:
-            The ``DistributedModelParallel`` sharded model.
-        """
         return DistributedModelParallel(
             module=model,
             sharders=sharders,
@@ -181,38 +154,3 @@ class ShardedModelRuntime:
             init_parameters=init_parameters,
             init_data_parallel=init_data_parallel,
         )
-
-    def shard(
-        self,
-        model: nn.Module,
-        *,
-        device: torch.device,
-        batch_size: int,
-        checkpoint_path: Optional[str],
-    ) -> _DistributedModelParallel:
-        """Collectively plan and shard one model, returning the DMP model.
-
-        Composes :meth:`plan` and :meth:`apply_plan`, passing the plan and
-        sharders explicitly between them. Uses the caller's device,
-        sampled batch size and optional saved plan, with the constraints
-        captured at open time. Does not initialize a process group,
-        create features, change the train/eval mode or restore weights;
-        restore belongs to the caller via ``self.checkpoints``.
-
-        Args:
-            model: the wrapped model to shard.
-            device: the local device to shard onto.
-            batch_size: the dataloader's sampled batch size.
-            checkpoint_path: the checkpoint whose saved plan should be
-                reused, or None to plan from scratch.
-
-        Returns:
-            The ``DistributedModelParallel`` sharded model.
-        """
-        plan, sharders = self.plan(
-            model,
-            device=device,
-            batch_size=batch_size,
-            checkpoint_path=checkpoint_path,
-        )
-        return self.apply_plan(model, device=device, plan=plan, sharders=sharders)

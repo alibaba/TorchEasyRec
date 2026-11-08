@@ -131,70 +131,31 @@ class ShardedModelRuntimeTest(unittest.TestCase):
             "/m/model.ckpt-9/plan" if with_plan else None,
         )
 
-    def test_apply_plan_reuses_one_plan_without_replanning(self) -> None:
-        """One plan applies to several models without planning again.
-
-        RTP traces the full model and then applies the same plan to the
-        derived sparse graph; planning must run exactly once.
-        """
+    def test_shard_forwards_rtp_initialization_settings(self) -> None:
+        """shard() preserves RTP's settings and the DMP defaults."""
+        runtime = ShardedModelRuntime(mock.Mock(), None)
         dmp = mock.Mock()
         with (
-            mock.patch("tzrec.utils.runtime.CheckpointManager"),
-            mock.patch(
-                "tzrec.utils.runtime.create_planner", return_value=mock.Mock()
-            ) as create_planner,
+            mock.patch("tzrec.utils.runtime.create_planner", return_value=mock.Mock()),
             mock.patch("tzrec.utils.runtime.get_default_sharders", return_value=[]),
             mock.patch(
                 "tzrec.utils.runtime.DistributedModelParallel", return_value=dmp
             ) as dmp_cls,
             mock.patch("tzrec.utils.runtime.logger"),
         ):
-            with ShardedModelRuntime.open(_pipeline_config(), mode="export") as runtime:
-                plan, sharders = runtime.plan(
-                    mock.Mock(),
-                    device=torch.device("cpu"),
-                    batch_size=8,
-                    checkpoint_path=None,
-                )
-                first = runtime.apply_plan(
-                    mock.Mock(),
-                    device=torch.device("cpu"),
-                    plan=plan,
-                    sharders=sharders,
-                )
-                second = runtime.apply_plan(
-                    mock.Mock(),
-                    device=torch.device("cpu"),
-                    plan=plan,
-                    sharders=sharders,
-                )
-        self.assertIs(first, dmp)
-        self.assertIs(second, dmp)
-        self.assertEqual(create_planner.call_count, 1)
-        self.assertEqual(dmp_cls.call_count, 2)
-        for call in dmp_cls.call_args_list:
-            self.assertIs(call.kwargs["plan"], plan)
-
-    def test_apply_plan_forwards_rtp_initialization_settings(self) -> None:
-        """apply_plan preserves RTP's settings and the DMP defaults."""
-        runtime = ShardedModelRuntime(mock.Mock(), None)
-        dmp = mock.Mock()
-        with mock.patch(
-            "tzrec.utils.runtime.DistributedModelParallel", return_value=dmp
-        ) as dmp_cls:
-            runtime.apply_plan(
+            runtime.shard(
                 mock.Mock(),
                 device=torch.device("cpu"),
-                plan=mock.Mock(),
-                sharders=[],
+                batch_size=8,
+                checkpoint_path=None,
                 init_parameters=False,
                 init_data_parallel=False,
             )
-            runtime.apply_plan(
+            runtime.shard(
                 mock.Mock(),
                 device=torch.device("cpu"),
-                plan=mock.Mock(),
-                sharders=[],
+                batch_size=8,
+                checkpoint_path=None,
             )
         self.assertFalse(dmp_cls.call_args_list[0].kwargs["init_parameters"])
         self.assertFalse(dmp_cls.call_args_list[0].kwargs["init_data_parallel"])
