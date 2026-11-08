@@ -17,7 +17,9 @@ import runpy
 import shutil
 import sys
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
+from typing import Optional
 from unittest import mock
 
 import pyarrow as pa
@@ -32,6 +34,7 @@ from tzrec.main import (
     evaluate,
     predict,
     predict_checkpoint,
+    train_and_evaluate,
 )
 from tzrec.models.model import BaseModel
 from tzrec.optim.ema import DenseEMA
@@ -51,6 +54,7 @@ from tzrec.protos.train_pb2 import (
 from tzrec.utils import checkpoint_util, predict_util
 from tzrec.utils.delta_embedding_dump import DumpDecision
 from tzrec.utils.online_learning_util import OnlineLearningHandover
+from tzrec.utils.runtime import ShardedModelRuntime
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
@@ -140,13 +144,13 @@ class MainTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must inherit BaseModel"):
             _create_model(model_config, [], [])
 
-    def test_train_and_evaluate_closes_exporter_and_ckpt_on_exception(self) -> None:
-        """A training exception must still drain the exporter and ckpt manager.
+    def test_train_and_evaluate_closes_exporter_not_ckpt_on_exception(self) -> None:
+        """A training exception releases loop-owned resources only.
 
-        Before wrapping the training body in try/finally, a raise inside the
-        loop skipped the happy-path close() calls; the daemon export worker
-        outlived the function (keeping the manager reachable so its finalizer
-        never fired), leaked the protected checkpoint, and could publish late.
+        The exporter worker is drained by the loop's resource stack; the
+        CheckpointManager is borrowed from the training entry, which owns its
+        lifetime, so the loop must not close it. The collective
+        finalize_publish must not run on an exception path.
         """
         ckpt_manager = mock.Mock()
         ckpt_manager.maybe_save.return_value = False
@@ -178,10 +182,10 @@ class MainTest(unittest.TestCase):
                     model_dir=self.test_dir,
                     train_config=train_config,
                     eval_config=eval_config,
-                    ckpt_manager=ckpt_manager,
+                    runtime=ShardedModelRuntime(ckpt_manager, None),
                 )
-        self.assertTrue(exporter.close.called)
-        self.assertTrue(ckpt_manager.close.called)
+        exporter.close.assert_called_once()
+        ckpt_manager.close.assert_not_called()
         # a collective; missing ranks would hang it on exception paths
         exporter.finalize_publish.assert_not_called()
 
@@ -234,7 +238,7 @@ class MainTest(unittest.TestCase):
                 model_dir="unused",
                 train_config=train_config,
                 eval_config=EvalConfig(),
-                ckpt_manager=ckpt_manager,
+                runtime=ShardedModelRuntime(ckpt_manager, None),
                 dense_ema=dense_ema,
                 export_config=ExportConfig(use_dense_ema=False),
             )
@@ -287,7 +291,7 @@ class MainTest(unittest.TestCase):
                     model_dir="unused",
                     train_config=train_config,
                     eval_config=EvalConfig(),
-                    ckpt_manager=mock.Mock(),
+                    runtime=ShardedModelRuntime(mock.Mock(), None),
                     delta_embedding_dumper=mock.Mock() if has_dumper else None,
                 )
 
@@ -347,7 +351,7 @@ class MainTest(unittest.TestCase):
                 model_dir="unused",
                 train_config=train_config,
                 eval_config=EvalConfig(),
-                ckpt_manager=ckpt_manager,
+                runtime=ShardedModelRuntime(ckpt_manager, None),
                 delta_embedding_dumper=dumper,
             )
 
@@ -479,7 +483,7 @@ class MainTest(unittest.TestCase):
                 os.path.join(self.test_dir, name),
                 config,
                 EvalConfig(),
-                manager,
+                ShardedModelRuntime(manager, None),
                 ckpt_path=ckpt_path,
                 skip_steps=skip_steps,
                 ignore_restore_optimizer=ignore_optimizer,
@@ -625,7 +629,7 @@ class MainTest(unittest.TestCase):
                 model_dir,
                 _train_config(num_steps=num_steps, log_step_count_steps=1),
                 EvalConfig(),
-                checkpoint_util.CheckpointManager(model_dir),
+                ShardedModelRuntime(checkpoint_util.CheckpointManager(model_dir), None),
                 skip_steps=ckpt_step if restore_from_model_dir else -1,
                 ckpt_path=ckpt_path,
                 ignore_restore_optimizer=True,
@@ -724,7 +728,7 @@ class KafkaOffsetLogTest(unittest.TestCase):
                     log_step_count_steps=log_step_count_steps,
                 ),
                 EvalConfig(),
-                checkpoint_util.CheckpointManager(model_dir),
+                ShardedModelRuntime(checkpoint_util.CheckpointManager(model_dir), None),
                 dataloader_state=dataloader_state,
             )
         return (
@@ -913,13 +917,13 @@ class PredictionLifecycleTest(unittest.TestCase):
             mock.patch("tzrec.main._create_model", return_value=model),
             mock.patch("tzrec.main.PredictWrapper", return_value=wrapped_model),
             mock.patch(
-                "tzrec.main.checkpoint_util.CheckpointManager",
+                "tzrec.utils.runtime.CheckpointManager",
                 return_value=ckpt_manager,
             ),
-            mock.patch("tzrec.main.create_planner", return_value=planner),
-            mock.patch("tzrec.main.get_default_sharders", return_value=[]),
+            mock.patch("tzrec.utils.runtime.create_planner", return_value=planner),
+            mock.patch("tzrec.utils.runtime.get_default_sharders", return_value=[]),
             mock.patch(
-                "tzrec.main.DistributedModelParallel",
+                "tzrec.utils.runtime.DistributedModelParallel",
                 return_value=distributed_model,
             ),
             mock.patch("tzrec.main.config_util.use_dense_ema", return_value=False),
@@ -1178,7 +1182,7 @@ class OnlineLearningHandoverTest(unittest.TestCase):
                 model_dir="unused",
                 train_config=train_config,
                 eval_config=EvalConfig(),
-                ckpt_manager=ckpt_manager,
+                runtime=ShardedModelRuntime(ckpt_manager, None),
                 delta_embedding_dumper=dumper,
             )
 
@@ -1195,6 +1199,144 @@ class OnlineLearningHandoverTest(unittest.TestCase):
         dumper.final_dump.assert_called_once_with(2)
         dumper.close.assert_called_once()
         exporter.finalize_publish.assert_called_once()
+
+
+class TrainEntryLifecycleTest(unittest.TestCase):
+    """The training entry owns the checkpoint manager and the sparse uploader."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+
+    def _run_train_entry(
+        self,
+        manager: mock.Mock,
+        train_loop: mock.Mock,
+        dumper: Optional[mock.Mock] = None,
+        dump_enabled: bool = True,
+    ) -> None:
+        """Run a fully mocked train_and_evaluate with the given train loop."""
+        config = EasyRecConfig(
+            model_dir=self.test_dir, train_input_path="train", eval_input_path=""
+        )
+        config.train_config.num_steps = 1
+        if dump_enabled:
+            config.train_config.delta_embedding_dump_config.CopyFrom(
+                DeltaEmbeddingDumpConfig(paired_dump_interval_steps=1)
+            )
+        train_dataloader = mock.Mock()
+        wrapped_model = mock.Mock()
+        wrapped_model.model.sparse_parameters.return_value = ([], [])
+        dmp_model = mock.Mock()
+        dmp_model.named_parameters.return_value = []
+        optimizer_builder = mock.Mock()
+        optimizer_builder.create_sparse_optimizer.return_value = (torch.optim.SGD, {})
+        optimizer_builder.create_dense_optimizer.return_value = (torch.optim.SGD, {})
+        optimizer_builder.create_part_optimizer.return_value = (torch.optim.SGD, {}, [])
+        optimizer_builder.group_param_by_regex_pattern.return_value = ({}, {})
+        optimizer_builder.build_part_optimizers.return_value = ([], [])
+        optimizer_builder.create_part_optim_schedulers.return_value = []
+        patches = [
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config", return_value=config
+            ),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32"),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch("tzrec.utils.runtime.CheckpointManager", return_value=manager),
+            mock.patch("tzrec.main.create_dataloader", return_value=train_dataloader),
+            mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+            mock.patch("tzrec.main.TrainWrapper", return_value=wrapped_model),
+            mock.patch("tzrec.main.apply_optimizer_in_backward"),
+            mock.patch("tzrec.utils.runtime.create_planner", return_value=mock.Mock()),
+            mock.patch("tzrec.utils.runtime.get_default_sharders", return_value=[]),
+            mock.patch("torch.distributed.barrier"),
+            mock.patch("tzrec.main.config_util.save_message"),
+            mock.patch(
+                "tzrec.utils.runtime.DistributedModelParallel", return_value=dmp_model
+            ),
+            mock.patch("tzrec.main.DeltaEmbeddingDumper", return_value=dumper),
+            mock.patch("tzrec.main.optimizer_builder", optimizer_builder),
+            mock.patch("tzrec.main.KeyedOptimizerWrapper", return_value=mock.Mock()),
+            mock.patch("tzrec.main.CombinedOptimizer", return_value=mock.Mock()),
+            mock.patch("tzrec.main.TZRecOptimizer", return_value=mock.Mock()),
+            mock.patch("tzrec.main._train_and_evaluate", side_effect=train_loop),
+        ]
+        with ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            train_and_evaluate("pipeline.config")
+
+    def test_success_drains_dumper_and_closes_manager(self) -> None:
+        """A normal return drains the started uploader and closes the manager.
+
+        The no-work return of the loop takes this same path: the entry, not
+        the loop, owns both.
+        """
+        dumper = mock.Mock()
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+        train_loop = mock.Mock()
+
+        self._run_train_entry(manager, train_loop, dumper=dumper)
+
+        dumper.start.assert_called_once()
+        dumper.close.assert_called_once_with()
+        manager.close.assert_called_once()
+        self.assertIs(train_loop.call_args.kwargs["runtime"].checkpoints, manager)
+
+    def test_train_failure_requests_non_draining_abort(self) -> None:
+        """A training failure asks the uploader to abort without draining.
+
+        The restarted run re-dumps from the latest checkpoint, so pending
+        in-memory deltas are dropped, and the manager is still closed.
+        """
+        dumper = mock.Mock()
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "train boom"):
+            self._run_train_entry(
+                manager,
+                mock.Mock(side_effect=RuntimeError("train boom")),
+                dumper=dumper,
+            )
+
+        dumper.close.assert_called_once_with(raise_on_error=False, drain=False)
+        manager.close.assert_called_once()
+
+    def test_abort_failure_does_not_mask_training_error(self) -> None:
+        """A secondary abort failure is logged; the training error wins."""
+        dumper = mock.Mock()
+        dumper.close.side_effect = RuntimeError("abort boom")
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "train boom"):
+            self._run_train_entry(
+                manager,
+                mock.Mock(side_effect=RuntimeError("train boom")),
+                dumper=dumper,
+            )
+
+        dumper.close.assert_called_once_with(raise_on_error=False, drain=False)
+        manager.close.assert_called_once()
+
+    def test_without_dumper_still_closes_manager(self) -> None:
+        """Delta-dump disabled training still closes the manager on success."""
+        dumper = mock.Mock()
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+
+        self._run_train_entry(manager, mock.Mock(), dumper=dumper, dump_enabled=False)
+
+        dumper.start.assert_not_called()
+        dumper.close.assert_not_called()
+        manager.close.assert_called_once()
 
 
 class EvaluateLifecycleTest(unittest.TestCase):
@@ -1224,34 +1366,36 @@ class EvaluateLifecycleTest(unittest.TestCase):
             mock.patch("tzrec.main.create_dataloader", return_value=mock.Mock()),
             mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
             mock.patch("tzrec.main.TrainWrapper", return_value=mock.Mock()),
+            mock.patch("tzrec.utils.runtime.CheckpointManager", return_value=manager),
+            mock.patch("tzrec.utils.runtime.create_planner", return_value=mock.Mock()),
+            mock.patch("tzrec.utils.runtime.get_default_sharders", return_value=[]),
             mock.patch(
-                "tzrec.main.checkpoint_util.CheckpointManager", return_value=manager
+                "tzrec.utils.runtime.DistributedModelParallel", return_value=mock.Mock()
             ),
-            mock.patch("tzrec.main.create_planner", return_value=mock.Mock()),
-            mock.patch("tzrec.main.get_default_sharders", return_value=[]),
-            mock.patch("tzrec.main.DistributedModelParallel", return_value=mock.Mock()),
             mock.patch("tzrec.main.config_util.use_dense_ema", return_value=False),
             mock.patch("tzrec.main.SummaryWriter", writer_cls),
             mock.patch("tzrec.main._evaluate") as run_eval,
         ):
             evaluate("pipeline.config")
-        return writer, writer_cls, run_eval
+        return manager, writer, writer_cls, run_eval
 
     def test_rank_zero_writer_closes_after_evaluate(self) -> None:
         """Rank zero's writer is closed when the evaluation call exits."""
-        writer, writer_cls, run_eval = self._run_evaluate("0")
+        manager, writer, writer_cls, run_eval = self._run_evaluate("0")
 
         writer_cls.assert_called_once_with(os.path.join(self.test_dir, "eval"))
         self.assertIs(run_eval.call_args.kwargs["eval_summary_writer"], writer)
         writer.close.assert_called_once()
+        manager.close.assert_called_once()
 
     def test_non_zero_rank_passes_no_writer(self) -> None:
         """Other ranks construct no writer and evaluate without one."""
-        writer, writer_cls, run_eval = self._run_evaluate("1")
+        manager, writer, writer_cls, run_eval = self._run_evaluate("1")
 
         writer_cls.assert_not_called()
         self.assertIsNone(run_eval.call_args.kwargs["eval_summary_writer"])
         writer.close.assert_not_called()
+        manager.close.assert_called_once()
 
 
 if __name__ == "__main__":
