@@ -17,7 +17,9 @@ import runpy
 import shutil
 import sys
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
+from typing import Optional
 from unittest import mock
 
 import pyarrow as pa
@@ -32,6 +34,7 @@ from tzrec.main import (
     evaluate,
     predict,
     predict_checkpoint,
+    train_and_evaluate,
 )
 from tzrec.models.model import BaseModel
 from tzrec.optim.ema import DenseEMA
@@ -144,10 +147,10 @@ class MainTest(unittest.TestCase):
     def test_train_and_evaluate_closes_exporter_not_ckpt_on_exception(self) -> None:
         """A training exception releases loop-owned resources only.
 
-        The exporter worker is drained by the loop's resource stack; the
-        CheckpointManager is borrowed from the training entry, which owns its
-        lifetime, so the loop must not close it. The collective
-        finalize_publish must not run on an exception path.
+        The exporter is released by the loop's trailing finally; the
+        CheckpointManager is borrowed from the runtime the training entry
+        opened, which owns its lifetime, so the loop must not close it.
+        The collective finalize_publish must not run on an exception path.
         """
         ckpt_manager = mock.Mock()
         ckpt_manager.maybe_save.return_value = False
@@ -185,6 +188,119 @@ class MainTest(unittest.TestCase):
         ckpt_manager.close.assert_not_called()
         # a collective; missing ranks would hang it on exception paths
         exporter.finalize_publish.assert_not_called()
+
+    def _run_train_entry(
+        self,
+        manager: mock.Mock,
+        train_loop: mock.Mock,
+        dumper: Optional[mock.Mock] = None,
+        dump_enabled: bool = True,
+    ) -> None:
+        """Run a fully mocked train_and_evaluate with the given train loop."""
+        config = EasyRecConfig(
+            model_dir=self.test_dir, train_input_path="train", eval_input_path=""
+        )
+        config.train_config.num_steps = 1
+        if dump_enabled:
+            config.train_config.delta_embedding_dump_config.CopyFrom(
+                DeltaEmbeddingDumpConfig(paired_dump_interval_steps=1)
+            )
+        train_dataloader = mock.Mock()
+        wrapped_model = mock.Mock()
+        wrapped_model.model.sparse_parameters.return_value = ([], [])
+        dmp_model = mock.Mock()
+        dmp_model.named_parameters.return_value = []
+        optimizer_builder = mock.Mock()
+        optimizer_builder.create_sparse_optimizer.return_value = (torch.optim.SGD, {})
+        optimizer_builder.create_dense_optimizer.return_value = (torch.optim.SGD, {})
+        optimizer_builder.create_part_optimizer.return_value = (torch.optim.SGD, {}, [])
+        optimizer_builder.group_param_by_regex_pattern.return_value = ({}, {})
+        optimizer_builder.build_part_optimizers.return_value = ([], [])
+        optimizer_builder.create_part_optim_schedulers.return_value = []
+        patches = [
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config", return_value=config
+            ),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32"),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch("tzrec.utils.runtime.CheckpointManager", return_value=manager),
+            mock.patch("tzrec.main.create_dataloader", return_value=train_dataloader),
+            mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+            mock.patch("tzrec.main.TrainWrapper", return_value=wrapped_model),
+            mock.patch("tzrec.main.apply_optimizer_in_backward"),
+            mock.patch("tzrec.utils.runtime.create_planner", return_value=mock.Mock()),
+            mock.patch("tzrec.utils.runtime.get_default_sharders", return_value=[]),
+            mock.patch("torch.distributed.barrier"),
+            mock.patch("tzrec.main.config_util.save_message"),
+            mock.patch(
+                "tzrec.utils.runtime.DistributedModelParallel", return_value=dmp_model
+            ),
+            mock.patch("tzrec.main.DeltaEmbeddingDumper", return_value=dumper),
+            mock.patch("tzrec.main.optimizer_builder", optimizer_builder),
+            mock.patch("tzrec.main.KeyedOptimizerWrapper", return_value=mock.Mock()),
+            mock.patch("tzrec.main.CombinedOptimizer", return_value=mock.Mock()),
+            mock.patch("tzrec.main.TZRecOptimizer", return_value=mock.Mock()),
+            mock.patch("tzrec.main._train_and_evaluate", side_effect=train_loop),
+        ]
+        with ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            train_and_evaluate("pipeline.config")
+
+    def test_train_entry_drains_uploader_and_closes_manager(self) -> None:
+        """A normal return drains the started uploader and closes the manager.
+
+        The no-work return of the loop takes this same path: the entry, not
+        the loop, owns both, and the loop borrows the runtime's manager.
+        """
+        dumper = mock.Mock()
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+        train_loop = mock.Mock()
+
+        self._run_train_entry(manager, train_loop, dumper=dumper)
+
+        dumper.start.assert_called_once()
+        dumper.close.assert_called_once_with()
+        manager.close.assert_called_once()
+        self.assertIs(train_loop.call_args.kwargs["runtime"].checkpoints, manager)
+
+    @parameterized.expand(
+        [
+            param("abort_ok", abort_raises=False),
+            param("abort_raises", abort_raises=True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_train_entry_failure_requests_non_draining_abort(
+        self, _name: str, abort_raises: bool
+    ) -> None:
+        """A training failure asks the uploader to abort without draining.
+
+        The restarted run re-dumps from the latest checkpoint, so pending
+        in-memory deltas are dropped; a secondary abort failure is only
+        logged and the original training error still propagates.
+        """
+        dumper = mock.Mock()
+        if abort_raises:
+            dumper.close.side_effect = RuntimeError("abort boom")
+        manager = mock.Mock()
+        manager.latest_checkpoint.return_value = (None, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "train boom"):
+            self._run_train_entry(
+                manager,
+                mock.Mock(side_effect=RuntimeError("train boom")),
+                dumper=dumper,
+            )
+
+        dumper.close.assert_called_once_with(raise_on_error=False, drain=False)
+        manager.close.assert_called_once()
 
     def test_train_eval_uses_ema_and_restores_training_parameters(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([2.0]))
