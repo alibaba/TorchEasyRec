@@ -836,7 +836,7 @@ feature_configs {
 
 分组序列特征支持使用物品或行为的属性构建一组子序列，如类目序列`cate1;cate2;cate1`、品牌序列`brand1;brand2;brand1`、行为时间序列`ts1;ts2;ts3`等。一条样本中，同一分组的子序列的长度需要保持相同。
 
-未配置`hard_search_key`时，分组序列特征在线上模型服务中可通过`sequence_pk`传入历史ItemId列表，从物品特征内存Cache中关联出物品属性子序列；行为属性子序列仍需从请求传入。配置`hard_search_key`后的输入方式见下文。
+分组序列特征在线上模型服务时比其他序列特征更加高效，只需传递`sequence_pk`，线上模型服务从物品特征内存Cache中关联出物品属性子特征的序列，无需从请求中传递。
 
 分组序列特征支持前文中**所有子特征类型**。
 
@@ -928,14 +928,14 @@ feature_configs {
 
 - **sequence_name**: 序列特征名
 - **sequence_length**: 序列特征最大长度
-- **sequence_delim**: 序列元素之间的分隔符，默认为`;`，不是逗号。它与子特征元素内部的多值分隔符`separator`不同，后者在FG中的默认值为`\x1d`。hard-search序列当前必须使用`;`。
-- **sequence_pk**: 序列特征主键输入名，未配置时为`user:${sequence_name}`。普通分组序列在线上通过该字段传入历史ItemId列表，用于关联物品属性；行为属性子序列仍需从请求传入。它不是hard-search查询使用的用户ID字段。hard-search组的PK去掉`user:`等侧前缀后，不能与任何特征的原始输入列名或其他序列组的PK同名，冲突时创建特征会报错。
-- **sequence_entity**: 可选，指定该序列组在线上模型服务中关联的FeatureStore实体名，例如`sequence_entity: "app"`。实体名须是TorchEasyRec Processor的`fs_entity`配置中列出的实体之一；hard-search序列当前仅支持主实体，即`fs_entity`中的第一个实体，该限制由Processor校验。
-- **hard_search_key**: 可选字符串，仅在分组`sequence_feature`上配置，格式为`item:<field>`，表示用于查询候选相关历史的候选物品字段，例如`item:cate`。未配置时保留原有序列行为，配置示例及使用限制见下文。
+- **sequence_delim**: 序列特征分隔符
+- **sequence_pk**: 序列特征主键，一般为ItemId列表，主要用于线上模型服务，线上模型服务会使用该ItemId列表从物品特征内存Cache中关联出物品属性子特征的序列，无需从请求中传递。而行为属性相关子序列（如行为时间序列`ts1;ts2;ts3`）跟用户相关，则仍需从请求从传递。
+- **sequence_entity**: 可选，指定该序列组在线上模型服务中关联的FeatureStore实体名，例如`sequence_entity: "app"`。实体名须是 TorchEasyRec Processor fs_entity 配置中列出的实体之一。
+- **hard_search_key**: 可选字符串，仅在分组`sequence_feature`上配置，格式为`item:<field>`，表示用于查询候选相关历史的候选物品字段，例如`item:cate`。未配置时保留原有序列行为，配置示例及使用要求见下文。
 - **features**: 序列特征子特征，配置同对应的子特征类型的配置
   - **feature_name**: 子特征特征名，完整的子特征名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，子特征名列名应为`click_seq__item_id`
   - **expression**: 特征FG所依赖子特征字段来源名，由两部分组成`input_side`:`input_name`。
-    - 未配置`hard_search_key`时，在线上模型服务中，`item`侧子序列由服务关联获取，`user`侧子序列需从请求传入；配置后，该组原始子序列输入由支持hard-search的Processor从FeatureDB获取。
+    - 在线上模型服务中，如果子特征的`input_side`为`item`，子序列无需从请求中传递；如果子特征的`input_side`为`user`，子序列需要从请求中传递。
   - **sequence_fields**: (可选) 指定每个序列子特征的序列类型的输入字段名，序列类型的字段在输入样本数据中列名应拼接上`${sequence_name}__`前缀
     - 在不指定sequence_fields的情况下:
       - 对于只有一个输入字段的特征算子（如: IdFeature，RawFeature，TokenizeFeature等），`input_side != feature`的输入字段默认是序列类型
@@ -976,9 +976,9 @@ feature_configs {
 }
 ```
 
-- **字段来源**：`hard_search_key: "item:cate"`指当前候选物品的`cate`标量字段，Processor从主FeatureStore实体的候选缓存行读取它，支持string、int32、int64。子特征的`expression: "item:iid"`则指历史物品ID子序列：原始输入列名为`click_same_cate__iid`，特征输出名为`click_same_cate__item_id`。`hard_search_key`不使用序列名前缀，也不引用特征输出名。
+- **字段来源与参数要求**：`hard_search_key: "item:cate"`指当前候选物品的`cate`标量字段，Processor从主FeatureStore实体的候选缓存行读取它，支持string、int32、int64。子特征的`expression: "item:iid"`则指历史物品ID子序列：原始输入列名为`click_same_cate__iid`，特征输出名为`click_same_cate__item_id`。`hard_search_key`不使用序列名前缀，也不引用特征输出名。使用`hard_search_key`时，`sequence_delim`当前必须为`;`；`sequence_entity`仅支持主实体（Processor `fs_entity`中的第一个实体）；`sequence_pk`（未配置时为`user:${sequence_name}`）去掉`user:`等侧前缀后，不能与任何特征的原始输入列名或其他序列组的PK同名，冲突时创建特征会报错。
 - **训练和离线预测**：必须在TorchEasyRec之外按每条样本的候选预先过滤历史，再提供已过滤且组内长度对齐的子序列。TorchEasyRec中的该字段用于标记和路由输入，不会触发外部数据查询或自动过滤序列。
-- **线上服务**：需使用支持hard-search的Processor并配置FeatureStore/FeatureDB。请求提供非空的`meta_data["user_id"]`和候选ItemId，Processor使用候选key查询FeatureDB并按候选组装历史；请求不得同时传入该组的PK或子序列输入。FeatureDB需关联与`sequence_name`对应的序列视图，具体过滤、排序和截断规则由服务端配置，并应与离线预处理保持一致。
+- **线上服务**：需使用支持hard-search的Processor并配置FeatureStore/FeatureDB。请求提供非空的`meta_data["user_id"]`和候选ItemId，该组所有原始子序列输入（无论子特征`input_side`为`item`或`user`）均由Processor使用候选key查询FeatureDB获取并按候选组装历史；请求不得同时传入该组的`sequence_pk`或子序列输入。FeatureDB需关联与`sequence_name`对应的序列视图，具体过滤、排序和截断规则由服务端配置，并应与离线预处理保持一致。
 - **INPUT_TILE**：hard-search组内的稀疏、稠密序列及依赖这些输入的派生特征均按候选侧处理，每个候选保留一行，即B个候选对应B行；组内序列字段来源为`user:`或`context:`时也适用。普通用户特征和普通用户历史仍在tile前保留一行并继续共享，无需全局关闭`INPUT_TILE`。支持`INPUT_TILE=2/3`和`INPUT_TILE=3`下的`INPUT_TILE_3_ONLINE=1`；distributed embedding导出继续使用`INPUT_TILE=3`，hard-search序列保持B行。
 - **组内输入限制**：hard-search组内的原始输入必须是带`${sequence_name}__`前缀的序列字段，不支持组内非序列原始输入。例如组内Lookup配置`map: "user:shared_map"`、`key: "item:raw_id"`时，默认非序列输入`shared_map`没有序列名前缀，该配置不支持。可将派生Lookup放在hard-search组外，通过`feature:<序列名>__<子特征名>`引用历史输出；共享的`user:shared_map`仍按用户侧tile，派生输出按候选侧处理。
 - **组合限制**：使用hard-search历史时，同一`SEQUENCE`组或`sequence_groups`子组的所有历史序列轴特征必须来自同一份hard-search历史并逐事件对齐，不能混用普通历史或不同hard-search序列组，即使`hard_search_key`相同且长度恰好一致也不支持。不同历史应使用独立的`sequence_groups`。不同hard-search来源的自动检查仅覆盖直接声明的序列组，派生特征的来源与事件对齐需自行确认。模型query部分仍允许混用用户侧和候选侧特征，这不代表hard-search组内允许非序列原始输入。`JAGGED_SEQUENCE`组不能包含任何hard-search特征，因此当前HSTU不支持该配置。
