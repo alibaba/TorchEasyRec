@@ -15,7 +15,7 @@ import json
 import os
 import socket
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import ExitStack, closing, nullcontext
 from datetime import datetime, timezone
 from queue import Queue
 from threading import Event, Thread
@@ -524,305 +524,337 @@ def _train_and_evaluate(
     tb_summaries_set = set(["loss", "learning_rate"])
     if is_local_rank_zero:
         plogger = ProgressLogger(desc="Training Epoch 0", start_n=skip_steps)
-    if is_rank_zero and train_config.use_tensorboard:
-        summary_writer = SummaryWriter(model_dir)
-        eval_summary_writer = SummaryWriter(os.path.join(model_dir, "eval_val"))
-        if not train_config.tensorboard_summaries:
-            tb_summaries = list(tb_summaries_set)
-        else:
-            for summary in train_config.tensorboard_summaries:
-                if summary in TENSORBOARD_SUMMARIES:
-                    tb_summaries_set.add(summary)
-                else:
-                    raise ValueError(
-                        "tensorboard_summaries should be one of [%s], you provided %s."
-                        % (", ".join(TENSORBOARD_SUMMARIES), summary)
-                    )
-            tb_summaries = list(tb_summaries_set)
+    # One scope owns the loop's acquirable resources: the checkpoint manager,
+    # both TensorBoard writers and the dense exporter. The manager is
+    # registered first so it closes last, as the baseline finally did; the
+    # profiler is kept out because its stop point defines the trace
+    # boundary, not a cleanup.
+    with ExitStack() as exit_stack:
+        exit_stack.enter_context(closing(ckpt_manager))
+        if is_rank_zero and train_config.use_tensorboard:
+            summary_writer = exit_stack.enter_context(SummaryWriter(model_dir))
+            eval_summary_writer = exit_stack.enter_context(
+                SummaryWriter(os.path.join(model_dir, "eval_val"))
+            )
+            if not train_config.tensorboard_summaries:
+                tb_summaries = list(tb_summaries_set)
+            else:
+                for summary in train_config.tensorboard_summaries:
+                    if summary in TENSORBOARD_SUMMARIES:
+                        tb_summaries_set.add(summary)
+                    else:
+                        raise ValueError(
+                            "tensorboard_summaries should be one of [%s], "
+                            "you provided %s."
+                            % (", ".join(TENSORBOARD_SUMMARIES), summary)
+                        )
+                tb_summaries = list(tb_summaries_set)
 
-    eval_result_filename = os.path.join(model_dir, eval_result_filename)
+        eval_result_filename = os.path.join(model_dir, eval_result_filename)
 
-    prof = None
-    if train_config.is_profiling:
-        if is_rank_zero:
-            logger.info(str(model))
-        prof = _create_train_profiler(
-            train_config.profiler_config, os.path.join(model_dir, "train_eval_trace")
+        i_step = 0
+        i_epoch = 0
+        losses = {}
+        eval_dense_ema = (
+            dense_ema if config_util.use_dense_ema(eval_config, train_config) else None
         )
+        export_dense_ema = (
+            dense_ema
+            if config_util.use_dense_ema(export_config, train_config)
+            else None
+        )
+
+        prof = None
+        if train_config.is_profiling:
+            if is_rank_zero:
+                logger.info(str(model))
+            prof = _create_train_profiler(
+                train_config.profiler_config,
+                os.path.join(model_dir, "train_eval_trace"),
+            )
         if prof is not None:
             prof.start()
 
-    i_step = 0
-    i_epoch = 0
-    losses = {}
-    eval_dense_ema = (
-        dense_ema if config_util.use_dense_ema(eval_config, train_config) else None
-    )
-    export_dense_ema = (
-        dense_ema if config_util.use_dense_ema(export_config, train_config) else None
-    )
+        try:
 
-    def run_eval(step: int, epoch: int) -> None:
-        """Run eval after a checkpoint save, if an eval dataloader is configured."""
-        if eval_dataloader is not None:
-            tracking_context = (
-                delta_embedding_dumper.pause_tracking()
-                if delta_embedding_dumper is not None
-                else nullcontext()
+            def run_eval(step: int, epoch: int) -> None:
+                """Run eval after a checkpoint save, if configured."""
+                if eval_dataloader is not None:
+                    tracking_context = (
+                        delta_embedding_dumper.pause_tracking()
+                        if delta_embedding_dumper is not None
+                        else nullcontext()
+                    )
+                    ema_context = (
+                        eval_dense_ema.average_parameters()
+                        if eval_dense_ema is not None
+                        else nullcontext()
+                    )
+                    with tracking_context, ema_context:
+                        _evaluate(
+                            model,
+                            eval_dataloader,
+                            eval_config,
+                            eval_result_filename=eval_result_filename,
+                            global_step=step,
+                            eval_summary_writer=eval_summary_writer,
+                            global_epoch=epoch,
+                            check_all_workers_data_status=check_all_workers_data_status,
+                        )
+                    model.train()
+
+            # In-process online dense export: rank zero builds the serving graph once
+            # here and hot-swaps gathered weights per delta-dump trigger; independent
+            # of saves.
+            publish_interval_minutes = None
+            dump_config = train_config.delta_embedding_dump_config
+            if train_config.HasField(
+                "delta_embedding_dump_config"
+            ) and dump_config.HasField("paired_dump_interval_minutes"):
+                publish_interval_minutes = dump_config.paired_dump_interval_minutes
+            # Register the exporter before validating its pairing and building
+            # the handover: once its worker thread is live, only the stack
+            # below can clean it up if either setup step fails.
+            online_dense_exporter = exit_stack.enter_context(
+                closing(
+                    OnlineDenseExportManager(
+                        model_dir,
+                        pipeline_config_path
+                        or os.path.join(model_dir, "pipeline.config"),
+                        model,
+                        publish_interval_minutes=publish_interval_minutes,
+                    )
+                )
             )
-            ema_context = (
-                eval_dense_ema.average_parameters()
-                if eval_dense_ema is not None
-                else nullcontext()
-            )
-            with tracking_context, ema_context:
-                _evaluate(
+            if online_dense_exporter.enabled and (
+                delta_embedding_dumper is None
+                or not train_config.delta_embedding_dump_config.HasField(
+                    "feature_store_config"
+                )
+            ):
+                raise RuntimeError(
+                    "ONLINE_DENSE_EXPORT=1 requires "
+                    "train_config.delta_embedding_dump_config "
+                    "with feature_store_config: the paired delta-dump "
+                    "decision is the only dense export trigger and the "
+                    "FeatureStore upload watermark is the only publish gate."
+                )
+            # A stream lineage retires itself once the next day's lineage has consumed
+            # data about as fresh; deployment of the successor follows its exit.
+            handover = create_online_learning_handover(model_dir, train_config)
+            handed_over = False
+
+            # this rank's last consumed event-time, reused by the epoch / final saves
+            data_timestamp = -1.0
+            for i_epoch in epoch_iter:
+                pipeline = create_train_pipeline(
                     model,
-                    eval_dataloader,
-                    eval_config,
-                    eval_result_filename=eval_result_filename,
-                    global_step=step,
-                    eval_summary_writer=eval_summary_writer,
-                    global_epoch=epoch,
+                    optimizer,
                     check_all_workers_data_status=check_all_workers_data_status,
                 )
-            model.train()
+                if plogger is not None:
+                    plogger.set_description(f"Training Epoch {i_epoch}")
 
-    # In-process online dense export: rank zero builds the serving graph once
-    # here and hot-swaps gathered weights per delta-dump trigger; independent
-    # of saves.
-    publish_interval_minutes = None
-    if train_config.HasField(
-        "delta_embedding_dump_config"
-    ) and train_config.delta_embedding_dump_config.HasField(
-        "paired_dump_interval_minutes"
-    ):
-        publish_interval_minutes = (
-            train_config.delta_embedding_dump_config.paired_dump_interval_minutes
-        )
-    online_dense_exporter = OnlineDenseExportManager(
-        model_dir,
-        pipeline_config_path or os.path.join(model_dir, "pipeline.config"),
-        model,
-        publish_interval_minutes=publish_interval_minutes,
-    )
-    if online_dense_exporter.enabled and (
-        delta_embedding_dumper is None
-        or not train_config.delta_embedding_dump_config.HasField("feature_store_config")
-    ):
-        raise RuntimeError(
-            "ONLINE_DENSE_EXPORT=1 requires train_config.delta_embedding_dump_config "
-            "with feature_store_config: the paired delta-dump decision is the only "
-            "dense export trigger and the FeatureStore upload watermark is the only "
-            "publish gate."
-        )
-    # A stream lineage retires itself once the next day's lineage has consumed
-    # data about as fresh; deployment of the successor follows its exit.
-    handover = create_online_learning_handover(model_dir, train_config)
-    handed_over = False
+                train_iterator = train_dataloader.get_iterator()  # pyre-ignore[16]
 
-    # this rank's last consumed event-time, reused by the epoch / final saves
-    data_timestamp = -1.0
-    try:
-        for i_epoch in epoch_iter:
-            pipeline = create_train_pipeline(
-                model,
-                optimizer,
-                check_all_workers_data_status=check_all_workers_data_status,
-            )
-            if plogger is not None:
-                plogger.set_description(f"Training Epoch {i_epoch}")
-
-            train_iterator = train_dataloader.get_iterator()  # pyre-ignore[16]
-
-            # Restore model and optimizer checkpoint
-            if i_step == 0 and ckpt_path is not None:
-                # A fine-tune checkpoint's schedule position belongs to the
-                # source job, like the step counter dropped in
-                # train_and_evaluate and the epoch budget popped with it.
-                restore_schedulers = (
-                    lr_scheduler
-                    if restore_from_model_dir and not ignore_restore_lr_scheduler
-                    else None
-                )
-                if ignore_restore_optimizer:
-                    ckpt_manager.restore(
-                        ckpt_path,
-                        model,
-                        None,
-                        train_config.fine_tune_ckpt_param_map,
-                        dense_ema=dense_ema,
-                        lr_schedulers=restore_schedulers,
+                # Restore model and optimizer checkpoint
+                if i_step == 0 and ckpt_path is not None:
+                    # A fine-tune checkpoint's schedule position belongs to the
+                    # source job, like the step counter dropped in
+                    # train_and_evaluate and the epoch budget popped with it.
+                    restore_schedulers = (
+                        lr_scheduler
+                        if restore_from_model_dir and not ignore_restore_lr_scheduler
+                        else None
                     )
-                else:
-                    # optimizer state is lazy, so peek one batch to init it
-                    # before restore.
-                    peek_batch = next(train_iterator)
-                    pipeline.progress(iter([peek_batch]))
-                    train_iterator = itertools.chain([peek_batch], train_iterator)
-                    ckpt_manager.restore(
-                        ckpt_path,
-                        model,
-                        optimizer,
-                        train_config.fine_tune_ckpt_param_map,
-                        dense_ema=dense_ema,
-                        lr_schedulers=restore_schedulers,
-                    )
-                if not restore_from_model_dir:
-                    # a fine-tune checkpoint's train metric describes the source
-                    # model, not the model this job is training.
-                    _model.reset_train_metric()
-                if delta_embedding_dumper is not None:
-                    delta_embedding_dumper.clear()
+                    if ignore_restore_optimizer:
+                        ckpt_manager.restore(
+                            ckpt_path,
+                            model,
+                            None,
+                            train_config.fine_tune_ckpt_param_map,
+                            dense_ema=dense_ema,
+                            lr_schedulers=restore_schedulers,
+                        )
+                    else:
+                        # optimizer state is lazy, so peek one batch to init it
+                        # before restore.
+                        peek_batch = next(train_iterator)
+                        pipeline.progress(iter([peek_batch]))
+                        train_iterator = itertools.chain([peek_batch], train_iterator)
+                        ckpt_manager.restore(
+                            ckpt_path,
+                            model,
+                            optimizer,
+                            train_config.fine_tune_ckpt_param_map,
+                            dense_ema=dense_ema,
+                            lr_schedulers=restore_schedulers,
+                        )
+                    if not restore_from_model_dir:
+                        # a fine-tune checkpoint's train metric describes the source
+                        # model, not the model this job is training.
+                        _model.reset_train_metric()
+                    if delta_embedding_dumper is not None:
+                        delta_embedding_dumper.clear()
 
-            for i_step in step_iter:
-                if i_step <= skip_steps:
-                    continue
-                try:
-                    losses, predictions, batch = pipeline.progress(train_iterator)
-                    # Update dataloader checkpoint state
-                    checkpoint_util.update_dataloder_state(
-                        dataloader_state, batch.checkpoint_info
-                    )
-                    if kafka_log_enabled:
-                        for key in batch.checkpoint_info or {}:
-                            kafka_baseline_offsets.setdefault(
-                                key, dataloader_state[key]
-                            )
-                    _model.update_train_metric(predictions, batch)
-                    if i_step % train_config.log_step_count_steps == 0:
-                        train_metrics = _model.compute_train_metric()
-                        _log_train(
-                            i_step,
-                            losses,
-                            params=optimizer.params,  # pyre-ignore
-                            param_groups=optimizer.param_groups,
-                            tb_summaries=tb_summaries,
-                            plogger=plogger,
-                            summary_writer=summary_writer,
-                            train_metrics=train_metrics,
-                            data_timestamp=batch.data_timestamp,
+                for i_step in step_iter:
+                    if i_step <= skip_steps:
+                        continue
+                    try:
+                        losses, predictions, batch = pipeline.progress(train_iterator)
+                        # Update dataloader checkpoint state
+                        checkpoint_util.update_dataloder_state(
+                            dataloader_state, batch.checkpoint_info
                         )
                         if kafka_log_enabled:
-                            _log_kafka_offsets(
-                                i_step, kafka_baseline_offsets, dataloader_state
+                            for key in batch.checkpoint_info or {}:
+                                kafka_baseline_offsets.setdefault(
+                                    key, dataloader_state[key]
+                                )
+                        _model.update_train_metric(predictions, batch)
+                        if i_step % train_config.log_step_count_steps == 0:
+                            train_metrics = _model.compute_train_metric()
+                            _log_train(
+                                i_step,
+                                losses,
+                                params=optimizer.params,  # pyre-ignore
+                                param_groups=optimizer.param_groups,
+                                tb_summaries=tb_summaries,
+                                plogger=plogger,
+                                summary_writer=summary_writer,
+                                train_metrics=train_metrics,
+                                data_timestamp=batch.data_timestamp,
                             )
+                            if kafka_log_enabled:
+                                _log_kafka_offsets(
+                                    i_step, kafka_baseline_offsets, dataloader_state
+                                )
 
-                    for lr in lr_scheduler:
-                        if not lr.by_epoch:
-                            lr.step()
+                        for lr in lr_scheduler:
+                            if not lr.by_epoch:
+                                lr.step()
 
-                    dump_decision = DumpDecision.NONE
-                    if delta_embedding_dumper is not None:
-                        dump_decision = delta_embedding_dumper.maybe_dump(i_step)
-                except StopIteration:
-                    # pass completed: later saves should record positions
-                    # within the next pass, on top of the completed-pass count.
-                    epochs_completed += 1
-                    dataloader_state.clear()
-                    dataloader_state[checkpoint_util.EPOCHS_COMPLETED] = (
-                        epochs_completed
+                        dump_decision = DumpDecision.NONE
+                        if delta_embedding_dumper is not None:
+                            dump_decision = delta_embedding_dumper.maybe_dump(i_step)
+                    except StopIteration:
+                        # pass completed: later saves should record positions
+                        # within the next pass, on top of the completed-pass count.
+                        epochs_completed += 1
+                        dataloader_state.clear()
+                        dataloader_state[checkpoint_util.EPOCHS_COMPLETED] = (
+                            epochs_completed
+                        )
+                        step_iter = itertools.chain([i_step], step_iter)
+                        i_step -= 1
+                        break
+
+                    # Single entry point for step / epoch / event-time saves + dedupe;
+                    # maybe_save reconciles this rank's event-time across ranks
+                    # in lockstep.
+                    data_timestamp = batch.data_timestamp
+                    if ckpt_manager.maybe_save(
+                        i_step,
+                        model,
+                        optimizer,
+                        dataloader_state,
+                        dense_ema,
+                        data_timestamp=data_timestamp,
+                        lr_schedulers=lr_scheduler,
+                    ):
+                        run_eval(i_step, i_epoch)
+                    # Lockstep: the rank-uniform paired dump decision is the only
+                    # export trigger, and the publish poll is an every-step
+                    # collective.
+                    online_dense_exporter.maybe_export(
+                        i_step,
+                        data_timestamp,
+                        model,
+                        force=dump_decision == DumpDecision.PAIRED,
+                        dense_ema=export_dense_ema,
                     )
-                    step_iter = itertools.chain([i_step], step_iter)
-                    i_step -= 1
+                    online_dense_exporter.poll_publish(
+                        delta_embedding_dumper.completed_upload_state()
+                        if delta_embedding_dumper is not None
+                        else None
+                    )
+                    if (
+                        handover is not None
+                        and i_step % train_config.log_step_count_steps == 0
+                        and handover.update_and_check(i_step, data_timestamp)
+                    ):
+                        logger.info(
+                            f"successor lineage {handover.successor_model_dir} caught "
+                            f"up at step {i_step}, handing over."
+                        )
+                        handed_over = True
+                        break
+                    if prof is not None:
+                        prof.step()
+
+                if handed_over:
                     break
 
-                # Single entry point for step / epoch / event-time saves + dedupe;
-                # maybe_save reconciles this rank's event-time across ranks in lockstep.
-                data_timestamp = batch.data_timestamp
+                if not (use_step and i_step >= train_config.num_steps - 1):
+                    for lr in lr_scheduler:
+                        if lr.by_epoch:
+                            lr.step()
+
                 if ckpt_manager.maybe_save(
                     i_step,
                     model,
                     optimizer,
                     dataloader_state,
                     dense_ema,
+                    epoch=i_epoch,
                     data_timestamp=data_timestamp,
                     lr_schedulers=lr_scheduler,
                 ):
                     run_eval(i_step, i_epoch)
-                # Lockstep: the rank-uniform paired dump decision is the only
-                # export trigger, and the publish poll is an every-step
-                # collective.
-                online_dense_exporter.maybe_export(
-                    i_step,
-                    data_timestamp,
-                    model,
-                    force=dump_decision == DumpDecision.PAIRED,
-                    dense_ema=export_dense_ema,
-                )
-                online_dense_exporter.poll_publish(
-                    delta_embedding_dumper.completed_upload_state()
-                    if delta_embedding_dumper is not None
-                    else None
-                )
-                if (
-                    handover is not None
-                    and i_step % train_config.log_step_count_steps == 0
-                    and handover.update_and_check(i_step, data_timestamp)
-                ):
-                    logger.info(
-                        f"successor lineage {handover.successor_model_dir} caught "
-                        f"up at step {i_step}, handing over."
-                    )
-                    handed_over = True
+
+                if use_step and i_step >= train_config.num_steps - 1:
                     break
-                if prof is not None:
-                    prof.step()
 
-            if handed_over:
-                break
+            # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
+            # codebook here). SID models run with periodic checkpointing disabled
+            # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
+            # the only checkpoint and persists whatever on_train_end produced.
+            _model.on_train_end()
+            final_dump_step = None
+            if delta_embedding_dumper is not None:
+                # Flush the trailing partial interval before the final checkpoint.
+                # final_dump does not re-dump boundary steps already written by
+                # maybe_dump (all ranks run the same step count, so every rank
+                # participated in those dumps and reaches the same final step) but
+                # still returns the step so the final export can pair with a
+                # sparse-only boundary.
+                final_dump_step = delta_embedding_dumper.final_dump(i_step)
 
-            if not (use_step and i_step >= train_config.num_steps - 1):
-                for lr in lr_scheduler:
-                    if lr.by_epoch:
-                        lr.step()
-
-            if ckpt_manager.maybe_save(
+            _log_train(
                 i_step,
-                model,
-                optimizer,
-                dataloader_state,
-                dense_ema,
-                epoch=i_epoch,
+                losses,
+                params=optimizer.params,
+                param_groups=optimizer.param_groups,
+                tb_summaries=tb_summaries,
+                plogger=plogger,
+                summary_writer=summary_writer,
                 data_timestamp=data_timestamp,
-                lr_schedulers=lr_scheduler,
-            ):
-                run_eval(i_step, i_epoch)
+            )
+            if kafka_log_enabled and i_step % train_config.log_step_count_steps != 0:
+                _log_kafka_offsets(i_step, kafka_baseline_offsets, dataloader_state)
+            if summary_writer is not None:
+                summary_writer.flush()
+        except BaseException:
+            if prof is not None:
+                try:
+                    prof.stop()
+                except Exception:
+                    logger.exception("Failed to stop training profiler after job error")
+            raise
+        else:
+            if prof is not None:
+                prof.stop()
 
-            if use_step and i_step >= train_config.num_steps - 1:
-                break
-
-        # One-shot end-of-loop hook (default no-op; e.g. SidRqkmeans fits its FAISS
-        # codebook here). SID models run with periodic checkpointing disabled
-        # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
-        # the only checkpoint and persists whatever on_train_end produced.
-        _model.on_train_end()
-        final_dump_step = None
-        if delta_embedding_dumper is not None:
-            # Flush the trailing partial interval before the final checkpoint.
-            # final_dump does not re-dump boundary steps already written by
-            # maybe_dump (all ranks run the same step count, so every rank
-            # participated in those dumps and reaches the same final step) but
-            # still returns the step so the final export can pair with a
-            # sparse-only boundary.
-            final_dump_step = delta_embedding_dumper.final_dump(i_step)
-
-        _log_train(
-            i_step,
-            losses,
-            params=optimizer.params,
-            param_groups=optimizer.param_groups,
-            tb_summaries=tb_summaries,
-            plogger=plogger,
-            summary_writer=summary_writer,
-            data_timestamp=data_timestamp,
-        )
-        if kafka_log_enabled and i_step % train_config.log_step_count_steps != 0:
-            _log_kafka_offsets(i_step, kafka_baseline_offsets, dataloader_state)
-        if summary_writer is not None:
-            summary_writer.close()
-        if prof is not None:
-            prof.stop()
         # a retired lineage is never resumed, so skip its final checkpoint
         if not handed_over and ckpt_manager.maybe_save(
             i_step,
@@ -855,9 +887,6 @@ def _train_and_evaluate(
             if delta_embedding_dumper is not None
             else None
         )
-    finally:
-        online_dense_exporter.close()
-        ckpt_manager.close()
 
 
 def train_and_evaluate(

@@ -65,6 +65,20 @@ def _train_config(**overrides) -> TrainConfig:
     return TrainConfig(**fields)
 
 
+class _FakeSummaryWriter:
+    """SummaryWriter stand-in: a context manager that closes itself on exit."""
+
+    def __init__(self) -> None:
+        self.flush = mock.Mock()
+        self.close = mock.Mock()
+
+    def __enter__(self) -> "_FakeSummaryWriter":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
+
 class MainTest(unittest.TestCase):
     """Tests for tzrec.main orchestration."""
 
@@ -169,6 +183,171 @@ class MainTest(unittest.TestCase):
         self.assertTrue(ckpt_manager.close.called)
         # a collective; missing ranks would hang it on exception paths
         exporter.finalize_publish.assert_not_called()
+
+    def test_train_profiler_stops_once_on_exception(self) -> None:
+        """An exception stops the profiler exactly once, without masking it.
+
+        A stop failure while handling the training error is logged locally;
+        the original training error still reaches the launcher and no
+        collective final publication runs.
+        """
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        exporter = mock.Mock()
+        exporter.enabled = False
+        prof = mock.Mock()
+        prof.stop.side_effect = RuntimeError("stop boom")
+        model = mock.Mock()
+        optimizer = mock.Mock()
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()])
+        pipeline = mock.Mock()
+        pipeline.progress.side_effect = RuntimeError("boom")
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch("tzrec.main._create_train_profiler", return_value=prof),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                _train_and_evaluate(
+                    model=model,
+                    optimizer=optimizer,
+                    train_dataloader=train_dataloader,
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir=self.test_dir,
+                    train_config=_train_config(
+                        log_step_count_steps=1, is_profiling=True
+                    ),
+                    eval_config=EvalConfig(),
+                    ckpt_manager=ckpt_manager,
+                )
+        prof.start.assert_called_once()
+        prof.stop.assert_called_once()
+        exporter.close.assert_called_once()
+        exporter.finalize_publish.assert_not_called()
+
+    def test_train_profiler_stop_failure_prevents_final_publish(self) -> None:
+        """A profiler stop failure on the success path aborts the final tail.
+
+        The stop defines the trace boundary; if it fails after training, the
+        final checkpoint save and the collective publish must not proceed.
+        """
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()])
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=-1.0)
+        pipeline = mock.Mock()
+        pipeline.progress.return_value = ({"loss": torch.tensor(1.0)}, {}, batch)
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        exporter = mock.Mock()
+        exporter.enabled = False
+        prof = mock.Mock()
+        prof.stop.side_effect = RuntimeError("stop boom")
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch("tzrec.main._create_train_profiler", return_value=prof),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop boom"):
+                _train_and_evaluate(
+                    model=model,
+                    optimizer=optimizer,
+                    train_dataloader=train_dataloader,
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir=self.test_dir,
+                    train_config=_train_config(
+                        log_step_count_steps=10, is_profiling=True
+                    ),
+                    eval_config=EvalConfig(),
+                    ckpt_manager=ckpt_manager,
+                )
+        prof.stop.assert_called_once()
+        exporter.finalize_publish.assert_not_called()
+        exporter.close.assert_called_once()
+        for call in ckpt_manager.maybe_save.call_args_list:
+            self.assertFalse(call.kwargs.get("final", False))
+
+    def test_second_writer_failure_closes_first_writer(self) -> None:
+        """A failure after the first writer registration still closes it."""
+        first_writer = _FakeSummaryWriter()
+        exporter = mock.Mock()
+        exporter.enabled = False
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch(
+                "tzrec.main.SummaryWriter",
+                side_effect=[first_writer, RuntimeError("second writer boom")],
+            ),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "second writer boom"):
+                _train_and_evaluate(
+                    model=mock.Mock(),
+                    optimizer=mock.Mock(),
+                    train_dataloader=mock.Mock(),
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir="unused",
+                    train_config=_train_config(use_tensorboard=True),
+                    eval_config=EvalConfig(),
+                    ckpt_manager=mock.Mock(),
+                )
+        first_writer.close.assert_called_once()
+        # the exporter was never constructed, so the stack holds nothing of it
+        exporter.close.assert_not_called()
+
+    def test_handover_failure_closes_exporter_writers_and_profiler(self) -> None:
+        """A handover setup failure releases everything acquired above it.
+
+        The exporter is registered before validation and handover setup, the
+        writers before it, and started tracing stops exactly once; no final
+        publication is initiated.
+        """
+        prof = mock.Mock()
+        writers = [_FakeSummaryWriter(), _FakeSummaryWriter()]
+        exporter = mock.Mock()
+        exporter.enabled = False
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.SummaryWriter", side_effect=writers),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch("tzrec.main._create_train_profiler", return_value=prof),
+            mock.patch(
+                "tzrec.main.create_online_learning_handover",
+                side_effect=RuntimeError("handover boom"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "handover boom"):
+                _train_and_evaluate(
+                    model=mock.Mock(),
+                    optimizer=mock.Mock(),
+                    train_dataloader=mock.Mock(),
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir="unused",
+                    train_config=_train_config(use_tensorboard=True, is_profiling=True),
+                    eval_config=EvalConfig(),
+                    ckpt_manager=mock.Mock(),
+                )
+        prof.start.assert_called_once()
+        prof.stop.assert_called_once()
+        exporter.close.assert_called_once()
+        exporter.finalize_publish.assert_not_called()
+        for writer in writers:
+            writer.close.assert_called_once()
 
     def test_train_eval_uses_ema_and_restores_training_parameters(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([2.0]))
