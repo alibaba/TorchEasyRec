@@ -34,6 +34,7 @@ class DataParserTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("INPUT_TILE", None)
         os.environ.pop("INPUT_TILE_3_ONLINE", None)
+        os.environ.pop("HARD_SEARCH_INPUT_TILE", None)
 
     def test_nofg(self):
         feature_cfgs = [
@@ -1736,7 +1737,7 @@ class DataParserTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            (fg_mode, tile, online)
+            (fg_mode, tile, online, compact)
             for fg_mode in (
                 FgMode.FG_DAG,
                 FgMode.FG_NORMAL,
@@ -1745,10 +1746,12 @@ class DataParserTest(unittest.TestCase):
             )
             for tile in ("2", "3")
             for online in (False, True)
+            for compact in (False, True)
         ],
         name_func=parameterized_name_func,
     )
-    def test_parse_hard_search_input_tile(self, fg_mode, tile, online):
+    def test_parse_hard_search_input_tile(self, fg_mode, tile, online, compact):
+        os.environ["HARD_SEARCH_INPUT_TILE"] = "1" if compact else "0"
         os.environ["INPUT_TILE"] = tile
         os.environ["INPUT_TILE_3_ONLINE"] = "1" if online else "0"
         feature_cfgs = self._create_test_fg_feature_cfgs(tag_b_seq=True)
@@ -1865,6 +1868,8 @@ class DataParserTest(unittest.TestCase):
             ),
             "batch_size": torch.tensor(3 if online else 1),
         }
+        if compact:
+            expected["click_seq__inverse_indices"] = torch.arange(3)
         self.assertEqual(set(data), set(expected))
         for name, value in expected.items():
             with self.subTest(tensor=name):

@@ -984,6 +984,17 @@ feature_configs {
 - **组合限制**：使用hard-search历史时，同一`SEQUENCE`组或`sequence_groups`子组的所有历史序列轴特征必须来自同一份hard-search历史并逐事件对齐，不能混用普通历史或不同hard-search序列组，即使`hard_search_key`相同且长度恰好一致也不支持。不同历史应使用独立的`sequence_groups`。不同hard-search来源的自动检查仅覆盖直接声明的序列组，派生特征的来源与事件对齐需自行确认。模型query部分仍允许混用用户侧和候选侧特征，这不代表hard-search组内允许非序列原始输入。`JAGGED_SEQUENCE`组不能包含任何hard-search特征，因此当前HSTU不支持该配置。
 - **重新导出**：新增或修改`hard_search_key`配置后，必须重新导出模型及FG产物，使模型输入分类与Processor一致。若通过导出assets提供自定义`fg.json`，其特征定义（包括hard-search标记、原始输入映射和序列配置）必须与建图配置一致，冲突时导出会报错；不包含hard-search的旧资产流程保持原样。上述支持范围为FX/TorchScript及distributed embedding导出；`USE_RTP=1`不支持hard-search，创建特征时会报错；AOT/TRT路径尚未验证。
 
+**按候选 key 复用历史计算**
+
+导出时设置 `HARD_SEARCH_INPUT_TILE=1 INPUT_TILE=3` 可启用请求内历史去重，普通导出也支持 `INPUT_TILE=2`。需要同时升级支持此功能的 Processor 并重新导出模型；训练无需开启此开关。旧模型继续使用每候选一行的历史输入。
+
+同一用户的一组候选 key 为 `[A, B, A, C, B]` 时，Processor 保留 `[A, B, C]` 对应的三份历史，只做三份历史的 FG 和 embedding，然后模型按位置映射恢复五个候选的历史。不同序列组分别去重，普通用户特征继续共享。缺失 key 的候选指向一份共享空历史，空历史仍遵循 FG 默认值配置；全部 key 缺失时不查询未过滤历史。
+
+- 支持稀疏、稠密及多值历史，以及仅依赖同一份历史与共享 `user:`/常量输入的派生特征。若 FG 派生特征还依赖逐候选 `item:`/`context:` 输入或另一份 hard-search 历史，开启此优化时会报错，需保留原有 B 行路径或调整特征配置。
+- DIN 等候选 attention 仍按 B 个 query 分别计算；本阶段在进入序列编码器前恢复 B 行。收益主要来自减少 FG、输入搬运和重复 embedding，展开后的 attention 张量仍为 B 行，实际延迟改善需结合候选 key 重复率与序列长度测量。
+- 支持 FX/TorchScript、distributed embedding 和 tile 3 在线模式，暂不支持 AOT/TRT、RTP、HSTU。普通离线预测继续提供每样本一份历史，由预测入口添加恒等位置映射，不按跨用户 key 去重。
+- 导出资产中的紧凑输入标记由导出器生成，不能仅修改 `fg.json` 或 Processor 环境变量开启。排查部署错误时应确认模型和 Processor 使用同一份导出目录。
+
 ### 普通序列特征
 
 ```

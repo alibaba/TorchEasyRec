@@ -1319,6 +1319,81 @@ def _set_hard_search_features(
         feature._is_hard_search_feat = feature.name in candidates
 
 
+def get_hard_search_feature_sequences(features: List[BaseFeature]) -> Dict[str, str]:
+    """Resolve compact feature rows to their sole hard-search sequence source.
+
+    Compact serving shares history-side computation within one request. Features
+    combining different histories or candidate inputs cannot share those rows.
+    """
+    if os.environ.get("HARD_SEARCH_INPUT_TILE", "0") != "1":
+        return {}
+    if os.environ.get("INPUT_TILE", "0")[:1] not in ("2", "3"):
+        raise ValueError("HARD_SEARCH_INPUT_TILE=1 requires INPUT_TILE=2 or 3.")
+    if any(
+        os.environ.get(key, "0") != "0"
+        for key in ("ENABLE_AOT", "ENABLE_TRT", "UNIFIED_AOT", "USE_RTP")
+    ):
+        raise ValueError("HARD_SEARCH_INPUT_TILE only supports FX/TorchScript export.")
+    sequences = {f.sequence_name for f in features if f.hard_search_key is not None}
+    if not sequences:
+        return {}
+    raw_sources = {}
+    side_inputs = {}
+    for feature in features:
+        try:
+            side_inputs[feature.name] = feature.side_inputs
+        except InvalidFgInputError:
+            side_inputs[feature.name] = []
+        if feature.hard_search_key is not None:
+            for side, name in side_inputs[feature.name]:
+                if side not in ("feature", "const"):
+                    raw_sources[name] = feature.sequence_name
+
+    resolved: Dict[str, Tuple[Set[str], bool]] = {}
+    pending = {f.name: f for f in features}
+    while pending:
+        progressed = []
+        for name, feature in pending.items():
+            inputs = side_inputs[name]
+            if any(
+                side == "feature" and source not in resolved for side, source in inputs
+            ):
+                continue
+            sources = (
+                {feature.sequence_name}
+                if feature.hard_search_key is not None
+                else set()
+            )
+            candidate = False
+            for side, source in inputs:
+                if side == "feature":
+                    dependency_sources, dependency_candidate = resolved[source]
+                    sources.update(dependency_sources)
+                    candidate |= dependency_candidate
+                elif side != "const":
+                    if source in raw_sources:
+                        sources.add(raw_sources[source])
+                    elif side != "user":
+                        candidate = True
+            resolved[name] = (sources, candidate)
+            progressed.append(name)
+        if not progressed:
+            raise ValueError("Cannot resolve hard-search feature dependencies.")
+        for name in progressed:
+            del pending[name]
+    result = {}
+    for name, (sources, candidate) in resolved.items():
+        if not sources:
+            continue
+        if len(sources) != 1 or candidate:
+            raise ValueError(
+                f"HARD_SEARCH_INPUT_TILE feature {name!r} must depend on one "
+                "hard-search sequence and shared user/constant inputs only."
+            )
+        result[name] = next(iter(sources))
+    return result
+
+
 def create_features(
     feature_configs: List[FeatureConfig],
     fg_mode: FgMode = FgMode.FG_NONE,

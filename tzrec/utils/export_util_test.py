@@ -204,6 +204,26 @@ class HardSearchExportTest(unittest.TestCase):
         os.mkdir(self.save_dir)
         self.asset_path = os.path.join(self.test_dir, "fg.json")
 
+    def test_compact_metadata_includes_generated_fg_nodes(self):
+        with mock.patch.dict(os.environ, INPUT_TILE="3", HARD_SEARCH_INPUT_TILE="1"):
+            config = _create_hard_search_export_config()
+            config.feature_configs.add(
+                lookup_feature=feature_pb2.LookupFeature(
+                    feature_name="vector",
+                    map="user:shared_map",
+                    key="feature:click_seq__id",
+                    value_dim=2,
+                )
+            )
+            features = create_features(list(config.feature_configs))
+            export_util._write_export_metadata(
+                config, features, self.save_dir, None, None
+            )
+            with open(os.path.join(self.save_dir, "model_acc.json")) as source:
+                metadata = json.load(source)["hard_search_input_tile"]
+            self.assertEqual(metadata["features"]["vector"], "click_seq")
+            self.assertEqual(metadata["features"]["vector__lookup"], "click_seq")
+
     @parameterized.expand(
         [
             ("missing_hard_search_key", "hard_search_key", None),
@@ -407,13 +427,18 @@ class HardSearchExportTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("normal_tile2", "2", False),
-            ("normal_tile3", "3", False),
-            ("distributed_forces_tile3", "2", True),
+            ("normal_tile2", "2", False, False),
+            ("normal_tile3", "3", False, False),
+            ("distributed_forces_tile3", "2", True, False),
+            ("compact_tile2", "2", False, True),
+            ("compact_tile3", "3", False, True),
+            ("compact_distributed", "3", True, True),
         ],
         name_func=parameterized_name_func,
     )
-    def test_hard_search_input_tile_export_numerics(self, _name, tile, distributed):
+    def test_hard_search_input_tile_export_numerics(
+        self, _name, tile, distributed, compact
+    ):
         if os.environ.get("TZREC_HSK_EXPORT_TEST") != self._testMethodName:
             result = subprocess.run(
                 [
@@ -440,6 +465,7 @@ class HardSearchExportTest(unittest.TestCase):
                 "WORLD_SIZE": "1",
                 "LOCAL_WORLD_SIZE": "1",
                 "INPUT_TILE": tile,
+                "HARD_SEARCH_INPUT_TILE": "1" if compact else "0",
                 "INPUT_TILE_3_ONLINE": "0",
                 "USE_DISTRIBUTED_EMBEDDING": "1" if distributed else "0",
                 "USE_RTP": "0",
@@ -505,9 +531,21 @@ class HardSearchExportTest(unittest.TestCase):
         }
         fx_model = export_util.symbolic_trace(model)
         lengths_cases = ([2, 0, 1], [0], [3, 1], [0, 0])
-        expected_outputs = []
-        for lengths in lengths_cases:
+        indices_cases = ([2, 0, 2, 1, 0], [0, 0, 0], [1, 0, 1], [1, 0, 1])
+
+        def make_inputs(lengths, indices):
             data = _hard_search_export_inputs(lengths)
+            if compact:
+                data["click_seq__inverse_indices"] = torch.tensor(indices)
+                count = len(indices)
+                data["item_id.values"] = torch.arange(1, count + 1)
+                data["item_id.lengths"] = torch.ones(count, dtype=torch.int64)
+                data["batch_size"] = torch.tensor(count)
+            return data
+
+        expected_outputs = []
+        for lengths, indices in zip(lengths_cases, indices_cases):
+            data = make_inputs(lengths, indices)
             scores = []
             offset = 0
             for index, length in enumerate(lengths):
@@ -517,7 +555,17 @@ class HardSearchExportTest(unittest.TestCase):
                 )
                 scores.append(2 * (2 * (index + 1) + 0.25 + 4.25 + 0.75 + sequence_sum))
                 offset += length
-            expected = {"score": torch.tensor(scores), "lengths": torch.tensor(lengths)}
+            if compact:
+                scores = [
+                    scores[source] + 4 * (target - source)
+                    for target, source in enumerate(indices)
+                ]
+            expected = {
+                "score": torch.tensor(scores),
+                "lengths": torch.tensor(lengths)[indices]
+                if compact
+                else torch.tensor(lengths),
+            }
             expected_outputs.append(expected)
             self.assertEqual(data["click_seq__id.lengths"].numel(), len(lengths))
             self.assertEqual(data["user_id.lengths"].numel(), 1)
@@ -525,7 +573,7 @@ class HardSearchExportTest(unittest.TestCase):
             torch.testing.assert_close(model(data), expected)
             torch.testing.assert_close(fx_model(data), expected)
 
-        data = _hard_search_export_inputs(lengths_cases[0])
+        data = make_inputs(lengths_cases[0], indices_cases[0])
         batch = model._data_parser.to_batch(data, force_no_tile=True)
 
         class ExportDataloader:
@@ -582,11 +630,49 @@ class HardSearchExportTest(unittest.TestCase):
         scripted = torch.jit.load(
             os.path.join(self.save_dir, "scripted_model.pt"), map_location="cpu"
         )
+        if compact:
+            self.assertEqual(
+                model_acc["hard_search_input_tile"],
+                {
+                    "version": 1,
+                    "features": {
+                        "click_seq__id": "click_seq",
+                        "click_seq__score": "click_seq",
+                    },
+                },
+            )
+        else:
+            self.assertNotIn("hard_search_input_tile", model_acc)
         if not distributed:
-            for lengths, expected in zip(lengths_cases, expected_outputs):
+            for lengths, indices, expected in zip(
+                lengths_cases, indices_cases, expected_outputs
+            ):
                 with self.subTest(lengths=lengths):
                     torch.testing.assert_close(
-                        scripted(_hard_search_export_inputs(lengths)), expected
+                        scripted(make_inputs(lengths, indices)), expected
+                    )
+            if compact:
+                from tzrec.utils.predict_util import load_predict_model
+
+                with mock.patch.dict(
+                    os.environ, HARD_SEARCH_INPUT_TILE="0", INPUT_TILE="0"
+                ):
+                    offline_data = _hard_search_export_inputs([2, 0, 1])
+                    for key in ("user_id.values", "user_id.lengths"):
+                        offline_data[key] = offline_data[key].repeat(3)
+                    offline_data["user_score.values"] = offline_data[
+                        "user_score.values"
+                    ].repeat(3, 1)
+                    offline = ScriptWrapper(TinyModel())._data_parser.to_batch(
+                        offline_data
+                    )
+                    self.assertNotIn(
+                        "click_seq__inverse_indices", offline.additional_infos
+                    )
+                    predict = load_predict_model(self.save_dir, [torch.device("cpu")])
+                    expected = scripted(make_inputs([2, 0, 1], [0, 1, 2]))
+                    torch.testing.assert_close(
+                        predict(offline, torch.tensor(1), torch.device("cpu")), expected
                     )
             return
 
@@ -625,9 +711,11 @@ class HardSearchExportTest(unittest.TestCase):
             torch.testing.assert_close(
                 weights[table], training_state[table + ".weight"]
             )
-        for lengths, expected in zip(lengths_cases, expected_outputs):
+        for lengths, indices, expected in zip(
+            lengths_cases, indices_cases, expected_outputs
+        ):
             with self.subTest(lengths=lengths):
-                data = _hard_search_export_inputs(lengths)
+                data = make_inputs(lengths, indices)
                 serving_data = dict(data)
                 for group_name, feature_names in dense_meta.items():
                     if group_name == "sequence__ec":
@@ -656,6 +744,164 @@ class HardSearchExportTest(unittest.TestCase):
                     serving_data["click_seq__id__lengths"].numel(), len(lengths)
                 )
                 torch.testing.assert_close(scripted(serving_data), expected)
+
+
+class CompactDerivedExportTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            (False, False, False),
+            (True, False, False),
+            (False, True, False),
+            (True, False, True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_derived_and_independent_history(self, distributed, quantized, multivalue):
+        with mock.patch.dict(
+            os.environ,
+            INPUT_TILE="3",
+            HARD_SEARCH_INPUT_TILE="1",
+            USE_RTP="0",
+            ENABLE_AOT="0",
+            ENABLE_TRT="0",
+        ):
+            config = _create_hard_search_export_config()
+            if multivalue:
+                config.feature_configs[3].sequence_feature.features[
+                    0
+                ].id_feature.value_dim = 0
+            other = config.feature_configs.add()
+            other.CopyFrom(config.feature_configs[3])
+            other.sequence_feature.sequence_name = "other"
+            other.sequence_feature.sequence_pk = "user:other"
+            unused = config.feature_configs.add()
+            unused.CopyFrom(config.feature_configs[3])
+            unused.sequence_feature.sequence_name = "unused"
+            unused.sequence_feature.sequence_pk = "user:unused"
+            for sub in unused.sequence_feature.features:
+                getattr(sub, sub.WhichOneof("feature")).stub_type = True
+            config.feature_configs.extend(
+                [
+                    feature_pb2.FeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="derived",
+                            expression="feature:click_seq__id",
+                            embedding_dim=2,
+                            num_buckets=8,
+                        )
+                    ),
+                    feature_pb2.FeatureConfig(
+                        raw_feature=feature_pb2.RawFeature(
+                            feature_name="derived_dense",
+                            expression="feature:click_seq__score",
+                        )
+                    ),
+                ]
+            )
+            config.model_config.feature_groups[0].feature_names.extend(
+                ["derived", "derived_dense"]
+            )
+            other_group = config.model_config.feature_groups.add()
+            other_group.CopyFrom(config.model_config.feature_groups[1])
+            other_group.group_name = "other"
+            other_group.feature_names[:] = ["other__id", "other__score"]
+            features = create_features(list(config.feature_configs))
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.features = features
+                    self.feature_groups = list(config.model_config.feature_groups)
+                    self.embedding_group = EmbeddingGroup(
+                        features, self.feature_groups, device=torch.device("cpu")
+                    )
+
+                def predict(self, batch):
+                    grouped = self.embedding_group(batch)
+                    return {
+                        name: grouped[name]
+                        for name in (
+                            "deep",
+                            "hsk.sequence",
+                            "hsk.sequence_length",
+                            "other.sequence",
+                            "other.sequence_length",
+                        )
+                    }
+
+            model = ScriptWrapper(Model()).eval()
+            if quantized:
+                export_util.quantize_embeddings(
+                    model,
+                    dtype=torch.float16,
+                    inplace=True,
+                    additional_qconfig_spec_keys=[EmbeddingCollection],
+                    additional_mapping={
+                        EmbeddingCollection: export_util.QuantEmbeddingCollection
+                    },
+                )
+            gm = export_util.symbolic_trace(model)
+            raw = _hard_search_export_inputs([2, 0])
+            raw.update(
+                {
+                    "batch_size": torch.tensor(4),
+                    "item_id.values": torch.tensor([1, 2, 3, 4]),
+                    "item_id.lengths": torch.ones(4, dtype=torch.int64),
+                    "click_seq__inverse_indices": torch.tensor([1, 0, 1, 0]),
+                    "other__inverse_indices": torch.tensor([0, 2, 1, 2]),
+                    "other__id.values": torch.tensor([3, 4, 5]),
+                    "other__id.lengths": torch.tensor([1, 2, 0]),
+                    "other__score.values": torch.tensor([[1.0], [2.0], [3.0]]),
+                    "other__score.lengths": torch.tensor([1, 2, 0]),
+                    "derived.values": torch.tensor([1, 2]),
+                    "derived.lengths": torch.tensor([2, 0]),
+                    "derived_dense.values": torch.tensor([[0.7], [0.0]]),
+                }
+            )
+            if multivalue:
+                raw["click_seq__id.key_lengths"] = torch.tensor([2, 0])
+                raw["other__id.key_lengths"] = torch.tensor([2, 0, 1])
+            expected = model(raw)
+            torch.testing.assert_close(
+                expected["hsk.sequence"][0], expected["hsk.sequence"][2]
+            )
+            torch.testing.assert_close(
+                expected["other.sequence"][1], expected["other.sequence"][3]
+            )
+            self.assertEqual(expected["deep"].shape[0], 4)
+            torch.testing.assert_close(
+                expected["deep"][:, -1], torch.tensor([0.0, 0.7, 0.0, 0.7])
+            )
+            torch.testing.assert_close(expected["deep"][0, -3:-1], torch.zeros(2))
+            torch.testing.assert_close(
+                expected["deep"][1, -3:-1], expected["deep"][3, -3:-1]
+            )
+            batch = model._data_parser.to_batch(raw)
+            torch.testing.assert_close(batch.to_dict(), raw)
+            if distributed:
+                kts, jts = {}, {}
+                export_util._SparseMarkCapture(gm, kts, jts).run(
+                    raw, torch.device("cpu")
+                )
+                attrs = {}
+                serving = dict(raw)
+                for name, kt in kts.items():
+                    attrs[name + "__keys"] = kt.keys()
+                    attrs[name + "__length_per_key"] = kt.length_per_key()
+                    serving[name] = (
+                        kt.values()[:1] if name.endswith("_user") else kt.values()
+                    )
+                for name, jt in jts.items():
+                    serving[name] = jt.values()
+                    serving[name + "__lengths"] = jt.lengths()
+                state = dict(gm.state_dict())
+                gm, _ = export_util._rewrite_dense_serving_graph(
+                    gm.graph, gm, attrs, torch.device("cpu")
+                )
+                gm.load_state_dict({name: state[name] for name in gm.state_dict()})
+                raw = serving
+            scripted = torch.jit.script(export_util.symbolic_trace(gm))
+            torch.testing.assert_close(scripted(raw), expected)
 
 
 class ExportUtilTest(unittest.TestCase):

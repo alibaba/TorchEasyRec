@@ -730,6 +730,49 @@ class FeatureTest(unittest.TestCase):
                 feature.is_hard_search_feat, feature.name not in user_names
             )
 
+    @parameterized.expand(
+        [
+            ("user:shared_map", True),
+            ("item:shared_map", False),
+            ("context:shared_map", False),
+            ("feature:other__cat_a", False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_compact_history_dependency_domains(self, map_input, valid):
+        configs = self._create_test_dag_feature_cfgs(grouped=True, stub_type=True)
+        configs[0].sequence_feature.hard_search_key = "item:cate"
+        other = feature_pb2.FeatureConfig()
+        other.CopyFrom(configs[0])
+        other.sequence_feature.sequence_name = "other"
+        other.sequence_feature.sequence_pk = "user:other"
+        del other.sequence_feature.features[1:]
+        configs.append(other)
+        configs.append(
+            feature_pb2.FeatureConfig(
+                lookup_feature=feature_pb2.LookupFeature(
+                    feature_name="derived",
+                    map=map_input,
+                    key="feature:click_seq__cat_a",
+                    embedding_dim=4,
+                    num_buckets=100,
+                )
+            )
+        )
+        features = feature_lib.create_features(configs, fg_mode=FgMode.FG_DAG)
+        with mock.patch.dict(os.environ, HARD_SEARCH_INPUT_TILE="1", INPUT_TILE="3"):
+            if valid:
+                sources = feature_lib.get_hard_search_feature_sequences(features)
+                self.assertEqual(sources["derived"], "click_seq")
+                self.assertEqual(sources["other__cat_a"], "other")
+            else:
+                with self.assertRaisesRegex(ValueError, "one hard-search sequence"):
+                    feature_lib.get_hard_search_feature_sequences(features)
+        with mock.patch.dict(os.environ, HARD_SEARCH_INPUT_TILE="0"):
+            self.assertEqual(
+                feature_lib.get_hard_search_feature_sequences(features), {}
+            )
+
     @parameterized.expand([[False], [True]])
     def test_create_fg_json(self, with_asset_dir=False):
         asset_dir = None

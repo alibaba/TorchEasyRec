@@ -2315,6 +2315,84 @@ class HardSearchEmbeddingGroupTest(unittest.TestCase):
 
     @parameterized.expand(
         [
+            (tile, pooling, online)
+            for tile, online in (("2", "0"), ("3", "0"), ("3", "1"))
+            for pooling in (None, "mean", "sum")
+        ],
+        name_func=parameterized_name_func,
+    )
+    @torch.no_grad()
+    def test_compact_history_attention(self, tile, pooling, online):
+        if self._run_in_subprocess():
+            return
+        with patch.dict(
+            os.environ,
+            INPUT_TILE=tile,
+            INPUT_TILE_3_ONLINE=online,
+            HARD_SEARCH_INPUT_TILE="1",
+        ):
+            model = ScriptWrapper(self._create_model(pooling)).eval()
+            traced = symbolic_trace(model)
+            scripted = torch.jit.script(traced)
+            buffer = io.BytesIO()
+            torch.jit.save(scripted, buffer)
+            buffer.seek(0)
+            loaded = torch.jit.load(buffer)
+        for indices, all_empty in (([2, 0, 2, 1, 0], False), ([1, 1, 1, 1], True)):
+            batch, _, _ = self._create_batch("3", 3, pooling, all_empty)
+            compact = batch.to_dict()
+            index = torch.tensor(indices)
+            count = len(indices)
+            # 相同历史对应不同候选 query，不能共享 attention 输出。
+            compact["item_value.values"] = torch.arange(count).float().view(-1, 1) / 4
+            item_ids = [2, 4, 2, 6, 1][:count]
+            compact["item_cat.values"] = torch.tensor(item_ids)
+            compact["item_cat.lengths"] = torch.ones(count, dtype=torch.int64)
+            compact["batch_size"] = torch.tensor(count)
+            compact["hard__inverse_indices"] = index
+            expanded = dict(compact)
+            del expanded["hard__inverse_indices"]
+            for name in ("hard__cat", "hard__value"):
+                lengths = compact[name + ".lengths"]
+                value_lengths = lengths
+                if name == "hard__cat" and pooling is not None:
+                    key_lengths = compact[name + ".key_lengths"]
+                    key_rows = key_lengths.split(lengths.tolist())
+                    expanded[name + ".key_lengths"] = torch.cat(
+                        [key_rows[i] for i in indices]
+                    )
+                    value_lengths = torch.tensor([row.sum() for row in key_rows])
+                rows = compact[name + ".values"].split(value_lengths.tolist())
+                expanded[name + ".values"] = torch.cat([rows[i] for i in indices])
+                expanded[name + ".lengths"] = lengths[index]
+            with patch.dict(
+                os.environ,
+                INPUT_TILE="3",
+                INPUT_TILE_3_ONLINE="0",
+                HARD_SEARCH_INPUT_TILE="0",
+            ):
+                reference = ScriptWrapper(self._create_model(pooling)).eval()(expanded)
+            with patch.dict(
+                os.environ,
+                INPUT_TILE=tile,
+                INPUT_TILE_3_ONLINE=online,
+                HARD_SEARCH_INPUT_TILE="1",
+            ):
+                for runner in (model, traced, scripted, loaded):
+                    torch.testing.assert_close(runner(compact), reference)
+                parsed = model._data_parser.to_batch(compact)
+                self.assertEqual(
+                    parsed.sparse_features[BASE_DATA_GROUP]["hard__cat"]
+                    .values()
+                    .numel(),
+                    compact["hard__cat.values"].numel(),
+                )
+                torch.testing.assert_close(
+                    parsed.to_dict()["hard__cat.lengths"], compact["hard__cat.lengths"]
+                )
+
+    @parameterized.expand(
+        [
             param(pooling=None, all_empty=False),
             param(pooling=None, all_empty=True),
             param(pooling="mean", all_empty=False),
