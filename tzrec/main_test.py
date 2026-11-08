@@ -302,6 +302,57 @@ class MainTest(unittest.TestCase):
         dumper.close.assert_called_once_with(raise_on_error=False, drain=False)
         manager.close.assert_called_once()
 
+    @parameterized.expand(
+        [
+            param("rank_zero", rank="0"),
+            param("non_zero_rank", rank="1"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_evaluate_summary_writer_by_rank(self, _name: str, rank: str) -> None:
+        """The standalone evaluate entry scopes its writer by rank.
+
+        Rank zero's writer reaches _evaluate and closes when the
+        evaluation call exits; other ranks create no writer and
+        evaluate without one.
+        """
+        config = EasyRecConfig(model_dir=self.test_dir, eval_input_path="eval")
+        runtime = mock.Mock()
+        runtime.checkpoints.latest_checkpoint.return_value = ("ckpt", 5)
+        runtime_cls = mock.MagicMock()
+        runtime_cls.open.return_value.__enter__.return_value = runtime
+        runtime_cls.open.return_value.__exit__.return_value = False
+        writer = _FakeSummaryWriter()
+        writer_cls = mock.Mock(return_value=writer)
+        with (
+            mock.patch.dict(os.environ, {"RANK": rank, "LOCAL_RANK": rank}),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config", return_value=config
+            ),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32"),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch("tzrec.main.create_dataloader", return_value=mock.Mock()),
+            mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+            mock.patch("tzrec.main.TrainWrapper", return_value=mock.Mock()),
+            mock.patch("tzrec.main.ShardedModelRuntime", runtime_cls),
+            mock.patch("tzrec.main.config_util.use_dense_ema", return_value=False),
+            mock.patch("tzrec.main.SummaryWriter", writer_cls),
+            mock.patch("tzrec.main._evaluate") as run_eval,
+        ):
+            evaluate("pipeline.config")
+
+        if rank == "0":
+            writer_cls.assert_called_once_with(os.path.join(self.test_dir, "eval"))
+            self.assertIs(run_eval.call_args.kwargs["eval_summary_writer"], writer)
+            writer.close.assert_called_once()
+        else:
+            writer_cls.assert_not_called()
+            self.assertIsNone(run_eval.call_args.kwargs["eval_summary_writer"])
+
     def test_train_eval_uses_ema_and_restores_training_parameters(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor([2.0]))
         dense_ema = DenseEMA({"parameter": parameter}, decay=0.5)
@@ -1312,65 +1363,6 @@ class OnlineLearningHandoverTest(unittest.TestCase):
         dumper.final_dump.assert_called_once_with(2)
         dumper.close.assert_called_once()
         exporter.finalize_publish.assert_called_once()
-
-
-class EvaluateLifecycleTest(unittest.TestCase):
-    """The standalone evaluate entry scopes its TensorBoard writer."""
-
-    def setUp(self):
-        self.test_dir = make_test_dir()
-        self.addCleanup(shutil.rmtree, self.test_dir)
-
-    def _run_evaluate(self, rank: str):
-        config = EasyRecConfig(model_dir=self.test_dir, eval_input_path="eval")
-        manager = mock.Mock()
-        manager.latest_checkpoint.return_value = ("ckpt", 5)
-        writer = _FakeSummaryWriter()
-        writer_cls = mock.Mock(return_value=writer)
-        with (
-            mock.patch.dict(os.environ, {"RANK": rank, "LOCAL_RANK": rank}),
-            mock.patch(
-                "tzrec.main.config_util.load_pipeline_config", return_value=config
-            ),
-            mock.patch(
-                "tzrec.main.init_process_group",
-                return_value=(torch.device("cpu"), "gloo"),
-            ),
-            mock.patch("tzrec.main.acc_utils.allow_tf32"),
-            mock.patch("tzrec.main._create_features", return_value=[]),
-            mock.patch("tzrec.main.create_dataloader", return_value=mock.Mock()),
-            mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
-            mock.patch("tzrec.main.TrainWrapper", return_value=mock.Mock()),
-            mock.patch("tzrec.utils.runtime.CheckpointManager", return_value=manager),
-            mock.patch("tzrec.utils.runtime.create_planner", return_value=mock.Mock()),
-            mock.patch("tzrec.utils.runtime.get_default_sharders", return_value=[]),
-            mock.patch(
-                "tzrec.utils.runtime.DistributedModelParallel", return_value=mock.Mock()
-            ),
-            mock.patch("tzrec.main.config_util.use_dense_ema", return_value=False),
-            mock.patch("tzrec.main.SummaryWriter", writer_cls),
-            mock.patch("tzrec.main._evaluate") as run_eval,
-        ):
-            evaluate("pipeline.config")
-        return manager, writer, writer_cls, run_eval
-
-    def test_rank_zero_writer_closes_after_evaluate(self) -> None:
-        """Rank zero's writer is closed when the evaluation call exits."""
-        manager, writer, writer_cls, run_eval = self._run_evaluate("0")
-
-        writer_cls.assert_called_once_with(os.path.join(self.test_dir, "eval"))
-        self.assertIs(run_eval.call_args.kwargs["eval_summary_writer"], writer)
-        writer.close.assert_called_once()
-        manager.close.assert_called_once()
-
-    def test_non_zero_rank_passes_no_writer(self) -> None:
-        """Other ranks construct no writer and evaluate without one."""
-        manager, writer, writer_cls, run_eval = self._run_evaluate("1")
-
-        writer_cls.assert_not_called()
-        self.assertIsNone(run_eval.call_args.kwargs["eval_summary_writer"])
-        writer.close.assert_not_called()
-        manager.close.assert_called_once()
 
 
 if __name__ == "__main__":
