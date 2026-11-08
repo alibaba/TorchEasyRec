@@ -668,7 +668,6 @@ class PredictionLifecycleTest(unittest.TestCase):
             ),
             mock.patch("tzrec.main.acc_utils.allow_tf32_for_export"),
             mock.patch("tzrec.main.acc_utils.is_trt_predict", return_value=False),
-            mock.patch("tzrec.main.acc_utils.is_aot_predict", return_value=False),
             mock.patch(
                 "tzrec.main.acc_utils.is_input_tile_predict", return_value=False
             ),
@@ -679,7 +678,7 @@ class PredictionLifecycleTest(unittest.TestCase):
             mock.patch("tzrec.main._create_features", return_value=[]),
             mock.patch("tzrec.main.create_dataloader", return_value=dataloader),
             mock.patch("tzrec.main.create_writer", return_value=writer),
-            mock.patch("tzrec.main.torch.jit.load", return_value=model),
+            mock.patch.object(predict_util, "load_predict_model", return_value=model),
             mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01),
         ):
             predict(
