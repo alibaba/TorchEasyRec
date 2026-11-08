@@ -975,6 +975,31 @@ class FeatureStoreDeltaUploaderTest(unittest.TestCase):
         self.assertTrue(view.close_finished.wait(timeout=5))
         self.assertTrue(len(view.calls) < 9)
 
+    def test_thread_start_failure_releases_sdk_writer(self):
+        """A failed worker thread start must not leak the opened SDK handle.
+
+        The uploader stays unstarted (no advertised worker) so a later close()
+        cannot join an unstarted thread, and the just-opened view handle is
+        released locally.
+        """
+        view = _FakeView()
+        uploader = self._uploader(client_factory=_FakeClientFactory(view))
+
+        with mock.patch.object(
+            threading.Thread,
+            "start",
+            side_effect=RuntimeError("cannot start worker"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot start worker"):
+                uploader.start()
+
+        self.assertIsNone(uploader._worker)
+        self.assertFalse(uploader._started)
+        self.assertEqual(view.closed, [True])
+        # a never-started uploader closes without joining anything
+        uploader.close(raise_on_error=False)
+        self.assertTrue(uploader._closed)
+
     def test_signed_int64_key_is_preserved(self):
         large_key = (1 << 63) - 1
         view = _FakeView()
