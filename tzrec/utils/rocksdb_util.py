@@ -58,8 +58,6 @@ BLOCK_CACHE_DATA_BYTES = 1 << 30
 # area of three buckets per table.
 CACHE_BUCKET_ROWS = 1024
 CACHE_OVERFLOW_ROWS = 3 * CACHE_BUCKET_ROWS
-# GPU cache shares of its value bytes the planner offers a RocksDB table.
-CACHE_RATIOS = (0.0001, 0.001, 0.01) + tuple(i / 10 for i in range(1, 10))
 
 # SST bytes per logical byte (uncompressed rows; 1.02-1.05 measured on a
 # 0.6 TB table set after sorted ingest and a day of training).

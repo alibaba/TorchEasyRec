@@ -1010,7 +1010,9 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         search_space = enumerator.enumerate(
             module=model, sharders=_tzrec_get_default_sharders()
         )
-        self.assertEqual(len(search_space), 20)
+        # 19 = nine HYBRID tiers below 1.0 plus ten CACHING ratios: the two
+        # families' equivalent 1.0 candidates (HBM_ONLY) are deduplicated.
+        self.assertEqual(len(search_space), 19)
         caching_modes = sorted(
             {
                 so.dynamicemb_options.caching
@@ -1350,14 +1352,26 @@ class RocksDBPlannerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            param("rocksdb", allow_rocksdb=True, modes={True}),
-            param("builtin", allow_rocksdb=False, modes={False, True}),
+            param("rocksdb", allow_rocksdb=True, modes={True}, input_lengths=[1.0]),
+            param(
+                "rocksdb_lookup_filter",
+                allow_rocksdb=True,
+                modes={True},
+                input_lengths=[5000.0],
+            ),
+            param(
+                "builtin", allow_rocksdb=False, modes={False, True}, input_lengths=[1.0]
+            ),
         ],
         name_func=parameterized_name_func,
     )
-    def test_memory_table_layouts(self, _, allow_rocksdb, modes):
+    def test_memory_table_layouts(self, _, allow_rocksdb, modes, input_lengths):
         # With RocksDB planning a table stays in memory only in a layout
-        # every restore preserves.
+        # every restore preserves: built-in CACHING over the linear grid,
+        # and RocksDB CACHING_PS over one geometric grid whose low end the
+        # lookup floor can cut. Without RocksDB, HYBRID spans the linear
+        # grid below the deduplicated 1.0.
+        rows = 1 << 24
         base = SimpleNamespace(
             dynamicemb_options=SimpleNamespace(
                 caching=False,
@@ -1365,32 +1379,81 @@ class RocksDBPlannerTest(unittest.TestCase):
                 score_strategy=SimpleNamespace(name="NO_EVICTION"),
             ),
             cache_params=None,
-            shards=[SimpleNamespace(size=[1 << 24])],
+            shards=[SimpleNamespace(size=[rows])],
             batch_size=128,
-            input_lengths=[1.0],
+            input_lengths=input_lengths,
         )
         variants = plan_util._emit_dynamicemb_variants(base, allow_rocksdb)
         self.assertEqual({v.dynamicemb_options.caching for v in variants}, modes)
-        if allow_rocksdb:
-            factories = [
-                v.dynamicemb_options.external_storage
-                for v in variants
-                if rocksdb_util.is_rocksdb_options(v.dynamicemb_options)
-            ]
-            self.assertGreater(len(factories), 1)
-            for factory in factories:
-                twin = plan_util._ratio_keyed_factory_cls()(
-                    None, "", cache_ratio=factory.cache_ratio
-                )
-                # Same-ratio factories fuse into one group, where DynamicEmb
-                # keeps every member's planned ratio.
-                self.assertEqual(factory, twin)
-                self.assertEqual(hash(factory), hash(twin))
-            for i, factory in enumerate(factories):
-                for other in factories[i + 1 :]:
-                    # Different ratios must not fuse: one group's shared
-                    # ratio would redistribute a planned cache budget.
-                    self.assertNotEqual(factory, other)
+        linear_grid = [(i + 1) / 10 for i in range(10)]
+        builtin = [v for v in variants if v.dynamicemb_options.external_storage is None]
+        self.assertEqual(
+            sorted(
+                v.cache_params.load_factor
+                for v in builtin
+                if v.dynamicemb_options.caching
+            ),
+            linear_grid,
+        )
+        full_cache = [v for v in variants if v.cache_params.load_factor == 1.0]
+        self.assertEqual(
+            len(full_cache), 1, "the HBM_ONLY 1.0 candidate is emitted once"
+        )
+        self.assertTrue(
+            full_cache[0].dynamicemb_options.caching, "the 1.0 candidate is CACHING"
+        )
+        if not allow_rocksdb:
+            self.assertEqual(
+                sorted(
+                    v.cache_params.load_factor
+                    for v in builtin
+                    if not v.dynamicemb_options.caching
+                ),
+                linear_grid[:-1],
+                "HYBRID keeps the grid below the deduplicated 1.0",
+            )
+            return
+        lookups = int(base.batch_size * sum(input_lengths))
+        expected = sorted(
+            {
+                float(r)
+                for r in np.geomspace(0.01, 0.5, num=10)
+                if lookups <= rocksdb_util.cache_rows(rows, float(r)) < rows
+            }
+        )
+        factories = [
+            v.dynamicemb_options.external_storage
+            for v in variants
+            if rocksdb_util.is_rocksdb_options(v.dynamicemb_options)
+        ]
+        self.assertEqual(
+            sorted(f.cache_ratio for f in factories),
+            expected,
+            "RocksDB candidates span the geometric grid above the floor",
+        )
+        if sum(input_lengths) == 1.0:
+            # Endpoints exact, ten distinct geometrically spaced steps.
+            self.assertEqual(expected[0], 0.01)
+            self.assertEqual(expected[-1], 0.5)
+            self.assertEqual(len(expected), 10)
+            self.assertEqual(
+                len({round(expected[i + 1] / expected[i], 9) for i in range(9)}),
+                1,
+                "ratios are geometrically spaced",
+            )
+        for factory in factories:
+            twin = plan_util._ratio_keyed_factory_cls()(
+                None, "", cache_ratio=factory.cache_ratio
+            )
+            # Same-ratio factories fuse into one group, where DynamicEmb
+            # keeps every member's planned ratio.
+            self.assertEqual(factory, twin)
+            self.assertEqual(hash(factory), hash(twin))
+        for i, factory in enumerate(factories):
+            for other in factories[i + 1 :]:
+                # Different ratios must not fuse: one group's shared
+                # ratio would redistribute a planned cache budget.
+                self.assertNotEqual(factory, other)
 
     def test_all_in_memory(self):
         _, offloaded, planner = self._plan(
@@ -1433,7 +1496,7 @@ class RocksDBPlannerTest(unittest.TestCase):
             # DynamicEmb sizes a fused group's cache with its budget over its
             # value bytes: the budget must be exactly a planned ratio's bytes.
             per_row = o.max_capacity * o.dim * 4
-            budgets = {math.ceil(r * per_row) for r in rocksdb_util.CACHE_RATIOS}
+            budgets = {math.ceil(r * per_row) for r in np.geomspace(0.01, 0.5, 10)}
             self.assertIn(o.local_hbm_for_values, budgets)
         # No temporary DDR deduction: the topology keeps its original caps.
         self.assertEqual(planner._topology.devices[0].storage.ddr, int(4.75 * GIB))
@@ -1447,14 +1510,26 @@ class RocksDBPlannerTest(unittest.TestCase):
         _, offloaded, _ = self._plan(tables, 4, 16, ssd_gib=100)
         self.assertEqual(set(offloaded), {"d"})
 
-    def test_cache_floor_with_configured_working_set(self):
-        # A configured unique_id_factor sets the working-set floor: with
-        # 128 samples and a factor of 1024, a cache must hold 262144 rows.
-        # The calculated boundary ratio (2^18 / 2^24 = 0.015625) is an extra
-        # candidate, small fixed ratios that cannot hold it are rejected,
-        # and the capacity the runtime would allocate is what counts.
-        model, constraints = _model_and_constraints({"a": (1 << 24, 64, {})})
-        constraints["sparse.ebc.a"].unique_id_factor = 1024.0
+    @parameterized.expand(
+        [
+            param("grid", factor=1024.0),
+            param("equal_endpoints", factor=32768.0),
+            param("floor_above_cap", factor=40000.0),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_cache_floor_with_configured_working_set(self, _, factor):
+        # A configured unique_id_factor anchors the RocksDB grid's lower
+        # endpoint at ceil(2 * factor * batch) / local rows, and the built-in
+        # families stay on the plain linear grid. With 128 samples: factor
+        # 1024 needs 262144 rows (endpoint 0.015625 = 2^18/2^24), factor
+        # 32768 needs exactly half the table (equal endpoints, one
+        # candidate), and factor 40000 needs more than half (no RocksDB
+        # candidates).
+        rows = 1 << 24
+        required = math.ceil(2 * factor * 128)
+        model, constraints = _model_and_constraints({"a": (rows, 64, {})})
+        constraints["sparse.ebc.a"].unique_id_factor = factor
         topology = Topology(world_size=1, compute_device="cuda")
         enumerator = plan_util.EmbeddingEnumerator(
             topology=topology,
@@ -1463,19 +1538,35 @@ class RocksDBPlannerTest(unittest.TestCase):
             allow_rocksdb=True,
         )
         options = enumerator.enumerate(model, plan_util.get_default_sharders())
+        self.assertEqual(
+            sorted(
+                o.cache_params.load_factor
+                for o in options
+                if not rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
+            ),
+            [(i + 1) / 10 for i in range(10)],
+            "the built-in families keep the linear grid",
+        )
         ps = [
             o for o in options if rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
         ]
-        self.assertTrue(ps)
+        if required > rows // 2:
+            self.assertEqual(ps, [], "a floor above half the table offloads nothing")
+            return
+        ratios = sorted(o.cache_params.load_factor for o in ps)
+        expected = sorted(
+            {float(r) for r in np.geomspace(required / rows, 0.5, num=10)}
+        )
+        self.assertEqual(ratios, expected)
+        if required * 2 == rows:
+            self.assertEqual(ratios, [0.5], "equal endpoints leave one candidate")
+        if factor == 1024.0:
+            # The lower endpoint holds exactly the required capacity.
+            self.assertEqual(rocksdb_util.cache_rows(rows, 0.015625), required)
         for o in ps:
-            capacity = rocksdb_util.cache_rows(1 << 24, o.cache_params.load_factor)
-            self.assertGreaterEqual(capacity, 2 * 1024 * 128)
-            self.assertLess(capacity, 1 << 24)
-        # The calculated boundary ratio 2^18 / 2^24 = 0.015625 is offered as
-        # a candidate with exactly the required runtime capacity.
-        boundary = [o for o in ps if math.isclose(o.cache_params.load_factor, 0.015625)]
-        self.assertTrue(boundary)
-        self.assertEqual(rocksdb_util.cache_rows(1 << 24, 0.015625), 2 * 1024 * 128)
+            capacity = rocksdb_util.cache_rows(rows, o.cache_params.load_factor)
+            self.assertGreaterEqual(capacity, required)
+            self.assertLess(capacity, rows)
 
     def test_shared_table_factor_takes_the_maximum(self):
         # Two features share table "a"; the working-set floor uses the
@@ -1535,9 +1626,16 @@ class RocksDBPlannerTest(unittest.TestCase):
         perf = {}
         for o in options:
             rocksdb = rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
-            perf[(rocksdb, o.cache_load_factor)] = o.total_perf
-        for ratio in (0.1, 0.5, 0.9):
-            self.assertGreater(perf[(True, ratio)], perf[(False, ratio)])
+            perf[(rocksdb, float(o.cache_load_factor))] = o.total_perf
+        ps_ratios = sorted(r for rocksdb, r in perf if rocksdb)
+        linear = sorted(r for rocksdb, r in perf if not rocksdb)
+        self.assertTrue(ps_ratios)
+        for ratio in ps_ratios:
+            # The cheapest built-in CACHING choice with at least as large a
+            # cache is still faster: its misses are fewer and served from
+            # host memory, not the disk.
+            faster_memory = min(b for b in linear if b >= ratio)
+            self.assertGreater(perf[(True, ratio)], perf[(False, faster_memory)])
 
     def test_ssd_axis_picks_the_table_that_fits(self):
         # Offloading "a" or "b" covers the GPU deficit; "a" is cheaper in

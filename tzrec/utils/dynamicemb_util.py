@@ -569,12 +569,15 @@ if has_dynamicemb:
                        + num_buckets * bucket_header<4B>                  # per-bucket
 
             ddr_budget = HYBRID  (caching=False): (1 - cache_ratio) * total_value_memory
-                         CACHING (caching=True):  total_value_memory  # full backing
+                         CACHING (caching=True):  total_value_memory  # full backing,
+                                                  except ratio 1.0: 0 (HBM_ONLY)
 
         HYBRID hash-partitions values across HBM and host; ``cache_ratio`` is
         HBM's value share. CACHING keeps the full backing store on host and
         uses HBM as a hot-row cache of size
-        ``cache_ratio * total_value_memory``. Hash-table metadata
+        ``cache_ratio * total_value_memory``. A ratio of 1.0 covers the
+        whole table, so the runtime drops the host tier (HBM_ONLY) and the
+        estimate charges no duplicated backing. Hash-table metadata
         (key + score + digest + bucket header) is accounted on HBM only --
         matches the existing tzrec convention.
         """
@@ -583,7 +586,13 @@ if has_dynamicemb:
         if is_hbm:
             value_ratio = cache_ratio
         else:
-            value_ratio = 1.0 if caching else (1.0 - cache_ratio)
+            # A CACHING candidate whose value budget covers the whole table
+            # builds HBM_ONLY at runtime, so its estimate carries no
+            # duplicated host backing.
+            if caching and cache_ratio >= 1.0:
+                value_ratio = 0.0
+            else:
+                value_ratio = 1.0 if caching else (1.0 - cache_ratio)
         return math.ceil(
             align_to_table_size(size[0])
             * (

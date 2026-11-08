@@ -1122,26 +1122,33 @@ def _emit_dynamicemb_variants(
 ) -> List[ShardingOption]:
     """Expand a dynamicemb ShardingOption into its placement candidates.
 
-    Without RocksDB planning, HYBRID (``caching=False``) and built-in
-    CACHING (``caching=True``) variants are offered over the automatic ratio
-    grid. With RocksDB planning, built-in CACHING and eligible RocksDB
-    CACHING_PS candidates are enumerated together, and built-in HYBRID is
-    excluded: HybridStorage re-splits rows between its tiers on load, so a
-    near-capacity table overflows hash buckets and loses rows on every
-    restore.
+    The built-in families keep the linear ratio grid ``0.1, 0.2, ..., 1.0``:
+    HYBRID (``caching=False``) below 1.0 and CACHING (``caching=True``) on
+    the whole grid. A 1.0 value budget covers the whole table, so the
+    runtime drops the host tier (HBM_ONLY) regardless of the family label;
+    only the CACHING 1.0 candidate is emitted. With RocksDB planning,
+    built-in HYBRID is excluded entirely: HybridStorage re-splits rows
+    between its tiers on load, so a near-capacity table overflows hash
+    buckets and loses rows on every restore.
 
     An explicit ``cache_load_factor`` pins the built-in placement: it never
     enables automatic RocksDB placement, and an explicit CACHING ratio that
     cannot hold the configured working set is rejected instead of silently
     raised. An explicit HYBRID value-tier ratio is exempt from that rule.
 
+    RocksDB CACHING_PS candidates span one geometric grid of ten ratios
+    from the working-set floor up to ``0.5``, both endpoints included.
     ``unique_id_factor`` is the physical table's measured unique ids per
     sample, resolved from its effective constraints (shared tables keep the
-    maximum of the members' configured values). When configured, automatic
-    CACHING and CACHING_PS ratio sets include a working-set-derived
-    candidate, and every automatic ratio must hold twice the factor's batch
-    ids after runtime bucket rounding; without a factor, the ordinary grids
-    and the existing lookup-estimate filter apply.
+    maximum of the members' configured values); when configured, the lower
+    endpoint is ``ceil(2 * unique_id_factor * batch_size) /
+    local_table_rows`` and the floor is those rows, otherwise the endpoint
+    is ``0.01`` and the existing lookup estimate (batch size times the
+    pooling factors) is the floor. A floor above ``0.5`` leaves the table
+    without RocksDB candidates. Every ratio must hold the floor in the
+    capacity the runtime would actually allocate (the cache's overflow area
+    never counts toward it) and stay below the full table, which the
+    built-in placement serves.
 
     Each emitted option owns a deep-copied ``dynamicemb_options`` instance
     so per-option mutations do not bleed across variants. Storage
@@ -1188,68 +1195,55 @@ def _emit_dynamicemb_variants(
             variants.append(opt)
         return variants
 
-    hybrid_grid = [(i + 1) / 10 for i in range(10)]
+    linear_grid = [(i + 1) / 10 for i in range(10)]
+    # Both families' 1.0 candidates build HBM_ONLY -- the runtime drops the
+    # host tier when the value budget covers the whole table -- so only the
+    # CACHING one is emitted.
     if allow_rocksdb:
         # No built-in HYBRID with RocksDB planning; CACHING only.
-        variants: List[ShardingOption] = []
+        variants: List[ShardingOption] = [_emit(r, False) for r in linear_grid]
     else:
         variants = []
-        for ratio in hybrid_grid:
+        for ratio in linear_grid[:-1]:
             opt = copy.deepcopy(base_option)
             opt.cache_params = CacheParams(load_factor=ratio, stats=stats)
             opt.dynamicemb_options.caching = False  # pyre-ignore [16]
             variants.append(opt)
+        variants.extend(_emit(r, False) for r in linear_grid)
 
-    if required is not None or allow_rocksdb:
-        local_rows = int(base_option.shards[0].size[0])
-    else:
-        local_rows = 0
-    if required is not None:
-        # The working-set floor: twice the factor's batch ids, with the
-        # calculated boundary as an extra candidate and every ratio filtered
-        # by the capacity the runtime would actually allocate. The floor is
-        # validated per local table/shard, not on the fused-group total.
-        ratios = sorted(
-            set([required / local_rows] + [0.0001, 0.001, 0.01] + hybrid_grid)
-        )
-        caching_ratios = [
-            r for r in ratios if rocksdb_util.cache_rows(local_rows, r) >= required
-        ]
-        if not caching_ratios:
-            raise ValueError(
-                f"table {base_option.fqn} requires {required} cache rows "
-                f"(2 x unique_id_factor {unique_id_factor} x batch size "
-                f"{base_option.batch_size}) but holds only {local_rows} "
-                "rows per shard; no cache placement can hold the configured "
-                "working set"
-            )
-        # Full-cache cases can use the built-in placement; RocksDB keeps
-        # only candidates whose cache is smaller than the whole table.
-        ps_ratios = [
-            r
-            for r in caching_ratios
-            if rocksdb_util.cache_rows(local_rows, r) < local_rows
-        ]
-    else:
-        caching_ratios = hybrid_grid
-        # The existing lookup estimate: batch size times the pooling
-        # factors, a lower bound on the ids a step brings.
-        lookups = int(base_option.batch_size * sum(base_option.input_lengths))
-        ps_ratios = [
-            r
-            for r in sorted(rocksdb_util.CACHE_RATIOS)
-            if lookups <= rocksdb_util.cache_rows(local_rows, r) < local_rows
-        ]
-    variants.extend(_emit(r, external=False) for r in caching_ratios)
-
-    eligible = (
+    if not (
         allow_rocksdb
         and base_option.cache_params is None
         and base_option.dynamicemb_options.score_strategy.name  # pyre-ignore [16]
         != "CUSTOMIZED"
+    ):
+        return variants
+    local_rows = int(base_option.shards[0].size[0])
+    if required:
+        # The working-set floor: twice the factor's batch ids.
+        floor = required
+        min_ratio = required / local_rows
+    else:
+        # Without a measured working set, the existing lookup estimate is
+        # the floor: batch size times the pooling factors, a lower bound
+        # on the ids a step brings.
+        floor = int(base_option.batch_size * sum(base_option.input_lengths))
+        min_ratio = 0.01
+    if min_ratio > 0.5:
+        # The working set needs more than half the table; only the built-in
+        # placements remain.
+        return variants
+    # One geometric grid over both endpoints; equal endpoints leave one
+    # distinct candidate. The capacity check uses the rows the runtime
+    # would actually allocate, never the cache's overflow area.
+    ps_ratios = sorted(
+        {
+            float(r)
+            for r in np.geomspace(min_ratio, 0.5, num=10)
+            if floor <= rocksdb_util.cache_rows(local_rows, float(r)) < local_rows
+        }
     )
-    if eligible:
-        variants.extend(_emit(r, external=True) for r in ps_ratios)
+    variants.extend(_emit(r, True) for r in ps_ratios)
     return variants
 
 

@@ -130,14 +130,22 @@ class StorageFormulaTest(unittest.TestCase):
             ("ratio_0_25", 0.25),
             ("ratio_0_5", 0.5),
             ("ratio_0_75", 0.75),
-            ("ratio_1_0", 1.0),
         ]
     )
     def test_ddr_caching_holds_full_table(self, _name, cache_ratio):
-        # CACHING DDR is the full backing store, independent of cache_ratio.
+        # CACHING DDR is the full backing store, independent of cache_ratio
+        # below 1.0; at 1.0 the table builds HBM_ONLY and drops it.
         full_ddr = self._calc(cache_ratio=0.0, is_hbm=False, caching=False)
         caching_ddr = self._calc(cache_ratio=cache_ratio, is_hbm=False, caching=True)
         self.assertEqual(caching_ddr, full_ddr)
+
+    def test_ddr_caching_hbm_only_drops_backing(self):
+        # A CACHING candidate whose value budget covers the whole table
+        # builds HBM_ONLY at runtime -- the runtime drops the host tier --
+        # so its estimate carries no duplicated backing.
+        self.assertEqual(self._calc(cache_ratio=1.0, is_hbm=False, caching=True), 0)
+        # Below the full budget the backing store is still charged in full.
+        self.assertGreater(self._calc(cache_ratio=0.75, is_hbm=False, caching=True), 0)
 
     def test_caching_ddr_strictly_greater_than_hybrid_when_cached(self):
         for cache_ratio in (0.1, 0.5, 0.9):
