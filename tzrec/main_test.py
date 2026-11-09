@@ -215,7 +215,7 @@ class MainTest(unittest.TestCase):
             mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
             mock.patch("tzrec.main._create_train_profiler", return_value=prof),
         ):
-            with self.assertRaisesRegex(RuntimeError, "boom"):
+            with self.assertRaisesRegex(RuntimeError, r"^boom$"):
                 _train_and_evaluate(
                     model=model,
                     optimizer=optimizer,
@@ -353,6 +353,66 @@ class MainTest(unittest.TestCase):
         exporter.finalize_publish.assert_not_called()
         for writer in writers:
             writer.close.assert_called_once()
+
+    def test_final_eval_writes_before_writers_close(self) -> None:
+        """A successful run evaluates finally, then closes each writer once.
+
+        The final evaluation still receives an open eval writer -- only the
+        train writer is flushed at the end of training -- and both writers
+        close exactly once, when the loop's ExitStack unwinds. The loop
+        never closes the checkpoint manager the runtime owns.
+        """
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([object()])
+        batch = SimpleNamespace(checkpoint_info=None, data_timestamp=-1.0)
+        pipeline = mock.Mock()
+        pipeline.progress.return_value = ({"loss": torch.tensor(1.0)}, {}, batch)
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.side_effect = [False, False, True]
+        exporter = mock.Mock()
+        exporter.enabled = False
+        writers = [_FakeSummaryWriter(), _FakeSummaryWriter()]
+        eval_seen = []
+
+        def _record_eval(*args, **kwargs):
+            eval_seen.append(
+                (
+                    kwargs["eval_summary_writer"],
+                    kwargs["eval_summary_writer"].close.called,
+                )
+            )
+
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+            mock.patch("tzrec.main.SummaryWriter", side_effect=writers),
+            mock.patch("tzrec.main._log_train"),
+            mock.patch("tzrec.main._evaluate", side_effect=_record_eval),
+        ):
+            _train_and_evaluate(
+                model=model,
+                optimizer=optimizer,
+                train_dataloader=train_dataloader,
+                eval_dataloader=mock.Mock(),
+                lr_scheduler=[],
+                model_dir=self.test_dir,
+                train_config=_train_config(
+                    use_tensorboard=True, log_step_count_steps=1
+                ),
+                eval_config=EvalConfig(),
+                runtime=ShardedModelRuntime(ckpt_manager, None),
+            )
+
+        self.assertEqual(eval_seen, [(writers[1], False)])
+        writers[0].close.assert_called_once()
+        writers[1].close.assert_called_once()
+        ckpt_manager.close.assert_not_called()
 
     def _run_train_entry(
         self,

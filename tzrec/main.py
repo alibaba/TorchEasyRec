@@ -613,8 +613,9 @@ def _train_and_evaluate(
             ) and dump_config.HasField("paired_dump_interval_minutes"):
                 publish_interval_minutes = dump_config.paired_dump_interval_minutes
             # Register the exporter before validating its pairing and building
-            # the handover: once its worker thread is live, only the stack
-            # below can clean it up if either setup step fails.
+            # the handover: once its worker thread is live, only the
+            # surrounding ExitStack can clean it up if either setup step
+            # fails.
             online_dense_exporter = exit_stack.enter_context(
                 closing(
                     OnlineDenseExportManager(
