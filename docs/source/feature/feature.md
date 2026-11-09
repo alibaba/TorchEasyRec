@@ -931,6 +931,7 @@ feature_configs {
 - **sequence_delim**: 序列特征分隔符
 - **sequence_pk**: 序列特征主键，一般为ItemId列表，主要用于线上模型服务，线上模型服务会使用该ItemId列表从物品特征内存Cache中关联出物品属性子特征的序列，无需从请求中传递。而行为属性相关子序列（如行为时间序列`ts1;ts2;ts3`）跟用户相关，则仍需从请求从传递。
 - **sequence_entity**: 可选，指定该序列组在线上模型服务中关联的FeatureStore实体名，例如`sequence_entity: "app"`。实体名须是 TorchEasyRec Processor fs_entity 配置中列出的实体之一。
+- **hard_search_key**: 可选字符串，仅在分组`sequence_feature`上配置，格式为`item:<field>`，表示用于查询候选相关历史的候选物品字段，例如`item:cate`。未配置时保留原有序列行为，配置示例及使用要求见下文。
 - **features**: 序列特征子特征，配置同对应的子特征类型的配置
   - **feature_name**: 子特征特征名，完整的子特征名应拼接上`${sequence_name}__`前缀，以上述配置中`item_id`子特征为例，子特征名列名应为`click_seq__item_id`
   - **expression**: 特征FG所依赖子特征字段来源名，由两部分组成`input_side`:`input_name`。
@@ -950,6 +951,48 @@ feature_configs {
   - 支持array\<string>或array\<bigint>类型为`[item_id1,item_id2,item_id3]`（建议，性能更好）；
   - 支持多值序列array\<array\<string>>或array\<array\<bigint>>类型，多值序列需设置value_dim=0，通常情况下训练推理性能比单值序列差一些。
   - 支持array\<float>为`[price1,price2,price3]`或者array\<array\<float>>类型为`[[emb11,emb12],[emb21,emb22]]`（建议，性能更好）。
+
+<a id="hard-search-sequences"></a>
+
+**长序列hard-search**
+
+hard-search 用于在长序列里根据当前候选物品筛选用户历史。例如，候选是手机时使用手机历史，候选是服装时使用服装历史。
+
+在分组序列中配置 `hard_search_key`：
+
+```protobuf
+feature_configs {
+    sequence_feature {
+        sequence_name: "click_same_cate"
+        sequence_length: 50
+        sequence_delim: ";"
+        sequence_pk: "user:click_same_cate_pk"
+        hard_search_key: "item:cate"
+        features {
+            id_feature {
+                feature_name: "item_id"
+                expression: "item:iid"
+                embedding_dim: 32
+                hash_bucket_size: 100000
+            }
+        }
+    }
+}
+```
+
+其中：
+
+- `hard_search_key: "item:cate"`：使用当前候选物品的 `cate` 字段筛选历史，格式为 `item:<field>`。
+- `expression: "item:iid"`：历史物品 ID 字段，对应原始输入列 `click_same_cate__iid`。
+- `sequence_pk`：使用独立名称，不能与其他原始输入列或序列组的 PK 同名。
+
+**数据准备**
+
+训练和离线预测时，需要提前按每条样本的候选物品筛选历史，再提供对应的序列字段。TorchEasyRec 不会自动查询或过滤历史。
+
+同一序列可以包含点击、加购、购买等多种行为。物品 ID、时间戳、行为类型等字段需按同一事件顺序排列。
+
+导出和线上服务的使用方式见 [hard-search](../usage/export.md#hard-search)。
 
 ### 普通序列特征
 
