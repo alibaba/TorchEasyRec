@@ -47,6 +47,12 @@ feature_configs {
 
 - **bucket_capacity**: （可选）dynamicemb 哈希表 bucket 大小，默认为 128，增大可提升表的装填率但会增加每次查表的探测代价
 
+- **cache_load_factor**: （可选）显存规划的显式固定比例，取值 [0, 1]。不配置时由规划器自动搜索（见下文[显存规划](#%E6%98%BE%E5%AD%98%E8%A7%84%E5%88%92)）。配置后的语义：
+
+  - `0`：HOST_ONLY，值与优化器状态全部放在主机内存
+  - `1`：HBM_ONLY，值与优化器状态全部放在显存
+  - `(0, 1)` 之间的值：同时生成 HYBRID 与 CACHING 两个候选，并固定在该比例；若该比例的 CACHING 缓存装不下一个批次的工作集，则只保留 HYBRID 候选
+
 - **initializer_args**: 参数初始化设置，默认是 UNIFORM
 
   - mode: 初始化方式，可选 NORMAL | TRUNCATED_NORMAL | UNIFORM | CONSTANT
@@ -99,6 +105,39 @@ feature_configs {
     --pipeline_config_path {PATH_TO_CONFIG_WITH_DYNAMICEMB} \
     --fine_tune_checkpoint {INIT_CKPT_PATH}/model.ckpt-0
     ```
+
+## 显存规划
+
+训练启动时，规划器为每张 dynamicemb 表在四种内存布局中选择一种：
+
+| 布局      | 值与优化器状态的位置                    | 显存占用                                             |
+| --------- | --------------------------------------- | ---------------------------------------------------- |
+| HOST_ONLY | 全部在主机内存                          | 仍占用哈希表元数据（key/score/digest 等，约 25B/行） |
+| HYBRID    | 按比例划分在显存与主机内存              | 请求比例的值 + 双层元数据                            |
+| CACHING   | 显存作缓存，主机内存保存全量 backing 表 | 缓存值 + 溢出区 + 全量元数据                         |
+| HBM_ONLY  | 全部在显存                              | 全量值 + 元数据，无主机占用                          |
+
+未显式配置 `cache_load_factor` 时，规划器自动搜索：
+
+- HYBRID 候选：在 0.5 以下按几何间隔取 5 个点（含两端），再加上 0.5/0.6/0.7/0.8/0.9 的线性高档位。
+- CACHING 候选：同样的低段几何网格，但搜索下限受批次工作集约束（见下）。
+- HOST_ONLY（比例 0）与 HBM_ONLY（比例 1）各作为一个独立候选。
+
+配置了 `embedding_constraints.unique_id_factor`（可通过
+`tzrec.tools.add_pooling_factor_to_config` 从训练数据测量，多特征共享表时取最大值）时，
+以 `q = ceil(5 * unique_id_factor * batch_size) / 表行数` 估计一个批次的去重工作集：
+
+- CACHING 搜索下限为 `max(q, 0.1)`：缓存必须装得下工作集，装不下的候选会被剔除
+  （比例达到或超过 1 时不提供部分缓存候选，HBM_ONLY 不受影响）
+- HYBRID 搜索起点为 `min(q, 0.1)`：值分区可直接访问主机层，不受缓存驻留约束
+- 未测量 unique_id_factor 时两个下限均为 0.1
+
+规划行为说明：
+
+- 布局会写入表的融合分组键：不同布局的表不会融合到同一份存储；同布局不同比例的表仍会融合，并保留各自的显存预算。
+- 规划按 `max_capacity` 的满表口径估算（含按 bucket 对齐、缓存 1024 行 bucket 与三 bucket 溢出区、元数据与流水线缓冲），并非只算值存储。
+- 与旧版本（0.1/0.2/.../1.0 线性网格、无 HOST_ONLY）相比，候选空间与最终规划都可能不同：小显存卡上原先规划失败的大表，现在可以通过 HOST_ONLY 或更低比例的 HYBRID 获得可行方案。
+- 依赖：该规划需要基于 recsys-examples PR #534（`25d74cb`）及之后源码构建的 dynamicemb wheel（版本号形如 `0.1.0+<日期>.25d74cb.cu130`）；旧版 wheel（如 `13a8055`）不含按表预算与零预算修复，配对新版规划会产生错误的运行结果。安装时请确认 `dynamicemb.__version__`。
 
 ## 从ZCH训练好的模型迁移
 
