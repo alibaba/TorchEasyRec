@@ -21,6 +21,7 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConf
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
+    get_embedding_names_by_table,
 )
 from torchrec.modules.mc_embedding_modules import (
     ManagedCollisionEmbeddingBagCollection,
@@ -35,7 +36,7 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, Keyed
 
 from tzrec.acc.utils import is_input_tile, is_input_tile_emb
 from tzrec.datasets.utils import Batch
-from tzrec.features.feature import BaseFeature
+from tzrec.features.feature import BaseFeature, get_hard_search_input_tile_features
 from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingCollection,
 )
@@ -108,6 +109,8 @@ def _merge_list_of_jt_dict(
 def _remap_mark_jt_dict(
     d_jt: Dict[str, JaggedTensor],
     feature_keys: List[Tuple[str, str]],
+    hard_search_input_tile_features: Dict[str, str],
+    additional_infos: Dict[str, torch.Tensor],
 ) -> Dict[str, JaggedTensor]:
     """Remap EmbeddingCollection output keys to shared keys and mark seq jts.
 
@@ -119,6 +122,8 @@ def _remap_mark_jt_dict(
     Args:
         d_jt: EmbeddingCollection output keyed by output key.
         feature_keys: list of (output_key, shared_key) pairs.
+        hard_search_input_tile_features: feature to sequence source mapping.
+        additional_infos: original compact lengths and candidate indices.
 
     Returns:
         Dict keyed by shared_key.
@@ -126,6 +131,14 @@ def _remap_mark_jt_dict(
     new_d_jt: Dict[str, JaggedTensor] = {}
     for output_key, shared_key in feature_keys:
         val = d_jt[output_key]
+        raw_name = shared_key.split("@", 1)[0]
+        if raw_name in hard_search_input_tile_features:
+            val = JaggedTensor(
+                values=val.values(),
+                lengths=val.lengths()[
+                    : additional_infos[f"{raw_name}.lengths"].size(0)
+                ],
+            )
         fx_mark_seq_ec_jt(shared_key, val)
         new_d_jt[shared_key] = val
     return new_d_jt
@@ -151,6 +164,92 @@ def _tile_and_combine_dense_kt(
         length_per_key=kt_length_per_key,
         values=torch.cat(kt_values, dim=1),
     )
+
+
+@torch.fx.wrap
+def _expand_hard_search_input_tile(
+    kt: KeyedTensor,
+    blocks: List[Tuple[int, int, str]],
+    additional_infos: Optional[Dict[str, torch.Tensor]],
+) -> KeyedTensor:
+    """Expand compact feature blocks into candidate row order."""
+    if not blocks:
+        return kt
+    if additional_infos is None:
+        raise ValueError("Compact hard-search inputs require inverse indices.")
+
+    values = kt.values()
+    if len(blocks) == 1:
+        expanded = values.index_select(0, additional_infos[blocks[0][2]])
+    else:
+        parts = []
+        for offset, width, index_key in blocks:
+            part = values.narrow(1, offset, width)
+            if index_key:
+                part = part.index_select(0, additional_infos[index_key])
+            parts.append(part)
+        expanded = torch.cat(parts, dim=1)
+
+    return KeyedTensor(
+        keys=kt.keys(),
+        length_per_key=kt.length_per_key(),
+        values=expanded,
+    )
+
+
+class HardSearchInputTileExpander(nn.Module):
+    """Expand pooled hard-search features using a static column plan."""
+
+    blocks: List[Tuple[int, int, str]]
+
+    def __init__(
+        self,
+        tables: List[EmbeddingBagConfig],
+        feature_to_sequence: Dict[str, str],
+    ) -> None:
+        super().__init__()
+        self.blocks = []
+        offset = 0
+        has_compact = False
+
+        for table, names in zip(tables, get_embedding_names_by_table(tables)):
+            for name in names:
+                raw_name = name.split("@", 1)[0]
+                sequence = feature_to_sequence.get(raw_name, "")
+                index_key = f"{sequence}__inverse_indices" if sequence else ""
+                width = table.embedding_dim
+                has_compact |= bool(index_key)
+
+                if self.blocks and self.blocks[-1][2] == index_key:
+                    start, previous_width, _ = self.blocks[-1]
+                    self.blocks[-1] = (start, previous_width + width, index_key)
+                else:
+                    self.blocks.append((offset, width, index_key))
+                offset += width
+
+        if not has_compact:
+            self.blocks = []
+
+    def forward(
+        self,
+        kt: KeyedTensor,
+        additional_infos: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> KeyedTensor:
+        """Expand candidate rows using the current request's indices."""
+        return _expand_hard_search_input_tile(kt, self.blocks, additional_infos)
+
+
+@torch.fx.wrap
+def _pool_sequence_values(
+    values: torch.Tensor, lengths: torch.Tensor, pooling: str
+) -> torch.Tensor:
+    """Pool sequence steps, including a batch with no steps at all."""
+    if lengths.numel() == 0:
+        return values[:0]
+    pooled = torch.segment_reduce(values, pooling, lengths=lengths)
+    if pooling == "mean":
+        pooled = torch.nan_to_num(pooled, nan=0.0)
+    return pooled
 
 
 @torch.fx.wrap
@@ -390,6 +489,7 @@ class EmbeddingGroup(nn.Module):
                     dense_feat_kt,
                     sparse_feat_kjt_user,
                     batch.tile_size,
+                    batch.additional_infos,
                 )
             )
 
@@ -422,6 +522,7 @@ class EmbeddingGroup(nn.Module):
                     sparse_feat_kjt_user,
                     sequence_mulval_length_kjt_user,
                     batch.tile_size,
+                    batch.additional_infos,
                 )
             )
 
@@ -975,6 +1076,38 @@ def build_embedding_collection_configs(
     emb_name_to_feature_to_shared_name: Dict[str, Dict[str, str]] = defaultdict(dict)
     for feature_group in feature_groups:
         group_name = feature_group.group_name
+        group_features = [name_to_feature[name] for name in feature_group.feature_names]
+        if any(feature.is_hard_search_feat for feature in group_features):
+            if (
+                isinstance(feature_group, FeatureGroupConfig)
+                and feature_group.group_type == model_pb2.JAGGED_SEQUENCE
+            ):
+                raise ValueError(
+                    f"Feature group {group_name!r}: hard_search_key is not supported "
+                    "with JAGGED_SEQUENCE (including HSTU)."
+                )
+            sequence_kinds = {
+                feature.is_hard_search_feat
+                for feature in group_features
+                if feature.is_sequence
+            }
+            if len(sequence_kinds) > 1:
+                raise ValueError(
+                    f"Feature group {group_name!r} mixes hard-search and ordinary "
+                    "history features on the same sequence axis; use separate "
+                    "sequence groups. Query features may be mixed."
+                )
+            hard_search_sequences = {
+                feature.sequence_name
+                for feature in group_features
+                if feature.is_sequence and feature.hard_search_key is not None
+            }
+            if len(hard_search_sequences) > 1:
+                raise ValueError(
+                    f"Feature group {group_name!r} combines different hard-search "
+                    "sequence groups on the same sequence axis; use separate "
+                    "sequence groups."
+                )
         for name in feature_group.feature_names:
             feature = name_to_feature[name]
             if not feature.is_sparse:
@@ -1159,6 +1292,17 @@ class EmbeddingGroupImpl(nn.Module):
                     mc_modules, list(mc_emb_bag_configs.values())
                 ),
             )
+        hard_search_input_tile_features = get_hard_search_input_tile_features(features)
+
+        self.ebc_input_tile_expander = HardSearchInputTileExpander(
+            self.ebc.embedding_bag_configs(),
+            hard_search_input_tile_features,
+        )
+        if self.has_mc_sparse:
+            self.mc_ebc_input_tile_expander = HardSearchInputTileExpander(
+                list(mc_emb_bag_configs.values()),
+                hard_search_input_tile_features,
+            )
         if self.has_dense_embedding:
             self.dense_ec = DenseEmbeddingCollection(
                 dense_embedding_configs,
@@ -1213,6 +1357,7 @@ class EmbeddingGroupImpl(nn.Module):
         dense_feature: KeyedTensor,
         sparse_feature_user: KeyedJaggedTensor,
         tile_size: int = -1,
+        additional_infos: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """Forward the module.
 
@@ -1222,6 +1367,7 @@ class EmbeddingGroupImpl(nn.Module):
             sparse_feature_user (KeyedJaggedTensor): user-side sparse feature
                 with batch_size=1, when use INPUT_TILE=3.
             tile_size: size for user-side feature input tile.
+            additional_infos: compact lengths and candidate inverse indices.
 
         Returns:
             group_features (dict): dict of feature_group to embedded tensor.
@@ -1230,12 +1376,12 @@ class EmbeddingGroupImpl(nn.Module):
         if self.has_sparse:
             kt = self.ebc(sparse_feature)
             fx_mark_keyed_tensor(self._all_group_str + "__ebc", kt)
-            kts.append(kt)
+            kts.append(self.ebc_input_tile_expander(kt, additional_infos))
 
         if self.has_mc_sparse:
             kt = self.mc_ebc(sparse_feature)[0]
             fx_mark_keyed_tensor(self._all_group_str + "__mc_ebc", kt)
-            kts.append(kt)
+            kts.append(self.mc_ebc_input_tile_expander(kt, additional_infos))
 
         # do user-side embedding input-tile
         if self.has_sparse_user:
@@ -1345,6 +1491,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         shared_feature_flag = ec_table_configs.shared_feature_flag
         emb_name_to_feature_to_shared_name = (
             ec_table_configs.emb_name_to_feature_to_shared_name
+        )
+        self._hard_search_input_tile_features = get_hard_search_input_tile_features(
+            features
         )
         self.has_sparse = bool(dim_to_emb_configs)
         self.has_mc_sparse = bool(dim_to_mc_emb_configs)
@@ -1566,6 +1715,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         sequence_mulval_lengths: KeyedJaggedTensor,
         sparse_feature_user: KeyedJaggedTensor,
         sequence_mulval_lengths_user: KeyedJaggedTensor,
+        additional_infos: Dict[str, torch.Tensor],
     ) -> Tuple[Dict[str, JaggedTensor], Dict[str, torch.Tensor]]:
         sparse_jt_dict_list: List[Dict[str, JaggedTensor]] = []
         seq_mulval_length_jt_dict_list: List[Dict[str, JaggedTensor]] = []
@@ -1576,7 +1726,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 self.ec_dict_features.values(), self.ec_dict.values()
             ):
                 sparse_jt_dict_list.append(
-                    _remap_mark_jt_dict(ec(sparse_feature), feature_keys)
+                    _remap_mark_jt_dict(
+                        ec(sparse_feature),
+                        feature_keys,
+                        self._hard_search_input_tile_features,
+                        additional_infos,
+                    )
                 )
 
         if self.has_mc_sparse:
@@ -1584,7 +1739,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 self.mc_ec_dict_features.values(), self.mc_ec_dict.values()
             ):
                 sparse_jt_dict_list.append(
-                    _remap_mark_jt_dict(mc_ec(sparse_feature)[0], feature_keys)
+                    _remap_mark_jt_dict(
+                        mc_ec(sparse_feature)[0],
+                        feature_keys,
+                        self._hard_search_input_tile_features,
+                        additional_infos,
+                    )
                 )
 
         if self.has_mulval_seq:
@@ -1595,7 +1755,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 self.ec_dict_features_user.values(), self.ec_dict_user.values()
             ):
                 sparse_jt_dict_list.append(
-                    _remap_mark_jt_dict(ec(sparse_feature_user), feature_keys)
+                    _remap_mark_jt_dict(
+                        ec(sparse_feature_user),
+                        feature_keys,
+                        self._hard_search_input_tile_features,
+                        additional_infos,
+                    )
                 )
 
         if self.has_mc_sparse_user:
@@ -1603,7 +1768,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 self.mc_ec_dict_features_user.values(), self.mc_ec_dict_user.values()
             ):
                 sparse_jt_dict_list.append(
-                    _remap_mark_jt_dict(mc_ec(sparse_feature_user)[0], feature_keys)
+                    _remap_mark_jt_dict(
+                        mc_ec(sparse_feature_user)[0],
+                        feature_keys,
+                        self._hard_search_input_tile_features,
+                        additional_infos,
+                    )
                 )
 
         if self.has_mulval_seq_user:
@@ -1633,14 +1803,15 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     length_jt = seq_mulval_length_jt_dict[info.raw_name]
                     # length_jt.values is sequence key_lengths
                     # length_jt.lengths is sequence seq_lengths
-                    jt_values = torch.segment_reduce(
-                        jt.values(), info.pooling, lengths=length_jt.values()
+                    jt_values = _pool_sequence_values(
+                        jt.values(), length_jt.values(), info.pooling
                     )
-                    if info.pooling == "mean":
-                        jt_values = torch.nan_to_num(jt_values, nan=0.0)
+                    lengths = length_jt.lengths()
+                    if info.raw_name in self._hard_search_input_tile_features:
+                        lengths = additional_infos[f"{info.raw_name}.lengths"]
                     jt = JaggedTensor(
                         values=jt_values,
-                        lengths=length_jt.lengths(),
+                        lengths=lengths,
                     )
                 seq_jt_dict[info.name] = jt
 
@@ -1660,6 +1831,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         sparse_feature_user: KeyedJaggedTensor,
         sequence_mulval_lengths_user: KeyedJaggedTensor,
         tile_size: int = -1,
+        additional_infos: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """Forward the module.
 
@@ -1676,6 +1848,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 of user-side multi-value sparse sequence features, with batch_size=1,
                 when use INPUT_TILE=3.
             tile_size: size for user-side feature input tile.
+            additional_infos: compact lengths and candidate inverse indices.
 
         Returns:
             group_features (dict): dict of feature_group to embedded tensor.
@@ -1683,6 +1856,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         need_input_tile = is_input_tile()
         need_input_tile_emb = is_input_tile_emb()
 
+        if additional_infos is None:
+            additional_infos = {}
         jt_dict, dense_t_dict = self._forward_impl(
             sparse_feature,
             dense_feature,
@@ -1690,6 +1865,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             sequence_mulval_lengths,
             sparse_feature_user,
             sequence_mulval_lengths_user,
+            additional_infos,
         )
 
         results = {}
@@ -1707,13 +1883,16 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                         query_t = jt_dict[info.name].to_padded_dense(1).squeeze(1)
                     else:
                         # for multi-value id feature
-                        query_t = torch.segment_reduce(
-                            query_jt.values(), info.pooling, lengths=query_jt.lengths()
+                        query_t = _pool_sequence_values(
+                            query_jt.values(), query_jt.lengths(), info.pooling
                         )
-                        if info.pooling == "mean":
-                            query_t = torch.nan_to_num(query_t, nan=0.0)
                     if info.is_user and need_input_tile_emb:
                         query_t = query_t.tile(tile_size, 1)
+                    if info.raw_name in self._hard_search_input_tile_features:
+                        sequence = self._hard_search_input_tile_features[info.raw_name]
+                        query_t = query_t.index_select(
+                            0, additional_infos[f"{sequence}__inverse_indices"]
+                        )
                     sparse_query_cache[info.name] = query_t
                 else:
                     query_t = dense_t_dict[info.name]
@@ -1747,6 +1926,11 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
                     if need_tile:
                         sequence_length = sequence_length.tile(tile_size)
+                    if info.raw_name in self._hard_search_input_tile_features:
+                        sequence = self._hard_search_input_tile_features[info.raw_name]
+                        sequence_length = sequence_length.index_select(
+                            0, additional_infos[f"{sequence}__inverse_indices"]
+                        )
                     fx_mark_seq_len(f"{group_name}", sequence_length)
                     results[f"{group_name}.sequence_length"] = sequence_length
 
@@ -1759,6 +1943,11 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
                 if need_tile:
                     seq_t = seq_t.tile(tile_size, 1, 1)
+                if info.raw_name in self._hard_search_input_tile_features:
+                    sequence = self._hard_search_input_tile_features[info.raw_name]
+                    seq_t = seq_t.index_select(
+                        0, additional_infos[f"{sequence}__inverse_indices"]
+                    )
                 seq_t_list.append(seq_t)
                 seq_t_keys.append(info.name)
 
