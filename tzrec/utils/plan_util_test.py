@@ -1350,6 +1350,24 @@ class RocksDBPlannerTest(unittest.TestCase):
         }
         return plan, offloaded, planner
 
+    def _plan_with_ssd_room(self, tables, hbm_gib, ddr_gib, **kwargs):
+        """Plan with an SSD budget that fits offloading every table fully.
+
+        The backend's fixed activation grows with the machine's visible
+        CPUs, so a hardcoded budget makes offload infeasible on large CI
+        runners; derive the budget from the real activation and the worst
+        per-table candidate cost instead.
+        """
+        _, _, space = self._planner(tables, hbm_gib, ddr_gib, **kwargs)
+        activation = plan_util._ssd_activation_storage(space, 1)
+        worst = {}
+        for o in space:
+            ssd = o.total_storage.ssd or 0
+            if ssd:
+                worst[o.fqn] = max(ssd, worst.get(o.fqn, 0))
+        budget_gib = (activation.ssd + sum(worst.values())) / GIB
+        return self._plan(tables, hbm_gib, ddr_gib, ssd_gib=budget_gib, **kwargs)
+
     @parameterized.expand(
         [
             param("rocksdb", allow_rocksdb=True, modes={True}, input_lengths=[1.0]),
@@ -1456,8 +1474,8 @@ class RocksDBPlannerTest(unittest.TestCase):
                 self.assertNotEqual(factory, other)
 
     def test_all_in_memory(self):
-        _, offloaded, planner = self._plan(
-            {"a": self.BIG, "b": self.BIG}, 80, 64, ssd_gib=100
+        _, offloaded, planner = self._plan_with_ssd_room(
+            {"a": self.BIG, "b": self.BIG}, 80, 64
         )
         self.assertEqual(offloaded, {})
         # The topology carries pre-activation capacity; nothing is deducted
@@ -1469,18 +1487,17 @@ class RocksDBPlannerTest(unittest.TestCase):
         # (small-ratio CACHING, host-backed misses) fits, but with SSD reads
         # priced faster than host transfers the mixed RocksDB plan has the
         # better estimated objective and must win.
-        _, offloaded, _ = self._plan(
+        _, offloaded, _ = self._plan_with_ssd_room(
             {"a": self.BIG, "b": self.BIG},
             4.75,
             16,
-            ssd_gib=100,
             ssd_mem_bw=100 * 1024**3 / 1000,
         )
         self.assertTrue(offloaded, "the faster mixed plan must win")
 
     def test_offload_when_memory_is_short(self):
         tables = {"a": self.BIG, "b": self.BIG, "c": (1 << 20, 64, {})}
-        _, offloaded, planner = self._plan(tables, 4, 4.75, ssd_gib=100)
+        _, offloaded, planner = self._plan_with_ssd_room(tables, 4, 4.75)
         self.assertTrue(offloaded)
         self.assertNotIn("c", offloaded)
         configs = {o.external_storage.backend_config for o in offloaded.values()}
@@ -1507,7 +1524,7 @@ class RocksDBPlannerTest(unittest.TestCase):
             "c": (1 << 24, 64, {"score_strategy": "CUSTOMIZED"}),
             "d": (1 << 24, 64, {}),
         }
-        _, offloaded, _ = self._plan(tables, 4, 16, ssd_gib=100)
+        _, offloaded, _ = self._plan_with_ssd_room(tables, 4, 16)
         self.assertEqual(set(offloaded), {"d"})
 
     @parameterized.expand(
