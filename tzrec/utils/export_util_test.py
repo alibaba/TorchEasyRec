@@ -202,9 +202,8 @@ class HardSearchExportTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
         self.save_dir = os.path.join(self.test_dir, "export")
         os.mkdir(self.save_dir)
-        self.asset_path = os.path.join(self.test_dir, "fg.json")
 
-    def test_compact_metadata_includes_generated_fg_nodes(self):
+    def test_hard_search_input_tile_metadata_includes_generated_fg_nodes(self):
         with mock.patch.dict(os.environ, INPUT_TILE="3", HARD_SEARCH_INPUT_TILE="1"):
             config = _create_hard_search_export_config()
             config.feature_configs.add(
@@ -226,218 +225,17 @@ class HardSearchExportTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("missing_hard_search_key", "hard_search_key", None),
-            ("changed_hard_search_key", "hard_search_key", "item:other_id"),
-            ("asset_adds_hard_search_key", "hard_search_key", "item:item_id"),
-            ("sequence_name", "sequence_name", "renamed_seq"),
-            ("sequence_length", "sequence_length", 4),
-            ("sequence_delim", "sequence_delim", "|"),
-            ("sequence_pk", "sequence_pk", "user:other_pk"),
-            ("sequence_entity", "sequence_entity", "app"),
-            ("missing_sequence_entity", "sequence_entity", None),
-            ("id_expression", "id.expression", "item:other_event_id"),
-            ("raw_expression", "score.expression", "item:other_event_score"),
-            ("id_subfeature_name", "id.feature_name", "renamed_id"),
-            ("raw_subfeature_name", "score.feature_name", "renamed_score"),
-            ("swapped_raw_mapping", None, None),
-            ("missing_sequence_group", None, None),
-            ("extra_sequence_group", None, None),
-            ("duplicate_sequence_group", None, None),
-            ("missing_subfeature", None, None),
-            ("extra_subfeature", None, None),
-            ("duplicate_subfeature", None, None),
-            ("missing_features_array", None, None),
-            ("invalid_features_array", None, None),
-            ("nondict_feature", None, None),
-            ("subfeature_hard_search_key", None, None),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_export_metadata_rejects_hard_search_asset_drift(self, case, field, value):
-        config = _create_hard_search_export_config(
-            hard_search=case != "asset_adds_hard_search_key"
-        )
-        original_config = copy.deepcopy(config)
-        features = create_features(list(config.feature_configs))
-        asset_fg = export_util.create_fg_json(features)
-        group = asset_fg["features"][-1]
-        if field is not None:
-            target = group
-            if "." in field:
-                name, field = field.split(".")
-                target = next(
-                    feature
-                    for feature in group["features"]
-                    if feature["feature_name"] == name
-                )
-            if value is None:
-                target.pop(field)
-            else:
-                target[field] = value
-        elif case == "swapped_raw_mapping":
-            first, second = group["features"]
-            first["expression"], second["expression"] = (
-                second["expression"],
-                first["expression"],
-            )
-        elif case == "missing_sequence_group":
-            asset_fg["features"].pop()
-        elif case in ("extra_sequence_group", "duplicate_sequence_group"):
-            extra = copy.deepcopy(group)
-            if case == "extra_sequence_group":
-                extra["sequence_name"] = "extra_seq"
-                extra["sequence_pk"] = "user:extra_seq_pk"
-            asset_fg["features"].append(extra)
-        elif case == "missing_subfeature":
-            group["features"].pop()
-        elif case == "missing_features_array":
-            asset_fg = {"custom_asset": True}
-        elif case == "invalid_features_array":
-            asset_fg["features"] = {}
-        elif case == "nondict_feature":
-            asset_fg["features"].append("invalid")
-        elif case == "subfeature_hard_search_key":
-            group["features"][0]["hard_search_key"] = group.pop("hard_search_key")
-        else:
-            extra = copy.deepcopy(group["features"][-1])
-            if case == "extra_subfeature":
-                extra["feature_name"] = "extra_score"
-            group["features"].append(extra)
-        source = ("\n" + json.dumps(asset_fg, indent=2) + "\n").encode()
-        with open(self.asset_path, "wb") as output:
-            output.write(source)
-        source_mtime = os.stat(self.asset_path).st_mtime_ns
-
-        try:
-            with self.assertRaisesRegex(
-                ValueError, r"(?i)(hard.search|hard_search_key|HSK)"
-            ):
-                export_util._write_export_metadata(
-                    config, features, self.save_dir, [self.asset_path], None
-                )
-        finally:
-            with open(self.asset_path, "rb") as input_file:
-                self.assertEqual(input_file.read(), source)
-            self.assertEqual(os.stat(self.asset_path).st_mtime_ns, source_mtime)
-            self.assertEqual(config, original_config)
-            self.assertEqual(os.listdir(self.save_dir), [])
-
-    @parameterized.expand(
-        [("matching", False), ("reordered", True)],
-        name_func=parameterized_name_func,
-    )
-    def test_export_metadata_preserves_matching_hard_search_asset(self, _name, reorder):
-        config = _create_hard_search_export_config()
-        original_config = copy.deepcopy(config)
-        features = create_features(list(config.feature_configs))
-        asset_fg = export_util.create_fg_json(features)
-        asset_fg["custom_asset"] = "preserve this formatting and metadata"
-        if reorder:
-            asset_fg["features"][-1]["features"].reverse()
-            asset_fg["features"].reverse()
-        source = ("\n" + json.dumps(asset_fg, indent=2) + "\n").encode()
-        with open(self.asset_path, "wb") as output:
-            output.write(source)
-        source_mtime = os.stat(self.asset_path).st_mtime_ns
-
-        export_util._write_export_metadata(
-            config,
-            features,
-            self.save_dir,
-            [self.asset_path],
-            {"CUSTOM_EXPORT": "hsk"},
-        )
-
-        for path in (self.asset_path, os.path.join(self.save_dir, "fg.json")):
-            with open(path, "rb") as input_file:
-                self.assertEqual(input_file.read(), source)
-        self.assertEqual(os.stat(self.asset_path).st_mtime_ns, source_mtime)
-        self.assertEqual(config, original_config)
-        saved_config = config_util.load_pipeline_config(
-            os.path.join(self.save_dir, "pipeline.config")
-        )
-        self.assertEqual(saved_config, original_config)
-        with open(os.path.join(self.save_dir, "model_acc.json")) as input_file:
-            self.assertEqual(json.load(input_file)["CUSTOM_EXPORT"], "hsk")
-
-    def test_export_metadata_writes_validated_fg_bytes(self):
-        config = _create_hard_search_export_config()
-        features = create_features(list(config.feature_configs))
-        fg_json = export_util.create_fg_json(features)
-        validated = ("\n" + json.dumps(fg_json, indent=2) + "\n").encode()
-        with open(self.asset_path, "wb") as output:
-            output.write(validated)
-        fg_json["features"][-1]["hard_search_key"] = "item:changed"
-        replacement = json.dumps(fg_json).encode()
-        create_configs = export_util.create_feature_configs
-
-        def regenerate_source(*args, **kwargs):
-            with open(self.asset_path, "wb") as output:
-                output.write(replacement)
-            return create_configs(*args, **kwargs)
-
-        with mock.patch.object(
-            export_util, "create_feature_configs", side_effect=regenerate_source
-        ):
-            export_util._write_export_metadata(
-                config, features, self.save_dir, [self.asset_path], None
-            )
-        with open(self.asset_path, "rb") as input_file:
-            self.assertEqual(input_file.read(), replacement)
-        with open(os.path.join(self.save_dir, "fg.json"), "rb") as input_file:
-            self.assertEqual(input_file.read(), validated)
-
-    @parameterized.expand(
-        [("opaque_asset", False), ("unmarked_sequence_drift", True)],
-        name_func=parameterized_name_func,
-    )
-    def test_export_metadata_preserves_legacy_asset_without_hard_search(
-        self, _name, sequence_drift
-    ):
-        config = _create_hard_search_export_config(hard_search=False)
-        features = create_features(list(config.feature_configs))
-        asset_fg = {"custom_asset": True}
-        if sequence_drift:
-            asset_fg = export_util.create_fg_json(features)
-            group = asset_fg["features"][-1]
-            group["sequence_length"] = 99
-            group["features"][-1]["expression"] = "item:legacy_score"
-        source = json.dumps(asset_fg, indent=2).encode()
-        with open(self.asset_path, "wb") as output:
-            output.write(source)
-        source_mtime = os.stat(self.asset_path).st_mtime_ns
-
-        export_util._write_export_metadata(
-            config, features, self.save_dir, [self.asset_path], None
-        )
-
-        for path in (self.asset_path, os.path.join(self.save_dir, "fg.json")):
-            with open(path, "rb") as input_file:
-                self.assertEqual(input_file.read(), source)
-        self.assertEqual(os.stat(self.asset_path).st_mtime_ns, source_mtime)
-        saved_config = config_util.load_pipeline_config(
-            os.path.join(self.save_dir, "pipeline.config")
-        )
-        self.assertEqual(saved_config, config)
-        self.assertFalse(
-            saved_config.feature_configs[-1].sequence_feature.HasField(
-                "hard_search_key"
-            )
-        )
-
-    @parameterized.expand(
-        [
             ("normal_tile2", "2", False, False),
             ("normal_tile3", "3", False, False),
             ("distributed_forces_tile3", "2", True, False),
-            ("compact_tile2", "2", False, True),
-            ("compact_tile3", "3", False, True),
-            ("compact_distributed", "3", True, True),
+            ("hard_search_input_tile_tile2", "2", False, True),
+            ("hard_search_input_tile_tile3", "3", False, True),
+            ("hard_search_input_tile_distributed", "3", True, True),
         ],
         name_func=parameterized_name_func,
     )
     def test_hard_search_input_tile_export_numerics(
-        self, _name, tile, distributed, compact
+        self, _name, tile, distributed, hard_search_input_tile
     ):
         if os.environ.get("TZREC_HSK_EXPORT_TEST") != self._testMethodName:
             result = subprocess.run(
@@ -465,7 +263,7 @@ class HardSearchExportTest(unittest.TestCase):
                 "WORLD_SIZE": "1",
                 "LOCAL_WORLD_SIZE": "1",
                 "INPUT_TILE": tile,
-                "HARD_SEARCH_INPUT_TILE": "1" if compact else "0",
+                "HARD_SEARCH_INPUT_TILE": "1" if hard_search_input_tile else "0",
                 "INPUT_TILE_3_ONLINE": "0",
                 "USE_DISTRIBUTED_EMBEDDING": "1" if distributed else "0",
                 "USE_RTP": "0",
@@ -535,7 +333,7 @@ class HardSearchExportTest(unittest.TestCase):
 
         def make_inputs(lengths, indices):
             data = _hard_search_export_inputs(lengths)
-            if compact:
+            if hard_search_input_tile:
                 data["click_seq__inverse_indices"] = torch.tensor(indices)
                 count = len(indices)
                 data["item_id.values"] = torch.arange(1, count + 1)
@@ -555,7 +353,7 @@ class HardSearchExportTest(unittest.TestCase):
                 )
                 scores.append(2 * (2 * (index + 1) + 0.25 + 4.25 + 0.75 + sequence_sum))
                 offset += length
-            if compact:
+            if hard_search_input_tile:
                 scores = [
                     scores[source] + 4 * (target - source)
                     for target, source in enumerate(indices)
@@ -563,7 +361,7 @@ class HardSearchExportTest(unittest.TestCase):
             expected = {
                 "score": torch.tensor(scores),
                 "lengths": torch.tensor(lengths)[indices]
-                if compact
+                if hard_search_input_tile
                 else torch.tensor(lengths),
             }
             expected_outputs.append(expected)
@@ -630,7 +428,7 @@ class HardSearchExportTest(unittest.TestCase):
         scripted = torch.jit.load(
             os.path.join(self.save_dir, "scripted_model.pt"), map_location="cpu"
         )
-        if compact:
+        if hard_search_input_tile:
             self.assertEqual(
                 model_acc["hard_search_input_tile"],
                 {
@@ -651,7 +449,7 @@ class HardSearchExportTest(unittest.TestCase):
                     torch.testing.assert_close(
                         scripted(make_inputs(lengths, indices)), expected
                     )
-            if compact:
+            if hard_search_input_tile:
                 from tzrec.utils.predict_util import load_predict_model
 
                 with mock.patch.dict(
@@ -746,7 +544,7 @@ class HardSearchExportTest(unittest.TestCase):
                 torch.testing.assert_close(scripted(serving_data), expected)
 
 
-class CompactDerivedExportTest(unittest.TestCase):
+class HardSearchInputTileDerivedExportTest(unittest.TestCase):
     @parameterized.expand(
         [
             (False, False, False),
@@ -1222,7 +1020,8 @@ class ExportUtilTest(unittest.TestCase):
             create_dataloader_mock.assert_called_once()
             self.assertEqual(create_dataloader_mock.call_args.args[2], "override_input")
             export_acc_config_mock.assert_called_once_with(
-                additional_export_config={"cand_seq_pk": "cand_seq"}
+                additional_export_config={"cand_seq_pk": "cand_seq"},
+                hard_search_input_tile_features={},
             )
             with open(os.path.join(tmp, "model_acc.json")) as f:
                 self.assertEqual(json.load(f), model_acc)
@@ -1339,7 +1138,8 @@ class ExportUtilTest(unittest.TestCase):
             create_dataloader_mock.assert_called_once()
             self.assertEqual(create_dataloader_mock.call_args.args[2], "override_input")
             export_acc_config_mock.assert_called_once_with(
-                additional_export_config={"cand_seq_pk": "cand_seq"}
+                additional_export_config={"cand_seq_pk": "cand_seq"},
+                hard_search_input_tile_features={},
             )
             with open(os.path.join(tmp, "model_acc.json")) as f:
                 self.assertEqual(json.load(f), model_acc)

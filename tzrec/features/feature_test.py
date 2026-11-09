@@ -599,16 +599,43 @@ class FeatureTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hard_search_key.*item:<field>"):
             feature_lib.create_features([config])
 
-    @parameterized.expand(
-        [("sequence_delim", "|"), ("sequence_length", 0), ("sequence_length", 2**31)],
-        name_func=parameterized_name_func,
-    )
-    def test_hard_search_invalid_sequence(self, field, value):
+    @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
+    def test_sequence_length_validation(self, hard_search):
         config = self._create_test_feature_cfgs()[-1]
-        config.sequence_feature.hard_search_key = "item:cate"
-        setattr(config.sequence_feature, field, value)
-        with self.assertRaisesRegex(ValueError, field):
+        if hard_search:
+            config.sequence_feature.hard_search_key = "item:cate"
+        config.sequence_feature.sequence_delim = "|"
+        config.sequence_feature.sequence_length = 0
+        features = feature_lib.create_features([config])
+        self.assertEqual(features[0].sequence_delim, "|")
+        self.assertEqual(features[0].sequence_length, 0)
+
+        config.sequence_feature.sequence_length = 2**31
+        with self.assertRaisesRegex(
+            ValueError, "requires a nonnegative int32 sequence_length"
+        ):
             feature_lib.create_features([config])
+
+        ungrouped = feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="seq_id",
+                expression="user:seq_id",
+                sequence_length=2**31,
+                num_buckets=10,
+                embedding_dim=4,
+            )
+        )
+        with self.assertRaisesRegex(
+            ValueError, "Sequence feature seq_id requires a nonnegative int32"
+        ):
+            feature_lib.create_features([ungrouped])
+
+        with self.assertRaisesRegex(
+            ValueError, "hard_search_key is only supported on a sequence group"
+        ):
+            id_feature.IdFeature(
+                self._create_test_feature_cfgs()[0], hard_search_key="item:cate"
+            )
 
     def test_hard_search_empty_group(self):
         config = self._create_test_feature_cfgs()[-1]
@@ -739,7 +766,7 @@ class FeatureTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_compact_history_dependency_domains(self, map_input, valid):
+    def test_hard_search_input_tile_dependency_domains(self, map_input, valid):
         configs = self._create_test_dag_feature_cfgs(grouped=True, stub_type=True)
         configs[0].sequence_feature.hard_search_key = "item:cate"
         other = feature_pb2.FeatureConfig()
@@ -762,15 +789,15 @@ class FeatureTest(unittest.TestCase):
         features = feature_lib.create_features(configs, fg_mode=FgMode.FG_DAG)
         with mock.patch.dict(os.environ, HARD_SEARCH_INPUT_TILE="1", INPUT_TILE="3"):
             if valid:
-                sources = feature_lib.get_hard_search_feature_sequences(features)
+                sources = feature_lib.get_hard_search_input_tile_features(features)
                 self.assertEqual(sources["derived"], "click_seq")
                 self.assertEqual(sources["other__cat_a"], "other")
             else:
                 with self.assertRaisesRegex(ValueError, "one hard-search sequence"):
-                    feature_lib.get_hard_search_feature_sequences(features)
+                    feature_lib.get_hard_search_input_tile_features(features)
         with mock.patch.dict(os.environ, HARD_SEARCH_INPUT_TILE="0"):
             self.assertEqual(
-                feature_lib.get_hard_search_feature_sequences(features), {}
+                feature_lib.get_hard_search_input_tile_features(features), {}
             )
 
     @parameterized.expand([[False], [True]])

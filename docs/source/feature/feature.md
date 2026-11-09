@@ -952,17 +952,21 @@ feature_configs {
   - 支持多值序列array\<array\<string>>或array\<array\<bigint>>类型，多值序列需设置value_dim=0，通常情况下训练推理性能比单值序列差一些。
   - 支持array\<float>为`[price1,price2,price3]`或者array\<array\<float>>类型为`[[emb11,emb12],[emb21,emb22]]`（建议，性能更好）。
 
-**候选相关历史（hard-search）**
+<a id="hard-search-sequences"></a>
 
-例如，为每个候选物品提供按其类目过滤后的点击历史：
+**长序列hard-search**
 
-```
+hard-search 用于在长序列里根据当前候选物品筛选用户历史。例如，候选是手机时使用手机历史，候选是服装时使用服装历史。
+
+在分组序列中配置 `hard_search_key`：
+
+```protobuf
 feature_configs {
     sequence_feature {
         sequence_name: "click_same_cate"
         sequence_length: 50
         sequence_delim: ";"
-        sequence_pk: "user:click_same_cate"
+        sequence_pk: "user:click_same_cate_pk"
         hard_search_key: "item:cate"
         features {
             id_feature {
@@ -976,24 +980,19 @@ feature_configs {
 }
 ```
 
-- **字段来源与参数要求**：`hard_search_key: "item:cate"`指当前候选物品的`cate`标量字段，Processor从主FeatureStore实体的候选缓存行读取它，支持string、int32、int64。子特征的`expression: "item:iid"`则指历史物品ID子序列：原始输入列名为`click_same_cate__iid`，特征输出名为`click_same_cate__item_id`。`hard_search_key`不使用序列名前缀，也不引用特征输出名。使用`hard_search_key`时，`sequence_delim`当前必须为`;`；`sequence_entity`仅支持主实体（Processor `fs_entity`中的第一个实体）；`sequence_pk`（未配置时为`user:${sequence_name}`）去掉`user:`等侧前缀后，不能与任何特征的原始输入列名或其他序列组的PK同名，冲突时创建特征会报错。
-- **训练和离线预测**：必须在TorchEasyRec之外按每条样本的候选预先过滤历史，再提供已过滤且组内长度对齐的子序列。TorchEasyRec中的该字段用于标记和路由输入，不会触发外部数据查询或自动过滤序列。
-- **线上服务**：需使用支持hard-search的Processor并配置FeatureStore/FeatureDB。请求提供非空的`meta_data["user_id"]`和候选ItemId，该组所有原始子序列输入（无论子特征`input_side`为`item`或`user`）均由Processor使用候选key查询FeatureDB获取并按候选组装历史；请求不得同时传入该组的`sequence_pk`或子序列输入。FeatureDB需关联与`sequence_name`对应的序列视图，具体过滤、排序和截断规则由服务端配置，并应与离线预处理保持一致。
-- **INPUT_TILE**：hard-search组内的稀疏、稠密序列及依赖这些输入的派生特征均按候选侧处理，每个候选保留一行，即B个候选对应B行；组内序列字段来源为`user:`或`context:`时也适用。普通用户特征和普通用户历史仍在tile前保留一行并继续共享，无需全局关闭`INPUT_TILE`。支持`INPUT_TILE=2/3`和`INPUT_TILE=3`下的`INPUT_TILE_3_ONLINE=1`；distributed embedding导出继续使用`INPUT_TILE=3`，hard-search序列保持B行。
-- **组内输入限制**：hard-search组内的原始输入必须是带`${sequence_name}__`前缀的序列字段，不支持组内非序列原始输入。例如组内Lookup配置`map: "user:shared_map"`、`key: "item:raw_id"`时，默认非序列输入`shared_map`没有序列名前缀，该配置不支持。可将派生Lookup放在hard-search组外，通过`feature:<序列名>__<子特征名>`引用历史输出；共享的`user:shared_map`仍按用户侧tile，派生输出按候选侧处理。
-- **组合限制**：使用hard-search历史时，同一`SEQUENCE`组或`sequence_groups`子组的所有历史序列轴特征必须来自同一份hard-search历史并逐事件对齐，不能混用普通历史或不同hard-search序列组，即使`hard_search_key`相同且长度恰好一致也不支持。不同历史应使用独立的`sequence_groups`。不同hard-search来源的自动检查仅覆盖直接声明的序列组，派生特征的来源与事件对齐需自行确认。模型query部分仍允许混用用户侧和候选侧特征，这不代表hard-search组内允许非序列原始输入。`JAGGED_SEQUENCE`组不能包含任何hard-search特征，因此当前HSTU不支持该配置。
-- **重新导出**：新增或修改`hard_search_key`配置后，必须重新导出模型及FG产物，使模型输入分类与Processor一致。若通过导出assets提供自定义`fg.json`，其特征定义（包括hard-search标记、原始输入映射和序列配置）必须与建图配置一致，冲突时导出会报错；不包含hard-search的旧资产流程保持原样。上述支持范围为FX/TorchScript及distributed embedding导出；`USE_RTP=1`不支持hard-search，创建特征时会报错；AOT/TRT路径尚未验证。
+其中：
 
-**按候选 key 复用历史计算**
+- `hard_search_key: "item:cate"`：使用当前候选物品的 `cate` 字段筛选历史，格式为 `item:<field>`。
+- `expression: "item:iid"`：历史物品 ID 字段，对应原始输入列 `click_same_cate__iid`。
+- `sequence_pk`：使用独立名称，不能与其他原始输入列或序列组的 PK 同名。
 
-导出时设置 `HARD_SEARCH_INPUT_TILE=1 INPUT_TILE=3` 可启用请求内历史去重，普通导出也支持 `INPUT_TILE=2`。需要同时升级支持此功能的 Processor 并重新导出模型；训练无需开启此开关。旧模型继续使用每候选一行的历史输入。
+**数据准备**
 
-同一用户的一组候选 key 为 `[A, B, A, C, B]` 时，Processor 保留 `[A, B, C]` 对应的三份历史，只做三份历史的 FG 和 embedding，然后模型按位置映射恢复五个候选的历史。不同序列组分别去重，普通用户特征继续共享。缺失 key 的候选指向一份共享空历史，空历史仍遵循 FG 默认值配置；全部 key 缺失时不查询未过滤历史。
+训练和离线预测时，需要提前按每条样本的候选物品筛选历史，再提供对应的序列字段。TorchEasyRec 不会自动查询或过滤历史。
 
-- 支持稀疏、稠密及多值历史，以及仅依赖同一份历史与共享 `user:`/常量输入的派生特征。若 FG 派生特征还依赖逐候选 `item:`/`context:` 输入或另一份 hard-search 历史，开启此优化时会报错，需保留原有 B 行路径或调整特征配置。
-- DIN 等候选 attention 仍按 B 个 query 分别计算；本阶段在进入序列编码器前恢复 B 行。收益主要来自减少 FG、输入搬运和重复 embedding，展开后的 attention 张量仍为 B 行，实际延迟改善需结合候选 key 重复率与序列长度测量。
-- 支持 FX/TorchScript、distributed embedding 和 tile 3 在线模式，暂不支持 AOT/TRT、RTP、HSTU。普通离线预测继续提供每样本一份历史，由预测入口添加恒等位置映射，不按跨用户 key 去重。
-- 导出资产中的紧凑输入标记由导出器生成，不能仅修改 `fg.json` 或 Processor 环境变量开启。排查部署错误时应确认模型和 Processor 使用同一份导出目录。
+同一序列可以包含点击、加购、购买等多种行为。物品 ID、时间戳、行为类型等字段需按同一事件顺序排列。
+
+导出和线上服务的使用方式见 [hard-search](../usage/export.md#hard-search)。
 
 ### 普通序列特征
 

@@ -66,7 +66,7 @@ from tzrec.features.feature import (
     BaseFeature,
     create_feature_configs,
     create_fg_json,
-    get_hard_search_feature_sequences,
+    get_hard_search_input_tile_features,
 )
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
@@ -372,59 +372,6 @@ def export_model_normal(
         )
 
 
-def _validate_hard_search_fg_asset(
-    features: List[BaseFeature], asset: str, save_dir: str
-) -> bytes:
-    """Validate custom FG definitions and return the exact bytes to export.
-
-    With hard search, the graph's candidate/user split depends on the generated
-    feature definitions. Compare those definitions directly so custom raw inputs,
-    DAG edges, or sequence metadata cannot silently change that split.
-    """
-    hard_search_nodes = []
-
-    def collect_hard_search_nodes(node: Dict[str, Any]) -> Dict[str, Any]:
-        """Record hard-search annotations while the JSON decoder builds objects."""
-        if "hard_search_key" in node:
-            hard_search_nodes.append(node)
-        return node
-
-    with open(asset, "rb") as input_file:
-        content = input_file.read()
-    supplied_fg = json.loads(content, object_hook=collect_hard_search_nodes)
-    if not hard_search_nodes and not any(f.is_hard_search_feat for f in features):
-        return content
-    supplied_features = (
-        supplied_fg.get("features") if isinstance(supplied_fg, dict) else None
-    )
-    if not isinstance(supplied_features, list) or not all(
-        isinstance(feature, dict) for feature in supplied_features
-    ):
-        raise ValueError(
-            f"Custom fg.json [{asset}] with hard_search_key requires a features array."
-        )
-    generated_fg = create_fg_json(features, asset_dir=save_dir)
-    for fg_json in (supplied_fg, generated_fg):
-        for feature in fg_json["features"]:
-            if isinstance(feature.get("features"), list):
-                feature["features"].sort(key=lambda f: json.dumps(f, sort_keys=True))
-    # Comparing all definitions also covers raw-input mappings outside HSK groups.
-    if (
-        len(hard_search_nodes)
-        != sum("hard_search_key" in f for f in generated_fg["features"])
-        or sorted(json.dumps(f, sort_keys=True) for f in supplied_features)
-        != sorted(json.dumps(f, sort_keys=True) for f in generated_fg["features"])
-        or supplied_fg.get("input_alias", {}) != generated_fg.get("input_alias", {})
-    ):
-        raise ValueError(
-            f"Custom fg.json [{asset}] hard_search_key feature definitions do not "
-            "match the export graph (sequence groups, lengths, delimiters, primary "
-            "keys, or raw-input mappings). Regenerate the asset from the export "
-            "feature configuration."
-        )
-    return content
-
-
 def _write_export_metadata(
     pipeline_config: EasyRecConfig,
     features: List[BaseFeature],
@@ -433,40 +380,30 @@ def _write_export_metadata(
     additional_export_config: Optional[Dict[str, Union[bool, str]]],
 ) -> None:
     """Write serving metadata and assets without mutating the training config."""
-    fg_assets = {
-        asset: _validate_hard_search_fg_asset(features, asset, save_dir)
-        for asset in assets or []
-        if asset.endswith("fg.json")
-    }
     feature_configs = create_feature_configs(features, asset_dir=save_dir)
     export_config = copy.deepcopy(pipeline_config)
     export_config.ClearField("feature_configs")
     export_config.feature_configs.extend(feature_configs)
     config_util.save_message(export_config, os.path.join(save_dir, "pipeline.config"))
-    acc_config: Dict[str, Any] = acc_utils.export_acc_config(
-        additional_export_config=additional_export_config
+    hard_search_input_tile_features = get_hard_search_input_tile_features(features)
+    hard_search_input_tile_features = {
+        feature.grouped_sequence_prefix
+        + node["feature_name"]: hard_search_input_tile_features[feature.name]
+        for feature in features
+        if feature.name in hard_search_input_tile_features
+        for node in feature.fg_json()
+    }
+    acc_config = acc_utils.export_acc_config(
+        additional_export_config=additional_export_config,
+        hard_search_input_tile_features=hard_search_input_tile_features,
     )
-    compact_features = get_hard_search_feature_sequences(features)
-    if compact_features:
-        acc_config["hard_search_input_tile"] = {
-            "version": 1,
-            "features": {
-                feature.grouped_sequence_prefix
-                + node["feature_name"]: compact_features[feature.name]
-                for feature in features
-                if feature.name in compact_features
-                for node in feature.fg_json()
-            },
-        }
     with open(os.path.join(save_dir, "model_acc.json"), "w") as output:
         json.dump(acc_config, output, indent=4)
+    has_fg_asset = False
     for asset in assets or []:
-        if asset in fg_assets:
-            with open(os.path.join(save_dir, os.path.basename(asset)), "wb") as output:
-                output.write(fg_assets[asset])
-        else:
-            shutil.copy(asset, save_dir)
-    if not fg_assets:
+        has_fg_asset = has_fg_asset or asset.endswith("fg.json")
+        shutil.copy(asset, save_dir)
+    if not has_fg_asset:
         logger.info("saving fg json...")
         with open(os.path.join(save_dir, "fg.json"), "w") as output:
             json.dump(create_fg_json(features, asset_dir=save_dir), output, indent=4)

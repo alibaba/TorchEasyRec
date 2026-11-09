@@ -11,6 +11,7 @@
 
 import hashlib
 import os
+import re
 import shutil
 from collections import OrderedDict
 from copy import copy
@@ -41,6 +42,7 @@ from torchrec.modules.mc_modules import (
 )
 from torchrec.types import DataType
 
+from tzrec.acc.utils import is_hard_search_input_tile
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
     C_NEG_SAMPLE_MASK,
@@ -451,31 +453,6 @@ class BaseFeature(object, metaclass=_meta_cls):
         self.sequence_pk: Optional[str] = None
         self.sequence_entity: Optional[str] = None
         self.hard_search_key = hard_search_key
-        if hard_search_key is not None:
-            if env_util.use_rtp():
-                raise ValueError("hard_search_key is not supported with USE_RTP=1.")
-            if not is_sequence or not sequence_name:
-                raise ValueError(
-                    "hard_search_key is only supported on a sequence group."
-                )
-            if (
-                not hard_search_key.startswith("item:")
-                or not hard_search_key[5:]
-                or ":" in hard_search_key[5:]
-                or any(char.isspace() for char in hard_search_key)
-            ):
-                raise ValueError(
-                    f"hard_search_key for {sequence_name} must be item:<field>."
-                )
-            if sequence_delim != ";":
-                raise ValueError(
-                    f"hard-search sequence {sequence_name} requires sequence_delim=';'."
-                )
-            if sequence_length is None or not 0 < sequence_length <= 2**31 - 1:
-                raise ValueError(
-                    f"hard-search sequence {sequence_name} requires a positive int32 "
-                    "sequence_length."
-                )
         if is_sequence:
             if sequence_name is None:
                 self.sequence_delim = self.config.sequence_delim
@@ -495,6 +472,26 @@ class BaseFeature(object, metaclass=_meta_cls):
                         f"sequence_entity for {sequence_name} must be non-empty."
                     )
                 self.sequence_entity = sequence_entity
+
+        if is_sequence and (
+            self.sequence_length is None or not 0 <= self.sequence_length <= 2**31 - 1
+        ):
+            raise ValueError(
+                f"Sequence feature {self.name} requires a nonnegative int32 "
+                "sequence_length."
+            )
+
+        if hard_search_key is not None:
+            if not self._is_grouped_seq or not self.sequence_name:
+                raise ValueError(
+                    "hard_search_key is only supported on a sequence group."
+                )
+            if env_util.use_rtp():
+                raise ValueError("hard_search_key is not supported with USE_RTP=1.")
+            if re.fullmatch(r"item:[^:\s]+", hard_search_key) is None:
+                raise ValueError(
+                    f"hard_search_key for {self.sequence_name} must be item:<field>."
+                )
 
         # for fg encoded data
         self._fg_encoded_kwargs = {}
@@ -1319,21 +1316,14 @@ def _set_hard_search_features(
         feature._is_hard_search_feat = feature.name in candidates
 
 
-def get_hard_search_feature_sequences(features: List[BaseFeature]) -> Dict[str, str]:
+def get_hard_search_input_tile_features(features: List[BaseFeature]) -> Dict[str, str]:
     """Resolve compact feature rows to their sole hard-search sequence source.
 
     Compact serving shares history-side computation within one request. Features
     combining different histories or candidate inputs cannot share those rows.
     """
-    if os.environ.get("HARD_SEARCH_INPUT_TILE", "0") != "1":
+    if not is_hard_search_input_tile():
         return {}
-    if os.environ.get("INPUT_TILE", "0")[:1] not in ("2", "3"):
-        raise ValueError("HARD_SEARCH_INPUT_TILE=1 requires INPUT_TILE=2 or 3.")
-    if any(
-        os.environ.get(key, "0") != "0"
-        for key in ("ENABLE_AOT", "ENABLE_TRT", "UNIFIED_AOT", "USE_RTP")
-    ):
-        raise ValueError("HARD_SEARCH_INPUT_TILE only supports FX/TorchScript export.")
     sequences = {f.sequence_name for f in features if f.hard_search_key is not None}
     if not sequences:
         return {}

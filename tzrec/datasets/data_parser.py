@@ -42,7 +42,7 @@ from tzrec.features.feature import (
     BaseFeature,
     FgMode,
     create_fg_json,
-    get_hard_search_feature_sequences,
+    get_hard_search_input_tile_features,
     get_hard_search_inputs,
 )
 from tzrec.utils import env_util
@@ -87,7 +87,9 @@ def _tile_size(x: torch.Tensor) -> int:
 
 
 @torch.fx.wrap
-def _pad_compact_lengths(lengths: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+def _pad_hard_search_input_tile_lengths(
+    lengths: torch.Tensor, indices: torch.Tensor
+) -> torch.Tensor:
     """Pad compact rows without repeating values for fixed-stride TorchRec inputs."""
     return torch.nn.functional.pad(lengths, (0, indices.numel() - lengths.numel()))
 
@@ -117,11 +119,11 @@ class DataParser:
         sampler_type: Optional[str] = None,
     ) -> None:
         self._features = features
-        compact_sequences = get_hard_search_feature_sequences(features)
-        self._hard_search_sequences = {
-            f.name: compact_sequences[f.name]
+        hard_search_input_tile_features = get_hard_search_input_tile_features(features)
+        self._hard_search_input_tile_features = {
+            f.name: hard_search_input_tile_features[f.name]
             for f in features
-            if not f.stub_type and f.name in compact_sequences
+            if not f.stub_type and f.name in hard_search_input_tile_features
         }
         self._labels = labels or []
         self._sample_weights = sample_weights or []
@@ -316,12 +318,12 @@ class DataParser:
                     f"sample weight column [{weight_name}] should be float dtype."
                 )
 
-        for sequence in sorted(set(self._hard_search_sequences.values())):
+        for sequence in sorted(set(self._hard_search_input_tile_features.values())):
             feature = next(
                 f
                 for f in self._features
                 if not f.stub_type
-                and self._hard_search_sequences.get(f.name) == sequence
+                and self._hard_search_input_tile_features.get(f.name) == sequence
             )
             rows = (
                 output_data[f"{feature.name}.lengths"].numel()
@@ -539,14 +541,14 @@ class DataParser:
 
         additional_infos = {}
         for feature in self._features:
-            if feature.name in self._hard_search_sequences:
+            if feature.name in self._hard_search_input_tile_features:
                 if feature.is_sparse:
                     key = f"{feature.name}.lengths"
                     additional_infos[key] = input_data[key]
                 elif not feature.is_sequence:
                     key = f"{feature.name}.values"
                     additional_infos[key] = input_data[key]
-        for sequence in sorted(set(self._hard_search_sequences.values())):
+        for sequence in sorted(set(self._hard_search_input_tile_features.values())):
             key = f"{sequence}__inverse_indices"
             additional_infos[key] = input_data[key]
         if self.sampler_type in ["hard_negative_sampler", "hard_negative_sampler_v2"]:
@@ -630,9 +632,9 @@ class DataParser:
             for key in keys:
                 values.append(input_data[f"{key}.values"])
                 length = input_data[f"{key}.lengths"]
-                if key in self._hard_search_sequences:
-                    sequence = self._hard_search_sequences[key]
-                    length = _pad_compact_lengths(
+                if key in self._hard_search_input_tile_features:
+                    sequence = self._hard_search_input_tile_features[key]
+                    length = _pad_hard_search_input_tile_lengths(
                         length, input_data[f"{sequence}__inverse_indices"]
                     )
                 if key in dg_sequence_mulval_sparse_keys:
@@ -709,8 +711,8 @@ class DataParser:
                     length_per_key_user.append(self.dense_length_per_key[dg][index])
                 else:
                     value = input_data[f"{key}.values"]
-                    if key in self._hard_search_sequences:
-                        sequence = self._hard_search_sequences[key]
+                    if key in self._hard_search_input_tile_features:
+                        sequence = self._hard_search_input_tile_features[key]
                         value = value.index_select(
                             0, input_data[f"{sequence}__inverse_indices"]
                         )
@@ -769,9 +771,9 @@ class DataParser:
             for key in keys:
                 value = input_data[f"{key}.values"]
                 length = input_data[f"{key}.lengths"]
-                if key in self._hard_search_sequences:
-                    sequence = self._hard_search_sequences[key]
-                    length = _pad_compact_lengths(
+                if key in self._hard_search_input_tile_features:
+                    sequence = self._hard_search_input_tile_features[key]
+                    length = _pad_hard_search_input_tile_lengths(
                         length, input_data[f"{sequence}__inverse_indices"]
                     )
                 if key in dg_sequence_mulval_sparse_keys:
@@ -871,9 +873,9 @@ class DataParser:
             for key in keys:
                 value = input_data[f"{key}.values"]
                 length = input_data[f"{key}.lengths"]
-                if key in self._hard_search_sequences:
-                    sequence = self._hard_search_sequences[key]
-                    length = _pad_compact_lengths(
+                if key in self._hard_search_input_tile_features:
+                    sequence = self._hard_search_input_tile_features[key]
+                    length = _pad_hard_search_input_tile_lengths(
                         length, input_data[f"{sequence}__inverse_indices"]
                     )
                 if key in dg_sequence_mulval_sparse_keys:

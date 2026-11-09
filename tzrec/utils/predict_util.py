@@ -1389,12 +1389,14 @@ def load_predict_model(
             logger.info(str(model))
         batch_model = _wrap_batch_predict_model(model)
     with open(os.path.join(model_path, "model_acc.json")) as source:
-        compact = json.load(source).get("hard_search_input_tile", {})
-    sequences = sorted(set(compact.get("features", {}).values()))
+        hard_search_input_tile_config = json.load(source).get(
+            "hard_search_input_tile", {}
+        )
+    sequences = sorted(set(hard_search_input_tile_config.get("features", {}).values()))
     if not sequences:
         return batch_model
 
-    def predict_compact(
+    def predict_hard_search_input_tile(
         batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
     ) -> Dict[str, torch.Tensor]:
         """Supply identity mappings for offline batches already expanded per sample."""
@@ -1416,4 +1418,4 @@ def load_predict_model(
             batch.additional_infos.update({key: indices for key in missing})
         return batch_model(batch, batch_size, device)
 
-    return predict_compact
+    return predict_hard_search_input_tile

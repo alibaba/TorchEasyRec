@@ -23,7 +23,7 @@ import torch
 from parameterized import param, parameterized
 from torch import nn
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
-from torchrec.modules.embedding_configs import PoolingType
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
@@ -33,6 +33,7 @@ from tzrec.modules.embedding import (
     EMPTY_KJT,
     EmbeddingGroup,
     EmbeddingGroupImpl,
+    HardSearchInputTileExpander,
     SequenceEmbeddingGroupImpl,
     _pool_sequence_values,
     build_embedding_bag_configs,
@@ -2322,7 +2323,7 @@ class HardSearchEmbeddingGroupTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     @torch.no_grad()
-    def test_compact_history_attention(self, tile, pooling, online):
+    def test_hard_search_input_tile_attention(self, tile, pooling, online):
         if self._run_in_subprocess():
             return
         with patch.dict(
@@ -2343,7 +2344,7 @@ class HardSearchEmbeddingGroupTest(unittest.TestCase):
             compact = batch.to_dict()
             index = torch.tensor(indices)
             count = len(indices)
-            # 相同历史对应不同候选 query，不能共享 attention 输出。
+            # Same history with different candidate queries must not share attention.
             compact["item_value.values"] = torch.arange(count).float().view(-1, 1) / 4
             item_ids = [2, 4, 2, 6, 1][:count]
             compact["item_cat.values"] = torch.tensor(item_ids)
@@ -2641,6 +2642,58 @@ class HardSearchEmbeddingGroupTest(unittest.TestCase):
                             regular, ["user_cat", "item_cat", "history__cat"]
                         )
                         self.assertEqual(dict(configs.ec_user), {})
+
+    def test_hard_search_input_tile_expander(self):
+        tables = [
+            EmbeddingBagConfig(
+                name="t1", embedding_dim=2, num_embeddings=8, feature_names=["a", "b"]
+            ),
+            EmbeddingBagConfig(
+                name="t2", embedding_dim=3, num_embeddings=8, feature_names=["c"]
+            ),
+        ]
+        kt = KeyedTensor(
+            keys=["a", "b", "c"],
+            length_per_key=[2, 2, 3],
+            values=torch.arange(14, dtype=torch.float32).reshape(2, 7),
+        )
+        passthrough = HardSearchInputTileExpander(tables, {})
+        self.assertEqual(passthrough.blocks, [])
+        self.assertIs(passthrough(kt), kt)
+
+        single = HardSearchInputTileExpander(
+            tables, {"a": "seq_a", "b": "seq_a", "c": "seq_a"}
+        )
+        self.assertEqual(single.blocks, [(0, 7, "seq_a__inverse_indices")])
+        with self.assertRaisesRegex(ValueError, "inverse indices"):
+            single(kt)
+        expanded = single(kt, {"seq_a__inverse_indices": torch.tensor([1, 0, 1])})
+        torch.testing.assert_close(expanded.values(), kt.values()[[1, 0, 1]])
+
+        mixed = HardSearchInputTileExpander(tables, {"a": "seq_a", "b": "seq_a"})
+        self.assertEqual(mixed.blocks, [(0, 4, "seq_a__inverse_indices"), (4, 3, "")])
+        mixed_out = mixed(
+            KeyedTensor(
+                keys=["a", "b", "c"],
+                length_per_key=[2, 2, 3],
+                values=torch.tensor(
+                    [
+                        [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0],
+                        [5.0, 6.0, 7.0, 8.0, 40.0, 50.0, 60.0],
+                    ]
+                ),
+            ),
+            {"seq_a__inverse_indices": torch.tensor([1, 0])},
+        )
+        torch.testing.assert_close(
+            mixed_out.values(),
+            torch.tensor(
+                [
+                    [5.0, 6.0, 7.0, 8.0, 10.0, 20.0, 30.0],
+                    [1.0, 2.0, 3.0, 4.0, 40.0, 50.0, 60.0],
+                ]
+            ),
+        )
 
 
 if __name__ == "__main__":
