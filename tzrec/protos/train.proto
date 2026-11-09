@@ -167,9 +167,13 @@ message RocksDBConfig {
     // filesystem (NVMe, ESSD, Extreme NAS), never an OSS mount. Each rank
     // uses <root_dir>/<model_dir id>/rank_<rank>/<mode>-<time>-<pid>.
     required string root_dir = 1;
-    // bytes this job may occupy on the filesystem of root_dir, for all of its
-    // ranks that share it. Unset: only the observed free space limits it.
-    optional uint64 disk_budget_bytes = 2;
+    // bytes this job may occupy on the storage behind root_dir, for all of
+    // its ranks that share it. Unset: only the observed free space limits it.
+    optional uint64 ssd_budget_bytes = 2;
+    // Whether all nodes share one storage volume behind root_dir.
+    // false: each node has its own volume, shared by that node's ranks.
+    // true: all ranks share one volume.
+    optional bool shared_across_nodes = 3 [default = false];
 }
 
 message TrainConfig {

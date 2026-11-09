@@ -958,37 +958,52 @@ if has_dynamicemb:
             # The GPU cache (cached rows and DynamicEmb's overflow area, with
             # their metadata) and the block cache's share for the table's
             # filters and index; the table itself is on disk.
-            from tzrec_ext.rocksdb import logical_row_bytes, metadata_cache_bytes
+            from tzrec_ext.rocksdb import (
+                index_entry_bytes,
+                logical_row_bytes,
+                metadata_cache_bytes,
+            )
 
             optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
             mult = _get_optimizer_multipler(optimizer_class, tensor.shape, tensor.dtype)
             indexed = dynamicemb_options.score_strategy.name != "NO_EVICTION"
-            hbm_specific_sizes = [
-                _calculate_dynamicemb_table_storage_specific_size(
-                    [
-                        rocksdb_util.cache_rows(size[0], caching_ratio)
-                        + rocksdb_util.CACHE_OVERFLOW_ROWS,
-                        size[1],
-                    ],
-                    tensor.element_size(),
-                    mult,
-                    1.0,
-                    is_hbm=True,
-                    bucket_capacity=rocksdb_util.CACHE_BUCKET_ROWS,
+            # One step's admitted overshoot bounds the extra rows a
+            # completed update can add before eviction runs.
+            lookups = sum(b * n for b, n in zip(batch_sizes, input_lengths))
+            hbm_specific_sizes = []
+            ddr_specific_sizes = []
+            ssd_specific_sizes = []
+            for size in shard_sizes:
+                rows, dim = int(size[0]), int(size[1])
+                row_bytes = logical_row_bytes(
+                    dim, round(dim * mult), tensor.element_size()
                 )
-                for size in shard_sizes
-            ]
-            ddr_specific_sizes = [
-                metadata_cache_bytes(
-                    size[0],
-                    logical_row_bytes(
-                        size[1], round(size[1] * mult), tensor.element_size()
-                    ),
-                    indexed,
+                index_bytes = index_entry_bytes() if indexed else 0
+                live = rows * (row_bytes + index_bytes)
+                overshoot = (lookups if indexed else 0) * (row_bytes + index_bytes)
+                # SST bytes for the live table and one step of overshoot,
+                # rounded up, plus the overwritten versions a full cache
+                # writeback leaves until compaction.
+                cache = rocksdb_util.cache_rows(rows, caching_ratio)
+                ssd_specific_sizes.append(
+                    math.ceil(rocksdb_util.SST_FACTOR * (live + overshoot))
+                    + cache * row_bytes
                 )
-                for size in shard_sizes
-            ]
+                hbm_specific_sizes.append(
+                    _calculate_dynamicemb_table_storage_specific_size(
+                        [cache + rocksdb_util.CACHE_OVERFLOW_ROWS, dim],
+                        tensor.element_size(),
+                        mult,
+                        1.0,
+                        is_hbm=True,
+                        bucket_capacity=rocksdb_util.CACHE_BUCKET_ROWS,
+                    )
+                )
+                ddr_specific_sizes.append(
+                    metadata_cache_bytes(rows, row_bytes, indexed)
+                )
         else:
+            ssd_specific_sizes = [0] * len(shard_sizes)
             hbm_specific_sizes, ddr_specific_sizes = (
                 _calculate_dynamicemb_storage_specific_sizes(
                     tensor=tensor,
@@ -1044,13 +1059,17 @@ if has_dynamicemb:
                 ddr_specific_sizes,
             )
         ]
+        # RocksDB shards carry their table's disk growth; built-in shards
+        # keep the zero SSD cost of Storage's default.
+        ssd_sizes: List[int] = ssd_specific_sizes
 
         return [
             Storage(
                 hbm=hbm_size,
                 ddr=ddr_size,
+                ssd=ssd_size,
             )
-            for hbm_size, ddr_size in zip(hbm_sizes, ddr_sizes)
+            for hbm_size, ddr_size, ssd_size in zip(hbm_sizes, ddr_sizes, ssd_sizes)
         ]
 
     from torchrec.sparse import jagged_tensor_validator as _jtv

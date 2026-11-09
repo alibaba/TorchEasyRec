@@ -22,11 +22,10 @@ checkpoint: saves write RocksDB tables through ``DynamicEmbDump`` into the
 checkpoint's ``dynamicemb/`` files like every other dynamicemb table, and a
 restore always imports them into a fresh working DB.
 
-Ranks whose ``root_dir`` lies on the same filesystem draw from one disk pool:
-its free space, and the optional ``disk_budget_bytes`` that caps the job's use
-of it, are shared (one NFS server, or one local device of a host). The planner
-projects each pool's peak occupancy from the logical row bytes of the RocksDB
-tables.
+Planning-time capacities come from ``resource_util``: homogeneous scalar
+budgets per rank, with the sharing scope set by ``shared_across_nodes``. This
+module keeps the shared backend cost accounting (the per-rank activation
+charged once when a plan uses RocksDB) and the runtime lifecycle.
 """
 
 import dataclasses
@@ -35,11 +34,9 @@ import hashlib
 import math
 import os
 import shutil
-import socket
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, List, Optional, cast
 
-import torch.distributed as dist
 from torch import nn
 
 from tzrec.protos import train_pb2
@@ -67,9 +64,8 @@ CACHE_RATIOS = (0.0001, 0.001, 0.01) + tuple(i / 10 for i in range(1, 10))
 # SST bytes per logical byte (uncompressed rows; 1.02-1.05 measured on a
 # 0.6 TB table set after sorted ingest and a day of training).
 SST_FACTOR = 1.1
-# Space a pool keeps free beyond the projected peak.
-DISK_RESERVE_BYTES = 16 << 30
-_NETWORK_FS = ("nfs", "nfs4", "cpfs", "cpfs-nfs", "lustre", "cephfs", "glusterfs")
+# Space the sharing scope keeps free beyond the projected peak.
+SSD_RESERVE_BYTES = 16 << 30
 
 
 def fixed_host_bytes() -> int:
@@ -82,313 +78,46 @@ def fixed_host_bytes() -> int:
     )
 
 
-class DiskCapacityError(RuntimeError):
-    """Raised when RocksDB tables do not fit their disk budget."""
+def backend_config(local_world_size: int, **budgets: int) -> Any:
+    """The common backend configuration a plan derives its budgets from.
 
-
-@dataclasses.dataclass
-class DiskView:
-    """One rank's view of the disk pool behind ``root_dir``.
-
-    Attributes:
-        rank (int): global rank.
-        pool (str): identity of the shared free space (see :func:`pool_key`).
-        free_bytes (int): bytes available to unprivileged writers (statvfs).
-        job_bytes (int): bytes already allocated by this job's rank directory.
+    Threads follow the CPUs one rank may use; the fixed buffers are planned
+    constants. Selected-plan budgets (block cache, import memory) arrive as
+    ``budgets``.
     """
+    from tzrec_ext.rocksdb import BackendConfig
 
-    rank: int
-    pool: str
-    free_bytes: int
-    job_bytes: int
-
-
-def _existing_ancestor(path: str) -> str:
-    path = os.path.realpath(path)
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    return path
-
-
-def _mount_entry(path: str) -> Tuple[str, str, str]:
-    """(mount_point, fstype, source) of the mount containing ``path``."""
-    best = ("/", "unknown", "unknown")
-    try:
-        with open("/proc/self/mountinfo") as f:
-            for line in f:
-                left, _, right = line.partition(" - ")
-                fields = left.split()
-                mount_point = fields[4].replace("\\040", " ")
-                if path == mount_point or path.startswith(
-                    mount_point.rstrip("/") + "/"
-                ):
-                    if len(mount_point) >= len(best[0]):
-                        rest = right.split()
-                        best = (mount_point, rest[0], rest[1] if len(rest) > 1 else "")
-    except OSError:
-        pass
-    return best
-
-
-def allocated_bytes(root: str) -> int:
-    """Filesystem allocation of the files under ``root``, each inode once.
-
-    Hard links are counted once; the allocation is ``st_blocks * 512``, which
-    on NFS is the server's report and may differ from quota accounting.
-    """
-    seen = set()
-    total = 0
-    for dirpath, _, files in os.walk(root):
-        for name in files:
-            try:
-                st = os.lstat(os.path.join(dirpath, name))
-            except OSError:
-                continue
-            key = (st.st_dev, st.st_ino)
-            if key in seen:
-                continue
-            seen.add(key)
-            total += st.st_blocks * 512
-    return total
-
-
-def pool_key(path: str, fstype: str, source: str, host: str, st_dev: int) -> str:
-    """Identity of the free space a filesystem shares across ranks.
-
-    The filesystem type decides only this: a network filesystem is one pool
-    per server, whichever host or export the ranks mount it from; a local
-    device is one pool per host and device. FUSE and unknown filesystems are
-    rejected, since nothing tells which ranks share them.
-    """
-    if fstype in _NETWORK_FS or fstype.startswith("nfs"):
-        return f"net:{source.split(':', 1)[0]}"
-    if source.startswith("/dev/") or fstype in ("overlay", "tmpfs"):
-        return f"local:{host}:{st_dev}"
-    raise DiskCapacityError(
-        f"rocksdb_config.root_dir {path} is on {fstype} from {source}; RocksDB "
-        "tables need a local disk or an NFS-like filesystem."
+    cpus = max(1, len(os.sched_getaffinity(0)) // max(local_world_size, 1))
+    return BackendConfig(
+        write_buffer_bytes=WRITE_BUFFER_BYTES,
+        staging_buffer_bytes=STAGING_BUFFER_BYTES,
+        io_threads=max(4, cpus),
+        max_background_jobs=max(2, cpus // 4),
+        **budgets,
     )
 
 
-def observe(root_dir: str, job_root: str, rank: int) -> DiskView:
-    """Describe the disk pool behind ``root_dir`` from this rank."""
-    path = _existing_ancestor(root_dir)
-    _, fstype, source = _mount_entry(path)
-    st = os.statvfs(path)
-    return DiskView(
-        rank=rank,
-        pool=pool_key(path, fstype, source, socket.gethostname(), os.stat(path).st_dev),
-        free_bytes=st.f_bavail * st.f_frsize,
-        job_bytes=allocated_bytes(job_root) if os.path.isdir(job_root) else 0,
+def activation_storage(local_world_size: int, restore_spill_bytes: int) -> Any:
+    """Per-rank fixed cost of one activated RocksDB backend, as Storage.
+
+    DDR carries the write buffer, staging, shared block-cache data and host
+    headroom; SSD carries compaction headroom, other DB files and the
+    restore-spill envelope of the searched candidates. The SSD reserve is
+    already removed from the topology capacity and is not charged here.
+    """
+    from torchrec.distributed.planner.types import Storage
+    from tzrec_ext.rocksdb import disk_overheads
+
+    overheads = disk_overheads(
+        backend_config(local_world_size, block_cache_bytes=0, import_budget_bytes=0)
     )
-
-
-def gather_views(root_dir: str, job_root: str) -> List[DiskView]:
-    """Disk views of every rank (collective when distributed)."""
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    mine = observe(root_dir, job_root, rank)
-    if not dist.is_initialized():
-        return [mine]
-    out: List[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(out, mine)
-    return out
-
-
-@dataclasses.dataclass
-class TableDisk:
-    """Disk-relevant facts of one RocksDB table on one rank.
-
-    Attributes:
-        name (str): table namespace.
-        rows (int): peak live rows on the rank.
-        row_bytes (int): stored bytes of one row (key, score, embedding,
-            optimizer state), from the backend's record layout.
-        index_bytes (int): eviction-index bytes per row (0 if not evicting).
-        bound (str): where ``rows`` comes from and whether it is enforced.
-        cache_rows (int): rows of its GPU cache on the rank.
-        overshoot_rows (int): new rows one step can add before eviction.
-    """
-
-    name: str
-    rows: int
-    row_bytes: int
-    index_bytes: int
-    bound: str
-    cache_rows: int
-    overshoot_rows: int
-
-    @property
-    def logical_bytes(self) -> int:
-        """Stored row plus index bytes at the peak row count."""
-        return self.rows * (self.row_bytes + self.index_bytes)
-
-    @property
-    def growth_bytes(self) -> int:
-        """Disk the table adds to a pool per rank: SSTs, overshoot, save flush.
-
-        Additive over tables; :func:`pool_fixed_bytes` holds the rest.
-        """
-        return (
-            int(
-                (
-                    self.logical_bytes
-                    + self.overshoot_rows * (self.row_bytes + self.index_bytes)
-                )
-                * SST_FACTOR
-            )
-            + self.cache_rows * self.row_bytes
-        )
-
-
-def pool_fixed_bytes(overheads: Dict[str, int], spill: int) -> int:
-    """Disk a rank's DB needs whatever its tables hold.
-
-    Compaction output, MANIFEST and logs, and the local spill of a restore
-    (bounded by the largest table).
-    """
-    return overheads["compaction_headroom"] + overheads["other_files"] + spill
-
-
-def pool_capacity(views: List[DiskView], budget: Optional[int], fixed: int) -> int:
-    """Disk each rank may give its tables' growth, in the tightest pool.
-
-    A pool's room is the budget (if set, else its free space plus what the job
-    already holds) less the reserve and every member's fixed bytes, split
-    evenly: row-wise shards give every rank the same rows.
-    """
-    pools: Dict[str, List[DiskView]] = {}
-    for v in views:
-        pools.setdefault(v.pool, []).append(v)
-    room = []
-    for members in pools.values():
-        n = len(members)
-        avail = min(v.free_bytes for v in members) + sum(v.job_bytes for v in members)
-        if budget is not None:
-            avail = min(avail, budget)
-        room.append((avail - DISK_RESERVE_BYTES - n * fixed) // n)
-    return max(0, min(room))
-
-
-@dataclasses.dataclass
-class DiskPoolPlan:
-    """Projected disk use of one disk pool; byte fields cover all its ranks."""
-
-    pool: str
-    ranks: List[int]
-    logical_bytes: int
-    sst_bytes: int
-    compaction_headroom: int
-    other_files: int
-    overshoot_bytes: int
-    save_extra: int
-    training_peak: int
-    save_peak: int
-    restore_peak: int
-    projected_peak: int
-    existing_job_bytes: int
-    free_bytes: int
-    budget: Optional[int]
-    problems: List[str]
-
-    @property
-    def feasible(self) -> bool:
-        """Whether the projection fits both the budget and the free space."""
-        return not self.problems
-
-    def describe(self) -> str:
-        """One-line breakdown for logs and errors."""
-
-        def g(b: Optional[int]) -> str:
-            return "unset" if b is None else f"{b / (1 << 30):.1f}GiB"
-
-        text = (
-            f"disk pool {self.pool} ranks {self.ranks}: logical "
-            f"{g(self.logical_bytes)} x SST factor {SST_FACTOR:.2f} = "
-            f"{g(self.sst_bytes)}, compaction headroom "
-            f"{g(self.compaction_headroom)}, other files {g(self.other_files)}, "
-            f"overshoot {g(self.overshoot_bytes)}, save +{g(self.save_extra)}, "
-            f"reserve {g(DISK_RESERVE_BYTES)} -> peak {g(self.projected_peak)} "
-            f"(train {g(self.training_peak)}, save {g(self.save_peak)}, restore "
-            f"{g(self.restore_peak)}); budget {g(self.budget)}, existing job "
-            f"{g(self.existing_job_bytes)}, free {g(self.free_bytes)}"
-        )
-        if self.problems:
-            text += "; PROBLEMS: " + "; ".join(self.problems)
-        return text
-
-
-def plan_disk_pools(
-    tables: List[TableDisk],
-    views: List[DiskView],
-    budget: Optional[int],
-    overheads: Dict[str, int],
-) -> List[DiskPoolPlan]:
-    """Project the peak disk use of every disk pool.
-
-    ``tables`` are one rank's RocksDB tables; row-wise sharding gives every
-    rank the same per-rank rows. Peaks are compared per scenario, not summed:
-    training (live SSTs, compaction output, other files, one step of
-    overshoot), save (training plus the overwritten versions a full cache
-    flush leaves until compaction; background work is paused while the export
-    reads, so a snapshot pins nothing) and restore (a fresh DB ingested from
-    the logical checkpoint as sorted files, plus the local spill of a table
-    too large to import at once, bounded by the largest table).
-    """
-    logical = sum(t.logical_bytes for t in tables)
-    overshoot = sum(t.overshoot_rows * (t.row_bytes + t.index_bytes) for t in tables)
-    flush = sum(t.cache_rows * t.row_bytes for t in tables)
-    spill = max((t.rows * t.row_bytes for t in tables), default=0)
-    pools: Dict[str, List[DiskView]] = {}
-    for v in views:
-        pools.setdefault(v.pool, []).append(v)
-    plans = []
-    for key, members in sorted(pools.items()):
-        n = len(members)
-        sst = int(logical * SST_FACTOR) * n
-        headroom = overheads["compaction_headroom"] * n
-        other = overheads["other_files"] * n
-        over = int(overshoot * SST_FACTOR) * n
-        training = sst + headroom + other + over
-        save = training + flush * n
-        restore = sst + headroom + other + spill * n
-        peak = max(training, save, restore) + DISK_RESERVE_BYTES
-        existing = sum(v.job_bytes for v in members)
-        free = min(v.free_bytes for v in members)
-        problems = []
-        if budget is not None and peak > budget:
-            problems.append(
-                f"projected peak exceeds the budget by {peak - budget} bytes"
-            )
-        # Bytes the job already holds are part of the peak and already taken
-        # from the free space; only the growth must still fit.
-        if peak - existing > free:
-            problems.append(
-                f"growth needs {peak - existing - free} bytes more than are free"
-            )
-        plans.append(
-            DiskPoolPlan(
-                pool=key,
-                ranks=sorted(v.rank for v in members),
-                logical_bytes=logical * n,
-                sst_bytes=sst,
-                compaction_headroom=headroom,
-                other_files=other,
-                overshoot_bytes=over,
-                save_extra=flush * n,
-                training_peak=training,
-                save_peak=save,
-                restore_peak=restore,
-                projected_peak=peak,
-                existing_job_bytes=existing,
-                free_bytes=free,
-                budget=budget,
-                problems=problems,
-            )
-        )
-    return plans
+    return Storage(
+        hbm=0,
+        ddr=fixed_host_bytes(),
+        ssd=overheads["compaction_headroom"]
+        + overheads["other_files"]
+        + restore_spill_bytes,
+    )
 
 
 def is_rocksdb_options(options: Optional["DynamicEmbTableOptions"]) -> bool:
