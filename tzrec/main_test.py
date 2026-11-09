@@ -1017,6 +1017,8 @@ class PredictionLifecycleTest(unittest.TestCase):
         writer: mock.Mock,
         model: mock.Mock,
         predict_threads: int = 1,
+        is_profiling: bool = False,
+        prof: Optional[mock.Mock] = None,
     ) -> None:
         with (
             mock.patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}),
@@ -1042,6 +1044,7 @@ class PredictionLifecycleTest(unittest.TestCase):
             mock.patch("tzrec.main.create_dataloader", return_value=dataloader),
             mock.patch("tzrec.main.create_writer", return_value=writer),
             mock.patch.object(predict_util, "load_predict_model", return_value=model),
+            mock.patch("torch.profiler.profile", return_value=prof),
             mock.patch.object(predict_util, "_PREDICT_PIPELINE_POLL_INTERVAL", 0.01),
         ):
             predict(
@@ -1051,6 +1054,7 @@ class PredictionLifecycleTest(unittest.TestCase):
                 reserved_columns="id",
                 writer_type="MockWriter",
                 predict_threads=predict_threads,
+                is_profiling=is_profiling,
             )
 
     def _run_predict_checkpoint(self, pipeline: mock.Mock, writer: mock.Mock) -> None:
@@ -1145,6 +1149,80 @@ class PredictionLifecycleTest(unittest.TestCase):
                 self.assertEqual(context.exception.failure.stage, stage)
                 self.assertEqual(context.exception.failure.message, f"{stage} boom")
                 writer.close.assert_not_called()
+
+    @parameterized.expand(
+        [("success", False), ("pipeline_failure", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_predict_profiler_stops_once_and_commit_follows(
+        self, _name: str, pipeline_fails: bool
+    ) -> None:
+        """The guarded profiler stop runs exactly once, on either exit path.
+
+        On success the stop must precede the commit rendezvous; a pipeline
+        failure still reaches the rendezvous, but its output is not
+        committed.
+        """
+        dataloader = mock.Mock()
+        dataloader.get_iterator.return_value = iter([self._batch(2), self._batch(2)])
+        writer = mock.Mock()
+        predictions = {"score": torch.tensor([0.1, 0.2])}
+        model = (
+            mock.Mock(side_effect=[predictions, RuntimeError("forward boom")])
+            if pipeline_fails
+            else mock.Mock(return_value=predictions)
+        )
+        prof = mock.Mock()
+        parent = mock.Mock()
+        parent.attach_mock(prof, "prof")
+        parent.attach_mock(writer, "writer")
+
+        if pipeline_fails:
+            with self.assertRaises(predict_util.PredictPipelineStageError):
+                self._run_predict(
+                    dataloader, writer, model, is_profiling=True, prof=prof
+                )
+            writer.close.assert_not_called()
+        else:
+            self._run_predict(dataloader, writer, model, is_profiling=True, prof=prof)
+            names = [name for name, _, _ in parent.mock_calls]
+            self.assertLess(names.index("prof.stop"), names.index("writer.close"))
+        prof.start.assert_called_once()
+        prof.stop.assert_called_once()
+
+    def test_predict_profiler_stop_failure_does_not_skip_commit(self) -> None:
+        """A logged profiler stop error must not bypass the commit rendezvous."""
+        dataloader = mock.Mock()
+        dataloader.get_iterator.return_value = iter([self._batch(2)])
+        writer = mock.Mock()
+        model = mock.Mock(return_value={"score": torch.tensor([0.1, 0.2])})
+        prof = mock.Mock()
+        prof.stop.side_effect = RuntimeError("stop boom")
+
+        self._run_predict(dataloader, writer, model, is_profiling=True, prof=prof)
+
+        prof.stop.assert_called_once()
+        writer.close.assert_called_once_with()
+
+    def test_predict_setup_failure_stops_profiler_without_commit(self) -> None:
+        """Setup failures still stop the profiler.
+
+        The setup failure propagates before reaching the commit rendezvous.
+        """
+        dataloader = mock.Mock()
+        dataloader.get_iterator.return_value = iter([self._batch(2)])
+        writer = mock.Mock()
+        model = mock.Mock(return_value={"score": torch.tensor([0.1, 0.2])})
+        prof = mock.Mock()
+
+        with mock.patch("tzrec.main.Queue", side_effect=RuntimeError("queue boom")):
+            with self.assertRaisesRegex(RuntimeError, "queue boom"):
+                self._run_predict(
+                    dataloader, writer, model, is_profiling=True, prof=prof
+                )
+
+        prof.stop.assert_called_once()
+        writer.close.assert_not_called()
 
     def test_predict_checkpoint_commits_only_after_writer_success(self) -> None:
         for writer_fails in (False, True):
