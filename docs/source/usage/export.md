@@ -46,6 +46,10 @@ torchrun --master_addr=localhost --master_port=32555 \
 - INPUT_TILE: 对User侧特征自动扩展，开启可减少请求大小、网络传输时间和计算时间，默认关闭。必须在TorchEasyRec Processor的fg_mode=normal下使用
   - **INPUT_TILE=2**：user侧特征fg仅计算一次
   - **INPUT_TILE=3**：user侧fg和embedding计算仅一次，适用于user侧特征比较多的情况
+- HARD_SEARCH_INPUT_TILE：复用同一请求中候选 key 相同的 hard-search 历史，减少重复的 FG 和 embedding 计算，默认关闭。
+  - **HARD_SEARCH_INPUT_TILE=0**：每个候选分别进行历史侧的 FG 和 embedding 计算。
+  - **HARD_SEARCH_INPUT_TILE=1**：相同候选 key 共享历史侧计算，attention 仍按各自候选计算。
+  - 当前仅支持在 `INPUT_TILE=2/3` 下开启，具体用法和限制见 [hard-search](#hard-search)。
 - INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，但导出的模型无法用于离线预测
   - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
 - USE_DISTRIBUTED_EMBEDDING: 开启分布式 embedding 导出模式，导出 dense graph 与分片 sparse embedding 参数；该模式会自动使用 `INPUT_TILE=3`
@@ -275,3 +279,37 @@ eascmd -i ${ACCESS_KEY_ID} -k ${ACCESS_KEY_SECRET} -e ${ENDPOINT} create aot_exp
 ```
 
 任务运行结束后，`--export_dir` 指向的目录即为导出好的模型，将其作为在线服务的模型路径部署即可（部署方式参见 [模型服务](serving.md)）。
+
+<a id="hard-search"></a>
+
+## hard-search
+
+配置 `hard_search_key` 后，线上服务可以根据候选物品查询对应历史。候选 key 重复较多时，还可以开启 `HARD_SEARCH_INPUT_TILE`，减少重复的 FG 和 embedding 计算。
+
+特征配置和数据准备见 [长序列hard-search](../feature/feature.md#hard-search-sequences)。
+
+### 线上服务
+
+配置与 `sequence_name` 对应的 FeatureStore/FeatureDB 序列视图。候选筛选字段需位于主 FeatureStore 实体中，支持 string、int32、int64 标量。
+
+请求提供非空的 `meta_data["user_id"]` 和候选 ItemId，Processor 根据候选字段查询历史。请求中不要同时传入该组 PK 或历史字段。
+
+### 开启 HARD_SEARCH_INPUT_TILE
+
+例如候选类目为 `[手机, 服装, 手机]` 时，两件手机商品可以复用历史侧的 FG 和 embedding 计算，attention 仍按各自候选计算。
+
+导出前设置：
+
+```bash
+export INPUT_TILE=3
+export HARD_SEARCH_INPUT_TILE=1
+```
+
+然后按本页的导出命令执行。普通导出也支持 `INPUT_TILE=2`；distributed embedding 使用 `INPUT_TILE=3`。
+
+普通用户特征继续按 INPUT_TILE 共享，各个 hard-search 序列组分别复用自己的历史。
+
+### 使用限制
+
+- 当前支持 FX/TorchScript 和 distributed embedding，不支持 AOT/TRT、RTP、HSTU。
+- 历史派生特征只能依赖同一份 hard-search 历史及共享用户输入或常量。若还依赖候选自身的 `item:` / `context:` 字段，或另一组历史，不能开启 `HARD_SEARCH_INPUT_TILE`。
