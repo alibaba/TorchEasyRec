@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import json
 import os
 from collections import OrderedDict
@@ -59,6 +60,9 @@ from torchrec.distributed.planner.storage_reservations import (
 )
 from torchrec.distributed.planner.types import (
     Enumerator,
+    Partitioner,
+    PlannerError,
+    PlannerErrorType,
     Proposer,
     SharderData,
     SharderDataMap,
@@ -76,6 +80,7 @@ from torchrec.distributed.types import (
     KeyValueParams,
     ModuleSharder,
     PipelineType,
+    ShardingPlan,
     ShardingType,
 )
 from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
@@ -85,9 +90,10 @@ from torchrec.modules.embedding_modules import (
 )
 
 from tzrec.protos import feature_pb2
-from tzrec.utils import env_util
+from tzrec.utils import env_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
+from tzrec.utils.misc_util import host_memory_bytes
 
 
 def create_planner(
@@ -96,8 +102,17 @@ def create_planner(
     ckpt_plan_path: Optional[str] = None,
     global_constraints_cfg: Optional[feature_pb2.ParameterConstraints] = None,
     model: Optional[nn.Module] = None,
+    rocksdb: Optional["rocksdb_util.RocksDBRuntime"] = None,
 ) -> EmbeddingShardingPlanner:
-    """Create EmbeddingShardingPlanner."""
+    """Create EmbeddingShardingPlanner.
+
+    ``STORAGE_RESERVE_PERCENT`` (default 0.15) holds back GPU memory for
+    non-embedding use. With a RocksDB runtime the planner may offload
+    dynamicemb tables (:class:`RocksDBOffloadPlanner`); its host memory per
+    rank is then the container's (cgroup-capped) RAM less
+    ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.15), split among the host's
+    ranks.
+    """
     if global_constraints_cfg is not None and (
         global_constraints_cfg.HasField("pooling_factor")
         or global_constraints_cfg.HasField("unique_id_factor")
@@ -116,6 +131,15 @@ def create_planner(
         topo_kwargs["hbm_cap"] = torch.cuda.get_device_properties(device).total_memory
 
     ddr_cap_per_rank = int(float(psutil.virtual_memory().total) / local_world_size)
+    if rocksdb is not None:
+        # The offload planner charges RocksDB's fixed host budgets against
+        # this cap: it must be the container's RAM, not the node's.
+        host_reserve_percent = float(
+            os.environ.get("HOST_MEMORY_RESERVE_PERCENT", 0.15)
+        )
+        ddr_cap_per_rank = int(
+            host_memory_bytes() * (1 - host_reserve_percent) / local_world_size
+        )
     topo_kwargs["ddr_cap"] = ddr_cap_per_rank
     if "INTRA_NODE_BANDWIDTH" in os.environ:
         topo_kwargs["intra_host_bw"] = float(os.environ["INTRA_NODE_BANDWIDTH"])
@@ -134,6 +158,7 @@ def create_planner(
     storage_reserve_percent = 0.15
     if "STORAGE_RESERVE_PERCENT" in os.environ:
         storage_reserve_percent = float(os.environ["STORAGE_RESERVE_PERCENT"])
+
     storage_reservation = HeuristicalStorageReservation(
         percentage=storage_reserve_percent
     )
@@ -202,7 +227,18 @@ def create_planner(
         )
 
     # build planner
-    planner = EmbeddingShardingPlanner(
+    planner_kwargs: Dict[str, Any] = {}
+    planner_cls = EmbeddingShardingPlanner
+    if rocksdb is not None:
+        # Every rank reports its disk pool; only rank 0 plans.
+        planner_cls = RocksDBOffloadPlanner
+        planner_kwargs = {
+            "rocksdb": rocksdb,
+            "views": rocksdb_util.gather_views(
+                rocksdb.config.root_dir, rocksdb.rank_dir
+            ),
+        }
+    planner = planner_cls(
         topology=topology,
         batch_size=batch_size,
         enumerator=EmbeddingEnumerator(
@@ -210,6 +246,7 @@ def create_planner(
             batch_size=batch_size,
             fqn_constraints=fqn_constraints,
             global_constraints=global_constraints,
+            rocksdb=rocksdb is not None,
         ),
         storage_reservation=storage_reservation,
         # DP bin counts are env-tunable; defaults match the proposer signature.
@@ -221,10 +258,12 @@ def create_planner(
                 ddr_bins_per_device=int(
                     os.environ.get("TZREC_DP_DDR_BINS_PER_DEVICE", "25")
                 ),
+                disk_bins=int(os.environ.get("TZREC_DP_DISK_BINS", "20")),
             ),
             UniformProposer(),
         ],
         debug=True,
+        **planner_kwargs,
     )
     return planner
 
@@ -281,6 +320,8 @@ def _sparse_dp_proposor_numpy(
     table_opts: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
     hbm_bins: int,
     ddr_bins: int,
+    table_disk: Optional[List[np.ndarray]] = None,
+    disk_bins: int = 1,
 ) -> List[List[int]]:
     """Sparse-K NumPy 2D DP over (hbm_bin, ddr_bin) reachable cells.
 
@@ -294,6 +335,10 @@ def _sparse_dp_proposor_numpy(
     per table, all 1-D NumPy arrays (the float ones in bin-units; the index
     one in opt-id space, used to reconstruct proposals).
 
+    ``table_disk`` optionally adds a third axis of ``disk_bins`` bins: per
+    table, its options' disk use in bin units, so that cells with different
+    disk use are not merged.
+
     Returns a list of proposals; each proposal is a list of opt-id integers,
     one per table, emitted in decreasing-HBM order with at most one entry per
     HBM bin (the perf-best plan across all DDR bins at that HBM level).
@@ -301,23 +346,30 @@ def _sparse_dp_proposor_numpy(
     table_count = len(table_opts)
     if table_count == 0:
         return []
+    if table_disk is None:
+        table_disk = [np.zeros(t[0].shape, dtype=np.float32) for t in table_opts]
 
     seed_hbm, seed_ddr, seed_perf, seed_opt_id = table_opts[0]
-    valid_mask = (seed_hbm < hbm_bins) & (seed_ddr < ddr_bins)
+    seed_disk = table_disk[0]
+    valid_mask = (seed_hbm < hbm_bins) & (seed_ddr < ddr_bins) & (seed_disk < disk_bins)
     if not valid_mask.any():
         return []
     seed_hbm = seed_hbm[valid_mask]
     seed_ddr = seed_ddr[valid_mask]
+    seed_disk = seed_disk[valid_mask]
     seed_perf = seed_perf[valid_mask]
     seed_opt_id = seed_opt_id[valid_mask]
     seed_hbm_i = seed_hbm.astype(np.int32)
     seed_ddr_i = seed_ddr.astype(np.int32)
-    flat_cell_i = seed_hbm_i.astype(np.int64) * ddr_bins + seed_ddr_i
+    flat_cell_i = (
+        seed_hbm_i.astype(np.int64) * ddr_bins + seed_ddr_i
+    ) * disk_bins + seed_disk.astype(np.int32)
     winners = _argmin_per_group(group_keys=flat_cell_i, perf_keys=seed_perf)
 
     dp_perf = seed_perf[winners]
     dp_hbm = seed_hbm[winners]
     dp_ddr = seed_ddr[winners]
+    dp_disk = seed_disk[winners]
     dp_hbm_i = seed_hbm_i[winners]
     back_opt_j: List[np.ndarray] = [seed_opt_id[winners]]
     back_prev_cell_i: List[np.ndarray] = [np.full(winners.size, -1, dtype=np.int32)]
@@ -334,20 +386,26 @@ def _sparse_dp_proposor_numpy(
 
         new_hbm = dp_hbm[:, None] + cur_table_hbm[None, :]
         new_ddr = dp_ddr[:, None] + cur_table_ddr[None, :]
+        new_disk = dp_disk[:, None] + table_disk[table_i][None, :]
         new_perf = dp_perf[:, None] + cur_table_perf[None, :]
-        valid_mask = (new_hbm < hbm_bins) & (new_ddr < ddr_bins)
+        valid_mask = (
+            (new_hbm < hbm_bins) & (new_ddr < ddr_bins) & (new_disk < disk_bins)
+        )
         if not valid_mask.any():
             dp_perf = np.zeros(0)
             break
 
         new_hbm_i = new_hbm.astype(np.int32)
         new_ddr_i = new_ddr.astype(np.int32)
-        flat_cell_i = new_hbm_i.astype(np.int64) * ddr_bins + new_ddr_i
+        flat_cell_i = (
+            new_hbm_i.astype(np.int64) * ddr_bins + new_ddr_i
+        ) * disk_bins + new_disk.astype(np.int32)
 
         valid_flat_cell_i = flat_cell_i[valid_mask]
         valid_new_perf = new_perf[valid_mask]
         valid_new_hbm = new_hbm[valid_mask]
         valid_new_ddr = new_ddr[valid_mask]
+        valid_new_disk = new_disk[valid_mask]
         valid_new_hbm_i = new_hbm_i[valid_mask]
         valid_prev_cell_i, valid_opt_j = np.where(valid_mask)
 
@@ -358,6 +416,7 @@ def _sparse_dp_proposor_numpy(
         dp_perf = valid_new_perf[winners]
         dp_hbm = valid_new_hbm[winners]
         dp_ddr = valid_new_ddr[winners]
+        dp_disk = valid_new_disk[winners]
         dp_hbm_i = valid_new_hbm_i[winners]
         back_opt_j.append(cur_table_opt_id[valid_opt_j[winners]])
         back_prev_cell_i.append(valid_prev_cell_i[winners].astype(np.int32))
@@ -422,19 +481,28 @@ class DynamicProgrammingProposer(Proposer):
     HBM level -- in decreasing HBM order; plans at the same HBM bin with worse
     perf are strictly dominated and skipped.
 
+    Options that store a table in RocksDB also use disk (``disk_bytes``). When
+    ``disk_capacity`` is set and their largest choices could exceed it, disk
+    becomes a third DP axis of ``disk_bins`` bins.
+
     Args:
         hbm_bins_per_device (int): per-device HBM bins for DP precision.
         ddr_bins_per_device (int): per-device DDR bins for DP precision.
+        disk_bins (int): disk bins, used only when disk can bind.
     """
 
     def __init__(
         self,
         hbm_bins_per_device: int = 100,
         ddr_bins_per_device: int = 25,
+        disk_bins: int = 20,
     ) -> None:
         self._inited: bool = False
         self._hbm_bins_per_device: int = max(hbm_bins_per_device, 1)
         self._ddr_bins_per_device: int = max(ddr_bins_per_device, 1)
+        self._disk_bins: int = max(disk_bins, 1)
+        # Disk the RocksDB options of all devices may use; None: no limit.
+        self.disk_capacity: Optional[int] = None
         self._sharding_options_by_fqn: OrderedDict[str, List[ShardingOption]] = (
             OrderedDict()
         )
@@ -460,6 +528,7 @@ class DynamicProgrammingProposer(Proposer):
             self._sharding_options_by_fqn[fqn].append(sharding_option)
 
     def _reset(self) -> None:
+        self._inited = False
         self._sharding_options_by_fqn = OrderedDict()
         self._proposal_list = []
         self._current_proposal = -1
@@ -534,14 +603,20 @@ class DynamicProgrammingProposer(Proposer):
         hbm_bin_size = float(hbm_total) / hbm_bins if hbm_bins > 0 else 1.0
         ddr_bin_size = float(ddr_total) / ddr_bins if ddr_bins > 0 else 1.0
 
+        disk_cap = self.disk_capacity
         # Per-table option arrays in bin-units, with infeasible options pruned.
         table_opts: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        table_disk: List[List[float]] = []
         for sharding_options in self._sharding_options_by_fqn.values():
             hbm_list: List[float] = []
             ddr_list: List[float] = []
+            disk_list: List[float] = []
             perf_list: List[float] = []
             opt_id_list: List[int] = []
             for opt_id, sharding_option in enumerate(sharding_options):
+                disk = getattr(sharding_option, "disk_bytes", 0)
+                if disk_cap is not None and disk > disk_cap:
+                    continue
                 max_shard_hbm = max(
                     (shard.storage.hbm or 0) for shard in sharding_option.shards
                 )
@@ -563,8 +638,10 @@ class DynamicProgrammingProposer(Proposer):
                     if ddr_total > 0
                     else 0.0
                 )
+                disk_list.append(disk)
                 perf_list.append(sharding_option.total_perf)
                 opt_id_list.append(opt_id)
+            table_disk.append(disk_list)
             table_opts.append(
                 (
                     np.asarray(hbm_list, dtype=np.float32),
@@ -574,7 +651,18 @@ class DynamicProgrammingProposer(Proposer):
                 )
             )
 
-        self._proposal_list = _sparse_dp_proposor_numpy(table_opts, hbm_bins, ddr_bins)
+        disk_bins = 1
+        disk_units: Optional[List[np.ndarray]] = None
+        # Disk is an axis only when the largest choices could exceed it.
+        if disk_cap and sum(max(d, default=0) for d in table_disk) > disk_cap:
+            disk_bins = self._disk_bins
+            disk_units = [
+                np.asarray(d, dtype=np.float32) * (disk_bins / disk_cap)
+                for d in table_disk
+            ]
+        self._proposal_list = _sparse_dp_proposor_numpy(
+            table_opts, hbm_bins, ddr_bins, disk_units, disk_bins
+        )
         if self._proposal_list:
             self._current_proposal = 0
 
@@ -906,7 +994,7 @@ def calculate_shard_storages(
 
 
 def _emit_dynamicemb_variants(
-    base_option: ShardingOption,
+    base_option: ShardingOption, rocksdb: bool = False, offload: bool = False
 ) -> List[ShardingOption]:
     """Expand a dynamicemb ShardingOption into HYBRID + CACHING variants.
 
@@ -914,6 +1002,11 @@ def _emit_dynamicemb_variants(
     when ``base_option.cache_params`` is unset, ten cache_load_factor values
     (0.1, 0.2, ..., 1.0). The downstream 2D DP proposer picks per table the
     best (mode, ratio) that fits both HBM and host topology budgets.
+
+    With RocksDB configured (``rocksdb``) only CACHING is offered: HybridStorage
+    re-splits rows between its tiers on load, so a near-capacity table
+    overflows hash buckets and loses rows on every restore. With ``offload``,
+    an eligible table also gets RocksDB variants (:func:`_rocksdb_variants`).
 
     ``base_option.dynamicemb_options`` must already be attached by the
     caller; each returned ShardingOption owns a freshly deep-copied
@@ -927,14 +1020,263 @@ def _emit_dynamicemb_variants(
         load_factors = [base_option.cache_params.load_factor]
         stats = base_option.cache_params.stats
     variants: List[ShardingOption] = []
-    for caching_mode in (False, True):
+    for caching_mode in (True,) if rocksdb else (False, True):
         for load_factor in load_factors:
             opt = copy.deepcopy(base_option)
             opt.cache_params = CacheParams(load_factor=load_factor, stats=stats)
             # deepcopy(base_option) already produced a fresh dynamicemb_options.
             opt.dynamicemb_options.caching = caching_mode  # pyre-ignore [16]
             variants.append(opt)
+    # A cache_load_factor pins a built-in placement, and CUSTOMIZED scores
+    # have no producer in TorchEasyRec.
+    if (
+        offload
+        and base_option.cache_params is None
+        and base_option.dynamicemb_options.score_strategy.name
+        != "CUSTOMIZED"  # pyre-ignore [16]
+    ):
+        variants.extend(_rocksdb_variants(base_option))
     return variants
+
+
+def _rocksdb_variants(base_option: ShardingOption) -> List[ShardingOption]:
+    """CACHING_PS variants of a dynamicemb table stored in RocksDB.
+
+    One per cache ratio of ``rocksdb_util.CACHE_RATIOS``. The ratio is part of
+    the storage factory's identity: DynamicEmb sizes a fused group's cache
+    with one ratio, so only tables planned at the same ratio may fuse. A ratio
+    whose cache rows fall below the step's estimated lookups (batch size times
+    the pooling factors, an estimate of the ids a step brings) is not offered;
+    the storage checks the real counts at run time. Nor is one whose cache
+    would hold the whole table. Each variant records the disk its table adds
+    per rank, for the DP's disk axis.
+    """
+    from tzrec_ext.rocksdb import index_entry_bytes, logical_row_bytes
+    from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+
+    from tzrec.utils.dynamicemb_util import _get_optimizer_multipler
+
+    tensor = base_option.tensor
+    rows, dim = int(base_option.shards[0].size[0]), int(base_option.shards[0].size[1])
+    optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
+    state_dim = round(
+        dim * _get_optimizer_multipler(optimizer_class, tensor.shape, tensor.dtype)
+    )
+    indexed = (
+        base_option.dynamicemb_options.score_strategy.name != "NO_EVICTION"
+    )  # pyre-ignore [16]
+    lookups = int(base_option.batch_size * sum(base_option.input_lengths))
+    variants = []
+    for ratio in rocksdb_util.CACHE_RATIOS:
+        cache = rocksdb_util.cache_rows(rows, ratio)
+        if cache < lookups or cache >= rows:
+            continue
+        opt = copy.deepcopy(base_option)
+        opt.dynamicemb_options.external_storage = (  # pyre-ignore [16]
+            RocksDBStorageFactory(None, "")
+        )
+        opt.dynamicemb_options.caching = True  # pyre-ignore [16]
+        opt.cache_params = CacheParams(load_factor=ratio)
+        table = rocksdb_util.TableDisk(
+            name=base_option.fqn,
+            rows=rows,
+            row_bytes=logical_row_bytes(dim, state_dim, tensor.element_size()),
+            index_bytes=index_entry_bytes() if indexed else 0,
+            bound="max_capacity per shard (enforced by eviction)"
+            if indexed
+            else "max_capacity per shard (declared horizon, NOT enforced)",
+            cache_rows=cache,
+            overshoot_rows=lookups if indexed else 0,
+        )
+        opt.rocksdb_table = table  # pyre-ignore [16]
+        opt.disk_bytes = table.growth_bytes * len(opt.shards)  # pyre-ignore [16]
+        variants.append(opt)
+    return variants
+
+
+class _DiskLimitedPartitioner(Partitioner):
+    """Rejects a proposal whose RocksDB tables need more disk than ``capacity``.
+
+    Only the DP proposer searches with disk, and even its first proposal (each
+    table's smallest option) comes before that search.
+
+    Args:
+        partitioner (Partitioner): the partitioner proposals then go to.
+        capacity (int): disk the RocksDB options of all devices may use.
+    """
+
+    def __init__(self, partitioner: Partitioner, capacity: int) -> None:
+        self._partitioner = partitioner
+        self._capacity = capacity
+
+    def partition(
+        self, proposal: List[ShardingOption], storage_constraint: Topology
+    ) -> List[ShardingOption]:
+        """Partition ``proposal`` if its RocksDB tables fit the disk."""
+        need = sum(getattr(o, "disk_bytes", 0) for o in proposal)
+        if need > self._capacity:
+            raise PlannerError(
+                f"RocksDB tables need {need} bytes of disk, {self._capacity} fit",
+                PlannerErrorType.INSUFFICIENT_STORAGE,
+            )
+        return self._partitioner.partition(proposal, storage_constraint)
+
+
+class RocksDBOffloadPlanner(EmbeddingShardingPlanner):
+    """Sharding planner that may offload dynamicemb tables to RocksDB.
+
+    A plan that keeps every table in GPU and host memory is preferred, so it
+    is searched first, without RocksDB variants or RocksDB's fixed costs. Only
+    if none fits does the DP proposer also see RocksDB variants (CACHING_PS at
+    several cache ratios, :func:`_rocksdb_variants`), with RocksDB's fixed
+    host memory taken from every device and the disk pools' room as its disk
+    capacity; it then picks the tables to offload and their cache ratios
+    together. The planner derives the backend's budgets from the chosen plan,
+    and every rank binds its own session to the broadcast plan.
+
+    Args:
+        rocksdb (RocksDBRuntime): this rank's RocksDB runtime.
+        views (List[DiskView]): every rank's view of its disk pool.
+        **kwargs: EmbeddingShardingPlanner arguments.
+    """
+
+    def __init__(
+        self,
+        rocksdb: "rocksdb_util.RocksDBRuntime",
+        views: List[rocksdb_util.DiskView],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._rocksdb = rocksdb
+        self._views = views
+
+    def _backend_config(self, **budgets: int) -> Any:
+        from tzrec_ext.rocksdb import BackendConfig
+
+        cpus = max(1, len(os.sched_getaffinity(0)) // self._topology.local_world_size)
+        return BackendConfig(
+            write_buffer_bytes=rocksdb_util.WRITE_BUFFER_BYTES,
+            staging_buffer_bytes=rocksdb_util.STAGING_BUFFER_BYTES,
+            io_threads=max(4, cpus),
+            max_background_jobs=max(2, cpus // 4),
+            **budgets,
+        )
+
+    def plan(
+        self, module: nn.Module, sharders: List[ModuleSharder[nn.Module]]
+    ) -> ShardingPlan:
+        """Plan in memory if possible, else with RocksDB offload."""
+        try:
+            return super().plan(module, sharders)
+        except PlannerError as e:
+            logger.info(f"no in-memory plan fits ({e}); planning RocksDB offload")
+        enumerator = cast(EmbeddingEnumerator, self._enumerator)
+        cfg = self._rocksdb.config
+        budget = cfg.disk_budget_bytes if cfg.HasField("disk_budget_bytes") else None
+        from tzrec_ext.rocksdb import disk_overheads
+
+        overheads = disk_overheads(
+            self._backend_config(block_cache_bytes=0, import_budget_bytes=0)
+        )
+        ddr = [d.storage.ddr for d in self._topology.devices]
+        dps = [p for p in self._proposers if isinstance(p, DynamicProgrammingProposer)]
+        partitioner = self._partitioner
+        enumerator.offload = True
+        try:
+            tables = [
+                o.rocksdb_table
+                for o in enumerator.enumerate(module, sharders)
+                if hasattr(o, "rocksdb_table")
+            ]
+            spill = max((t.rows * t.row_bytes for t in tables), default=0)
+            capacity = rocksdb_util.pool_capacity(
+                self._views, budget, rocksdb_util.pool_fixed_bytes(overheads, spill)
+            )
+            for p in dps:
+                p.disk_capacity = capacity * self._topology.world_size
+            self._partitioner = _DiskLimitedPartitioner(
+                partitioner, capacity * self._topology.world_size
+            )
+            for d in self._topology.devices:
+                d.storage.ddr -= rocksdb_util.fixed_host_bytes()
+            plan = super().plan(module, sharders)
+        finally:
+            for d, orig in zip(self._topology.devices, ddr):
+                d.storage.ddr = orig
+            for p in dps:
+                p.disk_capacity = None
+            self._partitioner = partitioner
+            enumerator.offload = False
+        self._configure(plan, ddr, budget, overheads)
+        return plan
+
+    def _configure(
+        self,
+        plan: ShardingPlan,
+        ddr: List[int],
+        budget: Optional[int],
+        overheads: Dict[str, int],
+    ) -> None:
+        """Derive the backend config of the chosen plan, check and log its disk."""
+        from tzrec_ext.rocksdb import metadata_cache_bytes
+
+        selected = self.get_selected_options()
+        offloaded = [o for o in selected if hasattr(o, "rocksdb_table")]
+        if not offloaded:
+            return
+        # At restore the block cache and memtables are still empty, but every
+        # built-in table's host memory is already allocated.
+        builtin = [0] * len(ddr)
+        for o in selected:
+            if not hasattr(o, "rocksdb_table"):
+                for shard in o.shards:
+                    if shard.rank is not None:
+                        builtin[shard.rank] += shard.storage.ddr
+        tables = [o.rocksdb_table for o in offloaded]
+        config = self._backend_config(
+            block_cache_bytes=rocksdb_util.BLOCK_CACHE_DATA_BYTES
+            + sum(
+                metadata_cache_bytes(t.rows, t.row_bytes, t.index_bytes > 0)
+                for t in tables
+            ),
+            import_budget_bytes=min(d - b for d, b in zip(ddr, builtin))
+            - rocksdb_util.STAGING_BUFFER_BYTES
+            - rocksdb_util._HOST_OVERHEAD_BYTES,
+        )
+        for module_plan in plan.plan.values():
+            for sharding in module_plan.values():
+                opts = getattr(sharding, "dynamicemb_options", None)
+                if rocksdb_util.is_rocksdb_options(opts):
+                    opts.external_storage = dataclasses.replace(
+                        opts.external_storage, backend_config=config
+                    )
+        pools = rocksdb_util.plan_disk_pools(tables, self._views, budget, overheads)
+        logger.info(
+            "dynamicemb tables offloaded to RocksDB (per rank): "
+            + ", ".join(
+                f"{o.fqn} cache ratio {o.cache_load_factor} ({t.cache_rows} rows)"
+                for o, t in zip(offloaded, tables)
+            )
+            + f"; backend {config}"
+        )
+        for pool in pools:
+            logger.info(f"RocksDB {pool.describe()}")
+        if any(not pool.feasible for pool in pools):
+            raise rocksdb_util.DiskCapacityError(
+                "RocksDB tables do not fit their disk: "
+                + "; ".join(pool.describe() for pool in pools if not pool.feasible)
+            )
+
+    def collective_plan(
+        self,
+        module: nn.Module,
+        sharders: Optional[List[ModuleSharder[nn.Module]]] = None,
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> ShardingPlan:
+        """Plan on rank 0, broadcast, and bind this rank's RocksDB session."""
+        plan = super().collective_plan(module, sharders, pg)
+        self._rocksdb.bind(plan)
+        return plan
 
 
 class EmbeddingEnumerator(_EmbeddingEnumerator):
@@ -953,6 +1295,9 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
             fqns to provided ParameterConstraints.
         global_constraints (Optional[ParameterConstraints]): all parameters provided
             ParameterConstraints.
+        rocksdb (bool): whether RocksDB is configured; then dynamicemb tables
+            get CACHING variants only, and RocksDB variants when ``offload``
+            is set (by :class:`RocksDBOffloadPlanner`).
     """
 
     def __init__(
@@ -964,6 +1309,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         use_exact_enumerate_order: Optional[bool] = False,
         fqn_constraints: Optional[Dict[str, ParameterConstraints]] = None,
         global_constraints: Optional[ParameterConstraints] = None,
+        rocksdb: bool = False,
     ) -> None:
         if not estimator:
             estimator = [
@@ -975,6 +1321,8 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         )
         self._fqn_constraints = fqn_constraints
         self._global_constraints = global_constraints
+        self.rocksdb = rocksdb
+        self.offload = False
 
     def _get_constraints(
         self, child_path: str, name: str
@@ -1130,7 +1478,9 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
                             sharding_options_per_table.extend(
-                                _emit_dynamicemb_variants(sharding_option)
+                                _emit_dynamicemb_variants(
+                                    sharding_option, self.rocksdb, self.offload
+                                )
                             )
                         else:
                             sharding_options_per_table.append(sharding_option)

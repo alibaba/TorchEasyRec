@@ -47,6 +47,7 @@ class ShardedModelRuntimeTest(unittest.TestCase):
             with ShardedModelRuntime.open(config, mode="train") as runtime:
                 manager_cls.assert_called_once_with(
                     config.model_dir,
+                    before_dynamicemb_load=None,
                     keep_checkpoint_max=3,
                     export_config=config.export_config,
                 )
@@ -63,7 +64,9 @@ class ShardedModelRuntimeTest(unittest.TestCase):
             "tzrec.utils.runtime.CheckpointManager", return_value=manager
         ) as manager_cls:
             with ShardedModelRuntime.open(config, mode=mode) as runtime:
-                manager_cls.assert_called_once_with(config.model_dir)
+                manager_cls.assert_called_once_with(
+                    config.model_dir, before_dynamicemb_load=None
+                )
                 self.assertIs(runtime.checkpoints, manager)
         manager.close.assert_called_once()
 
@@ -161,6 +164,132 @@ class ShardedModelRuntimeTest(unittest.TestCase):
         self.assertFalse(dmp_cls.call_args_list[0].kwargs["init_data_parallel"])
         self.assertTrue(dmp_cls.call_args_list[1].kwargs["init_parameters"])
         self.assertTrue(dmp_cls.call_args_list[1].kwargs["init_data_parallel"])
+
+
+class ShardedModelRuntimeBackendTest(unittest.TestCase):
+    """The runtime acquires, wires and closes the optional RocksDB backend."""
+
+    def test_open_without_rocksdb_config_never_touches_the_backend(self) -> None:
+        config = _pipeline_config()
+        with (
+            mock.patch("tzrec.utils.runtime.CheckpointManager"),
+            mock.patch("tzrec.utils.rocksdb_util.create_rocksdb_runtime") as factory,
+        ):
+            with ShardedModelRuntime.open(config, mode="train") as runtime:
+                factory.assert_not_called()
+                self.assertIsNone(runtime._rocksdb)
+
+    def test_open_passes_reset_to_the_manager_and_closes_in_order(self) -> None:
+        config = _pipeline_config()
+        config.train_config.rocksdb_config.root_dir = "/tmp/tzrec_rocksdb"
+        backend, manager = mock.Mock(), mock.Mock()
+        order = []
+        manager.close.side_effect = lambda: order.append("manager")
+        backend.close.side_effect = lambda: order.append("backend")
+        with (
+            mock.patch(
+                "tzrec.utils.runtime.CheckpointManager", return_value=manager
+            ) as manager_cls,
+            mock.patch(
+                "tzrec.utils.rocksdb_util.create_rocksdb_runtime",
+                return_value=backend,
+            ) as factory,
+        ):
+            with ShardedModelRuntime.open(config, mode="eval") as runtime:
+                factory.assert_called_once_with(
+                    config.train_config.rocksdb_config, config.model_dir, "eval"
+                )
+                manager_cls.assert_called_once_with(
+                    config.model_dir,
+                    before_dynamicemb_load=backend.reset_for_import,
+                )
+                self.assertIs(runtime._rocksdb, backend)
+                self.assertEqual(order, [])
+            self.assertEqual(order, ["manager", "backend"])
+
+    def test_open_closes_both_resources_on_setup_error(self) -> None:
+        config = _pipeline_config()
+        config.train_config.rocksdb_config.root_dir = "/tmp/tzrec_rocksdb"
+        backend, manager = mock.Mock(), mock.Mock()
+        order = []
+        manager.close.side_effect = lambda: order.append("manager")
+        backend.close.side_effect = lambda: order.append("backend")
+        with (
+            mock.patch("tzrec.utils.runtime.CheckpointManager", return_value=manager),
+            mock.patch(
+                "tzrec.utils.rocksdb_util.create_rocksdb_runtime",
+                return_value=backend,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "setup boom"):
+                with ShardedModelRuntime.open(config, mode="eval"):
+                    raise RuntimeError("setup boom")
+        self.assertEqual(order, ["manager", "backend"])
+
+    def test_open_closes_the_backend_when_the_manager_cannot_construct(self) -> None:
+        config = _pipeline_config()
+        config.train_config.rocksdb_config.root_dir = "/tmp/tzrec_rocksdb"
+        backend = mock.Mock()
+        with (
+            mock.patch(
+                "tzrec.utils.runtime.CheckpointManager",
+                side_effect=RuntimeError("no manager"),
+            ),
+            mock.patch(
+                "tzrec.utils.rocksdb_util.create_rocksdb_runtime",
+                return_value=backend,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no manager"):
+                with ShardedModelRuntime.open(config, mode="eval"):
+                    pass
+        backend.close.assert_called_once()
+
+    def test_shard_binds_then_attaches_and_enforces_via_the_backend(self) -> None:
+        backend = mock.Mock()
+        runtime = ShardedModelRuntime(mock.Mock(), None, rocksdb=backend)
+        planner, dmp = mock.Mock(), mock.Mock()
+        order = []
+        backend.bind.side_effect = lambda plan: order.append("bind")
+        with (
+            mock.patch("tzrec.utils.runtime.create_planner", return_value=planner),
+            mock.patch("tzrec.utils.runtime.get_default_sharders", return_value=[]),
+            mock.patch("tzrec.utils.runtime.DistributedModelParallel") as dmp_cls,
+            mock.patch("tzrec.utils.runtime.logger"),
+        ):
+            dmp_cls.side_effect = lambda *args, **kwargs: order.append("dmp") or dmp
+            self.assertIs(
+                runtime.shard(
+                    mock.Mock(),
+                    device=torch.device("cpu"),
+                    batch_size=8,
+                    checkpoint_path=None,
+                ),
+                dmp,
+            )
+        self.assertEqual(order, ["bind", "dmp"])
+        backend.bind.assert_called_once_with(planner.collective_plan.return_value)
+        backend.attach.assert_called_once_with(dmp)
+        runtime.enforce_embedding_capacity()
+        backend.evict.assert_called_once()
+
+    def test_shard_and_enforce_without_backend_are_noops(self) -> None:
+        runtime = ShardedModelRuntime(mock.Mock(), None)
+        with (
+            mock.patch("tzrec.utils.runtime.create_planner", return_value=mock.Mock()),
+            mock.patch("tzrec.utils.runtime.get_default_sharders", return_value=[]),
+            mock.patch(
+                "tzrec.utils.runtime.DistributedModelParallel", return_value=mock.Mock()
+            ),
+            mock.patch("tzrec.utils.runtime.logger"),
+        ):
+            runtime.shard(
+                mock.Mock(),
+                device=torch.device("cpu"),
+                batch_size=8,
+                checkpoint_path=None,
+            )
+            runtime.enforce_embedding_capacity()
 
 
 if __name__ == "__main__":

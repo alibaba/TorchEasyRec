@@ -13,7 +13,7 @@
 
 import os
 from contextlib import closing, contextmanager
-from typing import Iterator, Literal, Optional
+from typing import Any, Iterator, Literal, Optional
 
 import torch
 from torch import distributed as dist
@@ -42,12 +42,20 @@ class ShardedModelRuntime:
     and drain its queued prune work. What differs between the entries --
     when and what to restore -- stays with the caller through
     ``self.checkpoints``.
+
+    With ``train_config.rocksdb_config`` the runtime also owns this rank's
+    optional RocksDB backend: it acquires it at open time, binds the
+    planned external storages to the rank-local session inside
+    :meth:`shard`, attaches the built caches to their storage, and closes
+    it after the checkpoint manager on every exit path. Ordinary
+    configurations run without the backend and without importing it.
     """
 
     def __init__(
         self,
         checkpoints: CheckpointManager,
         global_constraints_cfg: Optional[ParameterConstraints],
+        rocksdb: Optional[Any] = None,
     ) -> None:
         """Initialize around an owned manager and job-wide constraints.
 
@@ -55,8 +63,12 @@ class ShardedModelRuntime:
             checkpoints: the checkpoint manager this runtime owns.
             global_constraints_cfg: the pipeline's global embedding
                 constraints used for planning, or None when unset.
+            rocksdb: this rank's RocksDB runtime
+                (``rocksdb_util.RocksDBRuntime``), or None when the job
+                does not offload embeddings.
         """
         self._global_constraints_cfg = global_constraints_cfg
+        self._rocksdb = rocksdb
         self.checkpoints = checkpoints
 
     @classmethod
@@ -73,7 +85,10 @@ class ShardedModelRuntime:
         its retention and export settings, while the other entries keep
         the read-only defaults. The manager is closed on every exit path,
         including setup failures and early returns inside the ``with``
-        body; without a prune worker, close is a no-op.
+        body; without a prune worker, close is a no-op. With
+        ``rocksdb_config`` the optional rank-local backend is acquired
+        here and closed after the manager, so its working directory never
+        outlives queued checkpoint work.
 
         Args:
             pipeline_config: the job's pipeline configuration.
@@ -81,25 +96,44 @@ class ShardedModelRuntime:
                 "eval", "predict_checkpoint" or "export".
 
         Yields:
-            The runtime owning the checkpoint manager.
+            The runtime owning the checkpoint manager and, when
+            configured, the RocksDB backend.
         """
-        if mode == "train":
-            manager = CheckpointManager(
-                pipeline_config.model_dir,
-                keep_checkpoint_max=pipeline_config.train_config.keep_checkpoint_max,
+        train = pipeline_config.train_config
+        constraints = (
+            train.global_embedding_constraints
+            if train.HasField("global_embedding_constraints")
+            else None
+        )
+        backend = None
+        if train.HasField("rocksdb_config"):
+            from tzrec.utils.rocksdb_util import create_rocksdb_runtime
+
+            backend = create_rocksdb_runtime(
+                train.rocksdb_config, pipeline_config.model_dir, mode
+            )
+        manager_kwargs = (
+            dict(
+                keep_checkpoint_max=train.keep_checkpoint_max,
                 export_config=pipeline_config.export_config,
             )
-        else:
-            # Existing standalone eval/predict/export manager defaults.
-            manager = CheckpointManager(pipeline_config.model_dir)
-        with closing(manager):
-            train = pipeline_config.train_config
-            constraints = (
-                train.global_embedding_constraints
-                if train.HasField("global_embedding_constraints")
-                else None
-            )
-            yield cls(manager, constraints)
+            if mode == "train"
+            else {}
+        )
+        try:
+            with closing(
+                CheckpointManager(
+                    pipeline_config.model_dir,
+                    before_dynamicemb_load=(
+                        backend.reset_for_import if backend is not None else None
+                    ),
+                    **manager_kwargs,
+                )
+            ) as checkpoints:
+                yield cls(checkpoints, constraints, rocksdb=backend)
+        finally:
+            if backend is not None:
+                backend.close()
 
     def shard(
         self,
@@ -114,11 +148,15 @@ class ShardedModelRuntime:
         """Collectively plan and shard one model, returning the DMP model.
 
         Uses the caller's device, sampled batch size and optional saved
-        plan, with the constraints captured at open time. Keeps the DMP
-        defaults; RTP's FX tracing passes False for both flags to trace
-        the unsharded view. Does not initialize a process group, create
-        features, change the train/eval mode or restore weights; restore
-        belongs to the caller via ``self.checkpoints``.
+        plan, with the constraints captured at open time. The broadcast
+        plan is bound to this rank's backend session before the DMP model
+        is constructed from it, and the built caches are attached to their
+        storage afterwards; the backend stays None for ordinary
+        configurations. Keeps the DMP defaults; RTP's FX tracing passes
+        False for both flags to trace the unsharded view. Does not
+        initialize a process group, create features, change the train/eval
+        mode or restore weights; restore belongs to the caller via
+        ``self.checkpoints``.
 
         Args:
             model: the wrapped model to shard.
@@ -141,12 +179,15 @@ class ShardedModelRuntime:
             else None,
             global_constraints_cfg=self._global_constraints_cfg,
             model=model,
+            rocksdb=self._rocksdb,
         )
         sharders = get_default_sharders()
         plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
         if int(os.environ.get("RANK", 0)) == 0:
             logger.info(str(plan))
-        return DistributedModelParallel(
+        if self._rocksdb is not None:
+            self._rocksdb.bind(plan)
+        dmp_model = DistributedModelParallel(
             module=model,
             sharders=sharders,
             device=device,
@@ -154,3 +195,17 @@ class ShardedModelRuntime:
             init_parameters=init_parameters,
             init_data_parallel=init_data_parallel,
         )
+        if self._rocksdb is not None:
+            self._rocksdb.attach(dmp_model)
+        return dmp_model
+
+    def enforce_embedding_capacity(self) -> None:
+        """Evict offloaded dynamic tables above their planned capacity.
+
+        Delegates to the attached backend when the job has one; without
+        one there is nothing to enforce. Call only with no lookup in
+        flight: after a completed update, and at the drained final-batch
+        boundary, before the step is published or saved.
+        """
+        if self._rocksdb is not None:
+            self._rocksdb.evict()
