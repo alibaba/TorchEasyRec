@@ -1159,8 +1159,9 @@ class PredictionLifecycleTest(unittest.TestCase):
     ) -> None:
         """The guarded profiler stop runs exactly once, on either exit path.
 
-        On success the stop must precede the commit rendezvous; on a pipeline
-        failure it must still run while the commit is skipped.
+        On success the stop must precede the commit rendezvous; a pipeline
+        failure still reaches the rendezvous, but its output is not
+        committed.
         """
         dataloader = mock.Mock()
         dataloader.get_iterator.return_value = iter([self._batch(2), self._batch(2)])
@@ -1204,10 +1205,9 @@ class PredictionLifecycleTest(unittest.TestCase):
         writer.close.assert_called_once_with()
 
     def test_predict_setup_failure_stops_profiler_without_commit(self) -> None:
-        """A failure before the pipeline threads stop the started profiler.
+        """Setup failures still stop the profiler.
 
-        The outer guard covers stream/queue setup: the profiler never leaks
-        running, and the failure must not start the commit collective.
+        The setup failure propagates before reaching the commit rendezvous.
         """
         dataloader = mock.Mock()
         dataloader.get_iterator.return_value = iter([self._batch(2)])

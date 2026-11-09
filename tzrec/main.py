@@ -1617,8 +1617,6 @@ def predict(
         )
         prof.start()
 
-    # Covers stream/queue setup too: a failure before the pipeline threads
-    # exist still stops the profiler and must not reach the commit rendezvous.
     try:
         if predict_threads is None:
             # with a distributed embedding, each lookup stream holds its own
