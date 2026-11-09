@@ -44,7 +44,8 @@ from tzrec.prompt.assembler import CU_SEQLENS, HOLE_POSITIONS, INPUT_IDS
 from tzrec.prompt.compile import sid_bands
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import npz_util
+from tzrec.utils import config_util, npz_util
+from tzrec.utils.hf_export_util import SERVING_MODEL_TYPE
 from tzrec.utils.logging_util import logger
 
 _PREDICT_PIPELINE_POLL_INTERVAL = 0.1
@@ -1386,7 +1387,8 @@ class GenRecExportModel:
     Args:
         model_path: the export directory.
         devices: devices to predict on, one LM replica each.
-        pipeline_config: the export's pipeline config, after any edits.
+        pipeline_config: the export's pipeline config, after any edits; the
+            export's own pipeline.config when None.
         log_model: log the front-end model.
     """
 
@@ -1394,9 +1396,13 @@ class GenRecExportModel:
         self,
         model_path: str,
         devices: List[torch.device],
-        pipeline_config: EasyRecConfig,
+        pipeline_config: Optional[EasyRecConfig],
         log_model: bool = False,
     ) -> None:
+        if pipeline_config is None:
+            pipeline_config = config_util.load_pipeline_config(
+                os.path.join(model_path, "pipeline.config"), allow_unknown_field=True
+            )
         with open(os.path.join(model_path, "config.json")) as f:
             hf_config = json.load(f)
         sid_space = hf_config.get("sid_space")
@@ -1578,16 +1584,19 @@ def load_predict_model(
             each, other exports use only the first.
         log_model (bool): log the loaded model.
         pipeline_config (EasyRecConfig, optional): the export's pipeline config,
-            after any edits. Required to predict a GenRec export, which decodes
-            with its beam settings; without it the export's model is loaded as is.
+            after any edits. A GenRec export, whose config.json has model_type
+            genrec, decodes with its beam settings, read from the export's own
+            pipeline.config when not given.
 
     Return:
         a callable of (batch, batch_size input of tiled models, device) returning
         the predictions, the decoded SIDs for a GenRec export.
     """
-    if (
-        pipeline_config is not None
-        and pipeline_config.model_config.WhichOneof("model") == "genrec_causal_lm_model"
-    ):
+    hf_config_path = os.path.join(model_path, "config.json")
+    is_genrec = False
+    if os.path.exists(hf_config_path):
+        with open(hf_config_path) as f:
+            is_genrec = json.load(f).get("model_type") == SERVING_MODEL_TYPE
+    if is_genrec:
         return GenRecExportModel(model_path, devices, pipeline_config, log_model)
     return _load_batch_model(model_path, devices, log_model)
