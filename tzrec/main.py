@@ -1706,8 +1706,8 @@ def predict(
         batch_model = predict_util.load_predict_model(
             scripted_model_path,
             forward_devices,
-            pipeline_config,
             log_model=is_profiling and is_rank_zero,
+            pipeline_config=pipeline_config,
         )
         while True:
             try:

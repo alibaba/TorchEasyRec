@@ -1533,8 +1533,9 @@ def _load_batch_model(
 def load_predict_model(
     model_path: str,
     devices: List[torch.device],
-    pipeline_config: EasyRecConfig,
     log_model: bool = False,
+    *,
+    pipeline_config: Optional[EasyRecConfig] = None,
 ) -> Callable[[Batch, Optional[torch.Tensor], torch.device], Dict[str, torch.Tensor]]:
     """Load an export for predict.
 
@@ -1543,14 +1544,18 @@ def load_predict_model(
         devices (list): devices to predict on; a distributed embedding export shares
             its sparse tables across them and a GenRec export keeps an LM replica on
             each, other exports use only the first.
-        pipeline_config (EasyRecConfig): the export's pipeline config, after any
-            edits; a GenRec export decodes with its beam settings.
         log_model (bool): log the loaded model.
+        pipeline_config (EasyRecConfig, optional): the export's pipeline config,
+            after any edits. Required to predict a GenRec export, which decodes
+            with its beam settings; without it the export's model is loaded as is.
 
     Return:
         a callable of (batch, batch_size input of tiled models, device) returning
         the predictions, the decoded SIDs for a GenRec export.
     """
-    if pipeline_config.model_config.WhichOneof("model") == "genrec_causal_lm_model":
+    if (
+        pipeline_config is not None
+        and pipeline_config.model_config.WhichOneof("model") == "genrec_causal_lm_model"
+    ):
         return GenRecExportModel(model_path, devices, pipeline_config, log_model)
     return _load_batch_model(model_path, devices, log_model)
