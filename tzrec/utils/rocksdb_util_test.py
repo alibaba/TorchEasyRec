@@ -83,7 +83,13 @@ class RocksDBRuntimeTest(unittest.TestCase):
         self.assertEqual(rocksdb_util.cache_rows(10**6, 0.01), 10240)
 
     def test_bind_opens_one_session_per_rank(self):
-        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+        try:
+            from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+        except ModuleNotFoundError as e:
+            # ``storage`` imports dynamicemb at module level, and only the
+            # GPU requirement variants install it; the facade the class
+            # guard checks stays importable without it.
+            self.skipTest(f"tzrec_ext.rocksdb.storage needs {e.name}")
 
         config = _backend_config()
         options = [
