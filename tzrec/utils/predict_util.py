@@ -1379,11 +1379,43 @@ def load_predict_model(
         the predictions.
     """
     if acc_utils.is_distributed_embedding_predict(model_path):
-        return DistributedEmbeddingModel(model_path, devices, log_model)
-    if acc_utils.is_aot_predict(model_path):
-        model = aot_utils.load_model_aot(model_path, device=devices[0])
+        batch_model = DistributedEmbeddingModel(model_path, devices, log_model)
     else:
-        model = _load_scripted_model(model_path, devices[0])
-    if log_model:
-        logger.info(str(model))
-    return _wrap_batch_predict_model(model)
+        if acc_utils.is_aot_predict(model_path):
+            model = aot_utils.load_model_aot(model_path, device=devices[0])
+        else:
+            model = _load_scripted_model(model_path, devices[0])
+        if log_model:
+            logger.info(str(model))
+        batch_model = _wrap_batch_predict_model(model)
+    with open(os.path.join(model_path, "model_acc.json")) as source:
+        hard_search_input_tile_config = json.load(source).get(
+            "hard_search_input_tile", {}
+        )
+    sequences = sorted(set(hard_search_input_tile_config.get("features", {}).values()))
+    if not sequences:
+        return batch_model
+
+    def predict_hard_search_input_tile(
+        batch: Batch, batch_size: Optional[torch.Tensor], device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Supply identity mappings for offline batches already expanded per sample."""
+        missing = [
+            f"{sequence}__inverse_indices"
+            for sequence in sequences
+            if f"{sequence}__inverse_indices" not in batch.additional_infos
+        ]
+        if missing:
+            rows = max(
+                [value.stride() for value in batch.sparse_features.values()]
+                + [value.values().size(0) for value in batch.dense_features.values()]
+                + [
+                    value.lengths().numel()
+                    for value in batch.sequence_dense_features.values()
+                ]
+            )
+            indices = torch.arange(rows, dtype=torch.int64)
+            batch.additional_infos.update({key: indices for key in missing})
+        return batch_model(batch, batch_size, device)
+
+    return predict_hard_search_input_tile
