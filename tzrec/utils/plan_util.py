@@ -47,10 +47,6 @@ from torchrec.distributed.planner.enumerators import (
 from torchrec.distributed.planner.enumerators import (
     EmbeddingEnumerator as _EmbeddingEnumerator,
 )
-from torchrec.distributed.planner.partitioners import (
-    GreedyPerfPartitioner,
-    Partitioner,
-)
 from torchrec.distributed.planner.proposers import UniformProposer
 from torchrec.distributed.planner.shard_estimators import (
     EmbeddingPerfEstimator,
@@ -98,40 +94,6 @@ from tzrec.utils.dynamicemb_util import (
     has_dynamicemb,
 )
 from tzrec.utils.logging_util import logger
-
-
-class _DynamicEmbGroupCheckPartitioner:
-    """Default partitioner wrapped with the native dynamicemb group check.
-
-    The wrapper adds the complete-proposal validation the additive candidate
-    estimates cannot do: after the inner partitioner places ranks, each
-    fused dynamicemb group's actual tier costs are recomputed under the
-    runtime's native grouping and fit rule (without allocating) and checked
-    against the reserved topology. An over-budget proposal raises
-    ``PlannerError`` -- the same signal the inner partitioner uses for
-    infeasible storage -- so the planner's existing partition/feedback flow
-    rejects it and another proposal is tried.
-    """
-
-    def __init__(self, inner: Partitioner) -> None:
-        """Wrap ``inner``, which performs the normal rank placement."""
-        self._inner = inner
-
-    def partition(
-        self,
-        proposal: List[ShardingOption],
-        storage_constraint: Topology,
-    ) -> List[ShardingOption]:
-        """Place ranks, then validate the fused dynamicemb groups."""
-        plan = self._inner.partition(
-            proposal=proposal,
-            storage_constraint=storage_constraint,
-        )
-        if has_dynamicemb and any(
-            getattr(option, "use_dynamicemb", False) for option in plan
-        ):
-            dynamicemb_util._validate_dynamicemb_group_fit(plan, storage_constraint)
-        return plan
 
 
 def create_planner(
@@ -256,7 +218,6 @@ def create_planner(
             global_constraints=global_constraints,
         ),
         storage_reservation=storage_reservation,
-        partitioner=_DynamicEmbGroupCheckPartitioner(GreedyPerfPartitioner()),
         # DP bin counts are env-tunable; defaults match the proposer signature.
         proposer=[
             DynamicProgrammingProposer(

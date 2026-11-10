@@ -28,8 +28,6 @@ from torchrec.distributed.planner.estimator.types import (
 )
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
-    PlannerError,
-    PlannerErrorType,
     SharderData,
     ShardingOption,
     Storage,
@@ -210,63 +208,47 @@ def _dynamicemb_placement_memory(
     its own key map and values and is never resident capacity.
     """
     cache_width = DYNAMICEMB_CACHE_BUCKET_CAPACITY
-    if layout in ("HYBRID", "CACHING"):
-        hbm_rows = _bucket_rounded_rows(
+    budget = 0
+    if layout in ("HOST_ONLY", "HBM_ONLY"):
+        on_hbm = layout == "HBM_ONLY"
+        hbm_rows = full_rows if on_hbm else 0
+        host_rows = 0 if on_hbm else full_rows
+        resident_rows = hbm_rows
+        budget = hbm_rows * row_bytes
+        keymaps = [(full_slots, width, score_words)]
+    else:
+        resident_rows = _bucket_rounded_rows(
             min(shard_rows, max(1, int(shard_rows * frac))), cache_width
         )
-        host_rows = _bucket_rounded_rows(
-            min(shard_rows, max(1, int(shard_rows * (1.0 - frac)))), width
-        )
-    else:
-        hbm_rows = 0
-        host_rows = 0
-    if layout == "HOST_ONLY":
-        return DynamicEmbTableMemory(
-            hbm_values=0,
-            host_values=full_rows * row_bytes,
-            hbm_index=_keymap_bytes(full_slots, score_words, bucket_capacity=width),
-            hbm_rows=0,
-            host_rows=full_rows,
-            resident_rows=0,
-            local_hbm_for_values=0,
-        )
-    if layout == "HBM_ONLY":
-        return DynamicEmbTableMemory(
-            hbm_values=full_rows * row_bytes,
-            host_values=0,
-            hbm_index=_keymap_bytes(full_slots, score_words, bucket_capacity=width),
-            hbm_rows=full_rows,
-            host_rows=0,
-            resident_rows=full_rows,
-            local_hbm_for_values=full_rows * row_bytes,
-        )
-    if layout == "HYBRID":
-        return DynamicEmbTableMemory(
-            hbm_values=hbm_rows * row_bytes,
-            host_values=host_rows * row_bytes,
-            hbm_index=(
-                _keymap_bytes(hbm_rows, score_words, bucket_capacity=cache_width)
-                + _keymap_bytes(host_rows, score_words, bucket_capacity=width)
-            ),
-            hbm_rows=hbm_rows,
-            host_rows=host_rows,
-            resident_rows=hbm_rows,
-            local_hbm_for_values=0,
-        )
-    # CACHING: a resident cache tier above a full host backing store.
-    overflow_rows = _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS * cache_width
+        if layout == "HYBRID":
+            hbm_rows = resident_rows
+            host_rows = _bucket_rounded_rows(
+                min(shard_rows, max(1, int(shard_rows * (1.0 - frac)))), width
+            )
+            keymaps = [
+                (hbm_rows, cache_width, score_words),
+                (host_rows, width, score_words),
+            ]
+        else:
+            overflow_rows = _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS * cache_width
+            hbm_rows = resident_rows + overflow_rows
+            host_rows = full_rows
+            keymaps = [
+                (resident_rows, cache_width, cache_words),
+                (overflow_rows, overflow_rows, cache_words),
+                (full_slots, width, score_words),
+            ]
     return DynamicEmbTableMemory(
-        hbm_values=(hbm_rows + overflow_rows) * row_bytes,
-        host_values=full_rows * row_bytes,
-        hbm_index=(
-            _keymap_bytes(hbm_rows, cache_words, bucket_capacity=cache_width)
-            + _keymap_bytes(overflow_rows, cache_words, bucket_capacity=overflow_rows)
-            + _keymap_bytes(full_slots, score_words, bucket_capacity=width)
+        hbm_values=hbm_rows * row_bytes,
+        host_values=host_rows * row_bytes,
+        hbm_index=sum(
+            _keymap_bytes(slots, words, bucket_capacity=bucket)
+            for slots, bucket, words in keymaps
         ),
-        hbm_rows=hbm_rows + overflow_rows,
-        host_rows=full_rows,
-        resident_rows=hbm_rows,
-        local_hbm_for_values=0,
+        hbm_rows=hbm_rows,
+        host_rows=host_rows,
+        resident_rows=resident_rows,
+        local_hbm_for_values=budget,
     )
 
 
@@ -303,10 +285,10 @@ def dynamicemb_table_memory(
     group outcomes the runtime can reach for the member -- a zero-budget
     member of a mixed group acquires a minimum HBM tier and a fully funded
     one a minimum host tier -- by taking, per field, the larger of the
-    reachable placements. An aligned-budget surplus can also make a fitting
-    mixed group wholly HBM-only; that native fit result is checked when a
-    complete proposal is evaluated, not by overcharging this per-table
-    budget.
+    reachable placements. Constraints normalize tensor shards and runtime
+    max_capacity to the same aligned rows before candidate generation. No
+    table's value budget exceeds its full size, so a group can fit wholly
+    in HBM only when all members are fully funded.
 
     Args:
         caching: the candidate's caching choice. Partial candidates
@@ -354,7 +336,7 @@ def dynamicemb_table_memory(
         cache_words=cache_words,
     )
 
-    def envelope(layouts: List[str]) -> DynamicEmbTableMemory:
+    def envelope(layouts: List[Tuple[str, float]]) -> DynamicEmbTableMemory:
         """Per-field maximum over the placements an endpoint can reach."""
         branches = [
             _dynamicemb_placement_memory(layout, **placement_kwargs, frac=frac)
@@ -372,10 +354,9 @@ def dynamicemb_table_memory(
         # HOST_ONLY in an all-zero group, or the minimum HBM tier of a mixed
         # HYBRID group -- which the runtime only builds for a table it can
         # split, so NO_EVICTION reaches the standalone branch alone.
-        layouts = [("HOST_ONLY", 0.0)]
-        if not no_eviction:
-            layouts.append(("HYBRID", 0.0))
-        return envelope(layouts)
+        return _dynamicemb_placement_memory(
+            "HOST_ONLY" if no_eviction else "HYBRID", **placement_kwargs, frac=0.0
+        )
     if ratio == 1.0:
         # Reachable native outcomes of a fully funded non-caching member:
         # HBM_ONLY in a fitting group, or the minimum host tier of a mixed
@@ -617,6 +598,10 @@ try:
         ProbabilisticAdmissionStrategy,
         align_to_table_size,
     )
+    from dynamicemb.dynamicemb_config import (
+        DEFAULT_BUCKET_CAPACITY,
+        _sharded_table_bucket_layout,
+    )
     from dynamicemb.key_value_table import get_score_policy
     from dynamicemb.planner import (
         DynamicEmbParameterConstraints,
@@ -785,7 +770,11 @@ def _build_dynamicemb_initializer(
 def build_dynamicemb_constraints(
     dynamicemb_cfg: feature_pb2.DynamicEmbedding, emb_config: BaseEmbeddingConfig
 ) -> ParameterConstraints:
-    """Build ParameterConstraints for DynamicEmbedding."""
+    """Build row-wise constraints with matching tensor and table capacities.
+
+    Normalize the shared table config before EBC/EC materializes its tensor.
+    Initializer and admission defaults continue to use the configured row count.
+    """
     if not has_dynamicemb:
         raise RuntimeError(
             "dynamicemb is not installed; required by features with "
@@ -794,6 +783,17 @@ def build_dynamicemb_constraints(
     _validate_eval_initializer_for_tombstones(dynamicemb_cfg, emb_config.name)
     embedding_dim = emb_config.embedding_dim
     num_embeddings = emb_config.num_embeddings
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    bucket_capacity = (
+        dynamicemb_cfg.bucket_capacity
+        if dynamicemb_cfg.HasField("bucket_capacity")
+        else DEFAULT_BUCKET_CAPACITY
+    )
+    num_buckets, bucket_capacity = _sharded_table_bucket_layout(
+        emb_config, world_size, bucket_capacity
+    )
+    local_rows = num_buckets * bucket_capacity
+    emb_config.num_embeddings = local_rows * world_size
 
     score_strategy = None
     if dynamicemb_cfg.score_strategy in DynamicEmbScoreStrategy.__members__.keys():
@@ -807,7 +807,10 @@ def build_dynamicemb_constraints(
 
     init_capacity = None
     if dynamicemb_cfg.HasField("init_capacity_per_rank"):
-        init_capacity = align_to_table_size(dynamicemb_cfg.init_capacity_per_rank)
+        init_capacity = min(
+            align_to_table_size(dynamicemb_cfg.init_capacity_per_rank, bucket_capacity),
+            local_rows,
+        )
 
     admit_strategy = None
     admission_strategy_type = dynamicemb_cfg.WhichOneof("admission_strategy")
@@ -825,7 +828,6 @@ def build_dynamicemb_constraints(
                 if admission_strategy_cfg.HasField("counter_capacity")
                 else num_embeddings
             )
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
             admit_strategy = FrequencyAdmissionStrategy(
                 threshold=admission_strategy_cfg.threshold,
                 counter=KVCounter(
@@ -842,14 +844,12 @@ def build_dynamicemb_constraints(
         else:
             raise ValueError(f"Unknown AdmissionStrategy: {admission_strategy_type}")
 
-    demb_opt_kwargs = {}
-    if dynamicemb_cfg.HasField("bucket_capacity"):
-        demb_opt_kwargs["bucket_capacity"] = dynamicemb_cfg.bucket_capacity
+    demb_opt_kwargs = {"bucket_capacity": bucket_capacity}
     if _auto_retain_evicted_keys:
         _arm_evicted_key_retention(demb_opt_kwargs)
 
     dynamicemb_options = dynamicemb.DynamicEmbTableOptions(
-        max_capacity=dynamicemb_cfg.max_capacity,
+        max_capacity=local_rows,
         init_capacity=init_capacity,
         # TODO: convert eb_config.init_fn to dynamicemb initializer
         initializer_args=_build_dynamicemb_initializer(
@@ -956,159 +956,6 @@ if has_dynamicemb:
             score_words=_dynamicemb_score_words(dynamicemb_options),
             no_eviction=_dynamicemb_no_eviction(dynamicemb_options),
         )
-
-    def _validate_dynamicemb_group_fit(
-        plan: List[ShardingOption],
-        storage_constraint: Topology,
-    ) -> None:
-        """Check a complete proposal's fused dynamicemb groups against memory.
-
-        Runs after normal rank placement and before the plan is accepted.
-        Groups the proposal's dynamicemb tables the way the runtime will
-        (native ``get_grouped_key``, within one module path), decides each
-        group's layout with the runtime's fit rule on the sums of its sizes
-        and budgets -- without allocating anything -- and recomputes the
-        group's actual tier costs through the same capacity arithmetic the
-        candidates were estimated with. The additive candidate estimates
-        cannot prove this: an aligned-budget surplus makes a mixed group
-        wholly HBM-only, moving member values from the estimated host tier
-        into HBM.
-
-        Raises:
-            PlannerError: when any rank's recomputed HBM or DDR use exceeds
-                the reserved topology, so the existing partition/feedback
-                flow rejects the proposal and another is tried.
-        """
-        num_ranks = len(storage_constraint.devices)
-        hbm_used = [0] * num_ranks
-        ddr_used = [0] * num_ranks
-        # (rank, module path, grouped key) -> member sizing entries
-        groups: Dict[tuple, List[tuple]] = {}
-
-        for sharding_option in plan:
-            is_dynamicemb = bool(getattr(sharding_option, "use_dynamicemb", False))
-            for shard in sharding_option.shards:
-                rank = cast(int, shard.rank)
-                if not is_dynamicemb:
-                    hbm_used[rank] += shard.storage.hbm or 0
-                    ddr_used[rank] += shard.storage.ddr or 0
-                    continue
-                options = sharding_option.dynamicemb_options
-                tensor = sharding_option.tensor
-                score_words = _dynamicemb_score_words(options)
-                no_eviction = _dynamicemb_no_eviction(options)
-                state_dim = _dynamicemb_optimizer_state_dim(
-                    getattr(tensor, "_optimizer_classes", [None])[0],
-                    tensor.shape,
-                    tensor.dtype,
-                )
-                memory = dynamicemb_table_memory(
-                    caching=bool(options.caching),
-                    ratio=float(sharding_option.cache_load_factor),
-                    shard_rows=shard.size[0],
-                    dim=tensor.shape[1],
-                    element_size=tensor.element_size(),
-                    optimizer_state_dim=state_dim,
-                    bucket_capacity=options.bucket_capacity,
-                    score_words=score_words,
-                    no_eviction=no_eviction,
-                )
-                sizing = _dynamicemb_table_sizing(
-                    shard.size[0],
-                    bucket_capacity=options.bucket_capacity,
-                    score_words=score_words,
-                    no_eviction=no_eviction,
-                )
-                key = (
-                    rank,
-                    sharding_option.path,
-                    tuple(sorted(options.get_grouped_key().items())),
-                )
-                # The estimator charged this shard the candidate's values and
-                # key maps plus its pipeline-I/O and admission-counter costs;
-                # the group recompute replaces the first two exactly and must
-                # keep the rest rather than drop it.
-                extra_hbm = int(shard.storage.hbm or 0) - (
-                    memory.hbm_values + memory.hbm_index
-                )
-                extra_ddr = int(shard.storage.ddr or 0) - memory.host_values
-                groups.setdefault(key, []).append(
-                    (
-                        options,
-                        memory,
-                        sizing,
-                        (tensor.shape[1] + state_dim) * tensor.element_size(),
-                        shard.size[0],
-                        score_words,
-                        extra_hbm,
-                        extra_ddr,
-                    )
-                )
-
-        for (rank, _path, _grouped_key), members in groups.items():
-            # The runtime's fit basis: the raw per-shard max_capacity bytes,
-            # while the candidate budgets derive from the aligned capacity --
-            # the gap is what lets a fully funded member's surplus cover an
-            # underfunded groupmate and turn the group wholly HBM-only.
-            total_bytes = sum(
-                raw_rows * row_bytes
-                for _opts, _mem, _sizing, row_bytes, raw_rows, _w, _eh, _ed in members
-            )
-            total_budget = sum(member[1].local_hbm_for_values for member in members)
-            if total_bytes <= total_budget:
-                layout = "HBM_ONLY"
-            elif bool(members[0][0].caching):
-                layout = "CACHING"
-            elif total_budget <= 0:
-                layout = "HOST_ONLY"
-            else:
-                layout = "HYBRID"
-            for (
-                _opts,
-                memory,
-                sizing,
-                row_bytes,
-                raw_rows,
-                score_words,
-                e_h,
-                e_d,
-            ) in members:
-                width, full_rows, full_slots, cache_words = sizing
-                # The runtime splits on the raw rows and its own fraction of
-                # budget over raw bytes.
-                frac = min(1.0, memory.local_hbm_for_values / (raw_rows * row_bytes))
-                placement = _dynamicemb_placement_memory(
-                    layout,
-                    shard_rows=raw_rows,
-                    row_bytes=row_bytes,
-                    full_rows=full_rows,
-                    full_slots=full_slots,
-                    width=width,
-                    score_words=score_words,
-                    cache_words=cache_words,
-                    frac=frac,
-                )
-                hbm_used[rank] += placement.hbm_values + placement.hbm_index + e_h
-                ddr_used[rank] += placement.host_values + e_d
-
-        for rank, device in enumerate(storage_constraint.devices):
-            over = []
-            if hbm_used[rank] > device.storage.hbm:
-                over.append(f"hbm {hbm_used[rank]} > {device.storage.hbm}")
-            if ddr_used[rank] > device.storage.ddr:
-                over.append(f"ddr {ddr_used[rank]} > {device.storage.ddr}")
-            if over:
-                if int(os.environ.get("RANK", 0)) == 0:
-                    logger.info(
-                        "[dynamicemb plan] proposal rejected: rank "
-                        f"{rank} exceeds storage after native group fusion "
-                        f"({'; '.join(over)})"
-                    )
-                raise PlannerError(
-                    "proposal exceeds rank storage after native dynamicemb "
-                    f"group fusion on rank {rank}: " + "; ".join(over),
-                    error_type=PlannerErrorType.INSUFFICIENT_STORAGE,
-                )
 
     def _to_sharding_plan(
         sharding_options: List[ShardingOption],

@@ -720,6 +720,122 @@ class NativeDynamicEmbOptionsGroupingTest(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(
+    dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+)
+@mark_ci_scope("gpu")
+class DynamicEmbCapacityNormalizationTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            ("single_rank", 250, 1, 128, 256, 128),
+            ("four_ranks", 1000, 4, 128, 256, 128),
+            ("three_ranks", 100003, 3, 256, 33536, 256),
+            ("one_bucket", 1000, 4, 2**63 - 1, 256, 256),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_tensor_shards_and_budgets_match_capacity(
+        self, _name, rows, world_size, bucket, local_rows, effective_bucket
+    ):
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": str(world_size)}):
+            table = EmbeddingBagConfig(
+                name="aligned",
+                num_embeddings=rows,
+                embedding_dim=16,
+                feature_names=["aligned"],
+            )
+            cfg = feature_pb2.DynamicEmbedding(
+                max_capacity=rows, bucket_capacity=bucket
+            )
+            constraint = dynamicemb_util.build_dynamicemb_constraints(cfg, table)
+            self.assertEqual(table.num_embeddings, local_rows * world_size)
+            self.assertEqual(constraint.dynamicemb_options.max_capacity, local_rows)
+            self.assertEqual(
+                constraint.dynamicemb_options.bucket_capacity, effective_bucket
+            )
+            model = TestSparseNN(tables=[table], sparse_device=torch.device("meta"))
+            enumerator = EmbeddingEnumerator(
+                topology=Topology(world_size=world_size, compute_device="cuda"),
+                batch_size=128,
+                fqn_constraints={"sparse.ebc.aligned": constraint},
+            )
+            options = enumerator.enumerate(model, get_default_sharders())
+            for option in options:
+                self.assertEqual(option.tensor.shape[0], local_rows * world_size)
+                for shard in option.shards:
+                    self.assertEqual(shard.size[0], local_rows)
+                    memory = dynamicemb_util.dynamicemb_table_memory(
+                        caching=option.dynamicemb_options.caching,
+                        ratio=option.cache_load_factor,
+                        shard_rows=shard.size[0],
+                        dim=16,
+                        element_size=4,
+                        bucket_capacity=effective_bucket,
+                    )
+                    full = local_rows * 16 * 4
+                    if option.cache_load_factor == 1.0:
+                        self.assertEqual(memory.local_hbm_for_values, full)
+                    else:
+                        self.assertLess(memory.local_hbm_for_values, full)
+
+    @parameterized.expand(
+        [("small", 1, 256), ("aligned", 512, 512), ("clamped", 1500, 1024)],
+        name_func=parameterized_name_func,
+    )
+    def test_initial_capacity_uses_the_effective_bucket(self, _name, initial, expected):
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": "4"}):
+            table = EmbeddingBagConfig(
+                name="aligned",
+                num_embeddings=4000,
+                embedding_dim=16,
+                feature_names=["aligned"],
+            )
+            cfg = feature_pb2.DynamicEmbedding(
+                max_capacity=4000, bucket_capacity=256, init_capacity_per_rank=initial
+            )
+            options = dynamicemb_util.build_dynamicemb_constraints(
+                cfg, table
+            ).dynamicemb_options
+            self.assertEqual(options.max_capacity, 1024)
+            self.assertEqual(options.init_capacity, expected)
+
+    def test_normalized_mixed_group_has_no_alignment_surplus(self):
+        from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+        from fbgemm_gpu.split_embedding_configs import EmbOptimType
+
+        options = []
+        for rows, dim, ratio in ((4000, 64, 0.0), (897, 2048, 1.0)):
+            table = EmbeddingBagConfig(
+                name=f"table_{dim}",
+                num_embeddings=rows,
+                embedding_dim=dim,
+                feature_names=[f"feature_{dim}"],
+            )
+            with mock.patch.dict(os.environ, {"WORLD_SIZE": "1"}):
+                option = dynamicemb_util.build_dynamicemb_constraints(
+                    feature_pb2.DynamicEmbedding(max_capacity=rows), table
+                ).dynamicemb_options
+            option.dim = dim
+            option.embedding_dtype = torch.float32
+            option.index_type = torch.int64
+            option.training = True
+            option.caching = False
+            option.local_hbm_for_values = int(ratio * option.max_capacity * dim * 4)
+            options.append(option)
+        self.assertLess(
+            sum(o.local_hbm_for_values for o in options),
+            sum(o.max_capacity * o.dim * 4 for o in options),
+        )
+        module = BatchedDynamicEmbeddingTablesV2(
+            table_options=options,
+            table_names=["zero", "full"],
+            feature_table_map=[0, 1],
+            optimizer=EmbOptimType.EXACT_SGD,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        self.assertEqual(module._storage_layout.name, "HYBRID")
+
+
 class DynamicEmbPlanConversionTest(unittest.TestCase):
     """Plan conversion turns a candidate into native runtime options."""
 
@@ -1166,22 +1282,6 @@ class CapacityMirrorRuntimeParityTest(unittest.TestCase):
         reverse = self._build_module([o for o, _ in reversed(specs)])
         self.assertEqual(forward._storage_layout.name, reverse._storage_layout.name)
         self.assertEqual(self._module_bytes(forward), self._module_bytes(reverse))
-
-    def test_aligned_surplus_makes_fitting_mixed_group_hbm_only(self):
-        # an aligned full-budget member can cover another member's shortfall:
-        # the summed budgets fit the summed sizes, and the whole group goes
-        # HBM_ONLY even though one member requested a partial share. The
-        # envelope must cover that allocation too.
-        full, full_mem = self._make_options(rows=5, dim=64, ratio=1.0, caching=False)
-        partial, partial_mem = self._make_options(
-            rows=5, dim=64, ratio=0.5, caching=False
-        )
-        module = self._build_module([full, partial])
-        hbm_values, host_values, keymap = self._module_bytes(module)
-        self.assertEqual(module._storage_layout.name, "HBM_ONLY")
-        self.assertEqual(host_values, 0)
-        self.assertLessEqual(hbm_values, full_mem.hbm_values + partial_mem.hbm_values)
-        self.assertLessEqual(keymap, full_mem.hbm_index + partial_mem.hbm_index)
 
 
 if __name__ == "__main__":
