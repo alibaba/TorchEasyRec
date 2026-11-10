@@ -88,11 +88,6 @@ from torchrec.modules.embedding_modules import (
 from tzrec.protos import feature_pb2
 from tzrec.utils import dynamicemb_util, env_util
 from tzrec.utils.dynamicemb_util import (
-    DYNAMICEMB_CACHE_BUCKET_CAPACITY,
-    DYNAMICEMB_CACHING,
-    DYNAMICEMB_HBM_ONLY,
-    DYNAMICEMB_HOST_ONLY,
-    DYNAMICEMB_HYBRID,
     _dynamicemb_optimizer_state_dim,
     dynamicemb_aligned_capacity,
     dynamicemb_table_memory,
@@ -605,7 +600,6 @@ def _extract_constraints_for_param(
     Optional[KeyValueParams],
     bool,
     Any,
-    Optional[float],
 ]:
     input_lengths = [POOLING_FACTOR]
     col_wise_shard_dim = None
@@ -619,8 +613,6 @@ def _extract_constraints_for_param(
     key_value_params = None
     use_dynamicemb = False
     dynamicemb_options = None
-    # Zero is a measured factor and is distinct from absence.
-    unique_id_factor = None
 
     if constraints and constraints.get(name):
         input_lengths = constraints[name].pooling_factors
@@ -639,9 +631,6 @@ def _extract_constraints_for_param(
         if hasattr(constraints[name], "dynamicemb_options"):
             # pyre-ignore [16]
             dynamicemb_options = constraints[name].dynamicemb_options
-        if hasattr(constraints[name], "unique_id_factor"):
-            unique_id_factor = constraints[name].unique_id_factor
-
     return (
         input_lengths,
         col_wise_shard_dim,
@@ -655,7 +644,6 @@ def _extract_constraints_for_param(
         key_value_params,
         use_dynamicemb,
         dynamicemb_options,
-        unique_id_factor,
     )
 
 
@@ -931,7 +919,7 @@ _DYNAMICEMB_HIGH_RATIOS = (0.5, 0.6, 0.7, 0.8, 0.9)
 _DYNAMICEMB_LOW_SEGMENT_POINTS = 5
 # A five-batch window is a planning heuristic for how much of a table a
 # pipeline of batches touches, not a claim about arbitrary skew.
-_DYNAMICEMB_WORKING_SET_BATCHES = 5
+_DYNAMICEMB_WORKING_SET_MULTIPLIER = 5
 _DYNAMICEMB_UNMEASURED_FLOOR = 0.1
 
 
@@ -957,23 +945,29 @@ def _dynamicemb_low_segment(low: float) -> List[float]:
 def _emit_dynamicemb_variants(
     base_option: ShardingOption,
     unique_id_factor: Optional[float],
-) -> List[ShardingOption]:
-    """Expand a dynamicemb ShardingOption into its memory-layout candidates.
+) -> List[Tuple[float, ShardingOption, bool]]:
+    """Expand a dynamicemb ShardingOption into its budget/caching candidates.
 
-    Each candidate pins one of the four layouts onto a deep-copied options
-    object and requests a specific HBM value share. Without an explicit
+    Each candidate owns a deep-copied options object carrying a caching
+    choice and a requested HBM value budget: a ratio-0 non-caching endpoint
+    (zero budget), partial non-caching ratios, partial caching ratios, and a
+    ratio-1 non-caching endpoint (full budget). Without an explicit
     ``cache_load_factor`` the partial ratios come from a geometric low
     segment plus the fixed high grid, with per-table lower endpoints derived
-    from the measured working set: CACHING floors at ``max(q, 0.1)`` because
-    its cache must hold the batch, HYBRID starts at ``min(q, 0.1)`` because
-    a value partition reaches its host tier directly. HOST_ONLY and
-    HBM_ONLY are each emitted once, at their endpoint ratios.
+    from the measured working set: caching floors at ``max(q, 0.1)`` because
+    its cache must hold the batch, the non-caching segment starts at
+    ``min(q, 0.1)`` because a value partition reaches its host tier
+    directly. A measured zero keeps the positive non-caching segment at
+    0.1; the separate zero endpoint already represents the empty working
+    set.
 
-    Variants the pinned runtime refuses to construct (HYBRID under
-    NO_EVICTION or a per-key score) and CACHING variants whose realized
-    cache cannot hold the batch's working set are filtered here rather than
-    left to fail at model construction. Physically equal automatic
-    candidates collapse to the smallest requested ratio.
+    The runtime's native fusion then selects one ``StorageLayout`` for each
+    compatible group from its summed sizes and budgets -- a candidate
+    proposes, the fused module decides. Caching candidates whose realized
+    cache cannot hold the batch's working set are filtered here; a score
+    policy the runtime cannot split keeps automatic non-caching choices
+    full-budget only, so a compatible group cannot silently become an
+    unsupported mixed-budget HYBRID.
 
     Args:
         base_option: the dynamicemb ShardingOption to expand; its
@@ -983,7 +977,8 @@ def _emit_dynamicemb_variants(
             unmeasured.
 
     Returns:
-        The normalized candidate list for this table.
+        ``(ratio, option, caching)`` triples for this table, ascending by
+        ratio; the physical-deduplication pass runs after estimation.
 
     Raises:
         ValueError: for a non-finite or negative measured factor, or an
@@ -991,21 +986,6 @@ def _emit_dynamicemb_variants(
     """
     options = base_option.dynamicemb_options
     tensor = base_option.tensor
-    shard_rows = base_option.shards[0].size[0]
-    aligned_rows = dynamicemb_aligned_capacity(shard_rows, options.bucket_capacity)
-    mirror_kwargs = dict(
-        shard_rows=shard_rows,
-        dim=tensor.shape[1],
-        element_size=tensor.element_size(),
-        optimizer_state_dim=_dynamicemb_optimizer_state_dim(
-            getattr(tensor, "_optimizer_classes", [None])[0],
-            tensor.shape,
-            tensor.dtype,
-        ),
-        bucket_capacity=options.bucket_capacity,
-        score_words=dynamicemb_util._dynamicemb_score_words(options),
-        no_eviction=dynamicemb_util._dynamicemb_no_eviction(options),
-    )
     batch_size = base_option.batch_size
 
     if unique_id_factor is not None:
@@ -1020,9 +1000,11 @@ def _emit_dynamicemb_variants(
         # distinct ids is already the per-rank batch's share: no second
         # world_size division.
         working_set_rows = math.ceil(
-            _DYNAMICEMB_WORKING_SET_BATCHES * factor * batch_size
+            _DYNAMICEMB_WORKING_SET_MULTIPLIER * factor * batch_size
         )
-        working_set_ratio = working_set_rows / aligned_rows
+        working_set_ratio = working_set_rows / dynamicemb_aligned_capacity(
+            base_option.shards[0].size[0], options.bucket_capacity
+        )
         # Overflow is billed to HBM but never satisfies cache residency.
         resident_requirement = working_set_rows
     else:
@@ -1035,72 +1017,94 @@ def _emit_dynamicemb_variants(
         base_option.cache_params.stats if base_option.cache_params is not None else None
     )
 
-    # ratio, the option, and the physical placement it realizes
-    candidates: List[Tuple[float, ShardingOption, tuple]] = []
+    # ratio, the option, and the caching choice it proposes
+    candidates: List[Tuple[float, ShardingOption, bool]] = []
 
-    def emit(layout: str, ratio: float) -> bool:
-        memory = dynamicemb_table_memory(layout=layout, ratio=ratio, **mirror_kwargs)
-        if layout == DYNAMICEMB_CACHING and memory.resident_rows < resident_requirement:
-            return False
+    def emit(caching: bool, ratio: float) -> bool:
+        if caching:
+            memory = dynamicemb_table_memory(
+                caching=True,
+                ratio=ratio,
+                shard_rows=base_option.shards[0].size[0],
+                dim=tensor.shape[1],
+                element_size=tensor.element_size(),
+                optimizer_state_dim=_dynamicemb_optimizer_state_dim(
+                    getattr(tensor, "_optimizer_classes", [None])[0],
+                    tensor.shape,
+                    tensor.dtype,
+                ),
+                bucket_capacity=options.bucket_capacity,
+                score_words=dynamicemb_util._dynamicemb_score_words(options),
+                no_eviction=dynamicemb_util._dynamicemb_no_eviction(options),
+            )
+            if memory.resident_rows < resident_requirement:
+                return False
         opt = copy.deepcopy(base_option)
         opt.cache_params = CacheParams(load_factor=ratio, stats=stats)
         # deepcopy(base_option) already produced a fresh dynamicemb_options.
-        opt.dynamicemb_options.caching = layout == DYNAMICEMB_CACHING
-        opt.dynamicemb_options.tzrec_layout = layout
-        candidates.append(
-            (
-                ratio,
-                opt,
-                (layout, memory.hbm_rows, memory.host_rows, memory.resident_rows),
-            )
-        )
+        opt.dynamicemb_options.caching = caching
+        candidates.append((ratio, opt, caching))
         return True
 
     if base_option.cache_params is not None:
         explicit_ratio = float(base_option.cache_params.load_factor)
         if explicit_ratio == 0.0:
-            emit(DYNAMICEMB_HOST_ONLY, 0.0)
+            emit(False, 0.0)
         elif explicit_ratio == 1.0:
-            emit(DYNAMICEMB_HBM_ONLY, 1.0)
+            emit(False, 1.0)
         else:
-            # A pinned HYBRID survives even when the same-ratio CACHING
-            # variant cannot cache the batch.
-            if dynamicemb_util._dynamicemb_layout_eligible(options, DYNAMICEMB_HYBRID):
-                emit(DYNAMICEMB_HYBRID, explicit_ratio)
-            emit(DYNAMICEMB_CACHING, explicit_ratio)
+            # A pinned non-caching partial survives even when the same-ratio
+            # caching variant cannot hold the batch.
+            if dynamicemb_util._dynamicemb_hybrid_supported(options):
+                emit(False, explicit_ratio)
+            emit(True, explicit_ratio)
             if not candidates:
                 raise ValueError(
                     f"dynamicemb table {base_option.name}: explicit "
                     f"cache_load_factor={explicit_ratio} has no eligible "
-                    "variant: the score strategy does not support HYBRID and "
-                    "the CACHING cache cannot hold the batch's working set."
+                    "variant: the score strategy does not support a split "
+                    "storage and the caching variant cannot hold the "
+                    "batch's working set."
                 )
+    elif not dynamicemb_util._dynamicemb_hybrid_supported(options):
+        # The runtime refuses to split this policy across two tiers: keep
+        # automatic non-caching choices full-budget only, so a compatible
+        # group cannot become an unsupported mixed-budget HYBRID. Supported
+        # caching choices stay.
+        emit(False, 1.0)
+        caching_floor = (
+            _DYNAMICEMB_UNMEASURED_FLOOR
+            if working_set_ratio is None
+            else max(working_set_ratio, _DYNAMICEMB_UNMEASURED_FLOOR)
+        )
+        caching_ratios = set(_dynamicemb_low_segment(caching_floor))
+        caching_ratios.update(r for r in _DYNAMICEMB_HIGH_RATIOS if r >= caching_floor)
+        if 0.5 < caching_floor < 1.0:
+            caching_ratios.add(caching_floor)
+        for ratio in sorted(r for r in caching_ratios if 0.0 < r < 1.0):
+            emit(True, ratio)
     else:
         if working_set_ratio is None:
             caching_floor = _DYNAMICEMB_UNMEASURED_FLOOR
-            hybrid_floor = _DYNAMICEMB_UNMEASURED_FLOOR
+            non_caching_floor = _DYNAMICEMB_UNMEASURED_FLOOR
         else:
             caching_floor = max(working_set_ratio, _DYNAMICEMB_UNMEASURED_FLOOR)
-            hybrid_floor = min(working_set_ratio, _DYNAMICEMB_UNMEASURED_FLOOR)
-        emit(DYNAMICEMB_HOST_ONLY, 0.0)
-        # A measured zero gives HYBRID no positive floor: start its segment
-        # at the smallest allocation the runtime realizes for this shard --
-        # one cache bucket's share of the table. A shard that cannot hold a
-        # smaller-than-full partial tier has no HYBRID candidate at all.
-        if hybrid_floor <= 0.0:
-            hybrid_floor = DYNAMICEMB_CACHE_BUCKET_CAPACITY / aligned_rows
-        if hybrid_floor < 1.0:
-            hybrid_ratios = sorted(
-                set(
-                    _dynamicemb_low_segment(hybrid_floor)
-                    + list(_DYNAMICEMB_HIGH_RATIOS)
-                )
+            non_caching_floor = min(working_set_ratio, _DYNAMICEMB_UNMEASURED_FLOOR)
+        if non_caching_floor <= 0.0:
+            # A measured zero keeps the positive segment at the unmeasured
+            # floor; the separate zero endpoint already represents it.
+            non_caching_floor = _DYNAMICEMB_UNMEASURED_FLOOR
+        emit(False, 0.0)
+        non_caching_ratios = sorted(
+            set(
+                _dynamicemb_low_segment(non_caching_floor)
+                + list(_DYNAMICEMB_HIGH_RATIOS)
             )
-            if dynamicemb_util._dynamicemb_layout_eligible(options, DYNAMICEMB_HYBRID):
-                for ratio in hybrid_ratios:
-                    emit(DYNAMICEMB_HYBRID, ratio)
+        )
+        for ratio in non_caching_ratios:
+            emit(False, ratio)
         # A floor that reached the whole table offers no partial cache; that
-        # does not make HBM_ONLY invalid.
+        # does not make the full endpoint invalid.
         if working_set_ratio is None or working_set_ratio < 1.0:
             caching_ratios = set(_dynamicemb_low_segment(caching_floor))
             caching_ratios.update(
@@ -1109,21 +1113,69 @@ def _emit_dynamicemb_variants(
             if 0.5 < caching_floor < 1.0:
                 caching_ratios.add(caching_floor)
             for ratio in sorted(r for r in caching_ratios if 0.0 < r < 1.0):
-                emit(DYNAMICEMB_CACHING, ratio)
-        emit(DYNAMICEMB_HBM_ONLY, 1.0)
+                emit(True, ratio)
+        emit(False, 1.0)
 
-    # Collapse physically equal candidates: the same layout with the same
-    # tier row capacities realizes the same placement, and performance is
-    # computed from realized fractions, so the smallest requested ratio is
-    # the deterministic representative. Endpoint layouts and distinct
-    # layouts never collide on the key.
-    by_physical: Dict[tuple, Tuple[float, ShardingOption]] = {}
-    for ratio, opt, physical_key in candidates:
-        representative = by_physical.get(physical_key)
-        if representative is None or ratio < representative[0]:
-            by_physical[physical_key] = (ratio, opt)
-    ordered = sorted(by_physical.values(), key=lambda entry: entry[0])
-    return [opt for _, opt in ordered]
+    return sorted(candidates, key=lambda entry: entry[0])
+
+
+def _dedup_dynamicemb_variants(
+    sharding_options: List[ShardingOption],
+) -> List[ShardingOption]:
+    """Collapse physically equal dynamicemb candidates after estimation.
+
+    Two candidates of one table realize the same placement when their
+    caching choice, tier row capacities, and runtime value budget all
+    match: native fusion decides a group from its summed sizes and budgets,
+    so equal rows with different budgets are not equivalent -- a different
+    summed budget can flip the group's fit result. The retained performance
+    estimator scores nominal ratios differently, so the best-scored
+    candidate wins, with a deterministic tie-break on ratio and input
+    order. Non-dynamicemb options pass through unchanged, and survivors keep
+    their input order.
+    """
+    # physical key -> (perf, -ratio, -index): lower perf wins, then the
+    # higher ratio, then the earlier option
+    winners: Dict[tuple, Tuple[float, float, int]] = {}
+    for index, option in enumerate(sharding_options):
+        if not getattr(option, "use_dynamicemb", False):
+            continue
+        dynamicemb_options = option.dynamicemb_options
+        tensor = option.tensor
+        memory = dynamicemb_table_memory(
+            caching=bool(dynamicemb_options.caching),
+            ratio=float(option.cache_load_factor),
+            shard_rows=option.shards[0].size[0],
+            dim=tensor.shape[1],
+            element_size=tensor.element_size(),
+            optimizer_state_dim=_dynamicemb_optimizer_state_dim(
+                getattr(tensor, "_optimizer_classes", [None])[0],
+                tensor.shape,
+                tensor.dtype,
+            ),
+            bucket_capacity=dynamicemb_options.bucket_capacity,
+            score_words=dynamicemb_util._dynamicemb_score_words(dynamicemb_options),
+            no_eviction=dynamicemb_util._dynamicemb_no_eviction(dynamicemb_options),
+        )
+        key = (
+            option.fqn,
+            bool(dynamicemb_options.caching),
+            memory.hbm_rows,
+            memory.host_rows,
+            memory.resident_rows,
+            memory.local_hbm_for_values,
+        )
+        score = (option.total_perf, -float(option.cache_load_factor), -index)
+        incumbent = winners.get(key)
+        if incumbent is None or score < incumbent:
+            winners[key] = score
+    # the tie-break stores -index, so the survivor position is its negation
+    survivor_indexes = {-score[2] for score in winners.values()}
+    return [
+        option
+        for index, option in enumerate(sharding_options)
+        if not getattr(option, "use_dynamicemb", False) or index in survivor_indexes
+    ]
 
 
 class EmbeddingEnumerator(_EmbeddingEnumerator):
@@ -1250,8 +1302,14 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                     key_value_params,
                     use_dynamicemb,
                     dynamicemb_options,
-                    unique_id_factor,
                 ) = _extract_constraints_for_param(_constraints, key)
+                # the union measurement rides on the resolved constraint;
+                # absence stays None, distinct from a measured zero
+                unique_id_factor = (
+                    getattr(_constraints[key], "unique_id_factor", None)
+                    if _constraints and _constraints.get(key)
+                    else None
+                )
 
                 # skip for other device groups
                 if device_group and device_group != self._compute_device:
@@ -1320,7 +1378,8 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
                             sharding_options_per_table.extend(
-                                _emit_dynamicemb_variants(
+                                option
+                                for _, option, _caching in _emit_dynamicemb_variants(
                                     sharding_option, unique_id_factor
                                 )
                             )
@@ -1340,6 +1399,9 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                 sharding_options.extend(sharding_options_per_table)
 
         self.populate_estimates(sharding_options)
+        # collapse physically equal dynamicemb candidates once their
+        # estimates exist: the retained representative is the best-scored one
+        sharding_options = _dedup_dynamicemb_variants(sharding_options)
 
         return sharding_options
 
