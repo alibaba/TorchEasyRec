@@ -9,12 +9,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 import os
 import random
 import unittest
 from types import SimpleNamespace
-from typing import List, Tuple, cast
+from typing import List, Tuple
+from unittest import mock
 
 import numpy as np
 import torch
@@ -25,15 +25,16 @@ from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
 from torchrec.distributed.planner.proposers import GridSearchProposer
 from torchrec.distributed.planner.types import PlannerError, Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import CacheParams, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 from tzrec.protos import feature_pb2
-from tzrec.utils.dynamicemb_util import has_dynamicemb
+from tzrec.utils import dynamicemb_util
+from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints, has_dynamicemb
 from tzrec.utils.plan_util import (
     DynamicProgrammingProposer,
     EmbeddingEnumerator,
-    _dynamicemb_low_segment,
+    _emit_dynamicemb_variants,
     _sparse_dp_proposor_numpy,
     create_planner,
 )
@@ -585,24 +586,25 @@ def _make_random_table_opts(
     return table_opts
 
 
+def _dp_proposals(search_space, topology):
+    proposer = DynamicProgrammingProposer(
+        hbm_bins_per_device=20, ddr_bins_per_device=20
+    )
+    proposer.load(search_space)
+    # First propose returns the lowest-mem-per-table seed.
+    proposer.propose()
+    proposer.feedback(partitionable=True, storage_constraint=topology)
+    proposals = []
+    proposal = proposer.propose()
+    while proposal:
+        proposals.append(proposal)
+        proposer.feedback(partitionable=True, storage_constraint=topology)
+        proposal = proposer.propose()
+    return proposals
+
+
 class DynamicProgrammingProposerTest(unittest.TestCase):
     """2D DP across HBM × DDR picks per-table mode under joint budgets."""
-
-    def _run(self, search_space, topology):
-        proposer = DynamicProgrammingProposer(
-            hbm_bins_per_device=20, ddr_bins_per_device=20
-        )
-        proposer.load(search_space)
-        # First propose returns the lowest-mem-per-table seed.
-        proposer.propose()
-        proposer.feedback(partitionable=True, storage_constraint=topology)
-        proposals = []
-        proposal = proposer.propose()
-        while proposal:
-            proposals.append(proposal)
-            proposer.feedback(partitionable=True, storage_constraint=topology)
-            proposal = proposer.propose()
-        return proposals
 
     def test_caching_preferred_when_ddr_is_generous(self):
         # Three options for one table:
@@ -617,7 +619,7 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         topology = _make_topology(
             num_devices=2, hbm_per_device=2000, ddr_per_device=2000
         )
-        proposals = self._run(opts, topology)
+        proposals = _dp_proposals(opts, topology)
         # Best plan must be the CACHING option (perf=10).
         best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
         self.assertEqual(best[0].total_perf, 10.0)
@@ -631,7 +633,7 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         topology = _make_topology(
             num_devices=1, hbm_per_device=2000, ddr_per_device=950
         )
-        proposals = self._run(opts, topology)
+        proposals = _dp_proposals(opts, topology)
         # Every proposed plan must pick the HYBRID option (perf=80).
         for p in proposals:
             self.assertEqual(p[0].total_perf, 80.0)
@@ -648,7 +650,7 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         topology = _make_topology(
             num_devices=1, hbm_per_device=1100, ddr_per_device=2000
         )
-        proposals = self._run(opts, topology)
+        proposals = _dp_proposals(opts, topology)
         # Either option is fine — they're tied. Just verify the proposer
         # returned something feasible.
         self.assertGreater(len(proposals), 0)
@@ -672,7 +674,7 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         topology = _make_topology(
             num_devices=1, hbm_per_device=2000, ddr_per_device=2000
         )
-        proposals = self._run(opts, topology)
+        proposals = _dp_proposals(opts, topology)
         self.assertGreater(len(proposals), 0)
         best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
         styles = sorted(
@@ -692,12 +694,12 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
             ddr_per_device=500,
         )
         # 1500 > per-machine cap (1000) -> pruned, no proposal.
-        proposals_pruned = self._run(
+        proposals_pruned = _dp_proposals(
             [_FakeShardingOption("t", hbm=100, ddr=1500, perf=10.0)], topology
         )
         self.assertEqual(proposals_pruned, [])
         # 900 <= per-machine cap (1000) -> survives, proposal emitted.
-        proposals_fit = self._run(
+        proposals_fit = _dp_proposals(
             [_FakeShardingOption("t", hbm=100, ddr=900, perf=10.0)], topology
         )
         self.assertGreater(len(proposals_fit), 0)
@@ -740,169 +742,86 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
 class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
     """End-to-end exercise of the dynamicemb planner integration."""
 
-    def _build_constraint(self, max_capacity=4096):
-        import dynamicemb
-        from dynamicemb.planner import DynamicEmbParameterConstraints
+    def _enumerate(self, with_plain_table=False, rows=4096, factor=None):
+        from tzrec.utils.plan_util import get_default_sharders as dynamicemb_sharders
 
-        opts = dynamicemb.DynamicEmbTableOptions(
-            max_capacity=max_capacity,
-            initializer_args=dynamicemb.DynamicEmbInitializerArgs(
-                mode=dynamicemb.DynamicEmbInitializerMode.UNIFORM,
-                lower=-0.01,
-                upper=0.01,
-            ),
-            eval_initializer_args=dynamicemb.DynamicEmbInitializerArgs(
-                mode=dynamicemb.DynamicEmbInitializerMode.CONSTANT, value=0.0
-            ),
-            score_strategy=dynamicemb.DynamicEmbScoreStrategy.STEP,
+        table = EmbeddingBagConfig(
+            num_embeddings=rows,
+            embedding_dim=32,
+            name="table_de",
+            feature_names=["feat_de"],
         )
-        return DynamicEmbParameterConstraints(
-            use_dynamicemb=True,
-            sharding_types=[ShardingType.ROW_WISE.value],
-            compute_kernels=[EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value],
-            dynamicemb_options=opts,
-        )
-
-    def _build_model(self, with_plain_table=False, num_embeddings=4096):
-        tables = [
-            EmbeddingBagConfig(
-                num_embeddings=num_embeddings,
-                embedding_dim=32,
-                name="table_de",
-                feature_names=["feat_de"],
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
+            constraint = build_dynamicemb_constraints(
+                feature_pb2.DynamicEmbedding(max_capacity=rows), table
             )
-        ]
+        constraint.unique_id_factor = factor
+        tables = [table]
         if with_plain_table:
             tables.append(
                 EmbeddingBagConfig(
-                    num_embeddings=num_embeddings,
+                    num_embeddings=rows,
                     embedding_dim=32,
                     name="table_plain",
                     feature_names=["feat_plain"],
                 )
             )
-        return TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
-
-    def _enumerate_with(
-        self, constraint, batch_size=128, world_size=2, num_embeddings=4096
-    ):
-        from tzrec.utils.plan_util import (
-            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
-        )
-        from tzrec.utils.plan_util import (
-            get_default_sharders as _tzrec_get_default_sharders,
-        )
-
-        model = self._build_model(num_embeddings=num_embeddings)
-        topology = Topology(world_size=world_size, compute_device="cuda")
-        enumerator = _TzrecEmbeddingEnumerator(
-            topology=topology,
-            batch_size=batch_size,
-            fqn_constraints={"sparse.ebc.table_de": constraint},
-        )
-        search_space = enumerator.enumerate(
-            module=model, sharders=_tzrec_get_default_sharders()
-        )
-        return search_space, topology
-
-    def test_enumerate_yields_all_candidates_and_default_grids(self):
-        # a table large enough that every grid ratio keeps a distinct
-        # budget and tier rows; smaller tables collapse physically equal
-        # candidates (see the candidate-grid tests)
-        num_embeddings = 200_000
-        search_space, _ = self._enumerate_with(
-            self._build_constraint(max_capacity=num_embeddings),
-            num_embeddings=num_embeddings,
-        )
-
-        dynamicemb_opts = [
-            so for so in search_space if getattr(so, "use_dynamicemb", False)
-        ]
-        # One sharding type/kernel combination, expanded to the default 20
-        # candidates before physical deduplication: 9 caching + 9 partial
-        # non-caching + the zero endpoint + the full endpoint.
-        self.assertEqual(len(dynamicemb_opts), 20)
-        by_caching = {True: [], False: []}
-        for so in dynamicemb_opts:
-            by_caching[bool(so.dynamicemb_options.caching)].append(so)
-        self.assertEqual(len(by_caching[True]), 9)
-        self.assertEqual(len(by_caching[False]), 11)
-        ratios_nc = sorted(
-            cast(float, so.cache_load_factor) for so in by_caching[False]
-        )
-        self.assertEqual(ratios_nc[0], 0.0)
-        self.assertEqual(ratios_nc[-1], 1.0)
-        self.assertEqual(
-            [round(r, 9) for r in ratios_nc[1:-1]],
-            [
-                0.1,
-                0.149534878,
-                0.223606798,
-                0.334370152,
-                0.5,
-                0.6,
-                0.7,
-                0.8,
-                0.9,
-            ],
-        )
-
-        # Unmeasured floors at 0.1: five geometric points to 0.5 plus the
-        # fixed high grid, with the shared 0.5 point merged -- nine ratios.
-        expected_low = [
-            0.1,
-            0.14953487812212204,
-            0.22360679774997896,
-            0.3343701524878291,
-            0.5,
-        ]
-        for caching in (True, False):
-            ratios = sorted(
-                cast(float, so.cache_load_factor)
-                for so in by_caching[caching]
-                if 0.0 < so.cache_load_factor < 1.0
-            )
-            self.assertEqual(len(ratios), 9)
-            for want, got in zip(expected_low, ratios[:5]):
-                self.assertAlmostEqual(want, got, places=9)
-            self.assertEqual(ratios[5:], [0.6, 0.7, 0.8, 0.9])
-            # monotonic, distinct ratios
-            self.assertEqual(ratios, sorted(set(ratios)))
-
-        # Each option must carry a non-zero perf and a real storage
-        # estimate; the zero endpoint's HBM estimate covers its mixed-group
-        # minimum tier and metadata, and the full endpoint's DDR estimate
-        # covers its mixed-group minimum host bucket.
-        for so in dynamicemb_opts:
-            self.assertGreater(so.total_perf, 0)
-            self.assertGreater(so.total_storage.hbm, 0)
-            self.assertGreaterEqual(so.total_storage.ddr, 0)
-        zero = by_caching[False][0]
-        self.assertEqual(zero.cache_load_factor, 0.0)
-        self.assertGreater(zero.total_storage.hbm, 0)
-        self.assertGreater(zero.total_storage.ddr, 0)
-        full = by_caching[False][-1]
-        self.assertEqual(full.cache_load_factor, 1.0)
-        self.assertGreater(full.total_storage.ddr, 0)
-
-    def test_dp_proposer_picks_feasible_dynamicemb_plan(self):
-        from tzrec.utils.plan_util import (
-            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
-        )
-        from tzrec.utils.plan_util import (
-            get_default_sharders as _tzrec_get_default_sharders,
-        )
-
-        model = self._build_model()
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
         topology = Topology(world_size=2, compute_device="cuda")
-        enumerator = _TzrecEmbeddingEnumerator(
+        enumerator = EmbeddingEnumerator(
             topology=topology,
             batch_size=128,
-            fqn_constraints={"sparse.ebc.table_de": self._build_constraint()},
+            fqn_constraints={"sparse.ebc.table_de": constraint},
         )
-        search_space = enumerator.enumerate(
-            module=model, sharders=_tzrec_get_default_sharders()
+        return enumerator.enumerate(model, dynamicemb_sharders()), topology
+
+    def test_normalized_shards_and_converted_budgets(self):
+        from torchrec.distributed.planner import planners
+
+        options, topology = self._enumerate(rows=8001, factor=3.2)
+        # 2048 distinct rows per shard: the first cache must cover half of 4096.
+        self.assertEqual(
+            min(
+                o.cache_params.load_factor
+                for o in options
+                if o.dynamicemb_options.caching
+            ),
+            0.5,
         )
+        for opt in options:
+            ratio, caching = opt.cache_load_factor, opt.dynamicemb_options.caching
+            self.assertEqual(opt.tensor.shape[0], 8192)
+            self.assertGreater(opt.total_perf, 0)
+            for rank, shard in enumerate(opt.shards):
+                self.assertEqual(shard.size[0], 4096)
+                if ratio == 1:
+                    self.assertEqual(shard.storage.ddr, 128 * 32 * 4)
+                shard.rank = rank
+            target = (
+                planners.to_sharding_plan([opt], topology)
+                .plan[opt.path][opt.name]
+                .dynamicemb_options
+            )
+            self.assertEqual(
+                (target.caching, target.max_capacity, target.local_hbm_for_values),
+                (caching, 4096, int(ratio * 4096 * 32 * 4)),
+            )
+
+    def test_large_table_under_tight_hbm(self):
+        options, _ = self._enumerate(rows=40_000_000)
+        budget = _make_topology(2, 520 << 20, 10 << 30)
+        self.assertFalse(
+            _dp_proposals([o for o in options if o.cache_load_factor >= 0.1], budget)
+        )
+        plan = _dp_proposals(options, budget)[0]
+        self.assertEqual(
+            [(o.dynamicemb_options.caching, o.cache_load_factor) for o in plan],
+            [(False, 0.0)],
+        )
+        self.assertFalse(_dp_proposals(options, _make_topology(2, 300 << 20, 10 << 30)))
+
+    def test_dp_proposer_picks_feasible_dynamicemb_plan(self):
+        search_space, topology = self._enumerate()
 
         proposer = DynamicProgrammingProposer()
         proposer.load(search_space)
@@ -930,12 +849,6 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         from torchrec.distributed.planner import planners
 
         from tzrec.optim.optimizer import set_sparse_init_accumulator_value
-        from tzrec.utils.plan_util import (
-            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
-        )
-        from tzrec.utils.plan_util import (
-            get_default_sharders as _tzrec_get_default_sharders,
-        )
 
         # The value travels as a plain kwarg of the dynamicemb table module.
         self.assertIn(
@@ -943,16 +856,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             inspect.signature(BatchedDynamicEmbeddingTablesV2.__init__).parameters,
         )
 
-        model = self._build_model()
-        topology = Topology(world_size=2, compute_device="cuda")
-        enumerator = _TzrecEmbeddingEnumerator(
-            topology=topology,
-            batch_size=128,
-            fqn_constraints={"sparse.ebc.table_de": self._build_constraint()},
-        )
-        search_space = enumerator.enumerate(
-            module=model, sharders=_tzrec_get_default_sharders()
-        )
+        search_space, topology = self._enumerate()
         sharding_option = next(
             so for so in search_space if getattr(so, "use_dynamicemb", False)
         )
@@ -971,26 +875,6 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         # dynamicemb strips only its planner-only keys before the table module.
         DynamicEmbParameterSharding.pop_additional_fused_params(fused_params)
         self.assertIn("initial_accumulator_value", fused_params)
-
-    def _enumerate(self, with_plain_table=False):
-        from tzrec.utils.plan_util import (
-            EmbeddingEnumerator as _TzrecEmbeddingEnumerator,
-        )
-        from tzrec.utils.plan_util import (
-            get_default_sharders as _tzrec_get_default_sharders,
-        )
-
-        model = self._build_model(with_plain_table=with_plain_table)
-        topology = Topology(world_size=2, compute_device="cuda")
-        enumerator = _TzrecEmbeddingEnumerator(
-            topology=topology,
-            batch_size=128,
-            fqn_constraints={"sparse.ebc.table_de": self._build_constraint()},
-        )
-        search_space = enumerator.enumerate(
-            module=model, sharders=_tzrec_get_default_sharders()
-        )
-        return search_space, topology
 
     def test_sharding_plan_sizes_ftrl_optimizer_state(self):
         import inspect
@@ -1064,444 +948,125 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
 @mark_ci_scope("gpu")
 class DynamicEmbCandidateGridTest(unittest.TestCase):
-    """Candidate generation: grids, endpoints, pins, residency, dedup."""
-
-    BATCH = 128
-    # large enough that every grid ratio realizes a distinct placement:
-    # per-rank rows 100_000, aligned 100_096
-    BIG = 200_000
-
-    def _constraint(
-        self,
-        *,
-        unique_id_factor=None,
-        explicit_ratio=None,
-        score_strategy="STEP",
-        num_embeddings=None,
-        pooling=None,
+    def _options(
+        self, factor=None, ratio=None, *, rows=4096, dtype=torch.float32, pooling=1
     ):
-        from torchrec.distributed.types import CacheParams
+        from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+        from torchrec.distributed.planner.types import Shard, ShardingOption
 
-        from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
-
-        num_embeddings = num_embeddings or self.BIG
-        cfg = feature_pb2.DynamicEmbedding()
-        cfg.max_capacity = num_embeddings
-        cfg.score_strategy = score_strategy
-        constraint = build_dynamicemb_constraints(
-            cfg,
-            EmbeddingBagConfig(
-                num_embeddings=num_embeddings,
-                embedding_dim=32,
-                name="table_de",
-                feature_names=["feat_de"],
-            ),
+        base = ShardingOption(
+            name="t",
+            module=("", torch.nn.Module()),
+            partition_by="uniform",
+            compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
+            sharding_type=ShardingType.ROW_WISE.value,
+            batch_size=128,
+            input_lengths=[pooling],
+            tensor=torch.empty((rows, 1), dtype=dtype, device="meta"),
+            shards=[Shard(size=[rows, 1], offset=[0, 0])],
+            cache_params=None if ratio is None else CacheParams(load_factor=ratio),
         )
-        if pooling is not None:
-            constraint.pooling_factors = [pooling]
-        if unique_id_factor is not None:
-            constraint.unique_id_factor = float(unique_id_factor)
-        if explicit_ratio is not None:
-            constraint.cache_params = CacheParams(load_factor=explicit_ratio)
-        return constraint
-
-    def _candidates(
-        self, constraint, batch_size=None, world_size=2, num_embeddings=None
-    ):
-        from tzrec.utils.plan_util import (
-            get_default_sharders as _tzrec_get_default_sharders,
+        base.dynamicemb_options = DynamicEmbTableOptions(
+            max_capacity=rows,
+            bucket_capacity=16,
+            score_strategy=DynamicEmbScoreStrategy.STEP,
         )
-
-        num_embeddings = num_embeddings or self.BIG
-        batch_size = batch_size or self.BATCH
-        model = TestSparseNN(
-            tables=[
-                EmbeddingBagConfig(
-                    num_embeddings=num_embeddings,
-                    embedding_dim=32,
-                    name="table_de",
-                    feature_names=["feat_de"],
-                )
-            ],
-            sparse_device=torch.device("meta"),
-        )
-        topology = Topology(world_size=world_size, compute_device="cuda")
-        enumerator = EmbeddingEnumerator(
-            topology=topology,
-            batch_size=batch_size,
-            fqn_constraints={"sparse.ebc.table_de": constraint},
-        )
-        search_space = enumerator.enumerate(
-            module=model, sharders=_tzrec_get_default_sharders()
-        )
-        families = {True: [], False: []}
-        for so in search_space:
-            if getattr(so, "use_dynamicemb", False):
-                families[bool(so.dynamicemb_options.caching)].append(so)
-        for candidates in families.values():
-            candidates.sort(key=lambda so: so.cache_load_factor)
-        return families
-
-    def _ratios(self, families, caching):
-        return [so.cache_load_factor for so in families.get(caching, [])]
-
-    def _partial_ratios(self, families, caching):
-        """The strictly-interior ratios of one family (endpoints excluded)."""
-        return [
-            so.cache_load_factor
-            for so in families.get(caching, [])
-            if 0.0 < so.cache_load_factor < 1.0
-        ]
-
-    @staticmethod
-    def _expected_floors(factor, batch_size, aligned_rows):
-        """The RFC's lower endpoints from a measured factor."""
-        if factor is None:
-            return 0.1, 0.1
-        working_set = math.ceil(5 * factor * batch_size)
-        q = working_set / aligned_rows
-        return max(q, 0.1), min(q, 0.1)
+        return _emit_dynamicemb_variants(base, factor)
 
     @parameterized.expand(
         [
-            param("unmeasured", factor=None),
-            param("q_small", factor=0.032),
-            param("q_just_below_0_1", factor=15.0),
-            param("q_just_above_0_1", factor=16.0),
-            param("q_at_0_5", factor=78.2),
-            param("q_in_0_5_1", factor=85.0),
+            ("unmeasured", None, 0.1, 0.1, 9),
+            ("measured_zero", 0, 0.1, 0.1, 9),
+            ("small_working_set", 0.1, 64 / 4096, 0.1, 9),
+            ("half", 3.2, 0.1, 0.5, 5),
+            ("above_half", 4.8, 0.1, 0.75, 3),
+            ("full", 6.4, 0.1, None, 0),
         ],
         name_func=parameterized_name_func,
     )
-    def test_measured_factor_moves_the_floors(self, name, factor):
-        aligned_rows = 100_096
-        caching_floor, hybrid_floor = self._expected_floors(
-            factor, self.BATCH, aligned_rows
+    def test_auto_grid(self, _, factor, hybrid_floor, cache_floor, ncache):
+        opts = self._options(factor)
+        noncache = [
+            o.cache_params.load_factor for o in opts if not o.dynamicemb_options.caching
+        ]
+        cache = [
+            o.cache_params.load_factor for o in opts if o.dynamicemb_options.caching
+        ]
+        self.assertEqual(noncache[0:2], [0, hybrid_floor])
+        self.assertEqual(noncache[5:], [0.5, 0.6, 0.7, 0.8, 0.9, 1])
+        np.testing.assert_allclose(
+            np.diff(np.log(noncache[1:6])), np.log(0.5 / hybrid_floor) / 4
         )
-        families = self._candidates(self._constraint(unique_id_factor=factor))
-        self.assertEqual(
-            [round(r, 9) for r in self._partial_ratios(families, True)],
-            [round(r, 9) for r in _expected_caching_ratios(caching_floor)],
-        )
-        self.assertEqual(
-            [round(r, 9) for r in self._partial_ratios(families, False)],
-            [round(r, 9) for r in _expected_hybrid_ratios(hybrid_floor)],
-        )
-        self.assertEqual(self._ratios(families, False)[:1], [0.0])
-        self.assertEqual(self._ratios(families, False)[-1:], [1.0])
+        self.assertEqual(len(cache), ncache)
+        self.assertEqual(cache[:1], [] if cache_floor is None else [cache_floor])
 
-    def test_high_lower_endpoint_inserts_itself(self):
-        # q in (0.7, 0.8): caching keeps the useful high ratios plus the
-        # endpoint itself instead of discarding caching entirely.
-        factor = 114.0
-        caching_floor, _ = self._expected_floors(factor, self.BATCH, 100_096)
-        self.assertGreater(caching_floor, 0.7)
-        self.assertLess(caching_floor, 0.8)
-        families = self._candidates(self._constraint(unique_id_factor=factor))
+    @parameterized.expand(
+        [
+            ("host", 0, 1, [False]),
+            ("full", 1, 1, [False]),
+            ("both", 0.37, 1, [False, True]),
+            ("insufficient_cache", 0.1, 9, [False]),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_ratio_pin(self, _, ratio, pooling, families):
+        opts = self._options(ratio=ratio, pooling=pooling)
         self.assertEqual(
-            [round(r, 9) for r in self._partial_ratios(families, True)],
-            [round(caching_floor, 9), 0.8, 0.9],
-        )
-        # the non-caching segment is exempt from the cache-residency floor
-        self.assertEqual(len(self._partial_ratios(families, False)), 9)
-
-    def test_working_set_reaching_the_table_drops_partial_caching(self):
-        # q >= 1: no partial cache is offered; HBM_ONLY stays valid.
-        factor = 160.0
-        caching_floor, _ = self._expected_floors(factor, self.BATCH, 100_096)
-        self.assertGreaterEqual(caching_floor, 1.0)
-        families = self._candidates(self._constraint(unique_id_factor=factor))
-        self.assertEqual(self._ratios(families, True), [])
-        self.assertEqual(len(self._partial_ratios(families, False)), 9)
-        self.assertEqual(len(self._ratios(families, False)[:1]), 1)
-        self.assertEqual(len(self._ratios(families, False)[-1:]), 1)
-
-    def test_measured_zero_keeps_the_unmeasured_floors(self):
-        # The zero endpoint already represents the empty working set, so a
-        # measured zero keeps both positive segments at the 0.1 unmeasured
-        # floor instead of introducing a minimum-allocation search.
-        families = self._candidates(self._constraint(unique_id_factor=0.0))
-        self.assertEqual(self._ratios(families, False)[:1], [0.0])
-        self.assertEqual(
-            [round(r, 9) for r in self._partial_ratios(families, False)],
-            [round(r, 9) for r in _expected_hybrid_ratios(0.1)],
-        )
-        self.assertEqual(
-            [round(r, 9) for r in self._partial_ratios(families, True)],
-            [round(r, 9) for r in _expected_caching_ratios(0.1)],
+            [(o.cache_params.load_factor, o.dynamicemb_options.caching) for o in opts],
+            [(ratio, family) for family in families],
         )
 
-    def test_low_segment_is_geometric_with_five_points(self):
-        points = _dynamicemb_low_segment(0.02)
-        self.assertEqual(len(points), 5)
-        self.assertEqual(points[0], 0.02)
-        self.assertEqual(points[-1], 0.5)
-        # geometric spacing: constant ratio between consecutive points
-        for i in range(len(points) - 2):
-            self.assertAlmostEqual(
-                points[i + 1] / points[i], points[i + 2] / points[i + 1], places=9
+    def test_physical_dedup_keeps_distinct_budgets(self):
+        # The low cache segment spans seven to eight fp16 rows. Its five
+        # requests buy just three distinct byte budgets in the same cache bucket.
+        opts = self._options(factor=7 / 640, rows=16, dtype=torch.float16)
+        ratios = [
+            o.cache_params.load_factor for o in opts if o.dynamicemb_options.caching
+        ]
+        self.assertEqual(ratios[0], 7 / 16)
+        self.assertEqual([int(r * 32) for r in ratios], [14, 15, 16, 19, 22, 25, 28])
+
+    def test_invalid_factor(self):
+        for factor in (float("nan"), -1):
+            with self.assertRaisesRegex(ValueError, "unique_id_factor"):
+                self._options(factor)
+
+    @parameterized.expand(
+        [
+            ("zero", 0, False, 4096, False, 0),
+            ("full", 1, False, 4096, False, 1),
+            ("hybrid", 0.5, False, 4096, False, 0.11 + 0.01 * 0.5),
+            ("cache", 0.1, True, 4096, False, 0.28 + 0.01 * 0.25),
+            ("cache_covers_shard", 0.1, True, 512, False, 0.28 + 0.01),
+            ("measured_cache", 0.1, True, 4096, True, 0.6),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_performance_uses_allocated_share_only(
+        self, _, ratio, caching, rows, measured, expected
+    ):
+        opt = next(
+            o
+            for o in self._options(ratio=ratio, rows=rows)
+            if o.dynamicemb_options.caching == caching
+        )
+        original = opt.cache_params
+        if measured:
+            original.stats = mock.Mock()
+            original.stats.expected_miss_rate.return_value = 0.4
+        with mock.patch.object(
+            dynamicemb_util,
+            "_orig_build_shard_perf_contexts",
+            side_effect=lambda *args: opt.cache_params.load_factor,
+        ):
+            hit_rate = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
+                None, [[rows, 1]], opt, None, None, None
             )
-        self.assertEqual(points, sorted(set(points)))
-        self.assertEqual(_dynamicemb_low_segment(0.5), [0.5])
-        self.assertEqual(_dynamicemb_low_segment(0.73), [])
-
-    def test_world_size_is_not_applied_twice(self):
-        # f = 78.2, B = 128 gives U5 = 50_048 = N/2, so the CACHING floor
-        # sits at 0.5. A second world_size division would lower it to 0.25
-        # and admit grid points that cannot hold the working set.
-        families = self._candidates(self._constraint(unique_id_factor=78.2))
-        self.assertEqual(round(min(self._ratios(families, True)), 9), 0.5)
-
-    def test_unmeasured_large_pooling_drops_small_caches_only(self):
-        # Without a factor the fallback estimate is the batch lookup count;
-        # caches that cannot hold it are dropped, while HYBRID is exempt
-        # from the cache check and keeps its whole grid.
-        families = self._candidates(self._constraint(pooling=500.0), batch_size=100)
-        self.assertEqual(
-            self._partial_ratios(families, True), [0.5, 0.6, 0.7, 0.8, 0.9]
-        )
-        self.assertEqual(len(self._partial_ratios(families, False)), 9)
-
-    def test_explicit_zero_is_one_host_only(self):
-        families = self._candidates(self._constraint(explicit_ratio=0.0))
-        self.assertEqual(sorted(k for k in families if families[k]), [False])
-        self.assertEqual(self._ratios(families, False)[:1], [0.0])
-
-    def test_explicit_one_is_one_hbm_only(self):
-        families = self._candidates(self._constraint(explicit_ratio=1.0))
-        self.assertEqual(sorted(k for k in families if families[k]), [False])
-        self.assertEqual(self._ratios(families, False)[-1:], [1.0])
-
-    def test_explicit_partial_pins_both_families(self):
-        families = self._candidates(self._constraint(explicit_ratio=0.37))
-        self.assertEqual([round(r, 9) for r in self._ratios(families, False)], [0.37])
-        self.assertEqual([round(r, 9) for r in self._ratios(families, True)], [0.37])
-
-    def test_explicit_caching_failure_keeps_hybrid(self):
-        # The pinned cache cannot hold the batch, but the same-ratio HYBRID
-        # needs no cache and survives.
-        families = self._candidates(
-            self._constraint(explicit_ratio=0.1, pooling=500.0), batch_size=100
-        )
-        self.assertEqual([round(r, 9) for r in self._ratios(families, False)], [0.1])
-        self.assertEqual(self._ratios(families, True), [])
-
-    def test_ineligible_factor_is_rejected(self):
-        constraint = self._constraint(unique_id_factor=float("nan"))
-        with self.assertRaisesRegex(ValueError, "unique_id_factor"):
-            self._candidates(constraint)
-        constraint = self._constraint(unique_id_factor=-1.0)
-        with self.assertRaisesRegex(ValueError, "unique_id_factor"):
-            self._candidates(constraint)
-
-    def test_clamp_collapses_equal_budgets_keeping_the_smallest_ratio(self):
-        # A 17-row shard aligned to 128 rows: every partial ratio from the
-        # second grid point up clamps to the same budget and realizes the
-        # same tier rows, so the physically equal candidates collapse at
-        # generation. The deterministic representative is the smallest
-        # generating ratio -- the second geometric point, not the highest
-        # ratio -- while 0.1 keeps a budget of its own below the threshold.
-        families = self._candidates(
-            self._constraint(num_embeddings=34), num_embeddings=34
-        )
-        non_caching = [r for r in self._ratios(families, False) if 0.0 < r < 1.0]
-        self.assertEqual(
-            [round(r, 9) for r in non_caching], [0.1, round(0.1 * 5**0.25, 9)]
-        )
-        # the caching family collapses the same way, keeping the same ratios
-        caching = [round(r, 9) for r in self._ratios(families, True)]
-        self.assertEqual(caching, [0.1, round(0.1 * 5**0.25, 9)])
-
-    def test_equal_rows_with_different_budgets_do_not_collapse(self):
-        # On a table whose tier rows are identical across ratios (a cache
-        # bucket already covers the shard) but whose budgets differ, the
-        # candidates are NOT equivalent: native fusion decides the group
-        # from summed budgets, and a different budget can flip the fit.
-        families = self._candidates(
-            self._constraint(num_embeddings=4096), num_embeddings=4096
-        )
-        caching = self._ratios(families, True)
-        self.assertEqual(len(caching), 9)
-        # every surviving candidate realizes the same 1024-row resident
-        # tier here, so what keeps them distinct is the budget the mirror
-        # computes for the dedup key -- verify by recomputing it
-        from tzrec.utils.dynamicemb_util import dynamicemb_table_memory
-
-        budgets = {
-            dynamicemb_table_memory(
-                caching=True,
-                ratio=float(so.cache_load_factor),
-                shard_rows=so.shards[0].size[0],
-                dim=so.tensor.shape[1],
-                element_size=so.tensor.element_size(),
-            ).local_hbm_for_values
-            for so in families[True]
-        }
-        self.assertEqual(len(budgets), len(caching))
-
-
-@unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
-@mark_ci_scope("gpu")
-class DynamicEmbPlannerRegressionTest(unittest.TestCase):
-    """Feasibility regressions for the four-layout candidate space."""
-
-    def _enumerate(self, num_embeddings, dim, world_size=2, batch_size=32):
-        from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
-
-        table = EmbeddingBagConfig(
-            num_embeddings=num_embeddings,
-            embedding_dim=dim,
-            name="table_big",
-            feature_names=["feat_big"],
-        )
-        cfg = feature_pb2.DynamicEmbedding()
-        cfg.max_capacity = num_embeddings
-        cfg.score_strategy = "STEP"
-        constraint = build_dynamicemb_constraints(cfg, table)
-        model = TestSparseNN(tables=[table], sparse_device=torch.device("meta"))
-        topology = Topology(world_size=world_size, compute_device="cuda")
-        enumerator = EmbeddingEnumerator(
-            topology=topology,
-            batch_size=batch_size,
-            fqn_constraints={"sparse.ebc.table_big": constraint},
-        )
-        from tzrec.utils.plan_util import (
-            get_default_sharders as _tzrec_get_default_sharders,
-        )
-
-        search_space = enumerator.enumerate(
-            module=model, sharders=_tzrec_get_default_sharders()
-        )
-        return [so for so in search_space if getattr(so, "use_dynamicemb", False)]
-
-    def _dp_proposals(self, search_space, world_size, hbm_cap, ddr_cap):
-        constraint = SimpleNamespace(
-            devices=[
-                SimpleNamespace(storage=SimpleNamespace(hbm=hbm_cap, ddr=ddr_cap))
-                for _ in range(world_size)
-            ],
-            local_world_size=world_size,
-        )
-        proposer = DynamicProgrammingProposer(
-            hbm_bins_per_device=100, ddr_bins_per_device=25
-        )
-        proposer.load(search_space)
-        if not proposer.propose():
-            return []
-        proposer.feedback(partitionable=True, storage_constraint=constraint)
-        proposals = []
-        proposal = proposer.propose()
-        while proposal:
-            proposals.append(proposal)
-            proposer.feedback(partitionable=True, storage_constraint=constraint)
-            proposal = proposer.propose()
-        return proposals
-
-    def test_large_table_fits_only_with_new_candidates(self):
-        # Per-rank rows = 20M, dim 32 fp32: values = 2.56 GB/rank. With the
-        # old candidate space the smallest HBM value share is 10%, which
-        # together with the always-resident hash-map metadata exceeds a
-        # 520 MB budget; HOST_ONLY fits with metadata alone.
-        search_space = self._enumerate(40_000_000, 32)
-        old_space = [so for so in search_space if so.cache_load_factor >= 0.1]
-        hbm_cap = 520 * (1 << 20)
-        for so in old_space:
-            self.assertGreater(max(shard.storage.hbm for shard in so.shards), hbm_cap)
-        zero = next(
-            so
-            for so in search_space
-            if not so.dynamicemb_options.caching and so.cache_load_factor == 0.0
-        )
-        self.assertLessEqual(max(shard.storage.hbm for shard in zero.shards), hbm_cap)
-
-        # the old candidate space has no feasible DP proposal...
-        self.assertEqual(self._dp_proposals(old_space, 2, hbm_cap, 10 << 30), [])
-        # ...while the full space yields one, placing the table at the zero
-        # endpoint
-        proposals = self._dp_proposals(search_space, 2, hbm_cap, 10 << 30)
-        self.assertTrue(proposals)
-        chosen = {so.fqn: so for so in proposals[0]}
-        placed = chosen["sparse.ebc.table_big"]
-        self.assertEqual(placed.cache_load_factor, 0.0)
-        self.assertFalse(placed.dynamicemb_options.caching)
-        self.assertEqual(placed.dynamicemb_options.local_hbm_for_values, 0)
-
-    def test_metadata_alone_exceeding_hbm_still_fails(self):
-        # HOST_ONLY is not free GPU memory: its hash-map metadata alone
-        # (>= 21 bytes per row over 20M rows) exceeds a 300 MB budget, so
-        # even the new candidate space has no feasible placement.
-        search_space = self._enumerate(40_000_000, 32)
-        self.assertEqual(
-            self._dp_proposals(search_space, 2, 300 * (1 << 20), 10 << 30),
-            [],
-        )
-
-    def test_zero_ddr_topology_envelope_is_conservative(self):
-        # A topology without host memory cannot hold zero, partial or
-        # caching values. The full endpoint's DDR estimate is the
-        # mixed-group minimum host bucket of the conservative envelope, so
-        # it too is pruned here even though an all-full group would really
-        # allocate no host tier -- the envelope approximation the design
-        # accepts rather than promising exact zero-DDR feasibility.
-        search_space = self._enumerate(4096, 32)
-        hbm_cap = 64 * (1 << 20)
-        survivors = []
-        for so in search_space:
-            max_hbm = max(shard.storage.hbm for shard in so.shards)
-            max_ddr = max(shard.storage.ddr for shard in so.shards)
-            if max_hbm <= hbm_cap and max_ddr <= 0:
-                survivors.append((so.cache_load_factor, so.dynamicemb_options.caching))
-        self.assertEqual(survivors, [])
-
-    def test_tight_ddr_keeps_high_hybrid_candidates(self):
-        # DDR pressure must not remove the useful high-HBM HYBRID points:
-        # the candidate set still spans up to 0.9, so a nearly-full HBM
-        # split remains plannable.
-        search_space = self._enumerate(40_000_000, 32)
-        non_caching_partials = sorted(
-            (
-                so
-                for so in search_space
-                if not so.dynamicemb_options.caching
-                and 0.0 < so.cache_load_factor < 1.0
-            ),
-            key=lambda so: so.cache_load_factor,
-        )
-        self.assertEqual(
-            [
-                round(cast(float, so.cache_load_factor), 9)
-                for so in non_caching_partials
-            ][-4:],
-            [0.6, 0.7, 0.8, 0.9],
-        )
-
-    def test_full_hbm_candidate_is_not_billed_twice(self):
-        # The HBM_ONLY candidate charges values once and no host tier.
-        search_space = self._enumerate(4096, 32)
-        full = next(
-            so
-            for so in search_space
-            if not so.dynamicemb_options.caching and so.cache_load_factor == 1.0
-        )
-        # values are charged once; the only DDR in the estimate is the
-        # mixed-group minimum host bucket, never a full backing table
-        for shard in full.shards:
-            self.assertLessEqual(shard.storage.ddr, 128 * 32 * 4)
-            self.assertGreater(shard.storage.hbm, 0)
-
-
-def _expected_caching_ratios(floor):
-    ratios = set(_dynamicemb_low_segment(floor))
-    ratios.update(r for r in (0.5, 0.6, 0.7, 0.8, 0.9) if r >= floor)
-    if 0.5 < floor < 1.0:
-        ratios.add(floor)
-    return sorted(r for r in ratios if 0.0 < r < 1.0)
-
-
-def _expected_hybrid_ratios(floor):
-    ratios = set(_dynamicemb_low_segment(floor))
-    ratios.update((0.5, 0.6, 0.7, 0.8, 0.9))
-    return sorted(r for r in ratios if 0.0 < r < 1.0)
+        if measured:
+            original.stats.expected_miss_rate.assert_called_once_with(0.25)
+        self.assertAlmostEqual(hit_rate, expected)
+        self.assertIs(opt.cache_params, original)
+        self.assertEqual(opt.cache_params.load_factor, ratio)
 
 
 if __name__ == "__main__":

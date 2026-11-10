@@ -12,7 +12,7 @@
 import dataclasses
 import math
 import os
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type, cast
+from typing import Any, Dict, List, NamedTuple, Optional, Type, cast
 
 import torch
 from torchrec import optim as trec_optim
@@ -58,15 +58,8 @@ _DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
 _DYNAMICEMB_HYBRID_X_EFF_BASE = 0.11
 _DYNAMICEMB_X_EFF_TIEBREAK = 0.01
 
-# Pinned-runtime allocation constants the capacity mirror reproduces:
-# the cache/HBM-tier bucket width and the cache's overflow area are fixed by
-# ``BatchedDynamicEmbeddingTablesV2._create_cache_storage``; bucket widths are
-# rounded to a 16-row multiple for digest loads (``HashBucketTable``); a
-# NO_EVICTION key map holds twice its value rows (``create_table_state``).
 DYNAMICEMB_CACHE_BUCKET_CAPACITY = 1024
 _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS = 3
-_DYNAMICEMB_BUCKET_ALIGN = 16
-_DYNAMICEMB_NO_EVICTION_LOAD_FACTOR = 0.5
 
 
 class DynamicEmbTableMemory(NamedTuple):
@@ -84,8 +77,7 @@ class DynamicEmbTableMemory(NamedTuple):
         host_rows: host value rows.
         resident_rows: rows credited toward normal cache residency -- the cache
             tier without its overflow area (all HBM value rows otherwise).
-        local_hbm_for_values: the exact ``local_hbm_for_values`` budget that
-            makes the runtime realize this placement.
+        local_hbm_for_values: requested value bytes, before physical tier rounding.
     """
 
     hbm_values: int
@@ -97,159 +89,14 @@ class DynamicEmbTableMemory(NamedTuple):
     local_hbm_for_values: int
 
 
-def _effective_bucket_capacity(bucket_capacity: Optional[int]) -> int:
-    """Bucket width the runtime's hash table actually uses.
-
-    ``HashBucketTable`` rounds the requested width up to a multiple of the
-    16-byte digest load width (128 and 1024 already qualify).
-    """
-    width = 128 if bucket_capacity is None else int(bucket_capacity)
-    if width <= 0:
-        raise ValueError(f"bucket_capacity must be positive, got {width}")
-    return (
-        (width + _DYNAMICEMB_BUCKET_ALIGN - 1)
-        // _DYNAMICEMB_BUCKET_ALIGN
-        * _DYNAMICEMB_BUCKET_ALIGN
-    )
+def _bucket_rounded_rows(rows: int, width: int) -> int:
+    """Round a tier to whole native buckets."""
+    return (rows + width - 1) // width * width
 
 
-def _bucket_rounded_rows(rows: int, bucket_capacity: int) -> int:
-    """Per-table capacity ``HashBucketTable`` builds for a requested row count.
-
-    Rounds up to a whole number of buckets, so capacities land at or above
-    the requested rows.
-    """
-    return (rows + bucket_capacity - 1) // bucket_capacity * bucket_capacity
-
-
-def _keymap_bytes(
-    slots: int,
-    score_words: int,
-    *,
-    bucket_capacity: int,
-) -> int:
-    """HBM bytes of one key map: slot fields, bucket sizes, counters.
-
-    Every key map of the pinned runtime allocates the same fields per slot:
-    an 8-byte key, a 1-byte digest, one 8-byte word per score word, and a
-    4-byte reference counter -- including host backing and HYBRID tiers whose
-    execution path may not use the counter. Plus a 4-byte bucket-size counter
-    per bucket. One score word costs 21 bytes per slot; two cost 29.
-    """
-    per_slot = 8 + 1 + 8 * score_words + 4
-    buckets = (slots + bucket_capacity - 1) // bucket_capacity
-    return per_slot * slots + 4 * buckets
-
-
-def dynamicemb_aligned_capacity(shard_rows: int, bucket_capacity: Optional[int]) -> int:
-    """N: full per-shard row capacity after the runtime's bucket rounding.
-
-    The value tiers of a storage round the requested shard rows up to whole
-    buckets; a NO_EVICTION table's key map starts at twice its value buffer.
-    This is the planning horizon denominators normalize against.
-    """
-    width = _effective_bucket_capacity(bucket_capacity)
-    return _bucket_rounded_rows(shard_rows, width)
-
-
-def _dynamicemb_table_sizing(
-    shard_rows: int,
-    *,
-    bucket_capacity: Optional[int],
-    score_words: int,
-    no_eviction: bool,
-) -> Tuple[int, int, int, int]:
-    """Shared sizing inputs of one table's full tiers.
-
-    Returns ``(width, full_rows, full_slots, cache_words)``: the effective
-    bucket width; ``full_rows``, the value-row capacity at the planning
-    horizon -- the bucket-aligned per-shard row count, which is the
-    ``init_capacity`` a NO_EVICTION value buffer uses at peak; ``full_slots``,
-    the key-map slot count of a full tier -- twice the value rows for
-    NO_EVICTION (its map sizes at ``max_load_factor`` 0.5), the value rows
-    themselves for every other policy; and ``cache_words``, the score width
-    of a cache tier -- the runtime's NO_EVICTION special case swaps the cache
-    to TIMESTAMP/LRU (one word), every other policy is inherited unchanged.
-    """
-    width = _effective_bucket_capacity(bucket_capacity)
-    full_rows = _bucket_rounded_rows(shard_rows, width)
-    full_slots = (
-        _bucket_rounded_rows(
-            math.ceil(full_rows / _DYNAMICEMB_NO_EVICTION_LOAD_FACTOR), width
-        )
-        if no_eviction
-        else full_rows
-    )
-    return width, full_rows, full_slots, (1 if no_eviction else score_words)
-
-
-def _dynamicemb_placement_memory(
-    layout: str,
-    *,
-    shard_rows: int,
-    row_bytes: int,
-    full_rows: int,
-    full_slots: int,
-    width: int,
-    score_words: int,
-    cache_words: int,
-    frac: float = 0.0,
-) -> DynamicEmbTableMemory:
-    """Common costing of one decided placement.
-
-    ``layout`` (``HOST_ONLY`` / ``HBM_ONLY`` / ``HYBRID`` / ``CACHING``)
-    picks the tier capacities and where values live; every layout then costs
-    through the same key-map and value arithmetic and one
-    ``DynamicEmbTableMemory`` construction. A splitting layout keeps
-    ``frac`` of the rows in its HBM tier under the native rules: integer
-    truncation, a one-row minimum, a clamp to the shard's rows, and bucket
-    rounding up -- the cache/HBM tier in 1024-row buckets, the remainder in
-    the table's own width. The cache's three-bucket overflow area carries
-    its own key map and values and is never resident capacity.
-    """
-    cache_width = DYNAMICEMB_CACHE_BUCKET_CAPACITY
-    budget = 0
-    if layout in ("HOST_ONLY", "HBM_ONLY"):
-        on_hbm = layout == "HBM_ONLY"
-        hbm_rows = full_rows if on_hbm else 0
-        host_rows = 0 if on_hbm else full_rows
-        resident_rows = hbm_rows
-        budget = hbm_rows * row_bytes
-        keymaps = [(full_slots, width, score_words)]
-    else:
-        resident_rows = _bucket_rounded_rows(
-            min(shard_rows, max(1, int(shard_rows * frac))), cache_width
-        )
-        if layout == "HYBRID":
-            hbm_rows = resident_rows
-            host_rows = _bucket_rounded_rows(
-                min(shard_rows, max(1, int(shard_rows * (1.0 - frac)))), width
-            )
-            keymaps = [
-                (hbm_rows, cache_width, score_words),
-                (host_rows, width, score_words),
-            ]
-        else:
-            overflow_rows = _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS * cache_width
-            hbm_rows = resident_rows + overflow_rows
-            host_rows = full_rows
-            keymaps = [
-                (resident_rows, cache_width, cache_words),
-                (overflow_rows, overflow_rows, cache_words),
-                (full_slots, width, score_words),
-            ]
-    return DynamicEmbTableMemory(
-        hbm_values=hbm_rows * row_bytes,
-        host_values=host_rows * row_bytes,
-        hbm_index=sum(
-            _keymap_bytes(slots, words, bucket_capacity=bucket)
-            for slots, bucket, words in keymaps
-        ),
-        hbm_rows=hbm_rows,
-        host_rows=host_rows,
-        resident_rows=resident_rows,
-        local_hbm_for_values=budget,
-    )
+def _keymap_bytes(slots: int, width: int, score_words: int) -> int:
+    """Count keys, digests, score words, reference counters and bucket sizes."""
+    return slots * (8 + 1 + 8 * score_words + 4) + 4 * (slots // width)
 
 
 def dynamicemb_table_memory(
@@ -264,123 +111,54 @@ def dynamicemb_table_memory(
     score_words: int = 1,
     no_eviction: bool = False,
 ) -> DynamicEmbTableMemory:
-    """Mirror the pinned runtime's physical allocation for one table shard.
+    """Estimate physical storage and the value budget of a normalized row-wise shard.
 
-    Reproduces ``BatchedDynamicEmbeddingTablesV2._create_cache_storage`` and
-    ``create_table_state`` without constructing a native table: the native
-    budget derivation, the layout's tier row counts (integer truncation,
-    one-row minimum, clamp to the shard rows, bucket rounding up), the
-    cache's 1024-row buckets with their three-bucket overflow area, the
-    HBM-resident key maps of every tier -- every key map of the pinned
-    runtime allocates a per-slot reference counter and none keeps a separate
-    row-index array -- and the exact ``local_hbm_for_values`` budget that
-    realizes the requested ratio. The budget is derived from the
-    bucket-aligned full-shard capacity, so the aligned denominator and budget
-    numerator never mix.
-
-    The planner proposes budgets and caching choices; the runtime's native
-    fusion then selects one layout for each compatible group from its summed
-    sizes and budgets. A partial candidate (``0 < ratio < 1``) costs its own
-    split placement. The zero and full endpoints conservatively envelope the
-    group outcomes the runtime can reach for the member -- a zero-budget
-    member of a mixed group acquires a minimum HBM tier and a fully funded
-    one a minimum host tier -- by taking, per field, the larger of the
-    reachable placements. Constraints normalize tensor shards and runtime
-    max_capacity to the same aligned rows before candidate generation. No
-    table's value budget exceeds its full size, so a group can fit wholly
-    in HBM only when all members are fully funded.
-
-    Args:
-        caching: the candidate's caching choice. Partial candidates
-            (``0 < ratio < 1``) pick their family with it; the endpoints are
-            non-caching.
-        ratio: requested HBM share of the table's values, in ``[0, 1]``.
-        shard_rows: per-rank row count of the sharded table (``M``).
-        dim: embedding width of the table.
-        element_size: bytes per embedding element.
-        optimizer_state_dim: optimizer state elements per row in embedding
-            dtype units (0 when the table is not trained).
-        bucket_capacity: the table's configured bucket width, if any.
-        score_words: score words the table's policy occupies per key (2 for
-            the compound LRU+LFU policy, 1 otherwise).
-        no_eviction: whether the table's strategy never evicts (its key map
-            holds twice its value rows and its value buffer is
-            ``init_capacity``; the runtime also refuses to split it across
-            HYBRID tiers).
-
-    Returns:
-        The physical tier capacities and budget of this placement.
-
-    Raises:
-        ValueError: for a non-finite or out-of-range ratio, or a caching
-            endpoint (the runtime endpoints are non-caching).
+    Constraints align shard_rows and the runtime max_capacity before enumeration.
+    Zero and full budgets may share a HYBRID group: reserve its minimum tiers
+    as well as the standalone endpoint. NO_EVICTION cannot form a HYBRID group.
     """
-    if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
-        raise ValueError(f"dynamicemb ratio must be in [0, 1], got {ratio}")
-    if caching and (ratio == 0.0 or ratio == 1.0):
-        raise ValueError("the zero and full endpoints are non-caching")
+    if not 0.0 <= ratio <= 1.0 or (caching and ratio in (0.0, 1.0)):
+        raise ValueError(f"invalid dynamicemb placement: caching={caching}, {ratio=}")
+    width = bucket_capacity if bucket_capacity is not None else 128
     row_bytes = (dim + optimizer_state_dim) * element_size
-    width, full_rows, full_slots, cache_words = _dynamicemb_table_sizing(
-        shard_rows,
-        bucket_capacity=bucket_capacity,
-        score_words=score_words,
-        no_eviction=no_eviction,
+    full_bytes = shard_rows * row_bytes
+    budget = (
+        full_bytes
+        if ratio == 1
+        else min(int(ratio * shard_rows * row_bytes), full_bytes - 1)
     )
-    placement_kwargs = dict(
-        shard_rows=shard_rows,
-        row_bytes=row_bytes,
-        full_rows=full_rows,
-        full_slots=full_slots,
-        width=width,
-        score_words=score_words,
-        cache_words=cache_words,
+    full_index = _keymap_bytes(
+        shard_rows * (2 if no_eviction else 1), width, score_words
     )
 
-    def envelope(layouts: List[Tuple[str, float]]) -> DynamicEmbTableMemory:
-        """Per-field maximum over the placements an endpoint can reach."""
-        branches = [
-            _dynamicemb_placement_memory(layout, **placement_kwargs, frac=frac)
-            for layout, frac in layouts
-        ]
-        return DynamicEmbTableMemory(
-            *[
-                max(getattr(b, f) for b in branches)
-                for f in DynamicEmbTableMemory._fields
-            ]
-        )
-
-    if ratio == 0.0:
-        # Reachable native outcomes of a zero-budget non-caching member:
-        # HOST_ONLY in an all-zero group, or the minimum HBM tier of a mixed
-        # HYBRID group -- which the runtime only builds for a table it can
-        # split, so NO_EVICTION reaches the standalone branch alone.
-        return _dynamicemb_placement_memory(
-            "HOST_ONLY" if no_eviction else "HYBRID", **placement_kwargs, frac=0.0
-        )
-    if ratio == 1.0:
-        # Reachable native outcomes of a fully funded non-caching member:
-        # HBM_ONLY in a fitting group, or the minimum host tier of a mixed
-        # HYBRID group. The full endpoint never joins a CACHING group, so no
-        # full backing table is charged.
-        layouts = [("HBM_ONLY", 1.0)]
-        if not no_eviction:
-            layouts.append(("HYBRID", 1.0))
-        return envelope(layouts)
-    # table_bytes is the runtime's fit-check basis: it sizes rows by the
-    # un-rounded per-shard max_capacity, then splits by the budget fraction.
-    table_bytes = shard_rows * row_bytes
-    budget = int(ratio * full_rows * row_bytes)
-    # A partial budget must stay below the runtime's fit threshold -- a
-    # budget that reaches the un-aligned table size turns the placement into
-    # HBM_ONLY at construction, and the full endpoint is emitted once
-    # already. The clamp is the runtime's own capacity clamp, mirrored.
-    if table_bytes > 0:
-        budget = min(budget, table_bytes - 1)
-    frac = min(1.0, budget / table_bytes) if table_bytes > 0 else 1.0
-    result = _dynamicemb_placement_memory(
-        "CACHING" if caching else "HYBRID", **placement_kwargs, frac=frac
+    if no_eviction and ratio in (0, 1):
+        resident = hbm = shard_rows if ratio == 1 else 0
+        host = shard_rows - hbm
+        index = full_index
+    else:
+        fraction = budget / full_bytes
+        cache_width = DYNAMICEMB_CACHE_BUCKET_CAPACITY
+        resident = _bucket_rounded_rows(max(1, int(shard_rows * fraction)), cache_width)
+        if caching:
+            overflow = _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS * cache_width
+            cache_words = 1 if no_eviction else score_words
+            hbm, host = resident + overflow, shard_rows
+            index = (
+                full_index
+                + _keymap_bytes(resident, cache_width, cache_words)
+                + _keymap_bytes(overflow, overflow, cache_words)
+            )
+        else:
+            hbm = resident
+            host = _bucket_rounded_rows(max(1, int(shard_rows * (1 - fraction))), width)
+            index = _keymap_bytes(hbm, cache_width, score_words) + _keymap_bytes(
+                host, width, score_words
+            )
+            if ratio == 1:
+                index = max(index, full_index)
+    return DynamicEmbTableMemory(
+        hbm * row_bytes, host * row_bytes, index, hbm, host, resident, budget
     )
-    return result._replace(local_hbm_for_values=budget)
 
 
 # Armed by train() when delta dump publishes evicted-key tombstones: that
@@ -467,40 +245,10 @@ def _dynamicemb_effective_cache_ratio(
     *,
     full_endpoint: bool = False,
 ) -> float:
-    """Effective HBM-hit ratio for the dynamicemb perf model.
+    """Estimate HBM hits from allocated residency or measured cache misses.
 
-    Returns the value passed to torchrec's perf bandwidth formula
-    ``bw = x_eff*hbm + (1-x_eff)*hbm_to_ddr_bw``. Larger value = faster path.
-
-    ``allocated_fraction`` is the candidate's *actual* capacity share,
-    derived from the capacity mirror's tier rows -- a partial caching
-    candidate's resident cache rows over its backing value rows (overflow
-    excluded), a partial non-caching candidate's HBM rows over its total
-    value rows. The requested ratio stays the budget basis; only the perf
-    model sees the allocated share, so a nominal 0.1 whose single 1024-row
-    bucket sits above a 4096-row backing scores 0.25.
-
-    Empirical pattern (alpha=1.05 pow-law access on A10):
-
-      * ``full_endpoint``: the fully funded non-caching endpoint takes the
-        standalone HBM-direct path. A fully funded member fused into a
-        HYBRID group loses that path; measure the fused module instead of
-        assuming standalone speed.
-      * a zero share on a non-caching candidate: host memory is read
-        directly; an explicit host-access estimate, not HYBRID's positive
-        intercept. The zero endpoint keeps this explicit rather than
-        dividing its envelope rows.
-      * ``caching=True``, any share in ``(0, 1]``: the cache path is 3.3x
-        slower than HBM-direct -> base 0.28 -- including a share that
-        reaches one, which does not switch the candidate to HBM-direct.
-      * ``caching=False``, ``0 < share < 1``: 6.8x slower -> base 0.11.
-
-    Within each partial block the perf is roughly flat in the share, but a
-    tiny monotonic perturbation lets the DP break ties.
-
-    If ``stats`` is provided for a caching candidate,
-    ``1 - stats.expected_miss_rate(x)`` overrides the heuristic verbatim
-    (clamped to ``[0, 1]``); the caller opts in to their own measurement.
+    Only the full non-caching endpoint takes the HBM-direct path. A cache
+    covering its entire backing table still uses the empirical cache model.
     """
     x = max(0.0, min(1.0, float(allocated_fraction)))
     if full_endpoint:
@@ -927,7 +675,8 @@ if has_dynamicemb:
         shard_rows: int,
         ratio: float,
         *,
-        is_inference: bool,
+        is_inference: bool = False,
+        caching: Optional[bool] = None,
     ) -> DynamicEmbTableMemory:
         """Capacity mirror for one shard of a planned dynamicemb table.
 
@@ -946,7 +695,7 @@ if has_dynamicemb:
         # the candidate's caching choice is the planner's own field on the
         # option; the runtime's fused-group layout is derived later
         return dynamicemb_table_memory(
-            caching=bool(dynamicemb_options.caching),
+            caching=bool(dynamicemb_options.caching) if caching is None else caching,
             ratio=ratio,
             shard_rows=shard_rows,
             dim=tensor.shape[1],
@@ -997,10 +746,6 @@ if has_dynamicemb:
                 # pyre-ignore [16]
                 dynamicemb_options = sharding_option.dynamicemb_options
 
-                # calc local_hbm_for_values from the same capacity mirror
-                # the candidate generator normalized against; the option's
-                # caching choice is the candidate's own, and the fused
-                # module's layout is the runtime's decision
                 tensor = sharding_option.tensor
                 optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
                 optimizer_kwargs = getattr(tensor, "_optimizer_kwargs", [{}])[0]
@@ -1128,64 +873,32 @@ if has_dynamicemb:
         *args,  # pyre-ignore [2]
         **kwargs,  # pyre-ignore [2]
     ):
-        """Inject the empirical x_eff into the perf estimator.
-
-        TorchRec version-specific sharder arguments are forwarded unchanged.
-
-        The performance model scores the candidate's *allocated* capacity
-        share, derived from the capacity mirror's tier rows (plus the
-        measured cache statistics a caching candidate carries); the fused
-        module's native layout can still differ, so this is a per-candidate
-        score, not a runtime measurement. The zero and full endpoints keep
-        their explicit handling instead of dividing their envelope rows. The
-        ``load_factor`` replacement is a temporary performance-only
-        substitution: it is restored before returning, so the separately
-        invoked storage estimator still sees the requested ratio, and the
-        allocated share never reaches budget conversion.
-        """
+        """Estimate performance from allocated residency without changing the budget."""
         dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
         original_cache_params = sharding_option.cache_params
         if dynamicemb_options is not None and shard_sizes:
-            requested = (
-                float(sharding_option.cache_load_factor)
-                if sharding_option.cache_load_factor is not None
-                else 1.0
-            )
-            caching = bool(getattr(dynamicemb_options, "caching", False))
-            stats = (
-                original_cache_params.stats
-                if original_cache_params is not None
-                else None
-            )
-            if requested >= 1.0 and not caching:
-                x_eff = _dynamicemb_effective_cache_ratio(
-                    requested, caching=caching, full_endpoint=True
-                )
-            elif requested <= 0.0 and not caching:
-                x_eff = _dynamicemb_effective_cache_ratio(0.0, caching=caching)
-            else:
+            requested = sharding_option.cache_load_factor
+            requested = 1.0 if requested is None else requested
+            caching = bool(dynamicemb_options.caching)
+            fraction = requested
+            if 0 < requested < 1:
                 memory = _dynamicemb_shard_memory(
                     dynamicemb_options,
                     sharding_option.tensor,
                     shard_sizes[0][0],
                     requested,
-                    is_inference=False,
                 )
-                if caching:
-                    # The backing tier's value rows supply the denominator;
-                    # overflow is excluded and NO_EVICTION's larger key-map
-                    # slot count never substitutes for them.
-                    x = (
-                        memory.resident_rows / memory.host_rows
-                        if memory.host_rows > 0
-                        else 1.0
-                    )
-                else:
-                    total_rows = memory.hbm_rows + memory.host_rows
-                    x = memory.hbm_rows / total_rows if total_rows > 0 else 1.0
-                x_eff = _dynamicemb_effective_cache_ratio(
-                    x, caching=caching, stats=stats
+                fraction = (
+                    memory.resident_rows / memory.host_rows
+                    if caching
+                    else memory.hbm_rows / (memory.hbm_rows + memory.host_rows)
                 )
+            x_eff = _dynamicemb_effective_cache_ratio(
+                fraction,
+                caching=caching,
+                stats=original_cache_params.stats if original_cache_params else None,
+                full_endpoint=requested == 1 and not caching,
+            )
             sharding_option.cache_params = (
                 dataclasses.replace(original_cache_params, load_factor=x_eff)
                 if original_cache_params is not None

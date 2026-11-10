@@ -87,12 +87,7 @@ from torchrec.modules.embedding_modules import (
 
 from tzrec.protos import feature_pb2
 from tzrec.utils import dynamicemb_util, env_util
-from tzrec.utils.dynamicemb_util import (
-    _dynamicemb_optimizer_state_dim,
-    dynamicemb_aligned_capacity,
-    dynamicemb_table_memory,
-    has_dynamicemb,
-)
+from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 
@@ -915,201 +910,67 @@ def calculate_shard_storages(
         )
 
 
-_DYNAMICEMB_HIGH_RATIOS = (0.5, 0.6, 0.7, 0.8, 0.9)
-_DYNAMICEMB_LOW_SEGMENT_POINTS = 5
-# A five-batch window is a planning heuristic for how much of a table a
-# pipeline of batches touches, not a claim about arbitrary skew.
-_DYNAMICEMB_WORKING_SET_MULTIPLIER = 5
-_DYNAMICEMB_UNMEASURED_FLOOR = 0.1
-
-
-def _dynamicemb_low_segment(low: float) -> List[float]:
-    """The geometric low-HBM segment ``G(low)``.
-
-    Five points spanning ``[low, 0.5]`` with both endpoints included and
-    pinned exactly; a degenerate segment is the single ratio ``0.5``, and a
-    lower endpoint above ``0.5`` has no segment at all.
-    """
-    if low > 0.5:
+def _dynamicemb_partial_ratios(low: float) -> List[float]:
+    """Sample five geometric points up to 0.5, then fixed tenths up to 0.9."""
+    if low >= 1.0:
         return []
-    if low == 0.5:
-        return [0.5]
-    if low <= 0.0:
-        raise ValueError(f"low segment endpoint must be positive, got {low}")
-    points = np.geomspace(low, 0.5, _DYNAMICEMB_LOW_SEGMENT_POINTS)
-    points[0] = low
-    points[-1] = 0.5
-    return [float(p) for p in points]
+    ratios = {low, *(r for r in (0.5, 0.6, 0.7, 0.8, 0.9) if r >= low)}
+    if low < 0.5:
+        ratios.update(float(r) for r in np.geomspace(low, 0.5, 5)[1:-1])
+    return sorted(ratios)
 
 
 def _emit_dynamicemb_variants(
-    base_option: ShardingOption,
-    unique_id_factor: Optional[float],
+    base_option: ShardingOption, unique_id_factor: Optional[float]
 ) -> List[ShardingOption]:
-    """Expand a dynamicemb ShardingOption into its budget/caching candidates.
-
-    Each candidate owns a deep-copied options object carrying a caching
-    choice and a requested HBM value budget: a ratio-0 non-caching endpoint
-    (zero budget), partial non-caching ratios, partial caching ratios, and a
-    ratio-1 non-caching endpoint (full budget). Without an explicit
-    ``cache_load_factor`` the partial ratios come from a geometric low
-    segment plus the fixed high grid, with per-table lower endpoints derived
-    from the measured working set: caching floors at ``max(q, 0.1)`` because
-    its cache must hold the batch, the non-caching segment starts at
-    ``min(q, 0.1)`` because a value partition reaches its host tier
-    directly. A measured zero keeps the positive non-caching segment at
-    0.1; the separate zero endpoint already represents the empty working
-    set.
-
-    The runtime's native fusion then selects one layout for each compatible
-    group from its summed sizes and budgets -- a candidate proposes, the
-    fused module decides. Caching candidates whose realized cache cannot
-    hold the batch's working set are filtered here. Physically equal
-    candidates of one table are collapsed at generation, before any
-    estimation: equivalence is the caching choice, the tier row capacities,
-    normal residency, and the runtime value budget -- equal rows with
-    different budgets are not equivalent, because a different summed budget
-    can flip a group's fit. Emission is in ascending ratio within each
-    family, so the first of an equivalent set is the smallest generating
-    ratio; an explicit pin emits only its own ratio and never collides with
-    the automatic choice.
-
-    Args:
-        base_option: the dynamicemb ShardingOption to expand; its
-            ``dynamicemb_options`` are attached by the caller.
-        unique_id_factor: the table's measured largest distinct-ID count per
-            sample (union over the features sharing the table), or None when
-            unmeasured.
-
-    Returns:
-        The table's candidates, in emission order (zero endpoint, non-caching
-        partials ascending, caching partials ascending, full endpoint).
-
-    Raises:
-        ValueError: for a non-finite or negative measured factor.
-    """
-    options = base_option.dynamicemb_options
-    tensor = base_option.tensor
-    batch_size = base_option.batch_size
-
-    if unique_id_factor is not None:
-        factor = float(unique_id_factor)
-        if not math.isfinite(factor) or factor < 0:
+    """Generate physically distinct candidates in ascending budget order per family."""
+    rows = base_option.shards[0].size[0]
+    if unique_id_factor is None:
+        required = math.ceil(base_option.batch_size * sum(base_option.input_lengths))
+        floor = 0.1
+    else:
+        if not math.isfinite(unique_id_factor) or unique_id_factor < 0:
             raise ValueError(
-                f"dynamicemb table {base_option.name}: unique_id_factor must "
-                f"be finite and non-negative, got {unique_id_factor}."
+                f"{base_option.name}: unique_id_factor must be finite and non-negative"
             )
-        # Inputs fan in from all ranks before the row-wise lookup and spread
-        # uniformly over its shards, so one rank's share of the batch's
-        # distinct ids is already the per-rank batch's share: no second
-        # world_size division.
-        working_set_rows = math.ceil(
-            _DYNAMICEMB_WORKING_SET_MULTIPLIER * factor * batch_size
-        )
-        working_set_ratio = working_set_rows / dynamicemb_aligned_capacity(
-            base_option.shards[0].size[0], options.bucket_capacity
-        )
-        # Overflow is billed to HBM but never satisfies cache residency.
-        resident_requirement = working_set_rows
+        required = math.ceil(5 * unique_id_factor * base_option.batch_size)
+        floor = required / rows or 0.1
+
+    params = base_option.cache_params
+    if params is None:
+        requests = [(False, 0.0)]
+        requests.extend((False, r) for r in _dynamicemb_partial_ratios(min(floor, 0.1)))
+        requests.extend((True, r) for r in _dynamicemb_partial_ratios(max(floor, 0.1)))
+        requests.append((False, 1.0))
     else:
-        working_set_ratio = None
-        # Conservative fallback without a measurement: the batch's raw
-        # lookup count from the effective batch size and input lengths.
-        resident_requirement = math.ceil(batch_size * sum(base_option.input_lengths))
+        ratio = float(params.load_factor)
+        requests = [(False, ratio)]
+        if 0 < ratio < 1:
+            requests.append((True, ratio))
 
-    stats = (
-        base_option.cache_params.stats if base_option.cache_params is not None else None
-    )
-
-    shard_rows = base_option.shards[0].size[0]
-    state_dim = _dynamicemb_optimizer_state_dim(
-        getattr(tensor, "_optimizer_classes", [None])[0],
-        tensor.shape,
-        tensor.dtype,
-    )
-    score_words = dynamicemb_util._dynamicemb_score_words(options)
-    no_eviction = dynamicemb_util._dynamicemb_no_eviction(options)
-
-    candidates: List[ShardingOption] = []
-    # Physical equivalence key of an emitted placement: the caching choice,
-    # tier rows, normal residency, and the runtime value budget.
-    seen_placements = set()
-
-    def emit(caching: bool, ratio: float) -> None:
-        memory = dynamicemb_table_memory(
+    candidates = []
+    seen = set()
+    for caching, ratio in requests:
+        memory = dynamicemb_util._dynamicemb_shard_memory(
+            base_option.dynamicemb_options,
+            base_option.tensor,
+            rows,
+            ratio,
             caching=caching,
-            ratio=ratio,
-            shard_rows=shard_rows,
-            dim=tensor.shape[1],
-            element_size=tensor.element_size(),
-            optimizer_state_dim=state_dim,
-            bucket_capacity=options.bucket_capacity,
-            score_words=score_words,
-            no_eviction=no_eviction,
         )
-        if caching and memory.resident_rows < resident_requirement:
-            return
-        placement = (
-            caching,
-            memory.hbm_rows,
-            memory.host_rows,
-            memory.resident_rows,
-            memory.local_hbm_for_values,
+        if caching and memory.resident_rows < required:
+            continue
+        # Equal tier rows with unequal budgets can change how a fused group fits.
+        key = (caching, memory)
+        if key in seen:
+            continue
+        seen.add(key)
+        option = copy.deepcopy(base_option)
+        option.cache_params = CacheParams(
+            load_factor=ratio, stats=params.stats if params else None
         )
-        if placement in seen_placements:
-            return
-        seen_placements.add(placement)
-        opt = copy.deepcopy(base_option)
-        opt.cache_params = CacheParams(load_factor=ratio, stats=stats)
-        # deepcopy(base_option) already produced a fresh dynamicemb_options.
-        opt.dynamicemb_options.caching = caching
-        candidates.append(opt)
-
-    if base_option.cache_params is not None:
-        explicit_ratio = float(base_option.cache_params.load_factor)
-        if explicit_ratio == 0.0:
-            emit(False, 0.0)
-        elif explicit_ratio == 1.0:
-            emit(False, 1.0)
-        else:
-            # An interior pin keeps both families at its ratio; a pinned
-            # non-caching partial survives even when the same-ratio caching
-            # variant cannot hold the batch.
-            emit(False, explicit_ratio)
-            emit(True, explicit_ratio)
-    else:
-        if working_set_ratio is None:
-            caching_floor = _DYNAMICEMB_UNMEASURED_FLOOR
-            non_caching_floor = _DYNAMICEMB_UNMEASURED_FLOOR
-        else:
-            caching_floor = max(working_set_ratio, _DYNAMICEMB_UNMEASURED_FLOOR)
-            non_caching_floor = min(working_set_ratio, _DYNAMICEMB_UNMEASURED_FLOOR)
-        if non_caching_floor <= 0.0:
-            # A measured zero keeps the positive segment at the unmeasured
-            # floor; the separate zero endpoint already represents it.
-            non_caching_floor = _DYNAMICEMB_UNMEASURED_FLOOR
-        emit(False, 0.0)
-        for ratio in sorted(
-            set(
-                _dynamicemb_low_segment(non_caching_floor)
-                + list(_DYNAMICEMB_HIGH_RATIOS)
-            )
-        ):
-            emit(False, ratio)
-        # One caching grid for the table. A floor that reached the whole
-        # table offers no partial cache; that does not make the full
-        # endpoint invalid.
-        if working_set_ratio is None or working_set_ratio < 1.0:
-            caching_ratios = set(_dynamicemb_low_segment(caching_floor))
-            caching_ratios.update(
-                r for r in _DYNAMICEMB_HIGH_RATIOS if r >= caching_floor
-            )
-            if 0.5 < caching_floor < 1.0:
-                caching_ratios.add(caching_floor)
-            for ratio in sorted(r for r in caching_ratios if 0.0 < r < 1.0):
-                emit(True, ratio)
-        emit(False, 1.0)
-
+        option.dynamicemb_options.caching = caching
+        candidates.append(option)
     return candidates
 
 
