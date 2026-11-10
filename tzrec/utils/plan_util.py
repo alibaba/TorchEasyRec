@@ -792,6 +792,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 kv_cache_load_factor=kv_cache_load_factor,
                 use_virtual_table=use_virtual_table,
                 dynamicemb_options=dynamicemb_options,
+                dynamicemb_memory=getattr(sharding_option, "dynamicemb_memory", None),
             )
             for shard, storage in zip(sharding_option.shards, shard_storages):
                 shard.storage = storage
@@ -821,6 +822,7 @@ def calculate_shard_storages(
     kv_cache_load_factor: float = KV_CACHING_RATIO,
     use_virtual_table: bool = False,
     dynamicemb_options=None,
+    dynamicemb_memory: Optional[dynamicemb_util.DynamicEmbTableMemory] = None,
 ) -> List[Storage]:
     """Calculates estimated storage sizes.
 
@@ -854,7 +856,9 @@ def calculate_shard_storages(
             cache.
         kv_cache_load_factor (float): ratio of kv caching.
         use_virtual_table (bool): use virtual table or not.
-        dynamicemb_options (DynamicEmbTableOptions): dynamice embedding options
+        dynamicemb_options (DynamicEmbTableOptions): dynamic embedding options.
+        dynamicemb_memory: precomputed capacity for the candidate's first shard.
+
     Returns:
         List[Storage]: storage object for each device in topology.
     """
@@ -882,6 +886,7 @@ def calculate_shard_storages(
             is_inference=is_inference,
             multipass_prefetch_max_pass=multipass_prefetch_max_pass,
             dynamicemb_options=dynamicemb_options,
+            dynamicemb_memory=dynamicemb_memory,
         )
     else:
         return tzrec_calculate_shard_storages(
@@ -987,6 +992,14 @@ def _emit_dynamicemb_variants(
             load_factor=ratio, stats=params.stats if params else None
         )
         option.dynamicemb_options.caching = caching
+        option.dynamicemb_memory = memory
+        if caching:
+            allocated = memory.resident_rows / memory.host_rows
+        elif 0 < ratio < 1:
+            allocated = memory.hbm_rows / (memory.hbm_rows + memory.host_rows)
+        else:
+            allocated = ratio
+        option.dynamicemb_allocated_ratio = allocated
         candidates.append(option)
     return candidates
 

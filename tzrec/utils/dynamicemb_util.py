@@ -750,16 +750,9 @@ if has_dynamicemb:
                 tensor = sharding_option.tensor
                 optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
                 optimizer_kwargs = getattr(tensor, "_optimizer_kwargs", [{}])[0]
-                table_memory = _dynamicemb_shard_memory(
-                    dynamicemb_options,
-                    tensor,
-                    shards[0].size[0],
-                    float(sharding_option.cache_load_factor),
-                    is_inference=False,
-                )
                 dynamicemb_options.training = optimizer_class is not None
                 dynamicemb_options.local_hbm_for_values = (
-                    table_memory.local_hbm_for_values
+                    sharding_option.dynamicemb_memory.local_hbm_for_values
                 )
                 # Fill in per-shard fields that used to be populated by
                 # dynamicemb's internal ``_get_dynamicemb_options_per_table``.
@@ -881,21 +874,8 @@ if has_dynamicemb:
             requested = sharding_option.cache_load_factor
             requested = 1.0 if requested is None else requested
             caching = bool(dynamicemb_options.caching)
-            fraction = requested
-            if 0 < requested < 1:
-                memory = _dynamicemb_shard_memory(
-                    dynamicemb_options,
-                    sharding_option.tensor,
-                    shard_sizes[0][0],
-                    requested,
-                )
-                fraction = (
-                    memory.resident_rows / memory.host_rows
-                    if caching
-                    else memory.hbm_rows / (memory.hbm_rows + memory.host_rows)
-                )
             x_eff = _dynamicemb_effective_cache_ratio(
-                fraction,
+                sharding_option.dynamicemb_allocated_ratio,
                 caching=caching,
                 stats=original_cache_params.stats if original_cache_params else None,
                 full_endpoint=requested == 1 and not caching,
@@ -949,6 +929,7 @@ if has_dynamicemb:
         is_inference: bool = False,
         multipass_prefetch_max_pass: Optional[int] = None,
         dynamicemb_options: Optional[dynamicemb.DynamicEmbTableOptions] = None,
+        dynamicemb_memory: Optional[DynamicEmbTableMemory] = None,
     ) -> List[Storage]:
         """Calculates estimated storage sizes.
 
@@ -985,7 +966,8 @@ if has_dynamicemb:
             count_ephemeral_storage_cost (bool): count ephemeral storage cost
             is_inference: bool, whether the model is for inference.
             multipass_prefetch_max_pass (int): multipass prefetch max_pass
-            dynamicemb_options (DynamicEmbTableOptions): dynamice embedding options
+            dynamicemb_options (DynamicEmbTableOptions): dynamic embedding options.
+            dynamicemb_memory: precomputed capacity for the candidate's first shard.
 
         Returns:
             List[Storage]: storage object for each device in topology.
@@ -1008,25 +990,21 @@ if has_dynamicemb:
             is_pooled=is_pooled,
         )
 
-        # A zero ratio is a HOST_ONLY placement, not a request for the
-        # UVM default; only an unset ratio falls back.
-        shard_caching_ratio = caching_ratio if caching_ratio is not None else 1.0
-        # Per-shard (HBM, DDR) bytes from the capacity mirror: the HBM side
-        # holds this placement's value tier plus every tier's key-map
-        # metadata (host tiers keep their key maps on HBM); the DDR side
-        # holds the host value tier.
-        shard_memories = [
-            _dynamicemb_shard_memory(
-                dynamicemb_options,
-                tensor,
-                size[0],
-                shard_caching_ratio,
-                is_inference=is_inference,
-            )
-            for size in shard_sizes
-        ]
-        hbm_specific_sizes = [m.hbm_values + m.hbm_index for m in shard_memories]
-        ddr_specific_sizes = [m.host_values for m in shard_memories]
+        by_rows: Dict[int, DynamicEmbTableMemory] = {}
+        if dynamicemb_memory is not None and not (
+            is_inference
+            and getattr(tensor, "_optimizer_classes", [None])[0] is not None
+        ):
+            by_rows[shard_sizes[0][0]] = dynamicemb_memory
+        for rows, _ in shard_sizes:
+            if rows not in by_rows:
+                by_rows[rows] = _dynamicemb_shard_memory(
+                    dynamicemb_options,
+                    tensor,
+                    rows,
+                    caching_ratio if caching_ratio is not None else 1.0,
+                    is_inference=is_inference,
+                )
         # The counter belongs to the strategy that counts with it; a
         # probabilistic admitter keeps no state, so it costs nothing.
         counter_hbm_specific_size = 0
@@ -1036,9 +1014,10 @@ if has_dynamicemb:
             slots = _bucket_rounded_rows(counter.capacity, width)
             counter_hbm_specific_size = _keymap_bytes(slots, width, score_words=1)
 
-        hbm_sizes: List[int] = [
-            (
-                hbm_specific_size
+        return [
+            Storage(
+                hbm=by_rows[rows].hbm_values
+                + by_rows[rows].hbm_index
                 + counter_hbm_specific_size
                 + shard_estimators.calculate_pipeline_io_cost(
                     input_size=input_size,
@@ -1048,33 +1027,12 @@ if has_dynamicemb:
                     multipass_prefetch_max_pass=multipass_prefetch_max_pass,
                     count_ephemeral_storage_cost=count_ephemeral_storage_cost,
                     is_inference=is_inference,
-                )
+                ),
+                ddr=by_rows[rows].host_values,
             )
-            for input_size, output_size, hbm_specific_size in zip(
-                input_sizes,
-                output_sizes,
-                hbm_specific_sizes,
+            for (rows, _), input_size, output_size in zip(
+                shard_sizes, input_sizes, output_sizes
             )
-        ]
-        ddr_sizes: List[int] = [
-            (
-                input_size + output_size + ddr_specific_size
-                if compute_device == "cpu" and not is_inference
-                else ddr_specific_size
-            )
-            for input_size, output_size, ddr_specific_size in zip(
-                input_sizes,
-                output_sizes,
-                ddr_specific_sizes,
-            )
-        ]
-
-        return [
-            Storage(
-                hbm=hbm_size,
-                ddr=ddr_size,
-            )
-            for hbm_size, ddr_size in zip(hbm_sizes, ddr_sizes)
         ]
 
     from torchrec.sparse import jagged_tensor_validator as _jtv

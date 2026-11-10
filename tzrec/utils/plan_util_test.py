@@ -742,7 +742,9 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
 class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
     """End-to-end exercise of the dynamicemb planner integration."""
 
-    def _enumerate(self, with_plain_table=False, rows=4096, factor=None):
+    def _enumerate(
+        self, with_plain_table=False, rows=4096, factor=None, optimizer=None
+    ):
         from tzrec.utils.plan_util import get_default_sharders as dynamicemb_sharders
 
         table = EmbeddingBagConfig(
@@ -767,6 +769,10 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
                 )
             )
         model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        if optimizer is not None:
+            model.sparse.ebc.embedding_bags["table_de"].weight._optimizer_classes = [
+                optimizer
+            ]
         topology = Topology(world_size=2, compute_device="cuda")
         enumerator = EmbeddingEnumerator(
             topology=topology,
@@ -889,7 +895,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         for name in ("learning_rate_power", "ftrl_beta", "l1_reg", "l2_reg"):
             self.assertIn(name, signature.parameters)
 
-        search_space, topology = self._enumerate()
+        search_space, topology = self._enumerate(optimizer=FTRL)
         sharding_option = next(
             so
             for so in search_space
@@ -899,7 +905,6 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         )
         for rank, shard in enumerate(sharding_option.shards):
             shard.rank = rank
-        sharding_option.tensor._optimizer_classes = [FTRL]
 
         plan = planners.to_sharding_plan([sharding_option], topology)
 
