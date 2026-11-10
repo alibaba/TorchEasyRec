@@ -273,7 +273,7 @@ def _log_dynamicemb_table_plan(
     """Per-table candidate log on rank 0.
 
     The line records the planner's candidate -- the caching choice, the
-    requested ratio, and the per-shard storage estimates. The layout of the
+    allocated share, and the per-shard storage estimates. The layout of the
     fused module is the runtime's own decision (its ``StorageLayout``); do
     not read a requested endpoint here as that table's final placement.
     """
@@ -871,14 +871,13 @@ if has_dynamicemb:
         dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
         original_cache_params = sharding_option.cache_params
         if dynamicemb_options is not None and shard_sizes:
-            requested = sharding_option.cache_load_factor
-            requested = 1.0 if requested is None else requested
+            allocated = sharding_option.cache_load_factor
             caching = bool(dynamicemb_options.caching)
             x_eff = _dynamicemb_effective_cache_ratio(
-                sharding_option.dynamicemb_allocated_ratio,
+                allocated,
                 caching=caching,
                 stats=original_cache_params.stats if original_cache_params else None,
-                full_endpoint=requested == 1 and not caching,
+                full_endpoint=allocated == 1 and not caching,
             )
             sharding_option.cache_params = (
                 dataclasses.replace(original_cache_params, load_factor=x_eff)

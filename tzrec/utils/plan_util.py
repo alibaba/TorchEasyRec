@@ -762,9 +762,10 @@ class EmbeddingStorageEstimator(ShardEstimator):
             dynamicemb_options = None
             if use_dynamicemb:
                 dynamicemb_options = sharding_option.dynamicemb_options
-                # A zero ratio is a HOST_ONLY placement, not a request for
-                # the UVM default; only an unset ratio falls back.
-                caching_ratio = caching_ratio if caching_ratio is not None else 1.0
+                # Only a different shard size or inference state needs a fresh estimate.
+                caching_ratio = getattr(
+                    sharding_option, "dynamicemb_requested_ratio", caching_ratio
+                )
             elif not caching_ratio:
                 caching_ratio = UVM_CACHING_RATIO
 
@@ -982,24 +983,32 @@ def _emit_dynamicemb_variants(
             )
         if caching and memory.resident_rows < required:
             continue
-        # Preserve distinct runtime budgets even when bucket rounding yields equal rows.
-        key = (caching, memory)
-        if key in seen:
-            continue
-        seen.add(key)
-        option = copy.deepcopy(base_option)
-        option.cache_params = CacheParams(
-            load_factor=ratio, stats=params.stats if params else None
-        )
-        option.dynamicemb_options.caching = caching
-        option.dynamicemb_memory = memory
+        if params is None:
+            endpoint = ratio if ratio in (0, 1) else None
+            key = (
+                caching,
+                endpoint,
+                memory.hbm_rows,
+                memory.host_rows,
+                memory.resident_rows,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
         if caching:
             allocated = memory.resident_rows / memory.host_rows
         elif 0 < ratio < 1:
             allocated = memory.hbm_rows / (memory.hbm_rows + memory.host_rows)
         else:
             allocated = ratio
-        option.dynamicemb_allocated_ratio = allocated
+        option = copy.deepcopy(base_option)
+        option.cache_params = CacheParams(
+            load_factor=allocated, stats=params.stats if params else None
+        )
+        option.dynamicemb_options.caching = caching
+        option.dynamicemb_memory = memory
+        option.dynamicemb_requested_ratio = ratio
         candidates.append(option)
     return candidates
 

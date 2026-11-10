@@ -810,7 +810,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             )
             self.assertEqual(
                 (target.caching, target.max_capacity, target.local_hbm_for_values),
-                (caching, 4096, int(ratio * 4096 * 32 * 4)),
+                (caching, 4096, opt.dynamicemb_memory.local_hbm_for_values),
             )
 
     def test_large_table_under_tight_hbm(self):
@@ -882,6 +882,25 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         DynamicEmbParameterSharding.pop_additional_fused_params(fused_params)
         self.assertIn("initial_accumulator_value", fused_params)
 
+    def test_inference_estimate_uses_budget_not_allocated_share(self):
+        from tzrec.optim.optimizer import FTRL
+        from tzrec.utils.plan_util import EmbeddingStorageEstimator
+
+        options, topology = self._enumerate(optimizer=FTRL)
+        opt = next(
+            o
+            for o in options
+            if not o.dynamicemb_options.caching and 0 < o.cache_load_factor < 1
+        )
+        # A 10% value budget on 2048 rows buys 1024 HBM rows and 1920 host rows.
+        self.assertEqual(opt.cache_load_factor, 1024 / (1024 + 1920))
+        EmbeddingStorageEstimator(topology, is_inference=True).estimate(
+            [opt], {opt.module_type_key: mock.Mock(fused_params={})}
+        )
+        self.assertEqual(
+            [shard.storage.ddr for shard in opt.shards], [1920 * 32 * 4] * 2
+        )
+
     def test_sharding_plan_sizes_ftrl_optimizer_state(self):
         import inspect
 
@@ -901,7 +920,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             for so in search_space
             if getattr(so, "use_dynamicemb", False)
             and so.dynamicemb_options.caching
-            and so.cache_load_factor == 0.1
+            and so.cache_load_factor == 0.5
         )
         for rank, shard in enumerate(sharding_option.shards):
             shard.rank = rank
@@ -980,10 +999,10 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("unmeasured", None, 0.1, 0.1, 7),
-            ("measured_zero", 0, 0.1, 0.1, 7),
-            ("small_working_set", 0.1, 64 / 4096, 0.1, 7),
-            ("half", 3.2, 0.1, 0.5, 3),
+            ("unmeasured", None, 0.1, 0.1, 3),
+            ("measured_zero", 0, 0.1, 0.1, 3),
+            ("small_working_set", 0.1, 64 / 4096, 0.1, 3),
+            ("half", 3.2, 0.1, 0.5, 2),
             ("above_half", 4.8, 0.1, 0.75, 1),
             ("full", 6.4, 0.1, None, 0),
         ],
@@ -991,19 +1010,20 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
     )
     def test_auto_grid(self, _, factor, hybrid_floor, cache_floor, ncache):
         opts = self._options(factor)
-        noncache = [
-            o.cache_params.load_factor for o in opts if not o.dynamicemb_options.caching
-        ]
-        cache = [
-            o.cache_params.load_factor for o in opts if o.dynamicemb_options.caching
-        ]
-        self.assertEqual(noncache[0:2], [0, hybrid_floor])
-        self.assertEqual(noncache[5:], [0.5, 0.6, 0.7, 0.8, 0.9, 1])
-        np.testing.assert_allclose(
-            np.diff(np.log(noncache[1:6])), np.log(0.5 / hybrid_floor) / 4
+        noncache = [o for o in opts if not o.dynamicemb_options.caching]
+        cache = [o for o in opts if o.dynamicemb_options.caching]
+        full_bytes = 4096 * 4
+        grid = [0, *np.geomspace(hybrid_floor, 0.5, 5), 0.6, 0.7, 0.8, 0.9, 1]
+        self.assertEqual(
+            [o.dynamicemb_memory.local_hbm_for_values for o in noncache],
+            [int(r * full_bytes) for r in grid],
         )
         self.assertEqual(len(cache), ncache)
-        self.assertEqual(cache[:1], [] if cache_floor is None else [cache_floor])
+        if cache:
+            self.assertEqual(
+                cache[0].dynamicemb_memory.local_hbm_for_values,
+                int(cache_floor * full_bytes),
+            )
 
     @parameterized.expand(
         [
@@ -1018,8 +1038,11 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
     def test_ratio_pin(self, _, ratio, pooling, families):
         opts = self._options(ratio=ratio, pooling=pooling)
         self.assertEqual(
-            [(o.cache_params.load_factor, o.dynamicemb_options.caching) for o in opts],
-            [(ratio, family) for family in families],
+            [
+                (o.dynamicemb_memory.local_hbm_for_values, o.dynamicemb_options.caching)
+                for o in opts
+            ],
+            [(int(ratio * 16384), family) for family in families],
         )
 
     def test_subbyte_budget_becomes_zero_endpoint(self):
@@ -1039,19 +1062,48 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
 
         pinned = self._options(ratio=0.1, rows=rows)
         self.assertEqual(
-            [(o.cache_load_factor, o.dynamicemb_options.caching) for o in pinned],
-            [(0.1, False), (1.0, False)],
+            [
+                (o.dynamicemb_memory.local_hbm_for_values, o.dynamicemb_options.caching)
+                for o in pinned
+            ],
+            [(int(0.1 * rows * 4), False), (rows * 4, False)],
         )
 
-    def test_physical_dedup_keeps_distinct_budgets(self):
-        # The five low ratios buy three byte budgets in the same partial cache.
-        opts = self._options(factor=2047 / 640, rows=4096, dtype=torch.float16)
-        ratios = [
-            o.cache_params.load_factor for o in opts if o.dynamicemb_options.caching
-        ]
-        self.assertEqual(ratios[0], 2047 / 4096)
+    def test_physical_dedup_keeps_first_budget(self):
+        opts = self._options()
+        caches = [o for o in opts if o.dynamicemb_options.caching]
         self.assertEqual(
-            [int(r * 8192) for r in ratios], [4094, 4095, 4096, 4915, 5734]
+            [
+                (o.cache_load_factor, o.dynamicemb_memory.local_hbm_for_values)
+                for o in caches
+            ],
+            [
+                (0.25, int(0.1 * 16384)),
+                (0.5, int(0.1 * 5**0.75 * 16384)),
+                (0.75, int(0.6 * 16384)),
+            ],
+        )
+        pinned_cache = self._options(ratio=0.15)[1]
+        self.assertEqual(pinned_cache.cache_load_factor, 0.25)
+        self.assertEqual(
+            pinned_cache.dynamicemb_memory.local_hbm_for_values, int(0.15 * 16384)
+        )
+
+    def test_equal_tier_rows_keep_zero_partial_and_full(self):
+        opts = self._options(rows=16)
+        self.assertEqual(
+            [
+                (o.cache_load_factor, o.dynamicemb_memory.local_hbm_for_values)
+                for o in opts
+            ],
+            [(0, 0), (1024 / 1040, 6), (1, 64)],
+        )
+        self.assertEqual(
+            {
+                (o.dynamicemb_memory.hbm_rows, o.dynamicemb_memory.host_rows)
+                for o in opts
+            },
+            {(1024, 16)},
         )
 
     def test_invalid_factor(self):
@@ -1093,7 +1145,10 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
             original.stats.expected_miss_rate.assert_called_once_with(0.25)
         self.assertAlmostEqual(hit_rate, expected)
         self.assertIs(opt.cache_params, original)
-        self.assertEqual(opt.cache_params.load_factor, ratio)
+        self.assertEqual(opt.cache_load_factor, 0.25 if caching else ratio)
+        self.assertEqual(
+            opt.dynamicemb_memory.local_hbm_for_values, int(ratio * rows * 4)
+        )
 
 
 if __name__ == "__main__":

@@ -245,15 +245,13 @@ class AdmissionStrategyTest(unittest.TestCase):
         )
         return constraints.dynamicemb_options
 
-    def _shard_storages(self, dynamicemb_options, **kwargs):
+    def _shard_storages(self, dynamicemb_options):
         # the estimator reads the candidate's caching choice off the options
         dynamicemb_options.caching = False
         return dynamicemb_util.dynamicemb_calculate_shard_storages(
             sharder_data=None,
             sharding_type=ShardingType.ROW_WISE.value,
-            tensor=kwargs.pop(
-                "tensor", torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM)
-            ),
+            tensor=torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM),
             compute_device="cuda",
             compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
             shard_sizes=[[self.NUM_EMBEDDINGS // 2, self.EMBEDDING_DIM]] * 2,
@@ -267,23 +265,7 @@ class AdmissionStrategyTest(unittest.TestCase):
             input_data_type_size=4,
             output_data_type_size=4,
             dynamicemb_options=dynamicemb_options,
-            **kwargs,
         )
-
-    def test_inference_excludes_optimizer_state_from_precomputed_memory(self):
-        options = self._options()
-        tensor = torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM)
-        tensor._optimizer_classes = [FTRL]
-        rows = self.NUM_EMBEDDINGS // 2
-        training = dynamicemb_util._dynamicemb_shard_memory(
-            options, tensor, rows, 1.0, caching=False
-        )
-        without_optimizer = self._shard_storages(options, is_inference=True)
-        estimated = self._shard_storages(
-            options, tensor=tensor, dynamicemb_memory=training, is_inference=True
-        )
-        self.assertEqual(estimated, without_optimizer)
-        self.assertLess(estimated[0].ddr, training.host_values)
 
     def test_frequency_strategy_owns_its_counter(self):
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
