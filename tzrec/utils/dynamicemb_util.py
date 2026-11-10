@@ -260,18 +260,12 @@ def _dynamicemb_effective_cache_ratio(
 def _log_dynamicemb_table_plan(
     *,
     fqn: str,
-    caching: bool,
     cache_load_factor: float,
+    caching: bool,
     hbm_bytes: int,
     ddr_bytes: int,
 ) -> None:
-    """Per-table candidate log on rank 0.
-
-    The line records the planner's candidate -- the caching choice, the
-    allocated share, and the per-shard storage estimates. The layout of the
-    fused module is the runtime's own decision (its ``StorageLayout``); do
-    not read a requested endpoint here as that table's final placement.
-    """
+    """Log the table candidate on rank 0; the runtime chooses the fused layout."""
     if int(os.environ.get("RANK", 0)) != 0:
         return
     hbm_gib = hbm_bytes / (1 << 30)
@@ -762,8 +756,8 @@ if has_dynamicemb:
                 )
                 _log_dynamicemb_table_plan(
                     fqn=f"{sharding_option.path}.{sharding_option.name}",
-                    caching=bool(dynamicemb_options.caching),
                     cache_load_factor=float(sharding_option.cache_load_factor),
+                    caching=bool(dynamicemb_options.caching),
                     hbm_bytes=int(shards[0].storage.hbm),
                     ddr_bytes=int(shards[0].storage.ddr),
                 )
