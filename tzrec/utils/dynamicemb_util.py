@@ -283,7 +283,13 @@ def _log_dynamicemb_table_plan(
     hbm_bytes: int,
     ddr_bytes: int,
 ) -> None:
-    """Log the table candidate on rank 0; the runtime chooses the fused layout."""
+    """Per-table mode log on rank 0.
+
+    Report the candidate's caching mode, allocated HBM share and per-shard
+    memory estimates. A cache_load_factor of 1.0 means this table is fully
+    funded. The runtime selects HBM_ONLY only if the entire fused group fits
+    in HBM, so report the planner's DDR estimate even for a fully funded table.
+    """
     if int(os.environ.get("RANK", 0)) != 0:
         return
     hbm_gib = hbm_bytes / (1 << 30)
