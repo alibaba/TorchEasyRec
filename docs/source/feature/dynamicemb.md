@@ -38,6 +38,8 @@ feature_configs {
 
 - **max_capacity**: 最大的id数，Id数超过后会根据Id的驱逐策略进行淘汰
 
+- **cache_load_factor**: （可选）缓存在 GPU 显存（HBM）中的 embedding 行数比例，取值范围为 `(0, 1]`。未设置时，分片规划器会在 `0.1、0.2、...、1.0` 中自动选择；显式设置后，规划器固定使用该比例，不再搜索其他比例。例如 `cache_load_factor: 0.25` 表示将 25% 的 embedding 行缓存在 HBM 中；设置为 `1.0` 时使用 HBM_ONLY，全部 embedding 行驻留显存。
+
 - **score_strategy**: Id驱逐策略，默认为 STEP，目前支持 TIMESTAMP | STEP | LFU | NO_EVICTION
 
   - TIMESTAMP: 每个Id根据最近更新的时间戳，驱逐时间戳最小的Id

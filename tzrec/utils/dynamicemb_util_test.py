@@ -18,7 +18,7 @@ from unittest import mock
 import torch
 from parameterized import param, parameterized
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import CacheParams, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.optim import optimizers, rowwise_adagrad
 
@@ -325,6 +325,29 @@ class AdmissionStrategyTest(unittest.TestCase):
 
     NUM_EMBEDDINGS = 1024
     EMBEDDING_DIM = 8
+
+    @parameterized.expand(
+        [("unset", None), ("explicit", 0.25), ("all_hbm", 1.0)],
+        name_func=parameterized_name_func,
+    )
+    def test_cache_load_factor_sets_cache_params(self, _name, cache_load_factor):
+        dynamicemb_cfg = feature_pb2.DynamicEmbedding(max_capacity=self.NUM_EMBEDDINGS)
+        if cache_load_factor is not None:
+            dynamicemb_cfg.cache_load_factor = cache_load_factor
+        constraints = dynamicemb_util.build_dynamicemb_constraints(
+            dynamicemb_cfg,
+            EmbeddingBagConfig(
+                name="dyn_table",
+                num_embeddings=self.NUM_EMBEDDINGS,
+                embedding_dim=self.EMBEDDING_DIM,
+                feature_names=["user_id"],
+            ),
+        )
+        if cache_load_factor is None:
+            self.assertIsNone(constraints.cache_params)
+        else:
+            self.assertIsInstance(constraints.cache_params, CacheParams)
+            self.assertEqual(constraints.cache_params.load_factor, cache_load_factor)
 
     def _options(self, **admission_strategy):
         dynamicemb_cfg = feature_pb2.DynamicEmbedding(
