@@ -912,7 +912,7 @@ def calculate_shard_storages(
         )
 
 
-_DYNAMICEMB_WORKING_SET_BATCHES = 5
+_DYNAMICEMB_WORKING_SET_MULTIPLIER = 5
 
 
 def _dynamicemb_partial_ratios(low: float) -> List[float]:
@@ -962,7 +962,9 @@ def _emit_dynamicemb_variants(
                 f"{base_option.name}: unique_id_factor must be finite and non-negative"
             )
         required = math.ceil(
-            _DYNAMICEMB_WORKING_SET_BATCHES * unique_id_factor * base_option.batch_size
+            _DYNAMICEMB_WORKING_SET_MULTIPLIER
+            * unique_id_factor
+            * base_option.batch_size
         )
         floor = required / rows or 0.1
 
