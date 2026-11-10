@@ -762,10 +762,6 @@ class EmbeddingStorageEstimator(ShardEstimator):
             dynamicemb_options = None
             if use_dynamicemb:
                 dynamicemb_options = sharding_option.dynamicemb_options
-                # Only a different shard size or inference state needs a fresh estimate.
-                caching_ratio = getattr(
-                    sharding_option, "dynamicemb_requested_ratio", caching_ratio
-                )
             elif not caching_ratio:
                 caching_ratio = UVM_CACHING_RATIO
 
@@ -858,7 +854,7 @@ def calculate_shard_storages(
         kv_cache_load_factor (float): ratio of kv caching.
         use_virtual_table (bool): use virtual table or not.
         dynamicemb_options (DynamicEmbTableOptions): dynamic embedding options.
-        dynamicemb_memory: precomputed capacity for the candidate's first shard.
+        dynamicemb_memory: per-shard capacity of the DynamicEmb candidate.
 
     Returns:
         List[Storage]: storage object for each device in topology.
@@ -866,6 +862,7 @@ def calculate_shard_storages(
     if dynamicemb_options is not None:
         from tzrec.utils.dynamicemb_util import dynamicemb_calculate_shard_storages
 
+        assert dynamicemb_memory is not None
         return dynamicemb_calculate_shard_storages(
             sharder_data=sharder_data,
             sharding_type=sharding_type,
@@ -878,7 +875,6 @@ def calculate_shard_storages(
             local_world_size=local_world_size,
             input_lengths=input_lengths,
             num_poolings=num_poolings,
-            caching_ratio=caching_ratio,
             is_pooled=is_pooled,
             input_data_type_size=input_data_type_size,
             output_data_type_size=output_data_type_size,
@@ -931,6 +927,8 @@ def _emit_dynamicemb_variants(
 ) -> List[ShardingOption]:
     """Generate physically distinct candidates in ascending budget order per family."""
     rows = base_option.shards[0].size[0]
+    if any(shard.size[0] != rows for shard in base_option.shards):
+        raise ValueError("DynamicEmb planning requires equal row counts across shards")
     if unique_id_factor is None:
         required = math.ceil(base_option.batch_size * sum(base_option.input_lengths))
         floor = 0.1
@@ -1008,7 +1006,6 @@ def _emit_dynamicemb_variants(
         )
         option.dynamicemb_options.caching = caching
         option.dynamicemb_memory = memory
-        option.dynamicemb_requested_ratio = ratio
         candidates.append(option)
     return candidates
 

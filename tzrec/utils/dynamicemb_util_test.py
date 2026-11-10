@@ -246,21 +246,26 @@ class AdmissionStrategyTest(unittest.TestCase):
         return constraints.dynamicemb_options
 
     def _shard_storages(self, dynamicemb_options):
-        # the estimator reads the candidate's caching choice off the options
-        dynamicemb_options.caching = False
+        rows = self.NUM_EMBEDDINGS // 2
         return dynamicemb_util.dynamicemb_calculate_shard_storages(
             sharder_data=None,
             sharding_type=ShardingType.ROW_WISE.value,
             tensor=torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM),
             compute_device="cuda",
             compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
-            shard_sizes=[[self.NUM_EMBEDDINGS // 2, self.EMBEDDING_DIM]] * 2,
+            shard_sizes=[[rows, self.EMBEDDING_DIM]] * 2,
             batch_sizes=[16],
             world_size=2,
             local_world_size=2,
             input_lengths=[1.0],
             num_poolings=[1.0],
-            caching_ratio=1.0,
+            dynamicemb_memory=dynamicemb_util.dynamicemb_table_memory(
+                shard_rows=rows,
+                dim=self.EMBEDDING_DIM,
+                element_size=4,
+                ratio=1.0,
+                caching=False,
+            ),
             is_pooled=True,
             input_data_type_size=4,
             output_data_type_size=4,

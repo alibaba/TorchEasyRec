@@ -882,24 +882,25 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         DynamicEmbParameterSharding.pop_additional_fused_params(fused_params)
         self.assertIn("initial_accumulator_value", fused_params)
 
-    def test_inference_estimate_uses_budget_not_allocated_share(self):
+    def test_fresh_inference_plan_excludes_training_optimizer_state(self):
         from tzrec.optim.optimizer import FTRL
-        from tzrec.utils.plan_util import EmbeddingStorageEstimator
 
-        options, topology = self._enumerate(optimizer=FTRL)
-        opt = next(
-            o
-            for o in options
-            if not o.dynamicemb_options.caching and 0 < o.cache_load_factor < 1
-        )
-        # A 10% value budget on 2048 rows buys 1024 HBM rows and 1920 host rows.
-        self.assertEqual(opt.cache_load_factor, 1024 / (1024 + 1920))
-        EmbeddingStorageEstimator(topology, is_inference=True).estimate(
-            [opt], {opt.module_type_key: mock.Mock(fused_params={})}
-        )
-        self.assertEqual(
-            [shard.storage.ddr for shard in opt.shards], [1920 * 32 * 4] * 2
-        )
+        for optimizer, row_bytes in ((FTRL, 3 * 32 * 4), (None, 32 * 4)):
+            with self.subTest(optimizer=optimizer):
+                options, _ = self._enumerate(optimizer=optimizer)
+                opt = next(
+                    o
+                    for o in options
+                    if not o.dynamicemb_options.caching and 0 < o.cache_load_factor < 1
+                )
+                self.assertEqual(opt.cache_load_factor, 1024 / (1024 + 1920))
+                self.assertEqual(
+                    opt.dynamicemb_memory.local_hbm_for_values,
+                    int(0.1 * 2048 * row_bytes),
+                )
+                self.assertEqual(
+                    [s.storage.ddr for s in opt.shards], [1920 * row_bytes] * 2
+                )
 
     def test_sharding_plan_sizes_ftrl_optimizer_state(self):
         import inspect

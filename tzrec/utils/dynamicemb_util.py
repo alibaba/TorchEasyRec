@@ -676,32 +676,19 @@ if has_dynamicemb:
         shard_rows: int,
         ratio: float,
         *,
-        is_inference: bool = False,
-        caching: Optional[bool] = None,
+        caching: bool,
     ) -> DynamicEmbTableMemory:
-        """Capacity mirror for one shard of a planned dynamicemb table.
-
-        Derives every input from the table itself so the estimator, the
-        candidate generator and plan conversion all see the same physical
-        capacities from the same options.
-        """
+        """Size a candidate using the optimizer attached to this plan's tensor."""
         optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
-        optimizer_state_dim = (
-            0
-            if is_inference
-            else _dynamicemb_optimizer_state_dim(
-                optimizer_class, tensor.shape, tensor.dtype
-            )
-        )
-        # the candidate's caching choice is the planner's own field on the
-        # option; the runtime's fused-group layout is derived later
         return dynamicemb_table_memory(
-            caching=bool(dynamicemb_options.caching) if caching is None else caching,
+            caching=caching,
             ratio=ratio,
             shard_rows=shard_rows,
             dim=tensor.shape[1],
             element_size=tensor.element_size(),
-            optimizer_state_dim=optimizer_state_dim,
+            optimizer_state_dim=_dynamicemb_optimizer_state_dim(
+                optimizer_class, tensor.shape, tensor.dtype
+            ),
             bucket_capacity=dynamicemb_options.bucket_capacity,
             score_words=_dynamicemb_score_words(dynamicemb_options),
             no_eviction=_dynamicemb_no_eviction(dynamicemb_options),
@@ -919,7 +906,8 @@ if has_dynamicemb:
         local_world_size: int,
         input_lengths: List[float],
         num_poolings: List[float],
-        caching_ratio: float,
+        dynamicemb_memory: DynamicEmbTableMemory,
+        dynamicemb_options: dynamicemb.DynamicEmbTableOptions,
         is_pooled: bool,
         input_data_type_size: float,
         output_data_type_size: float,
@@ -927,8 +915,6 @@ if has_dynamicemb:
         count_ephemeral_storage_cost: bool = False,
         is_inference: bool = False,
         multipass_prefetch_max_pass: Optional[int] = None,
-        dynamicemb_options: Optional[dynamicemb.DynamicEmbTableOptions] = None,
-        dynamicemb_memory: Optional[DynamicEmbTableMemory] = None,
     ) -> List[Storage]:
         """Calculates estimated storage sizes.
 
@@ -950,13 +936,6 @@ if has_dynamicemb:
                 factors.
             num_poolings (List[float]): average number of poolings per sample
                 (typically 1.0).
-            caching_ratio (float): requested HBM share of the dynamicemb
-                table's values, paired with the candidate's caching choice
-                on ``dynamicemb_options``: a partial non-caching candidate
-                splits values by this ratio, a caching candidate caches this
-                fraction above a full host backing store, and the zero and
-                full endpoints carry a zero or full value budget whose
-                mixed-group costs the estimate envelopes.
             is_pooled (bool): True if embedding output is pooled (ie. `EmbeddingBag`),
                 False if unpooled/sequential (ie. `Embedding`).
             input_data_type_size (int): number of bytes of input data type.
@@ -966,7 +945,7 @@ if has_dynamicemb:
             is_inference: bool, whether the model is for inference.
             multipass_prefetch_max_pass (int): multipass prefetch max_pass
             dynamicemb_options (DynamicEmbTableOptions): dynamic embedding options.
-            dynamicemb_memory: precomputed capacity for the candidate's first shard.
+            dynamicemb_memory: capacity shared by all row-wise shards of this candidate.
 
         Returns:
             List[Storage]: storage object for each device in topology.
@@ -989,21 +968,6 @@ if has_dynamicemb:
             is_pooled=is_pooled,
         )
 
-        by_rows: Dict[int, DynamicEmbTableMemory] = {}
-        if dynamicemb_memory is not None and not (
-            is_inference
-            and getattr(tensor, "_optimizer_classes", [None])[0] is not None
-        ):
-            by_rows[shard_sizes[0][0]] = dynamicemb_memory
-        for rows, _ in shard_sizes:
-            if rows not in by_rows:
-                by_rows[rows] = _dynamicemb_shard_memory(
-                    dynamicemb_options,
-                    tensor,
-                    rows,
-                    caching_ratio if caching_ratio is not None else 1.0,
-                    is_inference=is_inference,
-                )
         # The counter belongs to the strategy that counts with it; a
         # probabilistic admitter keeps no state, so it costs nothing.
         counter_hbm_specific_size = 0
@@ -1015,8 +979,8 @@ if has_dynamicemb:
 
         return [
             Storage(
-                hbm=by_rows[rows].hbm_values
-                + by_rows[rows].hbm_index
+                hbm=dynamicemb_memory.hbm_values
+                + dynamicemb_memory.hbm_index
                 + counter_hbm_specific_size
                 + shard_estimators.calculate_pipeline_io_cost(
                     input_size=input_size,
@@ -1027,11 +991,9 @@ if has_dynamicemb:
                     count_ephemeral_storage_cost=count_ephemeral_storage_cost,
                     is_inference=is_inference,
                 ),
-                ddr=by_rows[rows].host_values,
+                ddr=dynamicemb_memory.host_values,
             )
-            for (rows, _), input_size, output_size in zip(
-                shard_sizes, input_sizes, output_sizes
-            )
+            for input_size, output_size in zip(input_sizes, output_sizes)
         ]
 
     from torchrec.sparse import jagged_tensor_validator as _jtv
