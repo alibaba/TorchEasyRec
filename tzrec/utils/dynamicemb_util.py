@@ -116,6 +116,7 @@ def dynamicemb_table_memory(
     Constraints align shard_rows to the table's bucket width before enumeration.
     The runtime budget covers values and optimizer state only::
 
+        optimizer_state_dim = round(dim * optimizer_multiplier)
         row_bytes = (dim + optimizer_state_dim) * element_size
         full_bytes = shard_rows * row_bytes
 
@@ -330,21 +331,6 @@ def _log_dynamicemb_table_plan(
         f"local_hbm={hbm_gib:.3f}GiB "
         f"local_dram={dram_gib:.3f}GiB"
     )
-
-
-def _dynamicemb_optimizer_state_dim(
-    optimizer_class: Optional[Type[torch.optim.Optimizer]],
-    shape: torch.Size,
-    dtype: torch.dtype,
-) -> int:
-    """Optimizer state elements per row in embedding-dtype units.
-
-    The value layout stores embedding and optimizer state in one row, so the
-    state width in table elements is the embedding width times the
-    per-element multiplier, rounded the way the value sizing has always
-    rounded it.
-    """
-    return round(shape[1] * _get_optimizer_multipler(optimizer_class, shape, dtype))
 
 
 def _get_optimizer_multipler(

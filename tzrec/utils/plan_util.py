@@ -960,14 +960,16 @@ def _emit_dynamicemb_variants(
     tensor = base_option.tensor
     options = base_option.dynamicemb_options
     strategy = options.score_strategy
+    dim = tensor.shape[1]
+    optimizer_multiplier = dynamicemb_util._get_optimizer_multipler(
+        getattr(tensor, "_optimizer_classes", [None])[0], tensor.shape, tensor.dtype
+    )
     table_memory = partial(
         dynamicemb_util.dynamicemb_table_memory,
         shard_rows=rows,
-        dim=tensor.shape[1],
+        dim=dim,
         element_size=tensor.element_size(),
-        optimizer_state_dim=dynamicemb_util._dynamicemb_optimizer_state_dim(
-            getattr(tensor, "_optimizer_classes", [None])[0], tensor.shape, tensor.dtype
-        ),
+        optimizer_state_dim=round(dim * optimizer_multiplier),
         bucket_capacity=options.bucket_capacity,
         score_words=score_policy_num_scores(get_score_policy(strategy).policy),
         no_eviction=strategy == DynamicEmbScoreStrategy.NO_EVICTION,
