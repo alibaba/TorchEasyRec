@@ -25,6 +25,7 @@ from torchrec.optim import optimizers, rowwise_adagrad
 from tzrec.optim.optimizer import FTRL, has_fbgemm_ftrl
 from tzrec.protos import feature_pb2
 from tzrec.utils import dynamicemb_util
+from tzrec.utils.dynamicemb_util import DynamicEmbTableMemory
 from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
 
 
@@ -65,22 +66,31 @@ class ShardPerfContextPatchTest(unittest.TestCase):
                     original.reset_mock()
 
 
+@unittest.skipUnless(dynamicemb_util.has_dynamicemb, "requires dynamicemb")
+@mark_ci_scope("gpu")
 class DynamicEmbTableMemoryTest(unittest.TestCase):
     def test_normal_cache_residency_excludes_overflow(self):
-        size = partial(
-            dynamicemb_util.dynamicemb_table_memory,
-            caching=True,
-            ratio=0.1,
-            shard_rows=4096,
-            dim=32,
-            element_size=4,
-        )
-        m = size()
+        from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+
+        tensor = torch.empty(4096, 32, device="meta")
+        opt = DynamicEmbTableOptions(max_capacity=4096)
+        m = DynamicEmbTableMemory.from_options(tensor, opt, caching=True, ratio=0.1)
         self.assertEqual((m.resident_rows, m.hbm_rows, m.host_rows), (1024, 4096, 4096))
         self.assertEqual(m.local_hbm_for_values, int(0.1 * 4096 * 32 * 4))
-        self.assertEqual(size(score_words=2).hbm_index - m.hbm_index, 8192 * 8)
+        opt.score_strategy = (
+            DynamicEmbScoreStrategy.TIMESTAMP,
+            DynamicEmbScoreStrategy.LFU,
+        )
+        compound = DynamicEmbTableMemory.from_options(
+            tensor, opt, caching=True, ratio=0.1
+        )
+        self.assertEqual(compound.hbm_index - m.hbm_index, 8192 * 8)
 
     def test_invalid_placements(self):
+        from dynamicemb import DynamicEmbTableOptions
+
+        tensor = torch.empty(128, 16, device="meta")
+        opt = DynamicEmbTableOptions(max_capacity=128)
         for caching, ratio in [
             (False, -1),
             (False, float("nan")),
@@ -91,8 +101,8 @@ class DynamicEmbTableMemoryTest(unittest.TestCase):
                 self.subTest(caching=caching, ratio=ratio),
                 self.assertRaises(ValueError),
             ):
-                dynamicemb_util.dynamicemb_table_memory(
-                    caching=caching, ratio=ratio, shard_rows=128, dim=16, element_size=4
+                DynamicEmbTableMemory.from_options(
+                    tensor, opt, caching=caching, ratio=ratio
                 )
 
 
@@ -247,10 +257,11 @@ class AdmissionStrategyTest(unittest.TestCase):
 
     def _shard_storages(self, dynamicemb_options):
         rows = self.NUM_EMBEDDINGS // 2
+        tensor = torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM)
         return dynamicemb_util.dynamicemb_calculate_shard_storages(
             sharder_data=None,
             sharding_type=ShardingType.ROW_WISE.value,
-            tensor=torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM),
+            tensor=tensor,
             compute_device="cuda",
             compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
             shard_sizes=[[rows, self.EMBEDDING_DIM]] * 2,
@@ -259,12 +270,8 @@ class AdmissionStrategyTest(unittest.TestCase):
             local_world_size=2,
             input_lengths=[1.0],
             num_poolings=[1.0],
-            dynamicemb_memory=dynamicemb_util.dynamicemb_table_memory(
-                shard_rows=rows,
-                dim=self.EMBEDDING_DIM,
-                element_size=4,
-                ratio=1.0,
-                caching=False,
+            dynamicemb_memory=DynamicEmbTableMemory.from_options(
+                tensor, dynamicemb_options, caching=False, ratio=1.0
             ),
             is_pooled=True,
             input_data_type_size=4,
@@ -388,6 +395,7 @@ class AdmissionStrategyTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     @unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA counter")
+    @mock.patch.dict(os.environ, {"WORLD_SIZE": "2"})
     def test_counter_hbm_lands_only_for_frequency_admission(self, _, capacity, width):
         from dynamicemb.embedding_admission import MultiTableKVCounter
 
@@ -404,8 +412,7 @@ class AdmissionStrategyTest(unittest.TestCase):
         strategy = feature_pb2.DynamicEmbFrequencyAdmissionStrategy(
             threshold=1, counter_capacity=capacity, counter_bucket_capacity=width
         )
-        with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
-            frequency_options = self._options(frequency_admission_strategy=strategy)
+        frequency_options = self._options(frequency_admission_strategy=strategy)
         frequency = self._shard_storages(frequency_options)
         table = MultiTableKVCounter(
             [frequency_options.admit_strategy.counter], torch.device("cuda")
@@ -622,15 +629,16 @@ class CapacityMirrorRuntimeParityTest(unittest.TestCase):
             )
             opt.init_capacity = opt.max_capacity
             opt.caching = layout == "CACHING"
-            m = dynamicemb_util.dynamicemb_table_memory(
-                caching=opt.caching,
-                ratio=ratio,
-                shard_rows=opt.max_capacity,
-                dim=dim,
-                element_size=4,
-                optimizer_state_dim=state_dim,
-                bucket_capacity=width,
-                no_eviction=score == "NO_EVICTION",
+            tensor = torch.empty(table.num_embeddings, dim, device="meta")
+            tensor._optimizer_classes = [
+                {
+                    "SGD": optimizers.SGD,
+                    "ROWWISE": rowwise_adagrad.RowWiseAdagrad,
+                    "FTRL": FTRL,
+                }[optim]
+            ]
+            m = DynamicEmbTableMemory.from_options(
+                tensor, opt, caching=opt.caching, ratio=ratio
             )
             opt.local_hbm_for_values = m.local_hbm_for_values
             self.assertEqual(
