@@ -228,6 +228,29 @@ def _read_manifest(path: str) -> Tuple[List[int], Optional[str]]:
     return [int(c) for c in manifest["codebook"]], manifest.get("bundle_uuid")
 
 
+def sid_bands(
+    codebook: Sequence[int], base_vocab_size: int
+) -> Tuple[List[int], List[int], List[int]]:
+    """Place each SID level's codes after the base vocabulary.
+
+    Args:
+        codebook: the size of each level.
+        base_vocab_size: the base tokenizer's size, where SID tokens start.
+
+    Returns:
+        ``(level_offsets, band_lo, band_hi)``: each level's first flat index and
+        its inclusive token-id bounds.
+    """
+    offsets: List[int] = []
+    running = 0
+    for size in codebook:
+        offsets.append(running)
+        running += size
+    lo = [base_vocab_size + o for o in offsets]
+    hi = [lo[i] + codebook[i] - 1 for i in range(len(codebook))]
+    return offsets, lo, hi
+
+
 def _build_sid_space(
     cfg: PromptConfig, tok: Tokenizer, base_vocab_size: int, has_projection: bool
 ) -> ResolvedSidSpace:
@@ -284,13 +307,7 @@ def _build_sid_space(
         tok.add_special_tokens([cfg.sentinel_token])
         sentinel_id = tok.token_to_id(cfg.sentinel_token)
 
-    offsets: List[int] = []
-    running = 0
-    for size in codebook:
-        offsets.append(running)
-        running += size
-    lo = [base_vocab_size + o for o in offsets]
-    hi = [lo[i] + codebook[i] - 1 for i in range(len(codebook))]
+    offsets, lo, hi = sid_bands(codebook, base_vocab_size)
 
     return ResolvedSidSpace(
         codebook=tuple(codebook),

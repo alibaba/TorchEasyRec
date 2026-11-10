@@ -12,6 +12,7 @@
 import unittest
 from types import SimpleNamespace
 from typing import Optional, Sequence
+from unittest import mock
 
 import torch
 from parameterized import parameterized
@@ -19,7 +20,11 @@ from torch import nn
 from transformers.loss.loss_utils import ForCausalLMLoss
 
 from tzrec.datasets.utils import Batch
-from tzrec.models.genrec_causal_lm_model import GenRecCausalLMModel
+from tzrec.models.genrec_causal_lm_model import (
+    GenRecCausalLMModel,
+    _left_pad,
+    generate_codes,
+)
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
     INPUT_IDS,
@@ -60,17 +65,7 @@ class PaddedForwardTest(unittest.TestCase):
 
     def test_packs_rows_of_different_lengths(self) -> None:
         embeds = torch.arange(18, dtype=torch.float32).reshape(9, 2)
-        cu = torch.tensor([0, 4, 9])
-        batch = Batch(
-            additional_infos={
-                CU_SEQLENS: cu,
-                MAX_SEQLEN: torch.tensor(7),
-            }
-        )
-        model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
-        torch.nn.Module.__init__(model)
-
-        padded, mask = model._left_pad(embeds, batch)
+        padded, mask = _left_pad(embeds, torch.tensor([0, 4, 9]), 7)
 
         self.assertEqual(padded.shape, (2, 7, 2))
         self.assertEqual(
@@ -219,6 +214,35 @@ class PackedForwardTest(unittest.TestCase):
         )
 
 
+class GenerateCodesTest(unittest.TestCase):
+    def test_undoes_both_shifts_and_keeps_the_best_beams(self) -> None:
+        # base_vocab_size 100, codebook [4, 4, 4]
+        bands = [(100, 103), (104, 107), (108, 111)]
+        local_codes = torch.tensor([[0, 1, 3], [3, 0, 2], [1, 3, 0], [2, 2, 1]])
+        tokens = local_codes + torch.tensor([lo for lo, _ in bands])
+        lm = nn.Identity()
+        with mock.patch(
+            "tzrec.models.genrec_causal_lm_model.dynamic_beam_search",
+            return_value=tokens,
+        ) as beam_search:
+            codes = generate_codes(
+                lm,
+                torch.zeros(5, 4),
+                torch.tensor([0, 2, 5]),
+                3,
+                [2, 3, 4],
+                bands,
+                1,
+            )
+        self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1)[:, :1].tolist())
+        searched_lm, padded, mask, widths, searched_bands = beam_search.call_args.args
+        self.assertIs(searched_lm, lm)
+        self.assertEqual(padded.shape, (2, 3, 4))
+        self.assertEqual(mask.tolist(), [[0, 1, 1], [1, 1, 1]])
+        self.assertEqual(widths, [2, 3, 4])
+        self.assertEqual(searched_bands, bands)
+
+
 class GenRecCausalLMModelTest(unittest.TestCase):
     """The decode schedule and the training forward, both subclass-owned."""
 
@@ -250,6 +274,14 @@ class GenRecCausalLMModelTest(unittest.TestCase):
         self.assertEqual(model._capped_widths, expected)
         space = self.compiled_prompt.sid_space
         self.assertEqual(model._bands, list(zip(space.band_lo, space.band_hi)))
+
+    def test_requires_a_beam_schedule(self) -> None:
+        with self.assertRaisesRegex(ValueError, "beam_widths is required"):
+            self._beam_model(beam_widths=())
+
+    def test_rejects_fewer_than_one_returned_sequence(self) -> None:
+        with self.assertRaisesRegex(ValueError, "num_return_sequences must be >= 1"):
+            self._beam_model(num_return_sequences=0)
 
     def test_rejects_a_schedule_that_does_not_match_the_codebook(self) -> None:
         with self.assertRaisesRegex(ValueError, "entries but the codebook has"):

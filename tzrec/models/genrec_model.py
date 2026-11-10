@@ -11,11 +11,10 @@
 
 """Shared causal-LM plumbing for generative recommendation models.
 
-Builds the causal LM, resizes its vocabulary, wires slot projections, converts
-SID coordinates and scores the response window; a family subclass owns its
-forward and decode path. ``GenRecFrontEnd`` is the served half, the assembled
-prompt and the projected slots, exported like any tzrec model beside the LM's
-HuggingFace weights.
+Builds the causal LM, resizes its vocabulary, wires slot projections and scores
+the response window; a family subclass owns its forward and decode path.
+``GenRecFrontEnd`` is the served half, the assembled prompt and the projected
+slots, exported like any tzrec model beside the LM's HuggingFace weights.
 """
 
 import inspect
@@ -112,13 +111,6 @@ class BaseGenRecModel(BaseModel):
             compiled_prompt.sid_space.target_vocab_size, mean_resizing=False
         )
         self.init_input()
-
-        # decode subtracts these every step; a buffer follows the module's device
-        self.register_buffer(
-            "_level_offsets",
-            torch.tensor(compiled_prompt.sid_space.level_offsets),
-            persistent=False,
-        )
 
     def init_input(self) -> None:
         """Build the projected-slot embedding groups and projection modules."""
@@ -230,22 +222,6 @@ class BaseGenRecModel(BaseModel):
         return embeds.index_copy(
             0, batch.additional_infos[HOLE_POSITIONS], projected.to(embeds.dtype)
         )
-
-    def _tokens_to_local_codes(
-        self, tokens: torch.Tensor, batch_size: int
-    ) -> torch.Tensor:
-        """Undo both shifts: token id back to a local 0-based code.
-
-        Args:
-            tokens: generated token ids, ``(batch_size * beams, num_levels)``.
-            batch_size: rows in the batch.
-
-        Returns:
-            ``(batch_size, beams, num_levels)`` local codes.
-        """
-        space = self._prompt.sid_space
-        codes = tokens - space.base_vocab_size - self._level_offsets
-        return codes.view(batch_size, -1, space.num_levels)
 
     def init_loss(self) -> None:
         """No-op: the backbone owns the causal-LM loss."""
