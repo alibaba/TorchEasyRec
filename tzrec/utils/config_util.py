@@ -107,7 +107,7 @@ def save_message(message: Message, filepath: str) -> None:
         filepath: save path.
     """
     directory, _ = os.path.split(filepath)
-    if not os.path.exists(directory):
+    if directory and not os.path.exists(directory):
         os.makedirs(directory)
     pbtxt = text_format.MessageToString(message, as_utf8=True)
     with open(filepath, "w") as f:

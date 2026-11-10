@@ -20,7 +20,7 @@ forward has no ``logits_to_keep``, or which returns a legacy tuple cache, is
 not supported; Qwen2.5/Qwen3 are what CI covers.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -142,37 +142,10 @@ class GenRecCausalLMModel(BaseGenRecModel):
             common: the shared model config.
         """
         space = self._prompt.sid_space
-        self._num_return_sequences = int(common.num_return_sequences)
-        beam_widths = list(common.beam_widths)
-        if not beam_widths:
-            raise ValueError(
-                f"{type(self).__name__}: beam_widths is required; give one "
-                f"width per SID level, e.g. [50, 50, 50] or [100, 200, 400]."
-            )
-        if len(beam_widths) != space.num_levels:
-            raise ValueError(
-                f"{type(self).__name__}: beam_widths has "
-                f"{len(beam_widths)} entries but the codebook has "
-                f"{space.num_levels} levels; give one width per level."
-            )
-        if any(width < 1 for width in beam_widths):
-            raise ValueError(
-                f"{type(self).__name__}: beam_widths must be >= 1, got {beam_widths}."
-            )
-        if self._num_return_sequences < 1:
-            raise ValueError(
-                f"{type(self).__name__}: num_return_sequences must be >= 1, got "
-                f"{self._num_return_sequences}."
-            )
         self._bands: List[Tuple[int, int]] = list(zip(space.band_lo, space.band_hi))
-        self._capped_widths = capped_beam_widths(beam_widths, self._bands)
-
-        if self._num_return_sequences > self._capped_widths[-1]:
-            raise ValueError(
-                f"{type(self).__name__}: num_return_sequences "
-                f"({self._num_return_sequences}) must not exceed the final capped "
-                f"beam width ({self._capped_widths[-1]})."
-            )
+        self._capped_widths, self._num_return_sequences = resolve_beam_config(
+            common, self._bands
+        )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Run teacher-forced loss or inference decode over the assembled stream.
@@ -256,7 +229,9 @@ class GenRecCausalLMModel(BaseGenRecModel):
             token_mask = None
         else:
             attention = "sdpa"
-            inputs_embeds, padding_mask = self._left_pad(embeds, batch)
+            inputs_embeds, padding_mask = _left_pad(
+                embeds, infos[CU_SEQLENS], layout.max_seqlen
+            )
             token_mask = padding_mask.bool()
             position_ids = torch.zeros_like(padding_mask)
             position_ids[token_mask] = layout.position_ids
@@ -378,7 +353,8 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Returns:
             ``(rows, suffix, vocab)`` logits over the response window.
         """
-        padded, mask = self._left_pad(embeds, batch)
+        infos = batch.additional_infos
+        padded, mask = _left_pad(embeds, infos[CU_SEQLENS], int(infos[MAX_SEQLEN]))
         if padded.shape[1] < suffix:
             raise ValueError(
                 f"{type(self).__name__}: no sample reaches the supervised "
@@ -408,44 +384,113 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Returns:
             ``(B, num_return, num_levels)`` local codes, best first.
         """
-        padded, mask = self._left_pad(embeds, batch)
-        tokens = dynamic_beam_search(
-            self.lm, padded, mask, self._capped_widths, self._bands
-        )
-        codes = self._tokens_to_local_codes(tokens, padded.shape[0])
-        return codes[:, : self._num_return_sequences, :]
-
-    def _left_pad(
-        self,
-        embeds: torch.Tensor,
-        batch: Batch,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Pad the packed rows into a rectangle, newest token last.
-
-        Used by beam decode and by the padded training forward.
-
-        Args:
-            embeds: packed embeddings, ``(total_tokens, hidden)``.
-            batch: carries the packed prompt metadata.
-
-        Returns:
-            Padded embeddings and attention mask.
-        """
         infos = batch.additional_infos
-        cu_seqlens = infos[CU_SEQLENS]
-        max_seqlen = int(infos[MAX_SEQLEN])
-        starts = cu_seqlens[:-1]
-        lengths = cu_seqlens[1:] - starts
-        batch_size = lengths.numel()
-        hidden = embeds.shape[-1]
+        return generate_codes(
+            self.lm,
+            embeds,
+            infos[CU_SEQLENS],
+            int(infos[MAX_SEQLEN]),
+            self._capped_widths,
+            self._bands,
+            self._num_return_sequences,
+        )
 
-        columns = torch.arange(max_seqlen, device=embeds.device)
-        mask = columns[None, :] >= (max_seqlen - lengths)[:, None]
 
-        padded = embeds.new_zeros((batch_size, max_seqlen, hidden))
-        # mask selects row-major, which is how embeds and input_ids are packed
-        padded[mask] = embeds
-        return padded, mask.long()
+def resolve_beam_config(
+    common: GenRecModelConfig, bands: Sequence[Tuple[int, int]]
+) -> Tuple[List[int], int]:
+    """Validate the decode knobs against the codebook and cap the beam widths.
+
+    Args:
+        common: the shared model config.
+        bands: inclusive ``(lo, hi)`` token-id edge per SID level.
+
+    Returns:
+        The capped width per level, and ``num_return_sequences``.
+    """
+    num_return_sequences = int(common.num_return_sequences)
+    beam_widths = list(common.beam_widths)
+    if not beam_widths:
+        raise ValueError(
+            "beam_widths is required; give one width per SID level, e.g. "
+            "[50, 50, 50] or [100, 200, 400]."
+        )
+    if len(beam_widths) != len(bands):
+        raise ValueError(
+            f"beam_widths has {len(beam_widths)} entries but the codebook has "
+            f"{len(bands)} levels; give one width per level."
+        )
+    if any(width < 1 for width in beam_widths):
+        raise ValueError(f"beam_widths must be >= 1, got {beam_widths}.")
+    if num_return_sequences < 1:
+        raise ValueError(
+            f"num_return_sequences must be >= 1, got {num_return_sequences}."
+        )
+    capped_widths = capped_beam_widths(beam_widths, bands)
+    if num_return_sequences > capped_widths[-1]:
+        raise ValueError(
+            f"num_return_sequences ({num_return_sequences}) must not exceed the "
+            f"final capped beam width ({capped_widths[-1]})."
+        )
+    return capped_widths, num_return_sequences
+
+
+def _left_pad(
+    embeds: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pad packed rows into a rectangle, newest token last.
+
+    Args:
+        embeds: packed embeddings, ``(total_tokens, hidden)``.
+        cu_seqlens: row boundaries, ``(rows + 1,)``.
+        max_seqlen: the widest row.
+
+    Returns:
+        Padded embeddings and attention mask.
+    """
+    starts = cu_seqlens[:-1]
+    lengths = cu_seqlens[1:] - starts
+    batch_size = lengths.numel()
+    hidden = embeds.shape[-1]
+
+    columns = torch.arange(max_seqlen, device=embeds.device)
+    mask = columns[None, :] >= (max_seqlen - lengths)[:, None]
+
+    padded = embeds.new_zeros((batch_size, max_seqlen, hidden))
+    # mask selects row-major, which is how embeds and input_ids are packed
+    padded[mask] = embeds
+    return padded, mask.long()
+
+
+def generate_codes(
+    lm: torch.nn.Module,
+    embeds: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    capped_widths: Sequence[int],
+    bands: Sequence[Tuple[int, int]],
+    num_return_sequences: int,
+) -> torch.Tensor:
+    """Beam-search the SID answer of packed prompts.
+
+    Args:
+        lm: the causal LM.
+        embeds: the assembled prompt embeddings, packed.
+        cu_seqlens: row boundaries, ``(rows + 1,)``.
+        max_seqlen: the widest row.
+        capped_widths: beam width per SID level, already capped.
+        bands: inclusive ``(lo, hi)`` token-id edge per SID level.
+        num_return_sequences: beams to return per row.
+
+    Returns:
+        ``(rows, num_return_sequences, num_levels)`` local codes, best first.
+    """
+    padded, mask = _left_pad(embeds, cu_seqlens, max_seqlen)
+    tokens = dynamic_beam_search(lm, padded, mask, capped_widths, bands)
+    # a band starts at base_vocab_size + level_offset, so this undoes both shifts
+    codes = tokens - tokens.new_tensor([lo for lo, _ in bands])
+    codes = codes.view(padded.shape[0], -1, len(bands))
+    return codes[:, :num_return_sequences, :]
 
 
 @torch.fx.wrap
