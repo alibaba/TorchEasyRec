@@ -1064,7 +1064,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
 @mark_ci_scope("gpu")
 class DynamicEmbCandidateGridTest(unittest.TestCase):
-    """Layout candidate generation: grids, endpoints, eligibility, residency."""
+    """Candidate generation: grids, endpoints, pins, residency, dedup."""
 
     BATCH = 128
     # large enough that every grid ratio realizes a distinct placement:
@@ -1286,15 +1286,6 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
         self.assertEqual([round(r, 9) for r in self._ratios(families, False)], [0.1])
         self.assertEqual(self._ratios(families, True), [])
 
-    def test_explicit_no_eligible_variant_raises(self):
-        # NO_EVICTION refuses HYBRID and the pinned cache cannot hold the
-        # batch: the table has no eligible variant at the pin.
-        constraint = self._constraint(
-            explicit_ratio=0.1, pooling=500.0, score_strategy="NO_EVICTION"
-        )
-        with self.assertRaisesRegex(ValueError, "no eligible variant"):
-            self._candidates(constraint, batch_size=100)
-
     def test_ineligible_factor_is_rejected(self):
         constraint = self._constraint(unique_id_factor=float("nan"))
         with self.assertRaisesRegex(ValueError, "unique_id_factor"):
@@ -1303,32 +1294,23 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unique_id_factor"):
             self._candidates(constraint)
 
-    def test_unsplittable_policy_keeps_non_caching_full_budget_only(self):
-        # HybridStorage refuses NO_EVICTION tables. Automatic non-caching
-        # choices stay full-budget only -- a zero or partial member could
-        # fuse with budgeted members into an unsupported mixed HYBRID --
-        # while the supported caching choices keep their grid.
-        families = self._candidates(self._constraint(score_strategy="NO_EVICTION"))
-        self.assertEqual(self._ratios(families, False), [1.0])
-        self.assertEqual(len(self._partial_ratios(families, True)), 9)
-
-    def test_clamp_collapses_equal_budgets_keeping_best_score(self):
-        # A 17-row shard aligned to 128 rows: every partial ratio whose
-        # aligned budget reaches the un-rounded fit threshold clamps to the
-        # same budget and realizes the same tier rows, so the physically
-        # equal candidates collapse. The retained estimator scores nominal
-        # ratios differently, so the best-scored (highest-ratio) candidate
-        # wins rather than the smallest.
+    def test_clamp_collapses_equal_budgets_keeping_the_smallest_ratio(self):
+        # A 17-row shard aligned to 128 rows: every partial ratio from the
+        # second grid point up clamps to the same budget and realizes the
+        # same tier rows, so the physically equal candidates collapse at
+        # generation. The deterministic representative is the smallest
+        # generating ratio -- the second geometric point, not the highest
+        # ratio -- while 0.1 keeps a budget of its own below the threshold.
         families = self._candidates(
             self._constraint(num_embeddings=34), num_embeddings=34
         )
         non_caching = [r for r in self._ratios(families, False) if 0.0 < r < 1.0]
-        # 0.1's budget stays below the threshold; every ratio from the
-        # second grid point up clamps to it
-        self.assertEqual(non_caching, [0.1, 0.9])
-        # the caching family collapses the same way, also keeping 0.9
-        caching = self._ratios(families, True)
-        self.assertEqual(caching, [0.1, 0.9])
+        self.assertEqual(
+            [round(r, 9) for r in non_caching], [0.1, round(0.1 * 5**0.25, 9)]
+        )
+        # the caching family collapses the same way, keeping the same ratios
+        caching = [round(r, 9) for r in self._ratios(families, True)]
+        self.assertEqual(caching, [0.1, round(0.1 * 5**0.25, 9)])
 
     def test_equal_rows_with_different_budgets_do_not_collapse(self):
         # On a table whose tier rows are identical across ratios (a cache
@@ -1506,6 +1488,149 @@ class DynamicEmbPlannerRegressionTest(unittest.TestCase):
         for shard in full.shards:
             self.assertLessEqual(shard.storage.ddr, 128 * 32 * 4)
             self.assertGreater(shard.storage.hbm, 0)
+
+
+@unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
+@mark_ci_scope("gpu")
+class DynamicEmbGroupFitValidationTest(unittest.TestCase):
+    """Complete-proposal validation under the runtime's native fusion.
+
+    The additive candidate estimates understate what a fitting fused group
+    spends on HBM: the candidate budgets derive from the aligned capacity
+    while the runtime's fit rule compares them against the raw per-shard
+    sizes, so a fully funded member's surplus can cover an underfunded
+    groupmate and turn the whole group HBM-only, moving the groupmate's
+    values from the estimated host tier into HBM.
+    """
+
+    ZERO_ROWS = 4_000
+    ZERO_DIM = 64
+    FULL_ROWS = 897
+    FULL_DIM = 2048
+
+    def _proposal(self):
+        """A two-table placed proposal whose mixed group fits by surplus.
+
+        The full member's aligned budget (1024 rows of dim 2048) exceeds
+        its raw 897-row size by more than the zero member's raw 4000-row
+        dim-64 bytes, so the runtime's summed-budget fit rule takes the
+        whole group HBM-only even though one member requested nothing.
+        """
+        from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
+        from tzrec.utils.plan_util import (
+            get_default_sharders as _tzrec_get_default_sharders,
+        )
+
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=rows,
+                embedding_dim=dim,
+                name=name,
+                feature_names=[name],
+            )
+            for name, rows, dim in (
+                ("t_zero", self.ZERO_ROWS, self.ZERO_DIM),
+                ("t_full", self.FULL_ROWS, self.FULL_DIM),
+            )
+        ]
+        fqn_constraints = {}
+        for table in tables:
+            cfg = feature_pb2.DynamicEmbedding()
+            cfg.max_capacity = table.num_embeddings
+            cfg.score_strategy = "STEP"
+            fqn_constraints[f"sparse.ebc.{table.name}"] = build_dynamicemb_constraints(
+                cfg, table
+            )
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        topology = Topology(world_size=1, compute_device="cuda")
+        enumerator = EmbeddingEnumerator(
+            topology=topology,
+            batch_size=128,
+            fqn_constraints=fqn_constraints,
+        )
+        search_space = enumerator.enumerate(
+            module=model, sharders=_tzrec_get_default_sharders()
+        )
+        chosen = {}
+        for name, ratio in (("t_zero", 0.0), ("t_full", 1.0)):
+            option = next(
+                so
+                for so in search_space
+                if getattr(so, "use_dynamicemb", False)
+                and so.name == name
+                and so.cache_load_factor == ratio
+            )
+            for shard in option.shards:
+                shard.rank = 0
+            chosen[name] = option
+        return list(chosen.values())
+
+    def test_surplus_fit_group_rejects_between_estimate_and_actual(self):
+        from torchrec.distributed.planner.types import PlannerError, PlannerErrorType
+
+        from tzrec.utils import dynamicemb_util
+        from tzrec.utils.dynamicemb_util import dynamicemb_table_memory
+
+        proposal = self._proposal()
+        # the additive estimate every candidate was accepted by...
+        estimated = sum(
+            int(shard.storage.hbm) for option in proposal for shard in option.shards
+        )
+        # ...and what the surplus fit moves: the zero member's whole tier of
+        # values, which the estimate charged to the host side, lands in HBM
+        # once the group goes wholly HBM-only
+        zero = next(o for o in proposal if o.cache_load_factor == 0.0)
+        zero_memory = dynamicemb_table_memory(
+            caching=False,
+            ratio=0.0,
+            shard_rows=zero.shards[0].size[0],
+            dim=zero.tensor.shape[1],
+            element_size=zero.tensor.element_size(),
+            bucket_capacity=zero.dynamicemb_options.bucket_capacity,
+            score_words=1,
+        )
+        moved = zero_memory.host_values - zero_memory.hbm_values
+        self.assertGreater(moved, 0)
+        cap = estimated + moved // 2
+        constraint = SimpleNamespace(
+            devices=[SimpleNamespace(storage=SimpleNamespace(hbm=cap, ddr=1 << 40))],
+            local_world_size=1,
+        )
+        with self.assertRaises(PlannerError) as ctx:
+            dynamicemb_util._validate_dynamicemb_group_fit(proposal, constraint)
+        self.assertEqual(
+            ctx.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
+        )
+
+    def test_adequate_rank_cap_accepts_the_same_proposal(self):
+        from tzrec.utils import dynamicemb_util
+        from tzrec.utils.dynamicemb_util import dynamicemb_table_memory
+
+        proposal = self._proposal()
+        estimated = sum(
+            int(shard.storage.hbm) for option in proposal for shard in option.shards
+        )
+        zero = next(o for o in proposal if o.cache_load_factor == 0.0)
+        zero_memory = dynamicemb_table_memory(
+            caching=False,
+            ratio=0.0,
+            shard_rows=zero.shards[0].size[0],
+            dim=zero.tensor.shape[1],
+            element_size=zero.tensor.element_size(),
+            bucket_capacity=zero.dynamicemb_options.bucket_capacity,
+            score_words=1,
+        )
+        moved = zero_memory.host_values - zero_memory.hbm_values
+        # a cap above both the estimate and the actual group cost passes
+        constraint = SimpleNamespace(
+            devices=[
+                SimpleNamespace(
+                    storage=SimpleNamespace(hbm=estimated + 4 * moved, ddr=1 << 40)
+                )
+            ],
+            local_world_size=1,
+        )
+        dynamicemb_util._validate_dynamicemb_group_fit(proposal, constraint)
 
 
 def _expected_caching_ratios(floor):

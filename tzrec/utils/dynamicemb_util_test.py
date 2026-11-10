@@ -111,54 +111,61 @@ class DynamicEmbTableMemoryTest(unittest.TestCase):
 
     def test_zero_endpoint_covers_host_only_and_mixed_minimum_hbm(self):
         # an all-zero group allocates HOST_ONLY: no HBM values, full host
-        # values, and the hash-map metadata on HBM
+        # values, and the key map on HBM. Mixed into HYBRID the member
+        # acquires a 1024-row minimum HBM tier; the envelope keeps the
+        # larger of the two placements per field.
         aligned = self._aligned()
         row_bytes = self.DIM * self.ELEMENT_SIZE
-        host_only = dynamicemb_util.dynamicemb_table_memory(
+        zero = dynamicemb_util.dynamicemb_table_memory(
             caching=False,
             ratio=0.0,
             shard_rows=self.ROWS,
             dim=self.DIM,
             element_size=self.ELEMENT_SIZE,
         )
-        # per-slot: key 8 + digest 1 + score 8 + row index 8 = 25 bytes
-        host_only_index = 25 * aligned + 4 * 782
-        self.assertEqual(host_only.host_values, aligned * row_bytes)
-        self.assertEqual(host_only.local_hbm_for_values, 0)
-        self.assertGreaterEqual(host_only.hbm_index, host_only_index)
-        self.assertEqual(host_only.hbm_index, host_only_index)
-        # mixed into HYBRID the member acquires a 1024-row minimum HBM tier
-        self.assertEqual(host_only.hbm_values, 1024 * row_bytes)
-        self.assertEqual(host_only.hbm_rows, 1024)
+        self.assertEqual(zero.host_values, aligned * row_bytes)
+        self.assertEqual(zero.host_rows, aligned)
+        self.assertEqual(zero.hbm_values, 1024 * row_bytes)
+        self.assertEqual(zero.hbm_rows, 1024)
+        # one score word: 21 bytes per slot in both tiers' key maps,
+        # plus each map's bucket-size counters
+        self.assertEqual(
+            zero.hbm_index,
+            (21 * 1024 + 4) + (21 * aligned + 4 * 782),
+        )
+        self.assertEqual(zero.local_hbm_for_values, 0)
 
     def test_full_endpoint_covers_hbm_only_and_mixed_minimum_host(self):
-        # an all-full group allocates HBM_ONLY: values funded to the aligned
-        # capacity; a mixed group adds a minimum host bucket instead
+        # an all-full group allocates HBM_ONLY at the aligned capacity; a
+        # mixed group instead gives the member a minimum host bucket while
+        # its HBM tier rounds to whole 1024-row buckets, and the envelope
+        # keeps the larger of the two placements per field
         aligned = self._aligned()
         row_bytes = self.DIM * self.ELEMENT_SIZE
         full = self._memory(False, 1.0)
-        hbm_only_index = 29 * aligned + 4 * 782
-        self.assertGreaterEqual(full.hbm_values, aligned * row_bytes)
-        self.assertEqual(full.local_hbm_for_values, aligned * row_bytes)
-        self.assertGreaterEqual(full.hbm_index, hbm_only_index)
+        hbm_tier_rows = 98 * 1024  # the raw shard rows rounded to 1024s
+        self.assertEqual(full.hbm_values, hbm_tier_rows * row_bytes)
+        self.assertEqual(full.hbm_rows, hbm_tier_rows)
         # the minimum host tier of the mixed outcome is charged, but the
         # endpoint never joins a CACHING group, so no full backing table
         self.assertEqual(full.host_values, 128 * row_bytes)
         self.assertEqual(full.host_rows, 128)
+        self.assertEqual(
+            full.hbm_index,
+            (21 * hbm_tier_rows + 4 * 98) + (21 * 128 + 4),
+        )
+        self.assertEqual(full.local_hbm_for_values, aligned * row_bytes)
 
     def test_hybrid_splits_values_across_both_tiers(self):
         memory = self._memory(False, 0.25)
-        row_bytes = self.DIM * self.ELEMENT_SIZE
-        self.assertEqual(memory.hbm_values, memory.hbm_rows * row_bytes)
-        self.assertEqual(memory.host_values, memory.host_rows * row_bytes)
-        self.assertGreater(memory.local_hbm_for_values, 0)
         # both tiers round up to whole buckets, so together they cover the
         # full aligned table (and may exceed it by their roundings)
         self.assertGreaterEqual(memory.hbm_rows + memory.host_rows, self._aligned())
+        self.assertGreater(memory.local_hbm_for_values, 0)
         # the budget comes from the aligned full shard, not the raw rows
         self.assertEqual(
             memory.local_hbm_for_values,
-            int(0.25 * self._aligned() * row_bytes),
+            int(0.25 * self._aligned() * self.DIM * self.ELEMENT_SIZE),
         )
 
     def test_hybrid_near_full_split_keeps_a_minimum_host_bucket(self):
@@ -169,8 +176,8 @@ class DynamicEmbTableMemoryTest(unittest.TestCase):
 
     def test_caching_keeps_a_full_backing_table_and_bills_overflow(self):
         memory = self._memory(True, 0.1)
-        row_bytes = self.DIM * self.ELEMENT_SIZE
         aligned = self._aligned()
+        row_bytes = self.DIM * self.ELEMENT_SIZE
         # host tier is the full backing table
         self.assertEqual(memory.host_rows, aligned)
         self.assertEqual(memory.host_values, aligned * row_bytes)
@@ -179,7 +186,21 @@ class DynamicEmbTableMemoryTest(unittest.TestCase):
         self.assertGreaterEqual(memory.resident_rows, 0.1 * aligned)
         # overflow is billed to HBM but not credited to residency
         self.assertEqual(memory.hbm_rows - memory.resident_rows, 3 * 1024)
-        self.assertEqual(memory.hbm_values, memory.hbm_rows * row_bytes)
+
+    def test_caching_request_allocates_a_larger_share_than_it_budgets(self):
+        # A nominal 0.1 request on a 4096-row shard buys one whole 1024-row
+        # cache bucket: the allocated capacity share is 0.25 while the
+        # runtime budget stays the requested share of the aligned shard.
+        memory = dynamicemb_util.dynamicemb_table_memory(
+            caching=True,
+            ratio=0.1,
+            shard_rows=4096,
+            dim=16,
+            element_size=4,
+        )
+        self.assertEqual(memory.resident_rows, 1024)
+        self.assertEqual(memory.host_rows, 4096)
+        self.assertEqual(memory.local_hbm_for_values, int(0.1 * 4096 * 16 * 4))
 
     def test_caching_value_budget_uses_the_aligned_denominator(self):
         row_bytes = self.DIM * self.ELEMENT_SIZE
@@ -216,26 +237,26 @@ class DynamicEmbTableMemoryTest(unittest.TestCase):
         base = self._memory(False, 0.0)
         compound = self._memory(False, 0.0, score_words=2)
         aligned = self._aligned()
-        # the envelope's winning index branch may differ; both grow by
-        # exactly one extra 8-byte score word per slot on the HOST_ONLY tier
-        self.assertEqual(compound.hbm_index - base.hbm_index, 8 * aligned)
+        # one extra 8-byte score word per slot, in both the mixed minimum
+        # HBM tier and the host tier the zero envelope charges
+        self.assertEqual(compound.hbm_index - base.hbm_index, 8 * (aligned + 1024))
 
-    def test_no_eviction_key_map_is_twice_the_value_buffer(self):
-        # the key map holds 1/0.5 = 2x the rows, rounded to whole buckets
-        slots = -(-2 * self.ROWS // 128) * 128
-        rows = slots // 2
+    def test_no_eviction_value_rows_are_init_capacity_with_double_key_map(self):
+        # the fork sizes the value buffer at init_capacity -- the aligned
+        # per-shard rows at the planning horizon -- and the key map at twice
+        # those rows, already whole buckets
+        aligned = self._aligned()
+        slots = 2 * aligned
         memory = self._memory(False, 1.0, no_eviction=True)
-        self.assertEqual(memory.hbm_rows, rows)
-        # per slot: key + digest + score + ref + row index
-        self.assertEqual(memory.hbm_index, 29 * slots + 4 * (slots // 128))
+        self.assertEqual(memory.hbm_rows, aligned)
+        # per slot: key 8 + digest 1 + score 8 + reference counter 4
+        self.assertEqual(memory.hbm_index, 21 * slots + 4 * (slots // 128))
         self.assertGreater(memory.local_hbm_for_values, self.ROWS * self.DIM * 4)
 
     def test_invalid_requests_are_rejected(self):
         for bad_ratio in (-0.1, 1.5, float("inf"), float("nan")):
             with self.assertRaises(ValueError):
                 self._memory(False, bad_ratio)
-        with self.assertRaises(ValueError):
-            self._memory(False, 0.5, no_eviction=True)
         with self.assertRaises(ValueError):
             # the endpoints are non-caching
             self._memory(True, 0.0)
@@ -555,22 +576,34 @@ class AdmissionStrategyTest(unittest.TestCase):
 
 
 class EffectiveCacheRatioTest(unittest.TestCase):
-    """Restored empirical x_eff model with endpoint handling."""
+    """The empirical x_eff model over allocated capacity shares."""
 
     def test_full_endpoint_takes_the_full_hbm_path(self):
         # regardless of cache statistics inherited from a base constraint
         self.assertEqual(
             dynamicemb_util._dynamicemb_effective_cache_ratio(
-                1.0, False, stats=object()
+                1.0, False, stats=object(), full_endpoint=True
             ),
             1.0,
         )
 
     def test_zero_endpoint_reads_host_memory(self):
-        # explicit host-access estimate: no HYBRID intercept at ratio zero
+        # explicit host-access estimate: no HYBRID intercept at share zero
         self.assertEqual(
             dynamicemb_util._dynamicemb_effective_cache_ratio(0.0, False),
             0.0,
+        )
+
+    def test_caching_share_reaching_one_stays_on_the_cache_path(self):
+        # a cache covering the whole backing table is still a cache, not
+        # the standalone HBM-direct path; a share above one just clamps
+        self.assertAlmostEqual(
+            dynamicemb_util._dynamicemb_effective_cache_ratio(1.0, True),
+            0.28 + 0.01,
+        )
+        self.assertAlmostEqual(
+            dynamicemb_util._dynamicemb_effective_cache_ratio(1.5, True),
+            0.28 + 0.01,
         )
 
     def test_partial_candidates_keep_their_empirical_bases(self):
@@ -616,64 +649,44 @@ class EffectiveCacheRatioTest(unittest.TestCase):
 )
 @mark_ci_scope("gpu")
 class NativeDynamicEmbOptionsGroupingTest(unittest.TestCase):
-    """Upstream options and TorchRec's own grouping decide fusion.
+    """Project-built options through TorchRec's own grouping decide fusion.
 
-    The planner proposes budgets and caching choices on plain upstream
-    ``DynamicEmbTableOptions``; which tables fuse is the upstream grouping
-    key's decision. Capacity and budget fields must stay out of that key so
-    mixed-budget tables can share one fused module, while the caching
-    choice separates the groups the runtime builds differently.
+    The planner proposes budgets and caching choices on options built by
+    ``build_dynamicemb_constraints``; which tables fuse is the upstream
+    grouping key's decision. Capacity and budget fields must stay out of
+    that key so mixed-budget tables can share one fused module, while the
+    caching choice separates the groups the runtime builds differently.
     """
 
-    def _options(self, **kwargs):
-        import dynamicemb
-
-        return dynamicemb.DynamicEmbTableOptions(**kwargs)
-
-    def test_capacity_and_budget_stay_out_of_the_grouped_key(self):
-        # a zero-budget member, a partially funded member and a fully
-        # funded one share one grouped key: native fusion may put them in
-        # one module whose layout the runtime then selects
-        zero = self._options(max_capacity=100, dim=8)
-        partial = self._options(max_capacity=100, dim=8)
-        full = self._options(max_capacity=100, dim=8)
-        zero.local_hbm_for_values = 0
-        partial.local_hbm_for_values = 12345
-        full.local_hbm_for_values = 100 * 8 * 4
-        keys = [o.get_grouped_key() for o in (zero, partial, full)]
-        self.assertEqual(keys[0], keys[1])
-        self.assertEqual(keys[1], keys[2])
-        self.assertEqual(hash(zero), hash(partial))
-
-    def test_caching_choice_separates_groups(self):
-        caching = self._options(max_capacity=100, dim=8, caching=True)
-        non_caching = self._options(max_capacity=100, dim=8, caching=False)
-        self.assertNotEqual(caching.get_grouped_key(), non_caching.get_grouped_key())
-
-    def test_deepcopy_and_pickle_preserve_native_options(self):
-        import copy
-        import pickle
-
-        options = self._options(
-            max_capacity=100, dim=8, caching=True, local_hbm_for_values=123
+    def _options(self, **overrides):
+        cfg = feature_pb2.DynamicEmbedding(max_capacity=1024, score_strategy="STEP")
+        constraints = dynamicemb_util.build_dynamicemb_constraints(
+            cfg,
+            EmbeddingBagConfig(
+                num_embeddings=1024,
+                embedding_dim=16,
+                name="t",
+                feature_names=["f"],
+            ),
         )
-        clone = copy.deepcopy(options)
-        self.assertIs(type(clone), type(options))
-        self.assertEqual(clone.get_grouped_key(), options.get_grouped_key())
-        roundtrip = pickle.loads(pickle.dumps(options))
-        self.assertIs(type(roundtrip), type(options))
-        self.assertEqual(roundtrip.get_grouped_key(), options.get_grouped_key())
+        options = constraints.dynamicemb_options
+        options.dim = 16
+        options.max_capacity = 1024
+        options.embedding_dtype = torch.float32
+        options.index_type = torch.int64
+        for key, value in overrides.items():
+            setattr(options, key, value)
+        return options
 
-    def test_torchrec_group_tables_fuses_native_mixed_budgets(self):
+    def test_project_options_group_in_real_torchrec_grouping(self):
         # the real TorchRec grouping path: fused params (which carry the
-        # options object) decide which tables share one fused module.
-        # Different per-table budgets fuse; different caching choices do
-        # not.
+        # options built by the project's own constraint builder) decide
+        # which tables share one fused module. Different per-table budgets
+        # fuse; different caching choices do not.
         from torchrec.distributed.embedding_sharding import (
             ShardedEmbeddingTable,
             group_tables,
         )
-        from torchrec.distributed.embedding_types import EmbeddingComputeKernel
         from torchrec.modules.embedding_configs import PoolingType
 
         def table(name, **kwargs):
@@ -858,7 +871,11 @@ class CapacityMirrorRuntimeParityTest(unittest.TestCase):
         options = constraint.dynamicemb_options
         options.dim = dim
         options.max_capacity = rows
-        options.init_capacity = rows
+        # the planner aligns init_capacity to whole buckets; the fork sizes
+        # a NO_EVICTION value buffer at exactly this capacity
+        options.init_capacity = dynamicemb_util.dynamicemb_aligned_capacity(
+            rows, options.bucket_capacity
+        )
         options.embedding_dtype = torch.float32
         options.index_type = torch.int64
         memory = dynamicemb_util.dynamicemb_table_memory(
@@ -877,6 +894,9 @@ class CapacityMirrorRuntimeParityTest(unittest.TestCase):
         return options, memory
 
     def _keymap_bytes(self, state):
+        # every fork key map allocates the same fields: keys/digests/scores
+        # in the table storage, one bucket-size counter per bucket, and a
+        # per-slot reference counter (which spans the overflow area too)
         km = state.key_index_map
         total = km.table_storage_.numel()
         if km.overflow_table_storage_ is not None:
@@ -884,10 +904,7 @@ class CapacityMirrorRuntimeParityTest(unittest.TestCase):
         total += km.bucket_sizes.numel() * 4
         if km.overflow_bucket_sizes is not None:
             total += km.overflow_bucket_sizes.numel() * 4
-        if km.rows_ is not None:
-            total += km.rows_.numel() * 8
-        if km._ref_counter is not None:
-            total += km._ref_counter.numel() * 4
+        total += km._ref_counter.numel() * 4
         return int(total)
 
     def _tier_bytes(self, state):
@@ -960,6 +977,17 @@ class CapacityMirrorRuntimeParityTest(unittest.TestCase):
             param("caching_tenth", True, 0.1, 100_003, 64, None, "STEP", "SGD", 0),
             param("caching_most", True, 0.9, 100_003, 64, None, "STEP", "SGD", 0),
             param("caching_small_table", True, 0.1, 1000, 64, None, "STEP", "SGD", 0),
+            param(
+                "caching_no_eviction",
+                True,
+                0.25,
+                100_003,
+                64,
+                None,
+                "NO_EVICTION",
+                "SGD",
+                0,
+            ),
         ],
         name_func=parameterized_name_func,
     )

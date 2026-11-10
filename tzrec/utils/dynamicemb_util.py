@@ -1024,6 +1024,14 @@ if has_dynamicemb:
                     sharding_option.path,
                     tuple(sorted(options.get_grouped_key().items())),
                 )
+                # The estimator charged this shard the candidate's values and
+                # key maps plus its pipeline-I/O and admission-counter costs;
+                # the group recompute replaces the first two exactly and must
+                # keep the rest rather than drop it.
+                extra_hbm = int(shard.storage.hbm or 0) - (
+                    memory.hbm_values + memory.hbm_index
+                )
+                extra_ddr = int(shard.storage.ddr or 0) - memory.host_values
                 groups.setdefault(key, []).append(
                     (
                         options,
@@ -1032,14 +1040,19 @@ if has_dynamicemb:
                         (tensor.shape[1] + state_dim) * tensor.element_size(),
                         shard.size[0],
                         score_words,
+                        extra_hbm,
+                        extra_ddr,
                     )
                 )
 
         for (rank, _path, _grouped_key), members in groups.items():
-            # The runtime's fit basis: bucket-aligned per-shard rows.
+            # The runtime's fit basis: the raw per-shard max_capacity bytes,
+            # while the candidate budgets derive from the aligned capacity --
+            # the gap is what lets a fully funded member's surplus cover an
+            # underfunded groupmate and turn the group wholly HBM-only.
             total_bytes = sum(
-                member_sizing[1] * row_bytes
-                for _opts, _mem, member_sizing, row_bytes, _rows, _words in members
+                raw_rows * row_bytes
+                for _opts, _mem, _sizing, row_bytes, raw_rows, _w, _eh, _ed in members
             )
             total_budget = sum(member[1].local_hbm_for_values for member in members)
             if total_bytes <= total_budget:
@@ -1050,14 +1063,23 @@ if has_dynamicemb:
                 layout = "HOST_ONLY"
             else:
                 layout = "HYBRID"
-            for _opts, memory, sizing, row_bytes, _rows, score_words in members:
+            for (
+                _opts,
+                memory,
+                sizing,
+                row_bytes,
+                raw_rows,
+                score_words,
+                e_h,
+                e_d,
+            ) in members:
                 width, full_rows, full_slots, cache_words = sizing
-                # The runtime splits on its aligned per-shard rows and its
-                # own fraction of budget over aligned size.
-                frac = min(1.0, memory.local_hbm_for_values / (full_rows * row_bytes))
+                # The runtime splits on the raw rows and its own fraction of
+                # budget over raw bytes.
+                frac = min(1.0, memory.local_hbm_for_values / (raw_rows * row_bytes))
                 placement = _dynamicemb_placement_memory(
                     layout,
-                    shard_rows=full_rows,
+                    shard_rows=raw_rows,
                     row_bytes=row_bytes,
                     full_rows=full_rows,
                     full_slots=full_slots,
@@ -1066,8 +1088,8 @@ if has_dynamicemb:
                     cache_words=cache_words,
                     frac=frac,
                 )
-                hbm_used[rank] += placement.hbm_values + placement.hbm_index
-                ddr_used[rank] += placement.host_values
+                hbm_used[rank] += placement.hbm_values + placement.hbm_index + e_h
+                ddr_used[rank] += placement.host_values + e_d
 
         for rank, device in enumerate(storage_constraint.devices):
             over = []
