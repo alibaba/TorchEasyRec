@@ -630,7 +630,6 @@ class CapacityMirrorRuntimeParityTest(unittest.TestCase):
                 element_size=4,
                 optimizer_state_dim=state_dim,
                 bucket_capacity=width,
-                score_words=dynamicemb_util._dynamicemb_score_words(opt),
                 no_eviction=score == "NO_EVICTION",
             )
             opt.local_hbm_for_values = m.local_hbm_for_values

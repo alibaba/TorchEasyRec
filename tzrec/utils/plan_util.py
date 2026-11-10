@@ -14,6 +14,7 @@ import json
 import math
 import os
 from collections import OrderedDict
+from functools import partial
 from queue import Queue
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
@@ -926,6 +927,10 @@ def _emit_dynamicemb_variants(
     base_option: ShardingOption, unique_id_factor: Optional[float]
 ) -> List[ShardingOption]:
     """Generate physically distinct candidates in ascending budget order per family."""
+    from dynamicemb import DynamicEmbScoreStrategy
+    from dynamicemb.key_value_table import get_score_policy
+    from dynamicemb.scored_hashtable import score_policy_num_scores
+
     rows = base_option.shards[0].size[0]
     if any(shard.size[0] != rows for shard in base_option.shards):
         raise ValueError("DynamicEmb planning requires equal row counts across shards")
@@ -952,17 +957,26 @@ def _emit_dynamicemb_variants(
         if 0 < ratio < 1:
             requests.append((True, ratio))
 
+    tensor = base_option.tensor
+    options = base_option.dynamicemb_options
+    strategy = options.score_strategy
+    table_memory = partial(
+        dynamicemb_util.dynamicemb_table_memory,
+        shard_rows=rows,
+        dim=tensor.shape[1],
+        element_size=tensor.element_size(),
+        optimizer_state_dim=dynamicemb_util._dynamicemb_optimizer_state_dim(
+            getattr(tensor, "_optimizer_classes", [None])[0], tensor.shape, tensor.dtype
+        ),
+        bucket_capacity=options.bucket_capacity,
+        score_words=score_policy_num_scores(get_score_policy(strategy).policy),
+        no_eviction=strategy == DynamicEmbScoreStrategy.NO_EVICTION,
+    )
     candidates = []
     seen = set()
     for caching, requested in requests:
         ratio = requested
-        memory = dynamicemb_util._dynamicemb_shard_memory(
-            base_option.dynamicemb_options,
-            base_option.tensor,
-            rows,
-            ratio,
-            caching=caching,
-        )
+        memory = table_memory(caching=caching, ratio=ratio)
         if ratio > 0 and memory.local_hbm_for_values == 0:
             if caching:
                 continue
@@ -972,13 +986,7 @@ def _emit_dynamicemb_variants(
                 continue  # Automatic search already includes the full endpoint.
             caching, ratio = False, 1.0
         if ratio != requested:
-            memory = dynamicemb_util._dynamicemb_shard_memory(
-                base_option.dynamicemb_options,
-                base_option.tensor,
-                rows,
-                ratio,
-                caching=False,
-            )
+            memory = table_memory(caching=False, ratio=ratio)
         if caching and memory.resident_rows < required:
             continue
         if params is None:

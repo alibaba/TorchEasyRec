@@ -137,8 +137,10 @@ def dynamicemb_table_memory(
 
     Every tier's key map lives on HBM, including the host tier's. Each slot
     stores a key, digest, score words and reference counter; each bucket also
-    has a size counter. The cache overflow has its own map. A full NO_EVICTION
-    map has twice as many slots as value rows.
+    has a size counter. LRU+LFU stores two score words (timestamp and frequency);
+    other policies store one. The cache overflow has its own map. A full
+    NO_EVICTION map stores the value row index in its score word and has twice
+    as many slots as value rows.
 
     For zero and full budgets, take the larger cost per field across the
     standalone endpoint and its placement in a fused HYBRID group. NO_EVICTION
@@ -391,12 +393,10 @@ try:
         DEFAULT_BUCKET_CAPACITY,
         _sharded_table_bucket_layout,
     )
-    from dynamicemb.key_value_table import get_score_policy
     from dynamicemb.planner import (
         DynamicEmbParameterConstraints,
         DynamicEmbParameterSharding,
     )
-    from dynamicemb.scored_hashtable import score_policy_num_scores
     from dynamicemb.shard import (
         DynamicEmbeddingBagCollectionSharder,
         DynamicEmbeddingCollectionSharder,
@@ -427,25 +427,6 @@ try:
 
     # pyre-ignore [9]
     DynamicEmbeddingCollectionContext.__init__ = _demb_ctx_init_coerce_none
-
-    def _dynamicemb_score_words(dynamicemb_options) -> int:
-        """Score words the table's policy occupies per key in its key map.
-
-        Mirrors ``get_score_policy``/``score_policy_num_scores``: two words
-        for the compound LRU+LFU policy, one for every other policy
-        (NO_EVICTION alone keeps a slot-occupancy flag word).
-        """
-        return score_policy_num_scores(
-            get_score_policy(dynamicemb_options.score_strategy).policy
-        )
-
-    def _dynamicemb_no_eviction(dynamicemb_options) -> bool:
-        """Whether the table's strategy never evicts.
-
-        The pinned runtime has no compound NO_EVICTION policies, so the
-        single-strategy comparison is exact.
-        """
-        return dynamicemb_options.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
 
     @dataclasses.dataclass
     class TZRecDynamicEmbParameterSharding(DynamicEmbParameterSharding):
@@ -710,30 +691,6 @@ if has_dynamicemb:
     DynamicEmbeddingBagCollectionSharder.compute_kernels = _ebc_compute_kernels
     # pyrefly: ignore[unbound-name]
     DynamicEmbeddingCollectionSharder.compute_kernels = _ec_compute_kernels
-
-    def _dynamicemb_shard_memory(
-        dynamicemb_options,
-        tensor: torch.Tensor,
-        shard_rows: int,
-        ratio: float,
-        *,
-        caching: bool,
-    ) -> DynamicEmbTableMemory:
-        """Size a candidate using the optimizer attached to this plan's tensor."""
-        optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
-        return dynamicemb_table_memory(
-            caching=caching,
-            ratio=ratio,
-            shard_rows=shard_rows,
-            dim=tensor.shape[1],
-            element_size=tensor.element_size(),
-            optimizer_state_dim=_dynamicemb_optimizer_state_dim(
-                optimizer_class, tensor.shape, tensor.dtype
-            ),
-            bucket_capacity=dynamicemb_options.bucket_capacity,
-            score_words=_dynamicemb_score_words(dynamicemb_options),
-            no_eviction=_dynamicemb_no_eviction(dynamicemb_options),
-        )
 
     def _to_sharding_plan(
         sharding_options: List[ShardingOption],
