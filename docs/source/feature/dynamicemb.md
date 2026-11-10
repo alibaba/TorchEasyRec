@@ -36,7 +36,7 @@ feature_configs {
 }
 ```
 
-- **max_capacity**: 最大的id数，Id数超过后会根据Id的驱逐策略进行淘汰。每个分片的建表容量会按有效 `bucket_capacity` 向上对齐，因此实际容量可能略高于配置值。显式 `init_capacity_per_rank` 使用同一 bucket 对齐，并限制在分片最大容量内。
+- **max_capacity**: 最大的id数，Id数超过后会根据Id的驱逐策略进行淘汰。每个分片的建表容量会按有效 `bucket_capacity` 向上对齐，因此实际容量可能略高于配置值。
 
 - **cache_load_factor**: （可选）显存规划请求的值预算比例，取值 [0, 1]。不配置时由规划器自动搜索合适的比例；若配置了 `unique_id_factor`，规划器会结合 batch size 估算工作集。参见[如何从训练数据测量 unique_id_factor](../usage/train.md#pooling-factor)。配置后的语义：
 
