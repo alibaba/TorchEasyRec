@@ -925,7 +925,24 @@ def _dynamicemb_partial_ratios(low: float) -> List[float]:
 def _emit_dynamicemb_variants(
     base_option: ShardingOption, unique_id_factor: Optional[float]
 ) -> List[ShardingOption]:
-    """Generate physically distinct candidates in ascending budget order per family."""
+    """Expand a DynamicEmb sharding option into caching and non-caching candidates.
+
+    Without an explicit load factor, search the zero and full value budgets
+    and both partial-budget modes. The working set sets the lower bounds of
+    the partial grids: up to five geometric points through 0.5, then fixed
+    tenths up to 0.9. An explicit partial ratio requests both modes at that
+    budget. A cache must cover the working set; a cache covering the entire
+    shard is represented by the full non-caching endpoint.
+
+    In automatic search, keep the first budget for each set of rounded tier
+    capacities within a mode. Zero, partial and full budgets remain distinct:
+    equal row estimates do not imply the same layout after native fusion.
+    The DP proposer uses the candidates' HBM and host costs to select a plan.
+
+    The caller supplies base_option.dynamicemb_options. Each emitted option
+    owns a deep copy of its table options and reports the allocated share as
+    its load factor; its memory estimate retains the byte budget for runtime.
+    """
     tensor = base_option.tensor
     template = copy.copy(base_option)
     template.dynamicemb_options = copy.copy(base_option.dynamicemb_options)
