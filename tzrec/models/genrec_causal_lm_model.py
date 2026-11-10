@@ -50,6 +50,7 @@ def _shared_prefix_attention(
     value: torch.Tensor,
     attention_mask: Any,
     scaling: Optional[float] = None,
+    dropout: float = 0.0,
     *,
     multi_target_layout: MultiTargetLayout,
     **kwargs: Any,
@@ -60,12 +61,14 @@ def _shared_prefix_attention(
     causal mask, aligned to the last key, hides the row's other targets.
 
     Args:
-        module: backbone attention module after projection and rotary embedding.
+        module: the calling attention module; unused.
         query: packed queries shaped (1, query heads, total tokens, head dim).
         key: packed keys, retaining the backbone's grouped KV heads.
         value: packed values with the same layout as keys.
-        attention_mask: unused; the segments carry the visibility.
+        attention_mask: required by the HF attention interface; always None
+            here, the segments carry the visibility.
         scaling: backbone attention scale.
+        dropout: attention dropout probability, 0 outside training.
         multi_target_layout: batch-local segments and key gather indices.
         **kwargs: unused backbone attention options.
 
@@ -75,13 +78,8 @@ def _shared_prefix_attention(
     from flash_attn import flash_attn_varlen_func
 
     layout = multi_target_layout
-    if query.dtype == torch.float32:
-        dtype = (
-            torch.get_autocast_dtype("cuda")
-            if torch.is_autocast_enabled("cuda")
-            else module.q_proj.weight.dtype
-        )
-        query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+    # rotary embedding may promote q/k to fp32; v keeps the projection dtype
+    query, key = query.to(value.dtype), key.to(value.dtype)
     output = flash_attn_varlen_func(
         query[0].transpose(0, 1),
         key[0].transpose(0, 1).index_select(0, layout.key_indices),
@@ -90,7 +88,7 @@ def _shared_prefix_attention(
         cu_seqlens_k=layout.cu_seqlens_k,
         max_seqlen_q=layout.max_seqlen,
         max_seqlen_k=layout.max_seqlen,
-        dropout_p=0.0,
+        dropout_p=dropout,
         softmax_scale=scaling,
         causal=True,
     )
@@ -207,10 +205,6 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Returns:
             Per-target logits and labels, and each target's row weight.
         """
-        if self.lm.is_gradient_checkpointing:
-            raise ValueError(
-                "Shared SID training requires gradient checkpointing to be disabled."
-            )
         infos = batch.additional_infos
         layout = build_multi_target_layout(
             infos[CU_SEQLENS],
@@ -218,11 +212,6 @@ class GenRecCausalLMModel(BaseGenRecModel):
             self._prompt.sid_space.num_levels,
         )
         if self._attn_kernel == "flash_attention_2":
-            config = self.lm.config
-            if config.attention_dropout != 0 or config.use_sliding_window:
-                raise ValueError(
-                    "Shared-prefix FA2 requires full attention and zero dropout."
-                )
             attention, attention_mask = _SHARED_PREFIX_ATTENTION, None
             inputs_embeds = embeds.unsqueeze(0)
             position_ids = layout.position_ids.unsqueeze(0)
@@ -245,20 +234,18 @@ class GenRecCausalLMModel(BaseGenRecModel):
                 .unsqueeze(1)
             )
         previous_attention = self.lm.config._attn_implementation
-        try:
-            self.lm.set_attn_implementation(attention)
-            # NOTE: cuDNN's masked SDPA backward returns NaN dq at lengths that are
-            # odd multiples of 64 (torch 2.14, cuDNN 9.24); FA2 never reaches SDPA
-            with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
-                hidden = self.lm.base_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask={"full_attention": attention_mask},
-                    position_ids=position_ids,
-                    use_cache=False,
-                    multi_target_layout=layout,
-                ).last_hidden_state
-        finally:
-            self.lm.set_attn_implementation(previous_attention)
+        self.lm.set_attn_implementation(attention)
+        # NOTE: cuDNN's masked SDPA backward returns NaN dq at lengths that are
+        # odd multiples of 64 (torch 2.14, cuDNN 9.24); FA2 never reaches SDPA
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+            hidden = self.lm.base_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask={"full_attention": attention_mask},
+                position_ids=position_ids,
+                use_cache=False,
+                multi_target_layout=layout,
+            ).last_hidden_state
+        self.lm.set_attn_implementation(previous_attention)
         hidden = hidden[0] if token_mask is None else hidden[token_mask]
         return {
             "logits": self.lm.get_output_embeddings()(hidden[layout.score_indices]),

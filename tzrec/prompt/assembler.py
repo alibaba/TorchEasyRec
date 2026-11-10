@@ -405,7 +405,6 @@ def build_multi_target_layout(
     """
     device = cu_seqlens.device
     cu_seqlens = cu_seqlens.to(torch.int64)
-    response_lengths = response_lengths.to(torch.int64)
     row_lengths = torch.diff(cu_seqlens)
     prefix_lengths = row_lengths - response_lengths
     target_counts = response_lengths // num_levels

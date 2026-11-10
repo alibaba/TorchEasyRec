@@ -330,7 +330,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     @unittest.skipIf(*nv_gpu_unavailable)
-    @mark_ci_scope("h20", "gpu")
+    @mark_ci_scope("gpu")
     def test_genrec_multi_target_train_eval_export(self, world_size, attn_kernel):
         if torch.cuda.device_count() < world_size:
             self.skipTest("Requires two GPUs for distributed parent normalization")

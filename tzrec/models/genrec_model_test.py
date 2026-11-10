@@ -294,7 +294,7 @@ class BaseGenRecModelTest(unittest.TestCase):
         [["sdpa"], ["flash_attention_2"]], name_func=parameterized_name_func
     )
     @unittest.skipIf(*nv_gpu_unavailable)
-    @mark_ci_scope("h20", "gpu")
+    @mark_ci_scope("gpu")
     def test_shared_prefix_projection_gradients_match_expansion(self, backend) -> None:
         hybrid = backend == "flash_attention_2"
         if hybrid and flash_attn_unavailable[0]:
