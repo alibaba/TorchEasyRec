@@ -861,7 +861,7 @@ def build_dynamicemb_constraints(
                 f"dynamicemb table {emb_config.name} sets cache_load_factor="
                 f"{load_factor}; it must be a finite ratio in [0, 1]."
             )
-        constraints_kwargs["cache_params"] = (CacheParams(load_factor=load_factor),)
+        constraints_kwargs["cache_params"] = CacheParams(load_factor=load_factor)
 
     constraints = DynamicEmbParameterConstraints(
         use_dynamicemb=True,
