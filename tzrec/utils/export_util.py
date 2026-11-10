@@ -94,8 +94,66 @@ from tzrec.utils.state_dict_util import fix_mch_state, init_parameters
 from tzrec.utils.zch_util import iter_zch_tables
 
 
-def ensure_input_tile_for_distributed_embedding() -> None:
+def _has_dynamicemb_in_pipeline_config(
+    pipeline_config: Optional[EasyRecConfig],
+) -> bool:
+    """Whether any feature in ``pipeline_config`` configures ``dynamicemb``."""
+    if pipeline_config is None:
+        return False
+    for feat_config in pipeline_config.feature_configs:
+        feat_type = feat_config.WhichOneof("feature")
+        if not feat_type:
+            continue
+        oneof_feat_config = getattr(feat_config, feat_type)
+        if feat_type == "sequence_feature":
+            for sub_feat_config in oneof_feat_config.features:
+                sub_type = sub_feat_config.WhichOneof("feature")
+                if not sub_type:
+                    continue
+                sub_oneof = getattr(sub_feat_config, sub_type)
+                if hasattr(sub_oneof, "dynamicemb") and sub_oneof.HasField(
+                    "dynamicemb"
+                ):
+                    return True
+        elif hasattr(oneof_feat_config, "dynamicemb") and oneof_feat_config.HasField(
+            "dynamicemb"
+        ):
+            return True
+    return False
+
+
+def _has_dynamicemb_in_model(model: BaseModule) -> bool:
+    """Whether any feature or embedding table on ``model`` uses ``dynamicemb``."""
+    for feature in getattr(model, "features", None) or ():
+        config = getattr(feature, "config", None)
+        if (
+            config is not None
+            and hasattr(config, "dynamicemb")
+            and config.HasField("dynamicemb")
+        ):
+            return True
+    bag_infos, embedding_infos = _get_sparse_table_to_embedding_info(model)
+    return any(
+        getattr(info, "use_dynamicemb", False)
+        for info in (*bag_infos.values(), *embedding_infos.values())
+    )
+
+
+def ensure_input_tile_for_distributed_embedding(
+    pipeline_config: Optional[EasyRecConfig] = None,
+) -> None:
     """Ensure distributed embedding export uses INPUT_TILE=3."""
+    if (
+        not acc_utils.use_distributed_embedding()
+        and not env_util.use_rtp()
+        and _has_dynamicemb_in_pipeline_config(pipeline_config)
+    ):
+        logger.info(
+            "Detected dynamicemb feature in pipeline_config; "
+            "automatically enabling USE_DISTRIBUTED_EMBEDDING=1."
+        )
+        os.environ["USE_DISTRIBUTED_EMBEDDING"] = "1"
+
     if not acc_utils.use_distributed_embedding():
         return
 
@@ -161,7 +219,21 @@ def export_model(
         )
 
     use_rtp = env_util.use_rtp()
+    has_dynemb = _has_dynamicemb_in_pipeline_config(
+        pipeline_config
+    ) or _has_dynamicemb_in_model(model)
+    if has_dynemb and not use_rtp and not acc_utils.use_distributed_embedding():
+        logger.info(
+            "Detected dynamicemb feature; automatically enabling "
+            "USE_DISTRIBUTED_EMBEDDING=1."
+        )
+        os.environ["USE_DISTRIBUTED_EMBEDDING"] = "1"
+        ensure_input_tile_for_distributed_embedding()
     use_dist_embedding = acc_utils.use_distributed_embedding()
+    if has_dynemb and (use_rtp or not use_dist_embedding):
+        raise ValueError(
+            "dynamicemb requires USE_DISTRIBUTED_EMBEDDING=1 and a non-RTP export"
+        )
     if pipeline_config.export_config.HasField("dynamic_embedding"):
         if use_rtp or not use_dist_embedding:
             raise ValueError(

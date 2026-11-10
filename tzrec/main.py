@@ -1289,12 +1289,12 @@ def export(
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
 
-    ensure_input_tile_for_distributed_embedding()
-
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     if edit_config_json:
         config_util.edit_config(pipeline_config, json.loads(edit_config_json))
     ori_pipeline_config = copy.copy(pipeline_config)
+
+    ensure_input_tile_for_distributed_embedding(pipeline_config)
 
     # AOTI bakes allow_tf32 into Triton constexprs at trace time.
     acc_utils.allow_tf32_for_export(pipeline_config)
