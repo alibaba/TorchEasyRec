@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 import os
 import unittest
 import warnings
@@ -379,7 +378,14 @@ class AdmissionStrategyTest(unittest.TestCase):
         self.assertEqual(first.get_grouped_key(), second.get_grouped_key())
         self.assertNotEqual(first.get_grouped_key(), frequency.get_grouped_key())
 
-    def test_counter_hbm_lands_only_for_frequency_admission(self):
+    @parameterized.expand(
+        [("aligned", 2048, 1024), ("unaligned", 1026, 65)],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA counter")
+    def test_counter_hbm_lands_only_for_frequency_admission(self, _, capacity, width):
+        from dynamicemb.embedding_admission import MultiTableKVCounter
+
         no_admission = self._shard_storages(self._options())
         probabilistic = self._shard_storages(
             self._options(
@@ -390,16 +396,20 @@ class AdmissionStrategyTest(unittest.TestCase):
                 )
             )
         )
-        frequency_options = self._options(
-            frequency_admission_strategy=(
-                feature_pb2.DynamicEmbFrequencyAdmissionStrategy(threshold=1)
-            )
+        strategy = feature_pb2.DynamicEmbFrequencyAdmissionStrategy(
+            threshold=1, counter_capacity=capacity, counter_bucket_capacity=width
         )
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
+            frequency_options = self._options(frequency_admission_strategy=strategy)
         frequency = self._shard_storages(frequency_options)
-        counter = frequency_options.admit_strategy.counter
-        counter_hbm = math.ceil(
-            dynamicemb_util.align_to_table_size(counter.capacity)
-            * (8 + 8 + 1 + 4 / counter.bucket_capacity)
+        table = MultiTableKVCounter(
+            [frequency_options.admit_strategy.counter], torch.device("cuda")
+        ).table_
+        # The pinned runtime's memory_usage() omits its reference counters.
+        counter_hbm = (
+            table.table_storage_.nbytes
+            + table.bucket_sizes.nbytes
+            + table._ref_counter.nbytes
         )
         for base, prob, freq in zip(no_admission, probabilistic, frequency):
             self.assertEqual(prob.hbm, base.hbm)

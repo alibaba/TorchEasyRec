@@ -361,6 +361,7 @@ try:
         DynamicEmbeddingCollectionSharder,
     )
     from dynamicemb.shard.embedding import DynamicEmbeddingCollectionContext
+    from dynamicemb.types import BUCKET_ALIGNMENT
 
     # torchrec 1.7.0 no longer coerces EmbeddingCollectionContext's None list-fields
     # to []; dynamicemb still passes None (breaks sharded EC forward), so re-coerce.
@@ -1031,10 +1032,9 @@ if has_dynamicemb:
         counter_hbm_specific_size = 0
         if isinstance(dynamicemb_options.admit_strategy, FrequencyAdmissionStrategy):
             counter = dynamicemb_options.admit_strategy.counter
-            counter_hbm_specific_size = align_to_table_size(counter.capacity) * (
-                8 + 8 + 1 + 4 / counter.bucket_capacity
-            )
-            counter_hbm_specific_size = math.ceil(counter_hbm_specific_size)
+            width = _bucket_rounded_rows(counter.bucket_capacity, BUCKET_ALIGNMENT)
+            slots = _bucket_rounded_rows(counter.capacity, width)
+            counter_hbm_specific_size = _keymap_bytes(slots, width, score_words=1)
 
         hbm_sizes: List[int] = [
             (
