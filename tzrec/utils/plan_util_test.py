@@ -972,7 +972,9 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
 
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
 @mark_ci_scope("gpu")
-class DynamicEmbCandidateGridTest(unittest.TestCase):
+class DynamicEmbPlannerTest(unittest.TestCase):
+    """Test candidate generation and scoring with meta tensors."""
+
     def _options(
         self, factor=None, ratio=None, *, rows=4096, dtype=torch.float32, pooling=1
     ):
